@@ -29,16 +29,22 @@ restores its usable mode. It never resets workspace contents or re-imports files
 `ExecutionEnv.id` is stable per workspace (`nanobot:bwrap:<id>`), so Durable's
 same-file identity is preserved when that workspace is reopened.
 
-Imports are read-only mounts in a short-lived, isolated bwrap copy worker; their
-source descriptors are pinned and their mounts disappear before the execution
-environment starts. The worker rejects symlinks, special files, and files with
+Import admission normalizes and policy-checks the absolute path, then opens every
+ancestor from `/` relative to the previously pinned directory FD with
+`O_DIRECTORY|O_NOFOLLOW`; the final component is opened relative to that pinned
+parent with `O_NOFOLLOW`. Type/link checks use `fstat` on that exact final FD—no
+separate lstat/realpath loop authorizes a different pathname resolution. The
+resulting source descriptors are read-only mounts in a short-lived, isolated
+bwrap copy worker; their mounts disappear before execution starts. The worker
+rejects symlinks, special files, and files with
 `nlink != 1`; it opens files with `O_NOFOLLOW`, checks the opened inode, and copies
 bytes into exclusive new files (no source hard links or symlinks are preserved).
 Directories are traversed via pinned directory descriptors. Per-file and
 per-directory metadata checks reject sources that change while copying; this is
 not a filesystem-wide atomic snapshot, so callers must provide a quiescent tree
-for content consistency. Quiescence is not an authorization or path-race boundary;
-import-root ancestor ABA remains under separate review. Limits are 32 imports,
+for content consistency; this assumption is not the authorization boundary.
+A bounded actual-filesystem ancestor-symlink injection check is recorded below.
+Limits are 32 imports,
 64 MiB total file content, 10,000 entries, depth 64, and
 30 seconds. The worker uses a private copy of the host Node executable plus
 read-only `/usr`; runtimes that need external host libraries fail closed.
@@ -133,6 +139,16 @@ config-store access, or deployment changes were introduced.
   was denied (guest exit 0), and no real host IPC objects were inspected. The
   same shared bwrap argument builder applies this requirement to outer daemon,
   importer, and shell launches.
+- `timeout --signal=TERM --kill-after=5s 60s node --max-old-space-size=256
+  --max-semi-space-size=32 /tmp/pi-nanobot-import-ancestor-aba-probe.mjs`
+  used a controlled `open()` boundary hook around the built admission helper,
+  actual temporary directories/symlink swaps, and real file descriptors. For
+  both file and directory roots, it swapped an ancestor to a symlink to an
+  outside synthetic sentinel after opening the selected parent FD and kept it
+  swapped through the final open. The admitted FD exposed only authorized
+  inside bytes. Stable symlink ancestors were rejected through public creation;
+  no workspace remained and repeated rejection left the process FD count stable.
+  No fabricated inode/stat results or real host data were used.
 
 The probe uses only a temporary app store, synthetic imported files, a synthetic
 Unix auth socket, a loopback listener, and a synthetic outside sentinel; it

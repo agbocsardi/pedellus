@@ -63,7 +63,6 @@ interface AdmissionRecord {
 }
 
 interface ImportSource {
-	path: string;
 	name: string;
 	kind: "file" | "directory";
 	handle: FileHandle;
@@ -166,42 +165,55 @@ function rejectImportRoot(path: string): void {
 	}
 }
 
-async function canonicalImport(path: string): Promise<ImportSource> {
+function procFdPath(fd: number): string {
+	return `/proc/self/fd/${fd}`;
+}
+
+async function openImportSource(path: string): Promise<ImportSource> {
 	if (!isAbsolute(path) || path.includes("\0")) throw new Error("Import paths must be absolute");
 	const absolute = resolve(path);
-	let current = "/";
-	for (const segment of absolute.slice(1).split(sep).filter(Boolean)) {
-		current = join(current, segment);
-		const info = await lstat(current);
-		if (info.isSymbolicLink()) throw new Error(`Import paths cannot traverse symbolic links: ${path}`);
-	}
-	const info = await lstat(absolute);
-	if (!info.isFile() && !info.isDirectory()) throw new Error(`Import must be a regular file or directory: ${path}`);
-	const canonical = await realpath(absolute);
-	if (canonical !== absolute) throw new Error(`Import path changed during canonicalization: ${path}`);
-	rejectImportRoot(canonical);
-	const kind = info.isFile() ? "file" : "directory";
-	const handle = await open(
-		canonical,
-		constants.O_RDONLY | constants.O_NOFOLLOW | (kind === "directory" ? constants.O_DIRECTORY : constants.O_NONBLOCK),
-	);
+	const components = absolute.slice(1).split(sep).filter(Boolean);
+	const name = components.pop();
+	if (!name) throw new Error("Importing the host filesystem root is unsupported");
+
+	let parent = await open("/", constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
 	try {
-		const pinned = await handle.stat({ bigint: true });
-		if (
-			(kind === "file" && !pinned.isFile()) ||
-			(kind === "directory" && !pinned.isDirectory()) ||
-			String(pinned.dev) !== String(info.dev) ||
-			String(pinned.ino) !== String(info.ino)
-		) {
-			throw new Error(`Import path changed while being admitted: ${path}`);
+		for (const component of components) {
+			const child = await open(
+				join(procFdPath(parent.fd), component),
+				constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+			);
+			try {
+				if (!(await child.stat()).isDirectory()) throw new Error(`Import ancestor is not a directory: ${path}`);
+			} catch (error) {
+				await child.close().catch(() => undefined);
+				throw error;
+			}
+			const previous = parent;
+			parent = child;
+			await previous.close();
 		}
-		if (kind === "file" && pinned.nlink !== 1n) {
-			throw new Error(`Import file has an outside hard-link alias: ${path}`);
+
+		// Apply path policy only after this exact no-follow component sequence is pinned.
+		rejectImportRoot(absolute);
+		const handle = await open(
+			join(procFdPath(parent.fd), name),
+			constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+		);
+		try {
+			const pinned = await handle.stat({ bigint: true });
+			const kind = pinned.isFile() ? "file" : pinned.isDirectory() ? "directory" : undefined;
+			if (!kind) throw new Error(`Import must be a regular file or directory: ${path}`);
+			if (kind === "file" && pinned.nlink !== 1n) {
+				throw new Error(`Import file has an outside hard-link alias: ${path}`);
+			}
+			return { name: basename(absolute), kind, handle };
+		} catch (error) {
+			await handle.close();
+			throw error;
 		}
-		return { path: canonical, name: basename(canonical), kind, handle };
-	} catch (error) {
-		await handle.close();
-		throw error;
+	} finally {
+		await parent.close();
 	}
 }
 
@@ -660,7 +672,7 @@ async function persistWorkspace(
 		const names = new Set<string>();
 		for (const path of imports) {
 			if (typeof path !== "string") throw new Error("Import paths must be strings");
-			const source = await canonicalImport(path);
+			const source = await openImportSource(path);
 			if (names.has(source.name)) {
 				await source.handle.close();
 				throw new Error(`Import basename collision: ${source.name}`);
