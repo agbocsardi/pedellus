@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { chmod, copyFile, mkdtemp, realpath, rm, stat, writeFile, readFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, open, realpath, rm, writeFile, readFile } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import {
 	Connection,
@@ -22,24 +25,58 @@ import {
 	type ShellExecResult,
 } from "@earendil-works/pi-durable/env";
 import type { WatchTarget, WatchChange } from "@earendil-works/pi-durable/env";
-import { buildBwrapArgs, buildCommandBwrapArgs, shellQuote, validateBwrap } from "./sandbox.js";
+import {
+	buildBwrapArgs,
+	buildCommandBwrapArgs,
+	buildImportBwrapArgs,
+	shellQuote,
+	validateBwrap,
+	type ImportMount,
+} from "./sandbox.js";
 
 export interface ExecutionOptions {
-	workspace: string;
+	/** Trusted application-owned data directory; guest code can access only a generated child workspace. */
+	storageDirectory?: string;
+	/** Explicit files/directories copied into `imports/<basename>`; no source is mounted after admission. */
+	imports?: readonly string[];
+	/** Optional cwd within the virtual `/workspace`, never a host path. */
 	cwd?: string;
-	extraAllowedDirs?: readonly string[];
 	bwrapPath?: string;
 }
 
-interface Root {
-	path: string;
-	dev: number;
-	ino: number;
+export interface ManagedExecutionEnv extends ExecutionEnv {
+	readonly workspaceId: string;
 }
+
+interface WorkspaceRecord {
+	id: string;
+	rootPath: string;
+	rootDev: string;
+	rootIno: string;
+}
+
+interface AdmissionRecord {
+	version: 1;
+	id: string;
+	rootDev: string;
+	rootIno: string;
+}
+
+interface ImportSource {
+	path: string;
+	name: string;
+	kind: "file" | "directory";
+	handle: FileHandle;
+}
+
+class SandboxCleanupFailure extends AggregateError {}
 
 const SETUP_TIMEOUT_MS = 10_000;
 const TEARDOWN_TIMEOUT_MS = 5_000;
+const IMPORT_TIMEOUT_MS = 30_000;
 const PRIVATE_TMP = "/tmp";
+const GUEST_ROOT = "/workspace";
+const DEFAULT_STORAGE_DIRECTORY = join(homedir(), ".local", "share", "nanobot", "execution");
 const RESTRICTED_SYSTEM_ROOTS = [
 	"/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/sys", "/dev", "/run", "/var", "/opt", "/boot", "/root",
 ];
@@ -55,24 +92,179 @@ function isWithin(root: string, path: string): boolean {
 	return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
-async function canonicalRoot(path: string, label: string): Promise<Root> {
-	if (!isAbsolute(path) || path.includes("\0")) throw new Error(`${label} must be an absolute path`);
-	const root = await realpath(path);
-	const info = await stat(root);
-	if (!info.isDirectory()) throw new Error(`${label} is not a directory: ${path}`);
-	return { path: root, dev: info.dev, ino: info.ino };
+function validateManagedOptions(options: ExecutionOptions): void {
+	const supplied = options as ExecutionOptions & Record<string, unknown>;
+	if ("workspace" in supplied || "extraAllowedDirs" in supplied) {
+		throw new Error("Arbitrary writable host roots are unsupported; use a managed workspace and explicit imports");
+	}
+	const accepted = new Set(["storageDirectory", "imports", "cwd", "bwrapPath"]);
+	for (const key of Object.keys(supplied)) {
+		if (!accepted.has(key)) throw new Error(`Unsupported execution option: ${key}`);
+	}
+	if (options.storageDirectory !== undefined && (!isAbsolute(options.storageDirectory) || options.storageDirectory.includes("\0"))) {
+		throw new Error("storageDirectory must be an absolute trusted application data path");
+	}
+	if (options.cwd !== undefined && isAbsolute(options.cwd) && options.cwd !== GUEST_ROOT && !options.cwd.startsWith(`${GUEST_ROOT}/`)) {
+		throw new Error(`cwd must be inside the virtual ${GUEST_ROOT}`);
+	}
+	if (options.cwd?.includes("\0")) throw new Error("cwd must not contain NUL");
 }
 
-function checkRootLocation(root: string): void {
-	if (root === "/") throw new Error("Execution roots must not expose the host filesystem root");
+function requireOwner(info: { uid: number | bigint }, label: string): void {
+	const uid = typeof info.uid === "bigint" ? Number(info.uid) : info.uid;
+	if (typeof process.getuid === "function" && uid !== process.getuid()) {
+		throw new Error(`${label} is not owned by the current application user`);
+	}
+}
+
+async function ensurePrivateDirectory(path: string, label: string): Promise<string> {
+	await mkdir(path, { recursive: true, mode: 0o700 });
+	const info = await lstat(path);
+	if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`${label} is not a real directory`);
+	requireOwner(info, label);
+	if ((info.mode & 0o077) !== 0) throw new Error(`${label} must not be accessible to group or other users`);
+	return realpath(path);
+}
+
+interface StorePaths {
+	store: string;
+	workspaces: string;
+	admissions: string;
+}
+
+async function prepareStore(storageDirectory?: string): Promise<StorePaths> {
+	const requested = resolve(storageDirectory ?? DEFAULT_STORAGE_DIRECTORY);
+	const store = await ensurePrivateDirectory(requested, "Managed workspace store");
+	const workspaces = await ensurePrivateDirectory(join(store, "workspaces"), "Managed workspace directory");
+	const admissions = await ensurePrivateDirectory(join(store, "admissions"), "Managed admission directory");
+	return { store, workspaces, admissions };
+}
+
+function managedPaths(store: StorePaths, id: string): { container: string; root: string; admission: string } {
+	return {
+		container: join(store.workspaces, id),
+		root: join(store.workspaces, id, "root"),
+		admission: join(store.admissions, `${id}.json`),
+	};
+}
+
+function validWorkspaceId(id: string): boolean {
+	return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+}
+
+function rejectImportRoot(path: string): void {
+	if (path === "/") throw new Error("Importing the host filesystem root is unsupported");
+	const home = resolve(homedir());
+	if (isWithin(path, home)) throw new Error("Importing the host home directory or one of its parents is unsupported");
 	for (const systemRoot of RESTRICTED_SYSTEM_ROOTS) {
-		if (isWithin(systemRoot, root) || isWithin(root, systemRoot)) {
-			throw new Error(`Execution root overlaps a protected system path: ${root}`);
+		if (isWithin(systemRoot, path) || isWithin(path, systemRoot)) {
+			throw new Error(`Import path overlaps a protected system path: ${path}`);
 		}
 	}
-	// Host /tmp is not mounted. Mounting it as a root would expose unrelated host temporary data.
-	if (root === PRIVATE_TMP || isWithin(root, PRIVATE_TMP)) {
-		throw new Error(`Execution root must not replace the private temporary directory: ${root}`);
+	if (path === PRIVATE_TMP || isWithin(path, PRIVATE_TMP)) {
+		throw new Error("Importing host /tmp or one of its parents is unsupported");
+	}
+}
+
+async function canonicalImport(path: string): Promise<ImportSource> {
+	if (!isAbsolute(path) || path.includes("\0")) throw new Error("Import paths must be absolute");
+	const absolute = resolve(path);
+	let current = "/";
+	for (const segment of absolute.slice(1).split(sep).filter(Boolean)) {
+		current = join(current, segment);
+		const info = await lstat(current);
+		if (info.isSymbolicLink()) throw new Error(`Import paths cannot traverse symbolic links: ${path}`);
+	}
+	const info = await lstat(absolute);
+	if (!info.isFile() && !info.isDirectory()) throw new Error(`Import must be a regular file or directory: ${path}`);
+	const canonical = await realpath(absolute);
+	if (canonical !== absolute) throw new Error(`Import path changed during canonicalization: ${path}`);
+	rejectImportRoot(canonical);
+	const kind = info.isFile() ? "file" : "directory";
+	const handle = await open(
+		canonical,
+		constants.O_RDONLY | constants.O_NOFOLLOW | (kind === "directory" ? constants.O_DIRECTORY : constants.O_NONBLOCK),
+	);
+	try {
+		const pinned = await handle.stat({ bigint: true });
+		if (
+			(kind === "file" && !pinned.isFile()) ||
+			(kind === "directory" && !pinned.isDirectory()) ||
+			String(pinned.dev) !== String(info.dev) ||
+			String(pinned.ino) !== String(info.ino)
+		) {
+			throw new Error(`Import path changed while being admitted: ${path}`);
+		}
+		if (kind === "file" && pinned.nlink !== 1n) {
+			throw new Error(`Import file has an outside hard-link alias: ${path}`);
+		}
+		return { path: canonical, name: basename(canonical), kind, handle };
+	} catch (error) {
+		await handle.close();
+		throw error;
+	}
+}
+
+function privateDirectoryInfo(info: Awaited<ReturnType<typeof lstat>>, label: string, checkMode = true): void {
+	if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`${label} is not a real directory`);
+	requireOwner(info, label);
+	const mode = typeof info.mode === "bigint" ? Number(info.mode) : info.mode;
+	if (checkMode && (mode & 0o077) !== 0) throw new Error(`${label} is not private to the application user`);
+}
+
+async function readAdmission(store: StorePaths, id: string): Promise<WorkspaceRecord> {
+	if (!validWorkspaceId(id)) throw new Error("Invalid managed workspace id");
+	const paths = managedPaths(store, id);
+	const containerInfo = await lstat(paths.container);
+	privateDirectoryInfo(containerInfo, "Managed workspace container");
+	const rootInfo = await lstat(paths.root, { bigint: true });
+	if (!rootInfo.isDirectory()) throw new Error("Managed workspace root is not a directory");
+	requireOwner(rootInfo, "Managed workspace root");
+	const canonicalRootPath = await realpath(paths.root);
+	if (canonicalRootPath !== paths.root) throw new Error("Managed workspace root path is not canonical");
+
+	const recordInfo = await lstat(paths.admission, { bigint: true });
+	if (!recordInfo.isFile() || (recordInfo.mode & 0o077n) !== 0n) throw new Error("Managed admission metadata is not private");
+	requireOwner(recordInfo, "Managed admission metadata");
+	if (recordInfo.size > 4096n) throw new Error("Managed admission metadata is invalid");
+	const recordHandle = await open(paths.admission, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+	let raw: string;
+	try {
+		const opened = await recordHandle.stat({ bigint: true });
+		if (opened.dev !== recordInfo.dev || opened.ino !== recordInfo.ino || !opened.isFile()) {
+			throw new Error("Managed admission metadata changed while being opened");
+		}
+		raw = await recordHandle.readFile("utf8");
+	} finally {
+		await recordHandle.close();
+	}
+	const admission = JSON.parse(raw) as Partial<AdmissionRecord>;
+	if (
+		admission.version !== 1 ||
+		admission.id !== id ||
+		admission.rootDev !== String(rootInfo.dev) ||
+		admission.rootIno !== String(rootInfo.ino)
+	) {
+		throw new Error("Managed workspace provenance does not match its private admission record");
+	}
+	// The root inode has been authenticated through private, guest-inaccessible metadata before restoring its usable mode.
+	await chmod(paths.root, 0o700);
+	return { id, rootPath: paths.root, rootDev: String(rootInfo.dev), rootIno: String(rootInfo.ino) };
+}
+
+async function writeAdmission(store: StorePaths, record: WorkspaceRecord): Promise<void> {
+	const admission: AdmissionRecord = {
+		version: 1,
+		id: record.id,
+		rootDev: record.rootDev,
+		rootIno: record.rootIno,
+	};
+	const handle = await open(managedPaths(store, record.id).admission, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+	try {
+		await handle.writeFile(JSON.stringify(admission));
+		await handle.sync();
+	} finally {
+		await handle.close();
 	}
 }
 
@@ -81,7 +273,6 @@ function aborted<T>(context: Context, path?: string): Result<T, FileError> | und
 }
 
 function setupWait<T>(promise: Promise<T>, context: Context, label: string): Promise<T> {
-	if (context.abortSignal?.aborted) return Promise.reject(new Error("Execution environment setup aborted"));
 	return new Promise<T>((resolvePromise, reject) => {
 		let settled = false;
 		const finish = (error?: unknown, value?: T) => {
@@ -124,8 +315,9 @@ function waitForPidExit(pid: number): Promise<void> {
 	});
 }
 
-class BwrapExecutionEnv extends RemoteExecutionEnv implements ExecutionEnv {
-	readonly #roots: readonly string[];
+class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEnv {
+	readonly workspaceId: string;
+	readonly #roots = [GUEST_ROOT];
 	readonly #daemonDir: string;
 	readonly #pidFile: string;
 	readonly #bwrapPath: string;
@@ -133,13 +325,13 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ExecutionEnv {
 
 	constructor(
 		options: RemoteExecutionEnvOptions,
-		roots: readonly string[],
+		workspaceId: string,
 		daemonDir: string,
 		pidFile: string,
 		bwrapPath: string,
 	) {
 		super(options);
-		this.#roots = roots;
+		this.workspaceId = workspaceId;
 		this.#daemonDir = daemonDir;
 		this.#pidFile = pidFile;
 		this.#bwrapPath = bwrapPath;
@@ -278,10 +470,10 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ExecutionEnv {
 			const message = info.ok ? "Shell cwd is not a directory" : info.error.message;
 			return err<ShellExecResult, ExecutionError>(new ExecutionError("spawn_error", message, info.ok ? undefined : info.error));
 		}
-		const safeEnv = { ...SHELL_ENV, HOME: this.#roots[0]! };
+		const safeEnv = { ...SHELL_ENV, HOME: GUEST_ROOT };
 		const argv = typeof command === "string" ? ["/bin/sh", "-c", command] : [...command];
 		if (argv.length === 0) return err<ShellExecResult, ExecutionError>(new ExecutionError("spawn_error", "Empty argv: no program to run"));
-		const sandboxedCommand = [this.#bwrapPath, ...buildCommandBwrapArgs(this.#roots, actual.value, argv)];
+		const sandboxedCommand = [this.#bwrapPath, ...buildCommandBwrapArgs(GUEST_ROOT, actual.value, argv)];
 		const { env: _ignored, inheritEnv: _ignoredInheritance, ...safeOptions } = options ?? {};
 		return super.exec(sandboxedCommand, { ...safeOptions, cwd: cwd.path, env: safeEnv, inheritEnv: false }, context);
 	}
@@ -311,7 +503,21 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ExecutionEnv {
 	}
 }
 
-async function makeDaemonBundle(bwrapSource: string): Promise<{ directory: string; binary: string; bwrapBinary: string; pidFile: string; launcher: string }> {
+interface DaemonBundle {
+	directory: string;
+	binary: string;
+	bwrapBinary: string;
+	pidFile: string;
+	launcher: string;
+}
+
+interface ImportBundle {
+	directory: string;
+	node: string;
+	worker: string;
+}
+
+async function makeDaemonBundle(bwrapSource: string): Promise<DaemonBundle> {
 	const directory = await mkdtemp(join(tmpdir(), "nanobot-bwrap-"));
 	try {
 		const source = await realpath(localDaemon());
@@ -332,58 +538,212 @@ async function makeDaemonBundle(bwrapSource: string): Promise<{ directory: strin
 	}
 }
 
-async function verifyMountedRoots(connection: Connection, roots: readonly Root[], context: Context): Promise<void> {
-	for (const root of roots) {
-		const reply = await setupWait(connection.request("lstat", { path: root.path }), context, "Sandbox root probe");
-		const info = reply.json;
-		if (info.kind !== "directory" || Number(info.dev) !== root.dev || Number(info.ino) !== root.ino) {
-			throw new Error(`Execution root changed while the Bubblewrap namespace was being created: ${root.path}`);
-		}
+async function makeImportBundle(): Promise<ImportBundle> {
+	const directory = await mkdtemp(join(tmpdir(), "nanobot-import-"));
+	try {
+		const workerExtension = import.meta.url.endsWith(".ts") ? ".ts" : ".js";
+		const workerSource = await realpath(fileURLToPath(new URL(`./import-worker${workerExtension}`, import.meta.url)));
+		const nodeSource = await realpath(process.execPath);
+		const node = join(directory, "node");
+		const worker = join(directory, workerExtension === ".ts" ? "import-worker.ts" : "import-worker.mjs");
+		await copyFile(nodeSource, node, constants.COPYFILE_EXCL);
+		await chmod(node, 0o500);
+		await copyFile(workerSource, worker, constants.COPYFILE_EXCL);
+		await chmod(worker, 0o400);
+		return { directory, node, worker };
+	} catch (error) {
+		await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+		throw error;
 	}
 }
 
-export async function createExecutionEnv(options: ExecutionOptions, context: Context = BACKGROUND_CONTEXT): Promise<ExecutionEnv> {
-	if (process.platform !== "linux") throw new Error("ExecutionEnv requires Linux; no unsandboxed fallback is available");
-	if (context.abortSignal?.aborted) throw new Error("Execution environment setup aborted");
-	const bwrap = await setupWait(validateBwrap(options.bwrapPath ?? "/usr/bin/bwrap"), context, "Bubblewrap validation");
-	const rootRecords = [await canonicalRoot(options.workspace, "workspace")];
-	for (const extra of options.extraAllowedDirs ?? []) rootRecords.push(await canonicalRoot(extra, "extraAllowedDirs entry"));
-	const roots = [...new Map(rootRecords.map((root) => [root.path, root])).values()];
-	const home = await realpath(process.env.HOME ?? homedir());
-	for (const root of roots) {
-		checkRootLocation(root.path);
-		if (isWithin(root.path, home) || isWithin(home, root.path)) {
-			throw new Error(`Execution root must not expose the host home directory: ${root.path}`);
-		}
+async function runBoundedBwrap(
+	binary: string,
+	args: readonly string[],
+	inheritedFds: readonly number[],
+	context: Context,
+): Promise<void> {
+	if (context.abortSignal?.aborted) throw new Error("Import setup aborted");
+	return new Promise<void>((resolvePromise, reject) => {
+		const stdio: ("ignore" | "pipe" | number)[] = ["ignore", "pipe", "pipe", ...inheritedFds];
+		const child = spawn(binary, [...args], {
+			cwd: "/",
+			detached: true,
+			env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" },
+			stdio,
+		});
+		let failure: Error | undefined;
+		let stderr = "";
+		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		const stop = () => {
+			if (child.pid === undefined || child.exitCode !== null) return;
+			try { process.kill(-child.pid, "SIGTERM"); } catch { /* The process group may already be gone. */ }
+			killTimer = setTimeout(() => {
+				try { process.kill(-child.pid!, "SIGKILL"); } catch { /* The process group may already be gone. */ }
+			}, 750);
+		};
+		const fail = (error: Error) => {
+			failure ??= error;
+			stop();
+		};
+		const onAbort = () => fail(new Error("Import setup aborted"));
+		const timer = setTimeout(() => fail(new Error("Import setup timed out")), IMPORT_TIMEOUT_MS);
+		context.abortSignal?.addEventListener("abort", onAbort, { once: true });
+		child.once("spawn", () => { if (failure) stop(); });
+		child.once("error", (error) => fail(error));
+		child.stderr?.on("data", (chunk: Buffer) => {
+			if (stderr.length < 8192) stderr += chunk.toString("utf8").slice(0, 8192 - stderr.length);
+		});
+		child.stdout?.on("data", (chunk: Buffer) => {
+			if (chunk.length > 8192) fail(new Error("Import worker output exceeded its bound"));
+		});
+		child.once("close", (code, signal) => {
+			clearTimeout(timer);
+			if (killTimer) clearTimeout(killTimer);
+			context.abortSignal?.removeEventListener("abort", onAbort);
+			if (failure) reject(failure);
+			else if (code !== 0) reject(new Error(`Import sandbox failed (${signal ?? code}): ${stderr.trim() || "no diagnostic"}`));
+			else resolvePromise();
+		});
+		if (context.abortSignal?.aborted) onAbort();
+	});
+}
+
+async function copyImportsIntoWorkspace(
+	workspaceRoot: string,
+	sources: readonly ImportSource[],
+	bundle: ImportBundle,
+	bwrapPath: string,
+	context: Context,
+): Promise<void> {
+	if (sources.length === 0) return;
+	const sourceIsTypeScript = bundle.worker.endsWith(".ts");
+	const workerTarget = `/run/.nanobot-import-${randomUUID()}/import-worker${sourceIsTypeScript ? ".ts" : ".mjs"}`;
+	const manifestTarget = `${dirname(workerTarget)}/imports.json`;
+	const nodeTarget = `${dirname(workerTarget)}/node`;
+	const manifestPath = join(bundle.directory, "imports.json");
+	const mounts: ImportMount[] = [];
+	const entries = sources.map((source, index) => {
+		const sourceTarget = source.kind === "directory" ? `/imports/${index}` : `/imports/${index}/source`;
+		mounts.push({ fd: 3 + index, target: sourceTarget, kind: source.kind });
+		return { source: sourceTarget, destination: `imports/${source.name}`, kind: source.kind };
+	});
+	await writeFile(manifestPath, JSON.stringify(entries), { mode: 0o400, flag: "wx" });
+	try {
+		const args = buildImportBwrapArgs(
+			workspaceRoot,
+			mounts,
+			bundle.worker,
+			manifestPath,
+			bundle.node,
+			workerTarget,
+			manifestTarget,
+			nodeTarget,
+			sourceIsTypeScript ? ["--experimental-strip-types"] : [],
+		);
+		await runBoundedBwrap(bwrapPath, args, sources.map((source) => source.handle.fd), context);
+	} finally {
+		await rm(manifestPath, { force: true });
 	}
-	for (const root of roots) {
-		if (roots.some((other) => root.path !== other.path && isWithin(root.path, other.path))) {
-			throw new Error(`Execution roots must not contain one another: ${root.path}`);
+}
+
+async function persistWorkspace(
+	store: StorePaths,
+	id: string,
+	imports: readonly string[],
+	bwrapPath: string,
+	context: Context,
+): Promise<WorkspaceRecord> {
+	if (!Array.isArray(imports) || imports.length > 32) throw new Error("At most 32 explicit imports are supported");
+	const sources: ImportSource[] = [];
+	try {
+		const names = new Set<string>();
+		for (const path of imports) {
+			if (typeof path !== "string") throw new Error("Import paths must be strings");
+			const source = await canonicalImport(path);
+			if (names.has(source.name)) {
+				await source.handle.close();
+				throw new Error(`Import basename collision: ${source.name}`);
+			}
+			names.add(source.name);
+			sources.push(source);
 		}
+		const paths = managedPaths(store, id);
+		await mkdir(paths.container, { mode: 0o700 });
+		await mkdir(paths.root, { mode: 0o700 });
+		const before = await lstat(paths.root, { bigint: true });
+		if (!before.isDirectory()) throw new Error("New managed workspace root is not a directory");
+		requireOwner(before, "New managed workspace root");
+		if (sources.length > 0) {
+			const bundle = await makeImportBundle();
+			try {
+				await copyImportsIntoWorkspace(paths.root, sources, bundle, bwrapPath, context);
+			} finally {
+				await rm(bundle.directory, { recursive: true, force: true });
+			}
+		}
+		const after = await lstat(paths.root, { bigint: true });
+		if (!after.isDirectory() || before.dev !== after.dev || before.ino !== after.ino) {
+			throw new Error("Managed workspace root identity changed during import");
+		}
+		return { id, rootPath: paths.root, rootDev: String(after.dev), rootIno: String(after.ino) };
+	} catch (error) {
+		const paths = managedPaths(store, id);
+		try {
+			await rm(paths.container, { recursive: true, force: true });
+		} catch (cleanupError) {
+			throw new SandboxCleanupFailure(
+				[error, cleanupError],
+				`Managed workspace ${id} import failed and partial cleanup failed; inspect ${paths.container}`,
+			);
+		}
+		throw error;
+	} finally {
+		await Promise.all(sources.map((source) => source.handle.close().catch(() => undefined)));
 	}
-	const bundle = await makeDaemonBundle(bwrap.path);
+}
+
+async function verifyMountedWorkspace(connection: Connection, record: WorkspaceRecord, context: Context): Promise<void> {
+	const reply = await setupWait(connection.request("lstat", { path: GUEST_ROOT }), context, "Sandbox workspace probe");
+	const info = reply.json;
+	const dev = Number(info.dev);
+	const ino = Number(info.ino);
+	if (
+		info.kind !== "directory" ||
+		!Number.isSafeInteger(dev) ||
+		!Number.isSafeInteger(ino) ||
+		String(dev) !== record.rootDev ||
+		String(ino) !== record.rootIno
+	) {
+		throw new Error("Managed workspace root identity does not match its private admission record");
+	}
+}
+
+async function startWorkspaceEnvironment(
+	record: WorkspaceRecord,
+	bundle: DaemonBundle,
+	bwrapPath: string,
+	options: ExecutionOptions,
+	context: Context,
+): Promise<ManagedExecutionEnv> {
 	const daemonInSandbox = `/run/.nanobot-pi-env-${randomUUID()}/pi-env`;
 	const bwrapInSandbox = `${dirname(daemonInSandbox)}/bwrap`;
-	const connection = new Connection({
-		command: [
-			bundle.launcher,
-			bwrap.path,
-			...buildBwrapArgs(roots.map((root) => root.path), daemonInSandbox, bundle.binary, bundle.bwrapBinary),
-			daemonInSandbox,
-		],
-	});
-	const cwd = roots[0]!.path;
-	const env = new BwrapExecutionEnv(
-		{ connection, id: "nanobot:bwrap:local", cwd },
-		roots.map((root) => root.path),
-		bundle.directory,
-		bundle.pidFile,
-		bwrapInSandbox,
-	);
+	let connection: Connection | undefined;
+	let env: BwrapExecutionEnv | undefined;
 	try {
+		connection = new Connection({
+			command: [bundle.launcher, bwrapPath, ...buildBwrapArgs(record.rootPath, daemonInSandbox, bundle.binary, bundle.bwrapBinary)],
+		});
+		env = new BwrapExecutionEnv(
+			{ connection, id: `nanobot:bwrap:${record.id}`, cwd: GUEST_ROOT },
+			record.id,
+			bundle.directory,
+			bundle.pidFile,
+			bwrapInSandbox,
+		);
 		await setupWait(connection.info(), context, "Bubblewrap daemon startup");
-		await verifyMountedRoots(connection, roots, context);
-		const requestedCwd = options.cwd ?? cwd;
+		await verifyMountedWorkspace(connection, record, context);
+		const requestedCwd = options.cwd ?? GUEST_ROOT;
 		const checkedCwd = await setupWait(env.absolutePath(requestedCwd, context), context, "cwd validation");
 		if (!checkedCwd.ok) throw new Error(`cwd is not an allowed existing path: ${requestedCwd}: ${checkedCwd.error.message}`);
 		const info = await setupWait(env.fileInfo(checkedCwd.value, context), context, "cwd validation");
@@ -397,9 +757,73 @@ export async function createExecutionEnv(options: ExecutionOptions, context: Con
 		if (context.abortSignal?.aborted) throw new Error("Execution environment setup aborted");
 		return env;
 	} catch (error) {
-		await env.cleanup(BACKGROUND_CONTEXT).catch((cleanupError: unknown) => {
-			throw new AggregateError([error, cleanupError], "Execution environment setup failed and sandbox cleanup failed");
-		});
+		if (env) {
+			await env.cleanup(BACKGROUND_CONTEXT).catch((cleanupError: unknown) => {
+				throw new SandboxCleanupFailure([error, cleanupError], "Execution environment setup failed and sandbox cleanup failed");
+			});
+		} else {
+			connection?.close();
+			await rm(bundle.directory, { recursive: true, force: true }).catch(() => undefined);
+		}
+		throw error;
+	}
+}
+
+export async function createExecutionEnv(
+	options: ExecutionOptions,
+	context: Context = BACKGROUND_CONTEXT,
+): Promise<ManagedExecutionEnv> {
+	validateManagedOptions(options);
+	if (process.platform !== "linux") throw new Error("ExecutionEnv requires Linux; no unsandboxed fallback is available");
+	if (context.abortSignal?.aborted) throw new Error("Execution environment setup aborted");
+	const bwrap = await setupWait(validateBwrap(options.bwrapPath ?? "/usr/bin/bwrap"), context, "Bubblewrap validation");
+	const store = await prepareStore(options.storageDirectory);
+	const id = randomUUID();
+	const record = await persistWorkspace(store, id, options.imports ?? [], bwrap.path, context);
+	const paths = managedPaths(store, id);
+	let bundle: DaemonBundle | undefined;
+	try {
+		await writeAdmission(store, record);
+		bundle = await makeDaemonBundle(bwrap.path);
+		const env = await startWorkspaceEnvironment(record, bundle, bwrap.path, options, context);
+		bundle = undefined;
+		return env;
+	} catch (error) {
+		if (error instanceof SandboxCleanupFailure) {
+			throw new Error(`Managed workspace ${id} retained after sandbox cleanup failure`, { cause: error });
+		}
+		const cleanupErrors: unknown[] = [];
+		if (bundle) await rm(bundle.directory, { recursive: true, force: true }).catch((cleanupError: unknown) => cleanupErrors.push(cleanupError));
+		await rm(paths.admission, { force: true }).catch((cleanupError: unknown) => cleanupErrors.push(cleanupError));
+		await rm(paths.container, { recursive: true, force: true }).catch((cleanupError: unknown) => cleanupErrors.push(cleanupError));
+		if (cleanupErrors.length > 0) {
+			throw new SandboxCleanupFailure(
+				[error, ...cleanupErrors],
+				`Managed workspace ${id} setup failed and cleanup failed; inspect ${paths.container}`,
+			);
+		}
+		throw error;
+	}
+}
+
+export async function openExecutionEnv(
+	workspaceId: string,
+	options: ExecutionOptions = {},
+	context: Context = BACKGROUND_CONTEXT,
+): Promise<ManagedExecutionEnv> {
+	validateManagedOptions(options);
+	if (options.imports?.length) throw new Error("Imports are accepted only when creating a managed workspace");
+	if (!validWorkspaceId(workspaceId)) throw new Error("Invalid managed workspace id");
+	if (process.platform !== "linux") throw new Error("ExecutionEnv requires Linux; no unsandboxed fallback is available");
+	if (context.abortSignal?.aborted) throw new Error("Execution environment setup aborted");
+	const store = await prepareStore(options.storageDirectory);
+	const record = await readAdmission(store, workspaceId);
+	const bwrap = await setupWait(validateBwrap(options.bwrapPath ?? "/usr/bin/bwrap"), context, "Bubblewrap validation");
+	const bundle = await makeDaemonBundle(bwrap.path);
+	try {
+		return await startWorkspaceEnvironment(record, bundle, bwrap.path, options, context);
+	} catch (error) {
+		await rm(bundle.directory, { recursive: true, force: true }).catch(() => undefined);
 		throw error;
 	}
 }
