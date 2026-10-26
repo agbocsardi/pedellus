@@ -33,7 +33,8 @@ root docs, integration and acceptance. No P1/P2 milestone is passed by launch.
 - [ ] B2 — native Code Mode/tool-search lifecycle and offline nested replay:
       `pi-9dd12539`, pane `w1Y:p1`.
 - [ ] B3 — actual-connection SQLite WAL/FULL and fail-closed setup:
-      `pi-72ce3be3`, pane `w1Z:p1`.
+      `pi-72ce3be3`, pane `w1Z:p1`. Candidate `e8269c650` reported complete;
+      parent probes pass, independent read-only review/integration pending.
 - [ ] Parent review/integration and independent bounded verification; read-only
       security/replay review as needed before acceptance or gateway activation.
 
@@ -609,3 +610,29 @@ choice/boundaries through herdr_send; worker may adjust its standalone API withi
 ownership, but gateway/config/tool enabling remain untouched. Secure provenance,
 import/reopen semantics and adversarial evidence are still required; this is not
 a completed security proof. B2/B3 continue independently.
+
+### 2026-10-26 — SQLite candidate and parent verification
+
+B3 explicitly completed as `e8269c65054cacdb37052ba0c31f104b761d9b89`, clean
+worker branch `pi-72ce3be3`; owned storage/runtime/STORAGE.md changes only. Parent
+reviewed the native NodeSqliteDatabase queue/connection and SqliteStorage.open
+migration/ownership paths. Candidate upgrades the native opener's NORMAL to FULL,
+checks WAL/2 before and after native migrations, and gives that same adapter to
+storage; no second connection or tool activation.
+
+Parent reran `/tmp/pi-nanobot-storage-probe.mjs` with 70-second timeout and 512-MB
+Node heap: actual WAL/FULL reads, requestId/session reuse, owner exclusion, real
+subprocess SIGKILL/reopen with two retained entries, injected setup failure and
+successful reopen all passed. Parent separately wrote and ran
+`/tmp/pi-nanobot-parent-storage-failclosed.mjs` (45 seconds/256 MB): injected
+before/after initialization journal/synchronous mismatches, read failure and
+migration failure all reject, close adapter and permit clean lock/database reopen.
+Pre-check failures never reach migrations. Real non-WAL `:memory:` is rejected.
+These are private probes, not a committed test suite; mismatch/fault injections
+are not real VFS/disk-full or power-loss tests. No paid/live calls or credentials.
+
+Launched read-only reviewer `pi-7e58645f`, pane `w1P:p5`, same Luna/xhigh, scoped to
+this committed candidate and native SQLite implementation. Expected report
+`/tmp/pi-storage-full-review.md`; await explicit completion before integration.
+B1/B2 remain outstanding, tools disabled. This does not close the full storage
+backup/restore/disk-full/schema/host-loss acceptance gate.
