@@ -1,22 +1,70 @@
 # Durable Code Mode integration
 
-This is a reusable, **opt-in** bundle for the TypeScript port. The current gateway
-is unchanged: it still installs no extensions and persists `tools: []`. Creating
-the bundle does not install or select it.
+This is a reusable bundle for the TypeScript port; the factory itself is inert.
+The current gateway is unchanged: it installs no extensions and persists
+`tools: []`. This is only genuinely **per-conversation opt-in** when the host
+establishes Durable's native default-deny settings before resolving or resuming
+conversations. Durable defaults to selecting every installed extension when
+`settings.extensions` is absent, and an unset conversation `tools` field enables
+every tool in its selected extensions. Installing this bundle into those
+permissive defaults is runtime-wide opt-in—not opt-in only for conversations
+where the host calls `configure()`.
 
 ```ts
+import { Type } from "@earendil-works/pi-ai";
+import {
+  configure, createRegistry, defineExtension, defineTool, Harness,
+  type ToolRegistration,
+} from "@earendil-works/pi-durable";
+import { CODEMODE_TOOL_NAME } from "@earendil-works/pi-durable/codemode";
+import { TOOL_SEARCH_TOOL_NAME } from "@earendil-works/pi-durable/tool-search";
 import { createCodeModeIntegration } from "./extensions/codemode.js";
 
+// `storage`, `models`, `context`, and `modelRef` are host-owned. This example's
+// strict default denies every extension; a host may list reviewed safe defaults.
 const codeMode = createCodeModeIntegration(); // `models.*` stays disabled
+const reviewedEcho = defineTool({
+  name: "reviewed_echo",
+  description: "Echo one reviewed string",
+  parameters: Type.Object({ value: Type.String() }),
+  callers: ["tools"], // nested Code Mode only, not a direct model tool
+  execute: async ({ value }) => ({ output: [{ type: "text", text: value }] }),
+});
+const reviewedExtension = defineExtension({ name: "reviewed-echo", tools: [reviewedEcho] });
+const registry = createRegistry();
 for (const extension of codeMode.extensions) registry.install(extension);
-// Select the bundle only on reviewed conversations, and explicitly enable only
-// reviewed tools. `modelTools` narrows direct model calls; it cannot enable a
-// tool omitted from `tools`.
+registry.install(reviewedExtension);
+
+const harness = await Harness.open(storage, {
+  models,
+  registry,
+  settings: { extensions: [] }, // absent would select every installed extension
+  // Native creation defaults, written before agent resolution. Keep creation
+  // inputs host-mediated; ConversationCreateOptions.agent is applied afterward.
+  conversationCreated: (tx, conversation) => configure(tx, conversation.id, {
+    extensions: [], tools: [], modelTools: [],
+  }),
+}, context);
+
+// Select the actual registered native registrations, not stand-in objects or
+// strings. These are the registrations the Harness later resolves by name.
+const registrations = registry.snapshot().tools().map(({ tool }) => tool as ToolRegistration);
+const requireTool = (name: string): ToolRegistration => {
+  const tool = registrations.find((candidate) => candidate.name === name);
+  if (!tool) throw new Error(`Missing installed tool: ${name}`);
+  return tool;
+};
+const codemodeTool = requireTool(CODEMODE_TOOL_NAME);
+const toolSearchTool = requireTool(TOOL_SEARCH_TOOL_NAME);
+const conversation = await harness.createConversation({
+  ownership: { kind: "ownerless" }, agent: { model: modelRef },
+}, context);
 await conversation.configure({
-  extensions: { add: codeMode.extensions },
-  tools: approvedTools,
+  extensions: [...codeMode.extensions, reviewedExtension],
+  tools: [codemodeTool, toolSearchTool, reviewedEcho],
   modelTools: [codemodeTool, toolSearchTool],
 }, context);
+
 // Shutdown: stop Code Mode admission, close/abort the owning Harness so Durable
 // can drain nested tasks, then wait for the sandbox's actual worker exits.
 codeMode.stopAdmission();
@@ -65,6 +113,44 @@ capabilities. It is not enabled by default. Code Mode is model-only (scripts
 cannot recursively start Code Mode); native deferred discovery is still available
 to scripts through `searchTools()`.
 
+## Native default-deny and conversation grants
+
+`HarnessSettings.extensions` is the native default when an agent has no stored
+extension selection (or a selection cleared with `null`); absent means every
+installed extension. `HarnessOptions.conversationCreated` can store a native
+`AgentChange` for each new or forked conversation before it is resolved. For
+strict default-deny, pass `settings: { extensions: [] }` and set
+`{ extensions: [], tools: [], modelTools: [] }` in that callback. If using a
+non-empty default extension list, review every tool it contains: when `tools` is
+unset, all tools in the selected extensions are enabled. Do not add the Code
+Mode or tool-search extensions to the default list.
+
+The `conversationCreated` callback runs before `ConversationCreateOptions.agent`
+is applied. The host must mediate creation/configuration inputs rather than
+forwarding untrusted `extensions`, `tools`, or `modelTools` changes. These are
+native configuration APIs, not an authorization service.
+
+For an enabled conversation, explicitly select the installed bundle extensions
+and exact `ToolRegistration` values in `AgentChange.extensions` and
+`AgentChange.tools`. `modelTools` only filters tools offered directly to the
+model; it does not add an extension, enable a tool, or grant `executeTool()`
+access. Nested Code Mode calls resolve from the conversation's enabled `tools`
+filtered by `callers: ["tools"]`. The example above keeps `reviewed_echo` out
+of direct model tools while explicitly granting it to nested calls. Tool
+registration names alone are not authorization.
+
+These defaults do not revoke persisted selections. An existing conversation
+with an explicit stored extension selection or tools override keeps it after
+reopen, even if the Harness now uses `settings.extensions: []`; the creation
+callback is not called for conversations already in storage. Before `harness.resume()`
+(or `submit()`, `wait()`, or another operation that can start scheduling),
+reinstall the extensions, load every persisted conversation, and reapply its
+current host-approved native `configure()` values. For a revoked/ungranted
+conversation, clear the extension override with `extensions: null` (returning to
+the secure Harness default) and explicitly deny tools/model tools, e.g.
+`{ extensions: null, tools: [], modelTools: [] }`. Do this before starting the
+scheduler; the settings default by itself is not a revocation mechanism.
+
 ## Replay and failure semantics
 
 Durable journals Code Mode call results before delivering them to the deterministic
@@ -95,16 +181,16 @@ only the native sandbox is deliberately not a durable tool outcome; without
 caller cancellation, native Code Mode can leave the task pending for recovery.
 
 This bundle does not install native filesystem/bash tools, approve MCP, or make
-P1 confinement pass. It must remain uninstalled until the host explicitly enables
-reviewed tools under their own policy. It is not evidence that P1, P2 as a whole,
-or the TypeScript port has passed acceptance.
+P1 confinement pass. Keep it out of the gateway until a separate host/security
+review explicitly enables reviewed tools under their own policy. It is not
+evidence that P1, P2 as a whole, or the TypeScript port has passed acceptance.
 
 ## Offline verification evidence
 
 No committed test scaffolding was added. The bounded temporary probes used Node
 22.22.2, the actual Durable Harness and file-backed SQLite storage, the actual
 QuickJS worker, faux models, and only synthetic tools. No provider credentials,
-network, Telegram, bash, host configuration, or production data were used.
+network, Telegram, bash, production host configuration, or production data were used.
 
 - `/tmp/nanobot-p2-probes/verify-local.mjs` (run with
   `timeout 60s node --experimental-strip-types /tmp/nanobot-p2-probes/verify-local.mjs`):
@@ -117,6 +203,19 @@ network, Telegram, bash, host configuration, or production data were used.
   two-worker limit; cancellation aborts both running nested calls; Harness tasks
   drain before helper close. Captured output:
   `/tmp/nanobot-p2-probes/local-result.json`.
+- `/tmp/nanobot-p2-probes/verify-optin.mjs` (run with
+  `timeout 60s node --experimental-strip-types /tmp/nanobot-p2-probes/verify-optin.mjs`):
+  the actual Harness used `settings.extensions: []` plus native
+  `conversationCreated` default-deny for extensions, tools, and model tools.
+  Conversation A explicitly selected the bundle and one synthetic reviewed
+  effect; its script discovered and ran that effect once. Independent B had no
+  extension/tool grant and only a `modelTools` override; forged calls to `codemode`,
+  `tool_search`, and the synthetic effect all settled as unavailable, with no
+  effect. A separate Code-Mode-only conversation could not execute the omitted
+  nested effect even when `modelTools` named it. After SQLite reopen, B remained
+  restricted; a stale explicit grant persisted despite the new defaults and was
+  revoked through native `configure()` before `resume()`. Output is printed by
+  the probe; it uses no provider credentials or external effects.
 - `/tmp/nanobot-p2-probes/verify-replay.mjs` launches
   `/tmp/nanobot-p2-probes/replay-child.mjs`, sends the first actual Harness
   process `SIGKILL` after a completed synthetic effect and a second unsafe effect
