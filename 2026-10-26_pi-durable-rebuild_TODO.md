@@ -389,6 +389,25 @@ Pi packages remain useful when concrete needs arise, rather than adopting the
 whole org. Existing race/hard-link/tool-replay/storage gates stay open; preference
 for bwrap is not acceptance of the unsafe current filesystem wrapper.
 
+### 2026-10-26 — P1/P2 implementation batch started
+
+Owner explicitly requested `openai-codex / gpt-6-luna / xhigh` subagents.
+Native herdr_spawn created three committed-base worktrees from0ea2c76eb:
+`pi-ccd4ba61`/`w1X:p1` (bwrap execution, exclusive manifest/lock),
+`pi-9dd12539`/`w1Y:p1` (native Code Mode/tool-search/replay module), and
+`pi-72ce3be3`/`w1Z:p1` (actual-connection SQLite WAL/FULL setup/runtime integration).
+Full ownership/checklist/limits in `2026-10-26_full-port_TODO.md`. No gateway tool
+enabling, Python/live credentials/provider calls/deployment/cleanup in batch.
+Parent awaits explicit reports, not idle notices, then reviews and verifies.
+
+Execution worker reported writable bind mounts preserve outside hard-link inode
+aliases. Parent obtained explicit owner decision: initial execution targets an
+application-managed isolated workspace with explicit imports, rejects arbitrary
+writable host/extra roots, and has no automatic host publication. Sent choice to
+B1 before implementation; provenance/import/reopen/security proof remains open.
+This supersedes transparent host-workspace compatibility for the initial path,
+not the current tool-less gateway's behavior.
+
 ### 2026-10-26 — assessment
 
 Project relocated to its own checkout `/home/gergo/projects/pi-nanobot`, cloned

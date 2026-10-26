@@ -22,15 +22,49 @@ continues to constrain the currently integrated tool-less slice.
 Each unchecked milestone needs its exit evidence, not merely compilable code.
 P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
+## Active implementation batch — 2026-10-26
+
+Owner explicitly authorized Codex Luna xhigh implementation subagents. All start
+from committed `0ea2c76eb3896646fb089549ad9d7669c7a6ed52`, in independent
+Herdr worktrees; native wrapper tools only. Parent pane `w1P:p1` owns review,
+root docs, integration and acceptance. No P1/P2 milestone is passed by launch.
+
+- [ ] B1 — bwrap/native ExecutionEnv confinement: `pi-ccd4ba61`, pane `w1X:p1`.
+- [ ] B2 — native Code Mode/tool-search lifecycle and offline nested replay:
+      `pi-9dd12539`, pane `w1Y:p1`.
+- [ ] B3 — actual-connection SQLite WAL/FULL and fail-closed setup:
+      `pi-72ce3be3`, pane `w1Z:p1`.
+- [ ] Parent review/integration and independent bounded verification; read-only
+      security/replay review as needed before acceptance or gateway activation.
+
+| Child / branch | Worktree | Exclusive ownership |
+|---|---|---|
+| `pi-ccd4ba61` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-ccd4ba61` | `src/execution/**`, EXECUTION.md, manifest/lock |
+| `pi-9dd12539` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-9dd12539` | new `src/extensions/**`, CODEMODE.md |
+| `pi-72ce3be3` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-72ce3be3` | `src/storage/**`, runtime.ts storage-open integration only, STORAGE.md |
+
+All use `openai-codex / gpt-6-luna / xhigh`. Manifest owner is authorized to
+add exact direct pi-codemode1.4.0 for native imports and pi-env1.4.0 only if
+concretely useful; other dependencies require review. Existing Pi/grammY pins
+remain. No worker enables tools in gateway, edits Python/Telegram/other workers'
+files, reads live credentials, makes paid/live calls, changes host/server setup,
+pushes/deploys or cleans worktrees. Runtime retains tools:[]/modelTools:[] before
+resume. Probes use private synthetic data/faux models with bounded time/memory.
+Completion requires explicit herdr_report; idle/working notices are not evidence.
+
 ## Owner decisions and definition of full port
 
 - TypeScript owns the application/runtime. **Pi SDK-first** means Durable and its
   native tools/Code Mode/compaction/tasks, with supporting Pi packages as needed;
   not adoption of the entire Earendil ecosystem or a line-by-line Python rewrite.
 - **Prefer bwrap for Linux execution.** Close the existing adapter's filesystem
-  gaps before enabling tools. No Gondolin/micro-VM requirement and no Elanor/UI
-  framework migration. Consider another execution backend only if the bwrap
-  approach cannot meet the reviewed requirements and the owner approves a change.
+  gaps before enabling tools. The owner selected an **application-managed isolated
+  workspace with explicit imports** for the initial execution contract: reject
+  arbitrary writable host-directory/extra-root binds; no automatic publish-back.
+  This is an approved behavior change, not transparent compatibility with the old
+  workspace API. No Gondolin/micro-VM requirement or Elanor/UI-framework migration.
+  Consider another backend only if bwrap cannot meet the reviewed requirements
+  and the owner approves a change.
 - **Include the existing tracked WebUI**, despite older repository guidance saying
   it was removed. Adapt this fork's frontend/backend contracts; do not re-merge
   upstream or restore its unrelated OpenAI-compatible API server.
@@ -176,10 +210,12 @@ Python reference checks and accepted differences. Track semantic behavior, not L
   unsandboxed fallback, inherited credentials, or host-network escape. Host package
   installation or server changes still require explicit authorization.
 - [ ] Prove traversal, missing-leaf, rename, symlink-race and hard-link invariants
-  for **every** read/write/list/spill/temp/cwd path. Prefer isolated storage or
-  reviewed upstream providers; do not silently copy back over concurrent host
-  edits or expose arbitrary writable host directories. Preserve clear workspace
-  and extra-root semantics; never mount credentials or the Durable data root.
+  for **every** read/write/list/spill/temp/cwd path. Use the owner-approved managed
+  workspace contract: secure creation/reopen/provenance, explicit alias-free imports,
+  and documented lifetime/persistence. Reject arbitrary writable host/extra roots;
+  do not auto-copy/import/publish or overwrite host edits. A permission bit, marker
+  or one-time hard-link scan alone does not prove isolation. Never mount credentials
+  or the Durable data root.
 - [ ] Prove sandbox/process-group teardown, timeout and cancellation, bounded resource
   use and absence of post-return work. No unsafe host/native fallback. Preserve
   per-file serialization and environment identity through upstream tools.
@@ -544,3 +580,32 @@ when needed, and the existing frontend. pi-env is conditional on a concrete
 execution/remote transport need, not a new runtime requirement. The execution
 gate is unchanged: sandboxed bash alone cannot justify host-side filesystem race
 or hard-link exposure. No implementation, dependency or deployment change.
+
+### 2026-10-26 — implementation batch launched
+
+Owner requested Codex Luna xhigh workers to begin implementation. Verified clean
+parent at0ea2c76eb, HERDR_ENV=1, and read native wrapper guide at
+`/home/gergo/dotfiles/docs/herdr-socket.md` (older linked paths no longer exist).
+Launched the three disjoint workers recorded above using herdr_spawn with explicit
+committed base/model/thinking; all acknowledged startup/working. One initial
+metadata inspection recorded exact pane/workspace/worktree identities; no polling
+loop or terminal/CLI fallback. Existing prior resources retained untouched.
+
+Sent manifest/direct-dependency coordination to B1/B2 via herdr_send. Await explicit
+reports, handle exact permission requests within scope, review/integrate and run
+independent checks before claiming any gate. No initial proof of race/hard-link,
+tool replay, or host-power durability is inferred from startup. No production or
+live-secret changes authorized by this batch.
+
+### 2026-10-26 — managed workspace decision for execution
+
+B1 explicitly reported the remaining hard-link boundary: ordinary writable bind
+mounts cannot prevent outside-inode alias effects even with all FS operations
+inside bwrap. Before implementation, parent asked the owner to choose isolated
+copies/publication, managed workspace, or continued tool disablement. Owner chose
+**Managed workspace**: application-owned isolated storage, explicit imports,
+reject arbitrary writable host roots, no automatic publish-back. Sent the exact
+choice/boundaries through herdr_send; worker may adjust its standalone API within
+ownership, but gateway/config/tool enabling remain untouched. Secure provenance,
+import/reopen semantics and adversarial evidence are still required; this is not
+a completed security proof. B2/B3 continue independently.
