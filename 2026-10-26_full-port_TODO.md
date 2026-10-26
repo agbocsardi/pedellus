@@ -32,7 +32,8 @@ root docs, integration and acceptance. No P1/P2 milestone is passed by launch.
 - [ ] B1 — bwrap/native ExecutionEnv confinement: `pi-ccd4ba61`, pane `w1X:p1`.
 - [ ] B2 — native Code Mode/tool-search lifecycle and offline nested replay:
       `pi-9dd12539`, pane `w1Y:p1`. Candidate `eb900a862` explicitly completed;
-      parent candidate probes pass; independent review and direct dependency
+      parent candidate probes pass; review found a default-selection example
+      blocker. Default-deny A/B/reopen follow-up, re-review and direct dependency
       declaration/integration pending.
 - [x] B3 — actual-connection SQLite WAL/FULL and fail-closed setup:
       `pi-72ce3be3`, pane `w1Z:p1`. Candidate `e8269c650` integrated as
@@ -702,3 +703,21 @@ external-effect claim. These runs import candidate built artifacts; repeat on
 parent after reviewed integration. No live/paid calls, production changes or
 committed tests. Caught/discarded failures and structured nonzero-success policy
 still need later product hooks; B2/P2 and P1 are not globally accepted.
+
+### 2026-10-26 — Code Mode default-selection review blocker
+
+Reviewer `pi-7e58645f` explicitly reported bounded core adapter PASS but a
+**documentation/integration blocker** in `/tmp/pi-codemode-bundle-review.md`:
+installing extensions in a default native registry makes them defaults for
+conversations without explicit restrictive selection/tools. Selecting extensions
+on A does not deny B. The sample also did not bind/include its named tool handles.
+This is not exposure in the current gateway, which never installs the bundle and
+reapplies tools:[] before resume. Candidate remains unintegrated.
+
+Parent sent B2 a bounded follow-up via herdr_send: supported native default-deny
+host setup, real registration bindings/allowlists, explicit distinction between
+constructor and registry installation and between tools/modelTools, persisted
+policy revocation before resume, plus private actual-Harness A-enabled/B-disabled
+and reopen evidence. No new abstraction/API change unless needed, no manifest or
+gateway edits. Await explicit follow-up commit/report, then re-review; do not
+substitute passed sandbox/replay probes for this activation-policy gate.
