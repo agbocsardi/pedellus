@@ -33,8 +33,8 @@ root docs, integration and acceptance. No P1/P2 milestone is passed by launch.
 - [ ] B2 — native Code Mode/tool-search lifecycle and offline nested replay:
       `pi-9dd12539`, pane `w1Y:p1`. Candidate `eb900a862` explicitly completed;
       parent candidate probes pass; review found a default-selection example
-      blocker. Default-deny A/B/reopen follow-up, re-review and direct dependency
-      declaration/integration pending.
+      blocker. Corrected default-deny/new/fork/reopen evidence now passes parent
+      probes; final re-review and direct dependency declaration/integration pending.
 - [x] B3 — actual-connection SQLite WAL/FULL and fail-closed setup:
       `pi-72ce3be3`, pane `w1Z:p1`. Candidate `e8269c650` integrated as
       `2d5af1adf`; independent review and parent-checkout probes/build pass.
@@ -734,3 +734,21 @@ creation-hook behavior. Parent requested corrected initial/reopen options,
 asserted hook invocation and a fork-of-enabled-A denial check; no module rewrite
 or unnecessary commit. Await explicit corrected evidence, then reviewer re-check
 and dependency declaration. Neither follow-up is integrated yet.
+
+### 2026-10-26 — corrected opt-in/fork proof passes parent run
+
+B2 explicitly reported corrected fixture plus docs evidence commit `711ba19f7`.
+Parent read it and reran it successfully (65s/512 MB): actual top-level creation
+callback runs five times, clears inherited enabled-A fork grants before resolution,
+and never runs just for reopening existing IDs. A runs one synthetic effect;
+forged fork/B calls and modelTools-only missing nested tool remain denied;
+persisted C requires explicit revoke before resume.
+
+Sent final candidate chain eb900a862/da5a2392c/711ba19f7 to the same read-only
+reviewer for explicit blocker-resolution re-review. Parent also created separate
+private `/tmp/pi-nanobot-parent-codemode-local.mjs` and `...-optin.mjs` adaptations,
+using explicit selectable **built** artifact/SDK imports (no shared probe edits),
+and ran both with 65-second/512-MB bounds. Both exit0 and pass boundary/capacity,
+store/fork, nested errors, and corrected opt-in assertions against candidate.
+`PI_CODEMODE_CANDIDATE` can select the parent package after integration. Await
+final review and manifest-owner dependency commit; no gateway activation.
