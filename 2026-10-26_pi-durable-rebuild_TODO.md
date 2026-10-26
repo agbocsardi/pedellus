@@ -112,6 +112,23 @@ worktrees for runtime, execution security, and Telegram. New package lives in
 `packages/pi-nanobot`; Python and live deployments remain unchanged. Pin Pi 1.4.0.
 No live credentials, paid requests, or real Telegram polling in this initial batch.
 Security/recovery evidence gates remain open until independently checked.
+Scaffold/design commit: `6f2057944`; dependency install audited 93 packages with
+zero reported vulnerabilities. Node 22.22.2; `/usr/bin/bwrap` 0.9.0; a minimal
+user/PID/network namespace probe succeeded. No application acceptance check yet.
+
+Active implementation batch (all `openai-codex / gpt-6-luna / high`):
+
+| Agent | Pane / workspace | Branch | Ownership |
+|---|---|---|---|
+| `durable-execution-w1p` | `w1Q:p1` / `w1Q` | `sub-pi-durable-execution` | `src/execution/**`, `EXECUTION.md` |
+| `durable-runtime-w1p` | `w1R:p1` / `w1R` | `sub-pi-durable-runtime` | config/providers/runtime/CLI/index, example config, README |
+| `durable-telegram-w1p` | `w1S:p1` / `w1S` | `sub-pi-durable-telegram` | `src/channels/**`, `TELEGRAM.md` |
+
+Parent: `w1P:p1`. Managed worktrees are under
+`/home/gergo/.herdr/worktrees/pi-nanobot/sub-pi-durable-{execution,runtime,telegram}`.
+Shared read-only upstream source is `/tmp/pi-durable-reference-1.4.0`, pinned to
+Pi tag `v1.4.0` (`4a080252f06caf63a525d7873c5d94d3c23887e0`). Workers must report
+commits/checks/blockers before parent integration; no automatic merge or cleanup.
 
 ### 2026-10-26 — assessment
 
