@@ -154,5 +154,21 @@ using the SQLite gateway. The mock inspected committed exact-text intent before
 recording remote acceptance; after SIGKILL and full reopen, state was unknown,
 the intended text remained available, and no retransmission occurred. This checks
 our local crash boundary with mocked Telegram, not delivery over Telegram's network.
-No live bot or paid model call was used. External sends remain unknown at an
-ambiguous boundary and require reconciliation, never an exactly-once claim.
+No live bot or paid model call was used in the offline probes above. External
+sends remain unknown at an ambiguous boundary and require reconciliation, never
+an exactly-once claim.
+
+## Live smoke check — 2026-10-26
+
+Owner-authorized sole polling with private credentials outside the checkout and
+an explicit numeric sender allowlist exercised the real Telegram API. A scripted
+streaming faux model produced the reply (no paid LLM request). The owner confirmed
+the final response with a screenshot; API observations recorded one sendMessage
+and four editMessageText successes, including final text.
+
+The temporary runner's auto-pass observer did not fire, so parent stopped polling
+cleanly and independently reopened its isolated SQLite store. The SDK check found
+one user/assistant turn, no pending output, no enabled tools, and only faux model
+usage. This proves the real Telegram/Durable streaming path, not production
+readiness, execution confinement, or real-provider compatibility. No credentials
+or private transcript contents were added to the repository.

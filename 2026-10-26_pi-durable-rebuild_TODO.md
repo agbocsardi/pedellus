@@ -87,10 +87,11 @@ wiring replace them.
   - [x] Retain write-ahead send intents, unknown outcomes, and accepted chunk
         progress durably without blind automatic retransmission.
   - [x] Recheck integrated behavior and actual process-crash send boundary offline.
-  - [ ] Live Telegram smoke check with scripted model (await owner setup).
+  - [x] Live Telegram smoke check with scripted model, streaming edits, and persisted-state reopen.
   - [ ] bwrap-confined `ExecutionEnv` running `read`/`write`/`edit`/`bash`;
         prove workspace escape attempts fail.
-  - [ ] Telegram-in → `submit()` → streaming edits from `watch()` → out.
+  - [x] Telegram-in → `submit()` → streaming edits from `watch()` → out
+        (real Telegram, scripted streaming model; real fork provider still pending).
   - [ ] Kill -9 mid-tool; reopen; verify `replay` semantics as documented.
   - [ ] One real fork provider (umans or opencode_zen) through pi-ai.
 - [ ] Gate 2 — decide, on spike evidence only: proceed / stop.
@@ -341,6 +342,23 @@ isolated SQLite/transcript data `/tmp/pi-nanobot-live-xM2Emp`. Only configured
 numeric sender is allowlisted, model is explicitly injected faux streaming, tools
 remain disabled, no paid LLM calls. Await owner sending `pi durable smoke` and
 inspect final log/result; startup/authentication are not an end-to-end pass.
+
+### 2026-10-26 — live Telegram smoke verified
+
+Owner sent `pi durable smoke` and supplied screenshot showing the final reply.
+Real API accepted one sendMessage and four editMessageText calls (including final
+text). The temporary runner's automatic pass detector did not fire, despite
+matched input/finalVisible=true, so parent stopped its sole polling process with
+SIGTERM rather than treating that helper as authoritative. Log confirms CLOSED.
+
+Parent then reopened the actual isolated SQLite store through openGateway and
+verified one persisted user turn, one assistant entry, empty pending output queue,
+explicitly zero enabled tools, and only faux model usage. This independently
+establishes the real Telegram → Durable → streamed Telegram path; no paid LLM
+request was made. Secret contents were never printed or committed. Private smoke
+data/log remain outside checkout for inspection; bot polling is stopped. This
+completes the Telegram slice only: execution confinement and real fork-provider
+checks remain open, and nothing was deployed.
 
 ### 2026-10-26 — assessment
 
