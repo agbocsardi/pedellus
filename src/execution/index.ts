@@ -15,6 +15,7 @@ import {
 	type ShellExecResult,
 } from "@earendil-works/pi-durable/env";
 import type { Context } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { buildBwrapArgs, shellQuote, validateBwrap } from "./sandbox.js";
 
 export interface ExecutionOptions {
@@ -50,8 +51,9 @@ class ConfinedExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		this.#bwrap = bwrap;
 	}
 
-	private async checked(path: string): Promise<{ path: string } | { error: FileError }> {
+	private async checked(path: string, context?: Context): Promise<{ path: string } | { error: FileError }> {
 		const absolute = resolve(this.cwd, path);
+		if (context?.abortSignal?.aborted) return { error: new FileError("aborted", "aborted", absolute) };
 		try {
 			// Resolve existing ancestors, then append the missing suffix. This protects
 			// missing write leaves and detects current symlink escapes, but is not an
@@ -88,45 +90,46 @@ class ConfinedExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		}
 	}
 
-	private async checkedResult<T>(path: string, call: (absolute: string) => Promise<Result<T, FileError>>): Promise<Result<T, FileError>> {
-		const resolved = await this.checked(path);
+	private async checkedResult<T>(path: string, context: Context, call: (absolute: string) => Promise<Result<T, FileError>>): Promise<Result<T, FileError>> {
+		const resolved = await this.checked(path, context);
 		return "error" in resolved ? err<T, FileError>(resolved.error) : call(resolved.path);
 	}
 
 	override async absolutePath(path: string, context: Context): ReturnType<NodeExecutionEnv["absolutePath"]> {
 		const absolute = resolve(this.cwd, path);
-		const checked = await this.checked(absolute);
+		const checked = await this.checked(absolute, context);
 		return "error" in checked ? err<string, FileError>(checked.error) : ok(checked.path);
 	}
 
 	override async joinPath(parts: string[], context: Context): ReturnType<NodeExecutionEnv["joinPath"]> {
+		if (context.abortSignal?.aborted) return err<string, FileError>(new FileError("aborted", "aborted"));
 		const result = await super.joinPath(parts, context);
 		if (!result.ok) return result;
-		const checked = await this.checked(result.value);
+		const checked = await this.checked(result.value, context);
 		return "error" in checked ? err<string, FileError>(checked.error) : ok(checked.path);
 	}
 
-	override readTextFile(path: string, context: Context) { return this.checkedResult(path, (p) => super.readTextFile(p, context)); }
-	override openTextLineReader(path: string, context: Context) { return this.checkedResult(path, (p) => super.openTextLineReader(p, context)); }
-	override readTextLines(path: string, options: { maxLines?: number } | undefined, context: Context) { return this.checkedResult(path, (p) => super.readTextLines(p, options, context)); }
-	override readBinaryFile(path: string, context: Context) { return this.checkedResult(path, (p) => super.readBinaryFile(p, context)); }
-	override openBinaryReader(path: string, options: { noFollow?: boolean } | undefined, context: Context) { return this.checkedResult(path, (p) => super.openBinaryReader(p, options, context)); }
-	override writeFile(path: string, content: string | Uint8Array, context: Context) { return this.checkedResult(path, (p) => super.writeFile(p, content, context)); }
-	override appendFile(path: string, content: string | Uint8Array, context: Context) { return this.checkedResult(path, (p) => super.appendFile(p, content, context)); }
-	override truncateFile(path: string, size: number, context: Context) { return this.checkedResult(path, (p) => super.truncateFile(p, size, context)); }
-	override flushFile(path: string, context: Context) { return this.checkedResult(path, (p) => super.flushFile(p, context)); }
-	override fileInfo(path: string, context: Context) { return this.checkedResult(path, (p) => super.fileInfo(p, context)); }
-	override listDir(path: string, context: Context) { return this.checkedResult(path, (p) => super.listDir(p, context)); }
-	override openDirReader(path: string, context: Context) { return this.checkedResult(path, (p) => super.openDirReader(p, context)); }
-	override canonicalPath(path: string, context: Context) { return this.checkedResult(path, (p) => super.canonicalPath(p, context)); }
-	override exists(path: string, context: Context) { return this.checkedResult(path, (p) => super.exists(p, context)); }
-	override createDir(path: string, options: { recursive?: boolean } | undefined, context: Context) { return this.checkedResult(path, (p) => super.createDir(p, options, context)); }
-	override remove(path: string, options: { recursive?: boolean; force?: boolean } | undefined, context: Context) { return this.checkedResult(path, (p) => super.remove(p, options, context)); }
+	override readTextFile(path: string, context: Context) { return this.checkedResult(path, context, (p) => super.readTextFile(p, context)); }
+	override openTextLineReader(path: string, context: Context) { return this.checkedResult(path, context, (p) => super.openTextLineReader(p, context)); }
+	override readTextLines(path: string, options: { maxLines?: number } | undefined, context: Context) { return this.checkedResult(path, context, (p) => super.readTextLines(p, options, context)); }
+	override readBinaryFile(path: string, context: Context) { return this.checkedResult(path, context, (p) => super.readBinaryFile(p, context)); }
+	override openBinaryReader(path: string, options: { noFollow?: boolean } | undefined, context: Context) { return this.checkedResult(path, context, (p) => super.openBinaryReader(p, options, context)); }
+	override writeFile(path: string, content: string | Uint8Array, context: Context) { return this.checkedResult(path, context, (p) => super.writeFile(p, content, context)); }
+	override appendFile(path: string, content: string | Uint8Array, context: Context) { return this.checkedResult(path, context, (p) => super.appendFile(p, content, context)); }
+	override truncateFile(path: string, size: number, context: Context) { return this.checkedResult(path, context, (p) => super.truncateFile(p, size, context)); }
+	override flushFile(path: string, context: Context) { return this.checkedResult(path, context, (p) => super.flushFile(p, context)); }
+	override fileInfo(path: string, context: Context) { return this.checkedResult(path, context, (p) => super.fileInfo(p, context)); }
+	override listDir(path: string, context: Context) { return this.checkedResult(path, context, (p) => super.listDir(p, context)); }
+	override openDirReader(path: string, context: Context) { return this.checkedResult(path, context, (p) => super.openDirReader(p, context)); }
+	override canonicalPath(path: string, context: Context) { return this.checkedResult(path, context, (p) => super.canonicalPath(p, context)); }
+	override exists(path: string, context: Context) { return this.checkedResult(path, context, (p) => super.exists(p, context)); }
+	override createDir(path: string, options: { recursive?: boolean } | undefined, context: Context) { return this.checkedResult(path, context, (p) => super.createDir(p, options, context)); }
+	override remove(path: string, options: { recursive?: boolean; force?: boolean } | undefined, context: Context) { return this.checkedResult(path, context, (p) => super.remove(p, options, context)); }
 
 	override async renameFile(sourcePath: string, destinationPath: string, context: Context): ReturnType<NodeExecutionEnv["renameFile"]> {
-		const source = await this.checked(sourcePath);
+		const source = await this.checked(sourcePath, context);
 		if ("error" in source) return err<void, FileError>(source.error);
-		const destination = await this.checked(destinationPath);
+		const destination = await this.checked(destinationPath, context);
 		if ("error" in destination) return err<void, FileError>(destination.error);
 		return super.renameFile(source.path, destination.path, context);
 	}
@@ -134,7 +137,7 @@ class ConfinedExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 	override async watch(targets: Parameters<NodeExecutionEnv["watch"]>[0], onChange: Parameters<NodeExecutionEnv["watch"]>[1], context: Context): ReturnType<NodeExecutionEnv["watch"]> {
 		const safe = [];
 		for (const target of targets) {
-			const checked = await this.checked(target.path);
+			const checked = await this.checked(target.path, context);
 			if ("error" in checked) return err<FileWatcher, FileError>(checked.error);
 			safe.push({ ...target, path: checked.path });
 		}
@@ -190,13 +193,20 @@ class ConfinedExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 	}
 
 	override async exec(command: string | readonly string[], options: ShellExecOptions | undefined, context: Context): Promise<Result<ShellExecResult, ExecutionError>> {
+		if (context.abortSignal?.aborted) return err<ShellExecResult, ExecutionError>(new ExecutionError("aborted", "aborted"));
 		if (this.#closed) return err<ShellExecResult, ExecutionError>(new ExecutionError("spawn_error", "Execution environment is closed"));
 		const requestedCwd = options?.cwd ? resolve(this.cwd, options.cwd) : this.cwd;
-		const safeCwd = await this.checked(requestedCwd);
+		const safeCwd = await this.checked(requestedCwd, context);
 		if ("error" in safeCwd) return err<ShellExecResult, ExecutionError>(new ExecutionError("spawn_error", safeCwd.error.message, safeCwd.error));
 		const argv = typeof command === "string" ? ["/bin/sh", "-c", command] : [...command];
 		if (!argv.length) return err<ShellExecResult, ExecutionError>(new ExecutionError("spawn_error", "Empty argv: no program to run"));
-		const args = await buildBwrapArgs(this.#bwrap, this.#roots, safeCwd.path, argv);
+		let args: string[];
+		try {
+			args = await buildBwrapArgs(this.#bwrap, this.#roots, safeCwd.path, argv);
+		} catch (error) {
+			return err<ShellExecResult, ExecutionError>(new ExecutionError("spawn_error", error instanceof Error ? error.message : String(error), error instanceof Error ? error : undefined));
+		}
+		if (context.abortSignal?.aborted) return err<ShellExecResult, ExecutionError>(new ExecutionError("aborted", "aborted"));
 		return super.exec(["/bin/sh", "-c", args.map(shellQuote).join(" ")], {
 			...options,
 			cwd: this.cwd,
@@ -232,13 +242,25 @@ export async function createExecutionEnv(options: ExecutionOptions): Promise<Exe
 	}
 	const cwd = resolve(options.cwd ?? uniqueRoots[0]!);
 	const env = new ConfinedExecutionEnv(uniqueRoots, cwd, bwrap.path);
-	const check = await env.absolutePath(cwd, { abortSignal: undefined } as Context);
-	if (!check.ok) throw new Error(`cwd is outside allowed execution roots: ${cwd}`);
-	// Verify the namespace contract before returning an environment.
-	const probe = await env.exec(["/usr/bin/true"], { timeout: 5 }, { abortSignal: undefined } as Context);
-	if (!probe.ok) {
-		await env.cleanup({ abortSignal: undefined } as Context);
-		throw new Error(`Bubblewrap execution probe failed: ${probe.error.message}`);
+	try {
+		const check = await env.absolutePath(cwd, BACKGROUND_CONTEXT);
+		if (!check.ok) throw new Error(`cwd is not an allowed existing path: ${cwd}: ${check.error.message}`);
+		let cwdInfo;
+		try {
+			cwdInfo = await stat(check.value);
+		} catch (error) {
+			throw new Error(`cwd does not exist: ${cwd}`, { cause: error });
+		}
+		if (!cwdInfo.isDirectory()) throw new Error(`cwd is not a directory: ${cwd}`);
+		// Verify namespace setup and require an actual successful process exit.
+		const probe = await env.exec(["/usr/bin/true"], { timeout: 5 }, BACKGROUND_CONTEXT);
+		if (!probe.ok || probe.value.exitCode !== 0) {
+			const detail = probe.ok ? `exit code ${probe.value.exitCode}` : probe.error.message;
+			throw new Error(`Bubblewrap execution probe failed: ${detail}`);
+		}
+		return env;
+	} catch (error) {
+		await env.cleanup(BACKGROUND_CONTEXT);
+		throw error;
 	}
-	return env;
 }
