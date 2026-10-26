@@ -10,6 +10,7 @@ const TELEGRAM_LIMIT = 4096;
 const MAX_ADMITTED = 1000;
 const MAX_SEND_ATTEMPTS = 5;
 const POLL_TIMEOUT_MAX = 50;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export type TelegramOptions = {
   token: string;
@@ -66,8 +67,9 @@ export async function runTelegram(
   const adapterContext = scope.context;
   const signal = adapterContext.abortSignal;
   if (signal?.aborted) return;
+  const throttle = new TelegramThrottle();
 
-  const me = await apiCall<{ id: number; username?: string }>(options.token, "getMe", {}, signal);
+  const me = await apiCall<{ id: number; username?: string }>(options.token, "getMe", {}, signal, 15_000, throttle);
   const identity = String(me.id);
   const stateConversation = await gateway.conversationFor(`telegram:${identity}:channel-state`, context);
   let state = await stateConversation.commit(async (tx) =>
@@ -100,7 +102,7 @@ export async function runTelegram(
   const deliver = async (item: PendingReply) => {
     if (!options.allowFrom.includes(item.senderId)) {
       if (item.messageId !== undefined) {
-        await apiCall(options.token, "deleteMessage", { chat_id: item.chatId, message_id: item.messageId }, signal).catch(() => undefined);
+        await apiCall(options.token, "deleteMessage", { chat_id: item.chatId, message_id: item.messageId }, signal, 15_000, throttle).catch(() => undefined);
       }
       await forget(item.updateId);
       return;
@@ -175,7 +177,7 @@ export async function runTelegram(
           try {
             await apiCall(options.token, "editMessageText", {
               chat_id: item.chatId, message_id: current.messageId, text: chunks[0],
-            }, signal);
+            }, signal, 15_000, throttle);
           } catch (error) {
             if (isNotModified(error)) {
               // The remote edit may have succeeded before its response was lost.
@@ -183,18 +185,18 @@ export async function runTelegram(
               await clearPreview(item.updateId);
               const sent = await apiCall<{ message_id: number }>(options.token, "sendMessage", {
                 chat_id: item.chatId, text: chunks[0]!,
-              }, signal);
+              }, signal, 15_000, throttle);
               await rememberMessage(item.updateId, sent.message_id, chunks[0]!);
             } else throw error;
           }
           await rememberText(item.updateId, chunks[0]!);
         }
         for (const chunk of chunks.slice(1)) {
-          await apiCall(options.token, "sendMessage", { chat_id: item.chatId, text: chunk }, signal);
+          await apiCall(options.token, "sendMessage", { chat_id: item.chatId, text: chunk }, signal, 15_000, throttle);
         }
       } else {
         for (const chunk of chunks) {
-          await apiCall(options.token, "sendMessage", { chat_id: item.chatId, text: chunk }, signal);
+          await apiCall(options.token, "sendMessage", { chat_id: item.chatId, text: chunk }, signal, 15_000, throttle);
         }
       }
     }
@@ -207,13 +209,13 @@ export async function runTelegram(
       if (current.messageId === undefined) {
         const sent = await apiCall<{ message_id: number }>(options.token, "sendMessage", {
           chat_id: item.chatId, text: preview,
-        }, signal);
+        }, signal, 15_000, throttle);
         await rememberMessage(item.updateId, sent.message_id, preview);
       } else {
         try {
           await apiCall(options.token, "editMessageText", {
             chat_id: item.chatId, message_id: current.messageId, text: preview,
-          }, signal);
+          }, signal, 15_000, throttle);
           await rememberText(item.updateId, preview);
         } catch (error) {
           if (isNotModified(error)) {
@@ -222,7 +224,7 @@ export async function runTelegram(
             await clearPreview(item.updateId);
             const sent = await apiCall<{ message_id: number }>(options.token, "sendMessage", {
               chat_id: item.chatId, text: preview,
-            }, signal);
+            }, signal, 15_000, throttle);
             await rememberMessage(item.updateId, sent.message_id, preview);
           } else throw error;
         }
@@ -266,7 +268,7 @@ export async function runTelegram(
         offset: state.offset,
         timeout: Math.min(options.pollTimeoutSeconds ?? 30, POLL_TIMEOUT_MAX),
         allowed_updates: ["message"],
-      }, signal, (pollSeconds + 10) * 1000);
+      }, signal, (pollSeconds + 10) * 1000, throttle);
       for (const update of updates) {
         if (signal?.aborted) break;
         const message = update.message;
@@ -363,11 +365,13 @@ async function apiCall<T = void>(
   token: string,
   method: string,
   body: Record<string, unknown>,
-  signal?: AbortSignal,
-  timeoutMs = 15_000,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+  throttle: TelegramThrottle,
 ): Promise<T> {
   let lastStatus: number | undefined;
   for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt++) {
+    await throttle.wait(signal);
     if (signal?.aborted) throw signal.reason;
     let response: Response;
     try {
@@ -393,16 +397,25 @@ async function apiCall<T = void>(
     }
     if (response.ok && payload.ok) return payload.result as T;
     const code = payload.error_code ?? response.status;
-    if (code === 400 && (payload.description === "Bad Request: message is not modified" ||
-        payload.description === "Bad Request: message to edit not found")) {
-      throw new TelegramApiError(code, payload.description);
+    if (method === "editMessageText" && code === 400 &&
+        (isNotModifiedDescription(payload.description) || payload.description === "Bad Request: message to edit not found")) {
+      throw new TelegramApiError(code, payload.description!);
     }
-    if (code === 429 || code >= 500) {
+    if (code === 429) {
+      const retry = payload.parameters?.retry_after;
+      if (retry !== undefined) {
+        if (!Number.isFinite(retry) || retry <= 0 || !Number.isFinite(Date.now() + retry * 1000)) {
+          throw new Error(`Telegram ${method} failed with status ${code}`);
+        }
+        throttle.defer(Date.now() + retry * 1000);
+      }
       if (attempt < MAX_SEND_ATTEMPTS - 1) {
-        const retry = payload.parameters?.retry_after;
-        await delay(retry === undefined ? backoff(attempt) : retry * 1000, signal);
+        await throttle.wait(signal);
         continue;
       }
+    } else if (code >= 500 && attempt < MAX_SEND_ATTEMPTS - 1) {
+      await delay(backoff(attempt), signal);
+      continue;
     }
     throw new Error(`Telegram ${method} failed with status ${code}`);
   }
@@ -420,9 +433,15 @@ class TelegramApiError extends Error {
   }
 }
 
+function isNotModifiedDescription(description: string | undefined): boolean {
+  const prefix = "Bad Request: message is not modified";
+  return description === prefix || (description !== undefined && description.length <= 512 &&
+    description.startsWith(`${prefix}: `));
+}
+
 function isNotModified(error: unknown): boolean {
   return error instanceof TelegramApiError && error.status === 400 &&
-    error.description === "Bad Request: message is not modified";
+    isNotModifiedDescription(error.description);
 }
 
 function isMessageNotFound(error: unknown): boolean {
@@ -434,17 +453,34 @@ function backoff(attempt: number): number {
   return Math.min(10_000, 250 * 2 ** attempt);
 }
 
+class TelegramThrottle {
+  #retryAt = 0;
+
+  defer(deadline: number): void {
+    this.#retryAt = Math.max(this.#retryAt, deadline);
+  }
+
+  async wait(signal?: AbortSignal): Promise<void> {
+    while (this.#retryAt > Date.now()) await delay(this.#retryAt - Date.now(), signal);
+  }
+}
+
 async function delay(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) throw signal.reason;
-  await new Promise<void>((resolve, reject) => {
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(signal?.reason);
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
+  const deadline = Date.now() + ms;
+  if (!Number.isFinite(ms) || ms < 0 || !Number.isFinite(deadline)) throw new Error("Invalid delay");
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw signal.reason;
+    const chunk = Math.min(deadline - Date.now(), MAX_TIMER_DELAY_MS);
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(signal?.reason);
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, chunk);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
 }
