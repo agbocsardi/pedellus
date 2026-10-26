@@ -271,6 +271,9 @@ export async function runTelegram(
             await mutatePending(item.updateId, (entry) => {
               delete entry.deliveryStatus;
               delete entry.sendIntent;
+              delete entry.unknownStage;
+              delete entry.unknownChunkIndex;
+              delete entry.unknownSince;
               if (stage === "final" && chunkIndex !== undefined) entry.nextChunkIndex = chunkIndex + 1;
               if (stage === "preview" || chunkIndex === 0) {
                 entry.messageId = sent.message_id;
@@ -369,7 +372,7 @@ export async function runTelegram(
   };
 
   // An unresolved write-ahead intent may have reached Telegram before a crash.
-  for (const item of state.pending.filter((entry) => entry.deliveryStatus === "sending")) {
+  for (const item of state.pending.filter((entry) => entry.sendIntent !== undefined || entry.deliveryStatus === "sending")) {
     await markUnknown(item.updateId, item.sendIntent?.stage ?? "final", item.sendIntent?.chunkIndex);
     console.warn(`Telegram delivery outcome unknown for update ${item.updateId}; inspect the Durable channel-state record.`);
   }

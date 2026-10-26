@@ -135,10 +135,14 @@ with final flush. Additional checks passed version-1 state migration, ambiguous
 5xx send persisted as unknown and not retried after reopen, proven ENETDOWN retry,
 and first-chunk progress retained after a later explicit rejection. In-flight
 send cancellation now intentionally records unknown instead of resending.
-Accepted-send/lost-response now also proved one network send across polling and
+Every mocked `sendMessage` inspects the actual Durable document before remote
+acceptance and asserts `deliveryStatus: "sending"`, the exact intended text, and
+preview/final stage. Accepted-send/lost-response also proved one network send across polling and
 full storage reopen. A seeded unresolved persisted intent reopened as unknown,
 retained its exact intended text, and made no outbound request. All mocked
 requests assert the fixed HTTPS origin and `redirect: "error"`.
 
+A fresh subprocess SIGKILL-after-acceptance probe was not run; crash recovery
+was checked by seeding an unresolved persisted intent and fully reopening storage.
 No live bot or paid model call was used. External sends remain unknown at an
 ambiguous boundary and require reconciliation, never an exactly-once claim.
