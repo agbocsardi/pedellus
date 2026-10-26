@@ -34,6 +34,10 @@ submit/requestId, watch, built-in CodingTools, task recovery, and compaction.
 Do not recreate a bus, runner, receipt ledger, retry loop for model requests, or
 session JSON files. One conversation per external session key. Store key->ID
 mapping atomically in a root conversation document; no in-memory-only identity.
+Session keys must not resolve inherited Object.prototype properties. Ownerless
+conversation creation does not inherit the root agent: apply explicit host
+model/cwd/tool policy in its creating transaction and to persisted conversations
+before resume.
 Opening an existing conversation must not reset its transcript or configuration.
 On startup reapply explicit host model/cwd policy as needed, install extensions
 before resume, and resume pending work. Data lives outside the agent workspace.
@@ -57,11 +61,20 @@ function createExecutionEnv(options: ExecutionOptions): Promise<ExecutionEnv>;
 ```
 
 `ExecutionEnv` is the upstream interface from `@earendil-works/pi-durable/env`.
-The runtime awaits setup before Harness.open, reuses environments for their
-lifetime, validates configured cwd, and calls cleanup after Harness.close. If a
-conversation's cwd changes, construct/cache an appropriately confined environment,
-not a raw NodeExecutionEnv. Identity must preserve upstream per-file serialization
-across environments addressing the same files.
+When coding tools are approved, the runtime will await setup before Harness.open,
+reuse environments for their lifetime, validate configured cwd, and call cleanup
+after Harness.close. If a conversation's cwd changes, construct/cache an
+appropriately confined environment, not a raw NodeExecutionEnv. Identity must
+preserve upstream per-file serialization across environments addressing the same
+files.
+
+**Current integration decision:** the execution spike has unresolved filesystem
+TOCTOU and hardlink escape risks. The gateway must remain tool-less: do not install
+CodingTools, do not start an execution environment, and force `tools: []` on every
+existing/new conversation before resuming work. No unsafe opt-in configuration.
+The standalone experimental execution factory is not a production-safe capability.
+This preserves a useful chat/Telegram slice without pretending the security gate
+has passed.
 
 `src/runtime.ts` exports:
 

@@ -134,9 +134,17 @@ First Telegram report: `3da30092d` (not integrated). Parent review found escaped
 transaction drafts, incorrect final-answer model shape, seconds/milliseconds
 long-poll mismatch, delivery-cap polling stalls, and incomplete async cleanup.
 Returned to `durable-telegram-w1p` for fixes plus bounded offline mock validation.
-Runtime worker paused at a safety dialog for cleanup of an accidentally nested
-config path; user asked to deny it before a narrower correction. Execution worker
-still implementing. No application acceptance gate has passed.
+Runtime worker's safety dialog is cleared and implementation resumed. Parent
+sent corrections for per-conversation model/policy initialization, prototype-safe
+session mapping, canonical storage locking, and disjoint data roots.
+
+First execution report: `fd580afc0` (not integrated). Bounded sandbox/path probes
+and build/typecheck passed in its isolated worktree, but filesystem TOCTOU and
+hardlink aliasing remain security blockers. Parent requires the initial gateway to
+remain tool-less (no CodingTools registration, no unsafe flag, explicit empty tool
+policy on persisted/new conversations). Execution worker is fixing nonzero-probe
+handling, real Context usage, cwd validation, and Result/abort contracts before
+integration. No application acceptance gate has passed.
 
 ### 2026-10-26 — assessment
 
