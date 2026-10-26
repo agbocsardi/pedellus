@@ -130,6 +130,14 @@ Shared read-only upstream source is `/tmp/pi-durable-reference-1.4.0`, pinned to
 Pi tag `v1.4.0` (`4a080252f06caf63a525d7873c5d94d3c23887e0`). Workers must report
 commits/checks/blockers before parent integration; no automatic merge or cleanup.
 
+First Telegram report: `3da30092d` (not integrated). Parent review found escaped
+transaction drafts, incorrect final-answer model shape, seconds/milliseconds
+long-poll mismatch, delivery-cap polling stalls, and incomplete async cleanup.
+Returned to `durable-telegram-w1p` for fixes plus bounded offline mock validation.
+Runtime worker paused at a safety dialog for cleanup of an accidentally nested
+config path; user asked to deny it before a narrower correction. Execution worker
+still implementing. No application acceptance gate has passed.
+
 ### 2026-10-26 — assessment
 
 Project relocated to its own checkout `/home/gergo/projects/pi-nanobot`, cloned
