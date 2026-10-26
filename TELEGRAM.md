@@ -70,7 +70,7 @@ durable for restart recovery. Preview updates use one in-flight operation plus a
 latest-value coalescer; a flood wait skips replaceable previews rather than
 retaining stale calls. The channel-state document checkpoints its delta chain
 after 64 deltas using Durable's `CheckpointInfo.deltasSinceBase`. Schema version 2
-adds a durable next-final-chunk cursor and unknown-delivery metadata; version-1
+adds a durable next-final-chunk cursor, write-ahead send intent, and unknown-delivery metadata; version-1
 state migrates with a zero chunk cursor. Successful final chunks are committed
 before attempting later chunks, so an explicit later rejection does not resend
 known accepted earlier chunks. Required outcome/progress commits use an
@@ -88,16 +88,20 @@ policy provenance.
 Telegram `sendMessage` has no idempotency key. Durable input request IDs do not
 make external sends exactly-once. Observed ambiguous send outcomes are now held
 for operator reconciliation rather than blindly resent (an intentional behavior
-change). A crash between remote acceptance and the local outcome/progress commit
-can still duplicate a send; this remains an at-least-once/unknown external
-boundary, never exactly-once. No plaintext sidecar is used.
+change). Before dispatch, the pending record stores `deliveryStatus: "sending"` plus the
+exact intended text, stage, chunk index, and timestamp. Success atomically clears
+that intent and records the returned message ID / accepted chunk cursor. Known
+rejections clear the intent; unresolved intents after a crash reopen as unknown
+and cannot auto-resend. This deliberately favors reconciliation over blind
+at-least-once retransmission; it does not guarantee delivery or exactly-once.
+No plaintext sidecar is used.
 
 The adapter emits a fixed, sanitized operator warning containing only update ID
 and stage when it marks a send unknown. Inspect the existing channel-state
 conversation (`telegram:<bot-id>:channel-state`) with the Durable SDK and the
 exported `TelegramState` document token. Each pending item retains input, target,
-`nextChunkIndex`, `deliveryStatus`, `unknownStage`, `unknownChunkIndex` (for final
-output), and timestamp. Stop the adapter before reconciliation. After checking
+`nextChunkIndex`, `deliveryStatus`, `sendIntent` (exact intended text/stage/chunk),
+`unknownStage`, `unknownChunkIndex` (for final output), and timestamp. Stop the adapter before reconciliation. After checking
 Telegram independently, an operator can use a Durable transaction to record an
 accepted chunk's progress/message ID and clear the unknown fields, or remove an
 already-complete pending record; if confirmed unsent, clear only the unknown
@@ -131,7 +135,10 @@ with final flush. Additional checks passed version-1 state migration, ambiguous
 5xx send persisted as unknown and not retried after reopen, proven ENETDOWN retry,
 and first-chunk progress retained after a later explicit rejection. In-flight
 send cancellation now intentionally records unknown instead of resending.
-All mocked requests assert the fixed HTTPS origin and `redirect: "error"`.
+Accepted-send/lost-response now also proved one network send across polling and
+full storage reopen. A seeded unresolved persisted intent reopened as unknown,
+retained its exact intended text, and made no outbound request. All mocked
+requests assert the fixed HTTPS origin and `redirect: "error"`.
 
-No live bot or paid model call was used. External sends remain at-least-once /
-unknown, never exactly-once.
+No live bot or paid model call was used. External sends remain unknown at an
+ambiguous boundary and require reconciliation, never an exactly-once claim.

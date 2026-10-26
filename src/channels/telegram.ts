@@ -34,7 +34,8 @@ export type TelegramPendingDelivery = {
   messageId?: number;
   lastText?: string;
   nextChunkIndex: number;
-  deliveryStatus?: "unknown";
+  deliveryStatus?: "sending" | "unknown";
+  sendIntent?: { text: string; stage: "preview" | "final"; chunkIndex?: number; startedAt: number };
   unknownStage?: "preview" | "final";
   unknownChunkIndex?: number;
   unknownSince?: number;
@@ -107,7 +108,7 @@ export async function runTelegram(
     if (stopping || signal?.aborted) return;
     for (const item of state.pending) {
       if (active.size >= 8) break;
-      if (item.deliveryStatus === "unknown" && options.allowFrom.includes(item.senderId)) continue;
+      if (item.deliveryStatus !== undefined && options.allowFrom.includes(item.senderId)) continue;
       if (delivering.has(item.updateId) || failedThisPoll.has(item.updateId)) continue;
       delivering.add(item.updateId);
       const task = Promise.resolve().then(() => deliver(item)).catch(() => {
@@ -248,12 +249,45 @@ export async function runTelegram(
     ) {
       try {
         return await apiCall(api, "sendMessage", signal,
-          (callSignal) => api.sendMessage(item.chatId, text, {}, toGrammySignal(callSignal)),
+          async (callSignal) => {
+            await mutatePending(item.updateId, (entry) => {
+              entry.deliveryStatus = "sending";
+              entry.sendIntent = { text, stage, startedAt: Date.now(), ...(chunkIndex === undefined ? {} : { chunkIndex }) };
+            });
+            if (signal?.aborted) {
+              await clearSendIntent(item.updateId);
+              throw new TelegramApiError("sendMessage", 0, "not-sent");
+            }
+            let sent;
+            try {
+              sent = await api.sendMessage(item.chatId, text, {}, toGrammySignal(callSignal));
+            } catch (error) {
+              if ((error instanceof GrammyError && error.error_code < 500) ||
+                  (error instanceof HttpError && isProvenPreConnectFailure(error.error))) {
+                await clearSendIntent(item.updateId);
+              }
+              throw error;
+            }
+            await mutatePending(item.updateId, (entry) => {
+              delete entry.deliveryStatus;
+              delete entry.sendIntent;
+              if (stage === "final" && chunkIndex !== undefined) entry.nextChunkIndex = chunkIndex + 1;
+              if (stage === "preview" || chunkIndex === 0) {
+                entry.messageId = sent.message_id;
+                entry.lastText = text;
+              }
+            }, cleanupContext);
+            return sent;
+          },
           { throttle: outboundThrottle, replaceable });
       } catch (error) {
         if (error instanceof TelegramApiError && error.outcome === "unknown") {
           await markUnknown(item.updateId, stage, chunkIndex);
           console.warn(`Telegram delivery outcome unknown for update ${item.updateId} (${stage}); inspect the Durable channel-state record.`);
+        } else if (!(state.pending.find((entry) => entry.updateId === item.updateId)?.deliveryStatus === "sending")) {
+          await clearSendIntent(item.updateId);
+        } else {
+          await markUnknown(item.updateId, stage, chunkIndex);
         }
         throw error;
       }
@@ -298,6 +332,10 @@ export async function runTelegram(
       return copyJson(doc) as unknown as ChannelState;
     }, commitContext);
   };
+  const clearSendIntent = (updateId: number) => mutatePending(updateId, (entry) => {
+    delete entry.deliveryStatus;
+    delete entry.sendIntent;
+  }, cleanupContext);
   const rememberMessage = (updateId: number, messageId: number, text: string) =>
     mutatePending(updateId, (item) => { item.messageId = messageId; item.lastText = text; }, cleanupContext);
   const rememberText = (updateId: number, text: string) =>
@@ -330,6 +368,11 @@ export async function runTelegram(
     }, cleanupContext);
   };
 
+  // An unresolved write-ahead intent may have reached Telegram before a crash.
+  for (const item of state.pending.filter((entry) => entry.deliveryStatus === "sending")) {
+    await markUnknown(item.updateId, item.sendIntent?.stage ?? "final", item.sendIntent?.chunkIndex);
+    console.warn(`Telegram delivery outcome unknown for update ${item.updateId}; inspect the Durable channel-state record.`);
+  }
   // Recover admitted work before polling. Each requestId safely reacquires its existing submission.
   drain();
 
