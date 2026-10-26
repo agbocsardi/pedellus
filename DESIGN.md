@@ -20,7 +20,10 @@ exactly-once; request IDs deduplicate admissions only.
 - Runtime worker: `src/config.ts`, `src/providers.ts`, `src/runtime.ts`,
   `src/cli.ts`, `src/index.ts`, `config.example.json`, `README.md` only.
 - Telegram worker: `src/channels/**` and `TELEGRAM.md` only.
-- Package manifest, lockfile, tsconfig and this design belong to the parent.
+- Package manifest, lockfile, tsconfig and this design normally belong to the parent.
+  For the approved grammY migration, `pi-e078edd8` also owns manifest/lock changes
+  limited to adding the exact-pinned grammY dependency, plus package-local
+  `THIRD_PARTY_NOTICES.md`. The parent does not edit these concurrently.
 
 Do not modify the Python tree, root instructions, shared reference checkout, or
 another worker's files. Workers commit their code on separate branches; the parent
@@ -145,6 +148,21 @@ report a missing parallel module as expected, not a reason to add stub code.
 - Never log token-bearing URLs, raw provider errors with credentials, or thinking
   blocks to Telegram. Text-only Telegram; unsupported attachments are not silently
   described as seen. Bound message size, long-poll processing and delivery retries.
+
+## Approved Telegram transport direction
+
+Use grammY's typed API client in place of hand-written Bot API request/response
+plumbing. Preserve manually controlled `getUpdates` and the existing runTelegram
+contract: no polling runner may acknowledge an update before Durable admission
+and its recovery metadata are committed. Durable remains the sole state/session
+owner; do not import OpenClaw runtime, SDK, or ingress/outbound queues.
+
+Selectively adapt OpenClaw's bot-scoped flood policy, replaceable-preview
+coalescing, edit error classification, and lifecycle separation. Keep protocol
+adaptations narrow and preserve full MIT notice plus exact source provenance for
+copied code. See `OPENCLAW-ASSESSMENT.md`. Adding grammY does not prove sendMessage
+retry safety or exactly-once external delivery. No new unknown-send policy or
+operator interface is approved as part of this transport change.
 
 ## Telegram durability and output
 

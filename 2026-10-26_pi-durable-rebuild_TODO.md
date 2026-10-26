@@ -81,6 +81,7 @@ wiring replace them.
   - [ ] Close execution TOCTOU/hardlink blockers before enabling coding tools.
   - [x] Implement and integrate allowlisted, text-only Telegram adapter.
   - [x] Parent initial integration and bounded offline validation.
+  - [ ] Migrate Telegram transport to grammY with selective attributed OpenClaw ports.
   - [ ] Fix Telegram fatal-exit cleanup, edit retries/deleted previews,
         retry_after handling, and bounded document checkpointing.
   - [ ] Recheck integrated behavior after remaining reliability fixes.
@@ -226,6 +227,22 @@ keeping our thin Durable admission/watch/state boundary. No dependency switch or
 code copying implemented yet. See `packages/pi-nanobot/OPENCLAW-ASSESSMENT.md`.
 Shared relevant source paths with the active native worker without broadening its
 assigned fixes. No upstream install/execution or live bot request.
+
+Owner subsequently approved this recommendation for implementation. Sent the
+expanded task through `herdr_send` to sole Telegram editor `pi-e078edd8`
+(`w1W:p1` / branch `pi-e078edd8`): migrate HTTP plumbing to grammY's typed Api,
+preserve manually controlled durable-before-offset polling, adapt only relevant
+OpenClaw policies, keep external at-least-once/unknown semantics explicit, and
+retain full MIT notice/source provenance. Extended ownership narrowly to package
+manifest/lock and package-local third-party notice. No runtime/Python changes.
+Requested exact grammY1.46.0 after registry/Node compatibility verification;
+additional dependencies require justification.
+
+Launched independent native read-only reuse reviewer `pi-2a3d0c17`, pane `w1P:p3`,
+workspace `w1P`, using Codex gpt-6-luna high, to check extraction boundaries,
+SDK/polling/flood/error/cancellation traps, and attribution. Report target:
+`/tmp/pi-openclaw-telegram-reuse-review.md`. Implementation and review proceed
+independently; await explicit revised completion rather than prior task status.
 
 ### 2026-10-26 — assessment
 
