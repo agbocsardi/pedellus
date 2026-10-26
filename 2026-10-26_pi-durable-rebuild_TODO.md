@@ -286,6 +286,24 @@ redaction, poll ownership, flood waits and preview coalescing. Report target:
 `/tmp/pi-grammy-transport-review.md`. Both children are active; await revised
 explicit reports. No live bot/provider calls or deployment.
 
+### 2026-10-26 — unknown-delivery candidate review
+
+Independent actual-SDK report `/tmp/pi-grammy-transport-review.md` verifies
+custom fetch/redirect rejection, redacted errors, native signal bridge, 60s SDK
+timeout, manual polling, coalescing, and MIT notices. Its flood-scope observation
+is not a direction to merge gates: one shared outbound gate and separate polling
+cooldown are intentional, matching OpenClaw's explicit getUpdates bypass.
+
+Worker's `491d4b77a` adds durable caught-error unknown markers and accepted-chunk
+progress, with reported passing offline checks. Still NOT integrated: parent
+review found no write-ahead intent before sendMessage, leaving process death or
+failed outcome commits able to trigger duplicate sends after reopen. Sent precise
+callback-level pre-dispatch intent / atomic known-outcome / safe-rejection clearing
+algorithm via native send, plus intent-observation, ambiguous AbortError, and
+crash/reopen validation requirements. Original request and exact intended output
+must survive for reconciliation. Await final boundary fix, not another catch-only
+unknown marker. No deployment or live requests.
+
 ### 2026-10-26 — assessment
 
 Project relocated to its own checkout `/home/gergo/projects/pi-nanobot`, cloned

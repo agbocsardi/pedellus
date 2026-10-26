@@ -163,7 +163,10 @@ adaptations narrow and preserve full MIT notice plus exact source provenance for
 copied code. See `OPENCLAW-ASSESSMENT.md`. Adding grammY does not prove sendMessage retry safety or exactly-once external
 delivery. Independent review requires a specific unknown-send policy: an ambiguous
 timeout/reset/5xx on sendMessage must retain an explicit durable unknown-delivery
-marker, not enter automatic resend/drain or claim success. Preserve known accepted
+marker, not enter automatic resend/drain or claim success. Persist each send intent
+with exact intended text BEFORE network dispatch; unresolved intents after a crash
+must also be held as unknown. Atomically clear intent with known outcome/progress;
+a failed intent commit must prevent the request. Preserve known accepted
 chunk progress and expose sanitized status for operator inspection/reconciliation
 through existing Durable state/SDK. Known rejections (e.g.429) and proven no-send
 failures can retry under policy. No new retry UI/operator framework is in scope.
