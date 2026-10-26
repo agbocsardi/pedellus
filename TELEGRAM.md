@@ -1,10 +1,13 @@
 # Telegram adapter
 
 `src/channels/telegram.ts` exports `runTelegram(gateway, options, context)` and
-`TelegramOptions`. It uses Telegram's fixed HTTPS Bot API with Node's built-in
-`fetch`; no Telegram SDK or live credentials are needed. The adapter calls
-`getMe` before polling and never writes the token or token-bearing URL into an
-error message.
+`TelegramOptions`. It uses grammY 1.46.0's typed `Api` client, Telegram updates,
+and structured `GrammyError`/`HttpError` types. An explicit native-fetch bridge
+keeps offline probes mockable. The API root is fixed to
+`https://api.telegram.org`; the bridge forces `redirect: "error"`, disables
+sensitive grammY logs, and reads the current global `fetch` at call time. The
+adapter calls typed `getMe` before polling and never writes the token or
+token-bearing URL into an error message.
 
 ## Behavior
 
@@ -34,21 +37,45 @@ error message.
 - The poller continues admitting updates while up to eight deliveries wait on
   model or Telegram work. The eight-job limit applies only to started deliveries;
   a full durable pending queue (1000 items) fails closed before offset advance.
-  Long-poll timeout is sent in seconds and its fetch deadline is seconds plus a
-  10-second margin, converted to milliseconds. All requests reject redirects.
-- API calls have bounded retries for transport, rate-limit, and server errors. A bot-wide adapter-lifetime throttle honors the full finite positive Telegram `retry_after` deadline (not capped), including after the final local attempt; waits are abortable and total attempts are bounded. Long timer waits are chunked below Node's timer limit.
-  API failures are classified by method and numeric status only; raw Telegram
-  response bodies and fetch exceptions are not exposed. A terminal unanswered
-  model submission sends the fixed message `Your request could not be completed.
+  Long-poll timeout is sent in seconds and the grammY request deadline is bounded
+  to 60 seconds. All requests reject redirects.
+- `getUpdates` has its own flood wait and bounded transport/5xx retries,
+  independent of outbound calls. Outbound calls share one bot-token flood gate;
+  a later concurrent deadline wins. Full finite, positive `retry_after` values
+  are honored, including after a call exhausts its bounded attempts. Waits are
+  abortable and have a five-minute per-call budget; long timer waits are chunked
+  below Node's timer limit. Replaceable previews yield during a flood wait rather
+  than queueing stale edits.
+- Outbound `sendMessage` and edits are not retried inside the same API-call
+  attempt sequence after ambiguous network or 5xx failures. The durable pending
+  record remains eligible for the existing next-poll/restart delivery retry, so
+  an accepted send can still be duplicated. Explicit Bot API 429 rejections may
+  be retried within the bounded attempt/wait budget. GrammY error
+  descriptions/causes and raw response bodies are not surfaced or logged. A terminal unanswered model
+  submission sends the fixed message `Your request could not be completed.
   Please try again.`; empty text answers also get a fixed user-visible response.
   Polling errors other than cancellation terminate `runTelegram` for the host to
   handle.
 
 ## Adapter lifecycle and Telegram edit recovery
 
-Each run derives a local cancellation scope from the caller context. Fatal polling/admission exits stop new delivery scheduling, abort adapter-owned fetches, watches, preview queues, and submission waits, and reap active deliveries before returning. Cancellation of `submission.wait()` only stops this adapter's waiter; it does not abort the Durable model work. Pending delivery records remain durable for restart recovery. The channel-state document checkpoints its delta chain after 64 deltas, using Durable's `CheckpointInfo.deltasSinceBase` without changing its schema version.
+Each run derives a local cancellation scope from the caller context. Fatal
+polling/admission exits stop new delivery scheduling, abort adapter-owned
+requests, watches, preview work, and submission waits, and reap active deliveries
+before returning. Cancellation of `submission.wait()` only stops this adapter's
+waiter; it does not abort the Durable model work. Pending delivery records remain
+durable for restart recovery. Preview updates use one in-flight operation plus a
+latest-value coalescer; a flood wait skips replaceable previews rather than
+retaining stale calls. The channel-state document checkpoints its delta chain
+after 64 deltas, using Durable's `CheckpointInfo.deltasSinceBase` without
+changing its schema version.
 
-Telegram 400 `message is not modified` is treated as success for the exact short description or a bounded detailed description beginning with that exact prefix plus `: `; this classification applies only to `editMessageText`. An exact `message to edit not found` response clears stale preview metadata and sends a replacement. Other 400 errors remain failures. Telegram descriptions are retained only for these internal classifications; surfaced errors contain method/status, not raw descriptions or token-bearing URLs.
+A grammY 400 `message is not modified` error is treated as success for the exact
+short description or a bounded detailed description with that exact prefix
+followed by `: `; this classification applies only to `editMessageText`. An exact
+`message to edit not found` error clears stale preview metadata and sends a
+replacement. Other 400 errors remain failures. See `THIRD_PARTY_NOTICES.md` for
+policy provenance.
 
 ## Delivery boundary and current limitation
 
@@ -56,16 +83,15 @@ Telegram `sendMessage` has no idempotency key. If Telegram accepts a message
 but the process dies before the Durable document records its completion, a
 restart can resend it. Request IDs deduplicate Durable input admission only;
 external message delivery is at-least-once/unknown at the crash boundary, not
-exactly-once. A lost HTTP response can also make a bounded transport retry
-repeat a send. Conversely, an API rejection leaves the durable delivery pending
-for a later retry. No plaintext sidecar is used.
+exactly-once. Ambiguous network and 5xx send outcomes are not blindly retried,
+but restart recovery can still repeat an accepted send. No plaintext sidecar is
+used.
 
 ## Offline integration probe
 
-No live bot or credentials were used. The parent probe was copied to a private
-uncommitted variant that imports this checkout's source; the shared probe was not
-modified. It used a faux Durable Harness, persistent JSONL storage, and mocked
-`fetch`:
+No live bot or credentials were used. A private temporary copy of the parent
+probe imports this checkout's module, uses a faux Durable Harness/persistent
+JSONL storage, and mocks `fetch` (the shared probe was not modified):
 
 ```sh
 npm ci --prefix packages/pi-nanobot --ignore-scripts
@@ -74,26 +100,17 @@ npm run build --prefix packages/pi-nanobot
 timeout 150s node --max-old-space-size=512 --experimental-strip-types /tmp/tgprobe/pi-e078edd8-followup.mts
 ```
 
-The private follow-up copied the shared probe (without modifying it), pointed at
-this checkout, and used fresh gates per scenario. All actual-adapter mock-fetch
-probes passed:
+All actual-adapter mock-fetch probes passed: baseline recovery/requestId dedupe,
+allowlist/group rejection, reauthorization, Unicode splitting/final flush, and
+eight-active-delivery polling; fatal polling with a fresh blocked-send gate and
+pending-record verification before/after exit plus output delivery after reopen;
+cancellation during a blocked partial preview with no post-return work; 35-second
+`retry_after` with no early retry and prompt abort; concurrent 429s across eight
+deliveries respecting the shared bot-wide deadline; final 429 cooldown retained through five-attempt
+exhaustion and later delivery re-entry; short and detailed not-modified
+responses after simulated accepted/lost edits; and deleted-preview replacement
+with final flush. All mocked requests assert the fixed HTTPS origin
+and `redirect: "error"`.
 
-- Baseline recovery/requestId dedupe, allowlist/group rejection, reauthorization,
-  Unicode splitting/final flush, and polling admission with eight active sends.
-- Fatal polling with a fresh blocked outbound gate: verified one durable pending
-  record before forcing poll failure, prompt cancellation/reaping, the record
-  still pending after exit, and the completed response delivered after reopening.
-- Cancellation while a partial preview HTTP request was blocked; run returned
-  and no further adapter requests occurred.
-- `retry_after: 35` caused no second request during a 1.2-second observation;
-  cancellation returned promptly and no request occurred after return. Eight
-  concurrently blocked sends receiving 429 together also retried only after the
-  shared bot-wide cooldown.
-- Slow streamed model + actual preview edits: both the short and detailed
-  “message is not modified” descriptions after a simulated accepted/lost edit
-  were treated as success; deleted-preview error sent a replacement and the
-  final answer flushed.
-
-Every mocked request asserts fixed HTTPS origin and `redirect: "error"`. Package
-`npm ci`, typecheck, and build passed. No live bot or paid model call was used.
-External sends remain at-least-once/unknown, never exactly-once.
+No live bot or paid model call was used. External sends remain at-least-once /
+unknown, never exactly-once.
