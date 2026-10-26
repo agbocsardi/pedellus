@@ -1,0 +1,17 @@
+{
+  "workspace": "./workspace",
+  "dataDir": "./.nanobot-data",
+  "model": {
+    "provider": "openai",
+    "modelId": "gpt-6-sol"
+  },
+  "credentials": {
+    "openai": "OPENAI_API_KEY"
+  },
+  "thinkingLevel": "high",
+  "telegram": {
+    "tokenEnv": "TELEGRAM_BOT_TOKEN",
+    "allowFrom": ["123456789"],
+    "pollTimeoutSeconds": 30
+  }
+}
