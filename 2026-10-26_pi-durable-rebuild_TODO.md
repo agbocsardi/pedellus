@@ -215,6 +215,18 @@ end-to-end edit/deleted-preview/long429 cancellation probes. Also requested narr
 support for Telegram's detailed not-modified message and preservation of server
 cooldown after the last allowed429 attempt. Await explicit revised completion.
 
+### 2026-10-26 — OpenClaw Telegram reuse assessment
+
+At owner request, cloned OpenClaw into `/tmp/openclaw-telegram-reference`, pinned
+to `5f1d487758a8560d083fbbd07fc1cc4203b7def8`. MIT license permits selective
+porting with retained notice/provenance. Its private Telegram plugin is tightly
+coupled to OpenClaw's SDK/routing/queues and spans a much larger feature surface.
+Recommendation: grammY client/types plus selective transport-policy ports, while
+keeping our thin Durable admission/watch/state boundary. No dependency switch or
+code copying implemented yet. See `packages/pi-nanobot/OPENCLAW-ASSESSMENT.md`.
+Shared relevant source paths with the active native worker without broadening its
+assigned fixes. No upstream install/execution or live bot request.
+
 ### 2026-10-26 — assessment
 
 Project relocated to its own checkout `/home/gergo/projects/pi-nanobot`, cloned
