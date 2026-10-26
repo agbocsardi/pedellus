@@ -205,17 +205,21 @@ network, Telegram, bash, production host configuration, or production data were 
   `/tmp/nanobot-p2-probes/local-result.json`.
 - `/tmp/nanobot-p2-probes/verify-optin.mjs` (run with
   `timeout 60s node --experimental-strip-types /tmp/nanobot-p2-probes/verify-optin.mjs`):
-  the actual Harness used `settings.extensions: []` plus native
-  `conversationCreated` default-deny for extensions, tools, and model tools.
-  Conversation A explicitly selected the bundle and one synthetic reviewed
-  effect; its script discovered and ran that effect once. Independent B had no
-  extension/tool grant and only a `modelTools` override; forged calls to `codemode`,
-  `tool_search`, and the synthetic effect all settled as unavailable, with no
-  effect. A separate Code-Mode-only conversation could not execute the omitted
-  nested effect even when `modelTools` named it. After SQLite reopen, B remained
-  restricted; a stale explicit grant persisted despite the new defaults and was
-  revoked through native `configure()` before `resume()`. Output is printed by
-  the probe; it uses no provider credentials or external effects.
+  the actual Harness used `settings.extensions: []` and passed
+  `conversationCreated` as the top-level Harness option, recording all five
+  creation callbacks (A, B, C, D, and A's fork). The callback stored empty
+  extension, tool, and model-tool selections before resolution. A explicitly
+  selected the bundle and one synthetic reviewed effect; its script discovered
+  and ran that effect once. An ungranted fork of A inherited the parent's stored
+  grant, which the callback cleared before resolution; forged calls to
+  `codemode`, `tool_search`, and the synthetic effect were unavailable, with no
+  second effect. Independent B had no extension/tool grant and only a
+  `modelTools` override; its forged calls were likewise unavailable. A separate
+  Code-Mode-only conversation could not execute the omitted nested effect even
+  when `modelTools` named it. Opening existing IDs invoked zero creation
+  callbacks; B remained restricted, while stale C's explicit grant persisted
+  until revoked through native `configure()` before `resume()`. Output is printed
+  by the probe; it uses no provider credentials or external effects.
 - `/tmp/nanobot-p2-probes/verify-replay.mjs` launches
   `/tmp/nanobot-p2-probes/replay-child.mjs`, sends the first actual Harness
   process `SIGKILL` after a completed synthetic effect and a second unsafe effect
