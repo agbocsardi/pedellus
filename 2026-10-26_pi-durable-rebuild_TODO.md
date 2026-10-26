@@ -1,6 +1,8 @@
 # Rebuild nanobot on Pi Durable (TypeScript)
 
-Status: **assessment only**. No code written, no branch, no decision ratified.
+Status: **Gate 1 implementation started** on `feat/pi-durable-rebuild`.
+TypeScript port authorized; production cutover/full migration not yet approved.
+Package design and worker boundaries: `packages/pi-nanobot/DESIGN.md`.
 Scope: replace nanobot's Python harness (`agent/loop.py`, `agent/runner.py`,
 `session/`, tool durability, subagents) with `@earendil-works/pi-durable` 1.4.0,
 porting the product surface to TypeScript.
@@ -72,7 +74,12 @@ wiring replace them.
 
 ## Plan (gated)
 
-- [ ] Gate 1 — spike, throwaway, ~2–3 days:
+- [ ] Gate 1 — spike, throwaway (original estimate ~2–3 days, unverified):
+  - [x] Establish isolated TypeScript package, pinned dependencies, and design.
+  - [ ] Implement Durable runtime/config/provider/CLI slice.
+  - [ ] Implement confined execution environment and record security limits.
+  - [ ] Implement allowlisted, text-only Telegram adapter.
+  - [ ] Parent review/integration and bounded offline validation.
   - [ ] bwrap-confined `ExecutionEnv` running `read`/`write`/`edit`/`bash`;
         prove workspace escape attempts fail.
   - [ ] Telegram-in → `submit()` → streaming edits from `watch()` → out.
@@ -97,7 +104,16 @@ wiring replace them.
 
 ## Log
 
-### 2026-10-26
+### 2026-10-26 — implementation kickoff
+
+Owner authorized initial port and Codex Luna high-reasoning implementation
+subagents. Parent owns design/review/integration; workers get separate managed
+worktrees for runtime, execution security, and Telegram. New package lives in
+`packages/pi-nanobot`; Python and live deployments remain unchanged. Pin Pi 1.4.0.
+No live credentials, paid requests, or real Telegram polling in this initial batch.
+Security/recovery evidence gates remain open until independently checked.
+
+### 2026-10-26 — assessment
 
 Project relocated to its own checkout `/home/gergo/projects/pi-nanobot`, cloned
 from `fork-nanobot` at `53d7e0ead`. That clone's only remote is `github`
