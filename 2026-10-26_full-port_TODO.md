@@ -30,8 +30,9 @@ Herdr worktrees; native wrapper tools only. Parent pane `w1P:p1` owns review,
 root docs, integration and acceptance. No P1/P2 milestone is passed by launch.
 
 - [ ] B1 — bwrap/native ExecutionEnv confinement: `pi-ccd4ba61`, pane `w1X:p1`.
-      Partial `6ab2ccc89` withheld (direct-bind alias proof fails; quotas missing).
-      Worker explicitly confirms managed-storage/copy-import follow-up in progress.
+      Managed follow-up `4c1a96976` atop partial `6ab2ccc89` is withheld pending
+      review/fixes: parent confirmed host IPC shared-memory exposure; initial
+      import-ancestor race review plus quota/owner/lifecycle gates remain open.
 - [x] B2 — opt-in native Code Mode/tool-search SDK lifecycle and offline nested
       replay: `pi-9dd12539`, pane `w1Y:p1`. Integrated `49f11d387`, `e150a0485`,
       `e508567dd`; direct dependency `be2453c84`. Final review and parent-built
@@ -816,3 +817,41 @@ Bounded B2 task accepted; P2 overall stays unchecked (gateway activation,
 CodingTools/MCP/approvals, product failure verification, incompatible fingerprints,
 real coding task remain). B1 managed workspace/quota/provenance proof outstanding;
 unsafe partial execution remains withheld. Gateway still tools:[]/modelTools:[].
+
+### 2026-10-26 — managed candidate reviewed; host IPC escape confirmed
+
+B1 explicitly completed clean layered candidate `4c1a96976`: app-created opaque-id
+workspace, private admission/dev-inode metadata, persistent reopen, and explicit
+FD-mounted read-only imports copied into fresh inodes. Arbitrary writable roots
+and publication remain rejected. Source/EXECUTION.md disclose missing aggregate
+CPU/RSS/PID/disk quotas, default shell deadline, OS owner locking/GC and runtime
+integration. Parent has not integrated execution/pi-env or enabled any tools.
+
+Parent read daemon/shell/import/provenance paths, then adapted the worker probe
+without modifying it: `/tmp/pi-nanobot-parent-managed-probe.mjs`, explicit worker
+built imports, 90s timeout/5s kill grace/256-MB heap. Baseline native FS, explicit
+imports/source preservation, aliases/leaf symlinks, namespace sentinels/network,
+reopen, teardown and failed/cancelled setup all passed. This did not cover every
+host namespace or the initial host-path ancestor admission race.
+
+Reassigned reviewer `pi-7e58645f`/`w1P:p5` to the bounded managed contract, report
+`/tmp/pi-managed-execution-review.md`; priority initial canonicalImport ancestor
+ABA ordering and private admission/import guarantees. Host lstat/realpath/final
+O_NOFOLLOW may still pin an unintended outside inode despite safe worker-local
+traversal. Await its concrete conclusion; do not substitute a quiescent-source
+snapshot caveat for proof against secret traversal.
+
+Parent independently noticed missing IPC unshare and **confirmed exposure** with
+`/tmp/pi-nanobot-parent-managed-ipc.mjs` and C fixture
+`/tmp/pi-nanobot-parent-ipc-fixture.c` (70s/5s grace/256 MB). Only an owned synthetic
+0600 SysV segment was created; guest shmat(SHM_RDONLY) successfully read that
+known sentinel (exit23), and host/guest IPC namespace IDs matched. No real host
+IPC objects were listed/read. Fixture host cleaned up its own segment and exited0.
+No system package/config changes: used existing cc and private temporary binary.
+
+Sent B1 a minimal required IPC-isolation fix for outer daemon, copy worker and
+nested shell, fail closed with no unsafe toggle, plus actual-SHM regression and
+full managed checks. Sent reviewer the reproduction so it can focus on import
+admission without duplicating it. Await explicit fix/review reports. Candidate
+remains withheld; quotas, shell deadline and ownership/integration are still
+separate blockers even after namespace fixes.
