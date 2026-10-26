@@ -197,6 +197,15 @@ timed out`. One recovery inspection returned `agent_not_found` for `w1V:p1`.
 No duplicate launch, terminal fallback, or cleanup was attempted. This resource
 must be recovered/inspected before retrying; no implementation completion claimed.
 
+Owner explicitly authorized another socket-native spawn after fixing startup.
+Retry succeeded: `pi-e078edd8`, pane `w1W:p1`, workspace `w1W`, branch
+`pi-e078edd8`, base `d690c1c64`, checkout
+`/home/gergo/.herdr/worktrees/pi-nanobot/pi-e078edd8`, Codex gpt-6-luna high.
+Assigned only Telegram lifecycle/retry/checkpoint fixes and bounded offline
+verification. Native inspection confirmed working and no pending permissions;
+completion must arrive via `herdr_report`, not inferred from idle/state notices.
+Prior failed resource was left intact; no cleanup authorized.
+
 ### 2026-10-26 — assessment
 
 Project relocated to its own checkout `/home/gergo/projects/pi-nanobot`, cloned
