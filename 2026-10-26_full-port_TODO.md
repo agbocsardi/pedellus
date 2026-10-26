@@ -721,3 +721,16 @@ policy revocation before resume, plus private actual-Harness A-enabled/B-disable
 and reopen evidence. No new abstraction/API change unless needed, no manifest or
 gateway edits. Await explicit follow-up commit/report, then re-review; do not
 substitute passed sandbox/replay probes for this activation-policy gate.
+
+### 2026-10-26 — opt-in documentation follow-up; fixture correction pending
+
+B2 explicitly reported `da5a2392c774b5077db959df05ca4759e8c94121`, docs only,
+with concrete native defaults, actual tool bindings and persisted-grant revocation.
+Parent read the full follow-up and private verify-optin.mjs before acceptance.
+Found a proof bug: fixture nests conversationCreated inside settings, where native
+HarnessSettings ignores it; actual callback belongs on HarnessOptions (the doc
+snippet places it correctly). So reported probe success does not yet establish
+creation-hook behavior. Parent requested corrected initial/reopen options,
+asserted hook invocation and a fork-of-enabled-A denial check; no module rewrite
+or unnecessary commit. Await explicit corrected evidence, then reviewer re-check
+and dependency declaration. Neither follow-up is integrated yet.
