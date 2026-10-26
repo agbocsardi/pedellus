@@ -76,3 +76,26 @@ All offline Telegram integration probes passed.
 
 The probe asserts all requests use the fixed HTTPS origin with `redirect: "error"`.
 Telegram API delivery remains at-least-once/unknown at the external send boundary.
+
+## Parent integration review — follow-ups still open
+
+The parent integrated `3da30092d` / `cf2ea8f33` as `f93d7c483` / `da2cd5398`.
+Package-wide typecheck/build pass, and the parent reran the offline probe above
+against source verified identical to the integrated module. No live bot was used.
+
+Additional review found remaining lifecycle/retry issues; do not treat this as a
+live-ready adapter:
+
+- Fatal polling/admission errors do not cancel the adapter's active waits or stop
+  their completion handlers from draining more pending deliveries. Exit needs a
+  local cancellation scope and complete child-work cleanup while preserving the
+  underlying durable submissions for restart.
+- An edit accepted remotely whose response is lost can be retried into Telegram's
+  `message is not modified` rejection and remain stuck. Deleted preview handling
+  also needs an explicit recovery outcome.
+- Capping `retry_after` at 30 seconds can retry earlier than Telegram permits.
+- The channel document currently never checkpoints its delta chain.
+
+A socket-native follow-up launch failed before creating a child because its
+wrapper could not find `herdr` (`spawn herdr ENOENT`). No CLI delegation fallback
+was used. These items remain tracked in the root TODO.

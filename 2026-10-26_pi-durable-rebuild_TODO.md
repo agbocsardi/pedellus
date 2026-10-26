@@ -76,11 +76,14 @@ wiring replace them.
 
 - [ ] Gate 1 — spike, throwaway (original estimate ~2–3 days, unverified):
   - [x] Establish isolated TypeScript package, pinned dependencies, and design.
-  - [ ] Implement Durable runtime/config/provider/CLI slice.
+  - [x] Implement and integrate Durable runtime/config/provider/CLI slice.
   - [x] Integrate standalone execution spike and record its security limits.
   - [ ] Close execution TOCTOU/hardlink blockers before enabling coding tools.
-  - [ ] Implement allowlisted, text-only Telegram adapter.
-  - [ ] Parent review/integration and bounded offline validation.
+  - [x] Implement and integrate allowlisted, text-only Telegram adapter.
+  - [x] Parent initial integration and bounded offline validation.
+  - [ ] Fix Telegram fatal-exit cleanup, edit retries/deleted previews,
+        retry_after handling, and bounded document checkpointing.
+  - [ ] Recheck integrated behavior after remaining reliability fixes.
   - [ ] bwrap-confined `ExecutionEnv` running `read`/`write`/`edit`/`bash`;
         prove workspace escape attempts fail.
   - [ ] Telegram-in → `submit()` → streaming edits from `watch()` → out.
@@ -161,6 +164,29 @@ entry-ID-vs-text output, provider alias/credential selection, partial-startup
 cleanup, explicit SDK Models injection, and actual SQLite recovery/locking checks
 to the runtime worker. Telegram fixes still in progress. Existing children remain
 CLI-managed; no new socket child registry was created by their reload.
+
+### 2026-10-26 — initial integration
+
+Integrated runtime `4f9f5036b` / `fd25f259a` / `c65b0b258` as
+`01a8a81d7` / `9c92746fc` / `6c70cd6a5`, and Telegram `3da30092d` /
+`cf2ea8f33` as `f93d7c483` / `da2cd5398`. Full package typecheck/build passed.
+Parent reran `/tmp/tgprobe/probe.mts` after verifying its imported source exactly
+matches the integrated module: recovery/dedupe, allowlist revocation, Unicode
+splitting/final flush, polling beyond eight deliveries, and external cancellation
+passed. Parent independently checked actual SQLite + injected faux Models: text
+extraction, requestId dedupe, prototype-safe keys, private data permissions,
+concurrent-owner rejection, same-key reopen, and SIGKILL lock release/reopen.
+No live/paid provider or Telegram request; coding tools remain disabled. Storage
+lock recovery is not evidence of interrupted-tool replay safety.
+
+Review still requires Telegram fatal-poll/admission exit cancellation/reaping,
+idempotent edit/deleted-preview recovery, respecting long retry_after values, and
+bounded channel-state checkpoints. A socket-native worktree worker launch was
+attempted from `da2cd5398`, but failed before child creation: wrapper runs `herdr`
+from PATH and returned `spawn herdr ENOENT`. Existing CLI workers are not in the
+socket registry; user requires native tools only from here. No CLI launch/message
+fallback used. Fix the wrapper executable lookup (e.g. honor HERDR_BIN_PATH) or
+Pi's inherited PATH before delegating the remaining fixes.
 
 ### 2026-10-26 — assessment
 
