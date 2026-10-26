@@ -269,6 +269,23 @@ and leave reconciliation to existing Durable state/SDK rather than add a UI.
 Outbound flood waits must not stop getUpdates; SDK transport contracts and MIT
 provenance still need verification in the actual migration. Await revised report.
 
+### 2026-10-26 — grammY candidate review
+
+Worker reported migration candidate `ba52081d4`, exact grammY1.46.0, typed Api,
+separate poll/outbound gates, preview coalescing, native-fetch bridge, and MIT
+provenance. NOT integrated: parent review found that durable unknown-delivery
+and known accepted-chunk progress were still absent. Suppressing retries within
+one API call left the same pending send eligible on later polls/restart, contrary
+to the approved requirement. Returned through native send for minimal write-ahead
+intent, unknown-outcome exclusion from automatic drain, accepted-chunk progress,
+and offline ambiguous-response/cancellation/reopen/partial-chunk proofs.
+
+Reassigned read-only reviewer `pi-2a3d0c17` to inspect actual committed migration
+and now-installed grammY1.46.0 source/types, especially fetch/AbortSignal/timeouts,
+redaction, poll ownership, flood waits and preview coalescing. Report target:
+`/tmp/pi-grammy-transport-review.md`. Both children are active; await revised
+explicit reports. No live bot/provider calls or deployment.
+
 ### 2026-10-26 — assessment
 
 Project relocated to its own checkout `/home/gergo/projects/pi-nanobot`, cloned
