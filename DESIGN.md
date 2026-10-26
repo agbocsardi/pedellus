@@ -160,9 +160,13 @@ owner; do not import OpenClaw runtime, SDK, or ingress/outbound queues.
 Selectively adapt OpenClaw's bot-scoped flood policy, replaceable-preview
 coalescing, edit error classification, and lifecycle separation. Keep protocol
 adaptations narrow and preserve full MIT notice plus exact source provenance for
-copied code. See `OPENCLAW-ASSESSMENT.md`. Adding grammY does not prove sendMessage
-retry safety or exactly-once external delivery. No new unknown-send policy or
-operator interface is approved as part of this transport change.
+copied code. See `OPENCLAW-ASSESSMENT.md`. Adding grammY does not prove sendMessage retry safety or exactly-once external
+delivery. Independent review requires a specific unknown-send policy: an ambiguous
+timeout/reset/5xx on sendMessage must retain an explicit durable unknown-delivery
+marker, not enter automatic resend/drain or claim success. Preserve known accepted
+chunk progress and expose sanitized status for operator inspection/reconciliation
+through existing Durable state/SDK. Known rejections (e.g.429) and proven no-send
+failures can retry under policy. No new retry UI/operator framework is in scope.
 
 ## Telegram durability and output
 

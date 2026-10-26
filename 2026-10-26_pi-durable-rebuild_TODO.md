@@ -82,8 +82,10 @@ wiring replace them.
   - [x] Implement and integrate allowlisted, text-only Telegram adapter.
   - [x] Parent initial integration and bounded offline validation.
   - [ ] Migrate Telegram transport to grammY with selective attributed OpenClaw ports.
-  - [ ] Fix Telegram fatal-exit cleanup, edit retries/deleted previews,
-        retry_after handling, and bounded document checkpointing.
+  - [x] Integrate raw-transport Telegram fatal-exit cleanup, edit recovery,
+        retry_after handling, bounded checkpoints, and independent offline probes.
+  - [ ] During grammY migration, retain unknown send outcomes and known chunk
+        progress durably without blind automatic retransmission.
   - [ ] Recheck integrated behavior after remaining reliability fixes.
   - [ ] bwrap-confined `ExecutionEnv` running `read`/`write`/`edit`/`bash`;
         prove workspace escape attempts fail.
@@ -243,6 +245,29 @@ workspace `w1P`, using Codex gpt-6-luna high, to check extraction boundaries,
 SDK/polling/flood/error/cancellation traps, and attribution. Report target:
 `/tmp/pi-openclaw-telegram-reuse-review.md`. Implementation and review proceed
 independently; await explicit revised completion rather than prior task status.
+
+### 2026-10-26 — reliability checkpoint and independent reuse review
+
+Integrated native worker's raw-transport reliability commits `30fdfc721` /
+`53fd019f0` / `dbf0345fd` as `1f5e8ca32` / `ed8b676e1` / `80304bd14`.
+Full package typecheck/build passed. Parent made an uncommitted private probe
+variant importing the integration checkout and ran:
+`timeout 150s node --max-old-space-size=512 --experimental-strip-types /tmp/tgprobe/parent-reliability-probe.mts`.
+All eleven cases passed: baseline admission/recovery/allowlist/Unicode/concurrency,
+fresh-gate fatal-poll pending-state recovery, blocked-preview cancellation,
+35-second429 no-early-retry and cancellation, concurrent shared cooldown,
+short/detailed unchanged-edit recovery, and deleted-preview replacement/final flush.
+No live bot or paid request. This is NOT a completed grammY migration.
+
+Read independent review `/tmp/pi-openclaw-telegram-reuse-review.md` from
+`pi-2a3d0c17`. It confirms the thin typed Api/manual polling direction and warns
+that generic sendMessage retries after ambiguous network/5xx failures can duplicate
+accepted messages. Sent its findings and a concrete design decision to active
+migration worker `pi-e078edd8`: preserve explicit unknown-delivery records outside
+automatic resend, persist known accepted chunk progress, report sanitized status,
+and leave reconciliation to existing Durable state/SDK rather than add a UI.
+Outbound flood waits must not stop getUpdates; SDK transport contracts and MIT
+provenance still need verification in the actual migration. Await revised report.
 
 ### 2026-10-26 — assessment
 
