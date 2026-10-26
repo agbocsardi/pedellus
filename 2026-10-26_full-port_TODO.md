@@ -32,12 +32,11 @@ root docs, integration and acceptance. No P1/P2 milestone is passed by launch.
 - [ ] B1 — bwrap/native ExecutionEnv confinement: `pi-ccd4ba61`, pane `w1X:p1`.
       Partial `6ab2ccc89` withheld (direct-bind alias proof fails; quotas missing).
       Worker explicitly confirms managed-storage/copy-import follow-up in progress.
-- [ ] B2 — native Code Mode/tool-search lifecycle and offline nested replay:
-      `pi-9dd12539`, pane `w1Y:p1`. Candidate `eb900a862` explicitly completed;
-      parent candidate probes pass; review found a default-selection example
-      blocker. Corrected default-deny/new/fork/reopen evidence now passes parent
-      probes; final re-review/module integration pending. Direct dependency
-      declaration integrated separately as `be2453c84`.
+- [x] B2 — opt-in native Code Mode/tool-search SDK lifecycle and offline nested
+      replay: `pi-9dd12539`, pane `w1Y:p1`. Integrated `49f11d387`, `e150a0485`,
+      `e508567dd`; direct dependency `be2453c84`. Final review and parent-built
+      activation/sandbox/cancellation/safe-unsafe replay probes pass. Gateway
+      installation, CodingTools/MCP/approvals and failure-verification remain open.
 - [x] B3 — actual-connection SQLite WAL/FULL and fail-closed setup:
       `pi-72ce3be3`, pane `w1Z:p1`. Candidate `e8269c650` integrated as
       `2d5af1adf`; independent review and parent-checkout probes/build pass.
@@ -262,12 +261,16 @@ established equivalent or stop; do not accumulate hopeful wrappers.
   image handling and result rendering. Reuse compatible public factories;
   adapt operations through the approved environment, never call a raw host-FS
   tool implementation in a way that bypasses Durable hooks or confinement.
-- [ ] Install `pi-durable/codemode` using native CodemodeSandbox and native
-  tool-search. Reuse journal, store/fork behavior, declarations, nested task keys,
-  progress and error channels; no custom script worker or replay store.
-- [ ] Enforce memory/deadline/output/concurrency budgets; release worker capacity
-  on actual worker exit, not just a cancelled result. No recursive orchestration
-  or unrestricted globals. Keep limits owned by the host, not model arguments.
+- [x] Implement an opt-in SDK bundle of `pi-durable/codemode`, native
+  CodemodeSandbox and tool-search. Reuse native journal/store/fork, declarations,
+  nested keys, progress/error channels; no custom worker/replay store. Reviewed
+  and parent-built probes pass; gateway deliberately does not install it.
+- [x] Enforce Code Mode QuickJS-heap/deadline/output/concurrency budgets; hold
+  capacity until actual worker exit. No direct recursive Code Mode or host globals;
+  hard caps are host-owned. Heap cap is not Node/process RSS or P1 OS quotas.
+- [ ] Integrate the bundle into the gateway only after applicable P1 policy,
+  environment/approval boundaries and product lifecycle review pass. Establish
+  native default-deny state and revoke persisted grants before scheduling.
 - [ ] Bind standalone pi-mcp discovery/calls and OAuth to Durable tools. Preserve
   isError, structured content, progress and cancellation; schemas and exposure
   must agree. Keep explicit server/tool allowlists, scoped stdio environments,
@@ -278,7 +281,10 @@ established equivalent or stop; do not accumulate hopeful wrappers.
 - [ ] SIGKILL/reopen actual safe and unsafe calls, including nested Code Mode
   calls: reuse completed results, never automatically repeat unsafe/unknown
   effects, fail clearly on incompatible code/sandbox fingerprints or definitions.
-  Admission requestId dedupe is not external side-effect exactly-once.
+  Admission requestId dedupe is not external side-effect exactly-once. Completed,
+  interrupted-safe and interrupted-unsafe synthetic nested calls now pass actual
+  parent SIGKILL/reopen; real coding tools and incompatible fingerprint/definition
+  cases remain pending (`CODEMODE.md`).
 
 **Exit:** an actual coding task plus restart/cancel/approval cases with proven tool
 policy and no duplicate effects; migrated Python Code Mode workflows demonstrated
@@ -780,3 +786,33 @@ and clean-installed with scripts ignored: 100 packages added/101 audited, zero
 reported vulnerabilities. Package typecheck/build and diff check pass. Sent B1
 confirmation that dependency requests are satisfied; no duplicate manifest work.
 Code Mode module/docs remain unintegrated pending explicit final re-review.
+
+### 2026-10-26 — opt-in Code Mode SDK integrated and parent-reverified
+
+Reviewer `pi-7e58645f` explicitly reported final PASS in
+`/tmp/pi-codemode-bundle-review.md`: native default-deny example/tool bindings and
+corrected top-level creation hook resolve the prior blocker. Parent integrated
+B2's three commits as `49f11d387`, `e150a0485`, `e508567dd` with source provenance;
+direct dependency was already `be2453c84`. Parent exports the inert factory,
+budgets and types from src/index.ts; no runtime/config/registry enabling change.
+
+Package typecheck/build and inert public SDK import/create/close smoke pass.
+With PI_CODEMODE_CANDIDATE explicitly selecting the parent built package, parent
+reran all four private probes: local and opt-in (65s/512 MB), independently written
+edges (65s/512 MB), and actual safe/unsafe subprocess SIGKILL replay (110s/256-MB
+controller, children512 MB). All exit0/pass, including OOM/deadline, independent
+caller/host cancellation, true worker-exit drain, new/fork/reopen default-deny,
+completed-result reuse and refusal to rerun interrupted unsafe effects. Safe
+fixture supplies its own genuine idempotency; no exactly-once external claim.
+
+Parent also wrote `/tmp/pi-nanobot-parent-sdk-inert.mjs` (40s/512 MB): importing
+public SDK and creating an uninstalled bundle does not grant actual gateway
+capabilities. Forged codemode/tool_search/bash calls all reject as unavailable,
+Code Mode store is never created, and reopened conversation tools/callable remain
+empty. Storage crash/reopen and six failure-path regressions still pass. No live
+or paid integration calls, committed tests, production changes, push or cleanup.
+
+Bounded B2 task accepted; P2 overall stays unchecked (gateway activation,
+CodingTools/MCP/approvals, product failure verification, incompatible fingerprints,
+real coding task remain). B1 managed workspace/quota/provenance proof outstanding;
+unsafe partial execution remains withheld. Gateway still tools:[]/modelTools:[].

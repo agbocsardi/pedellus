@@ -419,6 +419,27 @@ closes storage and releases owner lock. Full roadmap records exact probe paths,
 bounds and remaining backup/disk-full/schema/close/power-loss gates. B1/B2 still
 outstanding, tools disabled, no push/deploy/live call/cleanup.
 
+### 2026-10-26 — opt-in Code Mode SDK accepted; execution still gated
+
+B2 module/docs chain integrated as `49f11d387`, `e150a0485`, `e508567dd`, with
+exact direct pi-codemode1.4.0 declaration `be2453c84`. Parent exports inert
+factory/budgets/types. Reviewer's default-selection blocker was fixed with native
+host default-deny, exact tool bindings and persisted-grant revocation; parent
+caught/fixed a temporary fixture callback placement error before accepting its
+new/fork/reopen proof. Final read-only review passed.
+
+Parent rebuilt and reran local/opt-in, independent OOM/deadline/cancellation/close
+edges, actual safe/unsafe nested SIGKILL replay, SDK-created-but-uninstalled
+bundle plus actual gateway forged-call rejection, and storage regressions against
+parent built imports; all passed. Exact paths/bounds in full roadmap/CODEMODE.md.
+No gateway tools enabled, live integration calls, production/push/cleanup.
+
+Execution partial `6ab2ccc89` was explicitly blocked on outside hard-link aliases
+and missing OS quotas and remains unintegrated. Worker now explicitly acknowledges
+managed app-created storage/copy-only imports and continues its bounded follow-up.
+B1/P1 and broader P2 remain open; do not equate the accepted inert SDK bundle with
+an approved filesystem/bash/MCP or production assistant.
+
 ### 2026-10-26 — assessment
 
 Project relocated to its own checkout `/home/gergo/projects/pi-nanobot`, cloned

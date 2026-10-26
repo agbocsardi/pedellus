@@ -96,6 +96,14 @@ The standalone experimental execution factory is not a production-safe capabilit
 This preserves a useful chat/Telegram slice without pretending the security gate
 has passed.
 
+`src/extensions/codemode.ts` provides the opt-in `createCodeModeIntegration`
+factory, budgets and lifecycle/types, also exported by `src/index.ts`. Native
+Code Mode/tool-search stays uninstalled in the gateway. SDK hosts must establish
+native default-deny extension/tool state before scheduling, grant tools explicitly,
+and reapply/revoke persisted selections before resume; `modelTools` is not the
+nested-call authorization boundary. See `CODEMODE.md` for reviewed host setup,
+budgets/replay/cancellation evidence and remaining product/security limitations.
+
 `src/runtime.ts` exports:
 
 ```ts

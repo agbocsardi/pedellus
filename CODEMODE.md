@@ -75,8 +75,10 @@ await codeMode.close();
 ## Contract and limits
 
 `createCodeModeIntegration()` composes `@earendil-works/pi-durable@1.4.0`'s
-`createCodemodeExtension` and `createToolSearchExtension`, with transitive
-`@earendil-works/pi-codemode@1.4.0`. Its extensions use Durable's registry and
+`createCodemodeExtension` and `createToolSearchExtension`, with the exact direct
+`@earendil-works/pi-codemode@1.4.0` dependency. The SDK barrel `src/index.ts`
+exports the factory, fixed `CODEMODE_BUDGETS`, and integration/options types.
+Importing that barrel or creating a bundle does not install it. Its extensions use Durable's registry and
 Harness; this is not the coding-agent `ExtensionAPI` / `AgentSession`. It does
 not implement a second runner, VM, journal, nested-call router, receipt store,
 or discovery index. All script tool
@@ -236,3 +238,36 @@ The probes have bounded `timeout` limits (60 seconds for local integration,
 and a 128 MiB QuickJS heap limit. They do not establish provider behavior,
 filesystem confinement, non-interruptible-worker upper bounds, safe-tool effect
 idempotency, or live service readiness.
+
+### Parent integration verification
+
+Final independent source/API review passed in `/tmp/pi-codemode-bundle-review.md`.
+The candidate chain was integrated as `49f11d387`, `e150a0485`, and `e508567dd`,
+with direct dependency declaration `be2453c84`. Parent typecheck/build/diff check
+and inert SDK export/lifecycle smoke passed.
+
+Parent ran the following private probes against the **parent's built package**,
+selected with `PI_CODEMODE_CANDIDATE=/home/gergo/projects/pi-nanobot/packages/pi-nanobot`:
+
+- `/tmp/pi-nanobot-parent-codemode-local.mjs` and `...-optin.mjs`: adaptations of
+  the reviewed worker fixtures with explicit built SDK imports; native boundaries,
+  store/fork, two-worker capacity, cancellation, default-deny/new/fork/reopen and
+  stale-grant revocation pass (65-second timeout/512-MB Node heap each).
+- `/tmp/pi-nanobot-parent-codemode-edges.mjs`: independently written checks of
+  missing host globals/recursion, CRLF and oversized option clamping, invalid-source
+  and nested-schema rejection, actual QuickJS OOM/CPU deadline, independent caller
+  and host cancellation, worker drain, idempotent close and post-close admission
+  pass (65 seconds/512 MB).
+- `/tmp/pi-nanobot-parent-codemode-replay.mjs` plus `...-replay-child.mjs`:
+  independently written actual SIGKILL/SQLite reopen scenarios for safe and unsafe
+  interrupted calls pass (110-second controller/256 MB, children 512 MB).
+  Completed effect executes once; unsafe interruption is not rerun; the explicitly
+  safe fixture runs again and completes using its own genuine fixed-key effect
+  idempotency. This is not an external-effect exactly-once guarantee.
+
+`/tmp/pi-nanobot-parent-sdk-inert.mjs` (40 seconds/512 MB) additionally imports the
+public SDK and creates an uninstalled bundle, then uses the actual gateway:
+forged `codemode`, `tool_search` and `bash` calls are rejected as unavailable,
+Code Mode store is never created, and reopened conversation policy stays tool-less.
+Parent storage crash/reopen and all six failure-path probes also still pass.
+No live/paid integrations, execution environment or production store were used.
