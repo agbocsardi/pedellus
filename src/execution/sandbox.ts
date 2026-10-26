@@ -57,6 +57,7 @@ function baseArgs(home = "/workspace"): string[] {
 		"--unshare-user",
 		"--unshare-pid",
 		"--unshare-net",
+		"--unshare-ipc",
 		"--die-with-parent",
 		"--cap-drop",
 		"ALL",

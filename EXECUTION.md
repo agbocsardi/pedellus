@@ -36,8 +36,10 @@ environment starts. The worker rejects symlinks, special files, and files with
 bytes into exclusive new files (no source hard links or symlinks are preserved).
 Directories are traversed via pinned directory descriptors. Per-file and
 per-directory metadata checks reject sources that change while copying; this is
-not a filesystem-wide atomic snapshot, so callers must provide a quiescent tree.
-Limits are 32 imports, 64 MiB total file content, 10,000 entries, depth 64, and
+not a filesystem-wide atomic snapshot, so callers must provide a quiescent tree
+for content consistency. Quiescence is not an authorization or path-race boundary;
+import-root ancestor ABA remains under separate review. Limits are 32 imports,
+64 MiB total file content, 10,000 entries, depth 64, and
 30 seconds. The worker uses a private copy of the host Node executable plus
 read-only `/usr`; runtimes that need external host libraries fail closed.
 Duplicate basenames, system roots, `/`, the host home itself/its parents, host
@@ -63,15 +65,19 @@ the standalone adapter.
 
 ## Namespace boundary
 
-- The pi-env `1.4.0` daemon runs in an outer Bubblewrap user/PID/network namespace.
+- The pi-env `1.4.0` daemon runs in an outer Bubblewrap user/PID/network/IPC namespace.
   The only writable host bind is the application-created workspace, mounted at
   virtual `/workspace`. `/usr` is read-only. Host `/etc`, home, dataDir, auth
   sockets, and host network are absent. `/tmp` is sandbox-private scratch.
+- The one-shot import worker and each shell command also receive a fresh IPC
+  namespace via mandatory `--unshare-ipc` in the shared Bubblewrap argument
+  builder. Unsupported launches fail closed; there is no fallback switch. The
+  import helper's synthetic SysV shared-memory probe is recorded below.
 - The standalone `@earendil-works/pi-env@1.4.0` daemon implements native Durable
   `RemoteExecutionEnv` FS and shell semantics. Every filesystem syscall (rename
   source and destination, readers, listings, watches, temp/spill paths, etc.)
   occurs inside the namespace; path checks are defense in depth, not the boundary.
-- Every shell command runs in a nested user/PID/network namespace with only
+- Every shell command runs in a nested user/PID/network/IPC namespace with only
   `/workspace`, read-only `/usr`, fresh `/proc` and `/dev`, private `/tmp`, dropped
   capabilities, cleared environment, and a PID-1 command. `HOME=/workspace`,
   `PATH=/usr/bin:/bin`, `TMPDIR=/tmp`, and `LANG=C.UTF-8`; caller `env` and
@@ -121,6 +127,12 @@ config-store access, or deployment changes were introduced.
 - The exact import limitation test hard-linked a synthetic outside sentinel into
   a selected import directory before admission. The worker rejected the `nlink`
   alias before copying content; no read or mutation of the sentinel was observed.
+- Parent-provided read-only IPC fixture/probe created one private synthetic
+  `0600` SysV segment and attempted read-only attach from the guest shell. After
+  requiring `--unshare-ipc`, host and guest IPC namespace IDs differed, `shmat`
+  was denied (guest exit 0), and no real host IPC objects were inspected. The
+  same shared bwrap argument builder applies this requirement to outer daemon,
+  importer, and shell launches.
 
 The probe uses only a temporary app store, synthetic imported files, a synthetic
 Unix auth socket, a loopback listener, and a synthetic outside sentinel; it
