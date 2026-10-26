@@ -46,13 +46,15 @@ token-bearing URL into an error message.
   abortable and have a five-minute per-call budget; long timer waits are chunked
   below Node's timer limit. Replaceable previews yield during a flood wait rather
   than queueing stale edits.
-- Outbound `sendMessage` and edits are not retried inside the same API-call
-  attempt sequence after ambiguous network or 5xx failures. The durable pending
-  record remains eligible for the existing next-poll/restart delivery retry, so
-  an accepted send can still be duplicated. Explicit Bot API 429 rejections may
-  be retried within the bounded attempt/wait budget. GrammY error
-  descriptions/causes and raw response bodies are not surfaced or logged. A terminal unanswered model
-  submission sends the fixed message `Your request could not be completed.
+- Ambiguous non-idempotent `sendMessage` outcomes (network timeout/reset,
+  in-flight cancellation, or Telegram 5xx) retain the original pending record
+  with a durable `deliveryStatus: "unknown"` marker. Such records are excluded
+  from automatic polling/restart resend. Explicit Bot API 429 rejections remain
+  retryable after cooldown. Only narrowly proven pre-connect failures
+  (`ENETDOWN`/`EHOSTUNREACH`) are automatically retried as no-send outcomes.
+  GrammY error descriptions/causes and raw response bodies are not surfaced or
+  logged. A terminal unanswered model submission sends the fixed message
+  `Your request could not be completed.
   Please try again.`; empty text answers also get a fixed user-visible response.
   Polling errors other than cancellation terminate `runTelegram` for the host to
   handle.
@@ -67,8 +69,12 @@ waiter; it does not abort the Durable model work. Pending delivery records remai
 durable for restart recovery. Preview updates use one in-flight operation plus a
 latest-value coalescer; a flood wait skips replaceable previews rather than
 retaining stale calls. The channel-state document checkpoints its delta chain
-after 64 deltas, using Durable's `CheckpointInfo.deltasSinceBase` without
-changing its schema version.
+after 64 deltas using Durable's `CheckpointInfo.deltasSinceBase`. Schema version 2
+adds a durable next-final-chunk cursor and unknown-delivery metadata; version-1
+state migrates with a zero chunk cursor. Successful final chunks are committed
+before attempting later chunks, so an explicit later rejection does not resend
+known accepted earlier chunks. Required outcome/progress commits use an
+uncancelled cleanup context and are reaped before return.
 
 A grammY 400 `message is not modified` error is treated as success for the exact
 short description or a bounded detailed description with that exact prefix
@@ -79,13 +85,24 @@ policy provenance.
 
 ## Delivery boundary and current limitation
 
-Telegram `sendMessage` has no idempotency key. If Telegram accepts a message
-but the process dies before the Durable document records its completion, a
-restart can resend it. Request IDs deduplicate Durable input admission only;
-external message delivery is at-least-once/unknown at the crash boundary, not
-exactly-once. Ambiguous network and 5xx send outcomes are not blindly retried,
-but restart recovery can still repeat an accepted send. No plaintext sidecar is
-used.
+Telegram `sendMessage` has no idempotency key. Durable input request IDs do not
+make external sends exactly-once. Observed ambiguous send outcomes are now held
+for operator reconciliation rather than blindly resent (an intentional behavior
+change). A crash between remote acceptance and the local outcome/progress commit
+can still duplicate a send; this remains an at-least-once/unknown external
+boundary, never exactly-once. No plaintext sidecar is used.
+
+The adapter emits a fixed, sanitized operator warning containing only update ID
+and stage when it marks a send unknown. Inspect the existing channel-state
+conversation (`telegram:<bot-id>:channel-state`) with the Durable SDK and the
+exported `TelegramState` document token. Each pending item retains input, target,
+`nextChunkIndex`, `deliveryStatus`, `unknownStage`, `unknownChunkIndex` (for final
+output), and timestamp. Stop the adapter before reconciliation. After checking
+Telegram independently, an operator can use a Durable transaction to record an
+accepted chunk's progress/message ID and clear the unknown fields, or remove an
+already-complete pending record; if confirmed unsent, clear only the unknown
+fields to permit recovery from the existing cursor. Never clear an unknown marker
+without resolving the external outcome. A retry command/UI is outside this batch.
 
 ## Offline integration probe
 
@@ -97,20 +114,24 @@ JSONL storage, and mocks `fetch` (the shared probe was not modified):
 npm ci --prefix packages/pi-nanobot --ignore-scripts
 npm run typecheck --prefix packages/pi-nanobot
 npm run build --prefix packages/pi-nanobot
-timeout 150s node --max-old-space-size=512 --experimental-strip-types /tmp/tgprobe/pi-e078edd8-followup.mts
+timeout 220s node --max-old-space-size=512 --experimental-strip-types /tmp/tgprobe/pi-e078edd8-followup.mts
 ```
 
 All actual-adapter mock-fetch probes passed: baseline recovery/requestId dedupe,
 allowlist/group rejection, reauthorization, Unicode splitting/final flush, and
-eight-active-delivery polling; fatal polling with a fresh blocked-send gate and
-pending-record verification before/after exit plus output delivery after reopen;
+eight-active-delivery polling; fatal polling with a fresh blocked-model gate and
+pending-record verification before/after exit plus model continuation and output
+delivery after reopen;
 cancellation during a blocked partial preview with no post-return work; 35-second
 `retry_after` with no early retry and prompt abort; concurrent 429s across eight
 deliveries respecting the shared bot-wide deadline; final 429 cooldown retained through five-attempt
 exhaustion and later delivery re-entry; short and detailed not-modified
 responses after simulated accepted/lost edits; and deleted-preview replacement
-with final flush. All mocked requests assert the fixed HTTPS origin
-and `redirect: "error"`.
+with final flush. Additional checks passed version-1 state migration, ambiguous
+5xx send persisted as unknown and not retried after reopen, proven ENETDOWN retry,
+and first-chunk progress retained after a later explicit rejection. In-flight
+send cancellation now intentionally records unknown instead of resending.
+All mocked requests assert the fixed HTTPS origin and `redirect: "error"`.
 
 No live bot or paid model call was used. External sends remain at-least-once /
 unknown, never exactly-once.
