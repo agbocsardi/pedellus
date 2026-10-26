@@ -1,5 +1,7 @@
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
+import { pathToFileURL } from "node:url";
+import { AssistantEntry } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { loadConfig } from "./config.js";
 import { openGateway } from "./runtime.js";
@@ -32,8 +34,13 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
           const prompt = await input.question("> ", { signal: stop.signal }).catch(() => "");
           if (!prompt) break;
           const result = await (await conversation.submit({ type: "input", content: prompt }, context)).wait(context);
-          if (result.status === "done" && result.type === "input") process.stdout.write(`${result.answer}\n`);
-          else process.stderr.write(`Turn ended: ${result.status}\n`);
+          if (result.status === "done" && result.type === "input") {
+            const answer = await conversation.commit((tx) => tx.entry(AssistantEntry, result.answer), context);
+            const text = answer?.model?.flatMap((message) => message.role === "assistant"
+              ? message.content.filter((block) => block.type === "text").map((block) => block.text)
+              : []).join("") ?? "";
+            process.stdout.write(`${text}\n`);
+          } else process.stderr.write(`Turn ended: ${result.status}\n`);
         }
       } finally { input.close(); }
     }
@@ -44,6 +51,6 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error: unknown) => { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; });
 }

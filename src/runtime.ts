@@ -1,8 +1,10 @@
-import { chmod, lstat, mkdir, realpath } from "node:fs/promises";
+import { chmod, lstat, mkdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { processLock } from "@earendil-works/chord/node";
 import type { Context } from "@earendil-works/chord";
-import { configure, createRegistry, defineDoc, Harness, type AgentChange, type Conversation, type ConversationId, type Harness as HarnessType } from "@earendil-works/pi-durable";
+import { withoutAbortSignal } from "@earendil-works/chord/context";
+import type { Models } from "@earendil-works/pi-ai/models";
+import { configure, createRegistry, defineDoc, Harness, type AgentChange, type Conversation, type ConversationId, type Cursor, type Harness as HarnessType, type Storage } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { PortConfig } from "./config.js";
 import { createProviderModels } from "./providers.js";
@@ -46,9 +48,17 @@ function encodedSessionKey(key: string): string {
   return `k:${Buffer.from(key, "utf8").toString("base64url")}`;
 }
 
-export async function openGateway(config: PortConfig, context: Context): Promise<Gateway> {
+export async function openGateway(config: PortConfig, context: Context, options: { models?: Models } = {}): Promise<Gateway> {
+  const prepared = options.models ? { models: options.models, model: config.model } : createProviderModels(config);
+  const { models, model } = prepared;
+  if (!models.getModel(model.provider, model.modelId)) throw new Error(`Unknown model ${model.provider}/${model.modelId}`);
   const workspace = await realpath(config.workspace);
-  const extraRoots = await Promise.all((config.extraAllowedDirs ?? []).map((p) => realpath(p)));
+  if (!(await stat(workspace)).isDirectory()) throw new Error("workspace must be a directory");
+  const extraRoots = await Promise.all((config.extraAllowedDirs ?? []).map(async (p) => {
+    const root = await realpath(p);
+    if (!(await stat(root)).isDirectory()) throw new Error(`extraAllowedDirs entry is not a directory: ${p}`);
+    return root;
+  }));
   const roots = [workspace, ...extraRoots];
   const dataDir = await canonicalFuturePath(config.dataDir);
   if (roots.some((root) => inside(dataDir, root) || inside(root, dataDir))) {
@@ -69,11 +79,11 @@ export async function openGateway(config: PortConfig, context: Context): Promise
   }
   const releaseLock = await processLock(`nanobot:${dbPath}`);
   let harness: HarnessType | undefined;
+  let storage: Storage | undefined;
   let closed = false;
   try {
-    const { models, model } = createProviderModels(config);
     const registry = createRegistry();
-    const storage = await openNodeSqliteStorage(dbPath);
+    storage = await openNodeSqliteStorage(dbPath);
     harness = await Harness.open(storage, { models, registry }, context);
     const agentPolicy: AgentChange = {
       model,
@@ -85,10 +95,14 @@ export async function openGateway(config: PortConfig, context: Context): Promise
     const root = await harness.root(context, { agent: agentPolicy });
     await root.configure(agentPolicy, context);
 
-    // Reapply host-owned policy to every mapped conversation before any task can resume.
+    // Reapply host-owned policy to every persisted conversation before any task can resume.
     await root.commit(async (tx) => {
-      const map = await tx.doc(SessionMap, root.id);
-      for (const key of Object.keys(map.sessions)) await configure(tx, map.sessions[key] as ConversationId, agentPolicy);
+      let cursor: Cursor | undefined;
+      do {
+        const page = await tx.scanConversations({}, 1000, cursor);
+        for (const conversation of page.items) await configure(tx, conversation.id, agentPolicy);
+        cursor = page.next;
+      } while (cursor !== undefined);
     }, context);
 
     const gateway: Gateway = {
@@ -116,7 +130,7 @@ export async function openGateway(config: PortConfig, context: Context): Promise
       async close(ctx) {
         if (closed) return;
         closed = true;
-        try { await harness!.close(ctx); }
+        try { await harness!.close(withoutAbortSignal(ctx)); }
         finally { await releaseLock(); }
       },
     };
@@ -124,7 +138,11 @@ export async function openGateway(config: PortConfig, context: Context): Promise
     harness.resume();
     return gateway;
   } catch (error) {
-    try { await harness?.close(context); } finally { await releaseLock(); }
+    try {
+      const cleanup = withoutAbortSignal(context);
+      if (harness) await harness.close(cleanup);
+      else await storage?.close(cleanup);
+    } finally { await releaseLock(); }
     throw error;
   }
 }
