@@ -77,7 +77,8 @@ wiring replace them.
 - [ ] Gate 1 — spike, throwaway (original estimate ~2–3 days, unverified):
   - [x] Establish isolated TypeScript package, pinned dependencies, and design.
   - [ ] Implement Durable runtime/config/provider/CLI slice.
-  - [ ] Implement confined execution environment and record security limits.
+  - [x] Integrate standalone execution spike and record its security limits.
+  - [ ] Close execution TOCTOU/hardlink blockers before enabling coding tools.
   - [ ] Implement allowlisted, text-only Telegram adapter.
   - [ ] Parent review/integration and bounded offline validation.
   - [ ] bwrap-confined `ExecutionEnv` running `read`/`write`/`edit`/`bash`;
@@ -145,6 +146,21 @@ remain tool-less (no CodingTools registration, no unsafe flag, explicit empty to
 policy on persisted/new conversations). Execution worker is fixing nonzero-probe
 handling, real Context usage, cwd validation, and Result/abort contracts before
 integration. No application acceptance gate has passed.
+
+Execution follow-up `f886d1f60` recovered after the workers were reloaded without
+socket-wrapper registration. Reviewed and integrated the two execution commits as
+`a4115ed02` / `e53c1445d`. Parent package typecheck/build passed. Parent bounded
+inline Node checks independently confirmed ordinary traversal/symlink/missing-leaf
+and rename rejection, sanitized shell env, zero effective capabilities, pre-abort,
+and rejection of a fake bwrap exiting 17. An initial check used the wrong Chord
+module path; rerun with `dist/context/index.js` passed. Race/hardlink security and
+crash/replay semantics remain unproven; the execution factory remains standalone.
+
+Runtime reports `4f9f5036b` / `fd25f259a` are not integrated. Review returned CLI
+entry-ID-vs-text output, provider alias/credential selection, partial-startup
+cleanup, explicit SDK Models injection, and actual SQLite recovery/locking checks
+to the runtime worker. Telegram fixes still in progress. Existing children remain
+CLI-managed; no new socket child registry was created by their reload.
 
 ### 2026-10-26 — assessment
 
