@@ -330,6 +330,18 @@ owner-editable template `/home/gergo/.config/pi-nanobot/test.env` (0600, parent
 0700), outside checkout; awaiting replacement token, numeric sender ID, and sole
 poller confirmation. Token values must not enter repository files or tool output.
 
+### 2026-10-26 — live Telegram smoke test started
+
+Owner populated private test.env; parent validated permissions/presence without
+printing credentials. Real getMe authenticated the bot and getWebhookInfo showed
+no webhook. Owner explicitly confirmed sole polling ownership. Started bounded
+three-minute scripted-model smoke runner `/tmp/pi-nanobot-live-smoke.mjs`, log
+`/tmp/pi-nanobot-live-smoke.log`, supervisor PID773417. READY confirmed; private
+isolated SQLite/transcript data `/tmp/pi-nanobot-live-xM2Emp`. Only configured
+numeric sender is allowlisted, model is explicitly injected faux streaming, tools
+remain disabled, no paid LLM calls. Await owner sending `pi durable smoke` and
+inspect final log/result; startup/authentication are not an end-to-end pass.
+
 ### 2026-10-26 — assessment
 
 Project relocated to its own checkout `/home/gergo/projects/pi-nanobot`, cloned
