@@ -3,8 +3,11 @@
 ## Scope and decision
 
 This package is the new TypeScript build target. The Python tree is read-only
-reference; the live fork and deployment are not changed. This is Gate 1 of the
-root TODO, not approval of a full migration. Use Node >=22.19 and exact Pi 1.4.0
+reference; the live fork and deployment are not changed. This document specifies Gate 1 of the root spike TODO. The owner subsequently
+requested the comprehensive [full-port roadmap](../../2026-10-26_full-port_TODO.md)
+(existing WebUI included, QuickJS-only Code Mode, Linux only, Earendil-first reuse).
+Those future milestones do not relax this slice's tool-less/security constraints
+or authorize production cutover. Use Node >=22.19 and exact Pi 1.4.0
 dependencies. No WebUI/API server, memory migration, Dream, cron, MCP, or custom
 scheduler in this slice. No new test suite: use existing upstream examples and
 bounded one-off runtime checks, recording commands and limitations.

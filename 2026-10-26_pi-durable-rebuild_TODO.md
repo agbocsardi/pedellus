@@ -1,7 +1,10 @@
 # Rebuild nanobot on Pi Durable (TypeScript)
 
-Status: **Gate 1 implementation started** on `feat/pi-durable-rebuild`.
-TypeScript port authorized; production cutover/full migration not yet approved.
+Status: **Gate 1 partially proven** on `feat/pi-durable-rebuild`: runtime and
+real Telegram/scripted-model slice verified; execution, tool replay, and real
+provider gates remain open. Full-port roadmap/scope now recorded in
+[`2026-10-26_full-port_TODO.md`](2026-10-26_full-port_TODO.md); that is the forward
+plan, this file retains spike evidence. Production cutover remains unapproved.
 Package design and worker boundaries: `packages/pi-nanobot/DESIGN.md`.
 Scope: replace nanobot's Python harness (`agent/loop.py`, `agent/runner.py`,
 `session/`, tool durability, subagents) with `@earendil-works/pi-durable` 1.4.0,
@@ -26,8 +29,9 @@ Durable already provides, natively, what nanobot hand-built:
 | deferred MCP tool discovery in `codemode.py` | `tool-search` extension + `deferred` tools + `modelTools` |
 | cron service (~1.3k LOC) | `runtime.sleepUntil()` durable timers (semantics still ours to port) |
 
-Net: roughly 12–13k lines of Python harness disappear; ~2–3k lines of TS
-wiring replace them.
+Original hypothesis: roughly 12–13k Python harness lines might be replaced by
+~2–3k TS wiring lines. This is not measured savings or a full-product estimate;
+use the evidence-gated full-port roadmap, not these numbers, for planning.
 
 ## What does NOT come for free (the actual project)
 
@@ -61,9 +65,9 @@ wiring replace them.
 
 - `pi-durable` is **experimental**; API breaks between releases. Every package
   is pinned to 1.4.0 (`chord`, `pi-ai`, `pi-codemode`, `pi-telemetry`).
-- One process owns a storage; no cross-process locking. The gateway becomes
-  the single owner and all clients attach — different model from today's
-  multi-service layout.
+- Upstream requires one storage owner and supplies no cross-process locking.
+  This spike now adds OS-backed owner exclusion. The gateway is the single
+  owner and clients attach; never open a second writable Harness for the UI.
 - Interrupted non-replay-safe tools now report "interrupted" to the model
   instead of nanobot's auto-continue-at-checkpoint. Behavior change users see.
 - Tool-call doctoring in `runner.py` (false-success suppression, failure
@@ -94,22 +98,27 @@ wiring replace them.
         (real Telegram, scripted streaming model; real fork provider still pending).
   - [ ] Kill -9 mid-tool; reopen; verify `replay` semantics as documented.
   - [ ] One real fork provider (umans or opencode_zen) through pi-ai.
-- [ ] Gate 2 — decide, on spike evidence only: proceed / stop.
-- [ ] Gate 3 — port in dependency order (new TS package, Python frozen as
-      reference): env+security → coding tools → MCP/tool-search/codemode →
-      memory+skills sections → cron/heartbeat → channels → WebUI on `watch()`.
-- [ ] Gate 4 — parallel-run one channel against the old gateway, then cut over
-      `uhl`; keep Python repo readable for one release cycle.
+- [ ] Gate 2 — accept remaining spike gates before activating unsafe capabilities;
+      full-port planning is approved, security acceptance is not inferred from it.
+- [ ] Gate 3 — implement P1–P8 of the full-port roadmap in bounded reviewed slices,
+      reusing Pi/Earendil libraries first; Python remains read-only reference.
+- [ ] Gate 4 — P9 owner-approved canary/migration/cutover and rollback drill.
+      Use separate accounts/data or side-effect-free replay for comparisons;
+      never run two pollers for the same Telegram bot or duplicate real actions.
 
-## Open questions for the owner
+## Owner decisions (2026-10-26)
 
-1. Cut over fully, or permanently run the TS gateway *beside* a thin Python
-   service for Telegram/Yandex-ish integration glue?
-2. Is losing the Python Code Mode (bwrap + Python stdlib) acceptable in
-   exchange for QuickJS codemode? (Python codemode is a fork feature with
-   tests.)
-3. Keep `memory/history.jsonl` as an importable legacy archive only, or port
-   its Dream/usage semantics verbatim?
+1. Full TypeScript product/runtime; no permanent Python agent sidecar.
+2. Native QuickJS-only Code Mode; Python scripting compatibility intentionally
+   dropped, useful workflows and worker safeguards must be migrated.
+3. Include the existing tracked WebUI; do not resurrect unrelated removed APIs
+   or upstream channels. Earlier "WebUI removed" guidance is stale for this scope.
+4. Linux only; no Windows requirement or portability work.
+5. Prefer the broader Earendil stack too. Review Gondolin, pi-env, pi-mcp,
+   Elanor and pi-voice against concrete contracts before adopting them.
+6. Preserve memory/archive/Dream/usage semantics and provenance by default;
+   any further compatibility loss needs an explicit decision. Full roadmap is
+   [`2026-10-26_full-port_TODO.md`](2026-10-26_full-port_TODO.md).
 
 ## Log
 
@@ -359,6 +368,16 @@ request was made. Secret contents were never printed or committed. Private smoke
 data/log remain outside checkout for inspection; bot polling is stopped. This
 completes the Telegram slice only: execution confinement and real fork-provider
 checks remain open, and nothing was deployed.
+
+### 2026-10-26 — full-port roadmap supersedes the initial outline
+
+Owner requested comprehensive scope and upstream-first Pi/Earendil reuse,
+including native tools/Code Mode. Explicit decisions: existing WebUI included,
+QuickJS only, Linux only. Created `2026-10-26_full-port_TODO.md` with reuse/parity
+maps, P1–P9 gates, native-library gaps, source provenance, migration and non-lossy
+rollback, and a bounded next-batch recommendation. Updated stale forward-plan
+questions/unsafe dual-poller canary wording here. No implementation batch launched,
+new dependency installed, machine changed, paid request or deployment performed.
 
 ### 2026-10-26 — assessment
 
