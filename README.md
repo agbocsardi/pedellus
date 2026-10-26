@@ -2,7 +2,7 @@
 
 Experimental Gate 1 TypeScript port. Requires Node >=22.19 and the pinned Pi 1.4.0 packages. This is not a production-ready replacement for the Python fork.
 
-The [full-port roadmap](../../2026-10-26_full-port_TODO.md) covers the existing WebUI, Linux-only deployment, native QuickJS Code Mode/tools, broader Earendil reuse, feature parity, migration and cutover gates.
+The [full-port roadmap](../../2026-10-26_full-port_TODO.md) covers the existing WebUI, Linux-only deployment, native QuickJS Code Mode/tools, Pi SDK-first reuse and bwrap confinement, feature parity, migration and cutover gates.
 
 ## Run
 

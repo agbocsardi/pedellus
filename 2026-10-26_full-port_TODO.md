@@ -1,4 +1,4 @@
-# Full nanobot port — TypeScript on the Earendil/Pi stack
+# Full nanobot port — TypeScript on the Pi SDK stack
 
 Date: 2026-10-26. Branch: `feat/pi-durable-rebuild`.
 Status: **roadmap agreed in scope; implementation is partial, not production-ready**.
@@ -24,8 +24,13 @@ P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
 ## Owner decisions and definition of full port
 
-- TypeScript owns the application/runtime. Reuse Earendil libraries wherever they
-  meet the contract, rather than reproduce the Python implementation line by line.
+- TypeScript owns the application/runtime. **Pi SDK-first** means Durable and its
+  native tools/Code Mode/compaction/tasks, with supporting Pi packages as needed;
+  not adoption of the entire Earendil ecosystem or a line-by-line Python rewrite.
+- **Prefer bwrap for Linux execution.** Close the existing adapter's filesystem
+  gaps before enabling tools. No Gondolin/micro-VM requirement and no Elanor/UI
+  framework migration. Consider another execution backend only if the bwrap
+  approach cannot meet the reviewed requirements and the owner approves a change.
 - **Include the existing tracked WebUI**, despite older repository guidance saying
   it was removed. Adapt this fork's frontend/backend contracts; do not re-merge
   upstream or restore its unrelated OpenAI-compatible API server.
@@ -78,8 +83,9 @@ For each component: inspect the public API, pinned source/examples, license,
 security assumptions, lifecycle/cancellation, and version compatibility. Prefer a
 supported dependency over vendoring. If adaptation is necessary, retain exact
 source provenance and required MIT/Apache/third-party notices. Do not fork a whole
-application to reuse one policy. Additional Earendil dependencies are welcome,
-but must earn their place; the owner did not request installing the entire org.
+application to reuse one policy. Supporting Pi SDK packages are preferred when
+needed; broader-org research is not an adoption backlog. The current plan uses
+bwrap and the existing frontend, not Gondolin or Elanor.
 
 Current Pi core remains coherently pinned to1.4.0. Other projects have independent
 versions: select/pin compatible releases and asset hashes when adopting them;
@@ -98,11 +104,11 @@ never assume an org-wide1.4.0 release or quietly upgrade the core to `main`.
 | Subagents/goals/workers | owned conversations, child tasks, background anchors/reporters, inbox/abort; upstream examples | Product budgets, read-only artifact scope, reporting/commands/goal policy |
 | Timers | native `sleepUntil`, task checkpoints and Harness clock | Recurrence, timezone/DST, missed-run and delivery semantics remain ours |
 | State, UI updates and RPC | Chord and Durable `watch`/`watchDoc`/`watchEvents`, task graph/inspect | Authenticated product endpoints/projections; use native state/RPC facilities where suitable, no independent runtime-event bus |
-| Remote files/commands/PTY | `pi-env` RemoteExecutionEnv/SSH/daemon | Candidate integration for isolated environments and existing remote UI; not a sandbox by itself |
-| Isolation and controlled egress | `gondolin` micro-VM/VFS/network/secret hooks | Preferred P1 feasibility candidate, NOT an already-approved security fix |
+| Remote files/commands/PTY | `pi-env` only if a concrete environment/remote-UI feature needs it | Reuse existing transport rather than build a protocol; not required for Code Mode and not a sandbox by itself |
+| Local execution isolation | existing Linux bwrap, through native ExecutionEnv interfaces | Confine filesystem operations as well as shell; close race/hard-link gaps; no micro-VM dependency |
 | Interactive terminal | `pi-tui` where useful | Thin Nanobot commands/presentation observing Durable, not another AgentSession |
-| Web components | existing frontend plus `elanor-react`/design tokens/icons where useful | React19 compatibility spike; preserve behavior and Nanobot branding, not wholesale cosmetic rewrite |
-| Voice | `pi-voice` file-transcription implementation/backend where reusable | It is a Pi extension, not proven headless Durable middleware; preserve channel/provider limits and explicit model-download consent |
+| Web components | existing React frontend/components | Adapt backend contracts; no Elanor, React upgrade, or design-system migration for this port |
+| Voice | preserve existing transcription behavior with reusable SDK/provider capabilities | No automatic pi-voice dependency or terminal UX migration; preserve provider/language/media limits |
 | Telemetry | `pi-telemetry` schemas/contracts and native reports/usage | Redacted operational reporting; no speculative analytics service |
 | Chat adapter policies | `pi-chat`, selective OpenClaw references, grammY and established channel SDKs | Reuse narrow media/rendering patterns after review; do not import their sessions/tmux/pollers/state owners |
 
@@ -121,14 +127,13 @@ never assume an org-wide1.4.0 release or quietly upgrade the core to `main`.
 4. Nested tool results are not a permanent bulk-evidence archive: Durable keeps
    nested results through the caller's lifetime and small task receipts afterward.
    Preserve worker evidence/large artifacts explicitly where the product needs it.
-5. Gondolin disk checkpoints are **not** RAM/process snapshots or durable task
-   replay. Host-backed VFS mounts still need path/race/hard-link review; VM branding
-   does not make an unsafe host provider safe. Its limits include resource-DoS
-   caveats, Alpine/image requirements and mediated-network protocol restrictions.
-6. Elanor currently requires React19; this WebUI declares React18. Elanor's repo
-   development toolchain also differs from the current Node22 application.
-   Verify consumer/package availability, licensing, CSS and peer dependencies;
-   don't smuggle a frontend/runtime upgrade into a backend port.
+5. bwrap confines only operations actually performed inside its namespaces. A
+   sandboxed bash tool does not fix host-side Node filesystem check-then-use races
+   or external hard-link aliases. Close those boundaries without assuming that
+   another SDK package, or even a VM, makes shared host storage automatically safe.
+6. Existing WebUI inclusion is not a request for a new UI framework. Elanor was
+   researched but dropped from the implementation plan; keep the current frontend
+   and React version unless a separate concrete requirement justifies a change.
 7. pi-chat demonstrates relevant Discord/Telegram/media patterns but runs Pi
    sessions with tmux orchestration and documents open outbound HTTP/TLS by
    default. Neither ownership nor that network default belongs in this port.
@@ -161,21 +166,21 @@ Python reference checks and accepted differences. Track semantic behavior, not L
 
 ## P1 — close trust and durability gaps first
 
-- [ ] Time-box a **Gondolin + native ExecutionEnv feasibility spike** before
-  investing in more custom filesystem/sandbox code. Evaluate the existing Pi
-  integration, reusable pi-env transport/daemon, and supported VFS APIs; decide
-  the thinnest Durable adapter. An existing coding-agent example is not a
-  drop-in Durable integration.
-- [ ] Check Linux architecture, QEMU/acceleration availability, startup latency,
-  concurrent-VM memory/CPU/disk costs and target-server feasibility. Installing
-  host packages, downloading guest images or changing the server needs approval.
-  Pin/verify selected image assets; no floating `latest` in reproducible deploys.
+- [ ] Finish a **bwrap-backed native ExecutionEnv** design/proof, starting with
+  the existing spike. Ensure filesystem operations, not just bash, cross the
+  confinement boundary. Evaluate applicable native environment/transport helpers
+  before writing custom machinery; pi-env is an option only if it simplifies
+  that concrete boundary. Do not make micro-VM/Elanor feasibility prerequisites.
+- [ ] Validate the configured bwrap executable, namespace setup, sanitized env,
+  allowed mounts, process/resource limits and target-server feasibility. No
+  unsandboxed fallback, inherited credentials, or host-network escape. Host package
+  installation or server changes still require explicit authorization.
 - [ ] Prove traversal, missing-leaf, rename, symlink-race and hard-link invariants
   for **every** read/write/list/spill/temp/cwd path. Prefer isolated storage or
   reviewed upstream providers; do not silently copy back over concurrent host
   edits or expose arbitrary writable host directories. Preserve clear workspace
   and extra-root semantics; never mount credentials or the Durable data root.
-- [ ] Prove guest/process/VM teardown, timeout and cancellation, bounded resource
+- [ ] Prove sandbox/process-group teardown, timeout and cancellation, bounded resource
   use and absence of post-return work. No unsafe host/native fallback. Preserve
   per-file serialization and environment identity through upstream tools.
 - [ ] Design allow/deny/ask policy and exact-call approval decisions on native
@@ -184,10 +189,11 @@ Python reference checks and accepted differences. Track semantic behavior, not L
   before broadening capabilities; a pending approval must not become permission
   after reopen or for a different nested call.
 - [ ] Enforce HTTP target validation including redirects, IPv4/IPv6 private ranges,
-  metadata and DNS/connect-time rebinding. Reuse Gondolin policy where applicable,
-  but separately guard **host-side** web/search/MCP/OAuth/media requests. Explicit
-  narrow exceptions, not a global disable switch. Secrets are host-only; scoped
-  substitution still allows exfiltration through an allowed reflecting service.
+  metadata and DNS/connect-time rebinding. Preserve the existing SSRF semantics
+  through guarded **host-side** web/search/MCP/OAuth/media requests; use mature
+  networking facilities where available. Explicit narrow exceptions, not a global
+  disable switch. Shell network remains isolated; approved host integrations do
+  not grant generated code arbitrary network or credential access.
 - [ ] Review storage guarantees against Python's fsync behavior. Upstream SQLite
   defaults to WAL `synchronous=NORMAL`: process-crash evidence does not prove
   latest commits survive power/host failure. Establish an appropriate FULL/fsync
@@ -318,8 +324,8 @@ parents or exceed budgets; schedule changes/cancellation do not revive old jobs.
   clients and the same Durable admission/watch boundary. Preserve session keys,
   notification routes, account scopes and channel-specific cancellation/rates.
 - [ ] Port transcription and image generation with native pi-ai/image support
-  wherever possible; assess headless reuse of pi-voice rather than its terminal
-  UX. Preserve configured providers, languages, limits, vision handoff/image
+  wherever possible, without adopting a separate voice extension/terminal UX.
+  Preserve configured providers, languages, limits, vision handoff/image
   budgets, caching/provenance and honest unsupported-input behavior.
 - [ ] Complete safe web/search, structured human questions, reactions/messages,
   patch/search/list/document extraction (PDF/Office), background exec/session
@@ -355,10 +361,9 @@ not stand in for Discord, Email, or real voice-note transcription acceptance.
   skills/MCP/OAuth/apps, memory/Dream, automation/calendar, usage and task views.
   Preserve current attachments/voice/images, file/diff/web previews, shortcuts,
   localization, remote-host/pairing controls and workspace behavior where supported.
-- [ ] Evaluate Elanor in one bounded component/settings slice. Decide React19
-  upgrade and package/license/CSS compatibility separately from protocol migration;
-  retain existing UI if adopting it would expand the port without concrete benefit.
-  Reuse design primitives, not Earendil logos or an unwanted product rebrand.
+- [ ] Retain existing frontend components, styling, React version and Nanobot
+  branding. No design-system evaluation/migration is needed to replace the
+  backend; UI changes should serve concrete missing product behavior.
 - [ ] Reuse pi-env SSH/host-key/PTY mechanisms for applicable existing remote
   controls after explicit owner trust. Never silently accept host keys, deploy a
   remote daemon, expose localhost previews or install remote packages.
@@ -404,7 +409,8 @@ reconciliation reports and no live side effects or shared-writer assumptions.
 ## P9 — production release and safe retirement
 
 - [ ] Build/install from the lockfile on a clean Linux environment; include all
-  Code Mode WASM/worker/image-processing assets and reviewed VM/daemon assets.
+  Code Mode WASM/worker/image-processing assets and any explicitly selected daemon
+  assets. No VM image or hypervisor is required by the bwrap plan.
   Verify supported Node version, system requirements, service startup/shutdown,
   bounded logs, diagnostics/readiness, resource limits and backup/restore runbook.
 - [ ] Run an owner-approved canary on dedicated credentials/accounts or replayed
@@ -439,8 +445,10 @@ showing a UI, and don't enable tools to unblock unrelated UI progress.
 
 The next batch should be small enough to review independently:
 
-1. Security/reuse spike: Gondolin + pi-env feasibility, exact trust/host-mount and
-   resource model, existing execution blockers, SQLite host-failure durability.
+1. bwrap/native ExecutionEnv completion: all filesystem and shell paths inside the
+   reviewed boundary, race/hard-link policy, sanitized environment and bounded
+   teardown; separately check SQLite host-failure durability. Native environment
+   helpers only where useful; no micro-VM or UI-framework side project.
 2. Native tool/Code Mode integration design and offline replay proof, initially
    inert or limited to approved synthetic capabilities until P1 passes. Include
    pi-mcp/OAuth/SSE compatibility and nested approval/failure semantics.
@@ -473,8 +481,8 @@ No delegation or new implementation worker was launched for this roadmap.
   omnibus plugin SDK merely to mirror old classes. Native commit/task ownership
   first; small product state where a concrete feature actually requires it.
 - Unknown delivery/provider spend is unknown, not success or zero. Process-crash
-  proofs do not imply host-power durability; VM isolation does not imply a safe
-  mounted host provider; task recovery does not make arbitrary I/O transactional.
+  proofs do not imply host-power durability; shell isolation does not imply safe
+  host-side filesystem operations; task recovery does not make arbitrary I/O transactional.
 - Do not publish dates/LOC savings as facts. Estimate each bounded slice after
   evidence, with security, provider access, UI compatibility and data migration
   uncertainty visible. Full port is substantially more than translating a loop.
@@ -489,7 +497,9 @@ README/protocol/semantics from that same Git tree. Python references above are t
 checkout; `webui/package.json` declares React18.3.1.
 
 Broader-org review on2026-10-26 used public main-branch documentation, not verified
-release integrations. Pin chosen releases/source commits and audit licenses before
+release integrations. The owner subsequently narrowed the preference to the Pi SDK:
+Gondolin/Elanor/pi-voice links below are historical research, not adoption tasks.
+Pin any actually chosen releases/source commits and audit licenses before
 implementation; these links are research provenance, not build inputs:
 
 - [Pi repository / package catalog](https://github.com/earendil-works/pi)
@@ -523,3 +533,14 @@ owner configured it, then public Pi/org/Gondolin/Elanor/pi-chat/pi-voice docs we
 reviewed. Broader dependencies remain researched candidates; no package, VM asset,
 server, Python source, production setting or live credential was changed. This
 planning work launches no new workers and does not authorize deployment.
+
+### 2026-10-26 — narrowed to Pi SDK-first, bwrap preferred
+
+Owner clarified that “their stack” primarily means the Pi SDK, not the whole
+Earendil ecosystem; bwrap is preferred if workable. Removed Gondolin/Elanor
+feasibility work and the implied React/design-system migration from the active
+plan. Kept native Durable tools/Code Mode/tasks/compaction, supporting Pi packages
+when needed, and the existing frontend. pi-env is conditional on a concrete
+execution/remote transport need, not a new runtime requirement. The execution
+gate is unchanged: sandboxed bash alone cannot justify host-side filesystem race
+or hard-link exposure. No implementation, dependency or deployment change.

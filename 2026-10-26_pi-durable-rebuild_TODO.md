@@ -101,7 +101,7 @@ use the evidence-gated full-port roadmap, not these numbers, for planning.
 - [ ] Gate 2 — accept remaining spike gates before activating unsafe capabilities;
       full-port planning is approved, security acceptance is not inferred from it.
 - [ ] Gate 3 — implement P1–P8 of the full-port roadmap in bounded reviewed slices,
-      reusing Pi/Earendil libraries first; Python remains read-only reference.
+      reusing the Pi SDK first; Python remains read-only reference.
 - [ ] Gate 4 — P9 owner-approved canary/migration/cutover and rollback drill.
       Use separate accounts/data or side-effect-free replay for comparisons;
       never run two pollers for the same Telegram bot or duplicate real actions.
@@ -114,8 +114,9 @@ use the evidence-gated full-port roadmap, not these numbers, for planning.
 3. Include the existing tracked WebUI; do not resurrect unrelated removed APIs
    or upstream channels. Earlier "WebUI removed" guidance is stale for this scope.
 4. Linux only; no Windows requirement or portability work.
-5. Prefer the broader Earendil stack too. Review Gondolin, pi-env, pi-mcp,
-   Elanor and pi-voice against concrete contracts before adopting them.
+5. Pi SDK-first: Durable/native tools/QuickJS/compaction/tasks, with pi-ai,
+   pi-mcp and other Pi helpers where needed. Prefer bwrap execution. No required
+   Gondolin, Elanor, UI-framework migration, or wider-org adoption project.
 6. Preserve memory/archive/Dream/usage semantics and provenance by default;
    any further compatibility loss needs an explicit decision. Full roadmap is
    [`2026-10-26_full-port_TODO.md`](2026-10-26_full-port_TODO.md).
@@ -378,6 +379,15 @@ maps, P1–P9 gates, native-library gaps, source provenance, migration and non-l
 rollback, and a bounded next-batch recommendation. Updated stale forward-plan
 questions/unsafe dual-poller canary wording here. No implementation batch launched,
 new dependency installed, machine changed, paid request or deployment performed.
+
+### 2026-10-26 — clarified SDK reuse and bwrap preference
+
+Owner clarified that reuse primarily means the Pi SDK stack. Updated the full
+roadmap: bwrap/native ExecutionEnv completion is the next security task, not a
+Gondolin spike; retain the existing frontend, no Elanor/React migration. Supporting
+Pi packages remain useful when concrete needs arise, rather than adopting the
+whole org. Existing race/hard-link/tool-replay/storage gates stay open; preference
+for bwrap is not acceptance of the unsafe current filesystem wrapper.
 
 ### 2026-10-26 — assessment
 
