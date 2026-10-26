@@ -29,6 +29,10 @@ exactly-once; request IDs deduplicate admissions only.
   limited to adding the exact-pinned grammY dependency, plus package-local
   `THIRD_PARTY_NOTICES.md`. The parent does not edit these concurrently.
 
+These are the historical spike assignments. Current P1/P2 ownership, including
+exclusive manifest/lock ownership, is recorded in the full-port roadmap's active
+batch and supersedes these assignments for that batch.
+
 Do not modify the Python tree, root instructions, shared reference checkout, or
 another worker's files. Workers commit their code on separate branches; the parent
 reviews and cherry-picks. No deployment, real bot polling, or paid model call
@@ -51,8 +55,17 @@ before resume, and resume pending work. Data lives outside the agent workspace.
 Refuse a second owner with a real OS-backed lock or fail-closed acquisition; never
 silently steal stale locks. Use an established available facility rather than a
 large new locking implementation. Specify crash-reopen behavior explicitly.
+The gateway enforces WAL/FULL on the native storage connection and verifies it
+before and after schema initialization, before opening Harness. See `STORAGE.md`
+for fail-closed/reopen evidence and the still-open host-loss/storage-fault gates.
 
 ### Integration contracts
+
+The owner approved a managed isolated workspace with explicit imports for the
+next execution implementation, rejecting arbitrary writable host/extra roots and
+omitting automatic publish-back. The legacy standalone spike contract below is
+not that future gateway contract; revised API/security proof is pending worker
+review. No execution capability is currently installed in the gateway.
 
 `src/execution/index.ts` exports:
 
@@ -130,8 +143,9 @@ report a missing parallel module as expected, not a reason to add stub code.
 
 - Linux-only initial coding tools. Shell always uses a trusted absolute bwrap,
   fresh mount/PID/network namespaces, dropped capabilities, sanitized environment,
-  no host-home/config mounts, only workspace/explicit extra roots writable and
-  required system tools read-only. No unsandboxed or host-network fallback.
+  no host-home/config mounts, only the application-managed isolated workspace
+  writable (explicit imports, no arbitrary writable host/extra roots), and required
+  system tools read-only. No unsandboxed or host-network fallback.
 - Filesystem paths are confined equivalently to the Python `_resolve_path`,
   including traversal, sibling-prefix, symlink escapes, and nonexistent write
   destinations. Check every public FileSystem entry point (both rename paths,

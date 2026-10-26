@@ -63,3 +63,14 @@ that the adapter was closed and the runtime lock released (a subsequent open
 succeeded). That injected failure is not an SQLite/VFS fault test. The SIGKILL
 case establishes process-crash recovery only; it does not test power loss or
 physical-host durability.
+
+Independent source review passed: `/tmp/pi-storage-full-review.md`. After integration
+as `2d5af1adf`, parent package typecheck/build and diff check passed, followed by
+`/tmp/pi-nanobot-parent-storage-crash.mjs` against the parent checkout (70-second
+bound, 512-MB Node heap): actual crash/reopen, WAL/FULL, owner exclusion, dedupe
+and setup cleanup passed. Parent's separate
+`/tmp/pi-nanobot-parent-storage-failclosed.mjs` (45 seconds/256 MB) also passed
+before/after journal/synchronous mismatch injections, read and migration failures,
+lock/database reopen after each, and real non-WAL in-memory database rejection.
+Injected faults are not real disk-full/VFS failures. Backup/restore, real storage
+faults, close failure and physical-host-loss acceptance remain open.

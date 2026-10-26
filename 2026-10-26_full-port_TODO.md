@@ -32,9 +32,10 @@ root docs, integration and acceptance. No P1/P2 milestone is passed by launch.
 - [ ] B1 — bwrap/native ExecutionEnv confinement: `pi-ccd4ba61`, pane `w1X:p1`.
 - [ ] B2 — native Code Mode/tool-search lifecycle and offline nested replay:
       `pi-9dd12539`, pane `w1Y:p1`.
-- [ ] B3 — actual-connection SQLite WAL/FULL and fail-closed setup:
-      `pi-72ce3be3`, pane `w1Z:p1`. Candidate `e8269c650` reported complete;
-      parent probes pass, independent read-only review/integration pending.
+- [x] B3 — actual-connection SQLite WAL/FULL and fail-closed setup:
+      `pi-72ce3be3`, pane `w1Z:p1`. Candidate `e8269c650` integrated as
+      `2d5af1adf`; independent review and parent-checkout probes/build pass.
+      Broader backup/restore/disk-full/schema/host-loss gates remain open.
 - [ ] Parent review/integration and independent bounded verification; read-only
       security/replay review as needed before acceptance or gateway activation.
 
@@ -231,11 +232,12 @@ Python reference checks and accepted differences. Track semantic behavior, not L
   networking facilities where available. Explicit narrow exceptions, not a global
   disable switch. Shell network remains isolated; approved host integrations do
   not grant generated code arbitrary network or credential access.
-- [ ] Review storage guarantees against Python's fsync behavior. Upstream SQLite
-  defaults to WAL `synchronous=NORMAL`: process-crash evidence does not prove
-  latest commits survive power/host failure. Establish an appropriate FULL/fsync
-  policy through a supported adapter/configuration, verify startup policy and
-  fail-closed behavior; do not claim host-failure-safe send intent prematurely.
+- [x] Establish reviewed WAL/FULL startup policy through the supported native
+  adapter, verify it before/after initialization on the actual connection and
+  fail closed on mismatch. Integrated `2d5af1adf`; source review plus parent
+  crash/reopen/fault-injection probes passed. As with Python fsync, physical
+  power/host-loss guarantees still depend on the actual storage stack; neither
+  SIGKILL nor pragma readback establishes host-failure-safe send intent.
 - [ ] Check snapshot/backup restore, schema/version failures, disk-full/storage
   errors and owner-lock recovery. Close failure must not start a second writer.
 
@@ -636,3 +638,24 @@ this committed candidate and native SQLite implementation. Expected report
 `/tmp/pi-storage-full-review.md`; await explicit completion before integration.
 B1/B2 remain outstanding, tools disabled. This does not close the full storage
 backup/restore/disk-full/schema/host-loss acceptance gate.
+
+### 2026-10-26 — SQLite policy integrated and reverified
+
+Reviewer `pi-7e58645f` explicitly reported PASS with no blocker;
+`/tmp/pi-storage-full-review.md` traces same-connection/native migration/queue,
+cleanup, owner lock and unchanged tool-less policy. Parent cherry-picked B3 as
+`2d5af1adf` after clean-status check. Package typecheck/build and diff check pass.
+
+Parent reran probes against the **parent checkout's built runtime**, not only
+worker artifacts: `/tmp/pi-nanobot-parent-storage-crash.mjs` (70s/512 MB; adaptation
+of worker probe with explicit parent imports) passes actual SIGKILL/reopen,
+WAL/FULL, owner exclusion, dedupe and setup-failure cleanup. Parent's independently
+written `/tmp/pi-nanobot-parent-storage-failclosed.mjs` (45s/256 MB), selected with
+`PI_STORAGE_CANDIDATE=/home/gergo/projects/pi-nanobot/packages/pi-nanobot`, passes
+all six failure scenarios and real non-WAL rejection. No paid/live requests.
+
+B3's bounded policy task is accepted. Backups/restores, real disk-full/VFS/schema
+faults, close failure and physical-host-loss acceptance remain separate unfinished
+work; P1 as a whole stays unchecked. README now describes the active FULL policy.
+Execution/Code Mode workers remain outstanding; tools still disabled, no production
+change, push or cleanup.

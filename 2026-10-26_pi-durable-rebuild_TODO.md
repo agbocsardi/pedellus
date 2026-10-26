@@ -408,6 +408,17 @@ B1 before implementation; provenance/import/reopen/security proof remains open.
 This supersedes transparent host-workspace compatibility for the initial path,
 not the current tool-less gateway's behavior.
 
+### 2026-10-26 — WAL/FULL policy integrated
+
+Storage worker B3 candidate `e8269c650` passed independent source review by
+`pi-7e58645f` (`w1P:p5`, `/tmp/pi-storage-full-review.md`) and was cherry-picked
+as `2d5af1adf`. Parent typecheck/build/diff check and actual parent-imported
+crash/reopen plus independent failure-injection probes passed. Native single
+connection is verified WAL/FULL before/after migrations; setup mismatch/failure
+closes storage and releases owner lock. Full roadmap records exact probe paths,
+bounds and remaining backup/disk-full/schema/close/power-loss gates. B1/B2 still
+outstanding, tools disabled, no push/deploy/live call/cleanup.
+
 ### 2026-10-26 — assessment
 
 Project relocated to its own checkout `/home/gergo/projects/pi-nanobot`, cloned
