@@ -30,11 +30,14 @@ Herdr worktrees; native wrapper tools only. Parent pane `w1P:p1` owns review,
 root docs, integration and acceptance. No P1/P2 milestone is passed by launch.
 
 - [ ] B1 — bwrap/native ExecutionEnv confinement: `pi-ccd4ba61`, pane `w1X:p1`.
+      Partial `6ab2ccc89` withheld (direct-bind alias proof fails; quotas missing).
+      Worker explicitly confirms managed-storage/copy-import follow-up in progress.
 - [ ] B2 — native Code Mode/tool-search lifecycle and offline nested replay:
       `pi-9dd12539`, pane `w1Y:p1`. Candidate `eb900a862` explicitly completed;
       parent candidate probes pass; review found a default-selection example
       blocker. Corrected default-deny/new/fork/reopen evidence now passes parent
-      probes; final re-review and direct dependency declaration/integration pending.
+      probes; final re-review/module integration pending. Direct dependency
+      declaration integrated separately as `be2453c84`.
 - [x] B3 — actual-connection SQLite WAL/FULL and fail-closed setup:
       `pi-72ce3be3`, pane `w1Z:p1`. Candidate `e8269c650` integrated as
       `2d5af1adf`; independent review and parent-checkout probes/build pass.
@@ -752,3 +755,28 @@ and ran both with 65-second/512-MB bounds. Both exit0 and pass boundary/capacity
 store/fork, nested errors, and corrected opt-in assertions against candidate.
 `PI_CODEMODE_CANDIDATE` can select the parent package after integration. Await
 final review and manifest-owner dependency commit; no gateway activation.
+
+### 2026-10-26 — partial execution withheld; direct dependency integrated
+
+B1 explicitly reported **blocked**, not complete: `6ab2ccc89` moves native pi-env
+filesystem daemon inside outer bwrap and uses nested bwrap for shell, but still
+binds arbitrary writable host roots. Its own synthetic external hard-link sentinel
+changes, so inode isolation fails; CPU/memory/process-count quotas are missing.
+Parent has not integrated this execution/pi-env candidate or accepted P1. This
+partial does not satisfy the owner-approved managed workspace contract.
+
+A single recovery inspection could not capture recent output because the worker
+was working; no polling retry, CLI/terminal fallback or replacement worker.
+Parent reconciled current owner instructions via wrapper; worker explicitly
+acknowledged continuing with app-created storage/copy-only imports, no arbitrary
+writable roots or automatic publication. Nested bwrap is no longer its blocker.
+A transport acknowledgement alone was never taken as proof earlier follow-ups
+had been processed. Await bounded managed follow-up/security evidence.
+
+B1 separately supplied `c491bac5940a5824fdc97fbe8af3f245dda0d64a`, exactly two
+manifest/lock declarations for direct pi-codemode1.4.0. Parent reviewed the diff,
+cherry-picked with provenance as `be2453c84` (without partial execution/pi-env),
+and clean-installed with scripts ignored: 100 packages added/101 audited, zero
+reported vulnerabilities. Package typecheck/build and diff check pass. Sent B1
+confirmation that dependency requests are satisfied; no duplicate manifest work.
+Code Mode module/docs remain unintegrated pending explicit final re-review.
