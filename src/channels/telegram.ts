@@ -1,6 +1,7 @@
 import { defineDoc, AssistantEntry } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import { copyJson } from "@earendil-works/chord";
+import { withCancel } from "@earendil-works/chord/context";
 import type { Conversation, SubmissionId } from "@earendil-works/pi-durable";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 
@@ -47,7 +48,7 @@ const TelegramState = defineDoc<ChannelState>({
   scope: "conversation",
   history: "latest",
   fork: "initial",
-  checkpointWhen: () => false,
+  checkpointWhen: (_value, _ops, { deltasSinceBase }) => deltasSinceBase >= 64,
   initial: () => ({ offset: 0, pending: [] }),
 });
 
@@ -61,7 +62,9 @@ export async function runTelegram(
   context: Context,
 ): Promise<void> {
   validateOptions(options);
-  const signal = context.abortSignal;
+  const scope = withCancel(context);
+  const adapterContext = scope.context;
+  const signal = adapterContext.abortSignal;
   if (signal?.aborted) return;
 
   const me = await apiCall<{ id: number; username?: string }>(options.token, "getMe", {}, signal);
@@ -74,9 +77,10 @@ export async function runTelegram(
   const active = new Set<Promise<void>>();
   const delivering = new Set<number>();
   const failedThisPoll = new Set<number>();
+  let stopping = false;
 
   const drain = () => {
-    if (signal?.aborted) return;
+    if (stopping || signal?.aborted) return;
     for (const item of state.pending) {
       if (active.size >= 8) break;
       if (delivering.has(item.updateId) || failedThisPoll.has(item.updateId)) continue;
@@ -87,7 +91,7 @@ export async function runTelegram(
       }).finally(() => {
         active.delete(task);
         delivering.delete(item.updateId);
-        drain();
+        if (!stopping && !signal?.aborted) drain();
       });
       active.add(task);
     }
@@ -101,9 +105,9 @@ export async function runTelegram(
       await forget(item.updateId);
       return;
     }
-    const conversation = await gateway.conversationFor(item.sessionKey, context);
+    const conversation = await gateway.conversationFor(item.sessionKey, adapterContext);
     const requestId = requestIdFor(identity, item.updateId);
-    const watch = await conversation.watch(context);
+    const watch = await conversation.watch(adapterContext);
     let previewTimer: ReturnType<typeof setTimeout> | undefined;
     let previewWork = Promise.resolve();
     let previewFailure: unknown;
@@ -131,16 +135,16 @@ export async function runTelegram(
           ?.flatMap((part) => part.type === "text" && part.text ? [part.text] : []).join("");
         if (text) queuePreview(text);
       });
-      const submission = await conversation.submit({ type: "input", content: item.text, requestId }, context);
+      const submission = await conversation.submit({ type: "input", content: item.text, requestId }, adapterContext);
       submissionId = submission.id;
-      const settled = await submission.wait(context);
+      const settled = await submission.wait(adapterContext);
       if (settled.status !== "done" || settled.type !== "input") {
         await stopPreviewWatch();
         await flushFinal("Your request could not be completed. Please try again.");
         await forget(item.updateId);
         return;
       }
-      const answer = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), context);
+      const answer = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), adapterContext);
       const message = answer?.model?.[0] as AssistantMessage | undefined;
       const text = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("").trim()
         || "The assistant returned no text response.";
@@ -168,9 +172,21 @@ export async function runTelegram(
       const current = state.pending.find((entry) => entry.updateId === item.updateId) ?? item;
       if (current.messageId !== undefined) {
         if (current.lastText !== chunks[0]) {
-          await apiCall(options.token, "editMessageText", {
-            chat_id: item.chatId, message_id: current.messageId, text: chunks[0],
-          }, signal);
+          try {
+            await apiCall(options.token, "editMessageText", {
+              chat_id: item.chatId, message_id: current.messageId, text: chunks[0],
+            }, signal);
+          } catch (error) {
+            if (isNotModified(error)) {
+              // The remote edit may have succeeded before its response was lost.
+            } else if (isMessageNotFound(error)) {
+              await clearPreview(item.updateId);
+              const sent = await apiCall<{ message_id: number }>(options.token, "sendMessage", {
+                chat_id: item.chatId, text: chunks[0]!,
+              }, signal);
+              await rememberMessage(item.updateId, sent.message_id, chunks[0]!);
+            } else throw error;
+          }
           await rememberText(item.updateId, chunks[0]!);
         }
         for (const chunk of chunks.slice(1)) {
@@ -194,10 +210,22 @@ export async function runTelegram(
         }, signal);
         await rememberMessage(item.updateId, sent.message_id, preview);
       } else {
-        await apiCall(options.token, "editMessageText", {
-          chat_id: item.chatId, message_id: current.messageId, text: preview,
-        }, signal);
-        await rememberText(item.updateId, preview);
+        try {
+          await apiCall(options.token, "editMessageText", {
+            chat_id: item.chatId, message_id: current.messageId, text: preview,
+          }, signal);
+          await rememberText(item.updateId, preview);
+        } catch (error) {
+          if (isNotModified(error)) {
+            await rememberText(item.updateId, preview);
+          } else if (isMessageNotFound(error)) {
+            await clearPreview(item.updateId);
+            const sent = await apiCall<{ message_id: number }>(options.token, "sendMessage", {
+              chat_id: item.chatId, text: preview,
+            }, signal);
+            await rememberMessage(item.updateId, sent.message_id, preview);
+          } else throw error;
+        }
       }
     }
   };
@@ -208,18 +236,22 @@ export async function runTelegram(
       const item = doc.pending.find((entry) => entry.updateId === updateId);
       if (item) change(item);
       return copyJson(doc) as unknown as ChannelState;
-    }, context);
+    }, adapterContext);
   };
   const rememberMessage = (updateId: number, messageId: number, text: string) =>
     mutatePending(updateId, (item) => { item.messageId = messageId; item.lastText = text; });
   const rememberText = (updateId: number, text: string) =>
     mutatePending(updateId, (item) => { item.lastText = text; });
+  const clearPreview = (updateId: number) => mutatePending(updateId, (item) => {
+    delete item.messageId;
+    delete item.lastText;
+  });
   const forget = async (updateId: number) => {
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
       doc.pending = doc.pending.filter((entry) => entry.updateId !== updateId);
       return copyJson(doc) as unknown as ChannelState;
-    }, context);
+    }, adapterContext);
   };
 
   // Recover admitted work before polling. Each requestId safely reacquires its existing submission.
@@ -243,7 +275,7 @@ export async function runTelegram(
           continue;
         }
         const sessionKey = `telegram:${identity}:chat:${message!.chat.id}`;
-        const conversation = await gateway.conversationFor(sessionKey, context);
+        const conversation = await gateway.conversationFor(sessionKey, adapterContext);
         const text = message!.text ?? message!.caption;
         // Text-only adapter: never imply that an unsupported attachment was read.
         const hasAttachment = ["photo", "document", "audio", "voice", "video", "video_note", "animation", "sticker"]
@@ -252,7 +284,7 @@ export async function runTelegram(
         const input = hasAttachment ? `${notice}${text ? ` Caption: ${text}` : ""}`
           : text ?? "[Unsupported Telegram message: this adapter accepts text only.]";
         const requestId = requestIdFor(identity, update.update_id);
-        await conversation.submit({ type: "input", content: input, requestId }, context);
+        await conversation.submit({ type: "input", content: input, requestId }, adapterContext);
         state = await stateConversation.commit(async (tx) => {
           const doc = await tx.doc(TelegramState, stateConversation.id);
           if (!doc.pending.some((entry) => entry.updateId === update.update_id)) {
@@ -267,7 +299,7 @@ export async function runTelegram(
           }
           doc.offset = Math.max(doc.offset, update.update_id + 1);
           return copyJson(doc) as unknown as ChannelState;
-        }, context);
+        }, adapterContext);
         // Admission and recovery metadata are committed before the next getUpdates acknowledges the offset.
         drain();
       }
@@ -275,7 +307,9 @@ export async function runTelegram(
   } catch (error) {
     if (!signal?.aborted) throw error;
   } finally {
-    await Promise.allSettled(active);
+    stopping = true;
+    scope.cancel(new DOMException("Telegram adapter stopped", "AbortError"));
+    await Promise.allSettled([...active]);
   }
 
   async function persistOffset(offset: number) {
@@ -283,7 +317,7 @@ export async function runTelegram(
       const doc = await tx.doc(TelegramState, stateConversation.id);
       doc.offset = Math.max(doc.offset, offset);
       return copyJson(doc) as unknown as ChannelState;
-    }, context);
+    }, adapterContext);
   }
 }
 
@@ -351,7 +385,7 @@ async function apiCall<T = void>(
       continue;
     }
     lastStatus = response.status;
-    let payload: { ok?: boolean; result?: T; error_code?: number; parameters?: { retry_after?: number } };
+    let payload: { ok?: boolean; result?: T; error_code?: number; description?: string; parameters?: { retry_after?: number } };
     try {
       payload = await response.json() as typeof payload;
     } catch {
@@ -359,16 +393,41 @@ async function apiCall<T = void>(
     }
     if (response.ok && payload.ok) return payload.result as T;
     const code = payload.error_code ?? response.status;
+    if (code === 400 && (payload.description === "Bad Request: message is not modified" ||
+        payload.description === "Bad Request: message to edit not found")) {
+      throw new TelegramApiError(code, payload.description);
+    }
     if (code === 429 || code >= 500) {
       if (attempt < MAX_SEND_ATTEMPTS - 1) {
         const retry = payload.parameters?.retry_after;
-        await delay(retry === undefined ? backoff(attempt) : Math.min(30_000, retry * 1000), signal);
+        await delay(retry === undefined ? backoff(attempt) : retry * 1000, signal);
         continue;
       }
     }
     throw new Error(`Telegram ${method} failed with status ${code}`);
   }
   throw new Error(`Telegram ${method} failed with status ${lastStatus ?? "unknown"}`);
+}
+
+class TelegramApiError extends Error {
+  readonly status: number;
+  readonly description: string;
+
+  constructor(status: number, description: string) {
+    super(`Telegram API failed with status ${status}`);
+    this.status = status;
+    this.description = description;
+  }
+}
+
+function isNotModified(error: unknown): boolean {
+  return error instanceof TelegramApiError && error.status === 400 &&
+    error.description === "Bad Request: message is not modified";
+}
+
+function isMessageNotFound(error: unknown): boolean {
+  return error instanceof TelegramApiError && error.status === 400 &&
+    error.description === "Bad Request: message to edit not found";
 }
 
 function backoff(attempt: number): number {

@@ -36,13 +36,19 @@ error message.
   a full durable pending queue (1000 items) fails closed before offset advance.
   Long-poll timeout is sent in seconds and its fetch deadline is seconds plus a
   10-second margin, converted to milliseconds. All requests reject redirects.
-- API calls have bounded retries for transport, rate-limit, and server errors.
+- API calls have bounded retries for transport, rate-limit, and server errors. Telegram `retry_after` is honored as a full retry deadline (not capped); waits remain abortable and total attempts are bounded.
   API failures are classified by method and numeric status only; raw Telegram
   response bodies and fetch exceptions are not exposed. A terminal unanswered
   model submission sends the fixed message `Your request could not be completed.
   Please try again.`; empty text answers also get a fixed user-visible response.
   Polling errors other than cancellation terminate `runTelegram` for the host to
   handle.
+
+## Adapter lifecycle and Telegram edit recovery
+
+Each run derives a local cancellation scope from the caller context. Fatal polling/admission exits stop new delivery scheduling, abort adapter-owned fetches, watches, preview queues, and submission waits, and reap active deliveries before returning. Cancellation of `submission.wait()` only stops this adapter's waiter; it does not abort the Durable model work. Pending delivery records remain durable for restart recovery. The channel-state document checkpoints its delta chain after 64 deltas, using Durable's `CheckpointInfo.deltasSinceBase` without changing its schema version.
+
+An exact Telegram 400 `message is not modified` response to an edit is treated as success (covering an edit accepted before a lost response). An exact `message to edit not found` response clears stale preview metadata and sends a replacement. Other 400 errors remain failures. Telegram descriptions are retained only for these exact internal classifications; surfaced errors contain method/status, not raw descriptions or token-bearing URLs.
 
 ## Delivery boundary and current limitation
 
@@ -56,46 +62,28 @@ for a later retry. No plaintext sidecar is used.
 
 ## Offline integration probe
 
-No live bot or credentials were used. The temporary, uncommitted probe at
-`/tmp/tgprobe/probe.mts` exercised the actual adapter with a faux Durable
-Harness, persistent JSONL reopen, and a mocked global `fetch`:
+No live bot or credentials were used. The parent probe was copied to a private
+uncommitted variant that imports this checkout's source; the shared probe was not
+modified. It used a faux Durable Harness, persistent JSONL storage, and mocked
+`fetch`:
 
 ```sh
-timeout 60s node --max-old-space-size=512 --experimental-strip-types /tmp/tgprobe/probe.mts
+npm ci --prefix packages/pi-nanobot --ignore-scripts
+npm run typecheck --prefix packages/pi-nanobot
+npm run build --prefix packages/pi-nanobot
+timeout 60s node --max-old-space-size=512 --experimental-strip-types /tmp/tgprobe/pi-e078edd8-probe.mts
 ```
 
-Observed output:
+The unchanged parent probe cases passed: durable restart/requestId dedupe,
+allowlist and group rejection, reauthorization, Unicode splitting/final flush,
+and polling admission while eight deliveries are blocked. Every request asserts
+the fixed HTTPS origin and `redirect: "error"`.
 
-```text
-PASS revoked-draft-safe state + deny/group rejection + restart reuses one admitted user turn
-PASS recovered pending reply is reauthorized against current allowlist
-PASS Unicode split/explicit final flush (4095,1202 code units)
-PASS polling admits update 9 while eight outbound deliveries are blocked; cancellation reaps active work
-All offline Telegram integration probes passed.
-```
-
-The probe asserts all requests use the fixed HTTPS origin with `redirect: "error"`.
-Telegram API delivery remains at-least-once/unknown at the external send boundary.
-
-## Parent integration review — follow-ups still open
-
-The parent integrated `3da30092d` / `cf2ea8f33` as `f93d7c483` / `da2cd5398`.
-Package-wide typecheck/build pass, and the parent reran the offline probe above
-against source verified identical to the integrated module. No live bot was used.
-
-Additional review found remaining lifecycle/retry issues; do not treat this as a
-live-ready adapter:
-
-- Fatal polling/admission errors do not cancel the adapter's active waits or stop
-  their completion handlers from draining more pending deliveries. Exit needs a
-  local cancellation scope and complete child-work cleanup while preserving the
-  underlying durable submissions for restart.
-- An edit accepted remotely whose response is lost can be retried into Telegram's
-  `message is not modified` rejection and remain stuck. Deleted preview handling
-  also needs an explicit recovery outcome.
-- Capping `retry_after` at 30 seconds can retry earlier than Telegram permits.
-- The channel document currently never checkpoints its delta chain.
-
-A socket-native follow-up launch failed before creating a child because its
-wrapper could not find `herdr` (`spawn herdr ENOENT`). No CLI delegation fallback
-was used. These items remain tracked in the root TODO.
+An additional private fatal-poll probe confirmed the adapter rejects promptly
+and aborts an in-flight outbound wait. Its follow-on attempt to assert completed
+output after reopening timed out; model-completion recovery after a fatal exit is
+therefore not claimed by this check (the durable admission remains pending for
+recovery). Exact edit-not-modified/deleted-preview scenarios and cancellation of
+a long `retry_after` wait were not exercised end-to-end in the temporary probe.
+Typecheck/build passed; no live bot or paid model call was used. External sends
+remain at-least-once/unknown, never exactly-once.
