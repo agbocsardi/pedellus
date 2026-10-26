@@ -86,7 +86,9 @@ probes passed:
 - Cancellation while a partial preview HTTP request was blocked; run returned
   and no further adapter requests occurred.
 - `retry_after: 35` caused no second request during a 1.2-second observation;
-  cancellation returned promptly and no request occurred after return.
+  cancellation returned promptly and no request occurred after return. Eight
+  concurrently blocked sends receiving 429 together also retried only after the
+  shared bot-wide cooldown.
 - Slow streamed model + actual preview edits: both the short and detailed
   “message is not modified” descriptions after a simulated accepted/lost edit
   were treated as success; deleted-preview error sent a replacement and the
