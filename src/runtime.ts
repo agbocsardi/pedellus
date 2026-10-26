@@ -5,8 +5,8 @@ import type { Context } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { configure, createRegistry, defineDoc, Harness, type AgentChange, type Conversation, type ConversationId, type Cursor, type Harness as HarnessType, type Storage } from "@earendil-works/pi-durable";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { PortConfig } from "./config.js";
+import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import { createProviderModels } from "./providers.js";
 
 const SessionMap = defineDoc<{ sessions: Record<string, number> }>({
@@ -83,7 +83,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   let closed = false;
   try {
     const registry = createRegistry();
-    storage = await openNodeSqliteStorage(dbPath);
+    storage = await openFullSyncNodeSqliteStorage(dbPath, context);
     harness = await Harness.open(storage, { models, registry }, context);
     const agentPolicy: AgentChange = {
       model,
