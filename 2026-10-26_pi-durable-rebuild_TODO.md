@@ -206,6 +206,15 @@ verification. Native inspection confirmed working and no pending permissions;
 completion must arrive via `herdr_report`, not inferred from idle/state notices.
 Prior failed resource was left intact; no cleanup authorized.
 
+Native child reported candidate `30fdfc721` with local cancellation/checkpoint/edit
+handling changes and passing baseline probes. Not integrated yet. Parent review
+found the added fatal-recovery probe reused an already-resolved gate from an
+earlier scenario, so its timeout does not establish a runtime recovery failure.
+Returned through `herdr_send` for a fresh-gate pending-state check and missing
+end-to-end edit/deleted-preview/long429 cancellation probes. Also requested narrow
+support for Telegram's detailed not-modified message and preservation of server
+cooldown after the last allowed429 attempt. Await explicit revised completion.
+
 ### 2026-10-26 — assessment
 
 Project relocated to its own checkout `/home/gergo/projects/pi-nanobot`, cloned
