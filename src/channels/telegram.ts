@@ -1,6 +1,8 @@
 import { defineDoc, AssistantEntry } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
-import type { Gateway } from "../runtime.js";
+import { copyJson } from "@earendil-works/chord";
+import type { Conversation, SubmissionId } from "@earendil-works/pi-durable";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 
 const API = "https://api.telegram.org";
 const TELEGRAM_LIMIT = 4096;
@@ -31,6 +33,7 @@ type PendingReply = {
   updateId: number;
   chatId: number;
   sessionKey: string;
+  senderId: string;
   text: string;
   messageId?: number;
   lastText?: string;
@@ -48,8 +51,12 @@ const TelegramState = defineDoc<ChannelState>({
   initial: () => ({ offset: 0, pending: [] }),
 });
 
+export interface TelegramGateway {
+  conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
+}
+
 export async function runTelegram(
-  gateway: Pick<Gateway, "conversationFor">,
+  gateway: TelegramGateway,
   options: TelegramOptions,
   context: Context,
 ): Promise<void> {
@@ -60,97 +67,120 @@ export async function runTelegram(
   const me = await apiCall<{ id: number; username?: string }>(options.token, "getMe", {}, signal);
   const identity = String(me.id);
   const stateConversation = await gateway.conversationFor(`telegram:${identity}:channel-state`, context);
-  let state = (await stateConversation.commit((tx) => tx.doc(TelegramState, stateConversation.id), context));
+  let state = await stateConversation.commit(async (tx) =>
+    copyJson(await tx.doc(TelegramState, stateConversation.id)) as unknown as ChannelState,
+  context);
 
   const active = new Set<Promise<void>>();
   const delivering = new Set<number>();
-  let draining: Promise<void> | undefined;
+  const failedThisPoll = new Set<number>();
 
   const drain = () => {
-    if (draining !== undefined) return draining;
-    draining = (async () => {
-      for (const item of [...state.pending]) {
-        if (signal?.aborted) return;
-        if (delivering.has(item.updateId)) continue;
-        if (active.size >= 8) await Promise.race(active);
-        delivering.add(item.updateId);
-        const task = deliver(item).catch(() => undefined).finally(() => {
-          active.delete(task);
-          delivering.delete(item.updateId);
-        });
-        active.add(task);
-      }
-    })().finally(() => { draining = undefined; });
-    return draining;
+    if (signal?.aborted) return;
+    for (const item of state.pending) {
+      if (active.size >= 8) break;
+      if (delivering.has(item.updateId) || failedThisPoll.has(item.updateId)) continue;
+      delivering.add(item.updateId);
+      const task = Promise.resolve().then(() => deliver(item)).catch(() => {
+        // Keep durable state for the next polling cycle; no exception details or tight retry loop.
+        failedThisPoll.add(item.updateId);
+      }).finally(() => {
+        active.delete(task);
+        delivering.delete(item.updateId);
+        drain();
+      });
+      active.add(task);
+    }
   };
 
   const deliver = async (item: PendingReply) => {
+    if (!options.allowFrom.includes(item.senderId)) {
+      if (item.messageId !== undefined) {
+        await apiCall(options.token, "deleteMessage", { chat_id: item.chatId, message_id: item.messageId }, signal).catch(() => undefined);
+      }
+      await forget(item.updateId);
+      return;
+    }
     const conversation = await gateway.conversationFor(item.sessionKey, context);
     const requestId = requestIdFor(identity, item.updateId);
     const watch = await conversation.watch(context);
     let previewTimer: ReturnType<typeof setTimeout> | undefined;
     let previewWork = Promise.resolve();
+    let previewFailure: unknown;
     let latestPreview = "";
-    let submissionId: string | undefined;
+    let submissionId: SubmissionId | undefined;
     let watchStopped = false;
     const queuePreview = (text: string) => {
       latestPreview = text;
       if (previewTimer !== undefined) return;
       previewTimer = setTimeout(() => {
         previewTimer = undefined;
-        previewWork = previewWork.then(() => publishPreview(latestPreview));
+        previewWork = previewWork.then(() => publishPreview(latestPreview)).catch((error: unknown) => {
+          previewFailure = error;
+        });
       }, 700);
     };
-    watch.start((view) => {
-      const live = view.docs["pi.live"] as {
-        run?: { inputs?: string[] };
-        generation?: { message?: { content?: { type: string; text?: string }[] } };
-      } | undefined;
-      if (submissionId === undefined || !live?.run?.inputs?.includes(submissionId)) return;
-      const text = live.generation?.message?.content
-        ?.flatMap((part) => part.type === "text" && part.text ? [part.text] : []).join("");
-      if (text) queuePreview(text);
-    });
     try {
+      watch.start(async (view) => {
+        const live = view.docs["pi.live"] as {
+          run?: { inputs?: SubmissionId[] };
+          generation?: { message?: { content?: { type: string; text?: string }[] } };
+        } | undefined;
+        if (submissionId === undefined || !live?.run?.inputs?.includes(submissionId)) return;
+        const text = live.generation?.message?.content
+          ?.flatMap((part) => part.type === "text" && part.text ? [part.text] : []).join("");
+        if (text) queuePreview(text);
+      });
       const submission = await conversation.submit({ type: "input", content: item.text, requestId }, context);
       submissionId = submission.id;
       const settled = await submission.wait(context);
       if (settled.status !== "done" || settled.type !== "input") {
+        await stopPreviewWatch();
+        await flushFinal("Your request could not be completed. Please try again.");
         await forget(item.updateId);
         return;
       }
       const answer = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), context);
-      const text = answer?.model?.flatMap((part) => part.type === "text" ? [part.text] : []).join("").trim();
-      await watch.stop();
-      watchStopped = true;
+      const message = answer?.model?.[0] as AssistantMessage | undefined;
+      const text = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("").trim()
+        || "The assistant returned no text response.";
+      await stopPreviewWatch();
+      await flushFinal(text);
+      await forget(item.updateId);
+    } finally {
+      await stopPreviewWatch();
+    }
+
+    async function stopPreviewWatch() {
+      if (watchStopped) return;
       if (previewTimer !== undefined) {
         clearTimeout(previewTimer);
         previewTimer = undefined;
       }
+      await watch.stop();
+      watchStopped = true;
       await previewWork;
-      if (text) {
-        const chunks = splitTelegramText(text);
-        const current = state.pending.find((entry) => entry.updateId === item.updateId) ?? item;
-        if (current.messageId !== undefined) {
-          if (current.lastText !== chunks[0]) {
-            await apiCall(options.token, "editMessageText", {
-              chat_id: item.chatId, message_id: current.messageId, text: chunks[0],
-            }, signal);
-            await rememberText(item.updateId, chunks[0]!);
-          }
-          for (const chunk of chunks.slice(1)) {
-            await apiCall(options.token, "sendMessage", { chat_id: item.chatId, text: chunk }, signal);
-          }
-        } else {
-          for (const chunk of chunks) {
-            await apiCall(options.token, "sendMessage", { chat_id: item.chatId, text: chunk }, signal);
-          }
+      if (previewFailure !== undefined) throw previewFailure;
+    }
+
+    async function flushFinal(text: string) {
+      const chunks = splitTelegramText(text);
+      const current = state.pending.find((entry) => entry.updateId === item.updateId) ?? item;
+      if (current.messageId !== undefined) {
+        if (current.lastText !== chunks[0]) {
+          await apiCall(options.token, "editMessageText", {
+            chat_id: item.chatId, message_id: current.messageId, text: chunks[0],
+          }, signal);
+          await rememberText(item.updateId, chunks[0]!);
+        }
+        for (const chunk of chunks.slice(1)) {
+          await apiCall(options.token, "sendMessage", { chat_id: item.chatId, text: chunk }, signal);
+        }
+      } else {
+        for (const chunk of chunks) {
+          await apiCall(options.token, "sendMessage", { chat_id: item.chatId, text: chunk }, signal);
         }
       }
-      await forget(item.updateId);
-    } finally {
-      if (previewTimer !== undefined) clearTimeout(previewTimer);
-      if (!watchStopped) await watch.stop();
     }
 
     async function publishPreview(text: string) {
@@ -177,7 +207,7 @@ export async function runTelegram(
       const doc = await tx.doc(TelegramState, stateConversation.id);
       const item = doc.pending.find((entry) => entry.updateId === updateId);
       if (item) change(item);
-      return doc;
+      return copyJson(doc) as unknown as ChannelState;
     }, context);
   };
   const rememberMessage = (updateId: number, messageId: number, text: string) =>
@@ -188,22 +218,23 @@ export async function runTelegram(
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
       doc.pending = doc.pending.filter((entry) => entry.updateId !== updateId);
-      return doc;
+      return copyJson(doc) as unknown as ChannelState;
     }, context);
   };
 
   // Recover admitted work before polling. Each requestId safely reacquires its existing submission.
-  await drain();
+  drain();
 
   try {
     while (!signal?.aborted) {
-      void drain(); // retries durable outbound work after a prior bounded delivery failure
-      if (active.size >= 8) await Promise.race(active);
+      failedThisPoll.clear();
+      drain();
+      const pollSeconds = options.pollTimeoutSeconds ?? 30;
       const updates = await apiCall<Update[]>(options.token, "getUpdates", {
         offset: state.offset,
         timeout: Math.min(options.pollTimeoutSeconds ?? 30, POLL_TIMEOUT_MAX),
         allowed_updates: ["message"],
-      }, signal, (options.pollTimeoutSeconds ?? 30) + 10_000);
+      }, signal, (pollSeconds + 10) * 1000);
       for (const update of updates) {
         if (signal?.aborted) break;
         const message = update.message;
@@ -226,13 +257,19 @@ export async function runTelegram(
           const doc = await tx.doc(TelegramState, stateConversation.id);
           if (!doc.pending.some((entry) => entry.updateId === update.update_id)) {
             if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
-            doc.pending.push({ updateId: update.update_id, chatId: message!.chat.id, sessionKey, text: input });
+            doc.pending.push({
+              updateId: update.update_id,
+              chatId: message!.chat.id,
+              sessionKey,
+              senderId: String(message!.from!.id),
+              text: input,
+            });
           }
           doc.offset = Math.max(doc.offset, update.update_id + 1);
-          return doc;
+          return copyJson(doc) as unknown as ChannelState;
         }, context);
         // Admission and recovery metadata are committed before the next getUpdates acknowledges the offset.
-        void drain();
+        drain();
       }
     }
   } catch (error) {
@@ -245,7 +282,7 @@ export async function runTelegram(
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
       doc.offset = Math.max(doc.offset, offset);
-      return doc;
+      return copyJson(doc) as unknown as ChannelState;
     }, context);
   }
 }
@@ -304,6 +341,7 @@ async function apiCall<T = void>(
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
+        redirect: "error",
         signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
