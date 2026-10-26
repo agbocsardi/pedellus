@@ -31,7 +31,9 @@ root docs, integration and acceptance. No P1/P2 milestone is passed by launch.
 
 - [ ] B1 — bwrap/native ExecutionEnv confinement: `pi-ccd4ba61`, pane `w1X:p1`.
 - [ ] B2 — native Code Mode/tool-search lifecycle and offline nested replay:
-      `pi-9dd12539`, pane `w1Y:p1`.
+      `pi-9dd12539`, pane `w1Y:p1`. Candidate `eb900a862` explicitly completed;
+      parent candidate probes pass; independent review and direct dependency
+      declaration/integration pending.
 - [x] B3 — actual-connection SQLite WAL/FULL and fail-closed setup:
       `pi-72ce3be3`, pane `w1Z:p1`. Candidate `e8269c650` integrated as
       `2d5af1adf`; independent review and parent-checkout probes/build pass.
@@ -659,3 +661,44 @@ faults, close failure and physical-host-loss acceptance remain separate unfinish
 work; P1 as a whole stays unchecked. README now describes the active FULL policy.
 Execution/Code Mode workers remain outstanding; tools still disabled, no production
 change, push or cleanup.
+
+### 2026-10-26 — Code Mode candidate and independent parent probes
+
+B2 explicitly completed clean branch `pi-9dd12539` as `eb900a862`, owning only
+`src/extensions/codemode.ts` and CODEMODE.md. Opt-in native extension/tool-search
+bundle: fixed QuickJS heap, source-clamped journaled deadlines/output, shared
+worker reservations held until exit, combined caller/shutdown cancellation, and
+host close/drain. No gateway/config/execution changes or tool activation.
+
+Reassigned completed read-only reviewer `pi-7e58645f`/`w1P:p5` via herdr_send to
+this candidate/native lifecycle/source/context boundary, with report target
+`/tmp/pi-codemode-bundle-review.md`. Await explicit report, not idle notice.
+Asked sole manifest owner B1 for a separate direct pi-codemode1.4.0 declaration
+commit when practical; parent has not edited its manifest ownership or integrated
+an undeclared direct import. Candidate compilation/probes currently use the exact
+transitive installation.
+
+Parent inspected native source parsing, worker reservation/exit, native durable
+run/journal and combined Chord cancellation. Ran candidate local Harness/QuickJS
+probe with expected boundary/capacity results. Parent independently wrote and ran
+`/tmp/pi-nanobot-parent-codemode-edges.mjs` (65s/512 MB): no host globals/recursion,
+CRLF and oversized budgets persisted clamped, malformed options never execute,
+missing required nested argument denied before execute, real QuickJS OOM and CPU
+loop timeout, caller abort without host shutdown, shutdown abort without caller
+abort, worker close drain/idempotence and admission rejection on a fresh Harness
+after close all pass. Corrected initial probe assumptions: native task docs retire
+on completion (inspect live run), and native validation intentionally coerces
+scalar values (use a genuinely missing field to verify rejection). No product
+change was needed for these probe fixes.
+
+Parent also wrote `/tmp/pi-nanobot-parent-codemode-replay.mjs` and companion
+`...-replay-child.mjs` (110s controller/256-MB heap; children 512 MB). Actual
+subprocess SIGKILL/SQLite reopen for both unsafe and safe interrupted synthetic
+calls passes: completed effect executes once; unsafe interruption surfaces native
+unknown/partial-run error without rerun; explicitly replay-safe call runs again
+and completes using the fixture's genuine fixed-key idempotency. RequestId remains
+stable. The fixture, not Durable, supplies effect idempotency; no exactly-once
+external-effect claim. These runs import candidate built artifacts; repeat on
+parent after reviewed integration. No live/paid calls, production changes or
+committed tests. Caught/discarded failures and structured nonzero-success policy
+still need later product hooks; B2/P2 and P1 are not globally accepted.
