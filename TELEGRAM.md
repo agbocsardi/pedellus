@@ -102,11 +102,17 @@ conversation (`telegram:<bot-id>:channel-state`) with the Durable SDK and the
 exported `TelegramState` document token. Each pending item retains input, target,
 `nextChunkIndex`, `deliveryStatus`, `sendIntent` (exact intended text/stage/chunk),
 `unknownStage`, `unknownChunkIndex` (for final output), and timestamp. Stop the adapter before reconciliation. After checking
-Telegram independently, an operator can use a Durable transaction to record an
-accepted chunk's progress/message ID and clear the unknown fields, or remove an
-already-complete pending record; if confirmed unsent, clear only the unknown
-fields to permit recovery from the existing cursor. Never clear an unknown marker
-without resolving the external outcome. A retry command/UI is outside this batch.
+Telegram independently, reconcile in one Durable transaction:
+
+- If accepted, record the returned message ID / accepted final-chunk progress,
+  then clear `sendIntent`, `deliveryStatus`, `unknownStage`, `unknownChunkIndex`,
+  and `unknownSince` atomically. Removing an already-complete record is also valid.
+- If confirmed unsent, preserve `nextChunkIndex` and known message metadata, and
+  clear those same five fields atomically to permit recovery from the cursor.
+
+Leaving `sendIntent` behind will quarantine the record again on reopen. Never
+clear these fields without resolving the external outcome. A retry command/UI is
+outside this batch.
 
 ## Offline integration probe
 
@@ -142,7 +148,11 @@ full storage reopen. A seeded unresolved persisted intent reopened as unknown,
 retained its exact intended text, and made no outbound request. All mocked
 requests assert the fixed HTTPS origin and `redirect: "error"`.
 
-A fresh subprocess SIGKILL-after-acceptance probe was not run; crash recovery
-was checked by seeding an unresolved persisted intent and fully reopening storage.
+Parent integration independently passed the full probe against the integration
+checkout and also ran an actual subprocess SIGKILL-after-mocked-acceptance check
+using the SQLite gateway. The mock inspected committed exact-text intent before
+recording remote acceptance; after SIGKILL and full reopen, state was unknown,
+the intended text remained available, and no retransmission occurred. This checks
+our local crash boundary with mocked Telegram, not delivery over Telegram's network.
 No live bot or paid model call was used. External sends remain unknown at an
 ambiguous boundary and require reconciliation, never an exactly-once claim.

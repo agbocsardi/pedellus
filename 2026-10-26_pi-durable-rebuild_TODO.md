@@ -81,12 +81,13 @@ wiring replace them.
   - [ ] Close execution TOCTOU/hardlink blockers before enabling coding tools.
   - [x] Implement and integrate allowlisted, text-only Telegram adapter.
   - [x] Parent initial integration and bounded offline validation.
-  - [ ] Migrate Telegram transport to grammY with selective attributed OpenClaw ports.
+  - [x] Migrate Telegram transport to grammY with selective attributed OpenClaw ports.
   - [x] Integrate raw-transport Telegram fatal-exit cleanup, edit recovery,
         retry_after handling, bounded checkpoints, and independent offline probes.
-  - [ ] During grammY migration, retain unknown send outcomes and known chunk
+  - [x] Retain write-ahead send intents, unknown outcomes, and accepted chunk
         progress durably without blind automatic retransmission.
-  - [ ] Recheck integrated behavior after remaining reliability fixes.
+  - [x] Recheck integrated behavior and actual process-crash send boundary offline.
+  - [ ] Live Telegram smoke check with scripted model (await owner setup).
   - [ ] bwrap-confined `ExecutionEnv` running `read`/`write`/`edit`/`bash`;
         prove workspace escape attempts fail.
   - [ ] Telegram-in → `submit()` → streaming edits from `watch()` → out.
@@ -303,6 +304,31 @@ algorithm via native send, plus intent-observation, ambiguous AbortError, and
 crash/reopen validation requirements. Original request and exact intended output
 must survive for reconciliation. Await final boundary fix, not another catch-only
 unknown marker. No deployment or live requests.
+
+### 2026-10-26 — integrated grammY and verified write-ahead boundary
+
+Integrated `ba52081d4` / `491d4b77a` / `6b745f46d` / `0c20d0fba` as
+`36479934e` / `34f9df76d` / `5f2a470dd` / `6fa14337f`. Exact grammy1.46.0;
+clean npm ci audited101 packages with zero reported vulnerabilities. Full package
+typecheck/build/diff-check passed. Parent independently ran updated full temporary
+`/tmp/tgprobe/parent-grammy-probe.mts` (220s timeout,512MB Node heap): all baseline,
+recovery/edit/flood/abort/migration/unknown/progress/intent checks passed.
+
+Parent also independently used an actual subprocess and SQLite gateway: mock
+Telegram inspected committed exact-text send intent, recorded remote acceptance,
+then parent killed the subprocess with SIGKILL before response/outcome commit.
+Reopening retained unknown intent and made zero retransmissions. This is offline
+external-send evidence, not proof of tool replay or real Telegram delivery.
+
+Final read-only audit `/tmp/pi-telegram-intent-final-review.md` passes code paths;
+its reconciliation-doc blocker is corrected: clear sendIntent, deliveryStatus,
+unknownStage, unknownChunkIndex, unknownSince atomically with resolved progress.
+No tool enabling or deployment. Live Telegram check is newly offered by owner;
+use a scripted injected model first, no paid/model credentials needed. Environment
+exports in another shell were not visible to this Pi process. Created private
+owner-editable template `/home/gergo/.config/pi-nanobot/test.env` (0600, parent
+0700), outside checkout; awaiting replacement token, numeric sender ID, and sole
+poller confirmation. Token values must not enter repository files or tool output.
 
 ### 2026-10-26 — assessment
 

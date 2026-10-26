@@ -10,8 +10,9 @@ No OpenClaw implementation has been copied into this package.
 Reuse selectively, not the entire channel plugin. Prefer grammY for Telegram's
 client/types, adapt useful OpenClaw transport policies, and retain a small
 Pi Durable admission/watch/delivery adapter. This would replace some hand-written
-HTTP plumbing, not our durable state or exactly-once admission boundary. Changing
-the dependency/transport architecture is a recommendation, not implemented yet.
+HTTP plumbing, not our durable state or exactly-once admission boundary. The owner approved this direction and it is now implemented with exact-pinned
+grammY1.46.0, manual typed API polling, and Durable-owned delivery state. The
+package-local `THIRD_PARTY_NOTICES.md` records the policy provenance and MIT notices.
 
 ## License
 
@@ -59,7 +60,9 @@ second framework around Durable rather than simplify nanobot.
 
 ## Current work
 
-The socket-native Telegram worker was given these paths as read-only references
-for its existing bounded fixes. No instruction to expand the feature surface,
-replace Durable, enable tools, import the plugin, or add dependencies was given.
-No upstream dependency install, application execution, or live bot call was run.
+The socket-native worker implemented the approved narrow grammY migration and
+selective policy adaptation; parent integration and offline validation passed.
+Durable was not replaced, tools remain disabled, and no OpenClaw plugin/runtime
+was imported. No upstream dependency install/application execution or live bot
+call was run during this assessment. See TELEGRAM.md for delivery boundaries and
+current verification.
