@@ -188,6 +188,15 @@ socket registry; user requires native tools only from here. No CLI launch/messag
 fallback used. Fix the wrapper executable lookup (e.g. honor HERDR_BIN_PATH) or
 Pi's inherited PATH before delegating the remaining fixes.
 
+After the owner reported the wrapper fixed, socket-native `herdr_spawn` from
+`46d5c16da` created retained child `pi-8d9f1378`, pane `w1V:p1`, workspace
+`w1V`, branch `pi-8d9f1378`, checkout
+`/home/gergo/.herdr/worktrees/pi-nanobot/pi-8d9f1378` (Codex gpt-6-luna high;
+Telegram reliability task above). Startup then failed with `Child ready handshake
+timed out`. One recovery inspection returned `agent_not_found` for `w1V:p1`.
+No duplicate launch, terminal fallback, or cleanup was attempted. This resource
+must be recovered/inspected before retrying; no implementation completion claimed.
+
 ### 2026-10-26 — assessment
 
 Project relocated to its own checkout `/home/gergo/projects/pi-nanobot`, cloned
