@@ -1,23 +1,90 @@
-# Execution environment spike
+# Execution environment spike — still blocked
 
-`src/execution/index.ts` exports `createExecutionEnv(options): Promise<ExecutionEnv>`. Setup is Linux-only, validates an absolute Bubblewrap executable (default `/usr/bin/bwrap`, version >= 0.9.0), canonicalizes workspace/extra roots, rejects nested roots, validates cwd, and runs a real sandbox probe before returning. There is no native-shell fallback.
+`src/execution/index.ts` exports `createExecutionEnv(options, context?)`. It is a
+standalone experiment; `runtime.ts` does not import it, the gateway remains
+tool-less, and this is **not** approval to register coding tools.
 
-Filesystem methods in the `NodeExecutionEnv` subclass check each public path before delegating: file reads/readers, writes/appends/truncate/flush, both rename operands, metadata/listing, watches, cwd/absolute/join paths, and missing write leaves. Existing symlink targets are resolved; missing leaves are resolved through the nearest existing ancestor; dangling symlinks are denied. Host temp/spill files are instead created in an environment-unique private `.pi-execution-tmp-*` below the workspace and removed by cleanup. The implementation extends upstream `NodeExecutionEnv` and overrides path-sensitive operations rather than wrapping an instance. Upstream result/error and abort handling is retained.
+## Current boundary
 
-Shell runs are wrapped in `/usr/bin/bwrap`-style Bubblewrap with fresh user, PID, and network namespaces, `--die-with-parent`, new session, all capabilities dropped, cleared environment, read-only `/usr` runtime, tmpfs `/tmp`, and only configured roots writable. Extra caller env is ignored. The host-side shell is only a trusted launcher; the supplied command runs inside Bubblewrap. Cleanup delegates process termination to `NodeExecutionEnv` and removes tracked temp paths.
+- Exact dependency: `@earendil-works/pi-env@1.4.0` (MIT, from Pi v1.4.0). Its
+  native daemon/protocol supplies Durable `RemoteExecutionEnv` filesystem and
+  shell semantics; no custom FS RPC implementation was added.
+- The daemon and a pinned copy of the validated bwrap executable are started
+  inside an outer bwrap user/PID/network namespace. Only configured roots are
+  writable bind mounts. `/usr` is read-only; host `/etc`, home, dataDir, auth
+  sockets, and network are not mounted/granted. Environment is cleared and set
+  to a small fixed `PATH`, `HOME` (workspace), `TMPDIR`, and `LANG`; caller `env`
+  and `inheritEnv` are ignored.
+- Each shell command runs in another bwrap PID namespace with the configured
+  roots mounted explicitly, capabilities dropped, and a PID-1 command. This
+  makes timeout/abort tear down ordinary and `setsid`-detached descendants.
+  There is no unsandboxed fallback. Setup probes a real command and rejects
+  nonzero exits. `createExecutionEnv` also accepts a Chord `Context` for bounded,
+  cancellable setup; cleanup closes the daemon, waits for the bwrap host PID to
+  exit, then removes its private launcher/binary directory.
+- Every filesystem syscall (including both rename operands, missing destinations,
+  readers, list/listFiles, watches, cwd lookup, temp files, and daemon spill
+  files) is performed by pi-env inside bwrap. The host `realpath` is used only
+  to canonicalize configured root directories; after sandbox start their device
+  and inode are checked against the mounted roots. The adapter retains an
+  in-sandbox path policy check as defense in depth. A stable environment id,
+  `nanobot:bwrap:local`, lets Durable coordinate same-path writes across local
+  environment instances. `/tmp` is private to the sandbox; it is not a host
+  `/tmp` bind. For a workspace below host `/tmp`, mount the workspace before
+  creating private `/tmp` ancestors so the source path is not hidden.
+- Workspace and extra-root writes retain direct, immediate host visibility.
+  Roots under protected system locations, roots overlapping the host home, `/`,
+  and nested roots are rejected. The factory has no `dataDir` input; the runtime
+  must continue to reject a Durable dataDir inside a mounted writable root.
 
-## Checks run
+## Security gate: hard-link identity remains exposed
 
-- `npm ci --prefix packages/pi-nanobot --ignore-scripts`
+bwrap confines path traversal and symlink resolution to its mount namespace,
+but a writable bind mount is still the same host filesystem and inode. A
+preexisting hard link in a writable root can therefore name a file also
+reachable outside it. The bounded synthetic probe created
+`outside/sentinel.txt`, hard-linked it into the workspace *before setup*, then
+wrote through that workspace alias; the outside sentinel changed to
+`HARDLINK_ALIAS_PROOF`. This is a reproduced security failure, not a theoretical
+caveat. Path checks, pi-env, nested PID namespaces, Durable replay policy, and
+submit/requestId deduplication do not solve it.
+
+No isolated-copy/publication behavior or blanket rejection of writable roots has
+been chosen. Keep tools disabled until the parent approves a reviewed policy
+that breaks external inode identity (and defines workspace/extra-root publication
+and conflict semantics), or an equivalent OS boundary. This spike also does not
+apply CPU, memory, or process-count limits; bwrap namespaces alone are not resource
+quotas. In particular, do not claim this adapter is production-safe from
+compilation or the passing symlink probes.
+
+## Bounded evidence
+
+- `npm install --prefix packages/pi-nanobot --save-exact
+  @earendil-works/pi-env@1.4.0 --ignore-scripts`
 - `npm run typecheck --prefix packages/pi-nanobot`
 - `npm run build --prefix packages/pi-nanobot`
-- Bounded inline Node probes (using `node --input-type=module` against `packages/pi-nanobot/dist/execution/index.js`): workspace write succeeded; `../secret` read was denied; bwrap command saw no supplied `OPENAI_API_KEY` and could not see the host secret; ordinary argv command succeeded. `/proc/self/status` reported `CapEff: 0000000000000000`, and `/root` was absent. Missing-leaf writes succeeded while symlink escapes and both unsafe rename operands were denied; spill/temp creation succeeded.
-- Follow-up used a fake executable whose script is `if [ "$1" = "--version" ]; then echo 'bubblewrap 0.9.0'; exit 0; fi; exit 17`; `createExecutionEnv({ workspace, bwrapPath: fake })` rejected with `Bubblewrap execution probe failed: exit code 17`. `createExecutionEnv({ workspace, cwd: file })` and the same call with a nonexistent cwd both rejected.
-- `absolutePath('.', withAbortSignal(abortController.signal, BACKGROUND_CONTEXT))` returned `FileError("aborted")`. `exec(['sh','-c','sleep 20 & wait'], { timeout: 0.2 }, BACKGROUND_CONTEXT)` returned timeout; running it with an aborted `withAbortSignal(...)` context returned aborted. Both settled under 5 seconds, exercising process-group cleanup.
-- Commands: `npm run typecheck --prefix packages/pi-nanobot` and `npm run build --prefix packages/pi-nanobot`.
+- Synthetic-only probe:
+  `timeout --signal=TERM --kill-after=5s 90s node --max-old-space-size=256
+  --max-semi-space-size=32 /tmp/pi-nanobot-p1-probe.mjs`
+  (the probe is outside the repository; no test scaffolding was committed).
+- Observed: native FS round trips, readers, directory and recursive listing,
+  watches, temp/spill paths, absent-destination rename, and both out-of-root
+  rename operands; explicit extra root remained writable. Ordinary and racing
+  symlink cases could not read or alter the synthetic outside sentinel. The host
+  sentinel, synthetic auth socket, and synthetic dataDir were unavailable to
+  shell; synthetic host-loopback TCP was unreachable; `/usr` was read-only and
+  rejected as an extra root. A detached `setsid` child left no marker after
+  abort, timeout, or explicit cleanup. A fake bwrap whose nested execution
+  exited 17 failed setup; aborting a deliberately delayed setup returned after
+  teardown. Nonexistent cwd was rejected.
+- One probe iteration exposed that an inner bwrap must bind the configured roots
+  itself before changing cwd; it was fixed and rerun. Creating `/tmp` before
+  binding a workspace below `/tmp` masked the source path; ordering was fixed and
+  rerun. The hard-link probe is the remaining failed invariant and blocks the
+  gate.
 
-## Security gate still blocked
-
-This is a best-effort path-check wrapper, **not a race-resistant filesystem capability**. Path checks and subsequent Node filesystem calls are separate operations, so concurrent symlink replacement can redirect reads/writes. A hard link inside a writable root can name an inode also reachable outside it; Bubblewrap bind mounts preserve hard links, so shell writes can also affect that external inode. Realpath checks do not solve either issue. The shell namespace probe proves the configured bwrap invocation works, not that arbitrary workspace contents are race/hardlink safe.
-
-Therefore do not expose filesystem or shell tools to untrusted/model-controlled calls as production-safe yet. Keep unsafe coding tools unregistered/disabled until the filesystem boundary is enforced by an OS primitive (e.g. an `openat2`/dirfd-based helper for all path operations plus a hard-link policy, or an isolated copy-on-write workspace that breaks external inode identity), or otherwise provide a reviewed equivalent. Parent integration must also reject `dataDir` inside workspace/extra roots; this factory has no `dataDir` option and cannot enforce that policy itself. This is an experimental integration slice, not a passed security gate.
+These checks use only temporary synthetic files, a synthetic Unix socket, and a
+loopback listener; no credentials, live bot, external provider, or host package
+changes were used. The probe's hard-link write is intentionally confined to that
+temporary directory, which is removed at exit. `npm ci --prefix packages/pi-nanobot
+--ignore-scripts` also completed successfully.
