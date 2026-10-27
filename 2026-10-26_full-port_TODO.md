@@ -8,6 +8,13 @@ continues to constrain the currently integrated tool-less slice.
 
 ## Milestone checklist
 
+> **Sequencing superseded 2026-10-27** by
+> [`2026-10-27_port-plan_TODO.md`](2026-10-27_port-plan_TODO.md). The list below
+> records what v1 planned and what has been completed; it is no longer the work
+> order. This file remains authoritative for evidence, completed slices, owner
+> decisions, the parity map and the reuse policy. Do not start a new batch from
+> this checklist without checking the v2 plan first.
+
 - [x] P0 — establish baseline, owner decisions, initial parity/reuse map.
 - [ ] P1 — prove execution, network, approval, and storage trust boundaries.
 - [ ] P2 — integrate native Pi tools, QuickJS Code Mode, tool discovery, and MCP.
