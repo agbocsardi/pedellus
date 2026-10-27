@@ -927,3 +927,20 @@ dedupe and unchanged tools:[] all pass. Exactly one mocked request, no live/paid
 call. Probes currently select candidate built artifacts; rerun against parent
 build after reviewed integration. Real-provider acceptance and full P8 parity
 remain open. C2/C3 continue independently; sandbox work remains untouched.
+
+### 2026-10-27 — usage candidate scope correction requested
+
+C3 explicitly completed `40d6688fc` on clean `pi-a34c1f70`, owning only new
+src/usage/index.ts and USAGE.md. Candidate reads native UsageDoc without creating
+it, detaches/freezes snapshots, projects model/tool/cost deltas without counting
+nested spend twice, and leaves request counts/unknowns explicit. No archive writer,
+cursor persistence, runtime integration or reset; broad P4 remains open.
+
+Parent reviewed the module, private fixture and pinned native usage accumulator.
+Found a cursor provenance blocker: numeric conversation IDs are storage-local,
+so another store's same-ID cursor could subtract unrelated totals. Returned a
+bounded follow-up through herdr_send: explicit stable host-owned source namespace,
+validated in current/serialized/expected cursor scope; no inferred ephemeral IDs,
+DB-path exposure, new state store or runtime/config changes. Require cross-store
+same-ID rejection and same-source reopen/JSON roundtrip evidence. Await explicit
+revised completion before independent acceptance/integration.
