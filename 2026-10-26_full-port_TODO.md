@@ -34,8 +34,11 @@ policy, environment and replay gates pass.
 - [x] `pi-6d106995`, `w2D:p3` / `w2D`: read-only native tool integration and
       security gate plan at `/tmp/pi-tool-core-plan.md`; identifies quotas,
       approvals, workspace ownership and replay gates before production tools.
-- [ ] `pi-b021e7c6`, `w2K:p1` / `w2K`: synthetic actual-Harness native
-      Code Mode/tool conversation and isolation tests; no gateway activation.
+- [x] `pi-b021e7c6`, `w2K:p1` / `w2K`: merged `30be34bc7` actual-Harness
+      synthetic Code Mode → nested tool → answer test with default-deny and
+      conversation isolation; parent corrected test timeout and ran combined
+      suite (22 checks). No gateway activation; permanent interrupted-replay
+      coverage remains open.
 - [ ] Review the existing Discord/memory/automation candidates when revisiting
       them; preserve their branches and do not imply they are integrated.
 

@@ -32,7 +32,7 @@ const within = (promise, ms = 20_000) => new Promise((resolve, reject) => {
   promise.then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); });
 });
 
-test('native Code Mode conversation requires exact host grant and is isolated per conversation', async () => {
+test('native Code Mode conversation requires exact host grant and is isolated per conversation', { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'nanobot-codemode-conversation-'));
   const integration = createCodeModeIntegration();
   let executions = 0;
@@ -135,4 +135,4 @@ test('native Code Mode conversation requires exact host grant and is isolated pe
     await integration.close();
     await rm(directory, { recursive: true, force: true });
   }
-}, { timeout: 30_000 });
+});
