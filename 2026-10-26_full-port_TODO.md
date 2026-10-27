@@ -48,8 +48,11 @@ tabs without force; the branches were retained.
       EOF/order/flood and migration history-eligibility/provenance/safety checks
       whose worker probes were inline or not retained. CLI readline's 32k limit is
       post-buffering, not a hard ingress-memory limit. Keep P3/P8 unchecked.
-- [ ] Decide which Python behavioral tests to port into permanent TypeScript parity
-      checks; no Python suite was adopted wholesale and no new tests were committed.
+- [ ] Port selected Python behavioral scenarios into permanent TypeScript parity
+      checks, prioritizing migration integrity, CLI lifecycle and model recovery.
+      Owner approved behavior-focused coverage; test Nanobot-owned contracts and
+      integration boundaries, not Pi Durable internals or a mechanical suite port.
+      No permanent TypeScript parity tests have yet been added.
 
 | Child / branch | Pane / workspace | Worktree | Exclusive ownership |
 |---|---|---|---|
