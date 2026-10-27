@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   ARCHIVAL_PREPARATION_FORMAT,
+  ARCHIVAL_PREPARATION_LIMITS,
   ARCHIVAL_PREPARATION_VERSION,
   ArchivalPreparationBoundsError,
   ArchivalPreparationInputError,
@@ -208,7 +209,11 @@ test("marks mixed, tool-use, media, unknown-block, and extra-block content parti
     }),
     JSON.stringify({
       role: "assistant",
-      content: [{ type: "text", text: "prefix" }, { type: "tool_use", id: "t1", name: "lookup", input: { q: "secret" } }],
+      content: [
+        { type: "text", text: "prefix" },
+        { type: "tool_use", id: "t1", name: "lookup", input: { q: "secret" } },
+        { type: "tool_result", content: [{ type: "text", text: "nested-hidden" }] },
+      ],
       timestamp: "2026-07-19T12:02:00+00:00",
       _entry_id: "m3",
     }),
@@ -238,6 +243,12 @@ test("marks mixed, tool-use, media, unknown-block, and extra-block content parti
       timestamp: "2026-07-19T12:06:00+00:00",
       _entry_id: "m7",
     }),
+    JSON.stringify({
+      role: "user",
+      content: [{ type: "mystery_text", text: "unknown but textual" }],
+      timestamp: "2026-07-19T12:07:00+00:00",
+      _entry_id: "m8",
+    }),
     "",
   ].join("\n");
   const result = prepareArchivalImport({
@@ -246,16 +257,19 @@ test("marks mixed, tool-use, media, unknown-block, and extra-block content parti
   });
   const messages = result.records.filter((record) => record.category === "session-message");
   assert.deepEqual(messages.map((record) => record.searchStatus), [
-    "partial", "partial", "partial", "partial", "partial", "complete", "partial",
+    "partial", "partial", "partial", "partial", "partial", "complete", "partial", "partial",
   ]);
   assert.deepEqual(messages[0].search.map((unit) => unit.text), ["visible"]);
   assert.deepEqual(messages[1].search, []);
   assert.deepEqual(messages[2].search.map((unit) => unit.text), ["prefix"]);
+  assert.doesNotMatch(messages[2].search.map((unit) => unit.text).join("\n"), /nested-hidden/);
+  assert.match(Buffer.from(messages[2].rawLineBase64, "base64").toString("utf8"), /nested-hidden/);
   assert.deepEqual(messages[3].search.map((unit) => unit.text), ["typed"]);
   assert.deepEqual(messages[4].search, []);
   assert.equal(messages[5].search[0].text, "plain");
   assert.equal(messages[5].search[0].name, "alice");
   assert.deepEqual(messages[6].search.map((unit) => unit.text), ["media text"]);
+  assert.deepEqual(messages[7].search.map((unit) => unit.text), ["unknown but textual"]);
   assert.match(Buffer.from(messages[0].rawLineBase64, "base64").toString("utf8"), /base64-image/);
   assert.match(Buffer.from(messages[1].rawLineBase64, "base64").toString("utf8"), /secret/);
 });
@@ -594,4 +608,163 @@ test("rejects unsafe format labels instead of echoing them", () => {
       ArchivalPreparationInputError,
     );
   }
+});
+
+test("uses intrinsic typed-array bytes and rejects shared or resizable snapshots", () => {
+  class SpoofedBytes extends Uint8Array {
+    get byteLength() {
+      return 4;
+    }
+    get byteOffset() {
+      return 0;
+    }
+  }
+  const actual = new SpoofedBytes(64);
+  actual.fill(0x61);
+  const actualBytes = Buffer.from(actual.buffer, 0, 64);
+  const source = {
+    sourceId: "spoofed",
+    format: "session-jsonl",
+    provenance: "synthetic-fixture",
+    sha256: sha256(actualBytes),
+    bytes: actual,
+  };
+  assert.throws(
+    () => prepareArchivalImport({ storeNamespace: "synthetic-store", sources: [source] },
+      { limits: { maxSourceBytes: 4 } }),
+    ArchivalPreparationBoundsError,
+  );
+  const result = prepareArchivalImport({ storeNamespace: "synthetic-store", sources: [source] });
+  assert.equal(result.sources[0].byteLength, 64);
+  assert.equal(result.bounds.inputBytes, 64);
+  assert.equal(result.records.length, 1);
+  assert.equal(Buffer.from(result.records[0].rawLineBase64, "base64").length, 64);
+  assert.equal(result.records[0].lineSha256, sha256(actualBytes));
+
+  const sharedBytes = new Uint8Array(new SharedArrayBuffer(8));
+  assert.throws(
+    () => prepareArchivalImport({
+      storeNamespace: "synthetic-store",
+      sources: [{
+        sourceId: "shared",
+        format: "session-jsonl",
+        provenance: "synthetic-fixture",
+        sha256: sha256(Buffer.from(sharedBytes)),
+        bytes: sharedBytes,
+      }],
+    }),
+    /SharedArrayBuffer/,
+  );
+
+  const resizableBytes = new Uint8Array(new ArrayBuffer(8, { maxByteLength: 16 }));
+  assert.throws(
+    () => prepareArchivalImport({
+      storeNamespace: "synthetic-store",
+      sources: [{
+        sourceId: "resizable",
+        format: "session-jsonl",
+        provenance: "synthetic-fixture",
+        sha256: sha256(Buffer.from(resizableBytes)),
+        bytes: resizableBytes,
+      }],
+    }),
+    /resizable ArrayBuffer/,
+  );
+});
+
+test("rejects inconsistent proxy source arrays", () => {
+  const target = [
+    snapshot("a", "session-jsonl", `${sessionHeaderLine("a")}\n${JSON.stringify({ role: "user", content: "a" })}\n`),
+    snapshot("b", "session-jsonl", `${sessionHeaderLine("b")}\n${JSON.stringify({ role: "user", content: "b" })}\n`),
+  ];
+  let lengthReads = 0;
+  const lyingLength = new Proxy(target, {
+    get(value, property, receiver) {
+      if (property === "length") {
+        lengthReads += 1;
+        return lengthReads === 1 ? 1 : 1_000;
+      }
+      return Reflect.get(value, property, receiver);
+    },
+  });
+  assert.throws(
+    () => prepareArchivalImport(
+      { storeNamespace: "synthetic-store", sources: lyingLength },
+      { limits: { maxSources: 1 } },
+    ),
+    /inconsistent/,
+  );
+  const overBound = new Proxy(target, {
+    get(value, property, receiver) {
+      if (property === "length") return 1_000;
+      return Reflect.get(value, property, receiver);
+    },
+  });
+  assert.throws(
+    () => prepareArchivalImport({ storeNamespace: "synthetic-store", sources: overBound },
+      { limits: { maxSources: 1 } }),
+    ArchivalPreparationBoundsError,
+  );
+});
+
+test("rejects unknown/cyclic limit objects and never freezes caller limits", () => {
+  const source = snapshot("clean", "session-jsonl", `${sessionHeaderLine("clean")}\n`);
+  const cyclic = { maxRecords: 1 };
+  cyclic.self = cyclic;
+  assert.throws(
+    () => prepareArchivalImport({ storeNamespace: "synthetic-store", sources: [source] }, { limits: cyclic }),
+    ArchivalPreparationInputError,
+  );
+  const limits = { maxRecords: 5 };
+  const result = prepareArchivalImport({ storeNamespace: "synthetic-store", sources: [source] }, { limits });
+  assert.equal(Object.isFrozen(limits), false);
+  assert.equal(Object.hasOwn(result.bounds.limits, "self"), false);
+  assert.deepEqual(
+    Object.keys(result.bounds.limits).sort(),
+    Object.keys(ARCHIVAL_PREPARATION_LIMITS).sort(),
+  );
+});
+
+test("rejects empty source requests", () => {
+  assert.throws(
+    () => prepareArchivalImport({ storeNamespace: "synthetic-store", sources: [] }),
+    /at least one source/,
+  );
+});
+
+test("reports empty content and empty message lists as none", () => {
+  const session = [
+    sessionHeaderLine("empty"),
+    JSON.stringify({ role: "user", content: [] }),
+    JSON.stringify({ role: "user", content: "" }),
+    JSON.stringify({ role: "user", content: [{ type: "text", text: "" }] }),
+    "",
+  ].join("\n");
+  const history = [
+    JSON.stringify({ timestamp: "2026-07-19T12:00", session_key: sessionKey, cursor: 1, messages: [] }),
+    JSON.stringify({
+      timestamp: "2026-07-19T12:01",
+      session_key: sessionKey,
+      cursor: 2,
+      messages: [{ role: "user", content: [] }],
+    }),
+    JSON.stringify({ timestamp: "2026-07-19T12:02", session_key: sessionKey, cursor: 3, content: "" }),
+    "",
+  ].join("\n");
+  const result = prepareArchivalImport({
+    storeNamespace: "synthetic-store",
+    sources: [
+      snapshot("session-empty", "session-jsonl", session),
+      snapshot("history-empty", "history-jsonl", history),
+    ],
+  });
+
+  const messages = result.records.filter((record) => record.category === "session-message");
+  assert.deepEqual(messages.map((record) => record.searchStatus), ["none", "none", "none"]);
+  assert.deepEqual(messages.map((record) => record.search.length), [0, 0, 0]);
+  const entries = result.records.filter((record) => record.category === "history-entry");
+  assert.deepEqual(entries.map((record) => record.searchStatus), ["none", "none", "none"]);
+  assert.deepEqual(entries.map((record) => record.search.length), [0, 0, 0]);
+  assert.equal(result.diagnostics.some((diagnostic) => diagnostic.code === "history-message-text-not-indexed"), false);
+  assert.equal(result.complete, true);
 });

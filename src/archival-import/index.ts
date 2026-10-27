@@ -243,6 +243,7 @@ const SUPPORTED_FORMATS = new Set(["session-jsonl", "history-jsonl", "session-ar
 const SAFE_LABEL = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const KNOWN_ROLES = new Set(["user", "assistant", "tool", "system"]);
+const KNOWN_TEXT_BLOCK_TYPES = new Set(["text", "input_text", "output_text"]);
 const INDEXED_SESSION_MESSAGE_FIELDS = new Set(["role", "content", "timestamp", "_entry_id", "name"]);
 const INDEXED_HISTORY_MESSAGE_FIELDS = new Set(["role", "content", "timestamp", "name", "_entry_id"]);
 const INDEXED_HISTORY_TOP_FIELDS = new Set(["timestamp", "session_key", "content", "summary", "messages", "cursor"]);
@@ -300,13 +301,115 @@ function sha256(bytes: Uint8Array | string): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function normalizedLimits(input: Partial<ArchivalPreparationLimits> | undefined): ArchivalPreparationLimits {
-  const result = { ...ARCHIVAL_PREPARATION_LIMITS, ...(input ?? {}) };
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype) as object;
+
+function typedArrayIntrinsic<T>(name: "buffer" | "byteLength" | "byteOffset"): (this: Uint8Array) => T {
+  const getter = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, name)?.get as
+    | ((this: Uint8Array) => T)
+    | undefined;
+  if (typeof getter !== "function") throw new Error(`Missing intrinsic typed-array ${name} getter`);
+  return getter;
+}
+
+const typedArrayBuffer = typedArrayIntrinsic<ArrayBufferLike>("buffer");
+const typedArrayByteLength = typedArrayIntrinsic<number>("byteLength");
+const typedArrayByteOffset = typedArrayIntrinsic<number>("byteOffset");
+const arrayBufferResizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "resizable")?.get as
+  | ((this: ArrayBuffer) => boolean)
+  | undefined;
+
+function isSharedArrayBuffer(buffer: ArrayBufferLike): boolean {
+  const probe = (ArrayBuffer as unknown as { isSharedArrayBuffer?: (value: unknown) => boolean })
+    .isSharedArrayBuffer;
+  if (typeof probe === "function") return probe(buffer);
+  return Object.prototype.toString.call(buffer) === "[object SharedArrayBuffer]";
+}
+
+interface CapturedSourceBytes {
+  readonly buffer: ArrayBufferLike;
+  readonly byteOffset: number;
+  readonly byteLength: number;
+}
+
+/** Inspect intrinsic view bounds without trusting subclass/own-property getters. */
+function inspectSourceBytes(value: unknown): CapturedSourceBytes {
+  if (!(value instanceof Uint8Array)) {
+    throw new ArchivalPreparationInputError("Archival source bytes must be a Uint8Array");
+  }
+  let buffer: ArrayBufferLike;
+  let byteOffset: number;
+  let byteLength: number;
+  try {
+    buffer = typedArrayBuffer.call(value);
+    byteOffset = typedArrayByteOffset.call(value);
+    byteLength = typedArrayByteLength.call(value);
+  } catch {
+    throw new ArchivalPreparationInputError("Archival source bytes are not a readable Uint8Array view");
+  }
+  if (!Number.isSafeInteger(byteLength) || byteLength < 0 ||
+      !Number.isSafeInteger(byteOffset) || byteOffset < 0) {
+    throw new ArchivalPreparationInputError("Archival source bytes have invalid view bounds");
+  }
+  if (isSharedArrayBuffer(buffer)) {
+    throw new ArchivalPreparationInputError("Archival source bytes must not use a SharedArrayBuffer");
+  }
+  try {
+    if (arrayBufferResizable?.call(buffer as ArrayBuffer) === true) {
+      throw new ArchivalPreparationInputError("Archival source bytes must not use a resizable ArrayBuffer");
+    }
+  } catch (error) {
+    if (error instanceof ArchivalPreparationInputError) throw error;
+    throw new ArchivalPreparationInputError("Archival source bytes have an unsupported buffer backing");
+  }
+  return { buffer, byteOffset, byteLength };
+}
+
+/** Copy only the intrinsic view once; never allocate before the caller's byte bound is checked. */
+function copySourceBytes(captured: CapturedSourceBytes): Buffer {
+  try {
+    const view = new Uint8Array(captured.buffer, captured.byteOffset, captured.byteLength);
+    const copy = Buffer.from(view);
+    if (copy.length !== captured.byteLength) {
+      throw new ArchivalPreparationInputError("Archival source byte count changed during capture");
+    }
+    return copy;
+  } catch (error) {
+    if (error instanceof ArchivalPreparationInputError) throw error;
+    throw new ArchivalPreparationInputError("Archival source bytes are detached or unreadable");
+  }
+}
+
+type MutableLimits = { -readonly [K in keyof ArchivalPreparationLimits]: ArchivalPreparationLimits[K] };
+
+function normalizedLimits(input: unknown): ArchivalPreparationLimits {
+  const result: MutableLimits = { ...ARCHIVAL_PREPARATION_LIMITS };
+  if (input === undefined) return result;
+  if (!isRecord(input)) {
+    throw new ArchivalPreparationInputError("Archival preparation limits must be an object");
+  }
+  let keys: string[];
+  try {
+    keys = Object.keys(input);
+  } catch {
+    throw new ArchivalPreparationInputError("Archival preparation limits are unreadable");
+  }
+  for (const key of keys) {
+    if (!Object.hasOwn(ARCHIVAL_PREPARATION_LIMITS, key)) {
+      throw new ArchivalPreparationInputError("Unknown archival preparation limit property");
+    }
+  }
   for (const key of Object.keys(ARCHIVAL_PREPARATION_LIMITS) as (keyof ArchivalPreparationLimits)[]) {
-    const value = result[key];
-    if (!Number.isSafeInteger(value) || value < 1 || value > HARD_LIMITS[key]) {
+    let value: unknown;
+    try {
+      value = input[key];
+    } catch {
       throw new ArchivalPreparationInputError(`Invalid archival preparation bound: ${key}`);
     }
+    if (value === undefined) continue;
+    if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > HARD_LIMITS[key]) {
+      throw new ArchivalPreparationInputError(`Invalid archival preparation bound: ${key}`);
+    }
+    result[key] = value as number;
   }
   return result;
 }
@@ -404,7 +507,8 @@ function hasUnindexedContent(
 /** Text-only search projection plus whether any content-bearing part was omitted. */
 function textProjection(content: unknown): { text: string | null; omitted: boolean } {
   if (typeof content === "string") return { text: content, omitted: false };
-  if (!Array.isArray(content)) return { text: null, omitted: false };
+  if (content === null || content === undefined) return { text: null, omitted: false };
+  if (!Array.isArray(content)) return { text: null, omitted: true };
   const parts: string[] = [];
   let omitted = false;
   for (const block of content) {
@@ -417,6 +521,9 @@ function textProjection(content: unknown): { text: string | null; omitted: boole
       continue;
     }
     const keys = Object.keys(block);
+    const knownType = block.type === undefined ||
+      (typeof block.type === "string" && KNOWN_TEXT_BLOCK_TYPES.has(block.type));
+    if (!knownType) omitted = true;
     if (typeof block.text === "string") {
       parts.push(block.text);
       if (keys.some((key) => key !== "type" && key !== "text")) omitted = true;
@@ -590,7 +697,7 @@ function messageLine(
     (parsed.timestamp !== undefined && timestamp === null) ||
     (parsed._entry_id !== undefined && entryId === null) ||
     (parsed.name !== undefined && name === null);
-  const units = projection.text === null
+  const units = projection.text === null || projection.text === ""
     ? []
     : [searchUnit(0, unitKind, rawRole, timestamp, name, entryId, projection.text)];
   return {
@@ -598,7 +705,7 @@ function messageLine(
     status: "prepared",
     quarantineReason: null,
     opaque: false,
-    searchStatus: units.length === 0 || omitted ? "partial" : "complete",
+    searchStatus: units.length === 0 ? (omitted ? "partial" : "none") : omitted ? "partial" : "complete",
     sessionKey,
     timestamp,
     role: rawRole,
@@ -638,7 +745,7 @@ function historyLine(parsed: Record<string, unknown>, nestedLimit: number): Clas
   if (parsed.summary !== undefined && typeof parsed.summary !== "string") partial = true;
   if (hasContent) {
     const projection = textProjection(parsed.content);
-    if (projection.text !== null) {
+    if (projection.text !== null && projection.text !== "") {
       units.push(searchUnit(units.length, "history-content", null, rawTimestamp, null, null, projection.text));
     }
     if (projection.omitted) partial = true;
@@ -660,32 +767,30 @@ function historyLine(parsed: Record<string, unknown>, nestedLimit: number): Clas
       const messageName = boundedString(message.name, 512);
       const messageEntryId = boundedString(message._entry_id, 512);
       const projection = textProjection(message.content);
-      if (projection.text === null) {
+      const messageOmitted = projection.omitted ||
+        hasUnindexedContent(message, INDEXED_HISTORY_MESSAGE_FIELDS) ||
+        (message.timestamp !== undefined && messageTimestamp === null) ||
+        (message.name !== undefined && messageName === null) ||
+        (message._entry_id !== undefined && messageEntryId === null);
+      if (projection.text !== null && projection.text !== "") {
+        units.push(searchUnit(
+          units.length,
+          "history-message",
+          rawRole,
+          messageTimestamp,
+          messageName,
+          messageEntryId,
+          projection.text,
+        ));
+      } else if (projection.omitted) {
         diagnostics.push("history-message-text-not-indexed");
-        partial = true;
-        continue;
       }
-      units.push(searchUnit(
-        units.length,
-        "history-message",
-        rawRole,
-        messageTimestamp,
-        messageName,
-        messageEntryId,
-        projection.text,
-      ));
-      if (projection.omitted ||
-          hasUnindexedContent(message, INDEXED_HISTORY_MESSAGE_FIELDS) ||
-          (message.timestamp !== undefined && messageTimestamp === null) ||
-          (message.name !== undefined && messageName === null) ||
-          (message._entry_id !== undefined && messageEntryId === null)) {
-        partial = true;
-      }
+      if (messageOmitted) partial = true;
     }
   }
   if (hasSummary) {
     const projection = textProjection(parsed.summary);
-    if (projection.text !== null) {
+    if (projection.text !== null && projection.text !== "") {
       units.push(searchUnit(units.length, "history-summary", null, rawTimestamp, null, null, projection.text));
     }
     if (projection.omitted) partial = true;
@@ -707,7 +812,7 @@ function historyLine(parsed: Record<string, unknown>, nestedLimit: number): Clas
     status: "prepared",
     quarantineReason: null,
     opaque: false,
-    searchStatus: units.length === 0 ? "partial" : partial ? "partial" : "complete",
+    searchStatus: units.length === 0 ? (partial ? "partial" : "none") : partial ? "partial" : "complete",
     sessionKey,
     timestamp: rawTimestamp,
     role: null,
@@ -747,6 +852,7 @@ function classifyLine(
 interface WorkSource {
   readonly input: ArchivalSourceSnapshot;
   readonly sourceOrder: number;
+  readonly byteLength: number;
   readonly bytes: Buffer | null;
   readonly sha256: string;
   readonly lineCount: number | null;
@@ -759,22 +865,26 @@ interface WorkSource {
 }
 
 function validatedSource(value: unknown): ArchivalSourceSnapshot {
-  if (!isRecord(value) || typeof value.sourceId !== "string" || !SAFE_LABEL.test(value.sourceId) ||
-      typeof value.provenance !== "string" || !SAFE_LABEL.test(value.provenance) ||
-      typeof value.sha256 !== "string" || !SHA256_HEX.test(value.sha256) ||
-      typeof value.format !== "string" || !SAFE_LABEL.test(value.format) ||
-      !(value.bytes instanceof Uint8Array)) {
+  if (!isRecord(value)) {
     throw new ArchivalPreparationInputError(
       "Each archival source needs safe sourceId/provenance/format labels, a declared SHA-256, and bytes",
     );
   }
-  return {
-    sourceId: value.sourceId,
-    sha256: value.sha256,
-    format: value.format,
-    provenance: value.provenance,
-    bytes: value.bytes,
-  };
+  const sourceId = value.sourceId;
+  const provenance = value.provenance;
+  const sha256 = value.sha256;
+  const format = value.format;
+  const bytes = value.bytes;
+  if (typeof sourceId !== "string" || !SAFE_LABEL.test(sourceId) ||
+      typeof provenance !== "string" || !SAFE_LABEL.test(provenance) ||
+      typeof sha256 !== "string" || !SHA256_HEX.test(sha256) ||
+      typeof format !== "string" || !SAFE_LABEL.test(format) ||
+      !(bytes instanceof Uint8Array)) {
+    throw new ArchivalPreparationInputError(
+      "Each archival source needs safe sourceId/provenance/format labels, a declared SHA-256, and bytes",
+    );
+  }
+  return { sourceId, sha256, format, provenance, bytes };
 }
 
 /** Prepare bounded archival records only; no import, persistence, or runtime state is created. */
@@ -782,12 +892,27 @@ export function prepareArchivalImport(
   request: ArchivalImportRequest,
   options: ArchivalPreparationOptions = {},
 ): ArchivalPreparationReport {
+  if (!isRecord(options)) {
+    throw new ArchivalPreparationInputError("Archival preparation options must be an object");
+  }
   const limits = normalizedLimits(options.limits);
-  if (!isRecord(request) || typeof request.storeNamespace !== "string" || !SAFE_LABEL.test(request.storeNamespace)) {
+  if (!isRecord(request)) {
     throw new ArchivalPreparationInputError("Archival import request needs one safe storeNamespace label");
   }
-  if (!Array.isArray(request.sources)) throw new ArchivalPreparationInputError("Archival sources must be an array");
-  if (request.sources.length > limits.maxSources) throw new ArchivalPreparationBoundsError("source-count");
+  const storeNamespace = request.storeNamespace;
+  if (typeof storeNamespace !== "string" || !SAFE_LABEL.test(storeNamespace)) {
+    throw new ArchivalPreparationInputError("Archival import request needs one safe storeNamespace label");
+  }
+  const sourceList = request.sources;
+  if (!Array.isArray(sourceList)) throw new ArchivalPreparationInputError("Archival sources must be an array");
+  const sourceCount = sourceList.length;
+  if (!Number.isSafeInteger(sourceCount) || sourceCount < 0) {
+    throw new ArchivalPreparationInputError("Archival source count is not a safe non-negative integer");
+  }
+  if (sourceCount === 0) {
+    throw new ArchivalPreparationInputError("Archival import request must include at least one source");
+  }
+  if (sourceCount > limits.maxSources) throw new ArchivalPreparationBoundsError("source-count");
 
   const seenSourceIds = new Set<string>();
   const works: WorkSource[] = [];
@@ -795,26 +920,31 @@ export function prepareArchivalImport(
   let inputBytes = 0;
   let acceptedBytes = 0;
 
-  for (const [sourceOrder, input] of request.sources.entries()) {
-    const source = validatedSource(input);
+  for (let sourceOrder = 0; sourceOrder < sourceCount; sourceOrder++) {
+    if (sourceOrder >= limits.maxSources) throw new ArchivalPreparationBoundsError("source-count");
+    const source = validatedSource(sourceList[sourceOrder]);
     if (seenSourceIds.has(source.sourceId)) {
       throw new ArchivalPreparationInputError("Archival sourceId values must be unique within one store namespace");
     }
     seenSourceIds.add(source.sourceId);
-    inputBytes += source.bytes.byteLength;
-    if (source.bytes.byteLength > limits.maxSourceBytes) {
+    const captured = inspectSourceBytes(source.bytes);
+    inputBytes += captured.byteLength;
+    if (captured.byteLength > limits.maxSourceBytes) {
       throw new ArchivalPreparationBoundsError("source-byte");
     }
-    if (acceptedBytes + source.bytes.byteLength > limits.maxTotalBytes) {
+    if (acceptedBytes + captured.byteLength > limits.maxTotalBytes) {
       throw new ArchivalPreparationBoundsError("total-byte");
     }
-    // Copy once so hashing, parsing, and raw-record emission all share stable bytes.
-    const bytes = Buffer.from(source.bytes);
+    // Copy once, after bounds, so hashing/parsing/records share stable intrinsic bytes.
+    const bytes = copySourceBytes(captured);
+    if (bytes.length !== captured.byteLength) {
+      throw new ArchivalPreparationInputError("Archival source byte count changed during capture");
+    }
     const digest = sha256(bytes);
     if (digest !== source.sha256) {
       throw new ArchivalPreparationInputError(`Declared SHA-256 does not match source bytes: ${source.sourceId}`);
     }
-    acceptedBytes += bytes.length;
+    acceptedBytes += captured.byteLength;
     const supported = SUPPORTED_FORMATS.has(source.format);
     const lineCount = supported ? countPhysicalLines(bytes) : null;
     if (lineCount !== null && lineCount > limits.maxLinesPerSource) {
@@ -823,6 +953,7 @@ export function prepareArchivalImport(
     const work: WorkSource = {
       input: source,
       sourceOrder,
+      byteLength: captured.byteLength,
       bytes: supported ? bytes : null,
       sha256: digest,
       lineCount,
@@ -838,11 +969,19 @@ export function prepareArchivalImport(
       unsupportedSources.push({
         sourceId: source.sourceId,
         format: source.format,
-        byteLength: bytes.length,
+        byteLength: captured.byteLength,
         sha256: digest,
         classification: "unsupported-source-format",
       });
     }
+  }
+  try {
+    if (sourceList[sourceCount] !== undefined) {
+      throw new ArchivalPreparationInputError("Archival source array length is inconsistent");
+    }
+  } catch (error) {
+    if (error instanceof ArchivalPreparationInputError) throw error;
+    throw new ArchivalPreparationInputError("Archival source array is unreadable");
   }
 
   const records: PreparedArchivalRecord[] = [];
@@ -944,7 +1083,7 @@ export function prepareArchivalImport(
   const report: ArchivalPreparationReport = {
     format: ARCHIVAL_PREPARATION_FORMAT,
     version: ARCHIVAL_PREPARATION_VERSION,
-    storeNamespace: request.storeNamespace,
+    storeNamespace,
     scope: "session-jsonl+history-jsonl+session-archive-jsonl",
     importPerformed: false,
     persistencePerformed: false,
@@ -990,7 +1129,7 @@ export function prepareArchivalImport(
       sourceId: work.input.sourceId,
       format: work.input.format,
       provenance: work.input.provenance,
-      byteLength: work.input.bytes.byteLength,
+      byteLength: work.byteLength,
       sha256: work.sha256,
       status: work.status,
       lineCount: work.lineCount,

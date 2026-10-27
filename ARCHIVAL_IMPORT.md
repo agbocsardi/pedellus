@@ -37,13 +37,21 @@ identifier before it is accepted or echoed; paths, spaces, control characters,
 and secrets are rejected with `ArchivalPreparationInputError` rather than being
 copied into the report. Do not put paths, account names, chat IDs, or secrets in
 the other labels. `sha256` must be lowercase hex over the exact supplied bytes;
-it is verified before any parsing. The module copies the bytes once and never
-mutates the caller's buffer.
+it is verified before any parsing. The module reads the intrinsic typed-array
+view metadata (not subclass/own-property `byteLength`/`byteOffset` getters),
+checks bounds before copying, then copies exactly the captured length and
+verifies the copy length. `SharedArrayBuffer` and resizable `ArrayBuffer`
+backings are rejected so the snapshot cannot change under the copy. All report
+byte counts use the captured intrinsic length, never a spoofed property. The
+module never mutates the caller's buffer.
 
-Each invocation describes **one legacy store/workspace namespace**. Session keys
-and archive cursors are store-local. The module echoes `storeNamespace` but
-cannot infer or verify that the caller grouped sources correctly; mixing stores
-remains a caller error.
+Each invocation describes **one legacy store/workspace namespace** and must
+contain at least one source. Session keys and archive cursors are store-local.
+The module echoes `storeNamespace` but cannot infer or verify that the caller
+grouped sources correctly; mixing stores remains a caller error. The source
+array length is captured once, bounded before iteration, and checked again
+inside the loop; an inconsistent proxy array that hides elements beyond its
+reported length is rejected rather than silently processed or ignored.
 
 ## Supported schemas
 
@@ -79,9 +87,10 @@ One physical line is one prepared record. Blank lines are preserved as
 - Current v3 `kind: "conversation"` records, older structured records with
   `messages`, and legacy text records with `content` are prepared as
   `history-entry` records.
-- The search projection contains one unit per embedded message (role,
-  timestamp, name, entry ID, text), plus a legacy `content` unit and/or a
-  `summary` unit. Message order is preserved; summary is appended last.
+- The search projection contains one unit per embedded message that has
+  non-empty textual content (role, timestamp, name, entry ID, text), plus a
+  legacy `content` unit and/or a `summary` unit when their text is non-empty.
+  Message order is preserved; summary is appended last.
 - Top-level `cursor` is exposed only when it is a non-negative safe integer.
   Usage fields, idempotency keys, and all other fields stay in the raw line.
 - Missing/non-string `timestamp`, invalid `session_key`, a non-array `messages`
@@ -148,13 +157,17 @@ fields explicitly if it wants name/role lookups.
 
 - `complete`: at least one search unit exists and **no content-bearing part of
   the record was omitted**;
-- `partial`: a prepared record has no indexable units, or any content-bearing
-  part was omitted (see below);
-- `none`: the record is opaque, blank, or quarantined.
+- `partial`: any content-bearing part was omitted (see below), including when
+  that leaves no search units;
+- `none`: the record is opaque, blank, quarantined, or a prepared record with no
+  textual content to index and nothing omitted (for example empty `content`,
+  an empty content array, or an empty history `messages` list).
 
 Omissions that force `partial`:
 
-- a content array containing non-string, non-text, or unknown blocks;
+- a content array containing non-string, non-text, nested, or unrecognized
+  block types (known text types are `text`, `input_text`, and `output_text`),
+  even when some text from the block is still projected;
 - a text/content block with keys beyond `type` plus `text` (or `type` plus
   `content`), or a block carrying both text and content;
 - non-empty `tool_calls` (IDs, names, arguments), `tool_call_id`, `media`,
@@ -197,8 +210,12 @@ diagnostics).
 The module **fails closed**. Exceeding any bound throws
 `ArchivalPreparationBoundsError`; it never truncates input, drops trailing
 records, or returns a partial report. A declared digest mismatch, duplicate
-`sourceId`, unsafe source/format/provenance/store label, missing bytes, or
-invalid limit throws `ArchivalPreparationInputError`. Unsupported source formats are different: they
+`sourceId`, unsafe source/format/provenance/store label, missing/empty/duplicate
+sources, inaccessible or mutable byte backing, or invalid limit throws
+`ArchivalPreparationInputError`. Limits must be an object containing only known
+bound properties with safe-integer values; unknown properties, cyclic/extra
+objects, and invalid values are rejected. The report receives a fresh limits
+object, so caller-owned limit objects are never retained or frozen. Unsupported source formats are different: they
 are classified in `unsupportedSources`, make `complete: false`, and contribute
 no records. The supported sources in the same request are still processed.
 
@@ -314,9 +331,12 @@ source-order preservation, distinct records for identical lines, opaque
 metadata/provider state, quarantine of malformed/unknown lines, text-search
 completeness for mixed/tool/media/unknown content, missing/duplicate/out-of-order
 session and archive headers, failure-vs-notice diagnostics, unsafe format label
-rejection, history conversation/text search units, supported transcript archives,
-unsupported format classification, every bound, digest/identity failures, deep
-freezing, and caller-byte immutability. Run it with:
+rejection, spoofed typed-array byte length, shared/resizable backing rejection,
+lying proxy source arrays, unknown/cyclic limit objects, empty requests, empty
+content/empty message lists, nested text omissions, history conversation/text
+search units, supported transcript archives, unsupported format classification,
+every bound, digest/identity failures, deep freezing, and caller-byte
+immutability. Run it with:
 
 ```bash
 npm run build
