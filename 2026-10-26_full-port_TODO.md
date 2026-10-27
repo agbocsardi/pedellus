@@ -1630,8 +1630,11 @@ At owner request, stop new work and preserve unmerged candidates for later revie
   grants after reopen, malformed modelTools fails only at use, and existing
   narrowed selections stay pinned after ceiling growth; resolve before reuse.
   The internal fixture is also reachable by deep import, despite no barrel export.
-- Discord foundation `pi-acb8f4a0` / `33e35634b`: follow-up independent review
-  was underway; production channel integration and P6 remain open.
+- Discord foundation `pi-acb8f4a0` / `33e35634b`: follow-up review passed
+  scoped non-production checks, including 169 behavior checks against then-HEAD.
+  Integrate only with the Discord test added to the current test list, not the
+  stale package hunk; admission timeout, operator capacity remediation, startup
+  recovery, real client wiring and P6 remain open.
 - Archival search renderer `pi-7384fed4` / `d3a4b2ba7`: narrowed prototype;
   review found unregistered tests, incomplete input validation, unsanitized enum
   fields and an unallowlisted limits spread. Fix before integration; synthetic
