@@ -4,7 +4,9 @@
 from **host-supplied snapshots**. It does not access the filesystem, environment,
 credential store, coding-agent resource loader, or extension discovery. `openGateway`
 installs it only when the host supplies `contextSnapshotProvider`; without that option,
-gateway behavior is unchanged.
+no context extension is installed. Before resume, the runtime explicitly selects no
+extensions (its registry is empty) to clear stale context-extension selections. Tool
+policy remains unchanged.
 
 ## API and scope
 
@@ -59,8 +61,10 @@ snapshot and installs the replacement extension before returning that conversati
 so the caller cannot submit first. The provider is called once per mapped session on
 open and once for each new session; host changes to existing snapshots take effect
 when the gateway is reopened. The callback receives the mapped session key and
-Durable ID established by the gateway. Stores with more than 256 mapped sessions
-fail closed when context is enabled rather than
+Durable ID established by the gateway. When context is opted out on reopen, the
+runtime clears extension selection before resume; native section replay removes old
+context from the effective prompt, but stored transcript history is not erased. Stores
+with more than 256 mapped sessions fail closed when context is enabled rather than
 silently leaving some sessions without their opted-in snapshot. A missing snapshot
 intentionally renders no context for that conversation; native Durable section replay
 then removes those keys from the effective current prompt. Reinstalling a changed

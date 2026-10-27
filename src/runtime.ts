@@ -5,8 +5,8 @@ import type { Context } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
-import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type Harness as HarnessType, type ModelRef, type Storage } from "@earendil-works/pi-durable";
-import { CONTEXT_LIMITS, createContextExtension, type ConversationContextSnapshot } from "./context/index.js";
+import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type Extension, type Harness as HarnessType, type ModelRef, type Storage } from "@earendil-works/pi-durable";
+import { CONTEXT_LIMITS, createContextExtensionBuilder, type ConversationContextSnapshot } from "./context/index.js";
 import type { ModelReference, PortConfig } from "./config.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
@@ -200,11 +200,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
       : fallbackThinkingLevel(choice);
     return { ...hostPolicy, model: choice.native, thinkingLevel };
   };
-  let contextExtension: ReturnType<typeof createContextExtension> | undefined;
-  const contextSnapshots = new Map<ConversationId, ConversationContextSnapshot>();
+  let contextExtension: Extension | undefined;
+  const contextExtensionBuilder = createContextExtensionBuilder();
+  const contextConversations = new Set<ConversationId>();
   const contextAgentPolicy = (conversationId: ConversationId): AgentChange => {
-    if (!contextExtension) return {};
-    return contextSnapshots.has(conversationId)
+    if (!options.contextSnapshotProvider || !contextExtension) return { extensions: [] };
+    return contextConversations.has(conversationId)
       ? { extensions: { add: [contextExtension] } }
       : { extensions: { remove: [contextExtension] } };
   };
@@ -262,7 +263,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       conversationId: ConversationId,
       ctx: Context,
     ): Promise<void> => {
-      if (!options.contextSnapshotProvider || contextSnapshots.has(conversationId)) return;
+      if (!options.contextSnapshotProvider || contextConversations.has(conversationId)) return;
       let pending = contextSnapshotLoads.get(conversationId);
       if (!pending) {
         pending = Promise.resolve()
@@ -272,8 +273,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
               throw new TypeError("Context snapshot provider must return an object or undefined");
             }
             const snapshot = bindContextSnapshot(supplied, conversationId);
-            const extension = createContextExtension([...contextSnapshots.values(), snapshot]);
-            contextSnapshots.set(conversationId, snapshot);
+            const extension = contextExtensionBuilder.add(snapshot);
+            contextConversations.add(conversationId);
             contextExtension = extension;
             registry.install(extension);
           })
