@@ -111,11 +111,13 @@ The source-backed mapping is:
   archived summaries, runtime annotations, and a tool contract. This extension
   accepts explicit bootstrap/memory/skill snapshots. `renderNanobotIdentity()`
   deterministically renders a bounded identity subset from host-provided runtime,
-  workspace path, optional platform-policy text, and known channel values. It is
-  not a Jinja engine and performs no platform/environment discovery. It rejects
-  control characters in the workspace path and rejects over-limit inputs or
-  complete output using the existing context-section limit; it never truncates
-  identity or policy text. It deliberately omits Python identity's
+  workspace path, and known channel values. It is not a Jinja engine and performs
+  no platform/environment discovery. It rejects control characters in the
+  workspace path and rejects over-limit inputs/output before composing text. Its
+  stricter output budget reserves room for the native identity heading and worst-
+  case escaped provenance label, so accepted identity content survives section
+  composition without truncation. Platform policy is explicitly not accepted by
+  this helper. It deliberately omits Python identity's platform-policy template,
   memory/history/skill file claims, untrusted-web snippet, and tool-use contract:
   those capabilities are not established by this package's gateway. This slice
   also does not implement runtime/user-message metadata or archived summaries.
