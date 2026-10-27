@@ -157,6 +157,12 @@ function copyUsage(value: unknown, label: string): Readonly<Usage> {
       usage[field] = safeTokenCount(value[field], `${label}.${field}`);
     }
   }
+  if (usage.reasoning !== undefined && usage.reasoning > output) {
+    throw new TypeError(`Invalid native usage subset: ${label}.reasoning exceeds output`);
+  }
+  if (usage.cacheWrite1h !== undefined && usage.cacheWrite1h > cacheWrite) {
+    throw new TypeError(`Invalid native usage subset: ${label}.cacheWrite1h exceeds cacheWrite`);
+  }
   return Object.freeze(usage);
 }
 

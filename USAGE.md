@@ -32,10 +32,14 @@ usage document; that remains `unavailable`. Snapshots and projections are
 detached and deeply frozen. Their string-keyed maps have null prototypes, so
 names such as `__proto__` and `toString` remain ordinary own keys. Token
 counters (required and optional) and derived legacy sums must be nonnegative
-safe integers; invalid values and aggregate overflow fail closed without
-rounding or clamping. Costs remain finite, nonnegative decimals. Malformed rows,
-a mismatched cursor scope, a missing current document, or a regressing
-cumulative counter fail closed.
+safe integers. Known optional counters must also satisfy Pi AI's subset
+invariants: `reasoning <= output` and `cacheWrite1h <= cacheWrite`. These
+checks apply to snapshots, parsed cursor rows, and known-field deltas; two valid
+cumulative rows that imply an impossible subset delta fail closed. Invalid
+values, subset violations, and aggregate overflow fail closed without rounding
+or clamping. Costs remain finite, nonnegative decimals. Malformed rows, a
+mismatched cursor scope, a missing current document, or a regressing cumulative
+counter fail closed.
 
 ## Source and attribution
 
@@ -72,9 +76,10 @@ exactly (case-sensitive; not normalized).
 - The Usage schema stores token counters and cost totals, not request counts or
   individual usage events. `requestCount.status` is always `"unknown"`; no
   request count is estimated from tokens. Missing optional `reasoning` and
-  `cacheWrite1h` values stay unknown, not zero. If an optional cumulative field
-  appears only after a cursor, its delta cannot safely be apportioned and the
-  affected field is listed in `unknownFields`.
+  `cacheWrite1h` values stay unknown, not zero. Present values are validated
+  against their required-counter subset. If an optional cumulative field appears
+  only after a cursor, its delta cannot safely be apportioned and the affected
+  field is listed in `unknownFields`, not emitted as zero.
 - Native cost fields are preserved verbatim in `native`; they are provider/model
   cost calculations reported by Pi AI, not an invoice or proof of billing. A
   numeric zero is a recorded zero in the native ledger, not evidence that an
