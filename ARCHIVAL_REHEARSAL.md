@@ -352,5 +352,4 @@ npm run build
 node --test tests/archival-import-rehearsal.behavior.test.mjs
 ```
 
-The test file is standalone and is not added to `package.json`; the parent owns
-test wiring.
+The test is also included in `test:behavior`.

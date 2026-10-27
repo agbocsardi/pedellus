@@ -48,8 +48,13 @@ Real history access and import require separate authorization; use synthetic dat
       acquisition with Linux no-follow safeguards. Synthetic filesystem race
       checks and independent reviews passed; no real history accessed. It refuses
       live `~/.nanobot` and requires a separately supplied quiescent snapshot.
-- [ ] Rehearse on synthetic records; plan a private-copy reconciliation and
-      backup/restore before seeking authorization for a real one-off import.
+- [x] `pi-d573dc66`: merged `c01f6d8a4`, unexported experimental end-to-end
+      synthetic rehearsal for acquisition, inert persistence and search. Independent
+      review identified unresolved same-user path-swap races during SQLite open;
+      policy flags are not enforcement. No CLI or real-data use is authorized.
+- [ ] Resolve the SQLite destination open/ancestor-swap race and establish safe
+      ownership, private-copy reconciliation and backup/restore before seeking
+      authorization for a real one-off import.
 - [x] `pi-458b1c64`: integrated `66163cf82`, bounded, pure source-byte
       preparation for session, archive-prefix and history JSONL; no importer or
       database writes. Parent and independent reviewers checked synthetic cases,

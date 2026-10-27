@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test:behavior": "npm run build && node --test test/terminal-cli.test.mjs tests/archive-preparation.behavior.test.mjs tests/archival-import-preparation.behavior.test.mjs tests/archival-import-persistence.behavior.test.mjs tests/archival-search.behavior.test.mjs tests/archival-source-acquisition.behavior.test.mjs tests/codemode-conversation.behavior.test.mjs tests/context-gateway.behavior.test.mjs tests/context.identity.test.mjs tests/context.workspace.behavior.test.mjs tests/migration.behavior.test.mjs tests/model-policy.test.mjs tests/tool-policy.behavior.test.mjs tests/tool-replay-revocation.behavior.test.mjs tests/nested-codemode-replay-revocation.behavior.test.mjs",
+    "test:behavior": "npm run build && node --test test/terminal-cli.test.mjs tests/archive-preparation.behavior.test.mjs tests/archival-import-preparation.behavior.test.mjs tests/archival-import-persistence.behavior.test.mjs tests/archival-import-rehearsal.behavior.test.mjs tests/archival-search.behavior.test.mjs tests/archival-source-acquisition.behavior.test.mjs tests/codemode-conversation.behavior.test.mjs tests/context-gateway.behavior.test.mjs tests/context.identity.test.mjs tests/context.workspace.behavior.test.mjs tests/migration.behavior.test.mjs tests/model-policy.test.mjs tests/tool-policy.behavior.test.mjs tests/tool-replay-revocation.behavior.test.mjs tests/nested-codemode-replay-revocation.behavior.test.mjs",
     "test:execution": "npm run build && node --test tests/execution-lifecycle.test.mjs tests/execution-deadline.behavior.test.mjs",
     "start": "node dist/cli.js"
   },
