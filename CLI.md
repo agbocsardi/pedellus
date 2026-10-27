@@ -12,7 +12,8 @@ from committed `pi.live` snapshots, filtered to assistant text blocks. The
 initial watch snapshot is not replayed. After a submission settles, the CLI
 reads its committed assistant entry and flushes any text missing from the last
 committed partial. Reasoning blocks, system entries, tool calls/arguments, and
-tool output are not printed. Terminal control sequences are stripped.
+tool output are not printed. ESC/C1 terminal controls, carriage returns, and bidi
+formatting controls are removed; ordinary newlines and Unicode scalar values are preserved.
 
 ## Local controls
 
@@ -42,10 +43,14 @@ control such as `/abort`. This boundary waits for submission admission and the
 control operation, never for model completion (except native `/abort` itself).
 Durable owns the busy inbox; this CLI does not create a second agent queue. At
 most 64 locally admitted inputs may remain unsettled, and at most 16 local
-control operations may be pending. Each input line is limited to 32,000
-characters and displayed response text to 64,000 characters. Writable
-backpressure is awaited; rejected-line notices are also awaited rather than
-queued. EOF waits for this process's admitted inputs to settle before gateway
+control operations may be pending. Only completed lines up to 32,000 UTF-16
+code units are admitted, and displayed response text is capped at 64,000
+UTF-16 code units without splitting a Unicode scalar. This is an admitted-line
+limit, not a hard ingress-memory cap: Node `readline` buffers until newline
+before yielding a line to the check, so a very long or newline-free stdin record
+can consume memory first. Injected `TerminalIO` sources likewise own any
+pre-yield memory bound. Writable backpressure is awaited; rejected-line
+notices are also awaited rather than queued. EOF waits for this process's admitted inputs to settle before gateway
 shutdown; if a failed/ended run leaves inputs queued under Durable's default
 `afterFailedRun: "keep"`, EOF reports that state and cancels only local
 watch/wait contexts. The durable submissions remain queued for owner

@@ -1,7 +1,6 @@
 import { createInterface } from "node:readline";
 import { stdin, stderr, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
-import { stripVTControlCharacters } from "node:util";
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { loadConfig } from "./config.js";
 import { runTerminalConversation } from "./terminal/index.js";
@@ -37,6 +36,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       }, context);
     } else {
       const conversation = await gateway.conversationFor("cli:default", context);
+      // Readline's post-line size check bounds admission, not its pre-newline input buffer.
       input = createInterface({ input: stdin, output: stdout, terminal: Boolean(stdin.isTTY && stdout.isTTY) });
       input.setPrompt("> ");
       await runTerminalConversation(conversation, context, {
@@ -56,16 +56,9 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
-    const cleaned = stripVTControlCharacters(message).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
-    let length = Math.min(cleaned.length, 1000);
-    if (length > 0 && length < cleaned.length && isHighSurrogate(cleaned.charCodeAt(length - 1))) length--;
-    console.error(cleaned.slice(0, length));
+  main().catch(() => {
+    // Dependency/config errors may embed credentials or paths; never print arbitrary messages here.
+    console.error("nanobot: command failed; diagnostic details suppressed");
     process.exitCode = 1;
   });
-}
-
-function isHighSurrogate(code: number): boolean {
-  return code >= 0xd800 && code <= 0xdbff;
 }

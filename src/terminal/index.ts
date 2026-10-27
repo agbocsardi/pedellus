@@ -14,7 +14,7 @@ import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 
 const MAX_PENDING_INPUTS = 64;
 const MAX_ACTIVE_COMMANDS = 16;
-const MAX_INPUT_CHARS = 32_000;
+const MAX_ADMITTED_LINE_CODE_UNITS = 32_000;
 const MAX_RESPONSE_CHARS = 64_000;
 const MAX_HISTORY_COUNT = 50;
 const DEFAULT_HISTORY_COUNT = 10;
@@ -27,7 +27,7 @@ const MAX_MESSAGE_BLOCK_SCAN = 2_048;
 const LITERAL_SLASH_PREFIX = "//";
 
 export interface TerminalIO {
-  /** Each item is one completed input line. */
+  /** Each item is a completed line; the source owns any memory bound before yielding it. */
   readonly input: AsyncIterable<string>;
   readonly output: Writable;
   readonly errorOutput?: Writable;
@@ -537,8 +537,9 @@ export async function runTerminalConversation(
     io.prompt?.();
     for await (const line of io.input) {
       if (signal?.aborted) break;
-      if (line.length > MAX_INPUT_CHARS) {
-        await notice(`Input exceeds the ${MAX_INPUT_CHARS}-character CLI limit.`, true);
+      // This bounds admitted content after the source yields a complete line, not its ingress buffer.
+      if (line.length > MAX_ADMITTED_LINE_CODE_UNITS) {
+        await notice(`Input exceeds the ${MAX_ADMITTED_LINE_CODE_UNITS}-code-unit CLI limit.`, true);
         io.prompt?.();
         continue;
       }
@@ -695,12 +696,16 @@ function errorName(error: unknown): string {
   return error instanceof Error ? completePrefix(sanitizeTerminalText(error.name), 80) || "Error" : "unknown error";
 }
 
+function stripTerminalControls(text: string): string {
+  return stripVTControlCharacters(text).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u206f\ufeff]/g, "");
+}
+
 function sanitizePartialText(text: string): string {
-  return replaceUnpairedSurrogates(stripVTControlCharacters(text).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, ""), true);
+  return replaceUnpairedSurrogates(stripTerminalControls(text), true);
 }
 
 function sanitizeTerminalText(text: string): string {
-  return replaceUnpairedSurrogates(stripVTControlCharacters(text).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, ""), false);
+  return replaceUnpairedSurrogates(stripTerminalControls(text), false);
 }
 
 function replaceUnpairedSurrogates(text: string, preserveTrailingHigh: boolean): string {
@@ -731,14 +736,21 @@ async function waitForDrain(stream: Writable, signal: AbortSignal | undefined): 
     const cleanup = (): void => {
       stream.off("drain", onDrain);
       stream.off("error", onError);
+      stream.off("close", onClose);
+      stream.off("finish", onFinish);
       signal?.removeEventListener("abort", onAbort);
     };
     const onDrain = (): void => { cleanup(); resolve(); };
     const onError = (error: Error): void => { cleanup(); reject(error); };
+    const onClose = (): void => { cleanup(); reject(new Error("Output stream closed before drain")); };
+    const onFinish = (): void => { cleanup(); reject(new Error("Output stream finished before drain")); };
     const onAbort = (): void => { cleanup(); reject(signal?.reason ?? new Error("Output wait cancelled")); };
     stream.once("drain", onDrain);
     stream.once("error", onError);
+    stream.once("close", onClose);
+    stream.once("finish", onFinish);
     signal?.addEventListener("abort", onAbort, { once: true });
-    if (signal?.aborted) onAbort();
+    if (stream.destroyed || stream.writableFinished) onClose();
+    else if (signal?.aborted) onAbort();
   });
 }
