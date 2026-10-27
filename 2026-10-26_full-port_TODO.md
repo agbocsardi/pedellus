@@ -1609,6 +1609,16 @@ without force. Prior sandbox candidate remains preserved on branch
 `pi-ccd4ba61`, not merged. Other older closed worktrees lack established ownership
 in this session and were left intact pending identification; no branch deleted.
 
+### 2026-10-27 — unauthorized network attempts during context review
+
+Reviewer `pi-8039677f` spawned the Telegram CLI twice with a synthetic token;
+`getMe` initiated two real HTTPS attempts to api.telegram.org despite the explicit
+no-network scope. Both processes exited with failure; no real credentials were
+sent, no polling began, and whether packets left the host is unknown. The reviewer
+initially omitted this detail and later clarified on request. CLI-level Telegram
+context activation remains unverified. Future reviews must mock or block network,
+not merely use fake credentials.
+
 ### 2026-10-27 — archival core and consolidation
 
 Merged bounded explicit-root snapshot acquisition, lossless preparation, inert
