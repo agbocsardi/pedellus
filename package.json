@@ -9,7 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test:behavior": "npm run build && node --test test/terminal-cli.test.mjs tests/archive-preparation.behavior.test.mjs tests/codemode-conversation.behavior.test.mjs tests/context.identity.test.mjs tests/migration.behavior.test.mjs tests/model-policy.test.mjs",
-    "test:execution": "npm run build && node --test tests/execution-lifecycle.test.mjs",
+    "test:execution": "npm run build && node --test tests/execution-lifecycle.test.mjs tests/execution-deadline.behavior.test.mjs",
     "start": "node dist/cli.js"
   },
   "dependencies": {

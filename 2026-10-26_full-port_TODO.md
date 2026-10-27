@@ -39,12 +39,15 @@ policy, environment and replay gates pass.
       conversation isolation; parent corrected test timeout and ran combined
       suite (22 checks). No gateway activation; permanent interrupted-replay
       coverage remains open.
-- [ ] `pi-a4ec5ee5`, `w2M:p1` / `w2M`: bound standalone sandbox shell
-      deadlines with focused real-bwrap checks; base `c5dc6337a085422ed0fdb2921dba4cdd2af73063`.
-      CPU/memory/PID/disk quotas and approval policy remain separate P1 gates.
-- [ ] `pi-2001d051`, `w2N:p1` / `w2N`: bounded opt-in default-deny native
-      tool authorization foundation, if safely achievable; base `5262018afe5f579cfbea85e36021cf5536eb77a5`.
-      No gateway activation or claim of human approval/security acceptance.
+- [x] `pi-a4ec5ee5`, `w2M:p1` / `w2M`: merged `98969d6af` standalone
+      sandbox deadline/output-window guard with validated options. Parent tested
+      isolated candidate and integrated build against real bwrap. The 5-second
+      experimental cap is not product policy; CPU/memory/PID/disk quotas and
+      approval remain separate P1 gates.
+- [ ] Tool authorization: `pi-2001d051` identified the need for an authoritative
+      host grant source and runtime revoke-before-resume integration. Owner asked
+      for explanation; choice between host-supplied grants and a persistent store
+      remains undecided. No gateway activation or security acceptance.
 - [ ] Review the existing Discord/memory/automation candidates when revisiting
       them; preserve their branches and do not imply they are integrated.
 
