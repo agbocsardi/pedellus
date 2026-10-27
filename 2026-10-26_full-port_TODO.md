@@ -1641,9 +1641,10 @@ At owner request, stop new work and preserve unmerged candidates for later revie
   review probes are `/tmp/probe1.mjs`, `/tmp/probe2.mjs`, `/tmp/probe3.mjs`.
 - Create-only publication `pi-ba6fe170` / `103198572`: same-user stage-name
   swaps remain a documented race; not a real-import safety boundary.
-- One-shot scheduling `pi-cbf84ad6` / `e27ccea03`: review found queued work
-  can run after revocation/expiry and cross-owner/capacity gaps; not safe to
-  integrate. Follow-up was in progress.
+- One-shot scheduling `pi-cbf84ad6` / `f03f75c9c`: follow-up addresses the
+  prior queued revocation/expiry, cross-owner and bounded-work findings but is
+  unreviewed and unintegrated. Retention grows over time and authorization can
+  still race placement; no production activation or P5 acceptance.
 - Isolated staging `pi-b54f4507` / `ace00bcbf`: synthetic tmpfs prototype,
   12 targeted checks passed; unreviewed and not integrated. It does not publish
   a host database or establish safety for real import.
