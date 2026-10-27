@@ -1229,3 +1229,21 @@ reviewer `pi-eb98e056`/`w1P:p6` is assigned the whole D1 contract and remaining
 checkpoint/auth/cleanup boundaries; report `/tmp/pi-model-policy-review.md`.
 Await explicit corrected commit and review. D2/D3 continue independently;
 sandbox/execution work remains excluded and tool-less gateway unchanged.
+
+### 2026-10-27 — atomic model follow-up; remaining guard work acknowledged
+
+D1 explicitly reported `3295a7c1f` atop `7a943bcb7`. Parent read the diff:
+AgentDoc/LiveDoc busy rejection and selection now share one native commit,
+acquisition reapplication is atomic, and model changes reset thinking by the
+approved supported-default/off policy. Not integrated: canonical cwd and prepared
+revoked-request enforcement are still missing from that follow-up; MODELS.md
+continues to allow the revoked prepared request.
+
+Parent returned those two remaining blockers explicitly. Worker acknowledged
+plans for canonicalization before policy construction, deterministic concurrency
+barriers, and a gateway-local allowlist Models view or native pre-resume inspection
+without mutating caller-injected Models. Requires actual same-provider prepared
+request SIGKILL/reopen evidence of zero new denied dispatches, plus compaction/
+deferred-poll source coverage and clean failure/reopen ownership. Prior external
+outcomes remain unknown, not cancelled or rewritten. Shared `3295a7c1f` and pending
+boundaries with the independent reviewer; await corrected explicit completion.
