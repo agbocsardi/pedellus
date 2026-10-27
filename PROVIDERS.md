@@ -47,6 +47,19 @@ OpenRouter subscription OAuth, Codex OAuth, ambient credentials, and Pi
 The OpenCode endpoint/API selection and model compatibility metadata come from
 each model in Pi's pinned catalog, rather than a Nanobot-side protocol guess.
 
+### Migration differences
+
+- Python defaults use OpenCode `/zen/v1` and `/zen/go/v1`; this port uses Pi's
+  model-specific `/inference...` routes and API families listed above, as the
+  original spike already did. There is no endpoint override in this slice.
+  Catalog/offline checks do not establish equivalent service access, pricing or
+  live compatibility; real-provider verification remains an acceptance gate.
+- Python's Xiaomi credential variable is `XIAOMIMIMO_API_KEY`, while Pi expects
+  `XIAOMI_API_KEY`. The example keeps `credentials.xiaomi_mimo` pointing to the
+  legacy `XIAOMIMIMO_API_KEY`; the adapter maps that selected value to Pi's expected
+  name. Either variable name works when explicitly referenced in configuration;
+  neither is discovered implicitly.
+
 ## Explicit gaps
 
 | Retained Python provider | Status in this slice | Why it is not aliased |

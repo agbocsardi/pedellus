@@ -6,7 +6,7 @@ The [full-port roadmap](../../2026-10-26_full-port_TODO.md) covers the existing 
 
 ## Run
 
-Copy `config.example.json` to a private explicit config file and edit the workspace, model, and environment-variable *names*. The config contains no credentials. `credentials.openai`, `credentials.opencode_zen`, and `credentials.opencode_go` refer only to environment names; the runtime does not read Nanobot/Pi user config or perform live credential discovery. The `opencode_zen` alias uses pi-ai's `opencode` provider and `opencode_go` uses `opencode-go`. SDK hosts may pass an explicit pi-ai `Models` instance as `openGateway(config, context, { models })` for offline/custom use; the CLI never installs a faux provider.
+Copy `config.example.json` to a private explicit config file and edit the workspace, model, and environment-variable *names*. The config contains no credentials. The nine supported provider aliases and their `credentials` fields are listed in [provider support and migration notes](./PROVIDERS.md). Credential references and `telegram.tokenEnv` must be environment-variable names, not values or `${...}` expressions; the runtime does not read Nanobot/Pi user config or perform live credential discovery. Native catalogs/routes are not drop-in Python-provider parity, and real-provider acceptance remains open. SDK hosts may pass an explicit pi-ai `Models` instance as `openGateway(config, context, { models })` for offline/custom use; the CLI never installs a faux provider.
 
 ```sh
 npm ci

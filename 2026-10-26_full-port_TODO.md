@@ -34,8 +34,10 @@ independent managed worktrees, and committed base
 `0fea899afce7e2c21055b45d3c567b8e6cd6f2ed`. Parent `w1P:p1` owns review,
 root roadmap, public exports/integration and acceptance.
 
-- [ ] C1 — P3/P8 provider/config parity: native compatible aliases, explicit
-      credential references and source-backed support/limitations matrix.
+- [x] C1 — bounded P3/P8 provider/config slice: nine total native aliases,
+      explicit credential references and source-backed support/limitations matrix.
+      Integrated `ca85ed9ba`; independent review and parent-built checks pass.
+      Real-provider acceptance, unsupported aliases and full P8 remain open.
 - [ ] C2 — P3/P4 trusted context composition: opt-in native sections from bounded
       host-supplied identity/memory/skill snapshots; no ambient file/code discovery.
 - [ ] C3 — P4 native usage projections and archive-delta foundation: retain
@@ -962,3 +964,23 @@ Requested bounded lifecycle evidence for stable repeated prompts, replacement
 with removed snapshots/sections, fork current-vs-historical context and reopen;
 clarify that current-section removal does not erase inherited transcript content.
 Await explicit follow-up and independent review before integration.
+
+### 2026-10-27 — provider slice integrated and parent-reverified
+
+Reviewer `pi-eb98e056` explicitly reported bounded PASS, no security blocker, in
+`/tmp/pi-provider-parity-review.md`. Parent integrated C1 as `ca85ed9ba` with source
+provenance, then passed package typecheck/build and both provider probes explicitly
+selecting the **parent built package**. Native DeepSeek transport/auth, actual
+SQLite transcript/usage, same-session reopen/dedupe and tool-less policy still pass.
+No live/paid calls; this does not pass the real-provider or P8 acceptance gates.
+
+Reconciled README and public credential-provider type export. Documented the
+Python-vs-Pi OpenCode route difference (already present in the original spike),
+and kept the example's Xiaomi reference on Python's `XIAOMIMIMO_API_KEY`, mapped
+explicitly to Pi's expected `XIAOMI_API_KEY`. Unsupported endpoint variants,
+OAuth/custom providers and model-specific quirks stay explicit, not auto-aliased.
+
+Reassigned the completed reviewer through herdr_send to C2's committed context
+module/lifecycle/skill/bounds contract; report target
+`/tmp/pi-context-composition-review.md`. C2 lifecycle follow-up and C3 provenance
+fix remain outstanding. Sandbox/execution changes remain deferred and tools disabled.

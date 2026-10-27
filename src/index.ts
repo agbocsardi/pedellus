@@ -1,4 +1,4 @@
-export { loadConfig, parseConfig, type PortConfig } from "./config.js";
+export { loadConfig, parseConfig, type CredentialProvider, type PortConfig } from "./config.js";
 export { createProviderModels } from "./providers.js";
 export {
   CODEMODE_BUDGETS,

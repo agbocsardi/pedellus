@@ -14,7 +14,7 @@
     "openrouter": "OPENROUTER_API_KEY",
     "opencode_zen": "OPENCODE_API_KEY",
     "opencode_go": "OPENCODE_API_KEY",
-    "xiaomi_mimo": "XIAOMI_API_KEY"
+    "xiaomi_mimo": "XIAOMIMIMO_API_KEY"
   },
   "thinkingLevel": "high",
   "telegram": {
