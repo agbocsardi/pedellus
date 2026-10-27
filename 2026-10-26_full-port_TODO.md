@@ -31,7 +31,10 @@ P1 security and P8 data integrity cannot be waived by a successful chat demo.
       and full adversarial import/launch evidence remain open.
 - [ ] `pi-de1aa411`, `w2E:p1` / `w2E`: bounded opt-in archive preparation from
       explicit synthetic host inputs and existing usage projection, no writes or
-      cursor advancement. Branch base `def089e6680987b710e345cce2cc125fd995d7b7`.
+      cursor advancement. Parent withheld `3070a0743`: raw summary may retain
+      reasoning, projection validation was shallow, and size checks occurred
+      after serialization. Returned corrections; no candidate acceptance. Branch
+      base `def089e6680987b710e345cce2cc125fd995d7b7`.
 - [ ] Parent review reports and integrate only verified work. Sandbox remains
       disabled in gateway; no live data, network requests, deployment or cleanup
       until work is reviewed. Both use `openai-codex / gpt-6-luna / high`.
