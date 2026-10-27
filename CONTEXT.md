@@ -113,8 +113,9 @@ The source-backed mapping is:
   deterministically renders a bounded identity subset from host-provided runtime,
   workspace path, optional platform-policy text, and known channel values. It is
   not a Jinja engine and performs no platform/environment discovery. It rejects
-  control characters in the workspace path and bounds the complete output with
-  the existing context-section limit. It deliberately omits Python identity's
+  control characters in the workspace path and rejects over-limit inputs or
+  complete output using the existing context-section limit; it never truncates
+  identity or policy text. It deliberately omits Python identity's
   memory/history/skill file claims, untrusted-web snippet, and tool-use contract:
   those capabilities are not established by this package's gateway. This slice
   also does not implement runtime/user-message metadata or archived summaries.

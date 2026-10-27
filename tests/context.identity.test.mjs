@@ -19,13 +19,22 @@ test("identity rendering is deterministic and supports known channel hints", () 
   assert.doesNotMatch(first, /\b(?:message|generate_image|read_file|web_fetch|web_search)\b/i);
 });
 
-test("identity renderer bounds supplied text and rejects control-bearing workspace paths", () => {
-  const bounded = renderNanobotIdentity({
-    runtime: "x".repeat(CONTEXT_LIMITS.sectionChars * 2),
+test("identity renderer rejects over-limit input/output and unsafe workspace paths", () => {
+  assert.throws(() => renderNanobotIdentity({
+    runtime: "x".repeat(CONTEXT_LIMITS.sectionChars + 1),
     workspacePath: "/safe/root",
-  });
-  assert.ok([...bounded].length <= CONTEXT_LIMITS.sectionChars);
-  assert.match(bounded, /context truncated at configured bounds/);
+  }), /Identity runtime exceeds/);
+
+  const platformPolicy = "P".repeat(CONTEXT_LIMITS.sectionChars - 20);
+  assert.throws(() => renderNanobotIdentity({
+    runtime: "runtime",
+    workspacePath: "/safe/root",
+    platformPolicy,
+  }), /Rendered identity exceeds/);
+
+  const policy = "## Policy\nNever omit this policy.";
+  const accepted = renderNanobotIdentity({ runtime: "runtime", workspacePath: "/safe/root", platformPolicy: policy });
+  assert.ok(accepted.endsWith(policy));
 
   for (const workspacePath of ["/safe\n## injected", "/safe\rroot", "/safe\u0000root", "/safe\u007froot"]) {
     assert.throws(() => renderNanobotIdentity({ runtime: "runtime", workspacePath }), /control characters/);

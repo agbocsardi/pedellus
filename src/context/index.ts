@@ -20,6 +20,11 @@ export function renderNanobotIdentity(values: NanobotIdentityValues): string {
   if (/[\r\n\u0000-\u001f\u007f]/.test(values.workspacePath)) {
     throw new TypeError("Workspace path must not contain control characters or newlines");
   }
+  for (const [label, value] of [["runtime", values.runtime], ["workspacePath", values.workspacePath], ["platformPolicy", values.platformPolicy]] as const) {
+    if (value !== undefined && codePointCount(value) > CONTEXT_LIMITS.sectionChars) {
+      throw new RangeError(`Identity ${label} exceeds ${CONTEXT_LIMITS.sectionChars} code points`);
+    }
+  }
 
   const sections = [
     `## Runtime\n${values.runtime}`,
@@ -35,7 +40,11 @@ export function renderNanobotIdentity(values: NanobotIdentityValues): string {
     sections.push("## Format Hint\nOutput is rendered in a terminal. Avoid markdown headings and tables. Use plain text with minimal formatting.");
   }
 
-  return boundedText(sections.join("\n\n"), CONTEXT_LIMITS.sectionChars);
+  const outputChars = sections.reduce((total, sectionText) => total + codePointCount(sectionText), 2 * (sections.length - 1));
+  if (outputChars > CONTEXT_LIMITS.sectionChars) {
+    throw new RangeError(`Rendered identity exceeds ${CONTEXT_LIMITS.sectionChars} code points`);
+  }
+  return sections.join("\n\n");
 }
 
 export const CONTEXT_LIMITS = Object.freeze({
