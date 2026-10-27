@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 /** Version of the deterministic inventory document, not an import/checkpoint version. */
-export const MIGRATION_REPORT_VERSION = 2 as const;
+export const MIGRATION_REPORT_VERSION = 3 as const;
 
 export const MIGRATION_LIMITS = Object.freeze({
   maxSources: 64,
@@ -60,7 +60,9 @@ export interface MigrationDryRunOptions {
 export interface MigrationIssue {
   readonly code: string;
   readonly sourceId: string;
+  /** Null for document/source-level diagnostics. */
   readonly line: number | null;
+  /** Exact raw physical-line digest; null when `line` is null. */
   readonly lineSha256: string | null;
 }
 
@@ -74,21 +76,27 @@ export interface SafeIdentifier {
 export interface MigrationRecord {
   readonly sourceId: string;
   readonly sourceSha256: string | null;
-  readonly line: number;
-  /** Hashes the exact raw line bytes, including a terminating LF when present. */
-  readonly lineSha256: string;
+  readonly identityScope: "line" | "document";
+  readonly line: number | null;
+  /** Exact raw physical-line hash; null for document-level records. */
+  readonly lineSha256: string | null;
   readonly category:
     | "session-header"
     | "session-message"
     | "history-entry"
     | "config-preset"
-    | "malformed-line";
+    | "malformed-line"
+    | "malformed-document";
   readonly originalId: SafeIdentifier | null;
   readonly sessionKey: SafeIdentifier | null;
   readonly timestamp: string | null;
   readonly role: string | null;
   readonly targetEntryKind: string | null;
-  readonly executionDisposition: "historical-only-never-runnable" | "not-applicable" | "review-required";
+  readonly executionDisposition:
+    | "historical-only-never-runnable"
+    | "review-required-history-only-never-runnable"
+    | "not-applicable"
+    | "review-required";
   readonly duplicateOf: Readonly<{ sourceId: string; line: number }> | null;
   readonly lineage: Readonly<Record<string, unknown>>;
   readonly usage: Readonly<{ status: "known" | "unknown" | "invalid"; counters: CounterSet }> | null;
@@ -176,6 +184,7 @@ interface ArchiveUsageObservation {
   readonly cursor: number | null;
   readonly counters: CounterSet | null;
   readonly status: "known" | "unknown" | "invalid";
+  readonly payloadValid: boolean;
   duplicateCursor: boolean;
 }
 
@@ -802,7 +811,7 @@ function inventorySessionSource(
   const lineLimitExceeded = (work.lineCount ?? 0) > options.limits.maxLinesPerSource;
   if (lineLimitExceeded) {
     work.status = "incomplete";
-    issue("line_limit_exceeded", work.input.sourceId, null, work.sha256);
+    issue("line_limit_exceeded", work.input.sourceId, null, null);
   }
 
   for (const line of allLines) {
@@ -917,6 +926,9 @@ function inventorySessionSource(
     const rawCalls = own(parsed, "tool_calls");
     const rawContent = own(parsed, "content");
     const rawMedia = own(parsed, "media");
+    const hasToolCallsField = Object.hasOwn(parsed, "tool_calls");
+    const hasToolCallIdField = Object.hasOwn(parsed, "tool_call_id");
+    const historyOnly = hasToolCallsField || hasToolCallIdField || rawRole === "tool";
     let messageShapeValid = true;
     const shapeIssue = (code: string) => {
       messageShapeValid = false;
@@ -929,6 +941,11 @@ function inventorySessionSource(
     if (rolePlan.targetEntryKind === "nanobot.legacy.message") {
       unknownRoleCount++;
       shapeIssue("unknown_session_message_role");
+    }
+    if (hasToolCallsField && rawRole !== "assistant") shapeIssue("tool_calls_role_mismatch");
+    if (hasToolCallIdField && rawRole !== "tool") shapeIssue("tool_call_id_role_mismatch");
+    if (hasToolCallIdField && (typeof own(parsed, "tool_call_id") !== "string" || own(parsed, "tool_call_id") === "")) {
+      shapeIssue("invalid_tool_call_id");
     }
     if (!Object.hasOwn(parsed, "content")) shapeIssue("missing_session_message_content");
     else {
@@ -1007,8 +1024,10 @@ function inventorySessionSource(
       sessionKey: safeIdentifier(sessionKeyRaw),
       timestamp,
       role: rolePlan.role,
-      targetEntryKind: messageShapeValid ? rolePlan.targetEntryKind : null,
-      executionDisposition: messageShapeValid ? rolePlan.executionDisposition : "review-required",
+      targetEntryKind: historyOnly ? "nanobot.legacy.history" : messageShapeValid ? rolePlan.targetEntryKind : null,
+      executionDisposition: historyOnly
+        ? messageShapeValid ? "historical-only-never-runnable" : "review-required-history-only-never-runnable"
+        : messageShapeValid ? rolePlan.executionDisposition : "review-required",
       duplicateOf,
       lineage,
       usage: null,
@@ -1018,14 +1037,15 @@ function inventorySessionSource(
     }
   }
 
-  if (!header) issue("missing_session_header", work.input.sourceId, null, work.sha256);
+  if (!header) issue("missing_session_header", work.input.sourceId, null, null);
+  const headerLineSha256 = headerLocation ? findLineHash(bytes, headerLocation.line) : null;
   const lastConsolidated = safeNonNegativeInt(own(header ?? {}, "last_consolidated"));
   if (lastConsolidated !== null && lastConsolidated > messageCount) {
-    issue("last_consolidated_exceeds_message_count", work.input.sourceId, headerLocation?.line ?? null, work.sha256);
+    issue("last_consolidated_exceeds_message_count", work.input.sourceId, headerLocation?.line ?? null, headerLineSha256);
   }
-  const checkpointRows = inventoryCheckpoints(metadata, work, headerLocation, options.limits, issue);
+  const checkpointRows = inventoryCheckpoints(metadata, work, headerLocation, headerLineSha256, options.limits, issue);
   const goal = inventoryGoal(metadata);
-  const runtime = inventoryRuntimeCheckpoint(metadata, options.limits, work, issue);
+  const runtime = inventoryRuntimeCheckpoint(metadata, options.limits, work, headerLocation, headerLineSha256, issue);
   const pendingUserTurn = own(metadata, "pending_user_turn");
   const pendingStatus = pendingUserTurn === true ? "active" : pendingUserTurn === undefined ? "not-present" :
     pendingUserTurn === false ? "inactive" : "unknown";
@@ -1039,8 +1059,8 @@ function inventorySessionSource(
   const usageValue = own(metadata, "usage");
   const watermarkValue = own(metadata, "_usage_archived");
   const usage = activeUsageDelta(usageValue, watermarkValue);
-  if (usage.status === "invalid") issue("invalid_active_usage_snapshot", work.input.sourceId, headerLocation?.line ?? null, work.sha256);
-  if (usage.status === "regression") issue("active_usage_watermark_regression", work.input.sourceId, headerLocation?.line ?? null, work.sha256);
+  if (usage.status === "invalid") issue("invalid_active_usage_snapshot", work.input.sourceId, headerLocation?.line ?? null, headerLineSha256);
+  if (usage.status === "regression") issue("active_usage_watermark_regression", work.input.sourceId, headerLocation?.line ?? null, headerLineSha256);
   const duplicateKey = sessionKeyRaw !== null && options.duplicateSessionKeys.has(sessionKeyRaw);
   options.sessionUsages.push({
     sessionKey: sessionKeyRaw,
@@ -1056,7 +1076,7 @@ function inventorySessionSource(
     sourceId: work.input.sourceId,
     sourceSha256: work.sha256,
     headerLine: headerLocation?.line ?? null,
-    headerLineSha256: headerLocation ? findLineHash(bytes, headerLocation.line) : null,
+    headerLineSha256,
     sessionKey: safeIdentifier(sessionKeyRaw),
     createdAt: safeTimestamp(own(header ?? {}, "created_at")),
     updatedAt: safeTimestamp(own(header ?? {}, "updated_at")),
@@ -1086,21 +1106,22 @@ function inventoryCheckpoints(
   metadata: Record<string, unknown>,
   work: SourceWork,
   header: Readonly<{ sourceId: string; line: number }> | null,
+  headerLineSha256: string | null,
   limits: MigrationLimits,
   issue: (code: string, sourceId: string, line: number | null, lineHash: string | null) => void,
 ): Readonly<Record<string, unknown>>[] {
   const raw = own(metadata, "compaction_checkpoints");
   if (raw === undefined) return [];
   if (!Array.isArray(raw)) {
-    issue("compaction_checkpoints_not_array", work.input.sourceId, header?.line ?? null, work.sha256);
+    issue("compaction_checkpoints_not_array", work.input.sourceId, header?.line ?? null, headerLineSha256);
     return [];
   }
   if (raw.length > limits.maxNestedReferences) {
-    issue("compaction_checkpoint_limit_exceeded", work.input.sourceId, header?.line ?? null, work.sha256);
+    issue("compaction_checkpoint_limit_exceeded", work.input.sourceId, header?.line ?? null, headerLineSha256);
   }
   return raw.slice(0, limits.maxNestedReferences).map((checkpoint) => {
     if (!isObject(checkpoint)) {
-      issue("compaction_checkpoint_not_object", work.input.sourceId, header?.line ?? null, work.sha256);
+      issue("compaction_checkpoint_not_object", work.input.sourceId, header?.line ?? null, headerLineSha256);
       return { status: "unknown" };
     }
     const id = safeIdentifier(own(checkpoint, "id"));
@@ -1109,7 +1130,7 @@ function inventoryCheckpoints(
     const firstKeptEntryId = safeIdentifier(own(checkpoint, "first_kept_entry_id"));
     const sourceEndId = safeIdentifier(own(checkpoint, "source_end_id"));
     if (!id || version !== 1 || type !== "compaction" || !firstKeptEntryId || !sourceEndId) {
-      issue("incomplete_compaction_checkpoint_lineage", work.input.sourceId, header?.line ?? null, work.sha256);
+      issue("incomplete_compaction_checkpoint_lineage", work.input.sourceId, header?.line ?? null, headerLineSha256);
     }
     return {
       id,
@@ -1142,6 +1163,8 @@ function inventoryRuntimeCheckpoint(
   metadata: Record<string, unknown>,
   limits: MigrationLimits,
   work: SourceWork,
+  header: Readonly<{ sourceId: string; line: number }> | null,
+  headerLineSha256: string | null,
   issue: (code: string, sourceId: string, line: number | null, lineHash: string | null) => void,
 ): { status: "active" | "unknown" | "not-present"; details: Record<string, unknown> } {
   const raw = own(metadata, "runtime_checkpoint");
@@ -1152,7 +1175,7 @@ function inventoryRuntimeCheckpoint(
   const pendingCalls = Array.isArray(pending) ? pending : null;
   const results = Array.isArray(completed) ? completed : null;
   if (pendingCalls && pendingCalls.length > limits.maxNestedReferences) {
-    issue("runtime_checkpoint_reference_limit_exceeded", work.input.sourceId, null, work.sha256);
+    issue("runtime_checkpoint_reference_limit_exceeded", work.input.sourceId, header?.line ?? null, headerLineSha256);
   }
   const pendingIds: SafeIdentifier[] = [];
   for (const call of (pendingCalls ?? []).slice(0, limits.maxNestedReferences)) {
@@ -1180,22 +1203,28 @@ function safeNonNegativeInt(value: unknown): number | null {
 
 function recordBase(
   work: SourceWork,
-  line: number,
-  lineHash: string,
+  line: number | null,
+  lineHash: string | null,
   category: MigrationRecord["category"],
-): Pick<MigrationRecord, "sourceId" | "sourceSha256" | "line" | "lineSha256" | "category"> {
+): Pick<MigrationRecord, "sourceId" | "sourceSha256" | "identityScope" | "line" | "lineSha256" | "category"> {
   return {
     sourceId: work.input.sourceId,
     sourceSha256: work.sha256,
+    identityScope: line === null ? "document" : "line",
     line,
-    lineSha256: lineHash,
+    lineSha256: line === null ? null : lineHash,
     category,
   };
 }
 
-function malformedRecord(work: SourceWork, line: number, lineHash: string): MigrationRecord {
+function malformedRecord(
+  work: SourceWork,
+  line: number | null,
+  lineHash: string | null,
+  category: MigrationRecord["category"] = "malformed-line",
+): MigrationRecord {
   return {
-    ...recordBase(work, line, lineHash, "malformed-line"),
+    ...recordBase(work, line, lineHash, category),
     originalId: null,
     sessionKey: null,
     timestamp: null,
@@ -1230,7 +1259,7 @@ function inventoryHistorySource(
   if (!bytes) return;
   if ((work.lineCount ?? 0) > options.limits.maxLinesPerSource) {
     work.status = "incomplete";
-    issue("line_limit_exceeded", work.input.sourceId, null, work.sha256);
+    issue("line_limit_exceeded", work.input.sourceId, null, null);
   }
   let linesProcessed = 0;
   for (const line of physicalLines(bytes)) {
@@ -1287,8 +1316,25 @@ function inventoryHistorySource(
     }
     const rawSessionKey = own(parsed, "session_key");
     const sessionKeyRaw = typeof rawSessionKey === "string" ? rawSessionKey : null;
-    if (rawSessionKey !== undefined && sessionKeyRaw === null) issue("invalid_history_session_key", work.input.sourceId, line.number, lineHash);
+    const sessionKeyValid = rawSessionKey === undefined || rawSessionKey === null || typeof rawSessionKey === "string";
+    if (!sessionKeyValid) {
+      work.status = "incomplete";
+      issue("invalid_history_session_key", work.input.sourceId, line.number, lineHash);
+    }
+    const rawTimestamp = own(parsed, "timestamp");
+    const timestampIsString = typeof rawTimestamp === "string";
+    if (!timestampIsString) {
+      work.status = "incomplete";
+      issue("invalid_history_payload_timestamp", work.input.sourceId, line.number, lineHash);
+    }
     const messages = own(parsed, "messages");
+    const payloadHasBody = typeof own(parsed, "content") === "string" ||
+      typeof own(parsed, "summary") === "string" || Array.isArray(messages);
+    if (!payloadHasBody) {
+      work.status = "incomplete";
+      issue("invalid_history_payload_body", work.input.sourceId, line.number, lineHash);
+    }
+    const historyPayloadValid = timestampIsString && sessionKeyValid && payloadHasBody;
     const rawSchemaVersion = own(parsed, "schema_version");
     const schemaVersion = safeNonNegativeInt(rawSchemaVersion);
     const rawMessageCount = own(parsed, "message_count");
@@ -1325,7 +1371,6 @@ function inventoryHistorySource(
     const endTime = safeTimestamp(rawEnd);
     if (rawStart !== undefined && startTime === null) issue("invalid_history_start_time", work.input.sourceId, line.number, lineHash);
     if (rawEnd !== undefined && endTime === null) issue("invalid_history_end_time", work.input.sourceId, line.number, lineHash);
-    const rawTimestamp = own(parsed, "timestamp");
     const timestamp = safeTimestamp(rawTimestamp);
     if (rawTimestamp !== undefined && timestamp === null) issue("invalid_history_timestamp", work.input.sourceId, line.number, lineHash);
     const messageCount = hasStructuredMessages ? messages.length : declaredMessages;
@@ -1338,8 +1383,12 @@ function inventoryHistorySource(
       endTime,
       idempotencyKeySha256: idempotencyDigest,
       embeddedMessageIds: "not-present-in-history-v3-cleaning-schema",
+      pythonHistoryPayloadValid: historyPayloadValid,
     };
-    const usageReport = usage ? { status: usage.status, counters: usage.counters } : null;
+    const usageReport = usage ? {
+      status: historyPayloadValid ? usage.status : "invalid",
+      counters: historyPayloadValid ? usage.counters : blankCounters(),
+    } : null;
     if (schemaVersion === null && rawSchemaVersion !== undefined) {
       issue("invalid_history_schema_version", work.input.sourceId, line.number, lineHash);
     }
@@ -1364,6 +1413,7 @@ function inventoryHistorySource(
       cursor,
       counters: usage?.counters ?? null,
       status: rawUsage === undefined || cursor === null ? "unknown" : usage?.status ?? "invalid",
+      payloadValid: historyPayloadValid,
       duplicateCursor: duplicateOf !== null,
     });
   }
@@ -1384,7 +1434,6 @@ function readConfigAlias(
   fieldPath: string,
   findings: ConfigAliasFindings,
   work: SourceWork,
-  lineHash: string,
   issue: (code: string, sourceId: string, line: number | null, lineHash: string | null) => void,
 ): { value: unknown; status: ConfigAliasStatus } {
   const hasSnake = Object.hasOwn(object, snakeKey);
@@ -1398,7 +1447,7 @@ function readConfigAlias(
     else counts.conflictCount++;
     findings.set(fieldPath, counts);
     work.status = "incomplete";
-    issue(sameValue ? "duplicate_config_aliases" : "conflicting_config_aliases", work.input.sourceId, 1, lineHash);
+    issue(sameValue ? "duplicate_config_aliases" : "conflicting_config_aliases", work.input.sourceId, null, null);
     return { value: sameValue ? own(object, camelKey) : undefined, status };
   }
   return { value: own(object, hasCamel ? camelKey : snakeKey), status: "single" };
@@ -1422,20 +1471,19 @@ function inventoryConfigSource(
   try {
     parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes)) as unknown;
   } catch {
-    issue("malformed_or_truncated_config_json", work.input.sourceId, 1, work.sha256);
+    issue("malformed_or_truncated_config_json", work.input.sourceId, null, null);
     work.status = "incomplete";
-    emit(malformedRecord(work, 1, work.sha256 ?? sha256(bytes)), work);
+    emit(malformedRecord(work, null, null, "malformed-document"), work);
     return { presetCount: 0, summary: { sourceId: work.input.sourceId, status: "invalid-json" } };
   }
   if (!isObject(parsed)) {
-    issue("config_root_not_object", work.input.sourceId, 1, work.sha256);
+    issue("config_root_not_object", work.input.sourceId, null, null);
     work.status = "incomplete";
     return { presetCount: 0, summary: { sourceId: work.input.sourceId, status: "invalid-root" } };
   }
-  const lineHash = work.sha256 ?? sha256(bytes);
   const aliasFindings: ConfigAliasFindings = new Map();
   const presetRead = readConfigAlias(
-    parsed, "model_presets", "modelPresets", "modelPresets", aliasFindings, work, lineHash, issue,
+    parsed, "model_presets", "modelPresets", "modelPresets", aliasFindings, work, issue,
   );
   let presets = Object.create(null) as Record<string, unknown>;
   let namedPresetCount: number | null;
@@ -1451,56 +1499,70 @@ function inventoryConfigSource(
     namedPresetCount = Object.keys(presets).length;
     modelPresetCollectionStatus = presetRead.status === "duplicate-equal" ? "duplicate-equal-aliases" : "object";
   } else {
-    issue("model_presets_not_object", work.input.sourceId, 1, lineHash);
+    issue("model_presets_not_object", work.input.sourceId, null, null);
     work.status = "incomplete";
     namedPresetCount = null;
     modelPresetCollectionStatus = "invalid-shape";
   }
 
   const agentsRaw = own(parsed, "agents");
-  if (agentsRaw !== undefined && !isObject(agentsRaw)) {
-    issue("agents_not_object", work.input.sourceId, 1, lineHash);
+  const agentsValid = agentsRaw === undefined || isObject(agentsRaw);
+  if (!agentsValid) {
+    issue("agents_not_object", work.input.sourceId, null, null);
     work.status = "incomplete";
   }
   const agents = isObject(agentsRaw) ? agentsRaw : {};
   const defaultsRaw = own(agents, "defaults");
-  if (defaultsRaw !== undefined && !isObject(defaultsRaw)) {
-    issue("agent_defaults_not_object", work.input.sourceId, 1, lineHash);
+  const defaultsValid = defaultsRaw === undefined || isObject(defaultsRaw);
+  if (!defaultsValid) {
+    issue("agent_defaults_not_object", work.input.sourceId, null, null);
     work.status = "incomplete";
   }
+  const agentDefaultsAvailable = agentsValid && defaultsValid;
   const defaults = isObject(defaultsRaw) ? defaultsRaw : Object.create(null) as Record<string, unknown>;
   const agentModel = safeIdentifier(own(defaults, "model"));
   const agentProvider = safeIdentifier(own(defaults, "provider"));
   const activeRead = readConfigAlias(
-    defaults, "model_preset", "modelPreset", "agents.defaults.modelPreset", aliasFindings, work, lineHash, issue,
+    defaults, "model_preset", "modelPreset", "agents.defaults.modelPreset", aliasFindings, work, issue,
   );
   let activePreset: SafeIdentifier | null = null;
   let activePresetStatus: string;
-  if (activeRead.status === "missing") activePresetStatus = "not-explicit";
+  if (!agentDefaultsAvailable) activePresetStatus = "unavailable-invalid-agent-config";
+  else if (activeRead.status === "missing") activePresetStatus = "not-explicit";
   else if (activeRead.status === "conflicting") activePresetStatus = "conflicting-aliases";
   else if (activeRead.value === null) activePresetStatus = "explicit-none";
   else if (typeof activeRead.value === "string") {
     activePreset = safeIdentifier(activeRead.value);
     activePresetStatus = activeRead.status === "duplicate-equal" ? "duplicate-equal-aliases" : "explicit";
   } else {
-    issue("invalid_active_model_preset", work.input.sourceId, 1, lineHash);
+    issue("invalid_active_model_preset", work.input.sourceId, null, null);
     work.status = "incomplete";
     activePresetStatus = "invalid-shape";
   }
-  const providerObject = isObject(own(parsed, "providers")) ? own(parsed, "providers") as Record<string, unknown> : {};
-  const configuredBuiltinProviders = Object.keys(providerObject).filter((key) => BUILTIN_PROVIDERS.has(key)).length;
-  const dynamicProviderCount = Object.keys(providerObject).filter((key) => !BUILTIN_PROVIDERS.has(key)).length;
+  const providersRaw = own(parsed, "providers");
+  const providersValid = providersRaw === undefined || isObject(providersRaw);
+  if (!providersValid) {
+    issue("providers_not_object", work.input.sourceId, null, null);
+    work.status = "incomplete";
+  }
+  const providerObject = isObject(providersRaw) ? providersRaw : {};
+  const providersStatus = providersRaw === undefined ? "not-present" : providersValid ? "object" : "invalid-shape";
+  const configuredBuiltinProviders = providersValid ? Object.keys(providerObject).filter((key) => BUILTIN_PROVIDERS.has(key)).length : null;
+  const dynamicProviderCount = providersValid ? Object.keys(providerObject).filter((key) => !BUILTIN_PROVIDERS.has(key)).length : null;
   const presetNames = Object.keys(presets).sort();
-  const hasImplicitDefault = own(defaults, "model") !== undefined || own(defaults, "provider") !== undefined;
+  const hasImplicitDefault = agentDefaultsAvailable && (own(defaults, "model") !== undefined || own(defaults, "provider") !== undefined);
   const presetCount = (namedPresetCount ?? 0) + (hasImplicitDefault ? 1 : 0);
-  const reportedPresetCount = namedPresetCount === null ? null : presetCount;
+  const reportedPresetCount = namedPresetCount === null || !agentDefaultsAvailable ? null : presetCount;
   let presetRecordsEmitted = 0;
   const runPresetsRead = readConfigAlias(
-    defaults, "run_presets", "runPresets", "agents.defaults.runPresets", aliasFindings, work, lineHash, issue,
+    defaults, "run_presets", "runPresets", "agents.defaults.runPresets", aliasFindings, work, issue,
   );
   let runPresetCount: number | null;
   let runPresetsStatus: string;
-  if (runPresetsRead.status === "missing") {
+  if (!agentDefaultsAvailable) {
+    runPresetCount = null;
+    runPresetsStatus = "unavailable-invalid-agent-config";
+  } else if (runPresetsRead.status === "missing") {
     runPresetCount = 0;
     runPresetsStatus = "not-present";
   } else if (runPresetsRead.status === "conflicting") {
@@ -1510,7 +1572,7 @@ function inventoryConfigSource(
     runPresetCount = Object.keys(runPresetsRead.value).length;
     runPresetsStatus = runPresetsRead.status === "duplicate-equal" ? "duplicate-equal-aliases" : "object";
   } else {
-    issue("run_presets_not_object", work.input.sourceId, 1, lineHash);
+    issue("run_presets_not_object", work.input.sourceId, null, null);
     work.status = "incomplete";
     runPresetCount = null;
     runPresetsStatus = "invalid-shape";
@@ -1519,14 +1581,14 @@ function inventoryConfigSource(
     const rawPreset = presets[name];
     const preset = isObject(rawPreset) ? rawPreset : null;
     if (!preset) {
-      issue("model_preset_not_object", work.input.sourceId, 1, lineHash);
+      issue("model_preset_not_object", work.input.sourceId, null, null);
       work.status = "incomplete";
     }
     const display = preset
-      ? presetSummary(name, preset, false, "modelPresets[*]", aliasFindings, work, lineHash, issue)
+      ? presetSummary(name, preset, false, "modelPresets[*]", aliasFindings, work, issue)
       : { name: safeIdentifier(name), status: "invalid-shape" };
     const record: MigrationRecord = {
-      ...recordBase(work, 1, lineHash, "config-preset"),
+      ...recordBase(work, null, null, "config-preset"),
       originalId: safeIdentifier(name),
       sessionKey: null,
       timestamp: null,
@@ -1541,11 +1603,11 @@ function inventoryConfigSource(
     presetRecordsEmitted++;
   }
   const defaultPreset = presetSummary(
-    "default", defaults, true, "agents.defaults", aliasFindings, work, lineHash, issue,
+    "default", defaults, true, "agents.defaults", aliasFindings, work, issue,
   );
   if (hasImplicitDefault) {
     if (emit({
-      ...recordBase(work, 1, lineHash, "config-preset"),
+      ...recordBase(work, null, null, "config-preset"),
       originalId: safeIdentifier("default"),
       sessionKey: null,
       timestamp: null,
@@ -1565,12 +1627,14 @@ function inventoryConfigSource(
     presetCount: reportedPresetCount,
     namedPresetCount,
     modelPresetCollectionStatus,
+    agentDefaultsStatus: agentDefaultsAvailable ? "available" : "invalid-shape",
     presetRecordsEmitted,
     unprocessedPresetCount: reportedPresetCount === null ? null : reportedPresetCount - presetRecordsEmitted,
     activePreset,
     activePresetStatus,
     runPresetCount,
     runPresetsStatus,
+    providersStatus,
     configuredBuiltinProviders,
     dynamicProviderCount,
     unknownRootKeyCount,
@@ -1592,11 +1656,10 @@ function presetSummary(
   fieldPrefix: string,
   findings: ConfigAliasFindings,
   work: SourceWork,
-  lineHash: string,
   issue: (code: string, sourceId: string, line: number | null, lineHash: string | null) => void,
 ): Record<string, unknown> {
   const read = (snake: string, camel: string, field: string) => readConfigAlias(
-    preset, snake, camel, `${fieldPrefix}.${field}`, findings, work, lineHash, issue,
+    preset, snake, camel, `${fieldPrefix}.${field}`, findings, work, issue,
   ).value;
   const maxTokens = read("max_tokens", "maxTokens", "maxTokens");
   const contextWindowTokens = read("context_window_tokens", "contextWindowTokens", "contextWindowTokens");
@@ -1631,6 +1694,7 @@ function reconcileUsage(
   let archivedKnownRecords = 0;
   let archivedUnknownRecords = 0;
   let archivedInvalidRecords = 0;
+  let archivedInvalidPayloadRecords = 0;
   let excludedCursorCollisions = 0;
   let activeExactSessions = 0;
   let activeUnknownSessions = 0;
@@ -1642,6 +1706,11 @@ function reconcileUsage(
   for (const archive of archives) {
     if (archive.duplicateCursor) {
       excludedCursorCollisions++;
+      continue;
+    }
+    if (!archive.payloadValid) {
+      archivedInvalidPayloadRecords++;
+      if (archive.status === "invalid") archivedInvalidRecords++;
       continue;
     }
     if (archive.status === "unknown" || archive.counters === null) {
@@ -1690,6 +1759,7 @@ function reconcileUsage(
       recordsWithKnownUsage: archivedKnownRecords,
       recordsWithoutUsage: archivedUnknownRecords,
       invalidUsageRecords: archivedInvalidRecords,
+      invalidPayloadRecords: archivedInvalidPayloadRecords,
       duplicateCursorRecordsExcluded: excludedCursorCollisions,
       aggregateOverflow: archiveOverflow,
     },
