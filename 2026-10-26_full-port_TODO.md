@@ -86,8 +86,9 @@ policy, environment and replay gates pass.
       isolated candidate and integrated build against real bwrap. The 5-second
       experimental cap is not product policy; CPU/memory/PID/disk quotas and
       approval remain separate P1 gates.
-- [ ] `pi-c5881b66`: synthetic nested Code Mode crash/revocation coverage,
-      no production tool activation; base `11a21a651`.
+- [x] `pi-c5881b66`: merged `1b0684de3`, synthetic nested Code Mode
+      crash/revocation/downgrade coverage; independently reviewed. Caught nested
+      failures may coexist with a successful script result. No tool activation.
 - [x] `pi-13288a3c`: merged `cdce81811`, synthetic SIGKILL/reopen coverage for
       revoked grants, safe-to-unsafe downgrade, and explicitly safe replay.
       Independently reviewed; no production tool registration.

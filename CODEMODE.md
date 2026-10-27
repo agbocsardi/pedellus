@@ -189,7 +189,8 @@ evidence that P1, P2 as a whole, or the TypeScript port has passed acceptance.
 
 ## Offline verification evidence
 
-No committed test scaffolding was added. The bounded temporary probes used Node
+Committed synthetic conversation and crash/replay coverage is described in
+[NESTED_CODEMODE_REPLAY.md](./NESTED_CODEMODE_REPLAY.md). Earlier temporary probes used Node
 22.22.2, the actual Durable Harness and file-backed SQLite storage, the actual
 QuickJS worker, faux models, and only synthetic tools. No provider credentials,
 network, Telegram, bash, production host configuration, or production data were used.

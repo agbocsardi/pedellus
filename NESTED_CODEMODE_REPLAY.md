@@ -61,8 +61,8 @@ entries and the nested `details.calls` rows:
 
 The effect log has exactly one line for each mixed effect before the crash. After
 resume it adds exactly one more `nested_granted_effect` line; the revoked,
-downgraded, and pending bodies never run again or for the first time. Counts are
-asserted by label rather than append order.
+downgraded, and pending bodies never run again or for the first time. The test
+asserts label counts and the final effect-log append.
 
 ## Native semantics this relies on
 
@@ -100,10 +100,7 @@ integration, and removes the temporary directory.
 Set `PI_CODEMODE_REPLAY_CANDIDATE=/path/to/packages/pi-nanobot` to run against
 another built checkout.
 
-This change adds the test file and fixture only. `package.json` is intentionally
-untouched by the assigned scope, so the test is **not** wired into the explicit
-`test:behavior` list; run it directly with the command above or add it in a
-separate package change.
+The test is included in `test:behavior`; it can also be run directly as above.
 
 ## Scope and non-claims
 
