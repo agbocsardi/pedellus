@@ -22,7 +22,7 @@ formatting controls are removed; ordinary newlines and Unicode scalar values are
 | `/help` | Show this CLI's local controls. |
 | `/status` | Show the conversation's current host-selected model, native run/inbox state, and Durable-recorded per-model/tool usage. Provider-side charges or unrecorded spend remain unknown. |
 | `/history [count]` | Show the latest user/assistant text messages only (default 10, max 50), using Durable entry pagination; each snippet is limited to 200 characters and the scan to 2,000 entries. System, reasoning, tool, and non-text blocks are omitted. |
-| `/model` | Report the current host-selected model. Arguments do not change it; model mutation belongs to the host's allowed-model API. |
+| `/model` | List the current host-selected model and finite allowed choices, including supported thinking levels. In the integrated CLI, select with `/model <provider> <modelId> [thinkingLevel]`; the pair must exactly match the host allowlist. A busy conversation rejects selection atomically; retry when idle. Standalone terminal callers without a host callback remain read-only. |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
 | `/steer TEXT` | Submit with native `whenBusy: "steer"`; while busy it joins the run at a native safe boundary. |
@@ -59,5 +59,6 @@ SIGTERM cancel local waits and watches, close input, and let the gateway
 close/reap its Harness.
 
 This remains a text-only local surface, not a complete Python command port or
-interactive terminal UI. It does not add another agent runner, queue, session
-store, or model selector.
+interactive terminal UI. Model selection delegates to Gateway's allowlist and
+persists in native Durable `pi.agent`; it adds no agent runner, queue, session
+store, or parallel model state.

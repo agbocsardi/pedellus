@@ -3,8 +3,8 @@
 This is the bounded P3 model-selection slice, not Python preset parity. The
 runtime accepts only a finite allowlist, uses the pinned Pi AI 1.4.0 model
 catalog, and stores each conversation's choice in Durable's native `pi.agent`
-document. No second selection store, model discovery, catalog refresh, fallback
-chain, or CLI `/model` command is added.
+document. The local CLI exposes that existing Gateway list/select policy; it adds no
+second selection store, model discovery, catalog refresh, or fallback chain.
 
 ## Configuration
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -8,6 +8,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { runTerminalConversation } from "../dist/terminal/index.js";
+import { openGateway } from "../dist/runtime.js";
+import { parseConfig } from "../dist/config.js";
 import { openFullSyncNodeSqliteStorage } from "../dist/storage/sqlite.js";
 import { AssistantEntry, createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
@@ -196,6 +198,60 @@ test("startup errors do not disclose sensitive paths", { timeout: timeoutMs + 2_
   assert.equal(result.status, 1);
   assert.match(result.stderr, /diagnostic details suppressed/);
   assert.doesNotMatch(result.stderr + result.stdout, new RegExp(secret));
+});
+
+test("local model command lists, selects, rejects invalid input without disclosure, and persists through Gateway", { timeout: timeoutMs + 2_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "nanobot-terminal-model-"));
+  const workspace = join(directory, "workspace");
+  const dataDir = join(directory, "state");
+  await mkdir(workspace);
+  const config = parseConfig({
+    workspace, dataDir,
+    model: { provider: "fixture", modelId: "alpha" },
+    allowedModels: [
+      { provider: "fixture", modelId: "alpha" },
+      { provider: "fixture", modelId: "beta" },
+    ],
+  }, directory);
+  const provider = fauxProvider({ provider: "fixture", models: [
+    { id: "alpha", name: "Alpha", reasoning: true },
+    { id: "beta", name: "Beta", reasoning: true },
+  ] });
+  const models = createModels();
+  models.setProvider(provider.provider);
+  let gateway;
+  try {
+    gateway = await openGateway(config, BACKGROUND_CONTEXT, { models });
+    const conversation = await gateway.conversationFor("cli:default", BACKGROUND_CONTEXT);
+    const chunks = [];
+    const output = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
+    await runTerminalConversation(conversation, BACKGROUND_CONTEXT, {
+      input: inputLines("/model", "/model fixture beta high", "/model fixture SYNTHETIC-CREDENTIAL"),
+      output,
+      modelSelection: {
+        list: () => gateway.listModels("cli:default", BACKGROUND_CONTEXT),
+        select: (selection) => gateway.selectModel("cli:default", selection, BACKGROUND_CONTEXT),
+      },
+    });
+    const printed = chunks.join("");
+    assert.match(printed, /Allowed models/);
+    assert.match(printed, /fixture beta/);
+    assert.match(printed, /Selected model: fixture\/beta \(thinking: high\)/);
+    assert.match(printed, /Model selection rejected: choice is invalid or unavailable/);
+    assert.doesNotMatch(printed, /SYNTHETIC-CREDENTIAL/);
+    assert.deepEqual((await gateway.listModels("cli:default", BACKGROUND_CONTEXT)).selected, {
+      provider: "fixture", modelId: "beta", thinkingLevel: "high",
+    });
+    await gateway.close(BACKGROUND_CONTEXT);
+    gateway = undefined;
+    gateway = await openGateway(config, BACKGROUND_CONTEXT, { models });
+    assert.deepEqual((await gateway.listModels("cli:default", BACKGROUND_CONTEXT)).selected, {
+      provider: "fixture", modelId: "beta", thinkingLevel: "high",
+    });
+  } finally {
+    await gateway?.close(BACKGROUND_CONTEXT);
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("terminal suppresses tool/reasoning text and strips terminal control characters", { timeout: timeoutMs + 2_000 }, async () => {
