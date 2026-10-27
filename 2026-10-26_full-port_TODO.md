@@ -22,6 +22,16 @@ continues to constrain the currently integrated tool-less slice.
 Each unchecked milestone needs its exit evidence, not merely compilable code.
 P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
+## Active sandbox follow-up — 2026-10-27
+
+- [ ] Worker `pi-5907db09`, pane `w26:p1`, workspace `w26`, branch
+      `pi-5907db09`, uses `opencode-go / deepseek-v4.1-flash / high` in an
+      independent worktree based on preserved sandbox tip `26ab7b9f6`.
+      Review outstanding confinement/import/IPC/owner/lifecycle risks and address
+      a bounded set with focused Nanobot behavioral checks. Gateway tools remain
+      disabled; no live data, deployment, or automatic integration. Await explicit
+      report, independently review and verify before accepting any security claim.
+
 ## Integrated implementation batch D — 2026-10-27
 
 **Current status:** all three slices are merged; final independent CLI and
