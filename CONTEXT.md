@@ -110,12 +110,14 @@ The source-backed mapping is:
   `AGENTS.md`/`SOUL.md`/`USER.md`, memory, always-skill bodies, skill summaries,
   archived summaries, runtime annotations, and a tool contract. This extension
   accepts explicit bootstrap/memory/skill snapshots. `renderNanobotIdentity()`
-  deterministically converts the fixed Nanobot identity template semantics from
-  host-provided runtime, workspace path, optional platform-policy text, and known
-  channel values. It is not a Jinja engine, performs no platform/environment
-  discovery, and leaves other values to the host. This slice still does not
-  implement the tool-contract template, runtime/user-message metadata, or archived
-  conversation summaries.
+  deterministically renders a bounded identity subset from host-provided runtime,
+  workspace path, optional platform-policy text, and known channel values. It is
+  not a Jinja engine and performs no platform/environment discovery. It rejects
+  control characters in the workspace path and bounds the complete output with
+  the existing context-section limit. It deliberately omits Python identity's
+  memory/history/skill file claims, untrusted-web snippet, and tool-use contract:
+  those capabilities are not established by this package's gateway. This slice
+  also does not implement runtime/user-message metadata or archived summaries.
 - `SkillsLoader` gives workspace skills precedence over built-ins, filters
   configured-disabled and requirement-unavailable entries, supports top-level or
   Nanobot/OpenClaw `always`, strips frontmatter from loaded bodies, and builds a
@@ -150,7 +152,7 @@ For provenance, semantic references are `nanobot/agent/context.py`,
 `nanobot/templates/memory/MEMORY.md`. The conversion decision is deliberate:
 
 - the host supplies identity values and chooses trustworthy sources; the identity
-  helper applies only fixed Nanobot template semantics and reads no ambient state;
+  helper renders a bounded, deliberately reduced subset and reads no ambient state;
 - this extension only composes supplied strings and never decides whether a file
   or skill is trusted;
 - host-mapped snapshots in a dedicated per-Harness registry replace automatic
