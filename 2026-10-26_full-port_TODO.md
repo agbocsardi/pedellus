@@ -907,3 +907,23 @@ Usage must preserve native attribution and expose gaps rather than fabricate
 requests or an atomic external archive. No sandbox/execution change, unsafe
 candidate acceptance, live request, dependency change or deployment is authorized.
 Await explicit child reports, then review and verify before integration.
+
+### 2026-10-27 — provider candidate and parent consumer proof
+
+C1 explicitly completed clean `pi-7dcd4062` as `311670d92`, nine total native
+provider aliases and strict env-name-only credentials, with source-backed gaps in
+PROVIDERS.md. Parent reviewed candidate/config changes and native auth/transport
+consumers; no integration yet. Launched independent read-only reviewer
+`pi-eb98e056`, pane `w1P:p6`, Luna/xhigh, report
+`/tmp/pi-provider-parity-review.md`; await explicit conclusion.
+
+Parent reran the worker's offline auth/catalog/faux-DeepSeek probe through a
+private selectable-import adaptation `/tmp/pi-nanobot-parent-provider-baseline.mjs`
+(45s/384 MB), passing all nine mappings and boundary checks. Parent independently
+wrote `/tmp/pi-nanobot-parent-provider-gateway.mjs` (60s/512 MB): actual native
+DeepSeek adapter with globally intercepted synthetic fetch, actual gateway and
+SQLite, transcript text/usage, credential absence from entries, reopen/requestId
+dedupe and unchanged tools:[] all pass. Exactly one mocked request, no live/paid
+call. Probes currently select candidate built artifacts; rerun against parent
+build after reviewed integration. Real-provider acceptance and full P8 parity
+remain open. C2/C3 continue independently; sandbox work remains untouched.
