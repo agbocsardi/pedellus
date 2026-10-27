@@ -31,14 +31,16 @@ Real history access and import require separate authorization; use synthetic dat
 - [ ] Prepare a bounded, provenance-preserving import of session files, archived
       prefixes and `history.jsonl`; unknown/malformed data must not disappear.
       Do not deduplicate merely because text or lines match.
-- [ ] `pi-c0a1faa5`: implement inert history-only records transactionally with
-      restart-safe idempotence; no live session-map entries, runnable calls or
-      tasks. Synthetic data only, base `cd917c4c4`.
-- [ ] `pi-be224dbf`: implement bounded paginated search/browsing over explicit
-      prepared snapshots with privacy and incomplete-coverage signals; synthetic
-      data only, base `cd917c4c4`. Review `bb13ae117`: malformed mixed-format
-      messages can currently abort search; corpus caps constrain large histories.
-      Stored-record search integration remains parent-owned.
+- [x] `pi-c0a1faa5`: merged `de3db07fb`, inert history-only persistence with
+      source-level provenance, exclusive-writer requirement, atomic ledger,
+      restart idempotence and full repeat verification. Synthetic data only;
+      parent and independent reviewer verified true mid-commit SQLite rollback.
+      No live session-map entries, runnable calls or tasks.
+- [ ] Build bounded asynchronous browsing/search over persisted records by Durable
+      entry ID, with stable line identities and honest coverage. `pi-be224dbf`
+      candidate `7b4b59c05` is preserved but not merged: full-array snapshots
+      do not scale to the stored corpus. `bb13ae117` has separate mixed-format
+      and corpus-size limitations. Neither is database search.
 - [ ] Rehearse on synthetic records; plan a private-copy reconciliation and
       backup/restore before seeking authorization for a real one-off import.
 - [x] `pi-458b1c64`: integrated `66163cf82`, bounded, pure source-byte
