@@ -19,6 +19,7 @@ import {
 } from "../dist/archival-search/index.js";
 import {
   ArchivalImportLedgerDoc,
+  ArchivalRecordEntry,
   persistArchivalImport,
   readArchivalImportLedger,
 } from "../dist/archival-persist/index.js";
@@ -86,6 +87,18 @@ async function allConversations(harness) {
   }, context);
 }
 
+async function createCarrier(harness, dataList) {
+  return harness.commit(async (tx) => {
+    const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
+    const entryIds = [];
+    for (const data of dataList) {
+      const entry = await tx.appendEntry(ArchivalRecordEntry, conversation.id, { data });
+      entryIds.push(entry.id);
+    }
+    return { conversationId: conversation.id, entryIds };
+  }, context);
+}
+
 async function writeLedger(harness, storeNamespace, rows) {
   await harness.commit(async (tx) => {
     const ledger = await tx.doc(ArchivalImportLedgerDoc);
@@ -100,7 +113,7 @@ const tinyLimits = Object.freeze({
   maxScanEntries: 1,
   maxScanUnits: 1,
   maxHits: 1,
-  maxOutputChars: 4_096,
+  maxOutputChars: 5_120,
   maxSnippetChars: 32,
   maxQueryChars: 200,
   scanBatchSize: 1,
@@ -351,6 +364,102 @@ test("reports partial, opaque, quarantine, and mixed-content coverage without re
   }
 });
 
+test("flags duplicate/extra carrier records and empty carriers as incomplete", async (t) => {
+  const database = await tempDatabase(t);
+  const { harness, storage } = await openHarness(database);
+  try {
+    const source = historySource("carrier-a", [
+      historyRecord("2026-10-27T00:00:00", "synthetic", [message("user", "carrier needle one")]),
+      historyRecord("2026-10-27T00:00:01", "synthetic", [message("user", "carrier needle two")]),
+    ]);
+    await persistArchivalImport(harness, { storeNamespace: "synthetic-store", sources: [source] }, context);
+    const ledger = await readArchivalImportLedger(harness, context);
+    const row = ledger.sources[0];
+    const entries = await allEntries(harness, row.conversationId);
+
+    await harness.commit(async (tx) => {
+      await tx.appendEntry(ArchivalRecordEntry, row.conversationId, {
+        data: { ...entries[0].data },
+      });
+    }, context);
+
+    const duplicatePage = await searchPersistedArchivalImport(
+      harness,
+      { text: "carrier needle" },
+      context,
+      { limits: { maxHits: 10 } },
+    );
+    assert.equal(duplicatePage.hits.length, 3);
+    assert.equal(duplicatePage.coverage.sourcesLedgerMismatch, 1);
+    assert.equal(duplicatePage.coverage.sourcesDuplicateOrOutOfOrder, 1);
+    assert.equal(duplicatePage.coverage.sourcesWithCaveats, 1);
+    assert.equal(duplicatePage.coverage.coverageComplete, false);
+
+    const empty = await harness.commit(
+      (tx) => tx.createConversation({ ownership: { kind: "ownerless" } }),
+      context,
+    );
+    await writeLedger(harness, ledger.storeNamespace, [{
+      ...row,
+      conversationId: empty.id,
+    }]);
+    const emptyPage = await searchPersistedArchivalImport(
+      harness,
+      { text: "carrier needle" },
+      context,
+      { limits: { maxHits: 10 } },
+    );
+    assert.equal(emptyPage.hits.length, 0);
+    assert.equal(emptyPage.coverage.sourcesLedgerMismatch, 1);
+    assert.equal(emptyPage.coverage.sourcesFullyScanned, 1);
+    assert.equal(emptyPage.coverage.coverageComplete, false);
+  } finally {
+    await harness.close(context);
+    await storage.close(context);
+  }
+});
+
+test("recomputes durableKey and flags an identity mismatch as incomplete", async (t) => {
+  const database = await tempDatabase(t);
+  const { harness, storage } = await openHarness(database);
+  try {
+    const source = historySource("identity-a", [
+      historyRecord("2026-10-27T00:00:00", "synthetic", [message("user", "identity needle")]),
+    ]);
+    await persistArchivalImport(harness, { storeNamespace: "synthetic-store", sources: [source] }, context);
+    const ledger = await readArchivalImportLedger(harness, context);
+    const row = ledger.sources[0];
+    const entries = await allEntries(harness, row.conversationId);
+    const tamperedKey = "e".repeat(64);
+    assert.notEqual(entries[0].data.durableKey, tamperedKey);
+    const carrier = await createCarrier(harness, [{
+      ...entries[0].data,
+      durableKey: tamperedKey,
+    }]);
+    await writeLedger(harness, ledger.storeNamespace, [{
+      ...row,
+      conversationId: carrier.conversationId,
+      firstEntryId: carrier.entryIds[0],
+      lastEntryId: carrier.entryIds[0],
+    }]);
+
+    const page = await searchPersistedArchivalImport(
+      harness,
+      { text: "identity needle" },
+      context,
+      { limits: { maxHits: 10 } },
+    );
+    assert.equal(page.hits.length, 1);
+    assert.equal(page.hits[0].durableKey, tamperedKey);
+    assert.equal(page.coverage.sourcesIdentityMismatch, 1);
+    assert.equal(page.coverage.sourcesLedgerMismatch, 1);
+    assert.equal(page.coverage.coverageComplete, false);
+  } finally {
+    await harness.close(context);
+    await storage.close(context);
+  }
+});
+
 test("matches literal Unicode text case-insensitively and keeps snippets surrogate-safe", async (t) => {
   const database = await tempDatabase(t);
   const { harness, storage } = await openHarness(database);
@@ -470,6 +579,19 @@ test("scopes by source and reports unsupported or unavailable ledger rows honest
     assert.equal(page.coverage.sourcesFullyScanned, 2);
     assert.equal(page.coverage.coverageComplete, false);
     assert.equal(page.coverage.ledgerOnlyCoverage, true);
+
+    await assert.rejects(
+      () => searchPersistedArchivalImport(harness, { text: "scope needle", sourceIds: [] }, context),
+      (error) => error instanceof ArchivalSearchInputError,
+    );
+    await assert.rejects(
+      () => searchPersistedArchivalImport(
+        harness,
+        { text: "scope needle", sourceIds: ["scope-does-not-exist"] },
+        context,
+      ),
+      (error) => error instanceof ArchivalSearchInputError,
+    );
   } finally {
     await harness.close(context);
     await storage.close(context);
@@ -495,7 +617,7 @@ test("resumes mid-entry at unit boundaries and keeps page output bounded", async
       maxScanUnits: 10,
       maxSources: 10,
       maxHits: 1,
-      maxOutputChars: 4_096,
+      maxOutputChars: 5_120,
       maxSnippetChars: 24,
       scanBatchSize: 10,
     };
@@ -642,7 +764,7 @@ test("searches entries larger than maxScanUnits across bounded unit pages", asyn
     // stops a page in the middle of an entry, including at its first unit.
     const outputLimits = {
       ...limits,
-      maxOutputChars: 4_096,
+      maxOutputChars: 5_120,
       maxSnippetChars: 24,
     };
     const outputHits = [];
@@ -698,13 +820,13 @@ test("bounds output and entry work while making progress at the smallest limits"
 
     const limits = {
       ...tinyLimits,
-      maxScanEntries: 2,
-      maxScanUnits: 2,
+      maxScanEntries: 6,
+      maxScanUnits: 6,
       maxSources: 4,
       maxHits: 100,
-      maxOutputChars: 4_096,
-      maxSnippetChars: 24,
-      scanBatchSize: 2,
+      maxOutputChars: 5_120,
+      maxSnippetChars: 400,
+      scanBatchSize: 6,
     };
     const collected = [];
     const stopReasons = new Set();
@@ -773,6 +895,37 @@ test("rejects stale or mismatched continuations and returns no-ledger honestly",
       ),
       (error) => error instanceof ArchivalSearchContinuationError && error instanceof ArchivalSearchInputError,
     );
+
+    const ledgerBeforeMutation = await readArchivalImportLedger(harness, context);
+    const mutatedRows = ledgerBeforeMutation.sources.map((row) => row.sourceId === "stale-a"
+      ? { ...row, preparationStatus: "incomplete" }
+      : row);
+    await writeLedger(harness, ledgerBeforeMutation.storeNamespace, mutatedRows);
+    await assert.rejects(
+      () => searchPersistedArchivalImport(
+        harness,
+        { text: "stale needle" },
+        context,
+        { limits: tinyLimits, continuation: first.continuation },
+      ),
+      (error) => error instanceof ArchivalSearchContinuationError && /ledger digest/.test(error.message),
+    );
+    await writeLedger(harness, ledgerBeforeMutation.storeNamespace, ledgerBeforeMutation.sources);
+
+    const countMutatedRows = ledgerBeforeMutation.sources.map((row) => row.sourceId === "stale-a"
+      ? { ...row, recordCount: row.recordCount + 1 }
+      : row);
+    await writeLedger(harness, ledgerBeforeMutation.storeNamespace, countMutatedRows);
+    await assert.rejects(
+      () => searchPersistedArchivalImport(
+        harness,
+        { text: "stale needle" },
+        context,
+        { limits: tinyLimits, continuation: first.continuation },
+      ),
+      (error) => error instanceof ArchivalSearchContinuationError && /ledger digest/.test(error.message),
+    );
+    await writeLedger(harness, ledgerBeforeMutation.storeNamespace, ledgerBeforeMutation.sources);
 
     const extra = historySource("stale-b", [
       historyRecord("2026-10-27T00:00:02", "synthetic", [message("user", "stale needle three")]),

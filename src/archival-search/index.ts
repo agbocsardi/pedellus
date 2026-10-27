@@ -13,6 +13,12 @@
  * unit work bound. Raw lines (including provider state, headers, and quarantine
  * bytes) are never returned.
  *
+ * Durable `scanEntries` materializes the whole requested EntryRecord, including
+ * raw line data and any model/head/edits/foreign payload. This module ignores
+ * those fields but cannot byte-bound them; `scanBatchSize`/`maxScanEntries`
+ * bound entry count only. Legitimate carriers are bounded per source by the
+ * persistence writer, while a corrupt foreign entry is not.
+ *
  * The caller must already hold exclusive single-writer ownership of the
  * Session/storage, normally the same Gateway process lock. Continuations are
  * host-trusted, unsigned state: they are not authorization and not tamper-proof.
@@ -72,7 +78,7 @@ const HARD_LIMITS = Object.freeze({
 });
 
 /** A page envelope (query/coverage/continuation/limitations) must fit before any hit. */
-const MIN_OUTPUT_CHARS = 4_096;
+const MIN_OUTPUT_CHARS = 5_120;
 /** Matches the persistence hard cap; a larger or tampered ledger is rejected here. */
 const MAX_LEDGER_SOURCES = 1_024;
 const MAX_SCOPE_SOURCES = 128;
@@ -134,6 +140,9 @@ export interface ArchivalSearchCoverageCounters {
   readonly sourcesWithCaveats: number;
   readonly sourcesUnsupported: number;
   readonly sourcesUnavailable: number;
+  readonly sourcesLedgerMismatch: number;
+  readonly sourcesDuplicateOrOutOfOrder: number;
+  readonly sourcesIdentityMismatch: number;
   readonly entriesScanned: number;
   readonly entriesSearchable: number;
   readonly entriesSearchablePartial: number;
@@ -160,11 +169,33 @@ export interface ArchivalSearchCoverage extends ArchivalSearchCoverageCounters {
   readonly unsupportedSourcesOutsideLedger: true;
 }
 
+export interface ArchivalSearchSourceObservation {
+  /** Archival-kind carrier entries observed, including malformed ones. */
+  readonly recordsObserved: number;
+  /** Sum of prepared unit slots across valid archival entries. */
+  readonly unitsObserved: number;
+  /** Sum of prepared physical line byte lengths across valid archival entries. */
+  readonly bytesObserved: number;
+  /** Non-archival entries observed in the carrier (should be zero). */
+  readonly foreignEntriesObserved: number;
+  readonly firstEntryIdObserved: number | null;
+  readonly lastEntryIdObserved: number | null;
+  readonly firstLineObserved: number | null;
+  readonly lastLineObserved: number | null;
+  readonly previousLineObserved: number | null;
+  /** False for duplicate/out-of-order lines or a line that does not start at the ledger first line. */
+  readonly lineSequenceValid: boolean;
+  readonly malformedArchival: boolean;
+  readonly identityMismatch: boolean;
+}
+
 export interface ArchivalSearchContinuation {
   readonly format: typeof ARCHIVAL_SEARCH_FORMAT;
   readonly version: typeof ARCHIVAL_SEARCH_VERSION;
   readonly querySha256: string;
   readonly storeNamespace: string;
+  /** Digest over every relevant ledger row, including preparation status/counts. */
+  readonly ledgerSha256: string;
   readonly ledgerSourceCount: number;
   readonly sourceIndex: number;
   readonly sourceId: string;
@@ -179,6 +210,8 @@ export interface ArchivalSearchContinuation {
   readonly currentEntryHasSearchableUnit: boolean;
   /** Whether this entry has already yielded a valid unit, even an empty-text one. */
   readonly currentEntryHasValidUnit: boolean;
+  /** Bounded per-source observation used to reconcile the carrier with the ledger. */
+  readonly sourceObservation: ArchivalSearchSourceObservation;
   readonly currentSourceHasCaveat: boolean;
   readonly coverage: ArchivalSearchCoverageCounters;
 }
@@ -202,6 +235,7 @@ export interface ArchivalSearchHit {
   readonly lineSha256: string;
   readonly category: ArchivalRecordCategory;
   readonly searchStatus: "complete" | "partial";
+  /** True when the prepared projection was partial; not a snippet-truncation flag. */
   readonly textOmitted: boolean;
   readonly sessionKey: string | null;
   readonly role: string | null;
@@ -297,14 +331,10 @@ export class ArchivalSearchCorruptionError extends Error {
 }
 
 const LIMITATIONS: readonly string[] = Object.freeze([
-  "Host must hold exclusive single-writer ownership; no lock is acquired and concurrent imports invalidate continuations.",
-  "Only ledgered sources are searchable; unsupported or never-persisted sources are invisible (ledgerOnlyCoverage).",
-  "The ledger is one document bounded to 512 sources by default (hard 1,024); larger archives need sharding.",
-  "Continuation is host-trusted, unsigned, and not tamper-proof; never use it for authorization.",
-  "A bounded sequential scan, not an index; only prepared search-unit text is matched, and opaque/quarantine/omitted text is never returned.",
-  "Snippets and metadata are private archival material; no redaction, retention, or authorization policy is applied.",
-  "Literal Unicode-aware substring matching only; no normalization, stemming, ranking, or timestamp filtering.",
-  "Output is bounded by JSON.stringify length; a hit that cannot fit raises a bounds error, never a silent drop.",
+  "Host owns exclusive single-writer storage; continuations are host-trusted and unsigned, not authorization.",
+  "Only ledgered sources are searchable; unsupported or never-persisted sources are invisible.",
+  "Sequential bounded scan, not an index; the ledger and coverage limits apply.",
+  "Snippets and metadata are private; no redaction, retention, or authorization policy is applied.",
 ]);
 
 const CATEGORIES = new Set<ArchivalRecordCategory>([
@@ -386,7 +416,7 @@ function normalizedLimits(input: unknown): ArchivalSearchLimits {
     result[key] = value;
   }
   if (result.maxOutputChars < MIN_OUTPUT_CHARS) {
-    throw new ArchivalSearchInputError("Archival search output bound must be at least 4096 characters");
+    throw new ArchivalSearchInputError("Archival search output bound must be at least 5120 characters");
   }
   return result;
 }
@@ -436,6 +466,9 @@ function normalizedQuery(input: unknown, limits: ArchivalSearchLimits): Normaliz
       throw new ArchivalSearchInputError("Archival search sourceIds must be an array");
     }
     if (rawSourceIds.length > MAX_SCOPE_SOURCES) throw new ArchivalSearchBoundsError("scope-source-count");
+    if (rawSourceIds.length === 0) {
+      throw new ArchivalSearchInputError("Archival search sourceIds must not be empty");
+    }
     const seen = new Set<string>();
     for (const value of rawSourceIds) {
       if (typeof value !== "string" || !SAFE_LABEL.test(value)) {
@@ -472,6 +505,9 @@ function emptyCoverage(): MutableCoverage {
     sourcesWithCaveats: 0,
     sourcesUnsupported: 0,
     sourcesUnavailable: 0,
+    sourcesLedgerMismatch: 0,
+    sourcesDuplicateOrOutOfOrder: 0,
+    sourcesIdentityMismatch: 0,
     entriesScanned: 0,
     entriesSearchable: 0,
     entriesSearchablePartial: 0,
@@ -485,6 +521,133 @@ function emptyCoverage(): MutableCoverage {
   };
 }
 
+type MutableSourceObservation = Mutable<ArchivalSearchSourceObservation>;
+
+function emptySourceObservation(): MutableSourceObservation {
+  return {
+    recordsObserved: 0,
+    unitsObserved: 0,
+    bytesObserved: 0,
+    foreignEntriesObserved: 0,
+    firstEntryIdObserved: null,
+    lastEntryIdObserved: null,
+    firstLineObserved: null,
+    lastLineObserved: null,
+    previousLineObserved: null,
+    lineSequenceValid: true,
+    malformedArchival: false,
+    identityMismatch: false,
+  };
+}
+
+const SOURCE_OBSERVATION_KEYS = new Set([
+  "recordsObserved",
+  "unitsObserved",
+  "bytesObserved",
+  "foreignEntriesObserved",
+  "firstEntryIdObserved",
+  "lastEntryIdObserved",
+  "firstLineObserved",
+  "lastLineObserved",
+  "previousLineObserved",
+  "lineSequenceValid",
+  "malformedArchival",
+  "identityMismatch",
+]);
+
+function readSourceObservation(value: unknown, label: string): MutableSourceObservation {
+  if (!isRecord(value)) throw new ArchivalSearchContinuationError(`${label} source observation is invalid`);
+  const keys = readInput(() => Object.keys(value), `${label} source observation is unreadable`);
+  if (keys.length !== SOURCE_OBSERVATION_KEYS.size || keys.some((key) => !SOURCE_OBSERVATION_KEYS.has(key))) {
+    throw new ArchivalSearchContinuationError(`${label} source observation is invalid`);
+  }
+  const numberFields = ["recordsObserved", "unitsObserved", "bytesObserved", "foreignEntriesObserved"] as const;
+  const numeric = new Map<string, number>();
+  for (const key of numberFields) {
+    const number = readInput(() => value[key], `${label} source observation is unreadable`);
+    if (!isSafeNonNegativeInteger(number)) {
+      throw new ArchivalSearchContinuationError(`${label} source observation is invalid`);
+    }
+    numeric.set(key, number);
+  }
+  const optionalPositive = (key: string): number | null => {
+    const number = readInput(() => value[key], `${label} source observation is unreadable`);
+    if (number === null) return null;
+    if (!isSafePositiveInteger(number)) {
+      throw new ArchivalSearchContinuationError(`${label} source observation is invalid`);
+    }
+    return number;
+  };
+  const firstEntryIdObserved = optionalPositive("firstEntryIdObserved");
+  const lastEntryIdObserved = optionalPositive("lastEntryIdObserved");
+  const firstLineObserved = optionalPositive("firstLineObserved");
+  const lastLineObserved = optionalPositive("lastLineObserved");
+  const previousLineObserved = optionalPositive("previousLineObserved");
+  const lineSequenceValid = readInput(() => value.lineSequenceValid, `${label} source observation is unreadable`);
+  const malformedArchival = readInput(() => value.malformedArchival, `${label} source observation is unreadable`);
+  const identityMismatch = readInput(() => value.identityMismatch, `${label} source observation is unreadable`);
+  if (typeof lineSequenceValid !== "boolean" || typeof malformedArchival !== "boolean" ||
+      typeof identityMismatch !== "boolean") {
+    throw new ArchivalSearchContinuationError(`${label} source observation is invalid`);
+  }
+  const recordsObserved = numeric.get("recordsObserved") as number;
+  if (recordsObserved === 0 &&
+      (firstEntryIdObserved !== null || lastEntryIdObserved !== null ||
+        firstLineObserved !== null || lastLineObserved !== null || previousLineObserved !== null ||
+        (numeric.get("unitsObserved") as number) !== 0 || (numeric.get("bytesObserved") as number) !== 0)) {
+    throw new ArchivalSearchContinuationError(`${label} source observation is inconsistent`);
+  }
+  if (lastEntryIdObserved !== null && firstEntryIdObserved === null) {
+    throw new ArchivalSearchContinuationError(`${label} source observation is inconsistent`);
+  }
+  if (lastLineObserved !== null && firstLineObserved === null) {
+    throw new ArchivalSearchContinuationError(`${label} source observation is inconsistent`);
+  }
+  return {
+    recordsObserved,
+    unitsObserved: numeric.get("unitsObserved") as number,
+    bytesObserved: numeric.get("bytesObserved") as number,
+    foreignEntriesObserved: numeric.get("foreignEntriesObserved") as number,
+    firstEntryIdObserved,
+    lastEntryIdObserved,
+    firstLineObserved,
+    lastLineObserved,
+    previousLineObserved,
+    lineSequenceValid,
+    malformedArchival,
+    identityMismatch,
+  };
+}
+
+function ledgerDigest(storeNamespace: string, sources: readonly ArchivalLedgerSource[]): string {
+  const rows = sources.map((source) => [
+    source.sourceId,
+    source.format,
+    source.provenance,
+    source.sha256,
+    source.byteLength,
+    source.lineCount,
+    source.preparationStatus,
+    source.preparationFormat,
+    source.preparationVersion,
+    source.recordSchemaVersion,
+    source.recordCount,
+    source.searchUnitCount,
+    source.conversationId,
+    source.firstEntryId,
+    source.lastEntryId,
+    source.firstLine,
+    source.lastLine,
+    source.firstPreparationOrdinal,
+    source.lastPreparationOrdinal,
+  ]);
+  return sha256(JSON.stringify(["nanobot-archival-search-ledger-v1", storeNamespace, rows]));
+}
+
+function durableKeyFor(storeNamespace: string, sourceId: string, line: number): string {
+  return sha256(JSON.stringify(["nanobot-archival-line-v1", storeNamespace, sourceId, line]));
+}
+
 const COVERAGE_KEYS = new Set<keyof ArchivalSearchCoverageCounters>([
   "sourcesConsidered",
   "sourcesFullyScanned",
@@ -492,6 +655,9 @@ const COVERAGE_KEYS = new Set<keyof ArchivalSearchCoverageCounters>([
   "sourcesWithCaveats",
   "sourcesUnsupported",
   "sourcesUnavailable",
+  "sourcesLedgerMismatch",
+  "sourcesDuplicateOrOutOfOrder",
+  "sourcesIdentityMismatch",
   "entriesScanned",
   "entriesSearchable",
   "entriesSearchablePartial",
@@ -508,6 +674,7 @@ const CONTINUATION_KEYS = new Set([
   "version",
   "querySha256",
   "storeNamespace",
+  "ledgerSha256",
   "ledgerSourceCount",
   "sourceIndex",
   "sourceId",
@@ -517,6 +684,7 @@ const CONTINUATION_KEYS = new Set([
   "currentEntryClassified",
   "currentEntryHasSearchableUnit",
   "currentEntryHasValidUnit",
+  "sourceObservation",
   "currentSourceHasCaveat",
   "coverage",
 ]);
@@ -551,6 +719,19 @@ function sourceInScope(sourceId: string, query: NormalizedQuery): boolean {
   return query.sourceIdSet === null || query.sourceIdSet.has(sourceId);
 }
 
+function assertKnownScope(
+  ledgerSources: readonly ArchivalLedgerSource[],
+  query: NormalizedQuery,
+): void {
+  if (query.sourceIds === null) return;
+  const known = new Set(ledgerSources.map((source) => source.sourceId));
+  for (const sourceId of query.sourceIds) {
+    if (!known.has(sourceId)) {
+      throw new ArchivalSearchInputError("Archival search sourceIds names a source outside the current ledger");
+    }
+  }
+}
+
 function countInScope(ledgerSources: readonly ArchivalLedgerSource[], query: NormalizedQuery, from = 0): number {
   let count = 0;
   for (let index = from; index < ledgerSources.length; index++) {
@@ -566,6 +747,7 @@ interface ContinuationState {
   readonly currentEntryClassified: boolean;
   readonly currentEntryHasSearchableUnit: boolean;
   readonly currentEntryHasValidUnit: boolean;
+  readonly sourceObservation: MutableSourceObservation;
   readonly currentSourceHasCaveat: boolean;
   readonly coverage: MutableCoverage;
 }
@@ -574,6 +756,7 @@ function readContinuation(
   value: unknown,
   ledgerSources: readonly ArchivalLedgerSource[],
   storeNamespace: string,
+  ledgerSha256: string,
   query: NormalizedQuery,
 ): ContinuationState | null {
   if (value === undefined || value === null) return null;
@@ -594,6 +777,12 @@ function readContinuation(
   if (typeof continuationNamespace !== "string" || continuationNamespace !== storeNamespace) {
     throw new ArchivalSearchContinuationError("Archival search continuation belongs to another store namespace");
   }
+  const continuationLedgerSha256 = readInput(() => value.ledgerSha256,
+    "Archival search continuation is unreadable");
+  if (typeof continuationLedgerSha256 !== "string" || !SHA256_HEX.test(continuationLedgerSha256) ||
+      continuationLedgerSha256 !== ledgerSha256) {
+    throw new ArchivalSearchContinuationError("Archival search continuation does not match the current ledger digest");
+  }
   const ledgerSourceCount = readInput(() => value.ledgerSourceCount, "Archival search continuation is unreadable");
   if (!isSafePositiveInteger(ledgerSourceCount) || ledgerSourceCount !== ledgerSources.length) {
     throw new ArchivalSearchContinuationError("Archival search continuation does not match the current ledger");
@@ -612,6 +801,10 @@ function readContinuation(
     "Archival search continuation is unreadable");
   const currentEntryHasValidUnit = readInput(() => value.currentEntryHasValidUnit,
     "Archival search continuation is unreadable");
+  const sourceObservation = readSourceObservation(
+    readInput(() => value.sourceObservation, "Archival search continuation is unreadable"),
+    "Archival search continuation",
+  );
   const currentSourceHasCaveat = readInput(() => value.currentSourceHasCaveat,
     "Archival search continuation is unreadable");
   if (typeof sourceId !== "string" || (conversationId !== null && !isSafePositiveInteger(conversationId)) ||
@@ -648,6 +841,7 @@ function readContinuation(
     currentEntryClassified,
     currentEntryHasSearchableUnit,
     currentEntryHasValidUnit,
+    sourceObservation,
     currentSourceHasCaveat,
     coverage,
   };
@@ -764,6 +958,38 @@ function readRecordEntry(
     };
   } catch {
     return null;
+  }
+}
+
+function observeArchivalEntry(
+  observation: MutableSourceObservation,
+  source: ArchivalLedgerSource,
+  entryId: number,
+  record: NormalizedRecord | null,
+  storeNamespace: string,
+): void {
+  observation.recordsObserved++;
+  if (observation.firstEntryIdObserved === null) observation.firstEntryIdObserved = entryId;
+  observation.lastEntryIdObserved = entryId;
+  if (record === null) {
+    observation.malformedArchival = true;
+    observation.lineSequenceValid = false;
+    return;
+  }
+  observation.unitsObserved += record.search.length;
+  observation.bytesObserved += record.byteLength;
+  if (observation.previousLineObserved === null) {
+    observation.firstLineObserved = record.line;
+    if (source.firstLine !== null && record.line !== source.firstLine) {
+      observation.lineSequenceValid = false;
+    }
+  } else if (record.line !== observation.previousLineObserved + 1) {
+    observation.lineSequenceValid = false;
+  }
+  observation.lastLineObserved = record.line;
+  observation.previousLineObserved = record.line;
+  if (record.durableKey !== durableKeyFor(storeNamespace, source.sourceId, record.line)) {
+    observation.identityMismatch = true;
   }
 }
 
@@ -970,6 +1196,7 @@ interface HitCheckpoint {
   readonly entryClassified: boolean;
   readonly hasSearchableUnit: boolean;
   readonly hasValidUnit: boolean;
+  readonly sourceObservation: ArchivalSearchSourceObservation;
   readonly coverage: MutableCoverage;
   readonly currentSourceHasCaveat: boolean;
   readonly hitsBefore: number;
@@ -982,6 +1209,7 @@ interface ScanState {
   currentEntryClassified: boolean;
   currentEntryHasSearchableUnit: boolean;
   currentEntryHasValidUnit: boolean;
+  sourceObservation: MutableSourceObservation;
   currentSourceHasCaveat: boolean;
   coverage: MutableCoverage;
   readonly hits: ArchivalSearchHit[];
@@ -993,6 +1221,7 @@ interface BuildPageArgs {
   readonly ledgerPresent: boolean;
   readonly ledgerSources: readonly ArchivalLedgerSource[];
   readonly storeNamespace: string | null;
+  readonly ledgerSha256: string;
   readonly query: NormalizedQuery;
   readonly limits: ArchivalSearchLimits;
   readonly state: ScanState;
@@ -1008,6 +1237,7 @@ function buildContinuation(args: BuildPageArgs): ArchivalSearchContinuation | nu
     version: ARCHIVAL_SEARCH_VERSION,
     querySha256: query.querySha256,
     storeNamespace,
+    ledgerSha256: args.ledgerSha256,
     ledgerSourceCount: ledgerSources.length,
     sourceIndex: state.sourceIndex,
     sourceId: source.sourceId,
@@ -1017,6 +1247,7 @@ function buildContinuation(args: BuildPageArgs): ArchivalSearchContinuation | nu
     currentEntryClassified: state.currentEntryClassified,
     currentEntryHasSearchableUnit: state.currentEntryHasSearchableUnit,
     currentEntryHasValidUnit: state.currentEntryHasValidUnit,
+    sourceObservation: { ...state.sourceObservation },
     currentSourceHasCaveat: state.currentSourceHasCaveat,
     coverage: { ...state.coverage },
   };
@@ -1033,6 +1264,9 @@ function buildPage(args: BuildPageArgs): ArchivalSearchPage {
     state.coverage.sourcesWithCaveats === 0 &&
     state.coverage.sourcesUnsupported === 0 &&
     state.coverage.sourcesUnavailable === 0 &&
+    state.coverage.sourcesLedgerMismatch === 0 &&
+    state.coverage.sourcesDuplicateOrOutOfOrder === 0 &&
+    state.coverage.sourcesIdentityMismatch === 0 &&
     state.coverage.entriesUnsearchable === 0;
   const stopReason = !args.ledgerPresent
     ? "no-ledger"
@@ -1112,6 +1346,7 @@ function emptyPage(
     currentEntryClassified: false,
     currentEntryHasSearchableUnit: false,
     currentEntryHasValidUnit: false,
+    sourceObservation: emptySourceObservation(),
     currentSourceHasCaveat: false,
     coverage: emptyCoverage(),
     hits: [],
@@ -1122,6 +1357,7 @@ function emptyPage(
     ledgerPresent,
     ledgerSources: [],
     storeNamespace,
+    ledgerSha256: "",
     query,
     limits,
     state,
@@ -1185,6 +1421,7 @@ export async function searchPersistedArchivalImport(
 
   const ledger = await readArchivalImportLedger(session, context);
   if (ledger === undefined) {
+    assertKnownScope([], query);
     const rawContinuation = readInput(() => Object.hasOwn(options, "continuation") ? options.continuation : undefined,
       "Archival search options are unreadable");
     if (rawContinuation !== undefined && rawContinuation !== null) {
@@ -1194,6 +1431,7 @@ export async function searchPersistedArchivalImport(
   }
   const ledgerSources = ledger.sources;
   const ledgerPresent = true;
+  assertKnownScope(ledgerSources, query);
   if (ledgerSources.length > MAX_LEDGER_SOURCES) {
     throw new ArchivalSearchBoundsError("ledger-source-count");
   }
@@ -1209,10 +1447,11 @@ export async function searchPersistedArchivalImport(
   if (storeNamespace === null) {
     throw new ArchivalSearchCorruptionError("Archival import ledger has sources but no store namespace");
   }
+  const ledgerSha256 = ledgerDigest(storeNamespace, ledgerSources);
 
   const rawContinuation = readInput(() => Object.hasOwn(options, "continuation") ? options.continuation : undefined,
     "Archival search options are unreadable");
-  const continuation = readContinuation(rawContinuation, ledgerSources, storeNamespace, query);
+  const continuation = readContinuation(rawContinuation, ledgerSources, storeNamespace, ledgerSha256, query);
   const startCoverage: MutableCoverage = continuation ? { ...continuation.coverage } : emptyCoverage();
   const state: ScanState = {
     sourceIndex: continuation?.sourceIndex ?? 0,
@@ -1221,6 +1460,7 @@ export async function searchPersistedArchivalImport(
     currentEntryClassified: continuation?.currentEntryClassified ?? false,
     currentEntryHasSearchableUnit: continuation?.currentEntryHasSearchableUnit ?? false,
     currentEntryHasValidUnit: continuation?.currentEntryHasValidUnit ?? false,
+    sourceObservation: continuation ? { ...continuation.sourceObservation } : emptySourceObservation(),
     currentSourceHasCaveat: continuation?.currentSourceHasCaveat ?? false,
     coverage: continuation ? { ...continuation.coverage } : emptyCoverage(),
     hits: [],
@@ -1231,7 +1471,28 @@ export async function searchPersistedArchivalImport(
   let entriesTouchedThisCall = 0;
   let unitsScannedThisCall = 0;
 
-  const finishSource = (): void => {
+  const finishSource = (source: ArchivalLedgerSource): void => {
+    const observation = state.sourceObservation;
+    const lineInvalid = !observation.lineSequenceValid;
+    const ledgerMismatch =
+      observation.recordsObserved !== source.recordCount ||
+      (source.lineCount !== null && observation.recordsObserved !== source.lineCount) ||
+      observation.unitsObserved !== source.searchUnitCount ||
+      observation.bytesObserved !== source.byteLength ||
+      observation.foreignEntriesObserved !== 0 ||
+      observation.firstEntryIdObserved !== source.firstEntryId ||
+      observation.lastEntryIdObserved !== source.lastEntryId ||
+      observation.firstLineObserved !== source.firstLine ||
+      observation.lastLineObserved !== source.lastLine ||
+      observation.malformedArchival ||
+      observation.identityMismatch ||
+      lineInvalid;
+    if (lineInvalid) state.coverage.sourcesDuplicateOrOutOfOrder++;
+    if (observation.identityMismatch) state.coverage.sourcesIdentityMismatch++;
+    if (ledgerMismatch) {
+      state.coverage.sourcesLedgerMismatch++;
+      state.currentSourceHasCaveat = true;
+    }
     state.coverage.sourcesConsidered++;
     state.coverage.sourcesFullyScanned++;
     if (state.currentSourceHasCaveat) state.coverage.sourcesWithCaveats++;
@@ -1243,6 +1504,7 @@ export async function searchPersistedArchivalImport(
     state.currentEntryClassified = false;
     state.currentEntryHasSearchableUnit = false;
     state.currentEntryHasValidUnit = false;
+    state.sourceObservation = emptySourceObservation();
     state.currentSourceHasCaveat = false;
   };
 
@@ -1257,6 +1519,7 @@ export async function searchPersistedArchivalImport(
     state.currentEntryClassified = false;
     state.currentEntryHasSearchableUnit = false;
     state.currentEntryHasValidUnit = false;
+    state.sourceObservation = emptySourceObservation();
     state.currentSourceHasCaveat = false;
   };
 
@@ -1270,6 +1533,7 @@ export async function searchPersistedArchivalImport(
       state.currentEntryClassified = false;
       state.currentEntryHasSearchableUnit = false;
       state.currentEntryHasValidUnit = false;
+      state.sourceObservation = emptySourceObservation();
       state.currentSourceHasCaveat = false;
       continue;
     }
@@ -1293,6 +1557,7 @@ export async function searchPersistedArchivalImport(
       state.currentEntryClassified = false;
       state.currentEntryHasSearchableUnit = false;
       state.currentEntryHasValidUnit = false;
+      state.sourceObservation = emptySourceObservation();
     }
     if (entriesTouchedThisCall >= limits.maxScanEntries) {
       state.stopReason = "max-entries";
@@ -1317,7 +1582,7 @@ export async function searchPersistedArchivalImport(
       continue;
     }
     if (result.items.length === 0) {
-      finishSource();
+      finishSource(source);
       continue;
     }
 
@@ -1356,6 +1621,11 @@ export async function searchPersistedArchivalImport(
         state.coverage.entriesScanned++;
         entriesTouchedThisCall++;
         record = readRecordEntry(entry, source, storeNamespace);
+        if (ArchivalRecordEntry.is(entry)) {
+          observeArchivalEntry(state.sourceObservation, source, entryId, record, storeNamespace);
+        } else {
+          state.sourceObservation.foreignEntriesObserved++;
+        }
         if (record === null) {
           state.coverage.entriesUnsearchable++;
           state.currentSourceHasCaveat = true;
@@ -1400,6 +1670,10 @@ export async function searchPersistedArchivalImport(
         record = readRecordEntry(entry, source, storeNamespace);
         if (record === null || !isSearchableRecord(record)) {
           throw new ArchivalSearchContinuationError("Archival search continuation no longer names a searchable archival entry");
+        }
+        if (record.durableKey !== durableKeyFor(storeNamespace, source.sourceId, record.line)) {
+          state.sourceObservation.identityMismatch = true;
+          state.currentSourceHasCaveat = true;
         }
         unitCount = record.search.length;
         if (state.nextUnit > unitCount) {
@@ -1480,6 +1754,7 @@ export async function searchPersistedArchivalImport(
           entryClassified: true,
           hasSearchableUnit: hasSearchableUnitBeforeUnit,
           hasValidUnit: hasValidUnitBeforeUnit,
+          sourceObservation: { ...state.sourceObservation },
           coverage: coverageBeforeUnit,
           currentSourceHasCaveat: caveatBeforeUnit,
           hitsBefore: hitsBeforeUnit,
@@ -1519,6 +1794,7 @@ export async function searchPersistedArchivalImport(
     ledgerPresent,
     ledgerSources,
     storeNamespace,
+    ledgerSha256,
     query,
     limits,
     state,
@@ -1535,6 +1811,7 @@ export async function searchPersistedArchivalImport(
     state.currentEntryClassified = checkpoint.entryClassified;
     state.currentEntryHasSearchableUnit = checkpoint.hasSearchableUnit;
     state.currentEntryHasValidUnit = checkpoint.hasValidUnit;
+    state.sourceObservation = { ...checkpoint.sourceObservation };
     state.currentSourceHasCaveat = checkpoint.currentSourceHasCaveat;
     state.hits.length = checkpoint.hitsBefore;
     state.stopReason = "max-output-chars";
@@ -1549,6 +1826,7 @@ export async function searchPersistedArchivalImport(
       ledgerPresent,
       ledgerSources,
       storeNamespace,
+      ledgerSha256,
       query,
       limits,
       state,

@@ -76,7 +76,9 @@ rejected; enumerate with a literal substring instead of a browse-all mode.
 Optional query filters:
 
 - `sourceIds`: exact source scope; duplicates are ignored and the scope is
-  bounded to 128 labels.
+  bounded to 128 labels. An empty scope or any ID outside the current ledger is
+  rejected with `ArchivalSearchInputError`; it is never reported as a complete
+  search of nothing.
 - `role`: exact role on the unit role, falling back to the record role.
 
 Timestamps are returned as stored opaque strings; there is no timestamp range
@@ -84,6 +86,9 @@ filter. A hit is produced once per matching unit (not once per occurrence) with
 the first-match snippet and a `matchCount` of non-overlapping literal
 occurrences. Snippets are bounded and adjusted so they never split a UTF-16
 surrogate pair; this is code-unit safety, not grapheme-cluster segmentation.
+`textOmitted` on a hit means the prepared projection itself was partial, not
+that the snippet was truncated; `snippetTruncated`/`matchTruncated` describe the
+snippet.
 
 The following are deliberately **not** searchable and are never returned:
 
@@ -128,31 +133,42 @@ looking like a clean archival carrier.
 A page returns `continuation: null` when the ledger scan finished, or an object
 containing:
 
-- format/version, query SHA-256, store namespace, and ledger source count;
+- format/version, query SHA-256, store namespace, ledger source count, and a
+  SHA-256 digest over every relevant ledger row (including preparation status
+  and counts);
 - the ledger source index/source ID/conversation ID;
 - the next Durable entry ID and unit index;
 - whether that entry's metadata is already classified, plus its unit-progress
   flags;
+- bounded per-source observation state (records/units/bytes, first/last entry
+  IDs and lines, sequence validity, malformed/identity flags);
 - the current source's caveat flag;
 - cumulative coverage counters.
 
 The next call validates format/version, query fingerprint, store namespace,
-ledger source count, source identity, and position shape. A query change, a
-different namespace, a changed ledger, or a changed source conversation is
-rejected with `ArchivalSearchContinuationError`; opaque or unavailable sources
-are skipped honestly. Changing page-size limits between calls is allowed.
+ledger digest, ledger source count, source identity, source-observation shape,
+and position shape. A query change, a different namespace, any changed relevant
+ledger row (preparation status/counts included), or a changed source
+conversation is rejected with `ArchivalSearchContinuationError`; opaque or
+unavailable sources are skipped honestly. Changing page-size limits between
+calls is allowed. Digesting the ledger is bounded by the ledger source cap but
+costs a linear row pass on every page.
 
 **Continuations are host-trusted, unsigned state.** `continuationTrust` is
-`"host-trusted-not-authenticated"`. There is no MAC/HMAC, claim authorization,
-or tamper-proof guarantee: a caller that can forge a continuation can reset
-coverage counters or skip positions. Keep continuations in trusted host/server
-state, bind them to an authenticated session if they cross a trust boundary, or
-replace this slice with a store that issues authenticated scan tokens. Do not
-use a continuation as proof that a source was searched.
+`"host-trusted-not-authenticated"`. The ledger digest is a mixing/staleness
+guard, not a MAC/HMAC, claim authorization, or tamper-proof guarantee: a caller
+that can forge a continuation can reset coverage counters or skip positions.
+Keep continuations in trusted host/server state, bind them to an authenticated
+session if they cross a trust boundary, or replace this slice with a store that
+issues authenticated scan tokens. Do not use a continuation as proof that a
+source was searched.
 
-The ledger source count and current source identity are a mixing/staleness
-guard, not a proof that every middle entry is unchanged. Exclusive single-writer
-ownership is what keeps the carrier stable during a continuation chain.
+The per-source observation and durableKey recomputation detect missing/extra
+carrier records, duplicate/out-of-order lines, and metadata/identity drift as
+coverage caveats. They do not prove every raw line byte is unchanged; use the
+persistence repeat-verification path for full integrity reconciliation.
+Exclusive single-writer ownership is what keeps the carrier stable during a
+continuation chain.
 
 ## Coverage and progressive bounds
 
@@ -169,7 +185,7 @@ Limits and their defaults/hard caps:
 | `maxQueryChars` | 200 | 1,000 | literal query bound |
 | `scanBatchSize` | 25 | 200 | entries requested from one Durable scan |
 
-`maxOutputChars` must be at least 4,096. The page envelope (query, coverage,
+`maxOutputChars` must be at least 5,120. The page envelope (query, coverage,
 continuation, limitations, counters) must fit; if even one bounded hit cannot
 fit, the call raises `ArchivalSearchBoundsError` instead of silently dropping
 the hit. A page that would exceed the output bound drops the latest hit(s),
@@ -199,6 +215,8 @@ archival surface was searched. Coverage separately reports:
 
 - `sourcesConsidered`, `sourcesFullyScanned`, `sourcesClean`,
   `sourcesWithCaveats`, `sourcesUnsupported`, `sourcesUnavailable`;
+- `sourcesLedgerMismatch`, `sourcesDuplicateOrOutOfOrder`,
+  `sourcesIdentityMismatch`;
 - `sourcesInScope`, `sourcesScopeExcluded`, `sourcesNotYetScanned`;
 - `entriesScanned`, `entriesSearchable`, `entriesSearchablePartial`,
   `entriesNoSearchText`, `entriesOpaque`, `entriesQuarantined`,
@@ -206,9 +224,20 @@ archival surface was searched. Coverage separately reports:
 - `unitsScanned`, `unitsInvalid`, and cumulative `hits`;
 - `coverageComplete`, which is true only when the ledger is present, the scan
   completed, every in-scope source was accounted for, no source was unavailable
-  or unsupported, and every scanned entry was fully searchable. Any opaque
-  header/provider/blank line, quarantine, partial search projection, missing
-  text, or foreign/malformed entry keeps it false.
+  or unsupported, no ledger/carrier mismatch, duplicate/out-of-order line, or
+  identity mismatch was observed, and every scanned entry was fully searchable.
+  Any opaque header/provider/blank line, quarantine, partial search projection,
+  missing text, or foreign/malformed entry keeps it false.
+
+At each source boundary, search reconciles bounded observed state against the
+ledger row: record count, `lineCount`, search-unit count, accumulated byte
+length, first/last Durable entry IDs, first/last line, and a contiguous
+`line = previous + 1` sequence starting at the ledger first line. It also
+recomputes each line's `durableKey` from
+`(storeNamespace, sourceId, line)`. Missing/extra records, empty carriers,
+duplicate or out-of-order lines, malformed archival entries, foreign entries,
+and identity drift mark the source as a mismatch and a caveat. The state is
+bounded per source; it does not retain every record or unit.
 
 `ledgerOnlyCoverage` and `unsupportedSourcesOutsideLedger` are always true:
 unsupported or never-persisted sources have no ledger row and are therefore
@@ -231,6 +260,15 @@ Search results are at least as sensitive as the archived material:
 - no raw provider continuation state, header metadata, quarantine bytes, or
   model/task content is returned;
 - treat pages, continuations, logs, and test fixtures as private material.
+
+Durable `scanEntries` returns the **entire** requested `EntryRecord`, including
+`data` with `rawLineBase64` and any `model`, `head`, `edits`, or foreign payload.
+Search ignores those fields but reads the records to validate/search them.
+`scanBatchSize` and `maxScanEntries` bound entry count, not bytes. A legitimate
+carrier written by persistence is bounded per source by its raw-byte limits, but
+a corrupt or hostile foreign entry is not byte-bounded by this module. The host
+must preserve exclusive ownership and carrier integrity; use the persistence
+repeat-verification path for legitimate-source integrity and size reconciliation.
 
 Use synthetic SQLite databases and synthetic snapshots for implementation
 checks. This slice does not authorize a real private copy.
@@ -257,6 +295,9 @@ databases and a native `Harness`. It covers:
   history record and output-trimmed pages, whose full hit set is reachable over
   repeated pages with monotonic unit progress and correct cumulative omission
   flags;
+- duplicate/extra archival entries, empty carriers, identity (durableKey)
+  mismatch, stale ledger preparation status/counts in a continuation, and
+  empty/unknown `sourceIds` rejection;
 - query/ledger continuation mismatch rejection and the no-ledger page;
 - read-only behavior: no new conversations, entries, ledger changes, tasks, or
   submissions.
@@ -282,8 +323,8 @@ node --test tests/archival-search.behavior.test.mjs
    single page still stops at `maxScanUnits`, so very large entries require
    multiple continuation calls.
 6. Continuations are unsigned host state with no authentication or tamper
-   proof; they are not authorization and must not be exposed to untrusted
-   clients.
+   proof; the ledger digest is a mixing guard, not a MAC. They are not
+   authorization and must not be exposed to untrusted clients.
 7. Matching is simple Unicode case folding and literal substring only; no
    full case folding, normalization, locale tailoring, tokenization, stemming,
    or timestamp filtering.
@@ -291,14 +332,18 @@ node --test tests/archival-search.behavior.test.mjs
    grapheme-cluster aware.
 9. No redaction, retention, authorization, audit, backup/restore, or operator
    approval flow is implemented.
-10. The module reads the bounded ledger document and page-sized entry batches;
-    it does not implement a resumable storage-side search cursor, so each page
-    reopens the carrier scan at an entry ID.
+10. The module reads the bounded ledger document, digests every ledger row on
+    each page, and materializes page-sized full `EntryRecord` batches (including
+    raw/model/foreign payload bytes). Entry counts are bounded, but corrupt
+    foreign entry bytes are not. It does not implement a resumable
+    storage-side search cursor, so each page reopens the carrier scan at an
+    entry ID.
 11. No CLI, runtime wiring, package-script, session-map, model, task, or Python
     resume surface is added. The one-off path discovery/import CLI remains
     separate.
-12. Search does not re-run persistence's full digest/record-count repeat
-    verification. It trusts the persisted carrier under exclusive ownership;
-    a missing or altered middle entry is not detected unless it surfaces as a
-    malformed/foreign entry. Use the persistence repeat-verification path for
-    integrity reconciliation.
+12. Search reconciles bounded per-source counts/bytes, first/last entry IDs and
+    lines, contiguous line order, and each line's recomputed durableKey, but it
+    does not read/verify every raw line hash or source SHA-256. A changed raw
+    line or search-unit text with unchanged ledger-visible metadata and
+    durableKey is not detected. Use the persistence repeat-verification path
+    for full integrity reconciliation.
