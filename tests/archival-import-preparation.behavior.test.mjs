@@ -768,3 +768,90 @@ test("reports empty content and empty message lists as none", () => {
   assert.equal(result.diagnostics.some((diagnostic) => diagnostic.code === "history-message-text-not-indexed"), false);
   assert.equal(result.complete, true);
 });
+
+test("reports input getter and proxy failures as input errors", () => {
+  const source = snapshot("input", "session-jsonl", `${sessionHeaderLine("input")}\n`);
+  const throwingNamespace = { sources: [source] };
+  Object.defineProperty(throwingNamespace, "storeNamespace", {
+    get() {
+      throw new Error("namespace getter");
+    },
+    enumerable: true,
+  });
+  assert.throws(() => prepareArchivalImport(throwingNamespace), ArchivalPreparationInputError);
+
+  const throwingSources = { storeNamespace: "synthetic-store" };
+  Object.defineProperty(throwingSources, "sources", {
+    get() {
+      throw new Error("sources getter");
+    },
+    enumerable: true,
+  });
+  assert.throws(() => prepareArchivalImport(throwingSources), ArchivalPreparationInputError);
+
+  const throwingBytes = { ...source };
+  Object.defineProperty(throwingBytes, "bytes", {
+    get() {
+      throw new Error("bytes getter");
+    },
+    enumerable: true,
+  });
+  assert.throws(
+    () => prepareArchivalImport({ storeNamespace: "synthetic-store", sources: [throwingBytes] }),
+    ArchivalPreparationInputError,
+  );
+
+  const throwingLimits = {};
+  Object.defineProperty(throwingLimits, "limits", {
+    get() {
+      throw new Error("limits getter");
+    },
+    enumerable: true,
+  });
+  assert.throws(
+    () => prepareArchivalImport({ storeNamespace: "synthetic-store", sources: [source] }, throwingLimits),
+    ArchivalPreparationInputError,
+  );
+
+  const throwingLength = new Proxy([source], {
+    get(value, property, receiver) {
+      if (property === "length") throw new Error("length getter");
+      return Reflect.get(value, property, receiver);
+    },
+  });
+  assert.throws(
+    () => prepareArchivalImport({ storeNamespace: "synthetic-store", sources: throwingLength }),
+    ArchivalPreparationInputError,
+  );
+});
+
+test("rejects unknown top-level option keys", () => {
+  const source = snapshot("options", "session-jsonl", `${sessionHeaderLine("options")}\n`);
+  assert.throws(
+    () => prepareArchivalImport(
+      { storeNamespace: "synthetic-store", sources: [source] },
+      { limits: {}, limit: {} },
+    ),
+    /Unknown archival preparation option property/,
+  );
+});
+
+test("classifies unknown future history schema versions as failures", () => {
+  const history = `${JSON.stringify({
+    timestamp: "2026-07-19T12:00",
+    session_key: sessionKey,
+    cursor: 1,
+    schema_version: 4,
+    messages: [{ role: "user", content: "future" }],
+  })}\n`;
+  const result = prepareArchivalImport({
+    storeNamespace: "synthetic-store",
+    sources: [snapshot("history-future", "history-jsonl", history)],
+  });
+  assert.equal(result.complete, false);
+  assert.equal(result.sources[0].status, "incomplete");
+  assert.equal(result.records[0].category, "history-entry");
+  assert.equal(result.records[0].search[0].text, "future");
+  const diagnostic = result.diagnostics.find((item) => item.code === "history-schema-version-unknown");
+  assert.equal(diagnostic?.severity, "failure");
+});

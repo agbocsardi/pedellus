@@ -239,6 +239,21 @@ export class ArchivalPreparationInputError extends TypeError {
   }
 }
 
+function rethrowInputFailure(error: unknown, message: string): never {
+  if (error instanceof ArchivalPreparationBoundsError || error instanceof ArchivalPreparationInputError) {
+    throw error;
+  }
+  throw new ArchivalPreparationInputError(message);
+}
+
+function readInput<T>(read: () => T, message: string): T {
+  try {
+    return read();
+  } catch (error) {
+    return rethrowInputFailure(error, message);
+  }
+}
+
 const SUPPORTED_FORMATS = new Set(["session-jsonl", "history-jsonl", "session-archive-jsonl"]);
 const SAFE_LABEL = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
@@ -269,6 +284,7 @@ const FAILURE_DIAGNOSTICS = new Set([
   "archive-header-out-of-order",
   "history-kind-unrecognized",
   "history-schema-version-invalid",
+  "history-schema-version-unknown",
 ]);
 
 function diagnosticSeverity(code: string): "failure" | "notice" {
@@ -382,6 +398,14 @@ function copySourceBytes(captured: CapturedSourceBytes): Buffer {
 type MutableLimits = { -readonly [K in keyof ArchivalPreparationLimits]: ArchivalPreparationLimits[K] };
 
 function normalizedLimits(input: unknown): ArchivalPreparationLimits {
+  try {
+    return normalizedLimitsValue(input);
+  } catch (error) {
+    return rethrowInputFailure(error, "Archival preparation limits are unreadable");
+  }
+}
+
+function normalizedLimitsValue(input: unknown): ArchivalPreparationLimits {
   const result: MutableLimits = { ...ARCHIVAL_PREPARATION_LIMITS };
   if (input === undefined) return result;
   if (!isRecord(input)) {
@@ -802,8 +826,10 @@ function historyLine(parsed: Record<string, unknown>, nestedLimit: number): Clas
     diagnostics.push("history-cursor-invalid");
     partial = true;
   }
-  if (parsed.schema_version !== undefined && nonNegativeInt(parsed.schema_version) === null) {
-    diagnostics.push("history-schema-version-invalid");
+  if (parsed.schema_version !== undefined) {
+    const schemaVersion = nonNegativeInt(parsed.schema_version);
+    if (schemaVersion === null) diagnostics.push("history-schema-version-invalid");
+    else if (![1, 2, 3].includes(schemaVersion)) diagnostics.push("history-schema-version-unknown");
   }
   if (parsed.kind !== undefined && parsed.kind !== "conversation") diagnostics.push("history-kind-unrecognized");
 
@@ -865,26 +891,25 @@ interface WorkSource {
 }
 
 function validatedSource(value: unknown): ArchivalSourceSnapshot {
-  if (!isRecord(value)) {
-    throw new ArchivalPreparationInputError(
-      "Each archival source needs safe sourceId/provenance/format labels, a declared SHA-256, and bytes",
-    );
+  const message = "Each archival source needs safe sourceId/provenance/format labels, a declared SHA-256, and bytes";
+  try {
+    if (!isRecord(value)) throw new ArchivalPreparationInputError(message);
+    const sourceId = value.sourceId;
+    const provenance = value.provenance;
+    const sha256 = value.sha256;
+    const format = value.format;
+    const bytes = value.bytes;
+    if (typeof sourceId !== "string" || !SAFE_LABEL.test(sourceId) ||
+        typeof provenance !== "string" || !SAFE_LABEL.test(provenance) ||
+        typeof sha256 !== "string" || !SHA256_HEX.test(sha256) ||
+        typeof format !== "string" || !SAFE_LABEL.test(format) ||
+        !(bytes instanceof Uint8Array)) {
+      throw new ArchivalPreparationInputError(message);
+    }
+    return { sourceId, sha256, format, provenance, bytes };
+  } catch (error) {
+    return rethrowInputFailure(error, message);
   }
-  const sourceId = value.sourceId;
-  const provenance = value.provenance;
-  const sha256 = value.sha256;
-  const format = value.format;
-  const bytes = value.bytes;
-  if (typeof sourceId !== "string" || !SAFE_LABEL.test(sourceId) ||
-      typeof provenance !== "string" || !SAFE_LABEL.test(provenance) ||
-      typeof sha256 !== "string" || !SHA256_HEX.test(sha256) ||
-      typeof format !== "string" || !SAFE_LABEL.test(format) ||
-      !(bytes instanceof Uint8Array)) {
-    throw new ArchivalPreparationInputError(
-      "Each archival source needs safe sourceId/provenance/format labels, a declared SHA-256, and bytes",
-    );
-  }
-  return { sourceId, sha256, format, provenance, bytes };
 }
 
 /** Prepare bounded archival records only; no import, persistence, or runtime state is created. */
@@ -892,20 +917,26 @@ export function prepareArchivalImport(
   request: ArchivalImportRequest,
   options: ArchivalPreparationOptions = {},
 ): ArchivalPreparationReport {
-  if (!isRecord(options)) {
+  if (!readInput(() => isRecord(options), "Archival preparation options are unreadable")) {
     throw new ArchivalPreparationInputError("Archival preparation options must be an object");
   }
-  const limits = normalizedLimits(options.limits);
-  if (!isRecord(request)) {
+  const optionKeys = readInput(() => Object.keys(options), "Archival preparation options are unreadable");
+  for (const key of optionKeys) {
+    if (key !== "limits") throw new ArchivalPreparationInputError("Unknown archival preparation option property");
+  }
+  const limits = normalizedLimits(readInput(() => options.limits, "Archival preparation options are unreadable"));
+  if (!readInput(() => isRecord(request), "Archival import request is unreadable")) {
     throw new ArchivalPreparationInputError("Archival import request needs one safe storeNamespace label");
   }
-  const storeNamespace = request.storeNamespace;
+  const storeNamespace = readInput(() => request.storeNamespace, "Archival import request is unreadable");
   if (typeof storeNamespace !== "string" || !SAFE_LABEL.test(storeNamespace)) {
     throw new ArchivalPreparationInputError("Archival import request needs one safe storeNamespace label");
   }
-  const sourceList = request.sources;
-  if (!Array.isArray(sourceList)) throw new ArchivalPreparationInputError("Archival sources must be an array");
-  const sourceCount = sourceList.length;
+  const sourceList = readInput(() => request.sources, "Archival import request is unreadable");
+  if (!readInput(() => Array.isArray(sourceList), "Archival sources must be an array")) {
+    throw new ArchivalPreparationInputError("Archival sources must be an array");
+  }
+  const sourceCount = readInput(() => sourceList.length, "Archival source array is unreadable");
   if (!Number.isSafeInteger(sourceCount) || sourceCount < 0) {
     throw new ArchivalPreparationInputError("Archival source count is not a safe non-negative integer");
   }
@@ -922,7 +953,10 @@ export function prepareArchivalImport(
 
   for (let sourceOrder = 0; sourceOrder < sourceCount; sourceOrder++) {
     if (sourceOrder >= limits.maxSources) throw new ArchivalPreparationBoundsError("source-count");
-    const source = validatedSource(sourceList[sourceOrder]);
+    const source = validatedSource(readInput(
+      () => sourceList[sourceOrder],
+      "Archival source array is unreadable",
+    ));
     if (seenSourceIds.has(source.sourceId)) {
       throw new ArchivalPreparationInputError("Archival sourceId values must be unique within one store namespace");
     }
@@ -975,13 +1009,10 @@ export function prepareArchivalImport(
       });
     }
   }
-  try {
-    if (sourceList[sourceCount] !== undefined) {
-      throw new ArchivalPreparationInputError("Archival source array length is inconsistent");
-    }
-  } catch (error) {
-    if (error instanceof ArchivalPreparationInputError) throw error;
-    throw new ArchivalPreparationInputError("Archival source array is unreadable");
+  // Host owns full enumeration. This only detects an immediately exposed extra
+  // index; it is not proof that a sparse/proxy array has no hidden elements.
+  if (readInput(() => sourceList[sourceCount], "Archival source array is unreadable") !== undefined) {
+    throw new ArchivalPreparationInputError("Archival source array length is inconsistent");
   }
 
   const records: PreparedArchivalRecord[] = [];

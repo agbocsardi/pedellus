@@ -49,9 +49,13 @@ Each invocation describes **one legacy store/workspace namespace** and must
 contain at least one source. Session keys and archive cursors are store-local.
 The module echoes `storeNamespace` but cannot infer or verify that the caller
 grouped sources correctly; mixing stores remains a caller error. The source
-array length is captured once, bounded before iteration, and checked again
-inside the loop; an inconsistent proxy array that hides elements beyond its
-reported length is rejected rather than silently processed or ignored.
+array length is captured once, bounded before iteration, and rechecked inside
+the loop. Before accepting, the module checks only the immediately next index
+for an exposed extra element. That catches a common short-length proxy, but it
+does **not** prove a sparse/proxy array has no hidden elements; complete
+enumeration and array honesty remain host responsibilities. The options object
+accepts only `limits`; unknown top-level option keys are rejected to catch
+typos.
 
 ## Supported schemas
 
@@ -205,33 +209,48 @@ records, 200,000 search units, 2,000 nested references (tool calls or embedded
 history messages) per line, and 10,000 diagnostics. Caller overrides cannot
 exceed hard caps (128 sources, 16 MiB/source, 64 MiB total, 250,000 lines,
 250,000 records, 500,000 search units, 10,000 nested references, 100,000
-diagnostics).
+diagnostics). `maxRecords` counts one report record per physical line, including
+blank lines. Each record also carries base64 raw bytes (about 4/3 of source
+bytes), search units, and JavaScript object overhead, so peak memory can be
+several times `inputBytes`. `maxSearchUnits` and `maxDiagnostics` bound additional
+objects, not heap bytes. Size the process for the whole report, not just input
+bytes.
 
 The module **fails closed**. Exceeding any bound throws
 `ArchivalPreparationBoundsError`; it never truncates input, drops trailing
 records, or returns a partial report. A declared digest mismatch, duplicate
 `sourceId`, unsafe source/format/provenance/store label, missing/empty/duplicate
 sources, inaccessible or mutable byte backing, or invalid limit throws
-`ArchivalPreparationInputError`. Limits must be an object containing only known
-bound properties with safe-integer values; unknown properties, cyclic/extra
-objects, and invalid values are rejected. The report receives a fresh limits
-object, so caller-owned limit objects are never retained or frozen. Unsupported source formats are different: they
-are classified in `unsupportedSources`, make `complete: false`, and contribute
-no records. The supported sources in the same request are still processed.
+`ArchivalPreparationInputError`. Unreadable option/request/source getters and
+proxy traps are reported as `ArchivalPreparationInputError` too; an
+`ArchivalPreparationBoundsError` is never reclassified as an input error. Limits
+must be an object containing only known bound properties with safe-integer
+values; unknown properties, cyclic/extra objects, and invalid values are
+rejected. The report receives a fresh limits
+object, so caller-owned limit objects are never retained or frozen. Unsupported
+source formats are different: they are classified in `unsupportedSources`, make
+`complete: false`, and contribute no records. The supported sources in the same request are still processed.
 
 Each source `status` is `complete`, `incomplete`, or `unsupported`.
 `complete: true` means every supplied source had a supported format, every
 physical line produced a record, no line was quarantined, and no diagnostic with
 `severity: "failure"` was emitted. Any failure diagnostic or quarantined line
-also sets that source's `status` to `incomplete`; `complete` does **not** mean
-all content was understood, searchable, reconciled, or imported.
+also sets that source's `status` to `incomplete`.
+
+`complete` is **preparation coverage only** (scan/classification/header and
+other failure checks). It is not search coverage. A `complete: true` report can
+still contain notices and `searchStatus: "partial"` records where text/content
+was omitted from the search projection. Use per-record `searchStatus` for search
+coverage; `complete` does not mean all content was understood, searchable,
+reconciled, or imported.
 
 Diagnostics carry `severity`:
 
 - `failure`: structural classification is incomplete. This includes missing,
   duplicate, or out-of-order session/archive headers; invalid header key or
   non-object header metadata; inconsistent header keys; an unrecognized history
-  `kind`; and an invalid history schema-version value.
+  `kind`; and an invalid or unknown (greater than 3) history schema-version
+  value.
 - `notice`: the record is still classified, but optional metadata is invalid or
   some text content could not be projected into search units. Examples:
   invalid message timestamp/name/entry ID, invalid history cursor, or
@@ -332,11 +351,12 @@ metadata/provider state, quarantine of malformed/unknown lines, text-search
 completeness for mixed/tool/media/unknown content, missing/duplicate/out-of-order
 session and archive headers, failure-vs-notice diagnostics, unsafe format label
 rejection, spoofed typed-array byte length, shared/resizable backing rejection,
-lying proxy source arrays, unknown/cyclic limit objects, empty requests, empty
-content/empty message lists, nested text omissions, history conversation/text
-search units, supported transcript archives, unsupported format classification,
-every bound, digest/identity failures, deep freezing, and caller-byte
-immutability. Run it with:
+lying proxy source arrays, input getter/proxy failures, unknown option keys,
+unknown future history schema versions, unknown/cyclic limit objects, empty
+requests, empty content/empty message lists, nested text omissions, history
+conversation/text search units, supported transcript archives, unsupported format
+classification, every bound, digest/identity failures, deep freezing, and
+caller-byte immutability. Run it with:
 
 ```bash
 npm run build
