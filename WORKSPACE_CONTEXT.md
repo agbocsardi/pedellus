@@ -3,10 +3,57 @@
 `src/context/workspace.ts` is a small, host-invoked loader that turns one
 explicit workspace root into the snapshot fields accepted by the existing
 context extension and `GatewayContextSnapshotProvider`. It is **not** installed
-by `openGateway`, `src/index.ts`, or any CLI path; a host must opt in by calling
-the loader or passing the provider adapter. It reads no ambient configuration,
-credential store, environment variable, or `~/.nanobot` location, opens no
-tools, and calls no model provider.
+by `openGateway`, `src/index.ts`, or any CLI path by default; a host must opt in
+by calling the loader or passing the provider adapter. It reads no ambient
+configuration, credential store, environment variable, or `~/.nanobot`
+location, opens no tools, and calls no model provider.
+
+## Local CLI/gateway host
+
+The local CLI/gateway host exposes the loader through one explicit config
+section. It remains absent by default; when absent, `src/cli.ts` passes no
+snapshot provider and `openGateway` installs no context extension.
+
+```json
+{
+  "workspace": "./workspace",
+  "workspaceContext": {
+    "memoryFiles": ["memory/MEMORY.md", "memory/system/preferences.md"]
+  }
+}
+```
+
+- `workspace` is the existing explicit root and is also the bootstrap root.
+  Bootstrap selection is fixed: `AGENTS.md`, `SOUL.md`, `USER.md`.
+- `memoryFiles` is an explicit ordered list of `memory/**/*.md` paths and
+  defaults to `[]`. No memory file is discovered. Paths are validated with the
+  loader's rules at config parse time and again before reading.
+- Unknown `workspaceContext` fields are rejected. There is no bootstrap-file
+  selection, include glob, or implicit default memory file.
+- **Identity is omitted.** The host does not render the Python identity template
+  from runtime, platform, channel, workspace, or user values, and this slice has
+  no identity config switch. The context extension therefore contributes no
+  `nanobot_identity` content.
+- The same fixed selection applies to every session key, including `cli:default`
+  and channel keys. Each conversation loads the files afresh and keeps its own
+  detached snapshot; a later session sees later file contents while an earlier
+  conversation keeps the snapshot captured for it.
+- Startup/recovery reloads the config selection for every persisted session
+  mapping before resume. Reopening therefore reconstructs workspace context
+  from the current files, not from a cached copy.
+- A loader failure (missing selected file, symlink/hardlink, bounds, unsafe
+  root, observable replacement) rejects gateway startup or `conversationFor`.
+  No partial context is installed, and a retry re-runs the loader.
+- This adds no tools, skills, workspace roots, credentials, or provider calls.
+  Tool policy is unchanged.
+- The configured `workspace` path is walked literally by the loader. A root path
+  containing a symlink component fails closed even though `openGateway` accepts
+  it after `realpath`; use a canonical explicit path when opting in.
+
+The example `config.example.json` intentionally omits `workspaceContext` so the
+shipped default stays off.
+
+## SDK usage
 
 ```ts
 import {

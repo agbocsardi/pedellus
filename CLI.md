@@ -7,8 +7,12 @@ nanobot --config /path/to/config.json
 ```
 
 When Telegram is configured, the CLI keeps the existing Telegram path; otherwise
-it opens the local `cli:default` Durable conversation. Model text streams only
-from committed `pi.live` snapshots, filtered to assistant text blocks. The
+it opens the local `cli:default` Durable conversation. Workspace context is off
+unless the config contains `workspaceContext`; when enabled it applies the same
+fixed bootstrap and explicit `memoryFiles` selection to every session key and
+adds no identity. See [workspace context](./WORKSPACE_CONTEXT.md). Model text
+streams only from committed `pi.live` snapshots, filtered to assistant text
+blocks. The
 initial watch snapshot is not replayed. After a submission settles, the CLI
 reads its committed assistant entry and flushes any text missing from the last
 committed partial. Reasoning blocks, system entries, tool calls/arguments, and

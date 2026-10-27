@@ -1,6 +1,11 @@
 import { readFile } from "node:fs/promises";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { dirname, isAbsolute, resolve } from "node:path";
+import {
+  WorkspaceContextBoundsError,
+  WorkspaceContextInputError,
+  validateWorkspaceMemoryFiles,
+} from "./context/workspace.js";
 
 const CREDENTIAL_PROVIDERS = [
   "anthropic",
@@ -21,9 +26,19 @@ export interface ModelReference {
   modelId: string;
 }
 
+export interface WorkspaceContextConfig {
+  /** Explicit workspace-relative `memory/**\/*.md` files, in output order. Defaults to none. */
+  readonly memoryFiles: readonly string[];
+}
+
 export interface PortConfig {
   workspace: string;
   dataDir: string;
+  /**
+   * Explicit opt-in for bounded workspace context. Absent means the gateway
+   * installs no context extension; there is no implicit workspace discovery.
+   */
+  workspaceContext?: WorkspaceContextConfig;
   /** Default selection; retained for backward compatibility with single-model configs. */
   model: ModelReference;
   /** Explicit finite model choices. Missing means the legacy singleton [model]. */
@@ -67,6 +82,25 @@ function modelKey(model: ModelReference): string {
   return JSON.stringify([model.provider, model.modelId]);
 }
 
+function workspaceContextConfig(value: unknown): WorkspaceContextConfig {
+  const raw = object(value, "workspaceContext");
+  for (const key of Object.keys(raw)) {
+    if (key !== "memoryFiles") throw new Error(`Unknown workspaceContext field: ${key}`);
+  }
+  let memoryFiles: readonly string[] = Object.freeze([]);
+  if (raw.memoryFiles !== undefined) {
+    try {
+      memoryFiles = validateWorkspaceMemoryFiles(raw.memoryFiles);
+    } catch (error) {
+      if (error instanceof WorkspaceContextInputError || error instanceof WorkspaceContextBoundsError) {
+        throw new Error(`workspaceContext.memoryFiles is invalid: ${error.message}`);
+      }
+      throw error;
+    }
+  }
+  return Object.freeze({ memoryFiles });
+}
+
 export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig {
   const raw = object(value, "config");
   const model = modelReference(raw.model, "model");
@@ -103,6 +137,9 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
     }
   }
   config.toolAllowlist = toolAllowlist;
+  if (raw.workspaceContext !== undefined) {
+    Object.assign(config, { workspaceContext: workspaceContextConfig(raw.workspaceContext) });
+  }
   if (raw.thinkingLevel !== undefined) {
     if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(raw.thinkingLevel))) throw new Error("Invalid thinkingLevel");
     Object.assign(config, { thinkingLevel: raw.thinkingLevel });

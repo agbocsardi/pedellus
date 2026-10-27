@@ -803,6 +803,15 @@ async function verifyWorkspace(
 }
 
 /**
+ * Validate an explicit memory selection without opening any file. Hosts can use
+ * this while parsing their own configuration; the loader applies the same
+ * rules again before reading.
+ */
+export function validateWorkspaceMemoryFiles(value: unknown): readonly string[] {
+  return validatedMemoryFiles(value);
+}
+
+/**
  * Load one immutable snapshot value set from an explicit workspace root.
  *
  * Missing `AGENTS.md`/`SOUL.md`/`USER.md` are omitted (Python's bootstrap

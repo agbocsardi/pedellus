@@ -43,7 +43,9 @@ IDs collide across stores. `openGateway` can also accept an opt-in host snapshot
 provider and reconstructs snapshots before resume; it does not load files itself.
 An opt-in [workspace loader](./WORKSPACE_CONTEXT.md) supplies fixed bootstrap files
 and explicitly selected memory files to such a provider; it does not discover skills
-or provide full Python memory parity. Prepared requests containing old Nanobot context
+or provide full Python memory parity. The local CLI/gateway host opts in only when the
+config contains a `workspaceContext` section (`workspaceContext.memoryFiles`, default
+off); it contributes no identity. Prepared requests containing old Nanobot context
 conservatively block recovery,
 and the Gateway has no blocked-task reconciliation interface yet. See the
 [context contract](./CONTEXT.md).
