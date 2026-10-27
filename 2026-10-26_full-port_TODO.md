@@ -44,9 +44,10 @@ Real history access and import require separate authorization; use synthetic dat
       candidate `7b4b59c05` remains unmerged and preserved.
 - [ ] Wire persisted search and browsing into a usable host interface, and solve
       ledger/source scalability before real import.
-- [ ] `pi-63980860`: implement bounded explicit-root source discovery and byte
-      acquisition, using synthetic files only; no real history access. Base
-      `ae92f1fdca7a23acfa4e658c8e1fd2f93ee74e0f`.
+- [x] `pi-63980860`: merged `9040373e2`, bounded explicit-root discovery and
+      acquisition with Linux no-follow safeguards. Synthetic filesystem race
+      checks and independent reviews passed; no real history accessed. It refuses
+      live `~/.nanobot` and requires a separately supplied quiescent snapshot.
 - [ ] Rehearse on synthetic records; plan a private-copy reconciliation and
       backup/restore before seeking authorization for a real one-off import.
 - [x] `pi-458b1c64`: integrated `66163cf82`, bounded, pure source-byte

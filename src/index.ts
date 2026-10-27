@@ -15,6 +15,12 @@ export {
   type PreparedSearchUnit,
 } from "./archival-import/index.js";
 export {
+  acquireLegacySourceSnapshots,
+  prepareAcquiredArchivalImport,
+  type ArchivalSourceAcquisitionOptions,
+  type ArchivalSourceAcquisitionReport,
+} from "./archival-source/index.js";
+export {
   searchPersistedArchivalImport,
   type ArchivalSearchQuery,
   type ArchivalSearchOptions,
