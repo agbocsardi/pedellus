@@ -22,6 +22,20 @@ continues to constrain the currently integrated tool-less slice.
 Each unchecked milestone needs its exit evidence, not merely compilable code.
 P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
+## Active product implementation batch — 2026-10-27
+
+Two independent `openai-codex / gpt-6-luna / high` workers start from committed
+`053fdd50f1d370e42ca073cceac7a0e74de7f219`. Gateway remains tool-less, no live
+requests or real data; focused behavioral tests are authorized. Parent owns shared
+exports, runner wiring, review and integration.
+
+- [ ] `pi-b4e885e2`, `w2A:p1` / `w2A`: local CLI model selection using the
+      existing Gateway allowlist and native state, with synthetic behavioral tests.
+- [ ] `pi-b74e3b73`, `w2B:p1` / `w2B`: bounded opt-in identity/memory/skill
+      context-loading or safe in-memory template conversion with explicit limits.
+- [ ] Review reports and tests, integrate only accepted slices, then remove clean
+      completed worktrees. Preserve broad P3/P4 gates and explicit limitations.
+
 ## Active behavioral coverage batch — 2026-10-27
 
 Three independent `openai-codex / gpt-6-luna / high` workers start from committed
