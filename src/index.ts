@@ -1,6 +1,13 @@
 export { loadConfig, parseConfig, type CredentialProvider, type PortConfig } from "./config.js";
 export { createProviderModels } from "./providers.js";
 export {
+  prepareArchivePayload,
+  type ArchiveUsageScope,
+  type PreparedArchivePayload,
+  type SanitizedArchiveMessage,
+  type SanitizedConversationSnapshot,
+} from "./archive/index.js";
+export {
   CONTEXT_LIMITS,
   CONTEXT_SECTION_KEYS,
   createContextExtension,

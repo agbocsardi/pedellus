@@ -55,7 +55,6 @@ product-level transaction/idempotency design before any writer integration.
 
 The host-provided expected usage scope must be mapped to the selected
 transcript/conversation by the caller; the API can compare source identity but
-cannot infer that relationship from a session key. No gateway integration,
-export wiring, package manifest/lock change, or archive writer is included.
-Consumers must import this module directly until the package owner chooses its
-public export surface.
+cannot infer that relationship from a session key. The SDK exports
+`prepareArchivePayload`; it is not installed in the gateway. No archive writer,
+cursor update, or persistence transaction is included.

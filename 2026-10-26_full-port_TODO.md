@@ -29,15 +29,15 @@ P1 security and P8 data integrity cannot be waived by a successful chat demo.
       `/tmp/pi-nanobot-execution-security-review.md`. Five lifecycle checks pass.
       Not P1 security acceptance: quotas, orphan recovery, kernel/bwrap assumptions
       and full adversarial import/launch evidence remain open.
-- [ ] `pi-de1aa411`, `w2E:p1` / `w2E`: bounded opt-in archive preparation from
-      explicit synthetic host inputs and existing usage projection, no writes or
-      cursor advancement. Parent withheld `3070a0743`: raw summary may retain
-      reasoning, projection validation was shallow, and size checks occurred
-      after serialization. Returned corrections; no candidate acceptance. Branch
-      base `def089e6680987b710e345cce2cc125fd995d7b7`.
-- [ ] Parent review reports and integrate only verified work. Sandbox remains
-      disabled in gateway; no live data, network requests, deployment or cleanup
-      until work is reviewed. Both use `openai-codex / gpt-6-luna / high`.
+- [x] `pi-de1aa411`, `w2E:p1` / `w2E`: merged `c0cb0cd0d` bounded opt-in
+      archive preparation from explicit sanitized inputs and usage projections.
+      Parent reviewed fixes for summary cleaning, validation, bounds and unknown
+      usage transitions; fresh candidate and integrated tests pass. Parent exposed
+      SDK function and wired tests; no writes, cursor advancement or gateway
+      integration. Caller owns transcript/scope authenticity and completeness.
+- [x] Parent reviewed both reports, integrated the archive slice and verified the
+      combined behavioral suite. Sandbox remains disabled in gateway; broad P1/P4
+      and archive transaction gates remain open. Both used Codex Luna high.
 
 ## Active product implementation batch — 2026-10-27
 
