@@ -43,7 +43,8 @@ Real history access and import require separate authorization; use synthetic dat
       index, authentication or real history import is included. `pi-be224dbf`
       candidate `7b4b59c05` remains unmerged and preserved.
 - [ ] Wire persisted search and browsing into a usable host interface, and solve
-      ledger/source scalability before real import.
+      ledger/source scalability before real import. `pi-d41226d1` is reviewing a
+      safe local browse design; synthetic/source review only.
 - [x] `pi-63980860`: merged `9040373e2`, bounded explicit-root discovery and
       acquisition with Linux no-follow safeguards. Synthetic filesystem race
       checks and independent reviews passed; no real history accessed. It refuses
@@ -101,8 +102,10 @@ policy, environment and replay gates pass.
 - [x] `pi-13288a3c`: merged `cdce81811`, synthetic SIGKILL/reopen coverage for
       revoked grants, safe-to-unsafe downgrade, and explicitly safe replay.
       Independently reviewed; no production tool registration.
-- [ ] `pi-9a1348f8`: read-only assessment of next tool-security slice; no real
-      tools/data/network.
+- [x] `pi-9a1348f8`: assessed next tool-security slice; recommended synthetic
+      Gateway grant plumbing before exposing a workspace-confined read tool.
+- [ ] `pi-1631ba70`: synthetic-only exact-registration and Gateway grant proof,
+      base `a4e26190f`; no real tools/data/network.
 - [ ] Tool authorization: owner chose **host-supplied config**, default deny, as
       authoritative for allow/disallow and startup revocation. `pi-8a97b7a5`,
       `w2P:p1` / `w2P`, Codex Luna high, base `1e61299e5eda604e8cb9fa3c8d536c07258a4ca3`,
@@ -125,7 +128,7 @@ No shared runner/runtime changes, gateway tool activation, live requests or real
       truncation indicators; committed and preserved, not independently reviewed
       or integrated after owner priority pivot.
 - [ ] `pi-23d2bdf0`, `w2H:p1` / `w2H`: committed `9cc565dc3` opt-in native
-      one-shot scheduling; preserved unreviewed/unmerged after priority pivot.
+      one-shot scheduling; preserved unmerged. `pi-528324cd` is reviewing.
 - [ ] Parent review reports and behavioral checks, integrate accepted slices and
       clean their worktrees. Recurring cron, Dream and P4/P5 acceptance stay open.
 
@@ -138,7 +141,8 @@ No shared runner/runtime changes, gateway tool activation, live requests or real
       tests only; no real bot login or network requests. Parent owns gateway/config
       integration and review; tools remain disabled. Candidate `cdc7cc1c` is
       preserved but unmerged after the priority pivot; durable outbound handling
-      and real-client integration remain open. P6 remains open.
+      and real-client integration remain open. `pi-09e01e6a` is reviewing. P6
+      remains open.
 
 ## Completed archive and security review — 2026-10-27
 
