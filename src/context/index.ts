@@ -121,11 +121,12 @@ const SKILL_FRONTMATTER = /^---\s*\r?\n[\s\S]*?\r?\n---\s*\r?\n?/;
 
 /**
  * Make an opt-in Durable extension from immutable, host-supplied snapshots.
- * Create a fresh extension and dedicated registry for each Harness/storage:
- * Durable conversation IDs collide across stores, and PromptInput provides no
- * store namespace. Reconstruct same-store snapshots and install before resume.
- * This host precondition is not runtime-detectable. Renderers read only this
- * private copy and the request's actual `agent.tools`; no ambient discovery.
+ * Direct callers must use a fresh extension and dedicated registry per
+ * Harness/storage: Durable conversation IDs collide across stores, and
+ * PromptInput provides no store namespace. Reconstruct same-store snapshots
+ * before resume. `openGateway` enforces this using its persisted session map;
+ * direct callers own that precondition. Renderers read only this private copy
+ * and the request's actual `agent.tools`; no ambient discovery.
  */
 export function createContextExtension(
   snapshots: readonly ConversationContextSnapshot[],
