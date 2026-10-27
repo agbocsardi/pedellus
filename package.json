@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test:behavior": "npm run build && node --test test/terminal-cli.test.mjs tests/context.identity.test.mjs tests/migration.behavior.test.mjs tests/model-policy.test.mjs",
+    "test:execution": "npm run build && node --test tests/execution-lifecycle.test.mjs",
     "start": "node dist/cli.js"
   },
   "dependencies": {
@@ -16,6 +17,7 @@
     "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/pi-codemode": "1.4.0",
     "@earendil-works/pi-durable": "1.4.0",
+    "@earendil-works/pi-env": "1.4.0",
     "grammy": "1.46.0"
   },
   "devDependencies": {

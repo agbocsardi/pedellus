@@ -65,19 +65,19 @@ No real data, live calls, gateway tools or automatic integration.
       `npm run test:behavior`; the combined build and 11 reported tests pass.
       Coverage is bounded, not full parity; remaining gaps are tracked below.
 
-## Active sandbox follow-up — 2026-10-27
+## Integrated standalone sandbox candidate — 2026-10-27
 
-- [ ] Worker `pi-5907db09`, pane `w26:p1`, workspace `w26`, branch
-      `pi-5907db09`, uses `opencode-go / deepseek-v4.1-flash / high` in an
-      independent worktree based on preserved sandbox tip `26ab7b9f6`.
-      Review outstanding confinement/import/IPC/owner/lifecycle risks and address
-      a bounded set with focused Nanobot behavioral checks. Gateway tools remain
-      disabled; no live data, deployment, or automatic integration. Await explicit
-      report, independently review and verify before accepting any security claim.
-      Candidate `fdd8dcf35` adds workspace ownership and guarded deletion; parent
-      returned a suspected early lock release during failed-create rollback and
-      requested evidence for guest death vs owner SIGKILL lock release. Quotas,
-      orphan handling and replay remain open; candidate is not integrated.
+- [x] Worker `pi-5907db09`, branch `pi-5907db09`, followed preserved tip
+      `26ab7b9f6` with ownership and launch-intent fixes through `ae0629e0b`.
+      Parent recovered its report after the old parent socket disappeared,
+      reviewed the ownership and fencing changes, and reran typecheck and five
+      real-Bubblewrap lifecycle tests on the candidate and integration checkout.
+      The standalone experimental adapter is merged; gateway tools remain disabled.
+- [ ] P1 security acceptance remains open: independently adversarially review the
+      whole managed import and launch boundary, force the pre-publication crash
+      interleaving, establish safe orphan/manual reconciliation, bound CPU/memory/
+      process/disk use and shell timeouts, assess bwrap path TOCTOU and tool replay.
+      Tests do not prove host-power durability or all race/security invariants.
 
 ## Integrated implementation batch D — 2026-10-27
 
@@ -110,7 +110,8 @@ tabs without force; the branches were retained.
       checks, prioritizing migration integrity, CLI lifecycle and model recovery.
       Owner approved behavior-focused coverage; test Nanobot-owned contracts and
       integration boundaries, not Pi Durable internals or a mechanical suite port.
-      No permanent TypeScript parity tests have yet been added.
+      Initial permanent CLI, migration, context and model-policy behavioral tests
+      are integrated; further scenarios remain to be selected and ported.
 
 | Child / branch | Pane / workspace | Worktree | Exclusive ownership |
 |---|---|---|---|
