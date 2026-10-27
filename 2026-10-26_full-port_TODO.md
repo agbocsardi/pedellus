@@ -54,7 +54,8 @@ Real history access and import require separate authorization; use synthetic dat
       policy flags are not enforcement. No CLI or real-data use is authorized.
 - [ ] Resolve the SQLite destination open/ancestor-swap race and establish safe
       ownership, private-copy reconciliation and backup/restore before seeking
-      authorization for a real one-off import.
+      authorization for a real one-off import. `pi-0129a8e3` is assessing
+      local APIs and synthetic mitigations; no real data/network.
 - [x] `pi-458b1c64`: integrated `66163cf82`, bounded, pure source-byte
       preparation for session, archive-prefix and history JSONL; no importer or
       database writes. Parent and independent reviewers checked synthetic cases,
@@ -75,10 +76,12 @@ policy, environment and replay gates pass.
 - [x] `pi-e3cdee37`: merged `9aa8906e6`, bounded opt-in workspace loader for
       bootstrap and explicitly selected memory files; independent review and
       synthetic race/renderer checks passed. No default Gateway or skills wiring.
-- [ ] Design safe recovery for prepared requests containing old Nanobot context:
-      current conservative guard blocks startup even when context is unchanged,
-      and Gateway exposes no recovery interface to settle/cancel blocked tasks.
-      Deferred poll and compaction replay paths are source-reviewed only.
+- [ ] `pi-1c7f4920`: design/implement safe recovery for prepared requests
+      containing old Nanobot context; current guard blocks startup and exposes no
+      reconciliation interface. Deferred poll and compaction replay paths are
+      source-reviewed only. Synthetic data, base `d0d3a560a`.
+- [ ] `pi-c5cd04c3`: explicit opt-in workspace context for CLI/Gateway host;
+      default off, synthetic inputs only, base `d0d3a560a`.
 - [x] `pi-6d106995`, `w2D:p3` / `w2D`: read-only native tool integration and
       security gate plan at `/tmp/pi-tool-core-plan.md`; identifies quotas,
       approvals, workspace ownership and replay gates before production tools.
@@ -98,6 +101,8 @@ policy, environment and replay gates pass.
 - [x] `pi-13288a3c`: merged `cdce81811`, synthetic SIGKILL/reopen coverage for
       revoked grants, safe-to-unsafe downgrade, and explicitly safe replay.
       Independently reviewed; no production tool registration.
+- [ ] `pi-9a1348f8`: read-only assessment of next tool-security slice; no real
+      tools/data/network.
 - [ ] Tool authorization: owner chose **host-supplied config**, default deny, as
       authoritative for allow/disallow and startup revocation. `pi-8a97b7a5`,
       `w2P:p1` / `w2P`, Codex Luna high, base `1e61299e5eda604e8cb9fa3c8d536c07258a4ca3`,
