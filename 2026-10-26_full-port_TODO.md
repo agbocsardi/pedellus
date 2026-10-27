@@ -1626,7 +1626,10 @@ network call. Future tool reviews must not execute host shell tools.
 
 At owner request, stop new work and preserve unmerged candidates for later review:
 - Gateway synthetic grant fixture `pi-1631ba70` / `93fe32449`: public Gateway
-  remains tool-less; follow-up independent review was underway.
+  remains tool-less. Review found raw unmapped ownerless conversations can inherit
+  grants after reopen, malformed modelTools fails only at use, and existing
+  narrowed selections stay pinned after ceiling growth; resolve before reuse.
+  The internal fixture is also reachable by deep import, despite no barrel export.
 - Discord foundation `pi-acb8f4a0` / `33e35634b`: follow-up independent review
   was underway; production channel integration and P6 remain open.
 - Archival search renderer `pi-7384fed4` / `d3a4b2ba7`: narrowed prototype;
