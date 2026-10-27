@@ -41,7 +41,7 @@ type InboxView = { items?: readonly { mode?: string }[] };
 type RunView = { taskId: number; inputs: readonly number[] };
 type NativeSubmission = Awaited<ReturnType<Conversation["submit"]>>;
 type SettledSubmission = Awaited<ReturnType<NativeSubmission["wait"]>>;
-type LocalSubmission = { id: number; submission: NativeSubmission; runTaskId?: number };
+type LocalSubmission = { id: number; submission: NativeSubmission; runTaskId?: number; finalized?: boolean };
 type GenerationOutput = {
   attempt: number;
   streamed: string;
@@ -49,6 +49,8 @@ type GenerationOutput = {
   desynchronized: boolean;
   active: boolean;
   openLine: boolean;
+  /** Final entry reconciled; suppress older committed snapshots still queued behind output backpressure. */
+  finalized: boolean;
 };
 type RunOutput = { generation?: GenerationOutput };
 
@@ -139,6 +141,7 @@ export async function runTerminalConversation(
         desynchronized: false,
         active: false,
         openLine: false,
+        finalized: false,
       };
       runOutputs.set(taskId, run);
     }
@@ -153,8 +156,13 @@ export async function runTerminalConversation(
       for (const state of runOutputs.values()) if (state.generation?.active) state.generation.active = false;
       return;
     }
+    // Delayed watch snapshots may predate the settled assistant entry reconciled below.
+    if (runOutputs.get(run.taskId)?.generation?.finalized) return;
 
-    const ownedInputs = run.inputs.filter((id) => submissions.has(id));
+    const ownedInputs = run.inputs.filter((id) => {
+      const submission = submissions.get(id);
+      return submission !== undefined && !submission.finalized;
+    });
     if (ownedInputs.length === 0) {
       for (const state of runOutputs.values()) {
         if (state.generation?.active) {
@@ -181,6 +189,7 @@ export async function runTerminalConversation(
     for (const id of ownedInputs) submissions.get(id)!.runTaskId = run.taskId;
     const state = responseState(run.taskId);
     const generation = live?.generation;
+    if (state.finalized && (generation === undefined || state.attempt === generation.attempt)) return;
     if (generation === undefined) {
       if (state.active) {
         state.active = false;
@@ -201,6 +210,7 @@ export async function runTerminalConversation(
       state.streamed = "";
       state.truncated = false;
       state.desynchronized = false;
+      state.finalized = false;
       state.active = true;
     }
 
@@ -261,10 +271,20 @@ export async function runTerminalConversation(
       const message = entry?.model?.[0] as AssistantMessage | undefined;
       const finalText = sanitizeTerminalText(assistantText(message));
       await serializeRender(async () => {
-        if (!rememberAnswer(settled.answer)) return;
         const local = submissions.get(submissionId);
         const taskId = local?.runTaskId;
         const generation = taskId === undefined ? undefined : runOutputs.get(taskId)?.generation;
+        if (local) local.finalized = true;
+        if (taskId !== undefined) {
+          for (const pending of submissions.values()) {
+            if (pending.runTaskId === taskId) pending.finalized = true;
+          }
+        }
+        if (generation) {
+          generation.finalized = true;
+          generation.active = false;
+        }
+        if (!rememberAnswer(settled.answer)) return;
 
         if (finalText.length === 0) {
           if (generation?.streamed.length === 0) await rawNotice("The assistant returned no text response.");
@@ -278,6 +298,7 @@ export async function runTerminalConversation(
           if (shown) {
             if (!generation.openLine && !generation.streamed.endsWith("\n")) await write("\n");
             await write(shown);
+            generation.streamed += shown;
             generation.openLine = !shown.endsWith("\n");
           }
           if (suffix.length > shown.length || generation.truncated) {
