@@ -1005,3 +1005,20 @@ regressing counters and nested cost immutability pass. Candidate built artifacts
 only so far; repeat on parent after explicit independent review/integration.
 No archive writer, request-count invention, abort-runtime proof, live calls or
 sandbox changes. P4 remains incomplete.
+
+### 2026-10-27 — context lifecycle parent verification
+
+C2 explicitly reported docs-only follow-up `8a0da7610`, clarifying restart host
+responsibility and fork/current-vs-history behavior; module remains `dece7e988`.
+Parent read the private SQLite fixture and reran a selectable-import adaptation
+`/tmp/pi-nanobot-parent-context-lifecycle.mjs` (90s/384 MB), passing unchanged-prompt
+patch stability, same-name replacement/null removals, fork inheritance then current
+section clearing, retained historical source, and same-snapshot reopen stability.
+Shared the committed clarification and fixture with reviewer `pi-eb98e056`.
+
+Parent independently wrote `/tmp/pi-nanobot-parent-context-edges.mjs` (45s/384 MB):
+saturated total/section/tool budgets, Unicode-safe truncation, getter-free skill/
+scope gating, missing-conversation isolation and duplicate/overflow rejection pass
+against candidate. No module revision, ambient reads or gateway activation.
+Independent C2/C3 conclusions remain pending; rerun all accepted probes on the
+parent package after integration rather than claim candidate-only evidence.
