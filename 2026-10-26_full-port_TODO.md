@@ -24,8 +24,11 @@ P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
 ## Active archive and security review — 2026-10-27
 
-- [ ] `pi-539bbaa7`, `w2D:p2` / `w2D`: read-only independent review of the
-      merged standalone sandbox's launch, teardown and import security boundary.
+- [x] `pi-539bbaa7`, `w2D:p2` / `w2D`: independent read-only sandbox review
+      found no confirmed guest escape or import authorization bypass; report
+      `/tmp/pi-nanobot-execution-security-review.md`. Five lifecycle checks pass.
+      Not P1 security acceptance: quotas, orphan recovery, kernel/bwrap assumptions
+      and full adversarial import/launch evidence remain open.
 - [ ] `pi-de1aa411`, `w2E:p1` / `w2E`: bounded opt-in archive preparation from
       explicit synthetic host inputs and existing usage projection, no writes or
       cursor advancement. Branch base `def089e6680987b710e345cce2cc125fd995d7b7`.
