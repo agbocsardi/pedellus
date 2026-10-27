@@ -114,7 +114,7 @@ export interface PreparedSearchUnit {
   readonly timestamp: string | null;
   readonly name: string | null;
   readonly entryId: string | null;
-  /** Text-only projection. Non-text blocks, tool arguments and raw metadata are not indexed. */
+  /** Text-only projection. Role/name/IDs are separate unit fields; tool arguments and raw metadata are not indexed. */
   readonly text: string;
 }
 
@@ -139,6 +139,7 @@ export interface PreparedArchivalRecord {
   readonly quarantineReason: ArchivalQuarantineReason | null;
   /** True when the payload is deliberately not interpreted beyond safe structural fields. */
   readonly opaque: boolean;
+  /** Whether all text-scoped content was projected; partial when anything content-bearing was omitted. */
   readonly searchStatus: "complete" | "partial" | "none";
   readonly disposition: "archive-only-never-resume-or-replay";
   /** Allowlisted structural identity, copied without normalization. */
@@ -240,6 +241,13 @@ const SUPPORTED_FORMATS = new Set(["session-jsonl", "history-jsonl", "session-ar
 const SAFE_LABEL = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const KNOWN_ROLES = new Set(["user", "assistant", "tool", "system"]);
+const INDEXED_SESSION_MESSAGE_FIELDS = new Set(["role", "content", "timestamp", "_entry_id", "name"]);
+const INDEXED_HISTORY_MESSAGE_FIELDS = new Set(["role", "content", "timestamp", "name", "_entry_id"]);
+const INDEXED_HISTORY_TOP_FIELDS = new Set(["timestamp", "session_key", "content", "summary", "messages", "cursor"]);
+// Known operational/accounting fields intentionally outside the text-search scope.
+const NON_SEARCH_HISTORY_TOP_FIELDS = new Set([
+  "schema_version", "kind", "start_time", "end_time", "message_count", "usage", "_idempotency_key",
+]);
 
 const UNSUPPORTED_SURFACES: readonly UnsupportedArchivalSurface[] = Object.freeze([
   {
@@ -351,20 +359,51 @@ function nonNegativeInt(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
-/** Text-only search projection; raw bytes remain authoritative. */
-function textProjection(content: unknown): string | null {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return null;
+function hasValue(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  if (typeof value === "string") return value.length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  if (isRecord(value)) return Object.keys(value).length > 0;
+  return true;
+}
+
+function hasUnindexedContent(
+  value: Record<string, unknown>,
+  indexed: ReadonlySet<string>,
+  knownNonSearch: ReadonlySet<string> = new Set(),
+): boolean {
+  return Object.keys(value).some((key) =>
+    !indexed.has(key) && !knownNonSearch.has(key) && hasValue(value[key]));
+}
+
+/** Text-only search projection plus whether any content-bearing part was omitted. */
+function textProjection(content: unknown): { text: string | null; omitted: boolean } {
+  if (typeof content === "string") return { text: content, omitted: false };
+  if (!Array.isArray(content)) return { text: null, omitted: false };
   const parts: string[] = [];
+  let omitted = false;
   for (const block of content) {
     if (typeof block === "string") {
       parts.push(block);
-    } else if (isRecord(block)) {
-      if (typeof block.text === "string") parts.push(block.text);
-      else if (typeof block.content === "string") parts.push(block.content);
+      continue;
+    }
+    if (!isRecord(block)) {
+      omitted = true;
+      continue;
+    }
+    const keys = Object.keys(block);
+    if (typeof block.text === "string") {
+      parts.push(block.text);
+      if (keys.some((key) => key !== "type" && key !== "text")) omitted = true;
+      if (typeof block.content === "string") omitted = true;
+    } else if (typeof block.content === "string") {
+      parts.push(block.content);
+      if (keys.some((key) => key !== "type" && key !== "content")) omitted = true;
+    } else {
+      omitted = true;
     }
   }
-  return parts.length > 0 ? parts.join("\n") : null;
+  return { text: parts.length > 0 ? parts.join("\n") : null, omitted };
 }
 
 function searchUnit(
@@ -384,6 +423,7 @@ interface ClassifiedLine {
   readonly status: "prepared" | "quarantined";
   readonly quarantineReason: ArchivalQuarantineReason | null;
   readonly opaque: boolean;
+  /** Whether all text-scoped content was projected; partial when anything content-bearing was omitted. */
   readonly searchStatus: "complete" | "partial" | "none";
   readonly sessionKey: string | null;
   readonly timestamp: string | null;
@@ -515,18 +555,25 @@ function messageLine(
   const timestamp = boundedString(parsed.timestamp, 64);
   const entryId = boundedString(parsed._entry_id, 512);
   const name = boundedString(parsed.name, 512);
-  const text = textProjection(rawContent);
+  const projection = textProjection(rawContent);
   const diagnostics: string[] = [];
   if (parsed.timestamp !== undefined && timestamp === null) diagnostics.push("message-timestamp-invalid");
   if (parsed._entry_id !== undefined && entryId === null) diagnostics.push("message-entry-id-invalid");
   if (parsed.name !== undefined && name === null) diagnostics.push("message-name-invalid");
-  const units = text === null ? [] : [searchUnit(0, unitKind, rawRole, timestamp, name, entryId, text)];
+  const omitted = projection.omitted ||
+    hasUnindexedContent(parsed, INDEXED_SESSION_MESSAGE_FIELDS) ||
+    (parsed.timestamp !== undefined && timestamp === null) ||
+    (parsed._entry_id !== undefined && entryId === null) ||
+    (parsed.name !== undefined && name === null);
+  const units = projection.text === null
+    ? []
+    : [searchUnit(0, unitKind, rawRole, timestamp, name, entryId, projection.text)];
   return {
     category,
     status: "prepared",
     quarantineReason: null,
     opaque: false,
-    searchStatus: text === null ? "partial" : "complete",
+    searchStatus: units.length === 0 || omitted ? "partial" : "complete",
     sessionKey,
     timestamp,
     role: rawRole,
@@ -560,8 +607,17 @@ function historyLine(parsed: Record<string, unknown>, nestedLimit: number): Clas
 
   const units: PreparedSearchUnit[] = [];
   const diagnostics: string[] = [];
-  let partial = false;
-  if (hasContent) units.push(searchUnit(units.length, "history-content", null, rawTimestamp, null, null, parsed.content as string));
+  let partial = hasUnindexedContent(parsed, INDEXED_HISTORY_TOP_FIELDS, NON_SEARCH_HISTORY_TOP_FIELDS);
+  if (rawSessionKey !== undefined && rawSessionKey !== null && sessionKey === null) partial = true;
+  if (parsed.content !== undefined && typeof parsed.content !== "string") partial = true;
+  if (parsed.summary !== undefined && typeof parsed.summary !== "string") partial = true;
+  if (hasContent) {
+    const projection = textProjection(parsed.content);
+    if (projection.text !== null) {
+      units.push(searchUnit(units.length, "history-content", null, rawTimestamp, null, null, projection.text));
+    }
+    if (projection.omitted) partial = true;
+  }
   if (hasMessages) {
     for (const message of messages as unknown[]) {
       if (!isRecord(message)) {
@@ -570,14 +626,16 @@ function historyLine(parsed: Record<string, unknown>, nestedLimit: number): Clas
         continue;
       }
       const rawRole = message.role;
-      const content = message.content;
       if (typeof rawRole !== "string" || rawRole.length === 0) {
         diagnostics.push("history-message-not-indexed");
         partial = true;
         continue;
       }
-      const text = textProjection(content);
-      if (text === null) {
+      const messageTimestamp = boundedString(message.timestamp, 64);
+      const messageName = boundedString(message.name, 512);
+      const messageEntryId = boundedString(message._entry_id, 512);
+      const projection = textProjection(message.content);
+      if (projection.text === null) {
         diagnostics.push("history-message-text-not-indexed");
         partial = true;
         continue;
@@ -586,20 +644,34 @@ function historyLine(parsed: Record<string, unknown>, nestedLimit: number): Clas
         units.length,
         "history-message",
         rawRole,
-        boundedString(message.timestamp, 64),
-        boundedString(message.name, 512),
-        boundedString(message._entry_id, 512),
-        text,
+        messageTimestamp,
+        messageName,
+        messageEntryId,
+        projection.text,
       ));
+      if (projection.omitted ||
+          hasUnindexedContent(message, INDEXED_HISTORY_MESSAGE_FIELDS) ||
+          (message.timestamp !== undefined && messageTimestamp === null) ||
+          (message.name !== undefined && messageName === null) ||
+          (message._entry_id !== undefined && messageEntryId === null)) {
+        partial = true;
+      }
     }
   }
   if (hasSummary) {
-    units.push(searchUnit(units.length, "history-summary", null, rawTimestamp, null, null, parsed.summary as string));
+    const projection = textProjection(parsed.summary);
+    if (projection.text !== null) {
+      units.push(searchUnit(units.length, "history-summary", null, rawTimestamp, null, null, projection.text));
+    }
+    if (projection.omitted) partial = true;
   }
 
   const rawCursor = parsed.cursor;
   const archiveCursor = nonNegativeInt(rawCursor);
-  if (rawCursor !== undefined && archiveCursor === null) diagnostics.push("history-cursor-invalid");
+  if (rawCursor !== undefined && archiveCursor === null) {
+    diagnostics.push("history-cursor-invalid");
+    partial = true;
+  }
   if (parsed.schema_version !== undefined && nonNegativeInt(parsed.schema_version) === null) {
     diagnostics.push("history-schema-version-invalid");
   }

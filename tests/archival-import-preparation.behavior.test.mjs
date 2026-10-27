@@ -135,9 +135,12 @@ test("prepares versioned, ordered, lossless records from one store namespace", (
   assert.equal(messages[0].search[0].kind, "session-message");
   assert.equal(messages[0].search[0].text, "hello");
   assert.equal(messages[0].sessionKey, sessionKey);
+  assert.equal(messages[0].searchStatus, "complete");
   assert.equal(messages[1].search[0].text, "hi there");
   assert.equal(messages[1].role, "assistant");
+  assert.equal(messages[1].searchStatus, "partial");
   assert.equal(messages[2].search[0].text, "hello again");
+  assert.equal(messages[2].searchStatus, "complete");
 
   const blank = result.records.find((record) => record.category === "blank-line");
   assert.equal(blank.opaque, true);
@@ -176,10 +179,126 @@ test("prepares versioned, ordered, lossless records from one store namespace", (
   assert.equal(unknownArchive.status, "quarantined");
   assert.match(Buffer.from(unknownArchive.rawLineBase64, "base64").toString("utf8"), /batch_manifest/);
 
+  const allSearchText = result.records.flatMap((record) => record.search.map((unit) => unit.text)).join("\n");
+  assert.doesNotMatch(allSearchText, /provider-private-token|opaque session summary|opaque objective|call-1|danger/);
+
   assert.equal(result.counts.providerStateRecords, 1);
   assert.equal(result.counts.quarantinedLines, 2);
   assert.equal(result.unsupportedSources.length, 0);
   assert.equal(result.unsupportedSurfaces.some((surface) => /archive-batch/.test(surface.surface)), true);
+});
+
+test("marks mixed, tool-use, media, unknown-block, and extra-block content partial", () => {
+  const lines = [
+    JSON.stringify({
+      role: "user",
+      content: [{ type: "text", text: "visible" }, { type: "image", source: { data: "base64-image" } }],
+      timestamp: "2026-07-19T12:00:00+00:00",
+      _entry_id: "m1",
+    }),
+    JSON.stringify({
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "c1", function: { name: "lookup", arguments: "{\"q\":\"secret\"}" } }],
+      timestamp: "2026-07-19T12:01:00+00:00",
+      _entry_id: "m2",
+    }),
+    JSON.stringify({
+      role: "assistant",
+      content: [{ type: "text", text: "prefix" }, { type: "tool_use", id: "t1", name: "lookup", input: { q: "secret" } }],
+      timestamp: "2026-07-19T12:02:00+00:00",
+      _entry_id: "m3",
+    }),
+    JSON.stringify({
+      role: "user",
+      content: [{ type: "text", text: "typed", cache_control: { type: "ephemeral" } }],
+      timestamp: "2026-07-19T12:03:00+00:00",
+      _entry_id: "m4",
+    }),
+    JSON.stringify({
+      role: "user",
+      content: [{ type: "mystery", payload: "opaque" }],
+      timestamp: "2026-07-19T12:04:00+00:00",
+      _entry_id: "m5",
+    }),
+    JSON.stringify({
+      role: "user",
+      content: "plain",
+      name: "alice",
+      timestamp: "2026-07-19T12:05:00+00:00",
+      _entry_id: "m6",
+    }),
+    JSON.stringify({
+      role: "user",
+      content: "media text",
+      media: [{ type: "image", path: "/private/image.png" }],
+      timestamp: "2026-07-19T12:06:00+00:00",
+      _entry_id: "m7",
+    }),
+    "",
+  ].join("\n");
+  const result = prepareArchivalImport({
+    storeNamespace: "synthetic-store",
+    sources: [snapshot("session-mixed", "session-jsonl", lines)],
+  });
+  const messages = result.records.filter((record) => record.category === "session-message");
+  assert.deepEqual(messages.map((record) => record.searchStatus), [
+    "partial", "partial", "partial", "partial", "partial", "complete", "partial",
+  ]);
+  assert.deepEqual(messages[0].search.map((unit) => unit.text), ["visible"]);
+  assert.deepEqual(messages[1].search, []);
+  assert.deepEqual(messages[2].search.map((unit) => unit.text), ["prefix"]);
+  assert.deepEqual(messages[3].search.map((unit) => unit.text), ["typed"]);
+  assert.deepEqual(messages[4].search, []);
+  assert.equal(messages[5].search[0].text, "plain");
+  assert.equal(messages[5].search[0].name, "alice");
+  assert.deepEqual(messages[6].search.map((unit) => unit.text), ["media text"]);
+  assert.match(Buffer.from(messages[0].rawLineBase64, "base64").toString("utf8"), /base64-image/);
+  assert.match(Buffer.from(messages[1].rawLineBase64, "base64").toString("utf8"), /secret/);
+});
+
+test("marks history search partial for unindexed message and top-level content", () => {
+  const history = [
+    JSON.stringify({
+      timestamp: "2026-07-19T12:00",
+      session_key: sessionKey,
+      cursor: 1,
+      messages: [
+        { role: "assistant", content: "answer", tools_used: ["lookup"] },
+        { role: "user", content: [{ type: "text", text: "visible" }, { type: "image", source: { data: "img" } }] },
+      ],
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-19T12:10",
+      session_key: sessionKey,
+      cursor: 2,
+      messages: [{ role: "user", content: "clean" }],
+      extra_field: { note: "opaque top-level content" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-19T12:20",
+      session_key: sessionKey,
+      cursor: 3,
+      schema_version: 3,
+      kind: "conversation",
+      start_time: "2026-07-19T12:20",
+      end_time: "2026-07-19T12:20",
+      message_count: 1,
+      usage: { prompt_tokens: 1 },
+      messages: [{ role: "user", content: "clean" }],
+      summary: "summary",
+    }),
+    "",
+  ].join("\n");
+  const result = prepareArchivalImport({
+    storeNamespace: "synthetic-store",
+    sources: [snapshot("history-mixed", "history-jsonl", history)],
+  });
+  const entries = result.records.filter((record) => record.category === "history-entry");
+  assert.deepEqual(entries.map((record) => record.searchStatus), ["partial", "partial", "complete"]);
+  assert.deepEqual(entries[0].search.map((unit) => unit.text), ["answer", "visible"]);
+  assert.deepEqual(entries[1].search.map((unit) => unit.text), ["clean"]);
+  assert.match(Buffer.from(entries[1].rawLineBase64, "base64").toString("utf8"), /opaque top-level content/);
 });
 
 test("keeps identical physical lines as distinct records and preserves CRLF/EOF shape", () => {

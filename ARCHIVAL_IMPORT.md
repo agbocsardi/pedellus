@@ -120,15 +120,53 @@ source bytes exactly, including blank lines, CRLF, and a final line without LF.
 positions produce two records with the same hash but different `ordinal`,
 `line`, and `byteOffset`. No content-only deduplication is performed anywhere.
 
-The search projection is **text-only and best effort**. Non-text content blocks,
-tool arguments/results, session metadata, provider-private state, usage,
-timestamps beyond the copied strings, and unknown fields are not indexed. Raw
-bytes remain authoritative. `searchStatus` describes the text projection only:
-`complete` means all textual content detected on the line was indexed; `partial`
-means some text/content could not be projected (for example non-text blocks or
-malformed embedded messages); `none` means the line is opaque or quarantined.
-Unindexed tool arguments, metadata, and unknown fields do not by themselves
-change `complete`.
+The search projection is deliberately **text-scoped**, and `searchStatus`
+reports whether that scope covered the record. It must not be read as "every
+field is indexed".
+
+Indexed content:
+
+- session/archive message: `role`, `content` text, `timestamp`, `name`, and
+  `_entry_id`;
+- history: top-level `timestamp`, `session_key`, `content`, `summary`, and
+  `cursor`; each embedded message's `role`, `content` text, `timestamp`, `name`,
+  and `_entry_id`.
+
+`PreparedSearchUnit` carries role/timestamp/name/entry ID as separate searchable
+metadata; they are not concatenated into `text`. A future index must index those
+fields explicitly if it wants name/role lookups.
+
+`searchStatus` values:
+
+- `complete`: at least one search unit exists and **no content-bearing part of
+  the record was omitted**;
+- `partial`: a prepared record has no indexable units, or any content-bearing
+  part was omitted (see below);
+- `none`: the record is opaque, blank, or quarantined.
+
+Omissions that force `partial`:
+
+- a content array containing non-string, non-text, or unknown blocks;
+- a text/content block with keys beyond `type` plus `text` (or `type` plus
+  `content`), or a block carrying both text and content;
+- non-empty `tool_calls` (IDs, names, arguments), `tool_call_id`, `media`,
+  `thinking_blocks`, `cli_apps`, `mcp_presets`, or any other non-indexed message
+  field with a value;
+- non-empty history message `tools_used` or any other non-indexed history
+  message field with a value;
+- malformed embedded history messages, an invalid history cursor, non-string
+  top-level content/summary fields, or indexed metadata strings
+  (timestamp/name/entry ID/session key) that are too long or the wrong type to
+  project;
+- unknown history top-level fields with values.
+
+Known operational/accounting history fields are intentionally outside the
+search scope and do **not** alone force `partial`: `schema_version`, `kind`,
+`start_time`, `end_time`, `message_count`, `usage`, and `_idempotency_key`. They
+remain raw-only. Session-header metadata and `provider_state` payloads are opaque
+and always have no search units, even when their raw bytes contain text-like
+values; they are source-grade-sensitive archival data, not index input. Raw bytes
+remain authoritative for every record.
 
 ## Quarantine
 
