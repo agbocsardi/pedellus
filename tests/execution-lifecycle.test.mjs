@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { access, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -70,21 +71,22 @@ test("one live owner per workspace and guarded deletion", { timeout: 120_000 }, 
 	}
 });
 
-test("a live sandbox run marker blocks open and removal until it exits", { timeout: 120_000 }, async () => {
+test("a live published supervisor pid blocks open and removal until it exits", { timeout: 120_000 }, async () => {
 	const store = await temporaryDirectory("nanobot-exec-marker-store-");
 	let blocker;
 	try {
 		const first = await createExecutionEnv({ storageDirectory: store });
 		const id = first.workspaceId;
-		const marker = join(store, "runs", `${id}.pid`);
-		const livePid = Number((await readFile(marker, "utf8")).trim());
-		assert.equal(livePid > 0, true);
+		const marker = join(store, "runs", `${id}.launch`);
+		const published = /^pid ([1-9]\d{0,9}) ([0-9a-f-]{36})$/.exec((await readFile(marker, "utf8")).trim());
+		assert.ok(published, "launcher publishes its supervisor pid and nonce");
+		const livePid = Number(published[1]);
 		process.kill(livePid, 0);
 		await first.cleanup(BACKGROUND_CONTEXT);
 		assert.deepEqual(await readdir(join(store, "runs")), []);
 
 		blocker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-		await writeFile(marker, `${blocker.pid}\n`, { mode: 0o600 });
+		await writeFile(marker, `pid ${blocker.pid} ${randomUUID()}\n`, { mode: 0o600 });
 		await assert.rejects(openExecutionEnv(id, { storageDirectory: store }), /still have a live sandbox/);
 		await assert.rejects(removeExecutionWorkspace(id, { storageDirectory: store }), /still have a live sandbox/);
 
@@ -99,14 +101,46 @@ test("a live sandbox run marker blocks open and removal until it exits", { timeo
 		}
 
 		await writeFile(marker, "not-a-pid\n", { mode: 0o600 });
-		await assert.rejects(openExecutionEnv(id, { storageDirectory: store }), /marker is malformed/);
-		await rm(marker);	} finally {
+		await assert.rejects(openExecutionEnv(id, { storageDirectory: store }), /launch file is malformed/);
+		await rm(marker);
+	} finally {
 		blocker?.kill("SIGKILL");
 		await rm(store, { recursive: true, force: true });
 	}
 });
 
-test("a failed setup rolls back its workspace and marks no run before releasing ownership", { timeout: 120_000 }, async () => {
+test("an unverified pending launch intent is never auto-recovered", { timeout: 120_000 }, async () => {
+	const store = await temporaryDirectory("nanobot-exec-pending-store-");
+	try {
+		const first = await createExecutionEnv({ storageDirectory: store });
+		const id = first.workspaceId;
+		const marker = join(store, "runs", `${id}.launch`);
+		await first.cleanup(BACKGROUND_CONTEXT);
+
+		// Simulate an owner that died after writing the durable intent but before its launcher published a pid.
+		await writeFile(marker, `pending ${randomUUID()}\n`, { mode: 0o600 });
+		for (let attempt = 0; attempt < 3; attempt++) {
+			await assert.rejects(openExecutionEnv(id, { storageDirectory: store }), /unverified launch intent/);
+			await assert.rejects(removeExecutionWorkspace(id, { storageDirectory: store }), /unverified launch intent/);
+		}
+		await access(marker);
+		await access(join(store, "admissions", `${id}.json`));
+
+		// Only explicit manual reconciliation clears it.
+		await rm(marker);
+		const reopened = await openExecutionEnv(id, { storageDirectory: store });
+		try {
+			const info = await reopened.fileInfo("/workspace", BACKGROUND_CONTEXT);
+			assert.equal(info.ok, true);
+		} finally {
+			await reopened.cleanup(BACKGROUND_CONTEXT);
+		}
+	} finally {
+		await rm(store, { recursive: true, force: true });
+	}
+});
+
+test("a failed setup rolls back its workspace and leaves no launch intent", { timeout: 120_000 }, async () => {
 	const store = await temporaryDirectory("nanobot-exec-fail-store-");
 	try {
 		await assert.rejects(
@@ -160,7 +194,7 @@ test("a killed owner releases its kernel lock without stale takeover", { timeout
 		child.kill("SIGKILL");
 		await new Promise((resolve) => child.once("exit", resolve));
 		// The marker must outlive the owner; otherwise a crashed sandbox would be invisible to the next owner.
-		await access(join(store, "runs", `${id}.pid`));
+		await access(join(store, "runs", `${id}.launch`));
 		// The owner lock is gone immediately, but the sandbox supervisor may still be alive for a moment.
 		// Opening must either fail closed or wait until that supervisor is reaped; never race it silently.
 		let env;

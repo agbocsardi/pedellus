@@ -58,7 +58,7 @@ interface WorkspaceRecord {
 }
 
 interface AdmissionRecord {
-	version: 2;
+	version: 3;
 	id: string;
 	rootDev: string;
 	rootIno: string;
@@ -180,17 +180,21 @@ async function prepareStore(storageDirectory?: string): Promise<StorePaths> {
 	return { store, workspaces, admissions, runs };
 }
 
-function managedPaths(store: StorePaths, id: string): { container: string; root: string; admission: string; runMarker: string } {
+function managedPaths(store: StorePaths, id: string): { container: string; root: string; admission: string; launch: string } {
 	return {
 		container: join(store.workspaces, id),
 		root: join(store.workspaces, id, "root"),
 		admission: join(store.admissions, `${id}.json`),
-		runMarker: join(store.runs, `${id}.pid`),
+		launch: join(store.runs, `${id}.launch`),
 	};
 }
 
 function validWorkspaceId(id: string): boolean {
-	return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+	return validUuid(id);
+}
+
+function validUuid(value: string): boolean {
+	return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function rejectImportRoot(path: string): void {
@@ -293,8 +297,8 @@ async function readAdmission(store: StorePaths, id: string): Promise<WorkspaceRe
 		await recordHandle.close();
 	}
 	const admission = JSON.parse(raw) as Partial<AdmissionRecord>;
-	if (admission.version !== 2) {
-		throw new Error("Managed workspace predates run-marker ownership and cannot be reopened safely; remove it manually");
+	if (admission.version !== 3) {
+		throw new Error("Managed workspace predates launch-intent ownership and cannot be reopened safely; remove it manually");
 	}
 	if (
 		admission.id !== id ||
@@ -310,7 +314,7 @@ async function readAdmission(store: StorePaths, id: string): Promise<WorkspaceRe
 
 async function writeAdmission(store: StorePaths, record: WorkspaceRecord): Promise<void> {
 	const admission: AdmissionRecord = {
-		version: 2,
+		version: 3,
 		id: record.id,
 		rootDev: record.rootDev,
 		rootIno: record.rootIno,
@@ -324,43 +328,81 @@ async function writeAdmission(store: StorePaths, record: WorkspaceRecord): Promi
 	}
 }
 
-/**
- * Refuse to start a second sandbox while the run marker names a live supervisor process. The host-side launcher
- * writes the marker before it execs bwrap, so the marker exists before any guest can touch the workspace. Once the
- * recorded supervisor is gone (crash, SIGKILL, or verified teardown) its PID namespace has been torn down and the
- * marker is stale. A reused PID only delays startup (fail closed) until that process exits; it is never trusted.
- */
-async function assertNoLiveSandbox(store: StorePaths, id: string): Promise<void> {
-	const marker = managedPaths(store, id).runMarker;
-	let raw: string;
+type LaunchState =
+	| { readonly kind: "pending"; readonly nonce: string }
+	| { readonly kind: "pid"; readonly pid: number; readonly nonce: string };
+
+function parseLaunchState(raw: string): LaunchState {
+	const value = raw.trim();
+	const pending = /^pending (\S+)$/.exec(value);
+	if (pending && validUuid(pending[1]!)) return { kind: "pending", nonce: pending[1]! };
+	const published = /^pid ([1-9]\d{0,9}) (\S+)$/.exec(value);
+	if (published && validUuid(published[2]!)) return { kind: "pid", pid: Number(published[1]), nonce: published[2]! };
+	throw new Error("Managed sandbox launch file is malformed; manual reconciliation is required");
+}
+
+async function readLaunchFile(file: string): Promise<LaunchState | undefined> {
 	try {
-		const info = await lstat(marker);
-		if (info.isSymbolicLink() || !info.isFile()) throw new Error("Managed sandbox run marker is not a regular file");
-		requireOwner(info, "Managed sandbox run marker");
-		const handle = await open(marker, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		const info = await lstat(file);
+		if (info.isSymbolicLink() || !info.isFile()) throw new Error("Managed sandbox launch file is not a regular file");
+		requireOwner(info, "Managed sandbox launch file");
+		const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
 		try {
-			raw = (await handle.readFile("utf8")).trim();
+			return parseLaunchState(await handle.readFile("utf8"));
 		} finally {
 			await handle.close();
 		}
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
 	}
-	if (!/^[1-9]\d{0,9}$/.test(raw)) throw new Error("Managed sandbox run marker is malformed; refusing a second sandbox");
-	const pid = Number(raw);
+}
+
+async function readLaunchState(store: StorePaths, id: string): Promise<LaunchState | undefined> {
+	return readLaunchFile(managedPaths(store, id).launch);
+}
+
+/**
+ * Refuse to start a second sandbox while a launch may still be in flight. The owner writes `pending` before it
+ * spawns the launcher, so a crash between spawn and the launcher publishing its pid still leaves a durable intent.
+ * A pending intent is never auto-recovered: the owner could not prove whether a pre-publication launcher exists, so
+ * only manual reconciliation may clear it. A published pid is checked for liveness; a dead pid proves the launcher
+ * and its PID namespace are gone, so the stale file is removed. A reused pid only delays startup (fail closed).
+ */
+async function assertLaunchSafe(store: StorePaths, id: string): Promise<void> {
+	const state = await readLaunchState(store, id);
+	if (state === undefined) return;
+	if (state.kind === "pending") {
+		throw new Error(
+			`Managed workspace ${id} has an unverified launch intent; manual reconciliation is required before reuse`,
+		);
+	}
 	try {
-		process.kill(pid, 0);
+		process.kill(state.pid, 0);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-			await rm(marker, { force: true });
+			await rm(managedPaths(store, id).launch, { force: true });
 			return;
 		}
 		throw error;
 	}
 	throw new Error(
-		`Managed workspace ${id} may still have a live sandbox (supervisor pid ${pid}); previous owner did not finish teardown`,
+		`Managed workspace ${id} may still have a live sandbox (supervisor pid ${state.pid}); previous owner did not finish teardown`,
 	);
+}
+
+/** Write the launch intent before spawning anything; O_EXCL refuses to overwrite another launch's state. */
+async function writeLaunchIntent(path: string, nonce: string): Promise<void> {
+	const handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+	try {
+		await handle.writeFile(`pending ${nonce}\n`);
+		await handle.sync();
+	} catch (error) {
+		await handle.close().catch(() => undefined);
+		await rm(path, { force: true }).catch(() => undefined);
+		throw error;
+	}
+	await handle.close();
 }
 
 function aborted<T>(context: Context, path?: string): Result<T, FileError> | undefined {
@@ -415,7 +457,8 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 	readonly #roots = [GUEST_ROOT];
 	readonly #daemonDir: string;
 	readonly #pidFile: string;
-	readonly #runMarker: string;
+	readonly #launchFile: string;
+	readonly #nonce: string;
 	readonly #bwrapPath: string;
 	readonly #lock: WorkspaceLock;
 	#closed = false;
@@ -425,7 +468,8 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 		workspaceId: string,
 		daemonDir: string,
 		pidFile: string,
-		runMarker: string,
+		launchFile: string,
+		nonce: string,
 		bwrapPath: string,
 		lock: WorkspaceLock,
 	) {
@@ -433,7 +477,8 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 		this.workspaceId = workspaceId;
 		this.#daemonDir = daemonDir;
 		this.#pidFile = pidFile;
-		this.#runMarker = runMarker;
+		this.#launchFile = launchFile;
+		this.#nonce = nonce;
 		this.#bwrapPath = bwrapPath;
 		this.#lock = lock;
 	}
@@ -579,9 +624,14 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 		return super.exec(sandboxedCommand, { ...safeOptions, cwd: cwd.path, env: safeEnv, inheritEnv: false }, context);
 	}
 
-	/** Stop the daemon and confirm its supervisor pid is gone; never releases workspace ownership. */
+	/**
+	 * Stop the daemon and confirm its supervisor pid is gone. Without that pid, ownership is deliberately left
+	 * unresolved: an in-flight pre-publication launcher cannot be distinguished from no launcher at all.
+	 */
 	async #stopDaemon(context: Context): Promise<void> {
 		let failure: unknown;
+		let supervisorPid: number | undefined;
+		let attemptedPid: number | undefined;
 		try {
 			await super.cleanup(context);
 		} catch (error) {
@@ -591,7 +641,11 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 			try {
 				const pidText = await readFile(this.#pidFile, "utf8").catch(() => "");
 				const pid = Number(pidText.trim());
-				if (Number.isSafeInteger(pid) && pid > 0) await waitForPidExit(pid);
+				if (Number.isSafeInteger(pid) && pid > 0) {
+					attemptedPid = pid;
+					await waitForPidExit(pid);
+					supervisorPid = pid;
+				}
 			} catch (error) {
 				failure ??= error;
 			}
@@ -599,9 +653,26 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 				failure ??= error;
 			});
 		}
+		if (supervisorPid !== undefined) {
+			// That supervisor is reaped, so no in-flight pre-publication launcher can remain. Drop only this launch's own
+			// intent; a file that changed hands must stay fail-closed rather than be cleared by the wrong owner.
+			try {
+				const state = await readLaunchFile(this.#launchFile);
+				if (state !== undefined) {
+					if (state.nonce !== this.#nonce || (state.kind === "pid" && state.pid !== supervisorPid)) {
+						throw new Error("Sandbox launch file changed ownership during teardown");
+					}
+					await rm(this.#launchFile, { force: true });
+				}
+			} catch (error) {
+				failure ??= new Error("Sandbox launch file could not be removed; manual reconciliation is required", { cause: error });
+			}
+		}
 		if (failure !== undefined) throw failure;
-		// The supervisor is reaped, so its PID namespace has been torn down. The marker is now stale.
-		await rm(this.#runMarker, { force: true }).catch(() => undefined);
+		if (supervisorPid === undefined) {
+			const detail = attemptedPid === undefined ? "" : ` (supervisor pid ${attemptedPid} did not exit)`;
+			throw new Error(`Sandbox launch could not be confirmed${detail}; launch intent retained for manual reconciliation`);
+		}
 	}
 
 	override async cleanup(context: Context): Promise<void> {
@@ -647,27 +718,34 @@ interface ImportBundle {
 	worker: string;
 }
 
-async function makeDaemonBundle(bwrapSource: string, runMarker: string): Promise<DaemonBundle> {
+async function makeDaemonBundle(bwrapSource: string, launchFile: string, nonce: string): Promise<DaemonBundle> {
 	const directory = await mkdtemp(join(tmpdir(), "nanobot-bwrap-"));
 	try {
 		const source = await realpath(localDaemon());
 		const binary = join(directory, "pi-env");
 		const bwrapBinary = join(directory, "bwrap");
 		const pidFile = join(directory, "bwrap.pid");
-		const markerTemp = `${runMarker}.tmp`;
 		const launcher = join(directory, "launch");
 		await copyFile(source, binary, constants.COPYFILE_EXCL);
 		await chmod(binary, 0o500);
 		await copyFile(bwrapSource, bwrapBinary, constants.COPYFILE_EXCL);
 		await chmod(bwrapBinary, 0o500);
-		// Record the supervisor pid in the private store before exec. If this write fails, no sandbox starts.
+		// Publish the supervisor pid, claim only this launch's pending intent, then exec. Any failure before exec
+		// leaves no sandbox; the owner's teardown must confirm this pid is gone before clearing the intent.
 		const script = [
 			"#!/bin/sh",
 			"set -e",
+			`launch=${shellQuote(launchFile)}`,
+			`nonce=${shellQuote(nonce)}`,
 			"pid=$$",
 			`printf '%s\\n' "$pid" > ${shellQuote(pidFile)}`,
-			`printf '%s\\n' "$pid" > ${shellQuote(markerTemp)}`,
-			`mv ${shellQuote(markerTemp)} ${shellQuote(runMarker)}`,
+			'IFS= read -r current < "$launch" || exit 3',
+			'[ "$current" = "pending $nonce" ] || exit 3',
+			'tmp="$launch.tmp.$pid"',
+			`printf 'pid %s %s\\n' "$pid" "$nonce" > "$tmp"`,
+			'mv "$tmp" "$launch"',
+			'IFS= read -r published < "$launch" || exit 4',
+			'[ "$published" = "pid $pid $nonce" ] || exit 4',
 			'exec "$@"',
 			"",
 		].join("\n");
@@ -867,13 +945,17 @@ async function startWorkspaceEnvironment(
 	options: ExecutionOptions,
 	context: Context,
 	lock: WorkspaceLock,
-	runMarker: string,
+	launchFile: string,
+	nonce: string,
 ): Promise<ManagedExecutionEnv> {
 	const daemonInSandbox = `/run/.nanobot-pi-env-${randomUUID()}/pi-env`;
 	const bwrapInSandbox = `${dirname(daemonInSandbox)}/bwrap`;
 	let connection: Connection | undefined;
 	let env: BwrapExecutionEnv | undefined;
+	let intentWritten = false;
 	try {
+		await writeLaunchIntent(launchFile, nonce);
+		intentWritten = true;
 		connection = new Connection({
 			command: [bundle.launcher, bwrapPath, ...buildBwrapArgs(record.rootPath, daemonInSandbox, bundle.binary, bundle.bwrapBinary)],
 		});
@@ -882,7 +964,8 @@ async function startWorkspaceEnvironment(
 			record.id,
 			bundle.directory,
 			bundle.pidFile,
-			runMarker,
+			launchFile,
+			nonce,
 			bwrapInSandbox,
 			lock,
 		);
@@ -908,7 +991,10 @@ async function startWorkspaceEnvironment(
 				throw new SandboxCleanupFailure([error, cleanupError], "Execution environment setup failed and sandbox cleanup failed");
 			});
 		} else {
+			// No Connection was constructed, so no launcher was spawned. Drop only an intent this launch created;
+			// a pre-existing file must stay fail-closed for manual reconciliation.
 			connection?.close();
+			if (intentWritten) await rm(launchFile, { force: true }).catch(() => undefined);
 			await rm(bundle.directory, { recursive: true, force: true }).catch(() => undefined);
 		}
 		throw error;
@@ -940,9 +1026,10 @@ export async function createExecutionEnv(
 		let bundle: DaemonBundle | undefined;
 		try {
 			await writeAdmission(store, record);
-			bundle = await makeDaemonBundle(bwrap.path, paths.runMarker);
+			const nonce = randomUUID();
+			bundle = await makeDaemonBundle(bwrap.path, paths.launch, nonce);
 			const created = bundle;
-			const env = await startWorkspaceEnvironment(record, created, bwrap.path, options, context, lock, paths.runMarker);
+			const env = await startWorkspaceEnvironment(record, created, bwrap.path, options, context, lock, paths.launch, nonce);
 			handedOff = true;
 			return env;
 		} catch (error) {
@@ -963,7 +1050,8 @@ export async function createExecutionEnv(
 			if (bundleToRemove) await attempt(() => rm(bundleToRemove.directory, { recursive: true, force: true }));
 			await attempt(() => rm(paths.admission, { force: true }));
 			await attempt(() => rm(paths.container, { recursive: true, force: true }));
-			await attempt(() => rm(paths.runMarker, { force: true }));
+			// The whole workspace is being destroyed; its launch state has no remaining subject.
+			await attempt(() => rm(paths.launch, { force: true }));
 			if (cleanupErrors.length > 0) {
 				lock.retain();
 				throw new SandboxCleanupFailure(
@@ -994,13 +1082,14 @@ export async function openExecutionEnv(
 	let handedOff = false;
 	try {
 		// A previous owner may have died while its sandbox was still alive; refuse until that supervisor is reaped.
-		await assertNoLiveSandbox(store, workspaceId);
+		await assertLaunchSafe(store, workspaceId);
 		const record = await readAdmission(store, workspaceId);
 		const paths = managedPaths(store, workspaceId);
 		const bwrap = await setupWait(validateBwrap(options.bwrapPath ?? "/usr/bin/bwrap"), context, "Bubblewrap validation");
-		const bundle = await makeDaemonBundle(bwrap.path, paths.runMarker);
+		const nonce = randomUUID();
+		const bundle = await makeDaemonBundle(bwrap.path, paths.launch, nonce);
 		try {
-			const env = await startWorkspaceEnvironment(record, bundle, bwrap.path, options, context, lock, paths.runMarker);
+			const env = await startWorkspaceEnvironment(record, bundle, bwrap.path, options, context, lock, paths.launch, nonce);
 			handedOff = true;
 			return env;
 		} catch (error) {
@@ -1032,7 +1121,7 @@ export async function removeExecutionWorkspace(
 	let deleting = false;
 	try {
 		// A crashed owner may have left its sandbox running; never delete underneath a live guest.
-		await assertNoLiveSandbox(store, workspaceId);
+		await assertLaunchSafe(store, workspaceId);
 		// Authenticate the private admission record and root identity before deleting anything.
 		await readAdmission(store, workspaceId);
 		const paths = managedPaths(store, workspaceId);
@@ -1041,7 +1130,7 @@ export async function removeExecutionWorkspace(
 		deleting = true;
 		await rm(paths.container, { recursive: true, force: true });
 		await rm(paths.admission, { force: true });
-		await rm(paths.runMarker, { force: true });
+		await rm(paths.launch, { force: true });
 	} catch (error) {
 		// A partial deletion must not be reopened by a new owner until this process exits.
 		if (deleting) lock.retain();
