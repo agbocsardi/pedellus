@@ -51,6 +51,10 @@ No real data, live calls, gateway tools or automatic integration.
       a bounded set with focused Nanobot behavioral checks. Gateway tools remain
       disabled; no live data, deployment, or automatic integration. Await explicit
       report, independently review and verify before accepting any security claim.
+      Candidate `fdd8dcf35` adds workspace ownership and guarded deletion; parent
+      returned a suspected early lock release during failed-create rollback and
+      requested evidence for guest death vs owner SIGKILL lock release. Quotas,
+      orphan handling and replay remain open; candidate is not integrated.
 
 ## Integrated implementation batch D — 2026-10-27
 
