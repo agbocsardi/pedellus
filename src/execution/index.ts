@@ -6,7 +6,9 @@ import type { FileHandle } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isChordError } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
+import { processLock } from "@earendil-works/chord/node";
 import {
 	Connection,
 	localDaemon,
@@ -69,6 +71,43 @@ interface ImportSource {
 }
 
 class SandboxCleanupFailure extends AggregateError {}
+
+/**
+ * One kernel-held lock per managed workspace, shared with every other Nanobot process on the host. The lock lives in
+ * this process: a crash or SIGKILL releases it, and there is no stale on-disk state to steal. If teardown cannot be
+ * verified, the lock is retained for the rest of this process's lifetime so no second owner can start a writer.
+ */
+class WorkspaceLock {
+	readonly #release: () => Promise<void>;
+	#released = false;
+	#retained = false;
+
+	constructor(release: () => Promise<void>) {
+		this.#release = release;
+	}
+
+	retain(): void {
+		this.#retained = true;
+	}
+
+	async release(): Promise<void> {
+		if (this.#released) return;
+		this.#released = true;
+		if (this.#retained) return;
+		await this.#release();
+	}
+}
+
+async function acquireWorkspaceLock(store: StorePaths, id: string): Promise<WorkspaceLock> {
+	try {
+		return new WorkspaceLock(await processLock(`nanobot:execution:${store.store}:${id}`));
+	} catch (error) {
+		if (isChordError(error) && error.reason === "locked") {
+			throw new Error(`Managed workspace ${id} is owned by another live process`, { cause: error });
+		}
+		throw error;
+	}
+}
 
 const SETUP_TIMEOUT_MS = 10_000;
 const TEARDOWN_TIMEOUT_MS = 5_000;
@@ -333,6 +372,7 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 	readonly #daemonDir: string;
 	readonly #pidFile: string;
 	readonly #bwrapPath: string;
+	readonly #lock: WorkspaceLock;
 	#closed = false;
 
 	constructor(
@@ -341,12 +381,14 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 		daemonDir: string,
 		pidFile: string,
 		bwrapPath: string,
+		lock: WorkspaceLock,
 	) {
 		super(options);
 		this.workspaceId = workspaceId;
 		this.#daemonDir = daemonDir;
 		this.#pidFile = pidFile;
 		this.#bwrapPath = bwrapPath;
+		this.#lock = lock;
 	}
 
 	private async checked(path: string, context: Context, allowPrivateTmp = true): Promise<{ path: string } | { error: FileError }> {
@@ -511,7 +553,12 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 				failure ??= error;
 			});
 		}
-		if (failure !== undefined) throw failure;
+		if (failure !== undefined) {
+			// Teardown is unverified: keep the lock until this process exits rather than admit a second writer.
+			this.#lock.retain();
+			throw failure;
+		}
+		await this.#lock.release();
 	}
 }
 
@@ -737,6 +784,7 @@ async function startWorkspaceEnvironment(
 	bwrapPath: string,
 	options: ExecutionOptions,
 	context: Context,
+	lock: WorkspaceLock,
 ): Promise<ManagedExecutionEnv> {
 	const daemonInSandbox = `/run/.nanobot-pi-env-${randomUUID()}/pi-env`;
 	const bwrapInSandbox = `${dirname(daemonInSandbox)}/bwrap`;
@@ -752,6 +800,7 @@ async function startWorkspaceEnvironment(
 			bundle.directory,
 			bundle.pidFile,
 			bwrapInSandbox,
+			lock,
 		);
 		await setupWait(connection.info(), context, "Bubblewrap daemon startup");
 		await verifyMountedWorkspace(connection, record, context);
@@ -791,30 +840,38 @@ export async function createExecutionEnv(
 	const bwrap = await setupWait(validateBwrap(options.bwrapPath ?? "/usr/bin/bwrap"), context, "Bubblewrap validation");
 	const store = await prepareStore(options.storageDirectory);
 	const id = randomUUID();
-	const record = await persistWorkspace(store, id, options.imports ?? [], bwrap.path, context);
-	const paths = managedPaths(store, id);
+	const lock = await acquireWorkspaceLock(store, id);
+	let handedOff = false;
 	let bundle: DaemonBundle | undefined;
 	try {
-		await writeAdmission(store, record);
-		bundle = await makeDaemonBundle(bwrap.path);
-		const env = await startWorkspaceEnvironment(record, bundle, bwrap.path, options, context);
-		bundle = undefined;
-		return env;
-	} catch (error) {
-		if (error instanceof SandboxCleanupFailure) {
-			throw new Error(`Managed workspace ${id} retained after sandbox cleanup failure`, { cause: error });
+		const record = await persistWorkspace(store, id, options.imports ?? [], bwrap.path, context);
+		const paths = managedPaths(store, id);
+		try {
+			await writeAdmission(store, record);
+			bundle = await makeDaemonBundle(bwrap.path);
+			const env = await startWorkspaceEnvironment(record, bundle, bwrap.path, options, context, lock);
+			handedOff = true;
+			bundle = undefined;
+			return env;
+		} catch (error) {
+			if (error instanceof SandboxCleanupFailure) {
+				throw new Error(`Managed workspace ${id} retained after sandbox cleanup failure`, { cause: error });
+			}
+			const cleanupErrors: unknown[] = [];
+			if (bundle) await rm(bundle.directory, { recursive: true, force: true }).catch((cleanupError: unknown) => cleanupErrors.push(cleanupError));
+			await rm(paths.admission, { force: true }).catch((cleanupError: unknown) => cleanupErrors.push(cleanupError));
+			await rm(paths.container, { recursive: true, force: true }).catch((cleanupError: unknown) => cleanupErrors.push(cleanupError));
+			if (cleanupErrors.length > 0) {
+				throw new SandboxCleanupFailure(
+					[error, ...cleanupErrors],
+					`Managed workspace ${id} setup failed and cleanup failed; inspect ${paths.container}`,
+				);
+			}
+			throw error;
 		}
-		const cleanupErrors: unknown[] = [];
-		if (bundle) await rm(bundle.directory, { recursive: true, force: true }).catch((cleanupError: unknown) => cleanupErrors.push(cleanupError));
-		await rm(paths.admission, { force: true }).catch((cleanupError: unknown) => cleanupErrors.push(cleanupError));
-		await rm(paths.container, { recursive: true, force: true }).catch((cleanupError: unknown) => cleanupErrors.push(cleanupError));
-		if (cleanupErrors.length > 0) {
-			throw new SandboxCleanupFailure(
-				[error, ...cleanupErrors],
-				`Managed workspace ${id} setup failed and cleanup failed; inspect ${paths.container}`,
-			);
-		}
-		throw error;
+	} finally {
+		// Release only when the environment did not take ownership; cleanup keeps it on unverified teardown.
+		if (!handedOff) await lock.release().catch(() => undefined);
 	}
 }
 
@@ -829,13 +886,56 @@ export async function openExecutionEnv(
 	if (process.platform !== "linux") throw new Error("ExecutionEnv requires Linux; no unsandboxed fallback is available");
 	if (context.abortSignal?.aborted) throw new Error("Execution environment setup aborted");
 	const store = await prepareStore(options.storageDirectory);
-	const record = await readAdmission(store, workspaceId);
-	const bwrap = await setupWait(validateBwrap(options.bwrapPath ?? "/usr/bin/bwrap"), context, "Bubblewrap validation");
-	const bundle = await makeDaemonBundle(bwrap.path);
+	const lock = await acquireWorkspaceLock(store, workspaceId);
+	let handedOff = false;
 	try {
-		return await startWorkspaceEnvironment(record, bundle, bwrap.path, options, context);
+		const record = await readAdmission(store, workspaceId);
+		const bwrap = await setupWait(validateBwrap(options.bwrapPath ?? "/usr/bin/bwrap"), context, "Bubblewrap validation");
+		const bundle = await makeDaemonBundle(bwrap.path);
+		try {
+			const env = await startWorkspaceEnvironment(record, bundle, bwrap.path, options, context, lock);
+			handedOff = true;
+			return env;
+		} catch (error) {
+			await rm(bundle.directory, { recursive: true, force: true }).catch(() => undefined);
+			throw error;
+		}
+	} finally {
+		if (!handedOff) await lock.release().catch(() => undefined);
+	}
+}
+
+/**
+ * Remove one managed workspace after every owner has stopped. The same kernel-held owner lock is required, so a live
+ * environment (including one in another process) cannot be deleted underneath its guests.
+ */
+export async function removeExecutionWorkspace(
+	workspaceId: string,
+	options: ExecutionOptions = {},
+	context: Context = BACKGROUND_CONTEXT,
+): Promise<void> {
+	validateManagedOptions(options);
+	if (options.imports?.length) throw new Error("Imports are accepted only when creating a managed workspace");
+	if (!validWorkspaceId(workspaceId)) throw new Error("Invalid managed workspace id");
+	if (process.platform !== "linux") throw new Error("ExecutionEnv requires Linux; no unsandboxed fallback is available");
+	if (context.abortSignal?.aborted) throw new Error("Managed workspace removal aborted");
+	const store = await prepareStore(options.storageDirectory);
+	const lock = await acquireWorkspaceLock(store, workspaceId);
+	let deleting = false;
+	try {
+		// Authenticate the private admission record and root identity before deleting anything.
+		await readAdmission(store, workspaceId);
+		const paths = managedPaths(store, workspaceId);
+		const container = await lstat(paths.container);
+		privateDirectoryInfo(container, "Managed workspace container");
+		deleting = true;
+		await rm(paths.container, { recursive: true, force: true });
+		await rm(paths.admission, { force: true });
 	} catch (error) {
-		await rm(bundle.directory, { recursive: true, force: true }).catch(() => undefined);
+		// A partial deletion must not be reopened by a new owner until this process exits.
+		if (deleting) lock.retain();
 		throw error;
+	} finally {
+		await lock.release();
 	}
 }

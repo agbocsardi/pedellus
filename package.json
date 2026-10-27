@@ -8,6 +8,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:execution": "npm run build && node --test tests/execution-lifecycle.test.mjs",
     "start": "node dist/cli.js"
   },
   "dependencies": {

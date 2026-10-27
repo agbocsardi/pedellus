@@ -18,6 +18,7 @@ interface ExecutionOptions {
 
 createExecutionEnv(options, context?): Promise<ManagedExecutionEnv>;
 openExecutionEnv(workspaceId, options?, context?): Promise<ManagedExecutionEnv>;
+removeExecutionWorkspace(workspaceId, options?, context?): Promise<void>;
 ```
 
 Creation generates a random UUID, makes an owner-only store entry at
@@ -55,19 +56,32 @@ select credentials or other data you do not intend to disclose. Imports never
 mutate their source.
 
 `cleanup()` stops the daemon and descendants but **retains** the workspace for
-`openExecutionEnv(id, ...)`. The workspace persists until its trusted host owner
-removes it after all owners have stopped. This spike has no deletion API, cross-
-process workspace lock, or garbage collector; those are parent runtime/manager
-integration requirements. A setup failure removes its new workspace unless
-cleanup itself fails, in which case the id/path is included in the error and the
-retained private data is reported for recovery or garbage collection. There is no
-automatic publication.
+`openExecutionEnv(id, ...)`. Reopening does not reset contents or re-import files.
+Every create/open/remove holds one kernel-backed Chord `processLock` named from
+the canonical store path and workspace id. A second live owner in any process
+fails closed; the lock follows the owning process and is released by a crash or
+SIGKILL, so there is no stale lock file to steal. If teardown cannot be verified,
+cleanup retains the lock for the rest of that process instead of admitting a
+second writer. `removeExecutionWorkspace` requires the same lock, re-validates
+the private admission record and root identity, then deletes the workspace
+container and admission record. It refuses while any owner is live. A partial
+deletion retains the owner lock until that process exits so a damaged workspace
+cannot be reopened as if it were intact.
+
+A setup failure removes its new workspace unless cleanup itself fails, in which
+case the id/path is included in the error and the retained private data is
+reported for recovery. A crash can leave an orphaned container without an
+admission record; `removeExecutionWorkspace` fails closed on it, so the trusted
+host owner must reclaim that store entry. There is no automatic garbage
+collector, cross-store discovery, or publication. Runtime/config integration and
+conversation-to-workspace mapping remain with the parent; do not infer them from
+the standalone adapter.
 
 The old `{ workspace, extraAllowedDirs }` API is intentionally rejected at
 runtime, not just omitted from TypeScript types. The factory has no `dataDir`
-input. Runtime/config integration, conversation ownership, an OS-backed owner
-lock, and safe garbage collection remain with the parent; do not infer them from
-the standalone adapter.
+input. Runtime/config integration, conversation ownership, and automatic
+garbage collection remain with the parent; do not infer them from the standalone
+adapter.
 
 ## Namespace boundary
 
@@ -98,15 +112,17 @@ the standalone adapter.
 
 ## Remaining security blockers
 
-The managed-root and import invariants passed bounded synthetic probes, but this
-is not an overall security acceptance. Shell execution still has no aggregate
-CPU, memory, PID-count, or disk quota; a writable persistent workspace can fill
-host storage, and an omitted shell timeout is not capped here. Bubblewrap
-namespaces alone are not resource quotas. The app-owned store also still needs
-the parent runtime's cross-process owner lock, deletion/GC lifecycle, and
-conversation-to-workspace persistence. Keep tools disabled until those limits
-and integration contracts are reviewed. No Python daemon, VM, unsafe fallback,
-config-store access, or deployment changes were introduced.
+The managed-root, import, and owner invariants passed bounded synthetic probes,
+but this is not an overall security acceptance. Shell execution still has no
+aggregate CPU, memory, PID-count, or disk quota; a writable persistent workspace
+can fill host storage, and an omitted shell timeout is not capped here.
+Bubblewrap namespaces alone are not resource quotas. Denial of service by filling
+the private store is bounded only by the host filesystem. The parent still owns
+runtime/config integration, conversation-to-workspace persistence, and any
+automatic orphan garbage collection; the lock only prevents concurrent owners.
+Keep tools disabled until those limits and integration contracts are reviewed.
+No Python daemon, VM, unsafe fallback, config-store access, or deployment changes
+were introduced.
 
 ## Bounded synthetic evidence
 
@@ -114,7 +130,7 @@ config-store access, or deployment changes were introduced.
 - `npm run typecheck --prefix packages/pi-nanobot`
 - `npm run build --prefix packages/pi-nanobot`
 - `timeout --signal=TERM --kill-after=5s 90s node --max-old-space-size=256 --max-semi-space-size=32 /tmp/pi-nanobot-managed-probe.mjs`
-  (private probe only; no repository tests were added).
+  (private probe; no repository tests were added at that time).
 - Probe evidence: native FS readers/listing/watch/temp/spill/rename; explicit file
   and directory imports created fresh inodes and left sources unchanged; opaque-
   id reopen preserved workspace edits; guest could not see admission metadata,
@@ -154,3 +170,13 @@ The probe uses only a temporary app store, synthetic imported files, a synthetic
 Unix auth socket, a loopback listener, and a synthetic outside sentinel; it
 removes all temporary data on exit. No real credentials, live bot, provider,
 Python deployment, or host package install was used.
+
+- `npm run --prefix packages/pi-nanobot test:execution` builds and runs
+  `node --test tests/execution-lifecycle.test.mjs` with a 120 s per-test budget.
+  Nanobot-owned behavior only: a second live `openExecutionEnv` and a
+  `removeExecutionWorkspace` attempt both fail closed while an owner exists;
+  cleanup retains the workspace and leaves imported content intact for reopen;
+  guarded deletion removes the container and admission record; a separate Node
+  owner process is SIGKILLed and the workspace reopens without a stale-lock
+  takeover. Actual Bubblewrap daemons and temporary stores only; no host
+  workspace, credentials, service, or deployment was touched.
