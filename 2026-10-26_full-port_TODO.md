@@ -1085,3 +1085,21 @@ mandatory host contract, not a runtime-detectable multi-store guard; inherited
 history is retained even when current sections clear. Filesystem loading, Python
 template conversion, progressive skills/retrieval, archive and Dream remain open.
 Usage fixes/re-review still outstanding; sandbox work remains deferred.
+
+### 2026-10-27 — usage numeric fixes verified; subset correction pending
+
+C3 explicitly completed `c1ba415c9`, separating safe-integer tokens from decimal
+costs, rejecting derived/aggregate overflow, and correcting native duplication and
+trusted-cursor claims. Parent reviewed and reran updated baseline plus independent
+120-step edges against candidate; numeric/source/cursor/nested/failure/compaction
+checks passed. Independent re-review confirms the earlier blockers are resolved.
+
+Reviewer found a remaining semantic gap: optional reasoning must be a subset of
+output, and cacheWrite1h a subset of cacheWrite. Candidate accepted impossible
+relationships, and the private makeUsage fixture itself generated those invalid
+optional values. Thus prior fixture passes are not acceptance evidence for valid
+optional-token semantics. Parent requested minimal validation on copied snapshots,
+cursors and derived deltas, valid fixture counters and explicit invalid-subset
+probes, while preserving missing/unknown behavior. No speculative totalTokens
+reconstruction or source repair. Usage remains unmerged; await final correction
+and review, then fresh parent-built verification.
