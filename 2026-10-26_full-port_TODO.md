@@ -56,8 +56,9 @@ Real history access and import require separate authorization; use synthetic dat
       policy flags are not enforcement. No CLI or real-data use is authorized.
 - [ ] Resolve the SQLite destination open/ancestor-swap race and establish safe
       ownership, private-copy reconciliation and backup/restore before seeking
-      authorization for a real one-off import. `pi-0129a8e3` is assessing
-      local APIs and synthetic mitigations; no real data/network.
+      authorization for a real one-off import. `pi-0129a8e3` found Node SQLite
+      lacks a safe pinned-open API. `pi-b54f4507` is prototyping isolated tmpfs
+      staging and `pi-ba6fe170` is investigating safe publication; synthetic only.
 - [x] `pi-458b1c64`: integrated `66163cf82`, bounded, pure source-byte
       preparation for session, archive-prefix and history JSONL; no importer or
       database writes. Parent and independent reviewers checked synthetic cases,
