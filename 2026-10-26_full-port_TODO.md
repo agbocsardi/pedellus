@@ -22,6 +22,26 @@ continues to constrain the currently integrated tool-less slice.
 Each unchecked milestone needs its exit evidence, not merely compilable code.
 P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
+## One-off historical import and search — 2026-10-27
+
+Owner clarified that Python sessions and history must remain searchable in the
+Durable-side store, but must never be continued as live Python execution state.
+Real history access and import require separate authorization; use synthetic data.
+
+- [ ] Prepare a bounded, provenance-preserving import of session files, archived
+      prefixes and `history.jsonl`; unknown/malformed data must not disappear.
+      Do not deduplicate merely because text or lines match.
+- [ ] Write inert history-only records transactionally with restart-safe
+      idempotence; no live session-map entries, runnable calls or tasks.
+- [ ] Provide practical paginated search and browsing, preserving source privacy
+      and explicit incompleteness. Review `bb13ae117`: malformed mixed-format
+      messages can currently abort search; corpus caps constrain large histories.
+- [ ] Rehearse on synthetic records; plan a private-copy reconciliation and
+      backup/restore before seeking authorization for a real one-off import.
+- [ ] `pi-458b1c64`: implement a standalone bounded snapshot preparation slice;
+      `pi-bfa199e0`: review Python archive shapes and search implications. Both
+      use opencode-go/deepseek-v4.1-flash high, no live data or network.
+
 ## Priority pivot: conversation context and tool execution — 2026-10-27
 
 Owner requested a coherent conversation/context/tool core before broader product
