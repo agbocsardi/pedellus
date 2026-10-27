@@ -132,12 +132,17 @@ adapter.
   `PATH=/usr/bin:/bin`, `TMPDIR=/tmp`, and `LANG=C.UTF-8`; caller `env` and
   `inheritEnv` are ignored. Setup is cancellable, probes a real command, and has
   no unsandboxed fallback. Shell timeout/cancellation/cleanup tear down detached
-  descendants. The adapter enforces a host-owned 5-second maximum deadline
-  (seconds, clamped with `min`; shorter caller limits remain intact), even when
-  omitted. It also applies the native output window capped at 64 KiB / 2,000
-  lines and 64 KiB/s, and disables spill-to-disk. Smaller caller windows remain
-  in effect. This bounds retained/transferred output, not bytes generated
-  internally by a command.
+  descendants. As an experimental standalone-adapter guardrail—not a chosen
+  product timeout policy—it enforces a host-owned 5-second maximum deadline
+  (seconds, clamped with `min`; shorter valid caller limits remain intact), even
+  when omitted. Commands exceeding it return a timeout error. It also applies
+  the native output window capped at 64 KiB / 2,000 lines and 64 KiB/s, and
+  disables spill-to-disk. Smaller valid caller windows remain in effect. With
+  this native tail window, older output is omitted and reported as
+  `ShellOutputInfo.skipped`; callers cannot recover omitted output and there is
+  no spill file. The window bounds retained/transferred output, not bytes
+  generated internally by a command. Invalid timeout/window values fail before
+  shell launch.
 - Managed provenance is the app-created owner-only store plus guest-inaccessible
   admission metadata and verified root identity—not a marker, chmod, realpath, or
   an `nlink` scan alone. Imports are copied into fresh inodes; preexisting outside

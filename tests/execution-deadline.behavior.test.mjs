@@ -46,6 +46,29 @@ test("caller cancellation remains prompt and reaps a delayed descendant", { time
 	});
 });
 
+test("malformed timeout and output-window options fail before shell launch", { timeout: 5_000 }, async () => {
+	await withEnv(async (env) => {
+		const marker = "/workspace/invalid-options-ran";
+		const invalidTimeouts = [0, -1, NaN, Infinity, null, "1", {}];
+		for (const timeout of invalidTimeouts) {
+			const result = await env.exec(`touch ${marker}`, { timeout }, BACKGROUND_CONTEXT);
+			assert.equal(result.ok, false);
+			assert.equal(result.error.code, "timeout");
+		}
+		const invalidWindows = [null, "window", ...[NaN, Infinity, -1, 0, 0.5, "1", null].flatMap((value) =>
+			["maxBytes", "maxLines", "minIntervalMs", "bytesPerSecond"].map((field) => ({ [field]: value })),
+		)];
+		for (const window of invalidWindows) {
+			const result = await env.exec(`touch ${marker}`, { window }, BACKGROUND_CONTEXT);
+			assert.equal(result.ok, false);
+			assert.equal(result.error.code, "spawn_error");
+		}
+		const exists = await env.exists(marker, BACKGROUND_CONTEXT);
+		assert.equal(exists.ok, true);
+		assert.equal(exists.value, false, "invalid options must not spawn the shell command");
+	});
+});
+
 test("caller timeout and output window limits are never relaxed", { timeout: 3_000 }, async () => {
 	await withEnv(async (env) => {
 		const short = await env.exec("sleep 2", { timeout: 0.1 }, BACKGROUND_CONTEXT);
