@@ -47,25 +47,36 @@ responsibility.
 
 ## Gateway API
 
-`Gateway.listModels(sessionKey, context)` returns the allowlisted models and the
-persisted selection for an existing session key. `Gateway.selectModel(sessionKey,
-{ provider, modelId, thinkingLevel? }, context)` validates against that same
-allowlist and atomically updates native Durable agent configuration. Provider
-names use the config alias shown in `listModels`. Neither method creates a
+`Gateway.listModels(sessionKey: string, context: Context):
+Promise<GatewayModelList>` returns `models: readonly GatewayModelChoice[]` and
+`selected: GatewayModelSelection`. A choice has `{ provider, modelId, name,
+thinkingLevels }`; a selection has `{ provider, modelId, thinkingLevel }`.
+`Gateway.selectModel(sessionKey: string, selection:
+GatewayModelSelectionRequest, context: Context):
+Promise<GatewayModelSelection>` accepts `{ provider, modelId, thinkingLevel? }`.
+The `provider` field is always the exact config alias (for example,
+`opencode_zen`), both in results and requests. Durable stores the corresponding
+native Pi provider ID in `pi.agent`. Provider and model ID are compared as a
+pair; no `provider/model` string parsing is used. Neither method creates a
 session; call `conversationFor()` first. Unknown keys and disallowed models are
 rejected.
 
-If `thinkingLevel` is omitted, the current level is preserved when supported by
-the target model. Otherwise the configured default is used when that target
-supports it, falling back to `off`. An explicit unsupported level is rejected
+If `thinkingLevel` is omitted while selecting the same model, a still-supported
+current level is preserved; otherwise the configured default is used when that
+target supports it, falling back to `off`. If `thinkingLevel` is omitted while
+changing models, thinking resets to the configured default when supported by the
+target, otherwise `off` (including when no default is configured). An explicit
+unsupported level is rejected
 without changing the conversation. Choices and thinking levels survive Durable
 reopen because they live in native `pi.agent`; transcripts, entries, request IDs,
 and usage are not rewritten by selection.
 
-Durable fixes a prepared request's model and thinking level. A model change while
-a run is busy is committed normally and takes effect at the next native request
-preparation; it does not cancel or mutate the in-flight request. The selection
-API relies on that native boundary.
+Selection and the busy check share one native conversation transaction: it reads
+`pi.live.run` and `pi.agent`, rejects with `ConversationBusy` when a run is
+active, and only then applies the host security policy and selected model/thinking
+level. There is no wait-then-configure race; the caller can retry once idle. A
+prepared request keeps its checkpointed model/thinking level, as described
+below.
 
 ## Startup policy and revocation
 
@@ -74,7 +85,8 @@ forces `tools: []` and `modelTools: []` on every persisted conversation. These
 host-owned security fields are not user-selectable. A persisted model still in
 the allowlist and a supported thinking choice are preserved; missing or invalid
 thinking state is normalized to the configured default when supported, else
-`off`.
+`off`. This includes the reserved root conversation: its initial agent policy is
+create-only, so opening an existing root does not replace an allowed choice.
 
 A persisted `pi.agent` model no longer present in the current allowlist is
 deterministically replaced with the configured default model and its configured
