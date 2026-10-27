@@ -42,11 +42,11 @@ Independent Codex Luna high worktrees start from `e05fbd9d0109b9f0eea894b675c036
 No shared runner/runtime changes, gateway tool activation, live requests or real data.
 
 - [ ] `pi-b5ac8248`, `w2G:p1` / `w2G`: opt-in memory search over explicit
-      snapshots. Parent withheld `710b3cdf5`: aggregate scanned entry/message
-      work and accumulated matches were inadequately bounded, and document match
-      truncation was unreported. Returned focused correction and behavior checks.
-- [ ] `pi-23d2bdf0`, `w2H:p1` / `w2H`: assess and, if safe, implement a
-      native Durable one-shot automation foundation with restart/cancel semantics.
+      snapshots. Follow-up `bb13ae117` reports aggregate caps and explicit
+      truncation indicators; committed and preserved, not independently reviewed
+      or integrated after owner priority pivot.
+- [ ] `pi-23d2bdf0`, `w2H:p1` / `w2H`: committed `9cc565dc3` opt-in native
+      one-shot scheduling; preserved unreviewed/unmerged after priority pivot.
 - [ ] Parent review reports and behavioral checks, integrate accepted slices and
       clean their worktrees. Recurring cron, Dream and P4/P5 acceptance stay open.
 
@@ -57,7 +57,9 @@ No shared runner/runtime changes, gateway tool activation, live requests or real
       bounded opt-in Discord adapter with strict allowlisted private DMs, durable
       admission and honest delivery/reconnect limits. Synthetic fake transport
       tests only; no real bot login or network requests. Parent owns gateway/config
-      integration and review; tools remain disabled. P6 remains open.
+      integration and review; tools remain disabled. Candidate `cdc7cc1c` is
+      preserved but unmerged after the priority pivot; durable outbound handling
+      and real-client integration remain open. P6 remains open.
 
 ## Active archive and security review — 2026-10-27
 
