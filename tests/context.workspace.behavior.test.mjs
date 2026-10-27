@@ -650,3 +650,70 @@ test("memory directory replacement during a load is detected", async (t) => {
   }
   assert.equal(replaced, true);
 });
+
+test("root-level selected file replacement after its read is detected", async (t) => {
+  const root = await tempRoot(t);
+  const memoryFiles = [];
+  const fixture = { "AGENTS.md": "original instructions" };
+  for (let index = 0; index < 32; index++) {
+    const relative = `memory/file-${index}.md`;
+    memoryFiles.push(relative);
+    fixture[relative] = `memory ${index}`;
+  }
+  await writeFiles(root, fixture);
+  const realMemory = realpathSync(join(root, "memory"));
+  const moved = join(root, "AGENTS.md.moved");
+  t.after(() => rm(moved, { force: true }));
+
+  let settled = false;
+  let replaced = false;
+  const operation = load(root, { memoryFiles });
+  const tracked = operation.then(() => { settled = true; }, () => { settled = true; });
+  const watcher = (async () => {
+    for (let attempt = 0; attempt < 50_000 && !settled; attempt++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (settled) return;
+      // The memory directory can only be opened after every bootstrap file,
+      // including AGENTS.md, has been read and closed.
+      if (!fdTargetExists(realMemory)) continue;
+      renameSync(join(root, "AGENTS.md"), moved);
+      writeFileSync(join(root, "AGENTS.md"), "REPLACEMENT_AFTER_READ");
+      replaced = true;
+      return;
+    }
+  })();
+
+  try {
+    await assert.rejects(operation, isFileError("changed", "AGENTS.md"));
+  } finally {
+    await tracked;
+    await watcher;
+  }
+  assert.equal(replaced, true);
+});
+
+test("identity source limits count code points and revoked proxies are typed inputs", async (t) => {
+  const root = await tempRoot(t);
+  const acceptedSource = "😀".repeat(CONTEXT_LIMITS.sourceChars);
+  const snapshot = await load(root, {
+    identity: { source: acceptedSource, content: "identity" },
+  });
+  assert.equal([...snapshot.identity.source].length, CONTEXT_LIMITS.sourceChars);
+  assert.equal(snapshot.identity.source, acceptedSource);
+
+  await assert.rejects(load(root, {
+    identity: { source: "😀".repeat(CONTEXT_LIMITS.sourceChars + 1), content: "identity" },
+  }), isInputError);
+
+  const revokedRequest = Proxy.revocable({ workspaceRoot: root }, {});
+  revokedRequest.revoke();
+  await assert.rejects(loadWorkspaceContextSnapshot(revokedRequest.proxy), isInputError);
+
+  const revokedMemory = Proxy.revocable(["memory/MEMORY.md"], {});
+  revokedMemory.revoke();
+  await assert.rejects(load(root, { memoryFiles: revokedMemory.proxy }), isInputError);
+
+  const revokedIdentity = Proxy.revocable({ source: "session:x", content: "identity" }, {});
+  revokedIdentity.revoke();
+  await assert.rejects(load(root, { identity: revokedIdentity.proxy }), isInputError);
+});

@@ -11,12 +11,14 @@
  * Path safety is Linux-only and fails closed elsewhere: directories are pinned
  * through `/proc/self/fd` with `O_DIRECTORY | O_NOFOLLOW`, files are opened with
  * `O_NOFOLLOW`, additional hard-link aliases (`nlink != 1`) are rejected, and
- * observable metadata changes during a read are failures. The root and every
- * reached directory are rechecked before returning. `nlink == 1` is not proof
- * of inode origin (link-then-unlink can leave one link), and a change after the
+ * observable metadata changes during a read are failures. After all reads, each
+ * selected file is reopened through its pinned directory and compared, then the
+ * root and every reached directory are rechecked. `nlink == 1` is not proof of
+ * inode origin (link-then-unlink can leave one link), and a change after the
  * final check remains a TOCTOU window. This is not a defence against a
  * privileged/kernel adversary or coarse filesystem metadata, but it does
- * prevent ordinary symlink/hard-link escapes and detectable directory swaps.
+ * prevent ordinary symlink/hard-link escapes and detectable file/directory
+ * swaps.
  */
 import { constants } from "node:fs";
 import type { BigIntStats } from "node:fs";
@@ -142,9 +144,17 @@ const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBL
 const RESTRICTED_ROOTS = Object.freeze(["/proc", "/sys", "/dev"]);
 const TRUNCATION_MARKER = "\n[context truncated at configured bounds]";
 
+interface SelectedFile {
+  readonly segments: readonly string[];
+  readonly name: string;
+  readonly source: string;
+  readonly stat: BigIntStats;
+}
+
 interface LoadState {
   bytes: number;
   chars: number;
+  readonly files: SelectedFile[];
   readonly directories: Map<string, Readonly<{ segments: readonly string[]; stat: BigIntStats }>>;
 }
 
@@ -157,7 +167,14 @@ interface MutableWorkspaceSnapshot {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  if (value === null || typeof value !== "object") return false;
+  try {
+    return !Array.isArray(value);
+  } catch {
+    // A revoked Proxy must become a typed input error at the caller, not an
+    // untyped TypeError escaping from Array.isArray.
+    return false;
+  }
 }
 
 interface OwnDataField {
@@ -200,7 +217,13 @@ function ownDataField(value: unknown, key: string, label: string): OwnDataField 
 
 /** Read an array length exactly once from its own data descriptor. */
 function ownArrayLength(value: unknown, label: string): number {
-  if (!Array.isArray(value)) {
+  let array = false;
+  try {
+    array = Array.isArray(value);
+  } catch {
+    throw new WorkspaceContextInputError(`${label} must be an array`);
+  }
+  if (!array) {
     throw new WorkspaceContextInputError(`${label} must be an array`);
   }
   let descriptor: PropertyDescriptor | undefined;
@@ -308,7 +331,7 @@ function validatedIdentity(value: unknown): ContextDocumentSnapshot | undefined 
     throw new WorkspaceContextInputError("identity.content must be an own data property");
   }
   if (typeof source !== "string" || source.length === 0 ||
-      source.length > WORKSPACE_CONTEXT_LIMITS.maxSourceChars ||
+      codePointCount(source) > WORKSPACE_CONTEXT_LIMITS.maxSourceChars ||
       CONTROL_CHARACTERS.test(source)) {
     throw new WorkspaceContextInputError("identity.source must be a bounded single-line provenance label");
   }
@@ -571,6 +594,7 @@ async function readPinnedFile(
   parent: FileHandle,
   name: string,
   source: string,
+  directorySegments: readonly string[],
   state: LoadState,
 ): Promise<string> {
   const handle = await openPinned(parent, name, FILE_FLAGS, source);
@@ -611,6 +635,13 @@ async function readPinnedFile(
     }
     if (!sameFile(before, pathInfo)) throw new WorkspaceContextFileError("changed", source);
 
+    state.files.push(Object.freeze({
+      segments: Object.freeze([...directorySegments]),
+      name,
+      source,
+      stat: before,
+    }));
+
     const content = decodeUtf8(buffer, source);
     state.bytes += size;
     state.chars += codePointCount(content);
@@ -624,7 +655,7 @@ async function readPinnedFile(
 }
 
 async function readRootFile(root: FileHandle, name: string, state: LoadState): Promise<string> {
-  return readPinnedFile(root, name, name, state);
+  return readPinnedFile(root, name, name, [], state);
 }
 
 function recordDirectory(
@@ -670,7 +701,7 @@ async function readMemoryFile(root: FileHandle, path: string, state: LoadState):
       recordDirectory(state, openedSegments, info, path);
       parent = next;
     }
-    return await readPinnedFile(parent, name, path, state);
+    return await readPinnedFile(parent, name, path, directories, state);
   } finally {
     for (const handle of opened.reverse()) {
       await handle.close().catch(() => undefined);
@@ -697,6 +728,32 @@ async function openRelativeDirectory(
   } catch (error) {
     if (current !== null) await current.close().catch(() => undefined);
     throw error;
+  }
+}
+
+/**
+ * Reopen each successfully read file through its pinned directory chain and
+ * compare dev/inode/size/mode/nlink/mtime/ctime. This catches a file renamed or
+ * replaced after its own read but before the snapshot is returned.
+ */
+async function verifySelectedFiles(root: FileHandle, state: LoadState): Promise<void> {
+  for (const file of state.files) {
+    let directory: FileHandle | null = null;
+    let parent = root;
+    try {
+      if (file.segments.length > 0) {
+        directory = await openRelativeDirectory(root, file.segments, file.source);
+        parent = directory;
+      }
+      const now = await lstat(join(procFdPath(parent.fd), file.name), { bigint: true });
+      if (!sameFile(file.stat, now)) {
+        throw new WorkspaceContextFileError("changed", file.source);
+      }
+    } catch {
+      throw new WorkspaceContextFileError("changed", file.source);
+    } finally {
+      if (directory !== null) await directory.close().catch(() => undefined);
+    }
   }
 }
 
@@ -784,6 +841,7 @@ export async function loadWorkspaceContextSnapshot(
   const state: LoadState = {
     bytes: 0,
     chars: identity === undefined ? 0 : codePointCount(identity.content),
+    files: [],
     directories: new Map(),
   };
   try {
@@ -810,6 +868,7 @@ export async function loadWorkspaceContextSnapshot(
     if (memories.length > 0) snapshot.memory = Object.freeze(memories);
 
     enforceRenderingBudgets(snapshot);
+    await verifySelectedFiles(root, state);
     await verifyWorkspace(root, rootPath, rootBefore, state);
   } finally {
     await root.close().catch(() => undefined);

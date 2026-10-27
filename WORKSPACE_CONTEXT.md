@@ -77,6 +77,7 @@ descriptor and used for a bounded indexed loop.
 | Invalid root, relative root, `/`, `~/.nanobot`, `/proc`, `/sys`, `/dev` | `WorkspaceContextInputError`. |
 | File or aggregate bound exceeded | `WorkspaceContextBoundsError`. |
 | Observable file change during read | Rejected (`changed`). |
+| Selected file replaced after its read but before return | Rejected (`changed`, file source label). |
 | Root path or an opened directory changed identity during load | Rejected (`changed`). |
 | Renderer section budget would clip any accepted document | `WorkspaceContextBoundsError` (`identitySection`, `instructionsSection`, `memorySection`, or `contextTotal`). |
 
@@ -102,27 +103,35 @@ rather than falling back to weaker path checks.
 - Device, inode, size, mode, link count, `mtimeNs`, and `ctimeNs` are compared
   before read, after read, and against a final path `lstat`. Replacement,
   truncation, growth, or removal during the read fails closed.
-- After all reads, the pinned root and every directory reached are rechecked.
-  Root dev/inode/mode must still match both the pinned handle and
+- After all reads, every selected file is reopened through its pinned directory
+  chain and compared by dev/inode/size/mode/link count/`mtimeNs`/`ctimeNs`.
+  This catches a root-level `AGENTS.md` (or any other selected file) renamed or
+  replaced after its own read but before the snapshot is returned.
+- After the file checks, the pinned root and every directory reached are
+  rechecked. Root dev/inode/mode must still match both the pinned handle and
   `lstat(rootPath)`; each tracked directory is reopened through the pinned root
   and compared. A rename or replacement fails the whole load instead of
   returning content with stale provenance.
+- Request/identity/memory inputs are read only through own data descriptors;
+  revoked Proxies become typed `WorkspaceContextInputError` values.
 - No path, raw OS message, or file content is included in error messages.
 
 This prevents ordinary symlink and hard-link escapes and detects observable
-directory replacement. Residual limits: the `nlink == 1` check does not prove
-inode origin after link-then-unlink; metadata comparisons are only as precise
-as the filesystem's `stat` data (coarse timestamp filesystems can miss a
-same-size rewrite); and a change after the final check remains a TOCTOU
-window. It is not a defence against a privileged or kernel-level adversary,
-mount tricks, or a filesystem that fails to update metadata.
+file or directory replacement. Residual limits: the `nlink == 1` check does not
+prove inode origin after link-then-unlink; metadata comparisons are only as
+precise as the filesystem's `stat` data (coarse timestamp filesystems can miss
+a same-size rewrite); and a change after the final file/directory check remains
+a TOCTOU window between verification and the caller using the snapshot. It is
+not a defence against a privileged or kernel-level adversary, mount tricks, or
+a filesystem that fails to update metadata.
 
 ## Bounds
 
 `WORKSPACE_CONTEXT_LIMITS` exposes the fixed limits: 3 bootstrap files, at most
 32 memory sources, 64 KiB per file, 128 KiB total bytes, 48,000 total code
 points (the renderer's context budget, including explicit identity), 14,400
-identity code points, 256 code points per provenance label, at most 246
+identity code points, 256 code points per provenance label (identity source is
+also counted in code points), at most 246
 characters per memory path (including the `workspace:` prefix), at most 8 path
 segments, and at most 64 characters per path segment. UTF-8 is decoded with
 `fatal: true`; a BOM is stripped by the decoder.
