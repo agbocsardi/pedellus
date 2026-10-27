@@ -31,11 +31,12 @@ const within = (promise, ms, label) => new Promise((resolve, reject) => {
 
 const count = (lines, label) => lines.filter((line) => line === label).length;
 
-test('SIGKILL mid-tool: revoked host grant prevents rerun while an explicit grant replays', { timeout: 45_000 }, async () => {
+test('SIGKILL mid-tool: revoked grant and unsafe downgrade stay interrupted while an explicit safe grant replays', { timeout: 45_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'nanobot-tool-replay-'));
   const effects = join(directory, 'effects.log');
   const stateFile = join(directory, 'state.json');
   let child;
+  let childExit;
   let harness;
   let stderr = '';
   try {
@@ -45,11 +46,17 @@ test('SIGKILL mid-tool: revoked host grant prevents rerun while an explicit gran
       directory,
     ], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PI_TOOL_REPLAY_CANDIDATE: packageRoot },
+      // Keep the child synthetic: no inherited API keys or other host credentials.
+      env: {
+        HOME: directory,
+        TMPDIR: directory,
+        PATH: process.env.PATH ?? '',
+        PI_TOOL_REPLAY_CANDIDATE: packageRoot,
+      },
     });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => { stderr += chunk; });
-    const exited = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+    childExit = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
     await within(new Promise((resolve, reject) => {
       let stdout = '';
       child.stdout.setEncoding('utf8');
@@ -58,24 +65,28 @@ test('SIGKILL mid-tool: revoked host grant prevents rerun while an explicit gran
         if (stdout.includes('READY')) resolve();
       });
       child.once('error', reject);
-      void exited.then((exit) => reject(new Error(`child exited before READY (${JSON.stringify(exit)}): ${stderr}`)));
+      void childExit.then((exit) => reject(new Error(`child exited before READY (${JSON.stringify(exit)}): ${stderr}`)));
     }), 20_000, 'child readiness');
 
     assert.equal(child.kill('SIGKILL'), true);
-    assert.deepEqual(await within(exited, 10_000, 'SIGKILL exit'), { code: null, signal: 'SIGKILL' });
+    assert.deepEqual(await within(childExit, 10_000, 'SIGKILL exit'), { code: null, signal: 'SIGKILL' });
     child = undefined;
 
     const state = JSON.parse(await readFile(stateFile, 'utf8'));
     const before = (await readFile(effects, 'utf8')).trim().split('\n').filter(Boolean);
-    assert.deepEqual([...before].sort(), ['granted_effect:granted', 'revoked_effect:revoked']);
+    assert.deepEqual([...before].sort(), [
+      'downgraded_effect:downgraded',
+      'granted_effect:granted',
+      'revoked_effect:revoked',
+    ]);
 
     // Parent-side fake implementations: a replay-safe tool appends, then completes.
-    const synthetic = (name) => defineTool({
+    const synthetic = (name, replay = 'safe') => defineTool({
       name,
       description: `Synthetic ${name} for restart replay verification`,
       parameters: Type.Object({ label: Type.String() }),
       callers: ['model'],
-      replay: 'safe',
+      replay,
       execute: async ({ label }) => {
         await appendFile(effects, `${name}:${label}\n`);
         return { output: [fauxText(`${name} replayed after an explicitly granted restart`)] };
@@ -83,7 +94,12 @@ test('SIGKILL mid-tool: revoked host grant prevents rerun while an explicit gran
     });
     const revokedTool = synthetic('revoked_effect');
     const grantedTool = synthetic('granted_effect');
-    const extension = defineExtension({ name: 'tool-replay-synthetic', tools: [revokedTool, grantedTool] });
+    // Persisted intent says safe; the current registration says unsafe. Recovery must not rerun.
+    const downgradedTool = synthetic('downgraded_effect', 'unsafe');
+    const extension = defineExtension({
+      name: 'tool-replay-synthetic',
+      tools: [revokedTool, grantedTool, downgradedTool],
+    });
     const registry = createRegistry();
     registry.install(extension);
     const faux = fauxProvider();
@@ -99,7 +115,8 @@ test('SIGKILL mid-tool: revoked host grant prevents rerun while an explicit gran
     }, context);
     const revoked = await harness.conversation(state.revoked.conversation, context);
     const granted = await harness.conversation(state.granted.conversation, context);
-    assert.ok(revoked && granted, 'both conversations reopen');
+    const downgraded = await harness.conversation(state.downgraded.conversation, context);
+    assert.ok(revoked && granted && downgraded, 'all conversations reopen');
 
     // The grant is revoked before scheduling resumes, so recovery must not re-execute.
     await revoked.configure({ tools: [], modelTools: [] }, context);
@@ -111,12 +128,22 @@ test('SIGKILL mid-tool: revoked host grant prevents rerun while an explicit gran
     assert.ok((await granted.agent(context)).tools.some((tool) => tool.name === 'granted_effect'));
     await granted.configure({ extensions: [extension], tools: [grantedTool], modelTools: [grantedTool] }, context);
 
+    // The downgraded tool keeps its grant; only its current replay classification is unsafe.
+    assert.ok((await downgraded.agent(context)).tools.some((tool) => tool.name === 'downgraded_effect'));
+    assert.equal(downgradedTool.replay, 'unsafe');
+    await downgraded.configure({
+      extensions: [extension],
+      tools: [downgradedTool],
+      modelTools: [downgradedTool],
+    }, context);
+
     harness.resume();
     const settled = await within(Promise.all([
       (await harness.submission(state.revoked.submission, context))?.wait(context),
       (await harness.submission(state.granted.submission, context))?.wait(context),
+      (await harness.submission(state.downgraded.submission, context))?.wait(context),
     ]), 25_000, 'restart settlement');
-    assert.deepEqual(settled.map((record) => record?.status), ['done', 'done']);
+    assert.deepEqual(settled.map((record) => record?.status), ['done', 'done', 'done']);
 
     const toolResults = async (conversation) => {
       const entries = [...(await conversation.entries({}, 1000, undefined, context)).items].reverse();
@@ -125,27 +152,45 @@ test('SIGKILL mid-tool: revoked host grant prevents rerun while an explicit gran
         entries,
       };
     };
+    const assertFinalAnswer = (view) => assert.ok(view.entries.some((entry) => entry.model?.some((message) =>
+      message.role === 'assistant' && message.content?.some((part) =>
+        part.type === 'text' && part.text === 'restart settled without another model round'))));
+
     const revokedView = await toolResults(revoked);
     assert.deepEqual(revokedView.results.map(({ toolName, isError }) => [toolName, isError]), [
       ['revoked_effect', true],
     ]);
     assert.match(JSON.stringify(revokedView.results[0].content), /interrupted and may have partially run/);
-    assert.ok(revokedView.entries.some((entry) => entry.model?.some((message) =>
-      message.role === 'assistant' && message.content?.some((part) => part.type === 'text' && part.text === 'restart settled without another model round'))));
+    assertFinalAnswer(revokedView);
 
     const grantedView = await toolResults(granted);
     assert.deepEqual(grantedView.results.map(({ toolName, isError }) => [toolName, isError]), [
       ['granted_effect', false],
     ]);
     assert.match(JSON.stringify(grantedView.results[0].content), /replayed after an explicitly granted restart/);
+    assertFinalAnswer(grantedView);
+
+    const downgradedView = await toolResults(downgraded);
+    assert.deepEqual(downgradedView.results.map(({ toolName, isError }) => [toolName, isError]), [
+      ['downgraded_effect', true],
+    ]);
+    assert.match(JSON.stringify(downgradedView.results[0].content), /interrupted and may have partially run/);
+    assertFinalAnswer(downgradedView);
 
     const after = (await readFile(effects, 'utf8')).trim().split('\n').filter(Boolean);
     assert.equal(count(after, 'revoked_effect:revoked'), 1, 'revoked body never executes after revocation');
     assert.equal(count(after, 'granted_effect:granted'), 2, 'explicitly granted safe body reruns once after restart');
+    assert.equal(count(after, 'downgraded_effect:downgraded'), 1, 'unsafe downgrade must not rerun the body');
     assert.deepEqual(after, [...before, 'granted_effect:granted']);
   } finally {
-    if (child && child.exitCode === null) child.kill('SIGKILL');
-    if (harness) await harness.close(context);
-    await rm(directory, { recursive: true, force: true });
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+      if (childExit) await within(childExit, 5_000, 'cleanup child exit').catch(() => {});
+    }
+    try {
+      if (harness) await harness.close(context);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   }
 });

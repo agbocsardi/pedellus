@@ -29,7 +29,7 @@ const stateFile = join(directory, 'state.json');
 
 const synthetic = (name) => defineTool({
   name,
-  description: `Synthetic ${name} whose body must not rerun after its host grant is revoked`,
+  description: `Synthetic ${name} for restart replay classification checks`,
   parameters: Type.Object({ label: Type.String() }),
   callers: ['model'],
   replay: 'safe',
@@ -41,7 +41,11 @@ const synthetic = (name) => defineTool({
 });
 const revokedTool = synthetic('revoked_effect');
 const grantedTool = synthetic('granted_effect');
-const extension = defineExtension({ name: 'tool-replay-synthetic', tools: [revokedTool, grantedTool] });
+const downgradedTool = synthetic('downgraded_effect');
+const extension = defineExtension({
+  name: 'tool-replay-synthetic',
+  tools: [revokedTool, grantedTool, downgradedTool],
+});
 const registry = createRegistry();
 registry.install(extension);
 
@@ -69,11 +73,17 @@ const route = (transcript) => {
       { stopReason: 'toolUse' },
     );
   }
+  if (input.includes('downgraded')) {
+    return fauxAssistantMessage(
+      fauxToolCall('downgraded_effect', { label: 'downgraded' }, { id: 'downgraded-call' }),
+      { stopReason: 'toolUse' },
+    );
+  }
   return fauxAssistantMessage('child must not reach a final answer');
 };
 const faux = fauxProvider();
-// One queued response is consumed per request; keep a few for both conversations.
-faux.setResponses(Array.from({ length: 4 }, () => route));
+// One queued response is consumed per request; keep a few for all conversations.
+faux.setResponses(Array.from({ length: 6 }, () => route));
 const models = createModels();
 models.setProvider(faux.provider);
 
@@ -89,6 +99,7 @@ const create = () => harness.createConversation({
 }, context);
 const revokedConversation = await create();
 const grantedConversation = await create();
+const downgradedConversation = await create();
 await revokedConversation.configure({
   extensions: [extension],
   tools: [revokedTool],
@@ -99,6 +110,11 @@ await grantedConversation.configure({
   tools: [grantedTool],
   modelTools: [grantedTool],
 }, context);
+await downgradedConversation.configure({
+  extensions: [extension],
+  tools: [downgradedTool],
+  modelTools: [downgradedTool],
+}, context);
 
 const revokedSubmission = await revokedConversation.submit(
   { type: 'input', content: 'run revoked synthetic effect', requestId: 'revoked-request' },
@@ -108,19 +124,24 @@ const grantedSubmission = await grantedConversation.submit(
   { type: 'input', content: 'run granted synthetic effect', requestId: 'granted-request' },
   context,
 );
+const downgradedSubmission = await downgradedConversation.submit(
+  { type: 'input', content: 'run downgraded synthetic effect', requestId: 'downgraded-request' },
+  context,
+);
 
 const deadline = Date.now() + 10_000;
 while (Date.now() < deadline) {
   const log = await readFile(effects, 'utf8').catch(() => '');
-  if (log.trim().split('\n').filter(Boolean).length >= 2) break;
+  if (log.trim().split('\n').filter(Boolean).length >= 3) break;
   await new Promise((resolve) => setTimeout(resolve, 20));
 }
 const lines = (await readFile(effects, 'utf8')).trim().split('\n').filter(Boolean);
-assert.equal(lines.length, 2, `both synthetic bodies must have started: ${JSON.stringify(lines)}`);
+assert.equal(lines.length, 3, `all synthetic bodies must have started: ${JSON.stringify(lines)}`);
 
 await writeFile(stateFile, JSON.stringify({
   revoked: { conversation: revokedConversation.id, submission: revokedSubmission.id },
   granted: { conversation: grantedConversation.id, submission: grantedSubmission.id },
+  downgraded: { conversation: downgradedConversation.id, submission: downgradedSubmission.id },
 }));
 process.stdout.write('READY\n');
 await new Promise(() => {});
