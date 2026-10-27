@@ -944,3 +944,21 @@ validated in current/serialized/expected cursor scope; no inferred ephemeral IDs
 DB-path exposure, new state store or runtime/config changes. Require cross-store
 same-ID rejection and same-source reopen/JSON roundtrip evidence. Await explicit
 revised completion before independent acceptance/integration.
+
+### 2026-10-27 — context candidate and lifecycle follow-up
+
+C2 explicitly completed clean `pi-1db6d944` as `dece7e988`, only new
+src/context/index.ts and CONTEXT.md. Native sections capture bounded host-supplied
+identity/bootstrap/memory/selected-skill text, with own-property skill gates and
+actual agent.tools visibility. No ambient loading, dependency, public export or
+gateway activation. Python template conversion, discovery/retrieval, archives and
+Dream remain explicitly unimplemented.
+
+Parent reviewed module/docs/private fixture and reran a private selectable-import
+baseline `/tmp/pi-nanobot-parent-context-baseline.mjs` (60s/384 MB): actual Harness
+conversation isolation, post-construction mutation, disabled/always/selected
+skills, hostile metadata, tool visibility and Unicode bounds pass against candidate.
+Requested bounded lifecycle evidence for stable repeated prompts, replacement
+with removed snapshots/sections, fork current-vs-historical context and reopen;
+clarify that current-section removal does not erase inherited transcript content.
+Await explicit follow-up and independent review before integration.
