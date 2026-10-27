@@ -99,7 +99,7 @@ policy, environment and replay gates pass.
 - [ ] Review the existing Discord/memory/automation candidates when revisiting
       them; preserve their branches and do not imply they are integrated.
 
-## Active memory and automation slices — 2026-10-27
+## Deferred memory and automation slices — 2026-10-27
 
 Independent Codex Luna high worktrees start from `e05fbd9d0109b9f0eea894b675c03665d1d22b38`.
 No shared runner/runtime changes, gateway tool activation, live requests or real data.
@@ -113,7 +113,7 @@ No shared runner/runtime changes, gateway tool activation, live requests or real
 - [ ] Parent review reports and behavioral checks, integrate accepted slices and
       clean their worktrees. Recurring cron, Dream and P4/P5 acceptance stay open.
 
-## Active Discord channel foundation — 2026-10-27
+## Deferred Discord channel foundation — 2026-10-27
 
 - [ ] `pi-71c6dac3`, `w2F:p1` / `w2F`, branch `pi-71c6dac3`, Codex Luna
       high, based on `1f0c282912df433552fee5917d356cb3dcd6eb97`: build a
@@ -124,7 +124,7 @@ No shared runner/runtime changes, gateway tool activation, live requests or real
       preserved but unmerged after the priority pivot; durable outbound handling
       and real-client integration remain open. P6 remains open.
 
-## Active archive and security review — 2026-10-27
+## Completed archive and security review — 2026-10-27
 
 - [x] `pi-539bbaa7`, `w2D:p2` / `w2D`: independent read-only sandbox review
       found no confirmed guest escape or import authorization bypass; report
@@ -141,7 +141,7 @@ No shared runner/runtime changes, gateway tool activation, live requests or real
       combined behavioral suite. Sandbox remains disabled in gateway; broad P1/P4
       and archive transaction gates remain open. Both used Codex Luna high.
 
-## Active product implementation batch — 2026-10-27
+## Completed product implementation batch — 2026-10-27
 
 Two independent `openai-codex / gpt-6-luna / high` workers start from committed
 `053fdd50f1d370e42ca073cceac7a0e74de7f219`. Gateway remains tool-less, no live
@@ -161,7 +161,7 @@ exports, runner wiring, review and integration.
 - [ ] Review reports and tests, integrate only accepted slices, then remove clean
       completed worktrees. Preserve broad P3/P4 gates and explicit limitations.
 
-## Active behavioral coverage batch — 2026-10-27
+## Completed behavioral coverage batch — 2026-10-27
 
 Three independent `openai-codex / gpt-6-luna / high` workers start from committed
 `038e9fcf83c06aaf5d04daeeaf105b47ee2fac03`. They own distinct new test files;
@@ -1583,3 +1583,23 @@ Removed nine clean owned Herdr child worktrees and closed two owned review tabs
 without force. Prior sandbox candidate remains preserved on branch
 `pi-ccd4ba61`, not merged. Other older closed worktrees lack established ownership
 in this session and were left intact pending identification; no branch deleted.
+
+### 2026-10-27 — archival core and consolidation
+
+Merged bounded explicit-root snapshot acquisition, lossless preparation, inert
+transactional Durable persistence and paginated stored-record search. These are
+SDK slices, not yet an operator import or browse interface. All source snapshots
+remain source-grade sensitive; use synthetic fixtures until the owner authorizes
+a private-copy rehearsal. The source loader refuses live `~/.nanobot`. Stored
+search is a bounded sequential scan requiring exclusive stable host ownership;
+ledger scalability, backup/restore and authenticated cursors remain open.
+
+Merged permanent synthetic interrupted-tool replay/revocation coverage; real
+Gateway tools remain disabled pending authorization, sandbox and replay gates.
+Parent ran the combined behavioral suite: 104 checks passed; standalone execution
+suite: 9 passed. Updated README and historical test-policy wording; removed completed owned worker resources while
+preserving unmerged Discord, memory, automation and snapshot-search branches.
+
+Parallel follow-up: `pi-d573dc66` is building a synthetic offline import
+rehearsal, and `pi-207d85c2` is reviewing the next tool-security slice, both
+using opencode-go/deepseek-v4.1-flash high from `fc70d3b28`.

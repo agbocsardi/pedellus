@@ -37,11 +37,13 @@ MCP and product failure-verification gates remain separate.
 ## Opt-in context SDK
 
 `createContextExtension` composes bounded, host-supplied identity/bootstrap,
-memory and selected-skill snapshots through native Durable sections. It does not
-load files or install itself in the gateway. Create a **fresh extension and
-dedicated registry per Harness/storage**: conversation IDs collide across stores.
-Reconstruct same-store snapshots before resume. See [context contract](./CONTEXT.md)
-for bounds, skill gates, fork/history behavior and remaining P3/P4 gaps.
+memory and selected-skill snapshots through native Durable sections. Direct callers
+need a **fresh extension and dedicated registry per Harness/storage**: conversation
+IDs collide across stores. `openGateway` can also accept an opt-in host snapshot
+provider and reconstructs snapshots before resume; it does not load files itself.
+Prepared requests containing old Nanobot context conservatively block recovery,
+and the Gateway has no blocked-task reconciliation interface yet. See the
+[context contract](./CONTEXT.md).
 
 ## Read-only usage SDK
 
@@ -52,11 +54,27 @@ unique store namespace and trusted cursor state. Unknown spend/request counts an
 native nested-usage duplication cannot be reconstructed from cumulative totals.
 See [usage boundaries](./USAGE.md) before using a projection for accounting.
 
+## Historical import SDK
+
+The opt-in SDK has separate bounded slices for [source acquisition](./ARCHIVAL_SOURCE.md),
+[preparation](./ARCHIVAL_IMPORT.md), [inert persistence](./ARCHIVAL_PERSISTENCE.md)
+and [search](./ARCHIVAL_SEARCH.md). Acquisition requires a separately supplied
+quiescent copy and refuses the live `~/.nanobot` directory. Imported records are
+history-only: they do not create live sessions, runnable tools or tasks. Persistence
+and paginated search require exclusive host ownership of a stable store. There is
+not yet an operator-facing import command, browse UI, authenticated search cursor,
+large-corpus index, or completed real-history rehearsal.
+
 ## Current status and checks
 
-Run the offline Nanobot behavioral checks with `npm run test:behavior` (builds
-first; uses synthetic providers and temporary SQLite data). These cover selected
-CLI, migration-inventory and model-policy contracts, not full parity or Pi Durable
-itself. Sandbox checks and real-provider acceptance remain separate.
+Run `npm run typecheck` and `npm run test:behavior` for offline Nanobot-owned
+contracts using synthetic providers, temporary SQLite stores and crash/reopen
+fixtures. These do not establish full parity or production security. The standalone
+experimental sandbox is not installed in the Gateway; resource quotas, approvals,
+replay policy and filesystem confinement remain open. [Tool replay checks](./TOOL_REPLAY.md)
+exercise synthetic direct tools only. The Gateway remains tool-less and rejects
+nonempty `toolAllowlist`.
 
-The runtime/config/providers/CLI wiring, provider aliases and durable identity map are implemented. Because filesystem TOCTOU and writable-hardlink confinement remain unproven, the runtime deliberately installs no CodingTools, exposes no tools, and does not initialize an execution environment or bwrap. Existing and newly created conversations receive an explicit tool-less host policy before resume. Chat/Telegram can be used without tools. The standalone execution module is not imported here. Security acceptance remains open, including filesystem race/hardlink guarantees. A temporary bounded offline runtime check using actual SQLite and explicit injected faux Models passed: submit and read assistant text, request-ID dedupe, same-key reopen identity, prototype-like keys, concurrent-owner rejection, SIGKILL lock release/reopen, missing credentials before data directory creation, and invalid workspace/extra-root rejection. Parent integration passed package-wide `npm run typecheck` and `npm run build`, plus independent actual-SQLite checks for text extraction, request-ID deduplication, prototype-safe keys, private storage, exclusive ownership, reopen identity, and SIGKILL lock release/reopen. SIGKILL mid-tool replay is not proven by that storage-lock check. Parent independently reran all raw-transport Telegram reliability probes: fatal-poll recovery, preview cancellation, long cooldown cancellation, shared flood waits, unchanged edits, deleted-preview recovery, and baseline cases passed. The grammY 1.46.0 migration, write-ahead send intents, unknown-outcome quarantine, and accepted-chunk progress are integrated. Parent reran the full offline probe against the integration checkout and independently checked SIGKILL after mocked remote acceptance using actual SQLite: reopening retained exact-text unknown state and made no retransmission. Independent review passed the code boundary; reconciliation instructions name every field that must be cleared atomically. A real Telegram smoke check passed with an injected scripted streaming model: one send plus four edits, confirmed final reply, then SQLite reopen verified one persisted turn and empty output queue. Polling was stopped afterward; no paid LLM was called. Execution confinement and a real fork-provider check remain open; see `TELEGRAM.md` and `DESIGN.md`. No paid LLM request or production cutover was performed; live Telegram use was limited to the explicitly authorized scripted smoke check above. A scripted faux model is allowed only via explicit SDK injection, never a production fallback.
+For earlier Telegram reliability and scripted smoke evidence, see [TELEGRAM.md](./TELEGRAM.md).
+Real-provider acceptance, backup/restore and owner-approved cutover remain open;
+no paid LLM request or production cutover has been performed.

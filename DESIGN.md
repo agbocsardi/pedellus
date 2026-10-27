@@ -10,8 +10,9 @@ and bwrap preferred; no new UI framework or micro-VM requirement).
 Those future milestones do not relax this slice's tool-less/security constraints
 or authorize production cutover. Use Node >=22.19 and exact Pi 1.4.0
 dependencies. No WebUI/API server, memory migration, Dream, cron, MCP, or custom
-scheduler in this slice. No new test suite: use existing upstream examples and
-bounded one-off runtime checks, recording commands and limitations.
+scheduler in this slice. The original spike excluded new tests; the owner later
+authorized focused Nanobot-owned behavioral and integration tests, not wholesale
+copies of the Python or Pi Durable suites.
 
 The original assessment's LOC/time estimates and API equivalences are hypotheses,
 not measured savings. Native durable commits do not make external side effects
