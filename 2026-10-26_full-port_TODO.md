@@ -141,8 +141,10 @@ No shared runner/runtime changes, gateway tool activation, live requests or real
       tests only; no real bot login or network requests. Parent owns gateway/config
       integration and review; tools remain disabled. Candidate `cdc7cc1c` is
       preserved but unmerged after the priority pivot; durable outbound handling
-      and real-client integration remain open. `pi-09e01e6a` is reviewing. P6
-      remains open.
+      and real-client integration remain open. `pi-09e01e6a` reviewed and found
+      admission, DM isolation, shutdown, replay and delivery blockers;
+      `pi-acb8f4a0` is fixing them from `cdc7cc1c` using synthetic transports.
+      P6 remains open.
 
 ## Completed archive and security review — 2026-10-27
 
