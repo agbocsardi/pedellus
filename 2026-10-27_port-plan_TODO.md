@@ -33,6 +33,33 @@ checks pass.
    follow-up is the normal shape here. Each round is honest; the sum is why 226
    commits produced no usable bot.
 
+## Accidental-damage threat model
+
+Owner decision 2026-10-27: no NASA sandboxing. The boundary this port is held to:
+
+The tool layer must not (a) lose or corrupt owner data, (b) leak credentials or
+private context to a provider or the internet, or (c) fire an unintended external
+effect — a send, a purchase, a scheduled job, a deleted file.
+
+Out of scope: an adversary who already has shell access to the homelab, kernel or
+runtime exploits, hostile multi-tenant isolation. The personal bot runs as `gergo`
+with no sandbox, exactly as the Python gateway does today
+(`tools.exec.sandbox: ""`).
+
+Consequences for the gates:
+
+- Filesystem tools get a workspace path guard and refuse `../` and symlink escapes.
+  That is parity with the existing fork, not an improvement to engineer past.
+- `bash` inherits the ported deny patterns (destructive `rm -rf`, disk/power
+  commands, writes to nanobot state files) and the `allowedEnvKeys` allowlist, so a
+  command can't silently read `secrets.env`. Same contract, different language.
+- Runaway protection (timeout, process-group kill) stays: a fork bomb or a runaway
+  is accidental damage even without an attacker.
+- Untrusted-input surfaces are the exception. Flóri's Discord bot runs with
+  `exec.sandbox: "bwrap"` and `restrictToWorkspace` because strangers can message
+  it. Any ported bot with that exposure — the Discord channel at G4 — needs the
+  sandbox. The merged adapter is kept for that, not for the personal bot.
+
 ## Hard rules (unchanged, not negotiable by this plan)
 
 - Python tree and production deployment untouched until an approved cutover.
@@ -65,32 +92,68 @@ name. Park the remaining 16-entry provider matrix; fill it at G6 against real ne
 
 ### G1 — tool-less shadow bot (**the judgement gate**)
 
-Second Telegram bot, separate token, its own store, real config, memory files read
-only, no tools, no cron. Runs beside the Python bot for one week of real use.
+A second Telegram bot, its own token, its own SQLite store, reading the real memory
+directory but writing nothing. It answers messages and nothing else. Runs beside
+Cody for a week while you carry on normally.
 
-Exit: a written comparison — what it answered correctly, where it stalled, latency,
-token cost per turn, and whether you would hand it to Marjo. Explicit decision:
-continue, or stop and keep the Python bot. **This is the only gate allowed to
+What it is for, in order of importance:
+
+1. **Find out whether Durable's compaction and context assembly are good enough for
+   you.** This is the whole bet. Your Python harness has a checkpoint format you
+   tuned over months; the port replaces it with Durable's. A week of real messages
+   — cron noise, long threads, a photo, a boring one-liner — tells you more about
+   whether that swap was worth it than any test suite. Nothing else in the plan
+   tests this, and no gate after it can cancel the port.
+2. **Prove the plumbing on real traffic.** Real provider credentials, real Telegram
+   polling, real restarts mid-conversation, real provider errors and rate limits.
+   Today all of that is scripted-model or synthetic. This is the first time the
+   thing meets the outside world.
+3. **Give you a cost and latency baseline before tools multiply it.** Token spend
+   per turn, first-token latency, edit cadence. Cheap now, meaningless later.
+4. **A kill switch that costs nothing.** Deleting a bot token and a store directory
+   is a five-minute rollback. Doing this after memory, cron and Discord are ported
+   is not.
+
+How you'd actually run it: point it at the same `memory/` tree read-only, give it
+its own `~/.local/share/nanobot-ts/`, and use it for a slice of your real traffic —
+either by messaging it directly with the things you'd normally ask me, or by
+doubling up on a few routine interactions. Deliberately not a parallel copy of
+every conversation: you'd stop reading the comparison after two days.
+
+What it can't tell you: whether tools, cron or Discord work, because it has none of
+them. That's by design — those need the safety decisions that come after, and
+bundling them would put the judgement behind the hardest work again.
+
+Exit: a written comparison on the four points above plus one explicit question
+answered — continue, or stop and keep Python. **This is the only gate allowed to
 cancel the port.**
 
-### G2 — confined filesystem and shell tools
 
-Bubblewrap environment wired into the gateway for `read`/`write`/`edit`/`bash`,
-with the managed-workspace contract and default-deny policy.
+### G2 — workspace-scoped tools, no sandbox
 
-In scope: escape attempts on every path (traversal, missing leaf, rename, symlink
-race, hard link), teardown/timeout with no post-return work, CPU/memory/PID/disk
-ceilings, per-conversation grants with expiry and revocation verified on replay and
-after reopen.
+Owner decision 2026-10-27: the personal bot does **not** run in bubblewrap, same as
+today. The parity bar is the existing Python gateway, which has
+`tools.exec.sandbox: ""`. See "Accidental-damage threat model" below.
 
-Out of scope for this gate, accepted as documented residual risk on a dedicated
-unix user with no other data reachable: same-user path-swap races below the
-filesystem API, host-power durability below fsync, kernel/bwrap CVE surface. Record
-them in `EXECUTION.md` as accepted, with the compensating control, rather than
-carrying them as blockers.
+In scope: `read`/`write`/`edit`/`bash` with the workspace path guard, the ported
+shell deny patterns and `allowedEnvKeys` environment allowlist, default-deny tool
+policy per conversation, grants with expiry and revocation verified on replay and
+after reopen, and a runaway guard (command timeout plus process-group kill) because
+a runaway is itself accidental damage.
 
-Exit: `read`/`write`/`edit`/`bash` usable from a real Telegram turn inside the
-confined workspace; adversarial cases pass; accepted risks written down.
+Out of scope, by decision: bubblewrap for this bot, kernel escape, TOCTOU and
+hard-link aliasing below the filesystem API, same-user path swaps, quotas as a
+hostile-tenant boundary, host-power durability below fsync. Written down in
+`EXECUTION.md` as accepted, with the compensating control, not carried as blockers.
+
+Sandboxing is not cancelled, only moved: a bot facing untrusted input (the Discord
+instance, like Flóri today at `exec.sandbox: "bwrap"` with `restrictToWorkspace`)
+needs it, and the merged standalone adapter is the artifact for that. It is a G4
+dependency for Discord, not a G2 prerequisite.
+
+Exit: the four tools work from a real Telegram turn on the real workspace, a
+deliberate `../` escape and a symlink out of the workspace are refused, a runaway
+command is killed, and the accepted-risk list is written down.
 
 ### G3 — memory and skills (**decision required before start**)
 
@@ -172,6 +235,23 @@ Each is a real fork; the plan does not proceed past its gate without an answer.
 publication), Discord adapter, memory-search-over-snapshots, the gateway grant
 synthetic fixture, and the WebUI inventory. Branches stay; no new work on them and
 no reviews. Re-evaluate at G1.
+
+## Dropped P1 items, explicitly
+
+v1's P1 exit bundled these. They are not silently gone; each has a disposition:
+
+| Item | Disposition |
+|---|---|
+| bwrap for the personal bot | Dropped by owner decision. Sandbox reserved for untrusted-input bots (G4 Discord). |
+| TOCTOU / hard-link / symlink-race proof | Dropped for the personal bot. Path guard and deny patterns instead. |
+| CPU/memory/PID/disk quotas | Reduced to timeout + process-group kill. Full cgroups are not a happy-path requirement. |
+| Orphan/manual reconciliation for sandbox workspaces | Parked with the sandbox. Revisit if and when the Discord bot needs it. |
+| SSRF redirect / DNS-rebinding hardening | Kept for web/search/MCP because the failure mode is a real unintended outbound request. Port the fork's existing guard; don't redesign it. |
+| Storage failure, disk-full, backup/restore, owner-lock recovery | Kept, but at G6 as an operational runbook item, not a gate. |
+| Host-power durability below fsync | Accepted. Same exposure as the Python bot today. |
+| MCP legacy SSE | Decision 4. |
+| Prepared-context reconciliation | Reduced to: refuse to start with a clear message and a documented manual clear. Full reconciliation only if it actually bites at G1. |
+
 
 ## What "done" means
 
