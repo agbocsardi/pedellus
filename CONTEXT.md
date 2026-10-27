@@ -39,6 +39,27 @@ snapshot with the correct Durable conversation; this API cannot detect incorrect
 host mapping. Use relative/opaque provenance labels rather than disclosing
 unnecessary absolute host paths.
 
+## Restart and fork lifecycle
+
+The Durable agent document persists the selected extension name, not this
+extension's captured snapshots. Before reopening/resuming a storage or accepting
+new work, the host must recreate and install the same-named extension with fresh
+snapshots for each conversation whose context should remain available. A missing
+snapshot intentionally renders no context for that conversation on its next
+request; native Durable section replay then removes those keys from the effective
+current prompt. Reinstalling a changed same-name extension updates current sections
+on the next request, while unchanged snapshots require no section patch.
+
+Forks inherit the parent's transcript, including historical `pi.system` context
+entries, through the fork point. A fork has a new `conversationId`, so it receives
+no captured context unless the host supplies a snapshot for that ID. Before its
+first request it can still have the inherited effective prompt; when it first
+renders without a snapshot, Durable clears those keys from the *current prompt*.
+This is not transcript erasure: old system entries remain in stored history (and
+may remain visible through a fork's inherited history). The host owns snapshot
+mapping and any decision to copy context to a fork; clearing a section must not be
+treated as securely deleting prior context or secrets.
+
 Fixed Durable section keys/order are `nanobot_identity`, `nanobot_instructions`,
 `nanobot_memory`, `nanobot_skills`, and `nanobot_tools`. Native sections keep
 unchanged content stable for prompt-cache reuse; no timestamps or session data are
