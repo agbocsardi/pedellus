@@ -66,9 +66,10 @@ against another built checkout.
 - Covered: model-issued direct tool calls, actual process `SIGKILL`, SQLite
   reopen, grant revocation before resume, positive safe replay with an explicit
   grant, and safe-persisted/unsafe-current replay downgrade.
-- Not covered: nested Code Mode calls (separate probes/docs), real coding tools,
-  approval/UI flows, external-effect exactly-once semantics, or fingerprint /
-  definition compatibility.
+- Not covered: real coding tools, approval/UI flows, external-effect
+  exactly-once semantics, or fingerprint / definition compatibility.
+- Nested Code Mode coverage lives in
+  [`NESTED_CODEMODE_REPLAY.md`](./NESTED_CODEMODE_REPLAY.md).
 - The Gateway's nonempty `toolAllowlist` fail-closed behavior is unchanged and
   not bypassed. This test uses a raw Harness because the Gateway deliberately
   has no approved registered tools to grant.
