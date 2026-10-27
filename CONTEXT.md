@@ -7,8 +7,8 @@ this slice installs or selects the extension in the gateway.
 
 ## API and scope
 
-Import `createContextExtension()` directly from `src/context/index.ts`. Give it a
-bounded array of snapshots keyed by their Durable `conversationId`:
+Import `createContextExtension()` from the package SDK (or `src/context/index.ts`).
+Give it a bounded array of snapshots keyed by their Durable `conversationId`:
 
 ```ts
 const context = createContextExtension([{

@@ -38,8 +38,11 @@ root roadmap, public exports/integration and acceptance.
       explicit credential references and source-backed support/limitations matrix.
       Integrated `ca85ed9ba`; independent review and parent-built checks pass.
       Real-provider acceptance, unsupported aliases and full P8 remain open.
-- [ ] C2 — P3/P4 trusted context composition: opt-in native sections from bounded
-      host-supplied identity/memory/skill snapshots; no ambient file/code discovery.
+- [x] C2 — bounded P3/P4 context composition SDK: opt-in native sections from
+      host-supplied identity/memory/skill snapshots, no ambient discovery.
+      Integrated `8cedf36a0` / `0252ab6dc` / `73bc37a86`; independent final review
+      and parent-built probes pass with mandatory dedicated per-Harness ownership.
+      Gateway loading, template conversion and full memory/skills parity remain open.
 - [ ] C3 — P4 native usage projections and archive-delta foundation: retain
       attribution/unknowns, avoid nested double count, no archive writer or resets.
 - [ ] Parent review, bounded independent verification and approved integration;
@@ -1059,3 +1062,26 @@ bound applied to both records and selected names before insertion. Require actua
 two-Harness same-root-ID isolated-registry evidence and oversized-selection checks,
 plus unchanged lifecycle/bounds behavior. No new runtime, namespace scheme or
 sandbox work. Context remains unmerged pending correction and explicit re-review.
+
+### 2026-10-27 — context composition SDK integrated and parent-reverified
+
+C2 explicitly completed correction `687e9d50e`; final independent reviewer
+`pi-eb98e056` reported PASS with required per-Harness host precondition in
+`/tmp/pi-context-composition-review.md`. Parent reviewed both fixes and reran
+candidate baseline, two-Harness isolation, native SQLite lifecycle and independent
+saturated-bounds/accessor probes. Integrated the three source commits with
+provenance as `8cedf36a0`, `0252ab6dc`, `73bc37a86`.
+
+Parent exports the opt-in factory/limits/types from SDK and links CONTEXT.md from
+README; no runtime/config/gateway registration or discovery change. Fresh package
+typecheck/build and all four probes **explicitly selecting the parent built package**
+pass. Added private `/tmp/pi-nanobot-parent-context-sdk-inert.mjs` (45s/384 MB):
+creating the public context and Code Mode factories installs neither into the
+actual gateway; context sentinel absent from transcript, forged tool calls remain
+unavailable, and SQLite reopen remains tool-less. No live/paid requests.
+
+Bounded C2 accepted, not P3/P4 completion. Registry/extension ownership is a
+mandatory host contract, not a runtime-detectable multi-store guard; inherited
+history is retained even when current sections clear. Filesystem loading, Python
+template conversion, progressive skills/retrieval, archive and Dream remain open.
+Usage fixes/re-review still outstanding; sandbox work remains deferred.
