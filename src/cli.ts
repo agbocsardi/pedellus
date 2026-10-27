@@ -3,6 +3,7 @@ import { stdin, stderr, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { loadConfig } from "./config.js";
+import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { runTerminalConversation } from "./terminal/index.js";
 import { openGateway } from "./runtime.js";
 
@@ -24,7 +25,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   process.once("SIGTERM", shutdown);
   let gateway: Awaited<ReturnType<typeof openGateway>> | undefined;
   try {
-    gateway = await openGateway(config, context);
+    gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
     if (config.telegram) {
       const token = process.env[config.telegram.tokenEnv];
       if (!token) throw new Error(`Missing Telegram token environment variable: ${config.telegram.tokenEnv}`);
