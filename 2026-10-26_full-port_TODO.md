@@ -31,8 +31,9 @@ No real data, live calls, gateway tools or automatic integration.
 
 - [ ] `pi-35c6804d`, `w27:p1` / `w27`: final CLI review and lifecycle/output
       behavioral tests, including EOF/order and backpressure.
-- [ ] `pi-70f63e0d`, `w28:p1` / `w28`: final migration review and legacy
-      eligibility/provenance/safety behavioral tests.
+- [x] `pi-70f63e0d`, `w28:p1` / `w28`: final migration review found prior
+      blockers resolved; merged `c2d6fef34` and parent ran four behavioral tests
+      for eligibility, provenance, aliases, session shapes and safety.
 - [x] `pi-13bd5370`, `w29:p1` / `w29`: merged `8496fc587` model-policy
       behavioral test. Parent reviewed and ran it against the parent build; it
       covers busy rejection, thinking/selection, normal reopen and revoked choice.
@@ -73,10 +74,10 @@ tabs without force; the branches were retained.
       parent-built slow-sink check passed. This is integration, not final acceptance.
 - [x] D3 — P8 read-only migration inventory: merged `e00651d33`; parent-built
       alias/message-shape probe passed. This is inventory only, not an importer.
-- [ ] Independently review the final CLI and migration commits; reproduce the CLI
-      EOF/order/flood and migration history-eligibility/provenance/safety checks
-      whose worker probes were inline or not retained. CLI readline's 32k limit is
-      post-buffering, not a hard ingress-memory limit. Keep P3/P8 unchecked.
+- [ ] Independently review the final CLI commit and reproduce CLI EOF/order/flood
+      checks whose worker probes were not retained. CLI readline's 32k limit is
+      post-buffering, not a hard ingress-memory limit. Migration's final review
+      and initial eligibility/provenance/safety tests now pass; keep P3/P8 unchecked.
 - [ ] Port selected Python behavioral scenarios into permanent TypeScript parity
       checks, prioritizing migration integrity, CLI lifecycle and model recovery.
       Owner approved behavior-focused coverage; test Nanobot-owned contracts and
