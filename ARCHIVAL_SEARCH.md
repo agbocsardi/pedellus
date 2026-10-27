@@ -140,6 +140,8 @@ containing:
 - the next Durable entry ID and unit index;
 - whether that entry's metadata is already classified, plus its unit-progress
   flags;
+- for an in-flight entry, its line, durableKey, unit count, and a SHA-256
+  fingerprint over the entry ID, line, key, search status, and full unit list;
 - bounded per-source observation state (records/units/bytes, first/last entry
   IDs and lines, sequence validity, malformed/identity flags);
 - the current source's caveat flag;
@@ -147,12 +149,16 @@ containing:
 
 The next call validates format/version, query fingerprint, store namespace,
 ledger digest, ledger source count, source identity, source-observation shape,
-and position shape. A query change, a different namespace, any changed relevant
-ledger row (preparation status/counts included), or a changed source
-conversation is rejected with `ArchivalSearchContinuationError`; opaque or
-unavailable sources are skipped honestly. Changing page-size limits between
-calls is allowed. Digesting the ledger is bounded by the ledger source cap but
-costs a linear row pass on every page.
+in-flight entry identity, and position shape. A query change, a different
+namespace, any changed relevant ledger row (preparation status/counts
+included), a changed source conversation, a changed/deleted in-flight entry, or
+a missing named in-flight entry is rejected with
+`ArchivalSearchContinuationError`; opaque or unavailable sources are skipped
+honestly. Changing page-size limits between calls is allowed. Digesting the
+ledger is bounded by the ledger source cap but costs a linear row pass on every
+page. Resuming a large in-flight entry also re-hashes its full unit list, so
+that verification cost is proportional to the in-flight entry's unit data per
+resumed page.
 
 **Continuations are host-trusted, unsigned state.** `continuationTrust` is
 `"host-trusted-not-authenticated"`. The ledger digest is a mixing/staleness
@@ -169,6 +175,12 @@ coverage caveats. They do not prove every raw line byte is unchanged; use the
 persistence repeat-verification path for full integrity reconciliation.
 Exclusive single-writer ownership is what keeps the carrier stable during a
 continuation chain.
+
+Reconciliation is **forward-looking only**: search does not re-read records that
+are already behind the cursor. Deleting or changing an already-scanned record
+after it was observed is not detected by a later page. The host MUST hold
+exclusive single-writer ownership and a stable carrier snapshot for the entire
+continuation chain; an external writer invalidates these coverage claims.
 
 ## Coverage and progressive bounds
 
@@ -295,6 +307,9 @@ databases and a native `Harness`. It covers:
   history record and output-trimmed pages, whose full hit set is reachable over
   repeated pages with monotonic unit progress and correct cumulative omission
   flags;
+- in-flight line/key tampering with a recomputed durableKey, in-flight unit
+  reordering, deletion of the named in-flight entry, and deletion of the named
+  fresh entry with unit position reset;
 - duplicate/extra archival entries, empty carriers, identity (durableKey)
   mismatch, stale ledger preparation status/counts in a continuation, and
   empty/unknown `sourceIds` rejection;
@@ -345,5 +360,8 @@ node --test tests/archival-search.behavior.test.mjs
     lines, contiguous line order, and each line's recomputed durableKey, but it
     does not read/verify every raw line hash or source SHA-256. A changed raw
     line or search-unit text with unchanged ledger-visible metadata and
-    durableKey is not detected. Use the persistence repeat-verification path
-    for full integrity reconciliation.
+    durableKey is not detected. Reconciliation only covers forward-observed
+    carrier state; records changed or deleted after they were already scanned
+    are not detected. Use the persistence repeat-verification path for full
+    integrity reconciliation and keep an exclusive single-writer stable snapshot
+    for the continuation chain.

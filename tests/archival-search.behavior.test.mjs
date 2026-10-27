@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels, fauxProvider } from "@earendil-works/pi-ai";
@@ -85,6 +86,28 @@ async function allConversations(harness) {
     } while (cursor !== undefined);
     return items;
   }, context);
+}
+
+function directUpdateEntry(database, entryId, mutator) {
+  const db = new DatabaseSync(database);
+  try {
+    const row = db.prepare("SELECT record FROM entries WHERE id = ?").get(entryId);
+    assert.ok(row, `entry ${entryId} exists`);
+    const entry = JSON.parse(row.record);
+    mutator(entry);
+    db.prepare("UPDATE entries SET record = ? WHERE id = ?").run(JSON.stringify(entry), entryId);
+  } finally {
+    db.close();
+  }
+}
+
+function directDeleteEntry(database, entryId) {
+  const db = new DatabaseSync(database);
+  try {
+    db.prepare("DELETE FROM entries WHERE id = ?").run(entryId);
+  } finally {
+    db.close();
+  }
 }
 
 async function createCarrier(harness, dataList) {
@@ -454,6 +477,187 @@ test("recomputes durableKey and flags an identity mismatch as incomplete", async
     assert.equal(page.coverage.sourcesIdentityMismatch, 1);
     assert.equal(page.coverage.sourcesLedgerMismatch, 1);
     assert.equal(page.coverage.coverageComplete, false);
+  } finally {
+    await harness.close(context);
+    await storage.close(context);
+  }
+});
+
+test("rejects an in-flight entry whose line/key changed between pages", async (t) => {
+  const database = await tempDatabase(t);
+  const { harness, storage } = await openHarness(database);
+  try {
+    const source = historySource("inflight-line", [
+      historyRecord("2026-10-27T00:00:00", "synthetic", [
+        message("user", "inflight needle one"),
+        message("assistant", "inflight needle two"),
+      ]),
+      historyRecord("2026-10-27T00:00:01", "synthetic", [message("user", "inflight needle three")]),
+      historyRecord("2026-10-27T00:00:02", "synthetic", [message("user", "inflight needle four")]),
+    ]);
+    await persistArchivalImport(harness, { storeNamespace: "synthetic-store", sources: [source] }, context);
+    const ledger = await readArchivalImportLedger(harness, context);
+    const row = ledger.sources[0];
+    const entries = await allEntries(harness, row.conversationId);
+    const first = await searchPersistedArchivalImport(
+      harness,
+      { text: "inflight needle" },
+      context,
+      { limits: tinyLimits },
+    );
+    assert.equal(first.continuation.nextEntryId, entries[0].id);
+    assert.equal(first.continuation.nextUnit, 1);
+
+    directUpdateEntry(database, entries[0].id, (entry) => {
+      entry.data.line = 3;
+      entry.data.durableKey = sha256(JSON.stringify([
+        "nanobot-archival-line-v1", ledger.storeNamespace, row.sourceId, 3,
+      ]));
+    });
+
+    await assert.rejects(
+      () => searchPersistedArchivalImport(
+        harness,
+        { text: "inflight needle" },
+        context,
+        { limits: tinyLimits, continuation: first.continuation },
+      ),
+      (error) => error instanceof ArchivalSearchContinuationError && /in-flight entry changed/.test(error.message),
+    );
+  } finally {
+    await harness.close(context);
+    await storage.close(context);
+  }
+});
+
+test("rejects an in-flight entry whose unit list was reordered between pages", async (t) => {
+  const database = await tempDatabase(t);
+  const { harness, storage } = await openHarness(database);
+  try {
+    const source = historySource("inflight-units", [
+      historyRecord("2026-10-27T00:00:00", "synthetic", [
+        message("user", "unit needle zero"),
+        message("assistant", "unit filler one"),
+        message("user", "unit target two"),
+      ]),
+    ]);
+    await persistArchivalImport(harness, { storeNamespace: "synthetic-store", sources: [source] }, context);
+    const ledger = await readArchivalImportLedger(harness, context);
+    const row = ledger.sources[0];
+    const entries = await allEntries(harness, row.conversationId);
+    const first = await searchPersistedArchivalImport(
+      harness,
+      { text: "unit target" },
+      context,
+      { limits: tinyLimits },
+    );
+    assert.equal(first.hits.length, 0);
+    assert.equal(first.continuation.nextUnit, 1);
+
+    directUpdateEntry(database, entries[0].id, (entry) => {
+      const [zero, one, two] = entry.data.search;
+      entry.data.search = [{ ...two, unit: 0 }, { ...one, unit: 1 }, { ...zero, unit: 2 }];
+    });
+
+    await assert.rejects(
+      () => searchPersistedArchivalImport(
+        harness,
+        { text: "unit target" },
+        context,
+        { limits: tinyLimits, continuation: first.continuation },
+      ),
+      (error) => error instanceof ArchivalSearchContinuationError && /in-flight entry changed/.test(error.message),
+    );
+  } finally {
+    await harness.close(context);
+    await storage.close(context);
+  }
+});
+
+test("rejects deletion of an in-flight entry between pages", async (t) => {
+  const database = await tempDatabase(t);
+  const { harness, storage } = await openHarness(database);
+  try {
+    const source = historySource("inflight-delete", [
+      historyRecord("2026-10-27T00:00:00", "synthetic", [
+        message("user", "delete needle one"),
+        message("assistant", "delete needle two"),
+      ]),
+      historyRecord("2026-10-27T00:00:01", "synthetic", [message("user", "delete needle three")]),
+    ]);
+    await persistArchivalImport(harness, { storeNamespace: "synthetic-store", sources: [source] }, context);
+    const ledger = await readArchivalImportLedger(harness, context);
+    const entries = await allEntries(harness, ledger.sources[0].conversationId);
+    const first = await searchPersistedArchivalImport(
+      harness,
+      { text: "delete needle" },
+      context,
+      { limits: tinyLimits },
+    );
+    assert.equal(first.continuation.nextEntryId, entries[0].id);
+    assert.equal(first.continuation.nextUnit, 1);
+    directDeleteEntry(database, entries[0].id);
+
+    await assert.rejects(
+      () => searchPersistedArchivalImport(
+        harness,
+        { text: "delete needle" },
+        context,
+        { limits: tinyLimits, continuation: first.continuation },
+      ),
+      (error) => error instanceof ArchivalSearchContinuationError && /in-flight entry is missing/.test(error.message),
+    );
+  } finally {
+    await harness.close(context);
+    await storage.close(context);
+  }
+});
+
+test("resets unit position when a named fresh entry was deleted", async (t) => {
+  const database = await tempDatabase(t);
+  const { harness, storage } = await openHarness(database);
+  try {
+    const source = historySource("fresh-delete", [
+      historyRecord("2026-10-27T00:00:00", "synthetic", [message("user", "fresh needle one")]),
+      historyRecord("2026-10-27T00:00:01", "synthetic", [message("user", "fresh needle two")]),
+      historyRecord("2026-10-27T00:00:02", "synthetic", [message("user", "fresh needle three")]),
+    ]);
+    await persistArchivalImport(harness, { storeNamespace: "synthetic-store", sources: [source] }, context);
+    const ledger = await readArchivalImportLedger(harness, context);
+    const entries = await allEntries(harness, ledger.sources[0].conversationId);
+    const limits = { ...tinyLimits, maxHits: 1, maxScanUnits: 10, maxScanEntries: 10, scanBatchSize: 10 };
+    const first = await searchPersistedArchivalImport(
+      harness,
+      { text: "fresh needle" },
+      context,
+      { limits },
+    );
+    assert.equal(first.hits.length, 1);
+    assert.equal(first.continuation.nextEntryId, entries[0].id + 1);
+    assert.equal(first.continuation.currentEntryClassified, false);
+    const namedFresh = entries.find((entry) => entry.id >= first.continuation.nextEntryId);
+    assert.ok(namedFresh);
+    directDeleteEntry(database, namedFresh.id);
+
+    const hits = [...first.hits];
+    let continuation = first.continuation;
+    let last;
+    let guard = 0;
+    do {
+      last = await searchPersistedArchivalImport(
+        harness,
+        { text: "fresh needle" },
+        context,
+        { limits, continuation },
+      );
+      hits.push(...last.hits);
+      continuation = last.continuation;
+      if (++guard > 20) throw new Error("fresh-delete paging did not progress");
+    } while (continuation !== null);
+
+    assert.equal(hits.every((hit) => hit.unitIndex === 0), true);
+    assert.equal(last.coverage.sourcesLedgerMismatch, 1);
+    assert.equal(last.coverage.coverageComplete, false);
   } finally {
     await harness.close(context);
     await storage.close(context);

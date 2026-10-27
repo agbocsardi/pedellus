@@ -19,6 +19,12 @@
  * bound entry count only. Legitimate carriers are bounded per source by the
  * persistence writer, while a corrupt foreign entry is not.
  *
+ * Reconciliation is forward-looking only: an already-scanned record is not
+ * re-read, so changing/deleting it later is not detected. The host must keep an
+ * exclusive single-writer stable carrier snapshot for the continuation chain.
+ * An in-flight entry is re-hashed at every resumed page, so that cost scales
+ * with the entry's unit data.
+ *
  * The caller must already hold exclusive single-writer ownership of the
  * Session/storage, normally the same Gateway process lock. Continuations are
  * host-trusted, unsigned state: they are not authorization and not tamper-proof.
@@ -189,6 +195,14 @@ export interface ArchivalSearchSourceObservation {
   readonly identityMismatch: boolean;
 }
 
+export interface ArchivalSearchCurrentEntry {
+  readonly line: number;
+  readonly durableKey: string;
+  readonly unitCount: number;
+  /** Digest over the in-flight entry ID, line, key, status, and full unit list. */
+  readonly fingerprint: string;
+}
+
 export interface ArchivalSearchContinuation {
   readonly format: typeof ARCHIVAL_SEARCH_FORMAT;
   readonly version: typeof ARCHIVAL_SEARCH_VERSION;
@@ -210,6 +224,8 @@ export interface ArchivalSearchContinuation {
   readonly currentEntryHasSearchableUnit: boolean;
   /** Whether this entry has already yielded a valid unit, even an empty-text one. */
   readonly currentEntryHasValidUnit: boolean;
+  /** In-flight entry identity, or null when no entry is partially scanned. */
+  readonly currentEntry: ArchivalSearchCurrentEntry | null;
   /** Bounded per-source observation used to reconcile the carrier with the ledger. */
   readonly sourceObservation: ArchivalSearchSourceObservation;
   readonly currentSourceHasCaveat: boolean;
@@ -684,6 +700,7 @@ const CONTINUATION_KEYS = new Set([
   "currentEntryClassified",
   "currentEntryHasSearchableUnit",
   "currentEntryHasValidUnit",
+  "currentEntry",
   "sourceObservation",
   "currentSourceHasCaveat",
   "coverage",
@@ -747,6 +764,7 @@ interface ContinuationState {
   readonly currentEntryClassified: boolean;
   readonly currentEntryHasSearchableUnit: boolean;
   readonly currentEntryHasValidUnit: boolean;
+  readonly currentEntry: ArchivalSearchCurrentEntry | null;
   readonly sourceObservation: MutableSourceObservation;
   readonly currentSourceHasCaveat: boolean;
   readonly coverage: MutableCoverage;
@@ -801,6 +819,27 @@ function readContinuation(
     "Archival search continuation is unreadable");
   const currentEntryHasValidUnit = readInput(() => value.currentEntryHasValidUnit,
     "Archival search continuation is unreadable");
+  const rawCurrentEntry = readInput(() => value.currentEntry, "Archival search continuation is unreadable");
+  let currentEntry: ArchivalSearchCurrentEntry | null = null;
+  if (rawCurrentEntry !== null) {
+    if (!isRecord(rawCurrentEntry) ||
+        Object.keys(rawCurrentEntry).length !== 4 ||
+        !Object.hasOwn(rawCurrentEntry, "line") ||
+        !Object.hasOwn(rawCurrentEntry, "durableKey") ||
+        !Object.hasOwn(rawCurrentEntry, "unitCount") ||
+        !Object.hasOwn(rawCurrentEntry, "fingerprint")) {
+      throw new ArchivalSearchContinuationError("Archival search continuation in-flight entry is invalid");
+    }
+    const line = readInput(() => rawCurrentEntry.line, "Archival search continuation is unreadable");
+    const durableKey = readInput(() => rawCurrentEntry.durableKey, "Archival search continuation is unreadable");
+    const unitCount = readInput(() => rawCurrentEntry.unitCount, "Archival search continuation is unreadable");
+    const fingerprint = readInput(() => rawCurrentEntry.fingerprint, "Archival search continuation is unreadable");
+    if (!isSafePositiveInteger(line) || typeof durableKey !== "string" || !SHA256_HEX.test(durableKey) ||
+        !isSafePositiveInteger(unitCount) || typeof fingerprint !== "string" || !SHA256_HEX.test(fingerprint)) {
+      throw new ArchivalSearchContinuationError("Archival search continuation in-flight entry is invalid");
+    }
+    currentEntry = { line, durableKey, unitCount, fingerprint };
+  }
   const sourceObservation = readSourceObservation(
     readInput(() => value.sourceObservation, "Archival search continuation is unreadable"),
     "Archival search continuation",
@@ -816,6 +855,10 @@ function readContinuation(
       typeof currentEntryHasValidUnit !== "boolean" ||
       (nextEntryId === null && currentEntryClassified) ||
       (nextUnit > 0 && !currentEntryClassified) ||
+      (currentEntryClassified && currentEntry === null) ||
+      (nextUnit > 0 && currentEntry === null) ||
+      (currentEntry !== null && !currentEntryClassified) ||
+      (currentEntry !== null && nextUnit > currentEntry.unitCount) ||
       (nextUnit === 0 && (currentEntryHasSearchableUnit || currentEntryHasValidUnit)) ||
       (!currentEntryHasValidUnit && currentEntryHasSearchableUnit) ||
       typeof currentSourceHasCaveat !== "boolean") {
@@ -841,6 +884,7 @@ function readContinuation(
     currentEntryClassified,
     currentEntryHasSearchableUnit,
     currentEntryHasValidUnit,
+    currentEntry,
     sourceObservation,
     currentSourceHasCaveat,
     coverage,
@@ -991,6 +1035,18 @@ function observeArchivalEntry(
   if (record.durableKey !== durableKeyFor(storeNamespace, source.sourceId, record.line)) {
     observation.identityMismatch = true;
   }
+}
+
+function entryFingerprint(entryId: number, record: NormalizedRecord): string {
+  return sha256(JSON.stringify([
+    "nanobot-archival-search-entry-v1",
+    entryId,
+    record.sourceId,
+    record.line,
+    record.durableKey,
+    record.searchStatus,
+    record.search,
+  ]));
 }
 
 interface NormalizedUnit {
@@ -1196,6 +1252,7 @@ interface HitCheckpoint {
   readonly entryClassified: boolean;
   readonly hasSearchableUnit: boolean;
   readonly hasValidUnit: boolean;
+  readonly currentEntry: ArchivalSearchCurrentEntry | null;
   readonly sourceObservation: ArchivalSearchSourceObservation;
   readonly coverage: MutableCoverage;
   readonly currentSourceHasCaveat: boolean;
@@ -1209,6 +1266,7 @@ interface ScanState {
   currentEntryClassified: boolean;
   currentEntryHasSearchableUnit: boolean;
   currentEntryHasValidUnit: boolean;
+  currentEntry: ArchivalSearchCurrentEntry | null;
   sourceObservation: MutableSourceObservation;
   currentSourceHasCaveat: boolean;
   coverage: MutableCoverage;
@@ -1247,6 +1305,7 @@ function buildContinuation(args: BuildPageArgs): ArchivalSearchContinuation | nu
     currentEntryClassified: state.currentEntryClassified,
     currentEntryHasSearchableUnit: state.currentEntryHasSearchableUnit,
     currentEntryHasValidUnit: state.currentEntryHasValidUnit,
+    currentEntry: state.currentEntry,
     sourceObservation: { ...state.sourceObservation },
     currentSourceHasCaveat: state.currentSourceHasCaveat,
     coverage: { ...state.coverage },
@@ -1346,6 +1405,7 @@ function emptyPage(
     currentEntryClassified: false,
     currentEntryHasSearchableUnit: false,
     currentEntryHasValidUnit: false,
+    currentEntry: null,
     sourceObservation: emptySourceObservation(),
     currentSourceHasCaveat: false,
     coverage: emptyCoverage(),
@@ -1460,6 +1520,7 @@ export async function searchPersistedArchivalImport(
     currentEntryClassified: continuation?.currentEntryClassified ?? false,
     currentEntryHasSearchableUnit: continuation?.currentEntryHasSearchableUnit ?? false,
     currentEntryHasValidUnit: continuation?.currentEntryHasValidUnit ?? false,
+    currentEntry: continuation?.currentEntry ?? null,
     sourceObservation: continuation ? { ...continuation.sourceObservation } : emptySourceObservation(),
     currentSourceHasCaveat: continuation?.currentSourceHasCaveat ?? false,
     coverage: continuation ? { ...continuation.coverage } : emptyCoverage(),
@@ -1504,6 +1565,7 @@ export async function searchPersistedArchivalImport(
     state.currentEntryClassified = false;
     state.currentEntryHasSearchableUnit = false;
     state.currentEntryHasValidUnit = false;
+    state.currentEntry = null;
     state.sourceObservation = emptySourceObservation();
     state.currentSourceHasCaveat = false;
   };
@@ -1519,6 +1581,7 @@ export async function searchPersistedArchivalImport(
     state.currentEntryClassified = false;
     state.currentEntryHasSearchableUnit = false;
     state.currentEntryHasValidUnit = false;
+    state.currentEntry = null;
     state.sourceObservation = emptySourceObservation();
     state.currentSourceHasCaveat = false;
   };
@@ -1533,6 +1596,7 @@ export async function searchPersistedArchivalImport(
       state.currentEntryClassified = false;
       state.currentEntryHasSearchableUnit = false;
       state.currentEntryHasValidUnit = false;
+      state.currentEntry = null;
       state.sourceObservation = emptySourceObservation();
       state.currentSourceHasCaveat = false;
       continue;
@@ -1557,6 +1621,7 @@ export async function searchPersistedArchivalImport(
       state.currentEntryClassified = false;
       state.currentEntryHasSearchableUnit = false;
       state.currentEntryHasValidUnit = false;
+      state.currentEntry = null;
       state.sourceObservation = emptySourceObservation();
     }
     if (entriesTouchedThisCall >= limits.maxScanEntries) {
@@ -1580,6 +1645,12 @@ export async function searchPersistedArchivalImport(
     if (result.kind === "missing") {
       skipSource("unavailable");
       continue;
+    }
+    if (state.currentEntry !== null) {
+      const firstItem = result.items[0];
+      if (firstItem === undefined || firstItem.id !== state.nextEntryId) {
+        throw new ArchivalSearchContinuationError("Archival search continuation in-flight entry is missing");
+      }
     }
     if (result.items.length === 0) {
       finishSource(source);
@@ -1615,9 +1686,12 @@ export async function searchPersistedArchivalImport(
         state.currentEntryClassified = false;
         state.currentEntryHasSearchableUnit = false;
         state.currentEntryHasValidUnit = false;
+        state.currentEntry = null;
       };
 
       if (!resumingEntry) {
+        state.nextUnit = 0;
+        state.currentEntry = null;
         state.coverage.entriesScanned++;
         entriesTouchedThisCall++;
         record = readRecordEntry(entry, source, storeNamespace);
@@ -1663,6 +1737,12 @@ export async function searchPersistedArchivalImport(
           continue;
         }
         state.currentEntryClassified = true;
+        state.currentEntry = {
+          line: record.line,
+          durableKey: record.durableKey,
+          unitCount: record.search.length,
+          fingerprint: entryFingerprint(entryId, record),
+        };
         searchableEntry = true;
         unitCount = record.search.length;
       } else {
@@ -1670,6 +1750,14 @@ export async function searchPersistedArchivalImport(
         record = readRecordEntry(entry, source, storeNamespace);
         if (record === null || !isSearchableRecord(record)) {
           throw new ArchivalSearchContinuationError("Archival search continuation no longer names a searchable archival entry");
+        }
+        const expectedEntry = state.currentEntry;
+        if (expectedEntry === null ||
+            record.line !== expectedEntry.line ||
+            record.durableKey !== expectedEntry.durableKey ||
+            record.search.length !== expectedEntry.unitCount ||
+            entryFingerprint(entryId, record) !== expectedEntry.fingerprint) {
+          throw new ArchivalSearchContinuationError("Archival search continuation in-flight entry changed");
         }
         if (record.durableKey !== durableKeyFor(storeNamespace, source.sourceId, record.line)) {
           state.sourceObservation.identityMismatch = true;
@@ -1754,6 +1842,7 @@ export async function searchPersistedArchivalImport(
           entryClassified: true,
           hasSearchableUnit: hasSearchableUnitBeforeUnit,
           hasValidUnit: hasValidUnitBeforeUnit,
+          currentEntry: state.currentEntry,
           sourceObservation: { ...state.sourceObservation },
           coverage: coverageBeforeUnit,
           currentSourceHasCaveat: caveatBeforeUnit,
@@ -1811,6 +1900,7 @@ export async function searchPersistedArchivalImport(
     state.currentEntryClassified = checkpoint.entryClassified;
     state.currentEntryHasSearchableUnit = checkpoint.hasSearchableUnit;
     state.currentEntryHasValidUnit = checkpoint.hasValidUnit;
+    state.currentEntry = checkpoint.currentEntry;
     state.sourceObservation = { ...checkpoint.sourceObservation };
     state.currentSourceHasCaveat = checkpoint.currentSourceHasCaveat;
     state.hits.length = checkpoint.hitsBefore;
