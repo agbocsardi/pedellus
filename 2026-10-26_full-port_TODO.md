@@ -1622,6 +1622,23 @@ not merely use fake credentials. A separate synthetic-tool reviewer invoked a
 local `/bin/sh` probe despite the no-real-tools assignment; the command made no
 network call. Future tool reviews must not execute host shell tools.
 
+### 2026-10-27 — wrap-up and preserved candidates
+
+At owner request, stop new work and preserve unmerged candidates for later review:
+- Gateway synthetic grant fixture `pi-1631ba70` / `93fe32449`: public Gateway
+  remains tool-less; follow-up independent review was underway.
+- Discord foundation `pi-acb8f4a0` / `33e35634b`: follow-up independent review
+  was underway; production channel integration and P6 remain open.
+- Archival search renderer `pi-7384fed4` / `d3a4b2ba7`: narrowed prototype;
+  independent review was underway.
+- Create-only publication `pi-ba6fe170` / `103198572`: same-user stage-name
+  swaps remain a documented race; not a real-import safety boundary.
+- One-shot scheduling `pi-cbf84ad6` / `e27ccea03`: review found queued work
+  can run after revocation/expiry and cross-owner/capacity gaps; not safe to
+  integrate. Follow-up was in progress.
+- Isolated staging `pi-b54f4507`: synthetic prototype in progress; no real
+  import or publication was authorized.
+
 ### 2026-10-27 — owner-controlled context recovery
 
 Integrated independently reviewed prepared-context inspection and explicit
