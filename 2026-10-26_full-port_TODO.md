@@ -42,6 +42,9 @@ policy, environment and replay gates pass.
 - [ ] `pi-a4ec5ee5`, `w2M:p1` / `w2M`: bound standalone sandbox shell
       deadlines with focused real-bwrap checks; base `c5dc6337a085422ed0fdb2921dba4cdd2af73063`.
       CPU/memory/PID/disk quotas and approval policy remain separate P1 gates.
+- [ ] `pi-2001d051`, `w2N:p1` / `w2N`: bounded opt-in default-deny native
+      tool authorization foundation, if safely achievable; base `5262018afe5f579cfbea85e36021cf5536eb77a5`.
+      No gateway activation or claim of human approval/security acceptance.
 - [ ] Review the existing Discord/memory/automation candidates when revisiting
       them; preserve their branches and do not imply they are integrated.
 
