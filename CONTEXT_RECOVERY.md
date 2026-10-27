@@ -17,7 +17,11 @@ ones durably.
 
 `listPreparedContextBlocks(config, context, options?)`:
 
-- takes the same kernel process lock and canonical SQLite path as the gateway;
+- requires an existing `dataDir/nanobot.sqlite`; a missing directory, typo, or
+  missing database fails closed instead of creating an empty store;
+- takes the same kernel process lock and canonical SQLite path as the gateway.
+  Stop the running gateway first: a live owner is reported as a lock conflict,
+  not as an empty or successful result;
 - opens storage and a Harness but never calls `resume()`;
 - scans live tasks for prepared generation/compaction dispatches;
 - reads each pinned context and reports only dispatches with a nonempty Nanobot
@@ -36,24 +40,40 @@ interface PreparedContextBlock {
   conversationId: number;
   phase: "request" | "poll" | "summarize" | "retry";
   at: number;          // pinned cutoff/tail entry ID
-  fingerprint: string; // binds cancellation to this exact state
+  fingerprint: string; // exact task state binding, see below
 }
 ```
 
+The fingerprint is SHA-256 over a version string, task ID, kind, conversation ID,
+phase, and pinned entry ID. It does **not** cover the checkpoint model, stream
+options, request body, task definition version, transcript bytes, or any other
+checkpoint field. Cancellation re-reads the blocked list under the lock and
+requires the exact task ID and fingerprint, so a changed phase or cutoff is
+rejected rather than retargeted; unrelated checkpoint changes are not
+independently bound.
+
 `cancelPreparedContextBlock(config, { taskId, fingerprint }, context, options?)`
-re-lists blocked dispatches under the lock and requires the exact fingerprint.
-A changed phase, cutoff/tail, task, or already-cancelled state is rejected rather
-than retargeted. It then calls native `Harness.abortTask(taskId)` and closes
-without resuming scheduling.
+re-lists blocked dispatches under the lock and requires the exact fingerprint,
+then calls native `Harness.abortTask(taskId)` and closes without resuming
+scheduling. It re-reads the task rather than trusting the native `marked` return:
+
+- `abort-marked`: live and durably marked; the next gateway open runs the abort
+  protocol;
+- `terminal`: already settled;
+- `orphaned`: immediately settled because no registered definition can take the
+  persisted task (for example an unsupported task version).
 
 Native `abortTask` persists an abort mark. The next `openGateway` skips
-abort-marked tasks in both the model and context replay guards, applies host
-policy/context, then resumes. The native abort protocol runs before any provider
-phase. Generation abort appends a committed partial as an `aborted` assistant
-entry when one exists and settles its input as `unanswered` with reason
-`aborted`; compaction abort removes its live status. The native abort protocol also
-cascades to ordinary tool tasks the cancelled task owns. No checkpoint is rewritten
-and no remote request is retried.
+abort-marked tasks in the context guard and applies host policy/context before
+resuming. The model guard is not bypassed for an abort-marked generation `poll`:
+that abort can call `models.cancelDeferred`, so its checkpoint model must still be
+in `allowedModels`. Other abort-marked phases cannot dispatch and may skip the
+model guard. The native abort protocol runs before any run phase. Generation abort
+appends a committed partial as an `aborted` assistant entry when one exists and
+settles its input as `unanswered` with reason `aborted`; compaction abort removes
+its live status. The native abort protocol also cascades to ordinary tool tasks
+the cancelled task owns. No checkpoint is rewritten and no remote request is
+retried.
 
 ## What is intentionally not supported
 
@@ -69,10 +89,13 @@ and no remote request is retried.
   auto-accept unchanged content.
 - **Cancelling a remote request that was already dispatched.** In `request`,
   Durable has no handle to cancel; any provider response or charge remains
-  outside our control and is never retried automatically. In `poll`, native abort
-  asks the configured `Models` catalog to cancel the deferred handle best-effort.
-  The default recovery catalog is empty (offline, no credentials), so no provider
-  call is made; cancellation just stops further polling.
+  outside our control and is never retried automatically. Recovery itself never
+  calls `cancelDeferred`. For `poll`, the next gateway open's native abort may ask
+  its configured `Models` catalog to cancel the deferred handle best-effort, but
+  only after the model guard accepts the checkpoint model. If that model was
+  removed from `allowedModels`, recovery can still mark the task but the gateway
+  remains blocked and no remote cancellation is attempted; restore the allowlist
+  or leave the task blocked.
 - **Blocking-compaction cancellation cascading into a stale request.** If a
   generation was waiting for the cancelled blocking compaction, the gateway's
   next normal preparation re-renders the current host context. If that
@@ -84,7 +107,10 @@ and no remote request is retried.
 ## CLI
 
 `node dist/cli.js recovery` does not open the gateway, require provider
-credentials, or install a context snapshot provider.
+credentials, or install a context snapshot provider. It does require an existing
+database and the gateway process to be stopped. Inspection may perform Durable's
+native `Harness.open()` crash reconciliation (for example `running` to `pending`
+and restart counters); it never resumes task execution.
 
 ```sh
 # Inspect blocked prepared dispatches (JSON, no task payloads or secrets)
@@ -95,9 +121,10 @@ node dist/cli.js recovery --config /path/to/config.json \
   --cancel 42 --fingerprint 8b42b0c2b065d87442bdcd67238c3197bf6163a9ef6e53bb18373c70f382a189
 ```
 
-The cancel output is `{"status":"abort-marked","taskId":42}`. Reopen the gateway
-to run the native abort protocol. A task already terminal when cancellation runs
-reports `terminal`.
+The cancel output is `{"status":"abort-marked","taskId":42}`; an immediately
+settled task reports `terminal` or `orphaned`. Reopen the gateway to run the native
+abort protocol for `abort-marked`. A revoked poll model remains fail-closed at that
+reopen and is not remotely cancelled.
 
 ## SDK
 
@@ -113,9 +140,10 @@ await cancelPreparedContextBlock(config, {
 }, context);
 ```
 
-`options.models` is available for a host that wants poll cancellation to use its
-real catalog. The default is an empty catalog, so recovery performs no provider
-call and needs no credentials.
+`options.models` only constructs the paused inspection Harness; recovery never
+dispatches, resumes, or authorizes a model with it. The default is an empty
+catalog, so recovery performs no provider call and needs no credentials. A later
+gateway open uses its own authoritative `allowedModels` and catalog.
 
 ## Verified offline boundaries
 
@@ -131,10 +159,20 @@ providers only:
   the CLI, the other still blocks, then the second is cancelled; both end terminal
   without replay;
 - SIGKILL during a prepared manual compaction `summarize`; cancel prevents a
-  second summarize dispatch and preserves the large original transcript.
+  second summarize dispatch and preserves the large original transcript;
+- an unsupported persisted task version reports `orphaned` immediately instead of
+  a bare abort mark;
+- a synthetic prepared `poll` on a revoked model remains blocked after
+  cancellation, with a faux `cancelDeferred` spy at zero; restoring the allowlist
+  permits the native abort and exactly one best-effort `cancelDeferred`, with no
+  model dispatch;
+- holding the real gateway lock makes recovery report an actionable conflict;
+  closing the gateway then releases the lock;
+- a typo/missing data directory or missing database is rejected before `mkdir` or
+  SQLite initialization, leaving no empty store behind.
 
-Not covered here: an actual deferred `poll` crash fixture (the guard and recovery
-share the same checkpoint scanner used for `request`/`summarize`, but polling is
-source-reviewed only), provider-side cancellation of a live remote request,
-cross-process recovery against a running gateway, and physical power-loss
-durability beyond SQLite's configured WAL/FULL behavior.
+Not covered here: an actual deferred `poll` crash fixture (the synthetic poll task
+exercises the same checkpoint scanner and abort path, but no real crash fixture),
+provider-side cancellation of a live remote request, recovery while a gateway is
+still running (it fails closed on the lock), and physical power-loss durability
+beyond SQLite's configured WAL/FULL behavior.

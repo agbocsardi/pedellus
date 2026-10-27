@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isChordError } from "@earendil-works/chord";
 import { processLock } from "@earendil-works/chord/node";
 import type { Context } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
@@ -15,7 +16,7 @@ import {
   type TaskId,
 } from "@earendil-works/pi-durable";
 import type { PortConfig } from "../config.js";
-import { prepareDataDirectory } from "../store.js";
+import { assertExistingDatabaseFileForRecovery, prepareDataDirectory } from "../store.js";
 import { openFullSyncNodeSqliteStorage } from "../storage/sqlite.js";
 import {
   hasPersistedNanobotContext,
@@ -32,9 +33,10 @@ export class PreparedContextRecoveryError extends Error {
 
 export interface ContextRecoveryOptions {
   /**
-   * Model catalog used only to construct the paused Harness. Recovery never
-   * dispatches a model request, so the default empty catalog works offline and
-   * requires no credentials. Deferred-poll cancellation is therefore skipped.
+   * Model catalog used only to construct the paused Harness. Recovery itself
+   * never dispatches, resumes, or authorizes a model; the default empty catalog
+   * works offline and needs no credentials. A later gateway open still uses its
+   * own authoritative `allowedModels` and model catalog.
    */
   readonly models?: Models;
 }
@@ -47,7 +49,10 @@ export interface PreparedContextBlock {
   readonly phase: "request" | "poll" | "summarize" | "retry";
   /** Pinned cutoff (generation) or tail (compaction) entry ID. */
   readonly at: number;
-  /** Binds an explicit cancellation to this exact task state. */
+  /**
+   * SHA-256 of the fingerprint version, task ID, kind, conversation ID, phase,
+   * and pinned entry ID. It does not bind the rest of the checkpoint.
+   */
   readonly fingerprint: string;
 }
 
@@ -58,8 +63,12 @@ export interface PreparedContextBlockTarget {
 }
 
 export interface PreparedContextCancelResult {
-  /** `abort-marked` is durable; the next gateway open runs the native abort protocol. */
-  readonly status: "abort-marked" | "terminal";
+  /**
+   * Re-read after `abortTask`: `abort-marked` is durable and live, `terminal`
+   * already settled, and `orphaned` settled because no registered definition can
+   * take the task (for example an unsupported persisted version).
+   */
+  readonly status: "abort-marked" | "terminal" | "orphaned";
   readonly taskId: number;
 }
 
@@ -90,10 +99,29 @@ async function openRecoveryHarness(
   context: Context,
   options: ContextRecoveryOptions,
 ): Promise<OpenedRecovery> {
-  const { dbPath } = await prepareDataDirectory(config);
-  const releaseLock = await processLock(`nanobot:${dbPath}`);
+  let dbPath: string;
+  try {
+    ({ dbPath } = await prepareDataDirectory(config, { requireExistingDatabase: true }));
+  } catch (error) {
+    throw new PreparedContextRecoveryError(
+      `Cannot open recovery store: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  let releaseLock;
+  try {
+    releaseLock = await processLock(`nanobot:${dbPath}`);
+  } catch (error) {
+    if (isChordError(error) && error.reason === "locked") {
+      throw new PreparedContextRecoveryError(
+        "Recovery cannot acquire the store lock because another live owner holds it. " +
+        "Stop the running gateway process before inspecting or cancelling prepared tasks.",
+      );
+    }
+    throw error;
+  }
   let storage: Storage | undefined;
   try {
+    await assertExistingDatabaseFileForRecovery(dbPath);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
     const models = options.models ?? createModels({
       authContext: { env: async () => undefined, fileExists: async () => false },
@@ -193,7 +221,9 @@ function validateTarget(target: PreparedContextBlockTarget): void {
  * Durably abort exactly one prepared dispatch after revalidating its current
  * fingerprint. No scheduling is resumed and no checkpoint is rewritten: the
  * native abort mark is persisted, and the next `openGateway` runs the native
- * abort protocol before any provider phase. Cancelling is the only supported
+ * abort protocol before any provider phase. `abortTask` can also settle a task
+ * as terminal/orphaned immediately, so the result is read back rather than
+ * inferred from the native return value. Cancelling is the only supported
  * reconciliation; a pinned request cannot be safely re-rendered in place.
  */
 export async function cancelPreparedContextBlock(
@@ -217,8 +247,23 @@ export async function cancelPreparedContextBlock(
         `Task ${target.taskId} changed since inspection; list blocked dispatches again before cancelling`,
       );
     }
-    const result = await opened.harness.abortTask(target.taskId as TaskId, context);
-    return { status: result === "terminal" ? "terminal" : "abort-marked", taskId: target.taskId };
+    await opened.harness.abortTask(target.taskId as TaskId, context);
+    const task = await opened.harness.getTask(target.taskId as TaskId, context);
+    if (!task) {
+      throw new PreparedContextRecoveryError(
+        `Task ${target.taskId} disappeared while it was being cancelled`,
+      );
+    }
+    if (task.state.status === "terminal") {
+      return {
+        status: task.state.outcome.status === "orphaned" ? "orphaned" : "terminal",
+        taskId: target.taskId,
+      };
+    }
+    if (task.abortRequested === true) return { status: "abort-marked", taskId: target.taskId };
+    throw new PreparedContextRecoveryError(
+      `Task ${target.taskId} is live but did not accept an abort mark; refusing to report success`,
+    );
   } finally {
     await closeRecoveryHarness(opened, context);
   }

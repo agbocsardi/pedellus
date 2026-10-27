@@ -32,12 +32,41 @@ export interface PreparedDataDirectory {
   readonly dbPath: string;
 }
 
+export interface PrepareDataDirectoryOptions {
+  /**
+   * Recovery must not initialize or recreate a store after a typo or a moved
+   * dataDir. Require the data directory and `nanobot.sqlite` to already exist.
+   */
+  readonly requireExistingDatabase?: boolean;
+}
+
+async function assertExistingDatabaseFile(dbPath: string): Promise<void> {
+  let pathStat;
+  try {
+    pathStat = await lstat(dbPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error("SQLite database does not exist; refusing to create a new recovery store");
+    }
+    throw error;
+  }
+  if (!pathStat.isFile()) throw new Error("SQLite database path must be a regular file, not a symlink or special file");
+}
+
+/** Recheck after acquiring the owner lock, before handing the path to SQLite. */
+export async function assertExistingDatabaseFileForRecovery(dbPath: string): Promise<void> {
+  await assertExistingDatabaseFile(dbPath);
+}
+
 /**
  * Canonicalize the configured workspace/data roots and the SQLite path. Both the
  * gateway and the owner-driven recovery path use this, so neither can open a
  * database that overlaps a writable host root or a symlinked database file.
  */
-export async function prepareDataDirectory(config: PortConfig): Promise<PreparedDataDirectory> {
+export async function prepareDataDirectory(
+  config: PortConfig,
+  options: PrepareDataDirectoryOptions = {},
+): Promise<PreparedDataDirectory> {
   const workspace = await realpath(config.workspace);
   if (!(await stat(workspace)).isDirectory()) throw new Error("workspace must be a directory");
   const extraRoots = await Promise.all((config.extraAllowedDirs ?? []).map(async (path) => {
@@ -50,18 +79,35 @@ export async function prepareDataDirectory(config: PortConfig): Promise<Prepared
   if (roots.some((root) => inside(dataDir, root) || inside(root, dataDir))) {
     throw new Error("dataDir must be disjoint from workspace and extraAllowedDirs");
   }
-  await mkdir(dataDir, { recursive: true, mode: 0o700 });
+  if (options.requireExistingDatabase === true) {
+    let dataDirStat;
+    try {
+      dataDirStat = await stat(dataDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new Error("SQLite data directory does not exist; refusing to create a new recovery store");
+      }
+      throw error;
+    }
+    if (!dataDirStat.isDirectory()) throw new Error("SQLite data directory must be a directory");
+  } else {
+    await mkdir(dataDir, { recursive: true, mode: 0o700 });
+  }
   const canonicalDataDir = await realpath(dataDir);
   if (roots.some((root) => inside(canonicalDataDir, root) || inside(root, canonicalDataDir))) {
     throw new Error("dataDir resolves inside or above workspace/extraAllowedDirs");
   }
   await chmod(canonicalDataDir, 0o700);
   const dbPath = resolve(canonicalDataDir, "nanobot.sqlite");
-  try {
-    const pathStat = await lstat(dbPath);
-    if (!pathStat.isFile()) throw new Error("SQLite database path must be a regular file, not a symlink or special file");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  if (options.requireExistingDatabase === true) {
+    await assertExistingDatabaseFile(dbPath);
+  } else {
+    try {
+      const pathStat = await lstat(dbPath);
+      if (!pathStat.isFile()) throw new Error("SQLite database path must be a regular file, not a symlink or special file");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
   return { workspace, extraRoots, canonicalDataDir, dbPath };
 }

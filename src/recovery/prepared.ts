@@ -25,17 +25,15 @@ export function preparedTaskModel(task: unknown): { provider: string; modelId: s
   const { kind, id } = task;
   if (kind !== "pi.generation" && kind !== "pi.compaction") return undefined;
   if (!isRecord(task.state)) throw new Error(`Cannot safely validate live ${kind} task ${String(id)} state`);
-  const { status } = task.state;
-  // An abort-marked task runs its abort protocol, never a provider phase. Recovery
-  // marks tasks explicitly; the native abort invocation cannot resend a request.
-  if (status === "terminal" || status === "completing" || task.abortRequested === true) return undefined;
+  const { status, checkpoint } = task.state;
+  if (status === "terminal" || status === "completing") return undefined;
   if (!["pending", "running", "waiting", "sleeping"].includes(String(status))) {
     throw new Error(`Cannot safely validate live ${kind} task ${String(id)} status ${String(status)}`);
   }
-  if (!isRecord(task.state.checkpoint) || typeof task.state.checkpoint.phase !== "string") {
+  if (!isRecord(checkpoint) || typeof checkpoint.phase !== "string") {
     throw new Error(`Cannot safely validate live ${kind} task ${String(id)} checkpoint`);
   }
-  const phase = task.state.checkpoint.phase;
+  const phase = checkpoint.phase;
   const hasPreparedRequest = kind === "pi.generation"
     ? phase === "request" || phase === "poll"
     : phase === "summarize" || phase === "retry";
@@ -43,14 +41,19 @@ export function preparedTaskModel(task: unknown): { provider: string; modelId: s
     ? phase === "prepare" || phase === "retry" || phase === "tools"
     : phase === "select";
   if (hasNoPreparedRequest) return undefined;
-  if (!hasPreparedRequest || !isRecord(task.state.checkpoint.model) ||
-      typeof task.state.checkpoint.model.provider !== "string" ||
-      typeof task.state.checkpoint.model.modelId !== "string") {
+  if (!hasPreparedRequest || !isRecord(checkpoint.model) ||
+      typeof checkpoint.model.provider !== "string" ||
+      typeof checkpoint.model.modelId !== "string") {
     throw new Error(`Cannot safely validate live ${kind} task ${String(id)} checkpoint phase ${phase}`);
   }
+  // An abort-marked task runs its abort protocol, never a run phase, so most
+  // abort-marked checkpoints do not need the model guard. The exception is a
+  // generation poll: its native abort calls models.cancelDeferred, which may be a
+  // provider request. Keep that model authoritative even after cancellation.
+  if (task.abortRequested === true && !(kind === "pi.generation" && phase === "poll")) return undefined;
   return {
-    provider: task.state.checkpoint.model.provider,
-    modelId: task.state.checkpoint.model.modelId,
+    provider: checkpoint.model.provider,
+    modelId: checkpoint.model.modelId,
   };
 }
 
