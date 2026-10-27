@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 /** Version of the deterministic inventory document, not an import/checkpoint version. */
-export const MIGRATION_REPORT_VERSION = 1 as const;
+export const MIGRATION_REPORT_VERSION = 2 as const;
 
 export const MIGRATION_LIMITS = Object.freeze({
   maxSources: 64,
@@ -111,6 +111,7 @@ export interface MigrationDryRunReport {
   readonly format: "nanobot-legacy-migration-dry-run";
   readonly version: typeof MIGRATION_REPORT_VERSION;
   readonly scope: "session-jsonl+history-jsonl+config-json-only";
+  readonly aggregationScope: "caller-must-supply-one-store-or-workspace-per-invocation;not-enforced";
   readonly importPerformed: false;
   readonly ambientReadsPerformed: false;
   readonly target: Readonly<{
@@ -210,8 +211,9 @@ const BUILTIN_PROVIDERS = new Set([
   "umans", "opencode_zen", "opencode_go",
 ]);
 const KNOWN_PRESET_FIELDS = new Set([
-  "label", "model", "provider", "max_tokens", "context_window_tokens", "temperature",
-  "reasoning_effort", "needs_vision_handoff",
+  "label", "model", "provider", "max_tokens", "maxTokens", "context_window_tokens",
+  "contextWindowTokens", "temperature", "reasoning_effort", "reasoningEffort",
+  "needs_vision_handoff", "needsVisionHandoff",
 ]);
 const UNINSPECTED_CONFIG_SECTIONS = ["channels", "tools", "gateway", "api", "transcription"] as const;
 const KNOWN_SESSION_METADATA = new Set([
@@ -735,6 +737,7 @@ export function inventoryLegacySnapshots(
     format: "nanobot-legacy-migration-dry-run",
     version: MIGRATION_REPORT_VERSION,
     scope: "session-jsonl+history-jsonl+config-json-only",
+    aggregationScope: "caller-must-supply-one-store-or-workspace-per-invocation;not-enforced",
     importPerformed: false,
     ambientReadsPerformed: false,
     target: { product: "Pi Durable", pinnedVersion: "1.4.0", behavior: "inventory-and-review-only" },
@@ -912,15 +915,36 @@ function inventorySessionSource(
     options.onMessage();
     const rawRole = own(parsed, "role");
     const rawCalls = own(parsed, "tool_calls");
+    const rawContent = own(parsed, "content");
+    const rawMedia = own(parsed, "media");
+    let messageShapeValid = true;
+    const shapeIssue = (code: string) => {
+      messageShapeValid = false;
+      work.status = "incomplete";
+      issue(code, work.input.sourceId, line.number, lineHash);
+    };
+    if (rawRole === undefined) shapeIssue("missing_session_message_role");
+    else if (typeof rawRole !== "string" || rawRole.length === 0) shapeIssue("invalid_session_message_role");
     const rolePlan = targetForRole(rawRole, Array.isArray(rawCalls));
     if (rolePlan.targetEntryKind === "nanobot.legacy.message") {
       unknownRoleCount++;
-      issue("unknown_session_message_role", work.input.sourceId, line.number, lineHash);
+      shapeIssue("unknown_session_message_role");
     }
+    if (!Object.hasOwn(parsed, "content")) shapeIssue("missing_session_message_content");
+    else {
+      const nullContentAllowed = rawContent === null && (
+        (rawRole === "assistant" && Array.isArray(rawCalls) && rawCalls.length > 0) ||
+        (rawRole === "user" && Array.isArray(rawMedia) && rawMedia.length > 0)
+      );
+      if (typeof rawContent !== "string" && !Array.isArray(rawContent) && !nullContentAllowed) {
+        shapeIssue("invalid_session_message_content");
+      }
+    }
+    if (rawMedia !== undefined && !Array.isArray(rawMedia)) shapeIssue("session_message_media_not_array");
     const rawTimestamp = own(parsed, "timestamp");
     const timestamp = safeTimestamp(rawTimestamp);
     if (rawTimestamp !== undefined && timestamp === null) issue("invalid_session_message_timestamp", work.input.sourceId, line.number, lineHash);
-    if (rawCalls !== undefined && !Array.isArray(rawCalls)) issue("tool_calls_not_array", work.input.sourceId, line.number, lineHash);
+    if (rawCalls !== undefined && !Array.isArray(rawCalls)) shapeIssue("tool_calls_not_array");
     const messageKeys = Object.keys(parsed);
     const unknownFields = messageKeys.filter((key) => !KNOWN_MESSAGE_FIELDS.has(key));
     const unsupportedFields = messageKeys.filter((key) => UNSUPPORTED_MESSAGE_FIELDS.has(key));
@@ -954,17 +978,18 @@ function inventorySessionSource(
     const calls = Array.isArray(rawCalls) ? rawCalls : [];
     historicalToolCallCount += calls.length;
     if (calls.length > options.limits.maxNestedReferences) {
+      work.status = "incomplete";
       issue("nested_tool_reference_limit_exceeded", work.input.sourceId, line.number, lineHash);
     }
     const callIds: SafeIdentifier[] = [];
     for (const call of calls.slice(0, options.limits.maxNestedReferences)) {
       if (!isObject(call)) {
-        issue("tool_call_record_not_object", work.input.sourceId, line.number, lineHash);
+        shapeIssue("tool_call_record_not_object");
         continue;
       }
       const id = safeIdentifier(own(call, "id"));
       if (id) callIds.push(id);
-      else issue("tool_call_missing_id", work.input.sourceId, line.number, lineHash);
+      else shapeIssue("tool_call_missing_id");
     }
     const toolCallId = safeIdentifier(own(parsed, "tool_call_id"));
     const toolName = safeIdentifier(own(parsed, "name"));
@@ -982,8 +1007,8 @@ function inventorySessionSource(
       sessionKey: safeIdentifier(sessionKeyRaw),
       timestamp,
       role: rolePlan.role,
-      targetEntryKind: rolePlan.targetEntryKind,
-      executionDisposition: rolePlan.executionDisposition,
+      targetEntryKind: messageShapeValid ? rolePlan.targetEntryKind : null,
+      executionDisposition: messageShapeValid ? rolePlan.executionDisposition : "review-required",
       duplicateOf,
       lineage,
       usage: null,
@@ -1349,6 +1374,42 @@ interface ConfigResult {
   readonly summary: Record<string, unknown>;
 }
 
+type ConfigAliasStatus = "missing" | "single" | "duplicate-equal" | "conflicting";
+type ConfigAliasFindings = Map<string, { duplicateEqualCount: number; conflictCount: number }>;
+
+function readConfigAlias(
+  object: Record<string, unknown>,
+  snakeKey: string,
+  camelKey: string,
+  fieldPath: string,
+  findings: ConfigAliasFindings,
+  work: SourceWork,
+  lineHash: string,
+  issue: (code: string, sourceId: string, line: number | null, lineHash: string | null) => void,
+): { value: unknown; status: ConfigAliasStatus } {
+  const hasSnake = Object.hasOwn(object, snakeKey);
+  const hasCamel = Object.hasOwn(object, camelKey);
+  if (!hasSnake && !hasCamel) return { value: undefined, status: "missing" };
+  if (hasSnake && hasCamel) {
+    const sameValue = JSON.stringify(own(object, snakeKey)) === JSON.stringify(own(object, camelKey));
+    const status = sameValue ? "duplicate-equal" : "conflicting";
+    const counts = findings.get(fieldPath) ?? { duplicateEqualCount: 0, conflictCount: 0 };
+    if (sameValue) counts.duplicateEqualCount++;
+    else counts.conflictCount++;
+    findings.set(fieldPath, counts);
+    work.status = "incomplete";
+    issue(sameValue ? "duplicate_config_aliases" : "conflicting_config_aliases", work.input.sourceId, 1, lineHash);
+    return { value: sameValue ? own(object, camelKey) : undefined, status };
+  }
+  return { value: own(object, hasCamel ? camelKey : snakeKey), status: "single" };
+}
+
+function configAliasReport(findings: ConfigAliasFindings): Readonly<Record<string, unknown>>[] {
+  return [...findings]
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([field, counts]) => ({ field, ...counts }));
+}
+
 function inventoryConfigSource(
   work: SourceWork,
   emit: (record: MigrationRecord, work: SourceWork) => boolean,
@@ -1372,36 +1433,98 @@ function inventoryConfigSource(
     return { presetCount: 0, summary: { sourceId: work.input.sourceId, status: "invalid-root" } };
   }
   const lineHash = work.sha256 ?? sha256(bytes);
-  const presetsCamel = own(parsed, "modelPresets");
-  const presetsSnake = own(parsed, "model_presets");
-  if (presetsCamel !== undefined && presetsSnake !== undefined) {
-    issue("ambiguous_model_preset_aliases", work.input.sourceId, 1, lineHash);
+  const aliasFindings: ConfigAliasFindings = new Map();
+  const presetRead = readConfigAlias(
+    parsed, "model_presets", "modelPresets", "modelPresets", aliasFindings, work, lineHash, issue,
+  );
+  let presets = Object.create(null) as Record<string, unknown>;
+  let namedPresetCount: number | null;
+  let modelPresetCollectionStatus: string;
+  if (presetRead.status === "conflicting") {
+    namedPresetCount = null;
+    modelPresetCollectionStatus = "conflicting-aliases";
+  } else if (presetRead.value === undefined) {
+    namedPresetCount = 0;
+    modelPresetCollectionStatus = "not-present";
+  } else if (isObject(presetRead.value)) {
+    presets = presetRead.value;
+    namedPresetCount = Object.keys(presets).length;
+    modelPresetCollectionStatus = presetRead.status === "duplicate-equal" ? "duplicate-equal-aliases" : "object";
+  } else {
+    issue("model_presets_not_object", work.input.sourceId, 1, lineHash);
+    work.status = "incomplete";
+    namedPresetCount = null;
+    modelPresetCollectionStatus = "invalid-shape";
   }
-  const rawPresets = presetsCamel !== undefined ? presetsCamel : presetsSnake;
-  const presets = isObject(rawPresets) ? rawPresets : Object.create(null) as Record<string, unknown>;
-  if (rawPresets !== undefined && !isObject(rawPresets)) issue("model_presets_not_object", work.input.sourceId, 1, lineHash);
-  const defaults = isObject(own(isObject(own(parsed, "agents")) ? own(parsed, "agents") as Record<string, unknown> : {}, "defaults"))
-    ? own(own(parsed, "agents") as Record<string, unknown>, "defaults") as Record<string, unknown>
-    : Object.create(null) as Record<string, unknown>;
+
+  const agentsRaw = own(parsed, "agents");
+  if (agentsRaw !== undefined && !isObject(agentsRaw)) {
+    issue("agents_not_object", work.input.sourceId, 1, lineHash);
+    work.status = "incomplete";
+  }
+  const agents = isObject(agentsRaw) ? agentsRaw : {};
+  const defaultsRaw = own(agents, "defaults");
+  if (defaultsRaw !== undefined && !isObject(defaultsRaw)) {
+    issue("agent_defaults_not_object", work.input.sourceId, 1, lineHash);
+    work.status = "incomplete";
+  }
+  const defaults = isObject(defaultsRaw) ? defaultsRaw : Object.create(null) as Record<string, unknown>;
   const agentModel = safeIdentifier(own(defaults, "model"));
   const agentProvider = safeIdentifier(own(defaults, "provider"));
-  const activeRaw = own(defaults, "model_preset");
-  const activePreset = safeIdentifier(activeRaw === undefined ? "default" : activeRaw);
+  const activeRead = readConfigAlias(
+    defaults, "model_preset", "modelPreset", "agents.defaults.modelPreset", aliasFindings, work, lineHash, issue,
+  );
+  let activePreset: SafeIdentifier | null = null;
+  let activePresetStatus: string;
+  if (activeRead.status === "missing") activePresetStatus = "not-explicit";
+  else if (activeRead.status === "conflicting") activePresetStatus = "conflicting-aliases";
+  else if (activeRead.value === null) activePresetStatus = "explicit-none";
+  else if (typeof activeRead.value === "string") {
+    activePreset = safeIdentifier(activeRead.value);
+    activePresetStatus = activeRead.status === "duplicate-equal" ? "duplicate-equal-aliases" : "explicit";
+  } else {
+    issue("invalid_active_model_preset", work.input.sourceId, 1, lineHash);
+    work.status = "incomplete";
+    activePresetStatus = "invalid-shape";
+  }
   const providerObject = isObject(own(parsed, "providers")) ? own(parsed, "providers") as Record<string, unknown> : {};
   const configuredBuiltinProviders = Object.keys(providerObject).filter((key) => BUILTIN_PROVIDERS.has(key)).length;
   const dynamicProviderCount = Object.keys(providerObject).filter((key) => !BUILTIN_PROVIDERS.has(key)).length;
   const presetNames = Object.keys(presets).sort();
   const hasImplicitDefault = own(defaults, "model") !== undefined || own(defaults, "provider") !== undefined;
-  const presetCount = presetNames.length + (hasImplicitDefault ? 1 : 0);
+  const presetCount = (namedPresetCount ?? 0) + (hasImplicitDefault ? 1 : 0);
+  const reportedPresetCount = namedPresetCount === null ? null : presetCount;
   let presetRecordsEmitted = 0;
-  const runPresetsRaw = own(defaults, "run_presets") ?? own(defaults, "runPresets");
-  const runPresetCount = isObject(runPresetsRaw) ? Object.keys(runPresetsRaw).length : 0;
-  if (runPresetsRaw !== undefined && !isObject(runPresetsRaw)) issue("run_presets_not_object", work.input.sourceId, 1, lineHash);
+  const runPresetsRead = readConfigAlias(
+    defaults, "run_presets", "runPresets", "agents.defaults.runPresets", aliasFindings, work, lineHash, issue,
+  );
+  let runPresetCount: number | null;
+  let runPresetsStatus: string;
+  if (runPresetsRead.status === "missing") {
+    runPresetCount = 0;
+    runPresetsStatus = "not-present";
+  } else if (runPresetsRead.status === "conflicting") {
+    runPresetCount = null;
+    runPresetsStatus = "conflicting-aliases";
+  } else if (isObject(runPresetsRead.value)) {
+    runPresetCount = Object.keys(runPresetsRead.value).length;
+    runPresetsStatus = runPresetsRead.status === "duplicate-equal" ? "duplicate-equal-aliases" : "object";
+  } else {
+    issue("run_presets_not_object", work.input.sourceId, 1, lineHash);
+    work.status = "incomplete";
+    runPresetCount = null;
+    runPresetsStatus = "invalid-shape";
+  }
   for (const name of presetNames) {
     const rawPreset = presets[name];
     const preset = isObject(rawPreset) ? rawPreset : null;
-    if (!preset) issue("model_preset_not_object", work.input.sourceId, 1, lineHash);
-    const display = preset ? presetSummary(name, preset, false) : { name: safeIdentifier(name), status: "invalid-shape" };
+    if (!preset) {
+      issue("model_preset_not_object", work.input.sourceId, 1, lineHash);
+      work.status = "incomplete";
+    }
+    const display = preset
+      ? presetSummary(name, preset, false, "modelPresets[*]", aliasFindings, work, lineHash, issue)
+      : { name: safeIdentifier(name), status: "invalid-shape" };
     const record: MigrationRecord = {
       ...recordBase(work, 1, lineHash, "config-preset"),
       originalId: safeIdentifier(name),
@@ -1417,7 +1540,9 @@ function inventoryConfigSource(
     if (!emit(record, work)) break;
     presetRecordsEmitted++;
   }
-  const defaultPreset = presetSummary("default", defaults, true);
+  const defaultPreset = presetSummary(
+    "default", defaults, true, "agents.defaults", aliasFindings, work, lineHash, issue,
+  );
   if (hasImplicitDefault) {
     if (emit({
       ...recordBase(work, 1, lineHash, "config-preset"),
@@ -1436,15 +1561,20 @@ function inventoryConfigSource(
   const unknownRootKeyCount = Object.keys(parsed).filter((key) => !knownRootKeys.has(key)).length;
   const summary = {
     sourceId: work.input.sourceId,
-    status: "parsed",
-    presetCount,
+    status: work.status === "complete" ? "parsed" : "incomplete",
+    presetCount: reportedPresetCount,
+    namedPresetCount,
+    modelPresetCollectionStatus,
     presetRecordsEmitted,
-    unprocessedPresetCount: presetCount - presetRecordsEmitted,
+    unprocessedPresetCount: reportedPresetCount === null ? null : reportedPresetCount - presetRecordsEmitted,
     activePreset,
+    activePresetStatus,
     runPresetCount,
+    runPresetsStatus,
     configuredBuiltinProviders,
     dynamicProviderCount,
     unknownRootKeyCount,
+    aliasFindings: configAliasReport(aliasFindings),
     uninspectedSections: UNINSPECTED_CONFIG_SECTIONS.filter((key) => own(parsed, key) !== undefined),
     defaultModel: agentModel,
     defaultProvider: agentProvider,
@@ -1455,17 +1585,33 @@ function inventoryConfigSource(
   return { presetCount, summary };
 }
 
-function presetSummary(name: string, preset: Record<string, unknown>, implicit: boolean): Record<string, unknown> {
+function presetSummary(
+  name: string,
+  preset: Record<string, unknown>,
+  implicit: boolean,
+  fieldPrefix: string,
+  findings: ConfigAliasFindings,
+  work: SourceWork,
+  lineHash: string,
+  issue: (code: string, sourceId: string, line: number | null, lineHash: string | null) => void,
+): Record<string, unknown> {
+  const read = (snake: string, camel: string, field: string) => readConfigAlias(
+    preset, snake, camel, `${fieldPrefix}.${field}`, findings, work, lineHash, issue,
+  ).value;
+  const maxTokens = read("max_tokens", "maxTokens", "maxTokens");
+  const contextWindowTokens = read("context_window_tokens", "contextWindowTokens", "contextWindowTokens");
+  const reasoningEffort = read("reasoning_effort", "reasoningEffort", "reasoningEffort");
+  const needsVisionHandoff = read("needs_vision_handoff", "needsVisionHandoff", "needsVisionHandoff");
   return {
     name: safeIdentifier(name),
     implicit,
     model: safeIdentifier(own(preset, "model")),
     provider: safeIdentifier(own(preset, "provider")),
-    maxTokens: safeNonNegativeInt(own(preset, "max_tokens")),
-    contextWindowTokens: safeNonNegativeInt(own(preset, "context_window_tokens")),
+    maxTokens: safeNonNegativeInt(maxTokens),
+    contextWindowTokens: safeNonNegativeInt(contextWindowTokens),
     temperature: finiteNumber(own(preset, "temperature")),
-    reasoningEffort: safeIdentifier(own(preset, "reasoning_effort")),
-    needsVisionHandoff: typeof own(preset, "needs_vision_handoff") === "boolean" ? own(preset, "needs_vision_handoff") : null,
+    reasoningEffort: safeIdentifier(reasoningEffort),
+    needsVisionHandoff: typeof needsVisionHandoff === "boolean" ? needsVisionHandoff : null,
     unrecognizedFieldCount: implicit ? null : Object.keys(preset).filter((key) => !KNOWN_PRESET_FIELDS.has(key)).length,
     secretBearingProviderFields: "omitted",
   };
