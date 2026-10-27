@@ -43,10 +43,13 @@ root roadmap, public exports/integration and acceptance.
       Integrated `8cedf36a0` / `0252ab6dc` / `73bc37a86`; independent final review
       and parent-built probes pass with mandatory dedicated per-Harness ownership.
       Gateway loading, template conversion and full memory/skills parity remain open.
-- [ ] C3 — P4 native usage projections and archive-delta foundation: retain
-      attribution/unknowns, avoid nested double count, no archive writer or resets.
-- [ ] Parent review, bounded independent verification and approved integration;
-      record unsupported semantics without marking broad milestones complete.
+- [x] C3 — bounded P4 read-only native usage/archive-delta foundation: source-
+      scoped immutable snapshots, exact safe-integer deltas and explicit unknowns.
+      Integrated `2b6b8f2d9` / `e155b2099` / `7113cf96a` / `914638d3d`;
+      independent final review and parent-built checks pass. Native duplication/
+      omitted spend cannot be repaired; archive writer/reset/atomic cursor remain open.
+- [x] Parent review, bounded independent verification and integration of C1–C3;
+      unsupported semantics remain explicit and broad milestones unchecked.
 
 | Child / branch | Pane / workspace | Worktree | Exclusive ownership |
 |---|---|---|---|
@@ -1103,3 +1106,38 @@ cursors and derived deltas, valid fixture counters and explicit invalid-subset
 probes, while preserving missing/unknown behavior. No speculative totalTokens
 reconstruction or source repair. Usage remains unmerged; await final correction
 and review, then fresh parent-built verification.
+
+### 2026-10-27 — usage SDK integrated; bounded batch complete
+
+C3 explicitly completed subset fix `bcfc51523`; independent reviewer
+`pi-7dcd4062` reported final PASS, no material blocker, in
+`/tmp/pi-usage-projection-review.md`. Parent read the final fix/report and reran
+valid fixture baseline plus independent numeric/subset/cursor/conservation edges.
+Integrated all four source commits with provenance as `2b6b8f2d9`, `e155b2099`,
+`7113cf96a`, `914638d3d`, then exports the read-only helpers/types via SDK.
+README links USAGE.md; no runtime/storage/config activation or archive writer.
+
+Fresh package typecheck/build and updated usage baseline/edges explicitly select
+the **parent built package** and pass. Baseline includes safe-integer/overflow,
+subset snapshot/cursor/delta validation, native missing/first-known fields, fresh
+empty document, trusted older-cursor behavior, actual Harness omit/forward nested
+usage, classified failure and compaction accounting. Independent edges cover
+120-step token/cost conservation, exact source/cursor scope, optional unknowns,
+malformed/regressing rows and immutable costs. Public SDK SQLite probe
+`/tmp/pi-nanobot-parent-usage-sdk-readonly.mjs` (45s/384 MB) verifies unchanged
+native snapshots after projection, external cursor JSON roundtrip, reopen usage
+conservation and tool-less policy.
+
+Final bounded parent-build regression reruns provider baseline/native transport
+with actual gateway/SQLite, all four context probes, and context/Code Mode inert
+SDK check; all pass. Added the reviewer's cumulative-source caveat explicitly:
+a later omitted optional field can look like a zero **recorded** increment after
+aggregation; it is not proof of zero actual provider use. Native already-duplicated
+nested spend, unknown/uncommitted spend and request counts stay unrecoverable here.
+Cursors require trusted host-owned state; no authenticity, rollback protection or
+external archive transaction is claimed.
+
+C1–C3 bounded tasks accepted; P3/P4/P8 remain incomplete. No production/live/paid
+request, new dependency, committed test suite, push/deploy or worktree cleanup.
+Containerization/sandbox/execution work remains untouched, candidate withheld,
+gateway still tools:[]/modelTools:[]. Batch complete; no new worker task assigned.

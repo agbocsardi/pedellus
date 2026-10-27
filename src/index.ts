@@ -14,5 +14,20 @@ export {
   type CodeModeIntegration,
   type CodeModeIntegrationOptions,
 } from "./extensions/codemode.js";
+export {
+  parseUsageArchiveCursor,
+  projectUsageDelta,
+  readUsageSnapshot,
+  snapshotUsageState,
+  type LegacyModelUsage,
+  type LegacyUsageDelta,
+  type NativeUsageDelta,
+  type UsageArchiveCursor,
+  type UsageArchiveProjection,
+  type UsageSnapshot,
+  type UsageSourceIdentity,
+  type UsageSourceScope,
+  type UsageUnknownField,
+} from "./usage/index.js";
 export { openGateway, type Gateway } from "./runtime.js";
 export { main } from "./cli.js";

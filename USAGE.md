@@ -7,6 +7,7 @@ second ledger, write `memory/history.jsonl`, archive automatically, reset a
 conversation, or persist a cursor.
 
 ```ts
+// Also exported by the package SDK.
 import { readUsageSnapshot, projectUsageDelta, parseUsageArchiveCursor } from "./usage/index.js";
 
 // Supplied and persisted by the owning host; do not derive this from the Harness or DB path.
@@ -79,7 +80,11 @@ exactly (case-sensitive; not normalized).
   `cacheWrite1h` values stay unknown, not zero. Present values are validated
   against their required-counter subset. If an optional cumulative field appears
   only after a cursor, its delta cannot safely be apportioned and the affected
-  field is listed in `unknownFields`, not emitted as zero.
+  field is listed in `unknownFields`, not emitted as zero. After an optional
+  cumulative value exists, Durable leaves it unchanged when a later response omits
+  that field; this projection cannot detect the omission and can return a zero
+  **recorded** delta without an `unknownFields` entry. Optional totals/deltas are
+  reported-ledger subtotals, not proof of actual provider zeros or completeness.
 - Native cost fields are preserved verbatim in `native`; they are provider/model
   cost calculations reported by Pi AI, not an invoice or proof of billing. A
   numeric zero is a recorded zero in the native ledger, not evidence that an
