@@ -16,6 +16,7 @@ export const CONTEXT_LIMITS = Object.freeze({
   maxMemorySources: 32,
   maxSkills: 32,
   maxSkillInputs: 64,
+  maxSkillNameCodeUnits: 128,
   maxToolNames: 128,
   descriptionChars: 1_024,
 });
@@ -45,7 +46,10 @@ export interface ContextSkillSnapshot {
   readonly metadata?: unknown;
 }
 
-/** All context for one Durable conversation. The extension never falls back to another conversation's snapshot. */
+/**
+ * All context for one Durable conversation. IDs are storage-local; snapshots must be
+ * captured by an extension/registry dedicated to one Harness, never shared across Harnesses.
+ */
 export interface ConversationContextSnapshot {
   readonly conversationId: ConversationId;
   /** Already-rendered identity text; this module does not expand Python/Jinja placeholders. */
@@ -56,7 +60,7 @@ export interface ConversationContextSnapshot {
   /** Memory content the host has explicitly selected for this conversation. */
   readonly memory?: readonly ContextDocumentSnapshot[];
   readonly skills?: readonly ContextSkillSnapshot[];
-  /** Explicitly selected, enabled non-always skills to include in this snapshot. */
+  /** Up to 64 selected names (at most 128 UTF-16 code units each) for enabled non-always skills. */
   readonly selectedSkills?: readonly string[];
 }
 
@@ -69,9 +73,11 @@ const SKILL_FRONTMATTER = /^---\s*\r?\n[\s\S]*?\r?\n---\s*\r?\n?/;
 
 /**
  * Make an opt-in Durable extension from immutable, host-supplied snapshots.
- * The returned section renderers only read this private copy and the current
- * request's actual `agent.tools`; they do no filesystem, environment, or
- * extension/resource discovery.
+ * Create a fresh extension and dedicated registry for each Harness/storage:
+ * Durable conversation IDs collide across stores, and PromptInput provides no
+ * store namespace. Reconstruct same-store snapshots and install before resume.
+ * This host precondition is not runtime-detectable. Renderers read only this
+ * private copy and the request's actual `agent.tools`; no ambient discovery.
  */
 export function createContextExtension(
   snapshots: readonly ConversationContextSnapshot[],
@@ -109,7 +115,9 @@ export function createContextExtension(
 
 function prepareContext(snapshot: unknown): PreparedContext {
   const rawSelected = readArray(ownValue(snapshot, "selectedSkills"), CONTEXT_LIMITS.maxSkillInputs);
-  const selected = new Set(rawSelected.filter((name): name is string => typeof name === "string"));
+  const selected = new Set(rawSelected.filter((name): name is string =>
+    typeof name === "string" && name.length <= CONTEXT_LIMITS.maxSkillNameCodeUnits,
+  ));
   const rawSkills = readArray(ownValue(snapshot, "skills"), CONTEXT_LIMITS.maxSkillInputs);
   const skillNames = new Set<string>();
   const activeSkills: { name: string; source: string; description: string; content: string }[] = [];
@@ -117,7 +125,7 @@ function prepareContext(snapshot: unknown): PreparedContext {
 
   for (const raw of rawSkills) {
     const name = ownString(raw, "name");
-    if (!name || name.length > 128) continue;
+    if (!name || name.length > CONTEXT_LIMITS.maxSkillNameCodeUnits) continue;
     if (skillNames.has(name)) throw new TypeError(`Duplicate skill name in context snapshot: ${name}`);
     skillNames.add(name);
 

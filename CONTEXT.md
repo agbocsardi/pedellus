@@ -36,16 +36,23 @@ selected skills change. A snapshot with no matching conversation ID contributes 
 identity, document, memory, or skill content. There is no fallback to another
 conversation, a parent/fork, or a default workspace. A host must associate each
 snapshot with the correct Durable conversation; this API cannot detect incorrect
-host mapping. Use relative/opaque provenance labels rather than disclosing
-unnecessary absolute host paths.
+host mapping. Durable conversation IDs are only unique within one storage/Harness;
+independent Harnesses can both have root ID `1`. Construct a fresh context extension
+**and dedicated registry per Harness/storage**. Never share either across stores:
+`PromptInput` has no trustworthy store namespace, so this module cannot distinguish
+colliding IDs. This is a required host precondition, not runtime-detected. Use
+relative/opaque provenance labels rather than disclosing unnecessary absolute host
+paths.
 
 ## Restart and fork lifecycle
 
 The Durable agent document persists the selected extension name, not this
 extension's captured snapshots. Before reopening/resuming a storage or accepting
-new work, the host must recreate and install the same-named extension with fresh
-snapshots for each conversation whose context should remain available. A missing
-snapshot intentionally renders no context for that conversation on its next
+new work, the host must create a fresh dedicated registry and same-named context
+extension for that Harness, reconstructing snapshots from that same store's
+conversation IDs. Install it before resume for each conversation whose context
+should remain available; never reuse a registry/extension from another store. A
+missing snapshot intentionally renders no context for that conversation on its next
 request; native Durable section replay then removes those keys from the effective
 current prompt. Reinstalling a changed same-name extension updates current sections
 on the next request, while unchanged snapshots require no section patch.
@@ -71,12 +78,16 @@ tool names are copied into the prompt.
 ## Bounds and skill rules
 
 The exported `CONTEXT_LIMITS` documents hard bounds: 256 conversation snapshots;
-48,000 Unicode code points total for snapshot text, 16,000 per context section,
-2,000 for tool visibility, 32 memory sources, 64 inspected skill records / 32
-included skills, 128 listed tool names, 256 code points per provenance label, and
-1,024 per skill description. Truncation is marked, and slicing preserves Unicode
-code points. The total section-value bound is 50,000 code points including the
-tool-visibility section. Inputs are rendered only within these bounds.
+**per conversation**, 48,000 Unicode code points for context section values,
+16,000 per context section, and 2,000 for tool visibility; 32 memory sources; 64
+inspected skill records / 32 included skills; 64 selected-skill names of at most
+128 UTF-16 code units each; 128 listed tool names; 256 code points per provenance
+label; and 1,024 per skill description. A selected-skill name over 128 code units
+is ignored before set insertion; skill record names use the same limit. Truncation
+is marked, and slicing preserves Unicode code points. The 50,000-code-point
+section-value bound (48,000 context + 2,000 tool visibility) is also **per
+conversation**, not an aggregate across the 256 snapshots. The snapshot-count cap
+limits fan-out; aggregate retained strings across all snapshots can be larger.
 
 A skill must have `enabled: true` from the host to appear; absent, false, or
 non-boolean values are disabled. The host is responsible for applying Nanobot's
@@ -138,6 +149,7 @@ For provenance, semantic references are `nanobot/agent/context.py`,
 - the host must render identity values and choose trustworthy sources;
 - this extension only composes supplied strings and never decides whether a file
   or skill is trusted;
-- session-isolated snapshots replace automatic ambient reads for this slice;
+- host-mapped snapshots in a dedicated per-Harness registry replace automatic
+  ambient reads for this slice;
 - search/ranking, archived history, memory-tree discovery, and Dream are explicitly
   deferred rather than implied by context inclusion.
