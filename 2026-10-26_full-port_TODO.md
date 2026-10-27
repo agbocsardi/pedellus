@@ -32,7 +32,8 @@ No real data, live calls, gateway tools or automatic integration.
 - [x] `pi-35c6804d`, `w27:p1` / `w27`: final CLI review found earlier
       blockers addressed; merged `eeea55965` and parent ran three tests covering
       slow output, SQLite EOF preservation and terminal filtering. Dedicated
-      control-order, flood and secret-bearing startup-error tests remain open.
+      parent subsequently added admission/control ordering, oversized-line
+      rejection backpressure and secret-bearing startup-path checks.
 - [x] `pi-70f63e0d`, `w28:p1` / `w28`: final migration review found prior
       blockers resolved; merged `c2d6fef34` and parent ran four behavioral tests
       for eligibility, provenance, aliases, session shapes and safety.
@@ -80,10 +81,11 @@ tabs without force; the branches were retained.
       parent-built slow-sink check passed. This is integration, not final acceptance.
 - [x] D3 — P8 read-only migration inventory: merged `e00651d33`; parent-built
       alias/message-shape probe passed. This is inventory only, not an importer.
-- [ ] Add dedicated CLI control-order, rejection-flood and secret-bearing startup
-      error behavioral checks. Final CLI review and EOF/slow-output tests pass;
-      readline's 32k limit is post-buffering, not a hard ingress-memory limit.
-      Migration's final review and initial safety tests pass; keep P3/P8 unchecked.
+- [ ] Extend CLI stress coverage beyond oversized-line rejection to pending-input
+      and control-cap floods. Final CLI review, EOF/slow-output, admission/control
+      ordering and startup-path secrecy checks pass; readline's 32k limit is
+      post-buffering, not a hard ingress-memory limit. Migration's final review and
+      initial safety tests pass; keep P3/P8 unchecked.
 - [ ] Port selected Python behavioral scenarios into permanent TypeScript parity
       checks, prioritizing migration integrity, CLI lifecycle and model recovery.
       Owner approved behavior-focused coverage; test Nanobot-owned contracts and

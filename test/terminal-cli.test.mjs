@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { Writable } from "node:stream";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { runTerminalConversation } from "../dist/terminal/index.js";
 import { openFullSyncNodeSqliteStorage } from "../dist/storage/sqlite.js";
@@ -111,6 +113,89 @@ test("EOF preserves failed-run follow-up in SQLite for reopen", { timeout: timeo
     await storage?.close(BACKGROUND_CONTEXT);
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("controls execute between preceding and following admissions", { timeout: timeoutMs + 2_000 }, async () => {
+  const { harness, conversation, faux } = await makeHarness(new MemoryStorage());
+  faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+  const operations = [];
+  let releaseAdmission;
+  let markEntered;
+  const gate = new Promise((resolve) => { releaseAdmission = resolve; });
+  const entered = new Promise((resolve) => { markEntered = resolve; });
+  const proxy = new Proxy(conversation, { get(target, property) {
+    if (property === "submit") return async (...args) => {
+      const content = args[0].content;
+      operations.push(`submit:${content}:start`);
+      if (content === "first") { markEntered(); await gate; }
+      const submission = await target.submit(...args);
+      operations.push(`submit:${content}:done`);
+      return submission;
+    };
+    if (property === "abort") return async (...args) => {
+      operations.push("abort:start");
+      const result = await target.abort(...args);
+      operations.push("abort:done");
+      return result;
+    };
+    const value = Reflect.get(target, property, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  const controller = new AbortController();
+  const output = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+  const terminal = runTerminalConversation(proxy, withAbortSignal(controller.signal, BACKGROUND_CONTEXT), {
+    input: inputLines("first", "/abort", "second"), output,
+  });
+  try {
+    await entered;
+    assert.deepEqual(operations, ["submit:first:start"]);
+    releaseAdmission();
+    await terminal;
+    assert.deepEqual(operations, ["submit:first:start", "submit:first:done", "abort:start", "abort:done", "submit:second:start", "submit:second:done"]);
+  } finally {
+    releaseAdmission();
+    controller.abort();
+    await Promise.allSettled([terminal]);
+    await harness.close(BACKGROUND_CONTEXT);
+  }
+});
+
+test("rejected lines stop ingress while output is backpressured", { timeout: timeoutMs + 2_000 }, async () => {
+  const { harness, conversation } = await makeHarness(new MemoryStorage());
+  let consumed = 0;
+  let release;
+  let markBlocked;
+  const blocked = new Promise((resolve) => { markBlocked = resolve; });
+  const output = new Writable({ highWaterMark: 1, write(_chunk, _encoding, callback) {
+    release = callback;
+    markBlocked();
+  } });
+  const controller = new AbortController();
+  const input = (async function* () {
+    for (let i = 0; i < 1000; i++) { consumed++; yield "x".repeat(32_001); }
+  })();
+  const terminal = runTerminalConversation(conversation, withAbortSignal(controller.signal, BACKGROUND_CONTEXT), { input, output });
+  try {
+    await blocked;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(consumed, 1);
+  } finally {
+    controller.abort();
+    release?.();
+    await Promise.allSettled([terminal]);
+    await harness.close(BACKGROUND_CONTEXT);
+  }
+});
+
+test("startup errors do not disclose sensitive paths", { timeout: timeoutMs + 2_000 }, () => {
+  const secret = "SYNTHETIC-SECRET-CONFIG-PATH";
+  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const result = spawnSync(process.execPath, [cli, "--config", `/nonexistent/${secret}`], {
+    encoding: "utf8", timeout: timeoutMs,
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /diagnostic details suppressed/);
+  assert.doesNotMatch(result.stderr + result.stdout, new RegExp(secret));
 });
 
 test("terminal suppresses tool/reasoning text and strips terminal control characters", { timeout: timeoutMs + 2_000 }, async () => {
