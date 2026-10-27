@@ -77,6 +77,39 @@ function modelKey(model: ModelReference | ModelRef): string {
   return JSON.stringify([model.provider, model.modelId]);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Models selected into checkpoints by Durable's native provider-dispatch tasks. */
+function preparedTaskModel(task: unknown): ModelReference | undefined {
+  if (!isRecord(task) || typeof task.kind !== "string") return undefined;
+  const { kind, id } = task;
+  if (kind !== "pi.generation" && kind !== "pi.compaction") return undefined;
+  if (!isRecord(task.state)) throw new Error(`Cannot safely validate live ${kind} task ${String(id)} state`);
+  const { status, checkpoint } = task.state;
+  if (status === "terminal" || status === "completing") return undefined;
+  if (!["pending", "running", "waiting", "sleeping"].includes(String(status))) {
+    throw new Error(`Cannot safely validate live ${kind} task ${String(id)} status ${String(status)}`);
+  }
+  if (!isRecord(checkpoint) || typeof checkpoint.phase !== "string") {
+    throw new Error(`Cannot safely validate live ${kind} task ${String(id)} checkpoint`);
+  }
+  const phase = checkpoint.phase;
+  const hasPreparedRequest = kind === "pi.generation"
+    ? phase === "request" || phase === "poll"
+    : phase === "summarize" || phase === "retry";
+  const hasNoPreparedRequest = kind === "pi.generation"
+    ? phase === "prepare" || phase === "retry" || phase === "tools"
+    : phase === "select";
+  if (hasNoPreparedRequest) return undefined;
+  if (!hasPreparedRequest || !isRecord(checkpoint.model) ||
+      typeof checkpoint.model.provider !== "string" || typeof checkpoint.model.modelId !== "string") {
+    throw new Error(`Cannot safely validate live ${kind} task ${String(id)} checkpoint phase ${phase}`);
+  }
+  return { provider: checkpoint.model.provider, modelId: checkpoint.model.modelId };
+}
+
 function isModelSelection(value: unknown): value is GatewayModelSelectionRequest {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -103,7 +136,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     throw new Error(`Unsupported thinkingLevel ${config.thinkingLevel} for default model ${config.model.provider}/${config.model.modelId}`);
   }
   const defaultThinkingLevel = config.thinkingLevel ?? "off";
-  const hostPolicy: AgentChange = { cwd: config.workspace, tools: [], modelTools: [] };
+  const workspace = await realpath(config.workspace);
+  if (!(await stat(workspace)).isDirectory()) throw new Error("workspace must be a directory");
+  const hostPolicy: AgentChange = { cwd: workspace, tools: [], modelTools: [] };
   const defaultAgentPolicy: AgentChange = {
     ...hostPolicy,
     model,
@@ -139,8 +174,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
       await configure(tx, conversation.id, policyForState(state));
     }, ctx);
   }
-  const workspace = await realpath(config.workspace);
-  if (!(await stat(workspace)).isDirectory()) throw new Error("workspace must be a directory");
   const extraRoots = await Promise.all((config.extraAllowedDirs ?? []).map(async (p) => {
     const root = await realpath(p);
     if (!(await stat(root)).isDirectory()) throw new Error(`extraAllowedDirs entry is not a directory: ${p}`);
@@ -174,8 +207,21 @@ export async function openGateway(config: PortConfig, context: Context, options:
     harness = await Harness.open(storage, { models, registry }, context);
     const root = await harness.root(context, { agent: defaultAgentPolicy });
 
-    // Reapply host security and revoke persisted models outside the current allowlist before resume.
+    // Refuse to resume a prepared request with a model removed from the current allowlist.
     await root.commit(async (tx) => {
+      let taskCursor: Cursor | undefined;
+      do {
+        const page = await tx.scanTasks({}, 1000, taskCursor);
+        for (const task of page.items) {
+          const preparedModel = preparedTaskModel(task);
+          if (preparedModel !== undefined && !choicesByNative.has(modelKey(preparedModel))) {
+            throw new Error(`Cannot resume ${task.kind} task ${task.id}: prepared model ${modelKey(preparedModel)} is outside allowedModels`);
+          }
+        }
+        taskCursor = page.next;
+      } while (taskCursor !== undefined);
+
+      // Reapply host security and revoke persisted models outside the current allowlist before resume.
       let cursor: Cursor | undefined;
       do {
         const page = await tx.scanConversations({}, 1000, cursor);

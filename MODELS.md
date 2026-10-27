@@ -80,27 +80,42 @@ below.
 
 ## Startup policy and revocation
 
-Before `Harness.resume()`, the host reapplies its trusted workspace `cwd` and
-forces `tools: []` and `modelTools: []` on every persisted conversation. These
-host-owned security fields are not user-selectable. A persisted model still in
-the allowlist and a supported thinking choice are preserved; missing or invalid
-thinking state is normalized to the configured default when supported, else
-`off`. This includes the reserved root conversation: its initial agent policy is
+Before `Harness.resume()`, the host uses the workspace's canonical `realpath`
+for `cwd`, forces `tools: []` and `modelTools: []`, and reapplies policy to every
+persisted conversation. These host-owned fields are not user-selectable. A
+persisted allowed model and supported thinking choice are preserved; missing or
+invalid thinking state is normalized to the configured default when supported,
+else `off`. This includes the root conversation: its initial agent policy is
 create-only, so opening an existing root does not replace an allowed choice.
 
-A persisted `pi.agent` model no longer present in the current allowlist is
-deterministically replaced with the configured default model and its configured
-default thinking level (or `off` if not configured). This happens before
-`Harness.resume()` and again when a session is acquired. The transcript and
-requestId identity are left intact. This revocation policy intentionally does
-not preserve a choice that the host has removed from the allowlist.
+Before applying policy, startup scans active native Durable task checkpoints. If
+a prepared generation `request`/`poll` or compaction `summarize`/`retry` refers
+to a model removed from the allowlist, startup fails closed before
+`Harness.resume()`. Model identity is checked as the native provider/model pair,
+so another model from the same provider does not authorize replay. No checkpoint,
+transcript, or task is rewritten or canceled. Restore the prior allowlist and let
+the task finish before revoking that model. Generation `prepare`/`retry` and
+compaction `select` checkpoints have not selected a request model; they resume
+using the normalized current `pi.agent` choice.
 
-Durable separately checkpoints the model and thinking level of an already
-prepared generation request. Reopen resumes that exact native request; this
-adapter does not rewrite or cancel an in-flight checkpoint when the allowlist
-changes. The newly configured default applies at the next native request
-preparation. This follows Durable's fixed-request boundary and is not an
-assertion that a prepared external request can be revoked.
+This guard follows Durable 1.4.0's public task records and dispatch paths:
+`generation.ts` resolves the checkpoint model before streaming or polling, while
+`compaction.ts` resolves it before summarization. `tool.ts` resolves every tool
+from the current agent's `tools`/`callable` lists; those are cleared before
+resume, and this gateway registers no tools or model-using hooks. Thus there is
+no image/classifier tool task that can dispatch through this gateway. The model
+catalog supplied by an SDK host is not mutated. Offline SIGKILL/reopen sentinels
+left prepared alpha generation and compaction requests, then reopened with only
+same-provider beta allowed; both startups failed before a second provider call.
+Each sentinel recorded the original faux-provider dispatch. If that original call
+began before the process was killed, the adapter cannot know whether it was
+processed or paid; the guard proves only that reopen does not replay it under the
+revoked policy.
+
+When no live prepared task targets a revoked model, a removed persisted
+`pi.agent` selection is deterministically replaced by the configured default and
+its thinking level (or `off`). This occurs before resume and again on session
+acquisition. Transcript and requestId identity remain intact.
 
 ## Source basis
 
@@ -109,8 +124,9 @@ assertion that a prepared external request can be revoked.
   `nanobot/command/builtin.py` (`cmd_model`). This port intentionally uses a
   per-conversation native choice rather than the Python process-loop preset.
 - Pinned Durable 1.4.0: `packages/durable/README.md` (Per-Conversation Agent,
-  Busy Conversations) and `packages/durable/src/harness/generation.ts` (request
-  preparation checkpoints model and thinking).
+  Busy Conversations), public task/`scanTasks` records, and
+  `packages/durable/src/harness/{generation,compaction,tool}.ts` (checkpointed
+  model dispatch and tool resolution).
 - Pinned Pi AI 1.4.0: `packages/ai/src/models.ts`
   (`getSupportedThinkingLevels`), provider `ApiKeyAuth.resolve`, and installed
   `docs/models.md`, `docs/models-configuration.md`, and `docs/providers.md`.
