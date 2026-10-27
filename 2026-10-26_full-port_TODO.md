@@ -1336,3 +1336,22 @@ report can justify public disclosure; no new privacy framework/importer requeste
 Await corrected commit and re-review. Parent preserved actual D1 crash probe tool
 results at `/tmp/pi-nanobot-parent-model-crash-results.md`; no new acceptance
 claim or extra execution/sandbox work.
+
+### 2026-10-27 — full CLI review and read-only scope recovery
+
+Reviewer `pi-7dcd4062` explicitly reported BLOCKED for immutable `66d5fcb10` in
+`/tmp/pi-terminal-cli-review.md`, confirming parent blockers and adding post-
+readline input-buffer limits, CR/C1/bidi terminal controls, closed-Writable drain
+hangs, surrogate truncation and raw process-level error-message risks. Parent sent
+all remaining findings together to sole D2 editor; require committed correction
+and inspectable private checks, not acceptance of concurrent working-tree changes.
+
+A reviewer activity notice showed a blocked question. One recovery inspection
+found an unnecessary dirty-checkout questionnaire about fixing the render race,
+with no Bash permission request. Parent issued native scope correction: reviewer
+is read-only, no edits/commits/approval of another worker's dirty changes, wait for
+committed follow-up; abandon its own questionnaire only through supported native
+cancellation if possible, otherwise leave it blocked. No approval keys, terminal
+fallback or global permission change; delivery acknowledgement is not resolution.
+The private race reproduction was shared for review, never delegated as a second
+editing task. Existing D2 work remains exclusively owned by `pi-0d64c0d6`.
