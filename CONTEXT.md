@@ -109,10 +109,13 @@ The source-backed mapping is:
 - Python `ContextBuilder` combines the rendered identity template, workspace
   `AGENTS.md`/`SOUL.md`/`USER.md`, memory, always-skill bodies, skill summaries,
   archived summaries, runtime annotations, and a tool contract. This extension
-  accepts already-rendered identity text and explicit bootstrap/memory/skill
-  snapshots only. It does not implement Jinja template variables, Python's
-  `platform_policy.md`, tool-contract template, runtime/user-message metadata, or
-  archived conversation summaries.
+  accepts explicit bootstrap/memory/skill snapshots. `renderNanobotIdentity()`
+  deterministically converts the fixed Nanobot identity template semantics from
+  host-provided runtime, workspace path, optional platform-policy text, and known
+  channel values. It is not a Jinja engine, performs no platform/environment
+  discovery, and leaves other values to the host. This slice still does not
+  implement the tool-contract template, runtime/user-message metadata, or archived
+  conversation summaries.
 - `SkillsLoader` gives workspace skills precedence over built-ins, filters
   configured-disabled and requirement-unavailable entries, supports top-level or
   Nanobot/OpenClaw `always`, strips frontmatter from loaded bodies, and builds a
@@ -146,7 +149,8 @@ For provenance, semantic references are `nanobot/agent/context.py`,
 `nanobot/templates/{AGENTS,SOUL,USER}.md`, and
 `nanobot/templates/memory/MEMORY.md`. The conversion decision is deliberate:
 
-- the host must render identity values and choose trustworthy sources;
+- the host supplies identity values and chooses trustworthy sources; the identity
+  helper applies only fixed Nanobot template semantics and reads no ambient state;
 - this extension only composes supplied strings and never decides whether a file
   or skill is trusted;
 - host-mapped snapshots in a dedicated per-Harness registry replace automatic
