@@ -43,8 +43,9 @@ Real history access and import require separate authorization; use synthetic dat
       index, authentication or real history import is included. `pi-be224dbf`
       candidate `7b4b59c05` remains unmerged and preserved.
 - [ ] Wire persisted search and browsing into a usable host interface, and solve
-      ledger/source scalability before real import. `pi-d41226d1` is reviewing a
-      safe local browse design; synthetic/source review only.
+      ledger/source scalability before real import. `pi-d41226d1` reviewed a
+      local browse design; `pi-7384fed4` is implementing a bounded synthetic-only
+      host prototype against an already-owned Session, no new SQLite opener.
 - [x] `pi-63980860`: merged `9040373e2`, bounded explicit-root discovery and
       acquisition with Linux no-follow safeguards. Synthetic filesystem race
       checks and independent reviews passed; no real history accessed. It refuses
