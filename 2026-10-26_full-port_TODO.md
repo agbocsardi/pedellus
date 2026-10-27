@@ -22,7 +22,50 @@ continues to constrain the currently integrated tool-less slice.
 Each unchecked milestone needs its exit evidence, not merely compilable code.
 P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
-## Active implementation batch — 2026-10-27
+## Active implementation batch D — 2026-10-27
+
+Owner requested continuation after C1–C3 acceptance. Continue with
+`openai-codex / gpt-6-luna / xhigh`; containerization/sandbox/execution work
+remains explicitly excluded and coding tools disabled. Independent managed
+worktrees start from committed `32e8b4def1ed5bca8b0a417f55dda9563cce7f0c`.
+Parent `w1P:p1` owns coordination, root docs, public exports, integration and
+acceptance; prior resources stay retained, not automatically cleaned up.
+
+- [ ] D1 — P3 allowed-model policy and native persisted per-conversation selection:
+      preserve allowed choices on reacquisition/reopen, revoke removed choices
+      before resume, keep tool-less host policy; no parallel model-state store.
+- [ ] D2 — P3 streaming local CLI and bounded native conversation controls:
+      text-only committed output, busy-input/control handling, actual history/status,
+      cancellation/EOF cleanup; Telegram behavior remains unchanged.
+- [ ] D3 — P8 read-only legacy migration dry-run inventory: bounded host-supplied
+      bytes, hashes/provenance/counts/usage reconciliation and explicit unsupported/
+      active/unknown records; no destination import or live data access.
+- [ ] Parent independent review, bounded fresh-build verification and integration;
+      broad P3/P8 milestones remain unchecked until their exit evidence exists.
+
+| Child / branch | Pane / workspace | Worktree | Exclusive ownership |
+|---|---|---|---|
+| `pi-86637320` | `w23:p1` / `w23` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-86637320` | src/config.ts, src/providers.ts, src/runtime.ts, config.example.json, PROVIDERS.md, new MODELS.md |
+| `pi-0d64c0d6` | `w24:p1` / `w24` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-0d64c0d6` | src/cli.ts, new src/terminal/**, CLI.md |
+| `pi-4b9c165f` | `w25:p1` / `w25` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-4b9c165f` | new src/migration/**, MIGRATION.md |
+
+Ownership paths are relative to packages/pi-nanobot. No manifest/lock changes or
+new dependencies assigned; request review if concretely needed. Python and pinned
+`/tmp/pi-durable-reference-1.4.0` remain read-only references. No live/paid/network
+requests, real credentials/history/config, host/deployment changes, push or cleanup.
+No committed test suite/scaffolding; use bounded private synthetic/native Harness
+and SQLite probes, existing typecheck/build. Explicit herdr_report completion is
+required; startup/idle/acknowledgement is not acceptance.
+
+D1 proposes existing-session listModels/selectModel with explicit Context and
+native transaction-scoped busy check/configuration. Model/thinking preservation
+must not race security-policy reapplication. D2 initially supports /model status
+only; parent may integrate selection after D1 review. Unsupported legacy commands
+must remain explicit, especially /new archive semantics and /stop's parked-work
+behavior; do not silently alias to native abort/reset. D3 is a dry-run inventory,
+not a migration transaction or permission to auto-resume legacy work.
+
+## Completed implementation batch C — 2026-10-27
 
 Owner requested continued roadmap work using **Codex Luna xhigh**, explicitly
 excluding containerization/sandbox work. That step is deferred for this batch:
@@ -1141,3 +1184,22 @@ C1–C3 bounded tasks accepted; P3/P4/P8 remain incomplete. No production/live/p
 request, new dependency, committed test suite, push/deploy or worktree cleanup.
 Containerization/sandbox/execution work remains untouched, candidate withheld,
 gateway still tools:[]/modelTools:[]. Batch complete; no new worker task assigned.
+
+### 2026-10-27 — next non-sandbox batch launched
+
+Owner requested proceeding. Parent verified clean branch at `32e8b4def`, current
+roadmap/runtime/config/providers/CLI and retained completed children. Launched
+D1–D3 independently through native herdr_spawn using the same explicit committed
+base and Luna/xhigh. One initial metadata inspection recorded the identities above;
+no polling, terminal fallback or prior-resource cleanup.
+
+D1 sent an early API proposal; parent approved existing-session-only model listing/
+selection with explicit Context, exact provider identity and atomic busy-check/
+configure semantics. Requested native security reapplication preserve allowed
+choices, including root and absent thinking settings, and provider-specific key
+isolation when aliases share an auth-env name. D2 has no dependency on an unfinished
+D1 API: /model status only for now. D3 uses supplied bytes to avoid introducing
+ambient filesystem authority while the execution gate remains open.
+
+Await explicit reports; review/integrate and fresh-build verify before accepting
+any bounded task. No new provider/channel/live credential/production grant.
