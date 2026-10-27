@@ -47,9 +47,12 @@ policy, environment and replay gates pass.
 - [ ] Tool authorization: owner chose **host-supplied config**, default deny, as
       authoritative for allow/disallow and startup revocation. `pi-8a97b7a5`,
       `w2P:p1` / `w2P`, Codex Luna high, base `1e61299e5eda604e8cb9fa3c8d536c07258a4ca3`,
-      is investigating/implementing a bounded config and pre-resume seam. Context
-      worker independently edits runtime in its own worktree; parent reconciles.
-      Actual tools stay disabled until approval, sandbox and replay gates pass.
+      merged `5e4cc5096`: `toolAllowlist` defaults empty; malformed entries are
+      rejected and nonempty lists fail startup while no approved tools exist.
+      This is not yet a functional allowlist: bind reviewed native registrations,
+      verify current policy on pending/replayed calls, and reconcile per-session
+      narrowing before allowing a nonempty configuration. Context worker edits
+      runtime separately; parent reconciles. Sandbox and replay gates remain open.
 - [ ] Review the existing Discord/memory/automation candidates when revisiting
       them; preserve their branches and do not imply they are integrated.
 
