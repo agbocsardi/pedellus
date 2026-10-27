@@ -1638,8 +1638,9 @@ At owner request, stop new work and preserve unmerged candidates for later revie
 - One-shot scheduling `pi-cbf84ad6` / `e27ccea03`: review found queued work
   can run after revocation/expiry and cross-owner/capacity gaps; not safe to
   integrate. Follow-up was in progress.
-- Isolated staging `pi-b54f4507`: synthetic prototype in progress; no real
-  import or publication was authorized.
+- Isolated staging `pi-b54f4507` / `ace00bcbf`: synthetic tmpfs prototype,
+  12 targeted checks passed; unreviewed and not integrated. It does not publish
+  a host database or establish safety for real import.
 
 ### 2026-10-27 — owner-controlled context recovery
 
