@@ -1292,3 +1292,47 @@ invocation precondition for store-local cursor/key collision maps. No full confi
 loader, arbitrary normalization, destination importer or namespace fiction.
 Shared the exact reproduction with worker/reviewer; await corrected commit and
 fresh-build evidence. Broader P8 surfaces and migration transaction stay open.
+
+### 2026-10-27 — model guard candidate and parent crash/reopen verification
+
+D1 explicitly completed final chain `7a943bcb7` / `3295a7c1f` / `36ff7b95f`.
+Parent reviewed guard/canonicalization diff and full updated selection fixture.
+Private selectable-import adaptation `/tmp/pi-nanobot-parent-model-selection.mjs`
+(75s/512 MB) passes actual SQLite selection/reopen, forced stale-acquisition and
+thinking barriers, root preservation/revocation, canonical symlink cwd, busy
+rejection and provider-key isolation against candidate build.
+
+Worker supplied four inspectable private generation/compaction SIGKILL fixtures
+and bounds after explicit parent/reviewer requests. Parent read all four and
+created selectable-import copies under `/tmp/pi-nanobot-parent-model-{sigkill,
+compaction-sigkill}-{reopen,worker}.mjs`, leaving worker fixtures unchanged.
+Added repeated rejected startup to check retained denied task and owner/connection
+cleanup. Both controller probes pass (40s timeout + 5s kill grace, 512-MB per-Node
+old-space ceiling inherited by children; actual ~15.5s each). Real child SIGKILL
+leaves prepared same-provider alpha; beta-only reopen twice rejects before replay,
+with the sentinel retaining only one original fake dispatch. No original remote
+outcome/spend or host-power durability claim; deferred-poll is source-reviewed,
+not separately exercised by these crash fixtures.
+
+Independent reviewer has final source and exact fixture paths. Candidate remains
+unintegrated pending explicit final verdict and later fresh parent-build reruns.
+CLI/migration corrections continue; sandbox/execution still untouched.
+
+### 2026-10-27 — full migration source-review blockers returned
+
+Independent reviewer `pi-1db6d944` updated
+`/tmp/pi-migration-inventory-review.md`, still blocked. Beyond parent-confirmed
+alias/session-shape issues, invalid legacy history payloads could contribute known
+usage despite Python rejecting them; config and some issue hashes mislabeled whole
+source digests as raw line hashes; malformed role/call combinations were not
+uniformly labeled history-only. Raw session keys can identify accounts, so reports
+need explicit private-source-level handling rather than an implied PII scrub.
+
+Parent sent all findings together to sole D3 editor: source-faithful history usage
+eligibility, document-vs-line provenance (audit issue fields too), alias/nested-shape
+validation, universal historical-call non-execution classification, one-store
+precondition and private-report contract. No heuristic secret scrub or inventory
+report can justify public disclosure; no new privacy framework/importer requested.
+Await corrected commit and re-review. Parent preserved actual D1 crash probe tool
+results at `/tmp/pi-nanobot-parent-model-crash-results.md`; no new acceptance
+claim or extra execution/sandbox work.
