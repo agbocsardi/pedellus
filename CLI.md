@@ -15,6 +15,22 @@ committed partial. Reasoning blocks, system entries, tool calls/arguments, and
 tool output are not printed. ESC/C1 terminal controls, carriage returns, and bidi
 formatting controls are removed; ordinary newlines and Unicode scalar values are preserved.
 
+## Recovery
+
+Startup fails closed when a prepared model dispatch still pins historical Nanobot
+context. The same executable exposes an owner-only recovery path that never opens
+the gateway, resumes scheduling, or requires credentials:
+
+```sh
+node dist/cli.js recovery --config /path/to/config.json
+node dist/cli.js recovery --config /path/to/config.json --cancel <taskId> --fingerprint <sha256>
+```
+
+Inspection prints JSON with task ID, kind, phase, pinned entry, and fingerprint.
+Cancellation requires the exact fingerprint, durably marks only that native task
+for abort, and preserves the transcript. Reopen the gateway to run the abort
+protocol. See [prepared context recovery](./CONTEXT_RECOVERY.md).
+
 ## Local controls
 
 | Command | Behavior |

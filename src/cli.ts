@@ -3,16 +3,42 @@ import { stdin, stderr, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { loadConfig } from "./config.js";
+import { cancelPreparedContextBlock, listPreparedContextBlocks, PreparedContextRecoveryError } from "./recovery/index.js";
 import { runTerminalConversation } from "./terminal/index.js";
 import { openGateway } from "./runtime.js";
+
+const RECOVERY_USAGE =
+  "Usage: nanobot recovery --config <path> [--cancel <taskId> --fingerprint <sha256>]";
+
+type RecoveryInvocation =
+  | { readonly kind: "list"; readonly configPath: string }
+  | { readonly kind: "cancel"; readonly configPath: string; readonly taskId: number; readonly fingerprint: string };
 
 function configPath(args: string[]): string {
   if (args.length !== 2 || args[0] !== "--config" || !args[1]) throw new Error("Usage: nanobot --config <path>");
   return args[1];
 }
 
+function recoveryInvocation(args: string[]): RecoveryInvocation | undefined {
+  if (args[0] !== "recovery") return undefined;
+  const rest = args.slice(1);
+  if (rest.length === 2 && rest[0] === "--config" && rest[1]) {
+    return { kind: "list", configPath: rest[1] };
+  }
+  if (rest.length === 6 && rest[0] === "--config" && rest[1] &&
+      rest[2] === "--cancel" && rest[3] && rest[4] === "--fingerprint" && rest[5]) {
+    const taskId = Number(rest[3]);
+    if (!/^[1-9][0-9]*$/.test(rest[3]) || !Number.isSafeInteger(taskId) || !/^[0-9a-f]{64}$/.test(rest[5])) {
+      throw new PreparedContextRecoveryError(RECOVERY_USAGE);
+    }
+    return { kind: "cancel", configPath: rest[1], taskId, fingerprint: rest[5] };
+  }
+  throw new PreparedContextRecoveryError(RECOVERY_USAGE);
+}
+
 export async function main(args = process.argv.slice(2)): Promise<void> {
-  const config = await loadConfig(configPath(args));
+  const recovery = recoveryInvocation(args);
+  const config = await loadConfig(recovery ? recovery.configPath : configPath(args));
   const stop = new AbortController();
   const context = withAbortSignal(stop.signal, BACKGROUND_CONTEXT);
   let input: ReturnType<typeof createInterface> | undefined;
@@ -24,6 +50,19 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   process.once("SIGTERM", shutdown);
   let gateway: Awaited<ReturnType<typeof openGateway>> | undefined;
   try {
+    if (recovery?.kind === "list") {
+      const blocked = await listPreparedContextBlocks(config, context);
+      stdout.write(`${JSON.stringify({ blocked })}\n`);
+      return;
+    }
+    if (recovery?.kind === "cancel") {
+      const result = await cancelPreparedContextBlock(config, {
+        taskId: recovery.taskId,
+        fingerprint: recovery.fingerprint,
+      }, context);
+      stdout.write(`${JSON.stringify(result)}\n`);
+      return;
+    }
     gateway = await openGateway(config, context);
     if (config.telegram) {
       const token = process.env[config.telegram.tokenEnv];
@@ -60,9 +99,13 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch(() => {
-    // Dependency/config errors may embed credentials or paths; never print arbitrary messages here.
-    console.error("nanobot: command failed; diagnostic details suppressed");
+  main().catch((error) => {
+    if (error instanceof PreparedContextRecoveryError) {
+      console.error(`nanobot recovery: ${error.message}`);
+    } else {
+      // Dependency/config errors may embed credentials or paths; never print arbitrary messages here.
+      console.error("nanobot: command failed; diagnostic details suppressed");
+    }
     process.exitCode = 1;
   });
 }

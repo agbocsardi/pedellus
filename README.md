@@ -44,8 +44,9 @@ provider and reconstructs snapshots before resume; it does not load files itself
 An opt-in [workspace loader](./WORKSPACE_CONTEXT.md) supplies fixed bootstrap files
 and explicitly selected memory files to such a provider; it does not discover skills
 or provide full Python memory parity. Prepared requests containing old Nanobot context
-conservatively block recovery,
-and the Gateway has no blocked-task reconciliation interface yet. See the
+conservatively block recovery. An owner can inspect blocked task IDs/fingerprints and
+explicitly cancel them without resuming or rewriting the prepared request; see
+[prepared context recovery](./CONTEXT_RECOVERY.md) and the
 [context contract](./CONTEXT.md).
 
 ## Read-only usage SDK
