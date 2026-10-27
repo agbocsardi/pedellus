@@ -92,9 +92,11 @@ Before applying policy, startup scans active native Durable task checkpoints. If
 a prepared generation `request`/`poll` or compaction `summarize`/`retry` refers
 to a model removed from the allowlist, startup fails closed before
 `Harness.resume()`. Model identity is checked as the native provider/model pair,
-so another model from the same provider does not authorize replay. No checkpoint,
-transcript, or task is rewritten or canceled. Restore the prior allowlist and let
-the task finish before revoking that model. Generation `prepare`/`retry` and
+so another model from the same provider does not authorize replay. The guard does
+not rewrite checkpoints or transcripts or cancel tasks. Before the guard,
+`Harness.open()` may perform its normal recovery of interrupted running tasks to
+pending and increment restart counts. Restore the prior allowlist and let the task
+finish before revoking that model. Generation `prepare`/`retry` and
 compaction `select` checkpoints have not selected a request model; they resume
 using the normalized current `pi.agent` choice.
 

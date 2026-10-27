@@ -1374,3 +1374,21 @@ A render serializer alone does not terminalize final state or reject older queue
 watch frames; shared the exact committed repro with the sole editor. Require
 late-frame rejection/finalization plus remaining ingress/sanitization/closed-sink/
 error-secrecy fixes. Neither D2 nor D3 is integrated.
+
+### 2026-10-27 — user-directed consolidation
+
+User requested direct integration and cleanup. Merged model `36ff7b95f`, CLI
+`3956e7717`, and migration `e00651d33` without conflicts. Model independent
+review passed; clarified Durable's normal startup task reconciliation in
+`MODELS.md`. Parent-built package typecheck/build, slow-sink exact output,
+migration alias/message-shape probe and generation/compaction SIGKILL reopen
+probes passed. The final CLI and migration commits did not receive independent
+final review; earlier EOF/order/flood and migration safety probes were inline or
+not retained. No broad milestone, production-readiness or full parity claim.
+CLI's completed-line limit does not bound readline's ingress memory. Gateway
+tools remain disabled; sandbox/execution work was not integrated.
+
+Removed nine clean owned Herdr child worktrees and closed two owned review tabs
+without force. Prior sandbox candidate remains preserved on branch
+`pi-ccd4ba61`, not merged. Other older closed worktrees lack established ownership
+in this session and were left intact pending identification; no branch deleted.
