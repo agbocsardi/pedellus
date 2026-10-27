@@ -1630,7 +1630,9 @@ At owner request, stop new work and preserve unmerged candidates for later revie
 - Discord foundation `pi-acb8f4a0` / `33e35634b`: follow-up independent review
   was underway; production channel integration and P6 remain open.
 - Archival search renderer `pi-7384fed4` / `d3a4b2ba7`: narrowed prototype;
-  independent review was underway.
+  review found unregistered tests, incomplete input validation, unsanitized enum
+  fields and an unallowlisted limits spread. Fix before integration; synthetic
+  review probes are `/tmp/probe1.mjs`, `/tmp/probe2.mjs`, `/tmp/probe3.mjs`.
 - Create-only publication `pi-ba6fe170` / `103198572`: same-user stage-name
   swaps remain a documented race; not a real-import safety boundary.
 - One-shot scheduling `pi-cbf84ad6` / `e27ccea03`: review found queued work
