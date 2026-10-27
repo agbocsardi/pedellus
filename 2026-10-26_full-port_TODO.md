@@ -1022,3 +1022,22 @@ scope gating, missing-conversation isolation and duplicate/overflow rejection pa
 against candidate. No module revision, ambient reads or gateway activation.
 Independent C2/C3 conclusions remain pending; rerun all accepted probes on the
 parent package after integration rather than claim candidate-only evidence.
+
+### 2026-10-27 — independent usage review blockers
+
+Reviewer `pi-7dcd4062` explicitly reported BLOCKED in
+`/tmp/pi-usage-projection-review.md`. Namespace separation passes, but token rows
+accept fractional/unsafe numbers, and the candidate overstates nested deduplication.
+Pinned Durable counts nested usage again if a caller forwards that usage in its
+own result; aggregated UsageDoc has no provenance to recover/deduplicate it.
+Earlier passing well-behaved-caller probes do not establish prevention of that
+source-level duplication. This adapter must preserve native facts, not claim to
+repair them.
+
+Parent returned bounded fixes to C3: safe-integer token validation including
+legacy aggregate overflow (decimal costs remain valid), exact nested-source
+limitation with good/bad-caller Harness evidence, and explicit trusted host-owned
+cursor boundary. Namespace/shape validation is not cursor authenticity or rollback
+protection; a legitimate-looking older/lowered same-scope cursor can re-emit usage.
+No signing scheme, new ledger or archive writer requested. Usage remains unmerged
+pending corrected candidate and explicit independent re-review.
