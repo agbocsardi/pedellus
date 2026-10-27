@@ -80,5 +80,14 @@ export {
   type UsageSourceScope,
   type UsageUnknownField,
 } from "./usage/index.js";
+export {
+  cancelPreparedContextBlock,
+  listPreparedContextBlocks,
+  PreparedContextRecoveryError,
+  type ContextRecoveryOptions,
+  type PreparedContextBlock,
+  type PreparedContextBlockTarget,
+  type PreparedContextCancelResult,
+} from "./recovery/index.js";
 export { openGateway, type Gateway, type GatewayContextSnapshotProvider, type OpenGatewayOptions } from "./runtime.js";
 export { main } from "./cli.js";

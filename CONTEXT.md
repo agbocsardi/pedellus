@@ -69,9 +69,14 @@ or `pi.compaction` summarize/retry) whose pinned cutoff still contains a nonempt
 Nanobot section. Those phases resend/fetch/summarize the old checkpointed view, not a
 newly rendered prompt; even an apparently unchanged provider snapshot is not treated
 as proof of equivalence. This conservative guard blocks gateway recovery even if the
-host expects the snapshot to be unchanged. The Gateway currently provides no recovery
-interface to settle or cancel such a task while startup is blocked; operator
-reconciliation is still an open design issue. Stores
+host expects the snapshot to be unchanged. Owner recovery is explicit: list the
+blocked tasks, then cancel selected task IDs with their state fingerprint. Cancellation
+uses native `abortTask`, writes no checkpoint or transcript change, and is completed
+by the next gateway open's abort protocol. Abort-marked tasks are skipped by the
+context guard, but an abort-marked generation poll still passes the model guard
+because its abort can call `cancelDeferred`; a revoked poll model remains fail-closed
+without a remote cancel. See [prepared context recovery](./CONTEXT_RECOVERY.md).
+Stores
 with more than 256 mapped sessions fail closed when context is enabled rather than
 silently leaving some sessions without their opted-in snapshot. A missing snapshot
 intentionally renders no context for that conversation; native Durable section replay

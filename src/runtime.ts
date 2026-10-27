@@ -1,13 +1,13 @@
-import { chmod, lstat, mkdir, realpath, stat } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
 import { processLock } from "@earendil-works/chord/node";
 import type { Context } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type Extension, type Harness as HarnessType, type ModelRef, type Storage } from "@earendil-works/pi-durable";
-import { CONTEXT_LIMITS, CONTEXT_SECTION_KEYS, createContextExtensionBuilder, type ConversationContextSnapshot } from "./context/index.js";
+import { CONTEXT_LIMITS, createContextExtensionBuilder, type ConversationContextSnapshot } from "./context/index.js";
 import type { ModelReference, PortConfig } from "./config.js";
+import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
+import { prepareDataDirectory } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
 
@@ -61,29 +61,6 @@ export interface Gateway {
   close(context: Context): Promise<void>;
 }
 
-function inside(path: string, root: string): boolean {
-  const rel = relative(root, path);
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
-}
-
-async function canonicalFuturePath(path: string): Promise<string> {
-  const target = resolve(path);
-  let existing = target;
-  const tail: string[] = [];
-  while (true) {
-    try {
-      const canonical = await realpath(existing);
-      return resolve(canonical, ...tail.reverse());
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      const parent = resolve(existing, "..");
-      if (parent === existing) throw error;
-      tail.push(relative(parent, existing));
-      existing = parent;
-    }
-  }
-}
-
 function encodedSessionKey(key: string): string {
   if (!key) throw new Error("sessionKey must not be empty");
   return `k:${Buffer.from(key, "utf8").toString("base64url")}`;
@@ -117,79 +94,6 @@ function modelKey(model: ModelReference | ModelRef): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-/** Models selected into checkpoints by Durable's native provider-dispatch tasks. */
-function preparedTaskModel(task: unknown): ModelReference | undefined {
-  if (!isRecord(task) || typeof task.kind !== "string") return undefined;
-  const { kind, id } = task;
-  if (kind !== "pi.generation" && kind !== "pi.compaction") return undefined;
-  if (!isRecord(task.state)) throw new Error(`Cannot safely validate live ${kind} task ${String(id)} state`);
-  const { status, checkpoint } = task.state;
-  if (status === "terminal" || status === "completing") return undefined;
-  if (!["pending", "running", "waiting", "sleeping"].includes(String(status))) {
-    throw new Error(`Cannot safely validate live ${kind} task ${String(id)} status ${String(status)}`);
-  }
-  if (!isRecord(checkpoint) || typeof checkpoint.phase !== "string") {
-    throw new Error(`Cannot safely validate live ${kind} task ${String(id)} checkpoint`);
-  }
-  const phase = checkpoint.phase;
-  const hasPreparedRequest = kind === "pi.generation"
-    ? phase === "request" || phase === "poll"
-    : phase === "summarize" || phase === "retry";
-  const hasNoPreparedRequest = kind === "pi.generation"
-    ? phase === "prepare" || phase === "retry" || phase === "tools"
-    : phase === "select";
-  if (hasNoPreparedRequest) return undefined;
-  if (!hasPreparedRequest || !isRecord(checkpoint.model) ||
-      typeof checkpoint.model.provider !== "string" || typeof checkpoint.model.modelId !== "string") {
-    throw new Error(`Cannot safely validate live ${kind} task ${String(id)} checkpoint phase ${phase}`);
-  }
-  return { provider: checkpoint.model.provider, modelId: checkpoint.model.modelId };
-}
-
-function preparedContextReplay(task: unknown): {
-  readonly id: string | number;
-  readonly kind: "pi.generation" | "pi.compaction";
-  readonly conversationId: ConversationId;
-  readonly at: number;
-  readonly phase: string;
-} | undefined {
-  if (!isRecord(task) || (task.kind !== "pi.generation" && task.kind !== "pi.compaction")) return undefined;
-  const { id, conversationId, state } = task;
-  if (!isRecord(state) || state.status === "terminal" || state.status === "completing") return undefined;
-  if (!isRecord(state.checkpoint) || typeof state.checkpoint.phase !== "string") {
-    throw new Error(`Cannot safely inspect prepared ${task.kind} task ${String(id)} checkpoint`);
-  }
-  const { phase } = state.checkpoint;
-  // Generation request/poll pin `cutoff`; compaction summarize/retry pin `tail`.
-  const field = task.kind === "pi.generation"
-    ? phase === "request" || phase === "poll" ? "cutoff" : undefined
-    : phase === "summarize" || phase === "retry" ? "tail" : undefined;
-  if (field === undefined) return undefined;
-  const at = state.checkpoint[field];
-  if ((typeof id !== "string" && typeof id !== "number") || typeof conversationId !== "number" ||
-      !Number.isSafeInteger(conversationId) || conversationId < 1 || typeof at !== "number" ||
-      !Number.isSafeInteger(at) || at < 1) {
-    throw new Error(`Cannot safely inspect prepared ${task.kind} task ${String(id)} checkpoint`);
-  }
-  return { id, kind: task.kind, conversationId: conversationId as ConversationId, at, phase };
-}
-
-const NANOBOT_CONTEXT_SECTION_KEYS = new Set<string>(Object.values(CONTEXT_SECTION_KEYS));
-
-function hasPersistedNanobotContext(messages: readonly unknown[]): boolean {
-  const effective = new Map<string, string>();
-  for (const message of messages) {
-    if (!isRecord(message) || message.role !== "system" || !isRecord(message.sections)) continue;
-    for (const [key, value] of Object.entries(message.sections)) {
-      if (!NANOBOT_CONTEXT_SECTION_KEYS.has(key)) continue;
-      if (value === null) effective.delete(key);
-      else if (typeof value === "string") effective.set(key, value);
-      else throw new Error(`Cannot safely inspect persisted context section ${key}`);
-    }
-  }
-  return [...effective.values()].some((value) => value.length > 0);
 }
 
 function isModelSelection(value: unknown): value is GatewayModelSelectionRequest {
@@ -226,8 +130,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     throw new TypeError("contextSnapshotProvider must be a function");
   }
   const defaultThinkingLevel = config.thinkingLevel ?? "off";
-  const workspace = await realpath(config.workspace);
-  if (!(await stat(workspace)).isDirectory()) throw new Error("workspace must be a directory");
+  const { workspace, dbPath } = await prepareDataDirectory(config);
   const hostPolicy: AgentChange = { cwd: workspace, tools: [], modelTools: [] };
   const defaultAgentPolicy: AgentChange = {
     ...hostPolicy,
@@ -272,29 +175,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const state = await tx.doc(AgentDoc, conversation.id);
       await configure(tx, conversation.id, { ...policyForState(state), ...contextAgentPolicy(conversation.id) });
     }, ctx);
-  }
-  const extraRoots = await Promise.all((config.extraAllowedDirs ?? []).map(async (p) => {
-    const root = await realpath(p);
-    if (!(await stat(root)).isDirectory()) throw new Error(`extraAllowedDirs entry is not a directory: ${p}`);
-    return root;
-  }));
-  const roots = [workspace, ...extraRoots];
-  const dataDir = await canonicalFuturePath(config.dataDir);
-  if (roots.some((root) => inside(dataDir, root) || inside(root, dataDir))) {
-    throw new Error("dataDir must be disjoint from workspace and extraAllowedDirs");
-  }
-  await mkdir(dataDir, { recursive: true, mode: 0o700 });
-  const canonicalDataDir = await realpath(dataDir);
-  if (roots.some((root) => inside(canonicalDataDir, root) || inside(root, canonicalDataDir))) {
-    throw new Error("dataDir resolves inside or above workspace/extraAllowedDirs");
-  }
-  await chmod(canonicalDataDir, 0o700);
-  const dbPath = resolve(canonicalDataDir, "nanobot.sqlite");
-  try {
-    const stat = await lstat(dbPath);
-    if (!stat.isFile()) throw new Error("SQLite database path must be a regular file, not a symlink or special file");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const releaseLock = await processLock(`nanobot:${dbPath}`);
   let harness: HarnessType | undefined;
@@ -390,7 +270,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       if (hasPersistedNanobotContext(view.messages)) {
         throw new Error(
           `Cannot safely resume ${replay.kind} task ${replay.id} (${replay.phase}): its prepared request includes ` +
-          "persisted Nanobot context; settle or cancel it before gateway recovery",
+          "persisted Nanobot context; cancel that prepared dispatch with the context recovery interface before gateway recovery",
         );
       }
     }

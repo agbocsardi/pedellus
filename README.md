@@ -46,8 +46,10 @@ and explicitly selected memory files to such a provider; it does not discover sk
 or provide full Python memory parity. The local CLI/gateway host opts in only when the
 config contains a `workspaceContext` section (`workspaceContext.memoryFiles`, default
 off); it contributes no identity. Prepared requests containing old Nanobot context
-conservatively block recovery,
-and the Gateway has no blocked-task reconciliation interface yet. See the
+conservatively block recovery. With the gateway stopped and an existing database, an
+owner can inspect blocked task IDs/fingerprints and explicitly cancel them without
+resuming or rewriting the prepared request; see
+[prepared context recovery](./CONTEXT_RECOVERY.md) and the
 [context contract](./CONTEXT.md).
 
 ## Read-only usage SDK

@@ -1622,6 +1622,16 @@ not merely use fake credentials. A separate synthetic-tool reviewer invoked a
 local `/bin/sh` probe despite the no-real-tools assignment; the command made no
 network call. Future tool reviews must not execute host shell tools.
 
+### 2026-10-27 — owner-controlled context recovery
+
+Integrated independently reviewed prepared-context inspection and explicit
+cancellation. Recovery requires the gateway stopped and an existing store; it
+runs Durable reconciliation and does not resume model requests. Revoked deferred
+poll models still block reopen until authorized, because abort may send a remote
+cancellation. Original input can remain unanswered; cancellation does not prove
+remote outcome. The synthetic poll fixture is not a real deferred-poll crash.
+Combined typecheck and 155 behavior checks passed after integration.
+
 ### 2026-10-27 — archival core and consolidation
 
 Merged bounded explicit-root snapshot acquisition, lossless preparation, inert
