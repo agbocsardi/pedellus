@@ -1270,3 +1270,25 @@ duplicated prefix/newlines (`exactOnce:false`), built module SHA256
 Shared the repro with worker and reviewer. Serialize render/reconcile transitions,
 not only output writes; rerun final candidate and parent build with exact assertion.
 No live calls, committed test suite or sandbox changes; await explicit fixes/review.
+
+### 2026-10-27 — migration inventory candidate; schema corrections requested
+
+D3 explicitly completed clean `pi-4b9c165f` as `1cd69b350`, new migration module
+and MIGRATION.md only. Parent read the whole source/docs and Python session/config/
+archive consumers. Assigned independent read-only reviewer `pi-1db6d944`/`w21:p1`,
+report `/tmp/pi-migration-inventory-review.md`; no new editing ownership.
+
+Parent independently wrote `/tmp/pi-nanobot-parent-migration-schema.mjs`
+(30s/384 MB, synthetic bytes only). Actual persisted camelCase modelPreset was
+incorrectly reported as default; camelCase maxTokens/contextWindowTokens/
+reasoningEffort/needsVisionHandoff became null. Python's Base uses to_camel and
+save_config writes by_alias=True. Missing message role and numeric user content
+also returned complete:true with no diagnostic. Candidate remains unintegrated.
+
+Returned bounded fixes: source-backed snake/camel aliases for reported fields,
+explicit ambiguity rather than fabricated defaults, supported role/content shape
+checks with incomplete/manual-review status, and one legacy-store/workspace per
+invocation precondition for store-local cursor/key collision maps. No full config
+loader, arbitrary normalization, destination importer or namespace fiction.
+Shared the exact reproduction with worker/reviewer; await corrected commit and
+fresh-build evidence. Broader P8 surfaces and migration transaction stay open.
