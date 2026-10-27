@@ -9,25 +9,42 @@ conversation, or persist a cursor.
 ```ts
 import { readUsageSnapshot, projectUsageDelta, parseUsageArchiveCursor } from "./usage/index.js";
 
-const snapshot = await readUsageSnapshot(harness, conversation.id, context);
+// Supplied and persisted by the owning host; do not derive this from the Harness or DB path.
+const storeNamespace = hostProvidedStableStoreNamespace;
+const expectedScope = { storeNamespace, conversationId: conversation.id };
+const snapshot = await readUsageSnapshot(harness, storeNamespace, conversation.id, context);
 const cursor = savedJson === undefined
   ? undefined
-  : parseUsageArchiveCursor(savedJson, conversation.id);
+  : parseUsageArchiveCursor(savedJson, expectedScope);
 const projection = projectUsageDelta(snapshot, cursor);
 // projection.legacy is the legacy token shape; projection.native preserves costs,
 // tools and exact native provider/model keys. projection.nextCursor is only a proposal.
 ```
 
-`readUsageSnapshot` calls `harness.snapshot(UsageDoc, conversationId, context)`;
-it never calls `tx.doc()` and therefore never creates an absent usage document.
-Snapshots and projections are detached and deeply frozen. Their string-keyed
-maps have null prototypes, so names such as `__proto__` and `toString` remain
-ordinary own keys. Malformed numeric rows, a mismatched cursor scope, a missing
+`readUsageSnapshot` reads `harness.snapshot(UsageDoc, conversationId, context)`
+and tags the result with the supplied namespace; it never calls `tx.doc()` and
+therefore never creates an absent usage document.
+A fresh Durable Harness conversation has an empty `pi.usage` document from its
+built-in creation commit, so its read is `available` with empty buckets—not an
+unavailable document or fabricated zero usage. A plain Chord Session without
+Durable's conversation creation hook (or legacy/corrupt storage) may have no
+usage document; that remains `unavailable`. Snapshots and projections are
+detached and deeply frozen. Their string-keyed maps have null prototypes, so
+names such as `__proto__` and `toString` remain ordinary own keys. Malformed numeric rows, a mismatched cursor scope, a missing
 current document, or a regressing cumulative counter fail closed.
 
 ## Source and attribution
 
-The native `pi.usage` document is authoritative for this adapter:
+The native `pi.usage` document is authoritative for this adapter. Durable
+conversation IDs are storage-local and can collide across independent stores, so
+every snapshot/read and cursor parse requires an opaque host-supplied
+`storeNamespace`. It is a non-secret, non-blank string of at most 512 characters,
+included in serialized `source` and compared alongside the conversation ID. The
+host must persist it across reopen and guarantee it is unique for each
+independently initialized store; reusing one namespace across stores defeats
+this separation. The adapter does not infer it from a Harness or file path,
+generate an ID, or keep a side ledger. Namespaces are compared
+exactly (case-sensitive; not normalized).
 
 - `models` is keyed by Durable's exact `provider/modelId` key. It includes
   committed assistant usage and compaction-summary attempts. Failed responses
@@ -77,18 +94,22 @@ recorded zero values.
 
 ## Cursor and future archive transaction
 
-A cursor is versioned and bound to one Durable conversation ID. It contains the
-complete cumulative native snapshot last associated with a successful archive.
-`projectUsageDelta(snapshot, cursor)` is deterministic: repeating it with the
-same snapshot/cursor returns the same delta, while using its `nextCursor` again
-returns no measured delta. It rejects another conversation's cursor and detected
-counter regressions. Keep the returned `nextCursor` only after the corresponding
-archive is durably committed; do not advance it merely because projection
-succeeded.
+A cursor is versioned and bound to the pair of host `storeNamespace` and Durable
+conversation ID. It contains the complete cumulative native snapshot last
+associated with a successful archive. `parseUsageArchiveCursor` requires the
+expected pair, and `projectUsageDelta` checks both components against the current
+snapshot. Thus equal numeric IDs in independently namespaced stores do not share
+cursors. Projection is deterministic: repeating it with the same snapshot/cursor
+returns the same delta, while using its `nextCursor` again returns no measured
+delta. It rejects another source scope and detected counter regressions. Keep
+the returned `nextCursor` only after the corresponding archive is durably
+committed; do not advance it merely because projection succeeded.
 
 This package does **not** make a history-file append and cursor update atomic.
-A future archive owner must couple archive data and cursor in one durable
-transaction, or use a durable outbox/idempotency protocol with explicit recovery
+The host namespace is only an identity contract; it does not prove storage
+ownership, prevent the host from reusing a namespace, or make a cursor
+transaction durable. A future archive owner must couple archive data and cursor
+in one durable transaction, or use a durable outbox/idempotency protocol with explicit recovery
 for “append succeeded, cursor did not” and “cursor advanced, append failed.” A
 plain JSONL append followed by a separate cursor write can duplicate or lose
 usage on a crash. Do not claim exactly-once external archive effects from this

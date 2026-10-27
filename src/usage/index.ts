@@ -7,9 +7,14 @@ import {
   type UsageState,
 } from "@earendil-works/pi-durable";
 
-export type UsageSourceScope = Readonly<{
-  kind: "pi-durable-conversation";
+export type UsageSourceIdentity = Readonly<{
+  /** Stable, host-owned namespace unique to this independently initialized store. */
+  storeNamespace: string;
   conversationId: ConversationId;
+}>;
+
+export type UsageSourceScope = Readonly<UsageSourceIdentity & {
+  kind: "pi-durable-conversation";
 }>;
 
 export type UsageSnapshot = Readonly<{
@@ -155,20 +160,29 @@ function conversationId(value: unknown): ConversationId {
   return value as ConversationId;
 }
 
-function makeSource(id: unknown): UsageSourceScope {
-  return Object.freeze({ kind: "pi-durable-conversation", conversationId: conversationId(id) });
+function makeSource(namespace: unknown, id: unknown): UsageSourceScope {
+  if (typeof namespace !== "string" || namespace.trim().length === 0 || namespace.length > 512) {
+    throw new TypeError("Invalid host-supplied usage store namespace");
+  }
+  return Object.freeze({
+    kind: "pi-durable-conversation",
+    storeNamespace: namespace,
+    conversationId: conversationId(id),
+  });
 }
 
 function sameSource(left: UsageSourceScope, right: UsageSourceScope): boolean {
-  return left.kind === right.kind && left.conversationId === right.conversationId;
+  return left.kind === right.kind && left.storeNamespace === right.storeNamespace &&
+    left.conversationId === right.conversationId;
 }
 
 /** Copy and freeze one native document value; absent documents stay explicitly unavailable. */
 export function snapshotUsageState(
+  storeNamespace: string,
   id: ConversationId,
   state: Readonly<UsageState> | undefined,
 ): UsageSnapshot {
-  const source = makeSource(id);
+  const source = makeSource(storeNamespace, id);
   if (state === undefined) {
     return Object.freeze({
       source,
@@ -191,10 +205,11 @@ export function snapshotUsageState(
 /** Read only the native conversation UsageDoc; this helper never creates or mutates a document. */
 export async function readUsageSnapshot(
   reader: Pick<DocumentReader, "snapshot">,
+  storeNamespace: string,
   id: ConversationId,
   context: Context,
 ): Promise<UsageSnapshot> {
-  return snapshotUsageState(id, await reader.snapshot(UsageDoc, id, context));
+  return snapshotUsageState(storeNamespace, id, await reader.snapshot(UsageDoc, id, context));
 }
 
 function normalizeSnapshot(value: unknown): UsageSnapshot {
@@ -203,10 +218,10 @@ function normalizeSnapshot(value: unknown): UsageSnapshot {
   }
   const source = parseSource(value.source);
   if (value.status === "unavailable") {
-    return snapshotUsageState(source.conversationId, undefined);
+    return snapshotUsageState(source.storeNamespace, source.conversationId, undefined);
   }
   if (value.status !== "available") throw new TypeError("Invalid usage snapshot status");
-  return snapshotUsageState(source.conversationId, {
+  return snapshotUsageState(source.storeNamespace, source.conversationId, {
     models: value.models as UsageState["models"],
     tools: value.tools as UsageState["tools"],
   });
@@ -216,7 +231,7 @@ function parseSource(value: unknown): UsageSourceScope {
   if (!isObject(value) || value.kind !== "pi-durable-conversation") {
     throw new TypeError("Invalid usage source scope");
   }
-  return makeSource(value.conversationId);
+  return makeSource(value.storeNamespace, value.conversationId);
 }
 
 function makeCursor(snapshot: UsageSnapshot): UsageArchiveCursor {
@@ -226,12 +241,17 @@ function makeCursor(snapshot: UsageSnapshot): UsageArchiveCursor {
   return Object.freeze({ version: 1, source: snapshot.source, cumulative: snapshot });
 }
 
-/** Validate a JSON-loaded cursor against its expected conversation before using it. */
-export function parseUsageArchiveCursor(value: unknown, expectedId: ConversationId): UsageArchiveCursor {
+/** Validate a JSON-loaded cursor against its expected host namespace and conversation before using it. */
+export function parseUsageArchiveCursor(
+  value: unknown,
+  expectedScope: UsageSourceIdentity,
+): UsageArchiveCursor {
   if (!isObject(value) || value.version !== 1) throw new TypeError("Invalid usage archive cursor version");
-  const expected = makeSource(expectedId);
+  const expected = makeSource(expectedScope.storeNamespace, expectedScope.conversationId);
   const source = parseSource(value.source);
-  if (!sameSource(source, expected)) throw new Error("Usage archive cursor belongs to another conversation");
+  if (!sameSource(source, expected)) {
+    throw new Error("Usage archive cursor belongs to another store/conversation scope");
+  }
   const cumulative = normalizeSnapshot(value.cumulative);
   if (cumulative.status !== "available" || !sameSource(cumulative.source, source)) {
     throw new Error("Usage archive cursor has an invalid cumulative snapshot");
@@ -398,7 +418,7 @@ export function projectUsageDelta(
   }
   const cursor = rawCursor === undefined
     ? undefined
-    : parseUsageArchiveCursor(rawCursor, snapshot.source.conversationId);
+    : parseUsageArchiveCursor(rawCursor, snapshot.source);
   const previous = cursor?.cumulative;
   const unknownFields: UsageUnknownField[] = [];
   const models = subtractBucket(snapshot.models, previous?.models, "models", unknownFields);
