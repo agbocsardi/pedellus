@@ -10,10 +10,13 @@
  *
  * Path safety is Linux-only and fails closed elsewhere: directories are pinned
  * through `/proc/self/fd` with `O_DIRECTORY | O_NOFOLLOW`, files are opened with
- * `O_NOFOLLOW`, hard-link aliases (`nlink != 1`) are rejected, and observable
- * metadata changes during a read are failures. This is not a defence against a
- * privileged/kernel adversary, but it does prevent ordinary symlink and
- * hard-link escapes from the workspace.
+ * `O_NOFOLLOW`, additional hard-link aliases (`nlink != 1`) are rejected, and
+ * observable metadata changes during a read are failures. The root and every
+ * reached directory are rechecked before returning. `nlink == 1` is not proof
+ * of inode origin (link-then-unlink can leave one link), and a change after the
+ * final check remains a TOCTOU window. This is not a defence against a
+ * privileged/kernel adversary or coarse filesystem metadata, but it does
+ * prevent ordinary symlink/hard-link escapes and detectable directory swaps.
  */
 import { constants } from "node:fs";
 import type { BigIntStats } from "node:fs";
@@ -28,6 +31,9 @@ import {
 } from "./index.js";
 import type { GatewayContextSnapshotProvider } from "../runtime.js";
 
+/** Deterministic provenance prefix for workspace files. */
+const WORKSPACE_SOURCE_PREFIX = "workspace:";
+
 /** Bounded loader limits. They are enforced before content reaches the renderer. */
 export const WORKSPACE_CONTEXT_LIMITS = Object.freeze({
   maxBootstrapFiles: 3,
@@ -38,7 +44,8 @@ export const WORKSPACE_CONTEXT_LIMITS = Object.freeze({
   maxTotalChars: CONTEXT_LIMITS.contextChars,
   maxIdentityChars: CONTEXT_LIMITS.sectionChars - 1_600,
   maxSourceChars: CONTEXT_LIMITS.sourceChars,
-  maxPathChars: 256,
+  // The renderer prepends "workspace:" when it renders this provenance label.
+  maxPathChars: CONTEXT_LIMITS.sourceChars - WORKSPACE_SOURCE_PREFIX.length,
   maxPathSegmentChars: 64,
   maxPathSegments: 8,
   maxWorkspaceRootChars: 4_096,
@@ -133,10 +140,12 @@ const PROC_FD = "/proc/self/fd";
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const RESTRICTED_ROOTS = Object.freeze(["/proc", "/sys", "/dev"]);
+const TRUNCATION_MARKER = "\n[context truncated at configured bounds]";
 
 interface LoadState {
   bytes: number;
   chars: number;
+  readonly directories: Map<string, Readonly<{ segments: readonly string[]; stat: BigIntStats }>>;
 }
 
 interface MutableWorkspaceSnapshot {
@@ -149,6 +158,63 @@ interface MutableWorkspaceSnapshot {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+interface OwnDataField {
+  readonly found: boolean;
+  readonly value: unknown;
+}
+
+/**
+ * Capture only own data properties. Inherited and accessor-backed fields are
+ * rejected rather than invoked; this mirrors the context renderer's own-data
+ * reading rule but fails closed instead of silently treating them as absent.
+ */
+function ownDataField(value: unknown, key: string, label: string): OwnDataField {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+    throw new WorkspaceContextInputError(`${label} must be an object`);
+  }
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(value, key);
+  } catch {
+    throw new WorkspaceContextInputError(`${label}.${key} is unreadable`);
+  }
+  if (descriptor === undefined) {
+    let inherited = false;
+    try {
+      inherited = key in value;
+    } catch {
+      inherited = true;
+    }
+    if (inherited) {
+      throw new WorkspaceContextInputError(`${label}.${key} must be an own data property`);
+    }
+    return { found: false, value: undefined };
+  }
+  if (!Object.hasOwn(descriptor, "value")) {
+    throw new WorkspaceContextInputError(`${label}.${key} must be an own data property`);
+  }
+  return { found: true, value: descriptor.value };
+}
+
+/** Read an array length exactly once from its own data descriptor. */
+function ownArrayLength(value: unknown, label: string): number {
+  if (!Array.isArray(value)) {
+    throw new WorkspaceContextInputError(`${label} must be an array`);
+  }
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(value, "length");
+  } catch {
+    throw new WorkspaceContextInputError(`${label} length is unreadable`);
+  }
+  if (descriptor === undefined || !Object.hasOwn(descriptor, "value") ||
+      typeof descriptor.value !== "number" || !Number.isSafeInteger(descriptor.value) ||
+      descriptor.value < 0) {
+    throw new WorkspaceContextInputError(`${label} length must be an own data property`);
+  }
+  return descriptor.value;
 }
 
 function isWithin(parent: string, child: string): boolean {
@@ -187,16 +253,18 @@ function validatedRoot(value: unknown): string {
 
 function validatedMemoryFiles(value: unknown): readonly string[] {
   if (value === undefined) return Object.freeze([]);
-  if (!Array.isArray(value)) {
-    throw new WorkspaceContextInputError("memoryFiles must be an array of workspace-relative paths");
-  }
-  if (value.length > WORKSPACE_CONTEXT_LIMITS.maxMemoryFiles) {
+  const length = ownArrayLength(value, "memoryFiles");
+  if (length > WORKSPACE_CONTEXT_LIMITS.maxMemoryFiles) {
     throw new WorkspaceContextBoundsError("maxMemoryFiles");
   }
   const seen = new Set<string>();
   const paths: string[] = [];
-  for (let index = 0; index < value.length; index++) {
-    const path = validatedMemoryPath(value[index]);
+  for (let index = 0; index < length; index++) {
+    const field = ownDataField(value, String(index), "memoryFiles entry");
+    if (!field.found) {
+      throw new WorkspaceContextInputError("memoryFiles entries must be own data properties");
+    }
+    const path = validatedMemoryPath(field.value);
     if (seen.has(path)) {
       throw new WorkspaceContextInputError("memoryFiles must not contain duplicate paths");
     }
@@ -232,8 +300,13 @@ function validatedIdentity(value: unknown): ContextDocumentSnapshot | undefined 
   if (!isRecord(value)) {
     throw new WorkspaceContextInputError("identity must be a host-supplied document");
   }
-  const source = value.source === undefined ? "host:identity" : value.source;
-  const content = value.content;
+  const sourceField = ownDataField(value, "source", "identity");
+  const contentField = ownDataField(value, "content", "identity");
+  const source = sourceField.found && sourceField.value !== undefined ? sourceField.value : "host:identity";
+  const content = contentField.value;
+  if (!contentField.found) {
+    throw new WorkspaceContextInputError("identity.content must be an own data property");
+  }
   if (typeof source !== "string" || source.length === 0 ||
       source.length > WORKSPACE_CONTEXT_LIMITS.maxSourceChars ||
       CONTROL_CHARACTERS.test(source)) {
@@ -256,6 +329,107 @@ function codePointCount(value: string): number {
   let count = 0;
   for (const _character of value) count++;
   return count;
+}
+
+function codePointPrefix(value: string, limit: number): { prefix: string; truncated: boolean } {
+  let count = 0;
+  let end = 0;
+  for (const character of value) {
+    if (count >= limit) return { prefix: value.slice(0, end), truncated: true };
+    end += character.length;
+    count++;
+  }
+  return { prefix: value, truncated: false };
+}
+
+/** Mirror the renderer's bounded-text rule so budget checks measure exact output. */
+function clipToBudget(value: string, limit: number): string {
+  if (limit <= 0) return "";
+  const { prefix, truncated } = codePointPrefix(value, limit);
+  if (!truncated) return value;
+  const markerCount = codePointCount(TRUNCATION_MARKER);
+  if (limit <= markerCount) return prefix;
+  return `${codePointPrefix(value, limit - markerCount).prefix}${TRUNCATION_MARKER}`;
+}
+
+/** Mirror the renderer's provenance escaping for exact section-size accounting. */
+function safeInlineForBudget(value: string): string {
+  return JSON.stringify(value).replace(/[<>&\u2028\u2029]/g, (character) => {
+    const code = character.codePointAt(0)!.toString(16).padStart(4, "0");
+    return `\\u${code}`;
+  });
+}
+
+/**
+ * Reproduce `renderDocuments()` from context/index.ts closely enough to detect
+ * whether it would truncate. Returns the full section text only when nothing
+ * was clipped.
+ */
+function renderedDocumentsForBudget(
+  documents: readonly (readonly [string, ContextDocumentSnapshot])[],
+  limit: number,
+): { text: string; truncated: boolean } {
+  if (documents.length === 0 || limit <= 0) return { text: "", truncated: false };
+  const chunks: string[] = [];
+  let used = 0;
+  let truncated = false;
+  for (const [label, document] of documents) {
+    const header = `## ${label}\nSource: ${safeInlineForBudget(document.source)}\n\n`;
+    const headerTaken = clipToBudget(header, limit - used);
+    if (headerTaken !== header) truncated = true;
+    chunks.push(headerTaken);
+    used += codePointCount(headerTaken);
+    if (headerTaken !== header || used >= limit) break;
+
+    const contentTaken = clipToBudget(document.content, limit - used);
+    if (contentTaken !== document.content) truncated = true;
+    chunks.push(contentTaken);
+    used += codePointCount(contentTaken);
+    if (contentTaken !== document.content || used >= limit) break;
+
+    const separatorTaken = clipToBudget("\n\n", limit - used);
+    if (separatorTaken !== "\n\n") truncated = true;
+    chunks.push(separatorTaken);
+    used += codePointCount(separatorTaken);
+  }
+  return { text: chunks.join(""), truncated };
+}
+
+/**
+ * Fail closed when the existing renderer would clip any accepted document.
+ * Per-section and shared-total budgets are checked with the renderer's exact
+ * headings, provenance escaping, separators, and truncation rules.
+ */
+function enforceRenderingBudgets(snapshot: MutableWorkspaceSnapshot): void {
+  let total = 0;
+
+  if (snapshot.identity !== undefined) {
+    const rendered = renderedDocumentsForBudget([["Identity", snapshot.identity]], CONTEXT_LIMITS.sectionChars);
+    if (rendered.truncated) throw new WorkspaceContextBoundsError("identitySection");
+    total += codePointCount(rendered.text);
+  }
+
+  const instructions: [string, ContextDocumentSnapshot][] = [];
+  if (snapshot.agents !== undefined) instructions.push(["AGENTS.md", snapshot.agents]);
+  if (snapshot.soul !== undefined) instructions.push(["SOUL.md", snapshot.soul]);
+  if (snapshot.user !== undefined) instructions.push(["USER.md", snapshot.user]);
+  if (instructions.length > 0) {
+    const rendered = renderedDocumentsForBudget(instructions, CONTEXT_LIMITS.sectionChars);
+    if (rendered.truncated) throw new WorkspaceContextBoundsError("instructionsSection");
+    total += codePointCount(rendered.text);
+  }
+
+  if (snapshot.memory !== undefined && snapshot.memory.length > 0) {
+    const memory = snapshot.memory.map((document, index) =>
+      [`Memory ${index + 1}`, document] as [string, ContextDocumentSnapshot]);
+    const rendered = renderedDocumentsForBudget(memory, CONTEXT_LIMITS.sectionChars);
+    if (rendered.truncated) throw new WorkspaceContextBoundsError("memorySection");
+    total += codePointCount(rendered.text);
+  }
+
+  if (total > CONTEXT_LIMITS.contextChars) {
+    throw new WorkspaceContextBoundsError("contextTotal");
+  }
 }
 
 function failureKind(code: string | undefined): WorkspaceFileFailureKind {
@@ -332,6 +506,19 @@ function sameFile(left: BigIntStats, right: BigIntStats): boolean {
     left.nlink === right.nlink &&
     left.mtimeNs === right.mtimeNs &&
     left.ctimeNs === right.ctimeNs;
+}
+
+function sameDirectory(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs;
+}
+
+/** Directory identity only: a rename or replacement changes dev/ino/mode. */
+function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
 }
 
 async function statHandle(handle: FileHandle, source: string): Promise<BigIntStats> {
@@ -440,11 +627,29 @@ async function readRootFile(root: FileHandle, name: string, state: LoadState): P
   return readPinnedFile(root, name, name, state);
 }
 
+function recordDirectory(
+  state: LoadState,
+  segments: readonly string[],
+  stat: BigIntStats,
+  source: string,
+): void {
+  const key = segments.join("/");
+  const existing = state.directories.get(key);
+  if (existing !== undefined) {
+    if (!sameDirectory(existing.stat, stat)) {
+      throw new WorkspaceContextFileError("changed", source);
+    }
+    return;
+  }
+  state.directories.set(key, Object.freeze({ segments: Object.freeze([...segments]), stat }));
+}
+
 async function readMemoryFile(root: FileHandle, path: string, state: LoadState): Promise<string> {
   const segments = path.split("/");
   const name = segments[segments.length - 1]!;
   const directories = segments.slice(0, -1);
   const opened: FileHandle[] = [];
+  const openedSegments: string[] = [];
   let parent = root;
   try {
     for (const segment of directories) {
@@ -460,13 +665,82 @@ async function readMemoryFile(root: FileHandle, path: string, state: LoadState):
         await next.close().catch(() => undefined);
         throw new WorkspaceContextFileError("not-directory", path);
       }
+      openedSegments.push(segment);
       opened.push(next);
+      recordDirectory(state, openedSegments, info, path);
       parent = next;
     }
     return await readPinnedFile(parent, name, path, state);
   } finally {
     for (const handle of opened.reverse()) {
       await handle.close().catch(() => undefined);
+    }
+  }
+}
+
+async function openRelativeDirectory(
+  root: FileHandle,
+  segments: readonly string[],
+  source: string,
+): Promise<FileHandle> {
+  let current: FileHandle | null = null;
+  let parent = root;
+  try {
+    for (const segment of segments) {
+      const next = await openPinned(parent, segment, DIRECTORY_FLAGS, source);
+      if (current !== null) await current.close().catch(() => undefined);
+      current = next;
+      parent = next;
+    }
+    if (current === null) throw new WorkspaceContextFileError("not-directory", source);
+    return current;
+  } catch (error) {
+    if (current !== null) await current.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
+ * Recheck the pinned root and every directory reached during the load. A
+ * rename/replacement after the initial pins is a failure: the returned
+ * provenance would otherwise describe a path that no longer names the content.
+ */
+async function verifyWorkspace(
+  root: FileHandle,
+  rootPath: string,
+  rootBefore: BigIntStats,
+  state: LoadState,
+): Promise<void> {
+  let rootNow: BigIntStats | null = null;
+  let pathNow: BigIntStats | null = null;
+  try {
+    rootNow = await root.stat({ bigint: true });
+  } catch {
+    rootNow = null;
+  }
+  try {
+    pathNow = await lstat(rootPath, { bigint: true });
+  } catch {
+    pathNow = null;
+  }
+  if (rootNow === null || pathNow === null ||
+      !sameIdentity(rootNow, rootBefore) || !sameIdentity(pathNow, rootBefore)) {
+    throw new WorkspaceContextFileError("changed", "workspace-root");
+  }
+
+  for (const entry of state.directories.values()) {
+    const source = entry.segments.join("/");
+    let handle: FileHandle | null = null;
+    try {
+      handle = await openRelativeDirectory(root, entry.segments, source);
+      const now = await handle.stat({ bigint: true });
+      if (!sameDirectory(now, entry.stat)) {
+        throw new WorkspaceContextFileError("changed", source);
+      }
+    } catch {
+      throw new WorkspaceContextFileError("changed", source);
+    } finally {
+      if (handle !== null) await handle.close().catch(() => undefined);
     }
   }
 }
@@ -486,18 +760,31 @@ export async function loadWorkspaceContextSnapshot(
   if (!isRecord(request)) {
     throw new WorkspaceContextInputError("Workspace context request must be an object");
   }
-  const rootPath = validatedRoot(request.workspaceRoot);
-  const memoryFiles = validatedMemoryFiles(request.memoryFiles);
-  const identity = validatedIdentity(request.identity);
+  const rootPath = validatedRoot(ownDataField(request, "workspaceRoot", "Workspace context request").value);
+  const memoryField = ownDataField(request, "memoryFiles", "Workspace context request");
+  const memoryFiles = validatedMemoryFiles(memoryField.found ? memoryField.value : undefined);
+  const identityField = ownDataField(request, "identity", "Workspace context request");
+  const identity = validatedIdentity(identityField.found ? identityField.value : undefined);
   if (WORKSPACE_CONTEXT_LIMITS.maxBootstrapFiles + memoryFiles.length > WORKSPACE_CONTEXT_LIMITS.maxFiles) {
     throw new WorkspaceContextBoundsError("maxFiles");
   }
 
   const root = await openAbsoluteDirectoryNoFollow(rootPath);
+  let rootBefore: BigIntStats;
+  try {
+    rootBefore = await statHandle(root, "workspace-root");
+    if (!rootBefore.isDirectory()) {
+      throw new WorkspaceContextInputError("workspaceRoot must be a directory");
+    }
+  } catch (error) {
+    await root.close().catch(() => undefined);
+    throw error;
+  }
   const snapshot: MutableWorkspaceSnapshot = {};
   const state: LoadState = {
     bytes: 0,
     chars: identity === undefined ? 0 : codePointCount(identity.content),
+    directories: new Map(),
   };
   try {
     if (identity !== undefined) snapshot.identity = identity;
@@ -511,16 +798,19 @@ export async function loadWorkspaceContextSnapshot(
         throw error;
       }
       if (content.length === 0) continue;
-      snapshot[field] = frozenDocument(`workspace:${name}`, content);
+      snapshot[field] = frozenDocument(`${WORKSPACE_SOURCE_PREFIX}${name}`, content);
     }
 
     const memories: ContextDocumentSnapshot[] = [];
     for (const path of memoryFiles) {
       const content = await readMemoryFile(root, path, state);
       if (content.length === 0) continue;
-      memories.push(frozenDocument(`workspace:${path}`, content));
+      memories.push(frozenDocument(`${WORKSPACE_SOURCE_PREFIX}${path}`, content));
     }
     if (memories.length > 0) snapshot.memory = Object.freeze(memories);
+
+    enforceRenderingBudgets(snapshot);
+    await verifyWorkspace(root, rootPath, rootBefore, state);
   } finally {
     await root.close().catch(() => undefined);
   }

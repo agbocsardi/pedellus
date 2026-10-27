@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdirSync, readdirSync, readlinkSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { chmod, link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { createContextExtension } from "../dist/context/index.js";
+import { CONTEXT_LIMITS, createContextExtension } from "../dist/context/index.js";
 import {
   WORKSPACE_CONTEXT_LIMITS,
   WorkspaceContextBoundsError,
@@ -47,6 +48,23 @@ function isBoundsError(bound) {
     assert.equal(error.bound, bound);
     return true;
   };
+}
+
+function fdTargetExists(target) {
+  let entries;
+  try {
+    entries = readdirSync("/proc/self/fd");
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    try {
+      if (readlinkSync(`/proc/self/fd/${entry}`) === target) return true;
+    } catch {
+      // The fd may have closed between readdir and readlink.
+    }
+  }
+  return false;
 }
 
 async function load(root, extra = {}) {
@@ -384,4 +402,251 @@ test("provider supports async resolvers and propagates lookup failures", async (
   assert.equal(await provider("none", 2, {}), undefined);
   await assert.rejects(provider("missing", 3, {}), isFileError("missing", "memory/missing.md"));
   assert.throws(() => createWorkspaceContextSnapshotProvider(null), isInputError);
+});
+
+test("request, identity, and memory selections are captured from own data properties only", async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, {
+    "AGENTS.md": "own data",
+    "memory/MEMORY.md": "proxy memory",
+  });
+
+  await assert.rejects(loadWorkspaceContextSnapshot(Object.create({ workspaceRoot: root })), isInputError);
+  await assert.rejects(loadWorkspaceContextSnapshot({
+    get workspaceRoot() { return root; },
+  }), isInputError);
+  await assert.rejects(loadWorkspaceContextSnapshot(
+    Object.create({ workspaceRoot: root, memoryFiles: [] }),
+  ), isInputError);
+  await assert.rejects(loadWorkspaceContextSnapshot({
+    workspaceRoot: root,
+    get memoryFiles() { return []; },
+  }), isInputError);
+  await assert.rejects(loadWorkspaceContextSnapshot(
+    Object.assign(Object.create({ memoryFiles: [] }), { workspaceRoot: root }),
+  ), isInputError);
+  await assert.rejects(loadWorkspaceContextSnapshot(
+    Object.assign(
+      Object.create({ identity: { source: "session:x", content: "content" } }),
+      { workspaceRoot: root },
+    ),
+  ), isInputError);
+
+  const inheritedIdentitySource = {
+    workspaceRoot: root,
+    identity: Object.create({ source: "session:inherited" }),
+  };
+  Object.defineProperty(inheritedIdentitySource.identity, "content", {
+    value: "content", enumerable: true, configurable: true, writable: true,
+  });
+  await assert.rejects(loadWorkspaceContextSnapshot(inheritedIdentitySource), isInputError);
+
+  await assert.rejects(load(root, {
+    identity: { source: "session:x", get content() { return "hidden"; } },
+  }), isInputError);
+
+  const inheritedIdentityContent = {
+    workspaceRoot: root,
+    identity: Object.create({ content: "hidden" }),
+  };
+  Object.defineProperty(inheritedIdentityContent.identity, "source", {
+    value: "session:x", enumerable: true, configurable: true, writable: true,
+  });
+  await assert.rejects(loadWorkspaceContextSnapshot(inheritedIdentityContent), isInputError);
+
+  await assert.rejects(load(root, { memoryFiles: new Array(1) }), isInputError);
+
+  const accessorItem = [];
+  Object.defineProperty(accessorItem, "0", {
+    get() { return "memory/MEMORY.md"; }, enumerable: true, configurable: true,
+  });
+  await assert.rejects(load(root, { memoryFiles: accessorItem }), isInputError);
+
+  const target = ["memory/MEMORY.md"];
+  let lengthReads = 0;
+  let getCalls = 0;
+  const proxied = new Proxy(target, {
+    get(object, key, receiver) {
+      getCalls++;
+      return Reflect.get(object, key, receiver);
+    },
+    getOwnPropertyDescriptor(object, key) {
+      if (key === "length") {
+        lengthReads++;
+        return { value: 1, writable: true, enumerable: false, configurable: false };
+      }
+      return Reflect.getOwnPropertyDescriptor(object, key);
+    },
+  });
+  const snapshot = await load(root, { memoryFiles: proxied });
+  assert.equal(lengthReads, 1);
+  assert.equal(getCalls, 0);
+  assert.deepEqual(snapshot.memory.map(({ content }) => content), ["proxy memory"]);
+});
+
+test("provenance labels fit CONTEXT_LIMITS.sourceChars including the workspace prefix", async (t) => {
+  const root = await tempRoot(t);
+  const buildPath = (length) => {
+    const base = `memory/${"a".repeat(64)}/${"b".repeat(64)}/${"c".repeat(64)}/`;
+    const remaining = length - base.length - ".md".length;
+    assert.ok(remaining > 0 && remaining <= 64, `last segment length ${remaining}`);
+    return `${base}${"d".repeat(remaining)}.md`;
+  };
+
+  const accepted = buildPath(WORKSPACE_CONTEXT_LIMITS.maxPathChars);
+  assert.equal(accepted.length, WORKSPACE_CONTEXT_LIMITS.maxPathChars);
+  await assert.rejects(load(root, { memoryFiles: [accepted] }), isFileError("missing", accepted));
+  await writeFiles(root, { [accepted]: "max label" });
+  const snapshot = await load(root, { memoryFiles: [accepted] });
+  assert.equal(snapshot.memory[0].source.length, CONTEXT_LIMITS.sourceChars);
+  assert.equal(`workspace:${accepted}`.length, CONTEXT_LIMITS.sourceChars);
+  const extension = createContextExtension([{ conversationId: 1, ...snapshot }]);
+  const memory = render(extension, "nanobot_memory");
+  assert.ok(memory.includes(`Source: "workspace:${accepted}"`));
+  assert.doesNotMatch(memory, /context truncated/);
+
+  const rejected = buildPath(WORKSPACE_CONTEXT_LIMITS.maxPathChars + 1);
+  await assert.rejects(load(root, { memoryFiles: [rejected] }), isInputError);
+});
+
+test("accepted documents cannot be silently truncated by the renderer", async (t) => {
+  const nearLimit = await tempRoot(t);
+  const userTail = "USER_TAIL_MUST_SURVIVE";
+  await writeFiles(nearLimit, {
+    "AGENTS.md": "A".repeat(5_000),
+    "SOUL.md": "S".repeat(5_000),
+    "USER.md": `${"U".repeat(5_000)}${userTail}`,
+  });
+  const accepted = await load(nearLimit);
+  const extension = createContextExtension([{ conversationId: 1, ...accepted }]);
+  const instructions = render(extension, "nanobot_instructions");
+  assert.match(instructions, /USER_TAIL_MUST_SURVIVE/);
+  assert.match(instructions, /## USER\.md/);
+  assert.doesNotMatch(instructions, /context truncated/);
+
+  const instructionsTooLarge = await tempRoot(t);
+  await writeFiles(instructionsTooLarge, {
+    "AGENTS.md": "A".repeat(15_900),
+    "SOUL.md": "S".repeat(500),
+    "USER.md": "U".repeat(500),
+  });
+  await assert.rejects(load(instructionsTooLarge), isBoundsError("instructionsSection"));
+
+  const memoryTooLarge = await tempRoot(t);
+  const memoryFiles = [];
+  const memoryFixture = {};
+  for (let index = 0; index < 20; index++) {
+    const relative = `memory/topic-${index}.md`;
+    memoryFiles.push(relative);
+    memoryFixture[relative] = "M".repeat(800);
+  }
+  await writeFiles(memoryTooLarge, memoryFixture);
+  await assert.rejects(load(memoryTooLarge, { memoryFiles }), isBoundsError("memorySection"));
+
+  const memoryNearLimit = await tempRoot(t);
+  await writeFiles(memoryNearLimit, { "memory/MEMORY.md": "Z".repeat(1_000) });
+  const memoryAccepted = await load(memoryNearLimit, { memoryFiles: ["memory/MEMORY.md"] });
+  const memoryExtension = createContextExtension([{ conversationId: 1, ...memoryAccepted }]);
+  const memory = render(memoryExtension, "nanobot_memory");
+  assert.equal([...memory].filter((character) => character === "Z").length, 1_000);
+  assert.doesNotMatch(memory, /context truncated/);
+
+  const identityNearLimit = await tempRoot(t);
+  const identityAccepted = await load(identityNearLimit, {
+    identity: {
+      source: "<".repeat(CONTEXT_LIMITS.sourceChars),
+      content: "J".repeat(WORKSPACE_CONTEXT_LIMITS.maxIdentityChars),
+    },
+  });
+  const identityExtension = createContextExtension([{ conversationId: 1, ...identityAccepted }]);
+  const identity = render(identityExtension, "nanobot_identity");
+  assert.ok([...identity].length <= CONTEXT_LIMITS.sectionChars);
+  assert.equal([...identity].filter((character) => character === "J").length, WORKSPACE_CONTEXT_LIMITS.maxIdentityChars);
+  assert.doesNotMatch(identity, /context truncated/);
+});
+
+test("root rename or replacement during a load is detected", async (t) => {
+  const root = await tempRoot(t);
+  const memoryFiles = [];
+  const fixture = {};
+  for (let index = 0; index < 32; index++) {
+    const relative = `memory/a/b/c/d/e/f/file-${index}.md`;
+    memoryFiles.push(relative);
+    fixture[relative] = `content ${index}`;
+  }
+  await writeFiles(root, fixture);
+  const realRoot = realpathSync(root);
+  const moved = `${root}.moved`;
+  t.after(() => rm(moved, { recursive: true, force: true }));
+
+  let settled = false;
+  let renamed = false;
+  const operation = load(root, { memoryFiles });
+  const tracked = operation.then(() => { settled = true; }, () => { settled = true; });
+  const watcher = (async () => {
+    for (let attempt = 0; attempt < 20_000 && !settled; attempt++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (settled) return;
+      if (!fdTargetExists(realRoot)) continue;
+      renameSync(root, moved);
+      mkdirSync(root);
+      renamed = true;
+      return;
+    }
+  })();
+
+  try {
+    await assert.rejects(operation, isFileError("changed", "workspace-root"));
+  } finally {
+    await tracked;
+    await watcher;
+  }
+  assert.equal(renamed, true);
+});
+
+test("memory directory replacement during a load is detected", async (t) => {
+  const root = await tempRoot(t);
+  const memoryFiles = [];
+  const fixture = {};
+  for (let index = 0; index < 32; index++) {
+    const relative = `memory/file-${index}.md`;
+    memoryFiles.push(relative);
+    fixture[relative] = `memory ${index}`;
+  }
+  await writeFiles(root, fixture);
+  const realMemory = realpathSync(join(root, "memory"));
+  const moved = join(root, "memory.moved");
+  t.after(() => rm(moved, { recursive: true, force: true }));
+
+  let settled = false;
+  let replaced = false;
+  const operation = load(root, { memoryFiles });
+  const tracked = operation.then(() => { settled = true; }, () => { settled = true; });
+  const watcher = (async () => {
+    for (let attempt = 0; attempt < 20_000 && !settled; attempt++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (settled) return;
+      if (!fdTargetExists(realMemory)) continue;
+      renameSync(join(root, "memory"), moved);
+      mkdirSync(join(root, "memory"));
+      for (let index = 0; index < 32; index++) {
+        writeFileSync(join(root, "memory", `file-${index}.md`), fixture[`memory/file-${index}.md`]);
+      }
+      replaced = true;
+      return;
+    }
+  })();
+
+  try {
+    await assert.rejects(operation, (error) => {
+      assert.ok(error instanceof WorkspaceContextFileError);
+      assert.equal(error.kind, "changed");
+      assert.match(error.source, /^memory/);
+      return true;
+    });
+  } finally {
+    await tracked;
+    await watcher;
+  }
+  assert.equal(replaced, true);
 });

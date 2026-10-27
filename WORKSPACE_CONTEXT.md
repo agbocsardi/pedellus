@@ -49,10 +49,17 @@ files outside `memory/` are rejected.
 
 Provenance labels are deterministic (`workspace:AGENTS.md`,
 `workspace:memory/system/preferences.md`) and never contain the absolute root.
-Content is the file body; the existing renderer supplies the `##` heading and
-`Source:` line. A missing bootstrap file is omitted, matching Python
+The `workspace:` prefix counts toward `CONTEXT_LIMITS.sourceChars`, so a memory
+path is capped at 246 characters and the resulting label at 256. Content is the
+file body; the existing renderer supplies the `##` heading and `Source:` line. A
+missing bootstrap file is omitted, matching Python
 `ContextBuilder._load_bootstrap_files`. A missing explicitly selected memory
 file is an error because the caller named it. Empty files are omitted.
+
+Request fields are captured only as own data properties. Inherited fields,
+getters, array holes, and accessor-backed `memoryFiles` entries are rejected
+rather than invoked. The `memoryFiles` length is read once from its own data
+descriptor and used for a bounded indexed loop.
 
 ## Missing, empty, and failure behaviour
 
@@ -70,6 +77,8 @@ file is an error because the caller named it. Empty files are omitted.
 | Invalid root, relative root, `/`, `~/.nanobot`, `/proc`, `/sys`, `/dev` | `WorkspaceContextInputError`. |
 | File or aggregate bound exceeded | `WorkspaceContextBoundsError`. |
 | Observable file change during read | Rejected (`changed`). |
+| Root path or an opened directory changed identity during load | Rejected (`changed`). |
+| Renderer section budget would clip any accepted document | `WorkspaceContextBoundsError` (`identitySection`, `instructionsSection`, `memorySection`, or `contextTotal`). |
 
 Any file or safety error rejects the whole load; there is no partial snapshot.
 Errors carry a stable kind and a workspace-relative source label, not an
@@ -86,26 +95,43 @@ rather than falling back to weaker path checks.
 - Every directory is pinned through `/proc/self/fd/<fd>`; memory path
   components are opened relative to a pinned parent with `O_NOFOLLOW`.
 - Files are opened with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`.
-- `fstat` must report a regular file with `nlink == 1`; hard-link aliases are
-  rejected even when the target is outside the workspace.
+- `fstat` must report a regular file with `nlink == 1`; additional hard-link
+  aliases are rejected at check time. This is a link-count check, not proof
+  that the inode originated inside the workspace: a link-then-unlink sequence
+  can leave a file with `nlink == 1`.
 - Device, inode, size, mode, link count, `mtimeNs`, and `ctimeNs` are compared
   before read, after read, and against a final path `lstat`. Replacement,
   truncation, growth, or removal during the read fails closed.
+- After all reads, the pinned root and every directory reached are rechecked.
+  Root dev/inode/mode must still match both the pinned handle and
+  `lstat(rootPath)`; each tracked directory is reopened through the pinned root
+  and compared. A rename or replacement fails the whole load instead of
+  returning content with stale provenance.
 - No path, raw OS message, or file content is included in error messages.
 
-This prevents ordinary symlink and hard-link escapes. It is not a defence
-against a privileged or kernel-level adversary or a filesystem that fails to
-update metadata.
+This prevents ordinary symlink and hard-link escapes and detects observable
+directory replacement. Residual limits: the `nlink == 1` check does not prove
+inode origin after link-then-unlink; metadata comparisons are only as precise
+as the filesystem's `stat` data (coarse timestamp filesystems can miss a
+same-size rewrite); and a change after the final check remains a TOCTOU
+window. It is not a defence against a privileged or kernel-level adversary,
+mount tricks, or a filesystem that fails to update metadata.
 
 ## Bounds
 
 `WORKSPACE_CONTEXT_LIMITS` exposes the fixed limits: 3 bootstrap files, at most
 32 memory sources, 64 KiB per file, 128 KiB total bytes, 48,000 total code
 points (the renderer's context budget, including explicit identity), 14,400
-identity code points, 256 code points per provenance label, at most 8 path
-segments, and at most 64 characters per path segment. UTF-8 is decoded with `fatal: true`; a BOM is stripped by the
-decoder. Per-section rendering limits still apply; the loader bounds inputs but
-does not replace the renderer's own per-section truncation.
+identity code points, 256 code points per provenance label, at most 246
+characters per memory path (including the `workspace:` prefix), at most 8 path
+segments, and at most 64 characters per path segment. UTF-8 is decoded with
+`fatal: true`; a BOM is stripped by the decoder.
+
+Before returning, the loader mirrors the renderer's exact heading, provenance
+escaping, separator, and truncation rules. If `AGENTS.md`/`SOUL.md`/`USER.md`,
+memory, or identity would be clipped by the per-section 16,000-code-point limit
+or the shared 48,000-code-point budget, the load fails closed. It never returns
+a snapshot whose later document would be silently dropped by the renderer.
 
 ## Detachment and session isolation
 
