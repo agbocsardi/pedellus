@@ -9,6 +9,7 @@
     { "provider": "openai", "modelId": "gpt-6-sol" },
     { "provider": "openai", "modelId": "gpt-6-luna" }
   ],
+  "toolAllowlist": [],
   "credentials": {
     "anthropic": "ANTHROPIC_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
