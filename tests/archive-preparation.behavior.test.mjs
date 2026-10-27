@@ -56,12 +56,14 @@ test("prepares immutable Python-v3 payload without inventing requests", () => {
   assert.equal(Object.isFrozen(snapshot.messages[0]), false);
 });
 
-test("matches Python summary stripping and truncation before persistence", () => {
+test("matches Python summary stripping and code-point truncation", () => {
   const result = prepare({ ...snapshot, summary: "  conclusion <think>secret reasoning</think> ok  " });
   assert.equal(result.summary, "conclusion  ok");
   assert.doesNotMatch(result.summary, /secret reasoning|<think>/);
   const long = prepare({ ...snapshot, summary: "x".repeat(8_001) });
   assert.equal(long.summary, `${"x".repeat(8_000)}\n... (truncated)`);
+  const astral = "😀".repeat(4_001);
+  assert.equal(prepare({ ...snapshot, summary: astral }).summary, astral);
 });
 
 test("rejects incomplete snapshots, oversized fields, and wrong source scope", () => {
@@ -72,6 +74,24 @@ test("rejects incomplete snapshots, oversized fields, and wrong source scope", (
   const large = { ...snapshot, messages: [{ ...snapshot.messages[0], content: "x".repeat(4 * 1024 * 1024) }] };
   assert.throws(() => prepare(large), /field limit|preflight size/);
   assert.equal(large.messages[0].content.length, 4 * 1024 * 1024);
+});
+
+test("retains uncertain optional transitions against cumulative cursor rows", () => {
+  const baseRow = {
+    input: 0, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 1,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+  const previous = projectUsageDelta(snapshotUsageState(scope.storeNamespace, scope.conversationId, {
+    models: { "provider/model": baseRow }, tools: {},
+  }));
+  const current = projectUsageDelta(snapshotUsageState(scope.storeNamespace, scope.conversationId, {
+    models: { "provider/model": { ...baseRow, reasoning: 1 } }, tools: {},
+  }), previous.nextCursor);
+  assert.equal(current.hasDelta, true);
+  assert.equal(Object.keys(current.native.models).length, 0);
+  assert.equal(current.unknownFields.some((row) => row.field === "reasoning"), true);
+  const prepared = prepare(snapshot, current);
+  assert.deepEqual(prepared.usage_provenance.unknownFields, current.unknownFields);
 });
 
 test("rejects forged accounting shapes and preserves valid tool-only provenance", () => {

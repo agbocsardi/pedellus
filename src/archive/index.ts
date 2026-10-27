@@ -166,20 +166,17 @@ function validateProjection(value: unknown, expected: ArchiveUsageScope): Record
     throw new TypeError("Malformed or oversized unknown usage fields");
   }
   const unknownKeys = new Set<string>();
+  const validatedUnknownFields: Array<{ bucket: "models" | "tools"; key: string; field: "cacheWrite1h" | "reasoning" }> = [];
   for (const item of value.unknownFields) {
     if (!isRecord(item) || !exactKeys(item, ["bucket", "key", "field"]) ||
         (item.bucket !== "models" && item.bucket !== "tools") || typeof item.key !== "string" ||
         (item.field !== "cacheWrite1h" && item.field !== "reasoning")) {
       throw new TypeError("Malformed optional usage provenance");
     }
-    const bucket = item.bucket === "models" ? models : tools;
-    if (!Object.hasOwn(bucket, item.key)) throw new TypeError("Unknown usage field references a missing native row");
-    const markedRow = bucket[item.key];
-    if (markedRow === undefined) throw new TypeError("Unknown usage field references a missing native row");
-    if (Object.hasOwn(markedRow, item.field)) throw new TypeError("Unknown usage marker conflicts with a known delta");
     const marker = `${item.bucket}\0${item.key}\0${item.field}`;
     if (unknownKeys.has(marker)) throw new TypeError("Duplicate unknown usage field marker");
     unknownKeys.add(marker);
+    validatedUnknownFields.push({ bucket: item.bucket, key: item.key, field: item.field });
   }
   const cursor = value.nextCursor;
   if (!isRecord(cursor) || !exactKeys(cursor, ["version", "source", "cumulative"]) || cursor.version !== 1) {
@@ -193,6 +190,13 @@ function validateProjection(value: unknown, expected: ArchiveUsageScope): Record
   validateScope(cursor.cumulative.source, expected);
   const cumulativeModels = validateBucket(cursor.cumulative.models, "cursor.models");
   const cumulativeTools = validateBucket(cursor.cumulative.tools, "cursor.tools");
+  for (const item of validatedUnknownFields) {
+    const cumulative = item.bucket === "models" ? cumulativeModels : cumulativeTools;
+    const delta = item.bucket === "models" ? models : tools;
+    if (!Object.hasOwn(cumulative, item.key)) throw new TypeError("Unknown usage field references a missing cumulative row");
+    const deltaRow = delta[item.key];
+    if (deltaRow && Object.hasOwn(deltaRow, item.field)) throw new TypeError("Unknown usage marker conflicts with a known delta");
+  }
   if (Object.keys(models).some((key) => !Object.hasOwn(cumulativeModels, key)) ||
       Object.keys(tools).some((key) => !Object.hasOwn(cumulativeTools, key))) {
     throw new TypeError("Usage delta row is absent from its cumulative cursor");
@@ -321,8 +325,9 @@ export function prepareArchivePayload(
     throw new RangeError("Archive usage provenance exceeds preflight size limit");
   }
   const cleanedSummary = snapshot.summary?.trim() ? stripThink(snapshot.summary.trim()) : "";
-  const summary = cleanedSummary.length > MAX_SUMMARY_CHARS
-    ? `${Array.from(cleanedSummary).slice(0, MAX_SUMMARY_CHARS).join("")}\n... (truncated)`
+  const summaryCodePoints = Array.from(cleanedSummary);
+  const summary = summaryCodePoints.length > MAX_SUMMARY_CHARS
+    ? `${summaryCodePoints.slice(0, MAX_SUMMARY_CHARS).join("")}\n... (truncated)`
     : cleanedSummary;
   const timestamps = messages.map((message) => message.timestamp).filter((value): value is string => !!value);
   const payload: Record<string, unknown> = {

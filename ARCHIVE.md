@@ -12,14 +12,16 @@ The host must supply an already-sanitized message snapshot, a usage delta from
 Durable conversation ID). The function verifies projection scope against that
 host mapping but cannot prove the mapping is true or authenticate provenance.
 It validates all recognized projection, legacy/native row, aggregate,
-request-count, cursor, and optional-field marker shapes/invariants; unknown
-projection fields are rejected. This is structural validation, not
+request-count, cursor, and optional-field marker shapes/invariants. An unknown
+optional-transition marker can refer to a cumulative cursor row with no numeric
+delta row; validation checks that provenance against the cursor snapshot.
+Unknown projection fields are rejected. This is structural validation, not
 transcript-completeness validation. Message content must already be sanitized
 as in Python's `_clean_history_messages`; this function does not change it.
 `timestamp` is host-supplied; message timestamps determine `start_time` and
 `end_time`. An absent session key maps to Python's `unknown` convention. The
 optional summary uses Python-compatible `strip_think`, trimming, and the
-8,000-character truncation (including suffix). Inputs are not changed; output
+8,000-code-point truncation (including suffix). Inputs are not changed; output
 is detached and deeply frozen.
 
 The output's `usage` field is only the projection's legacy model-token shape.
