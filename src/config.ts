@@ -28,6 +28,8 @@ export interface PortConfig {
   model: ModelReference;
   /** Explicit finite model choices. Missing means the legacy singleton [model]. */
   allowedModels?: readonly ModelReference[];
+  /** Host-owned global ceiling; conversations may only narrow it. No tools are currently registered. */
+  toolAllowlist?: readonly string[];
   thinkingLevel?: ModelThinkingLevel;
   extraAllowedDirs?: readonly string[];
   bwrapPath?: string;
@@ -86,6 +88,21 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
     model,
     allowedModels,
   };
+  let toolAllowlist: string[] = [];
+  if (raw.toolAllowlist !== undefined) {
+    if (!Array.isArray(raw.toolAllowlist)) throw new Error("toolAllowlist must be an array");
+    toolAllowlist = raw.toolAllowlist.map((name, index) => {
+      if (typeof name !== "string" || name.length === 0 || name.trim() !== name || /[\u0000-\u001f\u007f]/.test(name)) {
+        throw new Error(`toolAllowlist[${index}] must be an exact non-empty tool name`);
+      }
+      return name;
+    });
+    const foldedNames = toolAllowlist.map((name) => name.toLocaleLowerCase("en-US"));
+    if (new Set(foldedNames).size !== foldedNames.length) {
+      throw new Error("toolAllowlist must not contain duplicate or case-ambiguous names");
+    }
+  }
+  config.toolAllowlist = toolAllowlist;
   if (raw.thinkingLevel !== undefined) {
     if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(raw.thinkingLevel))) throw new Error("Invalid thinkingLevel");
     Object.assign(config, { thinkingLevel: raw.thinkingLevel });

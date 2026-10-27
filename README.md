@@ -22,6 +22,8 @@ One process acquires Chord's kernel-backed `processLock` using the canonical SQL
 
 The gateway upgrades upstream SQLite's NORMAL default to **WAL `synchronous=FULL` on its actual connection**, verifying both settings before and after native schema initialization and failing closed on mismatch. Parent crash/reopen and injected setup/readback/migration-failure probes passed; this is not proof of physical power/host-loss survival. Backup/restore, disk-full and broader storage acceptance remain open. See [storage policy and evidence](./STORAGE.md).
 
+`toolAllowlist` is the host-owned **global ceiling** and defaults to `[]`. Conversations may only narrow such a ceiling; they cannot widen it. The gateway currently has no approved registered tools, so any nonempty list makes startup fail closed. This field neither names installed registration identities nor represents human approval, and it does not activate tools.
+
 ## Opt-in Code Mode SDK
 
 The SDK barrel exports `createCodeModeIntegration`, fixed budgets and types for

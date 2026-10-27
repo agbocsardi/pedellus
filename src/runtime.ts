@@ -121,6 +121,11 @@ function isModelSelection(value: unknown): value is GatewayModelSelectionRequest
 }
 
 export async function openGateway(config: PortConfig, context: Context, options: { models?: Models } = {}): Promise<Gateway> {
+  // A config name is not a Durable registration identity or an authorization grant. Until the
+  // gateway installs reviewed registrations, fail closed rather than silently accepting grants.
+  if ((config.toolAllowlist ?? []).length > 0) {
+    throw new Error("toolAllowlist is non-empty, but this gateway has no approved registered tools");
+  }
   const allowedModels = config.allowedModels ?? [config.model];
   const prepared = options.models
     ? { models: options.models, model: nativeModelReference(config.model) }
