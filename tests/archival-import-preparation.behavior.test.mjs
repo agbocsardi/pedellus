@@ -15,6 +15,7 @@ const snapshot = (sourceId, format, text, extra = {}) => {
   return { sourceId, format, provenance: "synthetic-fixture", sha256: sha256(bytes), bytes, ...extra };
 };
 const sessionKey = "telegram:1";
+const sessionHeaderLine = (key) => JSON.stringify({ _type: "metadata", key, metadata: {} });
 
 const sessionText = [
   JSON.stringify({
@@ -95,6 +96,8 @@ test("prepares versioned, ordered, lossless records from one store namespace", (
   assert.equal(result.disposition, "archive-only-never-resume-or-replay");
   assert.equal(result.complete, false);
   assert.equal(result.counts.quarantinedRecords, 2);
+  assert.equal(result.counts.incompleteSources, 3);
+  for (const source of result.sources) assert.equal(source.status, "incomplete");
   assert.equal(result.records.length, expectedLineCount);
   assert.equal(result.bounds.recordsEmitted, expectedLineCount);
   assert.deepEqual(result.records.map((record) => record.ordinal), result.records.map((_, index) => index));
@@ -331,13 +334,15 @@ test("preserves caller source order instead of sorting labels", () => {
   const result = prepareArchivalImport({
     storeNamespace: "synthetic-store",
     sources: [
-      snapshot("z-last", "session-jsonl", `${JSON.stringify({ role: "user", content: "z" })}\n`),
-      snapshot("a-first", "session-jsonl", `${JSON.stringify({ role: "user", content: "a" })}\n`),
+      snapshot("z-last", "session-jsonl", `${sessionHeaderLine("z")}\n${JSON.stringify({ role: "user", content: "z" })}\n`),
+      snapshot("a-first", "session-jsonl", `${sessionHeaderLine("a")}\n${JSON.stringify({ role: "user", content: "a" })}\n`),
     ],
   });
   assert.deepEqual(result.sources.map((source) => source.sourceId), ["z-last", "a-first"]);
   assert.deepEqual(result.records.map((record) => [record.sourceOrder, record.sourceId]), [
     [0, "z-last"],
+    [0, "z-last"],
+    [1, "a-first"],
     [1, "a-first"],
   ]);
   assert.equal(result.complete, true);
@@ -349,7 +354,7 @@ test("classifies unsupported sources and never claims complete coverage", () => 
     storeNamespace: "synthetic-store",
     sources: [
       snapshot("unsupported-batch", "archive-batch-tar", "not parsed"),
-      snapshot("session-a", "session-jsonl", `${JSON.stringify({ role: "user", content: "kept" })}\n`),
+      snapshot("session-a", "session-jsonl", `${sessionHeaderLine("kept")}\n${JSON.stringify({ role: "user", content: "kept" })}\n`),
     ],
   });
   assert.equal(result.complete, false);
@@ -491,4 +496,102 @@ test("keeps partial history search and unknown session rows explicit", () => {
   const unknownType = result.records.find((record) => record.quarantineReason === "session-record-type-unknown");
   assert.equal(unknownType.status, "quarantined");
   assert.match(Buffer.from(unknownType.rawLineBase64, "base64").toString("utf8"), /mystery/);
+});
+
+test("marks header diagnostics as failures without dropping records", () => {
+  const message = (text) => JSON.stringify({ role: "user", content: text });
+  const archiveHeader = (key) => JSON.stringify({ _type: "transcript_archive", key });
+  const sources = [
+    snapshot("session-missing-header", "session-jsonl", `${message("missing")}\n`),
+    snapshot("session-duplicate-header", "session-jsonl",
+      `${sessionHeaderLine("h1")}\n${sessionHeaderLine("h1")}\n${message("duplicate")}\n`),
+    snapshot("session-out-of-order-header", "session-jsonl",
+      `${message("before")}\n${sessionHeaderLine("h2")}\n`),
+    snapshot("session-inconsistent-header", "session-jsonl",
+      `${sessionHeaderLine("h3")}\n${sessionHeaderLine("h4")}\n${message("inconsistent")}\n`),
+    snapshot("session-malformed-header", "session-jsonl",
+      `${JSON.stringify({ _type: "metadata", metadata: "not-object" })}\n${message("malformed")}\n`),
+    snapshot("archive-missing-header", "session-archive-jsonl", `${message("archive missing")}\n`),
+    snapshot("archive-duplicate-header", "session-archive-jsonl",
+      `${archiveHeader("a1")}\n${archiveHeader("a1")}\n${message("archive duplicate")}\n`),
+    snapshot("archive-out-of-order-header", "session-archive-jsonl",
+      `${message("archive before")}\n${archiveHeader("a2")}\n`),
+    snapshot("archive-malformed-header", "session-archive-jsonl",
+      `${JSON.stringify({ _type: "transcript_archive" })}\n${message("archive malformed")}\n`),
+  ];
+  const result = prepareArchivalImport({ storeNamespace: "synthetic-store", sources });
+
+  assert.equal(result.complete, false);
+  assert.equal(result.counts.incompleteSources, sources.length);
+  for (const source of result.sources) assert.equal(source.status, "incomplete");
+
+  for (const code of [
+    "session-header-missing",
+    "session-header-duplicate",
+    "session-header-out-of-order",
+    "session-header-key-invalid",
+    "session-header-metadata-not-object",
+    "header-key-inconsistent",
+    "archive-header-missing",
+    "archive-header-duplicate",
+    "archive-header-out-of-order",
+    "archive-header-key-invalid",
+  ]) {
+    const diagnostic = result.diagnostics.find((item) => item.code === code);
+    assert.equal(diagnostic?.severity, "failure", code);
+  }
+
+  const counts = Object.fromEntries(result.sources.map((source) => [source.sourceId, source.recordsEmitted]));
+  assert.deepEqual(counts, {
+    "session-missing-header": 1,
+    "session-duplicate-header": 3,
+    "session-out-of-order-header": 2,
+    "session-inconsistent-header": 3,
+    "session-malformed-header": 2,
+    "archive-missing-header": 1,
+    "archive-duplicate-header": 3,
+    "archive-out-of-order-header": 2,
+    "archive-malformed-header": 2,
+  });
+  assert.equal(result.records.filter((record) => record.category === "session-header").length, 6);
+  assert.equal(result.records.filter((record) => record.category === "archive-header").length, 4);
+});
+
+test("keeps optional metadata diagnostics as notices", () => {
+  const result = prepareArchivalImport({
+    storeNamespace: "synthetic-store",
+    sources: [
+      snapshot("session-notices", "session-jsonl", [
+        sessionHeaderLine("notices"),
+        JSON.stringify({
+          role: "user",
+          content: "notice text",
+          timestamp: 123,
+          name: 456,
+          _entry_id: 789,
+        }),
+        "",
+      ].join("\n")),
+    ],
+  });
+
+  assert.equal(result.complete, true);
+  assert.equal(result.sources[0].status, "complete");
+  assert.equal(result.records[1].searchStatus, "partial");
+  for (const code of ["message-timestamp-invalid", "message-name-invalid", "message-entry-id-invalid"]) {
+    const diagnostic = result.diagnostics.find((item) => item.code === code);
+    assert.equal(diagnostic?.severity, "notice", code);
+  }
+});
+
+test("rejects unsafe format labels instead of echoing them", () => {
+  for (const format of ["path/to/secret", "bad\u0000format", "has space", "x".repeat(161)]) {
+    assert.throws(
+      () => prepareArchivalImport({
+        storeNamespace: "synthetic-store",
+        sources: [snapshot("source", format, "x")],
+      }),
+      ArchivalPreparationInputError,
+    );
+  }
 });

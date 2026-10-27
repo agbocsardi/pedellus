@@ -161,7 +161,7 @@ export interface ArchivalSourcePreparation {
   readonly provenance: string;
   readonly byteLength: number;
   readonly sha256: string;
-  readonly status: "complete" | "unsupported";
+  readonly status: "complete" | "incomplete" | "unsupported";
   readonly lineCount: number | null;
   readonly recordsEmitted: number;
   readonly searchUnitsEmitted: number;
@@ -173,6 +173,8 @@ export interface ArchivalDiagnostic {
   readonly sourceId: string;
   readonly line: number | null;
   readonly lineSha256: string | null;
+  /** Failures make the source/report incomplete; notices do not. */
+  readonly severity: "failure" | "notice";
 }
 
 export interface UnsupportedArchivalSource {
@@ -248,6 +250,29 @@ const INDEXED_HISTORY_TOP_FIELDS = new Set(["timestamp", "session_key", "content
 const NON_SEARCH_HISTORY_TOP_FIELDS = new Set([
   "schema_version", "kind", "start_time", "end_time", "message_count", "usage", "_idempotency_key",
 ]);
+
+/**
+ * Structural classification failures. All other diagnostics are notices:
+ * invalid optional message metadata, unindexed search content, or invalid cursors.
+ */
+const FAILURE_DIAGNOSTICS = new Set([
+  "session-header-key-invalid",
+  "session-header-metadata-not-object",
+  "session-header-missing",
+  "session-header-duplicate",
+  "session-header-out-of-order",
+  "header-key-inconsistent",
+  "archive-header-key-invalid",
+  "archive-header-missing",
+  "archive-header-duplicate",
+  "archive-header-out-of-order",
+  "history-kind-unrecognized",
+  "history-schema-version-invalid",
+]);
+
+function diagnosticSeverity(code: string): "failure" | "notice" {
+  return FAILURE_DIAGNOSTICS.has(code) ? "failure" : "notice";
+}
 
 const UNSUPPORTED_SURFACES: readonly UnsupportedArchivalSurface[] = Object.freeze([
   {
@@ -725,19 +750,23 @@ interface WorkSource {
   readonly bytes: Buffer | null;
   readonly sha256: string;
   readonly lineCount: number | null;
-  readonly status: ArchivalSourcePreparation["status"];
+  status: ArchivalSourcePreparation["status"];
   recordsEmitted: number;
   searchUnitsEmitted: number;
   sessionKey: string | null;
+  headerSeen: boolean;
+  sawNonBlankRecord: boolean;
 }
 
 function validatedSource(value: unknown): ArchivalSourceSnapshot {
   if (!isRecord(value) || typeof value.sourceId !== "string" || !SAFE_LABEL.test(value.sourceId) ||
       typeof value.provenance !== "string" || !SAFE_LABEL.test(value.provenance) ||
       typeof value.sha256 !== "string" || !SHA256_HEX.test(value.sha256) ||
-      typeof value.format !== "string" || value.format.length > 160 ||
+      typeof value.format !== "string" || !SAFE_LABEL.test(value.format) ||
       !(value.bytes instanceof Uint8Array)) {
-    throw new ArchivalPreparationInputError("Each archival source needs safe labels, a declared SHA-256, and bytes");
+    throw new ArchivalPreparationInputError(
+      "Each archival source needs safe sourceId/provenance/format labels, a declared SHA-256, and bytes",
+    );
   }
   return {
     sourceId: value.sourceId,
@@ -801,6 +830,8 @@ export function prepareArchivalImport(
       recordsEmitted: 0,
       searchUnitsEmitted: 0,
       sessionKey: null,
+      headerSeen: false,
+      sawNonBlankRecord: false,
     };
     works.push(work);
     if (!supported) {
@@ -821,7 +852,9 @@ export function prepareArchivalImport(
 
   const addDiagnostic = (code: string, work: WorkSource, line: number | null, lineHash: string | null): void => {
     if (diagnostics.length >= limits.maxDiagnostics) throw new ArchivalPreparationBoundsError("diagnostic-count");
-    diagnostics.push({ code, sourceId: work.input.sourceId, line, lineSha256: lineHash });
+    const severity = diagnosticSeverity(code);
+    if (severity === "failure" && work.status === "complete") work.status = "incomplete";
+    diagnostics.push({ code, sourceId: work.input.sourceId, line, lineSha256: lineHash, severity });
   };
 
   for (const work of works) {
@@ -842,12 +875,22 @@ export function prepareArchivalImport(
           : classifyLine(format, decoded.value, work.sessionKey, limits.maxNestedReferences);
       }
 
+      if (classified.status === "quarantined" && work.status === "complete") work.status = "incomplete";
+
       if (classified.category === "session-header" || classified.category === "archive-header") {
+        const header = classified.category === "session-header" ? "session" : "archive";
+        if (work.headerSeen) {
+          addDiagnostic(`${header}-header-duplicate`, work, line.number, lineHash);
+        } else if (work.sawNonBlankRecord) {
+          addDiagnostic(`${header}-header-out-of-order`, work, line.number, lineHash);
+        }
+        work.headerSeen = true;
         if (classified.sessionKey !== null) {
           if (work.sessionKey === null) work.sessionKey = classified.sessionKey;
-          else if (work.sessionKey !== classified.sessionKey) addDiagnostic("session-key-inconsistent", work, line.number, lineHash);
+          else if (work.sessionKey !== classified.sessionKey) addDiagnostic("header-key-inconsistent", work, line.number, lineHash);
         }
       }
+      if (classified.category !== "blank-line") work.sawNonBlankRecord = true;
 
       if (classified.sessionKey === null && classified.category !== "session-header" &&
           classified.category !== "archive-header" && work.sessionKey !== null) {
@@ -889,8 +932,11 @@ export function prepareArchivalImport(
       work.recordsEmitted++;
       work.searchUnitsEmitted += classified.units.length;
     }
-    if (format === "session-jsonl" && work.sessionKey === null) {
+    if (format === "session-jsonl" && !work.headerSeen) {
       addDiagnostic("session-header-missing", work, null, null);
+    }
+    if (format === "session-archive-jsonl" && !work.headerSeen) {
+      addDiagnostic("archive-header-missing", work, null, null);
     }
   }
 
@@ -919,7 +965,9 @@ export function prepareArchivalImport(
     },
     counts: {
       sources: works.length,
-      supportedSources: works.filter((work) => work.status === "complete").length,
+      supportedSources: works.filter((work) => work.status !== "unsupported").length,
+      completeSources: works.filter((work) => work.status === "complete").length,
+      incompleteSources: works.filter((work) => work.status === "incomplete").length,
       unsupportedSources: unsupportedSources.length,
       inputBytes,
       linesVisited,

@@ -31,11 +31,14 @@ const report = prepareArchivalImport({
 });
 ```
 
-`sourceId`, `provenance`, and `storeNamespace` are bounded opaque labels
-(`[A-Za-z0-9][A-Za-z0-9._:-]{0,159}`). Do not put paths, account names, chat
-IDs, or secrets in them. `sha256` must be lowercase hex over the exact supplied
-bytes; it is verified before any parsing. The module copies the bytes once and
-never mutates the caller's buffer.
+`sourceId`, `format`, `provenance`, and `storeNamespace` are bounded opaque
+labels (`[A-Za-z0-9][A-Za-z0-9._:-]{0,159}`). `format` must already be a safe
+identifier before it is accepted or echoed; paths, spaces, control characters,
+and secrets are rejected with `ArchivalPreparationInputError` rather than being
+copied into the report. Do not put paths, account names, chat IDs, or secrets in
+the other labels. `sha256` must be lowercase hex over the exact supplied bytes;
+it is verified before any parsing. The module copies the bytes once and never
+mutates the caller's buffer.
 
 Each invocation describes **one legacy store/workspace namespace**. Session keys
 and archive cursors are store-local. The module echoes `storeNamespace` but
@@ -49,7 +52,9 @@ remains a caller error.
 One physical line is one prepared record. Blank lines are preserved as
 `blank-line` records, so every source byte is represented.
 
-- `_type: "metadata"` header lines are prepared as `session-header` records.
+- The first non-blank record is expected to be the `_type: "metadata"` header.
+  Header lines are prepared as `session-header` records; missing, duplicate, and
+  out-of-order headers are diagnosed as failures without dropping any record.
   Only `key` and `updated_at` are exposed as safe structural search/provenance
   fields. The `metadata` object itself — usage, `_last_summary`,
   `compaction_checkpoints`, `runtime_checkpoint`, pending tool calls,
@@ -90,7 +95,10 @@ One physical line is one prepared record. Blank lines are preserved as
 Python's trimmed-prefix transcript batches are supported faithfully when the
 host supplies each batch explicitly:
 
-- `_type: "transcript_archive"` → `archive-header` (opaque; exposes `key` only).
+- The first non-blank record is expected to be `_type: "transcript_archive"`.
+  It becomes an `archive-header` (opaque; exposes `key` only). Missing,
+  duplicate, and out-of-order archive headers are diagnosed as failures without
+  dropping records.
 - Message rows → `archive-message` (same message-shape rules as sessions).
 - The header's key is propagated to later archive messages in that snapshot.
 - Archive batches are content-addressed by Python. This module does **not**
@@ -189,19 +197,34 @@ diagnostics).
 The module **fails closed**. Exceeding any bound throws
 `ArchivalPreparationBoundsError`; it never truncates input, drops trailing
 records, or returns a partial report. A declared digest mismatch, duplicate
-`sourceId`, unsafe label, missing bytes, or invalid limit throws
-`ArchivalPreparationInputError`. Unsupported source formats are different: they
+`sourceId`, unsafe source/format/provenance/store label, missing bytes, or
+invalid limit throws `ArchivalPreparationInputError`. Unsupported source formats are different: they
 are classified in `unsupportedSources`, make `complete: false`, and contribute
 no records. The supported sources in the same request are still processed.
 
+Each source `status` is `complete`, `incomplete`, or `unsupported`.
 `complete: true` means every supplied source had a supported format, every
-physical line produced a record, and no line was quarantined. A source with any
-quarantined line makes `complete: false` even though the scan itself finished.
-`complete` does **not** mean all content was understood, searchable,
-reconciled, or imported; recognized opaque records (session headers, provider
-state) do not by themselves make it false. Quarantined and opaque records remain
-visible through `counts`, `status`, `quarantineReason`, `searchStatus`, and
-`diagnostics`. `reviewRequired` is always `true`.
+physical line produced a record, no line was quarantined, and no diagnostic with
+`severity: "failure"` was emitted. Any failure diagnostic or quarantined line
+also sets that source's `status` to `incomplete`; `complete` does **not** mean
+all content was understood, searchable, reconciled, or imported.
+
+Diagnostics carry `severity`:
+
+- `failure`: structural classification is incomplete. This includes missing,
+  duplicate, or out-of-order session/archive headers; invalid header key or
+  non-object header metadata; inconsistent header keys; an unrecognized history
+  `kind`; and an invalid history schema-version value.
+- `notice`: the record is still classified, but optional metadata is invalid or
+  some text content could not be projected into search units. Examples:
+  invalid message timestamp/name/entry ID, invalid history cursor, or
+  unindexable embedded history messages. Notices do **not** make the source or
+  report incomplete; use `searchStatus` for text-search coverage.
+
+Recognized opaque records (session headers, provider state) do not by themselves
+make `complete` false. Quarantined and opaque records remain visible through
+`counts`, `status`, `quarantineReason`, `searchStatus`, and `diagnostics`.
+`reviewRequired` is always `true`.
 
 Physical lines are split on LF only, matching the Python writer (`json.dumps` +
 `"\n"`). A CR-only legacy file is not re-split into Python text-mode lines; it
@@ -219,8 +242,11 @@ JSON. A final line without LF is accepted and marked `lineTerminated: false`.
   skills, and media;
 - any runtime/session continuation state or external effect.
 
-Passing `format` as an unsupported string is not an error: it is classified as
-`unsupported-source-format` with its own byte length and verified digest.
+Passing a safe, syntactically valid `format` that is not one of the three
+supported values is not an error: it is classified as
+`unsupported-source-format` with its own byte length and verified digest. An
+unsafe, path-like, control-character, or overlong `format` label is rejected
+before it can be echoed.
 
 ## Security and privacy exposure
 
@@ -244,7 +270,8 @@ redacted export:
   form as private archival material: private approved storage, restricted
   access, no automatic publication, no telemetry, and no inclusion in error
   reports.
-- `storeNamespace`, `sourceId`, and `provenance` should remain opaque labels;
+- `storeNamespace`, `sourceId`, `format`, and `provenance` should remain opaque
+  labels;
   putting paths, chat IDs, or secrets there would add exposure.
 
 Do not run this on live data as part of the implementation check. Use synthetic
@@ -284,10 +311,12 @@ hashing, malformed-line handling, and unsupported-surface classification.
 `tests/archival-import-preparation.behavior.test.mjs` covers byte-for-byte raw
 reconstruction (including CRLF and a final unterminated line), ordering and
 source-order preservation, distinct records for identical lines, opaque
-metadata/provider state, quarantine of malformed/unknown lines, history
-conversation/text search units, supported transcript archives, unsupported
-format classification, every bound, digest/identity failures, deep freezing, and
-caller-byte immutability. Run it with:
+metadata/provider state, quarantine of malformed/unknown lines, text-search
+completeness for mixed/tool/media/unknown content, missing/duplicate/out-of-order
+session and archive headers, failure-vs-notice diagnostics, unsafe format label
+rejection, history conversation/text search units, supported transcript archives,
+unsupported format classification, every bound, digest/identity failures, deep
+freezing, and caller-byte immutability. Run it with:
 
 ```bash
 npm run build
