@@ -63,7 +63,13 @@ open and once for each new session; host changes to existing snapshots take effe
 when the gateway is reopened. The callback receives the mapped session key and
 Durable ID established by the gateway. When context is opted out on reopen, the
 runtime clears extension selection before resume; native section replay removes old
-context from the effective prompt, but stored transcript history is not erased. Stores
+context from the effective prompt, but stored transcript history is not erased. Before
+resume, the gateway also rejects live prepared dispatches (`pi.generation` request/poll
+or `pi.compaction` summarize/retry) whose pinned cutoff still contains a nonempty
+Nanobot section. Those phases resend/fetch/summarize the old checkpointed view, not a
+newly rendered prompt; even an apparently unchanged provider snapshot is not treated
+as proof of equivalence. This conservative guard blocks gateway recovery until such a
+task is settled/cancelled, even if the host expects the snapshot to be unchanged. Stores
 with more than 256 mapped sessions fail closed when context is enabled rather than
 silently leaving some sessions without their opted-in snapshot. A missing snapshot
 intentionally renders no context for that conversation; native Durable section replay

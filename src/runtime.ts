@@ -5,8 +5,8 @@ import type { Context } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
-import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type Extension, type Harness as HarnessType, type ModelRef, type Storage } from "@earendil-works/pi-durable";
-import { CONTEXT_LIMITS, createContextExtensionBuilder, type ConversationContextSnapshot } from "./context/index.js";
+import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type Extension, type Harness as HarnessType, type ModelRef, type Storage } from "@earendil-works/pi-durable";
+import { CONTEXT_LIMITS, CONTEXT_SECTION_KEYS, createContextExtensionBuilder, type ConversationContextSnapshot } from "./context/index.js";
 import type { ModelReference, PortConfig } from "./config.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
@@ -146,6 +146,50 @@ function preparedTaskModel(task: unknown): ModelReference | undefined {
     throw new Error(`Cannot safely validate live ${kind} task ${String(id)} checkpoint phase ${phase}`);
   }
   return { provider: checkpoint.model.provider, modelId: checkpoint.model.modelId };
+}
+
+function preparedContextReplay(task: unknown): {
+  readonly id: string | number;
+  readonly kind: "pi.generation" | "pi.compaction";
+  readonly conversationId: ConversationId;
+  readonly at: number;
+  readonly phase: string;
+} | undefined {
+  if (!isRecord(task) || (task.kind !== "pi.generation" && task.kind !== "pi.compaction")) return undefined;
+  const { id, conversationId, state } = task;
+  if (!isRecord(state) || state.status === "terminal" || state.status === "completing") return undefined;
+  if (!isRecord(state.checkpoint) || typeof state.checkpoint.phase !== "string") {
+    throw new Error(`Cannot safely inspect prepared ${task.kind} task ${String(id)} checkpoint`);
+  }
+  const { phase } = state.checkpoint;
+  // Generation request/poll pin `cutoff`; compaction summarize/retry pin `tail`.
+  const field = task.kind === "pi.generation"
+    ? phase === "request" || phase === "poll" ? "cutoff" : undefined
+    : phase === "summarize" || phase === "retry" ? "tail" : undefined;
+  if (field === undefined) return undefined;
+  const at = state.checkpoint[field];
+  if ((typeof id !== "string" && typeof id !== "number") || typeof conversationId !== "number" ||
+      !Number.isSafeInteger(conversationId) || conversationId < 1 || typeof at !== "number" ||
+      !Number.isSafeInteger(at) || at < 1) {
+    throw new Error(`Cannot safely inspect prepared ${task.kind} task ${String(id)} checkpoint`);
+  }
+  return { id, kind: task.kind, conversationId: conversationId as ConversationId, at, phase };
+}
+
+const NANOBOT_CONTEXT_SECTION_KEYS = new Set<string>(Object.values(CONTEXT_SECTION_KEYS));
+
+function hasPersistedNanobotContext(messages: readonly unknown[]): boolean {
+  const effective = new Map<string, string>();
+  for (const message of messages) {
+    if (!isRecord(message) || message.role !== "system" || !isRecord(message.sections)) continue;
+    for (const [key, value] of Object.entries(message.sections)) {
+      if (!NANOBOT_CONTEXT_SECTION_KEYS.has(key)) continue;
+      if (value === null) effective.delete(key);
+      else if (typeof value === "string") effective.set(key, value);
+      else throw new Error(`Cannot safely inspect persisted context section ${key}`);
+    }
+  }
+  return [...effective.values()].some((value) => value.length > 0);
 }
 
 function isModelSelection(value: unknown): value is GatewayModelSelectionRequest {
@@ -316,7 +360,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
     }
 
-    // Refuse to resume a prepared request with a model removed from the current allowlist.
+    // Refuse unsafe prepared replays before resume; checkpoints pin historical context cutoffs.
+    const preparedContextReplays: NonNullable<ReturnType<typeof preparedContextReplay>>[] = [];
     await root.commit(async (tx) => {
       let taskCursor: Cursor | undefined;
       do {
@@ -326,11 +371,27 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (preparedModel !== undefined && !choicesByNative.has(modelKey(preparedModel))) {
             throw new Error(`Cannot resume ${task.kind} task ${task.id}: prepared model ${modelKey(preparedModel)} is outside allowedModels`);
           }
+          const contextReplay = preparedContextReplay(task);
+          if (contextReplay !== undefined) preparedContextReplays.push(contextReplay);
         }
         taskCursor = page.next;
       } while (taskCursor !== undefined);
+    }, context);
 
-      // Reapply host security and revoke persisted models outside the current allowlist before resume.
+    for (const replay of preparedContextReplays) {
+      const conversation = await harness.conversation(replay.conversationId, context);
+      if (!conversation) throw new Error(`Cannot safely resume ${replay.kind} task ${replay.id}: conversation is missing`);
+      const view = await conversation.context(context, { at: replay.at as EntryId });
+      if (hasPersistedNanobotContext(view.messages)) {
+        throw new Error(
+          `Cannot safely resume ${replay.kind} task ${replay.id} (${replay.phase}): its prepared request includes ` +
+          "persisted Nanobot context; settle or cancel it before gateway recovery",
+        );
+      }
+    }
+
+    // Apply host security and context selection only after every prepared dispatch passes the replay guard.
+    await root.commit(async (tx) => {
       let cursor: Cursor | undefined;
       do {
         const page = await tx.scanConversations({}, 1000, cursor);

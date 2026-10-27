@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import test from "node:test";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -37,6 +38,161 @@ async function send(gateway, key, id, message) {
   assert.equal((await submission.wait(context)).status, "done");
   return conversation;
 }
+
+test("SIGKILL prepared request is rejected before replay when context is opted out", { timeout: 20_000 }, async () => {
+  const temp = await mkdtemp(resolve(tmpdir(), "nanobot-context-sigkill-"));
+  const workspace = resolve(temp, "workspace");
+  const dataDir = resolve(temp, "state");
+  await mkdir(workspace);
+  const runtimeUrl = JSON.stringify(pathToFileURL(`${pkg}/dist/runtime.js`).href);
+  const configModuleUrl = JSON.stringify(pathToFileURL(`${pkg}/dist/config.js`).href);
+  const aiUrl = JSON.stringify(pathToFileURL(`${ai}/index.js`).href);
+  const chordContextUrl = JSON.stringify(pathToFileURL(`${chord}/context/index.js`).href);
+  const script = `
+    import { pathToFileURL } from "node:url";
+    const { openGateway } = await import(${runtimeUrl});
+    const { parseConfig } = await import(${configModuleUrl});
+    const { createModels, fauxProvider } = await import(${aiUrl});
+    const { BACKGROUND_CONTEXT } = await import(${chordContextUrl});
+    const context = BACKGROUND_CONTEXT;
+    const provider = fauxProvider({ provider: "context-sigkill", models: [{ id: "synthetic" }] });
+    provider.setResponses([() => {
+      process.stdout.write("PREPARED_CONTEXT_REQUEST_DISPATCHED\\n");
+      return new Promise(() => {});
+    }]);
+    const models = createModels();
+    models.setProvider(provider.provider);
+    const model = { provider: "context-sigkill", modelId: "synthetic" };
+    const config = parseConfig({ workspace: ${JSON.stringify(workspace)}, dataDir: ${JSON.stringify(dataDir)}, model, allowedModels: [model] }, ${JSON.stringify(temp)});
+    const gateway = await openGateway(config, context, {
+      models,
+      contextSnapshotProvider: () => ({ identity: { source: "synthetic", content: "secret-prepared-context" } }),
+    });
+    const conversation = await gateway.conversationFor("sigkill-session", context);
+    await conversation.submit({ type: "input", content: "leave request pending", requestId: "sigkill-request" }, context);
+    setInterval(() => {}, 1000);
+  `;
+  let child;
+  let stderr = "";
+  try {
+    child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    await new Promise((resolveReady, rejectReady) => {
+      let stdout = "";
+      const timeout = setTimeout(() => rejectReady(new Error(`child did not dispatch request: ${stderr}`)), 8_000);
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+        if (stdout.includes("PREPARED_CONTEXT_REQUEST_DISPATCHED")) {
+          clearTimeout(timeout);
+          resolveReady();
+        }
+      });
+      child.once("error", (error) => { clearTimeout(timeout); rejectReady(error); });
+      child.once("exit", (code, signal) => {
+        clearTimeout(timeout);
+        rejectReady(new Error(`child exited before request dispatch (${code}, ${signal}): ${stderr}`));
+      });
+    });
+    const exited = new Promise((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
+    assert.equal(child.kill("SIGKILL"), true);
+    assert.deepEqual(await exited, { code: null, signal: "SIGKILL" });
+    child = undefined;
+
+    const replayed = [];
+    const provider = fauxProvider({ provider: "context-sigkill", models: [{ id: "synthetic" }] });
+    provider.setResponses([() => {
+      replayed.push("dispatched");
+      return fauxAssistantMessage("must not run");
+    }]);
+    const models = createModels();
+    models.setProvider(provider.provider);
+    const model = { provider: "context-sigkill", modelId: "synthetic" };
+    const config = parseConfig({ workspace, dataDir, model, allowedModels: [model] }, temp);
+    const openWithoutContext = () => openGateway(config, context, { models });
+    await assert.rejects(openWithoutContext(), /prepared request includes persisted Nanobot context/);
+    assert.deepEqual(replayed, []);
+    // A second rejection proves the failed open released the per-database process lock.
+    await assert.rejects(openWithoutContext(), /prepared request includes persisted Nanobot context/);
+    assert.deepEqual(replayed, []);
+  } finally {
+    if (child && child.exitCode === null) child.kill("SIGKILL");
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("SIGKILL prepared request without Nanobot context still replays", { timeout: 20_000 }, async () => {
+  const temp = await mkdtemp(resolve(tmpdir(), "nanobot-context-safe-replay-"));
+  const workspace = resolve(temp, "workspace");
+  const dataDir = resolve(temp, "state");
+  await mkdir(workspace);
+  const providerId = "context-safe-replay";
+  const runtimeUrl = JSON.stringify(pathToFileURL(`${pkg}/dist/runtime.js`).href);
+  const configModuleUrl = JSON.stringify(pathToFileURL(`${pkg}/dist/config.js`).href);
+  const aiUrl = JSON.stringify(pathToFileURL(`${ai}/index.js`).href);
+  const chordContextUrl = JSON.stringify(pathToFileURL(`${chord}/context/index.js`).href);
+  const script = `
+    const { openGateway } = await import(${runtimeUrl});
+    const { parseConfig } = await import(${configModuleUrl});
+    const { createModels, fauxProvider } = await import(${aiUrl});
+    const { BACKGROUND_CONTEXT } = await import(${chordContextUrl});
+    const context = BACKGROUND_CONTEXT;
+    const provider = fauxProvider({ provider: ${JSON.stringify(providerId)}, models: [{ id: "synthetic" }] });
+    provider.setResponses([() => {
+      process.stdout.write("PREPARED_CONTEXT_REQUEST_DISPATCHED\\n");
+      return new Promise(() => {});
+    }]);
+    const models = createModels();
+    models.setProvider(provider.provider);
+    const model = { provider: ${JSON.stringify(providerId)}, modelId: "synthetic" };
+    const config = parseConfig({ workspace: ${JSON.stringify(workspace)}, dataDir: ${JSON.stringify(dataDir)}, model, allowedModels: [model] }, ${JSON.stringify(temp)});
+    const gateway = await openGateway(config, context, { models });
+    const conversation = await gateway.conversationFor("safe-session", context);
+    await conversation.submit({ type: "input", content: "request without context", requestId: "safe-request" }, context);
+    setInterval(() => {}, 1000);
+  `;
+  let child;
+  let gateway;
+  let stderr = "";
+  try {
+    child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    await new Promise((resolveReady, rejectReady) => {
+      let stdout = "";
+      const timeout = setTimeout(() => rejectReady(new Error(`child did not dispatch request: ${stderr}`)), 8_000);
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+        if (stdout.includes("PREPARED_CONTEXT_REQUEST_DISPATCHED")) {
+          clearTimeout(timeout);
+          resolveReady();
+        }
+      });
+      child.once("error", (error) => { clearTimeout(timeout); rejectReady(error); });
+      child.once("exit", (code, signal) => {
+        clearTimeout(timeout);
+        rejectReady(new Error(`child exited before request dispatch (${code}, ${signal}): ${stderr}`));
+      });
+    });
+    const exited = new Promise((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
+    assert.equal(child.kill("SIGKILL"), true);
+    assert.deepEqual(await exited, { code: null, signal: "SIGKILL" });
+    child = undefined;
+
+    const captured = [];
+    const models = setupModels(providerId, captured);
+    gateway = await openGateway(gatewayConfig(workspace, dataDir, providerId), context, { models });
+    await gateway.harness.waitForIdle(context);
+    assert.equal(captured.length, 1);
+    assert.doesNotMatch(captured[0], /nanobot_identity|nanobot_memory/);
+  } finally {
+    if (child && child.exitCode === null) child.kill("SIGKILL");
+    if (gateway) await gateway.close(context);
+    await rm(temp, { recursive: true, force: true });
+  }
+});
 
 test("context remains absent and tool policy remains empty without opt-in", async () => {
   const temp = await mkdtemp(resolve(tmpdir(), "nanobot-context-off-"));
