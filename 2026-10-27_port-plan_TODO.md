@@ -55,6 +55,34 @@ Contract both backends must satisfy:
 - Default-deny tool policy per conversation; grants carry expiry, are revocable, and
   are re-checked on replay and after reopen.
 
+## W1/W2 shared contract
+
+The tool layer and the sandbox must agree on one contract, not each carry its own.
+The failure mode this prevents: policy that lives in a wrapper outside both produces
+a tool that works in the host and a tool that works in the sandbox, diverging
+quietly.
+
+Placement rules, which are design constraints rather than implementation choices:
+
+- **Tool policy** (allowed, denied, which tools a conversation is offered) goes into
+  per-conversation grants and `beforeTool` hooks. It is backend-independent and must
+  behave identically whichever `ExecutionEnv` is active.
+- **Filesystem and process policy** (path guard, deny patterns, environment
+  allowlist, timeout, process-group kill) is enforced by the `ExecutionEnv`, because
+  that is the only layer that sees the actual syscall or process. Duplicating it in
+  `beforeTool` creates two sources of truth that can disagree.
+- **Limits and truncation** are declared once, at the tool definition, and honoured
+  by both backends. `bash` truncating to a retained tail with a full-output path is
+  the native shape; keep it rather than layering a second truncation pass.
+- Nothing that a sandbox enforces may depend on the host backend enforcing it first,
+  and nothing the host backend allows may be silently refused by the sandbox without
+  that difference being recorded as a config-level difference.
+
+Both workstreams exit against the same conformance checks, and `registerEnvConformance()`
+from `@earendil-works/pi-durable/testing` is the supported way to drive them. A check
+that only one backend passes is a contract bug or a documented backend difference,
+never a build flavour.
+
 ## Workstreams
 
 Ordered by dependency. Each has an exit that is cheap to check and easy to falsify.
@@ -75,6 +103,10 @@ name. The remaining provider matrix is filled later, against need.
 damage-model contract above, plus per-conversation grants with expiry and
 revocation verified on replay and after reopen.
 
+Follows the W1/W2 shared contract: policy in grants and `beforeTool`, filesystem and
+process enforcement in the `ExecutionEnv`, limits declared once at the tool
+definition.
+
 Out of scope here: bubblewrap (W2), quotas as a hostile-tenant boundary, cross-user
 path swaps, host-power durability below fsync. Record each as accepted in
 `EXECUTION.md` with its compensating control.
@@ -90,6 +122,10 @@ parity with the host-side tool layer rather than abandoned as a spike. Bubblewra
 the preferred backend. It must be selectable per instance through configuration, so
 a deployment that needs confinement can require it and one that does not is not
 blocked by it.
+
+Bound by the W1/W2 shared contract: confinement is enforced here, tool policy is not.
+Where the sandbox genuinely cannot honour a host-side allowance, that difference is a
+config-level declaration, not a silent refusal.
 
 Scope:
 
