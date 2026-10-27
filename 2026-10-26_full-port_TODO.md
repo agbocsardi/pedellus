@@ -22,6 +22,23 @@ continues to constrain the currently integrated tool-less slice.
 Each unchecked milestone needs its exit evidence, not merely compilable code.
 P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
+## Active behavioral coverage batch — 2026-10-27
+
+Three independent `openai-codex / gpt-6-luna / high` workers start from committed
+`038e9fcf83c06aaf5d04daeeaf105b47ee2fac03`. They own distinct new test files;
+production-source issues and shared runner changes must be reported to parent.
+No real data, live calls, gateway tools or automatic integration.
+
+- [ ] `pi-35c6804d`, `w27:p1` / `w27`: final CLI review and lifecycle/output
+      behavioral tests, including EOF/order and backpressure.
+- [ ] `pi-70f63e0d`, `w28:p1` / `w28`: final migration review and legacy
+      eligibility/provenance/safety behavioral tests.
+- [ ] `pi-13bd5370`, `w29:p1` / `w29`: model-selection and recovery policy
+      behavioral tests at the Nanobot integration boundary.
+- [ ] Parent review, reconcile any shared runner wiring, run targeted checks on
+      the integrated branch, and preserve remaining gaps. Explicit completion
+      reports are required; idle/acknowledgement is not acceptance.
+
 ## Active sandbox follow-up — 2026-10-27
 
 - [ ] Worker `pi-5907db09`, pane `w26:p1`, workspace `w26`, branch
