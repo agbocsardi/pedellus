@@ -29,8 +29,10 @@ Two independent `openai-codex / gpt-6-luna / high` workers start from committed
 requests or real data; focused behavioral tests are authorized. Parent owns shared
 exports, runner wiring, review and integration.
 
-- [ ] `pi-b4e885e2`, `w2A:p1` / `w2A`: local CLI model selection using the
-      existing Gateway allowlist and native state, with synthetic behavioral tests.
+- [x] `pi-b4e885e2`, `w2A:p1` / `w2A`: merged `95537e3ad` local CLI model
+      listing/selection through the Gateway allowlist and native state. Parent
+      reviewed, typechecked and ran its tests from an isolated immutable build,
+      then ran the combined 12-check behavioral batch on the parent build.
 - [ ] `pi-b74e3b73`, `w2B:p1` / `w2B`: bounded opt-in identity/memory/skill
       context-loading or safe in-memory template conversion with explicit limits.
       Parent withheld `f9203b7f`: it instructed models to use unavailable tools,
