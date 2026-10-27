@@ -132,7 +132,17 @@ adapter.
   `PATH=/usr/bin:/bin`, `TMPDIR=/tmp`, and `LANG=C.UTF-8`; caller `env` and
   `inheritEnv` are ignored. Setup is cancellable, probes a real command, and has
   no unsandboxed fallback. Shell timeout/cancellation/cleanup tear down detached
-  descendants.
+  descendants. As an experimental standalone-adapter guardrail—not a chosen
+  product timeout policy—it enforces a host-owned 5-second maximum deadline
+  (seconds, clamped with `min`; shorter valid caller limits remain intact), even
+  when omitted. Commands exceeding it return a timeout error. It also applies
+  the native output window capped at 64 KiB / 2,000 lines and 64 KiB/s, and
+  disables spill-to-disk. Smaller valid caller windows remain in effect. With
+  this native tail window, older output is omitted and reported as
+  `ShellOutputInfo.skipped`; callers cannot recover omitted output and there is
+  no spill file. The window bounds retained/transferred output, not bytes
+  generated internally by a command. Invalid timeout/window values fail before
+  shell launch.
 - Managed provenance is the app-created owner-only store plus guest-inaccessible
   admission metadata and verified root identity—not a marker, chmod, realpath, or
   an `nlink` scan alone. Imports are copied into fresh inodes; preexisting outside
@@ -144,7 +154,8 @@ adapter.
 The managed-root, import, and owner invariants passed bounded synthetic probes,
 but this is not an overall security acceptance. Shell execution still has no
 aggregate CPU, memory, PID-count, or disk quota; a writable persistent workspace
-can fill host storage, and an omitted shell timeout is not capped here.
+can fill host storage. The adapter's deadline and output window are not
+substitutes for CPU, memory, process-count, or disk quotas.
 Bubblewrap namespaces alone are not resource quotas. Denial of service by filling
 the private store is bounded only by the host filesystem. The launch intent is a
 fail-closed liveness witness, not a sandbox-wide truth: a reused pid can delay

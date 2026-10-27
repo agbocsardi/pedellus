@@ -118,12 +118,52 @@ const DEFAULT_STORAGE_DIRECTORY = join(homedir(), ".local", "share", "nanobot", 
 const RESTRICTED_SYSTEM_ROOTS = [
 	"/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/sys", "/dev", "/run", "/var", "/opt", "/boot", "/root",
 ];
+/** Experimental standalone-adapter guardrail; not a selected product timeout policy. */
+const MAX_SHELL_TIMEOUT_SECONDS = 5;
+const SHELL_OUTPUT_WINDOW = {
+	maxBytes: 64 * 1024,
+	maxLines: 2_000,
+	minIntervalMs: 100,
+	bytesPerSecond: 64 * 1024,
+} as const;
+
 const SHELL_ENV = {
 	PATH: "/usr/bin:/bin",
 	HOME: "",
 	TMPDIR: PRIVATE_TMP,
 	LANG: "C.UTF-8",
 };
+
+function validateShellOptions(options: ShellExecOptions | undefined): {
+	timeout: number;
+	window: NonNullable<ShellExecOptions["window"]>;
+} | ExecutionError {
+	const timeout = options?.timeout === undefined ? MAX_SHELL_TIMEOUT_SECONDS : options.timeout;
+	if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) {
+		return new ExecutionError("timeout", "Invalid shell timeout: expected a finite number of seconds greater than zero");
+	}
+	const rawWindow: unknown = options?.window;
+	if (rawWindow !== undefined && (typeof rawWindow !== "object" || rawWindow === null || Array.isArray(rawWindow))) {
+		return new ExecutionError("spawn_error", "Invalid shell output window: expected an object");
+	}
+	const supplied = rawWindow as Partial<NonNullable<ShellExecOptions["window"]>> | undefined;
+	const fields = ["maxBytes", "maxLines", "minIntervalMs", "bytesPerSecond"] as const;
+	for (const field of fields) {
+		const value: unknown = supplied?.[field];
+		if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0)) {
+			return new ExecutionError("spawn_error", `Invalid shell output window ${field}: expected a positive safe integer`);
+		}
+	}
+	return {
+		timeout: Math.min(timeout, MAX_SHELL_TIMEOUT_SECONDS),
+		window: {
+			maxBytes: Math.min(supplied?.maxBytes ?? SHELL_OUTPUT_WINDOW.maxBytes, SHELL_OUTPUT_WINDOW.maxBytes),
+			maxLines: Math.min(supplied?.maxLines ?? SHELL_OUTPUT_WINDOW.maxLines, SHELL_OUTPUT_WINDOW.maxLines),
+			minIntervalMs: Math.max(supplied?.minIntervalMs ?? SHELL_OUTPUT_WINDOW.minIntervalMs, SHELL_OUTPUT_WINDOW.minIntervalMs),
+			bytesPerSecond: Math.min(supplied?.bytesPerSecond ?? SHELL_OUTPUT_WINDOW.bytesPerSecond, SHELL_OUTPUT_WINDOW.bytesPerSecond),
+		},
+	};
+}
 
 function isWithin(root: string, path: string): boolean {
 	const rel = relative(root, path);
@@ -601,6 +641,8 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 	): Promise<Result<ShellExecResult, ExecutionError>> {
 		if (context.abortSignal?.aborted) return err<ShellExecResult, ExecutionError>(new ExecutionError("aborted", "aborted"));
 		if (this.#closed) return err<ShellExecResult, ExecutionError>(new ExecutionError("spawn_error", "Execution environment is closed"));
+		const validated = validateShellOptions(options);
+		if (validated instanceof ExecutionError) return err(validated);
 		const requestedCwd = options?.cwd ?? this.cwd;
 		const cwd = await this.checked(requestedCwd, context, false);
 		if ("error" in cwd) {
@@ -620,8 +662,15 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 		const argv = typeof command === "string" ? ["/bin/sh", "-c", command] : [...command];
 		if (argv.length === 0) return err<ShellExecResult, ExecutionError>(new ExecutionError("spawn_error", "Empty argv: no program to run"));
 		const sandboxedCommand = [this.#bwrapPath, ...buildCommandBwrapArgs(GUEST_ROOT, actual.value, argv)];
-		const { env: _ignored, inheritEnv: _ignoredInheritance, ...safeOptions } = options ?? {};
-		return super.exec(sandboxedCommand, { ...safeOptions, cwd: cwd.path, env: safeEnv, inheritEnv: false }, context);
+		const { env: _ignored, inheritEnv: _ignoredInheritance, spill: _ignoredSpill, ...safeOptions } = options ?? {};
+		return super.exec(sandboxedCommand, {
+			...safeOptions,
+			timeout: validated.timeout,
+			window: validated.window,
+			cwd: cwd.path,
+			env: safeEnv,
+			inheritEnv: false,
+		}, context);
 	}
 
 	/**
