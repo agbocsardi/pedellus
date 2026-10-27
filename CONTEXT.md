@@ -48,11 +48,14 @@ paths.
 
 The Durable agent document persists the selected extension name, not this
 extension's captured snapshots. Before reopening/resuming a storage or accepting
-new work, the host must create a fresh dedicated registry and same-named context
-extension for that Harness, reconstructing snapshots from that same store's
-conversation IDs. Install it before resume for each conversation whose context
-should remain available; never reuse a registry/extension from another store. A
-missing snapshot intentionally renders no context for that conversation on its next
+new work, the host must enumerate that store's conversation IDs, reconstruct
+same-store snapshots, create a fresh dedicated registry, install a fresh
+`createContextExtension(snapshots)` in it, and pass that registry to `Harness.open()`.
+Only after this reconstruction may the host call `resume()` or admit work. Never
+reuse a registry/extension from another store. The current gateway runtime creates
+its own registry inside `openGateway()` and has no context snapshot provider; its
+owner must add that seam rather than sharing a context registry or activating
+ambient loaders. A missing snapshot intentionally renders no context for that conversation on its next
 request; native Durable section replay then removes those keys from the effective
 current prompt. Reinstalling a changed same-name extension updates current sections
 on the next request, while unchanged snapshots require no section patch.
