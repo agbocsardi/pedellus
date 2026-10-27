@@ -1,6 +1,20 @@
 export { loadConfig, parseConfig, type CredentialProvider, type PortConfig } from "./config.js";
 export { createProviderModels } from "./providers.js";
 export {
+  ARCHIVAL_PREPARATION_FORMAT,
+  ARCHIVAL_PREPARATION_VERSION,
+  ARCHIVAL_PREPARATION_LIMITS,
+  ArchivalPreparationBoundsError,
+  ArchivalPreparationInputError,
+  prepareArchivalImport,
+  type ArchivalImportRequest,
+  type ArchivalPreparationOptions,
+  type ArchivalPreparationReport,
+  type ArchivalSourceSnapshot,
+  type PreparedArchivalRecord,
+  type PreparedSearchUnit,
+} from "./archival-import/index.js";
+export {
   prepareArchivePayload,
   type ArchiveUsageScope,
   type PreparedArchivePayload,

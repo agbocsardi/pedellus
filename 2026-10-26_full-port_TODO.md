@@ -38,9 +38,12 @@ Real history access and import require separate authorization; use synthetic dat
       messages can currently abort search; corpus caps constrain large histories.
 - [ ] Rehearse on synthetic records; plan a private-copy reconciliation and
       backup/restore before seeking authorization for a real one-off import.
-- [ ] `pi-458b1c64`: implement a standalone bounded snapshot preparation slice;
-      `pi-bfa199e0`: review Python archive shapes and search implications. Both
-      use opencode-go/deepseek-v4.1-flash high, no live data or network.
+- [x] `pi-458b1c64`: integrated `66163cf82`, bounded, pure source-byte
+      preparation for session, archive-prefix and history JSONL; no importer or
+      database writes. Parent and independent reviewers checked synthetic cases,
+      including bounds bypasses, headers and search projection completeness.
+      `pi-bfa199e0` reviewed Python archive shapes and search implications. Both
+      used opencode-go/deepseek-v4.1-flash high, no live data or network.
 
 ## Priority pivot: conversation context and tool execution — 2026-10-27
 
