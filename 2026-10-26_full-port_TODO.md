@@ -33,6 +33,9 @@ exports, runner wiring, review and integration.
       existing Gateway allowlist and native state, with synthetic behavioral tests.
 - [ ] `pi-b74e3b73`, `w2B:p1` / `w2B`: bounded opt-in identity/memory/skill
       context-loading or safe in-memory template conversion with explicit limits.
+      Parent withheld `f9203b7f`: it instructed models to use unavailable tools,
+      asserted Dream was active, and omitted input/path bounds. Returned focused
+      corrections; no automatic context activation or filesystem access.
 - [ ] Review reports and tests, integrate only accepted slices, then remove clean
       completed worktrees. Preserve broad P3/P4 gates and explicit limitations.
 
