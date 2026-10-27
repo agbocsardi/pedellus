@@ -1203,3 +1203,29 @@ ambient filesystem authority while the execution gate remains open.
 
 Await explicit reports; review/integrate and fresh-build verify before accepting
 any bounded task. No new provider/channel/live credential/production grant.
+
+### 2026-10-27 — first model-policy candidate withheld
+
+D1 explicitly completed clean `pi-86637320` as `7a943bcb7`. Parent reviewed
+runtime/config/provider/docs and private fixture. Candidate broadens native model
+selection and preserves agent state, but is **not integrated**: acquisition and
+selection still read snapshots then configure separately, allowing stale policy
+reapplication to roll back a concurrent choice. Busy selection was accepted,
+contrary to the approved atomic-rejection contract; its concurrent probe selected
+an already-selected model and therefore did not prove the missing race boundary.
+Host cwd policy also used the noncanonical configuration spelling.
+
+Prepared generation requests persist their own native model/thinking checkpoints.
+Rewriting only pi.agent on reopen does not stop a denied same-provider checkpoint
+from dispatching through the still-complete provider catalog. Parent requires
+fail-closed pre-resume or another proven native pre-dispatch guard, no checkpoint
+rewrite/cancel or claim that prior remote spend is known. Native deferred-poll
+and compaction paths must be considered, not only fresh model generation.
+
+Returned bounded corrections through herdr_send. Worker subsequently confirmed
+planned atomic LiveDoc busy rejection/AgentDoc read+configure, and model-change
+thinking reset to configured supported default or off. Independent read-only
+reviewer `pi-eb98e056`/`w1P:p6` is assigned the whole D1 contract and remaining
+checkpoint/auth/cleanup boundaries; report `/tmp/pi-model-policy-review.md`.
+Await explicit corrected commit and review. D2/D3 continue independently;
+sandbox/execution work remains excluded and tool-less gateway unchanged.
