@@ -6,7 +6,8 @@
  * recomputed by `prepareArchivalImport`, so a caller cannot supply forged
  * prepared records. Each prepared physical line is stored verbatim as an inert
  * custom Durable entry. No model entry, task, submission, live session-map row,
- * search index, or resumed Python state is created.
+ * search index, or resumed Python state is created. The caller must hold
+ * exclusive single-writer ownership; unsupported formats are never ledgered.
  */
 import { createHash } from "node:crypto";
 import type { Context, JsonValue } from "@earendil-works/chord";
@@ -14,7 +15,8 @@ import {
   defineDoc,
   defineEntry,
   type ConversationId,
-  type EntryId,
+  type Cursor,
+  type EntryRecord,
   type Session,
   type Tx,
 } from "@earendil-works/pi-durable";
@@ -30,9 +32,12 @@ import {
 export const ARCHIVAL_PERSISTENCE_FORMAT = "nanobot-archival-import-persistence" as const;
 export const ARCHIVAL_PERSISTENCE_VERSION = 1 as const;
 export const ARCHIVAL_LEDGER_FORMAT = "nanobot-archival-import-ledger" as const;
-export const ARCHIVAL_LEDGER_VERSION = 1 as const;
-export const ARCHIVAL_RECORD_ENTRY_KIND = "nanobot.archival-record.v1" as const;
+export const ARCHIVAL_LEDGER_VERSION = 2 as const;
+export const ARCHIVAL_RECORD_ENTRY_KIND = "nanobot.archival-record.v2" as const;
 export const ARCHIVAL_RECORD_SCHEMA = "nanobot.archival-record" as const;
+export const ARCHIVAL_RECORD_SCHEMA_VERSION = 2 as const;
+/** The host must hold exclusive single-writer ownership; this module never acquires a lock. */
+export const ARCHIVAL_PERSISTENCE_OWNERSHIP = "exclusive-single-writer-session" as const;
 
 /** Defaults allow any report the preparation defaults can produce. */
 export const ARCHIVAL_PERSISTENCE_LIMITS = Object.freeze({
@@ -87,11 +92,16 @@ export interface ArchivalPersistenceSourceResult {
   readonly byteLength: number;
   readonly status: ArchivalPersistenceSourceStatus;
   readonly preparationStatus: "complete" | "incomplete" | "unsupported";
+  readonly recordSchemaVersion: number | null;
   readonly conversationId: number | null;
   readonly recordsPersisted: number;
   readonly recordsTotal: number;
-  readonly firstOrdinal: number | null;
-  readonly lastOrdinal: number | null;
+  /** Stable durable identity is (storeNamespace, sourceId, line), not a request-global ordinal. */
+  readonly firstLine: number | null;
+  readonly lastLine: number | null;
+  /** Original preparation ordinals, provenance only; they reset for each request. */
+  readonly firstPreparationOrdinal: number | null;
+  readonly lastPreparationOrdinal: number | null;
 }
 
 export interface ArchivalPersistenceReport {
@@ -118,6 +128,15 @@ export interface ArchivalPersistenceReport {
     readonly searchUnitsPersisted: number;
   }>;
   readonly sources: readonly ArchivalPersistenceSourceResult[];
+  readonly ownershipRequirement: typeof ARCHIVAL_PERSISTENCE_OWNERSHIP;
+  /** A future index must key on durableKey/(sourceId,line), never preparation ordinals. */
+  readonly searchIntegration: "future-index-must-use-durable-key-not-preparation-ordinal";
+  readonly bounds: Readonly<{
+    readonly maxSources: number;
+    readonly maxRecordsPerSource: number;
+    readonly maxRecords: number;
+    readonly maxLedgerSources: number;
+  }>;
   /** Explicit non-claims for this slice; a future search/import layer is separate. */
   readonly searchIndexed: false;
   readonly runnableStateCreated: false;
@@ -141,13 +160,16 @@ export interface ArchivalLedgerSource {
   readonly preparationStatus: "complete" | "incomplete" | "unsupported";
   readonly preparationFormat: string;
   readonly preparationVersion: number;
+  readonly recordSchemaVersion: number;
   readonly recordCount: number;
   readonly searchUnitCount: number;
   readonly conversationId: number | null;
   readonly firstEntryId: number | null;
   readonly lastEntryId: number | null;
-  readonly firstOrdinal: number | null;
-  readonly lastOrdinal: number | null;
+  readonly firstLine: number | null;
+  readonly lastLine: number | null;
+  readonly firstPreparationOrdinal: number | null;
+  readonly lastPreparationOrdinal: number | null;
 }
 
 export interface ArchivalLedgerState {
@@ -174,15 +196,18 @@ export interface ArchivalPersistedSearchUnit {
 export interface ArchivalRecordEntryData {
   readonly [key: string]: JsonValue;
   readonly schema: typeof ARCHIVAL_RECORD_SCHEMA;
-  readonly schemaVersion: 1;
+  readonly schemaVersion: typeof ARCHIVAL_RECORD_SCHEMA_VERSION;
+  /** SHA-256 over the stable durable identity (storeNamespace, sourceId, line). */
+  readonly durableKey: string;
   readonly storeNamespace: string;
   readonly sourceId: string;
   readonly sourceFormat: string;
   readonly sourceProvenance: string;
   readonly sourceSha256: string;
   readonly recordVersion: number;
-  readonly ordinal: number;
-  readonly sourceOrder: number;
+  /** Original preparation ordinals, provenance only; they reset for each request. */
+  readonly preparationOrdinal: number;
+  readonly preparationSourceOrder: number;
   readonly line: number;
   readonly byteOffset: number;
   readonly byteLength: number;
@@ -237,14 +262,27 @@ export class ArchivalPersistenceInputError extends TypeError {
   }
 }
 
+export type ArchivalPersistenceConflictReason =
+  | "namespace"
+  | "digest"
+  | "format"
+  | "provenance"
+  | "metadata"
+  | "preparation-status"
+  | "preparation-version"
+  | "record-schema-version"
+  | "unsupported-ledger-row";
+
 export class ArchivalPersistenceConflictError extends Error {
   readonly code = "archival_import_persistence_conflict";
   readonly sourceId: string;
+  readonly reason: ArchivalPersistenceConflictReason;
 
-  constructor(sourceId: string, message: string) {
+  constructor(sourceId: string, reason: ArchivalPersistenceConflictReason, message: string) {
     super(message);
     this.name = "ArchivalPersistenceConflictError";
     this.sourceId = sourceId;
+    this.reason = reason;
   }
 }
 
@@ -258,13 +296,16 @@ export class ArchivalPersistenceCorruptionError extends Error {
 }
 
 const LIMITATIONS: readonly string[] = Object.freeze([
+  "The host must hold exclusive single-writer ownership of the Session/storage, normally the same Gateway process lock; this module never acquires a lock itself.",
   "Raw transcript, metadata, provider-state, and quarantined line bytes are stored unredacted as base64; base64 is encoding, not encryption.",
-  "No search index is built and no search API is exposed by this slice; inert custom entries remain to be indexed by a separate reviewed layer.",
-  "Each supported source is stored in its own ownerless Durable conversation. That carrier is archival-only: it is not the runtime session map and is never resumed or replayed.",
+  "No search index is built and no search API is exposed by this slice. A future index must use the durableKey/(sourceId,line) identity, never preparation ordinals.",
+  "Each supported source is stored in its own ownerless Durable conversation. A native Harness initializes its built-in conversation documents, and a Gateway scans conversations on open; the carrier is still not the runtime session map and is never resumed or replayed.",
   "One legacy store namespace is allowed per database. A later import with a different namespace is rejected instead of mixing store-local session keys.",
-  "Unsupported source formats are recorded in the ledger with zero records; this slice does not persist their raw bytes.",
+  "Unsupported source formats are not imported and are NOT written to the ledger, so they can be supplied again after review; this slice does not persist their raw bytes.",
   "Persisted timestamps, session keys, entry IDs, and archive cursor values are historical data. No archive cursor is advanced and no Python session is continued.",
-  "Line identity is provenance, never a deduplication key. Identical lines at different physical positions are stored as separate entries.",
+  "Line identity is provenance, never a deduplication key. Identical lines at different physical positions are stored as separate entries. Durable identity is (storeNamespace, sourceId, line); preparation ordinal/source order reset per request and are provenance only.",
+  "Changed digests, formats, preparation versions, record schema versions, or provenance require operator migration/reconciliation. They are rejected explicitly and are never silently superseded or given a duplicate new identity.",
+  "The session ledger is one document bounded to 512 sources by default (hard cap 1,024). Ledger size and repeat-verification cost grow linearly with source and record counts; larger imports need a reviewed migration/sharding plan.",
 ]);
 
 const SUPPORTED_SEARCH_UNIT_KINDS = new Set([
@@ -513,18 +554,25 @@ function decodeExactBase64(value: string, expectedLength: number): Buffer {
   return raw;
 }
 
+function durableKeyFor(storeNamespace: string, sourceId: string, line: number): string {
+  return createHash("sha256")
+    .update(JSON.stringify(["nanobot-archival-line-v1", storeNamespace, sourceId, line]))
+    .digest("hex");
+}
+
 function toEntryData(report: ArchivalPreparationReport, source: ArchivalSourcePreparation, record: PreparedArchivalRecord): ArchivalRecordEntryData {
   return {
     schema: ARCHIVAL_RECORD_SCHEMA,
-    schemaVersion: 1,
+    schemaVersion: ARCHIVAL_RECORD_SCHEMA_VERSION,
+    durableKey: durableKeyFor(report.storeNamespace, source.sourceId, record.line),
     storeNamespace: report.storeNamespace,
     sourceId: source.sourceId,
     sourceFormat: source.format,
     sourceProvenance: source.provenance,
     sourceSha256: source.sha256,
     recordVersion: record.recordVersion,
-    ordinal: record.ordinal,
-    sourceOrder: record.sourceOrder,
+    preparationOrdinal: record.ordinal,
+    preparationSourceOrder: record.sourceOrder,
     line: record.line,
     byteOffset: record.byteOffset,
     byteLength: record.byteLength,
@@ -558,34 +606,90 @@ function validConversationId(value: unknown): value is number {
   return isSafePositiveInteger(value);
 }
 
-function validEntryId(value: unknown): value is number {
-  return isSafePositiveInteger(value);
-}
-
-/** Read the durable ledger without creating it. Returns `undefined` before the first import. */
+/** A fresh, deeply frozen copy; the Session snapshot is a live document value. */
 export async function readArchivalImportLedger(
   session: Session,
   context: Context,
 ): Promise<ArchivalLedgerState | undefined> {
-  return session.snapshot(ArchivalImportLedgerDoc, context);
+  const value = await session.snapshot(ArchivalImportLedgerDoc, context);
+  return value === undefined ? undefined : deepFreeze(structuredClone(value));
+}
+
+function sameSearchUnits(value: unknown, expected: readonly PreparedArchivalRecord["search"][number][]): boolean {
+  if (!Array.isArray(value) || value.length !== expected.length) return false;
+  return expected.every((unit, index) => {
+    const candidate = value[index];
+    return isRecord(candidate) &&
+      candidate.unit === unit.unit &&
+      candidate.kind === unit.kind &&
+      candidate.role === unit.role &&
+      candidate.timestamp === unit.timestamp &&
+      candidate.name === unit.name &&
+      candidate.entryId === unit.entryId &&
+      candidate.text === unit.text;
+  });
+}
+
+/** Compare one stored entry against the exact recomputed source record, ignoring request-relative ordinals. */
+function assertEntryMatchesRecord(
+  entry: EntryRecord,
+  report: ArchivalPreparationReport,
+  source: ArchivalSourcePreparation,
+  record: PreparedArchivalRecord,
+): void {
+  if (!ArchivalRecordEntry.is(entry) || !isRecord(entry.data)) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} conversation contains a non-archival or malformed entry`);
+  }
+  if (entry.model !== undefined || entry.head !== undefined || entry.edits !== undefined) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} archival entry carries runtime/model state`);
+  }
+  const data = entry.data;
+  if (data.schema !== ARCHIVAL_RECORD_SCHEMA || data.schemaVersion !== ARCHIVAL_RECORD_SCHEMA_VERSION) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} archival entry has an unexpected record schema`);
+  }
+  if (data.durableKey !== durableKeyFor(report.storeNamespace, source.sourceId, record.line)) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} line ${record.line} has a mismatched durable identity`);
+  }
+  if (data.storeNamespace !== report.storeNamespace || data.sourceId !== source.sourceId ||
+      data.sourceFormat !== source.format || data.sourceProvenance !== source.provenance ||
+      data.sourceSha256 !== source.sha256) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} line ${record.line} has mismatched provenance`);
+  }
+  if (!isSafeNonNegativeInteger(data.preparationOrdinal) ||
+      !isSafeNonNegativeInteger(data.preparationSourceOrder)) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} line ${record.line} lost its preparation provenance`);
+  }
+  if (data.recordVersion !== record.recordVersion || data.line !== record.line ||
+      data.byteOffset !== record.byteOffset || data.byteLength !== record.byteLength ||
+      data.lineTerminated !== record.lineTerminated || data.lineSha256 !== record.lineSha256 ||
+      data.category !== record.category || data.status !== record.status ||
+      data.quarantineReason !== record.quarantineReason || data.opaque !== record.opaque ||
+      data.searchStatus !== record.searchStatus || data.disposition !== record.disposition ||
+      data.sessionKey !== record.sessionKey || data.timestamp !== record.timestamp ||
+      data.role !== record.role || data.archiveCursor !== record.archiveCursor) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} line ${record.line} changed in durable storage`);
+  }
+  if (data.rawLineEncoding !== "base64" || data.rawLineBase64 !== record.rawLineBase64) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} line ${record.line} raw bytes changed in durable storage`);
+  }
+  if (!sameSearchUnits(data.search, record.search)) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} line ${record.line} search projection changed in durable storage`);
+  }
 }
 
 /**
- * Verify one existing source against its ledger row. The commit that created
- * the conversation also created the ledger, so a missing carrier is corruption,
- * not a cue to re-append records.
+ * Fully verify one existing source against the recomputed preparation. This is
+ * bounded by `maxRecordsPerSource`; it never trusts the ledger's count or its
+ * first/last spot-check.
  */
 async function verifyExistingSource(
   tx: Tx,
+  report: ArchivalPreparationReport,
   source: ArchivalSourcePreparation,
   existing: ArchivalLedgerSource,
-): Promise<ConversationId | null> {
-  if (source.status === "unsupported") {
-    if (existing.conversationId !== null || existing.recordCount !== 0) {
-      throw new ArchivalPersistenceCorruptionError(`Unsupported source ${source.sourceId} has persisted records`);
-    }
-    return null;
-  }
+  records: readonly PreparedArchivalRecord[],
+  limits: ArchivalPersistenceLimits,
+): Promise<ConversationId> {
   if (!validConversationId(existing.conversationId)) {
     throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} has no valid archival conversation`);
   }
@@ -593,25 +697,54 @@ async function verifyExistingSource(
   if ((await tx.conversation(conversationId)) === undefined) {
     throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} archival conversation is missing`);
   }
-  if (existing.recordCount > 0) {
-    if (!validEntryId(existing.firstEntryId) || !validEntryId(existing.lastEntryId)) {
-      throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} has no valid first/last entry`);
+  if (existing.recordCount !== records.length || existing.searchUnitCount !== source.searchUnitsEmitted) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} ledger count does not match the recomputed preparation`);
+  }
+  if (records.length > limits.maxRecordsPerSource) {
+    throw new ArchivalPersistenceBoundsError("record-count-per-source");
+  }
+
+  const expectedFirstLine = records.length > 0 ? records[0]!.line : null;
+  const expectedLastLine = records.length > 0 ? records[records.length - 1]!.line : null;
+  if (existing.firstLine !== expectedFirstLine || existing.lastLine !== expectedLastLine) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} ledger line identity does not match the recomputed preparation`);
+  }
+
+  let cursor: Cursor | undefined;
+  let index = 0;
+  let firstActualEntryId: number | null = null;
+  let lastActualEntryId: number | null = null;
+  while (true) {
+    const remaining = records.length + 1 - index;
+    const page = await tx.scanEntries(
+      { conversationId, order: "ascending" },
+      Math.min(1_000, Math.max(1, remaining)),
+      cursor,
+    );
+    for (const entry of page.items) {
+      if (index >= records.length) {
+        throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} conversation has extra durable entries`);
+      }
+      assertEntryMatchesRecord(entry, report, source, records[index]!);
+      if (firstActualEntryId === null) firstActualEntryId = entry.id as number;
+      lastActualEntryId = entry.id as number;
+      index += 1;
     }
-    for (const [entryId, expectedLine] of [
-      [existing.firstEntryId, existing.firstOrdinal],
-      [existing.lastEntryId, existing.lastOrdinal],
-    ] as const) {
-      const entry = await tx.entry(ArchivalRecordEntry, entryId as EntryId);
-      if (!entry || entry.conversationId !== conversationId) {
-        throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} archival entry is missing`);
-      }
-      if (entry.data.sourceId !== source.sourceId || entry.data.sourceSha256 !== source.sha256) {
-        throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} archival entry provenance does not match its ledger`);
-      }
-      if (expectedLine !== null && entry.data.ordinal !== expectedLine) {
-        throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} archival entry ordinal does not match its ledger`);
-      }
+    cursor = page.next;
+    if (cursor === undefined) break;
+    if (page.items.length === 0) {
+      throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} conversation scan returned an empty continuation page`);
     }
+  }
+  if (index !== records.length) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} conversation is missing ${records.length - index} durable entries`);
+  }
+  if (records.length === 0) {
+    if (existing.firstEntryId !== null || existing.lastEntryId !== null) {
+      throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} ledger names entries for an empty source`);
+    }
+  } else if (existing.firstEntryId !== firstActualEntryId || existing.lastEntryId !== lastActualEntryId) {
+    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} ledger first/last entry identity is inconsistent`);
   }
   return conversationId;
 }
@@ -634,13 +767,16 @@ function ledgerSourceFromReport(
     preparationStatus: expectedSourceStatus(source),
     preparationFormat: report.format,
     preparationVersion: report.version,
+    recordSchemaVersion: ARCHIVAL_RECORD_SCHEMA_VERSION,
     recordCount: records.length,
     searchUnitCount: source.searchUnitsEmitted,
     conversationId,
     firstEntryId,
     lastEntryId,
-    firstOrdinal: records.length > 0 ? records[0]!.ordinal : null,
-    lastOrdinal: records.length > 0 ? records[records.length - 1]!.ordinal : null,
+    firstLine: records.length > 0 ? records[0]!.line : null,
+    lastLine: records.length > 0 ? records[records.length - 1]!.line : null,
+    firstPreparationOrdinal: records.length > 0 ? records[0]!.ordinal : null,
+    lastPreparationOrdinal: records.length > 0 ? records[records.length - 1]!.ordinal : null,
   };
 }
 
@@ -652,10 +788,23 @@ function assertLedgerShape(ledger: ArchivalLedgerState): void {
   }
   const seen = new Set<string>();
   for (const source of ledger.sources) {
+    const validOptionalLine = (value: unknown): boolean =>
+      value === null || (isSafePositiveInteger(value));
     if (typeof source.sourceId !== "string" || seen.has(source.sourceId) ||
         typeof source.sha256 !== "string" || typeof source.format !== "string" ||
-        typeof source.provenance !== "string" || typeof source.byteLength !== "number" ||
-        !isSafeNonNegativeInteger(source.recordCount)) {
+        typeof source.provenance !== "string" || !isSafeNonNegativeInteger(source.byteLength) ||
+        !isSafeNonNegativeInteger(source.recordCount) ||
+        !isSafeNonNegativeInteger(source.searchUnitCount) ||
+        !isSafeNonNegativeInteger(source.recordSchemaVersion) ||
+        (source.lineCount !== null && !isSafeNonNegativeInteger(source.lineCount)) ||
+        (source.preparationStatus !== "complete" && source.preparationStatus !== "incomplete" &&
+          source.preparationStatus !== "unsupported") ||
+        (source.conversationId !== null && !isSafePositiveInteger(source.conversationId)) ||
+        (source.firstEntryId !== null && !isSafePositiveInteger(source.firstEntryId)) ||
+        (source.lastEntryId !== null && !isSafePositiveInteger(source.lastEntryId)) ||
+        !validOptionalLine(source.firstLine) || !validOptionalLine(source.lastLine) ||
+        (source.firstPreparationOrdinal !== null && !isSafeNonNegativeInteger(source.firstPreparationOrdinal)) ||
+        (source.lastPreparationOrdinal !== null && !isSafeNonNegativeInteger(source.lastPreparationOrdinal))) {
       throw new ArchivalPersistenceCorruptionError("Archival import ledger has a malformed source row");
     }
     seen.add(source.sourceId);
@@ -666,6 +815,32 @@ function previousDigestDiffers(existing: ArchivalLedgerSource, source: ArchivalS
   return existing.sha256 !== source.sha256;
 }
 
+function unsupportedSourceResult(source: ArchivalSourcePreparation): ArchivalPersistenceSourceResult {
+  return {
+    sourceId: source.sourceId,
+    format: source.format,
+    provenance: source.provenance,
+    sha256: source.sha256,
+    byteLength: source.byteLength,
+    status: "unsupported-not-persisted",
+    preparationStatus: "unsupported",
+    recordSchemaVersion: null,
+    conversationId: null,
+    recordsPersisted: 0,
+    recordsTotal: 0,
+    firstLine: null,
+    lastLine: null,
+    firstPreparationOrdinal: null,
+    lastPreparationOrdinal: null,
+  };
+}
+
+/**
+ * Persist one bounded request. The caller MUST hold exclusive single-writer
+ * ownership of the Session/storage, normally the same process lock the Gateway
+ * uses for this database. This function never acquires an ambient lock, and it
+ * must not run concurrently with another writer.
+ */
 export async function persistArchivalImport(
   session: Session,
   request: ArchivalImportRequest,
@@ -685,125 +860,186 @@ export async function persistArchivalImport(
   const report = prepareArchivalImport(request, options.preparation);
   const validated = validatePreparedReport(report, limits);
 
-  const result = await session.commit(async (tx) => {
-    const ledger = await tx.doc(ArchivalImportLedgerDoc);
-    assertLedgerShape(ledger);
-    if (ledger.storeNamespace !== null && ledger.storeNamespace !== report.storeNamespace) {
-      throw new ArchivalPersistenceConflictError(
-        report.storeNamespace,
-        "Archival import database already holds a different store namespace",
-      );
+  let result: ArchivalPersistenceSourceResult[];
+  if (validated.every((item) => item.source.status === "unsupported")) {
+    // An unsupported-only request must not create even an empty ledger document
+    // or a permanent source row; it remains fully retryable.
+    const existingLedger = await session.snapshot(ArchivalImportLedgerDoc, context);
+    if (existingLedger !== undefined) {
+      assertLedgerShape(existingLedger);
+      if (existingLedger.storeNamespace !== null && existingLedger.storeNamespace !== report.storeNamespace) {
+        throw new ArchivalPersistenceConflictError(
+          report.storeNamespace,
+          "namespace",
+          "Archival import database already holds a different store namespace",
+        );
+      }
+      for (const { source } of validated) {
+        if (existingLedger.sources.some((row) => row.sourceId === source.sourceId)) {
+          throw new ArchivalPersistenceConflictError(
+            source.sourceId,
+            "unsupported-ledger-row",
+            `Archival source ${source.sourceId} has an unsupported ledger row; operator migration/reconciliation is required`,
+          );
+        }
+      }
     }
+    result = validated.map(({ source }) => unsupportedSourceResult(source));
+  } else {
+    result = await session.commit(async (tx) => {
+      const ledger = await tx.doc(ArchivalImportLedgerDoc);
+      assertLedgerShape(ledger);
+      if (ledger.storeNamespace !== null && ledger.storeNamespace !== report.storeNamespace) {
+        throw new ArchivalPersistenceConflictError(
+          report.storeNamespace,
+          "namespace",
+          "Archival import database already holds a different store namespace",
+        );
+      }
 
-    const sourceResults: ArchivalPersistenceSourceResult[] = [];
-    const pending: ValidatedSource[] = [];
-    const existingById = new Map(ledger.sources.map((entry) => [entry.sourceId, entry]));
+      const sourceResults: ArchivalPersistenceSourceResult[] = [];
+      const pending: ValidatedSource[] = [];
+      const existingById = new Map(ledger.sources.map((entry) => [entry.sourceId, entry]));
 
-    // Preflight every source before staging a conversation or entry write.
-    for (const item of validated) {
-      const { source, records } = item;
-      const existing = existingById.get(source.sourceId);
-      if (existing) {
-        if (previousDigestDiffers(existing, source)) {
-          throw new ArchivalPersistenceConflictError(
-            source.sourceId,
-            `Archival source ${source.sourceId} is already persisted with a different digest`,
-          );
+      // Preflight every source before staging a conversation or entry write.
+      for (const item of validated) {
+        const { source, records } = item;
+        const existing = existingById.get(source.sourceId);
+        if (source.status === "unsupported") {
+          if (existing) {
+            throw new ArchivalPersistenceConflictError(
+              source.sourceId,
+              "unsupported-ledger-row",
+              `Archival source ${source.sourceId} has an unsupported ledger row; operator migration/reconciliation is required`,
+            );
+          }
+          // Unsupported bytes are not imported and must not leave a permanent ledger row.
+          sourceResults.push(unsupportedSourceResult(source));
+          continue;
         }
-        if (existing.format !== source.format || existing.provenance !== source.provenance ||
-            existing.byteLength !== source.byteLength || existing.lineCount !== source.lineCount ||
-            existing.preparationStatus !== expectedSourceStatus(source) ||
-            existing.preparationFormat !== report.format || existing.preparationVersion !== report.version) {
-          throw new ArchivalPersistenceConflictError(
-            source.sourceId,
-            `Archival source ${source.sourceId} metadata does not match its existing identity`,
-          );
+        if (existing) {
+          if (previousDigestDiffers(existing, source)) {
+            throw new ArchivalPersistenceConflictError(
+              source.sourceId,
+              "digest",
+              `Archival source ${source.sourceId} is already persisted with a different digest; operator reconciliation is required`,
+            );
+          }
+          if (existing.format !== source.format) {
+            throw new ArchivalPersistenceConflictError(
+              source.sourceId,
+              "format",
+              `Archival source ${source.sourceId} is already persisted with a different format; operator migration is required`,
+            );
+          }
+          if (existing.provenance !== source.provenance) {
+            throw new ArchivalPersistenceConflictError(
+              source.sourceId,
+              "provenance",
+              `Archival source ${source.sourceId} is already persisted with different provenance`,
+            );
+          }
+          if (existing.byteLength !== source.byteLength || existing.lineCount !== source.lineCount) {
+            throw new ArchivalPersistenceConflictError(
+              source.sourceId,
+              "metadata",
+              `Archival source ${source.sourceId} byte/line metadata does not match its existing identity`,
+            );
+          }
+          if (existing.preparationStatus !== expectedSourceStatus(source)) {
+            throw new ArchivalPersistenceConflictError(
+              source.sourceId,
+              "preparation-status",
+              `Archival source ${source.sourceId} preparation status changed; operator reconciliation is required`,
+            );
+          }
+          if (existing.preparationFormat !== report.format || existing.preparationVersion !== report.version) {
+            throw new ArchivalPersistenceConflictError(
+              source.sourceId,
+              "preparation-version",
+              `Archival source ${source.sourceId} was prepared by a different preparation version; operator migration/reconciliation is required`,
+            );
+          }
+          if (existing.recordSchemaVersion !== ARCHIVAL_RECORD_SCHEMA_VERSION) {
+            throw new ArchivalPersistenceConflictError(
+              source.sourceId,
+              "record-schema-version",
+              `Archival source ${source.sourceId} uses record schema version ${String(existing.recordSchemaVersion)}; operator migration/reconciliation is required`,
+            );
+          }
+          const conversationId = await verifyExistingSource(tx, report, source, existing, records, limits);
+          sourceResults.push({
+            sourceId: source.sourceId,
+            format: source.format,
+            provenance: source.provenance,
+            sha256: source.sha256,
+            byteLength: source.byteLength,
+            status: "already-persisted",
+            preparationStatus: expectedSourceStatus(source),
+            recordSchemaVersion: existing.recordSchemaVersion,
+            conversationId: conversationId as number,
+            recordsPersisted: 0,
+            recordsTotal: existing.recordCount,
+            firstLine: existing.firstLine,
+            lastLine: existing.lastLine,
+            firstPreparationOrdinal: existing.firstPreparationOrdinal,
+            lastPreparationOrdinal: existing.lastPreparationOrdinal,
+          });
+          continue;
         }
-        const conversationId = await verifyExistingSource(tx, source, existing);
+        if (ledger.sources.length + pending.length >= limits.maxLedgerSources) {
+          throw new ArchivalPersistenceBoundsError("ledger-source-count");
+        }
+        pending.push(item);
+      }
+
+      // Stage all new supported sources after the preflight passes.
+      for (const { source, records } of pending) {
+        const created = await tx.createConversation({ ownership: { kind: "ownerless" } });
+        let firstEntryId: number | null = null;
+        let lastEntryId: number | null = null;
+        for (const record of records) {
+          const entry = await tx.appendEntry(ArchivalRecordEntry, created.id, {
+            data: toEntryData(report, source, record),
+          });
+          firstEntryId ??= entry.id as number;
+          lastEntryId = entry.id as number;
+        }
+        ledger.sources.push(ledgerSourceFromReport(
+          report,
+          source,
+          records,
+          created.id as number,
+          firstEntryId,
+          lastEntryId,
+        ));
         sourceResults.push({
           sourceId: source.sourceId,
           format: source.format,
           provenance: source.provenance,
           sha256: source.sha256,
           byteLength: source.byteLength,
-          status: "already-persisted",
+          status: "persisted",
           preparationStatus: expectedSourceStatus(source),
-          conversationId: conversationId === null ? null : (conversationId as number),
-          recordsPersisted: 0,
-          recordsTotal: existing.recordCount,
-          firstOrdinal: existing.firstOrdinal,
-          lastOrdinal: existing.lastOrdinal,
+          recordSchemaVersion: ARCHIVAL_RECORD_SCHEMA_VERSION,
+          conversationId: created.id as number,
+          recordsPersisted: records.length,
+          recordsTotal: records.length,
+          firstLine: records.length > 0 ? records[0]!.line : null,
+          lastLine: records.length > 0 ? records[records.length - 1]!.line : null,
+          firstPreparationOrdinal: records.length > 0 ? records[0]!.ordinal : null,
+          lastPreparationOrdinal: records.length > 0 ? records[records.length - 1]!.ordinal : null,
         });
-        continue;
-      }
-      if (ledger.sources.length + pending.length >= limits.maxLedgerSources) {
-        throw new ArchivalPersistenceBoundsError("ledger-source-count");
-      }
-      pending.push(item);
-    }
-
-    // Stage all new sources after the preflight passes.
-    for (const { source, records } of pending) {
-      if (source.status === "unsupported") {
-        ledger.sources.push(ledgerSourceFromReport(report, source, records, null, null, null));
-        sourceResults.push({
-          sourceId: source.sourceId,
-          format: source.format,
-          provenance: source.provenance,
-          sha256: source.sha256,
-          byteLength: source.byteLength,
-          status: "unsupported-not-persisted",
-          preparationStatus: "unsupported",
-          conversationId: null,
-          recordsPersisted: 0,
-          recordsTotal: 0,
-          firstOrdinal: null,
-          lastOrdinal: null,
-        });
-        continue;
       }
 
-      const created = await tx.createConversation({ ownership: { kind: "ownerless" } });
-      let firstEntryId: number | null = null;
-      let lastEntryId: number | null = null;
-      for (const record of records) {
-        const entry = await tx.appendEntry(ArchivalRecordEntry, created.id, {
-          data: toEntryData(report, source, record),
-        });
-        firstEntryId ??= entry.id as number;
-        lastEntryId = entry.id as number;
-      }
-      ledger.sources.push(ledgerSourceFromReport(
-        report,
-        source,
-        records,
-        created.id as number,
-        firstEntryId,
-        lastEntryId,
-      ));
-      sourceResults.push({
-        sourceId: source.sourceId,
-        format: source.format,
-        provenance: source.provenance,
-        sha256: source.sha256,
-        byteLength: source.byteLength,
-        status: "persisted",
-        preparationStatus: expectedSourceStatus(source),
-        conversationId: created.id as number,
-        recordsPersisted: records.length,
-        recordsTotal: records.length,
-        firstOrdinal: records.length > 0 ? records[0]!.ordinal : null,
-        lastOrdinal: records.length > 0 ? records[records.length - 1]!.ordinal : null,
-      });
-    }
-
-    if (ledger.storeNamespace === null) ledger.storeNamespace = report.storeNamespace;
-    // Keep source order stable and the ledger deterministic for the same request.
-    const requestOrder = new Map<string, number>();
-    report.sources.forEach((source, index) => requestOrder.set(source.sourceId, index));
-    sourceResults.sort((a, b) => (requestOrder.get(a.sourceId) ?? 0) - (requestOrder.get(b.sourceId) ?? 0));
-    return sourceResults;
-  }, context);
+      if (ledger.storeNamespace === null) ledger.storeNamespace = report.storeNamespace;
+      // Keep source order stable and the ledger deterministic for the same request.
+      const requestOrder = new Map<string, number>();
+      report.sources.forEach((source, index) => requestOrder.set(source.sourceId, index));
+      sourceResults.sort((a, b) => (requestOrder.get(a.sourceId) ?? 0) - (requestOrder.get(b.sourceId) ?? 0));
+      return sourceResults;
+    }, context);
+  }
 
   const newSourcesPersisted = result.filter((source) => source.status === "persisted").length;
   const alreadyPersistedSources = result.filter((source) => source.status === "already-persisted").length;
@@ -835,6 +1071,14 @@ export async function persistArchivalImport(
       ),
     },
     sources: result,
+    ownershipRequirement: ARCHIVAL_PERSISTENCE_OWNERSHIP,
+    searchIntegration: "future-index-must-use-durable-key-not-preparation-ordinal",
+    bounds: {
+      maxSources: limits.maxSources,
+      maxRecordsPerSource: limits.maxRecordsPerSource,
+      maxRecords: limits.maxRecords,
+      maxLedgerSources: limits.maxLedgerSources,
+    },
     searchIndexed: false,
     runnableStateCreated: false,
     sessionMapUpdated: false,
