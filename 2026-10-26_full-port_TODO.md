@@ -22,6 +22,20 @@ continues to constrain the currently integrated tool-less slice.
 Each unchecked milestone needs its exit evidence, not merely compilable code.
 P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
+## Priority pivot: conversation context and tool execution — 2026-10-27
+
+Owner requested a coherent conversation/context/tool core before broader product
+surfaces. Discord remains required. Native gateway tools remain disabled until P1
+policy, environment and replay gates pass.
+
+- [ ] `pi-d9ecab85`, `w2J:p1` / `w2J`: bounded opt-in context lifecycle,
+      conversation/store isolation and reconstruction before resume. Codex Luna
+      high, branch base `93ea70c98959504e7ad573169b765e7b483426fe`.
+- [ ] `pi-6d106995`, `w2D:p3` / `w2D`: read-only native tool integration and
+      security gate plan; report `/tmp/pi-tool-core-plan.md`.
+- [ ] Review the existing Discord/memory/automation candidates when revisiting
+      them; preserve their branches and do not imply they are integrated.
+
 ## Active memory and automation slices — 2026-10-27
 
 Independent Codex Luna high worktrees start from `e05fbd9d0109b9f0eea894b675c03665d1d22b38`.
