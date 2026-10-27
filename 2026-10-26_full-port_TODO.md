@@ -1618,7 +1618,9 @@ no-network scope. Both processes exited with failure; no real credentials were
 sent, no polling began, and whether packets left the host is unknown. The reviewer
 initially omitted this detail and later clarified on request. CLI-level Telegram
 context activation remains unverified. Future reviews must mock or block network,
-not merely use fake credentials.
+not merely use fake credentials. A separate synthetic-tool reviewer invoked a
+local `/bin/sh` probe despite the no-real-tools assignment; the command made no
+network call. Future tool reviews must not execute host shell tools.
 
 ### 2026-10-27 — archival core and consolidation
 
