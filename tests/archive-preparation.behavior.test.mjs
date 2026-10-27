@@ -3,7 +3,8 @@ import test from "node:test";
 import { prepareArchivePayload } from "../dist/archive/index.js";
 import { projectUsageDelta, snapshotUsageState } from "../dist/usage/index.js";
 
-const projection = projectUsageDelta(snapshotUsageState("synthetic", 3, {
+const scope = { storeNamespace: "synthetic", conversationId: 3 };
+const projection = projectUsageDelta(snapshotUsageState(scope.storeNamespace, scope.conversationId, {
   models: {
     "provider/model": {
       input: 2, output: 3, cacheRead: 1, cacheWrite: 0, totalTokens: 6,
@@ -17,9 +18,21 @@ const snapshot = {
   session_key: "synthetic-session",
   messages: [{ timestamp: "2026-07-19T12:00:00+00:00", role: "user", content: "hello" }],
 };
+const prepare = (data = snapshot, usage = projection, expectedScope = scope) =>
+  prepareArchivePayload(data, usage, expectedScope);
 
-test("prepares an immutable Python-v3-compatible payload without inventing requests", () => {
-  const result = prepareArchivePayload(snapshot, projection);
+const validToolOnlyProjection = projectUsageDelta(snapshotUsageState(scope.storeNamespace, scope.conversationId, {
+  models: {},
+  tools: {
+    audit: {
+      input: 0, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 1,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+  },
+}));
+
+test("prepares immutable Python-v3 payload without inventing requests", () => {
+  const result = prepare();
   assert.equal(result.schema_version, 3);
   assert.equal(result.kind, "conversation");
   assert.equal(result.message_count, 1);
@@ -36,31 +49,40 @@ test("prepares an immutable Python-v3-compatible payload without inventing reque
     },
   });
   assert.equal("requests" in result.usage, false);
-  assert.equal(result.usage_provenance.source.storeNamespace, "synthetic");
+  assert.equal(result.usage_provenance.source.storeNamespace, scope.storeNamespace);
   assert.equal(Object.isFrozen(result), true);
   assert.equal(Object.isFrozen(result.messages), true);
   assert.equal(Object.isFrozen(result.usage_provenance.nextCursor), true);
   assert.equal(Object.isFrozen(snapshot.messages[0]), false);
 });
 
-test("rejects incomplete snapshots and oversized archives without mutating inputs", () => {
-  assert.throws(() => prepareArchivePayload({ ...snapshot, messages: [] }, projection), /1-1000/);
-  assert.throws(() => prepareArchivePayload({ ...snapshot, messages: [{ role: "user", content: "x" }] }, projection), /incomplete/);
+test("matches Python summary stripping and truncation before persistence", () => {
+  const result = prepare({ ...snapshot, summary: "  conclusion <think>secret reasoning</think> ok  " });
+  assert.equal(result.summary, "conclusion  ok");
+  assert.doesNotMatch(result.summary, /secret reasoning|<think>/);
+  const long = prepare({ ...snapshot, summary: "x".repeat(8_001) });
+  assert.equal(long.summary, `${"x".repeat(8_000)}\n... (truncated)`);
+});
+
+test("rejects incomplete snapshots, oversized fields, and wrong source scope", () => {
+  assert.throws(() => prepare({ ...snapshot, messages: [] }), /1-1000/);
+  assert.throws(() => prepare({ ...snapshot, messages: [{ role: "user", content: "x" }] }), /incomplete/);
+  assert.throws(() => prepare({ ...snapshot, summary: "x".repeat(256 * 1024 + 1) }), /field limit/);
+  assert.throws(() => prepare(snapshot, projection, { ...scope, conversationId: 4 }), /does not match/);
   const large = { ...snapshot, messages: [{ ...snapshot.messages[0], content: "x".repeat(4 * 1024 * 1024) }] };
-  assert.throws(() => prepareArchivePayload(large, projection), /4 MiB/);
+  assert.throws(() => prepare(large), /field limit|preflight size/);
   assert.equal(large.messages[0].content.length, 4 * 1024 * 1024);
 });
 
-test("preserves recorded unknown provenance while keeping legacy usage model-only", () => {
-  const toolOnly = Object.freeze({
-    ...projection,
-    hasDelta: true,
-    legacy: Object.freeze({}),
-    native: Object.freeze({ ...projection.native, tools: Object.freeze({ audit: { marker: "retained" } }) }),
-    unknownFields: Object.freeze([{ bucket: "tools", key: "audit", field: "reasoning" }]),
-  });
-  const result = prepareArchivePayload(snapshot, toolOnly);
+test("rejects forged accounting shapes and preserves valid tool-only provenance", () => {
+  assert.throws(() => prepare(snapshot, { ...projection, legacy: { ...projection.legacy, prompt_tokens: -1 } }), /Malformed|Invalid|mismatch/);
+  assert.throws(() => prepare(snapshot, { ...projection, native: { ...projection.native, models: {
+    ...projection.native.models,
+    "provider/model": { ...projection.native.models["provider/model"], output: Number.NaN },
+  } } }), /Invalid archive usage counter/);
+  assert.throws(() => prepare(snapshot, { ...projection, nextCursor: { ...projection.nextCursor, version: 8 } }), /cursor proposal/);
+  const result = prepare(snapshot, validToolOnlyProjection);
   assert.equal("usage" in result, false);
-  assert.equal(result.usage_provenance.native.tools.audit.marker, "retained");
-  assert.equal(result.usage_provenance.unknownFields[0].field, "reasoning");
+  assert.equal(result.usage_provenance.native.tools.audit.output, 1);
+  assert.equal(result.usage_provenance.requestCount.status, "unknown");
 });
