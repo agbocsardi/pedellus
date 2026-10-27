@@ -1247,3 +1247,26 @@ request SIGKILL/reopen evidence of zero new denied dispatches, plus compaction/
 deferred-poll source coverage and clean failure/reopen ownership. Prior external
 outcomes remain unknown, not cancelled or rewritten. Shared `3295a7c1f` and pending
 boundaries with the independent reviewer; await corrected explicit completion.
+
+### 2026-10-27 — streaming CLI candidate withheld; slow-sink race reproduced
+
+D2 explicitly completed clean `pi-0d64c0d6` as `66d5fcb10`, streaming native
+watches/submissions with local commands and CLI docs. Parent read the full module
+and CLI wiring. Not integrated: EOF explicitly withdrew durable queued inputs
+after a failed kept run, rather than preserve them; asynchronous /abort could
+overtake prior admission (or swallow subsequent input); rejection notices could
+queue without honoring sink backpressure; render/final state mutated concurrently.
+Requested bounded fixes plus incomplete-C1/Unicode sanitization checks. EOF may
+cancel local observers and report held work, not delete durable user intent merely
+to settle local waits; explicit /abort retains its documented native semantics.
+
+Assigned independent read-only reviewer `pi-7dcd4062`/`w10:p1` to D2, report
+`/tmp/pi-terminal-cli-review.md`. Parent independently wrote and ran
+`/tmp/pi-nanobot-parent-terminal-backpressure.mjs` (30s/384 MB): actual native
+Harness/faux provider, first partial Writable callback blocked until the final
+assistant entry is committed. Expected 326 output characters, observed 372 with
+duplicated prefix/newlines (`exactOnce:false`), built module SHA256
+`8b84bce635cfae30e3ccb303f7eb08ca8d64ffa1db805a96be9c5c8a4fc350df`.
+Shared the repro with worker and reviewer. Serialize render/reconcile transitions,
+not only output writes; rerun final candidate and parent build with exact assertion.
+No live calls, committed test suite or sandbox changes; await explicit fixes/review.
