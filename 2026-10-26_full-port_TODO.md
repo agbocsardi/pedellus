@@ -31,8 +31,11 @@ policy, environment and replay gates pass.
 - [ ] `pi-d9ecab85`, `w2J:p1` / `w2J`: bounded opt-in context lifecycle,
       conversation/store isolation and reconstruction before resume. Codex Luna
       high, branch base `93ea70c98959504e7ad573169b765e7b483426fe`.
-- [ ] `pi-6d106995`, `w2D:p3` / `w2D`: read-only native tool integration and
-      security gate plan; report `/tmp/pi-tool-core-plan.md`.
+- [x] `pi-6d106995`, `w2D:p3` / `w2D`: read-only native tool integration and
+      security gate plan at `/tmp/pi-tool-core-plan.md`; identifies quotas,
+      approvals, workspace ownership and replay gates before production tools.
+- [ ] `pi-b021e7c6`, `w2K:p1` / `w2K`: synthetic actual-Harness native
+      Code Mode/tool conversation and isolation tests; no gateway activation.
 - [ ] Review the existing Discord/memory/automation candidates when revisiting
       them; preserve their branches and do not imply they are integrated.
 
