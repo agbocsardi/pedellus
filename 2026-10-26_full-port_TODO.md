@@ -33,11 +33,12 @@ exports, runner wiring, review and integration.
       listing/selection through the Gateway allowlist and native state. Parent
       reviewed, typechecked and ran its tests from an isolated immutable build,
       then ran the combined 12-check behavioral batch on the parent build.
-- [ ] `pi-b74e3b73`, `w2B:p1` / `w2B`: bounded opt-in identity/memory/skill
-      context-loading or safe in-memory template conversion with explicit limits.
-      Parent withheld `f9203b7f`: it instructed models to use unavailable tools,
-      asserted Dream was active, and omitted input/path bounds. Returned focused
-      corrections; no automatic context activation or filesystem access.
+- [x] `pi-b74e3b73`, `w2B:p1` / `w2B`: merged `a85f7f2dc` opt-in bounded
+      in-memory identity subset; parent added SDK export and combined test wiring.
+      The helper rejects oversized inputs and policy text, and native section
+      composition retains accepted near-limit identity. No unsupported tool/Dream
+      claims, filesystem loading, platform policy or gateway activation; those
+      remain separate P3/P4 work. Parent typecheck and 16 behavioral checks pass.
 - [ ] Review reports and tests, integrate only accepted slices, then remove clean
       completed worktrees. Preserve broad P3/P4 gates and explicit limitations.
 

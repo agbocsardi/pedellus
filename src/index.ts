@@ -4,6 +4,8 @@ export {
   CONTEXT_LIMITS,
   CONTEXT_SECTION_KEYS,
   createContextExtension,
+  renderNanobotIdentity,
+  type NanobotIdentityValues,
   type ContextDocumentSnapshot,
   type ContextSkillSnapshot,
   type ConversationContextSnapshot,
