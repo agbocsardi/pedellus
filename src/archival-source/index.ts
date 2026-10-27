@@ -13,7 +13,7 @@ import { existsSync } from "node:fs";
 import { lstat, open, opendir } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   ARCHIVAL_PREPARATION_LIMITS,
@@ -82,6 +82,7 @@ export interface ArchivalSourceAcquisitionOptions {
 
 export type ArchivalSourceKind = "session" | "archive" | "history";
 export type ArchivalSourceFormat = "session-jsonl" | "session-archive-jsonl" | "history-jsonl";
+export type ArchivalSourceSurfaceName = "sessions" | "archive" | "memory" | "history";
 export type ArchivalSourceSurfaceStatus = "present" | "missing" | "error" | "not-checked";
 export type ArchivalSourceDiagnosticSurface =
   | "root"
@@ -133,6 +134,10 @@ export interface ArchivalSourceAcquisitionReport {
   readonly preparationPerformed: false;
   readonly replayPerformed: false;
   readonly runtimeActionsPrepared: 0;
+  /** Number of the four expected surfaces currently present. */
+  readonly surfacesAvailable: number;
+  /** Expected surfaces that are missing, not checked, or errored. */
+  readonly expectedSurfacesMissing: readonly ArchivalSourceSurfaceName[];
   readonly discovery: Readonly<{
     readonly sessions: ArchivalSourceSurfaceStatus;
     readonly archive: ArchivalSourceSurfaceStatus;
@@ -156,6 +161,7 @@ export interface ArchivalSourceAcquisitionReport {
     readonly archiveSources: number;
     readonly historySources: number;
     readonly ignoredEntries: number;
+    readonly structuralEntries: number;
     readonly directoryEntriesVisited: number;
     readonly bytesRead: number;
     readonly batches: number;
@@ -198,10 +204,17 @@ export class ArchivalSourcePlatformError extends Error {
 }
 
 const SAFE_LABEL = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 const PROC_FD = "/proc/self/fd";
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const RESTRICTED_ROOTS = Object.freeze(["/proc", "/sys", "/dev"]);
+const EXPECTED_SURFACES: readonly ArchivalSourceSurfaceName[] = Object.freeze([
+  "sessions",
+  "archive",
+  "memory",
+  "history",
+]);
 
 const LIMITATIONS: readonly string[] = Object.freeze([
   "Linux only: safe traversal uses O_NOFOLLOW and /proc/self/fd directory pinning. Other platforms fail closed rather than use weaker path checks.",
@@ -320,6 +333,33 @@ function assertSupportedPlatform(): void {
   }
 }
 
+function accountHome(): string {
+  let info: ReturnType<typeof userInfo>;
+  try {
+    info = userInfo();
+  } catch {
+    throw new ArchivalSourceInputError("Archival source acquisition cannot determine the account home directory");
+  }
+  const home = info.homedir;
+  if (typeof home !== "string" || home.length === 0 || !isAbsolute(home)) {
+    throw new ArchivalSourceInputError("Archival source acquisition cannot determine the account home directory");
+  }
+  return resolve(home);
+}
+
+function protectedHomes(): readonly string[] {
+  const homes = new Set<string>([accountHome()]);
+  try {
+    const environmentHome = homedir();
+    if (typeof environmentHome === "string" && environmentHome.length > 0 && isAbsolute(environmentHome)) {
+      homes.add(resolve(environmentHome));
+    }
+  } catch {
+    // The passwd home remains authoritative when HOME is unreadable.
+  }
+  return [...homes];
+}
+
 function validatedRoot(value: unknown): string {
   if (typeof value !== "string" || value.length === 0 || value.includes("\0") || !isAbsolute(value)) {
     throw new ArchivalSourceInputError("Archival source root must be an explicit absolute path");
@@ -328,13 +368,19 @@ function validatedRoot(value: unknown): string {
   if (root === sep) {
     throw new ArchivalSourceInputError("Archival source root must not be the filesystem root");
   }
-  const home = resolve(homedir());
-  const defaultLegacy = resolve(join(home, ".nanobot"));
-  if (isWithin(root, home)) {
-    throw new ArchivalSourceInputError("Archival source root must not be the home directory or an ancestor of it");
-  }
-  if (isWithin(root, defaultLegacy) || isWithin(defaultLegacy, root)) {
+  // Defence in depth: refuse any live default-location component even when HOME
+  // is redirected or the passwd home does not match the path spelling.
+  if (root.split(sep).some((component) => component.toLowerCase() === ".nanobot")) {
     throw new ArchivalSourceInputError("Archival source root must not overlap the default ~/.nanobot location");
+  }
+  for (const home of protectedHomes()) {
+    const defaultLegacy = resolve(join(home, ".nanobot"));
+    if (isWithin(root, home)) {
+      throw new ArchivalSourceInputError("Archival source root must not be the home directory or an ancestor of it");
+    }
+    if (isWithin(root, defaultLegacy) || isWithin(defaultLegacy, root)) {
+      throw new ArchivalSourceInputError("Archival source root must not overlap the default ~/.nanobot location");
+    }
   }
   const temporary = resolve(tmpdir());
   if (root === temporary) {
@@ -499,6 +545,7 @@ interface AcquisitionState {
   readonly directories: Map<string, Readonly<{ segments: readonly string[]; stat: BigIntStats }>>;
   entriesVisited: number;
   ignoredEntries: number;
+  structuralEntries: number;
   candidateEntries: number;
   archiveKeyEntries: number;
   declaredBytes: number;
@@ -708,7 +755,10 @@ async function discoverSessions(root: FileHandle, state: AcquisitionState): Prom
     await withDirectory(root, ["sessions"], state, async (handle, names, stat) => {
       state.surfaces.sessions = "present";
       for (const name of names) {
-        if (name === "archive") continue;
+        if (name === "archive") {
+          state.structuralEntries++;
+          continue;
+        }
         if (!name.endsWith(".jsonl")) {
           state.ignoredEntries++;
           continue;
@@ -736,13 +786,14 @@ async function discoverArchive(root: FileHandle, state: AcquisitionState): Promi
     return;
   }
   try {
-    await withDirectory(root, ["sessions", "archive"], state, async (handle, names, stat) => {
+    await withDirectory(root, ["sessions", "archive"], state, async (handle, names) => {
       state.surfaces.archive = "present";
       for (const name of names) {
         let info: BigIntStats;
         try {
           info = await lstat(join(procFdPath(handle.fd), name), { bigint: true });
         } catch (error) {
+          state.structuralEntries++;
           const failure = asAccessFailure(error);
           addDiagnostic(
             state,
@@ -753,6 +804,7 @@ async function discoverArchive(root: FileHandle, state: AcquisitionState): Promi
           continue;
         }
         if (info.isSymbolicLink()) {
+          state.structuralEntries++;
           addDiagnostic(state, "archive-key-directory-symlink", "failure", "archive-key");
           continue;
         }
@@ -760,6 +812,7 @@ async function discoverArchive(root: FileHandle, state: AcquisitionState): Promi
           state.ignoredEntries++;
           continue;
         }
+        state.structuralEntries++;
         state.archiveKeyEntries++;
         if (state.archiveKeyEntries > state.limits.maxSources) {
           throw new ArchivalSourceBoundsError("archive-key-count");
@@ -786,7 +839,6 @@ async function discoverArchive(root: FileHandle, state: AcquisitionState): Promi
           );
         }
       }
-      void stat;
     });
   } catch (error) {
     if (error instanceof ArchivalSourceBoundsError) throw error;
@@ -924,7 +976,6 @@ async function readCandidate(
       if (!sameFile(after, opened)) throw new AccessFailure("changed");
       const pathAfter = await lstat(path, { bigint: true });
       if (!sameFile(pathAfter, opened)) throw new AccessFailure("changed");
-      if (bytes.length !== byteLength) throw new AccessFailure("changed");
       return bytes;
     } finally {
       await handle.close().catch(() => undefined);
@@ -1086,6 +1137,7 @@ export async function acquireLegacySourceSnapshots(
     directories: new Map(),
     entriesVisited: 0,
     ignoredEntries: 0,
+    structuralEntries: 0,
     candidateEntries: 0,
     archiveKeyEntries: 0,
     declaredBytes: 0,
@@ -1155,10 +1207,17 @@ export async function acquireLegacySourceSnapshots(
     }
 
     await verifyRootAndDirectories(root, rootPath, rootBefore, state);
+    if (state.candidateEntries === 0) {
+      addDiagnostic(state, "no-sources-discovered", "failure", "root");
+    }
   } finally {
     await root.close().catch(() => undefined);
   }
 
+  const expectedSurfacesMissing = EXPECTED_SURFACES.filter(
+    (surface) => state.surfaces[surface] !== "present",
+  );
+  const surfacesAvailable = EXPECTED_SURFACES.length - expectedSurfacesMissing.length;
   const complete = state.diagnostics.every((diagnostic) => diagnostic.severity !== "failure");
   if (complete) {
     batches = batchesFor(state.sources, limits);
@@ -1178,6 +1237,8 @@ export async function acquireLegacySourceSnapshots(
     preparationPerformed: false,
     replayPerformed: false,
     runtimeActionsPrepared: 0,
+    surfacesAvailable,
+    expectedSurfacesMissing,
     discovery: { ...state.surfaces },
     bounds: {
       limits,
@@ -1196,6 +1257,7 @@ export async function acquireLegacySourceSnapshots(
       archiveSources: state.sources.filter((source) => source.kind === "archive").length,
       historySources: state.sources.filter((source) => source.kind === "history").length,
       ignoredEntries: state.ignoredEntries,
+      structuralEntries: state.structuralEntries,
       directoryEntriesVisited: state.entriesVisited,
       bytesRead: state.bytesRead,
       batches: batches.length,
@@ -1211,28 +1273,150 @@ export async function acquireLegacySourceSnapshots(
 
 /**
  * Run the existing preparation API over a complete acquisition, one bounded
- * batch at a time. No persistence or import is performed. An incomplete
- * acquisition is rejected instead of preparing a partial snapshot.
+ * batch at a time. No persistence or import is performed. The acquisition is
+ * treated as an internal trust boundary: version, labels, digests, sources, and
+ * batch membership are revalidated and batches are recomputed from `sources`,
+ * so a forged report cannot silently omit or duplicate work.
  */
 export function prepareAcquiredArchivalImport(
   report: ArchivalSourceAcquisitionReport,
   options: ArchivalPreparationOptions = {},
 ): readonly ArchivalPreparationReport[] {
-  if (!report || typeof report !== "object" || report.format !== ARCHIVAL_SOURCE_ACQUISITION_FORMAT) {
-    throw new ArchivalSourceInputError("Expected an archival source acquisition report");
-  }
-  if (report.complete !== true) {
-    throw new ArchivalSourceInputError("Cannot prepare an incomplete archival source acquisition");
-  }
-  if (report.sources.length === 0) return [];
-  return report.batches.map((batch) => {
-    if (batch.sources.length === 0) {
-      throw new ArchivalSourceInputError("Archival source batch must not be empty");
-    }
+  const validated = validatedAcquisitionReport(report);
+  return validated.batches.map((batch) => {
     const request: ArchivalImportRequest = {
-      storeNamespace: report.storeNamespace,
+      storeNamespace: validated.storeNamespace,
       sources: batch.sources,
     };
     return prepareArchivalImport(request, options);
   });
+}
+
+interface ValidatedAcquisitionReport {
+  readonly storeNamespace: string;
+  readonly sources: readonly AcquiredArchivalSource[];
+  readonly batches: readonly ArchivalSourceBatch[];
+}
+
+function validatedAcquisitionReport(report: unknown): ValidatedAcquisitionReport {
+  if (!isRecord(report) || report.format !== ARCHIVAL_SOURCE_ACQUISITION_FORMAT) {
+    throw new ArchivalSourceInputError("Expected an archival source acquisition report");
+  }
+  if (report.version !== ARCHIVAL_SOURCE_ACQUISITION_VERSION) {
+    throw new ArchivalSourceInputError("Unsupported archival source acquisition report version");
+  }
+  if (report.complete !== true) {
+    throw new ArchivalSourceInputError("Cannot prepare an incomplete archival source acquisition");
+  }
+  const storeNamespace = validatedStoreNamespace(report.storeNamespace);
+  const rootLabel = report.rootLabel;
+  if (typeof rootLabel !== "string" || !SAFE_LABEL.test(rootLabel)) {
+    throw new ArchivalSourceInputError("Archival source acquisition report has an invalid root label");
+  }
+  const rawSources = report.sources;
+  if (!Array.isArray(rawSources) || rawSources.length === 0) {
+    throw new ArchivalSourceInputError("Archival source acquisition report must contain at least one source");
+  }
+  const rawBounds = report.bounds;
+  if (!isRecord(rawBounds)) {
+    throw new ArchivalSourceInputError("Archival source acquisition report has invalid bounds");
+  }
+  const limits = normalizedLimits(rawBounds.limits);
+
+  const sources: AcquiredArchivalSource[] = [];
+  const seenSourceIds = new Set<string>();
+  for (const rawSource of rawSources) {
+    if (!isRecord(rawSource)) {
+      throw new ArchivalSourceInputError("Archival source acquisition report contains an invalid source");
+    }
+    const sourceId = rawSource.sourceId;
+    if (typeof sourceId !== "string" || !SAFE_LABEL.test(sourceId) || seenSourceIds.has(sourceId)) {
+      throw new ArchivalSourceInputError("Archival source acquisition report has an invalid or duplicate source ID");
+    }
+    const kind = rawSource.kind;
+    if (kind !== "session" && kind !== "archive" && kind !== "history") {
+      throw new ArchivalSourceInputError("Archival source acquisition report has an invalid source kind");
+    }
+    const format = sourceFormat(kind);
+    if (rawSource.format !== format) {
+      throw new ArchivalSourceInputError("Archival source acquisition report source format does not match its kind");
+    }
+    const provenance = rawSource.provenance;
+    if (typeof provenance !== "string" || !SAFE_LABEL.test(provenance)) {
+      throw new ArchivalSourceInputError("Archival source acquisition report has an invalid provenance label");
+    }
+    const sha256 = rawSource.sha256;
+    if (typeof sha256 !== "string" || !SHA256_HEX.test(sha256)) {
+      throw new ArchivalSourceInputError("Archival source acquisition report has an invalid source digest");
+    }
+    const byteLength = rawSource.byteLength;
+    if (typeof byteLength !== "number" || !Number.isSafeInteger(byteLength) || byteLength < 0) {
+      throw new ArchivalSourceInputError("Archival source acquisition report has an invalid source byte length");
+    }
+    const rawSnapshot = rawSource.snapshot;
+    if (!isRecord(rawSnapshot)) {
+      throw new ArchivalSourceInputError("Archival source acquisition report has an invalid snapshot");
+    }
+    const bytes = rawSnapshot.bytes;
+    if (!(bytes instanceof Uint8Array) || byteLength !== bytes.length) {
+      throw new ArchivalSourceInputError("Archival source acquisition report snapshot bytes do not match its source");
+    }
+    if (rawSnapshot.sourceId !== sourceId ||
+        rawSnapshot.format !== format ||
+        rawSnapshot.provenance !== provenance ||
+        rawSnapshot.sha256 !== sha256) {
+      throw new ArchivalSourceInputError("Archival source acquisition report snapshot identity does not match its source");
+    }
+    let digest: string;
+    try {
+      digest = sha256Hex(bytes);
+    } catch {
+      throw new ArchivalSourceInputError("Archival source acquisition report snapshot bytes are unreadable");
+    }
+    if (digest !== sha256) {
+      throw new ArchivalSourceInputError("Archival source acquisition report snapshot digest does not match its source");
+    }
+    seenSourceIds.add(sourceId);
+    sources.push({
+      sourceId,
+      kind,
+      format,
+      provenance,
+      sha256,
+      byteLength,
+      snapshot: { sourceId, sha256, format, provenance, bytes },
+    });
+  }
+
+  const batches = batchesFor(sources, limits);
+  const rawBatches = report.batches;
+  if (!Array.isArray(rawBatches) || rawBatches.length !== batches.length) {
+    throw new ArchivalSourceInputError("Archival source acquisition report batches do not match its sources");
+  }
+  for (let index = 0; index < batches.length; index++) {
+    const expected = batches[index];
+    const rawBatch = rawBatches[index];
+    if (!expected || !isRecord(rawBatch) ||
+        rawBatch.batch !== index ||
+        rawBatch.totalBytes !== expected.totalBytes ||
+        !Array.isArray(rawBatch.sources) ||
+        rawBatch.sources.length !== expected.sources.length) {
+      throw new ArchivalSourceInputError("Archival source acquisition report batches do not match its sources");
+    }
+    for (let sourceIndex = 0; sourceIndex < expected.sources.length; sourceIndex++) {
+      const expectedSnapshot = expected.sources[sourceIndex];
+      const rawSnapshot = rawBatch.sources[sourceIndex];
+      if (!expectedSnapshot || !isRecord(rawSnapshot) ||
+          rawSnapshot.sourceId !== expectedSnapshot.sourceId ||
+          rawSnapshot.sha256 !== expectedSnapshot.sha256 ||
+          rawSnapshot.format !== expectedSnapshot.format ||
+          rawSnapshot.provenance !== expectedSnapshot.provenance ||
+          !(rawSnapshot.bytes instanceof Uint8Array) ||
+          rawSnapshot.bytes.length !== expectedSnapshot.bytes.length) {
+        throw new ArchivalSourceInputError("Archival source acquisition report batches do not match its sources");
+      }
+    }
+  }
+
+  return { storeNamespace, sources, batches };
 }

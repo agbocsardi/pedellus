@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import {
   ARCHIVAL_SOURCE_ACQUISITION_FORMAT,
@@ -74,6 +75,38 @@ function serializedWithoutBytes(report) {
   return JSON.stringify(report, (key, value) => (key === "bytes" ? "<bytes>" : value));
 }
 
+async function makeInstrumentedModule() {
+  const temporary = await mkdtemp(join(tmpdir(), "nanobot-archival-race-"));
+  await mkdir(join(temporary, "archival-import"), { recursive: true });
+  await mkdir(join(temporary, "archival-source"), { recursive: true });
+  await copyFile(
+    new URL("../dist/archival-import/index.js", import.meta.url),
+    join(temporary, "archival-import/index.js"),
+  );
+  const original = await readFile(new URL("../dist/archival-source/index.js", import.meta.url), "utf8");
+  const instrumented = original
+    .replace(
+      "const before = await lstat(path, { bigint: true });",
+      "await globalThis.__archivalSourceRaceHook?.('before-read-lstat');\n        const before = await lstat(path, { bigint: true });",
+    )
+    .replace(
+      "const handle = await open(path, FILE_FLAGS);",
+      "await globalThis.__archivalSourceRaceHook?.('before-open');\n        const handle = await open(path, FILE_FLAGS);",
+    )
+    .replace(
+      /(offset \+= bytesRead;[\s\S]*?\n\s*\}\n)(\s*)const after = await handle\.stat\(\{ bigint: true \}\);/,
+      "$1$2await globalThis.__archivalSourceRaceHook?.('after-read');\n$2const after = await handle.stat({ bigint: true });",
+    );
+  for (const marker of ["before-read-lstat", "before-open", "after-read"]) {
+    assert.equal(instrumented.includes(marker), true, `missing race hook ${marker}`);
+  }
+  await writeFile(join(temporary, "archival-source/index.js"), instrumented);
+  const module = await import(
+    `${pathToFileURL(join(temporary, "archival-source/index.js")).href}?race=${Date.now()}`
+  );
+  return { temporary, module };
+}
+
 test("discovers only the exact legacy surfaces and snapshots exact bytes", async () => {
   const root = await makeRoot();
   try {
@@ -119,7 +152,12 @@ test("discovers only the exact legacy surfaces and snapshots exact bytes", async
     assert.equal(first.counts.sessionSources, 1);
     assert.equal(first.counts.archiveSources, 2);
     assert.equal(first.counts.historySources, 1);
+    assert.equal(first.surfacesAvailable, 4);
+    assert.deepEqual(first.expectedSurfacesMissing, []);
     assert.equal(first.counts.ignoredEntries, 3);
+    assert.equal(first.counts.structuralEntries, 3);
+    assert.equal(first.counts.directoryEntriesVisited,
+      first.counts.sourcesDiscovered + first.counts.ignoredEntries + first.counts.structuralEntries);
     assert.equal(first.counts.diagnostics, 0);
     assert.equal(first.batches.length, 1);
     assert.equal(first.batches[0].sources.length, 4);
@@ -181,14 +219,16 @@ test("discovers only the exact legacy surfaces and snapshots exact bytes", async
   }
 });
 
-test("reports missing surfaces as notices and an empty root as an honest empty acquisition", async () => {
+test("marks an empty or wrong root incomplete instead of silently importing nothing", async () => {
   const emptyRoot = await makeRoot();
   try {
     const empty = await acquireLegacySourceSnapshots({
       root: emptyRoot,
       storeNamespace: "synthetic-store",
     });
-    assert.equal(empty.complete, true);
+    assert.equal(empty.complete, false);
+    assert.equal(empty.surfacesAvailable, 0);
+    assert.deepEqual(empty.expectedSurfacesMissing, ["sessions", "archive", "memory", "history"]);
     assert.equal(empty.discovery.sessions, "missing");
     assert.equal(empty.discovery.archive, "not-checked");
     assert.equal(empty.discovery.memory, "missing");
@@ -199,11 +239,28 @@ test("reports missing surfaces as notices and an empty root as an honest empty a
       "sessions-directory-missing",
       "archive-directory-not-checked",
       "memory-directory-missing",
+      "no-sources-discovered",
     ]);
-    assert.equal(empty.diagnostics.every((diagnostic) => diagnostic.severity === "notice"), true);
-    assert.deepEqual(prepareAcquiredArchivalImport(empty), []);
+    assert.equal(empty.diagnostics.at(-1).severity, "failure");
+    assert.throws(() => prepareAcquiredArchivalImport(empty), ArchivalSourceInputError);
   } finally {
     await removeRoot(emptyRoot);
+  }
+
+  const emptySessionsRoot = await makeRoot();
+  try {
+    await mkdir(join(emptySessionsRoot, "sessions"), { recursive: true });
+    const emptySessions = await acquireLegacySourceSnapshots({
+      root: emptySessionsRoot,
+      storeNamespace: "synthetic-store",
+    });
+    assert.equal(emptySessions.complete, false);
+    assert.equal(emptySessions.surfacesAvailable, 1);
+    assert.deepEqual(emptySessions.expectedSurfacesMissing, ["archive", "memory", "history"]);
+    assert.equal(emptySessions.diagnostics.some((diagnostic) => diagnostic.code === "no-sources-discovered"), true);
+    assert.equal(emptySessions.batches.length, 0);
+  } finally {
+    await removeRoot(emptySessionsRoot);
   }
 
   const partialRoot = await makeRoot();
@@ -215,6 +272,8 @@ test("reports missing surfaces as notices and an empty root as an honest empty a
       storeNamespace: "synthetic-store",
     });
     assert.equal(partial.complete, true);
+    assert.equal(partial.surfacesAvailable, 2);
+    assert.deepEqual(partial.expectedSurfacesMissing, ["archive", "history"]);
     assert.equal(partial.discovery.sessions, "present");
     assert.equal(partial.discovery.archive, "missing");
     assert.equal(partial.discovery.memory, "present");
@@ -405,6 +464,9 @@ test("honors explicit batch limits and relationship validation", async () => {
     });
     assert.deepEqual(report.batches.map((batch) => batch.sources.length), [2, 2, 1]);
     assert.equal(report.batches.length, 3);
+    const prepared = prepareAcquiredArchivalImport(report);
+    assert.equal(prepared.length, 3);
+    assert.deepEqual(prepared.map((entry) => entry.sources.length), [2, 2, 1]);
 
     await assert.rejects(
       acquireLegacySourceSnapshots({
@@ -534,8 +596,192 @@ test("requires an explicit dedicated root and an operator-supplied safe namespac
       ArchivalSourceInputError,
     );
     const missing = await acquireLegacySourceSnapshots({ root, storeNamespace: "synthetic-store" });
-    assert.equal(missing.complete, true);
+    assert.equal(missing.complete, false);
     assert.equal(missing.sources.length, 0);
+    assert.equal(missing.diagnostics.some((diagnostic) => diagnostic.code === "no-sources-discovered"), true);
+  } finally {
+    await removeRoot(root);
+  }
+});
+
+test("protects the account home when HOME is redirected", async () => {
+  const realHome = userInfo().homedir;
+  assert.equal(typeof realHome, "string");
+  assert.equal(realHome.length > 0, true);
+  const fakeHome = await mkdtemp(join(tmpdir(), "nanobot-fake-home-"));
+  const previousHome = process.env.HOME;
+  try {
+    process.env.HOME = fakeHome;
+    await assert.rejects(
+      acquireLegacySourceSnapshots({
+        root: join(realHome, ".nanobot", "probe-nonexistent"),
+        storeNamespace: "synthetic-store",
+      }),
+      ArchivalSourceInputError,
+    );
+    await assert.rejects(
+      acquireLegacySourceSnapshots({
+        root: join(fakeHome, ".nanobot", "copy"),
+        storeNamespace: "synthetic-store",
+      }),
+      ArchivalSourceInputError,
+    );
+    await assert.rejects(
+      acquireLegacySourceSnapshots({ root: join(realHome, ".."), storeNamespace: "synthetic-store" }),
+      ArchivalSourceInputError,
+    );
+    process.env.HOME = "/";
+    await assert.rejects(
+      acquireLegacySourceSnapshots({ root: join(realHome, ".."), storeNamespace: "synthetic-store" }),
+      ArchivalSourceInputError,
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await removeRoot(fakeHome);
+  }
+});
+
+test("rejects forged or inconsistent acquisition reports before preparation", async () => {
+  const root = await makeRoot();
+  try {
+    await writeFixture(root, "sessions/s1.jsonl", sessionText());
+    await writeFixture(root, "sessions/s2.jsonl", sessionText("synthetic:2"));
+    const report = await acquireLegacySourceSnapshots({
+      root,
+      storeNamespace: "synthetic-store",
+    });
+    assert.equal(report.complete, true);
+    assert.equal(report.batches.length, 1);
+    assert.equal(report.batches[0].sources.length, 2);
+
+    assert.throws(
+      () => prepareAcquiredArchivalImport({ ...report, version: 99 }),
+      ArchivalSourceInputError,
+    );
+    assert.throws(
+      () => prepareAcquiredArchivalImport({ ...report, sources: [], batches: report.batches }),
+      ArchivalSourceInputError,
+    );
+    assert.throws(
+      () => prepareAcquiredArchivalImport({
+        ...report,
+        batches: [{
+          ...report.batches[0],
+          sources: report.batches[0].sources.slice(0, 1),
+          totalBytes: report.sources[0].byteLength,
+        }],
+      }),
+      ArchivalSourceInputError,
+    );
+
+    const first = report.sources[0];
+    assert.throws(
+      () => prepareAcquiredArchivalImport({
+        ...report,
+        batches: [
+          { batch: 0, sources: [first.snapshot], totalBytes: first.byteLength },
+          { batch: 1, sources: [first.snapshot], totalBytes: first.byteLength },
+        ],
+      }),
+      ArchivalSourceInputError,
+    );
+    assert.throws(
+      () => prepareAcquiredArchivalImport({
+        ...report,
+        sources: [first, first],
+        batches: [
+          { batch: 0, sources: [first.snapshot], totalBytes: first.byteLength },
+          { batch: 1, sources: [first.snapshot], totalBytes: first.byteLength },
+        ],
+      }),
+      ArchivalSourceInputError,
+    );
+    assert.throws(
+      () => prepareAcquiredArchivalImport({
+        ...report,
+        sources: [{ ...first, sha256: "0".repeat(64) }, ...report.sources.slice(1)],
+      }),
+      ArchivalSourceInputError,
+    );
+  } finally {
+    await removeRoot(root);
+  }
+});
+
+test("detects deterministic mutations before, during, and after read", async () => {
+  const { temporary, module } = await makeInstrumentedModule();
+  try {
+    const cases = [
+      {
+        phase: "before-read-lstat",
+        mutate: async (target) => { await writeFile(target, sessionText("changed-before-lstat")); },
+      },
+      {
+        phase: "before-open",
+        mutate: async (target) => {
+          await rename(target, `${target}.old`);
+          await writeFile(target, sessionText("replaced-before-open"));
+        },
+      },
+      {
+        phase: "after-read",
+        mutate: async (target) => { await writeFile(target, sessionText("changed-after-read")); },
+      },
+    ];
+    for (const { phase, mutate } of cases) {
+      const root = await makeRoot();
+      try {
+        await writeFixture(root, "sessions/s1.jsonl", sessionText());
+        const target = join(root, "sessions/s1.jsonl");
+        let fired = false;
+        globalThis.__archivalSourceRaceHook = async (currentPhase) => {
+          if (currentPhase !== phase || fired) return;
+          fired = true;
+          await mutate(target);
+        };
+        const report = await module.acquireLegacySourceSnapshots({
+          root,
+          storeNamespace: "synthetic-store",
+        });
+        assert.equal(fired, true, phase);
+        assert.equal(report.complete, false, phase);
+        assert.equal(report.sources.length, 0, phase);
+        assert.equal(report.batches.length, 0, phase);
+        assert.equal(
+          report.diagnostics.some((diagnostic) => diagnostic.code === "source-changed"),
+          true,
+          phase,
+        );
+      } finally {
+        delete globalThis.__archivalSourceRaceHook;
+        await removeRoot(root);
+      }
+    }
+  } finally {
+    delete globalThis.__archivalSourceRaceHook;
+    await removeRoot(temporary);
+  }
+});
+
+test("closes file descriptors across repeated acquisitions", async () => {
+  const root = await makeRoot();
+  try {
+    for (let index = 0; index < 30; index++) {
+      await writeFixture(root, `sessions/s${String(index).padStart(2, "0")}.jsonl`, sessionText(`synthetic:${index}`));
+    }
+    const counts = [];
+    for (let round = 0; round < 3; round++) {
+      const report = await acquireLegacySourceSnapshots({
+        root,
+        storeNamespace: "synthetic-store",
+      });
+      assert.equal(report.complete, true);
+      assert.equal(report.sources.length, 30);
+      counts.push((await readdir("/proc/self/fd")).length);
+    }
+    assert.equal(counts[1], counts[0]);
+    assert.equal(counts[2], counts[1]);
   } finally {
     await removeRoot(root);
   }
