@@ -33,8 +33,10 @@ No real data, live calls, gateway tools or automatic integration.
       behavioral tests, including EOF/order and backpressure.
 - [ ] `pi-70f63e0d`, `w28:p1` / `w28`: final migration review and legacy
       eligibility/provenance/safety behavioral tests.
-- [ ] `pi-13bd5370`, `w29:p1` / `w29`: model-selection and recovery policy
-      behavioral tests at the Nanobot integration boundary.
+- [x] `pi-13bd5370`, `w29:p1` / `w29`: merged `8496fc587` model-policy
+      behavioral test. Parent reviewed and ran it against the parent build; it
+      covers busy rejection, thinking/selection, normal reopen and revoked choice.
+      Prepared-request crash recovery and deferred poll are not permanent tests.
 - [ ] Parent review, reconcile any shared runner wiring, run targeted checks on
       the integrated branch, and preserve remaining gaps. Explicit completion
       reports are required; idle/acknowledgement is not acceptance.
