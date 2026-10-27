@@ -45,6 +45,10 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
         errorOutput: stderr,
         prompt: () => input?.prompt(),
         closeInput: () => input?.close(),
+        modelSelection: {
+          list: () => gateway!.listModels("cli:default", context),
+          select: (selection) => gateway!.selectModel("cli:default", selection, context),
+        },
       });
     }
   } finally {

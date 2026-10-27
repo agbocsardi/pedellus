@@ -2,7 +2,7 @@ import type { Context } from "@earendil-works/chord";
 import { withAbortSignal } from "@earendil-works/chord/context";
 import type { Writable } from "node:stream";
 import { stripVTControlCharacters } from "node:util";
-import { AssistantEntry } from "@earendil-works/pi-durable";
+import { AssistantEntry, ConversationBusy } from "@earendil-works/pi-durable";
 import type {
   Conversation,
   ConversationView,
@@ -10,7 +10,7 @@ import type {
   LiveState,
   UsageState,
 } from "@earendil-works/pi-durable";
-import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, ModelThinkingLevel } from "@earendil-works/pi-ai";
 
 const MAX_PENDING_INPUTS = 64;
 const MAX_ACTIVE_COMMANDS = 16;
@@ -26,6 +26,24 @@ const MAX_STATUS_QUEUE_SCAN = 2_000;
 const MAX_MESSAGE_BLOCK_SCAN = 2_048;
 const LITERAL_SLASH_PREFIX = "//";
 
+export interface TerminalModelChoice {
+  provider: string;
+  modelId: string;
+  name: string;
+  thinkingLevels: readonly ModelThinkingLevel[];
+}
+
+export interface TerminalModelSelection {
+  provider: string;
+  modelId: string;
+  thinkingLevel: ModelThinkingLevel;
+}
+
+export interface TerminalModelSelectionHost {
+  list(): Promise<{ models: readonly TerminalModelChoice[]; selected: TerminalModelSelection }>;
+  select(selection: { provider: string; modelId: string; thinkingLevel?: ModelThinkingLevel }): Promise<TerminalModelSelection>;
+}
+
 export interface TerminalIO {
   /** Each item is a completed line; the source owns any memory bound before yielding it. */
   readonly input: AsyncIterable<string>;
@@ -35,6 +53,8 @@ export interface TerminalIO {
   readonly prompt?: () => void;
   /** Close an input source that supports prompt cancellation (for example readline.Interface). */
   readonly closeInput?: () => void;
+  /** Optional host-owned model policy; standalone terminal callers remain read-only without it. */
+  readonly modelSelection?: TerminalModelSelectionHost;
 }
 
 type InboxView = { items?: readonly { mode?: string }[] };
@@ -411,12 +431,49 @@ export async function runTerminalConversation(
     await notice(`Last ${messages.length} text message(s):\n${messages.join("\n")}${capped ? "\n[History scan capped.]" : ""}`);
   };
 
-  const showModel = async (mutationRequested: boolean): Promise<void> => {
-    const agent = await conversation.agent(operationContext);
-    const model = modelLabel(agent.model);
-    await notice(mutationRequested
-      ? `Model changes are host-controlled and unavailable here. Current model: ${model}.`
-      : `Current model: ${model}.`);
+  const showModel = async (args: string): Promise<void> => {
+    const host = io.modelSelection;
+    if (!host) {
+      const agent = await conversation.agent(operationContext);
+      const model = modelLabel(agent.model);
+      await notice(args.trim()
+        ? `Model changes are host-controlled and unavailable here. Current model: ${model}.`
+        : `Current model: ${model}.`);
+      return;
+    }
+
+    const parts = args.trim() ? args.trim().split(/\s+/) : [];
+    if (parts.length === 0) {
+      const listing = await host.list();
+      const maxChoices = 50;
+      const rows = listing.models.slice(0, maxChoices).map((choice) => {
+        const selected = choice.provider === listing.selected.provider && choice.modelId === listing.selected.modelId;
+        const levels = choice.thinkingLevels.map((level) => safeLabel(level, 32)).join(", ");
+        return `  ${selected ? "* " : "  "}${safeLabel(choice.provider, 80)} ${safeLabel(choice.modelId, 160)} — ${safeLabel(choice.name, 160)} [thinking: ${levels || "off"}]`;
+      });
+      if (listing.models.length > maxChoices) rows.push(`  … ${listing.models.length - maxChoices} more allowed models omitted`);
+      await notice([
+        `Current model: ${modelLabel(listing.selected)} (thinking: ${safeLabel(listing.selected.thinkingLevel, 32)}).`,
+        "Allowed models (use /model <provider> <modelId> [thinkingLevel]):",
+        ...rows,
+      ].join("\n"));
+      return;
+    }
+    if (parts.length < 2 || parts.length > 3 || parts.some((part) => !part)) {
+      await notice("Usage: /model <provider> <modelId> [thinkingLevel]. Use /model to list allowed choices.", true);
+      return;
+    }
+    const selection = { provider: parts[0]!, modelId: parts[1]!, ...(parts[2] === undefined ? {} : { thinkingLevel: parts[2]! as ModelThinkingLevel }) };
+    try {
+      const selected = await host.select(selection);
+      await notice(`Selected model: ${modelLabel(selected)} (thinking: ${safeLabel(selected.thinkingLevel, 32)}).`);
+    } catch (error) {
+      if (error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy")) {
+        await notice("Model selection rejected: this conversation is busy. Retry when it is idle.", true);
+      } else {
+        await notice("Model selection rejected: choice is invalid or unavailable. Use /model to list allowed choices.", true);
+      }
+    }
   };
 
   const showStatus = async (): Promise<void> => {
@@ -466,10 +523,10 @@ export async function runTerminalConversation(
     switch (name) {
       case "help":
         await notice([
-          "Local commands: /help /status /history [count] /model /compact /abort /steer TEXT /after TEXT",
+          "Local commands: /help /status /history [count] /model [provider modelId [thinkingLevel]] /compact /abort /steer TEXT /after TEXT",
           "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
           "/abort uses native Durable semantics: it cancels foreground work and withdraws queued inputs.",
-          "/model only reports the current host-selected model; it cannot change it.",
+          io.modelSelection ? "/model lists the host allowlist; select with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
         ].join("\n"));
         return;
       case "status":
@@ -480,7 +537,7 @@ export async function runTerminalConversation(
         await showHistory(args);
         return;
       case "model":
-        await showModel(args.trim().length > 0);
+        await showModel(args);
         return;
       case "compact": {
         if (args.trim()) { await notice("Usage: /compact", true); return; }
@@ -646,6 +703,10 @@ function formatHistoryMessage(message: Message): string | undefined {
     ? `${characters.slice(0, HISTORY_TEXT_CHARS).join("")}…`
     : cleaned;
   return `${message.role === "user" ? "You" : "Assistant"}: ${snippet}`;
+}
+
+function safeLabel(value: string, max: number): string {
+  return completePrefix(sanitizeTerminalText(value), max) || "(empty)";
 }
 
 function modelLabel(model: { provider: string; modelId: string } | undefined): string {
