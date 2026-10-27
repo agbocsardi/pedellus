@@ -129,8 +129,9 @@ No shared runner/runtime changes, gateway tool activation, live requests or real
       snapshots. Follow-up `bb13ae117` reports aggregate caps and explicit
       truncation indicators; committed and preserved, not independently reviewed
       or integrated after owner priority pivot.
-- [ ] `pi-23d2bdf0`, `w2H:p1` / `w2H`: committed `9cc565dc3` opt-in native
-      one-shot scheduling; preserved unmerged. `pi-528324cd` is reviewing.
+- [ ] `pi-23d2bdf0`, `w2H:p1` / `w2H`: `9cc565dc3` one-shot scheduling
+      remains unmerged. `pi-528324cd` found delivery/ACL/bounds/idempotency gaps;
+      `pi-cbf84ad6` is implementing a synthetic-only follow-up.
 - [ ] Parent review reports and behavioral checks, integrate accepted slices and
       clean their worktrees. Recurring cron, Dream and P4/P5 acceptance stay open.
 
