@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels, fauxProvider } from "@earendil-works/pi-ai";
@@ -18,6 +19,8 @@ import {
   ARCHIVAL_LEDGER_VERSION,
   ARCHIVAL_PERSISTENCE_FORMAT,
   ARCHIVAL_PERSISTENCE_OWNERSHIP,
+  ARCHIVAL_PERSISTENCE_VERSION,
+  ARCHIVAL_SEARCH_INTEGRATION,
   ARCHIVAL_RECORD_ENTRY_KIND,
   ARCHIVAL_RECORD_SCHEMA,
   ARCHIVAL_RECORD_SCHEMA_VERSION,
@@ -75,13 +78,16 @@ function syntheticRequest(namespace = "synthetic-store") {
   };
 }
 
-async function openHarness(database) {
-  const storage = await openFullSyncNodeSqliteStorage(database, context);
+async function harnessOn(storage) {
   const faux = fauxProvider();
   const models = createModels();
   models.setProvider(faux.provider);
-  const harness = await Harness.open(storage, { models, registry: createRegistry() }, context);
-  return { harness, storage };
+  return Harness.open(storage, { models, registry: createRegistry() }, context);
+}
+
+async function openHarness(database) {
+  const storage = await openFullSyncNodeSqliteStorage(database, context);
+  return { harness: await harnessOn(storage), storage };
 }
 
 async function allEntries(harness, conversationId) {
@@ -234,6 +240,8 @@ test("persists exact raw lines and provenance as inert custom entries only", asy
     const report = await persistArchivalImport(harness, request, context);
 
     assert.equal(report.format, ARCHIVAL_PERSISTENCE_FORMAT);
+    assert.equal(report.version, ARCHIVAL_PERSISTENCE_VERSION);
+    assert.equal(report.version, 2);
     assert.equal(report.disposition, "archive-only-never-resume-or-replay");
     assert.equal(report.persistencePerformed, true);
     assert.equal(report.newSourcesPersisted, 3);
@@ -246,7 +254,7 @@ test("persists exact raw lines and provenance as inert custom entries only", asy
     assert.equal(JSON.stringify(report).includes("same synthetic line"), false);
     assert.equal(report.counts.recordsPersisted, prepared.records.length);
     assert.equal(report.ownershipRequirement, ARCHIVAL_PERSISTENCE_OWNERSHIP);
-    assert.equal(report.searchIntegration, "future-index-must-use-durable-key-not-preparation-ordinal");
+    assert.equal(report.searchIntegration, ARCHIVAL_SEARCH_INTEGRATION);
     assert.equal(report.bounds.maxLedgerSources, 512);
     assert.match(report.limitations.join(" "), /exclusive single-writer/);
     assert.match(report.limitations.join(" "), /Gateway scans conversations/);
@@ -689,7 +697,7 @@ test("full verification ignores request-relative ordinals and uses durable line 
     assert.notEqual(aEntries[0].data.durableKey, cEntries[0].data.durableKey);
     const allKeys = [...aEntries, ...bEntries, ...cEntries].map((entry) => entry.data.durableKey);
     assert.equal(new Set(allKeys).size, allKeys.length);
-    assert.equal(cReport.searchIntegration, "future-index-must-use-durable-key-not-preparation-ordinal");
+    assert.equal(cReport.searchIntegration, ARCHIVAL_SEARCH_INTEGRATION);
   } finally {
     await harness.close(context);
     await storage.close(context);
@@ -753,5 +761,139 @@ test("explicit format, provenance, preparation, and record-schema conflicts requ
   } finally {
     await harness.close(context);
     await storage.close(context);
+  }
+});
+
+test("rejects a nonempty ledger whose store namespace is null", async (t) => {
+  const database = await tempDatabase(t);
+  const { harness, storage } = await openHarness(database);
+  try {
+    const request = syntheticRequest();
+    await persistArchivalImport(harness, request, context);
+    await harness.commit(async (tx) => {
+      const ledger = await tx.doc(ArchivalImportLedgerDoc);
+      ledger.storeNamespace = null;
+    }, context);
+    await assert.rejects(
+      readArchivalImportLedger(harness, context),
+      (error) => error instanceof ArchivalPersistenceCorruptionError && /without a store namespace/.test(error.message),
+    );
+    await assert.rejects(
+      persistArchivalImport(harness, request, context),
+      (error) => error instanceof ArchivalPersistenceCorruptionError && /without a store namespace/.test(error.message),
+    );
+  } finally {
+    await harness.close(context);
+    await storage.close(context);
+  }
+});
+
+test("ledger first/last preparation ordinals are verified against stored entries, not the request", async (t) => {
+  const text = [
+    JSON.stringify({ _type: "metadata", key: "ordinal-verify", metadata: {} }),
+    JSON.stringify({ role: "user", content: "one" }),
+    JSON.stringify({ role: "assistant", content: "two" }),
+    "",
+  ].join("\n");
+  const request = {
+    storeNamespace: "synthetic-store",
+    sources: [snapshot("ordinal-verify", "session-jsonl", text)],
+  };
+  const prepared = prepareArchivalImport(request);
+  const source = prepared.sources[0];
+  const records = prepared.records;
+  assert.equal(records.length, 3);
+
+  const scenarios = [
+    {
+      name: "ledger first preparation ordinal",
+      overrides: { firstPreparationOrdinal: 999 },
+      mutate() {},
+    },
+    {
+      name: "ledger last preparation ordinal",
+      overrides: { lastPreparationOrdinal: 999 },
+      mutate() {},
+    },
+    {
+      name: "stored middle preparation ordinal",
+      overrides: {},
+      mutate(data) {
+        data[1] = { ...data[1], preparationOrdinal: 777 };
+      },
+    },
+    {
+      name: "stored middle source order",
+      overrides: {},
+      mutate(data) {
+        data[1] = { ...data[1], preparationSourceOrder: 99 };
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const database = await tempDatabase(t);
+    const { harness, storage } = await openHarness(database);
+    try {
+      const data = records.map((record) => entryDataFor(prepared, source, record));
+      scenario.mutate(data);
+      const carrier = await createCarrier(harness, data);
+      await writeLedger(harness, request.storeNamespace, [
+        ledgerRow(prepared, source, records, carrier, scenario.overrides),
+      ]);
+      await assert.rejects(
+        persistArchivalImport(harness, request, context),
+        ArchivalPersistenceCorruptionError,
+        scenario.name,
+      );
+    } finally {
+      await harness.close(context);
+      await storage.close(context);
+    }
+  }
+});
+
+test("mid-commit storage failure rolls back every SQLite archival write", async (t) => {
+  const database = await tempDatabase(t);
+  const inner = await openFullSyncNodeSqliteStorage(database, context);
+  const failing = new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === "commit") {
+        return async (writes, ctx) => target.commit(
+          [...writes, { type: "task", value: { id: 999_999_999 } }],
+          ctx,
+        );
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const harness = await harnessOn(failing);
+  try {
+    await assert.rejects(
+      persistArchivalImport(harness, syntheticRequest(), context),
+      /./,
+    );
+  } finally {
+    await harness.close(context).catch(() => {});
+    await inner.close(context).catch(() => {});
+  }
+
+  const reopened = await openHarness(database);
+  try {
+    assert.equal(await readArchivalImportLedger(reopened.harness, context), undefined);
+    assert.deepEqual(await allConversations(reopened.harness), []);
+    assert.equal((await allSessionDocuments(reopened.storage)).length, 0);
+    const raw = new DatabaseSync(database);
+    try {
+      for (const table of ["entries", "conversations", "documents", "record_ids"]) {
+        assert.equal(raw.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n, 0, table);
+      }
+    } finally {
+      raw.close();
+    }
+  } finally {
+    await reopened.harness.close(context);
+    await reopened.storage.close(context);
   }
 });

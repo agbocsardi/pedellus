@@ -36,6 +36,17 @@ const ledger = await readArchivalImportLedger(harness, context);
 `harness` is any Durable `Session` (a native `Harness` or `createSession()`
 result). The caller supplies the `Context`.
 
+## Version and pre-release scope
+
+The report format is `nanobot-archival-import-persistence` **version 2**. The
+ledger is version 2 and stored entries are schema version 2
+(`nanobot.archival-record.v2`). Version 1 of the report, ledger, and record
+schema existed only on the unmerged experimental branch; this is not yet a
+production format. **No v1→v2 migration is provided.** A v1 ledger is rejected
+by Durable's document-version check, and a v1 record schema is rejected as an
+explicit conflict. Re-import from the original snapshots after operator review
+rather than attempting an in-place migration.
+
 **Ownership contract:** the caller MUST already hold exclusive single-writer
 ownership of that Session/storage, normally the same process lock the Gateway
 uses for the database (`nanobot:<dbPath>` in `src/runtime.ts`). This module
@@ -88,9 +99,10 @@ batches can both start at ordinal 0 without colliding because they belong to
 different sources, and a source re-submitted alone can have different ordinals
 without changing its durable identity.
 
-Repeating the exact snapshots is idempotent: no conversation, entry, or ledger
-write is added, and the existing conversation ID is returned. Conflict reasons
-are explicit — `namespace`, `digest`, `format`, `provenance`, `metadata`,
+A nonempty ledger must name a store namespace; source rows with a null
+namespace are rejected as corruption. Repeating the exact snapshots is
+idempotent: no conversation, entry, or ledger write is added, and the existing
+conversation ID is returned. Conflict reasons are explicit — `namespace`, `digest`, `format`, `provenance`, `metadata`,
 `preparation-status`, `preparation-version`, `record-schema-version`, or
 `unsupported-ledger-row`. The call throws
 `ArchivalPersistenceConflictError` with that `reason`; it never overwrites,
@@ -133,6 +145,20 @@ reordered, changed, or foreign entries throw
 its digest and first/last IDs look right. The scan cost grows linearly with the
 source's record count.
 
+The scan also verifies the **original** preparation provenance stored in the
+entries: the stored prep ordinals must be the original contiguous sequence, all
+entries must share the original preparation source order, and the ledger's
+first/last preparation ordinals must equal the actual first/last stored entries.
+They are deliberately **not** compared to the current request's recomputed
+ordinals, which can restart at 0 when a source is re-submitted alone or in a
+different batch. This preserves source provenance across batching without
+treating ordinals as durable identity.
+
+The mid-commit regression test uses a Storage proxy that lets Durable begin the
+SQLite commit and then injects an invalid write, so the failure occurs inside
+the storage commit rather than before it. After reopen, the ledger,
+conversations, entries, documents, and record IDs are all absent.
+
 ## Stored entry shape
 
 Each entry is kind `nanobot.archival-record.v2`, schema version 2, with no
@@ -157,6 +183,18 @@ on open. Imported carriers are therefore visible to that scan even though they
 are not in the live session map. Run persistence against a dedicated/offline
 database or while holding the Gateway's exclusive lock, and review the host
 conversation-creation/scan policy before mixing the two.
+
+**Carrier exclusivity:** each archival carrier conversation is dedicated to
+exactly the custom entries written by this module. The full scan treats any
+extra entry, foreign kind, model/head/edit payload, or other appended runtime
+content as corruption. Do not add inbox items, user/assistant messages, tasks,
+or host entries to a carrier.
+
+**Paging/order contract:** future readers must page and order by Durable entry
+IDs (or the conversation's ascending entry scan), never by `durableKey`.
+`durableKey` is a stable line-identity lookup/deduplication key, not an ordering
+key: it is a SHA-256 digest. Search may use `durableKey` to identify a line but
+must not sort by it.
 
 ## Bounds
 
@@ -214,8 +252,10 @@ This slice does not provide a searchable import or an end-to-end migration.
 Still required before any import claim:
 
 1. a reviewed search/index projection over the persisted custom entries. It
-   must key matches by `durableKey`/`(storeNamespace, sourceId, line)` and must
-   not claim request-global preparation ordinals as durable identity
+   must page/order by Durable entry ID, use
+   `durableKey`/`(storeNamespace, sourceId, line)` for line identity, and must
+   not claim request-global preparation ordinals as durable identity.
+   `durableKey` is a SHA-256 identity, not an ordering key
    (`report.searchIntegration` states this);
 2. reconciliation of timestamps, session/archive identity, usage, counts, and
    duplicate/collision policy, including operator migration for changed
@@ -236,11 +276,13 @@ quarantine/provider-state preservation, ledger identity, in-process repeat,
 restart repeat, changed-digest/namespace/format/provenance/preparation/schema
 conflict rejection, forged prepared records being ignored,
 no tasks/submissions/session-map state, unsupported formats never being
-ledgered and remaining retryable, persistence bounds before writes, a failed
-storage commit leaving no ledger/conversation/entry, a detached deeply frozen
-ledger read, full-scan repeat rejection of tampered/missing/extra/reordered
-entries, and durable line identity across request-relative ordinal resets and
-separate batches.
+ledgered and remaining retryable, persistence bounds before writes, a detached
+deeply frozen ledger read, full-scan repeat rejection of
+tampered/missing/extra/reordered entries, ledger first/last preparation
+provenance checked against stored entries, rejection of a nonempty ledger with
+a null namespace, durable line identity across request-relative ordinal resets
+and separate batches, and a true mid-SQLite-commit failure leaving no ledger,
+conversation, entry, document, or record ID behind.
 
 ```bash
 npm run build

@@ -30,7 +30,7 @@ import {
 } from "../archival-import/index.js";
 
 export const ARCHIVAL_PERSISTENCE_FORMAT = "nanobot-archival-import-persistence" as const;
-export const ARCHIVAL_PERSISTENCE_VERSION = 1 as const;
+export const ARCHIVAL_PERSISTENCE_VERSION = 2 as const;
 export const ARCHIVAL_LEDGER_FORMAT = "nanobot-archival-import-ledger" as const;
 export const ARCHIVAL_LEDGER_VERSION = 2 as const;
 export const ARCHIVAL_RECORD_ENTRY_KIND = "nanobot.archival-record.v2" as const;
@@ -38,6 +38,8 @@ export const ARCHIVAL_RECORD_SCHEMA = "nanobot.archival-record" as const;
 export const ARCHIVAL_RECORD_SCHEMA_VERSION = 2 as const;
 /** The host must hold exclusive single-writer ownership; this module never acquires a lock. */
 export const ARCHIVAL_PERSISTENCE_OWNERSHIP = "exclusive-single-writer-session" as const;
+/** Future search should order by Durable entry ID and identify lines by durableKey. */
+export const ARCHIVAL_SEARCH_INTEGRATION = "future-index-order-by-entry-id-line-identity-by-durable-key" as const;
 
 /** Defaults allow any report the preparation defaults can produce. */
 export const ARCHIVAL_PERSISTENCE_LIMITS = Object.freeze({
@@ -130,7 +132,7 @@ export interface ArchivalPersistenceReport {
   readonly sources: readonly ArchivalPersistenceSourceResult[];
   readonly ownershipRequirement: typeof ARCHIVAL_PERSISTENCE_OWNERSHIP;
   /** A future index must key on durableKey/(sourceId,line), never preparation ordinals. */
-  readonly searchIntegration: "future-index-must-use-durable-key-not-preparation-ordinal";
+  readonly searchIntegration: typeof ARCHIVAL_SEARCH_INTEGRATION;
   readonly bounds: Readonly<{
     readonly maxSources: number;
     readonly maxRecordsPerSource: number;
@@ -298,8 +300,8 @@ export class ArchivalPersistenceCorruptionError extends Error {
 const LIMITATIONS: readonly string[] = Object.freeze([
   "The host must hold exclusive single-writer ownership of the Session/storage, normally the same Gateway process lock; this module never acquires a lock itself.",
   "Raw transcript, metadata, provider-state, and quarantined line bytes are stored unredacted as base64; base64 is encoding, not encryption.",
-  "No search index is built and no search API is exposed by this slice. A future index must use the durableKey/(sourceId,line) identity, never preparation ordinals.",
-  "Each supported source is stored in its own ownerless Durable conversation. A native Harness initializes its built-in conversation documents, and a Gateway scans conversations on open; the carrier is still not the runtime session map and is never resumed or replayed.",
+  "No search index is built and no search API is exposed by this slice. A future index must order/page by Durable entry ID and use durableKey/(sourceId,line) for line identity, never preparation ordinals; durableKey is not an ordering key.",
+  "Each supported source is stored in its own exclusive ownerless Durable conversation. A native Harness initializes its built-in conversation documents, and a Gateway scans conversations on open; the carrier is still not the runtime session map and is never resumed or replayed. Do not append extra entries to a carrier.",
   "One legacy store namespace is allowed per database. A later import with a different namespace is rejected instead of mixing store-local session keys.",
   "Unsupported source formats are not imported and are NOT written to the ledger, so they can be supplied again after review; this slice does not persist their raw bytes.",
   "Persisted timestamps, session keys, entry IDs, and archive cursor values are historical data. No archive cursor is advanced and no Python session is continued.",
@@ -612,7 +614,10 @@ export async function readArchivalImportLedger(
   context: Context,
 ): Promise<ArchivalLedgerState | undefined> {
   const value = await session.snapshot(ArchivalImportLedgerDoc, context);
-  return value === undefined ? undefined : deepFreeze(structuredClone(value));
+  if (value === undefined) return undefined;
+  const cloned = deepFreeze(structuredClone(value));
+  assertLedgerShape(cloned);
+  return cloned;
 }
 
 function sameSearchUnits(value: unknown, expected: readonly PreparedArchivalRecord["search"][number][]): boolean {
@@ -636,7 +641,7 @@ function assertEntryMatchesRecord(
   report: ArchivalPreparationReport,
   source: ArchivalSourcePreparation,
   record: PreparedArchivalRecord,
-): void {
+): ArchivalRecordEntryData {
   if (!ArchivalRecordEntry.is(entry) || !isRecord(entry.data)) {
     throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} conversation contains a non-archival or malformed entry`);
   }
@@ -675,6 +680,7 @@ function assertEntryMatchesRecord(
   if (!sameSearchUnits(data.search, record.search)) {
     throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} line ${record.line} search projection changed in durable storage`);
   }
+  return data as ArchivalRecordEntryData;
 }
 
 /**
@@ -714,6 +720,10 @@ async function verifyExistingSource(
   let index = 0;
   let firstActualEntryId: number | null = null;
   let lastActualEntryId: number | null = null;
+  let firstActualPreparationOrdinal: number | null = null;
+  let lastActualPreparationOrdinal: number | null = null;
+  let expectedPreparationOrdinal: number | null = null;
+  let actualPreparationSourceOrder: number | null = null;
   while (true) {
     const remaining = records.length + 1 - index;
     const page = await tx.scanEntries(
@@ -725,7 +735,20 @@ async function verifyExistingSource(
       if (index >= records.length) {
         throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} conversation has extra durable entries`);
       }
-      assertEntryMatchesRecord(entry, report, source, records[index]!);
+      const data = assertEntryMatchesRecord(entry, report, source, records[index]!);
+      if (index === 0) {
+        firstActualPreparationOrdinal = data.preparationOrdinal;
+        expectedPreparationOrdinal = data.preparationOrdinal;
+        actualPreparationSourceOrder = data.preparationSourceOrder;
+      }
+      if (data.preparationOrdinal !== expectedPreparationOrdinal) {
+        throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} stored preparation ordinals are not the original contiguous sequence`);
+      }
+      if (data.preparationSourceOrder !== actualPreparationSourceOrder) {
+        throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} stored preparation source order changed across entries`);
+      }
+      expectedPreparationOrdinal = (expectedPreparationOrdinal as number) + 1;
+      lastActualPreparationOrdinal = data.preparationOrdinal;
       if (firstActualEntryId === null) firstActualEntryId = entry.id as number;
       lastActualEntryId = entry.id as number;
       index += 1;
@@ -740,11 +763,18 @@ async function verifyExistingSource(
     throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} conversation is missing ${records.length - index} durable entries`);
   }
   if (records.length === 0) {
-    if (existing.firstEntryId !== null || existing.lastEntryId !== null) {
+    if (existing.firstEntryId !== null || existing.lastEntryId !== null ||
+        existing.firstPreparationOrdinal !== null || existing.lastPreparationOrdinal !== null) {
       throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} ledger names entries for an empty source`);
     }
-  } else if (existing.firstEntryId !== firstActualEntryId || existing.lastEntryId !== lastActualEntryId) {
-    throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} ledger first/last entry identity is inconsistent`);
+  } else {
+    if (existing.firstEntryId !== firstActualEntryId || existing.lastEntryId !== lastActualEntryId) {
+      throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} ledger first/last entry identity is inconsistent`);
+    }
+    if (existing.firstPreparationOrdinal !== firstActualPreparationOrdinal ||
+        existing.lastPreparationOrdinal !== lastActualPreparationOrdinal) {
+      throw new ArchivalPersistenceCorruptionError(`Source ${source.sourceId} ledger preparation ordinals do not match the stored entries`);
+    }
   }
   return conversationId;
 }
@@ -785,6 +815,9 @@ function assertLedgerShape(ledger: ArchivalLedgerState): void {
       !Array.isArray(ledger.sources) ||
       (ledger.storeNamespace !== null && typeof ledger.storeNamespace !== "string")) {
     throw new ArchivalPersistenceCorruptionError("Archival import ledger is malformed");
+  }
+  if (ledger.storeNamespace === null && ledger.sources.length > 0) {
+    throw new ArchivalPersistenceCorruptionError("Archival import ledger has source rows without a store namespace");
   }
   const seen = new Set<string>();
   for (const source of ledger.sources) {
@@ -1072,7 +1105,7 @@ export async function persistArchivalImport(
     },
     sources: result,
     ownershipRequirement: ARCHIVAL_PERSISTENCE_OWNERSHIP,
-    searchIntegration: "future-index-must-use-durable-key-not-preparation-ordinal",
+    searchIntegration: ARCHIVAL_SEARCH_INTEGRATION,
     bounds: {
       maxSources: limits.maxSources,
       maxRecordsPerSource: limits.maxRecordsPerSource,
