@@ -51,6 +51,7 @@ export {
   type ContextSkillSnapshot,
   type ConversationContextSnapshot,
 } from "./context/index.js";
+export { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 export {
   createWorkspaceContextSnapshotProvider,
   loadWorkspaceContextSnapshot,

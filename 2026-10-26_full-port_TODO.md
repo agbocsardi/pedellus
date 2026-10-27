@@ -82,8 +82,9 @@ policy, environment and replay gates pass.
       containing old Nanobot context; current guard blocks startup and exposes no
       reconciliation interface. Deferred poll and compaction replay paths are
       source-reviewed only. Synthetic data, base `d0d3a560a`.
-- [ ] `pi-c5cd04c3`: explicit opt-in workspace context for CLI/Gateway host;
-      default off, synthetic inputs only, base `d0d3a560a`.
+- [x] `pi-c5cd04c3`: merged `ede92bcc6`, explicit default-off workspace context
+      config and CLI/Gateway host wiring; independently reviewed. Only fixed
+      bootstrap and selected memory; no identity or skills parity.
 - [x] `pi-6d106995`, `w2D:p3` / `w2D`: read-only native tool integration and
       security gate plan at `/tmp/pi-tool-core-plan.md`; identifies quotas,
       approvals, workspace ownership and replay gates before production tools.

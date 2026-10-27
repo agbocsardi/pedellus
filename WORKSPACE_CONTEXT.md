@@ -48,7 +48,10 @@ snapshot provider and `openGateway` installs no context extension.
   Tool policy is unchanged.
 - The configured `workspace` path is walked literally by the loader. A root path
   containing a symlink component fails closed even though `openGateway` accepts
-  it after `realpath`; use a canonical explicit path when opting in.
+  it after `realpath`; use a canonical explicit path when opting in. With a
+  symlinked path the gateway can open, but session creation fails closed.
+- Context-enabled gateways are limited to 256 mapped sessions, including channel
+  state sessions; opening or creating sessions beyond that limit fails closed.
 
 The example `config.example.json` intentionally omits `workspaceContext` so the
 shipped default stays off.
