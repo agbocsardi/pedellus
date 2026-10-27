@@ -30,8 +30,12 @@ unavailable document or fabricated zero usage. A plain Chord Session without
 Durable's conversation creation hook (or legacy/corrupt storage) may have no
 usage document; that remains `unavailable`. Snapshots and projections are
 detached and deeply frozen. Their string-keyed maps have null prototypes, so
-names such as `__proto__` and `toString` remain ordinary own keys. Malformed numeric rows, a mismatched cursor scope, a missing
-current document, or a regressing cumulative counter fail closed.
+names such as `__proto__` and `toString` remain ordinary own keys. Token
+counters (required and optional) and derived legacy sums must be nonnegative
+safe integers; invalid values and aggregate overflow fail closed without
+rounding or clamping. Costs remain finite, nonnegative decimals. Malformed rows,
+a mismatched cursor scope, a missing current document, or a regressing
+cumulative counter fail closed.
 
 ## Source and attribution
 
@@ -56,10 +60,13 @@ exactly (case-sensitive; not normalized).
   usage.” Pi AI's required numeric fields can also normalize provider fields that
   were not reported to zero; the adapter preserves that native zero but cannot
   tell whether the provider meant an actual zero.
-- `tools` is keyed by tool name. Reported nested-call usage is counted under
-  that tool, not again under the caller. Nested model calls therefore may not
-  appear in the model bucket or retain per-model attribution there. Other
-  conversations (including child conversations) have separate documents;
+- `tools` is keyed by tool name. Durable records a nested result's usage under
+  the nested tool. If the caller forwards that same `usage` in its own result,
+  Durable records it again under the caller tool. `UsageState` has bucket totals
+  but no call provenance, so this projection preserves both native rows as
+  recorded and cannot identify or deduplicate that duplication. Nested model
+  calls may not appear in the model bucket or retain per-model attribution there.
+  Other conversations (including child conversations) have separate documents;
   `Harness.usage()` is a session-wide sum, not a cursor for this per-conversation
   adapter. Durable forks start with zero usage.
 - The Usage schema stores token counters and cost totals, not request counts or
@@ -77,20 +84,25 @@ exactly (case-sensitive; not normalized).
 The `legacy` projection contains only model-bucket token totals and per-model
 rows; it intentionally has no `requests` field. Legacy `prompt_tokens` is
 `input + cacheRead + cacheWrite` because Pi AI separates cached prompt tokens
-from `input`. `cached_tokens` is `cacheRead` (cache writes are retained only in
-`native`). `completion_tokens` is `output`, `total_tokens` is native
-`totalTokens`, and reasoning is not added because Pi AI defines it as a subset
-of output. The original native key is retained in `provider_model`; the familiar
-legacy `provider` / `model` pair is split at the first `/`. Use `native.models`
-for unambiguous source attribution and cost detail.
+from `input`. `cached_tokens` is `cacheRead` (cache writes are retained only
+in `native`). These conversions preserve safe-integer token counts exactly; they do not round
+fractions, clamp values, or replace overflow with a sentinel. `completion_tokens`
+is `output`, `total_tokens` is native `totalTokens`, and reasoning is not added
+because Pi AI defines it as a subset of output. The original native key is
+retained in `provider_model`; the familiar legacy `provider` / `model` pair is
+split at the first `/`. Use `native.models` for unambiguous source attribution
+and cost detail.
 
 Tools are never folded into the legacy model-token totals. `native.models` and
-`native.tools` hold independent counter/cost deltas; this avoids double-counting
-nested usage and retains cost components, cache-write counts, and optional native
-fields that the old archive shape cannot represent. When there is no model
-usage delta, `legacy` is `{}` rather than fabricated all-zero totals. If a new
-native row explicitly contains zero counters, its legacy row retains those
-recorded zero values.
+`native.tools` preserve bucket-specific counter and cost deltas Durable recorded,
+including cost components, cache-write counts, and optional native fields that
+the old archive shape cannot represent. The projection does not add another
+source count, but it cannot deduplicate usage Durable already recorded twice
+because a caller forwarded nested `usage`. The legacy shape remains
+model-only and never folds tool buckets into model totals.
+When there is no model usage delta, `legacy` is `{}` rather than fabricated
+all-zero totals. If a new native row explicitly contains zero counters, its
+legacy row retains those recorded zero values.
 
 ## Cursor and future archive transaction
 
@@ -99,19 +111,24 @@ conversation ID. It contains the complete cumulative native snapshot last
 associated with a successful archive. `parseUsageArchiveCursor` requires the
 expected pair, and `projectUsageDelta` checks both components against the current
 snapshot. Thus equal numeric IDs in independently namespaced stores do not share
-cursors. Projection is deterministic: repeating it with the same snapshot/cursor
-returns the same delta, while using its `nextCursor` again returns no measured
-delta. It rejects another source scope and detected counter regressions. Keep
-the returned `nextCursor` only after the corresponding archive is durably
-committed; do not advance it merely because projection succeeded.
+cursors. Cursors must come from trusted host-owned durable state: validation is
+structural and scope-based, not authenticity or rollback protection. A valid
+same-scope cursor with older/lowered totals is accepted and can re-emit usage;
+this helper has no MAC, signature, or separate freshness watermark. Do not load
+untrusted cursor JSON as archive state. Projection is deterministic: repeating
+it with the same snapshot/cursor returns the same delta, while using its
+`nextCursor` again returns no measured delta. It rejects another source scope
+and detected counter regressions. Keep the returned `nextCursor` only after the
+corresponding archive is durably committed; do not advance it merely because
+projection succeeded.
 
 This package does **not** make a history-file append and cursor update atomic.
 The host namespace is only an identity contract; it does not prove storage
 ownership, prevent the host from reusing a namespace, or make a cursor
 transaction durable. A future archive owner must couple archive data and cursor
-in one durable transaction, or use a durable outbox/idempotency protocol with explicit recovery
-for “append succeeded, cursor did not” and “cursor advanced, append failed.” A
-plain JSONL append followed by a separate cursor write can duplicate or lose
+in one durable transaction, or use a durable outbox/idempotency protocol with
+explicit recovery for “append succeeded, cursor did not” and “cursor advanced,
+append failed.” A plain JSONL append followed by a separate cursor write can duplicate or lose
 usage on a crash. Do not claim exactly-once external archive effects from this
 helper. The cursor is conversation-scoped and cumulative, not aligned to
 individual transcript entries; the P4 archive policy must establish which

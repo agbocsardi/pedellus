@@ -72,7 +72,7 @@ export type UsageArchiveProjection = Readonly<{
   hasDelta: boolean;
   /** Compatible model-token projection; tool usage and native costs remain in `native`. */
   legacy: LegacyUsageDelta;
-  /** Exact bucket/model attribution and native costs/counters, without nested double-counting. */
+  /** Native bucket/model totals as recorded; nested duplication lacks call provenance. */
   native: NativeUsageDelta;
   /** Durable does not expose a request counter in UsageState. */
   requestCount: Readonly<{ status: "unknown" }>;
@@ -110,11 +110,22 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function finiteNonNegative(value: unknown, field: string): number {
+function finiteNonNegativeCost(value: unknown, field: string): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    throw new TypeError(`Invalid native usage counter: ${field}`);
+    throw new TypeError(`Invalid native usage cost: ${field}`);
   }
   return value;
+}
+
+function safeTokenCount(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`Invalid native token count: ${field}`);
+  }
+  return value;
+}
+
+function addTokenCounts(left: number, right: number, field: string): number {
+  return safeTokenCount(left + right, field);
 }
 
 function copyUsage(value: unknown, label: string): Readonly<Usage> {
@@ -122,23 +133,28 @@ function copyUsage(value: unknown, label: string): Readonly<Usage> {
     throw new TypeError(`Invalid native usage row: ${label}`);
   }
   const cost: Usage["cost"] = {
-    input: finiteNonNegative(value.cost.input, `${label}.cost.input`),
-    output: finiteNonNegative(value.cost.output, `${label}.cost.output`),
-    cacheRead: finiteNonNegative(value.cost.cacheRead, `${label}.cost.cacheRead`),
-    cacheWrite: finiteNonNegative(value.cost.cacheWrite, `${label}.cost.cacheWrite`),
-    total: finiteNonNegative(value.cost.total, `${label}.cost.total`),
+    input: finiteNonNegativeCost(value.cost.input, `${label}.cost.input`),
+    output: finiteNonNegativeCost(value.cost.output, `${label}.cost.output`),
+    cacheRead: finiteNonNegativeCost(value.cost.cacheRead, `${label}.cost.cacheRead`),
+    cacheWrite: finiteNonNegativeCost(value.cost.cacheWrite, `${label}.cost.cacheWrite`),
+    total: finiteNonNegativeCost(value.cost.total, `${label}.cost.total`),
   };
+  const input = safeTokenCount(value.input, `${label}.input`);
+  const output = safeTokenCount(value.output, `${label}.output`);
+  const cacheRead = safeTokenCount(value.cacheRead, `${label}.cacheRead`);
+  const cacheWrite = safeTokenCount(value.cacheWrite, `${label}.cacheWrite`);
+  safeTokenCount(input + cacheRead + cacheWrite, `${label}.prompt_tokens`);
   const usage: Usage = {
-    input: finiteNonNegative(value.input, `${label}.input`),
-    output: finiteNonNegative(value.output, `${label}.output`),
-    cacheRead: finiteNonNegative(value.cacheRead, `${label}.cacheRead`),
-    cacheWrite: finiteNonNegative(value.cacheWrite, `${label}.cacheWrite`),
-    totalTokens: finiteNonNegative(value.totalTokens, `${label}.totalTokens`),
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    totalTokens: safeTokenCount(value.totalTokens, `${label}.totalTokens`),
     cost: Object.freeze(cost),
   };
   for (const field of OPTIONAL_USAGE_FIELDS) {
     if (value[field] !== undefined) {
-      usage[field] = finiteNonNegative(value[field], `${label}.${field}`);
+      usage[field] = safeTokenCount(value[field], `${label}.${field}`);
     }
   }
   return Object.freeze(usage);
@@ -241,7 +257,10 @@ function makeCursor(snapshot: UsageSnapshot): UsageArchiveCursor {
   return Object.freeze({ version: 1, source: snapshot.source, cumulative: snapshot });
 }
 
-/** Validate a JSON-loaded cursor against its expected host namespace and conversation before using it. */
+/**
+ * Validate cursor shape and source scope only; callers must load trusted
+ * host-owned durable cursor state.
+ */
 export function parseUsageArchiveCursor(
   value: unknown,
   expectedScope: UsageSourceIdentity,
@@ -379,7 +398,10 @@ function legacyProjection(models: Readonly<Record<string, Readonly<Usage>>>): Le
   for (const key of keys) {
     const usage = models[key];
     if (usage === undefined) throw new Error(`Invalid native usage row: models.${key}`);
-    const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+    const promptTokens = safeTokenCount(
+      usage.input + usage.cacheRead + usage.cacheWrite,
+      `legacy.by_model.${key}.prompt_tokens`,
+    );
     const attribution = providerAndModel(key);
     const row = Object.freeze({
       ...attribution,
@@ -390,16 +412,16 @@ function legacyProjection(models: Readonly<Record<string, Readonly<Usage>>>): Le
       cached_tokens: usage.cacheRead,
     });
     setOwn(byModel, key, row);
-    prompt += promptTokens;
-    completion += usage.output;
-    total += usage.totalTokens;
-    cached += usage.cacheRead;
+    prompt = addTokenCounts(prompt, promptTokens, "legacy.prompt_tokens");
+    completion = addTokenCounts(completion, usage.output, "legacy.completion_tokens");
+    total = addTokenCounts(total, usage.totalTokens, "legacy.total_tokens");
+    cached = addTokenCounts(cached, usage.cacheRead, "legacy.cached_tokens");
   }
   return Object.freeze({
-    prompt_tokens: finiteNonNegative(prompt, "legacy.prompt_tokens"),
-    completion_tokens: finiteNonNegative(completion, "legacy.completion_tokens"),
-    total_tokens: finiteNonNegative(total, "legacy.total_tokens"),
-    cached_tokens: finiteNonNegative(cached, "legacy.cached_tokens"),
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: total,
+    cached_tokens: cached,
     by_model: Object.freeze(byModel),
   });
 }
