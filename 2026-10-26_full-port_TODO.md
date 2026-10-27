@@ -22,7 +22,42 @@ continues to constrain the currently integrated tool-less slice.
 Each unchecked milestone needs its exit evidence, not merely compilable code.
 P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
-## Active implementation batch — 2026-10-26
+## Active implementation batch — 2026-10-27
+
+Owner requested continued roadmap work using **Codex Luna xhigh**, explicitly
+excluding containerization/sandbox work. That step is deferred for this batch:
+no execution candidate integration, sandbox changes, or gateway tool activation.
+Existing P1 blockers remain open; other work does not waive them.
+
+All three workers use `openai-codex / gpt-6-luna / xhigh`, native Herdr wrappers,
+independent managed worktrees, and committed base
+`0fea899afce7e2c21055b45d3c567b8e6cd6f2ed`. Parent `w1P:p1` owns review,
+root roadmap, public exports/integration and acceptance.
+
+- [ ] C1 — P3/P8 provider/config parity: native compatible aliases, explicit
+      credential references and source-backed support/limitations matrix.
+- [ ] C2 — P3/P4 trusted context composition: opt-in native sections from bounded
+      host-supplied identity/memory/skill snapshots; no ambient file/code discovery.
+- [ ] C3 — P4 native usage projections and archive-delta foundation: retain
+      attribution/unknowns, avoid nested double count, no archive writer or resets.
+- [ ] Parent review, bounded independent verification and approved integration;
+      record unsupported semantics without marking broad milestones complete.
+
+| Child / branch | Pane / workspace | Worktree | Exclusive ownership |
+|---|---|---|---|
+| `pi-7dcd4062` | `w10:p1` / `w10` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-7dcd4062` | `src/providers.ts`, `src/config.ts`, config.example.json, new PROVIDERS.md |
+| `pi-1db6d944` | `w21:p1` / `w21` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-1db6d944` | new `src/context/**`, CONTEXT.md |
+| `pi-a34c1f70` | `w22:p1` / `w22` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-a34c1f70` | new `src/usage/**`, USAGE.md |
+
+Paths in ownership column are relative to `packages/pi-nanobot`. No manifest/lock
+changes assigned; request any necessary dependency rather than editing shared
+ownership. Python and pinned `/tmp/pi-durable-reference-1.4.0` are read-only
+references. No live credentials/data, paid/live calls, host/deployment changes,
+push, cleanup, or committed test scaffolding. Use bounded private synthetic
+checks and existing package typecheck/build. Workers explicitly report commits,
+checks and remaining gaps through `herdr_report`; startup/idle is not completion.
+
+## Previous implementation batch — 2026-10-26
 
 Owner explicitly authorized Codex Luna xhigh implementation subagents. All start
 from committed `0ea2c76eb3896646fb089549ad9d7669c7a6ed52`, in independent
@@ -855,3 +890,20 @@ full managed checks. Sent reviewer the reproduction so it can focus on import
 admission without duplicating it. Await explicit fix/review reports. Candidate
 remains withheld; quotas, shell deadline and ownership/integration are still
 separate blockers even after namespace fixes.
+
+### 2026-10-27 — non-sandbox roadmap batch launched
+
+Owner explicitly excluded containerization/sandbox work and requested coordinated
+Codex Luna xhigh subagents. Parent verified a clean `feat/pi-durable-rebuild` at
+`0fea899af`, Herdr environment, current roadmap/design and native wrapper guide.
+Launched C1/C2/C3 above independently from the same committed base. One initial
+metadata inspection recorded branch/pane/worktree identities; all accepted startup,
+with no pending permissions. No polling loop or terminal/CLI fallback.
+
+Provider work may expand the existing tool-less slice; context/usage are opt-in
+foundations pending native API/semantic review. Context accepts explicit trusted
+snapshots rather than introducing a filesystem authority while P1 is unresolved.
+Usage must preserve native attribution and expose gaps rather than fabricate
+requests or an atomic external archive. No sandbox/execution change, unsafe
+candidate acceptance, live request, dependency change or deployment is authorized.
+Await explicit child reports, then review and verify before integration.
