@@ -1,4 +1,5 @@
-import { createModels, type Models, type Provider } from "@earendil-works/pi-ai/models";
+import { createModels, getSupportedThinkingLevels, type Models, type Provider } from "@earendil-works/pi-ai/models";
+import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
 import { minimaxProvider } from "@earendil-works/pi-ai/providers/minimax";
@@ -8,62 +9,114 @@ import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import { opencodeProvider } from "@earendil-works/pi-ai/providers/opencode";
 import { opencodeGoProvider } from "@earendil-works/pi-ai/providers/opencode-go";
 import { xiaomiProvider } from "@earendil-works/pi-ai/providers/xiaomi";
-import type { CredentialProvider, PortConfig } from "./config.js";
+import type { CredentialProvider, ModelReference, PortConfig } from "./config.js";
 
 type ProviderAlias = {
   providerId: string;
   credential: CredentialProvider;
-  authEnv: string;
   create: () => Provider;
 };
 
 // Map lookup rejects prototype names instead of resolving inherited object properties.
 const PROVIDER_ALIASES = new Map<string, ProviderAlias>([
-  ["anthropic", { providerId: "anthropic", credential: "anthropic", authEnv: "ANTHROPIC_API_KEY", create: anthropicProvider }],
-  ["deepseek", { providerId: "deepseek", credential: "deepseek", authEnv: "DEEPSEEK_API_KEY", create: deepseekProvider }],
-  ["minimax_anthropic", { providerId: "minimax", credential: "minimax_anthropic", authEnv: "MINIMAX_API_KEY", create: minimaxProvider }],
-  ["moonshot", { providerId: "moonshotai", credential: "moonshot", authEnv: "MOONSHOT_API_KEY", create: moonshotaiProvider }],
-  ["openai", { providerId: "openai", credential: "openai", authEnv: "OPENAI_API_KEY", create: openaiProvider }],
-  ["openrouter", { providerId: "openrouter", credential: "openrouter", authEnv: "OPENROUTER_API_KEY", create: openrouterProvider }],
-  ["opencode_zen", { providerId: "opencode", credential: "opencode_zen", authEnv: "OPENCODE_API_KEY", create: opencodeProvider }],
-  ["opencode_go", { providerId: "opencode-go", credential: "opencode_go", authEnv: "OPENCODE_API_KEY", create: opencodeGoProvider }],
-  ["xiaomi_mimo", { providerId: "xiaomi", credential: "xiaomi_mimo", authEnv: "XIAOMI_API_KEY", create: xiaomiProvider }],
+  ["anthropic", { providerId: "anthropic", credential: "anthropic", create: anthropicProvider }],
+  ["deepseek", { providerId: "deepseek", credential: "deepseek", create: deepseekProvider }],
+  ["minimax_anthropic", { providerId: "minimax", credential: "minimax_anthropic", create: minimaxProvider }],
+  ["moonshot", { providerId: "moonshotai", credential: "moonshot", create: moonshotaiProvider }],
+  ["openai", { providerId: "openai", credential: "openai", create: openaiProvider }],
+  ["openrouter", { providerId: "openrouter", credential: "openrouter", create: openrouterProvider }],
+  ["opencode_zen", { providerId: "opencode", credential: "opencode_zen", create: opencodeProvider }],
+  ["opencode_go", { providerId: "opencode-go", credential: "opencode_go", create: opencodeGoProvider }],
+  ["xiaomi_mimo", { providerId: "xiaomi", credential: "xiaomi_mimo", create: xiaomiProvider }],
 ]);
+
+export interface ResolvedModelChoice {
+  /** Provider spelling accepted in config and Gateway selection calls. */
+  configured: ModelReference;
+  /** Provider/model identity stored by native Durable in pi.agent. */
+  native: ModelReference;
+  model: Model<Api>;
+  thinkingLevels: readonly ModelThinkingLevel[];
+}
+
+function modelKey(model: ModelReference): string {
+  return JSON.stringify([model.provider, model.modelId]);
+}
+
+export function nativeModelReference(model: ModelReference): ModelReference {
+  return {
+    provider: PROVIDER_ALIASES.get(model.provider)?.providerId ?? model.provider,
+    modelId: model.modelId,
+  };
+}
+
+/** Resolve only the explicit allowlist, without auth lookup, catalog refresh, or network access. */
+export function resolveModelChoices(models: Models, allowed: readonly ModelReference[]): ResolvedModelChoice[] {
+  const seen = new Set<string>();
+  return allowed.map((configured) => {
+    const native = nativeModelReference(configured);
+    const key = modelKey(native);
+    if (seen.has(key)) throw new Error("allowedModels contains aliases for the same native model");
+    seen.add(key);
+    const model = models.getModel(native.provider, native.modelId);
+    if (!model) throw new Error(`Unknown model ${native.provider}/${native.modelId} in the configured Models catalog`);
+    return { configured: { ...configured }, native, model, thinkingLevels: getSupportedThinkingLevels(model) };
+  });
+}
 
 export function createProviderModels(
   config: PortConfig,
   env: NodeJS.ProcessEnv = process.env,
-): { models: Models; model: { provider: string; modelId: string } } {
-  const selection = PROVIDER_ALIASES.get(config.model.provider);
-  if (!selection) throw new Error("Unsupported provider; see packages/pi-nanobot/PROVIDERS.md");
-
-  const credentials = config.credentials;
-  const keyName = credentials && Object.hasOwn(credentials, selection.credential)
-    ? credentials[selection.credential]
-    : undefined;
-  if (typeof keyName !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyName)) {
-    throw new Error(`Invalid environment variable reference: credentials.${selection.credential}`);
-  }
-  const apiKey = Object.hasOwn(env, keyName) ? env[keyName] : undefined;
-  if (!apiKey?.trim()) {
-    throw new Error(`Missing credential: set the environment variable named by credentials.${selection.credential}`);
+): { models: Models; model: ModelReference } {
+  const aliases = new Map<string, ProviderAlias>();
+  for (const configured of config.allowedModels ?? [config.model]) {
+    const selection = PROVIDER_ALIASES.get(configured.provider);
+    if (!selection) throw new Error("Unsupported provider; see packages/pi-nanobot/PROVIDERS.md");
+    const previous = aliases.get(selection.providerId);
+    if (previous && previous.credential !== selection.credential) {
+      throw new Error("Configured aliases cannot share a native provider with different credentials");
+    }
+    aliases.set(selection.providerId, selection);
   }
 
-  // The closed auth context prevents ambient env/auth-file discovery; expose only this key.
   const models = createModels({
-    authContext: {
-      env: async (name) => name === selection.authEnv ? apiKey : undefined,
-      fileExists: async () => false,
-    },
+    // Provider credentials below are resolved from their own captured config key. No ambient lookup is permitted.
+    authContext: { env: async () => undefined, fileExists: async () => false },
   });
-  const nativeProvider = selection.create();
-  if (!nativeProvider.auth.apiKey) throw new Error("Selected provider has no environment API-key authentication");
-  const apiKeyAuth = { ...nativeProvider.auth.apiKey };
-  delete apiKeyAuth.login;
-  models.setProvider({ ...nativeProvider, auth: { apiKey: apiKeyAuth } });
+  for (const [providerId, selection] of aliases) {
+    const credentials = config.credentials;
+    const keyName = credentials && Object.hasOwn(credentials, selection.credential)
+      ? credentials[selection.credential]
+      : undefined;
+    if (typeof keyName !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyName)) {
+      throw new Error(`Invalid environment variable reference: credentials.${selection.credential}`);
+    }
+    const apiKey = Object.hasOwn(env, keyName) ? env[keyName] : undefined;
+    if (!apiKey?.trim()) {
+      throw new Error(`Missing credential: set the environment variable named by credentials.${selection.credential}`);
+    }
 
-  if (!models.getModel(selection.providerId, config.model.modelId)) {
-    throw new Error(`Unknown model ${selection.providerId}/${config.model.modelId} in the pinned Pi provider catalog`);
+    const nativeProvider = selection.create();
+    const nativeApiKey = nativeProvider.auth.apiKey;
+    if (!nativeApiKey) throw new Error("Selected provider has no environment API-key authentication");
+    models.setProvider({
+      ...nativeProvider,
+      auth: {
+        // Native provider-scoped resolution prevents aliases with a shared env name (OpenCode) crossing keys.
+        apiKey: {
+          name: nativeApiKey.name,
+          resolve: async ({ signal }) => {
+            signal.throwIfAborted();
+            return { auth: { apiKey }, source: `credentials.${selection.credential}` };
+          },
+        },
+      },
+    });
+    if (providerId !== nativeProvider.id) throw new Error("Native provider alias identity changed unexpectedly");
   }
-  return { models, model: { provider: selection.providerId, modelId: config.model.modelId } };
+
+  const choices = resolveModelChoices(models, config.allowedModels ?? [config.model]);
+  const defaultChoice = choices.find((choice) => modelKey(choice.configured) === modelKey(config.model));
+  if (!defaultChoice) throw new Error("Default model must be included in allowedModels");
+  return { models, model: defaultChoice.native };
 }
