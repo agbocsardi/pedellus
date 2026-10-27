@@ -1041,3 +1041,21 @@ cursor boundary. Namespace/shape validation is not cursor authenticity or rollba
 protection; a legitimate-looking older/lowered same-scope cursor can re-emit usage.
 No signing scheme, new ledger or archive writer requested. Usage remains unmerged
 pending corrected candidate and explicit independent re-review.
+
+### 2026-10-27 — independent context review blockers
+
+Reviewer `pi-eb98e056` explicitly reported BLOCKED in
+`/tmp/pi-context-composition-review.md`: captured numeric conversation IDs can
+collide across independent Harnesses if a host shares extension/registry instances,
+and selectedSkills entries lack the skill-name length bound before Set hashing.
+Current single-Harness/fork/reopen checks do not prove safe multi-Harness reuse.
+PromptInput supplies no trustworthy store namespace; a fake namespace option
+would not solve the renderer's authority boundary.
+
+Parent returned minimal corrections to C2: a mandatory fresh dedicated extension
+and registry per Harness/storage-session contract in API/docs, narrowed isolation
+claims and explicit per-conversation output limits; one shared named skill-name
+bound applied to both records and selected names before insertion. Require actual
+two-Harness same-root-ID isolated-registry evidence and oversized-selection checks,
+plus unchanged lifecycle/bounds behavior. No new runtime, namespace scheme or
+sandbox work. Context remains unmerged pending correction and explicit re-review.
