@@ -36,12 +36,14 @@ Real history access and import require separate authorization; use synthetic dat
       restart idempotence and full repeat verification. Synthetic data only;
       parent and independent reviewer verified true mid-commit SQLite rollback.
       No live session-map entries, runnable calls or tasks.
-- [ ] `pi-3346e0ea`: bounded asynchronous browsing/search over persisted records
-      by Durable entry ID, with stable line identities and honest coverage; base
-      `f54ebf7ba`, synthetic data only. `pi-be224dbf` candidate `7b4b59c05` is
-      preserved but not merged: full-array snapshots do not scale to the stored
-      corpus. `bb13ae117` has separate mixed-format and corpus-size limitations.
-      Neither is database search.
+- [x] `pi-3346e0ea`: merged `fad9a6d8e`, bounded asynchronous search over
+      persisted records by Durable entry ID, with stable line identities and
+      explicit coverage. Synthetic tests and independent review passed; requires
+      exclusive single-writer stable snapshot across pages. No CLI/browse UI,
+      index, authentication or real history import is included. `pi-be224dbf`
+      candidate `7b4b59c05` remains unmerged and preserved.
+- [ ] Wire persisted search and browsing into a usable host interface, and solve
+      ledger/source scalability before real import.
 - [ ] `pi-63980860`: implement bounded explicit-root source discovery and byte
       acquisition, using synthetic files only; no real history access. Base
       `ae92f1fdca7a23acfa4e658c8e1fd2f93ee74e0f`.

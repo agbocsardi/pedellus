@@ -151,8 +151,8 @@ The next call validates format/version, query fingerprint, store namespace,
 ledger digest, ledger source count, source identity, source-observation shape,
 in-flight entry identity, and position shape. A query change, a different
 namespace, any changed relevant ledger row (preparation status/counts
-included), a changed source conversation, a changed/deleted in-flight entry, or
-a missing named in-flight entry is rejected with
+included), a changed source conversation, or changed in-flight line, key,
+search status, unit list, or missing named in-flight entry is rejected with
 `ArchivalSearchContinuationError`; opaque or unavailable sources are skipped
 honestly. Changing page-size limits between calls is allowed. Digesting the
 ledger is bounded by the ledger source cap but costs a linear row pass on every
@@ -359,8 +359,8 @@ node --test tests/archival-search.behavior.test.mjs
 12. Search reconciles bounded per-source counts/bytes, first/last entry IDs and
     lines, contiguous line order, and each line's recomputed durableKey, but it
     does not read/verify every raw line hash or source SHA-256. A changed raw
-    line or search-unit text with unchanged ledger-visible metadata and
-    durableKey is not detected. Reconciliation only covers forward-observed
+    line or already-scanned search-unit text with unchanged ledger-visible
+    metadata and durableKey is not detected. Reconciliation only covers forward-observed
     carrier state; records changed or deleted after they were already scanned
     are not detected. Use the persistence repeat-verification path for full
     integrity reconciliation and keep an exclusive single-writer stable snapshot

@@ -15,6 +15,13 @@ export {
   type PreparedSearchUnit,
 } from "./archival-import/index.js";
 export {
+  searchPersistedArchivalImport,
+  type ArchivalSearchQuery,
+  type ArchivalSearchOptions,
+  type ArchivalSearchPage,
+  type ArchivalSearchContinuation,
+} from "./archival-search/index.js";
+export {
   persistArchivalImport,
   readArchivalImportLedger,
   type ArchivalPersistenceOptions,
