@@ -60,8 +60,11 @@ export async function runTerminalConversation(
 ): Promise<void> {
   const operationController = new AbortController();
   const operationContext = withAbortSignal(operationController.signal, context);
+  const observerController = new AbortController();
+  const observerContext = withAbortSignal(observerController.signal, operationContext);
   const signal = operationContext.abortSignal;
-  const watch = await conversation.watch(operationContext);
+  const observerSignal = observerContext.abortSignal;
+  const watch = await conversation.watch(observerContext);
   const submissions = new Map<number, LocalSubmission>();
   const runOutputs = new Map<number, RunOutput>();
   const answerIds = new Set<number>();
@@ -74,7 +77,14 @@ export async function runTerminalConversation(
   let unansweredObserved = false;
   let admissionTail: Promise<void> = Promise.resolve();
   let outputTail: Promise<void> = Promise.resolve();
+  let renderTail: Promise<void> = Promise.resolve();
   let outputFailure: unknown;
+
+  const serializeRender = <T>(operation: () => Promise<T>): Promise<T> => {
+    const task = renderTail.then(operation);
+    renderTail = task.then(() => undefined, () => undefined);
+    return task;
+  };
 
   const closeInput = () => {
     try { io.closeInput?.(); } catch { /* the owning CLI still closes the gateway */ }
@@ -103,16 +113,6 @@ export async function runTerminalConversation(
     return operation;
   };
 
-  const terminateOnOutputFailure = async (operation: Promise<void>): Promise<void> => {
-    try {
-      await operation;
-    } catch (error) {
-      if (!signal?.aborted) outputFailure ??= error;
-      if (!operationController.signal.aborted) operationController.abort(error);
-      closeInput();
-    }
-  };
-
   const endOpenLines = async (): Promise<void> => {
     for (const state of runOutputs.values()) {
       if (state.generation?.openLine) {
@@ -122,10 +122,12 @@ export async function runTerminalConversation(
     }
   };
 
-  const notice = async (text: string, toError = false): Promise<void> => {
+  const rawNotice = async (text: string, toError = false): Promise<void> => {
     await endOpenLines();
     await write(`${text}\n`, toError);
   };
+  const notice = (text: string, toError = false): Promise<void> =>
+    serializeRender(() => rawNotice(text, toError));
 
   const responseState = (taskId: number): GenerationOutput => {
     const run = runOutputs.get(taskId) ?? {};
@@ -203,7 +205,7 @@ export async function runTerminalConversation(
     }
 
     const partial = generation.message as AssistantMessage | undefined;
-    const current = sanitizeTerminalText(assistantText(partial));
+    const current = sanitizePartialText(assistantText(partial));
     if (!current || state.desynchronized || state.truncated || current === state.streamed) return;
     if (!current.startsWith(state.streamed)) {
       // A committed partial can be revised by a provider. Never duplicate or leak a replacement over prior output.
@@ -213,21 +215,22 @@ export async function runTerminalConversation(
 
     const delta = current.slice(state.streamed.length);
     const remaining = Math.max(0, MAX_RESPONSE_CHARS - state.streamed.length);
-    const shown = delta.slice(0, remaining);
+    const limitExceeded = delta.length > remaining;
+    const shown = completePrefix(delta, remaining);
     if (shown) {
       if (!state.openLine) state.openLine = true;
       await write(shown);
       state.streamed += shown;
       state.openLine = !shown.endsWith("\n");
     }
-    if (shown.length < delta.length) {
+    if (limitExceeded) {
       state.truncated = true;
-      await notice("[Live response output limit reached.]", true);
+      await rawNotice("[Live response output limit reached.]", true);
     }
   };
 
   watch.start(async (view) => {
-    const callback = streamView(view);
+    const callback = serializeRender(() => streamView(view));
     watchCallbacks.add(callback);
     try {
       await callback;
@@ -253,80 +256,83 @@ export async function runTerminalConversation(
   };
 
   const finishSubmission = async (submissionId: number, settled: SettledSubmission): Promise<void> => {
-    const local = submissions.get(submissionId);
     if (settled.status === "done" && settled.type === "input") {
-      if (!rememberAnswer(settled.answer)) return;
       const entry = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), operationContext);
       const message = entry?.model?.[0] as AssistantMessage | undefined;
       const finalText = sanitizeTerminalText(assistantText(message));
-      const taskId = local?.runTaskId;
-      const generation = taskId === undefined ? undefined : runOutputs.get(taskId)?.generation;
+      await serializeRender(async () => {
+        if (!rememberAnswer(settled.answer)) return;
+        const local = submissions.get(submissionId);
+        const taskId = local?.runTaskId;
+        const generation = taskId === undefined ? undefined : runOutputs.get(taskId)?.generation;
 
-      if (finalText.length === 0) {
-        if (generation?.streamed.length === 0) await notice("The assistant returned no text response.");
-        else await notice("[The committed assistant entry had no text; the streamed partial was not a final answer.]", true);
-      } else if (generation === undefined || generation.streamed.length === 0) {
-        await notice(limitResponse(finalText));
-      } else if (finalText.startsWith(generation.streamed)) {
-        const suffix = finalText.slice(generation.streamed.length);
-        const remaining = Math.max(0, MAX_RESPONSE_CHARS - generation.streamed.length);
-        const shown = suffix.slice(0, remaining);
-        if (shown) {
-          if (!generation.openLine && !generation.streamed.endsWith("\n")) await write("\n");
-          await write(shown);
-          generation.openLine = !shown.endsWith("\n");
+        if (finalText.length === 0) {
+          if (generation?.streamed.length === 0) await rawNotice("The assistant returned no text response.");
+          else await rawNotice("[The committed assistant entry had no text; the streamed partial was not a final answer.]", true);
+        } else if (generation === undefined || generation.streamed.length === 0) {
+          await rawNotice(limitResponse(finalText));
+        } else if (finalText.startsWith(generation.streamed)) {
+          const suffix = finalText.slice(generation.streamed.length);
+          const remaining = Math.max(0, MAX_RESPONSE_CHARS - generation.streamed.length);
+          const shown = completePrefix(suffix, remaining);
+          if (shown) {
+            if (!generation.openLine && !generation.streamed.endsWith("\n")) await write("\n");
+            await write(shown);
+            generation.openLine = !shown.endsWith("\n");
+          }
+          if (suffix.length > shown.length || generation.truncated) {
+            await rawNotice("[Final response truncated by the terminal output limit.]", true);
+          } else if (generation.openLine) {
+            generation.openLine = false;
+            await write("\n");
+          }
+        } else if (generation.streamed.startsWith(finalText)) {
+          if (generation.openLine) {
+            generation.openLine = false;
+            await write("\n");
+          }
+          await rawNotice(`[Committed answer was shorter than the streamed text${generation.truncated ? "; output limit reached" : ""}; use /history to inspect it.]`, true);
+        } else {
+          // The terminal cannot retract committed partial text. Flush only the changed suffix, not the shared prefix.
+          let shared = 0;
+          while (shared < finalText.length && shared < generation.streamed.length && finalText[shared] === generation.streamed[shared]) shared++;
+          if (shared > 0 && shared < finalText.length && isHighSurrogate(finalText.charCodeAt(shared - 1)) && isLowSurrogate(finalText.charCodeAt(shared))) shared--;
+          const remaining = Math.max(0, MAX_RESPONSE_CHARS - generation.streamed.length);
+          const remainder = completePrefix(finalText.slice(shared), remaining);
+          const truncated = shared + remainder.length < finalText.length;
+          await rawNotice(`[Committed answer differed after ${shared} shared characters; final remainder: ${remainder || "(empty)"}${truncated ? "; output limit reached, use /history for the full entry" : ""}.]`, true);
         }
-        if (suffix.length > shown.length || generation.truncated) {
-          await notice("[Final response truncated by the terminal output limit.]", true);
-        } else if (generation.openLine) {
-          generation.openLine = false;
-          await write("\n");
-        }
-      } else if (generation.streamed.startsWith(finalText)) {
-        if (generation.openLine) {
-          generation.openLine = false;
-          await write("\n");
-        }
-        await notice(`[Committed answer was shorter than the streamed text${generation.truncated ? "; output limit reached" : ""}; use /history to inspect it.]`, true);
-      } else {
-        // The terminal cannot retract committed partial text. Flush only the changed suffix, not the shared prefix.
-        let shared = 0;
-        while (shared < finalText.length && shared < generation.streamed.length && finalText[shared] === generation.streamed[shared]) shared++;
-        const remaining = Math.max(0, MAX_RESPONSE_CHARS - generation.streamed.length);
-        const remainder = finalText.slice(shared, shared + remaining);
-        const truncated = shared + remainder.length < finalText.length;
-        await notice(`[Committed answer differed after ${shared} shared characters; final remainder: ${remainder || "(empty)"}${truncated ? "; output limit reached, use /history for the full entry" : ""}.]`, true);
-      }
+      });
     } else if (settled.status === "unanswered") {
-      unansweredObserved = true;
+      if (settled.reason !== "aborted") unansweredObserved = true;
       await notice(`Turn ended: ${safeReason(settled.reason)}`, true);
     }
-
   };
 
   const waitForSubmission = (id: number, submission: Awaited<ReturnType<Conversation["submit"]>>): void => {
     let task!: Promise<void>;
-    task = submission.wait(operationContext)
+    task = submission.wait(observerContext)
       .then((settled) => finishSubmission(id, settled))
       .catch(async (error: unknown) => {
-        if (!signal?.aborted) {
+        if (!signal?.aborted && !observerSignal?.aborted) {
           await notice(`Could not observe turn completion (${errorName(error)}).`, true);
         }
       })
-      .finally(() => {
-        const local = submissions.get(id);
-        submissions.delete(id);
-        reservedInputs = Math.max(0, reservedInputs - 1);
-        cleanupRun(local?.runTaskId);
+      .finally(async () => {
+        await serializeRender(async () => {
+          const local = submissions.get(id);
+          submissions.delete(id);
+          reservedInputs = Math.max(0, reservedInputs - 1);
+          cleanupRun(local?.runTaskId);
+        });
         waits.delete(task);
       });
     waits.add(task);
   };
 
-  const queueInput = (content: string, whenBusy?: "steer" | "followUp"): void => {
+  const queueInput = (content: string, whenBusy?: "steer" | "followUp"): Promise<void> => {
     if (reservedInputs >= MAX_PENDING_INPUTS) {
-      void terminateOnOutputFailure(notice(`Input limit reached (${MAX_PENDING_INPUTS} unsettled submissions). Wait for a turn or use /abort.`, true));
-      return;
+      return notice(`Input limit reached (${MAX_PENDING_INPUTS} unsettled submissions). Wait for a turn or use /abort.`, true);
     }
     reservedInputs++;
     const operation = admissionTail.then(async () => {
@@ -342,6 +348,7 @@ export async function runTerminalConversation(
       reservedInputs = Math.max(0, reservedInputs - 1);
       if (!signal?.aborted) await notice(`Input was not admitted (${errorName(error)}).`, true);
     });
+    return Promise.resolve();
   };
 
   const showHistory = async (rawCount: string): Promise<void> => {
@@ -465,14 +472,6 @@ export async function runTerminalConversation(
         await conversation.abort(operationContext);
         await notice("Native Durable conversation abort completed; queued inputs were withdrawn. This does not implement Python sustained-goal abort.");
         return;
-      case "steer":
-        if (!args.trim()) { await notice("Usage: /steer TEXT", true); return; }
-        queueInput(args.trim(), "steer");
-        return;
-      case "after":
-        if (!args.trim()) { await notice("Usage: /after TEXT", true); return; }
-        queueInput(args.trim(), "followUp");
-        return;
       default:
         if (name === "stop") {
           await notice("/stop is unsupported: it is not aliased to native /abort, which withdraws queued inputs.", true);
@@ -483,28 +482,29 @@ export async function runTerminalConversation(
         } else if (["goal", "interrupt", "btw", "skill", "policy", "receipt", "tasks", "task", "dream", "dream-log", "dream-restore", "remember", "pairing"].includes(name)) {
           await notice(`/${name} is not implemented in this CLI; it was not sent to the model.`, true);
         } else {
-          const safeName = name.slice(0, 80);
+          const safeName = completePrefix(name, 80);
           await notice(`Unsupported slash command /${safeName}; it was not sent. Use //${safeName} to send it literally.`, true);
         }
     }
   };
 
-  const localCommand = (name: string, args: string): void => {
+  const localCommand = (name: string, args: string): Promise<void> => {
     if (activeCommands >= MAX_ACTIVE_COMMANDS) {
-      void terminateOnOutputFailure(notice(`Local command limit reached (${MAX_ACTIVE_COMMANDS} active controls).`, true));
-      return;
+      return notice(`Local command limit reached (${MAX_ACTIVE_COMMANDS} active controls).`, true);
     }
     activeCommands++;
     let task!: Promise<void>;
-    task = runCommand(name, args)
+    task = admissionTail.then(() => runCommand(name, args))
       .catch(async (error: unknown) => {
-        if (!signal?.aborted) await notice(`/${name} failed (${errorName(error)}).`, true);
+        if (!signal?.aborted) await notice(`/${completePrefix(name, 80)} failed (${errorName(error)}).`, true);
       })
       .finally(() => {
         activeCommands--;
         commands.delete(task);
       });
     commands.add(task);
+    admissionTail = task.catch(() => undefined);
+    return Promise.resolve();
   };
 
   const onAbort = (): void => closeInput();
@@ -517,7 +517,7 @@ export async function runTerminalConversation(
     for await (const line of io.input) {
       if (signal?.aborted) break;
       if (line.length > MAX_INPUT_CHARS) {
-        void terminateOnOutputFailure(notice(`Input exceeds the ${MAX_INPUT_CHARS}-character CLI limit.`, true));
+        await notice(`Input exceeds the ${MAX_INPUT_CHARS}-character CLI limit.`, true);
         io.prompt?.();
         continue;
       }
@@ -528,13 +528,20 @@ export async function runTerminalConversation(
       }
       if (leading.startsWith(LITERAL_SLASH_PREFIX)) {
         const prefix = line.indexOf(LITERAL_SLASH_PREFIX);
-        queueInput(`${line.slice(0, prefix)}/${line.slice(prefix + LITERAL_SLASH_PREFIX.length)}`);
+        await queueInput(`${line.slice(0, prefix)}/${line.slice(prefix + LITERAL_SLASH_PREFIX.length)}`);
       } else if (leading.startsWith("/")) {
         const parsed = /^\s*\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(line);
-        if (parsed) localCommand(parsed[1]!.toLowerCase(), parsed[2] ?? "");
-        else void terminateOnOutputFailure(notice("Malformed slash command; it was not sent to the model.", true));
+        if (!parsed) await notice("Malformed slash command; it was not sent to the model.", true);
+        else {
+          const name = parsed[1]!.toLowerCase();
+          const args = parsed[2] ?? "";
+          if (name === "steer" || name === "after") {
+            if (!args.trim()) await notice(`Usage: /${name.toUpperCase()} TEXT`, true);
+            else await queueInput(args.trim(), name === "steer" ? "steer" : "followUp");
+          } else await localCommand(name, args);
+        }
       } else {
-        queueInput(line);
+        await queueInput(line);
       }
       io.prompt?.();
     }
@@ -557,8 +564,9 @@ export async function runTerminalConversation(
           if ((await local.submission.status(operationContext)).status === "queued") queued.push(local.submission);
         }
         if (queued.length > 0) {
-          await notice(`EOF reached after a failed/ended run; withdrawing ${queued.length} CLI input(s) still queued natively so their waits settle.`, true);
-          for (const submission of queued) await submission.abort(operationContext);
+          await notice(`EOF reached after a failed/ended run; preserving ${queued.length} Durable-queued CLI input(s). Closing local observers; reopen to reconcile them or use explicit /abort to withdraw.`, true);
+          observerController.abort(new Error("CLI EOF; preserve queued Durable submissions"));
+          break;
         }
       }
     }
@@ -579,6 +587,7 @@ export async function runTerminalConversation(
     await Promise.allSettled([...watchCallbacks, ...waits, ...commands]);
     await admissionTail;
     await outputTail;
+    await renderTail;
   }
   if (outputFailure !== undefined) throw outputFailure;
 }
@@ -620,7 +629,7 @@ function formatHistoryMessage(message: Message): string | undefined {
 function modelLabel(model: { provider: string; modelId: string } | undefined): string {
   return model === undefined
     ? "unknown (no model configured)"
-    : sanitizeTerminalText(`${model.provider}/${model.modelId}`).slice(0, 240);
+    : completePrefix(sanitizeTerminalText(`${model.provider}/${model.modelId}`), 240);
 }
 
 function formatUsage(usage: UsageState | undefined): string[] {
@@ -631,14 +640,14 @@ function formatUsage(usage: UsageState | undefined): string[] {
   for (const model in usage.models ?? {}) {
     if (!Object.hasOwn(usage.models, model)) continue;
     const totals = usage.models[model]!;
-    rows.push(`  model ${model.slice(0, 120)}: input=${totals.input} output=${totals.output} total=${totals.totalTokens} cost=${formatCost(totals.cost?.total)}`);
+    rows.push(`  model ${completePrefix(sanitizeTerminalText(model), 120)}: input=${totals.input} output=${totals.output} total=${totals.totalTokens} cost=${formatCost(totals.cost?.total)}`);
     if (rows.length >= maxRows) break;
   }
   if (rows.length < maxRows) {
     for (const tool in usage.tools ?? {}) {
       if (!Object.hasOwn(usage.tools, tool)) continue;
       const totals = usage.tools[tool]!;
-      rows.push(`  tool ${tool.slice(0, 120)}: input=${totals.input} output=${totals.output} total=${totals.totalTokens} cost=${formatCost(totals.cost?.total)}`);
+      rows.push(`  tool ${completePrefix(sanitizeTerminalText(tool), 120)}: input=${totals.input} output=${totals.output} total=${totals.totalTokens} cost=${formatCost(totals.cost?.total)}`);
       if (rows.length >= maxRows) break;
     }
   }
@@ -654,20 +663,47 @@ function formatCost(value: unknown): string {
 
 function limitResponse(text: string): string {
   if (text.length <= MAX_RESPONSE_CHARS) return `${text}\n`;
-  return `${text.slice(0, MAX_RESPONSE_CHARS)}\n[Response truncated by the terminal output limit.]\n`;
+  return `${completePrefix(text, MAX_RESPONSE_CHARS)}\n[Response truncated by the terminal output limit.]\n`;
 }
 
 function safeReason(reason: string): string {
-  return sanitizeTerminalText(reason).slice(0, 120) || "unknown";
+  return completePrefix(sanitizeTerminalText(reason), 120) || "unknown";
 }
 
 function errorName(error: unknown): string {
-  return error instanceof Error ? sanitizeTerminalText(error.name).slice(0, 80) || "Error" : "unknown error";
+  return error instanceof Error ? completePrefix(sanitizeTerminalText(error.name), 80) || "Error" : "unknown error";
+}
+
+function sanitizePartialText(text: string): string {
+  return replaceUnpairedSurrogates(stripVTControlCharacters(text).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, ""), true);
 }
 
 function sanitizeTerminalText(text: string): string {
-  return stripVTControlCharacters(text).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+  return replaceUnpairedSurrogates(stripVTControlCharacters(text).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, ""), false);
 }
+
+function replaceUnpairedSurrogates(text: string, preserveTrailingHigh: boolean): string {
+  let result = "";
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (isHighSurrogate(code)) {
+      if (isLowSurrogate(text.charCodeAt(index + 1))) result += text[index]! + text[++index]!;
+      else if (preserveTrailingHigh && index === text.length - 1) result += text[index]!;
+      else result += "�";
+    } else if (isLowSurrogate(code)) result += "�";
+    else result += text[index]!;
+  }
+  return result;
+}
+
+function completePrefix(text: string, maxCodeUnits: number): string {
+  let length = Math.min(text.length, Math.max(0, maxCodeUnits));
+  if (length > 0 && isHighSurrogate(text.charCodeAt(length - 1))) length--;
+  return text.slice(0, length);
+}
+
+function isHighSurrogate(code: number): boolean { return code >= 0xd800 && code <= 0xdbff; }
+function isLowSurrogate(code: number): boolean { return code >= 0xdc00 && code <= 0xdfff; }
 
 async function waitForDrain(stream: Writable, signal: AbortSignal | undefined): Promise<void> {
   await new Promise<void>((resolve, reject) => {

@@ -36,15 +36,20 @@ to send one literal leading slash (for example, `//help` sends `/help` to the
 model).
 
 Normal input, `/steer`, and `/after` are admitted in input order by the native
-conversation. Durable owns the busy inbox; this CLI does not create a second
-agent queue. At most 64 locally admitted inputs may remain unsettled, and at
-most 16 local control operations may run concurrently. Each input line is
-limited to 32,000 characters and displayed response text to 64,000 characters.
-Writable backpressure is awaited. EOF waits for this process's admitted inputs
-to settle before gateway shutdown; if a failed/ended run leaves this process's
-inputs queued under Durable's default `afterFailedRun: "keep"`, EOF explicitly
-withdraws only those still-queued local submissions and reports that fallback
-(the native API cannot drain them without another user submission). SIGINT and
+conversation. Controls are ordered between those admissions: a control observes
+all earlier durable submissions, and later inputs cannot overtake a mutating
+control such as `/abort`. This boundary waits for submission admission and the
+control operation, never for model completion (except native `/abort` itself).
+Durable owns the busy inbox; this CLI does not create a second agent queue. At
+most 64 locally admitted inputs may remain unsettled, and at most 16 local
+control operations may be pending. Each input line is limited to 32,000
+characters and displayed response text to 64,000 characters. Writable
+backpressure is awaited; rejected-line notices are also awaited rather than
+queued. EOF waits for this process's admitted inputs to settle before gateway
+shutdown; if a failed/ended run leaves inputs queued under Durable's default
+`afterFailedRun: "keep"`, EOF reports that state and cancels only local
+watch/wait contexts. The durable submissions remain queued for owner
+reconciliation or reopen; only explicit `/abort` withdraws them. SIGINT and
 SIGTERM cancel local waits and watches, close input, and let the gateway
 close/reap its Harness.
 
