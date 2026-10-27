@@ -143,6 +143,11 @@ test("dry-run acquires and prepares the explicit copy without opening the destin
   assert.deepEqual(report.blockers, []);
   assert.equal(report.storeNamespace, fixture.options.storeNamespace);
   assert.equal(report.contentExposed, false);
+  assert.equal(report.queryEchoed, false);
+  assert.equal(report.experimental, true);
+  assert.equal(report.syntheticOnly, true);
+  assert.equal(report.realImportAuthorized, false);
+  assert.equal(report.sameUserRaceHardened, false);
 
   // Dry-run does not even create a database file or lock artifact.
   assert.deepEqual(await readdir(fixture.destinationDir), []);
@@ -190,6 +195,7 @@ test("apply persists all surfaces, inspects the ledger, and searches one bounded
   assert.equal(new Set(report.search.hits.map((hit) => hit.sourceId)).size, 3);
   assert.equal("continuation" in report.search, false);
   assert.equal(report.contentExposed, true);
+  assert.equal(report.queryEchoed, true);
 
   const text = withoutPaths(JSON.stringify(report.search), [
     fixture.base,
@@ -223,6 +229,17 @@ test("a one-page search withholds continuations and reports query errors as bloc
   assert.equal(applied.search.hits.length, 1);
   assert.equal(applied.search.continuationAvailable, true);
   assert.equal("continuation" in applied.search, false);
+  assert.equal(applied.queryEchoed, true);
+
+  const zeroHit = await runArchivalImportRehearsal({
+    ...fixture.options,
+    apply: true,
+    search: { query: { text: "synthetic no-such-token" } },
+  }, context);
+  assert.equal(zeroHit.status, "already-applied");
+  assert.equal(zeroHit.search.hits.length, 0);
+  assert.equal(zeroHit.queryEchoed, true);
+  assert.equal(zeroHit.contentExposed, false);
 
   const blocked = await runArchivalImportRehearsal({
     ...fixture.options,
@@ -770,18 +787,129 @@ test("limit and ledger-capacity violations are blocked before any batch write", 
   };
   const capacityBlocked = await runArchivalImportRehearsal(capacityOptions, context);
   assert.equal(capacityBlocked.status, "blocked");
-  assert.equal(capacityBlocked.destination.databaseOpened, true);
+  assert.equal(capacityBlocked.destination.databaseOpened, false);
   assert.equal(capacityBlocked.writesPerformed, false);
   assert.equal(capacityBlocked.blockers.some((blocker) => blocker.code === "ledger-capacity-exceeded"), true);
-  assert.equal(capacityBlocked.ledger.present, false);
-  const capacityDb = new DatabaseSync(join(capacity.destinationDir, "nanobot.sqlite"));
-  try {
-    assert.equal(await tableCount(capacityDb, "conversations"), 0);
-    assert.equal(await tableCount(capacityDb, "entries"), 0);
-  } finally {
-    capacityDb.close();
-  }
+  assert.equal(capacityBlocked.ledger, null);
+  assert.deepEqual(await readdir(capacity.destinationDir), []);
   const rerun = await runArchivalImportRehearsal(capacityOptions, context);
   assert.equal(rerun.status, "blocked");
   assert.equal(rerun.blockers.some((blocker) => blocker.code === "ledger-capacity-exceeded"), true);
+});
+
+test("persistence overrides above hard caps or malformed block before destination open", async (t) => {
+  const fixture = await makeFixture(t);
+  const invalidOverrides = [
+    { maxSources: 999 },
+    { maxLedgerSources: 9_999 },
+    { maxRawBytes: 64 * 1024 * 1024 + 1 },
+    { maxSources: 0 },
+    { unknownLimit: 1 },
+    { maxSources: "128" },
+  ];
+  for (const persistenceLimits of invalidOverrides) {
+    const dry = await runArchivalImportRehearsal({ ...fixture.options, persistenceLimits }, context);
+    assert.equal(dry.status, "blocked", JSON.stringify(persistenceLimits));
+    assert.equal(dry.destination.databaseOpened, false, JSON.stringify(persistenceLimits));
+    assert.equal(dry.blockers.some((blocker) => blocker.code === "persistence-input-invalid"), true,
+      JSON.stringify(persistenceLimits));
+    assert.deepEqual(await readdir(fixture.destinationDir), [], JSON.stringify(persistenceLimits));
+
+    const apply = await runArchivalImportRehearsal({ ...fixture.options, apply: true, persistenceLimits }, context);
+    assert.equal(apply.status, "blocked", JSON.stringify(persistenceLimits));
+    assert.equal(apply.destination.databaseOpened, false, JSON.stringify(persistenceLimits));
+    assert.equal(apply.blockers.some((blocker) => blocker.code === "persistence-input-invalid"), true,
+      JSON.stringify(persistenceLimits));
+    assert.deepEqual(await readdir(fixture.destinationDir), [], JSON.stringify(persistenceLimits));
+  }
+});
+
+test("fd-based fchmod does not follow a database path swapped to a symlink", async (t) => {
+  const fixture = await makeFixture(t);
+  await runArchivalImportRehearsal({ ...fixture.options, apply: true }, context);
+  const databasePath = join(fixture.destinationDir, "nanobot.sqlite");
+  const outside = join(fixture.base, "outside-mode.txt");
+  await writeFile(outside, "outside mode target\n");
+  await chmod(outside, 0o664);
+
+  const modulePath = await instrumentedRehearsal(t, [[
+    "        await handle.chmod(0o600);",
+    "        await globalThis.__rehearsalBeforeFchmodHook?.(path);\n        await handle.chmod(0o600);",
+  ]]);
+  let swapped = false;
+  globalThis.__rehearsalBeforeFchmodHook = async (path) => {
+    if (swapped || !path.endsWith("nanobot.sqlite")) return;
+    swapped = true;
+    await rm(path, { force: true });
+    await symlink(outside, path);
+  };
+  try {
+    const { runArchivalImportRehearsal: instrumentedRun } = await import(
+      `${pathToFileURL(modulePath).href}?fchmod=${Date.now()}`
+    );
+    const report = await instrumentedRun({ ...fixture.options, apply: true }, context);
+    assert.equal(swapped, true);
+    assert.equal(report.status, "blocked");
+    assert.equal(report.destination.databaseOpened, true);
+    assert.equal(report.blockers.some((blocker) => blocker.code === "destination-database-unsafe"), true);
+    assert.equal(report.destination.databaseMode, "not-verified");
+    assert.equal(report.privacyLimitations.length > 0, true);
+  } finally {
+    globalThis.__rehearsalBeforeFchmodHook = undefined;
+  }
+  // The outside target was never chmodded through the symlink.
+  assert.equal((await stat(outside)).mode & 0o777, 0o664);
+  assert.equal(await readFile(outside, "utf8"), "outside mode target\n");
+});
+
+test("documents the same-user race: a post-lock hardlink swap can migrate an external DB before archival writes block", async (t) => {
+  const fixture = await makeFixture(t);
+  const outside = join(fixture.base, "outside.sqlite");
+  const outsideDb = new DatabaseSync(outside);
+  outsideDb.exec("CREATE TABLE outside_notes(x TEXT)");
+  outsideDb.exec("INSERT INTO outside_notes VALUES ('preserve me')");
+  outsideDb.close();
+  const sizeBefore = (await stat(outside)).size;
+
+  const modulePath = await instrumentedRehearsal(t, [[
+    "            storage = await openFullSyncNodeSqliteStorage(paths.databasePath, context);",
+    "            await globalThis.__rehearsalBeforeOpenHook?.(paths.databasePath);\n            storage = await openFullSyncNodeSqliteStorage(paths.databasePath, context);",
+  ]]);
+  let hookRan = false;
+  globalThis.__rehearsalBeforeOpenHook = async (path) => {
+    hookRan = true;
+    await link(outside, path);
+  };
+  let report;
+  try {
+    const { runArchivalImportRehearsal: instrumentedRun } = await import(
+      `${pathToFileURL(modulePath).href}?openrace=${Date.now()}`
+    );
+    report = await instrumentedRun({ ...fixture.options, apply: true }, context);
+  } finally {
+    globalThis.__rehearsalBeforeOpenHook = undefined;
+  }
+
+  // Documented residual: the post-lock check passed before the hardlink appeared,
+  // so SQLite opened/migrated the external inode. The post-open check blocks
+  // archival writes, but does not undo Durable migration pages.
+  assert.equal(hookRan, true);
+  assert.equal(report.status, "blocked");
+  assert.equal(report.destination.databaseOpened, true);
+  assert.equal(report.blockers.some((blocker) => blocker.code === "destination-database-hardlink"), true);
+  assert.equal(report.ledger, null);
+  assert.equal(report.experimental, true);
+  assert.equal(report.sameUserRaceHardened, false);
+  assert.equal(report.realImportAuthorized, false);
+  assert.equal((await lstat(join(fixture.destinationDir, "nanobot.sqlite"))).nlink, 2);
+  assert.equal((await stat(outside)).size > sizeBefore, true);
+
+  const mutated = new DatabaseSync(outside);
+  try {
+    assert.equal(mutated.prepare("SELECT x FROM outside_notes").get().x, "preserve me");
+    const tables = mutated.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((row) => row.name);
+    assert.equal(tables.includes("durable_schema"), true);
+  } finally {
+    mutated.close();
+  }
 });

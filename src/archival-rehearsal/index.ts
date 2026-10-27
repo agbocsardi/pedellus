@@ -26,10 +26,18 @@
  * contain source content or filesystem paths. Search results, when explicitly
  * requested, are bounded search hits (snippets and allowlisted metadata) and
  * are as sensitive as the archived material; raw line bytes are never returned.
+ *
+ * This slice is experimental and synthetic-only. It is NOT hardened against a
+ * same-user process that can write the private destination and ignores the
+ * Gateway lock: that process can race the post-lock check and SQLite's
+ * path-based open, and can add a hard link between fstat and fchmod. The
+ * post-open checks block archival writes and the fd-based fchmod never follows
+ * a swapped path, but the residual is documented and no real import is
+ * authorized without a further gate.
  */
 import { createHash } from "node:crypto";
-import { realpathSync, type Stats } from "node:fs";
-import { chmod, lstat, realpath } from "node:fs/promises";
+import { constants, realpathSync, type Stats } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Context } from "@earendil-works/chord";
@@ -60,8 +68,8 @@ import {
   ArchivalPersistenceConflictError,
   ArchivalPersistenceCorruptionError,
   ArchivalPersistenceInputError,
-  ARCHIVAL_PERSISTENCE_LIMITS,
   ARCHIVAL_RECORD_SCHEMA_VERSION,
+  normalizeArchivalPersistenceLimits,
   persistArchivalImport,
   readArchivalImportLedger,
   type ArchivalLedgerSource,
@@ -286,6 +294,8 @@ export interface ArchivalRehearsalReport {
   readonly privacyLimitations: readonly string[];
   readonly pathsExposed: false;
   readonly contentExposed: boolean;
+  /** True when a successful search page echoes the caller-supplied query text. */
+  readonly queryEchoed: boolean;
   readonly rawArchivalBytesExposed: false;
   readonly modelEntriesCreated: false;
   readonly tasksCreated: false;
@@ -295,6 +305,10 @@ export interface ArchivalRehearsalReport {
   readonly cursorAdvanced: false;
   readonly replayPerformed: false;
   readonly reviewRequired: true;
+  readonly experimental: true;
+  readonly syntheticOnly: true;
+  readonly realImportAuthorized: false;
+  readonly sameUserRaceHardened: false;
   readonly limitations: readonly string[];
 }
 
@@ -313,14 +327,15 @@ const LIMITATIONS: readonly string[] = Object.freeze([
   "The source copy is read through the existing no-follow acquisition boundary; live ~/.nanobot and home roots are refused there.",
   "The destination is an explicit private directory; the database is opened with the Gateway's process lock and WAL/FULL durability.",
   "The destination database and WAL/SHM/journal sidecars must be single-link regular files; hardlinks, symlinks, and specials are rejected.",
-  "Database/sidecar mode 0600 is enforced before archival writes and rechecked after close without chmodding external hardlinks; residual exposure is reported.",
+  "Database/sidecar mode 0600 is enforced with a no-follow descriptor, fstat/nlink/identity checks, and fchmod; a symlink or existing hardlink target is never chmodded.",
+  "A same-user process with write access to the destination can still race fstat/fchmod or the post-lock check/SQLite open; this is not hardened and is synthetic-only.",
   "Dry-run performs no destination open, lock, migration, or write. Apply writes only the supplied snapshot bytes to the destination database.",
   "Imports are batched; each batch is atomic. A rerun is idempotent per source identity (storeNamespace, sourceId, sha256).",
   "Preparation, per-batch persistence bounds, ledger conflicts, and ledger capacity are preflighted before the first batch write.",
   "Changed digests, namespaces, formats, provenance, or preparation/schema versions are conflicts that require operator reconciliation; they are never overwritten.",
   "Reports contain stable codes and opaque labels, not paths or content. Search hits and their echoed query text, when requested, are private.",
   "No model/provider entry, task, submission, session-map update, cursor advance, Python resume, or replay is created.",
-  "This rehearsal does not authorize a real import or a production retention/backup policy.",
+  "This rehearsal is experimental and synthetic-only; it does not authorize a real import, and the same-user destination race needs a further gate.",
 ]);
 
 interface CanonicalDirectory {
@@ -629,6 +644,74 @@ async function databasePathBlockers(databasePath: string): Promise<ArchivalRehea
   return blockers;
 }
 
+function privacyLimitationsFor(
+  databaseMode: "0600" | "not-opened" | "not-verified",
+  walShmMode: "private-0600" | "absent" | "not-opened" | "not-verified",
+): string[] {
+  const limitations: string[] = [];
+  if (databaseMode !== "0600" && databaseMode !== "not-opened") {
+    limitations.push("Destination database privacy could not be verified; treat it as exposed.");
+  }
+  if (walShmMode === "not-verified") {
+    limitations.push("WAL/SHM/journal sidecars could not be verified private; treat the destination as exposed.");
+  }
+  return limitations;
+}
+
+/** Open-only identity check followed by fchmod on an already-open descriptor. */
+type PrivateFileStatus =
+  | "absent"
+  | "private"
+  | "symlink"
+  | "hardlink"
+  | "not-regular"
+  | "identity-changed"
+  | "unreadable";
+
+const PRIVATE_FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+async function securePrivateFile(path: string): Promise<PrivateFileStatus> {
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(path, PRIVATE_FILE_FLAGS);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return "absent";
+    if (code === "ELOOP") return "symlink";
+    return "unreadable";
+  }
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile()) return "not-regular";
+    if (before.nlink !== 1n) return "hardlink";
+    // fchmod the opened inode; never a path that may have been swapped.
+    // A hard link added between this fstat and fchmod is a same-user residual;
+    // the fstat/lstat revalidation after fchmod detects it but cannot undo it.
+    await handle.chmod(0o600);
+    const after = await handle.stat({ bigint: true });
+    if (!after.isFile() || after.nlink !== 1n ||
+        after.dev !== before.dev || after.ino !== before.ino) {
+      return "identity-changed";
+    }
+    // Revalidate the path still names the same single-link inode.
+    let current: Awaited<ReturnType<typeof lstat>>;
+    try {
+      current = await lstat(path, { bigint: true });
+    } catch {
+      return "identity-changed";
+    }
+    if (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1n ||
+        current.dev !== before.dev || current.ino !== before.ino) {
+      return "identity-changed";
+    }
+    return "private";
+  } catch {
+    return "unreadable";
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
 /** Make the database and any existing sidecars owner-only before archival writes. */
 async function ensurePrivateDatabaseFiles(databasePath: string): Promise<{
   blockers: ArchivalRehearsalBlocker[];
@@ -637,43 +720,33 @@ async function ensurePrivateDatabaseFiles(databasePath: string): Promise<{
 }> {
   const blockers: ArchivalRehearsalBlocker[] = [];
   let databaseMode: "0600" | "not-verified" = "not-verified";
-  try {
-    const status = await lstat(databasePath);
-    if (status.isSymbolicLink() || !status.isFile()) {
-      blockers.push({ stage: "destination", code: "destination-database-unsafe" });
-    } else if (status.nlink !== 1) {
-      blockers.push({ stage: "destination", code: "destination-database-hardlink" });
-    } else {
-      await chmod(databasePath, 0o600);
-      databaseMode = "0600";
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      blockers.push({ stage: "destination", code: "destination-database-missing" });
-    } else {
-      blockers.push({ stage: "destination", code: "destination-database-permissions" });
-    }
+  const database = await securePrivateFile(databasePath);
+  if (database === "private") {
+    databaseMode = "0600";
+  } else if (database === "absent") {
+    blockers.push({ stage: "destination", code: "destination-database-missing" });
+  } else if (database === "hardlink") {
+    blockers.push({ stage: "destination", code: "destination-database-hardlink" });
+  } else if (database === "symlink" || database === "not-regular" || database === "identity-changed") {
+    blockers.push({ stage: "destination", code: "destination-database-unsafe" });
+  } else {
+    blockers.push({ stage: "destination", code: "destination-database-permissions" });
   }
 
   let sidecars = 0;
   let sidecarsVerified = true;
   for (const suffix of SIDECAR_SUFFIXES) {
-    const path = `${databasePath}${suffix}`;
-    try {
-      const status = await lstat(path);
-      sidecars += 1;
-      if (status.isSymbolicLink() || !status.isFile() || status.nlink !== 1) {
-        blockers.push({ stage: "destination", code: "destination-wal-shm-unsafe" });
-        sidecarsVerified = false;
-        continue;
-      }
-      await chmod(path, 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        blockers.push({ stage: "destination", code: "destination-wal-shm-permissions" });
-        sidecarsVerified = false;
-      }
-    }
+    const status = await securePrivateFile(`${databasePath}${suffix}`);
+    if (status === "absent") continue;
+    sidecars += 1;
+    if (status === "private") continue;
+    sidecarsVerified = false;
+    blockers.push({
+      stage: "destination",
+      code: status === "unreadable"
+        ? "destination-wal-shm-permissions"
+        : "destination-wal-shm-unsafe",
+    });
   }
   return {
     blockers,
@@ -683,8 +756,9 @@ async function ensurePrivateDatabaseFiles(databasePath: string): Promise<{
 }
 
 /**
- * Recheck identity and mode after close. Never chmod a symlink or a file with
- * extra hard links; report the residual exposure instead.
+ * Recheck identity and mode after close with the same fd-based primitive. A
+ * symlink/hardlink or a replaced path is never chmodded; residual exposure is a
+ * limitation instead.
  */
 async function finalizeDatabasePrivacy(databasePath: string): Promise<{
   databaseMode: "0600" | "not-verified";
@@ -692,16 +766,7 @@ async function finalizeDatabasePrivacy(databasePath: string): Promise<{
   privacyLimitations: string[];
 }> {
   const privacyLimitations: string[] = [];
-  let databaseMode: "0600" | "not-verified" = "not-verified";
-  try {
-    const status = await lstat(databasePath);
-    if (!status.isSymbolicLink() && status.isFile() && status.nlink === 1) {
-      await chmod(databasePath, 0o600);
-      databaseMode = "0600";
-    }
-  } catch {
-    // Reported below as not verified.
-  }
+  const databaseMode = (await securePrivateFile(databasePath)) === "private" ? "0600" : "not-verified";
   if (databaseMode !== "0600") {
     privacyLimitations.push("Destination database privacy could not be verified after close; treat it as exposed.");
   }
@@ -709,18 +774,10 @@ async function finalizeDatabasePrivacy(databasePath: string): Promise<{
   let sidecars = 0;
   let sidecarsVerified = true;
   for (const suffix of SIDECAR_SUFFIXES) {
-    const path = `${databasePath}${suffix}`;
-    try {
-      const status = await lstat(path);
-      sidecars += 1;
-      if (status.isSymbolicLink() || !status.isFile() || status.nlink !== 1) {
-        sidecarsVerified = false;
-        continue;
-      }
-      await chmod(path, 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") sidecarsVerified = false;
-    }
+    const status = await securePrivateFile(`${databasePath}${suffix}`);
+    if (status === "absent") continue;
+    sidecars += 1;
+    if (status !== "private") sidecarsVerified = false;
   }
   if (sidecars > 0 && !sidecarsVerified) {
     privacyLimitations.push("WAL/SHM/journal sidecars could not be verified private; treat the destination as exposed.");
@@ -734,14 +791,12 @@ async function finalizeDatabasePrivacy(databasePath: string): Promise<{
 
 function effectivePersistenceLimits(overrides: Partial<ArchivalPersistenceLimits> | undefined):
 ArchivalPersistenceLimits | null {
-  const effective: Record<string, number> = { ...ARCHIVAL_PERSISTENCE_LIMITS };
-  if (overrides === undefined) return effective as unknown as ArchivalPersistenceLimits;
-  for (const [key, value] of Object.entries(overrides)) {
-    if (!Object.hasOwn(ARCHIVAL_PERSISTENCE_LIMITS, key)) return null;
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return null;
-    effective[key] = value;
+  try {
+    return normalizeArchivalPersistenceLimits(overrides);
+  } catch {
+    // The persistence module owns the exact valid-key/hard-cap policy.
+    return null;
   }
-  return effective as unknown as ArchivalPersistenceLimits;
 }
 
 interface BatchPreflight {
@@ -820,6 +875,11 @@ function preflightBatches(
     if (searchUnits > persistenceLimits.maxSearchUnits) {
       pushBlocker(blockers, { stage: "persistence", code: "persistence-preflight-max-search-units" });
     }
+  }
+  if (persistenceLimits !== null && preparedSources.length > persistenceLimits.maxLedgerSources) {
+    // This lower bound does not need the ledger: even an empty destination
+    // cannot hold this many sources.
+    pushBlocker(blockers, { stage: "ledger", code: "ledger-capacity-exceeded" });
   }
   return { blockers, summaries, preparedSources, persistenceLimits };
 }
@@ -1115,6 +1175,7 @@ export async function runArchivalImportRehearsal(
     privacyLimitations: [],
     pathsExposed: false,
     contentExposed: false,
+    queryEchoed: false,
     rawArchivalBytesExposed: false,
     modelEntriesCreated: false,
     tasksCreated: false,
@@ -1124,6 +1185,10 @@ export async function runArchivalImportRehearsal(
     cursorAdvanced: false,
     replayPerformed: false,
     reviewRequired: true,
+    experimental: true,
+    syntheticOnly: true,
+    realImportAuthorized: false,
+    sameUserRaceHardened: false,
     limitations: LIMITATIONS,
     ...fields,
   });
@@ -1289,6 +1354,10 @@ export async function runArchivalImportRehearsal(
     }
 
     try {
+      // The native opener is path-based and follows symlinks/hardlinks. The
+      // post-open securePrivateFile nlink check blocks archival writes, but a
+      // same-user swap after the check above can still let Durable migrations
+      // write schema pages to an external inode. Documented residual.
       storage = await openFullSyncNodeSqliteStorage(paths.databasePath, context);
       databaseOpened = true;
       durability = "wal-full";
@@ -1326,6 +1395,7 @@ export async function runArchivalImportRehearsal(
         },
         batches: preparedBatches,
         blockers: permissions.blockers,
+        privacyLimitations: privacyLimitationsFor(databaseMode, walShmMode),
       });
     }
     session = createSession(storage);
@@ -1475,5 +1545,6 @@ export async function runArchivalImportRehearsal(
     writesPerformed,
     privacyLimitations: finalized?.privacyLimitations ?? [],
     contentExposed: search !== null && search.hits.length > 0,
+    queryEchoed: search !== null,
   });
 }

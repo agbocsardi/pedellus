@@ -136,12 +136,21 @@ and verifies again after Durable initialization. A lock held by another process
 is a hard blocker; this module never retries or weakens the lock.
 
 After opening, the database is chmodded to `0600` before any archival write;
-WAL/SHM files created afterwards inherit that mode. Existing sidecars are
-chmodded only when they are regular files with exactly one link. After close
-the database and any surviving sidecars are rechecked and chmodded again under
-the same rule. A residual, unverified exposure is reported in
+WAL/SHM files created afterwards inherit that mode. Mode changes use a
+no-follow descriptor, not a path: open with `O_RDONLY | O_NOFOLLOW |
+O_NONBLOCK`, `fstat` the handle, require a regular file with `nlink === 1`,
+`fchmod(0o600)`, then re-`fstat` and re-`lstat` the path to confirm it still
+names the same inode. Existing sidecars use the same primitive. After close the
+database and any surviving sidecars are rechecked under the same rule while
+the lock is still held. A residual, unverified exposure is reported in
 `destination.databaseMode`, `destination.walShmMode`, and
-`privacyLimitations`; a symlink or external hardlink is never chmodded.
+`privacyLimitations`; the path is never chmodded, so a symlink or existing
+external hardlink target is not affected.
+
+There remains a narrow same-user race between the pre-`fchmod` `fstat` and the
+`fchmod` itself: a process that can write the private destination could add a
+hard link in that window. This is outside the ownership contract and is not
+claimed hardened.
 
 The rehearsal uses a plain Durable `createSession()` and never opens a
 `Harness`, `openGateway()`, a model, a provider, an inbox, a task, a submission,
@@ -152,17 +161,27 @@ a live session map, or a Python resume path.
 Before taking the lock, `apply` preflights every acquisition batch:
 
 1. preparation runs once per batch with the caller's preparation limits;
-2. every per-batch persistence bound is checked against the effective
+2. every per-batch persistence bound is checked against the exact validated
    persistence limits (source count, raw bytes, records, search units, and the
-   per-source variants).
+   per-source variants). The rehearsal calls the persistence module's own
+   `normalizeArchivalPersistenceLimits()`, so unknown keys, malformed values,
+   and values above the persistence hard caps are rejected with
+   `persistence-input-invalid` before any destination access;
+3. an absolute ledger overflow (the snapshot itself has more sources than
+   `maxLedgerSources`) is also rejected before the destination is opened.
 
 A preparation or persistence-limit violation is reported **before** the
 destination is opened. After the lock, and before the first batch commit, the
 ledger is read and preflighted for namespace agreement, omitted sources,
-per-source conflicts, and total ledger capacity (`maxLedgerSources`). A source
-present in the ledger but absent from the current snapshot is a
-`ledger-source-not-in-snapshot` blocker, not `already-applied`; this catches a
-partial/stale rerun before it writes.
+per-source conflicts, and exact total ledger capacity (`ledger sources in the
+destination + new sources`). A source present in the ledger but absent from the
+current snapshot is a `ledger-source-not-in-snapshot` blocker, not
+`already-applied`; this catches a partial/stale rerun before it writes.
+
+Exact existing-ledger capacity requires opening the destination database, so a
+blocked apply may still create, migrate, or chmod `nanobot.sqlite`. The report
+sets `destination.databaseOpened` so this is visible. No batch/archival writes
+occur in that case.
 
 Only then does `apply` iterate the acquisition's deterministic batches and call
 `persistArchivalImport()` once per batch with the same caller-supplied
@@ -219,14 +238,17 @@ timestamps, roles, entry IDs, source labels), never `rawLineBase64`, provider
 continuation state, header metadata, quarantine bytes, or model/task content.
 When search is requested, the report also echoes the caller-supplied query text
 and query metadata inside `search.query`; without search, no query text is
-present. A report carrying search hits is therefore sensitive. `contentExposed`
-is true when non-empty search results are included.
+present. `queryEchoed` is true whenever a successful search page echoes the
+query, even with zero hits. `contentExposed` is true only when non-empty search
+results are included. A report with `queryEchoed: true` is sensitive even when
+`contentExposed` is false.
 
 ## Report shape and privacy
 
 Reports contain:
 
 - `status`: `dry-run`, `applied`, `already-applied`, or `blocked`;
+- readiness flags and `privacyLimitations`;
 - acquisition summary (completeness, surfaces, missing surfaces, counts, stable
   diagnostics, opaque source labels);
 - acknowledged missing surfaces;
@@ -238,7 +260,10 @@ Reports contain:
 - bounded ledger summary;
 - optional bounded search result;
 - `blockers` with `stage` and stable `code` (plus an opaque `sourceId` where
-  relevant).
+  relevant);
+- `queryEchoed` for successful search pages, distinct from `contentExposed`;
+- explicit readiness flags: `experimental: true`, `syntheticOnly: true`,
+  `realImportAuthorized: false`, `sameUserRaceHardened: false`.
 
 Reports never include filesystem paths, OS error messages, record content,
 `rawLineBase64`, or provider/quarantine bytes. Typed errors from the composed
@@ -263,12 +288,17 @@ bug reports.
   backup/restore policy.
 - Acquisition is Linux-only and diagnostic, not a cryptographic guarantee
   against privileged concurrent writers or unreliable filesystem metadata.
-- The lock/path boundary matches the Gateway's enforced boundary, but a
-  privileged race between the final check and SQLite open is not defended
-  against. Hardlinks and sidecar symlinks are rejected, and `0600` is enforced
-  before archival writes; an external actor that can replace files between
-  checks is outside this boundary. Do not run this against live data or a
-  shared destination.
+- The lock/path boundary matches the Gateway's enforced boundary. Cross-user
+  access is blocked by the 0700 destination, but a **same-user** process that
+  writes the destination and ignores the lock can race the post-lock check and
+  the SQLite open. `node:sqlite`'s native opener follows symlinks and has no
+  `O_NOFOLLOW`/fd-pinning option; passing `/proc/self/fd/<fd>` is not a safe pin
+  because SQLite resolves it to a pathname and creates WAL/SHM beside that
+  path. A hardlink/symlink swapped into that window can therefore make Durable
+  migrations write schema pages to the external inode before the post-open
+  `nlink` check blocks archival writes. This is a documented residual, not a
+  hardened guarantee. The rehearsal is experimental and synthetic-only until a
+  safe pinned open (or an equivalent ownership gate) is implemented.
 - This rehearsal does not authorize a real import.
 
 ## Tests
@@ -279,6 +309,7 @@ directories and SQLite databases only. It covers:
 - dry-run acquisition/preparation with no destination file, lock, or write;
 - apply across session, transcript-archive, and history surfaces;
 - ledger inspection and a bounded one-page search with continuations withheld;
+- zero-hit query echo (`queryEchoed`) distinct from content exposure;
 - search input failure reported as a blocker;
 - idempotent reruns across one-source batches and stable conversation IDs;
 - changed-digest and changed-namespace conflict reporting without overwrite;
@@ -291,7 +322,11 @@ directories and SQLite databases only. It covers:
 - stale-ledger rerun (source removed from the snapshot) blocked instead of
   reported as already-applied;
 - preparation, persistence, and ledger-capacity preflight blocking before any
-  batch write, including a 513-source ledger overflow with zero conversations;
+  batch write, including above-hard-cap/malformed overrides and a 513-source
+  absolute ledger overflow with no destination database;
+- fd-based fchmod with a path swapped to a symlink (outside mode unchanged),
+  and a documented same-user post-lock hardlink race showing external Durable
+  migration pages while archival writes are blocked;
 - a mid-SQLite-commit storage failure that leaves no ledger, conversation,
   entry, document, task, or submission behind, followed by a clean rerun;
 - invalid option shape with no path echo.

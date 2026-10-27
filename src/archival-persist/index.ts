@@ -359,6 +359,15 @@ function normalizedLimits(input: unknown): ArchivalPersistenceLimits {
   }
 }
 
+/**
+ * Exact validated normalization used by persistence. Exposed for preflight
+ * callers so they reject the same malformed, unknown, and above-hard-cap
+ * overrides without duplicating the limits table.
+ */
+export function normalizeArchivalPersistenceLimits(input?: unknown): ArchivalPersistenceLimits {
+  return normalizedLimits(input);
+}
+
 function normalizedLimitsValue(input: unknown): ArchivalPersistenceLimits {
   const result: MutableLimits = { ...ARCHIVAL_PERSISTENCE_LIMITS };
   if (input === undefined) return result;
