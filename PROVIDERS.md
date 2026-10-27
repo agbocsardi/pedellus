@@ -1,11 +1,13 @@
 # Provider/config parity slice
 
 This is a bounded P3/P8 slice, not provider-parity acceptance. It uses the pinned
-Pi AI `1.4.0` provider factories and their model catalogs. Only the selected
-provider is registered; the requested model ID must exist in that pinned catalog.
-This slice does not add model discovery, custom/dynamic endpoint configuration,
-fallback chains, or legacy presets. No live provider, paid request, or real
-credential was used to validate it.
+Pi AI `1.4.0` provider factories and their model catalogs. Only provider aliases
+referenced by the explicit `allowedModels` list are registered (legacy configs
+implicitly allow only `model`); every allowed model must exist in its pinned
+catalog. No model discovery, custom/dynamic endpoint configuration, catalog
+refresh, fallback chains, or legacy presets are added. No live provider, paid
+request, or real credential was used to validate it. See [MODELS.md](./MODELS.md)
+for allowlist, persisted selection, thinking levels, and revocation behavior.
 
 ## Credentials and selection
 
@@ -19,16 +21,20 @@ Configuration contains environment-variable **names**, never API keys:
 ```
 
 Credential references (and `telegram.tokenEnv`) must match
-`[A-Za-z_][A-Za-z0-9_]*`. The named variable must be set and nonblank when that
-provider is selected. Credentials are not inferred from provider defaults.
+`[A-Za-z_][A-Za-z0-9_]*`. Every alias used by `allowedModels` must have an explicit
+credential reference whose environment variable is set and nonblank before the
+gateway opens. Other aliases in `credentials` need not be configured unless
+allowlisted. Credentials are not inferred from provider defaults.
 
-The adapter exposes only that selected key through the native provider's
-expected environment-variable name. Other process environment values are
-unavailable to provider auth; Pi credential-file discovery is disabled, and
-native API-key login and OAuth methods are removed. Adapter-generated
-configuration/auth errors do not include credential values. OpenAI/Anthropic/
-OpenRouter subscription OAuth, Codex OAuth, ambient credentials, and Pi
-`auth.json` are not part of this slice.
+Each registered native provider receives only the key captured for its own
+configured alias through Pi's provider-scoped API-key resolver. This keeps
+`opencode_zen` and `opencode_go` isolated even though both native adapters name
+the same `OPENCODE_API_KEY` environment variable. Other process environment
+values are unavailable to provider auth; Pi credential-file discovery is
+disabled, and native API-key login and OAuth methods are removed. Adapter errors
+do not include credential values. OpenAI/Anthropic/OpenRouter subscription
+OAuth, Codex OAuth, ambient credentials, and Pi `auth.json` are not part of this
+slice.
 
 ## Supported native aliases
 

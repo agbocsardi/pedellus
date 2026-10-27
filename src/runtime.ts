@@ -3,20 +3,45 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { processLock } from "@earendil-works/chord/node";
 import type { Context } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
-import { configure, createRegistry, defineDoc, Harness, type AgentChange, type Conversation, type ConversationId, type Cursor, type Harness as HarnessType, type Storage } from "@earendil-works/pi-durable";
-import type { PortConfig } from "./config.js";
+import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type Harness as HarnessType, type ModelRef, type Storage } from "@earendil-works/pi-durable";
+import type { ModelReference, PortConfig } from "./config.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
-import { createProviderModels } from "./providers.js";
+import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
 
 const SessionMap = defineDoc<{ sessions: Record<string, number> }>({
   kind: "nanobot.session-map", version: 1, scope: "conversation", history: "latest", fork: "initial",
   initial: () => ({ sessions: {} }), checkpointWhen: () => true,
 });
 
+export interface GatewayModelChoice {
+  provider: string;
+  modelId: string;
+  name: string;
+  thinkingLevels: readonly ModelThinkingLevel[];
+}
+
+export interface GatewayModelSelectionRequest extends ModelReference {
+  thinkingLevel?: ModelThinkingLevel;
+}
+
+export interface GatewayModelSelection extends ModelReference {
+  thinkingLevel: ModelThinkingLevel;
+}
+
+export interface GatewayModelList {
+  models: readonly GatewayModelChoice[];
+  selected: GatewayModelSelection;
+}
+
 export interface Gateway {
   readonly harness: HarnessType;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
+  /** Lists the explicit allowlist and persisted selection for an already-known session key. */
+  listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
+  /** Persists a native pi.agent choice; rejects ConversationBusy atomically without changing it. */
+  selectModel(sessionKey: string, selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection>;
   close(context: Context): Promise<void>;
 }
 
@@ -48,12 +73,107 @@ function encodedSessionKey(key: string): string {
   return `k:${Buffer.from(key, "utf8").toString("base64url")}`;
 }
 
+function modelKey(model: ModelReference | ModelRef): string {
+  return JSON.stringify([model.provider, model.modelId]);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Models selected into checkpoints by Durable's native provider-dispatch tasks. */
+function preparedTaskModel(task: unknown): ModelReference | undefined {
+  if (!isRecord(task) || typeof task.kind !== "string") return undefined;
+  const { kind, id } = task;
+  if (kind !== "pi.generation" && kind !== "pi.compaction") return undefined;
+  if (!isRecord(task.state)) throw new Error(`Cannot safely validate live ${kind} task ${String(id)} state`);
+  const { status, checkpoint } = task.state;
+  if (status === "terminal" || status === "completing") return undefined;
+  if (!["pending", "running", "waiting", "sleeping"].includes(String(status))) {
+    throw new Error(`Cannot safely validate live ${kind} task ${String(id)} status ${String(status)}`);
+  }
+  if (!isRecord(checkpoint) || typeof checkpoint.phase !== "string") {
+    throw new Error(`Cannot safely validate live ${kind} task ${String(id)} checkpoint`);
+  }
+  const phase = checkpoint.phase;
+  const hasPreparedRequest = kind === "pi.generation"
+    ? phase === "request" || phase === "poll"
+    : phase === "summarize" || phase === "retry";
+  const hasNoPreparedRequest = kind === "pi.generation"
+    ? phase === "prepare" || phase === "retry" || phase === "tools"
+    : phase === "select";
+  if (hasNoPreparedRequest) return undefined;
+  if (!hasPreparedRequest || !isRecord(checkpoint.model) ||
+      typeof checkpoint.model.provider !== "string" || typeof checkpoint.model.modelId !== "string") {
+    throw new Error(`Cannot safely validate live ${kind} task ${String(id)} checkpoint phase ${phase}`);
+  }
+  return { provider: checkpoint.model.provider, modelId: checkpoint.model.modelId };
+}
+
+function isModelSelection(value: unknown): value is GatewayModelSelectionRequest {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  if (!Object.hasOwn(value, "provider") || !Object.hasOwn(value, "modelId")) return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.provider === "string" && candidate.provider.length > 0 &&
+    typeof candidate.modelId === "string" && candidate.modelId.length > 0;
+}
+
 export async function openGateway(config: PortConfig, context: Context, options: { models?: Models } = {}): Promise<Gateway> {
-  const prepared = options.models ? { models: options.models, model: config.model } : createProviderModels(config);
+  const allowedModels = config.allowedModels ?? [config.model];
+  const prepared = options.models
+    ? { models: options.models, model: nativeModelReference(config.model) }
+    : createProviderModels(config);
   const { models, model } = prepared;
-  if (!models.getModel(model.provider, model.modelId)) throw new Error(`Unknown model ${model.provider}/${model.modelId}`);
+  const choices = resolveModelChoices(models, allowedModels);
+  const choicesByConfigured = new Map(choices.map((choice) => [modelKey(choice.configured), choice]));
+  const choicesByNative = new Map(choices.map((choice) => [modelKey(choice.native), choice]));
+  const defaultChoice = choicesByConfigured.get(modelKey(config.model));
+  if (!defaultChoice) throw new Error("Default model must be included in allowedModels");
+  if (modelKey(model) !== modelKey(defaultChoice.native)) throw new Error("Resolved default model does not match its configured choice");
+  if (config.thinkingLevel !== undefined && !defaultChoice.thinkingLevels.includes(config.thinkingLevel)) {
+    throw new Error(`Unsupported thinkingLevel ${config.thinkingLevel} for default model ${config.model.provider}/${config.model.modelId}`);
+  }
+  const defaultThinkingLevel = config.thinkingLevel ?? "off";
   const workspace = await realpath(config.workspace);
   if (!(await stat(workspace)).isDirectory()) throw new Error("workspace must be a directory");
+  const hostPolicy: AgentChange = { cwd: workspace, tools: [], modelTools: [] };
+  const defaultAgentPolicy: AgentChange = {
+    ...hostPolicy,
+    model,
+    thinkingLevel: defaultThinkingLevel,
+  };
+  const fallbackThinkingLevel = (choice: ResolvedModelChoice): ModelThinkingLevel =>
+    config.thinkingLevel !== undefined && choice.thinkingLevels.includes(config.thinkingLevel)
+      ? config.thinkingLevel
+      : "off";
+  const choiceFromState = (state: Readonly<AgentState> | undefined): ResolvedModelChoice | undefined =>
+    state?.model === undefined ? undefined : choicesByNative.get(modelKey(state.model));
+  const policyForState = (state: Readonly<AgentState> | undefined): AgentChange => {
+    const existing = choiceFromState(state);
+    const choice = existing ?? defaultChoice;
+    const modelWasRevoked = existing === undefined;
+    const thinkingLevel = !modelWasRevoked && state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
+      ? state.thinkingLevel
+      : fallbackThinkingLevel(choice);
+    return { ...hostPolicy, model: choice.native, thinkingLevel };
+  };
+  const publicChoice = (choice: ResolvedModelChoice): GatewayModelChoice => ({
+    ...choice.configured,
+    name: choice.model.name,
+    thinkingLevels: [...choice.thinkingLevels],
+  });
+  const publicSelection = (choice: ResolvedModelChoice, thinkingLevel: ModelThinkingLevel): GatewayModelSelection => ({
+    ...choice.configured,
+    thinkingLevel,
+  });
+  async function applyConversationPolicy(conversation: Conversation, ctx: Context): Promise<void> {
+    await conversation.commit(async (tx) => {
+      const state = await tx.doc(AgentDoc, conversation.id);
+      await configure(tx, conversation.id, policyForState(state));
+    }, ctx);
+  }
   const extraRoots = await Promise.all((config.extraAllowedDirs ?? []).map(async (p) => {
     const root = await realpath(p);
     if (!(await stat(root)).isDirectory()) throw new Error(`extraAllowedDirs entry is not a directory: ${p}`);
@@ -85,22 +205,30 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const registry = createRegistry();
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
     harness = await Harness.open(storage, { models, registry }, context);
-    const agentPolicy: AgentChange = {
-      model,
-      cwd: workspace,
-      tools: [],
-      modelTools: [],
-      ...(config.thinkingLevel === undefined ? {} : { thinkingLevel: config.thinkingLevel }),
-    };
-    const root = await harness.root(context, { agent: agentPolicy });
-    await root.configure(agentPolicy, context);
+    const root = await harness.root(context, { agent: defaultAgentPolicy });
 
-    // Reapply host-owned policy to every persisted conversation before any task can resume.
+    // Refuse to resume a prepared request with a model removed from the current allowlist.
     await root.commit(async (tx) => {
+      let taskCursor: Cursor | undefined;
+      do {
+        const page = await tx.scanTasks({}, 1000, taskCursor);
+        for (const task of page.items) {
+          const preparedModel = preparedTaskModel(task);
+          if (preparedModel !== undefined && !choicesByNative.has(modelKey(preparedModel))) {
+            throw new Error(`Cannot resume ${task.kind} task ${task.id}: prepared model ${modelKey(preparedModel)} is outside allowedModels`);
+          }
+        }
+        taskCursor = page.next;
+      } while (taskCursor !== undefined);
+
+      // Reapply host security and revoke persisted models outside the current allowlist before resume.
       let cursor: Cursor | undefined;
       do {
         const page = await tx.scanConversations({}, 1000, cursor);
-        for (const conversation of page.items) await configure(tx, conversation.id, agentPolicy);
+        for (const conversation of page.items) {
+          const state = await tx.doc(AgentDoc, conversation.id);
+          await configure(tx, conversation.id, policyForState(state));
+        }
         cursor = page.next;
       } while (cursor !== undefined);
     }, context);
@@ -117,15 +245,52 @@ export async function openGateway(config: PortConfig, context: Context, options:
             return;
           }
           const created = await tx.createConversation({ ownership: { kind: "ownerless" } });
-          await configure(tx, created.id, agentPolicy);
+          await configure(tx, created.id, defaultAgentPolicy);
           map.sessions[key] = created.id as number;
           conversationId = created.id;
         }, ctx);
+        if (!Number.isSafeInteger(conversationId)) throw new Error("Stored conversation mapping has an invalid ID");
         const conversation = await harness!.conversation(conversationId!, ctx);
         if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
-        // Enforce current host policy on every acquisition, even if state was externally altered.
-        await conversation.configure(agentPolicy, ctx);
+        // Read and reapply host policy atomically so concurrent selection cannot be overwritten.
+        await applyConversationPolicy(conversation, ctx);
         return conversation;
+      },
+      async listModels(sessionKey, ctx) {
+        const conversation = await existingConversationFor(sessionKey, ctx);
+        await applyConversationPolicy(conversation, ctx);
+        const state = await harness!.snapshot(AgentDoc, conversation.id, ctx);
+        const choice = choiceFromState(state) ?? defaultChoice;
+        const level = state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
+          ? state.thinkingLevel
+          : fallbackThinkingLevel(choice);
+        return { models: choices.map(publicChoice), selected: publicSelection(choice, level) };
+      },
+      async selectModel(sessionKey, selection, ctx) {
+        if (!isModelSelection(selection)) throw new Error("Model selection requires provider and modelId strings");
+        const target = choicesByConfigured.get(modelKey(selection));
+        if (!target) throw new Error("Model is not in the configured allowlist");
+        const requestedLevel = Object.hasOwn(selection, "thinkingLevel") ? selection.thinkingLevel : undefined;
+        if (requestedLevel !== undefined && !target.thinkingLevels.includes(requestedLevel)) {
+          throw new Error(`Unsupported thinkingLevel ${requestedLevel} for ${selection.provider}/${selection.modelId}`);
+        }
+        const conversation = await existingConversationFor(sessionKey, ctx);
+        const level = await conversation.commit(async (tx) => {
+          const state = await tx.doc(AgentDoc, conversation.id);
+          const current = choiceFromState(state);
+          const live = await tx.doc(LiveDoc, conversation.id);
+          if (live.run !== undefined) throw new ConversationBusy(conversation.id);
+          const changed = current === undefined || modelKey(current.native) !== modelKey(target.native);
+          const currentLevel = current !== undefined && state.thinkingLevel !== undefined && current.thinkingLevels.includes(state.thinkingLevel)
+            ? state.thinkingLevel
+            : fallbackThinkingLevel(current ?? defaultChoice);
+          const nextLevel = requestedLevel ?? (changed
+            ? fallbackThinkingLevel(target)
+            : target.thinkingLevels.includes(currentLevel) ? currentLevel : fallbackThinkingLevel(target));
+          await configure(tx, conversation.id, { ...hostPolicy, model: target.native, thinkingLevel: nextLevel });
+          return nextLevel;
+        }, ctx);
+        return publicSelection(target, level);
       },
       async close(ctx) {
         if (closed) return;
@@ -134,6 +299,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
         finally { await releaseLock(); }
       },
     };
+    async function existingConversationFor(sessionKey: string, ctx: Context): Promise<Conversation> {
+      const key = encodedSessionKey(sessionKey);
+      const map = await harness!.snapshot(SessionMap, root.id, ctx);
+      const id = map && Object.hasOwn(map.sessions, key) ? map.sessions[key] : undefined;
+      if (!Number.isSafeInteger(id)) throw new Error("Unknown session key");
+      const conversation = await harness!.conversation(id as ConversationId, ctx);
+      if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
+      return conversation;
+    }
     // Scheduling begins only after registry and all persisted conversation policies are ready.
     harness.resume();
     return gateway;

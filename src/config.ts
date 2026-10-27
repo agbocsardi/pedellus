@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 const CREDENTIAL_PROVIDERS = [
@@ -15,11 +16,19 @@ const CREDENTIAL_PROVIDERS = [
 
 export type CredentialProvider = typeof CREDENTIAL_PROVIDERS[number];
 
+export interface ModelReference {
+  provider: string;
+  modelId: string;
+}
+
 export interface PortConfig {
   workspace: string;
   dataDir: string;
-  model: { provider: string; modelId: string };
-  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  /** Default selection; retained for backward compatibility with single-model configs. */
+  model: ModelReference;
+  /** Explicit finite model choices. Missing means the legacy singleton [model]. */
+  allowedModels?: readonly ModelReference[];
+  thinkingLevel?: ModelThinkingLevel;
   extraAllowedDirs?: readonly string[];
   bwrapPath?: string;
   credentials?: Partial<Record<CredentialProvider, string>>;
@@ -44,16 +53,41 @@ function envName(value: unknown, name: string): string {
   return result;
 }
 
+function modelReference(value: unknown, name: string): ModelReference {
+  const model = object(value, name);
+  return {
+    provider: nonempty(model.provider, `${name}.provider`),
+    modelId: nonempty(model.modelId, `${name}.modelId`),
+  };
+}
+
+function modelKey(model: ModelReference): string {
+  return JSON.stringify([model.provider, model.modelId]);
+}
+
 export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig {
   const raw = object(value, "config");
-  const model = object(raw.model, "model");
+  const model = modelReference(raw.model, "model");
+  let allowedModels: ModelReference[];
+  if (raw.allowedModels === undefined) {
+    allowedModels = [model];
+  } else {
+    if (!Array.isArray(raw.allowedModels) || raw.allowedModels.length === 0) {
+      throw new Error("allowedModels must be a non-empty array");
+    }
+    allowedModels = raw.allowedModels.map((entry, index) => modelReference(entry, `allowedModels[${index}]`));
+    const keys = allowedModels.map(modelKey);
+    if (new Set(keys).size !== keys.length) throw new Error("allowedModels must not contain duplicate models");
+    if (!keys.includes(modelKey(model))) throw new Error("model must be included in allowedModels");
+  }
   const config: PortConfig = {
     workspace: resolve(baseDir, nonempty(raw.workspace, "workspace")),
     dataDir: resolve(baseDir, nonempty(raw.dataDir, "dataDir")),
-    model: { provider: nonempty(model.provider, "model.provider"), modelId: nonempty(model.modelId, "model.modelId") },
+    model,
+    allowedModels,
   };
   if (raw.thinkingLevel !== undefined) {
-    if (!["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(raw.thinkingLevel))) throw new Error("Invalid thinkingLevel");
+    if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(raw.thinkingLevel))) throw new Error("Invalid thinkingLevel");
     Object.assign(config, { thinkingLevel: raw.thinkingLevel });
   }
   if (raw.extraAllowedDirs !== undefined) {
