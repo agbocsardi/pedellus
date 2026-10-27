@@ -29,8 +29,10 @@ Three independent `openai-codex / gpt-6-luna / high` workers start from committe
 production-source issues and shared runner changes must be reported to parent.
 No real data, live calls, gateway tools or automatic integration.
 
-- [ ] `pi-35c6804d`, `w27:p1` / `w27`: final CLI review and lifecycle/output
-      behavioral tests, including EOF/order and backpressure.
+- [x] `pi-35c6804d`, `w27:p1` / `w27`: final CLI review found earlier
+      blockers addressed; merged `eeea55965` and parent ran three tests covering
+      slow output, SQLite EOF preservation and terminal filtering. Dedicated
+      control-order, flood and secret-bearing startup-error tests remain open.
 - [x] `pi-70f63e0d`, `w28:p1` / `w28`: final migration review found prior
       blockers resolved; merged `c2d6fef34` and parent ran four behavioral tests
       for eligibility, provenance, aliases, session shapes and safety.
@@ -59,7 +61,7 @@ No real data, live calls, gateway tools or automatic integration.
 ## Integrated implementation batch D — 2026-10-27
 
 **Current status:** all three slices are merged; final independent CLI and
-migration reviews remain open. The task assignments below are historical, not
+migration reviews have passed within their stated scope. The assignments below are historical, not
 active instructions. Owned child worktrees and review tabs have been cleaned up;
 branches remain. Broad milestones P3/P8 remain unchecked.
 
@@ -78,10 +80,10 @@ tabs without force; the branches were retained.
       parent-built slow-sink check passed. This is integration, not final acceptance.
 - [x] D3 — P8 read-only migration inventory: merged `e00651d33`; parent-built
       alias/message-shape probe passed. This is inventory only, not an importer.
-- [ ] Independently review the final CLI commit and reproduce CLI EOF/order/flood
-      checks whose worker probes were not retained. CLI readline's 32k limit is
-      post-buffering, not a hard ingress-memory limit. Migration's final review
-      and initial eligibility/provenance/safety tests now pass; keep P3/P8 unchecked.
+- [ ] Add dedicated CLI control-order, rejection-flood and secret-bearing startup
+      error behavioral checks. Final CLI review and EOF/slow-output tests pass;
+      readline's 32k limit is post-buffering, not a hard ingress-memory limit.
+      Migration's final review and initial safety tests pass; keep P3/P8 unchecked.
 - [ ] Port selected Python behavioral scenarios into permanent TypeScript parity
       checks, prioritizing migration integrity, CLI lifecycle and model recovery.
       Owner approved behavior-focused coverage; test Nanobot-owned contracts and
