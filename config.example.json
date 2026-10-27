@@ -6,7 +6,15 @@
     "modelId": "gpt-6-sol"
   },
   "credentials": {
-    "openai": "OPENAI_API_KEY"
+    "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "minimax_anthropic": "MINIMAX_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "opencode_zen": "OPENCODE_API_KEY",
+    "opencode_go": "OPENCODE_API_KEY",
+    "xiaomi_mimo": "XIAOMI_API_KEY"
   },
   "thinkingLevel": "high",
   "telegram": {

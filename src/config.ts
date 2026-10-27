@@ -1,6 +1,20 @@
 import { readFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 
+const CREDENTIAL_PROVIDERS = [
+  "anthropic",
+  "deepseek",
+  "minimax_anthropic",
+  "moonshot",
+  "openai",
+  "openrouter",
+  "opencode_zen",
+  "opencode_go",
+  "xiaomi_mimo",
+] as const;
+
+export type CredentialProvider = typeof CREDENTIAL_PROVIDERS[number];
+
 export interface PortConfig {
   workspace: string;
   dataDir: string;
@@ -8,17 +22,26 @@ export interface PortConfig {
   thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   extraAllowedDirs?: readonly string[];
   bwrapPath?: string;
-  credentials?: Partial<Record<"openai" | "opencode_zen" | "opencode_go", string>>;
+  credentials?: Partial<Record<CredentialProvider, string>>;
   telegram?: { tokenEnv: string; allowFrom: readonly string[]; pollTimeoutSeconds?: number };
 }
 
 function object(value: unknown, name: string): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
-  return value as Record<string, unknown>;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new Error(`${name} must be a plain object`);
+  const copy = Object.fromEntries(Object.entries(value));
+  Object.setPrototypeOf(copy, null);
+  return copy;
 }
 function nonempty(value: unknown, name: string): string {
   if (typeof value !== "string" || value.trim() === "") throw new Error(`${name} must be a non-empty string`);
   return value;
+}
+function envName(value: unknown, name: string): string {
+  const result = nonempty(value, name);
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(result)) throw new Error(`${name} must be an environment variable name`);
+  return result;
 }
 
 export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig {
@@ -44,17 +67,17 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   }
   if (raw.credentials !== undefined) {
     const credentials = object(raw.credentials, "credentials");
-    const normalized: Record<string, string> = {};
+    const normalized: Record<string, string> = Object.create(null) as Record<string, string>;
     for (const [key, name] of Object.entries(credentials)) {
-      if (!["openai", "opencode_zen", "opencode_go"].includes(key)) throw new Error(`Unknown credential provider: ${key}`);
-      normalized[key] = nonempty(name, `credentials.${key}`);
+      if (!(CREDENTIAL_PROVIDERS as readonly string[]).includes(key)) throw new Error("Unknown credentials provider");
+      normalized[key] = envName(name, `credentials.${key}`);
     }
     Object.assign(config, { credentials: normalized });
   }
   if (raw.telegram !== undefined) {
     const t = object(raw.telegram, "telegram");
     if (!Array.isArray(t.allowFrom) || t.allowFrom.length === 0 || t.allowFrom.some((id) => typeof id !== "string" || !/^\d+$/.test(id))) throw new Error("telegram.allowFrom must be a non-empty list of decimal user IDs");
-    const telegram: NonNullable<PortConfig["telegram"]> = { tokenEnv: nonempty(t.tokenEnv, "telegram.tokenEnv"), allowFrom: t.allowFrom as string[] };
+    const telegram: NonNullable<PortConfig["telegram"]> = { tokenEnv: envName(t.tokenEnv, "telegram.tokenEnv"), allowFrom: t.allowFrom as string[] };
     if (t.pollTimeoutSeconds !== undefined) {
       if (typeof t.pollTimeoutSeconds !== "number" || !Number.isInteger(t.pollTimeoutSeconds) || t.pollTimeoutSeconds < 1 || t.pollTimeoutSeconds > 50) throw new Error("telegram.pollTimeoutSeconds must be an integer from 1 to 50");
       telegram.pollTimeoutSeconds = t.pollTimeoutSeconds;
