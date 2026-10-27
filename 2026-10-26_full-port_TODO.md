@@ -1355,3 +1355,22 @@ cancellation if possible, otherwise leave it blocked. No approval keys, terminal
 fallback or global permission change; delivery acknowledgement is not resolution.
 The private race reproduction was shared for review, never delegated as a second
 editing task. Existing D2 work remains exclusively owned by `pi-0d64c0d6`.
+
+### 2026-10-27 — initial CLI/migration fixes; final CLI frame race persists
+
+D2 explicitly completed `a46146954`; D3 completed `9f2839470`. Parent diff review
+confirms initial correction sets, but both omit previously sent supplementary
+full-review findings; returned those remaining issues explicitly rather than
+accepting partial fixes. D3's parent config/message schema assertions now pass;
+history eligibility/provenance/privacy/tool dispositions still need correction.
+
+D2's active dist had temporary debugging artifacts, so parent did not attribute
+that run to an immutable candidate. Instead archived exact `a46146954` into
+`/tmp/pi-terminal-a461-WVIFFE`, linked installed dependencies read-only and freshly
+built. Parent exact slow-sink probe still fails: expected326 characters, observed346,
+with a stale partial suffix printed **after** the complete final answer. Exact
+built terminal SHA256 `81c440ec79b8ae91a38217e6d5a019611b9a0ef5d2257b6c02b4d44d8c0dae1c`.
+A render serializer alone does not terminalize final state or reject older queued
+watch frames; shared the exact committed repro with the sole editor. Require
+late-frame rejection/finalization plus remaining ingress/sanitization/closed-sink/
+error-secrecy fixes. Neither D2 nor D3 is integrated.
