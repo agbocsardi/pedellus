@@ -8,6 +8,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:behavior": "npm run build && node --test test/terminal-cli.test.mjs tests/migration.behavior.test.mjs tests/model-policy.test.mjs",
     "start": "node dist/cli.js"
   },
   "dependencies": {

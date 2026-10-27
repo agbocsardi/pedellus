@@ -41,9 +41,9 @@ No real data, live calls, gateway tools or automatic integration.
       behavioral test. Parent reviewed and ran it against the parent build; it
       covers busy rejection, thinking/selection, normal reopen and revoked choice.
       Prepared-request crash recovery and deferred poll are not permanent tests.
-- [ ] Parent review, reconcile any shared runner wiring, run targeted checks on
-      the integrated branch, and preserve remaining gaps. Explicit completion
-      reports are required; idle/acknowledgement is not acceptance.
+- [x] Parent reviewed and integrated all three coverage slices and added
+      `npm run test:behavior`; the combined build and 11 reported tests pass.
+      Coverage is bounded, not full parity; remaining gaps are tracked below.
 
 ## Active sandbox follow-up — 2026-10-27
 
