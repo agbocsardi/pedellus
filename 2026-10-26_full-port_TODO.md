@@ -83,8 +83,9 @@ policy, environment and replay gates pass.
       isolated candidate and integrated build against real bwrap. The 5-second
       experimental cap is not product policy; CPU/memory/PID/disk quotas and
       approval remain separate P1 gates.
-- [ ] `pi-13288a3c`: synthetic interrupted-tool replay/revocation investigation
-      and behavioral coverage; no production registration, base `ae92f1fdc`.
+- [x] `pi-13288a3c`: merged `cdce81811`, synthetic SIGKILL/reopen coverage for
+      revoked grants, safe-to-unsafe downgrade, and explicitly safe replay.
+      Independently reviewed; no production tool registration.
 - [ ] Tool authorization: owner chose **host-supplied config**, default deny, as
       authoritative for allow/disallow and startup revocation. `pi-8a97b7a5`,
       `w2P:p1` / `w2P`, Codex Luna high, base `1e61299e5eda604e8cb9fa3c8d536c07258a4ca3`,

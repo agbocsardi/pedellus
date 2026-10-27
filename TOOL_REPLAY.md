@@ -56,8 +56,7 @@ allowlist (`HOME`, `TMPDIR`, `PATH`, and the candidate path) rather than
 inherited from the test process, so provider/API credentials in the parent
 environment are not passed to it. Cleanup kills and awaits the child if needed,
 closes the parent Harness, and removes the temporary directory. The test is
-intentionally not added to `package.json` here; the package manifest owner can
-wire it into `test:behavior` when integrating.
+included in `test:behavior`.
 
 Set `PI_TOOL_REPLAY_CANDIDATE=/path/to/packages/pi-nanobot` to run the test
 against another built checkout.
@@ -73,4 +72,4 @@ against another built checkout.
 - The Gateway's nonempty `toolAllowlist` fail-closed behavior is unchanged and
   not bypassed. This test uses a raw Harness because the Gateway deliberately
   has no approved registered tools to grant.
-- No production activation, runtime, index, package, or TODO change is implied.
+- This test does not activate production tools or change runtime policy.
