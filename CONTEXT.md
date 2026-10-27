@@ -2,8 +2,11 @@
 
 `src/context/index.ts` is a bounded, opt-in Durable extension for composing context
 from **host-supplied snapshots**. It does not access the filesystem, environment,
-credential store, coding-agent resource loader, or extension discovery. Nothing in
-this slice installs or selects the extension in the gateway.
+credential store, coding-agent resource loader, or extension discovery. `openGateway`
+installs it only when the host supplies `contextSnapshotProvider`; without that option,
+no context extension is installed. Before resume, the runtime explicitly selects no
+extensions (its registry is empty) to clear stale context-extension selections. Tool
+policy remains unchanged.
 
 ## API and scope
 
@@ -29,18 +32,19 @@ const context = createContextExtension([{
 }]);
 ```
 
-The host must install/select the returned extension explicitly. It copies and
-pre-renders snapshot values when constructed; later mutations to caller objects do
-not change prompt content. Recreate/reinstall it when host-owned snapshots or
-selected skills change. A snapshot with no matching conversation ID contributes no
-identity, document, memory, or skill content. There is no fallback to another
-conversation, a parent/fork, or a default workspace. A host must associate each
-snapshot with the correct Durable conversation; this API cannot detect incorrect
-host mapping. Durable conversation IDs are only unique within one storage/Harness;
-independent Harnesses can both have root ID `1`. Construct a fresh context extension
-**and dedicated registry per Harness/storage**. Never share either across stores:
-`PromptInput` has no trustworthy store namespace, so this module cannot distinguish
-colliding IDs. This is a required host precondition, not runtime-detected. Use
+When using `createContextExtension()` directly, the host installs/selects the
+returned extension explicitly; `openGateway` manages that lifecycle when its provider
+option is set. The extension copies and pre-renders snapshot values when constructed;
+later mutations to caller objects do not change prompt content. Recreate/reinstall it
+when host-owned snapshots or selected skills change. A snapshot with no matching
+conversation ID contributes no identity, document, memory, or skill content. There is no fallback to another
+conversation, a parent/fork, or a default workspace. In the gateway, the host opts in
+with `contextSnapshotProvider(sessionKey, conversationId, context)`, returning the
+snapshot fields other than `conversationId` (or `undefined`). The runtime attaches
+the mapped ID itself and reconstructs snapshots through the persisted session map.
+Durable conversation IDs are only unique within one storage/Harness; independent
+Harnesses can both have root ID `1`. `openGateway` creates a fresh extension and
+dedicated registry per storage and never shares either across stores. Use
 relative/opaque provenance labels rather than disclosing unnecessary absolute host
 paths.
 
@@ -48,14 +52,32 @@ paths.
 
 The Durable agent document persists the selected extension name, not this
 extension's captured snapshots. Before reopening/resuming a storage or accepting
-new work, the host must create a fresh dedicated registry and same-named context
-extension for that Harness, reconstructing snapshots from that same store's
-conversation IDs. Install it before resume for each conversation whose context
-should remain available; never reuse a registry/extension from another store. A
-missing snapshot intentionally renders no context for that conversation on its next
-request; native Durable section replay then removes those keys from the effective
-current prompt. Reinstalling a changed same-name extension updates current sections
-on the next request, while unchanged snapshots require no section patch.
+new work, the host must enumerate that store's conversation IDs, reconstruct
+same-store snapshots, create a fresh dedicated registry, install a fresh
+`createContextExtension(snapshots)` in it, and pass that registry to `Harness.open()`.
+`openGateway` performs this reconstruction by enumerating its persisted session map
+and calling the provider before `harness.resume()`. It also binds a new conversation's
+snapshot and installs the replacement extension before returning that conversation,
+so the caller cannot submit first. The provider is called once per mapped session on
+open and once for each new session; host changes to existing snapshots take effect
+when the gateway is reopened. The callback receives the mapped session key and
+Durable ID established by the gateway. When context is opted out on reopen, the
+runtime clears extension selection before resume; native section replay removes old
+context from the effective prompt, but stored transcript history is not erased. Before
+resume, the gateway also rejects live prepared dispatches (`pi.generation` request/poll
+or `pi.compaction` summarize/retry) whose pinned cutoff still contains a nonempty
+Nanobot section. Those phases resend/fetch/summarize the old checkpointed view, not a
+newly rendered prompt; even an apparently unchanged provider snapshot is not treated
+as proof of equivalence. This conservative guard blocks gateway recovery even if the
+host expects the snapshot to be unchanged. The Gateway currently provides no recovery
+interface to settle or cancel such a task while startup is blocked; operator
+reconciliation is still an open design issue. Stores
+with more than 256 mapped sessions fail closed when context is enabled rather than
+silently leaving some sessions without their opted-in snapshot. A missing snapshot
+intentionally renders no context for that conversation; native Durable section replay
+then removes those keys from the effective current prompt. Reinstalling a changed
+same-name extension updates current sections on the next request, while unchanged
+snapshots require no section patch.
 
 Forks inherit the parent's transcript, including historical `pi.system` context
 entries, through the fork point. A fork has a new `conversationId`, so it receives

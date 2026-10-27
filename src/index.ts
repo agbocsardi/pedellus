@@ -38,5 +38,5 @@ export {
   type UsageSourceScope,
   type UsageUnknownField,
 } from "./usage/index.js";
-export { openGateway, type Gateway } from "./runtime.js";
+export { openGateway, type Gateway, type GatewayContextSnapshotProvider, type OpenGatewayOptions } from "./runtime.js";
 export { main } from "./cli.js";

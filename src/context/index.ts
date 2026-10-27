@@ -121,11 +121,12 @@ const SKILL_FRONTMATTER = /^---\s*\r?\n[\s\S]*?\r?\n---\s*\r?\n?/;
 
 /**
  * Make an opt-in Durable extension from immutable, host-supplied snapshots.
- * Create a fresh extension and dedicated registry for each Harness/storage:
- * Durable conversation IDs collide across stores, and PromptInput provides no
- * store namespace. Reconstruct same-store snapshots and install before resume.
- * This host precondition is not runtime-detectable. Renderers read only this
- * private copy and the request's actual `agent.tools`; no ambient discovery.
+ * Direct callers must use a fresh extension and dedicated registry per
+ * Harness/storage: Durable conversation IDs collide across stores, and
+ * PromptInput provides no store namespace. Reconstruct same-store snapshots
+ * before resume. `openGateway` enforces this using its persisted session map;
+ * direct callers own that precondition. Renderers read only this private copy
+ * and the request's actual `agent.tools`; no ambient discovery.
  */
 export function createContextExtension(
   snapshots: readonly ConversationContextSnapshot[],
@@ -136,18 +137,50 @@ export function createContextExtension(
   }
   const contexts = new Map<ConversationId, PreparedContext>();
   for (const raw of readArray(snapshots, CONTEXT_LIMITS.maxConversations)) {
-    const conversationId = ownValue(raw, "conversationId");
-    if (typeof conversationId !== "number" || !Number.isSafeInteger(conversationId) || conversationId < 1) {
-      throw new TypeError("Each context snapshot needs an own Durable conversationId");
-    }
-    if (contexts.has(conversationId as ConversationId)) {
+    const [conversationId, prepared] = prepareSnapshot(raw);
+    if (contexts.has(conversationId)) {
       throw new TypeError(`Duplicate context snapshot for conversation ${conversationId}`);
     }
-    contexts.set(conversationId as ConversationId, prepareContext(raw));
+    contexts.set(conversationId, prepared);
   }
+  return buildContextExtension(contexts);
+}
 
+/** Build replacement extensions from prepared values without retaining mutable host snapshots. */
+export function createContextExtensionBuilder(): {
+  add(snapshot: ConversationContextSnapshot): Extension;
+} {
+  const contexts = new Map<ConversationId, PreparedContext>();
+  return {
+    add(snapshot) {
+      if (contexts.size >= CONTEXT_LIMITS.maxConversations) {
+        throw new RangeError(`At most ${CONTEXT_LIMITS.maxConversations} conversation snapshots are accepted`);
+      }
+      const [conversationId, prepared] = prepareSnapshot(snapshot);
+      if (contexts.has(conversationId)) {
+        throw new TypeError(`Duplicate context snapshot for conversation ${conversationId}`);
+      }
+      const next = new Map(contexts);
+      next.set(conversationId, prepared);
+      const extension = buildContextExtension(next);
+      contexts.set(conversationId, prepared);
+      return extension;
+    },
+  };
+}
+
+function prepareSnapshot(snapshot: unknown): [ConversationId, PreparedContext] {
+  const conversationId = ownValue(snapshot, "conversationId");
+  if (typeof conversationId !== "number" || !Number.isSafeInteger(conversationId) || conversationId < 1) {
+    throw new TypeError("Each context snapshot needs an own Durable conversationId");
+  }
+  return [conversationId as ConversationId, prepareContext(snapshot)];
+}
+
+function buildContextExtension(contexts: ReadonlyMap<ConversationId, PreparedContext>): Extension {
+  const captured = new Map(contexts);
   const content = (input: { readonly conversationId: ConversationId }, key: keyof typeof CONTEXT_SECTION_KEYS) =>
-    contexts.get(input.conversationId)?.sections[key];
+    captured.get(input.conversationId)?.sections[key];
 
   return defineExtension({
     name: "nanobot-context",

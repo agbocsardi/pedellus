@@ -28,9 +28,14 @@ Owner requested a coherent conversation/context/tool core before broader product
 surfaces. Discord remains required. Native gateway tools remain disabled until P1
 policy, environment and replay gates pass.
 
-- [ ] `pi-d9ecab85`, `w2J:p1` / `w2J`: bounded opt-in context lifecycle,
-      conversation/store isolation and reconstruction before resume. Codex Luna
-      high, branch base `93ea70c98959504e7ad573169b765e7b483426fe`.
+- [x] `pi-d9ecab85`, `w2J:p1` / `w2J`: opt-in Gateway context snapshot
+      lifecycle integrated through `fb356393c`; parent verified isolated and
+      combined builds, session/store isolation and synthetic SIGKILL/reopen.
+      Gateway can reconstruct host snapshots before resume; no ambient filesystem.
+- [ ] Design safe recovery for prepared requests containing old Nanobot context:
+      current conservative guard blocks startup even when context is unchanged,
+      and Gateway exposes no recovery interface to settle/cancel blocked tasks.
+      Deferred poll and compaction replay paths are source-reviewed only.
 - [x] `pi-6d106995`, `w2D:p3` / `w2D`: read-only native tool integration and
       security gate plan at `/tmp/pi-tool-core-plan.md`; identifies quotas,
       approvals, workspace ownership and replay gates before production tools.

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createRegistry } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtension, renderNanobotIdentity } from "../dist/context/index.js";
 
 const identityLimit = CONTEXT_LIMITS.sectionChars - 1_600;
@@ -53,6 +54,86 @@ test("near-limit identity survives native context composition including escaped 
   assert.ok([...composed].length <= CONTEXT_LIMITS.sectionChars);
   assert.ok(composed.includes(runtimeTail));
   assert.ok(composed.includes("Your workspace is at: /safe/root"));
+});
+
+test("snapshots map only to their conversation and are copied at construction", () => {
+  const snapshots = [{
+    conversationId: 1,
+    identity: { source: "synthetic:first", content: "first-only identity" },
+    memory: [{ source: "synthetic:first-memory", content: "first-only memory" }],
+  }, {
+    conversationId: 2,
+    identity: { source: "synthetic:second", content: "second-only identity" },
+  }];
+  const extension = createContextExtension(snapshots);
+  snapshots[0].identity.content = "mutated after construction";
+
+  const render = (key, conversationId) => {
+    const promptSection = extension.sections.find(({ key: sectionKey }) => sectionKey === key);
+    assert.ok(promptSection);
+    return promptSection.render({ conversationId, agent: { tools: [] } }, undefined) ?? "";
+  };
+  assert.match(render("nanobot_identity", 1), /first-only identity/);
+  assert.doesNotMatch(render("nanobot_identity", 1), /second-only|mutated/);
+  assert.match(render("nanobot_identity", 2), /second-only identity/);
+  assert.doesNotMatch(render("nanobot_identity", 2), /first-only/);
+  assert.equal(render("nanobot_identity", 3), "");
+  assert.match(render("nanobot_memory", 1), /first-only memory/);
+  assert.equal(render("nanobot_memory", 2), "");
+});
+
+test("skill inclusion is explicitly enabled/selected and tool visibility does not enable tools", () => {
+  const extension = createContextExtension([{
+    conversationId: 7,
+    skills: [
+      { name: "always-guide", source: "synthetic:always", enabled: true, metadata: { always: true }, content: "---\ndescription: guide\n---\nAlways body" },
+      { name: "picked-guide", source: "synthetic:picked", enabled: true, metadata: { description: "Picked" }, content: "Picked body" },
+      { name: "unselected-guide", source: "synthetic:unselected", enabled: true, content: "Unselected body" },
+      { name: "disabled-guide", source: "synthetic:disabled", enabled: false, metadata: { always: true }, content: "Disabled body" },
+    ],
+    selectedSkills: ["picked-guide"],
+  }]);
+  const render = (key, agent = { tools: [] }) => {
+    const promptSection = extension.sections.find(({ key: sectionKey }) => sectionKey === key);
+    assert.ok(promptSection);
+    return promptSection.render({ conversationId: 7, agent }, undefined) ?? "";
+  };
+
+  const skills = render("nanobot_skills");
+  assert.match(skills, /Always body/);
+  assert.match(skills, /Picked body/);
+  assert.doesNotMatch(skills, /Unselected body|Disabled body|description: guide/);
+  const tools = render("nanobot_tools", { tools: [{ name: "host_read" }] });
+  assert.match(tools, /host_read/);
+  assert.match(tools, /does not enable tools/);
+  assert.doesNotMatch(tools, /read_file|web_search|Dream/i);
+});
+
+test("same Durable IDs remain isolated in dedicated registries", () => {
+  const firstRegistry = createRegistry();
+  const secondRegistry = createRegistry();
+  const firstExtension = createContextExtension([{
+    conversationId: 1,
+    identity: { source: "synthetic:store-a", content: "store A" },
+  }]);
+  const secondExtension = createContextExtension([{
+    conversationId: 1,
+    identity: { source: "synthetic:store-b", content: "store B" },
+  }]);
+  firstRegistry.install(firstExtension);
+  secondRegistry.install(secondExtension);
+
+  const render = (registry) => {
+    const selected = registry.snapshot().extension("nanobot-context");
+    assert.ok(selected);
+    const promptSection = selected.sections.find(({ key }) => key === "nanobot_identity");
+    assert.ok(promptSection);
+    return promptSection.render({ conversationId: 1, agent: { tools: [] } }, undefined);
+  };
+  assert.match(render(firstRegistry), /store A/);
+  assert.doesNotMatch(render(firstRegistry), /store B/);
+  assert.match(render(secondRegistry), /store B/);
+  assert.doesNotMatch(render(secondRegistry), /store A/);
 });
 
 test("unknown channel hints and unknown template values remain unexpanded", () => {

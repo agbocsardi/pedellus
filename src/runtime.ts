@@ -5,7 +5,8 @@ import type { Context } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
-import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type Harness as HarnessType, type ModelRef, type Storage } from "@earendil-works/pi-durable";
+import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type Extension, type Harness as HarnessType, type ModelRef, type Storage } from "@earendil-works/pi-durable";
+import { CONTEXT_LIMITS, CONTEXT_SECTION_KEYS, createContextExtensionBuilder, type ConversationContextSnapshot } from "./context/index.js";
 import type { ModelReference, PortConfig } from "./config.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
@@ -33,6 +34,21 @@ export interface GatewayModelSelection extends ModelReference {
 export interface GatewayModelList {
   models: readonly GatewayModelChoice[];
   selected: GatewayModelSelection;
+}
+
+export type GatewayContextSnapshotProvider = (
+  sessionKey: string,
+  conversationId: ConversationId,
+  context: Context,
+) =>
+  | Omit<ConversationContextSnapshot, "conversationId">
+  | undefined
+  | Promise<Omit<ConversationContextSnapshot, "conversationId"> | undefined>;
+
+export interface OpenGatewayOptions {
+  readonly models?: Models;
+  /** Explicit host-owned context snapshots; absent means no context extension is installed. */
+  readonly contextSnapshotProvider?: GatewayContextSnapshotProvider;
 }
 
 export interface Gateway {
@@ -73,6 +89,28 @@ function encodedSessionKey(key: string): string {
   return `k:${Buffer.from(key, "utf8").toString("base64url")}`;
 }
 
+function decodedSessionKey(key: string): string {
+  if (!key.startsWith("k:")) throw new Error("Stored session map contains an invalid session key");
+  const decoded = Buffer.from(key.slice(2), "base64url").toString("utf8");
+  if (encodedSessionKey(decoded) !== key) throw new Error("Stored session map contains an invalid session key");
+  return decoded;
+}
+
+function bindContextSnapshot(
+  value: object | undefined,
+  conversationId: ConversationId,
+): ConversationContextSnapshot {
+  const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  if (value !== undefined) {
+    for (const key of ["identity", "agents", "soul", "user", "memory", "skills", "selectedSkills"]) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor && Object.hasOwn(descriptor, "value")) snapshot[key] = descriptor.value;
+    }
+  }
+  snapshot.conversationId = conversationId;
+  return snapshot as unknown as ConversationContextSnapshot;
+}
+
 function modelKey(model: ModelReference | ModelRef): string {
   return JSON.stringify([model.provider, model.modelId]);
 }
@@ -110,6 +148,50 @@ function preparedTaskModel(task: unknown): ModelReference | undefined {
   return { provider: checkpoint.model.provider, modelId: checkpoint.model.modelId };
 }
 
+function preparedContextReplay(task: unknown): {
+  readonly id: string | number;
+  readonly kind: "pi.generation" | "pi.compaction";
+  readonly conversationId: ConversationId;
+  readonly at: number;
+  readonly phase: string;
+} | undefined {
+  if (!isRecord(task) || (task.kind !== "pi.generation" && task.kind !== "pi.compaction")) return undefined;
+  const { id, conversationId, state } = task;
+  if (!isRecord(state) || state.status === "terminal" || state.status === "completing") return undefined;
+  if (!isRecord(state.checkpoint) || typeof state.checkpoint.phase !== "string") {
+    throw new Error(`Cannot safely inspect prepared ${task.kind} task ${String(id)} checkpoint`);
+  }
+  const { phase } = state.checkpoint;
+  // Generation request/poll pin `cutoff`; compaction summarize/retry pin `tail`.
+  const field = task.kind === "pi.generation"
+    ? phase === "request" || phase === "poll" ? "cutoff" : undefined
+    : phase === "summarize" || phase === "retry" ? "tail" : undefined;
+  if (field === undefined) return undefined;
+  const at = state.checkpoint[field];
+  if ((typeof id !== "string" && typeof id !== "number") || typeof conversationId !== "number" ||
+      !Number.isSafeInteger(conversationId) || conversationId < 1 || typeof at !== "number" ||
+      !Number.isSafeInteger(at) || at < 1) {
+    throw new Error(`Cannot safely inspect prepared ${task.kind} task ${String(id)} checkpoint`);
+  }
+  return { id, kind: task.kind, conversationId: conversationId as ConversationId, at, phase };
+}
+
+const NANOBOT_CONTEXT_SECTION_KEYS = new Set<string>(Object.values(CONTEXT_SECTION_KEYS));
+
+function hasPersistedNanobotContext(messages: readonly unknown[]): boolean {
+  const effective = new Map<string, string>();
+  for (const message of messages) {
+    if (!isRecord(message) || message.role !== "system" || !isRecord(message.sections)) continue;
+    for (const [key, value] of Object.entries(message.sections)) {
+      if (!NANOBOT_CONTEXT_SECTION_KEYS.has(key)) continue;
+      if (value === null) effective.delete(key);
+      else if (typeof value === "string") effective.set(key, value);
+      else throw new Error(`Cannot safely inspect persisted context section ${key}`);
+    }
+  }
+  return [...effective.values()].some((value) => value.length > 0);
+}
+
 function isModelSelection(value: unknown): value is GatewayModelSelectionRequest {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -120,7 +202,7 @@ function isModelSelection(value: unknown): value is GatewayModelSelectionRequest
     typeof candidate.modelId === "string" && candidate.modelId.length > 0;
 }
 
-export async function openGateway(config: PortConfig, context: Context, options: { models?: Models } = {}): Promise<Gateway> {
+export async function openGateway(config: PortConfig, context: Context, options: OpenGatewayOptions = {}): Promise<Gateway> {
   // A config name is not a Durable registration identity or an authorization grant. Until the
   // gateway installs reviewed registrations, fail closed rather than silently accepting grants.
   if ((config.toolAllowlist ?? []).length > 0) {
@@ -139,6 +221,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
   if (modelKey(model) !== modelKey(defaultChoice.native)) throw new Error("Resolved default model does not match its configured choice");
   if (config.thinkingLevel !== undefined && !defaultChoice.thinkingLevels.includes(config.thinkingLevel)) {
     throw new Error(`Unsupported thinkingLevel ${config.thinkingLevel} for default model ${config.model.provider}/${config.model.modelId}`);
+  }
+  if (options.contextSnapshotProvider !== undefined && typeof options.contextSnapshotProvider !== "function") {
+    throw new TypeError("contextSnapshotProvider must be a function");
   }
   const defaultThinkingLevel = config.thinkingLevel ?? "off";
   const workspace = await realpath(config.workspace);
@@ -164,6 +249,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
       : fallbackThinkingLevel(choice);
     return { ...hostPolicy, model: choice.native, thinkingLevel };
   };
+  let contextExtension: Extension | undefined;
+  const contextExtensionBuilder = createContextExtensionBuilder();
+  const contextConversations = new Set<ConversationId>();
+  const contextAgentPolicy = (conversationId: ConversationId): AgentChange => {
+    if (!options.contextSnapshotProvider || !contextExtension) return { extensions: [] };
+    return contextConversations.has(conversationId)
+      ? { extensions: { add: [contextExtension] } }
+      : { extensions: { remove: [contextExtension] } };
+  };
   const publicChoice = (choice: ResolvedModelChoice): GatewayModelChoice => ({
     ...choice.configured,
     name: choice.model.name,
@@ -176,7 +270,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   async function applyConversationPolicy(conversation: Conversation, ctx: Context): Promise<void> {
     await conversation.commit(async (tx) => {
       const state = await tx.doc(AgentDoc, conversation.id);
-      await configure(tx, conversation.id, policyForState(state));
+      await configure(tx, conversation.id, { ...policyForState(state), ...contextAgentPolicy(conversation.id) });
     }, ctx);
   }
   const extraRoots = await Promise.all((config.extraAllowedDirs ?? []).map(async (p) => {
@@ -212,7 +306,67 @@ export async function openGateway(config: PortConfig, context: Context, options:
     harness = await Harness.open(storage, { models, registry }, context);
     const root = await harness.root(context, { agent: defaultAgentPolicy });
 
-    // Refuse to resume a prepared request with a model removed from the current allowlist.
+    const contextSnapshotLoads = new Map<ConversationId, Promise<void>>();
+    const ensureContextSnapshot = async (
+      sessionKey: string,
+      conversationId: ConversationId,
+      ctx: Context,
+    ): Promise<void> => {
+      if (!options.contextSnapshotProvider || contextConversations.has(conversationId)) return;
+      let pending = contextSnapshotLoads.get(conversationId);
+      if (!pending) {
+        pending = Promise.resolve()
+          .then(() => options.contextSnapshotProvider!(sessionKey, conversationId, ctx))
+          .then((supplied) => {
+            if (supplied !== undefined && !isRecord(supplied)) {
+              throw new TypeError("Context snapshot provider must return an object or undefined");
+            }
+            const snapshot = bindContextSnapshot(supplied, conversationId);
+            const extension = contextExtensionBuilder.add(snapshot);
+            contextConversations.add(conversationId);
+            contextExtension = extension;
+            registry.install(extension);
+          })
+          .finally(() => contextSnapshotLoads.delete(conversationId));
+        contextSnapshotLoads.set(conversationId, pending);
+      }
+      await pending;
+    };
+
+    // Restore each host snapshot against the persisted session mapping before resume can schedule work.
+    if (options.contextSnapshotProvider) {
+      await root.commit(async (tx) => { await tx.doc(SessionMap, root.id); }, context);
+      const mapping = await harness.snapshot(SessionMap, root.id, context);
+      const sessions = mapping?.sessions;
+      if (!isRecord(sessions)) throw new Error("Stored session map is malformed");
+      const entries = Object.entries(sessions);
+      if (entries.length > CONTEXT_LIMITS.maxConversations) {
+        throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
+      }
+      const mappedConversationIds = new Set<ConversationId>();
+      const mappedSessions: { sessionKey: string; conversationId: ConversationId }[] = [];
+      for (const [encodedKey, rawId] of entries) {
+        const sessionKey = decodedSessionKey(encodedKey);
+        if (!Number.isSafeInteger(rawId) || rawId < 1 || rawId === root.id) {
+          throw new Error("Stored session map contains an invalid conversation ID");
+        }
+        const conversationId = rawId as ConversationId;
+        if (mappedConversationIds.has(conversationId)) {
+          throw new Error("Stored session map maps multiple session keys to one conversation");
+        }
+        mappedConversationIds.add(conversationId);
+        mappedSessions.push({ sessionKey, conversationId });
+      }
+      for (const { sessionKey, conversationId } of mappedSessions) {
+        if (!(await harness.conversation(conversationId, context))) {
+          throw new Error("Stored session mapping points to a missing conversation");
+        }
+        await ensureContextSnapshot(sessionKey, conversationId, context);
+      }
+    }
+
+    // Refuse unsafe prepared replays before resume; checkpoints pin historical context cutoffs.
+    const preparedContextReplays: NonNullable<ReturnType<typeof preparedContextReplay>>[] = [];
     await root.commit(async (tx) => {
       let taskCursor: Cursor | undefined;
       do {
@@ -222,17 +376,33 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (preparedModel !== undefined && !choicesByNative.has(modelKey(preparedModel))) {
             throw new Error(`Cannot resume ${task.kind} task ${task.id}: prepared model ${modelKey(preparedModel)} is outside allowedModels`);
           }
+          const contextReplay = preparedContextReplay(task);
+          if (contextReplay !== undefined) preparedContextReplays.push(contextReplay);
         }
         taskCursor = page.next;
       } while (taskCursor !== undefined);
+    }, context);
 
-      // Reapply host security and revoke persisted models outside the current allowlist before resume.
+    for (const replay of preparedContextReplays) {
+      const conversation = await harness.conversation(replay.conversationId, context);
+      if (!conversation) throw new Error(`Cannot safely resume ${replay.kind} task ${replay.id}: conversation is missing`);
+      const view = await conversation.context(context, { at: replay.at as EntryId });
+      if (hasPersistedNanobotContext(view.messages)) {
+        throw new Error(
+          `Cannot safely resume ${replay.kind} task ${replay.id} (${replay.phase}): its prepared request includes ` +
+          "persisted Nanobot context; settle or cancel it before gateway recovery",
+        );
+      }
+    }
+
+    // Apply host security and context selection only after every prepared dispatch passes the replay guard.
+    await root.commit(async (tx) => {
       let cursor: Cursor | undefined;
       do {
         const page = await tx.scanConversations({}, 1000, cursor);
         for (const conversation of page.items) {
           const state = await tx.doc(AgentDoc, conversation.id);
-          await configure(tx, conversation.id, policyForState(state));
+          await configure(tx, conversation.id, { ...policyForState(state), ...contextAgentPolicy(conversation.id) });
         }
         cursor = page.next;
       } while (cursor !== undefined);
@@ -249,14 +419,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
             conversationId = map.sessions[key] as ConversationId;
             return;
           }
+          if (options.contextSnapshotProvider && Object.keys(map.sessions).length >= CONTEXT_LIMITS.maxConversations) {
+            throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
+          }
           const created = await tx.createConversation({ ownership: { kind: "ownerless" } });
-          await configure(tx, created.id, defaultAgentPolicy);
+          await configure(tx, created.id, { ...defaultAgentPolicy, ...contextAgentPolicy(created.id) });
           map.sessions[key] = created.id as number;
           conversationId = created.id;
         }, ctx);
         if (!Number.isSafeInteger(conversationId)) throw new Error("Stored conversation mapping has an invalid ID");
         const conversation = await harness!.conversation(conversationId!, ctx);
         if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
+        await ensureContextSnapshot(sessionKey, conversationId!, ctx);
         // Read and reapply host policy atomically so concurrent selection cannot be overwritten.
         await applyConversationPolicy(conversation, ctx);
         return conversation;
