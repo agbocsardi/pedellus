@@ -67,6 +67,8 @@ policy, environment and replay gates pass.
       lifecycle integrated through `fb356393c`; parent verified isolated and
       combined builds, session/store isolation and synthetic SIGKILL/reopen.
       Gateway can reconstruct host snapshots before resume; no ambient filesystem.
+- [ ] `pi-e3cdee37`: opt-in bounded explicit-workspace snapshot loader for
+      bootstrap/memory context, synthetic workspaces only; base `11a21a651`.
 - [ ] Design safe recovery for prepared requests containing old Nanobot context:
       current conservative guard blocks startup even when context is unchanged,
       and Gateway exposes no recovery interface to settle/cancel blocked tasks.
@@ -84,6 +86,8 @@ policy, environment and replay gates pass.
       isolated candidate and integrated build against real bwrap. The 5-second
       experimental cap is not product policy; CPU/memory/PID/disk quotas and
       approval remain separate P1 gates.
+- [ ] `pi-c5881b66`: synthetic nested Code Mode crash/revocation coverage,
+      no production tool activation; base `11a21a651`.
 - [x] `pi-13288a3c`: merged `cdce81811`, synthetic SIGKILL/reopen coverage for
       revoked grants, safe-to-unsafe downgrade, and explicitly safe replay.
       Independently reviewed; no production tool registration.
