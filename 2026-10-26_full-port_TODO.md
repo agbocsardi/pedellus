@@ -22,6 +22,18 @@ continues to constrain the currently integrated tool-less slice.
 Each unchecked milestone needs its exit evidence, not merely compilable code.
 P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
+## Active memory and automation slices — 2026-10-27
+
+Independent Codex Luna high worktrees start from `e05fbd9d0109b9f0eea894b675c03665d1d22b38`.
+No shared runner/runtime changes, gateway tool activation, live requests or real data.
+
+- [ ] `pi-b5ac8248`, `w2G:p1` / `w2G`: bounded opt-in memory search over
+      host-provided snapshots, preserving applicable Python behavior and provenance.
+- [ ] `pi-23d2bdf0`, `w2H:p1` / `w2H`: assess and, if safe, implement a
+      native Durable one-shot automation foundation with restart/cancel semantics.
+- [ ] Parent review reports and behavioral checks, integrate accepted slices and
+      clean their worktrees. Recurring cron, Dream and P4/P5 acceptance stay open.
+
 ## Active Discord channel foundation — 2026-10-27
 
 - [ ] `pi-71c6dac3`, `w2F:p1` / `w2F`, branch `pi-71c6dac3`, Codex Luna
