@@ -22,6 +22,15 @@ continues to constrain the currently integrated tool-less slice.
 Each unchecked milestone needs its exit evidence, not merely compilable code.
 P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
+## Active Discord channel foundation — 2026-10-27
+
+- [ ] `pi-71c6dac3`, `w2F:p1` / `w2F`, branch `pi-71c6dac3`, Codex Luna
+      high, based on `1f0c282912df433552fee5917d356cb3dcd6eb97`: build a
+      bounded opt-in Discord adapter with strict allowlisted private DMs, durable
+      admission and honest delivery/reconnect limits. Synthetic fake transport
+      tests only; no real bot login or network requests. Parent owns gateway/config
+      integration and review; tools remain disabled. P6 remains open.
+
 ## Active archive and security review — 2026-10-27
 
 - [x] `pi-539bbaa7`, `w2D:p2` / `w2D`: independent read-only sandbox review
