@@ -11,9 +11,11 @@ acquireLegacySourceSnapshots()
 ```
 
 It is deliberately not an importer, a live-store reader, a runtime command, or
-a package-script/CLI addition. The caller must supply an explicit, dedicated
-copy and an explicit, private destination. Nothing is inferred from
-`~/.nanobot`, the current directory, or environment paths.
+a package-script/CLI addition. It is not re-exported from `src/index.ts`, not
+wired to the CLI, and not production-ready. This document makes no readiness
+claim. The caller must supply an explicit, dedicated copy and an explicit,
+private destination. Nothing is inferred from `~/.nanobot`, the current
+directory, or environment paths.
 
 ```ts
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -144,12 +146,18 @@ names the same inode. Existing sidecars use the same primitive. After close the
 database and any surviving sidecars are rechecked under the same rule while
 the lock is still held. A residual, unverified exposure is reported in
 `destination.databaseMode`, `destination.walShmMode`, and
-`privacyLimitations`; the path is never chmodded, so a symlink or existing
-external hardlink target is not affected.
+`privacyLimitations`.
 
-There remains a narrow same-user race between the pre-`fchmod` `fstat` and the
-`fchmod` itself: a process that can write the private destination could add a
-hard link in that window. This is outside the ownership contract and is not
+`O_NOFOLLOW` protects **only the final path component**. If a same-user process
+can replace an ancestor directory, the path can be redirected to a different
+inode while the final name still passes the no-follow open; the fd-based
+`fchmod` then affects whatever inode that redirected open produced. No absolute
+"symlink/hardlink target is never affected" claim is made. The same-user
+destination-race contract below is the governing limitation.
+
+There also remains a narrow same-user race between the pre-`fchmod` `fstat` and
+the `fchmod` itself: a process that can write the private destination could add
+a hard link in that window. This is outside the ownership contract and is not
 claimed hardened.
 
 The rehearsal uses a plain Durable `createSession()` and never opens a
@@ -248,7 +256,7 @@ results are included. A report with `queryEchoed: true` is sensitive even when
 Reports contain:
 
 - `status`: `dry-run`, `applied`, `already-applied`, or `blocked`;
-- readiness flags and `privacyLimitations`;
+- policy literals and `privacyLimitations`;
 - acquisition summary (completeness, surfaces, missing surfaces, counts, stable
   diagnostics, opaque source labels);
 - acknowledged missing surfaces;
@@ -262,8 +270,10 @@ Reports contain:
 - `blockers` with `stage` and stable `code` (plus an opaque `sourceId` where
   relevant);
 - `queryEchoed` for successful search pages, distinct from `contentExposed`;
-- explicit readiness flags: `experimental: true`, `syntheticOnly: true`,
-  `realImportAuthorized: false`, `sameUserRaceHardened: false`.
+- policy literals: `experimental: true`, `syntheticOnly: true`,
+  `realImportAuthorized: false`, `sameUserRaceHardened: false`. These are
+  fixed policy markers, **not** proof that the supplied input is synthetic,
+  **not** a provenance/authorization check, and **not** a readiness claim.
 
 Reports never include filesystem paths, OS error messages, record content,
 `rawLineBase64`, or provider/quarantine bytes. Typed errors from the composed
@@ -282,7 +292,8 @@ bug reports.
   provider is used.
 - No Harness, Gateway, runtime wiring, CLI, package script, session map, task,
   submission, model entry, inbox item, archive cursor, Python resume, replay, or
-  scheduled work is created.
+  scheduled work is created. This module is not re-exported from the package
+  barrel and is not exposed by the CLI.
 - No content validation beyond the existing preparation/persistence slices; no
   deduplication, reconciliation, retention, redaction, authorization, audit, or
   backup/restore policy.
@@ -291,7 +302,8 @@ bug reports.
 - The lock/path boundary matches the Gateway's enforced boundary. Cross-user
   access is blocked by the 0700 destination, but a **same-user** process that
   writes the destination and ignores the lock can race the post-lock check and
-  the SQLite open. `node:sqlite`'s native opener follows symlinks and has no
+  the SQLite open, or swap an ancestor directory around an `O_NOFOLLOW` open.
+  `node:sqlite`'s native opener follows symlinks and has no
   `O_NOFOLLOW`/fd-pinning option; passing `/proc/self/fd/<fd>` is not a safe pin
   because SQLite resolves it to a pathname and creates WAL/SHM beside that
   path. A hardlink/symlink swapped into that window can therefore make Durable
@@ -299,7 +311,11 @@ bug reports.
   `nlink` check blocks archival writes. This is a documented residual, not a
   hardened guarantee. The rehearsal is experimental and synthetic-only until a
   safe pinned open (or an equivalent ownership gate) is implemented.
-- This rehearsal does not authorize a real import.
+- This rehearsal does not authorize a real import. The `syntheticOnly`,
+  `realImportAuthorized`, and `sameUserRaceHardened` report fields are policy
+  literals, not evidence about the input or an authorization decision.
+- The behavior tests are standalone; package-script/test wiring is owned by the
+  parent integration, not this slice.
 
 ## Tests
 
@@ -335,3 +351,6 @@ directories and SQLite databases only. It covers:
 npm run build
 node --test tests/archival-import-rehearsal.behavior.test.mjs
 ```
+
+The test file is standalone and is not added to `package.json`; the parent owns
+test wiring.

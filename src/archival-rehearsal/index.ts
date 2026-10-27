@@ -31,9 +31,15 @@
  * same-user process that can write the private destination and ignores the
  * Gateway lock: that process can race the post-lock check and SQLite's
  * path-based open, and can add a hard link between fstat and fchmod. The
- * post-open checks block archival writes and the fd-based fchmod never follows
- * a swapped path, but the residual is documented and no real import is
- * authorized without a further gate.
+ * post-open checks block archival writes and the fd-based fchmod avoids
+ * following a swapped final path component, but O_NOFOLLOW protects only that
+ * component: an ancestor-directory swap can redirect the fd open/fchmod itself.
+ * No absolute isolation claim is made. The residual is documented and no real
+ * import is authorized without a further gate.
+ *
+ * This module is not re-exported from `src/index.ts` or wired to the CLI. It is
+ * not production-ready and makes no readiness claim; the parent owns any
+ * integration or test wiring.
  */
 import { createHash } from "node:crypto";
 import { constants, realpathSync, type Stats } from "node:fs";
@@ -187,6 +193,7 @@ export interface ArchivalRehearsalPreparedSource {
   readonly provenance: string;
   readonly byteLength: number;
   readonly sha256: string;
+  /** "unsupported" is retained from the preparation contract; acquisition currently emits only supported formats. */
   readonly status: "complete" | "incomplete" | "unsupported";
   readonly lineCount: number | null;
   readonly recordsEmitted: number;
@@ -305,9 +312,13 @@ export interface ArchivalRehearsalReport {
   readonly cursorAdvanced: false;
   readonly replayPerformed: false;
   readonly reviewRequired: true;
+  /** Policy literal; not evidence that the supplied input is synthetic. */
   readonly experimental: true;
+  /** Policy literal; not proof about the supplied source or its provenance. */
   readonly syntheticOnly: true;
+  /** Policy literal; no authorization is verified or granted. */
   readonly realImportAuthorized: false;
+  /** Policy literal; same-user race hardening is not claimed. */
   readonly sameUserRaceHardened: false;
   readonly limitations: readonly string[];
 }
@@ -327,7 +338,7 @@ const LIMITATIONS: readonly string[] = Object.freeze([
   "The source copy is read through the existing no-follow acquisition boundary; live ~/.nanobot and home roots are refused there.",
   "The destination is an explicit private directory; the database is opened with the Gateway's process lock and WAL/FULL durability.",
   "The destination database and WAL/SHM/journal sidecars must be single-link regular files; hardlinks, symlinks, and specials are rejected.",
-  "Database/sidecar mode 0600 is enforced with a no-follow descriptor, fstat/nlink/identity checks, and fchmod; a symlink or existing hardlink target is never chmodded.",
+  "Database/sidecar mode 0600 is enforced with a no-follow descriptor, fstat/nlink/identity checks, and fchmod. O_NOFOLLOW protects only the final component; an ancestor-directory swap can redirect the open/fchmod, so absolute symlink/hardlink-target isolation is not claimed.",
   "A same-user process with write access to the destination can still race fstat/fchmod or the post-lock check/SQLite open; this is not hardened and is synthetic-only.",
   "Dry-run performs no destination open, lock, migration, or write. Apply writes only the supplied snapshot bytes to the destination database.",
   "Imports are batched; each batch is atomic. A rerun is idempotent per source identity (storeNamespace, sourceId, sha256).",
@@ -757,8 +768,9 @@ async function ensurePrivateDatabaseFiles(databasePath: string): Promise<{
 
 /**
  * Recheck identity and mode after close with the same fd-based primitive. A
- * symlink/hardlink or a replaced path is never chmodded; residual exposure is a
- * limitation instead.
+ * symlink/hardlink at the final component or a replaced path is not chmodded
+ * by this helper; an ancestor-directory swap can redirect the open itself and
+ * is outside this check. Residual exposure is a limitation instead.
  */
 async function finalizeDatabasePrivacy(databasePath: string): Promise<{
   databaseMode: "0600" | "not-verified";
