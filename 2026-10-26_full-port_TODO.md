@@ -44,10 +44,12 @@ policy, environment and replay gates pass.
       isolated candidate and integrated build against real bwrap. The 5-second
       experimental cap is not product policy; CPU/memory/PID/disk quotas and
       approval remain separate P1 gates.
-- [ ] Tool authorization: `pi-2001d051` identified the need for an authoritative
-      host grant source and runtime revoke-before-resume integration. Owner asked
-      for explanation; choice between host-supplied grants and a persistent store
-      remains undecided. No gateway activation or security acceptance.
+- [ ] Tool authorization: owner chose **host-supplied config**, default deny, as
+      authoritative for allow/disallow and startup revocation. `pi-8a97b7a5`,
+      `w2P:p1` / `w2P`, Codex Luna high, base `1e61299e5eda604e8cb9fa3c8d536c07258a4ca3`,
+      is investigating/implementing a bounded config and pre-resume seam. Context
+      worker independently edits runtime in its own worktree; parent reconciles.
+      Actual tools stay disabled until approval, sandbox and replay gates pass.
 - [ ] Review the existing Discord/memory/automation candidates when revisiting
       them; preserve their branches and do not imply they are integrated.
 
