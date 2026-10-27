@@ -540,6 +540,147 @@ test("resumes mid-entry at unit boundaries and keeps page output bounded", async
   }
 });
 
+test("searches entries larger than maxScanUnits across bounded unit pages", async (t) => {
+  const database = await tempDatabase(t);
+  const { harness, storage } = await openHarness(database);
+  try {
+    const completeMessages = [];
+    const partialMessages = [];
+    for (let index = 0; index < 7; index++) {
+      completeMessages.push(message(index % 2 === 0 ? "user" : "assistant", `large needle complete-${index}`));
+      partialMessages.push(message(index % 2 === 0 ? "assistant" : "user", `large needle partial-${index}`));
+    }
+    const source = historySource("large-a", [
+      historyRecord("2026-10-27T00:00:00", "synthetic", completeMessages),
+      historyRecord("2026-10-27T00:00:01", "synthetic", partialMessages, {
+        extra_unindexed: "large partial omission marker",
+      }),
+    ]);
+    await persistArchivalImport(harness, { storeNamespace: "synthetic-store", sources: [source] }, context);
+
+    const limits = {
+      maxSources: 4,
+      maxScanEntries: 10,
+      maxScanUnits: 3,
+      maxHits: 100,
+      maxOutputChars: 24_000,
+      maxSnippetChars: 40,
+      maxQueryChars: 200,
+      scanBatchSize: 10,
+    };
+    const collected = [];
+    const stopReasons = new Set();
+    const midEntryProgress = new Map();
+    let continuation = null;
+    let pages = 0;
+    let page;
+    do {
+      page = await searchPersistedArchivalImport(
+        harness,
+        { text: "large needle" },
+        context,
+        { limits, ...(continuation === null ? {} : { continuation }) },
+      );
+      pages++;
+      assert.ok(pages < 30, "large-entry paging did not make progress");
+      assertPageBound(page, limits.maxOutputChars);
+      assert.ok(page.hits.length <= limits.maxHits);
+      assert.ok(page.progress.unitsScannedThisPage <= limits.maxScanUnits);
+      if (page.hits.length > 0) assert.ok(page.progress.unitsScannedThisPage > 0);
+      stopReasons.add(page.stopReason);
+      collected.push(...page.hits);
+      if (page.continuation !== null && page.continuation.nextUnit > 0) {
+        const entryId = page.continuation.nextEntryId;
+        const previous = midEntryProgress.get(entryId);
+        if (previous !== undefined) assert.ok(page.continuation.nextUnit > previous);
+        midEntryProgress.set(entryId, page.continuation.nextUnit);
+        assert.equal(page.coverage.entriesUnsearchable, 0);
+      }
+      if (page.coverage.entriesSearchablePartial > 0) {
+        assert.equal(page.coverage.coverageComplete, false);
+      }
+      continuation = page.continuation;
+    } while (continuation !== null);
+
+    assert.equal(pages >= 5, true);
+    assert.equal(collected.length, 14);
+    assert.equal(stopReasons.has("max-units"), true);
+    assert.equal(stopReasons.has("complete"), true);
+
+    const byLine = new Map();
+    for (const hit of collected) {
+      const list = byLine.get(hit.line) ?? [];
+      list.push(hit);
+      byLine.set(hit.line, list);
+    }
+    assert.deepEqual([...byLine.keys()].sort((a, b) => a - b), [1, 2]);
+    for (const [line, hits] of byLine) {
+      assert.deepEqual(hits.map((hit) => hit.unitIndex).sort((a, b) => a - b), [0, 1, 2, 3, 4, 5, 6]);
+      if (line === 1) {
+        assert.equal(hits.every((hit) => hit.searchStatus === "complete"), true);
+        assert.equal(hits.every((hit) => hit.textOmitted === false), true);
+      } else {
+        assert.equal(hits.every((hit) => hit.searchStatus === "partial"), true);
+        assert.equal(hits.every((hit) => hit.textOmitted === true), true);
+      }
+    }
+
+    assert.equal(page.scanComplete, true);
+    assert.equal(page.coverage.entriesScanned, 2);
+    assert.equal(page.coverage.entriesSearchable, 1);
+    assert.equal(page.coverage.entriesSearchablePartial, 1);
+    assert.equal(page.coverage.entriesNoSearchText, 0);
+    assert.equal(page.coverage.entriesUnsearchable, 0);
+    assert.equal(page.coverage.unitsScanned, 14);
+    assert.equal(page.coverage.unitsInvalid, 0);
+    assert.equal(page.coverage.hits, 14);
+    assert.equal(page.coverage.sourcesFullyScanned, 1);
+    assert.equal(page.coverage.sourcesWithCaveats, 1);
+    assert.equal(page.coverage.coverageComplete, false);
+
+    // The same large entries must remain fully reachable when output trimming
+    // stops a page in the middle of an entry, including at its first unit.
+    const outputLimits = {
+      ...limits,
+      maxOutputChars: 4_096,
+      maxSnippetChars: 24,
+    };
+    const outputHits = [];
+    const outputStopReasons = new Set();
+    let outputContinuation = null;
+    let outputPages = 0;
+    let outputPage;
+    do {
+      outputPage = await searchPersistedArchivalImport(
+        harness,
+        { text: "large needle" },
+        context,
+        { limits: outputLimits, ...(outputContinuation === null ? {} : { continuation: outputContinuation }) },
+      );
+      outputPages++;
+      assert.ok(outputPages < 40, "large-entry output paging did not make progress");
+      assertPageBound(outputPage, outputLimits.maxOutputChars);
+      outputStopReasons.add(outputPage.stopReason);
+      outputHits.push(...outputPage.hits);
+      assert.equal(outputPage.coverage.entriesUnsearchable, 0);
+      outputContinuation = outputPage.continuation;
+    } while (outputContinuation !== null);
+
+    assert.equal(outputHits.length, 14);
+    assert.equal(new Set(outputHits.map((hit) => `${hit.durableKey}:${hit.unitIndex}`)).size, 14);
+    assert.equal(outputStopReasons.has("max-output-chars"), true);
+    assert.equal(outputPage.scanComplete, true);
+    assert.equal(outputPage.coverage.entriesSearchable, 1);
+    assert.equal(outputPage.coverage.entriesSearchablePartial, 1);
+    assert.equal(outputPage.coverage.entriesUnsearchable, 0);
+    assert.equal(outputPage.coverage.unitsScanned, 14);
+    assert.equal(outputPage.coverage.hits, 14);
+  } finally {
+    await harness.close(context);
+    await storage.close(context);
+  }
+});
+
 test("bounds output and entry work while making progress at the smallest limits", async (t) => {
   const database = await tempDatabase(t);
   const { harness, storage } = await openHarness(database);

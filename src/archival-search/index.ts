@@ -7,8 +7,11 @@
  * resumes/replays a Python session.
  *
  * Pages are ordered by ledger source order and then by Durable entry ID. Search
- * only matches the prepared text-only `search[]` units. Raw lines (including
- * provider state, headers, and quarantine bytes) are never returned.
+ * only matches the prepared text-only `search[]` units. An entry may span many
+ * pages; units are validated incrementally and resumed at a unit boundary, so a
+ * large history record is never excluded merely because it exceeds one page's
+ * unit work bound. Raw lines (including provider state, headers, and quarantine
+ * bytes) are never returned.
  *
  * The caller must already hold exclusive single-writer ownership of the
  * Session/storage, normally the same Gateway process lock. Continuations are
@@ -170,6 +173,12 @@ export interface ArchivalSearchContinuation {
   readonly nextEntryId: number | null;
   /** Unit index within `nextEntryId`; non-zero means the entry was already classified. */
   readonly nextUnit: number;
+  /** Whether the current entry's metadata was already classified and counted. */
+  readonly currentEntryClassified: boolean;
+  /** Whether this entry has already yielded a valid non-empty searchable unit. */
+  readonly currentEntryHasSearchableUnit: boolean;
+  /** Whether this entry has already yielded a valid unit, even an empty-text one. */
+  readonly currentEntryHasValidUnit: boolean;
   readonly currentSourceHasCaveat: boolean;
   readonly coverage: ArchivalSearchCoverageCounters;
 }
@@ -505,6 +514,9 @@ const CONTINUATION_KEYS = new Set([
   "conversationId",
   "nextEntryId",
   "nextUnit",
+  "currentEntryClassified",
+  "currentEntryHasSearchableUnit",
+  "currentEntryHasValidUnit",
   "currentSourceHasCaveat",
   "coverage",
 ]);
@@ -551,6 +563,9 @@ interface ContinuationState {
   readonly sourceIndex: number;
   readonly nextEntryId: number | null;
   readonly nextUnit: number;
+  readonly currentEntryClassified: boolean;
+  readonly currentEntryHasSearchableUnit: boolean;
+  readonly currentEntryHasValidUnit: boolean;
   readonly currentSourceHasCaveat: boolean;
   readonly coverage: MutableCoverage;
 }
@@ -591,12 +606,25 @@ function readContinuation(
   const conversationId = readInput(() => value.conversationId, "Archival search continuation is unreadable");
   const nextEntryId = readInput(() => value.nextEntryId, "Archival search continuation is unreadable");
   const nextUnit = readInput(() => value.nextUnit, "Archival search continuation is unreadable");
+  const currentEntryClassified = readInput(() => value.currentEntryClassified,
+    "Archival search continuation is unreadable");
+  const currentEntryHasSearchableUnit = readInput(() => value.currentEntryHasSearchableUnit,
+    "Archival search continuation is unreadable");
+  const currentEntryHasValidUnit = readInput(() => value.currentEntryHasValidUnit,
+    "Archival search continuation is unreadable");
   const currentSourceHasCaveat = readInput(() => value.currentSourceHasCaveat,
     "Archival search continuation is unreadable");
   if (typeof sourceId !== "string" || (conversationId !== null && !isSafePositiveInteger(conversationId)) ||
       (nextEntryId !== null && !isSafePositiveInteger(nextEntryId)) ||
       !isSafeNonNegativeInteger(nextUnit) ||
       (nextEntryId === null && nextUnit !== 0) ||
+      typeof currentEntryClassified !== "boolean" ||
+      typeof currentEntryHasSearchableUnit !== "boolean" ||
+      typeof currentEntryHasValidUnit !== "boolean" ||
+      (nextEntryId === null && currentEntryClassified) ||
+      (nextUnit > 0 && !currentEntryClassified) ||
+      (nextUnit === 0 && (currentEntryHasSearchableUnit || currentEntryHasValidUnit)) ||
+      (!currentEntryHasValidUnit && currentEntryHasSearchableUnit) ||
       typeof currentSourceHasCaveat !== "boolean") {
     throw new ArchivalSearchContinuationError("Archival search continuation position is invalid");
   }
@@ -617,6 +645,9 @@ function readContinuation(
     sourceIndex,
     nextEntryId,
     nextUnit,
+    currentEntryClassified,
+    currentEntryHasSearchableUnit,
+    currentEntryHasValidUnit,
     currentSourceHasCaveat,
     coverage,
   };
@@ -776,35 +807,6 @@ function readUnit(value: unknown, expectedIndex: number): NormalizedUnit | null 
   }
 }
 
-interface NormalizedUnits {
-  readonly units: readonly (NormalizedUnit | null)[];
-  readonly invalidCount: number;
-  readonly searchableCount: number;
-}
-
-function normalizeUnits(record: NormalizedRecord): NormalizedUnits {
-  const units: (NormalizedUnit | null)[] = [];
-  let invalidCount = 0;
-  let searchableCount = 0;
-  for (let index = 0; index < record.search.length; index++) {
-    let raw: unknown;
-    try {
-      raw = record.search[index];
-    } catch {
-      raw = undefined;
-    }
-    const unit = readUnit(raw, index);
-    if (unit === null) {
-      invalidCount++;
-      units.push(null);
-      continue;
-    }
-    if (unit.text.length > 0) searchableCount++;
-    units.push(unit);
-  }
-  return { units, invalidCount, searchableCount };
-}
-
 function isSearchableRecord(record: NormalizedRecord): boolean {
   return record.status === "prepared" && !record.opaque &&
     SEARCHABLE_CATEGORIES.has(record.category) &&
@@ -813,49 +815,35 @@ function isSearchableRecord(record: NormalizedRecord): boolean {
 }
 
 interface Classification {
-  readonly units: readonly (NormalizedUnit | null)[];
-  readonly searchableCount: number;
   readonly caveat: boolean;
   readonly resumable: boolean;
 }
 
-function classifyRecord(
-  record: NormalizedRecord,
-  coverage: MutableCoverage,
-  limits: ArchivalSearchLimits,
-): Classification {
+/**
+ * Classify the entry from its allowlisted metadata only. Its unit list is
+ * validated lazily and incrementally during the bounded unit loop, so a record
+ * with more units than one page's `maxScanUnits` remains reachable across
+ * pages. If no valid searchable unit is ever found, the entry is reclassified
+ * at its end (see `finishCurrentEntry`).
+ */
+function classifyRecord(record: NormalizedRecord, coverage: MutableCoverage): Classification {
   if (record.status === "quarantined") {
     coverage.entriesQuarantined++;
-    return { units: [], searchableCount: 0, caveat: true, resumable: false };
+    return { caveat: true, resumable: false };
   }
   if (record.opaque || !SEARCHABLE_CATEGORIES.has(record.category)) {
     coverage.entriesOpaque++;
-    return { units: [], searchableCount: 0, caveat: true, resumable: false };
+    return { caveat: true, resumable: false };
   }
-  if (record.search.length > limits.maxScanUnits) {
-    // Do not let one tampered/oversized line consume an unbounded page.
-    coverage.entriesUnsearchable++;
-    return { units: [], searchableCount: 0, caveat: true, resumable: false };
+  if (record.search.length === 0) {
+    coverage.entriesNoSearchText++;
+    return { caveat: true, resumable: false };
   }
-  const normalized = normalizeUnits(record);
-  coverage.unitsInvalid += normalized.invalidCount;
-  const caveat = record.searchStatus === "partial" || normalized.invalidCount > 0;
-  if (normalized.searchableCount === 0) {
-    if (normalized.invalidCount > 0 && normalized.units.every((unit) => unit === null)) {
-      coverage.entriesUnsearchable++;
-    } else {
-      coverage.entriesNoSearchText++;
-    }
-    return { units: normalized.units, searchableCount: 0, caveat: true, resumable: false };
-  }
+  // readRecordEntry() permits a non-empty unit list only for a complete or
+  // partial search projection.
   if (record.searchStatus === "partial") coverage.entriesSearchablePartial++;
   else coverage.entriesSearchable++;
-  return {
-    units: normalized.units,
-    searchableCount: normalized.searchableCount,
-    caveat,
-    resumable: true,
-  };
+  return { caveat: record.searchStatus === "partial", resumable: true };
 }
 
 function escapedLiteral(value: string): string {
@@ -979,6 +967,9 @@ interface HitCheckpoint {
   readonly entryId: number;
   readonly sourceIndex: number;
   readonly nextUnit: number;
+  readonly entryClassified: boolean;
+  readonly hasSearchableUnit: boolean;
+  readonly hasValidUnit: boolean;
   readonly coverage: MutableCoverage;
   readonly currentSourceHasCaveat: boolean;
   readonly hitsBefore: number;
@@ -988,6 +979,9 @@ interface ScanState {
   sourceIndex: number;
   nextEntryId: number | null;
   nextUnit: number;
+  currentEntryClassified: boolean;
+  currentEntryHasSearchableUnit: boolean;
+  currentEntryHasValidUnit: boolean;
   currentSourceHasCaveat: boolean;
   coverage: MutableCoverage;
   readonly hits: ArchivalSearchHit[];
@@ -1020,6 +1014,9 @@ function buildContinuation(args: BuildPageArgs): ArchivalSearchContinuation | nu
     conversationId: source.conversationId,
     nextEntryId: state.nextEntryId,
     nextUnit: state.nextUnit,
+    currentEntryClassified: state.currentEntryClassified,
+    currentEntryHasSearchableUnit: state.currentEntryHasSearchableUnit,
+    currentEntryHasValidUnit: state.currentEntryHasValidUnit,
     currentSourceHasCaveat: state.currentSourceHasCaveat,
     coverage: { ...state.coverage },
   };
@@ -1112,6 +1109,9 @@ function emptyPage(
     sourceIndex: 0,
     nextEntryId: null,
     nextUnit: 0,
+    currentEntryClassified: false,
+    currentEntryHasSearchableUnit: false,
+    currentEntryHasValidUnit: false,
     currentSourceHasCaveat: false,
     coverage: emptyCoverage(),
     hits: [],
@@ -1218,6 +1218,9 @@ export async function searchPersistedArchivalImport(
     sourceIndex: continuation?.sourceIndex ?? 0,
     nextEntryId: continuation?.nextEntryId ?? null,
     nextUnit: continuation?.nextUnit ?? 0,
+    currentEntryClassified: continuation?.currentEntryClassified ?? false,
+    currentEntryHasSearchableUnit: continuation?.currentEntryHasSearchableUnit ?? false,
+    currentEntryHasValidUnit: continuation?.currentEntryHasValidUnit ?? false,
     currentSourceHasCaveat: continuation?.currentSourceHasCaveat ?? false,
     coverage: continuation ? { ...continuation.coverage } : emptyCoverage(),
     hits: [],
@@ -1237,6 +1240,9 @@ export async function searchPersistedArchivalImport(
     state.sourceIndex++;
     state.nextEntryId = null;
     state.nextUnit = 0;
+    state.currentEntryClassified = false;
+    state.currentEntryHasSearchableUnit = false;
+    state.currentEntryHasValidUnit = false;
     state.currentSourceHasCaveat = false;
   };
 
@@ -1248,6 +1254,9 @@ export async function searchPersistedArchivalImport(
     state.sourceIndex++;
     state.nextEntryId = null;
     state.nextUnit = 0;
+    state.currentEntryClassified = false;
+    state.currentEntryHasSearchableUnit = false;
+    state.currentEntryHasValidUnit = false;
     state.currentSourceHasCaveat = false;
   };
 
@@ -1258,6 +1267,9 @@ export async function searchPersistedArchivalImport(
       state.sourceIndex++;
       state.nextEntryId = null;
       state.nextUnit = 0;
+      state.currentEntryClassified = false;
+      state.currentEntryHasSearchableUnit = false;
+      state.currentEntryHasValidUnit = false;
       state.currentSourceHasCaveat = false;
       continue;
     }
@@ -1278,6 +1290,9 @@ export async function searchPersistedArchivalImport(
       state.currentSourceHasCaveat = source.preparationStatus === "incomplete";
       state.nextEntryId = 1;
       state.nextUnit = 0;
+      state.currentEntryClassified = false;
+      state.currentEntryHasSearchableUnit = false;
+      state.currentEntryHasValidUnit = false;
     }
     if (entriesTouchedThisCall >= limits.maxScanEntries) {
       state.stopReason = "max-entries";
@@ -1315,17 +1330,27 @@ export async function searchPersistedArchivalImport(
         throw new ArchivalSearchCorruptionError("Archival carrier entries are not in ascending Durable entry-ID order");
       }
       lastEntryId = entryId;
-      const resumingEntry = state.nextEntryId === entryId && state.nextUnit > 0;
-      const coverageBeforeEntry = { ...state.coverage };
-      const caveatBeforeEntry = state.currentSourceHasCaveat;
-      const nextUnitAtEntryStart = resumingEntry ? state.nextUnit : 0;
-      const coverageBeforeUnits = { ...state.coverage };
-      const caveatBeforeUnits = state.currentSourceHasCaveat;
-      const hitsBefore = state.hits.length;
-      let classification: Classification | null = null;
+      const resumingEntry = state.nextEntryId === entryId &&
+        (state.nextUnit > 0 || state.currentEntryClassified);
       let record: NormalizedRecord | null = null;
-      let normalizedUnits: readonly (NormalizedUnit | null)[] | null = null;
       let unitCount = 0;
+      let searchableEntry = false;
+
+      // Called only after every unit was traversed (or a resumed entry was
+      // already at its end). Mid-entry stops keep the pre-counted category and
+      // the flags plus unit position in the continuation.
+      const finishCurrentEntry = (current: NormalizedRecord): void => {
+        if (!state.currentEntryHasSearchableUnit) {
+          if (current.searchStatus === "partial") state.coverage.entriesSearchablePartial--;
+          else state.coverage.entriesSearchable--;
+          if (state.currentEntryHasValidUnit) state.coverage.entriesNoSearchText++;
+          else state.coverage.entriesUnsearchable++;
+          state.currentSourceHasCaveat = true;
+        }
+        state.currentEntryClassified = false;
+        state.currentEntryHasSearchableUnit = false;
+        state.currentEntryHasValidUnit = false;
+      };
 
       if (!resumingEntry) {
         state.coverage.entriesScanned++;
@@ -1334,6 +1359,9 @@ export async function searchPersistedArchivalImport(
         if (record === null) {
           state.coverage.entriesUnsearchable++;
           state.currentSourceHasCaveat = true;
+          state.currentEntryClassified = false;
+          state.currentEntryHasSearchableUnit = false;
+          state.currentEntryHasValidUnit = false;
           state.nextEntryId = entryId + 1;
           state.nextUnit = 0;
           if (!Number.isSafeInteger(state.nextEntryId)) {
@@ -1346,9 +1374,12 @@ export async function searchPersistedArchivalImport(
           }
           continue;
         }
-        classification = classifyRecord(record, state.coverage, limits);
+        state.currentEntryClassified = false;
+        state.currentEntryHasSearchableUnit = false;
+        state.currentEntryHasValidUnit = false;
+        const classification = classifyRecord(record, state.coverage);
         if (classification.caveat) state.currentSourceHasCaveat = true;
-        if (!classification.resumable || classification.searchableCount === 0) {
+        if (!classification.resumable) {
           state.nextEntryId = entryId + 1;
           state.nextUnit = 0;
           if (!Number.isSafeInteger(state.nextEntryId)) {
@@ -1361,9 +1392,9 @@ export async function searchPersistedArchivalImport(
           }
           continue;
         }
-        // The record is searchable; units are searched below.
-        normalizedUnits = classification.units;
-        unitCount = normalizedUnits.length;
+        state.currentEntryClassified = true;
+        searchableEntry = true;
+        unitCount = record.search.length;
       } else {
         entriesTouchedThisCall++;
         record = readRecordEntry(entry, source, storeNamespace);
@@ -1371,13 +1402,11 @@ export async function searchPersistedArchivalImport(
           throw new ArchivalSearchContinuationError("Archival search continuation no longer names a searchable archival entry");
         }
         unitCount = record.search.length;
-        if (unitCount > limits.maxScanUnits) {
-          throw new ArchivalSearchContinuationError("Archival search continuation entry exceeds the unit bound");
-        }
         if (state.nextUnit > unitCount) {
           throw new ArchivalSearchContinuationError("Archival search continuation unit position is invalid");
         }
         if (state.nextUnit === unitCount) {
+          finishCurrentEntry(record);
           state.nextEntryId = entryId + 1;
           state.nextUnit = 0;
           if (!Number.isSafeInteger(state.nextEntryId)) {
@@ -1390,17 +1419,10 @@ export async function searchPersistedArchivalImport(
           }
           continue;
         }
-        // Classification was already counted on the page that created this
-        // continuation; only the remaining units are read lazily.
-        classification = {
-          units: [],
-          searchableCount: 0,
-          caveat: true,
-          resumable: true,
-        };
+        searchableEntry = true;
       }
 
-      if (classification === null || record === null) {
+      if (!searchableEntry || record === null) {
         throw new ArchivalSearchCorruptionError("Archival carrier entry classification was lost");
       }
       let entryStopped = false;
@@ -1419,12 +1441,22 @@ export async function searchPersistedArchivalImport(
           entryStopped = true;
           break;
         }
+        const coverageBeforeUnit = { ...state.coverage };
+        const hasSearchableUnitBeforeUnit = state.currentEntryHasSearchableUnit;
+        const hasValidUnitBeforeUnit = state.currentEntryHasValidUnit;
+        const caveatBeforeUnit = state.currentSourceHasCaveat;
+        const hitsBeforeUnit = state.hits.length;
         state.coverage.unitsScanned++;
         unitsScannedThisCall++;
-        const unit = normalizedUnits === null
-          ? readUnit(record.search[unitIndex], unitIndex)
-          : (normalizedUnits[unitIndex] ?? null);
-        if (unit === null) continue;
+        const unit = readUnit(record.search[unitIndex], unitIndex);
+        if (unit === null) {
+          state.coverage.unitsInvalid++;
+          state.currentSourceHasCaveat = true;
+          continue;
+        }
+        state.currentEntryHasValidUnit = true;
+        if (unit.text.length === 0) continue;
+        state.currentEntryHasSearchableUnit = true;
         if (query.role !== null && (unit.role ?? record.role) !== query.role) continue;
         const match = matcher(unit.text);
         if (match === null) continue;
@@ -1438,21 +1470,26 @@ export async function searchPersistedArchivalImport(
         );
         state.coverage.hits++;
         state.hits.push(hit);
-      }
-      if (state.hits.length > hitsBefore) {
+        // A hit-level checkpoint lets output trimming keep earlier hits and
+        // resume exactly at this unit, even when this is the first unit of a
+        // large entry (entryClassified remains true, so it is not recounted).
         state.hitCheckpoints.push({
           entryId,
           sourceIndex: state.sourceIndex,
-          nextUnit: nextUnitAtEntryStart,
-          coverage: resumingEntry ? coverageBeforeUnits : coverageBeforeEntry,
-          currentSourceHasCaveat: resumingEntry ? caveatBeforeUnits : caveatBeforeEntry,
-          hitsBefore,
+          nextUnit: unitIndex,
+          entryClassified: true,
+          hasSearchableUnit: hasSearchableUnitBeforeUnit,
+          hasValidUnit: hasValidUnitBeforeUnit,
+          coverage: coverageBeforeUnit,
+          currentSourceHasCaveat: caveatBeforeUnit,
+          hitsBefore: hitsBeforeUnit,
         });
       }
       if (entryStopped) {
         stopped = true;
         break;
       }
+      finishCurrentEntry(record);
       state.nextEntryId = entryId + 1;
       state.nextUnit = 0;
       if (!Number.isSafeInteger(state.nextEntryId)) {
@@ -1495,6 +1532,9 @@ export async function searchPersistedArchivalImport(
     state.sourceIndex = checkpoint.sourceIndex;
     state.nextEntryId = checkpoint.entryId;
     state.nextUnit = checkpoint.nextUnit;
+    state.currentEntryClassified = checkpoint.entryClassified;
+    state.currentEntryHasSearchableUnit = checkpoint.hasSearchableUnit;
+    state.currentEntryHasValidUnit = checkpoint.hasValidUnit;
     state.currentSourceHasCaveat = checkpoint.currentSourceHasCaveat;
     state.hits.length = checkpoint.hitsBefore;
     state.stopReason = "max-output-chars";

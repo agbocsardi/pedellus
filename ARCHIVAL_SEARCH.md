@@ -131,6 +131,8 @@ containing:
 - format/version, query SHA-256, store namespace, and ledger source count;
 - the ledger source index/source ID/conversation ID;
 - the next Durable entry ID and unit index;
+- whether that entry's metadata is already classified, plus its unit-progress
+  flags;
 - the current source's caveat flag;
 - cumulative coverage counters.
 
@@ -170,16 +172,20 @@ Limits and their defaults/hard caps:
 `maxOutputChars` must be at least 4,096. The page envelope (query, coverage,
 continuation, limitations, counters) must fit; if even one bounded hit cannot
 fit, the call raises `ArchivalSearchBoundsError` instead of silently dropping
-the hit. A page that would exceed the output bound rolls back to the first
-hit-bearing entry that made it too large, returns the preceding hits, and
-resumes at that entry. Unit and hit limits also resume at the exact next unit.
+the hit. A page that would exceed the output bound drops the latest hit(s),
+keeps earlier hits, and resumes at the exact unit of the first dropped hit,
+even when that unit is inside a large entry. Unit and hit limits also resume at
+the exact next unit.
 
 Work limits are checked at entry/unit boundaries and always leave a resumable
 position. A source may require one extra empty entry scan to prove completion.
-A single entry with more than `maxScanUnits` prepared units is treated as
-`entriesUnsearchable` rather than partially searched; this bounds one line's
-work. Raising `maxScanUnits` (up to the hard cap) allows such a line to be
-searched.
+An entry with more units than one page's `maxScanUnits` is **not** rejected:
+its allowlisted metadata is classified once, then units are validated and
+searched incrementally across as many pages as needed. A page may stop in the
+middle of such an entry and resume at the exact next unit. If the complete
+traversal finds no valid searchable unit, the entry is reclassified at its end
+as `entriesNoSearchText` or `entriesUnsearchable`; a partial projection remains
+`entriesSearchablePartial` with `textOmitted: true` on its hits.
 
 `stopReason` is one of:
 
@@ -247,6 +253,10 @@ databases and a native `Harness`. It covers:
   coverage;
 - mid-entry unit paging, smallest scan limits, serialized output bounds, and
   progress without an accidental full-corpus load;
+- entries with more units than `maxScanUnits`, including a large partial
+  history record and output-trimmed pages, whose full hit set is reachable over
+  repeated pages with monotonic unit progress and correct cumulative omission
+  flags;
 - query/ledger continuation mismatch rejection and the no-ledger page;
 - read-only behavior: no new conversations, entries, ledger changes, tasks, or
   submissions.
@@ -267,8 +277,10 @@ node --test tests/archival-search.behavior.test.mjs
 4. Coverage is strict and therefore usually not `coverageComplete` for session
    sources: headers, provider state, blank lines, and quarantine are known
    unsearched surfaces.
-5. A line with more prepared units than `maxScanUnits` is unsearchable rather
-   than partially searched; raising the bound is required.
+5. A line with more prepared units than one page's `maxScanUnits` is searched
+   incrementally across pages; it is not excluded solely for unit count. A
+   single page still stops at `maxScanUnits`, so very large entries require
+   multiple continuation calls.
 6. Continuations are unsigned host state with no authentication or tamper
    proof; they are not authorization and must not be exposed to untrusted
    clients.
