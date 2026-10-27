@@ -25,6 +25,7 @@ const rehearsal = await runArchivalImportRehearsal({
   workspace: "/srv/rehearsal/workspace",          // must be disjoint
   storeNamespace: "operator-rehearsal-1",         // opaque, caller-supplied
   // apply: true,                                  // absent => dry-run, no writes
+  // acknowledgeMissingSurfaces: ["archive"],       // required for missing surfaces
   // search: { query: { text: "synthetic needle" } },
 }, BACKGROUND_CONTEXT);
 
@@ -44,11 +45,35 @@ Without `apply: true` the module:
 
 It does **not** open, create, migrate, lock, or write the destination database.
 A dry-run leaves the destination directory untouched. It does read the source
-copy and perform in-memory preparation.
+copy and perform in-memory preparation. It also preflights preparation and
+persistence limits, so a limit that would block apply is reported as `blocked`
+before any destination access. Missing known surfaces remain visible in
+`source.expectedSurfacesMissing` and do not by themselves block a dry-run.
 
 `apply: true` is the only write mode. It writes only the supplied snapshot
 bytes into the explicit destination database and then optionally inspects the
 ledger and performs one bounded search.
+
+## Missing surfaces require explicit attestation
+
+`surfacesAvailable` and `expectedSurfacesMissing` are always reported. Any
+missing known surface (`sessions`, `archive`, `memory`, `history`) makes apply a
+qualified operation: by default apply is **blocked** with
+`missing-surfaces-not-acknowledged`. The operator must name every missing
+surface in `acknowledgeMissingSurfaces`:
+
+```ts
+await runArchivalImportRehearsal({
+  ...options,
+  apply: true,
+  acknowledgeMissingSurfaces: ["archive", "memory", "history"],
+}, context);
+```
+
+A partial acknowledgement stays blocked. The applied report records the
+accepted missing surfaces in `acknowledgedMissingSurfaces`. Unknown surface
+names are rejected as input errors. Dry-run exposes the missing surfaces without
+requiring this acknowledgement.
 
 ## Source boundary
 
@@ -85,8 +110,19 @@ real user data.
   the other).
 
 The database is exactly `<destinationDir>/nanobot.sqlite`. If it exists it must
-be a regular file, never a symlink or special file. The directory and database
-path are rechecked after the lock is taken and before storage is opened.
+be a regular file with exactly one link, never a symlink, special file, or
+hardlink (`nlink === 1`). The lock protects the path/process boundary; it does
+not protect a hardlinked inode that is also writable outside the destination.
+Hardlinks are rejected with `destination-database-hardlink` both before and
+after the lock is taken.
+
+Existing pre-planted `-wal`, `-shm`, and `-journal` sidecars are checked the same
+way. A symlinked, non-regular, or hardlinked sidecar is rejected with
+`destination-wal-shm-unsafe` before SQLite opens the database, so SQLite cannot
+follow it to an outside file.
+
+The directory, database identity, and sidecars are rechecked after the lock is
+taken and before storage is opened.
 
 `apply` acquires the same process lock the Gateway uses for this database:
 
@@ -99,13 +135,36 @@ and verifies `journal_mode=wal` and `synchronous=FULL` before Durable is used,
 and verifies again after Durable initialization. A lock held by another process
 is a hard blocker; this module never retries or weakens the lock.
 
+After opening, the database is chmodded to `0600` before any archival write;
+WAL/SHM files created afterwards inherit that mode. Existing sidecars are
+chmodded only when they are regular files with exactly one link. After close
+the database and any surviving sidecars are rechecked and chmodded again under
+the same rule. A residual, unverified exposure is reported in
+`destination.databaseMode`, `destination.walShmMode`, and
+`privacyLimitations`; a symlink or external hardlink is never chmodded.
+
 The rehearsal uses a plain Durable `createSession()` and never opens a
 `Harness`, `openGateway()`, a model, a provider, an inbox, a task, a submission,
 a live session map, or a Python resume path.
 
 ## Persistence, batching, and idempotence
 
-`apply` iterates the acquisition's deterministic batches and calls
+Before taking the lock, `apply` preflights every acquisition batch:
+
+1. preparation runs once per batch with the caller's preparation limits;
+2. every per-batch persistence bound is checked against the effective
+   persistence limits (source count, raw bytes, records, search units, and the
+   per-source variants).
+
+A preparation or persistence-limit violation is reported **before** the
+destination is opened. After the lock, and before the first batch commit, the
+ledger is read and preflighted for namespace agreement, omitted sources,
+per-source conflicts, and total ledger capacity (`maxLedgerSources`). A source
+present in the ledger but absent from the current snapshot is a
+`ledger-source-not-in-snapshot` blocker, not `already-applied`; this catches a
+partial/stale rerun before it writes.
+
+Only then does `apply` iterate the acquisition's deterministic batches and call
 `persistArchivalImport()` once per batch with the same caller-supplied
 `storeNamespace`, the same acquisition limits, and any explicit persistence
 limits. Each batch is one atomic Durable commit.
@@ -120,9 +179,14 @@ limits. Each batch is one atomic Durable commit.
   or record-schema version is an explicit conflict. Nothing is overwritten,
   silently superseded, or duplicated. The report returns the conflict reason
   and opaque source ID.
-- A failure aborts the current batch. Earlier batches remain committed and
-  atomic; a rerun resolves them idempotently. The module does not retry the
-  failed batch itself.
+- Limit, capacity, namespace, omitted-source, and ledger-metadata conflicts are
+  preflighted before any batch write. A persistence commit failure still aborts
+  the current batch after earlier batches were committed; those remain atomic,
+  and a rerun resolves them idempotently. The module does not retry the failed
+  batch itself.
+- `writesPerformed` means this run committed at least one new archival source.
+  It does not describe database creation/migration, the lock, or chmod; those
+  are described by the destination summary.
 
 If any batch is blocked, the report still reads the bounded ledger when the
 session is usable, so the operator can see what was already persisted. Search
@@ -153,7 +217,10 @@ narrower query/source scope; continuations are not a rehearsal artifact.
 Search hits contain private snippets and allowlisted metadata (session key,
 timestamps, roles, entry IDs, source labels), never `rawLineBase64`, provider
 continuation state, header metadata, quarantine bytes, or model/task content.
-`contentExposed` is true when non-empty search results are included.
+When search is requested, the report also echoes the caller-supplied query text
+and query metadata inside `search.query`; without search, no query text is
+present. A report carrying search hits is therefore sensitive. `contentExposed`
+is true when non-empty search results are included.
 
 ## Report shape and privacy
 
@@ -162,8 +229,11 @@ Reports contain:
 - `status`: `dry-run`, `applied`, `already-applied`, or `blocked`;
 - acquisition summary (completeness, surfaces, missing surfaces, counts, stable
   diagnostics, opaque source labels);
+- acknowledged missing surfaces;
 - destination summary (`label` is a hash, `databaseOpened`, `lockAcquired`,
-  `durability`);
+  `durability`, `databaseMode`, `walShmMode`);
+- `privacyLimitations` when post-close database/sidecar privacy cannot be fully
+  verified;
 - per-batch preparation/persistence summaries, counts, and per-source results;
 - bounded ledger summary;
 - optional bounded search result;
@@ -174,7 +244,8 @@ Reports never include filesystem paths, OS error messages, record content,
 `rawLineBase64`, or provider/quarantine bytes. Typed errors from the composed
 modules are reduced to stable codes. `pathsExposed` and
 `rawArchivalBytesExposed` are always false. `contentExposed` is true only when
-non-empty search results were explicitly requested.
+non-empty search results were explicitly requested; those results and the query
+text are private.
 
 Search results, ledger rows, snippets, session keys, timestamps, and source
 labels remain private archival material. Do not log, publish, or attach them to
@@ -194,7 +265,10 @@ bug reports.
   against privileged concurrent writers or unreliable filesystem metadata.
 - The lock/path boundary matches the Gateway's enforced boundary, but a
   privileged race between the final check and SQLite open is not defended
-  against. Do not run this against live data or a shared destination.
+  against. Hardlinks and sidecar symlinks are rejected, and `0600` is enforced
+  before archival writes; an external actor that can replace files between
+  checks is outside this boundary. Do not run this against live data or a
+  shared destination.
 - This rehearsal does not authorize a real import.
 
 ## Tests
@@ -208,10 +282,16 @@ directories and SQLite databases only. It covers:
 - search input failure reported as a blocker;
 - idempotent reruns across one-source batches and stable conversation IDs;
 - changed-digest and changed-namespace conflict reporting without overwrite;
-- incomplete acquisition (symlink candidate), missing surfaces, and no-source
-  root with no destination write;
-- non-private, symlinked, overlapping, symlinked-database, and lock-held
-  destinations, plus `.nanobot`-component source/destination refusal;
+- incomplete acquisition (symlink candidate), missing surfaces, no-source
+  root, and apply blocked until every missing surface is acknowledged;
+- non-private, symlinked, overlapping, symlinked-database, hardlinked-database
+  (before and after the lock), symlinked WAL/SHM, and lock-held destinations,
+  plus `.nanobot`-component source/destination refusal;
+- database `0600` enforcement under umask 0;
+- stale-ledger rerun (source removed from the snapshot) blocked instead of
+  reported as already-applied;
+- preparation, persistence, and ledger-capacity preflight blocking before any
+  batch write, including a 513-source ledger overflow with zero conversations;
 - a mid-SQLite-commit storage failure that leaves no ledger, conversation,
   entry, document, task, or submission behind, followed by a clean rerun;
 - invalid option shape with no path echo.

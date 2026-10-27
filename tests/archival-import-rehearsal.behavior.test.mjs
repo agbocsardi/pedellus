@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { cp, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, link, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -105,6 +105,20 @@ async function tableCount(database, table) {
   } catch {
     return 0;
   }
+}
+
+async function instrumentedRehearsal(t, replacements) {
+  const temporary = await mkdtemp(join(packageRoot, ".rehearsal-instrument-"));
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+  await cp(join(packageRoot, "dist"), join(temporary, "dist"), { recursive: true });
+  const modulePath = join(temporary, "dist/archival-rehearsal/index.js");
+  let source = await readFile(modulePath, "utf8");
+  for (const [from, to] of replacements) {
+    assert.equal(source.includes(from), true, `missing instrumentation marker: ${from}`);
+    source = source.replace(from, to);
+  }
+  await writeFile(modulePath, source);
+  return modulePath;
 }
 
 test("dry-run acquires and prepares the explicit copy without opening the destination", async (t) => {
@@ -291,6 +305,7 @@ test("changed snapshot bytes and a changed namespace are reported as conflicts w
   assert.equal(changed.ledger.sources.find((source) => source.sourceId === sessionSource.sourceId).sha256,
     sessionSource.sha256);
 
+  await writeFile(join(fixture.sourceRoot, "sessions/s1.jsonl"), sessionText);
   const namespaceConflict = await runArchivalImportRehearsal({
     ...fixture.options,
     storeNamespace: "different-synthetic-store",
@@ -298,10 +313,9 @@ test("changed snapshot bytes and a changed namespace are reported as conflicts w
   }, context);
   assert.equal(namespaceConflict.status, "blocked");
   assert.equal(namespaceConflict.blockers.length, 1);
-  assert.equal(namespaceConflict.blockers[0].code, "persistence-conflict-namespace");
+  assert.equal(namespaceConflict.blockers[0].code, "ledger-namespace-mismatch");
   assert.equal(namespaceConflict.ledger.storeNamespace, fixture.options.storeNamespace);
 
-  await writeFile(join(fixture.sourceRoot, "sessions/s1.jsonl"), sessionText);
   const after = await runArchivalImportRehearsal({ ...fixture.options, apply: true }, context);
   assert.equal(after.status, "already-applied");
   assert.equal(after.ledger.sources.length, 3);
@@ -466,7 +480,7 @@ test("a mid-commit storage failure rolls back the destination database", async (
     const report = await instrumentedRun({ ...fixture.options, apply: true }, context);
     assert.equal(report.status, "blocked");
     assert.equal(report.destination.databaseOpened, true);
-    assert.equal(report.ledger, null);
+    assert.equal(report.ledger.present, false);
     assert.equal(report.blockers.some((blocker) => blocker.stage === "persistence"), true);
   } finally {
     globalThis.__rehearsalStorageHook = undefined;
@@ -553,4 +567,221 @@ test("paths with a .nanobot component are refused before acquisition or writes",
   assert.equal(destinationReport.blockers.some((blocker) => blocker.code === "destination-invalid" ||
     blocker.code === "destination-restricted"), true);
   assert.deepEqual(await readdir(restrictedDestination), []);
+});
+
+test("apply requires explicit per-surface acknowledgement when a known surface is missing", async (t) => {
+  const fixture = await makeFixture(t, { history: false, archive: false });
+  const blocked = await runArchivalImportRehearsal({ ...fixture.options, apply: true }, context);
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.destination.databaseOpened, false);
+  assert.deepEqual(blocked.blockers.map((blocker) => blocker.code), ["missing-surfaces-not-acknowledged"]);
+  assert.deepEqual([...blocked.source.expectedSurfacesMissing].sort(), ["archive", "history", "memory"]);
+  assert.deepEqual(await readdir(fixture.destinationDir), []);
+
+  const partialAck = await runArchivalImportRehearsal({
+    ...fixture.options,
+    apply: true,
+    acknowledgeMissingSurfaces: ["archive"],
+  }, context);
+  assert.equal(partialAck.status, "blocked");
+  assert.deepEqual(partialAck.blockers.map((blocker) => blocker.code), ["missing-surfaces-not-acknowledged"]);
+  assert.deepEqual(partialAck.acknowledgedMissingSurfaces, ["archive"]);
+  assert.deepEqual(await readdir(fixture.destinationDir), []);
+
+  const acknowledged = await runArchivalImportRehearsal({
+    ...fixture.options,
+    apply: true,
+    acknowledgeMissingSurfaces: ["archive", "memory", "history"],
+  }, context);
+  assert.equal(acknowledged.status, "applied");
+  assert.equal(acknowledged.ledger.sourceCount, 1);
+  assert.deepEqual([...acknowledged.acknowledgedMissingSurfaces].sort(), ["archive", "history", "memory"]);
+  assert.deepEqual(acknowledged.blockers, []);
+
+  const dry = await runArchivalImportRehearsal(fixture.options, context);
+  assert.equal(dry.status, "dry-run");
+  assert.deepEqual([...dry.source.expectedSurfacesMissing].sort(), ["archive", "history", "memory"]);
+
+  await assert.rejects(
+    runArchivalImportRehearsal({
+      ...fixture.options,
+      apply: true,
+      acknowledgeMissingSurfaces: ["not-a-surface"],
+    }, context),
+    /acknowledged surface is invalid/,
+  );
+});
+
+test("an existing hardlinked destination database is rejected before and after the lock", async (t) => {
+  const fixture = await makeFixture(t);
+  const outside = join(fixture.base, "outside-notes.txt");
+  await writeFile(outside, "user notes that must not change\n");
+  const databasePath = join(fixture.destinationDir, "nanobot.sqlite");
+  await link(outside, databasePath);
+
+  const before = await readFile(outside, "utf8");
+  const blocked = await runArchivalImportRehearsal({ ...fixture.options, apply: true }, context);
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.destination.databaseOpened, false);
+  assert.equal(blocked.blockers.some((blocker) => blocker.code === "destination-database-hardlink"), true);
+  assert.equal(await readFile(outside, "utf8"), before);
+  assert.deepEqual(await readdir(fixture.destinationDir), ["nanobot.sqlite"]);
+  assert.equal((await lstat(databasePath)).nlink, 2);
+  await rm(databasePath, { force: true });
+
+  // Force the hardlink to appear only after the pre-lock check: the post-lock
+  // check must reject it with the same stable code.
+  const outsideLate = join(fixture.base, "late-outside.txt");
+  await writeFile(outsideLate, "late user notes\n");
+  const modulePath = await instrumentedRehearsal(t, [[
+    "const postLockPathBlockers = await databasePathBlockers(paths.databasePath);",
+    "await globalThis.__rehearsalAfterLockHook?.(paths.databasePath);\n    const postLockPathBlockers = await databasePathBlockers(paths.databasePath);",
+  ]]);
+  let hookRan = false;
+  globalThis.__rehearsalAfterLockHook = async (path) => {
+    hookRan = true;
+    await link(outsideLate, path);
+  };
+  try {
+    const { runArchivalImportRehearsal: instrumentedRun } = await import(
+      `${pathToFileURL(modulePath).href}?hardlink=${Date.now()}`
+    );
+    const late = await instrumentedRun({ ...fixture.options, apply: true }, context);
+    assert.equal(hookRan, true);
+    assert.equal(late.status, "blocked");
+    assert.equal(late.destination.lockAcquired, true);
+    assert.equal(late.destination.databaseOpened, false);
+    assert.equal(late.blockers.some((blocker) => blocker.code === "destination-database-hardlink"), true);
+    assert.equal(await readFile(outsideLate, "utf8"), "late user notes\n");
+  } finally {
+    globalThis.__rehearsalAfterLockHook = undefined;
+  }
+});
+
+test("pre-planted symlinked WAL/SHM sidecars are rejected before opening the database", async (t) => {
+  for (const suffix of ["-wal", "-shm"]) {
+    const fixture = await makeFixture(t);
+    const outside = join(fixture.base, `outside${suffix}.sqlite`);
+    await writeFile(outside, "OUTSIDE-PLACEHOLDER");
+    await symlink(outside, join(fixture.destinationDir, `nanobot.sqlite${suffix}`));
+    const blocked = await runArchivalImportRehearsal({ ...fixture.options, apply: true }, context);
+    assert.equal(blocked.status, "blocked", suffix);
+    assert.equal(blocked.destination.databaseOpened, false, suffix);
+    assert.equal(blocked.blockers.some((blocker) => blocker.code === "destination-wal-shm-unsafe"), true, suffix);
+    assert.equal(await readFile(outside, "utf8"), "OUTSIDE-PLACEHOLDER", suffix);
+  }
+});
+
+test("apply makes the database 0600 even under umask 0", async (t) => {
+  const fixture = await makeFixture(t);
+  const prior = process.umask(0);
+  let report;
+  try {
+    report = await runArchivalImportRehearsal({ ...fixture.options, apply: true }, context);
+  } finally {
+    process.umask(prior);
+  }
+  assert.equal(report.status, "applied");
+  assert.equal(report.destination.databaseMode, "0600");
+  assert.equal(["private-0600", "absent"].includes(report.destination.walShmMode), true);
+  assert.deepEqual(report.privacyLimitations, []);
+  const databasePath = join(fixture.destinationDir, "nanobot.sqlite");
+  assert.equal((await stat(databasePath)).mode & 0o777, 0o600);
+  for (const name of await readdir(fixture.destinationDir)) {
+    const mode = (await stat(join(fixture.destinationDir, name))).mode & 0o777;
+    assert.equal(mode, 0o600, name);
+  }
+});
+
+test("a stale ledger source missing from the snapshot blocks instead of reporting already-applied", async (t) => {
+  const fixture = await makeFixture(t);
+  const first = await runArchivalImportRehearsal({ ...fixture.options, apply: true }, context);
+  assert.equal(first.status, "applied");
+  const removed = first.ledger.sources.find((source) => source.format === "session-archive-jsonl");
+  assert.ok(removed);
+  const database = new DatabaseSync(join(fixture.destinationDir, "nanobot.sqlite"));
+  const conversationsBefore = await tableCount(database, "conversations");
+  const entriesBefore = await tableCount(database, "entries");
+  database.close();
+
+  await rm(join(fixture.sourceRoot, "sessions/archive/k1/a1.jsonl"));
+  const stale = await runArchivalImportRehearsal({ ...fixture.options, apply: true }, context);
+  assert.equal(stale.status, "blocked");
+  assert.equal(stale.writesPerformed, false);
+  assert.equal(stale.ledger.sourceCount, 3);
+  assert.deepEqual(
+    stale.blockers.filter((blocker) => blocker.code === "ledger-source-not-in-snapshot")
+      .map((blocker) => blocker.sourceId),
+    [removed.sourceId],
+  );
+  const after = new DatabaseSync(join(fixture.destinationDir, "nanobot.sqlite"));
+  try {
+    assert.equal(await tableCount(after, "conversations"), conversationsBefore);
+    assert.equal(await tableCount(after, "entries"), entriesBefore);
+  } finally {
+    after.close();
+  }
+});
+
+test("limit and ledger-capacity violations are blocked before any batch write", async (t) => {
+  const many = async (count) => {
+    const fixture = await makeFixture(t, { history: false, archive: false });
+    for (let index = 1; index < count; index += 1) {
+      await writeFile(join(fixture.sourceRoot, `sessions/s${String(index).padStart(3, "0")}.jsonl`),
+        `${JSON.stringify({ role: "user", content: `synthetic ${index}` })}\n`);
+    }
+    return fixture;
+  };
+
+  const preparationLimit = await many(40);
+  const prepBlocked = await runArchivalImportRehearsal({
+    ...preparationLimit.options,
+    apply: true,
+    acknowledgeMissingSurfaces: ["archive", "history", "memory"],
+    acquisitionLimits: { maxSourcesPerBatch: 33 },
+  }, context);
+  assert.equal(prepBlocked.status, "blocked");
+  assert.equal(prepBlocked.destination.databaseOpened, false);
+  assert.equal(prepBlocked.blockers.some((blocker) => blocker.code === "preparation-bound-exceeded"), true);
+  assert.deepEqual(await readdir(preparationLimit.destinationDir), []);
+
+  const persistenceLimit = await many(40);
+  const persistBlocked = await runArchivalImportRehearsal({
+    ...persistenceLimit.options,
+    apply: true,
+    acknowledgeMissingSurfaces: ["archive", "history", "memory"],
+    acquisitionLimits: { maxSourcesPerBatch: 33 },
+    preparation: { limits: { maxSources: 128 } },
+  }, context);
+  assert.equal(persistBlocked.status, "blocked");
+  assert.equal(persistBlocked.destination.databaseOpened, false);
+  assert.equal(persistBlocked.blockers.some(
+    (blocker) => blocker.code === "persistence-preflight-max-sources"), true);
+  assert.deepEqual(await readdir(persistenceLimit.destinationDir), []);
+
+  const capacity = await many(513);
+  const capacityOptions = {
+    ...capacity.options,
+    apply: true,
+    acknowledgeMissingSurfaces: ["archive", "history", "memory"],
+    acquisitionLimits: { maxSources: 600, maxSourcesPerBatch: 128 },
+    preparation: { limits: { maxSources: 128 } },
+    persistenceLimits: { maxSources: 128 },
+  };
+  const capacityBlocked = await runArchivalImportRehearsal(capacityOptions, context);
+  assert.equal(capacityBlocked.status, "blocked");
+  assert.equal(capacityBlocked.destination.databaseOpened, true);
+  assert.equal(capacityBlocked.writesPerformed, false);
+  assert.equal(capacityBlocked.blockers.some((blocker) => blocker.code === "ledger-capacity-exceeded"), true);
+  assert.equal(capacityBlocked.ledger.present, false);
+  const capacityDb = new DatabaseSync(join(capacity.destinationDir, "nanobot.sqlite"));
+  try {
+    assert.equal(await tableCount(capacityDb, "conversations"), 0);
+    assert.equal(await tableCount(capacityDb, "entries"), 0);
+  } finally {
+    capacityDb.close();
+  }
+  const rerun = await runArchivalImportRehearsal(capacityOptions, context);
+  assert.equal(rerun.status, "blocked");
+  assert.equal(rerun.blockers.some((blocker) => blocker.code === "ledger-capacity-exceeded"), true);
 });

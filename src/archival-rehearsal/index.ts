@@ -9,10 +9,13 @@
  *
  * It adds an explicit, private destination directory, the Gateway's process
  * lock, WAL/FULL storage opening, source/destination/workspace disjointness,
- * and a dry-run default. It never discovers a live Python store, opens the
- * network, creates a model/provider/task/submission, resumes a session, or
- * replays archived data. The source root and destination directory are always
- * caller-supplied; nothing is inferred.
+ * hardlink/sidecar rejection, private file modes, a dry-run default, and
+ * preflight of preparation/persistence bounds and ledger capacity. A missing
+ * known surface requires explicit per-surface acknowledgement before apply. It
+ * never discovers a live Python store, opens the network, creates a
+ * model/provider/task/submission, resumes a session, or replays archived data.
+ * The source root and destination directory are always caller-supplied;
+ * nothing is inferred.
  *
  * A dry-run reads the source copy and prepares it in memory, but does not
  * open, create, migrate, or lock the destination database. `apply: true` is the
@@ -26,7 +29,7 @@
  */
 import { createHash } from "node:crypto";
 import { realpathSync, type Stats } from "node:fs";
-import { lstat, realpath } from "node:fs/promises";
+import { chmod, lstat, realpath } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Context } from "@earendil-works/chord";
@@ -38,7 +41,6 @@ import {
   ArchivalSourceBoundsError,
   ArchivalSourceInputError,
   ArchivalSourcePlatformError,
-  prepareAcquiredArchivalImport,
   type ArchivalSourceAcquisitionLimits,
   type ArchivalSourceAcquisitionReport,
   type ArchivalSourceDiagnostic,
@@ -48,13 +50,18 @@ import {
 import {
   ArchivalPreparationBoundsError,
   ArchivalPreparationInputError,
+  prepareArchivalImport,
   type ArchivalPreparationOptions,
+  type ArchivalPreparationReport,
+  type ArchivalSourcePreparation,
 } from "../archival-import/index.js";
 import {
   ArchivalPersistenceBoundsError,
   ArchivalPersistenceConflictError,
   ArchivalPersistenceCorruptionError,
   ArchivalPersistenceInputError,
+  ARCHIVAL_PERSISTENCE_LIMITS,
+  ARCHIVAL_RECORD_SCHEMA_VERSION,
   persistArchivalImport,
   readArchivalImportLedger,
   type ArchivalLedgerSource,
@@ -119,6 +126,12 @@ export interface ArchivalRehearsalOptions {
   readonly persistenceLimits?: Partial<ArchivalPersistenceLimits>;
   /** Forwarded to the existing preparation step. */
   readonly preparation?: ArchivalPreparationOptions;
+  /**
+   * Explicit per-surface attestation required for apply when a known optional
+   * surface (`sessions`, `archive`, `memory`, `history`) is missing from the
+   * copy. Dry-run exposes the missing surfaces without requiring this.
+   */
+  readonly acknowledgeMissingSurfaces?: readonly ArchivalSourceSurfaceName[];
   /** Optional one-page search, executed in the same lock/session after apply. */
   readonly search?: ArchivalRehearsalSearchOptions;
 }
@@ -160,6 +173,20 @@ export interface ArchivalRehearsalSourceSummary {
   readonly batches: number;
 }
 
+export interface ArchivalRehearsalPreparedSource {
+  readonly sourceId: string;
+  readonly format: string;
+  readonly provenance: string;
+  readonly byteLength: number;
+  readonly sha256: string;
+  readonly status: "complete" | "incomplete" | "unsupported";
+  readonly lineCount: number | null;
+  readonly recordsEmitted: number;
+  readonly searchUnitsEmitted: number;
+  readonly preparationFormat: string;
+  readonly preparationVersion: number;
+}
+
 export interface ArchivalRehearsalPreparationSummary {
   readonly format: string;
   readonly version: number;
@@ -167,17 +194,7 @@ export interface ArchivalRehearsalPreparationSummary {
   readonly recordsPrepared: number;
   readonly quarantinedRecords: number;
   readonly diagnostics: number;
-  readonly sources: readonly Readonly<{
-    readonly sourceId: string;
-    readonly format: string;
-    readonly provenance: string;
-    readonly byteLength: number;
-    readonly sha256: string;
-    readonly status: "complete" | "incomplete" | "unsupported";
-    readonly lineCount: number | null;
-    readonly recordsEmitted: number;
-    readonly searchUnitsEmitted: number;
-  }>[];
+  readonly sources: readonly ArchivalRehearsalPreparedSource[];
 }
 
 export interface ArchivalRehearsalPersistenceSummary {
@@ -221,6 +238,9 @@ export interface ArchivalRehearsalLedgerSummary {
     readonly byteLength: number;
     readonly lineCount: number | null;
     readonly preparationStatus: "complete" | "incomplete" | "unsupported";
+    readonly preparationFormat: string;
+    readonly preparationVersion: number;
+    readonly recordSchemaVersion: number;
     readonly recordCount: number;
     readonly searchUnitCount: number;
     readonly conversationId: number | null;
@@ -242,19 +262,28 @@ export interface ArchivalRehearsalReport {
   readonly status: ArchivalRehearsalStatus;
   readonly storeNamespace: string;
   readonly source: ArchivalRehearsalSourceSummary | null;
+  /** Missing surfaces the operator explicitly accepted for this apply. */
+  readonly acknowledgedMissingSurfaces: readonly ArchivalSourceSurfaceName[];
   readonly destination: Readonly<{
     /** Stable hash label; never the destination path. */
     readonly label: string;
     readonly databaseOpened: boolean;
     readonly lockAcquired: boolean;
     readonly durability: "wal-full" | "not-opened" | "not-verified";
+    /** Database file mode after apply; "not-verified" means no privacy guarantee. */
+    readonly databaseMode: "0600" | "not-opened" | "not-verified";
+    /** WAL/SHM/journal sidecar policy after apply. */
+    readonly walShmMode: "private-0600" | "absent" | "not-opened" | "not-verified";
   }>;
   readonly batches: readonly ArchivalRehearsalBatchResult[];
   readonly ledger: ArchivalRehearsalLedgerSummary | null;
   /** One bounded page, only when explicitly requested by the caller. */
   readonly search: ArchivalRehearsalSearchResult | null;
   readonly blockers: readonly ArchivalRehearsalBlocker[];
+  /** True only when this run committed at least one new archival source. */
   readonly writesPerformed: boolean;
+  /** Non-empty when destination privacy could not be fully verified after close. */
+  readonly privacyLimitations: readonly string[];
   readonly pathsExposed: false;
   readonly contentExposed: boolean;
   readonly rawArchivalBytesExposed: false;
@@ -280,12 +309,16 @@ export class ArchivalRehearsalInputError extends TypeError {
 
 const LIMITATIONS: readonly string[] = Object.freeze([
   "The caller must point at an operator-supplied synthetic or quiescent copy; this module cannot prove quiescence or synthetic provenance.",
+  "Apply requires explicit acknowledgement of each known surface missing from the snapshot; dry-run only reports them.",
   "The source copy is read through the existing no-follow acquisition boundary; live ~/.nanobot and home roots are refused there.",
   "The destination is an explicit private directory; the database is opened with the Gateway's process lock and WAL/FULL durability.",
+  "The destination database and WAL/SHM/journal sidecars must be single-link regular files; hardlinks, symlinks, and specials are rejected.",
+  "Database/sidecar mode 0600 is enforced before archival writes and rechecked after close without chmodding external hardlinks; residual exposure is reported.",
   "Dry-run performs no destination open, lock, migration, or write. Apply writes only the supplied snapshot bytes to the destination database.",
   "Imports are batched; each batch is atomic. A rerun is idempotent per source identity (storeNamespace, sourceId, sha256).",
+  "Preparation, per-batch persistence bounds, ledger conflicts, and ledger capacity are preflighted before the first batch write.",
   "Changed digests, namespaces, formats, provenance, or preparation/schema versions are conflicts that require operator reconciliation; they are never overwritten.",
-  "Reports contain stable codes and opaque labels, not paths or content. Search hits, when requested, contain private snippets and allowlisted metadata.",
+  "Reports contain stable codes and opaque labels, not paths or content. Search hits and their echoed query text, when requested, are private.",
   "No model/provider entry, task, submission, session-map update, cursor advance, Python resume, or replay is created.",
   "This rehearsal does not authorize a real import or a production retention/backup policy.",
 ]);
@@ -321,6 +354,7 @@ interface NormalizedRehearsalOptions {
   readonly acquisitionLimits: Partial<ArchivalSourceAcquisitionLimits> | undefined;
   readonly persistenceLimits: Partial<ArchivalPersistenceLimits> | undefined;
   readonly preparation: ArchivalPreparationOptions | undefined;
+  readonly acknowledgeMissingSurfaces: readonly ArchivalSourceSurfaceName[] | undefined;
   readonly search: ArchivalRehearsalSearchOptions | undefined;
 }
 
@@ -337,6 +371,7 @@ function readOptions(options: unknown): NormalizedRehearsalOptions {
     "acquisitionLimits",
     "persistenceLimits",
     "preparation",
+    "acknowledgeMissingSurfaces",
     "search",
   ]);
   for (const key of Object.keys(options)) {
@@ -373,6 +408,23 @@ function readOptions(options: unknown): NormalizedRehearsalOptions {
   if (options.preparation !== undefined && !isRecord(options.preparation)) {
     throw new ArchivalRehearsalInputError("Archival rehearsal preparation must be an object");
   }
+  let acknowledgeMissingSurfaces: readonly ArchivalSourceSurfaceName[] | undefined;
+  if (options.acknowledgeMissingSurfaces !== undefined) {
+    if (!Array.isArray(options.acknowledgeMissingSurfaces)) {
+      throw new ArchivalRehearsalInputError("Archival rehearsal acknowledgeMissingSurfaces must be an array");
+    }
+    const known = new Set<ArchivalSourceSurfaceName>(["sessions", "archive", "memory", "history"]);
+    const acknowledged: ArchivalSourceSurfaceName[] = [];
+    for (const surface of options.acknowledgeMissingSurfaces) {
+      if (typeof surface !== "string" || !known.has(surface as ArchivalSourceSurfaceName)) {
+        throw new ArchivalRehearsalInputError("Archival rehearsal acknowledged surface is invalid");
+      }
+      if (!acknowledged.includes(surface as ArchivalSourceSurfaceName)) {
+        acknowledged.push(surface as ArchivalSourceSurfaceName);
+      }
+    }
+    acknowledgeMissingSurfaces = acknowledged;
+  }
   if (options.search !== undefined) {
     if (!isRecord(options.search)) {
       throw new ArchivalRehearsalInputError("Archival rehearsal search must be an object");
@@ -398,6 +450,7 @@ function readOptions(options: unknown): NormalizedRehearsalOptions {
     acquisitionLimits: options.acquisitionLimits as Partial<ArchivalSourceAcquisitionLimits> | undefined,
     persistenceLimits: options.persistenceLimits as Partial<ArchivalPersistenceLimits> | undefined,
     preparation: options.preparation as ArchivalPreparationOptions | undefined,
+    acknowledgeMissingSurfaces,
     search: options.search as ArchivalRehearsalSearchOptions | undefined,
   };
 }
@@ -524,16 +577,7 @@ async function validatePaths(
     blockers.push({ stage: "destination", code: "destination-workspace-overlap" });
   }
   const databasePath = resolve(destination.path, DATABASE_FILE);
-  try {
-    const databaseStatus = await lstat(databasePath);
-    if (databaseStatus.isSymbolicLink() || !databaseStatus.isFile()) {
-      blockers.push({ stage: "destination", code: "destination-database-unsafe" });
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      blockers.push({ stage: "destination", code: "destination-database-unreadable" });
-    }
-  }
+  blockers.push(...await databasePathBlockers(databasePath));
   return {
     paths: blockers.length === 0
       ? { sourceRoot: source.path, destinationDir: destination.path, workspace: workspaceDirectory.path, databasePath }
@@ -544,6 +588,297 @@ async function validatePaths(
 
 function realpathSyncHome(path: string): string {
   return realpathSync(path);
+}
+
+const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"] as const;
+
+function pushBlocker(blockers: ArchivalRehearsalBlocker[], blocker: ArchivalRehearsalBlocker): void {
+  if (!blockers.some((existing) => existing.stage === blocker.stage &&
+    existing.code === blocker.code && existing.sourceId === blocker.sourceId)) {
+    blockers.push(blocker);
+  }
+}
+
+/** Existing database and sidecar identity checks used before and after the lock. */
+async function databasePathBlockers(databasePath: string): Promise<ArchivalRehearsalBlocker[]> {
+  const blockers: ArchivalRehearsalBlocker[] = [];
+  try {
+    const status = await lstat(databasePath);
+    if (status.isSymbolicLink() || !status.isFile()) {
+      blockers.push({ stage: "destination", code: "destination-database-unsafe" });
+    } else if (status.nlink !== 1) {
+      blockers.push({ stage: "destination", code: "destination-database-hardlink" });
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      blockers.push({ stage: "destination", code: "destination-database-unreadable" });
+    }
+  }
+  for (const suffix of SIDECAR_SUFFIXES) {
+    try {
+      const status = await lstat(`${databasePath}${suffix}`);
+      if (status.isSymbolicLink() || !status.isFile() || status.nlink !== 1) {
+        blockers.push({ stage: "destination", code: "destination-wal-shm-unsafe" });
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        blockers.push({ stage: "destination", code: "destination-wal-shm-unreadable" });
+      }
+    }
+  }
+  return blockers;
+}
+
+/** Make the database and any existing sidecars owner-only before archival writes. */
+async function ensurePrivateDatabaseFiles(databasePath: string): Promise<{
+  blockers: ArchivalRehearsalBlocker[];
+  databaseMode: "0600" | "not-verified";
+  walShmMode: "private-0600" | "absent" | "not-verified";
+}> {
+  const blockers: ArchivalRehearsalBlocker[] = [];
+  let databaseMode: "0600" | "not-verified" = "not-verified";
+  try {
+    const status = await lstat(databasePath);
+    if (status.isSymbolicLink() || !status.isFile()) {
+      blockers.push({ stage: "destination", code: "destination-database-unsafe" });
+    } else if (status.nlink !== 1) {
+      blockers.push({ stage: "destination", code: "destination-database-hardlink" });
+    } else {
+      await chmod(databasePath, 0o600);
+      databaseMode = "0600";
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      blockers.push({ stage: "destination", code: "destination-database-missing" });
+    } else {
+      blockers.push({ stage: "destination", code: "destination-database-permissions" });
+    }
+  }
+
+  let sidecars = 0;
+  let sidecarsVerified = true;
+  for (const suffix of SIDECAR_SUFFIXES) {
+    const path = `${databasePath}${suffix}`;
+    try {
+      const status = await lstat(path);
+      sidecars += 1;
+      if (status.isSymbolicLink() || !status.isFile() || status.nlink !== 1) {
+        blockers.push({ stage: "destination", code: "destination-wal-shm-unsafe" });
+        sidecarsVerified = false;
+        continue;
+      }
+      await chmod(path, 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        blockers.push({ stage: "destination", code: "destination-wal-shm-permissions" });
+        sidecarsVerified = false;
+      }
+    }
+  }
+  return {
+    blockers,
+    databaseMode,
+    walShmMode: sidecars === 0 ? "absent" : sidecarsVerified ? "private-0600" : "not-verified",
+  };
+}
+
+/**
+ * Recheck identity and mode after close. Never chmod a symlink or a file with
+ * extra hard links; report the residual exposure instead.
+ */
+async function finalizeDatabasePrivacy(databasePath: string): Promise<{
+  databaseMode: "0600" | "not-verified";
+  walShmMode: "private-0600" | "absent" | "not-verified";
+  privacyLimitations: string[];
+}> {
+  const privacyLimitations: string[] = [];
+  let databaseMode: "0600" | "not-verified" = "not-verified";
+  try {
+    const status = await lstat(databasePath);
+    if (!status.isSymbolicLink() && status.isFile() && status.nlink === 1) {
+      await chmod(databasePath, 0o600);
+      databaseMode = "0600";
+    }
+  } catch {
+    // Reported below as not verified.
+  }
+  if (databaseMode !== "0600") {
+    privacyLimitations.push("Destination database privacy could not be verified after close; treat it as exposed.");
+  }
+
+  let sidecars = 0;
+  let sidecarsVerified = true;
+  for (const suffix of SIDECAR_SUFFIXES) {
+    const path = `${databasePath}${suffix}`;
+    try {
+      const status = await lstat(path);
+      sidecars += 1;
+      if (status.isSymbolicLink() || !status.isFile() || status.nlink !== 1) {
+        sidecarsVerified = false;
+        continue;
+      }
+      await chmod(path, 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") sidecarsVerified = false;
+    }
+  }
+  if (sidecars > 0 && !sidecarsVerified) {
+    privacyLimitations.push("WAL/SHM/journal sidecars could not be verified private; treat the destination as exposed.");
+  }
+  return {
+    databaseMode,
+    walShmMode: sidecars === 0 ? "absent" : sidecarsVerified ? "private-0600" : "not-verified",
+    privacyLimitations,
+  };
+}
+
+function effectivePersistenceLimits(overrides: Partial<ArchivalPersistenceLimits> | undefined):
+ArchivalPersistenceLimits | null {
+  const effective: Record<string, number> = { ...ARCHIVAL_PERSISTENCE_LIMITS };
+  if (overrides === undefined) return effective as unknown as ArchivalPersistenceLimits;
+  for (const [key, value] of Object.entries(overrides)) {
+    if (!Object.hasOwn(ARCHIVAL_PERSISTENCE_LIMITS, key)) return null;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return null;
+    effective[key] = value;
+  }
+  return effective as unknown as ArchivalPersistenceLimits;
+}
+
+interface BatchPreflight {
+  readonly blockers: ArchivalRehearsalBlocker[];
+  readonly summaries: readonly (ArchivalRehearsalPreparationSummary | null)[];
+  readonly preparedSources: readonly ArchivalRehearsalPreparedSource[];
+  readonly persistenceLimits: ArchivalPersistenceLimits | null;
+}
+
+/** Pure preflight: preparation, persistence per-batch bounds, and summaries before any lock/write. */
+function preflightBatches(
+  acquisition: ArchivalSourceAcquisitionReport,
+  options: NormalizedRehearsalOptions,
+): BatchPreflight {
+  const blockers: ArchivalRehearsalBlocker[] = [];
+  const summaries: (ArchivalRehearsalPreparationSummary | null)[] = [];
+  const preparedSources: ArchivalRehearsalPreparedSource[] = [];
+  const persistenceLimits = effectivePersistenceLimits(options.persistenceLimits);
+  if (persistenceLimits === null) {
+    blockers.push({ stage: "persistence", code: "persistence-input-invalid" });
+  }
+
+  for (const batch of acquisition.batches) {
+    let prepared: ArchivalPreparationReport;
+    try {
+      prepared = prepareArchivalImport({
+        storeNamespace: options.storeNamespace,
+        sources: batch.sources,
+      }, options.preparation ?? {});
+    } catch (error) {
+      pushBlocker(blockers, blockerFor(error, "preparation"));
+      summaries.push(null);
+      continue;
+    }
+    const summary = preparationSummary(prepared);
+    summaries.push(summary);
+    preparedSources.push(...summary.sources);
+    if (persistenceLimits === null) continue;
+
+    if (batch.sources.length > persistenceLimits.maxSources) {
+      pushBlocker(blockers, { stage: "persistence", code: "persistence-preflight-max-sources" });
+    }
+    if (batch.totalBytes > persistenceLimits.maxRawBytes) {
+      pushBlocker(blockers, { stage: "persistence", code: "persistence-preflight-max-raw-bytes" });
+    }
+    let records = 0;
+    let searchUnits = 0;
+    for (const source of summary.sources) {
+      records += source.recordsEmitted;
+      searchUnits += source.searchUnitsEmitted;
+      if (source.byteLength > persistenceLimits.maxRawBytesPerSource) {
+        pushBlocker(blockers, {
+          stage: "persistence",
+          code: "persistence-preflight-max-raw-bytes-per-source",
+          sourceId: source.sourceId,
+        });
+      }
+      if (source.recordsEmitted > persistenceLimits.maxRecordsPerSource) {
+        pushBlocker(blockers, {
+          stage: "persistence",
+          code: "persistence-preflight-max-records-per-source",
+          sourceId: source.sourceId,
+        });
+      }
+      if (source.searchUnitsEmitted > persistenceLimits.maxSearchUnitsPerSource) {
+        pushBlocker(blockers, {
+          stage: "persistence",
+          code: "persistence-preflight-max-search-units-per-source",
+          sourceId: source.sourceId,
+        });
+      }
+    }
+    if (records > persistenceLimits.maxRecords) {
+      pushBlocker(blockers, { stage: "persistence", code: "persistence-preflight-max-records" });
+    }
+    if (searchUnits > persistenceLimits.maxSearchUnits) {
+      pushBlocker(blockers, { stage: "persistence", code: "persistence-preflight-max-search-units" });
+    }
+  }
+  return { blockers, summaries, preparedSources, persistenceLimits };
+}
+
+/** Ledger preflight: namespace, omitted sources, conflicts, and capacity before any batch write. */
+function preflightLedger(
+  ledger: ArchivalRehearsalLedgerSummary,
+  preparedSources: readonly ArchivalRehearsalPreparedSource[],
+  storeNamespace: string,
+  limits: ArchivalPersistenceLimits,
+): ArchivalRehearsalBlocker[] {
+  const blockers: ArchivalRehearsalBlocker[] = [];
+  const acquisitionIds = new Set(preparedSources.map((source) => source.sourceId));
+  if (!ledger.present) {
+    if (preparedSources.length > limits.maxLedgerSources) {
+      blockers.push({ stage: "ledger", code: "ledger-capacity-exceeded" });
+    }
+    return blockers;
+  }
+  if (ledger.storeNamespace !== storeNamespace) {
+    blockers.push({ stage: "ledger", code: "ledger-namespace-mismatch" });
+  }
+  const existing = new Map(ledger.sources.map((row) => [row.sourceId, row]));
+  for (const row of ledger.sources) {
+    if (!acquisitionIds.has(row.sourceId)) {
+      blockers.push({
+        stage: "ledger",
+        code: "ledger-source-not-in-snapshot",
+        sourceId: row.sourceId,
+      });
+    }
+  }
+  let newSources = 0;
+  for (const source of preparedSources) {
+    const row = existing.get(source.sourceId);
+    if (row === undefined) {
+      newSources += 1;
+      continue;
+    }
+    const conflict = (reason: string): void => {
+      blockers.push({
+        stage: "persistence",
+        code: `persistence-conflict-${reason}`,
+        sourceId: source.sourceId,
+      });
+    };
+    if (row.sha256 !== source.sha256) conflict("digest");
+    else if (row.format !== source.format) conflict("format");
+    else if (row.provenance !== source.provenance) conflict("provenance");
+    else if (row.byteLength !== source.byteLength || row.lineCount !== source.lineCount) conflict("metadata");
+    else if (row.preparationStatus !== source.status) conflict("preparation-status");
+    else if (row.preparationFormat !== source.preparationFormat ||
+      row.preparationVersion !== source.preparationVersion) conflict("preparation-version");
+    else if (row.recordSchemaVersion !== ARCHIVAL_RECORD_SCHEMA_VERSION) conflict("record-schema-version");
+  }
+  if (ledger.sources.length + newSources > limits.maxLedgerSources) {
+    blockers.push({ stage: "ledger", code: "ledger-capacity-exceeded" });
+  }
+  return blockers;
 }
 
 function sourceSummary(report: ArchivalSourceAcquisitionReport): ArchivalRehearsalSourceSummary {
@@ -568,7 +903,7 @@ function sourceSummary(report: ArchivalSourceAcquisitionReport): ArchivalRehears
   };
 }
 
-function preparationSummary(report: ReturnType<typeof prepareAcquiredArchivalImport>[number]):
+function preparationSummary(report: ArchivalPreparationReport):
 ArchivalRehearsalPreparationSummary {
   return {
     format: report.format,
@@ -587,6 +922,8 @@ ArchivalRehearsalPreparationSummary {
       lineCount: source.lineCount,
       recordsEmitted: source.recordsEmitted,
       searchUnitsEmitted: source.searchUnitsEmitted,
+      preparationFormat: report.format,
+      preparationVersion: report.version,
     })),
   };
 }
@@ -625,7 +962,7 @@ function searchSummary(page: ArchivalSearchPage): ArchivalRehearsalSearchResult 
 
 function ledgerSummary(
   ledger: Awaited<ReturnType<typeof readArchivalImportLedger>>,
-): ArchivalRehearsalLedgerSummary | null {
+): ArchivalRehearsalLedgerSummary {
   if (ledger === undefined) {
     return { present: false, storeNamespace: null, sourceCount: 0, sources: [] };
   }
@@ -642,6 +979,9 @@ function ledgerSummary(
       byteLength: row.byteLength,
       lineCount: row.lineCount,
       preparationStatus: row.preparationStatus,
+      preparationFormat: row.preparationFormat,
+      preparationVersion: row.preparationVersion,
+      recordSchemaVersion: row.recordSchemaVersion,
       recordCount: row.recordCount,
       searchUnitCount: row.searchUnitCount,
       conversationId: row.conversationId,
@@ -758,17 +1098,21 @@ export async function runArchivalImportRehearsal(
     status,
     storeNamespace: SAFE_LABEL.test(options.storeNamespace) ? options.storeNamespace : "invalid-namespace",
     source: null,
+    acknowledgedMissingSurfaces: [],
     destination: {
       label: destinationLabel,
       databaseOpened: false,
       lockAcquired: false,
       durability: "not-opened",
+      databaseMode: "not-opened",
+      walShmMode: "not-opened",
     },
     batches: [],
     ledger: null,
     search: null,
     blockers: [],
     writesPerformed: false,
+    privacyLimitations: [],
     pathsExposed: false,
     contentExposed: false,
     rawArchivalBytesExposed: false,
@@ -815,22 +1159,52 @@ export async function runArchivalImportRehearsal(
     return makeReport("blocked", { source, blockers: sourceBlockers });
   }
 
-  if (!options.apply) {
-    let prepared: readonly ReturnType<typeof prepareAcquiredArchivalImport>[number][];
-    try {
-      prepared = prepareAcquiredArchivalImport(acquisition, options.preparation ?? {});
-    } catch (error) {
-      return makeReport("blocked", { source, blockers: [blockerFor(error, "preparation")] });
-    }
-    const batches: ArchivalRehearsalBatchResult[] = acquisition.batches.map((batch, index) => ({
-      batch: batch.batch,
-      sourceCount: batch.sources.length,
-      totalBytes: batch.totalBytes,
-      preparation: prepared[index] ? preparationSummary(prepared[index]!) : null,
-      persistence: null,
-    }));
-    return makeReport("dry-run", { source, batches });
+  const acknowledged = new Set(options.acknowledgeMissingSurfaces ?? []);
+  const acknowledgedMissingSurfaces = acquisition.expectedSurfacesMissing.filter(
+    (surface) => acknowledged.has(surface),
+  );
+  // B1: a missing known surface makes apply a qualified, explicit operation.
+  if (options.apply && acknowledgedMissingSurfaces.length !== acquisition.expectedSurfacesMissing.length) {
+    return makeReport("blocked", {
+      source,
+      acknowledgedMissingSurfaces,
+      blockers: [{ stage: "source", code: "missing-surfaces-not-acknowledged" }],
+    });
   }
+
+  // Preflight preparation and every per-batch persistence bound before any lock or write.
+  const preflight = preflightBatches(acquisition, options);
+  const preparedBatches: ArchivalRehearsalBatchResult[] = acquisition.batches.map((batch, index) => ({
+    batch: batch.batch,
+    sourceCount: batch.sources.length,
+    totalBytes: batch.totalBytes,
+    preparation: preflight.summaries[index] ?? null,
+    persistence: null,
+  }));
+  if (preflight.blockers.length > 0) {
+    return makeReport("blocked", {
+      source,
+      acknowledgedMissingSurfaces,
+      batches: preparedBatches,
+      blockers: preflight.blockers,
+    });
+  }
+  if (!options.apply) {
+    return makeReport("dry-run", {
+      source,
+      acknowledgedMissingSurfaces,
+      batches: preparedBatches,
+    });
+  }
+  if (preflight.persistenceLimits === null) {
+    return makeReport("blocked", {
+      source,
+      acknowledgedMissingSurfaces,
+      batches: preparedBatches,
+      blockers: [{ stage: "persistence", code: "persistence-input-invalid" }],
+    });
+  }
+  const persistenceLimits = preflight.persistenceLimits;
 
   let releaseLock: (() => Promise<void>) | undefined;
   let storage: Storage | undefined;
@@ -838,11 +1212,14 @@ export async function runArchivalImportRehearsal(
   let databaseOpened = false;
   let lockAcquired = false;
   let durability: "wal-full" | "not-opened" | "not-verified" = "not-opened";
+  let databaseMode: "0600" | "not-opened" | "not-verified" = "not-opened";
+  let walShmMode: "private-0600" | "absent" | "not-opened" | "not-verified" = "not-opened";
   const batches: ArchivalRehearsalBatchResult[] = [];
   const blockers: ArchivalRehearsalBlocker[] = [];
   let ledger: ArchivalRehearsalLedgerSummary | null = null;
   let search: ArchivalRehearsalSearchResult | null = null;
   let writesPerformed = false;
+  let finalized: Awaited<ReturnType<typeof finalizeDatabasePrivacy>> | null = null;
 
   try {
     try {
@@ -852,6 +1229,8 @@ export async function runArchivalImportRehearsal(
       // The raw Chord error names `nanobot:<path>`; never propagate that path.
       return makeReport("blocked", {
         source,
+        acknowledgedMissingSurfaces,
+        batches: preparedBatches,
         blockers: [{ stage: "ownership", code: "destination-lock-unavailable" }],
       });
     }
@@ -862,26 +1241,51 @@ export async function runArchivalImportRehearsal(
       if (destinationNow.isSymbolicLink() || !destinationNow.isDirectory() || (destinationNow.mode & 0o077) !== 0) {
         return makeReport("blocked", {
           source,
-          destination: { label: destinationLabel, databaseOpened: false, lockAcquired, durability },
+          acknowledgedMissingSurfaces,
+          destination: {
+            label: destinationLabel,
+            databaseOpened: false,
+            lockAcquired,
+            durability,
+            databaseMode,
+            walShmMode,
+          },
+          batches: preparedBatches,
           blockers: [{ stage: "destination", code: "destination-changed" }],
         });
       }
-      const databaseNow = await lstat(paths.databasePath);
-      if (databaseNow.isSymbolicLink() || !databaseNow.isFile()) {
-        return makeReport("blocked", {
-          source,
-          destination: { label: destinationLabel, databaseOpened: false, lockAcquired, durability },
-          blockers: [{ stage: "destination", code: "destination-database-unsafe" }],
-        });
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        return makeReport("blocked", {
-          source,
-          destination: { label: destinationLabel, databaseOpened: false, lockAcquired, durability },
-          blockers: [{ stage: "destination", code: "destination-unreadable" }],
-        });
-      }
+    } catch {
+      return makeReport("blocked", {
+        source,
+        acknowledgedMissingSurfaces,
+        destination: {
+          label: destinationLabel,
+          databaseOpened: false,
+          lockAcquired,
+          durability,
+          databaseMode,
+          walShmMode,
+        },
+        batches: preparedBatches,
+        blockers: [{ stage: "destination", code: "destination-unreadable" }],
+      });
+    }
+    const postLockPathBlockers = await databasePathBlockers(paths.databasePath);
+    if (postLockPathBlockers.length > 0) {
+      return makeReport("blocked", {
+        source,
+        acknowledgedMissingSurfaces,
+        destination: {
+          label: destinationLabel,
+          databaseOpened: false,
+          lockAcquired,
+          durability,
+          databaseMode,
+          walShmMode,
+        },
+        batches: preparedBatches,
+        blockers: postLockPathBlockers,
+      });
     }
 
     try {
@@ -891,26 +1295,100 @@ export async function runArchivalImportRehearsal(
     } catch {
       return makeReport("blocked", {
         source,
-        destination: { label: destinationLabel, databaseOpened: false, lockAcquired, durability: "not-verified" },
+        acknowledgedMissingSurfaces,
+        destination: {
+          label: destinationLabel,
+          databaseOpened: false,
+          lockAcquired,
+          durability: "not-verified",
+          databaseMode,
+          walShmMode,
+        },
+        batches: preparedBatches,
         blockers: [{ stage: "destination", code: "destination-storage-open-failed" }],
+      });
+    }
+
+    const permissions = await ensurePrivateDatabaseFiles(paths.databasePath);
+    databaseMode = permissions.databaseMode;
+    walShmMode = permissions.walShmMode;
+    if (permissions.blockers.length > 0) {
+      return makeReport("blocked", {
+        source,
+        acknowledgedMissingSurfaces,
+        destination: {
+          label: destinationLabel,
+          databaseOpened,
+          lockAcquired,
+          durability,
+          databaseMode,
+          walShmMode,
+        },
+        batches: preparedBatches,
+        blockers: permissions.blockers,
       });
     }
     session = createSession(storage);
 
-    for (const batch of acquisition.batches) {
+    // N3 + N1/N2: read the ledger and reject omitted sources, conflicts, and
+    // ledger overflow before the first batch commit.
+    let initialLedger: ArchivalRehearsalLedgerSummary;
+    try {
+      initialLedger = ledgerSummary(await readArchivalImportLedger(session, context));
+      ledger = initialLedger;
+    } catch (error) {
+      return makeReport("blocked", {
+        source,
+        acknowledgedMissingSurfaces,
+        destination: {
+          label: destinationLabel,
+          databaseOpened,
+          lockAcquired,
+          durability,
+          databaseMode,
+          walShmMode,
+        },
+        batches: preparedBatches,
+        blockers: [blockerFor(error, "ledger")],
+      });
+    }
+    const ledgerBlockers = preflightLedger(
+      initialLedger,
+      preflight.preparedSources,
+      options.storeNamespace,
+      persistenceLimits,
+    );
+    if (ledgerBlockers.length > 0) {
+      return makeReport("blocked", {
+        source,
+        acknowledgedMissingSurfaces,
+        destination: {
+          label: destinationLabel,
+          databaseOpened,
+          lockAcquired,
+          durability,
+          databaseMode,
+          walShmMode,
+        },
+        batches: preparedBatches,
+        ledger,
+        blockers: ledgerBlockers,
+      });
+    }
+
+    for (const [index, batch] of acquisition.batches.entries()) {
       const request = { storeNamespace: options.storeNamespace, sources: batch.sources };
       try {
         const persistence = await persistArchivalImport(session, request, context, {
           ...(options.persistenceLimits === undefined ? {} : { limits: options.persistenceLimits }),
           ...(options.preparation === undefined ? {} : { preparation: options.preparation }),
         });
-        writesPerformed = writesPerformed ||
-          persistence.newSourcesPersisted > 0;
+        writesPerformed = writesPerformed || persistence.newSourcesPersisted > 0;
         batches.push({
           batch: batch.batch,
           sourceCount: batch.sources.length,
           totalBytes: batch.totalBytes,
-          preparation: null,
+          preparation: preflight.summaries[index] ?? null,
           persistence: persistenceSummary(persistence),
         });
       } catch (error) {
@@ -919,7 +1397,7 @@ export async function runArchivalImportRehearsal(
           batch: batch.batch,
           sourceCount: batch.sources.length,
           totalBytes: batch.totalBytes,
-          preparation: null,
+          preparation: preflight.summaries[index] ?? null,
           persistence: null,
         });
         // A persistence failure is final for this run; earlier batches remain
@@ -952,7 +1430,21 @@ export async function runArchivalImportRehearsal(
     }
   } finally {
     await closeQuietly(session, storage, context);
+    // Keep the privacy recheck inside the ownership boundary: never release the
+    // lock before the final database/sidecar mode check.
+    if (lockAcquired) {
+      try {
+        finalized = await finalizeDatabasePrivacy(paths.databasePath);
+      } catch {
+        finalized = null;
+      }
+    }
     if (releaseLock) await releaseLock().catch(() => undefined);
+  }
+
+  if (finalized !== null) {
+    databaseMode = finalized.databaseMode;
+    walShmMode = finalized.walShmMode;
   }
 
   const newSources = batches.reduce((total, batch) => total + (batch.persistence?.newSourcesPersisted ?? 0), 0);
@@ -967,17 +1459,21 @@ export async function runArchivalImportRehearsal(
       : "applied";
   return makeReport(status, {
     source,
+    acknowledgedMissingSurfaces,
     destination: {
       label: destinationLabel,
       databaseOpened,
       lockAcquired,
       durability,
+      databaseMode,
+      walShmMode,
     },
     batches,
     ledger,
     search,
     blockers,
     writesPerformed,
+    privacyLimitations: finalized?.privacyLimitations ?? [],
     contentExposed: search !== null && search.hits.length > 0,
   });
 }
