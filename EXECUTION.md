@@ -28,7 +28,9 @@ owner-only and binds the id to the created root's device/inode. Reopen accepts o
 a UUID with matching private metadata, verifies the root's identity/owner, then
 restores its usable mode. It never resets workspace contents or re-imports files.
 `ExecutionEnv.id` is stable per workspace (`nanobot:bwrap:<id>`), so Durable's
-same-file identity is preserved when that workspace is reopened.
+same-file identity is preserved when that workspace is reopened. Admission records
+use format version 2; workspaces created by the pre-run-marker format are refused
+instead of being reopened without a live-sandbox witness.
 
 Import admission normalizes and policy-checks the absolute path, then opens every
 ancestor from `/` relative to the previously pinned directory FD with
@@ -60,22 +62,34 @@ mutate their source.
 Every create/open/remove holds one kernel-backed Chord `processLock` named from
 the canonical store path and workspace id. A second live owner in any process
 fails closed; the lock follows the owning process and is released by a crash or
-SIGKILL, so there is no stale lock file to steal. If teardown cannot be verified,
-cleanup retains the lock for the rest of that process instead of admitting a
-second writer. `removeExecutionWorkspace` requires the same lock, re-validates
-the private admission record and root identity, then deletes the workspace
-container and admission record. It refuses while any owner is live. A partial
-deletion retains the owner lock until that process exits so a damaged workspace
-cannot be reopened as if it were intact.
+SIGKILL, so there is no stale lock file to steal.
 
-A setup failure removes its new workspace unless cleanup itself fails, in which
-case the id/path is included in the error and the retained private data is
-reported for recovery. A crash can leave an orphaned container without an
-admission record; `removeExecutionWorkspace` fails closed on it, so the trusted
-host owner must reclaim that store entry. There is no automatic garbage
-collector, cross-store discovery, or publication. Runtime/config integration and
-conversation-to-workspace mapping remain with the parent; do not infer them from
-the standalone adapter.
+The host-side launcher writes a run marker, `runs/<id>.pid`, with its own
+supervisor pid before it execs bwrap. The same pid remains the bwrap supervisor
+while the sandbox lives. Open and remove refuse to proceed while that pid still
+exists (any live pid is treated as a live sandbox; a reused pid only delays
+startup). Once the pid is gone the marker is stale and is removed. This matters
+because the owner's kernel lock disappears immediately on SIGKILL while
+`--die-with-parent` is not synchronously guaranteed: a crashed owner cannot hand
+the workspace to a second daemon while its old supervisor is still alive.
+
+A setup failure calls a non-releasing `discard()` teardown, deletes the partial
+bundle, admission, container, and marker, and only then releases ownership. If
+any part of that rollback is unverified, the lock is retained for the rest of the
+process. Runtime `cleanup()` likewise releases only after the supervisor pid is
+reaped and its marker removed. `removeExecutionWorkspace` requires the same lock
+and live-sandbox check, re-validates the private admission record and root
+identity, then deletes the workspace container, admission record, and run marker.
+It refuses while any owner is live. A partial deletion retains the owner lock
+until that process exits so a damaged workspace cannot be reopened as if intact.
+
+If a setup failure's rollback cannot be verified, the id/path is included in the
+error and the retained private data is reported for recovery. A crash can leave
+an orphaned container without an admission record; `removeExecutionWorkspace`
+fails closed on it, so the trusted host owner must reclaim that store entry. There
+is no automatic garbage collector, cross-store discovery, or publication.
+Runtime/config integration and conversation-to-workspace mapping remain with the
+parent; do not infer them from the standalone adapter.
 
 The old `{ workspace, extraAllowedDirs }` API is intentionally rejected at
 runtime, not just omitted from TypeScript types. The factory has no `dataDir`
@@ -117,12 +131,15 @@ but this is not an overall security acceptance. Shell execution still has no
 aggregate CPU, memory, PID-count, or disk quota; a writable persistent workspace
 can fill host storage, and an omitted shell timeout is not capped here.
 Bubblewrap namespaces alone are not resource quotas. Denial of service by filling
-the private store is bounded only by the host filesystem. The parent still owns
-runtime/config integration, conversation-to-workspace persistence, and any
-automatic orphan garbage collection; the lock only prevents concurrent owners.
-Keep tools disabled until those limits and integration contracts are reviewed.
-No Python daemon, VM, unsafe fallback, config-store access, or deployment changes
-were introduced.
+the private store is bounded only by the host filesystem. The run marker is a
+fail-closed liveness witness, not a sandbox-wide truth: a reused pid can delay
+reopen, and once the supervisor pid is gone the implementation relies on Linux
+PID-namespace teardown (bounded probing observed the supervisor stays alive while
+a guest runs and killing it kills the guest). The parent still owns runtime/config
+integration, conversation-to-workspace persistence, and any automatic orphan
+garbage collection; the lock only prevents concurrent owners. Keep tools disabled
+until those limits and integration contracts are reviewed. No Python daemon, VM,
+unsafe fallback, config-store access, or deployment changes were introduced.
 
 ## Bounded synthetic evidence
 
@@ -172,11 +189,22 @@ removes all temporary data on exit. No real credentials, live bot, provider,
 Python deployment, or host package install was used.
 
 - `npm run --prefix packages/pi-nanobot test:execution` builds and runs
-  `node --test tests/execution-lifecycle.test.mjs` with a 120 s per-test budget.
-  Nanobot-owned behavior only: a second live `openExecutionEnv` and a
+  `node --test tests/execution-lifecycle.test.mjs` (4 tests, 120 s per-test
+  budget). Nanobot-owned behavior only: a second live `openExecutionEnv` and a
   `removeExecutionWorkspace` attempt both fail closed while an owner exists;
   cleanup retains the workspace and leaves imported content intact for reopen;
-  guarded deletion removes the container and admission record; a separate Node
-  owner process is SIGKILLed and the workspace reopens without a stale-lock
-  takeover. Actual Bubblewrap daemons and temporary stores only; no host
-  workspace, credentials, service, or deployment was touched.
+  guarded deletion removes the container and admission record; the run marker is
+  written and live while the sandbox lives and gone after verified cleanup; a
+  live marker blocks both open and removal until its process exits; malformed
+  markers are refused; a failed setup (invalid cwd after daemon start) leaves no
+  workspace, admission, or run marker behind; and a separate Node owner process
+  is SIGKILLed, its marker survives, and the workspace either fails closed on a
+  still-live sandbox or reopens after that supervisor is reaped.
+- A bounded host probe (not a repository test) launched `bwrap --unshare-pid
+  --die-with-parent --as-pid-1 ... /usr/bin/sleep` and observed that the bwrap
+  supervisor pid stayed alive while the guest ran, and killing that pid killed
+  the guest. After a short-lived Node spawner exited, the supervisor and guest
+  were gone within the 0.5 s sampling window. The implementation does not rely
+  on that timing: it refuses while the recorded supervisor pid exists.
+- Actual Bubblewrap daemons and temporary stores only; no host workspace,
+  credentials, service, or deployment was touched.

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +23,16 @@ async function text(env, path) {
 	assert.equal(result.ok, true, result.ok ? "" : result.error.message);
 	return result.value;
 }
+
+async function directories(store) {
+	return {
+		workspaces: await readdir(join(store, "workspaces")),
+		admissions: await readdir(join(store, "admissions")),
+		runs: await readdir(join(store, "runs")),
+	};
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test("one live owner per workspace and guarded deletion", { timeout: 120_000 }, async () => {
 	const store = await temporaryDirectory("nanobot-exec-store-");
@@ -60,6 +70,64 @@ test("one live owner per workspace and guarded deletion", { timeout: 120_000 }, 
 	}
 });
 
+test("a live sandbox run marker blocks open and removal until it exits", { timeout: 120_000 }, async () => {
+	const store = await temporaryDirectory("nanobot-exec-marker-store-");
+	let blocker;
+	try {
+		const first = await createExecutionEnv({ storageDirectory: store });
+		const id = first.workspaceId;
+		const marker = join(store, "runs", `${id}.pid`);
+		const livePid = Number((await readFile(marker, "utf8")).trim());
+		assert.equal(livePid > 0, true);
+		process.kill(livePid, 0);
+		await first.cleanup(BACKGROUND_CONTEXT);
+		assert.deepEqual(await readdir(join(store, "runs")), []);
+
+		blocker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+		await writeFile(marker, `${blocker.pid}\n`, { mode: 0o600 });
+		await assert.rejects(openExecutionEnv(id, { storageDirectory: store }), /still have a live sandbox/);
+		await assert.rejects(removeExecutionWorkspace(id, { storageDirectory: store }), /still have a live sandbox/);
+
+		blocker.kill("SIGKILL");
+		await new Promise((resolve) => blocker.once("exit", resolve));
+		const reopened = await openExecutionEnv(id, { storageDirectory: store });
+		try {
+			const info = await reopened.fileInfo("/workspace", BACKGROUND_CONTEXT);
+			assert.equal(info.ok, true);
+		} finally {
+			await reopened.cleanup(BACKGROUND_CONTEXT);
+		}
+
+		await writeFile(marker, "not-a-pid\n", { mode: 0o600 });
+		await assert.rejects(openExecutionEnv(id, { storageDirectory: store }), /marker is malformed/);
+		await rm(marker);	} finally {
+		blocker?.kill("SIGKILL");
+		await rm(store, { recursive: true, force: true });
+	}
+});
+
+test("a failed setup rolls back its workspace and marks no run before releasing ownership", { timeout: 120_000 }, async () => {
+	const store = await temporaryDirectory("nanobot-exec-fail-store-");
+	try {
+		await assert.rejects(
+			createExecutionEnv({ storageDirectory: store, cwd: "/workspace/does-not-exist" }),
+			/cwd is not an allowed/,
+		);
+		const after = await directories(store);
+		assert.deepEqual(after, { workspaces: [], admissions: [], runs: [] });
+
+		const env = await createExecutionEnv({ storageDirectory: store });
+		try {
+			const info = await env.fileInfo("/workspace", BACKGROUND_CONTEXT);
+			assert.equal(info.ok, true);
+		} finally {
+			await env.cleanup(BACKGROUND_CONTEXT);
+		}
+	} finally {
+		await rm(store, { recursive: true, force: true });
+	}
+});
+
 test("a killed owner releases its kernel lock without stale takeover", { timeout: 120_000 }, async () => {
 	const store = await temporaryDirectory("nanobot-exec-crash-store-");
 	let child;
@@ -91,7 +159,21 @@ test("a killed owner releases its kernel lock without stale takeover", { timeout
 		});
 		child.kill("SIGKILL");
 		await new Promise((resolve) => child.once("exit", resolve));
-		const env = await openExecutionEnv(id, { storageDirectory: store });
+		// The marker must outlive the owner; otherwise a crashed sandbox would be invisible to the next owner.
+		await access(join(store, "runs", `${id}.pid`));
+		// The owner lock is gone immediately, but the sandbox supervisor may still be alive for a moment.
+		// Opening must either fail closed or wait until that supervisor is reaped; never race it silently.
+		let env;
+		const deadline = Date.now() + 15_000;
+		while (env === undefined) {
+			try {
+				env = await openExecutionEnv(id, { storageDirectory: store });
+			} catch (error) {
+				assert.match(String(error.message), /still have a live sandbox|owned by another live process/);
+				if (Date.now() > deadline) throw error;
+				await delay(100);
+			}
+		}
 		try {
 			const info = await env.fileInfo("/workspace", BACKGROUND_CONTEXT);
 			assert.equal(info.ok, true);

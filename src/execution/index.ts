@@ -58,7 +58,7 @@ interface WorkspaceRecord {
 }
 
 interface AdmissionRecord {
-	version: 1;
+	version: 2;
 	id: string;
 	rootDev: string;
 	rootIno: string;
@@ -168,6 +168,7 @@ interface StorePaths {
 	store: string;
 	workspaces: string;
 	admissions: string;
+	runs: string;
 }
 
 async function prepareStore(storageDirectory?: string): Promise<StorePaths> {
@@ -175,14 +176,16 @@ async function prepareStore(storageDirectory?: string): Promise<StorePaths> {
 	const store = await ensurePrivateDirectory(requested, "Managed workspace store");
 	const workspaces = await ensurePrivateDirectory(join(store, "workspaces"), "Managed workspace directory");
 	const admissions = await ensurePrivateDirectory(join(store, "admissions"), "Managed admission directory");
-	return { store, workspaces, admissions };
+	const runs = await ensurePrivateDirectory(join(store, "runs"), "Managed run-marker directory");
+	return { store, workspaces, admissions, runs };
 }
 
-function managedPaths(store: StorePaths, id: string): { container: string; root: string; admission: string } {
+function managedPaths(store: StorePaths, id: string): { container: string; root: string; admission: string; runMarker: string } {
 	return {
 		container: join(store.workspaces, id),
 		root: join(store.workspaces, id, "root"),
 		admission: join(store.admissions, `${id}.json`),
+		runMarker: join(store.runs, `${id}.pid`),
 	};
 }
 
@@ -290,8 +293,10 @@ async function readAdmission(store: StorePaths, id: string): Promise<WorkspaceRe
 		await recordHandle.close();
 	}
 	const admission = JSON.parse(raw) as Partial<AdmissionRecord>;
+	if (admission.version !== 2) {
+		throw new Error("Managed workspace predates run-marker ownership and cannot be reopened safely; remove it manually");
+	}
 	if (
-		admission.version !== 1 ||
 		admission.id !== id ||
 		admission.rootDev !== String(rootInfo.dev) ||
 		admission.rootIno !== String(rootInfo.ino)
@@ -305,7 +310,7 @@ async function readAdmission(store: StorePaths, id: string): Promise<WorkspaceRe
 
 async function writeAdmission(store: StorePaths, record: WorkspaceRecord): Promise<void> {
 	const admission: AdmissionRecord = {
-		version: 1,
+		version: 2,
 		id: record.id,
 		rootDev: record.rootDev,
 		rootIno: record.rootIno,
@@ -317,6 +322,45 @@ async function writeAdmission(store: StorePaths, record: WorkspaceRecord): Promi
 	} finally {
 		await handle.close();
 	}
+}
+
+/**
+ * Refuse to start a second sandbox while the run marker names a live supervisor process. The host-side launcher
+ * writes the marker before it execs bwrap, so the marker exists before any guest can touch the workspace. Once the
+ * recorded supervisor is gone (crash, SIGKILL, or verified teardown) its PID namespace has been torn down and the
+ * marker is stale. A reused PID only delays startup (fail closed) until that process exits; it is never trusted.
+ */
+async function assertNoLiveSandbox(store: StorePaths, id: string): Promise<void> {
+	const marker = managedPaths(store, id).runMarker;
+	let raw: string;
+	try {
+		const info = await lstat(marker);
+		if (info.isSymbolicLink() || !info.isFile()) throw new Error("Managed sandbox run marker is not a regular file");
+		requireOwner(info, "Managed sandbox run marker");
+		const handle = await open(marker, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		try {
+			raw = (await handle.readFile("utf8")).trim();
+		} finally {
+			await handle.close();
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	if (!/^[1-9]\d{0,9}$/.test(raw)) throw new Error("Managed sandbox run marker is malformed; refusing a second sandbox");
+	const pid = Number(raw);
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+			await rm(marker, { force: true });
+			return;
+		}
+		throw error;
+	}
+	throw new Error(
+		`Managed workspace ${id} may still have a live sandbox (supervisor pid ${pid}); previous owner did not finish teardown`,
+	);
 }
 
 function aborted<T>(context: Context, path?: string): Result<T, FileError> | undefined {
@@ -371,6 +415,7 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 	readonly #roots = [GUEST_ROOT];
 	readonly #daemonDir: string;
 	readonly #pidFile: string;
+	readonly #runMarker: string;
 	readonly #bwrapPath: string;
 	readonly #lock: WorkspaceLock;
 	#closed = false;
@@ -380,6 +425,7 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 		workspaceId: string,
 		daemonDir: string,
 		pidFile: string,
+		runMarker: string,
 		bwrapPath: string,
 		lock: WorkspaceLock,
 	) {
@@ -387,6 +433,7 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 		this.workspaceId = workspaceId;
 		this.#daemonDir = daemonDir;
 		this.#pidFile = pidFile;
+		this.#runMarker = runMarker;
 		this.#bwrapPath = bwrapPath;
 		this.#lock = lock;
 	}
@@ -532,9 +579,8 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 		return super.exec(sandboxedCommand, { ...safeOptions, cwd: cwd.path, env: safeEnv, inheritEnv: false }, context);
 	}
 
-	override async cleanup(context: Context): Promise<void> {
-		if (this.#closed) return;
-		this.#closed = true;
+	/** Stop the daemon and confirm its supervisor pid is gone; never releases workspace ownership. */
+	async #stopDaemon(context: Context): Promise<void> {
 		let failure: unknown;
 		try {
 			await super.cleanup(context);
@@ -553,12 +599,37 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 				failure ??= error;
 			});
 		}
-		if (failure !== undefined) {
+		if (failure !== undefined) throw failure;
+		// The supervisor is reaped, so its PID namespace has been torn down. The marker is now stale.
+		await rm(this.#runMarker, { force: true }).catch(() => undefined);
+	}
+
+	override async cleanup(context: Context): Promise<void> {
+		if (this.#closed) return;
+		this.#closed = true;
+		try {
+			await this.#stopDaemon(context);
+		} catch (error) {
 			// Teardown is unverified: keep the lock until this process exits rather than admit a second writer.
 			this.#lock.retain();
-			throw failure;
+			throw error;
 		}
 		await this.#lock.release();
+	}
+
+	/**
+	 * Setup-failure teardown. Confirms the daemon is gone but deliberately keeps ownership: the caller still has to
+	 * delete the partial workspace and only then releases the lock (or retains it if that rollback fails).
+	 */
+	async discard(context: Context): Promise<void> {
+		if (this.#closed) return;
+		this.#closed = true;
+		try {
+			await this.#stopDaemon(context);
+		} catch (error) {
+			this.#lock.retain();
+			throw error;
+		}
 	}
 }
 
@@ -576,19 +647,30 @@ interface ImportBundle {
 	worker: string;
 }
 
-async function makeDaemonBundle(bwrapSource: string): Promise<DaemonBundle> {
+async function makeDaemonBundle(bwrapSource: string, runMarker: string): Promise<DaemonBundle> {
 	const directory = await mkdtemp(join(tmpdir(), "nanobot-bwrap-"));
 	try {
 		const source = await realpath(localDaemon());
 		const binary = join(directory, "pi-env");
 		const bwrapBinary = join(directory, "bwrap");
 		const pidFile = join(directory, "bwrap.pid");
+		const markerTemp = `${runMarker}.tmp`;
 		const launcher = join(directory, "launch");
 		await copyFile(source, binary, constants.COPYFILE_EXCL);
 		await chmod(binary, 0o500);
 		await copyFile(bwrapSource, bwrapBinary, constants.COPYFILE_EXCL);
 		await chmod(bwrapBinary, 0o500);
-		const script = `#!/bin/sh\nprintf '%s\\n' "$$" > ${shellQuote(pidFile)}\nexec "$@"\n`;
+		// Record the supervisor pid in the private store before exec. If this write fails, no sandbox starts.
+		const script = [
+			"#!/bin/sh",
+			"set -e",
+			"pid=$$",
+			`printf '%s\\n' "$pid" > ${shellQuote(pidFile)}`,
+			`printf '%s\\n' "$pid" > ${shellQuote(markerTemp)}`,
+			`mv ${shellQuote(markerTemp)} ${shellQuote(runMarker)}`,
+			'exec "$@"',
+			"",
+		].join("\n");
 		await writeFile(launcher, script, { mode: 0o700, flag: "wx" });
 		return { directory, binary, bwrapBinary, pidFile, launcher };
 	} catch (error) {
@@ -785,6 +867,7 @@ async function startWorkspaceEnvironment(
 	options: ExecutionOptions,
 	context: Context,
 	lock: WorkspaceLock,
+	runMarker: string,
 ): Promise<ManagedExecutionEnv> {
 	const daemonInSandbox = `/run/.nanobot-pi-env-${randomUUID()}/pi-env`;
 	const bwrapInSandbox = `${dirname(daemonInSandbox)}/bwrap`;
@@ -799,6 +882,7 @@ async function startWorkspaceEnvironment(
 			record.id,
 			bundle.directory,
 			bundle.pidFile,
+			runMarker,
 			bwrapInSandbox,
 			lock,
 		);
@@ -819,7 +903,8 @@ async function startWorkspaceEnvironment(
 		return env;
 	} catch (error) {
 		if (env) {
-			await env.cleanup(BACKGROUND_CONTEXT).catch((cleanupError: unknown) => {
+			// Keep workspace ownership through the caller's rollback; discard does not release the lock.
+			await env.discard(BACKGROUND_CONTEXT).catch((cleanupError: unknown) => {
 				throw new SandboxCleanupFailure([error, cleanupError], "Execution environment setup failed and sandbox cleanup failed");
 			});
 		} else {
@@ -842,26 +927,45 @@ export async function createExecutionEnv(
 	const id = randomUUID();
 	const lock = await acquireWorkspaceLock(store, id);
 	let handedOff = false;
-	let bundle: DaemonBundle | undefined;
 	try {
-		const record = await persistWorkspace(store, id, options.imports ?? [], bwrap.path, context);
+		let record: WorkspaceRecord;
+		try {
+			record = await persistWorkspace(store, id, options.imports ?? [], bwrap.path, context);
+		} catch (error) {
+			// persistWorkspace removed its partial container unless it reported an unverified cleanup failure.
+			if (error instanceof SandboxCleanupFailure) lock.retain();
+			throw error;
+		}
 		const paths = managedPaths(store, id);
+		let bundle: DaemonBundle | undefined;
 		try {
 			await writeAdmission(store, record);
-			bundle = await makeDaemonBundle(bwrap.path);
-			const env = await startWorkspaceEnvironment(record, bundle, bwrap.path, options, context, lock);
+			bundle = await makeDaemonBundle(bwrap.path, paths.runMarker);
+			const created = bundle;
+			const env = await startWorkspaceEnvironment(record, created, bwrap.path, options, context, lock, paths.runMarker);
 			handedOff = true;
-			bundle = undefined;
 			return env;
 		} catch (error) {
 			if (error instanceof SandboxCleanupFailure) {
+				lock.retain();
 				throw new Error(`Managed workspace ${id} retained after sandbox cleanup failure`, { cause: error });
 			}
+			// The sandbox is either gone or never started; delete every host-side artifact before releasing ownership.
 			const cleanupErrors: unknown[] = [];
-			if (bundle) await rm(bundle.directory, { recursive: true, force: true }).catch((cleanupError: unknown) => cleanupErrors.push(cleanupError));
-			await rm(paths.admission, { force: true }).catch((cleanupError: unknown) => cleanupErrors.push(cleanupError));
-			await rm(paths.container, { recursive: true, force: true }).catch((cleanupError: unknown) => cleanupErrors.push(cleanupError));
+			const attempt = async (action: () => Promise<unknown>) => {
+				try {
+					await action();
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			};
+			const bundleToRemove = bundle;
+			if (bundleToRemove) await attempt(() => rm(bundleToRemove.directory, { recursive: true, force: true }));
+			await attempt(() => rm(paths.admission, { force: true }));
+			await attempt(() => rm(paths.container, { recursive: true, force: true }));
+			await attempt(() => rm(paths.runMarker, { force: true }));
 			if (cleanupErrors.length > 0) {
+				lock.retain();
 				throw new SandboxCleanupFailure(
 					[error, ...cleanupErrors],
 					`Managed workspace ${id} setup failed and cleanup failed; inspect ${paths.container}`,
@@ -870,8 +974,8 @@ export async function createExecutionEnv(
 			throw error;
 		}
 	} finally {
-		// Release only when the environment did not take ownership; cleanup keeps it on unverified teardown.
-		if (!handedOff) await lock.release().catch(() => undefined);
+		// Release only after the complete rollback above; a retained lock is a deliberate fail-closed no-op.
+		if (!handedOff) await lock.release().catch(() => lock.retain());
 	}
 }
 
@@ -889,11 +993,14 @@ export async function openExecutionEnv(
 	const lock = await acquireWorkspaceLock(store, workspaceId);
 	let handedOff = false;
 	try {
+		// A previous owner may have died while its sandbox was still alive; refuse until that supervisor is reaped.
+		await assertNoLiveSandbox(store, workspaceId);
 		const record = await readAdmission(store, workspaceId);
+		const paths = managedPaths(store, workspaceId);
 		const bwrap = await setupWait(validateBwrap(options.bwrapPath ?? "/usr/bin/bwrap"), context, "Bubblewrap validation");
-		const bundle = await makeDaemonBundle(bwrap.path);
+		const bundle = await makeDaemonBundle(bwrap.path, paths.runMarker);
 		try {
-			const env = await startWorkspaceEnvironment(record, bundle, bwrap.path, options, context, lock);
+			const env = await startWorkspaceEnvironment(record, bundle, bwrap.path, options, context, lock, paths.runMarker);
 			handedOff = true;
 			return env;
 		} catch (error) {
@@ -901,7 +1008,8 @@ export async function openExecutionEnv(
 			throw error;
 		}
 	} finally {
-		if (!handedOff) await lock.release().catch(() => undefined);
+		// Setup failure leaves the workspace intact; release only after its daemon teardown has been verified.
+		if (!handedOff) await lock.release().catch(() => lock.retain());
 	}
 }
 
@@ -923,6 +1031,8 @@ export async function removeExecutionWorkspace(
 	const lock = await acquireWorkspaceLock(store, workspaceId);
 	let deleting = false;
 	try {
+		// A crashed owner may have left its sandbox running; never delete underneath a live guest.
+		await assertNoLiveSandbox(store, workspaceId);
 		// Authenticate the private admission record and root identity before deleting anything.
 		await readAdmission(store, workspaceId);
 		const paths = managedPaths(store, workspaceId);
@@ -931,6 +1041,7 @@ export async function removeExecutionWorkspace(
 		deleting = true;
 		await rm(paths.container, { recursive: true, force: true });
 		await rm(paths.admission, { force: true });
+		await rm(paths.runMarker, { force: true });
 	} catch (error) {
 		// A partial deletion must not be reopened by a new owner until this process exits.
 		if (deleting) lock.retain();
