@@ -118,6 +118,14 @@ const DEFAULT_STORAGE_DIRECTORY = join(homedir(), ".local", "share", "nanobot", 
 const RESTRICTED_SYSTEM_ROOTS = [
 	"/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/sys", "/dev", "/run", "/var", "/opt", "/boot", "/root",
 ];
+const MAX_SHELL_TIMEOUT_SECONDS = 5;
+const SHELL_OUTPUT_WINDOW = {
+	maxBytes: 64 * 1024,
+	maxLines: 2_000,
+	minIntervalMs: 100,
+	bytesPerSecond: 64 * 1024,
+} as const;
+
 const SHELL_ENV = {
 	PATH: "/usr/bin:/bin",
 	HOME: "",
@@ -620,8 +628,27 @@ class BwrapExecutionEnv extends RemoteExecutionEnv implements ManagedExecutionEn
 		const argv = typeof command === "string" ? ["/bin/sh", "-c", command] : [...command];
 		if (argv.length === 0) return err<ShellExecResult, ExecutionError>(new ExecutionError("spawn_error", "Empty argv: no program to run"));
 		const sandboxedCommand = [this.#bwrapPath, ...buildCommandBwrapArgs(GUEST_ROOT, actual.value, argv)];
-		const { env: _ignored, inheritEnv: _ignoredInheritance, ...safeOptions } = options ?? {};
-		return super.exec(sandboxedCommand, { ...safeOptions, cwd: cwd.path, env: safeEnv, inheritEnv: false }, context);
+		const { env: _ignored, inheritEnv: _ignoredInheritance, spill: _ignoredSpill, ...safeOptions } = options ?? {};
+		const timeout = Math.min(options?.timeout ?? MAX_SHELL_TIMEOUT_SECONDS, MAX_SHELL_TIMEOUT_SECONDS);
+		const window = {
+			maxBytes: Math.min(
+				options?.window?.maxBytes ?? SHELL_OUTPUT_WINDOW.maxBytes,
+				SHELL_OUTPUT_WINDOW.maxBytes,
+			),
+			maxLines: Math.min(
+				options?.window?.maxLines ?? SHELL_OUTPUT_WINDOW.maxLines,
+				SHELL_OUTPUT_WINDOW.maxLines,
+			),
+			minIntervalMs: Math.max(
+				options?.window?.minIntervalMs ?? SHELL_OUTPUT_WINDOW.minIntervalMs,
+				SHELL_OUTPUT_WINDOW.minIntervalMs,
+			),
+			bytesPerSecond: Math.min(
+				options?.window?.bytesPerSecond ?? SHELL_OUTPUT_WINDOW.bytesPerSecond,
+				SHELL_OUTPUT_WINDOW.bytesPerSecond,
+			),
+		};
+		return super.exec(sandboxedCommand, { ...safeOptions, timeout, window, cwd: cwd.path, env: safeEnv, inheritEnv: false }, context);
 	}
 
 	/**
