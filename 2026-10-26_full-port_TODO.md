@@ -22,26 +22,34 @@ continues to constrain the currently integrated tool-less slice.
 Each unchecked milestone needs its exit evidence, not merely compilable code.
 P1 security and P8 data integrity cannot be waived by a successful chat demo.
 
-## Active implementation batch D — 2026-10-27
+## Integrated implementation batch D — 2026-10-27
 
-Owner requested continuation after C1–C3 acceptance. Continue with
+**Current status:** all three slices are merged; final independent CLI and
+migration reviews remain open. The task assignments below are historical, not
+active instructions. Owned child worktrees and review tabs have been cleaned up;
+branches remain. Broad milestones P3/P8 remain unchecked.
+
+Owner requested continuation after C1–C3 acceptance. The batch used
 `openai-codex / gpt-6-luna / xhigh`; containerization/sandbox/execution work
 remains explicitly excluded and coding tools disabled. Independent managed
 worktrees start from committed `32e8b4def1ed5bca8b0a417f55dda9563cce7f0c`.
-Parent `w1P:p1` owns coordination, root docs, public exports, integration and
-acceptance; prior resources stay retained, not automatically cleaned up.
+Parent `w1P:p1` owned coordination, root docs, public exports and integration.
+Later user-directed consolidation removed the owned child checkouts and review
+tabs without force; the branches were retained.
 
-- [ ] D1 — P3 allowed-model policy and native persisted per-conversation selection:
-      preserve allowed choices on reacquisition/reopen, revoke removed choices
-      before resume, keep tool-less host policy; no parallel model-state store.
-- [ ] D2 — P3 streaming local CLI and bounded native conversation controls:
-      text-only committed output, busy-input/control handling, actual history/status,
-      cancellation/EOF cleanup; Telegram behavior remains unchanged.
-- [ ] D3 — P8 read-only legacy migration dry-run inventory: bounded host-supplied
-      bytes, hashes/provenance/counts/usage reconciliation and explicit unsupported/
-      active/unknown records; no destination import or live data access.
-- [ ] Parent independent review, bounded fresh-build verification and integration;
-      broad P3/P8 milestones remain unchecked until their exit evidence exists.
+- [x] D1 — P3 model policy and native persisted per-conversation selection:
+      merged `36ff7b95f`; independent review and parent-built crash/reopen checks
+      passed. Deferred-poll revocation was source-reviewed, not crash-tested.
+- [x] D2 — P3 streaming CLI and native conversation controls: merged `3956e7717`;
+      parent-built slow-sink check passed. This is integration, not final acceptance.
+- [x] D3 — P8 read-only migration inventory: merged `e00651d33`; parent-built
+      alias/message-shape probe passed. This is inventory only, not an importer.
+- [ ] Independently review the final CLI and migration commits; reproduce the CLI
+      EOF/order/flood and migration history-eligibility/provenance/safety checks
+      whose worker probes were inline or not retained. CLI readline's 32k limit is
+      post-buffering, not a hard ingress-memory limit. Keep P3/P8 unchecked.
+- [ ] Decide which Python behavioral tests to port into permanent TypeScript parity
+      checks; no Python suite was adopted wholesale and no new tests were committed.
 
 | Child / branch | Pane / workspace | Worktree | Exclusive ownership |
 |---|---|---|---|
@@ -53,9 +61,9 @@ Ownership paths are relative to packages/pi-nanobot. No manifest/lock changes or
 new dependencies assigned; request review if concretely needed. Python and pinned
 `/tmp/pi-durable-reference-1.4.0` remain read-only references. No live/paid/network
 requests, real credentials/history/config, host/deployment changes, push or cleanup.
-No committed test suite/scaffolding; use bounded private synthetic/native Harness
-and SQLite probes, existing typecheck/build. Explicit herdr_report completion is
-required; startup/idle/acknowledgement is not acceptance.
+The batch used bounded private synthetic/native Harness and SQLite probes plus
+existing typecheck/build, without committed test scaffolding. Explicit reports,
+not startup/idle/acknowledgement, were required for completion.
 
 D1 proposes existing-session listModels/selectModel with explicit Context and
 native transaction-scoped busy check/configuration. Model/thinking preservation
@@ -115,8 +123,10 @@ from committed `0ea2c76eb3896646fb089549ad9d7669c7a6ed52`, in independent
 Herdr worktrees; native wrapper tools only. Parent pane `w1P:p1` owns review,
 root docs, integration and acceptance. No P1/P2 milestone is passed by launch.
 
-- [ ] B1 — bwrap/native ExecutionEnv confinement: `pi-ccd4ba61`, pane `w1X:p1`.
-      Managed follow-up `4c1a96976` atop partial `6ab2ccc89` is withheld pending
+- [ ] B1 — bwrap/native ExecutionEnv confinement: `pi-ccd4ba61`, former pane `w1X:p1`.
+      Branch retained, checkout removed; latest unmerged tip `26ab7b9f6` includes
+      additional follow-ups, but has not been accepted. Managed follow-up
+      `4c1a96976` atop partial `6ab2ccc89` is withheld pending
       review/fixes: parent confirmed host IPC shared-memory exposure; initial
       import-ancestor race review plus quota/owner/lifecycle gates remain open.
 - [x] B2 — opt-in native Code Mode/tool-search SDK lifecycle and offline nested
