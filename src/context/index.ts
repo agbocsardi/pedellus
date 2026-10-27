@@ -5,7 +5,55 @@ import {
   type Extension,
 } from "@earendil-works/pi-durable";
 
-/** Fixed bounds for host-supplied context text (Unicode code points). */
+/**
+ * Deterministically render Nanobot's fixed identity template semantics from
+ * host-provided values. This is not a Jinja engine and performs no discovery.
+ */
+export interface NanobotIdentityValues {
+  readonly runtime: string;
+  readonly workspacePath: string;
+  readonly channel?: string;
+}
+
+const IDENTITY_COMPOSITION_OVERHEAD = 1_600;
+
+export function renderNanobotIdentity(values: NanobotIdentityValues): string {
+  if (Object.hasOwn(values, "platformPolicy")) {
+    throw new TypeError("Platform policy is not part of the reduced identity renderer");
+  }
+  if (/[\r\n\u0000-\u001f\u007f]/.test(values.workspacePath)) {
+    throw new TypeError("Workspace path must not contain control characters or newlines");
+  }
+  for (const [label, value] of [["runtime", values.runtime], ["workspacePath", values.workspacePath]] as const) {
+    if (value !== undefined && codePointCount(value) > identityContentLimit()) {
+      throw new RangeError(`Identity ${label} exceeds ${identityContentLimit()} code points`);
+    }
+  }
+
+  const sections = [
+    `## Runtime\n${values.runtime}`,
+    `## Workspace\nYour workspace is at: ${values.workspacePath}`,
+  ];
+  if (values.channel === "telegram" || values.channel === "discord") {
+    sections.push("## Format Hint\nThis conversation is on a messaging app. Use short paragraphs. Avoid large headings (#, ##). Use **bold** sparingly. No tables — use plain lists.");
+  } else if (values.channel === "email") {
+    sections.push("## Format Hint\nThis conversation is via email. Structure with clear sections. Markdown may not render — keep formatting simple.");
+  } else if (values.channel === "cli") {
+    sections.push("## Format Hint\nOutput is rendered in a terminal. Avoid markdown headings and tables. Use plain text with minimal formatting.");
+  }
+
+  const outputChars = sections.reduce((total, sectionText) => total + codePointCount(sectionText), 2 * (sections.length - 1));
+  if (outputChars > identityContentLimit()) {
+    throw new RangeError(`Rendered identity exceeds ${identityContentLimit()} code points`);
+  }
+  return sections.join("\n\n");
+}
+
+function identityContentLimit(): number {
+  // renderDocuments adds a heading and source label; reserve for worst-case escaped U+2028/U+2029.
+  return CONTEXT_LIMITS.sectionChars - IDENTITY_COMPOSITION_OVERHEAD;
+}
+
 export const CONTEXT_LIMITS = Object.freeze({
   totalChars: 50_000,
   contextChars: 48_000,
