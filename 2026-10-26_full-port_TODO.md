@@ -42,6 +42,9 @@ Real history access and import require separate authorization; use synthetic dat
       preserved but not merged: full-array snapshots do not scale to the stored
       corpus. `bb13ae117` has separate mixed-format and corpus-size limitations.
       Neither is database search.
+- [ ] `pi-63980860`: implement bounded explicit-root source discovery and byte
+      acquisition, using synthetic files only; no real history access. Base
+      `ae92f1fdca7a23acfa4e658c8e1fd2f93ee74e0f`.
 - [ ] Rehearse on synthetic records; plan a private-copy reconciliation and
       backup/restore before seeking authorization for a real one-off import.
 - [x] `pi-458b1c64`: integrated `66163cf82`, bounded, pure source-byte
@@ -78,6 +81,8 @@ policy, environment and replay gates pass.
       isolated candidate and integrated build against real bwrap. The 5-second
       experimental cap is not product policy; CPU/memory/PID/disk quotas and
       approval remain separate P1 gates.
+- [ ] `pi-13288a3c`: synthetic interrupted-tool replay/revocation investigation
+      and behavioral coverage; no production registration, base `ae92f1fdc`.
 - [ ] Tool authorization: owner chose **host-supplied config**, default deny, as
       authoritative for allow/disallow and startup revocation. `pi-8a97b7a5`,
       `w2P:p1` / `w2P`, Codex Luna high, base `1e61299e5eda604e8cb9fa3c8d536c07258a4ca3`,
