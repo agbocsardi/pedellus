@@ -39,6 +39,9 @@ policy, environment and replay gates pass.
       conversation isolation; parent corrected test timeout and ran combined
       suite (22 checks). No gateway activation; permanent interrupted-replay
       coverage remains open.
+- [ ] `pi-a4ec5ee5`, `w2M:p1` / `w2M`: bound standalone sandbox shell
+      deadlines with focused real-bwrap checks; base `c5dc6337a085422ed0fdb2921dba4cdd2af73063`.
+      CPU/memory/PID/disk quotas and approval policy remain separate P1 gates.
 - [ ] Review the existing Discord/memory/automation candidates when revisiting
       them; preserve their branches and do not imply they are integrated.
 
