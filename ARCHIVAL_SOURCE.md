@@ -122,11 +122,16 @@ count or byte total beyond the acquisition limit throws
 batch, with the same caller-supplied `storeNamespace`. It revalidates the report
 format/version, every source and snapshot label/digest, unique source IDs, and
 batch membership, then recomputes batches from `sources`; a forged report with
-altered labels or omitted/duplicated batches is rejected instead of silently
-dropping work. It rejects an incomplete acquisition or a report with zero
-sources. It performs no persistence, search indexing, cursor advancement,
-session resume, archive replay, or runtime action. `history` and `archive`
-records are never run.
+inconsistent labels or omitted/duplicated batches is rejected instead of
+silently dropping work. It also rejects any report carrying a `failure`
+diagnostic or not marked complete, so retained sources from a failed acquisition
+cannot be laundered by flipping `complete: true`. This is an internal-consistency
+check, not global authentication: the report carries no path, so a globally
+self-consistent relabel cannot be detected here. Such a relabel only moves the
+conflict to the persistence layer, which fails closed on identity/provenance.
+It rejects an incomplete acquisition or a report with zero sources. It performs
+no persistence, search indexing, cursor advancement, session resume, archive
+replay, or runtime action. `history` and `archive` records are never run.
 
 ## Namespace, resume, and conflict rules
 
@@ -214,10 +219,13 @@ byte-for-byte snapshots, stable opaque labels, ignored/structural counter
 reconciliation, missing versus error surfaces, empty/wrong-root failure,
 symlink/hard-link/non-regular/unreadable rejection, redirected-`HOME` protection,
 root and namespace validation, incomplete-acquisition withholding, forged-report
-rejection, default and overridden batching, bounds, deterministic pre-open /
-post-read mutation races, descriptor hygiene, non-mutation, and preparation
-integration. The race tests use a test-only instrumented copy of the built
-module; production code has no test hook. Run it with:
+rejection (including a failed acquisition forged as complete and a throwing
+caller getter), default and overridden batching, bounds, mutable-snapshot digest
+rechecks, descriptor hygiene, non-mutation, preparation integration, and
+deterministic before-read / before-open / post-read / post-read-path /
+pre-verification races (directory and root identity). The race tests use a
+test-only instrumented copy of the built module; production code has no test
+hook. Run it with:
 
 ```bash
 npm run build

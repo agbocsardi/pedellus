@@ -96,8 +96,12 @@ async function makeInstrumentedModule() {
     .replace(
       /(offset \+= bytesRead;[\s\S]*?\n\s*\}\n)(\s*)const after = await handle\.stat\(\{ bigint: true \}\);/,
       "$1$2await globalThis.__archivalSourceRaceHook?.('after-read');\n$2const after = await handle.stat({ bigint: true });",
+    )
+    .replace(
+      "await verifyRootAndDirectories(root, rootPath, rootBefore, state);",
+      "await globalThis.__archivalSourceRaceHook?.('before-verify');\n        await verifyRootAndDirectories(root, rootPath, rootBefore, state);",
     );
-  for (const marker of ["before-read-lstat", "before-open", "after-read"]) {
+  for (const marker of ["before-read-lstat", "before-open", "after-read", "before-verify"]) {
     assert.equal(instrumented.includes(marker), true, `missing race hook ${marker}`);
   }
   await writeFile(join(temporary, "archival-source/index.js"), instrumented);
@@ -284,6 +288,9 @@ test("marks an empty or wrong root incomplete instead of silently importing noth
     ]);
     assert.equal(partial.sources.length, 1);
     assert.equal(partial.batches.length, 1);
+    const prepared = prepareAcquiredArchivalImport(partial);
+    assert.equal(prepared.length, 1);
+    assert.equal(prepared[0].sources.length, 1);
   } finally {
     await removeRoot(partialRoot);
   }
@@ -660,6 +667,29 @@ test("rejects forged or inconsistent acquisition reports before preparation", as
       ArchivalSourceInputError,
     );
     assert.throws(
+      () => prepareAcquiredArchivalImport({
+        ...report,
+        diagnostics: [{
+          code: "source-changed",
+          severity: "failure",
+          surface: "source",
+          sourceId: report.sources[0].sourceId,
+        }],
+      }),
+      ArchivalSourceInputError,
+    );
+    assert.throws(
+      () => prepareAcquiredArchivalImport({ ...report, diagnostics: [{ severity: "unknown" }] }),
+      ArchivalSourceInputError,
+    );
+    assert.throws(
+      () => prepareAcquiredArchivalImport({
+        ...report,
+        get bounds() { throw new Error("boom"); },
+      }),
+      ArchivalSourceInputError,
+    );
+    assert.throws(
       () => prepareAcquiredArchivalImport({ ...report, sources: [], batches: report.batches }),
       ArchivalSourceInputError,
     );
@@ -709,13 +739,63 @@ test("rejects forged or inconsistent acquisition reports before preparation", as
   }
 });
 
-test("detects deterministic mutations before, during, and after read", async () => {
+test("rejects a failed acquisition forged as complete", async () => {
+  const root = await makeRoot();
+  try {
+    await writeFixture(root, "sessions/real.jsonl", sessionText());
+    await symlink("real.jsonl", join(root, "sessions/link.jsonl"));
+    const bad = await acquireLegacySourceSnapshots({
+      root,
+      storeNamespace: "synthetic-store",
+    });
+    assert.equal(bad.complete, false);
+    assert.equal(bad.sources.length, 1);
+    assert.equal(bad.diagnostics.some((diagnostic) => diagnostic.severity === "failure"), true);
+    const forged = {
+      ...bad,
+      complete: true,
+      batches: [{
+        batch: 0,
+        sources: bad.sources.map((source) => source.snapshot),
+        totalBytes: bad.sources.reduce((total, source) => total + source.byteLength, 0),
+      }],
+    };
+    assert.throws(() => prepareAcquiredArchivalImport(forged), ArchivalSourceInputError);
+  } finally {
+    await removeRoot(root);
+  }
+});
+
+test("rejects a snapshot mutated after acquisition and accepts restored bytes", async () => {
+  const root = await makeRoot();
+  try {
+    await writeFixture(root, "sessions/s1.jsonl", sessionText());
+    const report = await acquireLegacySourceSnapshots({
+      root,
+      storeNamespace: "synthetic-store",
+    });
+    const bytes = report.sources[0].snapshot.bytes;
+    const original = Buffer.from(bytes);
+    bytes.fill(0x41);
+    assert.throws(() => prepareAcquiredArchivalImport(report), ArchivalSourceInputError);
+    bytes.set(original);
+    const prepared = prepareAcquiredArchivalImport(report);
+    assert.equal(prepared.length, 1);
+    assert.equal(prepared[0].sources.length, 1);
+  } finally {
+    await removeRoot(root);
+  }
+});
+
+test("detects deterministic mutations before, during, after read, and before verification", async () => {
   const { temporary, module } = await makeInstrumentedModule();
   try {
     const cases = [
       {
         phase: "before-read-lstat",
         mutate: async (target) => { await writeFile(target, sessionText("changed-before-lstat")); },
+        expectedSources: 0,
+        expectedCodes: ["source-changed"],
       },
       {
         phase: "before-open",
@@ -723,13 +803,38 @@ test("detects deterministic mutations before, during, and after read", async () 
           await rename(target, `${target}.old`);
           await writeFile(target, sessionText("replaced-before-open"));
         },
+        expectedSources: 0,
+        expectedCodes: ["source-changed"],
       },
       {
         phase: "after-read",
         mutate: async (target) => { await writeFile(target, sessionText("changed-after-read")); },
+        expectedSources: 0,
+        expectedCodes: ["source-changed"],
+      },
+      {
+        phase: "after-read",
+        mutate: async (target) => {
+          await rename(target, `${target}.old`);
+          await writeFile(target, sessionText("replaced-after-read"));
+        },
+        expectedSources: 0,
+        expectedCodes: ["source-changed"],
+      },
+      {
+        phase: "before-verify",
+        mutate: async (_target, root) => { await writeFile(join(root, "sessions/added.jsonl"), sessionText("added")); },
+        expectedSources: 1,
+        expectedCodes: ["directory-changed"],
+      },
+      {
+        phase: "before-verify",
+        mutate: async (_target, root) => { await writeFile(join(root, "added.txt"), "added\n"); },
+        expectedSources: 1,
+        expectedCodes: ["root-changed"],
       },
     ];
-    for (const { phase, mutate } of cases) {
+    for (const { phase, mutate, expectedSources, expectedCodes } of cases) {
       const root = await makeRoot();
       try {
         await writeFixture(root, "sessions/s1.jsonl", sessionText());
@@ -738,7 +843,7 @@ test("detects deterministic mutations before, during, and after read", async () 
         globalThis.__archivalSourceRaceHook = async (currentPhase) => {
           if (currentPhase !== phase || fired) return;
           fired = true;
-          await mutate(target);
+          await mutate(target, root);
         };
         const report = await module.acquireLegacySourceSnapshots({
           root,
@@ -746,13 +851,15 @@ test("detects deterministic mutations before, during, and after read", async () 
         });
         assert.equal(fired, true, phase);
         assert.equal(report.complete, false, phase);
-        assert.equal(report.sources.length, 0, phase);
+        assert.equal(report.sources.length, expectedSources, phase);
         assert.equal(report.batches.length, 0, phase);
-        assert.equal(
-          report.diagnostics.some((diagnostic) => diagnostic.code === "source-changed"),
-          true,
-          phase,
-        );
+        for (const code of expectedCodes) {
+          assert.equal(
+            report.diagnostics.some((diagnostic) => diagnostic.code === code),
+            true,
+            `${phase}: ${code}`,
+          );
+        }
       } finally {
         delete globalThis.__archivalSourceRaceHook;
         await removeRoot(root);

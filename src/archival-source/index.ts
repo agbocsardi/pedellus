@@ -1299,6 +1299,14 @@ interface ValidatedAcquisitionReport {
 }
 
 function validatedAcquisitionReport(report: unknown): ValidatedAcquisitionReport {
+  try {
+    return validatedAcquisitionReportValue(report);
+  } catch (error) {
+    return rethrowInputFailure(error, "Archival source acquisition report is unreadable");
+  }
+}
+
+function validatedAcquisitionReportValue(report: unknown): ValidatedAcquisitionReport {
   if (!isRecord(report) || report.format !== ARCHIVAL_SOURCE_ACQUISITION_FORMAT) {
     throw new ArchivalSourceInputError("Expected an archival source acquisition report");
   }
@@ -1307,6 +1315,19 @@ function validatedAcquisitionReport(report: unknown): ValidatedAcquisitionReport
   }
   if (report.complete !== true) {
     throw new ArchivalSourceInputError("Cannot prepare an incomplete archival source acquisition");
+  }
+  const rawDiagnostics = report.diagnostics;
+  if (!Array.isArray(rawDiagnostics)) {
+    throw new ArchivalSourceInputError("Archival source acquisition report has invalid diagnostics");
+  }
+  for (const diagnostic of rawDiagnostics) {
+    if (!isRecord(diagnostic) ||
+        (diagnostic.severity !== "failure" && diagnostic.severity !== "notice")) {
+      throw new ArchivalSourceInputError("Archival source acquisition report has invalid diagnostics");
+    }
+    if (diagnostic.severity === "failure") {
+      throw new ArchivalSourceInputError("Cannot prepare an archival source acquisition with failure diagnostics");
+    }
   }
   const storeNamespace = validatedStoreNamespace(report.storeNamespace);
   const rootLabel = report.rootLabel;
