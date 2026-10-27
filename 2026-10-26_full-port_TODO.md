@@ -984,3 +984,24 @@ Reassigned the completed reviewer through herdr_send to C2's committed context
 module/lifecycle/skill/bounds contract; report target
 `/tmp/pi-context-composition-review.md`. C2 lifecycle follow-up and C3 provenance
 fix remain outstanding. Sandbox/execution changes remain deferred and tools disabled.
+
+### 2026-10-27 — usage source fix and independent parent probes
+
+C3 explicitly reported clean follow-up `b5ddc97a1` atop `40d6688fc`: required
+host-owned storeNamespace plus conversation ID in snapshot/read/cursor contracts;
+exact serialized-scope validation, no inferred identity or side store. Parent
+reviewed the diff and native accumulator. Reassigned completed provider worker
+`pi-7dcd4062`/`w10:p1` as an independent **read-only** usage reviewer, report
+`/tmp/pi-usage-projection-review.md`; no further provider edits assigned.
+
+Parent reran the updated native Harness/usage fixture via selectable-import
+`/tmp/pi-nanobot-parent-usage-baseline.mjs` (60s/384 MB), passing fresh empty usage,
+immutable/prototype-safe snapshots, store/cursor scope, model/tool conservation,
+nested usage once, failed response and compaction accounting. Parent independently
+wrote `/tmp/pi-nanobot-parent-usage-edges.mjs` (45s/384 MB): 120 cumulative steps
+conserve model/tool tokens and costs; repeated JSON cursors, case-sensitive
+cross-store same-ID rejection, cumulative-source tampering, malformed/missing/
+regressing counters and nested cost immutability pass. Candidate built artifacts
+only so far; repeat on parent after explicit independent review/integration.
+No archive writer, request-count invention, abort-runtime proof, live calls or
+sandbox changes. P4 remains incomplete.
