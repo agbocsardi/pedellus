@@ -52,6 +52,13 @@ export {
   type ConversationContextSnapshot,
 } from "./context/index.js";
 export {
+  createWorkspaceContextSnapshotProvider,
+  loadWorkspaceContextSnapshot,
+  type WorkspaceContextRequest,
+  type WorkspaceContextSnapshot,
+  type WorkspaceContextSelectionResolver,
+} from "./context/workspace.js";
+export {
   CODEMODE_BUDGETS,
   createCodeModeIntegration,
   type CodeModeIntegration,

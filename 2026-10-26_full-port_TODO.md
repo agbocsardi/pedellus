@@ -67,8 +67,9 @@ policy, environment and replay gates pass.
       lifecycle integrated through `fb356393c`; parent verified isolated and
       combined builds, session/store isolation and synthetic SIGKILL/reopen.
       Gateway can reconstruct host snapshots before resume; no ambient filesystem.
-- [ ] `pi-e3cdee37`: opt-in bounded explicit-workspace snapshot loader for
-      bootstrap/memory context, synthetic workspaces only; base `11a21a651`.
+- [x] `pi-e3cdee37`: merged `9aa8906e6`, bounded opt-in workspace loader for
+      bootstrap and explicitly selected memory files; independent review and
+      synthetic race/renderer checks passed. No default Gateway or skills wiring.
 - [ ] Design safe recovery for prepared requests containing old Nanobot context:
       current conservative guard blocks startup even when context is unchanged,
       and Gateway exposes no recovery interface to settle/cancel blocked tasks.

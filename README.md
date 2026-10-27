@@ -41,7 +41,10 @@ memory and selected-skill snapshots through native Durable sections. Direct call
 need a **fresh extension and dedicated registry per Harness/storage**: conversation
 IDs collide across stores. `openGateway` can also accept an opt-in host snapshot
 provider and reconstructs snapshots before resume; it does not load files itself.
-Prepared requests containing old Nanobot context conservatively block recovery,
+An opt-in [workspace loader](./WORKSPACE_CONTEXT.md) supplies fixed bootstrap files
+and explicitly selected memory files to such a provider; it does not discover skills
+or provide full Python memory parity. Prepared requests containing old Nanobot context
+conservatively block recovery,
 and the Gateway has no blocked-task reconciliation interface yet. See the
 [context contract](./CONTEXT.md).
 
