@@ -44,6 +44,8 @@ const SKILL_BODY = "SKILL_BODY_MARKER_5F3A";
 const BOOTSTRAP_MARKER = "ACCEPTANCE_BOOTSTRAP_ALPHA";
 const MEMORY_MARKER = "MEMORY_MD_MARKER_7C1D";
 const TOPIC_PATH = "memory/topics/acceptance.md";
+/** Topic-file body marker; deliberately distinct from the early-turn FACT. */
+const TOPIC_MARKER = "TOPIC_LYNX-4820";
 const TOPIC_DESCRIPTION = "Synthetic acceptance topic written through a granted tool";
 const COMPACTION_PREFIX = "The conversation history before this point was compacted into the following summary";
 
@@ -169,6 +171,36 @@ function toolResultsOf(requestText) {
     }));
 }
 
+/** Text blocks of every message, for per-message provenance checks. */
+function messageTexts(requestText) {
+  const messages = JSON.parse(requestText);
+  return messages.map((message) => {
+    if (message === null || typeof message !== "object") return "";
+    if (typeof message.content === "string") return message.content;
+    if (!Array.isArray(message.content)) return "";
+    return message.content
+      .map((block) => (block?.type === "text" ? String(block.text ?? "") : ""))
+      .join("\n");
+  });
+}
+
+/**
+ * Locate the one compaction summary message and prove the early fact is inside
+ * it and nowhere else. The raw early turn carries a sentinel; the topic file
+ * carries its own marker, so neither can satisfy the fact assertion.
+ */
+function factIsolation(requestText) {
+  const texts = messageTexts(requestText);
+  const summaryIndexes = texts.flatMap((text, index) => (text.includes(COMPACTION_PREFIX) ? [index] : []));
+  const summaryIndex = summaryIndexes.length === 1 ? summaryIndexes[0] : -1;
+  return {
+    summaryCount: summaryIndexes.length,
+    summaryHasFact: summaryIndex >= 0 && texts[summaryIndex].includes(FACT),
+    othersHaveFact: texts.some((text, index) => index !== summaryIndex && text.includes(FACT)),
+    factOccurrences: texts.join("\n").split(FACT).length - 1,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Child phases
 // ---------------------------------------------------------------------------
@@ -245,12 +277,23 @@ function installer(core, probe, requestPrefix) {
   const summaryResponse = (entry) => {
     const extracted = /AURORA-[0-9]{4}/.exec(entry.text)?.[0];
     const topic = entry.text.includes(TOPIC_PATH) ? TOPIC_PATH : undefined;
+    // The serialized transcript marks each user turn with "[User]: ". Provenance
+    // is only accepted when the fact and the raw-turn sentinel sit in the same
+    // early user block; the topic file uses a separate marker.
+    const earlyBlock = entry.text.split("[User]: ").find((block) => block.includes("Early acceptance instruction"));
     state.summary = {
       observed: true,
       extractedFact: extracted ?? null,
       extractedTopic: topic ?? null,
       requestChars: entry.chars,
       requestSha256: entry.sha256,
+      provenance: {
+        factAndSentinelInEarlyUserTurn:
+          earlyBlock !== undefined && earlyBlock.includes(FACT) && earlyBlock.includes(SENTINEL),
+        factOccurrences: entry.text.split(FACT).length - 1,
+        sentinelOccurrences: entry.text.split(SENTINEL).length - 1,
+        hasTopicMarker: entry.text.includes(TOPIC_MARKER),
+      },
     };
     const body = extracted === undefined
       ? "## Critical Context\n- The acceptance code could not be extracted from this request.\n"
@@ -378,7 +421,7 @@ async function runFirstPhase(core, stateDir, evidence) {
       "",
       "# Acceptance topic",
       "",
-      `The acceptance code is ${FACT}. It was written through the granted write tool.`,
+      `The topic marker is ${TOPIC_MARKER}. It was written through the granted write tool.`,
       "",
     ].join("\n");
     await driver.send(conversation, context,
@@ -388,7 +431,7 @@ async function runFirstPhase(core, stateDir, evidence) {
         core.fauxAssistantMessage("Topic memory written."),
       ]);
     const onDisk = await readFile(join(workspace, ...TOPIC_PATH.split("/")), "utf8");
-    require("memory.write_reached_disk", onDisk.includes(FACT) && onDisk.includes(TOPIC_DESCRIPTION));
+    require("memory.write_reached_disk", onDisk.includes(TOPIC_MARKER) && onDisk.includes(TOPIC_DESCRIPTION) && !onDisk.includes(FACT));
     const writeResults = toolResultsOf(probe.requests.at(-1).text).filter((result) => result.toolName === "write");
     require("memory.write_tool_result", writeResults.length === 1 && writeResults[0].text.includes(TOPIC_PATH), writeResults[0]?.text);
 
@@ -400,7 +443,7 @@ async function runFirstPhase(core, stateDir, evidence) {
         core.fauxAssistantMessage("Topic memory read back."),
       ]);
     const readResults = toolResultsOf(probe.requests.at(-1).text).filter((result) => result.toolName === "read");
-    require("memory.read_tool_result", readResults.length === 1 && readResults[0].text.includes(FACT), readResults[0]?.text);
+    require("memory.read_tool_result", readResults.length === 1 && readResults[0].text.includes(TOPIC_MARKER) && !readResults[0].text.includes(FACT), readResults[0]?.text);
 
     // Enough recent transcript for native compaction to select an old prefix.
     const fillerLine = "Synthetic filler for the offline acceptance run. It carries no real data and exists only so native compaction has an old prefix to summarize. ";
@@ -443,6 +486,13 @@ async function runFirstPhase(core, stateDir, evidence) {
     require("compaction.summary_request_observed", summary !== undefined);
     require("compaction.fact_extracted_from_request", summary?.extractedFact === FACT, summary?.extractedFact ?? "none");
     require("compaction.topic_extracted_from_request", summary?.extractedTopic === TOPIC_PATH, summary?.extractedTopic ?? "none");
+    require("compaction.fact_and_sentinel_in_early_turn", summary?.provenance?.factAndSentinelInEarlyUserTurn === true,
+      JSON.stringify(summary?.provenance));
+    require("compaction.summary_request_fact_single", summary?.provenance?.factOccurrences === 1,
+      `${summary?.provenance?.factOccurrences} occurrences`);
+    require("compaction.summary_request_has_topic_marker", summary?.provenance?.hasTopicMarker === true);
+    require("compaction.summary_request_sentinel_single", summary?.provenance?.sentinelOccurrences === 1,
+      `${summary?.provenance?.sentinelOccurrences} occurrences`);
 
     let view;
     const headDeadline = Date.now() + 10_000;
@@ -452,10 +502,15 @@ async function runFirstPhase(core, stateDir, evidence) {
       await sleep(25);
     }
     const messages = JSON.stringify(view?.messages ?? []);
+    const isolation = factIsolation(messages);
     require("compaction.summary_head_placed", view?.head !== undefined);
-    require("compaction.summary_visible", messages.includes(COMPACTION_PREFIX) && messages.includes(FACT));
+    require("compaction.summary_message_has_fact", isolation.summaryCount === 1 && isolation.summaryHasFact,
+      JSON.stringify(isolation));
+    require("compaction.fact_only_in_summary_message", isolation.summaryCount === 1 && !isolation.othersHaveFact,
+      JSON.stringify(isolation));
+    require("compaction.summary_fact_once", isolation.factOccurrences === 1, `${isolation.factOccurrences} occurrences`);
     require("compaction.original_turn_absent", !messages.includes(SENTINEL));
-    require("compaction.fact_only_in_summary", messages.split(FACT).length - 1 === 1, `${messages.split(FACT).length - 1} occurrences`);
+    require("compaction.topic_body_absent_from_summary", !messages.includes(TOPIC_MARKER));
 
     const summaryEntry = { ...summary };
     evidence.requests = probe.requests.map(({ kind, chars, sha256: digest }) => ({ kind, chars, sha256: digest }));
@@ -494,16 +549,20 @@ async function runSecondPhase(core, stateDir, evidence) {
       "Which acceptance code do you remember from the earlier instruction?",
       [core.fauxAssistantMessage("The earlier instruction recorded an acceptance code.")]);
     const request = probe.requests[0];
-    require("reopen.compaction_summary_present", request.text.includes(COMPACTION_PREFIX));
-    require("reopen.summary_carries_early_fact", request.text.includes(FACT));
+    const isolation = factIsolation(request.text);
+    require("reopen.compaction_summary_present", isolation.summaryCount === 1, JSON.stringify(isolation));
+    require("reopen.summary_message_has_fact", isolation.summaryHasFact, JSON.stringify(isolation));
+    require("reopen.fact_only_in_summary_message", !isolation.othersHaveFact, JSON.stringify(isolation));
+    require("reopen.fact_once_in_request", isolation.factOccurrences === 1, `${isolation.factOccurrences} occurrences`);
     require("reopen.raw_turn_absent", !request.text.includes(SENTINEL));
+    require("reopen.topic_body_absent_before_read", !request.text.includes(TOPIC_MARKER));
     require("reopen.fact_not_in_system_prompt", !request.prompt.includes(FACT));
     require("reopen.bootstrap_rediscovered", request.prompt.includes(BOOTSTRAP_MARKER));
     require("reopen.loaded_memory_present", request.prompt.includes(MEMORY_MARKER));
     require("reopen.memory_manifest_rediscovered",
       request.prompt.includes(`\`${TOPIC_PATH}\` (topic`) && request.prompt.includes(TOPIC_DESCRIPTION));
     require("reopen.skill_summary_present", request.prompt.includes(SKILL_NAME) && request.prompt.includes(SKILL_DESCRIPTION));
-    require("reopen.skill_body_absent_before_load", !request.prompt.includes(SKILL_BODY));
+    require("reopen.skill_body_absent_before_load", !request.text.includes(SKILL_BODY));
 
     // Revocation still holds in a fresh process.
     const revoked = (await gateway.revokeTools(SESSION_KEY, ["write"], context)).map((grant) => grant.name);
@@ -523,7 +582,9 @@ async function runSecondPhase(core, stateDir, evidence) {
     const skillResults = results.filter((result) => result.toolName === "skill" && !result.isError);
     const readResults = results.filter((result) => result.toolName === "read" && !result.isError);
     require("reopen.skill_body_on_demand", skillResults.length === 1 && skillResults[0].text.includes(SKILL_BODY), skillResults[0]?.text);
-    require("reopen.memory_read_granted", readResults.length === 1 && readResults[0].text.includes(FACT), readResults[0]?.text);
+    require("reopen.memory_read_granted",
+      readResults.length === 1 && readResults[0].text.includes(TOPIC_MARKER) && !readResults[0].text.includes(FACT),
+      readResults[0]?.text);
 
     evidence.conversationId = conversation.id;
     evidence.requests = probe.requests.map(({ kind, chars, sha256: digest }) => ({ kind, chars, sha256: digest }));
@@ -641,7 +702,8 @@ async function run() {
     } catch {
       topicOnDisk = "";
     }
-    record("memory_write_on_disk", topicOnDisk.includes(FACT) && topicOnDisk.includes(TOPIC_DESCRIPTION));
+    record("memory_write_on_disk",
+      topicOnDisk.includes(TOPIC_MARKER) && topicOnDisk.includes(TOPIC_DESCRIPTION) && !topicOnDisk.includes(FACT));
 
     const second = await runChild([SCRIPT, "--phase=reopen", `--state=${stateDir}`], ROOT);
     phases.reopen = { exitCode: second.code, signal: second.signal, timedOut: second.timedOut, durationMs: second.durationMs };

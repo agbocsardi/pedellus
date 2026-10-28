@@ -12,8 +12,13 @@ It is not a unit-test suite and it is not real-model or A/B acceptance.
 
 ```bash
 npm ci --offline
-npm run test:core-acceptance
+npm run --silent test:core-acceptance
 ```
+
+`--silent` suppresses npm's own banners so stdout is only the report. After
+`npm run build`, `node scripts/core-acceptance.mjs` does the same. Plain
+`npm run test:core-acceptance` also works but prints npm/build banners before
+the JSON, so do not parse its raw stdout as JSON.
 
 The runner builds `dist/`, generates a synthetic workspace under the OS temp
 directory, and runs two bounded child processes:
@@ -32,14 +37,26 @@ directory, and runs two bounded child processes:
    from Markdown, and that pending grants are still present. The skill body and
    topic body load on demand through tool results.
 
+The early user turn is the only source of the acceptance fact and also carries a
+distinct raw-turn sentinel. The topic memory file uses its own marker, so a topic
+read or write can never satisfy the fact assertion. The runner proves the
+summarizer request contains the fact and the sentinel in the same early user
+block, then checks the placed compaction summary message is the only message in
+the phase-1 context and in the phase-2 request that contains the fact. In phase 2
+the raw sentinel, the topic body marker and the skill body are absent until their
+own tool results load them.
+
 The faux provider is the only model endpoint. The summarizer request is real
-(native Durable compaction), and the runner extracts the acceptance fact from
-that request before answering it; if extraction fails the run fails rather than
-supplying the fact from a canned answer.
+(native Durable compaction); the runner extracts the early-turn fact and topic
+locator from that request before answering it. If extraction or the per-message
+isolation check fails, the run fails rather than supplying the fact from a
+canned answer.
 
 ## Output contract
 
-The runner prints one JSON object and nothing else on stdout:
+The runner itself prints one JSON object and nothing else on stdout. Use the
+silent npm form above (or direct `node`) for machine parsing; plain npm run adds
+banners first.
 
 - `status`: `"pass"` or `"fail"`.
 - `checks[]`: stable `id`, `status` (`pass`/`fail`) and optionally a bounded

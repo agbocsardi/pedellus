@@ -16,7 +16,7 @@ npm run typecheck         # tsc --noEmit
 npm run build             # tsc -> dist/
 npm run test:behavior     # 155 behaviour checks (builds first)
 npm run test:execution    # 9 execution/sandbox checks (builds first)
-npm run test:core-acceptance  # offline core acceptance run (builds first; see ACCEPTANCE.md)
+npm run --silent test:core-acceptance  # offline core acceptance JSON (builds first; see ACCEPTANCE.md)
 npm start -- --config config.json   # local CLI against a config file
 ```
 
