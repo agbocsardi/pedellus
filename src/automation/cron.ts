@@ -16,6 +16,7 @@ import type {
   Tx,
 } from "@earendil-works/pi-durable";
 import {
+  CRON_DEFAULT_TIME_ZONE,
   materializeCronSchedule,
   nextCronOccurrence,
   parseCronScheduleRequest,
@@ -290,8 +291,14 @@ function normalizeRequest(actor: CronActor, request: CronScheduleInput): Normali
 }
 
 function sameScheduleRequest(left: CronSchedule, right: CronScheduleRequest): boolean {
-  if (left.kind === "once" && right.kind === "once") return left.at === right.at;
+  if (left.kind === "at" && (right.kind === "at" || right.kind === "once")) {
+    return left.at === right.at;
+  }
   if (left.kind === "every" && right.kind === "every") return left.everyMs === right.everyMs;
+  if (left.kind === "cron" && right.kind === "cron") {
+    return left.expr === right.expr
+      && left.timeZone === (right.timeZone ?? CRON_DEFAULT_TIME_ZONE);
+  }
   return false;
 }
 function sameNormalizedRequest(job: CronJob, request: NormalizedRequest): boolean {
@@ -432,7 +439,7 @@ function jobStatusOf(
   }
   if (timer !== null) return TERMINAL_TASK.has(timer.status) ? "stopped" : "scheduled";
   if (execution !== null) return execution.status === "completed" ? "completed" : execution.status;
-  return job.schedule.kind === "once" && job.lastOutcome !== null ? "completed" : "stopped";
+  return job.schedule.kind === "at" && job.lastOutcome !== null ? "completed" : "stopped";
 }
 
 function runTargetOf(record: Awaited<ReturnType<Harness["getTask"]>>): ConversationId | null {
@@ -711,7 +718,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
               ? undefined
               : await tx.task(job.executionTaskId as TaskId<CronRunResult>);
             const busy = prior !== undefined && prior.state.status !== "terminal";
-            const nextAtMs = job.schedule.kind === "once"
+            const nextAtMs = job.schedule.kind === "at"
               ? null
               : nextCronOccurrence(job.schedule, Math.max(now, input.scheduledAtMs));
             let executionTaskId: number | null = null;
@@ -858,7 +865,12 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
         } catch (error) {
           throw new TypeError(errorText(error));
         }
-        const firstAtMs = schedule.kind === "once" ? schedule.at : schedule.anchorMs;
+        const firstAtMs = schedule.kind === "at"
+          ? schedule.at
+          : schedule.kind === "every"
+            ? schedule.anchorMs
+            : nextCronOccurrence(schedule, now);
+        if (firstAtMs === null) throw new TypeError("schedule has no future occurrence");
         const jobId = `cron-${randomUUID()}`;
         const generation = 1;
         const timerTaskId = await tx.createTask(
@@ -910,7 +922,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           : await tx.task(job.executionTaskId as TaskId<CronRunResult>);
         const live = [timerRecord, executionRecord]
           .some((record) => record !== undefined && record.state.status !== "terminal");
-        const settledOnce = job.schedule.kind === "once"
+        const settledOnce = job.schedule.kind === "at"
           && job.lastOutcome !== null
           && job.timerTaskId === null
           && executionRecord?.state.status === "terminal";

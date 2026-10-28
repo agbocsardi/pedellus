@@ -18,6 +18,7 @@
     "@earendil-works/pi-codemode": "1.4.0",
     "@earendil-works/pi-durable": "1.4.0",
     "@earendil-works/pi-env": "1.4.0",
+    "croner": "10.0.1",
     "grammy": "1.46.0"
   },
   "devDependencies": {

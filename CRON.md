@@ -1,13 +1,14 @@
 # Cron: deterministic timer plus finite run
 
 This replaces the parked recurring-task foundation. It is **not wired** into the gateway,
-channels, config, tools, delivery, or a calendar parser. Nothing here sends a message outside
-the Durable conversation it submits to.
+channels, config, tools, delivery, or a command/tool surface. Calendar expressions and IANA time
+zones are schedule math; parsing user text or ISO datetimes stays outside. Nothing here sends a
+message outside the Durable conversation it submits to.
 
 Files:
 
 - `src/automation/cron.ts` — job document, timer task, run task, controller API.
-- `src/automation/cron-schedule.ts` — one-shot and interval schedule math.
+- `src/automation/cron-schedule.ts` — one-shot, interval, and calendar schedule math.
 - This document.
 
 ## Why two tasks
@@ -113,18 +114,49 @@ shown as parked; this slice invents no cron retry policy, so use Durable's norma
 
 ## Schedule math
 
-Supported schedules are `once` (absolute epoch milliseconds) and `every` (fixed interval). An
-interval is anchored at creation time, so the grid survives restarts. The first interval slot is
-validated as a safe integer before the job is created. The next slot is always strictly after
-`max(now, scheduledAtMs)`; a backward clock jump cannot duplicate or move a slot backwards, and
-missed slots are skipped rather than replayed. One-shot schedules run once however late. No count,
-interval, horizon, lateness, or history cap is added.
+Supported request kinds are Python-like `at`, `every`, and `cron`:
+
+- `at` is one absolute epoch-millisecond instant. `once` is retained as an alias for callers
+  written against the first foundation. The instant must be in the future when the job is created.
+- `every` is an interval anchored at creation. Every later occurrence is `anchorMs + k * everyMs`,
+  so the grid survives restarts and a backward clock jump. This differs from Python's
+  `now + interval` recomputation, which resets the phase on restart.
+- `cron` is a calendar expression evaluated in an IANA time zone. `timeZone` defaults to `UTC`,
+  matching the Python tool's default. Fixed UTC offsets such as `+02:00` are rejected.
+
+Calendar parsing and recurrence use `croner` 10.0.1. Expressions may have 5, 6, or 7 fields:
+`minute hour day-of-month month day-of-week`, with optional leading `second` and trailing `year`.
+This is croner's field order, not croniter's: a croniter six-field expression puts seconds last,
+while a croner six-field expression puts seconds first. Croner also accepts nicknames (`@daily`,
+`@hourly`, ...), `L`, `W`, `#`, `?`, and the `+` AND modifier for day-of-week, and defaults to OR
+logic between day-of-month and day-of-week like croniter.
+
+The next slot is always strictly after `max(now, scheduledAtMs)`; missed slots are skipped, not
+replayed or coalesced. A backward clock jump cannot duplicate or move a slot backwards. No job
+count, interval, lateness, horizon, or history cap is added.
+
+Time-zone behavior is verified against IANA data and documented honestly:
+
+- **Gap (spring forward):** a nonexistent wall time is skipped to the next matching wall-clock
+  time. For example, `30 2 * * *` in `America/New_York` on 2026-03-08 fires at 03:30 EDT
+  (`07:30Z`). Croniter instead normalizes a gap time to the transition instant, 03:00 EDT.
+- **Fold (fall back):** croner runs the first occurrence once. If a reference falls in the second
+  repeated hour, the schedule advances to the first matching slot at or after the repeated interval
+  ends instead of returning a past instant. Croniter runs both repeated occurrences.
+- The `at` and `every` kinds have no time zone of their own; `at` is already absolute and `every`
+  is a fixed elapsed interval.
+
+Invalid expressions, unknown/non-IANA zones, and expressions with no future occurrence are
+rejected before a job record or timer task is created. Stored values are safe integers; a next
+occurrence that would exceed the safe-integer range fails visibly instead of wrapping. Croner's
+own parser supports years 1-9999 and bounds its search near year 3000/9999; that is a library
+limit, not an added product cap.
 
 ## Not included / limitations
 
 - No migration of the parked probe document versions or stores. They are not supported.
-- No gateway, channel, config, command/tool surface, calendar expression, time zone/DST, delivery,
-  silence, model selection, or misfire policy.
+- No gateway, channel, config, command/tool surface, ISO/text-to-`at` parsing, delivery, silence,
+  model selection, or misfire policy.
 - Background runs are owned by the run task, so cancelling the job aborts that run. In `origin` mode
   an already-placed origin run is not owned by the run task; cancellation still fences both
   pointers and withdraws a still-queued input, but cannot retract an already-placed run.
@@ -148,5 +180,13 @@ moving backwards during a run; restart during a run and after execution with the
 armed; cancellation before due and during a run; one-shot origin completion; timer and execution
 fault visibility; parked target generation visibility; owner scoping; and dedupe. Additional
 review probes covered: a queued origin input withdrawn on cancel, the already-placed limitation,
-unhealthy-timer status dominance, and overflow rejection before job creation. No live data,
+unhealthy-timer status dominance, and overflow rejection before job creation.
+
+Calendar probes covered `at`/`every`/`cron` parsing, the `once` alias, UTC default, invalid zones
+and offsets, invalid expressions, no-future-occurrence rejection, strict advancement after an exact
+slot, backward/forward clock jumps, and safe-integer overflow. A fake-clock Harness probe confirmed
+a calendar timer commits the next occurrence before a blocked model answers, plus the
+`America/New_York` spring gap and fall fold. A stress probe walked calendar occurrences across
+`America/New_York`, `Europe/Berlin`, `Australia/Lord_Howe`, `Antarctica/Troll`, and
+`Pacific/Chatham`, asserting every next instant was strictly later and monotonic. No live data,
 credentials, network, or deployment was used.
