@@ -4,15 +4,15 @@ Date: 2026-10-27. Branch: `feat/pi-durable-rebuild`.
 
 ## Owner scope update — 2026-10-28
 
-Prioritize the core agent, memory, skills, tools and cron. The owner confirmed
+Prioritize the core agent, memory, skills, tools, cron and heartbeat. The owner confirmed
 skill wiring is essential. Background subagents and Code Mode workers are wanted;
 determine their implementation shape before building them. The owner also wants
 channels (Telegram, Discord, Email and WebSocket); plan their integration after
 the core, with actual use and sequencing to be discussed. Do not port the Python
-sustained goal/tasks interface or intent/keyword-triggered features. Defer heartbeat,
-WebUI and migration until the owner discusses them. Existing work is not a
+sustained goal/tasks interface or intent/keyword-triggered features. Defer WebUI
+and migration until the owner discusses them. Existing work is not a
 commitment to activate it.
-Complete and validate the core/memory/cron path first; compaction is core context
+Complete and validate the core/memory/cron/heartbeat path first; compaction is core context
 continuity. The broader W4–W6 descriptions below are historical options, not
 standing authorization to implement or deploy them.
 
