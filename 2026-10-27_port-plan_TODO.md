@@ -327,4 +327,15 @@ and host semantics before the sandbox follows. Host shell execution is not a
 confinement boundary: environment filtering and command deny patterns do not
 prevent arbitrary shell programs from reading host files. The owner accepted
 accidental-damage guardrails rather than adversarial isolation; Gateway tools
-still require W1 review, durable grants and its end-to-end checks.
+still require durable grants and its end-to-end checks.
+
+W1 foundation `3cf9838a1` and fix pass `dbea20e7c` passed independent final
+review (`pi-de3d8e5b`) and were cherry-picked as `931875a75` and `438c3f928`.
+Parent reran typecheck, 155 behavior checks and 9 execution checks successfully;
+the reviewer separately ran 24 host conformance checks. The host backend is
+not yet registered in the Gateway. Its lexical shell guard does not implement
+Python's exec URL guard, and cannot fully confine shell, hard links or detached
+processes; these are documented limitations, not claims of isolation. Native bash
+may report an undefined duration when a host-default timeout fires; integration
+must check/fix that user-visible error. Next: wire reviewed tools and durable
+conversation grants; independently review the direct-workspace bwrap builder.
