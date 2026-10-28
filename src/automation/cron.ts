@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { copyJson, type Context, type Draft, type JsonValue } from "@earendil-works/chord";
 import { LiveDoc, defineDoc, defineExtension, defineTask } from "@earendil-works/pi-durable";
 import type {
-  Conversation,
   ConversationHandle,
   ConversationId,
   Extension,
@@ -142,6 +141,14 @@ export interface CronScheduleInput {
 export interface CronActor {
   readonly owner: CronOwner;
 }
+/**
+ * The committing handle cron needs for a conversation's job document. A tool call and a host both
+ * commit conversation-scoped documents, so neither needs the full `Conversation` surface.
+ */
+export interface CronConversationWriter {
+  readonly id: ConversationId;
+  commit<T>(change: (tx: Tx) => T | Promise<T>, context: Context): Promise<T>;
+}
 export interface CronPreparation {
   readonly tx: Tx;
   readonly job: CronJob;
@@ -216,7 +223,8 @@ export interface CronFoundation {
   /** Install before opening or resuming the Harness; registers the timer and run tasks. */
   readonly extension: Extension;
   schedule(
-    actor: CronActor, conversation: Conversation, request: CronScheduleInput, context: Context,
+    actor: CronActor, conversation: CronConversationWriter, request: CronScheduleInput,
+    context: Context,
   ): Promise<CronScheduleReceipt>;
   cancel(
     harness: Pick<Harness, "abortTask" | "waitForTask" | "commit" | "abortSubmission">,

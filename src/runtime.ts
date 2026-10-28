@@ -6,6 +6,9 @@ import type { Models } from "@earendil-works/pi-ai/models";
 import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type Extension, type Harness as HarnessType, type ModelRef, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ConversationContextSnapshot } from "./context/index.js";
 import { createSkillTool, SKILL_TOOL_NAME } from "./context/skill-tool.js";
+import { createCronFoundation } from "./automation/cron.js";
+import { createCronTool, CRON_TOOL_NAME } from "./automation/cron-tool.js";
+import type { CronOwner } from "./automation/cron.js";
 import { parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
 import { prepareDataDirectory } from "./store.js";
@@ -142,6 +145,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     );
   }
   const toolsEnabled = toolAllowlist.length > 0;
+  // Internal agent scheduling: opt-in, and independent of the coding-tool ceiling so a reminder job
+  // needs no filesystem authority.
+  const cronConfig = config.cron;
+  const cronEnabled = cronConfig?.enabled === true;
   // Fail at startup, not at the first tool call, when the default cannot be represented by the host shell.
   const toolTimeoutSeconds = parseToolTimeoutSeconds(config.toolTimeoutSeconds);
   const allowedModels = config.allowedModels ?? [config.model];
@@ -178,7 +185,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ? createCodingToolExtension({
         tools: toolAllowlist as readonly CodingToolName[],
         ceiling: toolAllowlist,
-        contextTools: options.contextSnapshotProvider === undefined ? [] : [SKILL_TOOL_NAME],
+        contextTools: [
+          ...(options.contextSnapshotProvider === undefined ? [] : [SKILL_TOOL_NAME]),
+          ...(cronEnabled ? [CRON_TOOL_NAME] : []),
+        ],
         defaultTimeoutSeconds,
         now,
       })
@@ -227,11 +237,62 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (skillTool && contextConversations.has(conversationId) && skillConversations.has(conversationId)) {
       selected.push(skillTool.extension);
     }
+    if (cronFoundation && cronTool && cronOwners.has(conversationId)) {
+      selected.push(cronFoundation.extension, cronTool.extension);
+    }
     return { extensions: selected };
   };
   const toolRegistrations = new Map<string, ToolRegistration>(
     (toolExtension?.tools ?? []).map((tool) => [tool.name, tool]),
   );
+  // Origin sessions only: a scheduled run's fresh background conversation is not an origin session,
+  // so it cannot schedule further jobs. Owners are keyed by the mapped session key.
+  const cronOwners = new Map<ConversationId, CronOwner>();
+  const harnessRef: { current?: HarnessType } = {};
+  const cronFoundation = cronEnabled
+    ? createCronFoundation({
+        now,
+        // A background run is a fresh, task-owned conversation that starts default-deny. Copy the
+        // origin conversation's still-valid grants so the run has exactly the authority that
+        // scheduled it, bounded by those grants' own expiries. An origin-mode run needs nothing:
+        // it answers inside the conversation that already holds them.
+        prepare: async ({ tx, originConversationId, targetConversationId, background }) => {
+          if (!background) return;
+          const origin = await tx.doc(ToolGrantDoc, originConversationId);
+          const target = await tx.doc(ToolGrantDoc, targetConversationId);
+          const timestamp = now();
+          const granted: string[] = [];
+          for (const name of toolAllowlist) {
+            const expiresAt = origin.grants[name];
+            if (typeof expiresAt === "number" && Number.isSafeInteger(expiresAt) && expiresAt > timestamp) {
+              target.grants[name] = expiresAt;
+              granted.push(name);
+            }
+          }
+          const tools = granted.flatMap((name) => {
+            const tool = toolRegistrations.get(name);
+            return tool === undefined ? [] : [tool];
+          });
+          await configure(tx, targetConversationId, {
+            tools,
+            modelTools: tools,
+            extensions: toolExtension === undefined ? [] : [toolExtension],
+          });
+        },
+      })
+    : undefined;
+  const cronTool = cronFoundation === undefined
+    ? undefined
+    : createCronTool({
+        foundation: cronFoundation,
+        ownerFor: (conversationId) => cronOwners.get(conversationId),
+        harness: () => {
+          if (harnessRef.current === undefined) throw new Error("The runtime is not open");
+          return harnessRef.current;
+        },
+        ...(cronConfig?.timeZone === undefined ? {} : { timeZone: cronConfig.timeZone }),
+      });
+  const cronToolRegistration = cronTool?.extension.tools?.[0];
   const toolFilterFromNames = (
     names: readonly string[],
   ): { readonly tools: readonly ToolRegistration[] } => ({
@@ -246,19 +307,25 @@ export async function openGateway(config: PortConfig, context: Context, options:
   ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
     // The skill loader is context delivery, not an effectful tool: it stays outside the
     // grant document and the host ceiling, and is offered only for captured skill snapshots.
+    // The cron tool is an owner-scoped scheduling capability, not filesystem or shell authority,
+    // and is offered only in an origin session whose owner is known.
     const skillTools = skillToolRegistration !== undefined && skillConversations.has(conversationId)
       ? [skillToolRegistration]
       : [];
+    const cronTools = cronToolRegistration !== undefined && cronOwners.has(conversationId)
+      ? [cronToolRegistration]
+      : [];
+    const contextTools = [...skillTools, ...cronTools];
     if (!toolExtension) {
       // Retire instead of creating an empty document: a disabled ceiling must durably remove
       // previously granted tools so re-enabling it cannot resurrect them.
       await tx.retireDoc(ToolGrantDoc, conversationId);
-      return { tools: skillTools, modelTools: skillTools };
+      return { tools: contextTools, modelTools: contextTools };
     }
     const document = await tx.doc(ToolGrantDoc, conversationId);
     const tools = [
       ...toolFilterFromNames(pruneToolGrants(document, toolAllowlist, now())).tools,
-      ...skillTools,
+      ...contextTools,
     ];
     return { tools, modelTools: tools };
   };
@@ -300,6 +367,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const registry = createRegistry();
     if (toolExtension) registry.install(toolExtension);
     if (skillTool) registry.install(skillTool.extension);
+    if (cronFoundation) registry.install(cronFoundation.extension);
+    if (cronTool) registry.install(cronTool.extension);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
     const harnessOptions = {
       models,
@@ -313,6 +382,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           }),
     };
     harness = await Harness.open(storage, harnessOptions, context);
+    harnessRef.current = harness;
     const root = await harness.root(context, { agent: defaultAgentPolicy });
 
     const contextSnapshotLoads = new Map<ConversationId, Promise<void>>();
@@ -377,6 +447,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (!(await harness.conversation(conversationId, context))) {
           throw new Error("Stored session mapping points to a missing conversation");
         }
+        cronOwners.set(conversationId, { ownerId: sessionKey, sessionKey });
         await ensureContextSnapshot(sessionKey, conversationId, context);
       }
     }
@@ -455,6 +526,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
           conversationId = created.id;
         }, ctx);
         if (!Number.isSafeInteger(conversationId)) throw new Error("Stored conversation mapping has an invalid ID");
+        // A mapped session key is the cron owner; unmapped conversations (such as a scheduled run's
+        // own background conversation) have no owner and therefore never receive the cron tool.
+        cronOwners.set(conversationId!, { ownerId: sessionKey, sessionKey });
         const conversation = await harness!.conversation(conversationId!, ctx);
         if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
         await ensureContextSnapshot(sessionKey, conversationId!, ctx);

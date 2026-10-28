@@ -50,6 +50,13 @@ export interface WorkspaceSkillsConfig {
   readonly disabledSkills: readonly string[];
 }
 
+export interface CronConfig {
+  /** Opt-in agent-callable scheduling; false installs no cron tool and registers no cron tasks. */
+  readonly enabled: boolean;
+  /** IANA zone used by calendar expressions that omit `tz`. Defaults to UTC. */
+  readonly timeZone?: string;
+}
+
 export interface WorkspaceContextConfig {
   /** Explicit workspace-relative `memory/**\/*.md` files, in output order. Defaults to none. */
   readonly memoryFiles: readonly string[];
@@ -87,6 +94,8 @@ export interface PortConfig {
    * `bwrap` runs shell commands under direct-workspace Bubblewrap and fails closed when unavailable.
    */
   toolSandbox?: "host" | "bwrap";
+  /** Internal agent scheduling. Absent or disabled leaves the runtime without cron. */
+  cron?: CronConfig;
   thinkingLevel?: ModelThinkingLevel;
   extraAllowedDirs?: readonly string[];
   bwrapPath?: string;
@@ -212,6 +221,23 @@ function workspaceContextConfig(value: unknown): WorkspaceContextConfig {
   });
 }
 
+function cronConfig(value: unknown): CronConfig {
+  const raw = object(value, "cron");
+  for (const key of Object.keys(raw)) {
+    if (key !== "enabled" && key !== "timeZone") throw new Error(`Unknown cron field: ${key}`);
+  }
+  if (typeof raw.enabled !== "boolean") throw new Error("cron.enabled must be a boolean");
+  if (!raw.enabled) return { enabled: false };
+  if (raw.timeZone === undefined) return { enabled: true };
+  const timeZone = nonempty(raw.timeZone, "cron.timeZone");
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone }).format(0);
+  } catch {
+    throw new Error("cron.timeZone must be an IANA time zone name");
+  }
+  return { enabled: true, timeZone };
+}
+
 export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig {
   const raw = object(value, "config");
   const model = modelReference(raw.model, "model");
@@ -258,6 +284,9 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   }
   if (raw.workspaceContext !== undefined) {
     Object.assign(config, { workspaceContext: workspaceContextConfig(raw.workspaceContext) });
+  }
+  if (raw.cron !== undefined) {
+    Object.assign(config, { cron: cronConfig(raw.cron) });
   }
   if (raw.thinkingLevel !== undefined) {
     if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(raw.thinkingLevel))) throw new Error("Invalid thinkingLevel");

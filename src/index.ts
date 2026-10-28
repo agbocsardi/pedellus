@@ -54,6 +54,45 @@ export {
 } from "./context/index.js";
 export { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 export {
+  CRON_EXTENSION_NAME,
+  CRON_JOBS_KIND,
+  CRON_RUN_TASK_NAME,
+  CRON_TIMER_TASK_NAME,
+  CronJobsDoc,
+  createCronFoundation,
+  type CronActor,
+  type CronCancellation,
+  type CronConversationWriter,
+  type CronFoundation,
+  type CronFoundationOptions,
+  type CronJob,
+  type CronJobStatus,
+  type CronJobView,
+  type CronMode,
+  type CronOccurrenceInput,
+  type CronOutcome,
+  type CronOwner,
+  type CronPrepare,
+  type CronPreparation,
+  type CronScheduleInput,
+  type CronScheduleReceipt,
+  type CronSkip,
+  type CronTaskStatus,
+  type CronWithdrawal,
+} from "./automation/cron.js";
+export {
+  CRON_DEFAULT_TIME_ZONE,
+  CronScheduleError,
+  materializeCronSchedule,
+  nextCronOccurrence,
+  parseCronScheduleRequest,
+  type CronCalendarSchedule,
+  type CronIntervalSchedule,
+  type CronSchedule,
+  type CronScheduleRequest,
+} from "./automation/cron-schedule.js";
+export { createCronTool, CRON_TOOL_NAME, type CronTool, type CronToolOptions } from "./automation/cron-tool.js";
+export {
   createSkillTool,
   SKILL_TOOL_NAME,
   type ConversationSkill,

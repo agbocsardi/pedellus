@@ -1,0 +1,298 @@
+/**
+ * The model-facing `cron` tool.
+ *
+ * Cron is an internal agent capability: the user asks the agent, the agent schedules work here.
+ * There is no user scheduler, slash command, or UI. Every operation is owner-scoped to the calling
+ * conversation's job document, and the tool never widens authority:
+ *
+ * - a job inherits the origin conversation's grants when its run starts, so scheduling cannot grant
+ *   a tool the conversation does not already hold;
+ * - a `background` run gets a fresh task-owned conversation with those grants copied and nothing
+ *   else, so a scheduled turn cannot reach another conversation's state;
+ * - `origin` runs answer in the conversation that scheduled them.
+ *
+ * The tool itself is not grant-gated and is not part of the host coding-tool ceiling: it can only
+ * write owner-scoped job records in the calling conversation, and it executes no filesystem or shell
+ * work. Reading, writing and shell work inside a scheduled run still needs that run's copied grants.
+ */
+import type { Context } from "@earendil-works/chord";
+import { Type } from "@earendil-works/pi-ai";
+import {
+  defineExtension,
+  defineTool,
+  type ConversationId,
+  type Extension,
+  type Harness,
+  type Tx,
+} from "@earendil-works/pi-durable";
+import {
+  type CronActor,
+  type CronConversationWriter,
+  type CronFoundation,
+  type CronJobView,
+  type CronOwner,
+  type CronScheduleInput,
+  type CronWithdrawal,
+} from "./cron.js";
+import { CRON_DEFAULT_TIME_ZONE } from "./cron-schedule.js";
+
+export const CRON_TOOL_NAME = "cron";
+
+export interface CronToolOptions {
+  readonly foundation: CronFoundation;
+  /**
+   * Host-resolved owner of a conversation. `undefined` means the conversation is not an origin
+   * session (for example a scheduled run's own background conversation), so cron is unavailable.
+   */
+  readonly ownerFor: (conversationId: ConversationId, context: Context) => CronOwner | undefined;
+  /** The open Harness; the extension is registered before `Harness.open()`, so this is late-bound. */
+  readonly harness: () => Harness;
+  /** IANA zone for calendar expressions that omit `tz`. */
+  readonly timeZone?: string;
+}
+
+export interface CronTool {
+  readonly extension: Extension;
+}
+
+const ACTIONS = ["add", "list", "remove"] as const;
+const SCHEDULE_FIELDS = ["at", "every_seconds", "cron_expr"] as const;
+
+interface CronToolArguments {
+  readonly action: (typeof ACTIONS)[number];
+  readonly message?: string;
+  readonly name?: string;
+  readonly at?: string | number;
+  readonly every_seconds?: number;
+  readonly cron_expr?: string;
+  readonly tz?: string;
+  readonly isolated?: boolean;
+  readonly job_id?: string;
+}
+
+const text = (value: string, isError = false) => ({
+  output: [{ type: "text" as const, text: value }],
+  ...(isError ? { isError: true } : {}),
+});
+
+function iso(ms: number | null): string {
+  return ms === null ? "none" : new Date(ms).toISOString();
+}
+
+/**
+ * A one-shot time must carry an explicit UTC offset. Interpreting a naive local time would need the
+ * zone-offset arithmetic the calendar schedule avoids, and silently guessing is worse than asking
+ * the caller for an unambiguous instant.
+ */
+function parseAt(value: unknown): number {
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new TypeError("at must be a positive integer epoch-millisecond time or an ISO 8601 timestamp");
+    }
+    return value;
+  }
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new TypeError("at must be an ISO 8601 timestamp with a UTC offset, for example 2026-11-01T09:00:00+01:00");
+  }
+  const raw = value.trim();
+  if (!/(?:Z|[+-]\d{2}:\d{2})$/i.test(raw)) {
+    throw new TypeError(
+      `at must include an explicit UTC offset or Z (got "${raw}"); use cron_expr with tz for a local wall time`,
+    );
+  }
+  const parsed = Date.parse(raw);
+  if (!Number.isSafeInteger(parsed)) throw new TypeError(`at is not a valid ISO 8601 timestamp: ${raw}`);
+  return parsed;
+}
+
+function scheduleOf(args: CronToolArguments, zone: string): CronScheduleInput["schedule"] {
+  const present = SCHEDULE_FIELDS.filter((field) => args[field] !== undefined);
+  if (present.length === 0) {
+    throw new TypeError("add requires exactly one of at, every_seconds or cron_expr");
+  }
+  if (present.length > 1) {
+    throw new TypeError(`add accepts one schedule, not ${present.join(" + ")}`);
+  }
+  if (args.at !== undefined) return { kind: "at", at: parseAt(args.at) };
+  if (args.every_seconds !== undefined) {
+    const seconds = args.every_seconds;
+    if (!Number.isSafeInteger(seconds) || seconds <= 0) {
+      throw new TypeError("every_seconds must be a positive integer number of seconds");
+    }
+    const everyMs = seconds * 1000;
+    if (!Number.isSafeInteger(everyMs)) throw new TypeError("every_seconds is too large");
+    return { kind: "every", everyMs };
+  }
+  const expr = args.cron_expr;
+  if (typeof expr !== "string" || expr.trim() === "") {
+    throw new TypeError("cron_expr must be a non-empty cron expression");
+  }
+  const timeZone = args.tz === undefined ? zone : args.tz;
+  if (typeof timeZone !== "string" || timeZone.trim() === "") {
+    throw new TypeError("tz must be a non-empty IANA time zone name");
+  }
+  return { kind: "cron", expr: expr.trim(), timeZone: timeZone.trim() };
+}
+
+function scheduleText(view: CronJobView): string {
+  const { schedule } = view.job;
+  if (schedule.kind === "at") return `once at ${iso(schedule.at)}`;
+  if (schedule.kind === "every") return `every ${schedule.everyMs / 1000}s from ${iso(schedule.anchorMs)}`;
+  return `${schedule.expr} in ${schedule.timeZone}`;
+}
+
+function describe(view: CronJobView): string {
+  const parts = [
+    `${view.job.id}  ${view.job.name}`,
+    `  schedule: ${scheduleText(view)}`,
+    `  mode: ${view.job.mode}`,
+    `  status: ${view.status}`,
+    `  next: ${iso(view.nextAtMs)}`,
+  ];
+  if (view.job.lastOutcome !== null) {
+    const outcome = view.job.lastOutcome;
+    parts.push(
+      `  last run: ${outcome.status} at ${iso(outcome.finishedAtMs)}${outcome.error === null ? "" : ` (${outcome.error})`}`,
+    );
+  }
+  if (view.job.lastSkip !== null) {
+    parts.push(`  last skipped: ${iso(view.job.lastSkip.skippedAtMs)} (${view.job.lastSkip.reason})`);
+  }
+  if (view.job.lastFault !== null) {
+    parts.push(`  last failure: ${iso(view.job.lastFault.recordedAtMs)} (${view.job.lastFault.error})`);
+  }
+  return parts.join("\n");
+}
+
+function withdrawalText(withdrawn: CronWithdrawal | null): string {
+  if (withdrawn === null) return "";
+  if (withdrawn === "aborted") return " A queued run was withdrawn before it started.";
+  if (withdrawn === "already_placed") return " A run was already placed and may still finish.";
+  if (withdrawn === "settled") return " The last run had already finished.";
+  return "";
+}
+
+export function createCronTool(options: CronToolOptions): CronTool {
+  const zone = options.timeZone ?? CRON_DEFAULT_TIME_ZONE;
+  const tool = defineTool({
+    name: CRON_TOOL_NAME,
+    description:
+      "Schedule recurring or one-shot work for this conversation. Use it when the user asks you to " +
+      "do something later, repeatedly, or on a calendar schedule (reminders, daily checks, periodic " +
+      "reports). Actions: `add` creates a job whose message you will receive as a new turn when due; " +
+      "`list` shows this conversation's jobs, their status and next run; `remove` cancels one job. " +
+      "A job runs in an isolated background conversation by default, or in this conversation when " +
+      "`isolated` is false. Scheduled runs inherit this conversation's current tool grants; they never " +
+      "gain new ones.",
+    parameters: Type.Object({
+      action: Type.Union([
+        Type.Literal("add"),
+        Type.Literal("list"),
+        Type.Literal("remove"),
+      ], { description: "Which operation to perform." }),
+      message: Type.Optional(Type.String({
+        description: "add: the instruction the agent receives when the job fires. Required for add.",
+      })),
+      name: Type.Optional(Type.String({
+        description: "add: short human-readable label; defaults to the first characters of the message.",
+      })),
+      at: Type.Optional(Type.String({
+        description:
+          "add: one-shot time as an ISO 8601 timestamp with an explicit UTC offset or Z, " +
+          "for example 2026-11-01T09:00:00+01:00.",
+      })),
+      every_seconds: Type.Optional(Type.Integer({
+        description: "add: fixed interval in seconds, for example 3600 for hourly.",
+        minimum: 1,
+      })),
+      cron_expr: Type.Optional(Type.String({
+        description:
+          "add: cron expression for calendar schedules, seconds first when six fields " +
+          "(for example 0 0 9 * * 1-5 at 09:00 on weekdays).",
+      })),
+      tz: Type.Optional(Type.String({
+        description: "add: IANA time zone for cron_expr, for example Europe/Budapest. Defaults to the host zone.",
+      })),
+      isolated: Type.Optional(Type.Boolean({
+        description:
+          "add: true (default) runs the job in a fresh background conversation; false runs it in this " +
+          "conversation once it is idle.",
+      })),
+      job_id: Type.Optional(Type.String({
+        description: "remove: the job ID from `list`.",
+      })),
+    }),
+    outputLimits: { maxBytes: 64 * 1024, maxLines: 1_000, retain: "head" },
+    async execute(args, api, context) {
+      const owner = options.ownerFor(api.conversationId, context);
+      if (owner === undefined) {
+        return text("Scheduling is not available in this conversation.", true);
+      }
+      const actor: CronActor = { owner };
+      let harness: Harness;
+      try {
+        harness = options.harness();
+      } catch {
+        return text("Scheduling is not available yet: the runtime is still starting.", true);
+      }
+      const writer: CronConversationWriter = {
+        id: api.conversationId,
+        commit: <T>(change: (tx: Tx) => T | Promise<T>, ctx: Context) => harness.commit(change, ctx),
+      };
+      const request = args as unknown as CronToolArguments;
+      try {
+        if (request.action === "list") {
+          const views = await options.foundation.list(harness, api.conversationId, actor, context);
+          if (views.length === 0) return text("No scheduled jobs in this conversation.");
+          return text(views.map(describe).join("\n\n"));
+        }
+        if (request.action === "remove") {
+          const jobId = typeof request.job_id === "string" ? request.job_id.trim() : "";
+          if (jobId === "") return text("remove requires job_id; use action `list` to see the IDs.", true);
+          const result = await options.foundation.cancel(
+            harness, api.conversationId, jobId, actor, context,
+          );
+          if (result.status === "not_found") return text(`No scheduled job ${jobId} in this conversation.`, true);
+          if (result.status === "forbidden") return text(`Scheduled job ${jobId} belongs to another owner.`, true);
+          if (result.status === "already_terminal") {
+            return text(`Scheduled job ${jobId} is already finished or cancelled; nothing to remove.`);
+          }
+          return text(
+            `Cancelled ${jobId} (${result.job.name}).` +
+            (result.job.lastOutcome === null ? "" : " Its last recorded run is kept for reference.") +
+            withdrawalText(result.withdrawn),
+          );
+        }
+        if (request.action !== "add") {
+          return text(`Unknown action; use one of ${ACTIONS.join(", ")}.`, true);
+        }
+        const message = typeof request.message === "string" ? request.message.trim() : "";
+        if (message === "") return text("add requires a non-empty message to run when the job fires.", true);
+        if (request.name !== undefined && typeof request.name !== "string") {
+          return text("name must be a string when provided.", true);
+        }
+        // A call ID is stable across a retried call, so a replay cannot create a second job.
+        const receipt = await options.foundation.schedule(actor, writer, {
+          message,
+          ...(request.name === undefined ? {} : { name: request.name }),
+          schedule: scheduleOf(request, zone),
+          mode: request.isolated === false ? "origin" : "background",
+          idempotencyKey: `tool:${api.callId}`,
+        }, context);
+        const view = await options.foundation.inspect(
+          harness, api.conversationId, receipt.jobId, actor, context,
+        );
+        const when = iso(receipt.nextAtMs);
+        if (view !== undefined) return text(`Scheduled.\n\n${describe(view)}`);
+        return text(`Scheduled ${receipt.jobId}; first run at ${when}.`);
+      } catch (error) {
+        // Model-visible scheduling errors are actionable (bad expression, past time). They carry no
+        // credentials or host paths: the schedule parser and request validator own the message text.
+        const reason = error instanceof Error ? error.message : String(error);
+        return text(`Scheduling failed: ${reason}`, true);
+      }
+    },
+  });
+
+  return { extension: defineExtension({ name: "nanobot.cron-tool", tools: [tool] }) };
+}
