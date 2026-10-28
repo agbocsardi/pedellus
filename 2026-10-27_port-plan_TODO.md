@@ -296,6 +296,13 @@ final review found a recurring-job task can fault when its plan phase returns th
 same checkpoint after advancing a previously settled occurrence. The job then
 appears scheduled but never fires. Fix the plan transition and stale outcome
 summary before further integration; do not ship as-is. Review budget exhausted.
+The owner explicitly reopened cron implementation after this parking decision.
+A replacement is being explored using finite occurrence tasks: each finishes once,
+atomically creates its successor and updates the job pointer, and uses native
+idempotent agent submissions instead of a generic callback claim. No recurring
+plan-phase loop or migration of unshipped synthetic stores is required. Assess the
+extra task-record retention honestly; confirm restart, cancellation and fault
+visibility before integration.
 The design and Durable contract probes established fresh isolated conversations,
 origin busy retry, authorized tools and durable outbox feasibility; no arbitrary
 job-count, interval or horizon limits were approved.
