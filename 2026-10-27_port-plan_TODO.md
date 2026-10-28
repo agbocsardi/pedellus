@@ -404,12 +404,13 @@ Some earlier archival helpers and the managed-copy sandbox are already integrate
 SDK/experimental code; parked follow-ups do not mean those files are absent. They
 are not part of the current ordinary Gateway path.
 
-Git worktree inventory at consolidation: parent plus six linked checkouts:
-`pi-818cb00c`, `pi-8d9f1378`, `pi-e078edd8`, `sub-pi-durable-execution`,
-`sub-pi-durable-runtime`, `sub-pi-durable-telegram`. Keep the unmerged Telegram
-candidate. Do not remove the five older checkouts merely because their names look
-obsolete; ownership/dirty-state checks and confirmation precede removal. Other
-branch tips remain preserved; no bulk branch or Git-object pruning is authorized.
+Git worktree inventory after the 2026-10-28 cleanup: parent, `pi-818cb00c` (parked
+Telegram candidate, still unmerged) and the active worker. The five other checkouts
+(`pi-8d9f1378`, `pi-e078edd8`, `sub-pi-durable-execution`, `sub-pi-durable-runtime`,
+`sub-pi-durable-telegram`) were clean, and `git cherry` showed every unique commit
+already present in the integration branch, so their worktrees and branches were
+removed. Parked candidate branches without a checkout stay preserved; no bulk branch
+or Git-object pruning is authorized.
 
 The reviewed calendar worktree/branch was already removed after patch-equivalence
 verification. Consolidation closed its two remaining completed reviewer tabs and
