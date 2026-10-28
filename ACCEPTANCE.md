@@ -101,17 +101,19 @@ has an old prefix, then the measured full sequence:
   (2), one filler turn (1), native compaction summary (1);
 - phase 2: fresh process, one recall + skill + topic-read turn (2).
 
-A real summary may quote the raw-turn sentinel inside the summary itself. The
-real flow therefore rejects a sentinel outside the summary (a raw replay), not
-a sentinel quoted by the summarizer. The offline scripted summary never quotes
-it, so its stricter check remains.
+The early user instruction tells the model not to echo the fact or sentinel.
+The real flow still records fact/sentinel occurrences inside and outside the
+placed summary, so a model echo is distinguishable from genuine leakage. It
+rejects a fact outside the summary or a sentinel outside the summary, not a
+value quoted by the summarizer. The offline scripted summary never quotes them,
+so its stricter checks remain.
 
 The rehearsal measured **10 requests**, a conservative input reservation of
-about **316,800 tokens** (about 156,300 in phase 1, 160,500 in phase 2), an
-output reservation of **15,360**, reported faux input usage of **102,808** and
-output usage of **232**. The measured full flow therefore fits the 600,000 cap with
-substantial room for longer live responses, and the guard still enforces each
-request against the remaining ledger.
+about **317,600 tokens** (about 157,000 in phase 1, 160,500 in phase 2), an
+output reservation of **17,920**, reported faux input usage of **103,024** and
+output usage of **232**. The measured full flow therefore fits the 600,000 cap
+with substantial room for longer live responses, and the guard still enforces
+each request against the remaining ledger.
 
 Run:
 
@@ -128,6 +130,16 @@ child read the named environment variable, and it passes only that variable to
 `createProviderModels`; no owner config, ambient environment, personal
 workspace or non-auth credential is read. A phase-1 failure skips phase 2 so a
 failed attempt cannot turn into a second run.
+
+Budget behavior: generation requests may reserve up to 1,536 output tokens and
+the summarizer up to 4,096, while the shared total remains capped at 20,000.
+`requests` counts reservations committed before dispatch; `refused` counts
+pre-dispatch refusals and is never a dispatch. The ledger is replaced by a
+temp-file rename under an exclusive lock, but it is not fsync'd and is not a
+power-loss-durable accounting store. Only `streamSimple` and `completeSimple`
+are guarded; `stream`, `complete`, deferred/cancel, image, classifier and
+catalog-refresh methods fail closed. A provider that never calls `onPayload`
+fails closed through an abort/timeout race with code `unobserved`.
 
 Review points before the single live call:
 
@@ -172,8 +184,9 @@ acceptance experiment, not a proof about provider accounting.
   provider request is also capped at 120 s by the guard.
 - Real mode reserves 4,096 framing tokens per request on top of the exact
   payload byte length, clamps the payload output limit to the remaining output
-  budget (at most 1,536 per request), persists the ledger and holds an exclusive
-  lock; an unfillable or unsupported bound is refused before dispatch.
+  budget (1,536 for generation, 4,096 for the summarizer, shared 20,000 total),
+  persists the ledger and holds an exclusive lock; an unfillable or unsupported
+  bound is refused before dispatch and counted as a refusal.
 - All state is created under one owned temp directory and removed in `finally`.
 - Offline mode makes no provider request, credential lookup, personal workspace
   access, external fixture call or channel send. Live mode is opt-in and reads

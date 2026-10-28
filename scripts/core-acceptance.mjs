@@ -24,7 +24,7 @@ import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { BudgetError, INPUT_FRAMING_TOKENS_PER_REQUEST, createBudget, wrapModels } from "./core-acceptance-budget.mjs";
+import { BudgetError, INPUT_FRAMING_TOKENS_PER_REQUEST, UNGUARDED_MODEL_METHODS, createBudget, wrapModels } from "./core-acceptance-budget.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SCRIPT), "..");
@@ -209,6 +209,23 @@ function sentinelOutsideSummary(requestText) {
   const texts = messageTexts(requestText);
   const summaryIndexes = texts.flatMap((text, index) => (text.includes(COMPACTION_PREFIX) ? [index] : []));
   return texts.some((text, index) => !summaryIndexes.includes(index) && text.includes(SENTINEL));
+}
+
+/** Count fact/sentinel occurrences inside and outside the placed summary. */
+function occurrenceIsolation(requestText) {
+  const texts = messageTexts(requestText);
+  const summaryIndexes = texts.flatMap((text, index) => (text.includes(COMPACTION_PREFIX) ? [index] : []));
+  const summaryIndex = summaryIndexes.length === 1 ? summaryIndexes[0] : -1;
+  const summaryText = summaryIndex >= 0 ? texts[summaryIndex] : "";
+  const count = (needle) => texts.reduce((total, text) => total + text.split(needle).length - 1, 0);
+  const summaryFacts = summaryText.split(FACT).length - 1;
+  const summarySentinels = summaryText.split(SENTINEL).length - 1;
+  return {
+    factInSummary: summaryFacts,
+    factOutsideSummary: count(FACT) - summaryFacts,
+    sentinelInSummary: summarySentinels,
+    sentinelOutsideSummary: count(SENTINEL) - summarySentinels,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -690,6 +707,33 @@ async function runBudgetProbe(stateDir, evidence) {
     }
   }
 
+  // A summarizer may reserve more output than a generation, inside the same total.
+  {
+    const dir = await probeDir(stateDir, "summary-cap");
+    const budget = probeBudget(dir, {
+      maxOutputTokens: 1_000,
+      maxOutputPerRequest: 128,
+      maxOutputPerRequestByOperation: { completeSimple: 512 },
+    });
+    await budget.acquire();
+    try {
+      const summary = { max_tokens: 9_999, messages: "summary" };
+      const generation = { max_tokens: 9_999, messages: "generation" };
+      const summaryReservation = await budget.reservePayload(summary, "completeSimple");
+      const generationReservation = await budget.reservePayload(generation, "streamSimple");
+      const snapshot = budget.snapshot();
+      record("reserve.summary_cap", summaryReservation.outputReserve === 512 && summary.max_tokens === 512,
+        String(summaryReservation.outputReserve));
+      record("reserve.generation_cap", generationReservation.outputReserve === 128 && generation.max_tokens === 128,
+        String(generationReservation.outputReserve));
+      record("reserve.total_output_cap", snapshot.outputReserved === 640 && snapshot.maxOutputTokens === 1_000,
+        `${snapshot.outputReserved}/${snapshot.maxOutputTokens}`);
+      record("reserve.by_operation_reported", snapshot.maxOutputPerRequestByOperation.completeSimple === 512);
+    } finally {
+      await budget.close();
+    }
+  }
+
   // An over-budget input is refused before dispatch and does not increment the ledger.
   {
     const dir = await probeDir(stateDir, "input");
@@ -701,6 +745,8 @@ async function runBudgetProbe(stateDir, evidence) {
         "input",
       );
       record("reserve.input_refused", refusal.ok && budget.snapshot().requests === 0, refusal.detail);
+      record("reserve.input_refusal_marked", budget.snapshot().refused === 1 && budget.snapshot().records.length === 0,
+        `refused=${budget.snapshot().refused} records=${budget.snapshot().records.length}`);
     } finally {
       await budget.close();
     }
@@ -718,6 +764,8 @@ async function runBudgetProbe(stateDir, evidence) {
         "requests",
       );
       record("reserve.requests_refused", refusal.ok && budget.snapshot().requests === 1, refusal.detail);
+      record("reserve.requests_refusal_marked", budget.snapshot().refused === 1 && budget.snapshot().records.length === 1,
+        `refused=${budget.snapshot().refused} records=${budget.snapshot().records.length}`);
     } finally {
       await budget.close();
     }
@@ -733,6 +781,8 @@ async function runBudgetProbe(stateDir, evidence) {
         "output",
       );
       record("reserve.output_refused", refusal.ok && budget.snapshot().outputReserved === 10, refusal.detail);
+      record("reserve.output_refusal_marked", budget.snapshot().refused === 1 && budget.snapshot().records.length === 1,
+        `refused=${budget.snapshot().refused} records=${budget.snapshot().records.length}`);
     } finally {
       await budget.close();
     }
@@ -862,6 +912,115 @@ async function runBudgetProbe(stateDir, evidence) {
     }
   }
 
+  // A provider that never calls onPayload must fail closed, not hang.
+  {
+    const dir = await probeDir(stateDir, "unobserved-race");
+    const budget = probeBudget(dir, { timeoutMs: 25 });
+    await budget.acquire();
+    try {
+      const stats = { calls: 0 };
+      const inner = {
+        streamSimple() {
+          stats.calls += 1;
+          return {
+            result: () => new Promise(() => {}),
+            async *[Symbol.asyncIterator]() {},
+          };
+        },
+      };
+      const wrapped = wrapModels(inner, budget);
+      const controller = new AbortController();
+      controller.abort();
+      const preAborted = await Promise.race([
+        wrapped.streamSimple(
+          { api: "openai-completions", provider: "fake", id: "fake", maxTokens: 9_999 },
+          { messages: [] },
+          { signal: controller.signal },
+        ).result().then(() => "resolved", (error) => error),
+        sleep(500).then(() => "test-timeout"),
+      ]);
+      record("wrapper.preaborted_unobserved",
+        preAborted instanceof BudgetError && preAborted.code === "unobserved", String(preAborted));
+
+      const timedOut = await Promise.race([
+        wrapped.streamSimple(
+          { api: "openai-completions", provider: "fake", id: "fake", maxTokens: 9_999 },
+          { messages: [] },
+          {},
+        ).result().then(() => "resolved", (error) => error),
+        sleep(1_000).then(() => "test-timeout"),
+      ]);
+      record("wrapper.unobserved_timeout",
+        timedOut instanceof BudgetError && timedOut.code === "unobserved", String(timedOut));
+      record("wrapper.unobserved_not_reserved", budget.snapshot().requests === 0, String(budget.snapshot().requests));
+    } finally {
+      await budget.close();
+    }
+  }
+
+  // A budget refusal must stop before the adapter's dispatch point.
+  {
+    const dir = await probeDir(stateDir, "refused-dispatch");
+    const budget = probeBudget(dir, { maxInputTokens: 10_000 });
+    await budget.acquire();
+    try {
+      const stats = { calls: 0, dispatched: 0 };
+      const inner = {
+        streamSimple(model, context, options) {
+          stats.calls += 1;
+          const pending = (async () => {
+            await options.onPayload({ max_tokens: 10, messages: "x".repeat(20_000) }, model);
+            stats.dispatched += 1;
+          })();
+          // The wrapper may reject before calling result(), so keep this rejection handled.
+          pending.catch(() => undefined);
+          return {
+            async result() {
+              await pending;
+              return { usage };
+            },
+            async *[Symbol.asyncIterator]() {},
+          };
+        },
+      };
+      const wrapped = wrapModels(inner, budget);
+      const outcome = await wrapped.streamSimple(
+        { api: "openai-completions", provider: "fake", id: "fake", maxTokens: 9_999 },
+        { messages: [] },
+        {},
+      ).result().then(() => "resolved", (error) => error);
+      record("wrapper.budget_refusal_no_dispatch",
+        outcome instanceof BudgetError && outcome.code === "input" && stats.calls === 1 && stats.dispatched === 0,
+        `${String(outcome)} calls=${stats.calls} dispatched=${stats.dispatched}`);
+      record("wrapper.budget_refusal_marked",
+        budget.snapshot().refused === 1 && budget.snapshot().requests === 0,
+        `refused=${budget.snapshot().refused} requests=${budget.snapshot().requests}`);
+    } finally {
+      await budget.close();
+    }
+  }
+
+  // Unguarded stream/deferred/catalog methods must not dispatch.
+  {
+    const dir = await probeDir(stateDir, "unguarded");
+    const budget = probeBudget(dir);
+    await budget.acquire();
+    try {
+      const stats = { calls: 0 };
+      const wrapped = wrapModels(fakeStreamModels({ stats, usage }), budget);
+      const methods = ["stream", "complete", "streamDeferred", "fetchDeferred", "cancelDeferred", "generateImages", "classify", "refresh"];
+      const failed = [];
+      for (const method of methods) {
+        const refusal = await expectBudgetError(() => wrapped[method](), "unbounded");
+        if (!refusal.ok) failed.push(method);
+      }
+      record("wrapper.unsupported_dispatch_refused", failed.length === 0 && stats.calls === 0,
+        failed.length === 0 ? `${methods.length} methods` : `failed: ${failed.join(",")}`);
+    } finally {
+      await budget.close();
+    }
+  }
+
   // One real Gateway turn over the wrapped faux Models: Durable must consume the
   // proxied event stream and the reservation must land before the response.
   {
@@ -910,11 +1069,14 @@ const REAL_MODEL = Object.freeze({ provider: "opencode_go", modelId: "deepseek-v
 const REAL_THINKING = "low";
 const REAL_REQUEST_TIMEOUT_MS = 120_000;
 const REAL_CHILD_TIMEOUT_MS = 900_000;
+const REAL_SUMMARY_OUTPUT_CAP = 4_096;
+const REAL_GENERATION_OUTPUT_CAP = 1_536;
 const REAL_DEFAULT_CAPS = Object.freeze({
   maxRequests: 20,
   maxInputTokens: 600_000,
   maxOutputTokens: 20_000,
-  maxOutputPerRequest: 1_536,
+  maxOutputPerRequest: REAL_GENERATION_OUTPUT_CAP,
+  maxOutputPerRequestByOperation: Object.freeze({ completeSimple: REAL_SUMMARY_OUTPUT_CAP }),
 });
 const REAL_SUMMARY_SYSTEM_PREFIX = "You are a context summarization assistant";
 const REAL_ASSUMPTIONS = Object.freeze([
@@ -938,6 +1100,9 @@ function realCapsFromArgs() {
     maxInputTokens: read("max-input", REAL_DEFAULT_CAPS.maxInputTokens),
     maxOutputTokens: read("max-output", REAL_DEFAULT_CAPS.maxOutputTokens),
     maxOutputPerRequest: read("max-output-per-request", REAL_DEFAULT_CAPS.maxOutputPerRequest),
+    maxOutputPerRequestByOperation: {
+      completeSimple: read("max-output-per-summary", REAL_SUMMARY_OUTPUT_CAP),
+    },
     timeoutMs: REAL_REQUEST_TIMEOUT_MS,
   };
 }
@@ -1102,6 +1267,7 @@ async function runRealFirstPhase(core, stateDir, evidence, options, budget) {
   const driver = createRealDriver(core, probe, recorder, "p1", options.rehearsal);
   const config = realGatewayConfig(core, stateDir, options);
   let gateway;
+  let absoluteSummaryReserve;
   try {
     gateway = await core.openGateway(config, context, {
       models: wrapped,
@@ -1127,6 +1293,7 @@ async function runRealFirstPhase(core, stateDir, evidence, options, budget) {
     let turnStart = recorder.requests.length;
     await driver.send(conversation, context,
       `Early acceptance instruction: remember the acceptance code ${FACT}. This raw early turn also contains ${SENTINEL}. ` +
+        "Do not repeat or quote the acceptance code or the sentinel in your replies; just remember them. " +
         `Call the skill tool with name "${SKILL_NAME}" so its instructions are loaded. Then reply with one short sentence. ` +
         "Do not call any other tool.", [
         core.fauxAssistantMessage([core.fauxToolCall("skill", { name: SKILL_NAME })], { stopReason: "toolUse" }),
@@ -1203,6 +1370,15 @@ async function runRealFirstPhase(core, stateDir, evidence, options, budget) {
       `${summary.provenance.factOccurrences} occurrences`);
     require("compaction.summary_request_sentinel_present", summary.provenance.sentinelOccurrences >= 1,
       `${summary.provenance.sentinelOccurrences} occurrences`);
+    const budgetSnapshot = budget.snapshot();
+    const summaryRecord = budgetSnapshot.records.find((record) => record.kind === "completeSimple");
+    absoluteSummaryReserve = summaryRecord?.outputReserve;
+    require("compaction.summary_output_reserve",
+      summaryRecord !== undefined && summaryRecord.outputReserve > 0,
+      `${summaryRecord?.outputReserve ?? "missing"} (summary cap ${budgetSnapshot.maxOutputPerRequestByOperation.completeSimple})`);
+    require("compaction.summary_reserve_exceeds_generation",
+      summaryRecord !== undefined && summaryRecord.outputReserve >= budgetSnapshot.maxOutputPerRequest,
+      `${summaryRecord?.outputReserve ?? "missing"} vs ${budgetSnapshot.maxOutputPerRequest}`);
 
     let view;
     const headDeadline = Date.now() + 10_000;
@@ -1220,7 +1396,11 @@ async function runRealFirstPhase(core, stateDir, evidence, options, budget) {
     evidence.observations = {
       ...(evidence.observations ?? {}),
       summaryFactOccurrences: isolation.factOccurrences,
+      summaryRequestFactOccurrences: summary.provenance.factOccurrences,
+      summaryRequestSentinelOccurrences: summary.provenance.sentinelOccurrences,
+      summaryOutputReserve: absoluteSummaryReserve,
       topicMarkerInPlacedContext: messages.includes(TOPIC_MARKER),
+      ...occurrenceIsolation(messages),
     };
 
     evidence.requests = recorder.requests.map(({ kind, chars, sha256: digest }) => ({ kind, chars, sha256: digest }));
@@ -1279,6 +1459,7 @@ async function runRealSecondPhase(core, stateDir, evidence, options, budget) {
     evidence.observations = {
       ...(evidence.observations ?? {}),
       firstRequestFactOccurrences: isolation.factOccurrences,
+      ...occurrenceIsolation(first.text),
       topicMarkerInFirstRequest: first.text.includes(TOPIC_MARKER),
       skillBodyInFirstRequest: first.text.includes(SKILL_BODY),
     };
@@ -1389,6 +1570,7 @@ function realChildArgs(mode, phase, stateDir, caps, apiKeyEnv) {
     `--max-input=${caps.maxInputTokens}`,
     `--max-output=${caps.maxOutputTokens}`,
     `--max-output-per-request=${caps.maxOutputPerRequest}`,
+    `--max-output-per-summary=${caps.maxOutputPerRequestByOperation.completeSimple}`,
     ...(apiKeyEnv === undefined ? [] : [`--api-key-env=${apiKeyEnv}`]),
   ];
 }
@@ -1405,6 +1587,7 @@ function budgetEvidenceSummary(ledger) {
   if (ledger === undefined) return undefined;
   return {
     requests: ledger.requests,
+    refused: ledger.refused ?? 0,
     inputReserved: ledger.inputReserved,
     outputReserved: ledger.outputReserved,
     inputActual: ledger.inputActual,
@@ -1548,6 +1731,18 @@ async function runReal({ live }) {
         : { kind: "faux", model: `${PROVIDER}/${MODEL_ID}`, network: false, purpose: "rehearsal of the real flow" },
       assumptions: REAL_ASSUMPTIONS,
       caps: { ...caps, framingTokensPerRequest: INPUT_FRAMING_TOKENS_PER_REQUEST },
+      budgetBehavior: {
+        requests: "committed reservations before provider dispatch",
+        refused: "pre-dispatch refusals; never dispatches",
+        outputCaps: {
+          generation: caps.maxOutputPerRequest,
+          summarizer: caps.maxOutputPerRequestByOperation.completeSimple,
+        },
+        ledger: "temp-file rename without fsync, lock per phase; not power-loss durable",
+        unobserved: "missing onPayload with abort/timeout fails closed with code unobserved",
+        guardedMethods: ["streamSimple", "completeSimple"],
+        unguardedMethods: [...UNGUARDED_MODEL_METHODS],
+      },
       rehearsal: { checks: counts(rehearsalChecks), budget: rehearsalBudget,
         observations: { phase1: firstEvidence?.observations, phase2: secondEvidence?.observations } },
       ...(live ? { live: { checks: counts(liveChecks), budget: budgetEvidenceSummary(liveLedger),

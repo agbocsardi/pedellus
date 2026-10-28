@@ -19,12 +19,20 @@
  *   process share one budget.
  * - A request whose bound cannot be computed from a plain JSON payload with a
  *   recognised output limit, or whose bound would exceed a remaining cap, is
- *   rejected before dispatch. Nothing is estimated from after-the-fact usage.
+ *   rejected before dispatch and counted as a refusal, never as a dispatch.
+ *   Nothing is estimated from after-the-fact usage.
+ *
+ * The ledger is replaced with a temp-file rename inside the owned temp
+ * directory. That is atomic for concurrent readers and the lock excludes a
+ * second writer, but the file is not fsync'd: a power loss can lose the latest
+ * reservation. This is a run-local budget guard, not a durable accounting
+ * store, and a stale lock after a crash fails closed.
  *
  * `wrapModels` injects the gate through pi-ai's `onPayload` hook, which runs
  * after the provider adapter builds the final payload and before the HTTP
  * request. It also disables SDK-level retries so a retry cannot dispatch
- * outside the ledger.
+ * outside the ledger. Streams are settled with an abort/timeout race so a
+ * provider that never calls `onPayload` fails closed instead of hanging.
  */
 import { createHash } from "node:crypto";
 import { open, readFile, rename, unlink, writeFile } from "node:fs/promises";
@@ -34,6 +42,18 @@ export const LEDGER_VERSION = 1;
 /** Conservative per-request allowance for provider framing outside the payload. */
 export const INPUT_FRAMING_TOKENS_PER_REQUEST = 4096;
 const SUPPORTED_APIS = new Set(["openai-completions", "anthropic-messages", "openai-responses", "azure-openai-responses"]);
+/** Model methods that would dispatch without a reserve; refused rather than forwarded. */
+export const UNGUARDED_MODEL_METHODS = Object.freeze([
+  "stream",
+  "complete",
+  "streamDeferred",
+  "fetchDeferred",
+  "cancelDeferred",
+  "generateImages",
+  "classify",
+  "refresh",
+]);
+const UNGUARDED_DISPATCH_METHODS = new Set(UNGUARDED_MODEL_METHODS);
 
 export class BudgetError extends Error {
   constructor(message, code = "budget") {
@@ -57,6 +77,19 @@ function nonNegativeInteger(value, name) {
   return value;
 }
 
+function operationOutputCaps(value) {
+  if (value === undefined) return Object.freeze({});
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new BudgetError("maxOutputPerRequestByOperation must be an object", "config");
+  }
+  const caps = {};
+  for (const [kind, cap] of Object.entries(value)) {
+    if (kind.length === 0 || kind.length > 32) throw new BudgetError("maxOutputPerRequestByOperation key is invalid", "config");
+    caps[kind] = positiveInteger(cap, `maxOutputPerRequestByOperation.${kind}`);
+  }
+  return Object.freeze(caps);
+}
+
 function freshLedger() {
   return {
     version: LEDGER_VERSION,
@@ -65,6 +98,7 @@ function freshLedger() {
     outputReserved: 0,
     inputActual: 0,
     outputActual: 0,
+    refused: 0,
     records: [],
     violation: null,
   };
@@ -78,6 +112,7 @@ function validateLedger(value) {
   for (const field of ["requests", "inputReserved", "outputReserved", "inputActual", "outputActual"]) {
     ledger[field] = nonNegativeInteger(value[field], `ledger.${field}`);
   }
+  ledger.refused = value.refused === undefined ? 0 : nonNegativeInteger(value.refused, "ledger.refused");
   if (ledger.requests !== value.records.length) throw new BudgetError("budget ledger request count disagrees with its records", "ledger");
   for (const record of value.records) {
     if (record === null || typeof record !== "object" || Array.isArray(record)) throw new BudgetError("budget ledger record is not an object", "ledger");
@@ -112,6 +147,7 @@ export function createBudget(options) {
   const maxInputTokens = positiveInteger(options.maxInputTokens, "maxInputTokens");
   const maxOutputTokens = positiveInteger(options.maxOutputTokens, "maxOutputTokens");
   const maxOutputPerRequest = positiveInteger(options.maxOutputPerRequest, "maxOutputPerRequest");
+  const maxOutputPerRequestByOperation = operationOutputCaps(options.maxOutputPerRequestByOperation);
   const framingTokens = positiveInteger(options.framingTokens ?? INPUT_FRAMING_TOKENS_PER_REQUEST, "framingTokens");
   const timeoutMs = positiveInteger(options.timeoutMs ?? 120_000, "timeoutMs");
   const ledgerName = options.ledgerName ?? "budget-ledger.json";
@@ -129,7 +165,15 @@ export function createBudget(options) {
     return run;
   };
 
+  /** Mark a pre-dispatch refusal in the ledger, then return the error to throw. */
+  async function refuse(code, message) {
+    ledger.refused += 1;
+    await persist();
+    return new BudgetError(message, code);
+  }
+
   async function persist() {
+    // Atomic replacement for readers; deliberately no fsync (see module note).
     const temporary = `${ledgerPath}.${process.pid}.${now()}.tmp`;
     await writeFile(temporary, `${JSON.stringify(ledger, null, 2)}\n`, { mode: 0o600 });
     await rename(temporary, ledgerPath);
@@ -186,37 +230,42 @@ export function createBudget(options) {
     return serial(async () => {
       if (!acquired) throw new BudgetError("budget is not acquired", "state");
       if (ledger.violation !== null) throw new BudgetError(`budget is already violated: ${ledger.violation}`, "violated");
-      if (payload === null || typeof payload !== "object" || Array.isArray(payload)) throw new BudgetError("provider payload is not an object", "unbounded");
+      if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+        throw await refuse("unbounded", "provider payload is not an object");
+      }
       let text;
       try {
         text = JSON.stringify(payload);
       } catch (error) {
-        throw new BudgetError(`provider payload cannot be serialized: ${error?.message ?? String(error)}`, "unbounded");
+        throw await refuse("unbounded", `provider payload cannot be serialized: ${error?.message ?? String(error)}`);
       }
-      if (typeof text !== "string") throw new BudgetError("provider payload cannot be serialized", "unbounded");
+      if (typeof text !== "string") throw await refuse("unbounded", "provider payload cannot be serialized");
       const outputField = Object.hasOwn(payload, "max_tokens")
         ? "max_tokens"
         : Object.hasOwn(payload, "max_completion_tokens")
           ? "max_completion_tokens"
           : undefined;
-      if (outputField === undefined) throw new BudgetError("provider payload has no recognised output token limit", "unbounded");
+      if (outputField === undefined) {
+        throw await refuse("unbounded", "provider payload has no recognised output token limit");
+      }
       const requestedOutput = payload[outputField];
       if (!Number.isSafeInteger(requestedOutput) || requestedOutput < 1) {
-        throw new BudgetError("provider payload output token limit is not a positive integer", "unbounded");
+        throw await refuse("unbounded", "provider payload output token limit is not a positive integer");
       }
       const bytes = Buffer.byteLength(text, "utf8");
       const inputBound = bytes + framingTokens;
       if (ledger.requests + 1 > maxRequests) {
-        throw new BudgetError(`provider request cap reached (${maxRequests})`, "requests");
+        throw await refuse("requests", `provider request cap reached (${maxRequests})`);
       }
       if (inputBound > maxInputTokens - ledger.inputReserved) {
-        throw new BudgetError(
-          `request would exceed the input budget: bound ${inputBound} > remaining ${maxInputTokens - ledger.inputReserved} (${bytes} payload bytes + ${framingTokens} framing)`,
+        throw await refuse(
           "input",
+          `request would exceed the input budget: bound ${inputBound} > remaining ${maxInputTokens - ledger.inputReserved} (${bytes} payload bytes + ${framingTokens} framing)`,
         );
       }
-      const outputReserve = Math.min(requestedOutput, maxOutputPerRequest, maxOutputTokens - ledger.outputReserved);
-      if (outputReserve < 1) throw new BudgetError("request would exceed the output budget", "output");
+      const perRequestCap = maxOutputPerRequestByOperation[kind] ?? maxOutputPerRequest;
+      const outputReserve = Math.min(requestedOutput, perRequestCap, maxOutputTokens - ledger.outputReserved);
+      if (outputReserve < 1) throw await refuse("output", "request would exceed the output budget");
       payload[outputField] = outputReserve;
       const record = {
         kind,
@@ -303,6 +352,7 @@ export function createBudget(options) {
       maxInputTokens,
       maxOutputTokens,
       maxOutputPerRequest,
+      maxOutputPerRequestByOperation,
       framingTokens,
       timeoutMs,
       ...ledger,
@@ -332,12 +382,38 @@ function newGate() {
   return { observed: false, reserving: false, index: undefined, prepared, resolve, reject };
 }
 
-function wrapResult(events, budget, kind, gate) {
+/** Fail closed when a provider skips onPayload (including a pre-aborted request). */
+function awaitPrepared(gate, signal, timeoutMs) {
+  if (gate.observed) return Promise.resolve();
+  let timer;
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    if (signal === undefined) return;
+    if (signal.aborted) {
+      reject(new BudgetError("request was aborted before a pre-dispatch payload was observed", "unobserved"));
+      return;
+    }
+    onAbort = () => reject(new BudgetError("request was aborted before a pre-dispatch payload was observed", "unobserved"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  const timed = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new BudgetError("provider did not expose a pre-dispatch payload before the request timeout", "unobserved")),
+      timeoutMs,
+    );
+  });
+  return Promise.race([gate.prepared, aborted, timed]).finally(() => {
+    clearTimeout(timer);
+    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+  });
+}
+
+function wrapResult(events, budget, kind, gate, options = {}) {
   return new Proxy(events, {
     get(target, property) {
       if (property === "result") {
         return async () => {
-          await gate.prepared;
+          await awaitPrepared(gate, options.signal, options.timeoutMs ?? budget.timeoutMs);
           const message = await target.result();
           if (!gate.observed) throw new BudgetError("provider did not expose a pre-dispatch payload", "unobserved");
           await budget.recordUsage(message?.usage, { kind, index: gate.index });
@@ -350,9 +426,9 @@ function wrapResult(events, budget, kind, gate) {
   });
 }
 
-function wrapCompletion(promise, budget, kind, gate) {
+function wrapCompletion(promise, budget, kind, gate, options = {}) {
   return promise.then(async (message) => {
-    await gate.prepared;
+    await awaitPrepared(gate, options.signal, options.timeoutMs ?? budget.timeoutMs);
     if (!gate.observed) throw new BudgetError("provider did not expose a pre-dispatch payload", "unobserved");
     await budget.recordUsage(message?.usage, { kind, index: gate.index });
     return message;
@@ -434,13 +510,20 @@ export function wrapModels(models, budget, options = {}) {
       if (property === "streamSimple") {
         return (model, context, requestOptions) => {
           const { gate, merged } = prepare("streamSimple", model, context, requestOptions);
-          return wrapResult(models.streamSimple(model, context, merged), budget, "streamSimple", gate);
+          return wrapResult(models.streamSimple(model, context, merged), budget, "streamSimple", gate,
+            { signal: merged.signal, timeoutMs: budget.timeoutMs });
         };
       }
       if (property === "completeSimple") {
         return (model, context, requestOptions) => {
           const { gate, merged } = prepare("completeSimple", model, context, requestOptions);
-          return wrapCompletion(models.completeSimple(model, context, merged), budget, "completeSimple", gate);
+          return wrapCompletion(models.completeSimple(model, context, merged), budget, "completeSimple", gate,
+            { signal: merged.signal, timeoutMs: budget.timeoutMs });
+        };
+      }
+      if (UNGUARDED_DISPATCH_METHODS.has(property)) {
+        return () => {
+          throw new BudgetError(`Models.${String(property)} is not budget-guarded; refusing`, "unbounded");
         };
       }
       const value = Reflect.get(target, property, target);
