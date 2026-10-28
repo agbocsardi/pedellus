@@ -1,10 +1,12 @@
-# Managed Bubblewrap execution spike — standalone, not enabled in the Gateway
+# Execution backends
 
-`src/execution/index.ts` is standalone. `runtime.ts` does not import it, and this
-managed-copy adapter is **not** the Gateway's tool backend. The owner-approved
-W1 path is the separate guarded host environment on the actual workspace
-([`TOOLS.md`](./TOOLS.md)); optional direct-workspace bubblewrap remains W2. The
-managed-copy contract below is not approval to substitute it silently.
+`src/execution/index.ts` is a standalone managed-copy adapter. `runtime.ts` does
+not import it, and it is **not** the Gateway's tool backend. The owner-approved
+W1 path is the guarded host environment on the actual workspace
+([`TOOLS.md`](./TOOLS.md)); the optional direct-workspace Bubblewrap shell is now
+selectable per Gateway instance with `toolSandbox: "bwrap"` and is off by default
+([`DIRECT_BWRAP.md`](./DIRECT_BWRAP.md)). The managed-copy contract below is not
+approval to substitute it silently.
 
 ## API and lifecycle
 
@@ -154,14 +156,28 @@ adapter.
 `src/execution/policy.ts` is the shared execution policy. It owns the ported
 shell deny patterns, the environment allowlist, the Python timeout rules, shell
 command/allowlist/path filtering, and the filesystem containment check.
-`src/execution/host.ts` imports it; the optional bubblewrap backend is expected
-to import the same policy when its W2 integration lands. The Gateway's opt-in
-coding tools use `HostExecutionEnv` over the actual workspace and per-conversation
-durable grants; see [`TOOLS.md`](./TOOLS.md). That is accidental-damage
-protection, not hostile isolation.
+`src/execution/host.ts` imports it, including the optional direct-workspace
+Bubblewrap shell. The Gateway's opt-in coding tools use `HostExecutionEnv` over
+the actual workspace and per-conversation durable grants; see
+[`TOOLS.md`](./TOOLS.md). That is accidental-damage protection, not hostile
+isolation.
+
+The optional shell backend is selected with `toolSandbox: "bwrap"` (absent or
+`"host"` keeps the native shell) and an optional absolute `bwrapPath`. When tools
+are enabled, `createToolEnvironments` resolves and validates Bubblewrap before
+storage is opened, so a selected backend cannot silently fall back to the host
+shell. Only `exec` is wrapped: the native `read`/`write`/`edit` tools and all
+other `ExecutionEnv` filesystem methods stay the guarded host implementation on
+the same workspace. The shell uses `buildDirectBwrapArgs` from
+[`DIRECT_BWRAP.md`](./DIRECT_BWRAP.md), the shared deny/environment/timeout
+policy, the actual workspace bound read-write, a private `/tmp`, and the host
+network namespace. The parent writes bash spill files under its private scratch
+root, so the reported full-output path remains readable through the guarded
+filesystem while the environment lives but is not mounted in the sandbox; the
+sandboxed command receives `TMPDIR=/tmp`. This is not a managed copy.
 
 `createHostExecutionEnv({ workspaceRoot, allowedRoots?, shell?, cwd?,
-  tempDirectory? })` wraps the native `NodeExecutionEnv`:
+  shellSandbox?, tempDirectory? })` wraps the native `NodeExecutionEnv`:
 
 - Roots contract: roots are canonical absolute paths supplied by the backend.
   The policy checks absoluteness and normalizes separators/`..`, but deliberately
@@ -223,9 +239,10 @@ weaker approximation. The deny list and path guard do not close it.
 W2 source note: an earlier review overstated canonical rewriting in the
 bubblewrap `checked()` helper. A later trace showed it authorizes the canonical
 target and then passes the candidate path to the operation; escaping and dangling
-final symlink operations remain refused. That difference from the host path
-guard must still be reconciled against this shared policy when W2 imports it,
-not treated as already parity.
+final symlink operations remain refused. The direct-workspace W2 shell does not
+use that helper: its filesystem operations are the same native guarded
+`HostExecutionEnv` path, so there is no second path policy to reconcile there.
+The standalone managed-copy adapter remains unreviewed for gateway use.
 
 ## Remaining security blockers
 
@@ -246,8 +263,11 @@ garbage collection; the lock only prevents concurrent owners. This slice does no
 enable tools; the optional managed-copy bwrap adapter stays disabled until those
 limits are reviewed. The owner clarification makes optional bwrap non-blocking for
 the direct-workspace W1 path, which still requires its own review and durable
-grants. No Python daemon, VM, unsafe fallback, config-store access, or deployment
-changes were introduced.
+grants. The selectable `toolSandbox: "bwrap"` shell is the direct-workspace W2
+mode, not the managed-copy adapter; it keeps the host filesystem guard, has no
+CPU/memory/PID-count/disk quota, and is not a hostile-tenant boundary. No Python
+daemon, VM, unsafe fallback, config-store access, or deployment changes were
+introduced.
 
 ## Bounded synthetic evidence
 

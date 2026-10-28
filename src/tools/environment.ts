@@ -1,6 +1,7 @@
 import type { Context } from "@earendil-works/chord/context";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
+import { resolveDirectBwrapPath } from "../execution/direct-bwrap.js";
 import { createHostExecutionEnv, type HostExecutionEnv } from "../execution/host.js";
 
 export interface ToolEnvironmentOptions {
@@ -10,6 +11,10 @@ export interface ToolEnvironmentOptions {
   readonly allowedRoots?: readonly string[];
   /** Config-level shell timeout; absent keeps the shared policy default. */
   readonly timeoutSeconds?: number;
+  /** Shell backend. Absent or "host" keeps the guarded native shell; "bwrap" fails closed without Bubblewrap. */
+  readonly sandbox?: "host" | "bwrap";
+  /** Absolute trusted Bubblewrap executable used when `sandbox` is "bwrap". */
+  readonly bwrapPath?: string;
 }
 
 export interface ToolEnvironments {
@@ -24,6 +29,10 @@ export interface ToolEnvironments {
  */
 export function createToolEnvironments(options: ToolEnvironmentOptions): ToolEnvironments {
   const environments = new Map<ConversationId, Promise<HostExecutionEnv>>();
+  const shellSandbox =
+    options.sandbox === "bwrap"
+      ? { bwrapPath: resolveDirectBwrapPath(options.bwrapPath) }
+      : undefined;
   let closed = false;
 
   return {
@@ -40,6 +49,7 @@ export function createToolEnvironments(options: ToolEnvironmentOptions): ToolEnv
             restrictToWorkspace: true,
             ...(options.timeoutSeconds === undefined ? {} : { timeoutSeconds: options.timeoutSeconds }),
           },
+          ...(shellSandbox === undefined ? {} : { shellSandbox }),
         });
         environments.set(conversationId, pending);
         void pending.catch(() => {

@@ -185,6 +185,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ? createToolEnvironments({
         workspaceRoot: workspace,
         allowedRoots: extraRoots,
+        sandbox: config.toolSandbox ?? "host",
+        ...(config.bwrapPath === undefined ? {} : { bwrapPath: config.bwrapPath }),
         ...(toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: toolTimeoutSeconds }),
       })
     : undefined;

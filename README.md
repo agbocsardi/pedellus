@@ -29,7 +29,11 @@ keeps the gateway tool-less. A non-empty ceiling may name only the native
 host environment on the actual workspace, and every conversation still needs an
 explicit per-conversation grant with an expiry. Revoked and expired grants are
 reapplied before resume, and a `beforeTool` hook rechecks them at call time. This
-field is not an approval UI. See [coding tools and grants](./TOOLS.md).
+field is not an approval UI. A deployment may select the optional
+direct-workspace Bubblewrap shell with `toolSandbox: "bwrap"`; it is off by
+default, wraps shell commands only, and falls back to neither the host shell nor a
+managed copy. See [coding tools and grants](./TOOLS.md) and
+[direct Bubblewrap shell](./DIRECT_BWRAP.md).
 
 ## Opt-in Code Mode SDK
 
@@ -83,13 +87,15 @@ large-corpus index, or completed real-history rehearsal.
 
 Run `npm run typecheck` and `npm run test:behavior` for offline Nanobot-owned
 contracts using synthetic providers, temporary SQLite stores and crash/reopen
-fixtures. These do not establish full parity or production security. The standalone
-experimental sandbox is not installed in the Gateway; resource quotas, approvals and
-filesystem confinement remain open. The opt-in
+fixtures. These do not establish full parity or production security. The
+standalone managed-copy experimental sandbox is not installed in the Gateway;
+resource quotas, approvals and filesystem confinement remain open. The opt-in
 [coding tools and grants](./TOOLS.md) register native tools over the guarded host
 environment on the actual workspace; they are disabled by default and are not
-confinement. [Tool replay checks](./TOOL_REPLAY.md) exercise synthetic direct tools
-and the native replay/grant boundary.
+confinement. The optional [direct Bubblewrap shell](./DIRECT_BWRAP.md) narrows
+the shell mount view but is not a quota or hostile-tenant boundary.
+[Tool replay checks](./TOOL_REPLAY.md) exercise synthetic direct tools and the
+native replay/grant boundary.
 
 For earlier Telegram reliability and scripted smoke evidence, see [TELEGRAM.md](./TELEGRAM.md).
 Real-provider acceptance, backup/restore and owner-approved cutover remain open;

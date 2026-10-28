@@ -11,6 +11,7 @@
   ],
   "toolAllowlist": [],
   "toolTimeoutSeconds": 60,
+  "toolSandbox": "host",
   "credentials": {
     "anthropic": "ANTHROPIC_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",

@@ -1,11 +1,17 @@
-# Direct Bubblewrap shell argv builder — standalone, not wired
+# Direct Bubblewrap shell backend — optional, off by default
 
-`src/execution/direct-bwrap.ts` is a new, standalone argv builder for the optional
-Python-like Bubblewrap shell mode. It does **not** replace `src/execution/index.ts`
-or `src/execution/sandbox.ts`, is not imported by `runtime.ts`, and does not enable
-Gateway tools. The owner chose accidental-damage protection, not hostile isolation:
-the command runs directly on the actual read-write workspace, with no managed copy,
-import, publication, or sandbox-owned state.
+`src/execution/direct-bwrap.ts` is the argv builder for the optional Python-like
+Bubblewrap shell mode. `HostExecutionEnv` uses it only when a Gateway instance
+configures `toolSandbox: "bwrap"`; absent or `"host"` keeps the guarded native
+shell. It does **not** replace the managed-copy adapter in
+`src/execution/index.ts`/`src/execution/sandbox.ts`, and it does not copy, import,
+stage, or publish a workspace. The owner chose accidental-damage protection, not
+hostile isolation: the command runs directly on the actual read-write workspace,
+with no sandbox-owned state.
+
+Only shell commands are wrapped. The native `read`, `write` and `edit` tools keep
+using the guarded `HostExecutionEnv` filesystem methods on the same actual
+workspace; they do not run inside the Bubblewrap mount namespace.
 
 ## API
 
@@ -21,6 +27,14 @@ const argv = buildDirectBwrapArgs({
 });
 // spawn(argv[0], argv.slice(1), { cwd: "/home/user/project", env: filteredEnv })
 ```
+
+The Gateway builds one environment per conversation with
+`createHostExecutionEnv({ shellSandbox: { bwrapPath } })`. When tools are enabled,
+a configured backend is resolved and validated before storage is opened, and the
+environment is created lazily for its first tool call. `bwrapPath` is the
+optional top-level config field of the same name. An invalid or missing binary
+fails startup; a command that cannot build or start its argv fails the call.
+There is no fallback to the host shell.
 
 `buildDirectBwrapArgs` returns a `string[]` containing the trusted Bubblewrap
 binary followed by separate arguments. It never builds a shell string from paths,
@@ -73,8 +87,8 @@ not survive either command exit or SIGKILL of Bubblewrap's launcher parent.
   delay. It is process-lifecycle cleanup, not a CPU/memory/disk quota and not a
   replacement for the shell timeout and process-group policy.
 - The command environment is inherited from the caller, with `HOME` overridden to
-  the workspace. The builder does not call `--clearenv`; callers must pass the
-  filtered environment required by the shell policy.
+  the workspace. The builder does not call `--clearenv`; the Gateway passes only
+  the shared policy environment and replaces its host scratch `TMPDIR` with `/tmp`.
 
 ## Differences and limits
 
@@ -104,9 +118,12 @@ These are deliberate and must not be described as a confinement boundary.
   optional list does not include these four files.
 - **ARGV instead of a quoted shell string.** Python joins the whole Bubblewrap
   argv with `shlex.join` and later hands that string to `bash -l -c`. This builder
-  returns the argv directly. The caller chooses the in-sandbox shell (for example
-  `["/bin/sh", "-c", command]`) and any outer launch policy. Paths and cwd are not
-  reparsed by a shell.
+  returns the argv directly, and the Gateway spawns Bubblewrap without an outer
+  shell. For a string bash command the Gateway chooses `/bin/bash -c` when the
+  host has it (then `/usr/bin/bash`, `/bin/sh`, `/usr/bin/sh`), so bash-specific
+  command text keeps native tool semantics; Python's inner command shell is
+  `sh -c`. The literal command remains one argv element and paths/cwd are not
+  reparsed by an outer shell.
 - **Media is opt-in and disjoint.** Python always attempts to bind its media
   directory. Here `mediaDirectory` is added only when explicitly supplied, and a
   configured path must exist, be a directory, and not overlap the workspace.
@@ -123,20 +140,45 @@ These are deliberate and must not be described as a confinement boundary.
   if the caller's `PATH` names them. No general bind configuration is added; a
   workflow that needs a tool must use one available in the mounted system paths
   or inside the workspace.
-- **`/tmp` spill files are not host-visible.** `/tmp` is a private tmpfs, so a
-  command's spill or temporary output written there cannot be read by the host
-  after the sandbox exits. Host-side spill paths must be under the workspace.
+- **`/tmp` is private and not a spill transport.** `/tmp` is a private tmpfs, so
+  files a command writes there are invisible to the host and disappear when the
+  sandbox exits. The Gateway therefore sets `TMPDIR=/tmp` for the sandboxed command
+  rather than the host scratch path, which is not mounted. The native bash tool's
+  full-output spill file is different: the host parent writes it under its private
+  scratch root, so the reported `fullOutputPath` stays readable through the guarded
+  `read`/filesystem API while the environment lives. That spill path is not mounted
+  into the sandbox and is not readable by an in-sandbox `bash` command; use `read`.
+  Spill and scratch files are removed when the environment is cleaned up, not
+  durable storage.
 - **Policy lives elsewhere.** Deny patterns, environment allowlisting, command
-  timeout, and process-group kill remain `ExecutionEnv`/tool-layer policy. This
-  builder only describes the mount/namespace shape and does not enforce them.
+  timeout, cwd containment, and the filesystem guard remain
+  `ExecutionEnv`/`policy.ts` policy. The Gateway applies the same policy before
+  wrapping the command; this builder only describes the mount/namespace shape and
+  does not enforce them. There is no second policy in the bwrap path.
 - **No resource cleanup is needed.** The builder creates no files or directories
   and leaves no state. `/tmp` contents disappear when the sandbox exits.
 
 ## Validation performed and limits
 
 On 2026-10-28, bounded probes used temporary workspaces under `/tmp` on Linux with
-Bubblewrap 0.9.0. All 32 checks passed, plus separate `--new-session` and
-`--die-with-parent`/PID-namespace probes. The checks confirmed:
+Bubblewrap 0.9.0. All 32 builder checks passed, plus separate `--new-session` and
+`--die-with-parent`/PID-namespace probes. A second bounded Gateway integration
+probe (nine shell-environment checks through `createHostExecutionEnv` and four
+through `openGateway` with a faux provider and a temporary workspace/data
+directory) confirmed:
+
+- config accepts `toolSandbox: "bwrap"` and rejects an unknown value;
+- a configured `/usr/bin/true` or missing binary fails environment creation, and
+  `openGateway` with tools enabled fails before use;
+- a real Gateway turn runs `bash` on the actual workspace and its write persists;
+- the shell reports `TMPDIR=/tmp`, workspace siblings stay masked, and the host
+  network namespace is unchanged;
+- a host-written bash spill file is readable through the guarded filesystem while
+  its name is absent from the sandbox `/tmp`;
+- the shared timeout still ends the bwrap process group, and the shared path guard
+  still refuses an outside absolute path.
+
+The earlier builder checks confirmed:
 
 - a workspace path and cwd containing spaces survive argv handling unchanged;
 - workspace writes are visible on the host, and a relative cwd under the
@@ -157,6 +199,9 @@ Bubblewrap 0.9.0. All 32 checks passed, plus separate `--new-session` and
   the host root as workspace, media overlap, and an empty command all fail closed.
 
 Not checked here: adversarial escape, resource exhaustion or quotas, an actual
-pre-0.9 Bubblewrap binary, host `bash -l` environment parity, the shell deny
-patterns, environment allowlist, timeout, and process-group kill. Those remain
-`ExecutionEnv`/tool-layer checks, not properties of this argv builder.
+pre-0.9 Bubblewrap binary, host `bash -l` environment parity, and every filesystem
+race. The shared shell deny patterns, environment allowlist, timeout and
+process-group kill are `ExecutionEnv`/tool-layer checks, not properties of this
+argv builder; the integration probe exercised only the cases listed above. No
+provider request, real credential, network request, live data or permanent test
+file was used.

@@ -89,14 +89,16 @@ appropriately confined environment, not a raw NodeExecutionEnv. Identity must
 preserve upstream per-file serialization across environments addressing the same
 files.
 
-**Current integration decision:** bwrap execution remains unresolved and is not
-installed by the Gateway. The reviewed W1 coding tools instead run over the
+**Current integration decision:** the reviewed W1 coding tools run over the
 guarded `HostExecutionEnv` on the actual workspace, disabled by default and
 requiring explicit expiring per-conversation grants; see
-[`TOOLS.md`](./TOOLS.md). That path is accidental-damage protection, not
-confinement, and it does not make the standalone managed-copy execution factory
-a production-safe capability. Host shell execution can still read host files and
-use the network; Python's exec URL guard is not ported.
+[`TOOLS.md`](./TOOLS.md). A Gateway instance may additionally select the optional
+direct-workspace Bubblewrap shell with `toolSandbox: "bwrap"`, which wraps only
+the shell, keeps the native guarded filesystem on the same workspace, and stays
+off by default; see [`DIRECT_BWRAP.md`](./DIRECT_BWRAP.md). Both paths are
+accidental-damage protection, not confinement, and neither makes the standalone
+managed-copy execution factory a production-safe capability. Shell execution can
+still use the network; Python's exec URL guard is not ported.
 
 `src/extensions/codemode.ts` provides the opt-in `createCodeModeIntegration`
 factory, budgets and lifecycle/types, also exported by `src/index.ts`. Native
@@ -151,11 +153,13 @@ report a missing parallel module as expected, not a reason to add stub code.
 
 ## Security and deliberately limited functionality
 
-- Linux-only initial coding tools. Shell always uses a trusted absolute bwrap,
-  fresh mount/PID/network namespaces, dropped capabilities, sanitized environment,
-  no host-home/config mounts, only the application-managed isolated workspace
-  writable (explicit imports, no arbitrary writable host/extra roots), and required
-  system tools read-only. No unsandboxed or host-network fallback.
+- Linux-only coding tools. The default shell is the guarded host shell, which is
+  not confinement. The optional `toolSandbox: "bwrap"` shell uses a validated
+  absolute Bubblewrap binary over the actual workspace, read-only system paths,
+  a private `/tmp`, PID-namespace teardown, a sanitized environment, no
+  host-home/config mounts, and no unsandboxed fallback; like Python, it keeps the
+  host network namespace and is not a quota or hostile-tenant boundary. The
+  standalone managed-copy bwrap adapter remains uninstalled.
 - Filesystem paths are confined equivalently to the Python `_resolve_path`,
   including traversal, sibling-prefix, symlink escapes, and nonexistent write
   destinations. Check every public FileSystem entry point (both rename paths,

@@ -56,6 +56,11 @@ export interface PortConfig {
    * timeout. Absent keeps the shared policy default. This is not the per-call cap.
    */
   toolTimeoutSeconds?: number;
+  /**
+   * Shell backend for the opt-in coding tools. Absent or `host` keeps the guarded native shell;
+   * `bwrap` runs shell commands under direct-workspace Bubblewrap and fails closed when unavailable.
+   */
+  toolSandbox?: "host" | "bwrap";
   thinkingLevel?: ModelThinkingLevel;
   extraAllowedDirs?: readonly string[];
   bwrapPath?: string;
@@ -159,6 +164,12 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   config.toolAllowlist = toolAllowlist;
   const toolTimeoutSeconds = parseToolTimeoutSeconds(raw.toolTimeoutSeconds);
   if (toolTimeoutSeconds !== undefined) Object.assign(config, { toolTimeoutSeconds });
+  if (raw.toolSandbox !== undefined) {
+    if (raw.toolSandbox !== "host" && raw.toolSandbox !== "bwrap") {
+      throw new Error('toolSandbox must be "host" or "bwrap"');
+    }
+    Object.assign(config, { toolSandbox: raw.toolSandbox });
+  }
   if (raw.workspaceContext !== undefined) {
     Object.assign(config, { workspaceContext: workspaceContextConfig(raw.workspaceContext) });
   }

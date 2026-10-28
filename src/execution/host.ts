@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, realpath, rm, writeFile as writeFileHost } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -29,21 +30,19 @@ import {
 	type FilesystemPathProbe,
 	type ShellPolicyOptions,
 } from "./policy.js";
+import { buildDirectBwrapArgs, resolveDirectBwrapPath } from "./direct-bwrap.js";
 
-/**
- * A guarded host environment for accidental-damage protection, not confinement. Filesystem methods refuse lexical and
- * symlink escapes from the configured roots, but:
- *
- * - a host shell command can still read or write anything the process user can, and networking remains available;
- * - a hard link inside a root to an outside inode is indistinguishable by path and is allowed, so writes or removals
- *   through it affect the outside inode;
- * - a dangling symlink is refused even when its textual target is inside, because resolution cannot be authorized;
- * - `NodeExecutionEnv` kills the command's process group on timeout, abort and cleanup, but a descendant that creates a
- *   new session/process group (for example with `setsid`) escapes that teardown; there is no namespace here to catch it.
- *
- * The shell timeout, environment allowlist, command filters and filesystem checks all come from `./policy.ts`; the
- * same policy is intended to be imported by the optional bubblewrap backend.
- */
+/** Optional direct-workspace Bubblewrap shell. Filesystem calls remain the guarded native implementation. */
+export interface BwrapShellOptions {
+	/** Absolute trusted Bubblewrap executable. Absent prefers `/usr/bin/bwrap`, then PATH. There is no host fallback. */
+	bwrapPath?: string;
+}
+
+interface BwrapShell {
+	readonly binary: string;
+	readonly interpreter: readonly [string, ...string[]];
+}
+
 export interface HostExecutionOptions {
 	/** Existing directory that is the workspace root. It is canonicalized once at creation. */
 	workspaceRoot: string;
@@ -54,6 +53,12 @@ export interface HostExecutionOptions {
 	/** Initial cwd, absolute or relative to `workspaceRoot`; must be inside the configured roots. */
 	cwd?: string;
 	/**
+	 * Run shell commands under direct-workspace Bubblewrap. The workspace is the actual read-write directory; there is no
+	 * managed copy or publish-back. Filesystem methods stay native and guarded. Absent keeps the native host shell. A
+	 * configured backend that cannot start fails the call; it never falls back to host execution.
+	 */
+	shellSandbox?: BwrapShellOptions;
+	/**
 	 * Scratch directory for spills and temp files. Defaults to a private, owner-only directory under the host temp
 	 * root. It is always an allowed root so the native bash spill path remains readable while the environment lives.
 	 * Spill/temp paths last only for the environment lifetime: the owned default is removed on `cleanup`, and an
@@ -62,16 +67,43 @@ export interface HostExecutionOptions {
 	tempDirectory?: string;
 }
 
+/**
+ * A guarded host environment for accidental-damage protection, not confinement. Filesystem methods refuse lexical and
+ * symlink escapes from the configured roots, but:
+ *
+ * - a shell command can still read or write anything the process user can, and networking remains available; the
+ *   optional Bubblewrap shell narrows that mount view but is still not hostile isolation;
+ * - a hard link inside a root to an outside inode is indistinguishable by path and is allowed, so writes or removals
+ *   through it affect the outside inode;
+ * - a dangling symlink is refused even when its textual target is inside, because resolution cannot be authorized;
+ * - `NodeExecutionEnv` kills the command's process group on timeout, abort and cleanup, but a host descendant that
+ *   creates a new session/process group (for example with `setsid`) escapes that teardown; the Bubblewrap shell adds
+ *   `--unshare-pid` and `--die-with-parent` for its own descendants.
+ *
+ * The shell timeout, environment allowlist, command filters and filesystem checks all come from `./policy.ts`; the
+ * Bubblewrap shell uses that same policy and the direct-workspace argv builder rather than a second policy.
+ */
 export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 	readonly #policy: ExecutionPolicy;
+	readonly #workspaceRoot: string;
 	readonly #tempRoot: string;
 	readonly #ownsTempRoot: boolean;
+	readonly #bwrap: BwrapShell | undefined;
 
-	constructor(options: { cwd: string; policy: ExecutionPolicy; tempRoot: string; ownsTempRoot: boolean }) {
+	constructor(options: {
+		cwd: string;
+		workspaceRoot: string;
+		policy: ExecutionPolicy;
+		tempRoot: string;
+		ownsTempRoot: boolean;
+		bwrap?: BwrapShell;
+	}) {
 		super({ cwd: options.cwd });
 		this.#policy = options.policy;
+		this.#workspaceRoot = options.workspaceRoot;
 		this.#tempRoot = options.tempRoot;
 		this.#ownsTempRoot = options.ownsTempRoot;
+		this.#bwrap = options.bwrap;
 	}
 
 	async #probe(context: Context): Promise<FilesystemPathProbe> {
@@ -289,8 +321,62 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		};
 		if (timeout.value === undefined) delete safe.timeout;
 		else safe.timeout = timeout.value;
-		return super.exec(command, safe, context);
+		if (this.#bwrap === undefined) return super.exec(command, safe, context);
+
+		// The sandbox mounts only the workspace; a cwd in an extra allowed root would silently fall back to the
+		// workspace inside the builder, so refuse it instead of running somewhere the caller did not ask for.
+		if (!isPathWithin(this.#workspaceRoot, cwd.value)) {
+			return err(
+				new ExecutionError(
+					"spawn_error",
+					`Bubblewrap shell cwd is outside the workspace: ${cwd.value}`,
+				),
+			);
+		}
+
+		let argv: string[];
+		try {
+			argv = buildDirectBwrapArgs({
+				workspace: this.#workspaceRoot,
+				cwd: cwd.value,
+				bwrapPath: this.#bwrap.binary,
+				command:
+					typeof command === "string"
+						? [...this.#bwrap.interpreter, command]
+						: [...command],
+			});
+		} catch (error) {
+			const cause = error instanceof Error ? error : new Error(String(error));
+			return err(new ExecutionError("spawn_error", cause.message, cause));
+		}
+		return super.exec(
+			argv,
+			{
+				...safe,
+				// The host scratch root is not mounted inside the sandbox. Its `/tmp` is a private writable tmpfs, while
+				// bash spill files are still written by this host process under the private scratch root and stay readable.
+				env: { ...safe.env, TMPDIR: "/tmp" },
+			},
+			context,
+		);
 	}
+}
+
+/** Prefer bash inside the sandbox for native bash-tool semantics, then fall back to the mounted system shell. */
+function sandboxInterpreter(): readonly [string, ...string[]] {
+	for (const candidate of ["/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh"]) {
+		try {
+			if (statSync(candidate).isFile()) return [candidate, "-c"];
+		} catch {
+			// Try the next mounted system path.
+		}
+	}
+	return ["sh", "-c"];
+}
+
+function resolveBwrapShell(options: BwrapShellOptions | undefined): BwrapShell | undefined {
+	if (options === undefined) return undefined;
+	return { binary: resolveDirectBwrapPath(options.bwrapPath), interpreter: sandboxInterpreter() };
 }
 
 /** Create a guarded host environment. The root, allowed roots, cwd and default scratch directory are canonicalized once. */
@@ -323,7 +409,15 @@ export async function createHostExecutionEnv(options: HostExecutionOptions): Pro
 			},
 		};
 		const policy = createExecutionPolicy({ roots, shell });
-		return new HostExecutionEnv({ cwd, policy, tempRoot, ownsTempRoot });
+		const bwrap = resolveBwrapShell(options.shellSandbox);
+		return new HostExecutionEnv({
+			cwd,
+			workspaceRoot: root,
+			policy,
+			tempRoot,
+			ownsTempRoot,
+			...(bwrap === undefined ? {} : { bwrap }),
+		});
 	} catch (error) {
 		// A failure after scratch creation must not leave an owned private directory behind.
 		if (ownsTempRoot && tempRoot !== undefined) {
