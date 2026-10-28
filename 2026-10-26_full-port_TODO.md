@@ -1,19 +1,23 @@
 # Full nanobot port — TypeScript on the Pi SDK stack
 
 Date: 2026-10-26. Branch: `feat/pi-durable-rebuild`.
-Status: **roadmap agreed in scope; implementation is partial, not production-ready**.
-This is the forward plan. The [spike checklist](2026-10-26_pi-durable-rebuild_TODO.md)
-retains its evidence/history; [package design](packages/pi-nanobot/DESIGN.md)
-continues to constrain the currently integrated tool-less slice.
+Status: **historical roadmap/evidence; implementation is partial, not production-ready**.
+The [current plan and consolidation snapshot](2026-10-27_port-plan_TODO.md) govern
+scope, status and stop rules. Native coding tools/grants and opt-in memory/skills
+are now integrated; the old tool-less-slice description is historical. The
+[spike checklist](2026-10-26_pi-durable-rebuild_TODO.md) and
+[package design](packages/pi-nanobot/DESIGN.md) retain earlier rationale.
 
 ## Milestone checklist
 
 > **Sequencing superseded 2026-10-27** by
 > [`2026-10-27_port-plan_TODO.md`](2026-10-27_port-plan_TODO.md). The list below
 > records what v1 planned and what has been completed; it is no longer the work
-> order. This file remains authoritative for evidence, completed slices, owner
-> decisions, the parity map and the reuse policy. Do not start a new batch from
-> this checklist without checking the v2 plan first.
+> order. This file preserves evidence, completed slices, the original parity map
+> and reuse guidance. The current plan supersedes conflicting owner-scope assumptions:
+> sustained goals/tasks, standing intents, dedicated heartbeat and Dream archiving
+> are excluded; WebUI/migration are deferred. Implementation is paused for consolidation.
+> Do not start workers or implement unchecked boxes from this historical checklist.
 
 - [x] P0 — establish baseline, owner decisions, initial parity/reuse map.
 - [ ] P1 — prove execution, network, approval, and storage trust boundaries.

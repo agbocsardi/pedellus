@@ -30,29 +30,96 @@ Complete and validate the core/memory/cron path first; compaction is core contex
 continuity. The broader W4–W6 descriptions below are historical options, not
 standing authorization to implement or deploy them.
 
-## Current checklist
+## Current checklist — consolidated 2026-10-28
 
-- [x] Verify the existing typecheck, behavioral and execution baselines.
-- [x] Prove two provider API families and the bad-model error path (W0).
-- [ ] Freeze the shared W1/W2 contract and resolve backend differences.
-- [x] Deliver the tool layer and durable per-conversation grants (W1).
-- [x] Deliver the selectable Python-like shell sandbox (W2).
-- [ ] Decide memory authority and complete memory, context and compaction (W3).
-- [ ] Record the A/B and harness-specific acceptance results (W4).
-- [ ] Complete automation and channels item by item (W5).
-- [ ] Complete WebUI and retirement work (W6).
+- [x] Verify typecheck, 155 behavioral and 9 execution checks.
+- [x] Prove two provider API families and local bad-model rejection (W0).
+- [x] Settle the shared host/bwrap contract and document backend differences.
+- [x] Integrate four native coding tools and durable conversation grants (W1).
+- [x] Integrate optional direct-workspace bwrap shell; real provider tool turn (W2).
+- [x] Settle Markdown memory authority; integrate opt-in memory and skills.
+- [x] Verify compaction continuity across a fresh process with a faux summarizer.
+- [x] Integrate deterministic cron timer/run foundation and calendar/timezone math.
+- [x] Reconcile the plan, current Gateway wiring and parked branch inventory.
+- [x] Check the combined core path offline on both host and bwrap during consolidation.
+- [ ] Finish curated builtin skill compatibility/package review (parked).
+- [ ] Record real-model memory/skill/compaction acceptance and A/B fixture results (W4).
+- [ ] Deliver user-facing cron: callable tool, runtime lifecycle, authorization and delivery.
+- [ ] Agree background-subagent / Code Mode worker shape before implementation.
+- [ ] Complete requested channels individually after core acceptance.
+- [ ] Agree the next bounded implementation scope with the owner; no automatic restart.
 
-Supersedes the **sequencing** in `2026-10-26_full-port_TODO.md`: the P1–P9 ordered
-milestone list, its "Execution order and next bounded batch" section, and the
-per-batch worker-assignment sections as standing instructions. That file stays
-authoritative for completed work, the evidence log, the parity map and the reuse
-policy. This document changes order, granularity and stop rules only.
+WebUI, migration and retirement are deferred decisions, not outstanding authorization.
+Dedicated heartbeat, sustained goals/tasks, standing intents/keyword triggers and Dream
+archiving are excluded, not unfinished port milestones.
 
-Status at time of writing: gateway is tool-less, no real fork-provider call has been
-made. 155 behavior checks and 9 execution checks pass.
+## Current state — what is actually usable
 
-Scope of this document is engineering only. Deployment preferences and
-product-usage decisions live outside the repository and do not gate the work below.
+Baseline: `c532c5640` on `feat/pi-durable-rebuild`, before this documentation-only
+consolidation. The port is experimental, not deployed or approved for cutover.
+
+| Area | Integrated / usable | Missing or limited |
+| --- | --- | --- |
+| CLI / Gateway / SQLite | Local streaming CLI, persisted sessions/model choices, recovery controls, exclusive store lock and WAL/FULL | `/new` deliberately unsupported; no everyday-assistant acceptance or backup/restore drill |
+| Providers | Nine configured native aliases; real OpenCode Go Gateway tool turns; Anthropic-family Umans proof | Umans proof is not Gateway support; full provider/fallback matrix unproven |
+| Coding tools | Native `read`/`write`/`edit`/`bash`, host ceiling, expiring/revocable per-session grants | Ceiling defaults empty; grant/revoke is an SDK host API, not a CLI/Telegram approval command |
+| Shell backend | Guarded actual workspace; optional `toolSandbox: bwrap`, off by default | Network remains available; file tools stay guarded host APIs; no hostile isolation/quota claim |
+| Context / memory | Opt-in bootstrap and selected files, topic manifest, on-demand read/write through granted tools | Markdown authoritative; context fixed until new session/reopen; unreadable memory directory can block reopen |
+| Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool | No packaged curated port builtins; no inventory-count cap, but finite prompt/output bounds visibly truncate |
+| Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
+| Cron | Integrated internal timer/run module; `at`/`every`/`cron`, IANA zones, busy/restart/cancel handling | Not installed by Gateway or exported in its SDK barrel; no model-callable tool, delivery/silence, or authorization wiring |
+| Telegram | Restricted allowlisted inbound/reply adapter with streaming, durable send intent, unknown-send quarantine | Existing adapter only; scheduled outbound candidate is unmerged; no general pairing or media parity |
+| Code Mode / delegation | Reviewed opt-in QuickJS Code Mode/tool-search SDK | Not Gateway-installed; no product background-subagent or worker interface |
+| Other surfaces | Read-only usage and inert archival helpers exist | Discord candidates parked; Email/WebSocket, MCP, web/media tools not integrated |
+
+An enabled skill tool supplies instructions only and does not require coding-tool grants.
+All effectful coding work still requires its own grant. Configuring a tool ceiling alone
+does not produce a tool-capable ordinary CLI or Telegram session.
+
+## Remaining gates — ordered proposal, not a launch queue
+
+1. **Consolidation decision:** review this snapshot and explicitly choose the next scope.
+   Preserve unmerged work; do not start new workers or fixes automatically.
+2. **Close core acceptance:** settle curated builtin packaging/snapshot instructions;
+   exercise one owner-approved real-model memory + skill + compaction path and the
+   copied A/B fixtures. Existing synthetic evidence is not model-fidelity evidence.
+3. **Close cron as a user feature:** owner-scoped callable `add`/`list`/`remove`,
+   Gateway install-before-resume, explicit per-run context and grant reauthorization,
+   origin routing/outbound delivery, silent mode and visible errors. Prove schedule
+   → execution → delivery → restart without duplicate admission. Telegram delivery
+   candidate must first be accepted or rejected; no exactly-once external-send claim.
+4. **Only after explicit agreement:** background subagents / Code Mode workers,
+   then channel use and order (Telegram, Discord, Email, WebSocket).
+5. **Separate owner decisions:** WebUI, migration, deployment/canary, rollback and
+   Python retirement. Nothing in this checklist authorizes live data or deployment.
+
+## Evidence and limitations
+
+- Parent baseline: typecheck + **155 behavior / 9 execution** checks pass. Those
+  counts predate memory/skills/cron and do not imply dedicated regression coverage
+  for the new slices; their focused evidence largely consists of temporary probes.
+- Consolidation added no permanent tests. A temporary faux-provider probe traversed
+  the actual Gateway on **host and bwrap**: bootstrap + memory manifest, skill
+  body absent from prompt then loaded on demand, all four coding tools, topic write,
+  another session denied coding tools, revoke/reopen, stable conversation identity
+  and refreshed skill body. Both passed; no provider or Telegram network calls.
+- Compaction, calendar DST/leap-day, timer-before-model and crash/restart probes are
+  recorded below and in package docs. Real-model summarization, real scheduled
+  delivery and combined real-workspace acceptance remain unproven.
+- No new live-data activation, paid call, deployment or Python change occurred in
+  consolidation. The copied personal skills remain inactive. Historical Git privacy
+  references are retained by owner decision; do not rewrite history during cleanup.
+- Calendar refinement exceeded the planned review budget. It is now closed; this
+  exception is not permission for further review/fix chains.
+
+This is the current scope/status/stop-rule authority. It supersedes the sequencing
+and conflicting scope assumptions in `2026-10-26_full-port_TODO.md`, including the
+P1–P9 milestones and worker-assignment sections as standing instructions. The older
+file preserves historical evidence, completed slices, the original parity map and
+reuse guidance; its unchecked boxes are not a current implementation queue.
+
+Deployment preferences and product-usage decisions stay with the owner; engineering
+completion does not imply activation or cutover permission.
 
 ## Owner clarification — 2026-10-28
 
@@ -107,7 +174,7 @@ Contract both backends must satisfy:
 - `read`/`write`/`edit` refuse `../` traversal and symlink escapes out of the
   workspace root.
 - `bash` keeps the ported deny patterns (destructive `rm`, disk and power commands,
-  writes to runtime state files) and the `allowedEnvKeys` environment allowlist, so a
+  writes to runtime state files) and the `allowedEnvKeys` environment allowlist, so
   credentials are not implicitly inherited by commands.
 - Runaway protection: command timeout plus process-group kill. A runaway is damage
   even with no attacker.
@@ -174,51 +241,34 @@ Exit: the four tools work from a real turn; a deliberate `../` escape and a syml
 out of the workspace are refused; a runaway command is killed; a revoked grant stays
 revoked across reopen.
 
-### W2 — sandbox backend
+### W2 — optional shell sandbox (complete for agreed scope)
 
-> **Owner clarification, 2026-10-28:** The managed-copy, all-operations-confined
-> design below is superseded. Implement an optional Python-like shell bwrap mode
-> over the actual read-write workspace, with host-side filesystem guards. The
-> owner wants accidental-damage protection, not hostile isolation; network stays
-> available. W2 does not gate W1 Gateway activation.
+`toolSandbox: "bwrap"` wraps shell commands on the actual read-write workspace;
+filesystem tools use the same guarded host APIs as W1. Networking remains available,
+`/tmp` is private, system mounts are read-only, and the workspace parent is masked.
+Validated executable/setup errors fail closed without host fallback. Shared shell
+policy, environment filtering, timeout and native output semantics remain in force.
+Bwrap adds process namespace teardown, not hostile-tenant resource quotas.
 
-An `ExecutionEnv` implementation that confines filesystem and shell, finished to
-parity with the host-side tool layer rather than abandoned as a spike. Bubblewrap is
-the preferred backend. It must be selectable per instance through configuration, so
-a deployment that needs confinement can require it and one that does not is not
-blocked by it.
+Host spill files are readable through `read` during the environment lifetime, not
+inside bwrap's private `/tmp`. Extra mount/toolchain limitations are documented in
+`packages/pi-nanobot/DIRECT_BWRAP.md` and `TOOLS.md`. This replaces the old managed-copy,
+all-operations-confined design; it does not claim shell/file isolation parity.
 
-Bound by the W1/W2 shared contract: confinement is enforced here, tool policy is not.
-Where the sandbox genuinely cannot honour a host-side allowance, that difference is a
-config-level declaration, not a silent refusal.
-
-Scope:
-
-- All filesystem paths inside the confinement boundary, not only `bash`.
-- Validated bwrap executable, namespace setup, sanitized environment, explicit
-  mount set, process and resource limits.
-- Traversal, missing-leaf, rename, symlink-race and hard-link behaviour on every
-  read/write/list/spill/temp/cwd path.
-- Teardown, timeout, cancellation, bounded resource use, no post-return work.
-- Orphan and manual reconciliation for a workspace left behind by a crash.
-- No unsandboxed fallback and no host-network or credential mount.
-- `restrictToWorkspace` semantics preserved so existing configurations map cleanly.
-
-Exit: the behavioral suite runs against the sandboxed backend with the same results
-as the host backend; escape attempts on each path class are refused and recorded;
-the backend is selectable by config and off by default. Remaining known limits are
-written down rather than carried as blockers.
+Exit met: reviewed config-selectable backend, synthetic checks and an authorized real
+provider turn using all four tools. Default remains host/off; W2 does not gate W1.
 
 ### W3 — memory, context and compaction
 
-Preserve or re-derive: loaded context assembly, compaction with a durable transcript,
-topic-file reads and writes, skills discovery. Whether Markdown files remain the
-single source of truth or Durable owns a store is an open design question; it
-constrains this workstream and should be settled before it starts.
+Markdown is the memory source of truth; Durable owns runtime state, transcripts and
+compaction. Opt-in loaded context, topic manifest and file read/write, plus summary-only
+skills with on-demand bodies are integrated. Snapshots refresh at creation/reopen,
+not after an in-session file edit.
 
-Exit: a conversation that crosses a compaction checkpoint still recalls an early
-fact; topic memory reads on demand and a write survives restart; a skill is
-discovered and run.
+Foundation verified: topic writes survive restart, skill discovery/body loading works,
+and an early fact crosses native compaction into a fresh process via a faux summarizer.
+Remaining acceptance: curated builtin compatibility and real-model use of memory,
+skills and compaction. No claim of full Python memory/search/usage parity.
 
 ### W4 — acceptance suite
 
@@ -248,18 +298,21 @@ scored by reading the output. The suite's own automatic checks are partial by de
 
 ### W5 — automation and channels
 
-One-shot and recurring scheduling (resurrect `pi-cbf84ad6` after one review) →
-heartbeat → sustained goals and read-only workers → Discord → Email/WebSocket →
-media tools.
+Cron timer/calendar foundation is integrated; do not resurrect superseded one-shot
+kernels. User-facing scheduling, authorization and delivery remain unwired.
 
-Exit per item: it runs a week without a silent failure, and a failure is visible in
-the journal rather than inferred.
+Wanted after core acceptance and owner agreement: background subagents and Code Mode
+workers, then Telegram/Discord/Email/WebSocket integration. Define a bounded acceptance
+gate per chosen item before building. Dedicated heartbeat, sustained goals/tasks and
+standing intents are excluded; an ordinary cron job can cover heartbeat use cases.
+No new W5 work starts during consolidation.
 
 ### W6 — WebUI and retirement
 
-Inventory the fork's actual wire contracts, then adapt the existing frontend to the
-single Durable gateway. Then retention, backup/restore runbook, schema freeze, and
-retirement of the Python service with a tagged readable reference kept.
+Deferred pending an explicit owner discussion. Existing inventory/import work does
+not authorize UI reconnection, migration, retention policy, deployment or Python
+retirement. Backup/restore and cutover/rollback acceptance must be planned separately
+if and when a live pilot is approved.
 
 ## Open design questions
 
@@ -273,9 +326,12 @@ retirement of the Python service with a tagged readable reference kept.
 3. **MCP legacy SSE** — `pi-mcp` 1.4.0 does not support it. Either a reviewed
    compatibility layer, an endpoint migration, or an explicit loud failure on a
    configured SSE server.
-4. **Tool names** — native Pi names with a mapping table in prompts, or aliases
-   matching the Python names. Affects prompts, consumers and the migration guide.
-5. **Review budget** — proposed two rounds maximum per slice (below). Confirm.
+4. **Tool names — decided for coding:** native `read`/`write`/`edit`/`bash` plus
+   read-only `skill`; adapt curated instructions rather than adding Python aliases.
+5. **Delegation shape — open:** background subagents versus Code Mode workers,
+   parent/child authority, reporting and cancellation; decide before implementation.
+6. **Pilot and acceptance — open:** agree actual use, budgets and requested channels
+   before authorizing real-workspace/provider acceptance. No live polling by default.
 
 ## Review protocol
 
@@ -286,16 +342,17 @@ retirement of the Python service with a tagged readable reference kept.
   candidates; that is how 25 branches became a backlog.
 - A slice that grows a second security boundary mid-review is a scope error: park it
   and write the boundary down instead.
-- Existing behavioral suite stays green. New permanent tests only for behaviour that
-  would otherwise silently regress.
+- Existing behavioral suite stays green. Add or expand permanent tests only when
+  explicitly requested; otherwise use existing checks and bounded temporary probes.
 
 ## Consolidation pause — 2026-10-28
 
-Finish and verify the in-flight cron calendar feature, then stop starting new
-implementation slices. Do not begin Gateway cron-tool, grant, outbox, channel or
-other feature wiring after that. Run a consolidation round instead: reconcile the
-plan with what is actually integrated, verify the core path end to end, clean
-worktrees/branches/probes, and agree priorities with the owner before more work.
+Calendar verification and integration are finished. Consolidation is active;
+new implementation slices and review/fix chains are paused. Do not begin Gateway
+cron-tool, grant, outbox, channel or other feature wiring. Reconcile status, verify
+the core path offline and inventory cleanup; agree priorities before more work.
+Cleanup removes only proven-owned, reviewed resources, never fixed/unowned temp
+paths or independently owned worktrees.
 
 ## Cron foundation status
 
@@ -305,8 +362,9 @@ integrated as `430abd7db`, `560bdee98`, `27082bfd7`, `2f618474a`. These add
 (offline install). Functional verification passed, including leap-day and
 `W`/`LW` month-list expressions, strict-future and daylight-saving checks. Parent
 typecheck, 155 behavior and 9 execution checks pass after an offline `npm ci`.
-Known library limits: croner treats six-field seconds as first, resolves
-ambiguous wall times to the later offset, and has year bounds. This remains an
+Known library differences: six-field seconds come first; one-hour folds run the
+first occurrence, while tested 30-minute/two-hour folds resolve to the later offset
+and can skip same-day occurrences. Year/search bounds apply; see `CRON.md`. This remains an
 unwired foundation; no Gateway cron tool, delivery or grant reauthorization is
 active.
 
@@ -315,46 +373,75 @@ review (`pi-c2787ba0`) and was integrated as `a9e788a56`, `022162fd0`,
 `8a8213bf6`. Finite timers arm successors before model work; a separate run task
 reattaches using native submission IDs. Fake-provider crash, cancellation and
 hung-run probes passed; parent typecheck, 155 behavior and 9 execution checks
-pass. This is an unwired foundation: calendar schedules, Gateway tool, grant
-reauthorization, outbox and channel delivery are still required. Cancellation may
+pass. Calendar schedules are now integrated. This is still an unwired foundation:
+Gateway tool, grant reauthorization, outbox and channel delivery are required. Cancellation may
 wait for a model that ignores abort; origin cancellation cannot retract a placed
 turn. Stored task records have no platform retention yet.
 
-## Parked
+## Parked / unmerged inventory — 2026-10-28
 
-`pi-d2c45589` (`eef7f480f`, `93365737a`): cron timer foundation parked after
-final review found a recurring-job task can fault when its plan phase returns the
-same checkpoint after advancing a previously settled occurrence. The job then
-appears scheduled but never fires. Fix the plan transition and stale outcome
-summary before further integration; do not ship as-is. Review budget exhausted.
-The owner explicitly reopened cron implementation after this parking decision.
-A replacement is being explored using finite occurrence tasks: each finishes once,
-atomically creates its successor and updates the job pointer, and uses native
-idempotent agent submissions instead of a generic callback claim. No recurring
-plan-phase loop or migration of unshipped synthetic stores is required. Assess the
-extra task-record retention honestly; confirm restart, cancellation and fault
-visibility before integration. Owner approval requires deterministic rescheduling
-independent of LLM calls: arm the next timer durably before invoking a model, not
-in a model-success completion path. Slow or failed model work must not stop the
-schedule; preserve non-overlapping executions with visible skipped/busy outcomes.
-The design and Durable contract probes established fresh isolated conversations,
-origin busy retry, authorized tools and durable outbox feasibility; no arbitrary
-job-count, interval or horizon limits were approved.
+| Candidate | State / reason | Consolidation disposition |
+| --- | --- | --- |
+| `pi-818cb00c` / `b986d5adb` | Scheduled Telegram outbound path; existing independent review told to stop after its current command and report | Unmerged; collect findings only, no more probes/fixes/runtime wiring |
+| `pi-e796f4e1` / `bd5442e2d` | Curated builtin skills: skill-creator wrongly requires same-session verification despite fixed snapshots | Preserve branch; not enabled or accepted |
+| `pi-d2c45589` / `93365737a` | Old recurring cron kernel faults on no-progress checkpoint | Superseded by integrated finite timer/run design; do not revive |
+| `pi-cbf84ad6` / `f03f75c9c`, `pi-23d2bdf0` / `9cc565dc3` | Earlier one-shot scheduling kernels | Superseded; reference only |
+| `pi-acb8f4a0`, `pi-71c6dac3` | Discord candidates, not integrated | Preserve until channel scope agreed |
+| `pi-b5ac8248` | Memory search over supplied snapshots | Not Markdown-authority memory parity; no activation |
+| `pi-1631ba70` | Synthetic Gateway grant proof | Existing product grants supersede the need for a new fixture feature |
+| `pi-7384fed4`, `pi-b54f4507`, `pi-ba6fe170`, `pi-be224dbf` | Unmerged archival renderer/staging/publication/search refinements | Deferred with migration; preserve data-integrity findings |
 
-`archival-*` (source, preparation, rehearsal, persist, search, renderer, staging,
-publication), memory-search-over-snapshots, the gateway grant synthetic fixture and
-the WebUI inventory. Branches stay; no new work and no reviews until a concrete need
-appears. Discord is deferred to W5.
+Some earlier archival helpers and the managed-copy sandbox are already integrated
+SDK/experimental code; parked follow-ups do not mean those files are absent. They
+are not part of the current ordinary Gateway path.
 
-## Done
+Git worktree inventory at consolidation: parent plus six linked checkouts:
+`pi-818cb00c`, `pi-8d9f1378`, `pi-e078edd8`, `sub-pi-durable-execution`,
+`sub-pi-durable-runtime`, `sub-pi-durable-telegram`. Keep the unmerged Telegram
+candidate. Do not remove the five older checkouts merely because their names look
+obsolete; ownership/dirty-state checks and confirmation precede removal. Other
+branch tips remain preserved; no bulk branch or Git-object pruning is authorized.
 
-Tools, memory and skills working on the port with the damage-model contract
-satisfied on both backends, an acceptance suite recorded with diffs, and a sandbox
-backend selectable by configuration. Everything after that is operational.
+The reviewed calendar worktree/branch was already removed after patch-equivalence
+verification. Consolidation closed its two remaining completed reviewer tabs and
+removed only the parent's freshly owned synthetic-probe directory after recording
+results. Temporary paths of uncertain ownership remain untouched. Do not treat an
+old worker registry entry as proof that its worktree still exists.
+
+## Target exit — not yet achieved
+
+Tools, memory and skills work together on the port within the agreed damage model,
+a real-model acceptance suite and diffs are recorded, and the optional shell backend
+is selectable. Core foundations are integrated, but W3/W4 acceptance and user-facing
+cron remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
 
-### 2026-10-28 — baseline and next batch
+### 2026-10-28 — consolidation
+
+Owner paused implementation after calendar verification. Reconciled the current
+plan against Gateway/config/CLI/SDK code, package documentation and Git metadata.
+Corrected stale tool-less/provider/calendar claims, replaced superseded W2/W5/W6
+scope, separated integrated foundations from user-facing gaps and excluded features,
+and inventoried preserved candidates/worktrees without deleting unrelated checkouts.
+Corrected package README and the older roadmap entry point so they point here.
+
+Parent reran typecheck, 155 behavior and 9 execution checks successfully. A temporary
+synthetic Gateway probe passed the combined memory/skills/four-tool path on host and
+bwrap, including another session's default deny, revoke/reopen, stable session
+identity and refreshed on-demand skill body. The probe's first run had an incorrect
+assertion about resolved tool objects versus names; correcting the probe (not
+product code) yielded both passes. Removed its proven-owned temporary directory
+and closed two completed calendar reviewer tabs. The existing Telegram reviewer
+was told to stop after its current command and report findings; no fix pass starts.
+No new runtime code, permanent tests, network calls, personal workspace activation
+or deployment. Next: owner chooses a bounded scope after reviewing the consolidated
+state, not automatic implementation.
+
+### 2026-10-28 — baseline and next batch (historical)
+
+Entries below record events at the time; intermediate statements such as "not wired"
+are superseded by later entries and the current-state table above.
 
 On `9d3afa1b9`, bounded `npm run typecheck`, `npm run test:behavior` and
 `npm run test:execution` passed: 155 behavior and 9 execution checks. Started

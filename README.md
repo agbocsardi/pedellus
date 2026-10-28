@@ -1,8 +1,14 @@
-# Nanobot Durable runtime spike
+# Nanobot on Pi Durable (experimental)
 
-Experimental Gate 1 TypeScript port. Requires Node >=22.19 and the pinned Pi 1.4.0 packages. This is not a production-ready replacement for the Python fork.
+TypeScript port requiring Node >=22.19 and the pinned Pi 1.4.0 packages. This is not a production-ready replacement for the Python fork.
 
-The [full-port roadmap](../../2026-10-26_full-port_TODO.md) covers the existing WebUI, Linux-only deployment, native QuickJS Code Mode/tools, Pi SDK-first reuse and bwrap confinement, feature parity, migration and cutover gates.
+The [current plan and consolidation snapshot](../../2026-10-27_port-plan_TODO.md)
+are the scope/status authority. Core coding tools, durable grants, optional bwrap
+shell, opt-in memory/skills and compaction plumbing are integrated. Cron has a
+reviewed internal timer/calendar foundation, **not a user-facing scheduling tool**.
+New implementation is paused for consolidation; WebUI, migration and cutover are
+deferred. The [older roadmap](../../2026-10-26_full-port_TODO.md) preserves evidence,
+not a standing implementation queue.
 
 ## Run
 
@@ -24,16 +30,29 @@ The gateway upgrades upstream SQLite's NORMAL default to **WAL `synchronous=FULL
 
 `toolAllowlist` is the host-owned **global ceiling** and defaults to `[]`.
 Conversations may only narrow such a ceiling; they cannot widen it. An empty ceiling
-keeps the gateway tool-less. A non-empty ceiling may name only the native
+disables coding tools (the opt-in read-only `skill` tool is separate). A non-empty
+ceiling may name only the native
 `read`, `write`, `edit` and `bash` tools; the gateway registers them over a guarded
 host environment on the actual workspace, and every conversation still needs an
 explicit per-conversation grant with an expiry. Revoked and expired grants are
 reapplied before resume, and a `beforeTool` hook rechecks them at call time. This
-field is not an approval UI. A deployment may select the optional
+field is not an approval UI. Grant/revoke currently requires the SDK host API;
+the ordinary CLI and Telegram adapter have no approval/grant command, so setting
+the ceiling alone does not enable coding tools in those sessions. A deployment may
+select the optional
 direct-workspace Bubblewrap shell with `toolSandbox: "bwrap"`; it is off by
 default, wraps shell commands only, and falls back to neither the host shell nor a
 managed copy. See [coding tools and grants](./TOOLS.md) and
 [direct Bubblewrap shell](./DIRECT_BWRAP.md).
+
+## Internal cron foundation (not activated)
+
+[`CRON.md`](./CRON.md) describes finite timer/run tasks, `at`/`every`/calendar
+schedules and IANA time zones. Timers arm their successors independently of model
+execution. The module is not installed by `openGateway` or exported through the SDK
+barrel; callable scheduling, per-run authorization, outbound/silent delivery and
+operator-facing wiring remain missing. The unmerged Telegram outbound candidate is
+not part of this checkout's runtime.
 
 ## Opt-in Code Mode SDK
 
@@ -105,5 +124,11 @@ the shell mount view but is not a quota or hostile-tenant boundary.
 native replay/grant boundary.
 
 For earlier Telegram reliability and scripted smoke evidence, see [TELEGRAM.md](./TELEGRAM.md).
-Real-provider acceptance, backup/restore and owner-approved cutover remain open;
-no paid LLM request or production cutover has been performed.
+Bounded owner-authorized real-provider proofs and OpenCode Go tool turns passed
+on host and bwrap in disposable workspaces. These do not establish full-provider,
+real-memory/skill/compaction or scheduled-delivery acceptance. Offline consolidation
+also checked the combined Gateway memory/skills/four-tool path and revoke/reopen
+on both backends with a faux provider. The 155 behavior and 9 execution checks do
+not include dedicated permanent coverage for every newer slice; focused temporary
+probes are described in their documents. Backup/restore, A/B acceptance and
+owner-approved cutover remain open; no production cutover has been performed.
