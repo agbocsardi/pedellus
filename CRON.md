@@ -145,10 +145,11 @@ Time-zone behavior is verified against IANA data and documented honestly:
 - **Fold (fall back):** for one-hour folds such as `America/New_York` and `Europe/Berlin`,
   croner runs the first occurrence once. If a reference falls in the second repeated hour, a
   bounded one-minute reference advance finds the first matching slot at or after the fold ends
-  instead of returning a past instant. Croniter runs both repeated occurrences. Sub-hour folds
-  such as `Australia/Lord_Howe` (30 minutes) and two-hour folds such as `Antarctica/Troll` are
-  resolved by croner's own forward/backward search and may run both repeated occurrences; the
-  bounded advance still guarantees that the next slot is strictly after the reference.
+  instead of returning a past instant. Croniter runs both repeated occurrences. In sub-hour
+  folds such as `Australia/Lord_Howe` (30 minutes) and two-hour folds such as
+  `Antarctica/Troll`, croner resolves an ambiguous wall time to the later offset, so the earlier
+  repeated interval is skipped. The later occurrence may run, or be skipped to the next day when
+  the reference already passed that wall time; the result is always strictly after the reference.
 - Out-of-range croner dates, including references beyond JavaScript's supported date range, are
   wrapped as `CronScheduleError` rather than leaking croner's raw `TypeError`.
 - The `at` and `every` kinds have no time zone of their own; `at` is already absolute and `every`
