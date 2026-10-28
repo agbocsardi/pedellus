@@ -71,7 +71,11 @@ export function materializeCronSchedule(
     }
     return { kind: "once", at: request.at };
   }
-  return { kind: "every", everyMs: request.everyMs, anchorMs: now + request.everyMs };
+  const anchorMs = now + request.everyMs;
+  if (!Number.isSafeInteger(anchorMs)) {
+    throw new CronScheduleError("the first interval occurrence exceeds the safe integer range");
+  }
+  return { kind: "every", everyMs: request.everyMs, anchorMs };
 }
 
 /** First slot strictly after `afterMs` on the fixed grid. Passed slots are skipped, not replayed. */

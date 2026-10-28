@@ -74,6 +74,12 @@ run's target conversation, so its writes and the target choice are atomic. It is
 add context or tool grants; without it this slice adds none. It must be durable and idempotent
 because a crash before that commit reruns it.
 
+The run stores that target choice once in its checkpoint. A resume after that commit does not
+commit a new checkpoint just to look busy, so Durable's real restart counter is preserved and a
+run that repeatedly crashes can still park where list/inspect can show it. The submit is tagged as
+the non-`pi.` entry kind `nanobot.cron` with `jobId`, `scheduledAtMs`, `generation`, and `requestId`
+provenance in the origin (or background) transcript.
+
 A model run that ends without answering is detected when the target conversation becomes idle while
 the submission is still queued. The queued input is withdrawn, the run records an error, and the
 already-armed timer chain continues. This works with Durable's default
@@ -85,20 +91,31 @@ already-armed timer chain continues. This works with Durable's default
 active run. Every timer and run commit checks generation and its pointer, so stale work cannot arm a
 successor or overwrite the result after cancellation. A settled one-shot returns `already_terminal`.
 
+`cancel()` also withdraws the occurrence's queued submission when its target conversation and
+stable request ID are known. The lookup is by `requestId`; `abortSubmission()` reports the race
+result. A queued origin input is removed and cannot run after cancellation. An input that was
+already placed stays in the origin transcript and may still complete: that is the documented
+`already_placed` limitation. Cancellation cannot retract it, only fence future scheduling and
+recording.
+
 `list()` and `inspect()` are owner-scoped and derive status from the actual timer and run task
 records plus live inspection. The view exposes both task summaries, including faulted, parked,
-aborted, and missing states with their errors/reasons. A faulted run is visible while it is the
-active execution and is retained in `lastFault` when the timer later replaces its pointer. A parked
-timer or run is shown as parked; this slice invents no cron retry policy, so use Durable's normal
+aborted, and missing states with their errors/reasons. It also exposes the target conversation's
+current generation run. If that target generation parks while the cron run is still waiting, the
+job view reports it instead of a false-healthy running state. An unhealthy timer dominates the
+canonical status over a still-running run. A faulted run is visible while it is the active execution
+and is retained in `lastFault` when the timer later replaces its pointer. A parked timer or run is
+shown as parked; this slice invents no cron retry policy, so use Durable's normal
 `harness.retryTask()` or cancel.
 
 ## Schedule math
 
 Supported schedules are `once` (absolute epoch milliseconds) and `every` (fixed interval). An
-interval is anchored at creation time, so the grid survives restarts. The next slot is always
-strictly after `max(now, scheduledAtMs)`; a backward clock jump cannot duplicate or move a slot
-backwards, and missed slots are skipped rather than replayed. One-shot schedules run once however
-late. No count, interval, horizon, lateness, or history cap is added.
+interval is anchored at creation time, so the grid survives restarts. The first interval slot is
+validated as a safe integer before the job is created. The next slot is always strictly after
+`max(now, scheduledAtMs)`; a backward clock jump cannot duplicate or move a slot backwards, and
+missed slots are skipped rather than replayed. One-shot schedules run once however late. No count,
+interval, horizon, lateness, or history cap is added.
 
 ## Not included / limitations
 
@@ -106,8 +123,12 @@ late. No count, interval, horizon, lateness, or history cap is added.
 - No gateway, channel, config, command/tool surface, calendar expression, time zone/DST, delivery,
   silence, model selection, or misfire policy.
 - Background runs are owned by the run task, so cancelling the job aborts that run. In `origin` mode
-  an already-admitted origin run is not owned by the run task; cancellation still fences both
-  pointers but cannot retract that run from the origin transcript.
+  an already-placed origin run is not owned by the run task; cancellation still fences both
+  pointers and withdraws a still-queued input, but cannot retract an already-placed run.
+- Origin-mode runs use the origin conversation's current agent, tool selection, and grants at
+  request preparation. Background runs provision a fresh task-owned conversation through the
+  trusted `prepare` callback. A host that needs equivalent authorization must recheck current
+  grants during that preparation; this slice does not copy or invent grants.
 - A non-terminal run task, including a parked one, blocks new work with visible skips until it is
   retried or cancelled.
 - A timer fault leaves its pointer in place and stops the chain visibly; an execution fault is
@@ -120,5 +141,7 @@ faux provider. They covered: timer arming successor+run before the model; a bloc
 next timer skipping without touching `lastOutcome`; model failure with the timer chain intact; clock
 moving backwards during a run; restart during a run and after execution with the successor already
 armed; cancellation before due and during a run; one-shot origin completion; timer and execution
-fault visibility; owner scoping; and dedupe. No live data, credentials, network, or deployment was
-used.
+fault visibility; parked target generation visibility; owner scoping; and dedupe. Additional
+review probes covered: a queued origin input withdrawn on cancel, the already-placed limitation,
+unhealthy-timer status dominance, and overflow rejection before job creation. No live data,
+credentials, network, or deployment was used.
