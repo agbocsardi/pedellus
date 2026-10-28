@@ -50,25 +50,6 @@ export class CronScheduleError extends RangeError {
 
 const errorText = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
-const formatters = new Map<string, Intl.DateTimeFormat>();
-
-function formatterFor(timeZone: string): Intl.DateTimeFormat {
-  let formatter = formatters.get(timeZone);
-  if (formatter === undefined) {
-    formatter = new Intl.DateTimeFormat("en-US", {
-      timeZone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hourCycle: "h23",
-    });
-    formatters.set(timeZone, formatter);
-  }
-  return formatter;
-}
 
 /** Validate an IANA time zone, rejecting fixed UTC offsets masquerading as zone names. */
 function validateTimeZone(timeZone: string): string {
@@ -80,7 +61,7 @@ function validateTimeZone(timeZone: string): string {
     throw new CronScheduleError("timeZone must be an IANA name, not a UTC offset");
   }
   try {
-    formatterFor(value).format(0);
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format(0);
   } catch (error) {
     throw new CronScheduleError(`unknown timezone '${value}': ${errorText(error)}`);
   }
@@ -178,64 +159,22 @@ export function materializeCronSchedule(
   return schedule;
 }
 
-function zoneOffsetMinutes(atMs: number, timeZone: string): number {
-  const parts = formatterFor(timeZone).formatToParts(new Date(atMs));
-  const values: Record<string, number> = {};
-  for (const part of parts) {
-    if (part.type !== "literal") values[part.type] = Number(part.value);
-  }
-  const year = values.year ?? Number.NaN;
-  const month = values.month ?? Number.NaN;
-  const day = values.day ?? Number.NaN;
-  const hour = values.hour ?? Number.NaN;
-  const minute = values.minute ?? Number.NaN;
-  const second = values.second ?? Number.NaN;
-  if (
-    !Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)
-    || !Number.isInteger(hour) || !Number.isInteger(minute) || !Number.isInteger(second)
-  ) {
-    throw new CronScheduleError("could not resolve the timezone offset");
-  }
-  const local = Date.UTC(year, month - 1, day, hour, minute, second);
-  const secondStart = Math.floor(atMs / 1000) * 1000;
-  return Math.round((local - secondStart) / 60_000);
-}
-
 /**
- * Croner intentionally runs a repeated wall-clock time once, at its first occurrence. When a
- * reference falls in the second half of that fold, croner can return the earlier instant. Find
- * the end of the repeated interval so the next slot is always strictly later.
+ * Croner intentionally runs a repeated wall-clock time once, at its first occurrence, but a
+ * reference in the second repeated half can make it return the earlier instant. Advance the
+ * reference in bounded one-minute steps until croner returns a strictly future candidate. The
+ * candidate's previous occurrence recovers the first valid slot after the fold so it is not
+ * skipped. The bound covers the largest wall-clock fold in tzdb; it is not a schedule horizon.
  */
-function foldEnd(afterMs: number, timeZone: string): number | null {
-  const current = zoneOffsetMinutes(afterMs, timeZone);
-  let high = afterMs;
-  let low = afterMs - 60 * 60 * 1000;
-  while (low > 0 && zoneOffsetMinutes(low, timeZone) === current) {
-    high = low;
-    low -= 60 * 60 * 1000;
-  }
-  if (low <= 0) return null;
-  const before = zoneOffsetMinutes(low, timeZone);
-  if (before <= current) return null;
-  while (low + 1 < high) {
-    const middle = low + Math.floor((high - low) / 2);
-    if (zoneOffsetMinutes(middle, timeZone) === current) high = middle;
-    else low = middle;
-  }
-  const end = high + (before - current) * 60_000;
-  return Number.isSafeInteger(end) && end > afterMs ? end : null;
-}
+const CALENDAR_ADVANCE_MS = 60_000;
+const MAX_CALENDAR_ADVANCES = 24 * 60 + 1;
 
-function nextPastFold(cron: Cron, afterMs: number, timeZone: string): number | null {
-  const end = foldEnd(afterMs, timeZone);
-  if (end !== null) {
-    const atEnd = new Date(end);
-    if (cron.match(atEnd)) return end;
-    return cron.nextRun(atEnd)?.getTime() ?? null;
+function guardedCron<T>(action: () => T): T {
+  try {
+    return action();
+  } catch (error) {
+    throw new CronScheduleError(errorText(error));
   }
-  const retry = cron.nextRun(new Date(afterMs + 1000))?.getTime() ?? null;
-  if (retry !== null && retry > afterMs) return retry;
-  throw new CronScheduleError("cron expression could not advance past the reference time");
 }
 
 /**
@@ -275,19 +214,27 @@ export function nextCronOccurrence(schedule: CronSchedule, afterMs: number): num
     throw new CronScheduleError("stored cron expression is empty");
   }
   const cron = compileCron(schedule.expr.trim(), zone);
-  const candidate = cron.nextRun(new Date(afterMs));
-  if (candidate === null) return null;
-  let next = candidate.getTime();
-  if (!Number.isSafeInteger(next)) {
-    throw new CronScheduleError("the next occurrence exceeds the safe integer range");
+  let reference = afterMs;
+  for (let attempt = 0; attempt < MAX_CALENDAR_ADVANCES; attempt++) {
+    const candidate = guardedCron(() => cron.nextRun(new Date(reference)));
+    if (candidate === null) return null;
+    const next = candidate.getTime();
+    if (!Number.isSafeInteger(next)) {
+      throw new CronScheduleError("the next occurrence exceeds the safe integer range");
+    }
+    if (next > afterMs) {
+      const previous = guardedCron(() => cron.previousRuns(1, candidate)[0]);
+      if (previous !== undefined) {
+        const prior = previous.getTime();
+        if (!Number.isSafeInteger(prior)) {
+          throw new CronScheduleError("the previous occurrence exceeds the safe integer range");
+        }
+        if (prior > afterMs && prior < next) return prior;
+      }
+      return next;
+    }
+    reference = Math.floor(reference / CALENDAR_ADVANCE_MS) * CALENDAR_ADVANCE_MS
+      + CALENDAR_ADVANCE_MS;
   }
-  if (next <= afterMs) {
-    const folded = nextPastFold(cron, afterMs, zone);
-    if (folded === null) return null;
-    next = folded;
-  }
-  if (!Number.isSafeInteger(next)) {
-    throw new CronScheduleError("the next occurrence exceeds the safe integer range");
-  }
-  return next;
+  throw new CronScheduleError("cron expression could not advance past the reference time");
 }

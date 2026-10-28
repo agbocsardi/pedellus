@@ -116,8 +116,10 @@ shown as parked; this slice invents no cron retry policy, so use Durable's norma
 
 Supported request kinds are Python-like `at`, `every`, and `cron`:
 
-- `at` is one absolute epoch-millisecond instant. `once` is retained as an alias for callers
-  written against the first foundation. The instant must be in the future when the job is created.
+- `at` is one absolute epoch-millisecond instant. `once` is accepted and normalized to `at` for
+  callers written against the first foundation. Stored jobs use `at`, `every`, or `cron`; a stored
+  `once` record from an unshipped probe is not migrated. The instant must be in the future when
+  the job is created.
 - `every` is an interval anchored at creation. Every later occurrence is `anchorMs + k * everyMs`,
   so the grid survives restarts and a backward clock jump. This differs from Python's
   `now + interval` recomputation, which resets the phase on restart.
@@ -141,8 +143,11 @@ Time-zone behavior is verified against IANA data and documented honestly:
   time. For example, `30 2 * * *` in `America/New_York` on 2026-03-08 fires at 03:30 EDT
   (`07:30Z`). Croniter instead normalizes a gap time to the transition instant, 03:00 EDT.
 - **Fold (fall back):** croner runs the first occurrence once. If a reference falls in the second
-  repeated hour, the schedule advances to the first matching slot at or after the repeated interval
-  ends instead of returning a past instant. Croniter runs both repeated occurrences.
+  repeated hour, a bounded one-minute reference advance finds the first matching slot at or after
+  the repeated interval ends instead of returning a past instant. Croniter runs both repeated
+  occurrences.
+- Out-of-range croner dates, including references beyond JavaScript's supported date range, are
+  wrapped as `CronScheduleError` rather than leaking croner's raw `TypeError`.
 - The `at` and `every` kinds have no time zone of their own; `at` is already absolute and `every`
   is a fixed elapsed interval.
 
@@ -188,5 +193,6 @@ slot, backward/forward clock jumps, and safe-integer overflow. A fake-clock Harn
 a calendar timer commits the next occurrence before a blocked model answers, plus the
 `America/New_York` spring gap and fall fold. A stress probe walked calendar occurrences across
 `America/New_York`, `Europe/Berlin`, `Australia/Lord_Howe`, `Antarctica/Troll`, and
-`Pacific/Chatham`, asserting every next instant was strictly later and monotonic. No live data,
-credentials, network, or deployment was used.
+`Pacific/Chatham`, asserting every next instant was strictly later and monotonic. Edge probes
+covered the 1969 `America/New_York` fall fold and huge/out-of-range references, including wrapped
+`CronScheduleError` failures. No live data, credentials, network, or deployment was used.
