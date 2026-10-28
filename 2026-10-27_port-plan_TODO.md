@@ -2,6 +2,18 @@
 
 Date: 2026-10-27. Branch: `feat/pi-durable-rebuild`.
 
+## Current checklist
+
+- [x] Verify the existing typecheck, behavioral and execution baselines.
+- [x] Prove two provider API families and the bad-model error path (W0).
+- [ ] Freeze the shared W1/W2 contract and resolve backend differences.
+- [ ] Deliver the tool layer and durable per-conversation grants (W1).
+- [ ] Deliver the selectable sandbox backend against the same contract (W2).
+- [ ] Decide memory authority and complete memory, context and compaction (W3).
+- [ ] Record the A/B and harness-specific acceptance results (W4).
+- [ ] Complete automation and channels item by item (W5).
+- [ ] Complete WebUI and retirement work (W6).
+
 Supersedes the **sequencing** in `2026-10-26_full-port_TODO.md`: the P1–P9 ordered
 milestone list, its "Execution order and next bounded batch" section, and the
 per-batch worker-assignment sections as standing instructions. That file stays
@@ -236,3 +248,53 @@ appears. Discord is deferred to W5.
 Tools, memory and skills working on the port with the damage-model contract
 satisfied on both backends, an acceptance suite recorded with diffs, and a sandbox
 backend selectable by configuration. Everything after that is operational.
+
+## Session log
+
+### 2026-10-28 — baseline and next batch
+
+On `9d3afa1b9`, bounded `npm run typecheck`, `npm run test:behavior` and
+`npm run test:execution` passed: 155 behavior and 9 execution checks. Started
+read-only provider-proof and shared-contract investigations with
+`opencode-go/deepseek-v4.1-flash` at high thinking. No live provider calls or
+credentials used. The next step is to review their reports and settle the W1/W2 contract before
+implementation.
+
+The context, provider, usage, Code Mode, SQLite, Telegram and original execution
+branches are patch-equivalent to integrated work. Keep the genuinely unmerged
+grant fixture, Discord, scheduling, memory-search and archival candidates parked
+according to v2; the newer Discord and scheduling branches include their older
+candidates. Existing worktrees are clean and were not removed.
+
+W0: the owner authorized `~/.nanobot/secrets.env` and selected OpenCode Go
+DeepSeek V4.1 Flash, then Umans for the second family. A parent-only bounded
+`pi-ai` 1.4.0 completion through the port's `createProviderModels` with
+`opencode-go/deepseek-v4.1-flash`, high reasoning, max 256 tokens, and request
+`Reply with exactly: OK` returned `OK` (`stop`; 35 input, 14 output). Two earlier
+requests without `sessionId` returned HTTP 400 `MissingSessionID`; supplying a
+random session ID fixed routing. The deliberately invalid model was rejected by
+the pinned local catalog before dispatch, not by the remote service.
+
+A second parent-only `pi-ai` completion used the native Anthropic Messages
+adapter with explicit Umans endpoint `https://api.code.umans.ai`, model
+`umans-deepseek-v4.1-flash`, max 128 tokens, and the same request; it returned
+`OK` (`stop`; 35 input, 13 output). This was a throwaway custom model, not port
+provider integration: `umans` remains unsupported by the Gateway. Its displayed
+cost came from cloned Anthropic model metadata and is not Umans billing evidence.
+Neither proof establishes tool, streaming-recovery, fallback or provider-matrix
+parity. No secrets, real workspace or Gateway state were sent.
+Source: https://app.umans.ai/offers/code/docs#api-reference
+
+Shared-contract reviewer `pi-c62894ea` found that the bwrap spike imposes a
+5-second timeout and output window, discards native bash spill output, uses a
+different shell and environment, and canonicalizes paths before filesystem
+operations. The latter can alter no-follow, removal and rename semantics; the
+review also predicts an incorrect missing-program result. These are source-review
+findings, not all reproduced yet. The native conformance suite does not cover
+spill, environment filtering, path escape or deny patterns; supplemental bounded
+checks are needed. The first implementation slice must establish shared policy
+and host semantics before the sandbox follows. Host shell execution is not a
+confinement boundary: environment filtering and command deny patterns do not
+prevent arbitrary shell programs from reading host files. Keep Gateway tools
+disabled unless the actual damage-model boundary is met or a limitation is
+explicitly accepted; do not describe shell deny patterns as isolation.
