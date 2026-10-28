@@ -415,6 +415,11 @@ pass; the final reviewer exercised 250 synthetic skills and grant/reopen behavio
 The six retained Python builtins still need port-specific adaptation and packaging;
 non-SKILL.md builtin assets are not accessible through the workspace read tool.
 The copied personal skill inventory has not been activated or sent to a provider.
+Curated builtin candidate branch `pi-e796f4e1` (`d73d907e7`, `bd5442e2d`) is
+parked after its final review found that skill-creator incorrectly instructs
+in-session verification of newly created or updated skills, despite snapshots
+remaining fixed until a new conversation or Gateway reopen. Correct this when
+resuming; do not activate the candidate as-is.
 
 W3 memory manifest foundation `6bd2d38cf` passed independent review
 (`pi-2c56da78`) and was cherry-picked as `050a91ca7`. Markdown remains the memory
