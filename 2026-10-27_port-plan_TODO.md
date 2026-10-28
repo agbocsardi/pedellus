@@ -46,9 +46,11 @@ standing authorization to implement or deploy them.
 - [x] Check the combined core path offline on both host and bwrap during consolidation.
 - [ ] Finish curated builtin skill compatibility/package review (parked).
 - [ ] Record real-model memory/skill/compaction acceptance and A/B fixture results (W4).
-- [ ] Connect internal agent cron: model-callable tool, runtime lifecycle, authorization and delivery.
-      First pass committed (`79748d0ad`): `cron` add/list/remove tool, opt-in config, Gateway install and
-      background-run preparation. Unverified; one worker pass and one independent review are running.
+- [x] Connect internal agent cron: model-callable tool, runtime lifecycle and authorization.
+      Integrated `287a5fbf5`. An independent review plus one worker fix pass found no blocker; the
+      durable reopen bug it caught (cron owners restored only under a context provider) is fixed.
+      Verified by a worker probe and a parent smoke on the merged tree.
+- [ ] Deliver scheduled results beyond the run's own agent turn (channel outbox), and decide silence.
 - [ ] Give a scheduled background run the workspace context snapshot (AGENTS.md/memory/skills); today it
       can only read those files with granted tools. Recon done (child `pi-6e74fa21`); the chosen shape is
       below and is not implemented.
@@ -76,7 +78,7 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 | Context / memory | Opt-in bootstrap and selected files, topic manifest, on-demand read/write through granted tools | Markdown authoritative; context fixed until new session/reopen; unreadable memory directory can block reopen |
 | Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool | No packaged curated port builtins; no inventory-count cap, but finite prompt/output bounds visibly truncate |
 | Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
-| Cron | Integrated internal timer/run module; `at`/`every`/`cron`, IANA zones, busy/restart/cancel handling | Not installed by Gateway or exported in its SDK barrel; no model-callable tool, delivery/silence, or authorization wiring |
+| Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling | No channel delivery or silence policy; a background run has no workspace context snapshot; copied grants survive origin revocation until their own expiry; disabling cron leaves persisted timers blocked |
 | Telegram | Restricted allowlisted inbound/reply adapter with streaming, durable send intent, unknown-send quarantine | Existing adapter only; scheduled outbound candidate is unmerged; no general pairing or media parity |
 | Code Mode / delegation | Reviewed opt-in QuickJS Code Mode/tool-search SDK | Not Gateway-installed; no product background-subagent or worker interface |
 | Other surfaces | Read-only usage and inert archival helpers exist | Discord candidates parked; Email/WebSocket, MCP, web/media tools not integrated |
@@ -451,6 +453,27 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-28 — agent cron integrated
+
+Integrated `287a5fbf5`. The `cron` tool is now agent-callable (`add`/`list`/`remove`) behind
+`cron.enabled`, with ISO-or-calendar schedules, `isolated` default true, owner-scoped job documents
+and Gateway preparation that copies the origin's still-valid grants into a fresh background
+conversation. The tool is exempt from the grant document because it grants no filesystem or shell
+authority, and a background run's conversation never receives it.
+
+An independent review found no blocker and 7 should-fix items. Two were real: cron owners were
+restored only inside the context-snapshot branch, so a restart silently removed scheduling from
+every persisted session; and a post-commit read error after a successful `add` reported "Scheduling
+failed", inviting a duplicate retry. Both are fixed, along with honest cancel results, a replay-safe
+tool declaration that makes `tool:<callId>` dedupe real, a `cron` example-config entry and the `tz`
+default text.
+
+Verification: worker probe (config gate, model-issued add, isolated and origin runs, copied grants,
+list/remove/terminal/unknown IDs, invalid schedules, restart with a pending one-shot, sleeping-timer
+cancel) plus a parent smoke on the merged tree; typecheck, 155 behavior and 9 execution checks green.
+Known gaps recorded above: no channel delivery, no workspace context snapshot for a background run.
+
 
 ### 2026-10-28 — agent-callable cron, first pass
 
