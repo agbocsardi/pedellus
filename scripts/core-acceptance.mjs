@@ -1199,15 +1199,13 @@ function analyzeSummaryRequest(entry) {
 
 /**
  * The early turn is the only source of the acceptance fact. The no-echo rule is
- * scoped to this turn's conversational acknowledgement so it cannot be read as a
- * summarization instruction; the summarizer is told to retain the code verbatim.
+ * scoped to this turn's immediate conversational acknowledgement only; it says
+ * nothing about summarization, so it cannot bias the summarizer either way.
  */
 function realEarlyInstruction() {
   return `Early acceptance instruction: remember the acceptance code ${FACT}. This raw early turn also contains ${SENTINEL}. ` +
     "In your conversational reply to this message only, do not repeat or quote the acceptance code or the sentinel; " +
     "a short acknowledgement is enough. " +
-    "That no-echo restriction applies only to your acknowledgement here, not to summarization: if this conversation is " +
-    "summarized or compacted, keep the acceptance code verbatim as a fact in the summary so it survives. " +
     `Call the skill tool with name "${SKILL_NAME}" so its instructions are loaded. Then reply with one short sentence. ` +
     "Do not call any other tool.";
 }

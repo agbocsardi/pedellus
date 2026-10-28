@@ -101,14 +101,14 @@ has an old prefix, then the measured full sequence:
   (2), one filler turn (1), native compaction summary (1);
 - phase 2: fresh process, one recall + skill + topic-read turn (2).
 
-The early user instruction scopes its no-echo rule to that turn's conversational
-acknowledgement only, and explicitly tells the model that if the conversation is
-summarized or compacted it must keep the acceptance code verbatim as a fact in
-the summary. The real flow still records fact/sentinel occurrences inside and
-outside the placed summary, so a model echo is distinguishable from genuine
-leakage. It rejects a fact outside the summary or a sentinel outside the summary,
-not a value quoted by the summarizer. The offline scripted summary never quotes
-them, so its stricter checks remain.
+The early user instruction scopes its no-echo rule to that turn's immediate
+conversational acknowledgement and says nothing about summarization or
+compaction, so it does not bias the summarizer. The real flow still records
+fact/sentinel occurrences inside and outside the placed summary, so a model
+echo is distinguishable from genuine leakage. It rejects a fact outside the
+summary or a sentinel outside the summary, not a value quoted by the
+summarizer. The offline scripted summary never quotes them, so its stricter
+checks remain.
 
 The exact-marker pass rule is unchanged. To distinguish omission from reformatting
 without recording transcript text, real-mode observations classify the placed
@@ -120,8 +120,8 @@ computed, and the `finally` block still writes them when a later check fails, so
 an early exit keeps the failure evidence.
 
 The rehearsal measured **10 requests**, a conservative input reservation of
-about **319,600 tokens** across both phases, an output reservation of
-**17,920**, reported faux input usage of **103,618** and output usage of **232**.
+about **318,000 tokens** across both phases, an output reservation of
+**17,920**, reported faux input usage of **103,137** and output usage of **232**.
 The measured full flow therefore fits the 600,000 cap with substantial room for
 longer live responses, and the guard still enforces each request against the
 remaining ledger.
