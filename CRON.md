@@ -185,9 +185,11 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
   Gateway's `prepare` copies the origin's still-valid coding-tool grants and offers exactly those
   tools, so a **background** run cannot schedule another job or widen authority; a different host
   must apply the same deny-by-default rule. The foundation alone does not copy grant records. The
-  copy is recorded together with the origin conversation and stays capped by that origin's current
-  grants (see the bounded-copy limitation below); when the origin has no known owner, `prepare`
-  copies nothing and the run stays default-deny.
+  copy is recorded together with the origin conversation in the same commit that creates and
+  configures the target, and stays capped by that origin's current grants; the foundation's optional
+  `finalize` callback runs in the run's terminal or cancellation commit so the host can retire the
+  target's authority with it (see the bounded-copy limitation below). When the origin has no known
+  owner, `prepare` copies nothing and the run stays default-deny.
   When a context snapshot provider is configured, `prepare` also installs the origin's snapshot
   for the target conversation — bootstrap/AGENTS files, memory, the skill summary — and the
   read-only `skill` tool, so a scheduled turn renders the same workspace context as a normal turn.
@@ -203,10 +205,15 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
   copied grant and the origin's current grant for the name, and blocks once **either** expiry
   passes: revoking or expiring at the origin takes effect on the run's next call, including after a
   crash and reopen, and a later origin grant cannot extend the copy. A present-but-malformed origin
-  link, or a missing origin grant document, fails closed. The copy still drives tool selection, so a
-  run may be offered a tool the origin revoked until its policy is next rewritten; the call itself
-  is blocked. As for any granted call, one that already passed the hook and recorded intent can
-  still execute.
+  link, a missing origin grant document or an unknown origin owner fails closed. Because Durable's
+  tool hooks run only in the call phase, the Gateway also reauthorizes every live run target before
+  `resume()`: it intersects the copy with the origin's current grants and clears a copy whose durable
+  link, origin owner or origin document is missing or mismatched, so a new admission after a revoke
+  is not offered the tool. A committed `execute` intent for a native coding tool is `unsafe` and
+  settles as interrupted rather than rerunning. The run's terminal commit (or cancellation) retires
+  the target's copied grant document and tools. The copy still drives tool selection during the run,
+  so it may be offered a tool the origin just revoked; the call itself is blocked. As for any granted
+  call, one that already passed the hook and recorded intent can still execute.
 - Disabling cron (`cron.enabled: false`) on a store that has jobs is not a cleanup operation. Job
   documents and grants remain, and their persisted timer/run tasks have no installed task
   definition, so they stay blocked until cron is enabled again.
@@ -233,10 +240,15 @@ schedules, restart with a pending one-shot, and a background run that is offered
 A later bounded-authority probe drove the same path with a faux provider and covered the origin link
 written beside the copied grants, a copied grant usable while the origin still grants it, a missing
 origin grant document, revocation after preparation, a shortened origin expiry beating the still
-valid copy, and a later longer origin grant that could not extend the copy past its own expiry;
-another probe SIGKILLed the prepared run's in-flight model request, revoked at the origin, reopened
-the store, and confirmed the recovered call was blocked by the origin's current grants while the
-copy and link survived the restart. An origin-mode conversation with no link was unaffected.
+valid copy, and a later longer origin grant that could not extend the copy past its own expiry; it
+also confirmed the terminal commit retires the target's copied grants and tools, a finished target
+denies a direct host submission, and an invalid origin link fails closed during a live run. One
+restart probe SIGKILLed a prepared run whose origin was revoked mid-request: after reopen the
+pre-resume pass had already removed the copy and tool from the target, and the resumed admission was
+denied. Another SIGKILL probe interrupted a native `bash` call **after** its execute intent committed,
+revoked the origin grant while the command was running, and reopened: the call settled as interrupted
+without rerunning, the killed command's later effect never appeared, and the target's authority was
+already pruned before resume. An origin-mode conversation with no link was unaffected.
 
 Calendar probes covered `at`/`every`/`cron` parsing, the `once` alias, UTC default, invalid zones
 and offsets, invalid expressions, no-future-occurrence rejection, strict advancement after an exact

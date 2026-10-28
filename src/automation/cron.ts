@@ -149,6 +149,11 @@ export interface CronConversationWriter {
   readonly id: ConversationId;
   commit<T>(change: (tx: Tx) => T | Promise<T>, context: Context): Promise<T>;
 }
+/**
+ * One run's durable preparation or finalization. Preparation runs in the commit that chooses the
+ * run's target; finalization runs in the commit that records the run's terminal result or
+ * cancellation. A crash before either commit reruns its callback; a crash after it does not.
+ */
 export interface CronPreparation {
   readonly tx: Tx;
   readonly job: CronJob;
@@ -163,6 +168,13 @@ export interface CronPreparation {
  * This slice adds no context or tool grants of its own.
  */
 export type CronPrepare = (preparation: CronPreparation, context: Context) => void | Promise<void>;
+/**
+ * Optional durable finalization of one run's target, in the same commit that records the run's
+ * terminal result or cancellation. A host that gave the target authority should retire it here; the
+ * foundation itself changes no tool state. `background` is true when the target is a separate
+ * conversation, so an origin-mode run's own conversation is never finalized.
+ */
+export type CronFinalize = (finalization: CronPreparation, context: Context) => void | Promise<void>;
 
 export interface CronScheduleReceipt {
   readonly jobId: string;
@@ -221,6 +233,8 @@ export interface CronJobView {
 export interface CronFoundationOptions {
   /** Optional durable preparation. Without it no context or tool grant is added. */
   readonly prepare?: CronPrepare;
+  /** Optional durable finalization in the run's terminal commit; called only for a separate target. */
+  readonly finalize?: CronFinalize;
   /** The Harness clock (`HarnessOptions.now`); default `Date.now`. */
   readonly now?: () => number;
 }
@@ -520,6 +534,7 @@ async function viewsOf(
 /** Build the deterministic timer plus execution controller. Gateway and delivery stay outside. */
 export function createCronFoundation(options: CronFoundationOptions): CronFoundation {
   const prepare = options.prepare;
+  const finalize = options.finalize;
   const clock = options.now ?? (() => Date.now());
 
   const runTask: Task<CronOccurrenceInput, CronRunCheckpoint, CronRunResult, object> =
@@ -669,12 +684,29 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
 
       abort: async (running, runtime, context) => {
         const input = parseOccurrenceInput(running.input) ?? zeroInput;
-        await runtime.commit(
-          () => terminalAborted<CronRunCheckpoint, CronRunResult>(
+        const targetConversationId = running.state.checkpoint.targetConversationId;
+        await runtime.commit(async (tx) => {
+          // A cancelled run gives up its target's authority in this same commit: an abort is not a
+          // reason to leave a prepared copy alive for a later admission.
+          if (finalize !== undefined
+            && targetConversationId !== null && targetConversationId !== running.conversationId) {
+            const doc = await tx.doc(CronJobsDoc, running.conversationId);
+            const job = doc.jobs.find((candidate) => candidate.id === input.jobId);
+            if (job !== undefined) {
+              await finalize({
+                tx,
+                job: copyJob(job),
+                occurrence: input,
+                originConversationId: running.conversationId,
+                targetConversationId,
+                background: true,
+              }, context);
+            }
+          }
+          return terminalAborted<CronRunCheckpoint, CronRunResult>(
             runResult(input, "cancelled", "cancelled"), "cancelled",
-          ),
-          context,
-        );
+          );
+        }, context);
       },
     });
 
@@ -829,6 +861,18 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
         error: settlement.error,
         conversationId: targetConversationId,
       };
+      // The run's authority ends with the run, in this same terminal commit. The origin-mode target
+      // is the origin conversation itself and is deliberately left alone.
+      if (finalize !== undefined && targetConversationId !== conversationId) {
+        await finalize({
+          tx,
+          job: copyJob(job),
+          occurrence: input,
+          originConversationId: conversationId,
+          targetConversationId,
+          background: true,
+        }, context);
+      }
       return terminalCompleted<CronRunCheckpoint, CronRunResult>(
         runResult(input, settlement.status === "ok" ? "ok" : "error", settlement.error),
       );

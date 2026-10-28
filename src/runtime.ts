@@ -304,6 +304,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
             const origin = await tx.doc(ToolGrantDoc, originConversationId);
             const target = await tx.doc(ToolGrantDoc, targetConversationId);
             const link = await tx.doc(ToolGrantOriginDoc, targetConversationId);
+            // Replace, never extend, whatever the target held: the copy is exactly the origin's
+            // current grants at this instant, and the link is durable in the same commit.
+            for (const name of Object.keys(target.grants)) delete target.grants[name];
             link.originConversationId = originConversationId;
             const timestamp = now();
             for (const name of toolAllowlist) {
@@ -336,6 +339,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (skillsInstalled && skillTool !== undefined) extensions.push(skillTool.extension);
           await configure(tx, targetConversationId, { tools, modelTools: tools, extensions });
         },
+        // The run's copied authority ends with it. Retire the target's copied grants and stop
+        // offering its tools in the same commit that records the terminal outcome, so a finished or
+        // cancelled run cannot be used for a later admission. The origin link is kept: any
+        // re-created grant document for that target still has to satisfy the hook's origin check.
+        finalize: async ({ tx, originConversationId, targetConversationId }) => {
+          if (targetConversationId === originConversationId) return;
+          await tx.retireDoc(ToolGrantDoc, targetConversationId);
+          await configure(tx, targetConversationId, { tools: [], modelTools: [] });
+        },
       })
     : undefined;
   const cronTool = cronFoundation === undefined
@@ -358,10 +370,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       return tool === undefined ? [] : [tool];
     }),
   });
-  const toolFilterFor = async (
-    tx: Tx,
-    conversationId: ConversationId,
-  ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
+  const contextToolsFor = (conversationId: ConversationId): ToolRegistration[] => {
     // The skill loader is context delivery, not an effectful tool: it stays outside the
     // grant document and the host ceiling, and is offered only for captured skill snapshots.
     // The cron tool is an owner-scoped scheduling capability, not filesystem or shell authority,
@@ -372,7 +381,20 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const cronTools = cronToolRegistration !== undefined && cronOwners.has(conversationId)
       ? [cronToolRegistration]
       : [];
-    const contextTools = [...skillTools, ...cronTools];
+    return [...skillTools, ...cronTools];
+  };
+  /**
+   * The grant-derived tool filter. A scheduled background run passes `copiedGrantBound`, the
+   * authority its origin still supports: it replaces the copied document with exactly those names
+   * and expiries, so a copied grant never outlives or outgrows its origin. An empty bound is a
+   * genuine deny and retires the copy.
+   */
+  const toolFilterFor = async (
+    tx: Tx,
+    conversationId: ConversationId,
+    copiedGrantBound?: ReadonlyMap<string, number>,
+  ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
+    const contextTools = contextToolsFor(conversationId);
     if (!toolExtension) {
       // Retire instead of creating an empty document: a disabled ceiling must durably remove
       // previously granted tools so re-enabling it cannot resurrect them.
@@ -380,6 +402,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
       return { tools: contextTools, modelTools: contextTools };
     }
     const document = await tx.doc(ToolGrantDoc, conversationId);
+    if (copiedGrantBound !== undefined) {
+      for (const name of Object.keys(document.grants)) {
+        if (!copiedGrantBound.has(name)) delete document.grants[name];
+      }
+      for (const [name, expiresAt] of copiedGrantBound) document.grants[name] = expiresAt;
+    }
     const tools = [
       ...toolFilterFromNames(pruneToolGrants(document, toolAllowlist, now())).tools,
       ...contextTools,
@@ -553,13 +581,28 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // Refuse unsafe prepared replays before resume; checkpoints pin historical context cutoffs.
     const preparedContextReplays: NonNullable<ReturnType<typeof preparedContextReplay>>[] = [];
     const backgroundRunTargets: CronBackgroundTarget[] = [];
+    const runTasksById = new Map<number, { readonly originConversationId: ConversationId; readonly targetConversationId: ConversationId | null }>();
     await root.commit(async (tx) => {
       let taskCursor: Cursor | undefined;
       do {
         const page = await tx.scanTasks({}, 1000, taskCursor);
         for (const task of page.items) {
           const backgroundTarget = cronBackgroundTarget(task);
-          if (backgroundTarget !== undefined) backgroundRunTargets.push(backgroundTarget);
+          if (task.kind === CRON_RUN_TASK_NAME) {
+            runTasksById.set(Number(task.id), {
+              originConversationId: task.conversationId as ConversationId,
+              targetConversationId: backgroundTarget?.targetConversationId ?? null,
+            });
+          }
+          if (backgroundTarget !== undefined) {
+            // The target must still be the conversation this run task owns on behalf of its origin;
+            // a mismatched record is not a run target and gets no bound or snapshot restore.
+            const target = await tx.conversation(backgroundTarget.targetConversationId);
+            if (target?.owner?.taskId === Number(task.id)
+              && target.owner.conversationId === backgroundTarget.originConversationId) {
+              backgroundRunTargets.push(backgroundTarget);
+            }
+          }
           const preparedModel = preparedTaskModel(task);
           if (preparedModel !== undefined && !choicesByNative.has(modelKey(preparedModel))) {
             throw new Error(`Cannot resume ${task.kind} task ${task.id}: prepared model ${modelKey(preparedModel)} is outside allowedModels`);
@@ -583,6 +626,56 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
     }
 
+    // Every conversation owned by a cron run task is that run's target. A live run's copy is
+    // reauthorized below; a target whose run already ended keeps no prepared authority.
+    const runTargetCandidates: { conversationId: ConversationId; originConversationId: ConversationId; live: boolean }[] = [];
+    await root.commit(async (tx) => {
+      let cursor: Cursor | undefined;
+      do {
+        const page = await tx.scanConversations({}, 1000, cursor);
+        for (const conversation of page.items) {
+          const owner = conversation.owner;
+          if (owner?.taskId === undefined) continue;
+          const task = runTasksById.get(Number(owner.taskId));
+          if (task === undefined || task.originConversationId !== owner.conversationId) continue;
+          runTargetCandidates.push({
+            conversationId: conversation.id,
+            originConversationId: task.originConversationId,
+            live: task.targetConversationId === conversation.id,
+          });
+        }
+        cursor = page.next;
+      } while (cursor !== undefined);
+    }, context);
+
+    // A copied background-run grant is only as good as its origin's current grant. Durable's tool
+    // hooks run in the call phase only, so a committed execute intent resolves without them and a
+    // resumed turn could otherwise admit a call the origin already revoked. Intersect every live
+    // run's copy with the origin's current grants before resume, and treat a missing/mismatched
+    // link, an unknown origin owner, a missing origin document or an already finished run as a deny
+    // rather than a copy.
+    const copiedGrantBounds = new Map<ConversationId, ReadonlyMap<string, number>>();
+    for (const { conversationId: targetConversationId, originConversationId, live } of runTargetCandidates) {
+      const bounded = new Map<string, number>();
+      const link = live ? await harness.snapshot(ToolGrantOriginDoc, targetConversationId, context) : undefined;
+      const origin = live && cronOwners.has(originConversationId)
+        ? await harness.snapshot(ToolGrantDoc, originConversationId, context)
+        : undefined;
+      const copy = live ? await harness.snapshot(ToolGrantDoc, targetConversationId, context) : undefined;
+      if (link?.originConversationId === originConversationId && origin !== undefined) {
+        const timestamp = now();
+        for (const name of toolAllowlist) {
+          const copied = copy?.grants[name];
+          const originExpiry = origin.grants[name];
+          if (typeof copied === "number" && Number.isSafeInteger(copied) && copied > timestamp
+            && typeof originExpiry === "number" && Number.isSafeInteger(originExpiry) && originExpiry > timestamp) {
+            bounded.set(name, Math.min(copied, originExpiry));
+          }
+        }
+      }
+      copiedGrantBounds.set(targetConversationId, bounded);
+    }
+
     for (const replay of preparedContextReplays) {
       const conversation = await harness.conversation(replay.conversationId, context);
       if (!conversation) throw new Error(`Cannot safely resume ${replay.kind} task ${replay.id}: conversation is missing`);
@@ -603,7 +696,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         const page = await tx.scanConversations({}, 1000, cursor);
         for (const conversation of page.items) {
           const state = await tx.doc(AgentDoc, conversation.id);
-          const toolFilter = await toolFilterFor(tx, conversation.id);
+          const toolFilter = await toolFilterFor(tx, conversation.id, copiedGrantBounds.get(conversation.id));
           await configure(tx, conversation.id, {
             ...policyForState(state),
             ...extensionsPolicy(conversation.id),

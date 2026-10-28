@@ -89,15 +89,39 @@ agent tool filters are read from that conversation's own document.
 A cron `prepare` copies the origin conversation's still-valid coding-tool grants
 into the fresh, task-owned background conversation and records the origin in the
 latest-only `nanobot.tool-grant-origin` document (`{ originConversationId }`) in
-the same commit. The copy is a cap, not authority of its own: the grant hook
-requires the origin's current document to still grant the name, and blocks once
-either expiry passes. Revoking or expiring the origin grant therefore takes
-effect on the run's next call, including after a crash and reopen, and a later
-origin grant cannot widen the copy past its own expiry. A link that is present
-but malformed, or an origin grant document that is missing, blocks the call; a
-conversation without the link (an ordinary session, including an origin-mode
-run) is unaffected. When the origin cannot be attributed to a known owner at
-preparation, `prepare` copies nothing and the run stays default-deny.
+the same commit that creates and configures the target. The copy replaces, never
+extends, whatever the target held. It is a cap, not authority of its own: the
+grant hook requires the origin's current document to still grant the name, and
+blocks once either expiry passes. Revoking or expiring the origin grant therefore
+takes effect on the run's next call, including after a crash and reopen, and a
+later origin grant cannot widen the copy past its own expiry. A link that is
+present but malformed, an origin grant document that is missing, or an origin
+with no known owner blocks the call; a conversation without the link (an
+ordinary session, including an origin-mode run) is unaffected. When the origin
+cannot be attributed to a known owner at preparation, `prepare` copies nothing
+and the run stays default-deny.
+
+Durable's tool hooks run in the call phase only, so a committed `execute` intent
+resolves without them. Two rules keep that closed:
+
+- Before `harness.resume()`, every conversation owned by a live cron run task is
+  reauthorized. The gateway intersects its copied grants with the origin's
+  current grants (min expiry), and clears them when the durable origin link is
+  missing or mismatched, the origin owner is unknown, the origin document is
+  missing, or the run already ended. The rewritten document is what the pre-resume
+  policy pass turns into the conversation's offered tools, so a new admission
+  after a revoke is not offered the tool at all.
+- The native coding tools are `replay: "unsafe"`, so recovery never reruns a
+  committed execute intent: it settles as
+  `Tool <name> was interrupted and may have partially run`. Pruning before resume
+  means an interrupted copy has no authority left either way.
+
+The run's authority also ends with the run: `finishRun` (normal completion or a
+recorded error) and the run task's abort handler retire the target's copied grant
+document and rewrite its tools to none in the same commit that records the
+terminal result. The origin link is kept, so a re-created grant document for that
+target still has to satisfy the origin check. A finished run's conversation keeps
+no coding authority even if a host later submits to it directly.
 
 Every native conversation creation goes through the Durable `conversationCreated`
 hook, which retires any grant document and writes empty `tools`/`modelTools`
@@ -128,10 +152,11 @@ reopen and a call blocks before intent with `Tool <name> grant expired ...`.
 Revocation also reapplies the agent filter immediately, so later calls are no
 longer offered the tool. For a scheduled background run's copied grants the
 same recheck also reads the origin's current grant document, so a revocation or
-expiry at the origin blocks a call that recovery re-dispatches. The hook returns
-an explicit `block` if the grant read fails; it does not rely on Durable
-treating a throwing hook as denied, and it keeps storage error detail out of the
-model-visible reason.
+expiry at the origin blocks a call that recovery re-dispatches, and the pre-resume
+reauthorization described above removes a revoked copy from the target's policy
+before `resume()` can replay anything. The hook returns an explicit `block` if
+the grant read fails; it does not rely on Durable treating a throwing hook as
+denied, and it keeps storage error detail out of the model-visible reason.
 
 The native coding tools have no `replay: "safe"` marker, so Durable treats them
 as unsafe: recovery never reruns an interrupted execution body. The existing
