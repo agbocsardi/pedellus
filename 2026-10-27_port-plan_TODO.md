@@ -299,6 +299,17 @@ worktrees/branches/probes, and agree priorities with the owner before more work.
 
 ## Cron foundation status
 
+Cron calendar schedules `c14e5353c`, `3acdd2b80`, `247a97300`, `60cf77cd9` are
+integrated as `430abd7db`, `560bdee98`, `27082bfd7`, `2f618474a`. These add
+`at`/`every`/`cron` with IANA timezones, using exact dependency `croner` 10.0.1
+(offline install). Functional verification passed, including leap-day and
+`W`/`LW` month-list expressions, strict-future and daylight-saving checks. Parent
+typecheck, 155 behavior and 9 execution checks pass after an offline `npm ci`.
+Known library limits: croner treats six-field seconds as first, resolves
+ambiguous wall times to the later offset, and has year bounds. This remains an
+unwired foundation; no Gateway cron tool, delivery or grant reauthorization is
+active.
+
 Cron replacement `072ed6d2d`, `340c26b54`, `6dc74fac4` passed independent final
 review (`pi-c2787ba0`) and was integrated as `a9e788a56`, `022162fd0`,
 `8a8213bf6`. Finite timers arm successors before model work; a separate run task
