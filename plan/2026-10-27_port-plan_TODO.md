@@ -38,11 +38,15 @@ The owner resumed work and selected acceptance tooling, not live acceptance or c
 implementation. Use `opencode-go/deepseek-v4.1-flash`, high thinking, for implementation and independent
 review. This bounded batch supersedes the consolidation pause only for the work below.
 
-- [ ] Implement a reproducible disposable core acceptance runner using the actual Gateway, Markdown
+- [x] Implement a reproducible disposable core acceptance runner using the actual Gateway, Markdown
       memory, on-demand skills, native compaction and fresh-process reopen, with machine-readable evidence.
-- [ ] Validate the runner offline with synthetic provider responses and generated synthetic workspace data.
-- [ ] Complete one independent review; allow one blocker-fix pass, then merge or park with reasons.
-- [ ] Run existing typecheck, behavior and execution checks; record results and remaining W4 gates.
+- [x] Validate the runner offline with synthetic provider responses and generated synthetic workspace data.
+- [x] Complete one independent review and one blocker-fix pass; merge the reviewed result.
+- [x] Run existing typecheck, behavior and execution checks; record results and remaining W4 gates.
+
+The owner separately authorized an offline cron authority hardening slice in parallel: reauthorize
+background-run coding calls against the origin's current grants without widening their copied grant.
+Implementation and independent review are in progress in separate worktrees; no channels or live calls.
 
 No product-provider calls, credential loading, personal workspace access, channel sends, permanent
 regression suite expansion, A/B parity claims or deployment. Keep the runner offline-only in this
@@ -472,6 +476,16 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-28 — offline acceptance tooling integrated
+
+Integrated `d77c8d9` and `94a83d8`. The offline synthetic Gateway acceptance runner uses a generated
+workspace, native tools, on-demand skill, compaction and fresh-process reopen; `npm run --silent
+test:core-acceptance` passed 52 checks. An independent reviewer identified a false-positive risk from
+reusing the recall fact in topic memory; the single fix pass isolated it and the reviewer verified the
+fix. Parent reran the runner, typecheck, 155 behavior and 9 execution checks successfully. Real-model
+fidelity, A/B fixtures and channel delivery remain unrun; W4 is not complete. Owner additionally
+selected parallel cron origin-grant reauthorization, currently under implementation and review.
 
 ### 2026-10-28 — offline acceptance tooling authorized
 
