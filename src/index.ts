@@ -1,4 +1,4 @@
-export { loadConfig, parseConfig, type CredentialProvider, type PortConfig } from "./config.js";
+export { loadConfig, parseConfig, type CredentialProvider, type PortConfig, type WorkspaceSkillsConfig } from "./config.js";
 export { createProviderModels } from "./providers.js";
 export {
   ARCHIVAL_PREPARATION_FORMAT,
@@ -52,6 +52,24 @@ export {
   type ConversationContextSnapshot,
 } from "./context/index.js";
 export { workspaceContextGatewayOptions } from "./context/workspace-host.js";
+export {
+  SKILLS_CONTEXT_LIMITS,
+  SkillsContextBoundsError,
+  SkillsContextFileError,
+  SkillsContextInputError,
+  loadSkillsContext,
+  validateSkillNames,
+  type DiscoveredSkill,
+  type SkillMetadataReason,
+  type SkillMetadataReport,
+  type SkillMetadataStatus,
+  type SkillRequirementReason,
+  type SkillRequirements,
+  type SkippedSkill,
+  type SkippedSkillReason,
+  type SkillsContextRequest,
+  type SkillsContextResult,
+} from "./context/skills.js";
 export {
   createWorkspaceContextSnapshotProvider,
   loadWorkspaceContextSnapshot,

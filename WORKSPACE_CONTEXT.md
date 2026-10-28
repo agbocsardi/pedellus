@@ -18,7 +18,12 @@ snapshot provider and `openGateway` installs no context extension.
 {
   "workspace": "./workspace",
   "workspaceContext": {
-    "memoryFiles": ["memory/MEMORY.md", "memory/system/preferences.md"]
+    "memoryFiles": ["memory/MEMORY.md", "memory/system/preferences.md"],
+    "skills": {
+      "builtinSkillsRoot": "/opt/nanobot/skills",
+      "disabledSkills": ["clawhub"],
+      "selectedSkills": ["project-guide"]
+    }
   }
 }
 ```
@@ -28,8 +33,15 @@ snapshot provider and `openGateway` installs no context extension.
 - `memoryFiles` is an explicit ordered list of `memory/**/*.md` paths and
   defaults to `[]`. No memory file is discovered. Paths are validated with the
   loader's rules at config parse time and again before reading.
-- Unknown `workspaceContext` fields are rejected. There is no bootstrap-file
-  selection, include glob, or implicit default memory file.
+- `skills` is absent by default and adds no discovery. When present,
+  `builtinSkillsRoot` must be an absolute path to an existing directory and
+  `disabledSkills`/`selectedSkills` are explicit bounded name lists (default
+  `[]`). Workspace skills are read from `<workspace>/skills`; there is no
+  package, home-directory, or other default builtin root. See
+  [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md) for metadata and requirement rules.
+- Unknown `workspaceContext` or `workspaceContext.skills` fields are rejected.
+  There is no bootstrap-file selection, include glob, implicit default memory
+  file, or skill auto-selection.
 - **Identity is omitted.** The host does not render the Python identity template
   from runtime, platform, channel, workspace, or user values, and this slice has
   no identity config switch. The context extension therefore contributes no
@@ -42,10 +54,15 @@ snapshot provider and `openGateway` installs no context extension.
   mapping before resume. Reopening therefore reconstructs workspace context
   from the current files, not from a cached copy.
 - A loader failure (missing selected file, symlink/hardlink, bounds, unsafe
-  root, observable replacement) rejects gateway startup or `conversationFor`.
-  No partial context is installed, and a retry re-runs the loader.
-- This adds no tools, skills, workspace roots, credentials, or provider calls.
-  Tool policy is unchanged.
+  root, observable replacement, missing builtin skills root) rejects gateway
+  startup or `conversationFor`. No partial context is installed, and a retry
+  re-runs the loader.
+- A selected skill body is prompt content, not code: the host discovers and
+  renders it, and only the conversation's already-granted tools can act. Skill
+  requirements are checked against `PATH` alone, the same environment the guarded
+  shell exports.
+- This adds no tools, workspace roots, credentials, or provider calls. Tool
+  policy is unchanged.
 - The configured `workspace` path is walked literally by the loader. A root path
   containing a symlink component fails closed even though `openGateway` accepts
   it after `realpath`; use a canonical explicit path when opting in. With a
@@ -88,10 +105,12 @@ gateway/runtime attaches the conversation ID and owns snapshot mapping.
 | `SOUL.md` | Read from the workspace root if present. |
 | `USER.md` | Read from the workspace root if present. |
 | `memory/**/*.md` | Read only when individually named in `memoryFiles`, in that order. |
+| `skills/<name>/SKILL.md` | Read only when the explicit `workspaceContext.skills` section is present; see [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md). |
+| `<builtinSkillsRoot>/<name>/SKILL.md` | Read only when `workspaceContext.skills.builtinSkillsRoot` names an existing absolute directory. |
 
 Nothing else is discovered, scanned, or inferred. In particular there is no
 implicit `memory/MEMORY.md`, no `memory/system/` glob, no topic-memory tree, no
-skills scan, and no workspace-wide search. `memoryFiles` entries must be
+skill scan without the explicit `skills` section, and no workspace-wide search. `memoryFiles` entries must be
 literal relative paths under `memory/`, end in `.md`, and use only the safe
 segment character set (`A-Z`, `a-z`, `0-9`, `.`, `_`, `-`; segments start with
 an alphanumeric). Absolute paths, `..`, `.`, empty segments, backslashes, and
@@ -204,19 +223,23 @@ returned snapshot, and mutating a returned snapshot is rejected.
 
 ## Deliberate omissions from Python parity
 
-This slice maps only the pinned bootstrap files, explicit memory files, and an
-optional host-rendered identity. It does **not** implement or claim parity with:
+This slice maps only the pinned bootstrap files, explicit memory files, explicit
+workspace/builtin skill discovery, and an optional host-rendered identity. It
+does **not** implement or claim parity with:
 
 - `MemoryStore.get_memory_context()` system/legacy paragraph deduplication or
   the bundled `MEMORY.md` template check;
 - `get_memory_tree_context()` topic discovery/descriptions;
 - `history.jsonl`, archived summaries, session/Dream cursors, usage deltas, or
   Dream;
-- `SkillsLoader`, always/selected skills, requirement checks, or skill bodies;
+- Python's complete `SkillsLoader` behaviour: YAML block metadata, `os` gating,
+  install hints, and progressive summary placement are not implemented (the
+  bounded subset and its explicit rejections are described in
+  [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md));
 - Python's runtime/user-message metadata, platform policy, manifest retrieval,
   recent history injection, or tool contract;
-- any filesystem discovery beyond the named files, or any default `~/.nanobot`
-  workspace/credential lookup.
+- any filesystem discovery beyond the named files and skill directories, or any
+  default `~/.nanobot` workspace/credential lookup.
 
 The existing context extension remains responsible for rendering, limits,
 skills/tool visibility, and snapshot-to-conversation mapping. This module only

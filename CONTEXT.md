@@ -119,7 +119,9 @@ limits fan-out; aggregate retained strings across all snapshots can be larger.
 A skill must have `enabled: true` from the host to appear; absent, false, or
 non-boolean values are disabled. The host is responsible for applying Nanobot's
 disabled-skill configuration and requirement checks (Python checks binaries and
-environment variables). For enabled skills, `always: true` in parsed frontmatter,
+environment variables). The opt-in host wiring does that with the bounded
+loader in [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md); this extension still only
+reads the supplied snapshots. For enabled skills, `always: true` in parsed frontmatter,
 `metadata.nanobot.always`, or `metadata.openclaw.always` includes full content on
 every prompt. Otherwise the host must name the skill in `selectedSkills` to include
 its body. Disabled/unselected skills are not listed, and this extension offers no
@@ -151,10 +153,13 @@ The source-backed mapping is:
 - `SkillsLoader` gives workspace skills precedence over built-ins, filters
   configured-disabled and requirement-unavailable entries, supports top-level or
   Nanobot/OpenClaw `always`, strips frontmatter from loaded bodies, and builds a
-  progressive description/path summary. Here the host supplies provenance,
-  already-decided `enabled`, parsed metadata, and body; no roots are scanned,
-  requirements checked, paths loaded, or progressive loading advertised. Duplicate
-  skill names in one supplied snapshot are rejected.
+  progressive description/path summary. This extension does no discovery of its
+  own: the host supplies provenance, already-decided `enabled`, parsed metadata,
+  and body. The opt-in [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md) loader performs
+the bounded explicit-root discovery, requirement checks and selection that the
+host passes in; no ambient roots are scanned, no paths are loaded here, and no
+progressive loading is advertised. Duplicate skill names in one supplied
+snapshot are rejected.
 - `MemoryStore.get_memory_context()` loads system memory and non-template legacy
   `MEMORY.md` material with paragraph deduplication; `get_memory_tree_context()`
   indexes topic files. This extension only inserts memory snapshots explicitly

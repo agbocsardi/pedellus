@@ -6,6 +6,11 @@ import {
   WorkspaceContextInputError,
   validateWorkspaceMemoryFiles,
 } from "./context/workspace.js";
+import {
+  SkillsContextBoundsError,
+  SkillsContextInputError,
+  validateSkillNames,
+} from "./context/skills.js";
 
 const CREDENTIAL_PROVIDERS = [
   "anthropic",
@@ -32,9 +37,20 @@ export interface ModelReference {
   modelId: string;
 }
 
+export interface WorkspaceSkillsConfig {
+  /** Explicit absolute builtin skills root; absent means workspace skills only. */
+  readonly builtinSkillsRoot?: string;
+  /** Configured-disabled names; discovered but never enabled. */
+  readonly disabledSkills: readonly string[];
+  /** Explicit names whose bodies the context extension includes. */
+  readonly selectedSkills: readonly string[];
+}
+
 export interface WorkspaceContextConfig {
   /** Explicit workspace-relative `memory/**\/*.md` files, in output order. Defaults to none. */
   readonly memoryFiles: readonly string[];
+  /** Explicit opt-in for workspace/builtin skill discovery; absent means no skills are read. */
+  readonly skills?: WorkspaceSkillsConfig;
 }
 
 export interface PortConfig {
@@ -107,10 +123,43 @@ function modelKey(model: ModelReference): string {
   return JSON.stringify([model.provider, model.modelId]);
 }
 
+function workspaceSkillsConfig(value: unknown): WorkspaceSkillsConfig {
+  const raw = object(value, "workspaceContext.skills");
+  for (const key of Object.keys(raw)) {
+    if (key !== "builtinSkillsRoot" && key !== "disabledSkills" && key !== "selectedSkills") {
+      throw new Error(`Unknown workspaceContext.skills field: ${key}`);
+    }
+  }
+  let builtinSkillsRoot: string | undefined;
+  if (raw.builtinSkillsRoot !== undefined) {
+    const path = nonempty(raw.builtinSkillsRoot, "workspaceContext.skills.builtinSkillsRoot");
+    if (!isAbsolute(path)) {
+      throw new Error("workspaceContext.skills.builtinSkillsRoot must be an absolute path");
+    }
+    builtinSkillsRoot = resolve(path);
+  }
+  return Object.freeze({
+    ...(builtinSkillsRoot === undefined ? {} : { builtinSkillsRoot }),
+    disabledSkills: skillNames(raw.disabledSkills, "workspaceContext.skills.disabledSkills"),
+    selectedSkills: skillNames(raw.selectedSkills, "workspaceContext.skills.selectedSkills"),
+  });
+}
+
+function skillNames(value: unknown, label: string): readonly string[] {
+  try {
+    return validateSkillNames(value, label);
+  } catch (error) {
+    if (error instanceof SkillsContextInputError || error instanceof SkillsContextBoundsError) {
+      throw new Error(`${label} is invalid: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
 function workspaceContextConfig(value: unknown): WorkspaceContextConfig {
   const raw = object(value, "workspaceContext");
   for (const key of Object.keys(raw)) {
-    if (key !== "memoryFiles") throw new Error(`Unknown workspaceContext field: ${key}`);
+    if (key !== "memoryFiles" && key !== "skills") throw new Error(`Unknown workspaceContext field: ${key}`);
   }
   let memoryFiles: readonly string[] = Object.freeze([]);
   if (raw.memoryFiles !== undefined) {
@@ -123,7 +172,10 @@ function workspaceContextConfig(value: unknown): WorkspaceContextConfig {
       throw error;
     }
   }
-  return Object.freeze({ memoryFiles });
+  return Object.freeze({
+    memoryFiles,
+    ...(raw.skills === undefined ? {} : { skills: workspaceSkillsConfig(raw.skills) }),
+  });
 }
 
 export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig {
