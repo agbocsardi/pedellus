@@ -478,6 +478,22 @@ agent cron wiring remain open; this is not yet an everyday replacement or cutove
 
 ## Session log
 
+### 2026-10-28 — real-model synthetic core acceptance passed on revised prompt
+
+Owner authorized one additional live attempt under the same per-run limits. After independent review,
+`0097664` and `43382bd` scoped the no-echo instruction to the immediate conversational reply without
+instructing the summarizer, retained exact-match pass criteria, and recorded normalized observations
+on failure. The revised synthetic run passed 40 live checks: on-demand skill load, Markdown topic
+write/read, native compaction with the exact early fact in the summary, fresh-process reopen and
+exact recall. It made 10 provider requests, reported 55,369 input tokens plus cached input and 1,471
+output tokens, and reserved 319,567 input equivalents and 17,920 output tokens without a budget
+violation. Budget assumptions remain conditional as documented in ACCEPTANCE.md. The earlier
+confounded failure remains evidence; one later success does not establish general reliability.
+The summary also carried the skill body and topic marker into the reopened request; the initial system
+prompt still contained only skill metadata. A/B fixtures, channels and real workspaces remain unrun;
+W4 as a whole is not complete. Parent reran typecheck, offline acceptance and rehearsal, 155 behavior
+and 9 execution checks successfully.
+
 ### 2026-10-28 — cron terminal retirement fix
 
 Integrated `0e50103`: all request-linked terminal paths retire a prepared background target's
