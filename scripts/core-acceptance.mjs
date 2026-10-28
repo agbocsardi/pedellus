@@ -24,11 +24,13 @@ import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { BudgetError, INPUT_FRAMING_TOKENS_PER_REQUEST, createBudget, wrapModels } from "./core-acceptance-budget.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SCRIPT), "..");
 const PHASE1_EVIDENCE = "evidence-phase1.json";
 const PHASE2_EVIDENCE = "evidence-phase2.json";
+const BUDGET_EVIDENCE = "evidence-budget.json";
 const CHILD_TIMEOUT_MS = 120_000;
 const COMPACTION_WAIT_MS = 20_000;
 
@@ -51,6 +53,7 @@ const COMPACTION_PREFIX = "The conversation history before this point was compac
 
 const NOT_RUN = Object.freeze([
   "real-model provider calls (offline faux provider only)",
+  "a live run under the authorized 320000-input-token cap: the conservative pre-dispatch bound exceeds it (see ACCEPTANCE.md)",
   "A/B harness fixture comparison and parity claims",
   "channels, Telegram delivery and scheduled outbound sends",
   "credentials, personal workspace and live data",
@@ -599,9 +602,299 @@ function collectorStatus(checks) {
   return checks.length > 0 && checks.every((check) => check.status === "pass") ? "pass" : "fail";
 }
 
+// ---------------------------------------------------------------------------
+// Budget guard self-probe (offline, faux models only)
+// ---------------------------------------------------------------------------
+
+async function expectBudgetError(action, code) {
+  try {
+    await action();
+    return { ok: false, detail: "no error" };
+  } catch (error) {
+    return {
+      ok: error instanceof BudgetError && error.code === code,
+      detail: `${error?.name ?? "Error"}: ${error?.code ?? "none"}: ${error?.message ?? String(error)}`,
+    };
+  }
+}
+
+async function probeDir(stateDir, name) {
+  return mkdtemp(join(stateDir, `probe-${name}-`));
+}
+
+function probeBudget(dir, overrides = {}) {
+  return createBudget({
+    stateDir: dir,
+    maxRequests: 5,
+    maxInputTokens: 100_000,
+    maxOutputTokens: 500,
+    maxOutputPerRequest: 128,
+    timeoutMs: 5_000,
+    ...overrides,
+  });
+}
+
+function fakeStreamModels({ stats, payload, usage, api = "openai-completions" }) {
+  return {
+    streamSimple(model, context, options) {
+      stats.calls += 1;
+      const request = payload ?? { max_tokens: 9_999, messages: context.messages };
+      const pending = options.onPayload === undefined ? Promise.resolve() : options.onPayload(request, model);
+      return {
+        async result() {
+          await pending;
+          return { usage };
+        },
+        async *[Symbol.asyncIterator]() {},
+      };
+    },
+    completeSimple() {
+      throw new Error("completeSimple is not expected in this probe");
+    },
+    api,
+  };
+}
+
+async function runBudgetProbe(stateDir, evidence) {
+  const { checks, record } = collector("budget", stateDir);
+  const usage = { input: 5, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 7 };
+
+  // Reserve, clamp, persist and prove the framing part of the bound.
+  {
+    const dir = await probeDir(stateDir, "reserve");
+    const budget = probeBudget(dir);
+    await budget.acquire();
+    try {
+      const payload = { max_tokens: 9_999, messages: "x".repeat(200) };
+      const reservation = await budget.reservePayload(payload, "generation");
+      const snapshot = budget.snapshot();
+      record("reserve.output_clamped", payload.max_tokens === 128 && reservation.outputReserve === 128, String(payload.max_tokens));
+      record("reserve.input_bound", reservation.inputBound === reservation.bytes + INPUT_FRAMING_TOKENS_PER_REQUEST,
+        `${reservation.inputBound} = ${reservation.bytes} + ${INPUT_FRAMING_TOKENS_PER_REQUEST}`);
+      record("reserve.persisted", snapshot.requests === 1 && snapshot.inputReserved === reservation.inputBound && snapshot.outputReserved === 128);
+      const stored = JSON.parse(await readFile(join(dir, "budget-ledger.json"), "utf8"));
+      record("reserve.ledger_on_disk", stored.requests === 1 && stored.records.length === 1 && /^[0-9a-f]{64}$/.test(stored.records[0].payloadSha256));
+    } finally {
+      await budget.close();
+    }
+  }
+
+  // An over-budget input is refused before dispatch and does not increment the ledger.
+  {
+    const dir = await probeDir(stateDir, "input");
+    const budget = probeBudget(dir, { maxInputTokens: 10_000 });
+    await budget.acquire();
+    try {
+      const refusal = await expectBudgetError(
+        () => budget.reservePayload({ max_tokens: 100, messages: "x".repeat(20_000) }, "generation"),
+        "input",
+      );
+      record("reserve.input_refused", refusal.ok && budget.snapshot().requests === 0, refusal.detail);
+    } finally {
+      await budget.close();
+    }
+  }
+
+  // Request and output caps are independent of payload size.
+  {
+    const dir = await probeDir(stateDir, "requests");
+    const budget = probeBudget(dir, { maxRequests: 1 });
+    await budget.acquire();
+    try {
+      await budget.reservePayload({ max_tokens: 10, messages: "a" }, "generation");
+      const refusal = await expectBudgetError(
+        () => budget.reservePayload({ max_tokens: 10, messages: "b" }, "generation"),
+        "requests",
+      );
+      record("reserve.requests_refused", refusal.ok && budget.snapshot().requests === 1, refusal.detail);
+    } finally {
+      await budget.close();
+    }
+  }
+  {
+    const dir = await probeDir(stateDir, "output");
+    const budget = probeBudget(dir, { maxOutputTokens: 10, maxOutputPerRequest: 100 });
+    await budget.acquire();
+    try {
+      await budget.reservePayload({ max_tokens: 100, messages: "a" }, "generation");
+      const refusal = await expectBudgetError(
+        () => budget.reservePayload({ max_tokens: 100, messages: "b" }, "generation"),
+        "output",
+      );
+      record("reserve.output_refused", refusal.ok && budget.snapshot().outputReserved === 10, refusal.detail);
+    } finally {
+      await budget.close();
+    }
+  }
+
+  // A ledger is shared across processes and a second concurrent owner is refused.
+  {
+    const dir = await probeDir(stateDir, "reload");
+    const first = probeBudget(dir);
+    await first.acquire();
+    const reservation = await first.reservePayload({ max_tokens: 50, messages: "reload" }, "generation");
+    await first.recordUsage(usage, { index: reservation.index });
+    const before = first.snapshot();
+    await first.close();
+
+    const second = probeBudget(dir);
+    await second.acquire();
+    try {
+      const after = second.snapshot();
+      record("ledger.reload", after.requests === before.requests
+        && after.inputReserved === before.inputReserved
+        && after.outputReserved === before.outputReserved
+        && after.inputActual === before.inputActual
+        && after.outputActual === before.outputActual);
+      const third = probeBudget(dir);
+      const refusal = await expectBudgetError(() => third.acquire(), "locked");
+      record("ledger.lock_refused", refusal.ok, refusal.detail);
+    } finally {
+      await second.close();
+    }
+  }
+
+  // A damaged ledger fails closed.
+  {
+    const dir = await probeDir(stateDir, "malformed");
+    await writeFile(join(dir, "budget-ledger.json"), "{not json", "utf8");
+    const budget = probeBudget(dir);
+    const refusal = await expectBudgetError(() => budget.acquire(), "ledger");
+    record("ledger.malformed_refused", refusal.ok, refusal.detail);
+  }
+
+  // Reported usage is recorded, and a reservation breach is a hard failure.
+  {
+    const dir = await probeDir(stateDir, "usage");
+    const budget = probeBudget(dir);
+    await budget.acquire();
+    try {
+      const reservation = await budget.reservePayload({ max_tokens: 10, messages: "usage" }, "generation");
+      await budget.recordUsage(usage, { index: reservation.index });
+      const snapshot = budget.snapshot();
+      record("usage.recorded", snapshot.inputActual === 5 && snapshot.outputActual === 2 && snapshot.records[0].usage?.totalTokens === 7);
+      const refusal = await expectBudgetError(
+        () => budget.recordUsage({ input: 10_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 10_000_000 }, { index: reservation.index }),
+        "violated",
+      );
+      record("usage.overrun_refused", refusal.ok && budget.snapshot().violation !== null, refusal.detail);
+    } finally {
+      await budget.close();
+    }
+  }
+
+  // The wrapper reserves from the exact adapter payload and records the result.
+  {
+    const dir = await probeDir(stateDir, "wrapper");
+    const budget = probeBudget(dir);
+    await budget.acquire();
+    try {
+      const stats = { calls: 0 };
+      let observed;
+      const inner = fakeStreamModels({ stats, usage });
+      const original = inner.streamSimple.bind(inner);
+      inner.streamSimple = (model, context, options) => {
+        // Keep the request object so the probe can read the clamp applied by the gate.
+        const wrapped = { ...options, onPayload: async (payload, payloadModel) => {
+          observed = payload;
+          return options.onPayload(payload, payloadModel);
+        } };
+        return original(model, context, wrapped);
+      };
+      const wrapped = wrapModels(inner, budget);
+      const events = wrapped.streamSimple(
+        { api: "openai-completions", provider: "fake", id: "fake", maxTokens: 9_999 },
+        { messages: [] },
+        {},
+      );
+      await events.result();
+      const snapshot = budget.snapshot();
+      record("wrapper.payload_clamped", observed?.max_tokens === 128, String(observed?.max_tokens));
+      record("wrapper.reserved_once", snapshot.requests === 1 && stats.calls === 1, `${snapshot.requests}/${stats.calls}`);
+      record("wrapper.usage_recorded", snapshot.inputActual === 5 && snapshot.outputActual === 2);
+    } finally {
+      await budget.close();
+    }
+  }
+
+  // An API without a pre-dispatch hook is refused; the faux probe opts in explicitly.
+  {
+    const dir = await probeDir(stateDir, "unbounded");
+    const budget = probeBudget(dir);
+    await budget.acquire();
+    try {
+      const stats = { calls: 0 };
+      const wrapped = wrapModels(fakeStreamModels({ stats, usage, api: "faux" }), budget);
+      const refusal = await expectBudgetError(
+        () => wrapped.streamSimple({ api: "faux", provider: "fake", id: "fake", maxTokens: 9_999 }, { messages: [] }, {}),
+        "unbounded",
+      );
+      record("wrapper.unbounded_refused", refusal.ok && stats.calls === 0, refusal.detail);
+      record("wrapper.unbounded_not_reserved", budget.snapshot().requests === 0);
+    } finally {
+      await budget.close();
+    }
+  }
+  {
+    const dir = await probeDir(stateDir, "unobserved");
+    const budget = probeBudget(dir);
+    await budget.acquire();
+    try {
+      const stats = { calls: 0 };
+      const wrapped = wrapModels(fakeStreamModels({ stats, usage, api: "faux" }), budget, { allowUnobserved: true });
+      const events = wrapped.streamSimple({ api: "faux", provider: "fake", id: "fake", maxTokens: 9_999 }, { messages: [] }, {});
+      await events.result();
+      const snapshot = budget.snapshot();
+      record("wrapper.unobserved_probe_reserved", stats.calls === 1 && snapshot.requests === 1 && snapshot.records[0].kind === "streamSimple");
+    } finally {
+      await budget.close();
+    }
+  }
+
+  // One real Gateway turn over the wrapped faux Models: Durable must consume the
+  // proxied event stream and the reservation must land before the response.
+  {
+    const dir = await probeDir(stateDir, "gateway");
+    await generateWorkspace(dir);
+    const core = await loadCore();
+    const probe = buildProbe(core);
+    const budget = probeBudget(dir, { maxOutputPerRequest: 64 });
+    await budget.acquire();
+    let gateway;
+    try {
+      const config = gatewayConfig(core, dir);
+      gateway = await core.openGateway(config, core.context, {
+        models: wrapModels(probe.models, budget, { allowUnobserved: true }),
+        ...core.workspaceContextGatewayOptions(config),
+      });
+      const conversation = await gateway.conversationFor("core-acceptance:budget", core.context);
+      probe.provider.setResponses([core.fauxAssistantMessage("Budget probe acknowledged.")]);
+      const submission = await conversation.submit({ type: "input", content: "Budget probe turn.", requestId: "budget-1" }, core.context);
+      const settled = await submission.wait(core.context);
+      await conversation.waitForIdle(core.context);
+      const snapshot = budget.snapshot();
+      record("gateway.turn_completed", settled?.status === "done", settled?.status);
+      record("gateway.request_reserved", snapshot.requests === 1 && snapshot.outputReserved === 64,
+        `${snapshot.requests}/${snapshot.outputReserved}`);
+      record("gateway.usage_recorded", snapshot.inputActual > 0 && snapshot.outputActual > 0
+        && snapshot.records[0].usage?.totalTokens === snapshot.inputActual + snapshot.outputActual,
+        `${snapshot.inputActual}/${snapshot.outputActual}`);
+    } finally {
+      if (gateway) await gateway.close(core.context);
+      await budget.close();
+    }
+  }
+
+  evidence.checks = checks;
+  evidence.status = collectorStatus(checks);
+  evidence.limits = { framingTokensPerRequest: INPUT_FRAMING_TOKENS_PER_REQUEST };
+}
+
 async function runPhase(phase, stateDir) {
-  const evidencePath = join(stateDir, phase === "first" ? PHASE1_EVIDENCE : PHASE2_EVIDENCE);
-  const core = await loadCore();
+  const evidencePath = join(
+    stateDir,
+    phase === "first" ? PHASE1_EVIDENCE : phase === "reopen" ? PHASE2_EVIDENCE : BUDGET_EVIDENCE,
+  );
   const evidence = {
     phase,
     mode: "offline-synthetic",
@@ -610,11 +903,17 @@ async function runPhase(phase, stateDir) {
     status: "fail",
   };
   try {
-    if (phase === "first") await runFirstPhase(core, stateDir, evidence);
-    else await runSecondPhase(core, stateDir, evidence);
+    if (phase === "budget") {
+      await runBudgetProbe(stateDir, evidence);
+    } else {
+      const core = await loadCore();
+      if (phase === "first") await runFirstPhase(core, stateDir, evidence);
+      else if (phase === "reopen") await runSecondPhase(core, stateDir, evidence);
+      else throw new Error(`unknown phase ${phase}`);
+    }
   } catch (error) {
     evidence.checks.push({
-      id: `${phase === "first" ? "phase1" : "phase2"}.run_failed`,
+      id: `${phase === "first" ? "phase1" : phase === "reopen" ? "phase2" : "budget"}.run_failed`,
       status: "fail",
       detail: redact(error?.message ?? String(error), stateDir),
     });
@@ -714,7 +1013,17 @@ async function run() {
     const secondEvidence = await readEvidence(stateDir, PHASE2_EVIDENCE);
     record("phase2_evidence", secondEvidence !== undefined && secondEvidence.status === "pass");
 
-    const childChecks = [...(firstEvidence?.checks ?? []), ...(secondEvidence?.checks ?? [])];
+    // Offline self-probe of the real-run budget guard. No provider network call.
+    const budget = await runChild([SCRIPT, "--phase=budget", `--state=${stateDir}`], ROOT);
+    phases.budget = { exitCode: budget.code, signal: budget.signal, timedOut: budget.timedOut, durationMs: budget.durationMs };
+    record("budget_process", budget.code === 0 && !budget.timedOut,
+      budget.code === 0 && !budget.timedOut
+        ? undefined
+        : redact(budget.error?.message ?? budget.stderr.split("\n").slice(-4).join(" "), stateDir));
+    const budgetEvidence = await readEvidence(stateDir, BUDGET_EVIDENCE);
+    record("budget_evidence", budgetEvidence !== undefined && budgetEvidence.status === "pass");
+
+    const childChecks = [...(firstEvidence?.checks ?? []), ...(secondEvidence?.checks ?? []), ...(budgetEvidence?.checks ?? [])];
     checks.push(...childChecks);
     const allPass = checks.length > 0 && checks.every((check) => check.status === "pass");
     const report = {
@@ -724,7 +1033,14 @@ async function run() {
       mode: "offline-synthetic",
       provider: { kind: "faux", model: `${PROVIDER}/${MODEL_ID}`, network: false },
       notRun: NOT_RUN,
-      limits: { childTimeoutMs: CHILD_TIMEOUT_MS, compactionWaitMs: COMPACTION_WAIT_MS },
+      budgetGuard: {
+        status: budgetEvidence?.status ?? "missing",
+        counts: counts(budgetEvidence?.checks ?? []),
+        framingTokensPerRequest: INPUT_FRAMING_TOKENS_PER_REQUEST,
+        enforcement: "reserve payload bytes + framing and clamped output limit before dispatch; persisted ledger and exclusive lock",
+        realMode: "not enabled: the conservative pre-dispatch input bound exceeds the authorized 320000-token cap for the required compaction path (see ACCEPTANCE.md)",
+      },
+      limits: { childTimeoutMs: CHILD_TIMEOUT_MS, compactionWaitMs: COMPACTION_WAIT_MS, budgetFramingTokensPerRequest: INPUT_FRAMING_TOKENS_PER_REQUEST },
       durationMs: Date.now() - started,
       checks,
       counts: counts(checks),
