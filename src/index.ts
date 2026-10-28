@@ -46,12 +46,19 @@ export {
   CONTEXT_SECTION_KEYS,
   createContextExtension,
   renderNanobotIdentity,
+  stripSkillFrontmatter,
   type NanobotIdentityValues,
   type ContextDocumentSnapshot,
   type ContextSkillSnapshot,
   type ConversationContextSnapshot,
 } from "./context/index.js";
 export { workspaceContextGatewayOptions } from "./context/workspace-host.js";
+export {
+  createSkillTool,
+  SKILL_TOOL_NAME,
+  type ConversationSkill,
+  type SkillTool,
+} from "./context/skill-tool.js";
 export {
   SKILLS_CONTEXT_LIMITS,
   SkillsContextBoundsError,

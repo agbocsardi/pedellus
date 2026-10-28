@@ -5,6 +5,7 @@ import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type Extension, type Harness as HarnessType, type ModelRef, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ConversationContextSnapshot } from "./context/index.js";
+import { createSkillTool, SKILL_TOOL_NAME } from "./context/skill-tool.js";
 import { parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
 import { prepareDataDirectory } from "./store.js";
@@ -100,7 +101,7 @@ function bindContextSnapshot(
 ): ConversationContextSnapshot {
   const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   if (value !== undefined) {
-    for (const key of ["identity", "agents", "soul", "user", "memory", "skills", "selectedSkills"]) {
+    for (const key of ["identity", "agents", "soul", "user", "memory", "skills", "skillSummary", "selectedSkills"]) {
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (descriptor && Object.hasOwn(descriptor, "value")) snapshot[key] = descriptor.value;
     }
@@ -177,6 +178,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ? createCodingToolExtension({
         tools: toolAllowlist as readonly CodingToolName[],
         ceiling: toolAllowlist,
+        contextTools: options.contextSnapshotProvider === undefined ? [] : [SKILL_TOOL_NAME],
         defaultTimeoutSeconds,
         now,
       })
@@ -208,55 +210,67 @@ export async function openGateway(config: PortConfig, context: Context, options:
   let contextExtension: Extension | undefined;
   const contextExtensionBuilder = createContextExtensionBuilder();
   const contextConversations = new Set<ConversationId>();
+  // A read-only progressive skill loader: it serves bodies from the host snapshot only, so a
+  // builtin skill outside the workspace is reachable without widening the workspace or the shell.
+  const skillTool = options.contextSnapshotProvider === undefined ? undefined : createSkillTool();
+  const skillToolRegistration = skillTool?.extension.tools?.[0];
+  const skillConversations = new Set<ConversationId>();
+  // Always an explicit selection, never an add/remove edit: Durable's edit form resolves against the
+  // extensions installed at read time, so a later dynamic install (a new conversation's context
+  // extension) would otherwise be selected by unrelated conversations.
   const extensionsPolicy = (conversationId: ConversationId): AgentChange => {
-    const add: Extension[] = [];
-    const remove: Extension[] = [];
-    if (toolExtension) add.push(toolExtension);
-    if (options.contextSnapshotProvider && contextExtension) {
-      if (contextConversations.has(conversationId)) add.push(contextExtension);
-      else remove.push(contextExtension);
+    const selected: Extension[] = [];
+    if (toolExtension) selected.push(toolExtension);
+    if (options.contextSnapshotProvider && contextExtension && contextConversations.has(conversationId)) {
+      selected.push(contextExtension);
     }
-    if (add.length === 0 && remove.length === 0) return { extensions: [] };
-    return {
-      extensions: {
-        ...(add.length === 0 ? {} : { add }),
-        ...(remove.length === 0 ? {} : { remove }),
-      },
-    };
+    if (skillTool && contextConversations.has(conversationId) && skillConversations.has(conversationId)) {
+      selected.push(skillTool.extension);
+    }
+    return { extensions: selected };
   };
   const toolRegistrations = new Map<string, ToolRegistration>(
     (toolExtension?.tools ?? []).map((tool) => [tool.name, tool]),
   );
   const toolFilterFromNames = (
     names: readonly string[],
-  ): Pick<AgentChange, "tools" | "modelTools"> => {
-    const tools = names.flatMap((name) => {
+  ): { readonly tools: readonly ToolRegistration[] } => ({
+    tools: names.flatMap((name) => {
       const tool = toolRegistrations.get(name);
       return tool === undefined ? [] : [tool];
-    });
-    return { tools, modelTools: tools };
-  };
+    }),
+  });
   const toolFilterFor = async (
     tx: Tx,
     conversationId: ConversationId,
   ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
+    // The skill loader is context delivery, not an effectful tool: it stays outside the
+    // grant document and the host ceiling, and is offered only for captured skill snapshots.
+    const skillTools = skillToolRegistration !== undefined && skillConversations.has(conversationId)
+      ? [skillToolRegistration]
+      : [];
     if (!toolExtension) {
       // Retire instead of creating an empty document: a disabled ceiling must durably remove
       // previously granted tools so re-enabling it cannot resurrect them.
       await tx.retireDoc(ToolGrantDoc, conversationId);
-      return { tools: [], modelTools: [] };
+      return { tools: skillTools, modelTools: skillTools };
     }
     const document = await tx.doc(ToolGrantDoc, conversationId);
-    return toolFilterFromNames(pruneToolGrants(document, toolAllowlist, now()));
+    const tools = [
+      ...toolFilterFromNames(pruneToolGrants(document, toolAllowlist, now())).tools,
+      ...skillTools,
+    ];
+    return { tools, modelTools: tools };
   };
   const denyNewConversation = async (
     tx: Tx,
     conversation: { readonly id: ConversationId },
   ): Promise<void> => {
     // Every native creation path, including forks and raw/task-created conversations, starts denied.
-    // The grant document is retired so a fork's copied agent state can never inherit authority.
+    // The grant document is retired so a fork's copied agent state can never inherit authority, and
+    // extensions are explicit so a later dynamic install cannot be selected by default.
     await tx.retireDoc(ToolGrantDoc, conversation.id);
-    await configure(tx, conversation.id, { tools: [], modelTools: [] });
+    await configure(tx, conversation.id, { tools: [], modelTools: [], extensions: [] });
   };
   const publicChoice = (choice: ResolvedModelChoice): GatewayModelChoice => ({
     ...choice.configured,
@@ -285,6 +299,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   try {
     const registry = createRegistry();
     if (toolExtension) registry.install(toolExtension);
+    if (skillTool) registry.install(skillTool.extension);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
     const harnessOptions = {
       models,
@@ -318,6 +333,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
             const snapshot = bindContextSnapshot(supplied, conversationId);
             const extension = contextExtensionBuilder.add(snapshot);
             contextConversations.add(conversationId);
+            if (skillTool !== undefined) {
+              if (skillTool.setConversation(conversationId, snapshot) > 0) {
+                skillConversations.add(conversationId);
+              } else {
+                skillConversations.delete(conversationId);
+              }
+            }
             contextExtension = extension;
             registry.install(extension);
           })
@@ -496,8 +518,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const document = await tx.doc(ToolGrantDoc, conversation.id);
           for (const grant of normalized) document.grants[grant.name] = grant.expiresAt;
           const timestamp = now();
-          const active = pruneToolGrants(document, toolAllowlist, timestamp);
-          await configure(tx, conversation.id, toolFilterFromNames(active));
+          await configure(tx, conversation.id, await toolFilterFor(tx, conversation.id));
           return activeToolGrants(document, toolAllowlist, timestamp);
         }, ctx);
       },
@@ -511,8 +532,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const document = await tx.doc(ToolGrantDoc, conversation.id);
           for (const name of new Set(names)) delete document.grants[name];
           const timestamp = now();
-          const active = pruneToolGrants(document, toolAllowlist, timestamp);
-          await configure(tx, conversation.id, toolFilterFromNames(active));
+          await configure(tx, conversation.id, await toolFilterFor(tx, conversation.id));
           return activeToolGrants(document, toolAllowlist, timestamp);
         }, ctx);
       },

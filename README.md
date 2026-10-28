@@ -56,7 +56,9 @@ An opt-in [workspace loader](./WORKSPACE_CONTEXT.md) supplies fixed bootstrap fi
 and explicitly selected memory files to such a provider. Skill discovery is also
 opt-in through `workspaceContext.skills`: it reads only `<workspace>/skills` and an
 explicitly configured builtin skills root, fails closed on metadata it cannot
-parse, and never executes a skill ([details](./SKILLS_CONTEXT.md)). Neither loader
+parse, never executes a skill, and supports progressive loading — a prompt
+summary plus a read-only `skill` tool that serves a discovered workspace or
+builtin body on demand ([details](./SKILLS_CONTEXT.md)). Neither loader
 provides full Python memory or skills parity. The local CLI/gateway host opts in
 only when the config contains a `workspaceContext` section
 (`workspaceContext.memoryFiles`, default off); it contributes no identity. Prepared requests containing old Nanobot context

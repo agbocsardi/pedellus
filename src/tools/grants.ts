@@ -108,14 +108,21 @@ export function pruneToolGrants(
  * Last-line policy check before a call records intent. Native recovery reruns only tools that are
  * still resolved for the conversation, so reopening also rechecks grants by pruning them before
  * `resume()`; this hook catches expiry between reopen and the call.
+ *
+ * `contextTools` names non-effectful context tools (such as the read-only skill loader). They are
+ * exempt from the grant document and the ceiling because they cannot change state; everything else
+ * still needs an explicit unexpired grant.
  */
 export function createToolGrantHook(
   ceiling: readonly string[],
   now: () => number,
+  contextTools: readonly string[] = [],
 ): HookRegistration {
   const allowed = new Set(ceiling);
+  const ungated = new Set(contextTools);
   return hook(ToolTask, {
     async beforeTool(call: ToolHookCall, api, context) {
+      if (ungated.has(call.name)) return undefined;
       if (!allowed.has(call.name)) {
         return { block: `Tool ${call.name} is outside the host tool ceiling` };
       }

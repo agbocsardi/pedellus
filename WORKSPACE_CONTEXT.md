@@ -58,9 +58,15 @@ snapshot provider and `openGateway` installs no context extension.
   startup or `conversationFor`. No partial context is installed, and a retry
   re-runs the loader.
 - A selected skill body is prompt content, not code: the host discovers and
-  renders it, and only the conversation's already-granted tools can act. Skill
-  requirements are checked against `PATH` alone, the same environment the guarded
-  shell exports.
+  renders it, and only the conversation's already-granted tools can act. The
+  host also passes the loader's progressive summary as `skillSummary`, so the
+  gateway can list unselected workspace and builtin skills and serve a body on
+  demand through its read-only `skill` tool; see
+  [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md).
+- Skill requirements are checked against the non-secret variables the guarded
+  shell exports (`PATH`, `HOME`, `TMPDIR`, `LANG`, `TERM`, `PYTHONUNBUFFERED`,
+  from the shared shell policy). The gateway's other environment variables,
+  including credentials, never satisfy a `requires.env` gate.
 - This adds no tools, workspace roots, credentials, or provider calls. Tool
   policy is unchanged.
 - The configured `workspace` path is walked literally by the loader. A root path

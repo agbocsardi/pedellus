@@ -45,13 +45,54 @@ The result contains:
   A refused skill is therefore visible to the host instead of silently absent.
 - `summary`: Python-style progressive `name — description — path` lines.
   Unavailable skills are marked with their missing gates or unsupported
-  metadata; disabled skills are omitted.
+  metadata, disabled skills are omitted, enabled `always` skills are omitted
+  (their bodies are already in context), and refused directory entries are
+  listed once.
 
 The existing context extension still decides inclusion: an enabled skill is
 rendered only when frontmatter marks it `always` (top-level, `metadata.nanobot`,
 or `metadata.openclaw`) or the host names it in `selectedSkills`. Disabled or
 requirement-unavailable entries carry `enabled: false` and never render.
 Frontmatter is stripped by the extension, not here.
+
+## Progressive loading (gateway)
+
+Two pieces make progressive loading real instead of config preselection:
+
+1. **Summary in the prompt.** The host passes `summary` as
+   `ConversationContextSnapshot.skillSummary`; the context extension renders it
+   at the top of `nanobot_skills` as `## Available skills`. Enabled `always`
+   skills are omitted from the summary because their bodies are already in the
+   section. Unavailable skills are marked with the missing gate or unsupported
+   metadata, and refused directory entries appear in one `Skipped skill entries:`
+   line. Nothing about an unselected skill body reaches the prompt.
+2. **`skill` tool.** When the host supplied a snapshot, the gateway installs one
+   read-only model-facing tool, `skill`. With no argument it returns the same
+   listing; with `name` it returns that skill's Markdown body (frontmatter
+   stripped) from the per-conversation snapshot table. The table is populated
+   when the snapshot is bound and rebuilt from the provider on reopen, so a new
+   or restarted conversation can load any discovered workspace **or builtin**
+   skill without a config change — including builtin files that the `read` tool
+   cannot reach because they are outside the workspace.
+
+The tool is context delivery, not execution or privilege:
+
+- It reads only the captured snapshot; it never touches the filesystem, so the
+  builtin root is not exposed as a readable path and no path argument is accepted.
+- It is not part of `toolAllowlist`, is not grantable or revocable, and is not
+  affected by grant expiry. It grants nothing and runs nothing; effectful work
+  still needs an explicit `read`/`write`/`edit`/`bash` grant. The coding tool's
+  grant hook explicitly exempts this one non-effectful tool name.
+- It is selected only for conversations whose snapshot carried skills and only
+  when `workspaceContext.skills` is configured. Disabled and
+  requirement-unavailable skills can be listed but loading one is refused with a
+  reason.
+
+`requires.env` is evaluated against the environment the guarded shell actually
+exports — `PATH`, `HOME`, `TMPDIR`, `LANG`, `TERM`, `PYTHONUNBUFFERED` — built by
+the shared `defaultShellEnvironment()` policy. A host-only variable (for example
+a token in the gateway process environment) never satisfies a skill gate, because
+the shell never receives it.
 
 ## Host wiring
 
@@ -82,10 +123,11 @@ the config contains an explicit section (see
   the prepared-context recovery guard applies unchanged).
 - A loader failure rejects that conversation's setup and installs no partial
   context; a retry re-runs the loader.
-- Requirement gates are evaluated against an explicit environment map. The host
-  passes only `PATH`, because the guarded shell exports that same `PATH` and
-  inherits no other host variable. A `requires.env` entry therefore stays unmet
-  instead of being satisfied by a host-only value that the tools never see.
+- Requirement gates are evaluated against the non-secret environment the guarded
+  shell exports (`PATH`, `HOME`, `TMPDIR`, `LANG`, `TERM`, `PYTHONUNBUFFERED`),
+  not the gateway's full environment. A `requires.env` entry for a credential or
+  other host-only name therefore stays unmet instead of being satisfied by a
+  value the tools never see.
 - Discovery and prompt inclusion are not execution. The model sees a selected
   skill body and decides what to do with the already-granted `read`/`bash`
   tools; nothing in this module runs a skill, its scripts, or its references.
@@ -157,10 +199,8 @@ keep selected skill files well below the section bound.
   that skill closed instead, so a broken gate cannot look satisfied.
 - Unknown selected names are ignored, matching the loader's lookup behaviour.
   Disabled skills still shadow a builtin with the same name.
-- The summary is returned for the host to place; this module does not inject a
-  separate summary section, add a skill-loading tool, or claim that unselected
-  bodies are available at runtime. Progressive loading (summary first, then read
-  the file) is reliable only for workspace skills whose files are reachable; a
-  builtin skill must be selected or marked `always` to load its body, and its
-  sibling reference files stay outside the workspace.
+- The loader itself injects no section and offers no tool; the gateway wiring
+  above places the summary and installs the read-only loader. A builtin skill's
+  body is loadable through that tool, but its sibling reference files stay
+  outside the workspace and are not readable by the coding tools.
 - Memory, Dream, history, compaction, and tool policy are unchanged.

@@ -108,6 +108,12 @@ export interface ConversationContextSnapshot {
   /** Memory content the host has explicitly selected for this conversation. */
   readonly memory?: readonly ContextDocumentSnapshot[];
   readonly skills?: readonly ContextSkillSnapshot[];
+  /**
+   * Host-rendered progressive skill summary (name, description, provenance,
+   * availability). It is rendered at the top of the skills section so the model
+   * can learn that unloaded skills exist without their bodies being included.
+   */
+  readonly skillSummary?: string;
   /** Up to 64 selected names (at most 128 UTF-16 code units each) for enabled non-always skills. */
   readonly selectedSkills?: readonly string[];
 }
@@ -269,6 +275,13 @@ function prepareContext(snapshot: unknown): PreparedContext {
     `Skill ${safeInline(skill.name)} — ${safeInline(skill.description)}`,
     { source: skill.source, content: skill.content },
   ] as [string, ContextDocumentSnapshot]);
+  const skillSummary = ownString(snapshot, "skillSummary");
+  if (skillSummary !== undefined && skillSummary.trim().length > 0) {
+    skillRecords.unshift([
+      "Available skills",
+      { source: "host snapshot (skill summary)", content: skillSummary },
+    ]);
+  }
   if (omittedSkills > 0) {
     skillRecords.push(["Skills omitted", {
       source: "host snapshot (omitted entries)",
@@ -356,7 +369,7 @@ function parseMetadataObject(value: unknown): unknown {
   }
 }
 
-function stripSkillFrontmatter(content: string): string {
+export function stripSkillFrontmatter(content: string): string {
   const prefix = content.slice(0, CONTEXT_LIMITS.sectionChars + 1);
   const match = SKILL_FRONTMATTER.exec(prefix);
   return match ? content.slice(match[0].length) : content;

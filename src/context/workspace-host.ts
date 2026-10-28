@@ -1,4 +1,6 @@
+import { tmpdir } from "node:os";
 import type { PortConfig } from "../config.js";
+import { defaultShellEnvironment } from "../execution/policy.js";
 import type { OpenGatewayOptions } from "../runtime.js";
 import { loadSkillsContext, type SkillsContextRequest } from "./skills.js";
 import {
@@ -46,10 +48,11 @@ export function workspaceContextGatewayOptions(
     ...(skills.builtinSkillsRoot === undefined ? {} : { builtinSkillsRoot: skills.builtinSkillsRoot }),
     disabledSkills: Object.freeze([...skills.disabledSkills]),
     selectedSkills: Object.freeze([...skills.selectedSkills]),
-    // Requirement gates only see PATH: the guarded shell exports this same PATH
-    // and inherits no other host variable, so a `requires.env` entry for any
-    // other name stays unmet instead of being satisfied by a host-only value.
-    environment: Object.freeze({ PATH: process.env.PATH }),
+    // Gates see exactly the non-secret variables the guarded shell exports (PATH, HOME,
+    // TMPDIR, LANG, TERM, PYTHONUNBUFFERED); no other host variable, so a `requires.env`
+    // entry for a secret or host-only name stays unmet. TMPDIR here is the host temp root
+    // standing in for the per-conversation private directory.
+    environment: Object.freeze(defaultShellEnvironment(config.workspace, tmpdir(), process.env)),
   });
   return {
     contextSnapshotProvider: async () => {
@@ -59,6 +62,9 @@ export function workspaceContextGatewayOptions(
       ]);
       return {
         ...snapshot,
+        // The summary is what makes progressive loading work: the model learns that
+        // unselected workspace and builtin skills exist, then loads a body on demand.
+        ...(discovered.summary.length === 0 ? {} : { skillSummary: discovered.summary }),
         skills: discovered.skills,
         selectedSkills: discovered.selectedSkills,
       };

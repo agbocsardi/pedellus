@@ -50,6 +50,12 @@ described below; Code Mode is not part of this slice.
 - `extraAllowedDirs` remains an explicit list of additional canonical
   filesystem roots. They are not created, and the data directory must stay
   disjoint from them.
+- When `workspaceContext.skills` is configured, the gateway also offers one
+  read-only `skill` tool that lists discovered skills and returns one skill body
+  from the conversation's context snapshot. It is not one of the four coding
+  tools: it is not in this ceiling, cannot be granted or revoked, accepts no
+  filesystem path, and executes nothing. See
+  [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md).
 
 ## Per-conversation grants
 

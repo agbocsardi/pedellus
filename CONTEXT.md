@@ -28,6 +28,7 @@ const context = createContextExtension([{
     metadata: { description: "Project-specific instructions", always: true },
     content: skillMarkdown,
   }],
+  skillSummary: "- **weather** — Get current weather  `builtin:skills/weather/SKILL.md`",
   selectedSkills: [],
 }]);
 ```
@@ -116,6 +117,11 @@ section-value bound (48,000 context + 2,000 tool visibility) is also **per
 conversation**, not an aggregate across the 256 snapshots. The snapshot-count cap
 limits fan-out; aggregate retained strings across all snapshots can be larger.
 
+An optional host-rendered `skillSummary` is rendered first in the skills section
+as `## Available skills`, so the model learns which unselected skills exist
+without their bodies being included. The section still contains only the summary
+and the enabled `always`/selected bodies the host supplied.
+
 A skill must have `enabled: true` from the host to appear; absent, false, or
 non-boolean values are disabled. The host is responsible for applying Nanobot's
 disabled-skill configuration and requirement checks (Python checks binaries and
@@ -124,8 +130,10 @@ loader in [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md); this extension still only
 reads the supplied snapshots. For enabled skills, `always: true` in parsed frontmatter,
 `metadata.nanobot.always`, or `metadata.openclaw.always` includes full content on
 every prompt. Otherwise the host must name the skill in `selectedSkills` to include
-its body. Disabled/unselected skills are not listed, and this extension offers no
-skill-loading tool or claim that omitted skill bodies are available at runtime.
+its body. Disabled/unselected skill bodies are not included. This extension still offers
+no tool of its own: the gateway's separate read-only `skill` loader serves
+bodies from the host snapshot (see [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md)),
+and nothing here claims that an omitted body is available without that loader.
 Only own data properties are read from metadata; inherited/accessor `always` or
 enabled values cannot grant a skill. Skill frontmatter is stripped from included
 Markdown using a bounded delimiter check; YAML is not parsed here.

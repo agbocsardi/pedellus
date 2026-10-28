@@ -690,9 +690,19 @@ async function scanSkillRoot(
   }
 }
 
-function formatSummary(discovered: readonly DiscoveredSkill[]): string {
-  return discovered
-    .filter((skill) => !skill.disabled)
+/**
+ * Python-style progressive summary. Enabled `always` skills are omitted because
+ * the renderer already includes their bodies; disabled skills are omitted and
+ * requirement-unavailable ones are marked. Refused directory entries are listed
+ * once so a host (and a model that saw the name referenced) can tell that they
+ * were skipped rather than missing.
+ */
+function formatSummary(
+  discovered: readonly DiscoveredSkill[],
+  skipped: readonly SkippedSkill[],
+): string {
+  const lines = discovered
+    .filter((skill) => !skill.disabled && !(skill.always && skill.enabled))
     .map((skill) => {
       const missing = [
         ...skill.requirements.missingBins.map((name) => `CLI: ${name}`),
@@ -703,8 +713,13 @@ function formatSummary(discovered: readonly DiscoveredSkill[]): string {
         ? ""
         : ` (unavailable${missing.length > 0 ? `: ${missing.join(", ")}` : ""})`;
       return `- **${skill.name}** — ${skill.description}${suffix}  \`${skill.path ?? skill.source}\``;
-    })
-    .join("\n");
+    });
+  if (skipped.length > 0) {
+    lines.push(
+      `Skipped skill entries: ${skipped.map((entry) => `${entry.name} (${entry.reason})`).join(", ")}`,
+    );
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -795,6 +810,6 @@ export async function loadSkillsContext(
     selectedSkills,
     discovered: Object.freeze(discovered),
     skipped: Object.freeze([...state.skipped]),
-    summary: formatSummary(discovered),
+    summary: formatSummary(discovered, state.skipped),
   });
 }

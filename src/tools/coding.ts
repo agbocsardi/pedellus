@@ -18,6 +18,11 @@ export interface CodingToolExtensionOptions {
   readonly tools: readonly CodingToolName[];
   /** Host-owned ceiling the grant hook enforces; normally the configured allowlist. */
   readonly ceiling: readonly string[];
+  /**
+   * Non-effectful context tools registered by another extension in the same conversations.
+   * The grant hook exempts them; they are not grantable and never widen this ceiling.
+   */
+  readonly contextTools?: readonly string[];
   /** Effective config-level shell timeout, for a meaningful message when the host default fires. */
   readonly defaultTimeoutSeconds: number;
   /** Grant-clock override; defaults to `Date.now`. */
@@ -83,6 +88,10 @@ export function createCodingToolExtension(options: CodingToolExtensionOptions): 
   );
   if (unknown.length > 0) throw new Error(`Unknown coding tools: ${unknown.join(", ")}`);
   if (selected.size === 0) throw new Error("A coding tool extension requires at least one tool");
+  const contextTools = [...(options.contextTools ?? [])];
+  if (contextTools.some((name) => typeof name !== "string" || name.length === 0 || selected.has(name as CodingToolName))) {
+    throw new Error("Context tools must be non-empty names outside the coding tool set");
+  }
 
   const tools: ToolRegistration[] = [];
   const wraps: Wrap[] = [];
@@ -102,6 +111,6 @@ export function createCodingToolExtension(options: CodingToolExtensionOptions): 
     name: "nanobot-coding-tools",
     tools,
     wraps,
-    hooks: [createToolGrantHook(options.ceiling, options.now ?? Date.now)],
+    hooks: [createToolGrantHook(options.ceiling, options.now ?? Date.now, contextTools)],
   });
 }
