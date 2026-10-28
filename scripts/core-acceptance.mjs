@@ -204,6 +204,13 @@ function factIsolation(requestText) {
   };
 }
 
+/** True when the raw-turn sentinel appears outside the placed summary. */
+function sentinelOutsideSummary(requestText) {
+  const texts = messageTexts(requestText);
+  const summaryIndexes = texts.flatMap((text, index) => (text.includes(COMPACTION_PREFIX) ? [index] : []));
+  return texts.some((text, index) => !summaryIndexes.includes(index) && text.includes(SENTINEL));
+}
+
 // ---------------------------------------------------------------------------
 // Child phases
 // ---------------------------------------------------------------------------
@@ -214,10 +221,11 @@ async function loadCore() {
   });
   const aiDist = join(ROOT, "node_modules", "@earendil-works", "pi-ai", "dist");
   const chordDist = join(ROOT, "node_modules", "@earendil-works", "chord", "dist");
-  const [{ openGateway }, { parseConfig }, { workspaceContextGatewayOptions }, ai, transcript, chord] = await Promise.all([
+  const [{ openGateway }, { parseConfig }, { workspaceContextGatewayOptions }, providers, ai, transcript, chord] = await Promise.all([
     import(pathToFileURL(join(ROOT, "dist", "runtime.js")).href),
     import(pathToFileURL(join(ROOT, "dist", "config.js")).href),
     import(pathToFileURL(join(ROOT, "dist", "context", "workspace-host.js")).href),
+    import(pathToFileURL(join(ROOT, "dist", "providers.js")).href),
     import(pathToFileURL(join(aiDist, "index.js")).href),
     import(pathToFileURL(join(aiDist, "utils", "transcript.js")).href),
     import(pathToFileURL(join(chordDist, "context", "index.js")).href),
@@ -226,6 +234,7 @@ async function loadCore() {
     openGateway,
     parseConfig,
     workspaceContextGatewayOptions,
+    createProviderModels: providers.createProviderModels,
     createModels: ai.createModels,
     fauxProvider: ai.fauxProvider,
     fauxAssistantMessage: ai.fauxAssistantMessage,
@@ -436,7 +445,8 @@ async function runFirstPhase(core, stateDir, evidence) {
     const onDisk = await readFile(join(workspace, ...TOPIC_PATH.split("/")), "utf8");
     require("memory.write_reached_disk", onDisk.includes(TOPIC_MARKER) && onDisk.includes(TOPIC_DESCRIPTION) && !onDisk.includes(FACT));
     const writeResults = toolResultsOf(probe.requests.at(-1).text).filter((result) => result.toolName === "write");
-    require("memory.write_tool_result", writeResults.length === 1 && writeResults[0].text.includes(TOPIC_PATH), writeResults[0]?.text);
+    require("memory.write_tool_result", writeResults.length === 1 && writeResults[0].text.includes(TOPIC_PATH),
+      `${writeResults.length} result(s)`);
 
     // Topic memory read through the granted read tool.
     await driver.send(conversation, context,
@@ -584,10 +594,11 @@ async function runSecondPhase(core, stateDir, evidence) {
     const results = toolResultsOf(probe.requests.at(-1).text);
     const skillResults = results.filter((result) => result.toolName === "skill" && !result.isError);
     const readResults = results.filter((result) => result.toolName === "read" && !result.isError);
-    require("reopen.skill_body_on_demand", skillResults.length === 1 && skillResults[0].text.includes(SKILL_BODY), skillResults[0]?.text);
+    require("reopen.skill_body_on_demand", skillResults.length === 1 && skillResults[0].text.includes(SKILL_BODY),
+      sha256(skillResults[0]?.text ?? "").slice(0, 16));
     require("reopen.memory_read_granted",
       readResults.length === 1 && readResults[0].text.includes(TOPIC_MARKER) && !readResults[0].text.includes(FACT),
-      readResults[0]?.text);
+      sha256(readResults[0]?.text ?? "").slice(0, 16));
 
     evidence.conversationId = conversation.id;
     evidence.requests = probe.requests.map(({ kind, chars, sha256: digest }) => ({ kind, chars, sha256: digest }));
@@ -890,7 +901,705 @@ async function runBudgetProbe(stateDir, evidence) {
   evidence.limits = { framingTokensPerRequest: INPUT_FRAMING_TOKENS_PER_REQUEST };
 }
 
-async function runPhase(phase, stateDir) {
+// ---------------------------------------------------------------------------
+// Real-model acceptance flow and offline rehearsal
+// ---------------------------------------------------------------------------
+
+const REAL_FILLER_CHARS = 70_000;
+const REAL_MODEL = Object.freeze({ provider: "opencode_go", modelId: "deepseek-v4.1-flash" });
+const REAL_THINKING = "low";
+const REAL_REQUEST_TIMEOUT_MS = 120_000;
+const REAL_CHILD_TIMEOUT_MS = 900_000;
+const REAL_DEFAULT_CAPS = Object.freeze({
+  maxRequests: 20,
+  maxInputTokens: 600_000,
+  maxOutputTokens: 20_000,
+  maxOutputPerRequest: 1_536,
+});
+const REAL_SUMMARY_SYSTEM_PREFIX = "You are a context summarization assistant";
+const REAL_ASSUMPTIONS = Object.freeze([
+  "input bound assumes every provider token covers at least one UTF-8 payload byte (byte-level tokenizer); the opencode-go tokenizer is not verified from source",
+  "the 4096-token/request framing reserve is a conservative allowance, not a proof of provider chat-template or proxy-side additions",
+  "output bound assumes the provider honors max_tokens as the total generated-token cap, including reasoning; reasoning accounting is not verified from source",
+  "the guard observes the pi-ai pre-dispatch payload; proxy-internal transformations after that hook are unobservable",
+  "the rehearsal measures a faux synthetic payload; the live run re-reserves the native adapter payload, so the measured bound is a preflight floor, not the live exact bound",
+]);
+
+function realCapsFromArgs() {
+  const read = (name, fallback) => {
+    const raw = argValue(`--${name}=`);
+    if (raw === undefined) return fallback;
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`--${name} must be a positive integer`);
+    return value;
+  };
+  return {
+    maxRequests: read("max-requests", REAL_DEFAULT_CAPS.maxRequests),
+    maxInputTokens: read("max-input", REAL_DEFAULT_CAPS.maxInputTokens),
+    maxOutputTokens: read("max-output", REAL_DEFAULT_CAPS.maxOutputTokens),
+    maxOutputPerRequest: read("max-output-per-request", REAL_DEFAULT_CAPS.maxOutputPerRequest),
+    timeoutMs: REAL_REQUEST_TIMEOUT_MS,
+  };
+}
+
+function realGatewayConfig(core, stateDir, options) {
+  const model = options.live ? REAL_MODEL : { provider: PROVIDER, modelId: MODEL_ID };
+  const base = {
+    workspace: join(stateDir, "workspace"),
+    dataDir: join(stateDir, "data"),
+    model,
+    allowedModels: [model],
+    thinkingLevel: options.live ? REAL_THINKING : "off",
+    toolAllowlist: ["read", "write", "edit"],
+    workspaceContext: {
+      memoryFiles: ["memory/MEMORY.md"],
+      memoryManifest: true,
+      skills: { disabledSkills: [] },
+    },
+  };
+  return core.parseConfig(
+    options.live ? { ...base, credentials: { opencode_go: options.apiKeyEnv } } : base,
+    stateDir,
+  );
+}
+
+function createRealRecorder(core) {
+  const requests = [];
+  return {
+    requests,
+    observe({ operation, model, context }) {
+      const messages = context.messages;
+      const text = JSON.stringify(messages);
+      const prompt = core.getCurrentSystemPrompt(messages);
+      requests.push({
+        kind: prompt.startsWith(REAL_SUMMARY_SYSTEM_PREFIX) ? "summary" : "generation",
+        operation,
+        model: `${model.provider}/${model.id}`,
+        chars: text.length,
+        sha256: sha256(text),
+        prompt,
+        text,
+      });
+    },
+  };
+}
+
+function analyzeSummaryRequest(entry) {
+  const extracted = /AURORA-[0-9]{4}/.exec(entry.text)?.[0];
+  const topic = entry.text.includes(TOPIC_PATH) ? TOPIC_PATH : undefined;
+  const earlyBlock = entry.text.split("[User]: ").find((block) => block.includes("Early acceptance instruction"));
+  return {
+    observed: true,
+    extractedFact: extracted ?? null,
+    extractedTopic: topic ?? null,
+    requestChars: entry.chars,
+    requestSha256: entry.sha256,
+    provenance: {
+      factAndSentinelInEarlyUserTurn:
+        earlyBlock !== undefined && earlyBlock.includes(FACT) && earlyBlock.includes(SENTINEL),
+      factOccurrences: entry.text.split(FACT).length - 1,
+      sentinelOccurrences: entry.text.split(SENTINEL).length - 1,
+      hasTopicMarker: entry.text.includes(TOPIC_MARKER),
+    },
+  };
+}
+
+function createRealDriver(core, probe, recorder, requestPrefix, rehearsal) {
+  const state = { script: [], summary: undefined };
+  let turn = 0;
+  const dispatcher = () => {
+    // One dispatcher serves every request until the next `send`, so a tool
+    // turn's follow-up generation keeps the same plan. It re-arms itself.
+    if (rehearsal) probe.provider.appendResponses([dispatcher]);
+    const entry = recorder.requests.at(-1);
+    if (entry?.kind === "summary") {
+      const analysis = analyzeSummaryRequest(entry);
+      state.summary = analysis;
+      const body = analysis.extractedFact === null
+        ? "## Critical Context\n- The acceptance code could not be extracted from this request.\n"
+        : [
+            "## Goal",
+            "Continue the acceptance conversation while preserving its early fact.",
+            "",
+            "## Progress",
+            "### Done",
+            "- [x] Loaded the note-keeping skill body through the skill tool.",
+            `- [x] Wrote and read ${analysis.extractedTopic ?? "the topic memory file"} through granted tools.`,
+            "",
+            "## Critical Context",
+            `- Acceptance code extracted from the summarized transcript: ${analysis.extractedFact}`,
+            `- Topic memory locator: ${analysis.extractedTopic ?? "unavailable"}`,
+            "",
+          ].join("\n");
+      return core.fauxAssistantMessage(body, { stopReason: "stop" });
+    }
+    const step = state.script.shift();
+    if (step === undefined) throw new Error("Unexpected synthetic generation request");
+    return step;
+  };
+  return {
+    state,
+    recorder,
+    armSummary() {
+      if (probe === undefined) throw new Error("armSummary requires a rehearsal provider");
+      probe.provider.setResponses([dispatcher]);
+    },
+    async send(conversation, context, text, steps = []) {
+      if (rehearsal) {
+        state.script = [...steps];
+        probe.provider.setResponses([dispatcher]);
+      }
+      // Live mode ignores the rehearsal steps: they only script the faux provider.
+      turn += 1;
+      const requestId = `${requestPrefix}-${turn}`;
+      const submission = await conversation.submit({ type: "input", content: text, requestId }, context);
+      const settled = await submission.wait(context);
+      await conversation.waitForIdle(context);
+      if (settled?.status !== "done") throw new Error(`turn ${requestId} settled as ${settled?.status}`);
+      if (rehearsal && state.script.length !== 0) {
+        throw new Error(`turn ${requestId} left ${state.script.length} planned responses unconsumed`);
+      }
+    },
+  };
+}
+
+function lastAssistantText(view) {
+  for (let index = view.messages.length - 1; index >= 0; index -= 1) {
+    const message = view.messages[index];
+    if (message.role !== "assistant") continue;
+    return message.content
+      .flatMap((block) => (block.type === "text" ? [block.text] : []))
+      .join("\n")
+      .trim();
+  }
+  return "";
+}
+
+function realTopicContent() {
+  return [
+    "---",
+    `description: ${TOPIC_DESCRIPTION}`,
+    "---",
+    "",
+    "# Acceptance topic",
+    "",
+    `The topic marker is ${TOPIC_MARKER}. It was written through the granted write tool.`,
+    "",
+  ].join("\n");
+}
+
+async function runRealFirstPhase(core, stateDir, evidence, options, budget) {
+  const { checks, record, require } = collector("phase1", stateDir);
+  const workspace = join(stateDir, "workspace");
+  const context = core.context;
+  const recorder = createRealRecorder(core);
+  const probe = options.rehearsal ? buildProbe(core) : undefined;
+  const inner = options.rehearsal ? probe.models : options.models;
+  const wrapped = wrapModels(inner, budget, {
+    allowUnobserved: options.rehearsal,
+    onRequest: (request) => recorder.observe(request),
+  });
+  const driver = createRealDriver(core, probe, recorder, "p1", options.rehearsal);
+  const config = realGatewayConfig(core, stateDir, options);
+  let gateway;
+  try {
+    gateway = await core.openGateway(config, context, {
+      models: wrapped,
+      ...core.workspaceContextGatewayOptions(config),
+    });
+    const conversation = await gateway.conversationFor(SESSION_KEY, context);
+    evidence.conversationId = conversation.id;
+    const toolNames = async () => {
+      const agent = await conversation.agent(context);
+      return (agent.tools ?? []).map((tool) => (typeof tool === "string" ? tool : tool?.name));
+    };
+    const names = await toolNames();
+    record("skill.tool_offered", names.includes("skill"), names.join(","));
+    const expiry = Date.now() + 600_000;
+    const granted = await gateway.grantTools(SESSION_KEY, [
+      { name: "read", expiresAt: expiry },
+      { name: "write", expiresAt: expiry },
+      { name: "edit", expiresAt: expiry },
+    ], context);
+    require("tools.granted", granted.length === 3, granted.map((grant) => grant.name).join(","));
+
+    const topicContent = realTopicContent();
+    let turnStart = recorder.requests.length;
+    await driver.send(conversation, context,
+      `Early acceptance instruction: remember the acceptance code ${FACT}. This raw early turn also contains ${SENTINEL}. ` +
+        `Call the skill tool with name "${SKILL_NAME}" so its instructions are loaded. Then reply with one short sentence. ` +
+        "Do not call any other tool.", [
+        core.fauxAssistantMessage([core.fauxToolCall("skill", { name: SKILL_NAME })], { stopReason: "toolUse" }),
+        core.fauxAssistantMessage("Skill instructions loaded; the early code is recorded."),
+      ]);
+    let turnRequests = recorder.requests.slice(turnStart);
+    const first = turnRequests[0];
+    require("fact_in_first_request", first !== undefined && first.text.includes(FACT) && first.text.includes(SENTINEL));
+    require("skills.summary_in_prompt", first.prompt.includes(SKILL_NAME) && first.prompt.includes(SKILL_DESCRIPTION));
+    require("skills.body_absent_before_load", !first.text.includes(SKILL_BODY));
+    require("skills.tool_result_request_observed", turnRequests.length >= 2);
+    const skillResults = turnRequests.slice(1).flatMap((entry) => toolResultsOf(entry.text))
+      .filter((result) => result.toolName === "skill");
+    require("skills.body_via_tool_result",
+      skillResults.length === 1 && skillResults[0].text.includes(SKILL_BODY),
+      sha256(skillResults[0]?.text ?? "").slice(0, 16));
+
+    turnStart = recorder.requests.length;
+    await driver.send(conversation, context,
+      `Use the granted write tool to store the topic memory at ${TOPIC_PATH}. Write exactly this content:\n\n${topicContent}`, [
+        core.fauxAssistantMessage([core.fauxToolCall("write", { path: TOPIC_PATH, content: topicContent })], { stopReason: "toolUse" }),
+        core.fauxAssistantMessage("Topic memory written."),
+      ]);
+    const onDisk = await readFile(join(workspace, ...TOPIC_PATH.split("/")), "utf8");
+    require("memory.write_reached_disk",
+      onDisk.includes(TOPIC_MARKER) && onDisk.includes(TOPIC_DESCRIPTION) && !onDisk.includes(FACT));
+    turnRequests = recorder.requests.slice(turnStart);
+    const writeResults = turnRequests.flatMap((entry) => toolResultsOf(entry.text))
+      .filter((result) => result.toolName === "write");
+    require("memory.write_tool_result", writeResults.length === 1 && writeResults[0].text.includes(TOPIC_PATH),
+      `${writeResults.length} result(s)`);
+
+    turnStart = recorder.requests.length;
+    await driver.send(conversation, context, `Use the granted read tool to read ${TOPIC_PATH} back.`, [
+      core.fauxAssistantMessage([core.fauxToolCall("read", { path: TOPIC_PATH })], { stopReason: "toolUse" }),
+      core.fauxAssistantMessage("Topic memory read back."),
+    ]);
+    turnRequests = recorder.requests.slice(turnStart);
+    const readResults = turnRequests.flatMap((entry) => toolResultsOf(entry.text))
+      .filter((result) => result.toolName === "read");
+    require("memory.read_tool_result",
+      readResults.length === 1 && readResults[0].text.includes(TOPIC_MARKER) && !readResults[0].text.includes(FACT),
+      sha256(readResults[0]?.text ?? "").slice(0, 16));
+
+    const fillerLine = "Synthetic filler for the offline acceptance run. It carries no real data and exists only so native compaction has an old prefix to summarize. ";
+    const filler = fillerLine.repeat(Math.ceil(REAL_FILLER_CHARS / fillerLine.length)).slice(0, REAL_FILLER_CHARS);
+    await driver.send(conversation, context, `Filler turn. Do not use any tool. Reply with exactly ACK.\n\n${filler}`, [
+      core.fauxAssistantMessage("ACK"),
+    ]);
+
+    if (options.rehearsal) driver.armSummary();
+    const taskId = await conversation.compact(undefined, context);
+    const deadline = Date.now() + COMPACTION_WAIT_MS;
+    let task;
+    while (Date.now() < deadline) {
+      task = await gateway.harness.getTask(taskId, context);
+      if (task?.state?.status === "terminal") break;
+      await sleep(25);
+    }
+    await conversation.waitForIdle(context);
+    require("compaction.task_terminal", task?.state?.status === "terminal", task?.state?.status);
+    require("compaction.task_completed", task?.state?.outcome?.status === "completed", task?.state?.outcome?.status);
+    const summaryRequests = recorder.requests.filter((entry) => entry.kind === "summary");
+    require("compaction.summary_request_observed", summaryRequests.length === 1, String(summaryRequests.length));
+    const summary = analyzeSummaryRequest(summaryRequests.at(-1));
+    evidence.summary = summary;
+    require("compaction.fact_extracted_from_request", summary.extractedFact === FACT,
+      summary.extractedFact === FACT ? "matched" : "missing");
+    require("compaction.topic_extracted_from_request", summary.extractedTopic === TOPIC_PATH,
+      summary.extractedTopic === TOPIC_PATH ? "matched" : "missing");
+    require("compaction.fact_and_sentinel_in_early_turn", summary.provenance.factAndSentinelInEarlyUserTurn === true,
+      JSON.stringify(summary.provenance));
+    require("compaction.summary_request_fact_present", summary.provenance.factOccurrences >= 1,
+      `${summary.provenance.factOccurrences} occurrences`);
+    require("compaction.summary_request_sentinel_present", summary.provenance.sentinelOccurrences >= 1,
+      `${summary.provenance.sentinelOccurrences} occurrences`);
+
+    let view;
+    const headDeadline = Date.now() + 10_000;
+    while (Date.now() < headDeadline) {
+      view = await conversation.context(context);
+      if (view.head !== undefined) break;
+      await sleep(25);
+    }
+    const messages = JSON.stringify(view?.messages ?? []);
+    const isolation = factIsolation(messages);
+    require("compaction.summary_head_placed", view?.head !== undefined);
+    require("compaction.summary_message_has_fact", isolation.summaryCount === 1 && isolation.summaryHasFact, JSON.stringify(isolation));
+    require("compaction.fact_only_in_summary_message", isolation.summaryCount === 1 && !isolation.othersHaveFact, JSON.stringify(isolation));
+    require("compaction.original_turn_absent", !sentinelOutsideSummary(messages));
+    evidence.observations = {
+      ...(evidence.observations ?? {}),
+      summaryFactOccurrences: isolation.factOccurrences,
+      topicMarkerInPlacedContext: messages.includes(TOPIC_MARKER),
+    };
+
+    evidence.requests = recorder.requests.map(({ kind, chars, sha256: digest }) => ({ kind, chars, sha256: digest }));
+  } finally {
+    if (gateway) await gateway.close(context);
+    evidence.checks = checks;
+    evidence.status = collectorStatus(checks);
+  }
+}
+
+async function runRealSecondPhase(core, stateDir, evidence, options, budget) {
+  const { checks, record, require } = collector("phase2", stateDir);
+  const previous = JSON.parse(await readFile(join(stateDir, PHASE1_EVIDENCE), "utf8"));
+  const context = core.context;
+  const recorder = createRealRecorder(core);
+  const probe = options.rehearsal ? buildProbe(core) : undefined;
+  const inner = options.rehearsal ? probe.models : options.models;
+  const wrapped = wrapModels(inner, budget, {
+    allowUnobserved: options.rehearsal,
+    onRequest: (request) => recorder.observe(request),
+  });
+  const driver = createRealDriver(core, probe, recorder, "p2", options.rehearsal);
+  const config = realGatewayConfig(core, stateDir, options);
+  let gateway;
+  try {
+    gateway = await core.openGateway(config, context, {
+      models: wrapped,
+      ...core.workspaceContextGatewayOptions(config),
+    });
+    const conversation = await gateway.conversationFor(SESSION_KEY, context);
+    require("reopen.stable_conversation_identity", conversation.id === previous.conversationId,
+      `${conversation.id} vs ${previous.conversationId}`);
+    const resumed = (await gateway.listToolGrants(SESSION_KEY, context)).map((grant) => grant.name);
+    require("reopen.grants_persisted", resumed.includes("read") && resumed.includes("write"), resumed.join(","));
+    const revoked = (await gateway.revokeTools(SESSION_KEY, ["write"], context)).map((grant) => grant.name);
+    require("reopen.revoke_persisted", !revoked.includes("write") && revoked.includes("read"), revoked.join(","));
+
+    const turnStart = recorder.requests.length;
+    await driver.send(conversation, context,
+      "Fresh process acceptance check. State the acceptance code from the earlier instruction. Also call the " +
+        `skill tool for "${SKILL_NAME}" and read ${TOPIC_PATH}. The code must come from your conversation context.`, [
+        core.fauxAssistantMessage([
+          core.fauxToolCall("skill", { name: SKILL_NAME }),
+          core.fauxToolCall("read", { path: TOPIC_PATH }),
+        ], { stopReason: "toolUse" }),
+        core.fauxAssistantMessage(`The acceptance code is ${FACT}.`),
+      ]);
+    const turnRequests = recorder.requests.slice(turnStart);
+    const first = turnRequests[0];
+    require("reopen.request_observed", first !== undefined);
+    const isolation = factIsolation(first.text);
+    require("reopen.compaction_summary_present", isolation.summaryCount === 1, JSON.stringify(isolation));
+    require("reopen.summary_message_has_fact", isolation.summaryHasFact, JSON.stringify(isolation));
+    require("reopen.fact_only_in_summary_message", !isolation.othersHaveFact, JSON.stringify(isolation));
+    require("reopen.raw_turn_absent", !sentinelOutsideSummary(first.text));
+    evidence.observations = {
+      ...(evidence.observations ?? {}),
+      firstRequestFactOccurrences: isolation.factOccurrences,
+      topicMarkerInFirstRequest: first.text.includes(TOPIC_MARKER),
+      skillBodyInFirstRequest: first.text.includes(SKILL_BODY),
+    };
+    require("reopen.fact_not_in_system_prompt", !first.prompt.includes(FACT));
+    require("reopen.bootstrap_rediscovered", first.prompt.includes(BOOTSTRAP_MARKER));
+    require("reopen.loaded_memory_present", first.prompt.includes(MEMORY_MARKER));
+    require("reopen.memory_manifest_rediscovered",
+      first.prompt.includes(`\`${TOPIC_PATH}\` (topic`) && first.prompt.includes(TOPIC_DESCRIPTION));
+    require("reopen.skill_summary_present", first.prompt.includes(SKILL_NAME) && first.prompt.includes(SKILL_DESCRIPTION));
+    // The summary may legitimately quote a body; record it instead of failing.
+    evidence.observations = { ...(evidence.observations ?? {}), skillSummaryPresent: first.prompt.includes(SKILL_NAME) };
+
+    const results = turnRequests.flatMap((entry) => toolResultsOf(entry.text));
+    const skillResults = results.filter((result) => result.toolName === "skill" && !result.isError);
+    const readResults = results.filter((result) => result.toolName === "read" && !result.isError);
+    require("reopen.skill_body_on_demand", skillResults.length === 1 && skillResults[0].text.includes(SKILL_BODY),
+      sha256(skillResults[0]?.text ?? "").slice(0, 16));
+    require("reopen.memory_read_granted",
+      readResults.length === 1 && readResults[0].text.includes(TOPIC_MARKER) && !readResults[0].text.includes(FACT),
+      sha256(readResults[0]?.text ?? "").slice(0, 16));
+
+    const view = await conversation.context(context);
+    const answer = lastAssistantText(view);
+    require("reopen.recall_in_answer", answer.includes(FACT), sha256(answer).slice(0, 16));
+    evidence.answerSha256 = sha256(answer);
+    evidence.requests = recorder.requests.map(({ kind, chars, sha256: digest }) => ({ kind, chars, sha256: digest }));
+  } finally {
+    if (gateway) await gateway.close(context);
+    evidence.checks = checks;
+    evidence.status = collectorStatus(checks);
+  }
+}
+
+function sanitizeSynthetic(value) {
+  return String(value)
+    .split(FACT).join("<fact>")
+    .split(SENTINEL).join("<sentinel>")
+    .split(SKILL_BODY).join("<skill-body>")
+    .split(TOPIC_MARKER).join("<topic-marker>");
+}
+
+async function runRealPhase(phase, stateDir, options) {
+  const evidencePath = join(stateDir, phase === "first" ? PHASE1_EVIDENCE : PHASE2_EVIDENCE);
+  const evidence = {
+    phase,
+    mode: options.live ? "real-model" : "offline-real-rehearsal",
+    provider: {
+      kind: options.live ? "native" : "faux",
+      model: options.live ? `${REAL_MODEL.provider}/${REAL_MODEL.modelId}` : `${PROVIDER}/${MODEL_ID}`,
+    },
+    checks: [],
+    status: "fail",
+  };
+  let budget;
+  try {
+    const core = await loadCore();
+    if (options.live && (typeof options.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(options.apiKeyEnv))) {
+      throw new Error("live mode requires a valid --api-key-env name");
+    }
+    budget = createBudget({ stateDir, ...options.caps });
+    await budget.acquire();
+    let runtimeOptions = options;
+    if (options.live) {
+      // Read only the named variable; never pass ambient environment to the provider.
+      const apiKey = process.env[options.apiKeyEnv];
+      if (typeof apiKey !== "string" || apiKey.trim() === "") {
+        throw new Error("credential environment variable is not set");
+      }
+      const config = realGatewayConfig(core, stateDir, options);
+      const isolatedEnv = Object.create(null);
+      isolatedEnv[options.apiKeyEnv] = apiKey;
+      const prepared = core.createProviderModels(config, isolatedEnv);
+      runtimeOptions = { ...options, models: prepared.models };
+    }
+    if (phase === "first") await runRealFirstPhase(core, stateDir, evidence, runtimeOptions, budget);
+    else if (phase === "reopen") await runRealSecondPhase(core, stateDir, evidence, runtimeOptions, budget);
+    else throw new Error(`unknown real phase ${phase}`);
+  } catch (error) {
+    const detail = sanitizeSynthetic(redact(error?.message ?? String(error), stateDir));
+    evidence.checks.push({
+      id: `${phase === "first" ? "phase1" : "phase2"}.run_failed`,
+      status: "fail",
+      detail,
+    });
+    evidence.error = sanitizeSynthetic(redact(error?.stack ?? String(error), stateDir)).split("\n").slice(0, 6).join("\n");
+  } finally {
+    if (budget !== undefined) {
+      try {
+        evidence.budget = budget.snapshot();
+      } catch {
+        evidence.budget = undefined;
+      }
+      await budget.close().catch(() => undefined);
+    }
+  }
+  evidence.status = collectorStatus(evidence.checks);
+  await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
+  process.exit(evidence.status === "pass" ? 0 : 1);
+}
+
+function realChildArgs(mode, phase, stateDir, caps, apiKeyEnv) {
+  return [
+    SCRIPT,
+    `--mode=${mode}`,
+    `--phase=${phase}`,
+    `--state=${stateDir}`,
+    `--max-requests=${caps.maxRequests}`,
+    `--max-input=${caps.maxInputTokens}`,
+    `--max-output=${caps.maxOutputTokens}`,
+    `--max-output-per-request=${caps.maxOutputPerRequest}`,
+    ...(apiKeyEnv === undefined ? [] : [`--api-key-env=${apiKeyEnv}`]),
+  ];
+}
+
+async function readBudgetLedger(stateDir) {
+  try {
+    return JSON.parse(await readFile(join(stateDir, "budget-ledger.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function budgetEvidenceSummary(ledger) {
+  if (ledger === undefined) return undefined;
+  return {
+    requests: ledger.requests,
+    inputReserved: ledger.inputReserved,
+    outputReserved: ledger.outputReserved,
+    inputActual: ledger.inputActual,
+    outputActual: ledger.outputActual,
+    violation: ledger.violation,
+    records: ledger.records.map((record) => ({
+      kind: record.kind,
+      bytes: record.bytes,
+      inputBound: record.inputBound,
+      outputReserve: record.outputReserve,
+      payloadSha256: record.payloadSha256,
+      ...(record.usage === undefined ? {} : { usage: record.usage }),
+    })),
+  };
+}
+
+async function runReal({ live }) {
+  const started = Date.now();
+  const checks = [];
+  let stateDir;
+  const record = (id, ok, detail) => {
+    const safe = detail === undefined
+      ? undefined
+      : (stateDir === undefined ? String(detail) : redact(String(detail), stateDir)).slice(0, 800);
+    checks.push({ id: `runner.${id}`, status: ok ? "pass" : "fail", ...(safe === undefined ? {} : { detail: safe }) });
+    return ok;
+  };
+  const caps = realCapsFromArgs();
+  const apiKeyEnv = argValue("--api-key-env=");
+  if (live && (apiKeyEnv === undefined || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv))) {
+    process.stderr.write("core-acceptance: --mode=real requires --api-key-env=NAME\n");
+    return 2;
+  }
+  const phases = {};
+  try {
+    stateDir = await mkdtemp(join(tmpdir(), live ? "nanobot-real-acceptance-" : "nanobot-real-rehearsal-"));
+    const rehearsalDir = join(stateDir, live ? "preflight" : "run");
+    await mkdir(rehearsalDir, { recursive: true });
+    await generateWorkspace(rehearsalDir);
+    const first = await runChild(
+      realChildArgs("real-rehearsal", "first", rehearsalDir, caps),
+      ROOT,
+      REAL_CHILD_TIMEOUT_MS,
+    );
+    phases.rehearsalFirst = { exitCode: first.code, signal: first.signal, timedOut: first.timedOut, durationMs: first.durationMs };
+    record("rehearsal_first_process", first.code === 0 && !first.timedOut,
+      first.code === 0 && !first.timedOut ? undefined : redact(first.error?.message ?? first.stderr.split("\n").slice(-4).join(" "), stateDir));
+    const firstEvidence = await readEvidence(rehearsalDir, PHASE1_EVIDENCE);
+    record("rehearsal_first_evidence", firstEvidence !== undefined && firstEvidence.status === "pass");
+
+    const second = firstEvidence?.status === "pass"
+      ? await runChild(
+          realChildArgs("real-rehearsal", "reopen", rehearsalDir, caps),
+          ROOT,
+          REAL_CHILD_TIMEOUT_MS,
+        )
+      : undefined;
+    if (second === undefined) {
+      record("rehearsal_reopen_skipped", true, "phase 1 did not pass; no reopen dispatch");
+    } else {
+      phases.rehearsalReopen = { exitCode: second.code, signal: second.signal, timedOut: second.timedOut, durationMs: second.durationMs };
+      record("rehearsal_reopen_process", second.code === 0 && !second.timedOut,
+        second.code === 0 && !second.timedOut ? undefined : redact(second.error?.message ?? second.stderr.split("\n").slice(-4).join(" "), stateDir));
+    }
+    const secondEvidence = second === undefined ? undefined : await readEvidence(rehearsalDir, PHASE2_EVIDENCE);
+    record("rehearsal_reopen_evidence", secondEvidence !== undefined && secondEvidence.status === "pass");
+
+    const rehearsalLedger = await readBudgetLedger(rehearsalDir);
+    const rehearsalChecks = [...(firstEvidence?.checks ?? []), ...(secondEvidence?.checks ?? [])];
+    checks.push(...rehearsalChecks);
+    const rehearsalPass = checks.every((check) => check.status === "pass");
+    record("rehearsal.pass", rehearsalPass);
+    const rehearsalBoundsPass = rehearsalLedger !== undefined
+      && rehearsalLedger.requests <= caps.maxRequests
+      && rehearsalLedger.inputReserved <= caps.maxInputTokens
+      && rehearsalLedger.outputReserved <= caps.maxOutputTokens;
+    record("rehearsal.bounds_pass", rehearsalBoundsPass,
+      `${rehearsalLedger?.requests ?? "missing"}/${caps.maxRequests} requests, ` +
+        `${rehearsalLedger?.inputReserved ?? "missing"}/${caps.maxInputTokens} input, ` +
+        `${rehearsalLedger?.outputReserved ?? "missing"}/${caps.maxOutputTokens} output`);
+    record("rehearsal.measured_requests",
+      rehearsalLedger !== undefined && rehearsalLedger.requests <= caps.maxRequests,
+      `${rehearsalLedger?.requests ?? "missing"}/${caps.maxRequests}`);
+    record("rehearsal.measured_input_bound",
+      rehearsalLedger !== undefined && rehearsalLedger.inputReserved <= caps.maxInputTokens,
+      `${rehearsalLedger?.inputReserved ?? "missing"}/${caps.maxInputTokens}`);
+    record("rehearsal.measured_output_bound",
+      rehearsalLedger !== undefined && rehearsalLedger.outputReserved <= caps.maxOutputTokens,
+      `${rehearsalLedger?.outputReserved ?? "missing"}/${caps.maxOutputTokens}`);
+    const rehearsalBudget = budgetEvidenceSummary(rehearsalLedger);
+
+    let liveEvidence;
+    let liveLedger;
+    let liveChecks = [];
+    if (live) {
+      if (!rehearsalPass || !rehearsalBoundsPass) {
+        checks.push({ id: "runner.live_blocked_rehearsal", status: "fail", detail: "rehearsal did not pass or did not fit the caps; no live dispatch" });
+      } else {
+        const liveDir = join(stateDir, "live");
+        await mkdir(liveDir, { recursive: true });
+        await generateWorkspace(liveDir);
+        const liveFirst = await runChild(realChildArgs("real", "first", liveDir, caps, apiKeyEnv), ROOT, REAL_CHILD_TIMEOUT_MS);
+        phases.liveFirst = { exitCode: liveFirst.code, signal: liveFirst.signal, timedOut: liveFirst.timedOut, durationMs: liveFirst.durationMs };
+        record("live_first_process", liveFirst.code === 0 && !liveFirst.timedOut,
+          liveFirst.code === 0 && !liveFirst.timedOut ? undefined : redact(liveFirst.error?.message ?? liveFirst.stderr.split("\n").slice(-4).join(" "), stateDir));
+        const liveFirstEvidence = await readEvidence(liveDir, PHASE1_EVIDENCE);
+        record("live_first_evidence", liveFirstEvidence !== undefined && liveFirstEvidence.status === "pass");
+        let liveSecondEvidence;
+        if (liveFirstEvidence?.status === "pass") {
+          const liveSecond = await runChild(realChildArgs("real", "reopen", liveDir, caps, apiKeyEnv), ROOT, REAL_CHILD_TIMEOUT_MS);
+          phases.liveReopen = { exitCode: liveSecond.code, signal: liveSecond.signal, timedOut: liveSecond.timedOut, durationMs: liveSecond.durationMs };
+          record("live_reopen_process", liveSecond.code === 0 && !liveSecond.timedOut,
+            liveSecond.code === 0 && !liveSecond.timedOut ? undefined : redact(liveSecond.error?.message ?? liveSecond.stderr.split("\n").slice(-4).join(" "), stateDir));
+          liveSecondEvidence = await readEvidence(liveDir, PHASE2_EVIDENCE);
+          record("live_reopen_evidence", liveSecondEvidence !== undefined && liveSecondEvidence.status === "pass");
+        } else {
+          record("live_reopen_skipped", true, "phase 1 did not pass; no further provider dispatch");
+        }
+        liveChecks = [...(liveFirstEvidence?.checks ?? []), ...(liveSecondEvidence?.checks ?? [])];
+        checks.push(...liveChecks);
+        liveLedger = await readBudgetLedger(liveDir);
+        record("live.measured_requests", liveLedger !== undefined && liveLedger.requests <= caps.maxRequests,
+          `${liveLedger?.requests ?? "missing"}/${caps.maxRequests}`);
+        record("live.measured_input_bound", liveLedger !== undefined && liveLedger.inputReserved <= caps.maxInputTokens,
+          `${liveLedger?.inputReserved ?? "missing"}/${caps.maxInputTokens}`);
+        record("live.measured_output_bound", liveLedger !== undefined && liveLedger.outputReserved <= caps.maxOutputTokens,
+          `${liveLedger?.outputReserved ?? "missing"}/${caps.maxOutputTokens}`);
+        record("live.no_budget_violation", liveLedger?.violation === null, String(liveLedger?.violation));
+        liveEvidence = { first: liveFirstEvidence, reopen: liveSecondEvidence };
+      }
+    }
+
+    const allPass = checks.length > 0 && checks.every((check) => check.status === "pass");
+    const report = {
+      runner: "core-acceptance",
+      version: 1,
+      status: allPass ? "pass" : "fail",
+      mode: live ? "real-model" : "offline-real-rehearsal",
+      provider: live
+        ? { kind: "native", model: `${REAL_MODEL.provider}/${REAL_MODEL.modelId}`, thinking: REAL_THINKING, network: true }
+        : { kind: "faux", model: `${PROVIDER}/${MODEL_ID}`, network: false, purpose: "rehearsal of the real flow" },
+      assumptions: REAL_ASSUMPTIONS,
+      caps: { ...caps, framingTokensPerRequest: INPUT_FRAMING_TOKENS_PER_REQUEST },
+      rehearsal: { checks: counts(rehearsalChecks), budget: rehearsalBudget,
+        observations: { phase1: firstEvidence?.observations, phase2: secondEvidence?.observations } },
+      ...(live ? { live: { checks: counts(liveChecks), budget: budgetEvidenceSummary(liveLedger),
+        observations: { phase1: liveEvidence?.first?.observations, phase2: liveEvidence?.reopen?.observations } } } : {}),
+      notRun: live
+        ? ["A/B harness fixture comparison and parity claims", "channels, Telegram delivery and scheduled outbound sends", "the owner's real workspace, personal data and non-auth credentials", "Bubblewrap sandbox backend"]
+        : ["live provider calls (rehearsal only)", "A/B harness fixture comparison and parity claims", "channels, Telegram delivery and scheduled outbound sends", "credentials, personal workspace and live data", "Bubblewrap sandbox backend"],
+      limits: {
+        childTimeoutMs: REAL_CHILD_TIMEOUT_MS,
+        requestTimeoutMs: REAL_REQUEST_TIMEOUT_MS,
+        compactionWaitMs: COMPACTION_WAIT_MS,
+        budgetFramingTokensPerRequest: INPUT_FRAMING_TOKENS_PER_REQUEST,
+        fillerChars: REAL_FILLER_CHARS,
+      },
+      durationMs: Date.now() - started,
+      checks,
+      counts: counts(checks),
+      phases,
+    };
+    const text = `${JSON.stringify(report, null, 2)}\n`;
+    const output = argValue("--output=");
+    if (output !== undefined) {
+      try {
+        await writeFile(resolve(output), text, { flag: "wx" });
+      } catch (error) {
+        if (error?.code === "EEXIST") {
+          process.stderr.write(`core-acceptance: refusing to overwrite existing output ${resolve(output)}\n`);
+          return 2;
+        }
+        throw error;
+      }
+    }
+    process.stdout.write(text);
+    return allPass ? 0 : 1;
+  } catch (error) {
+    process.stderr.write(`core-acceptance: ${error?.message ?? String(error)}\n`);
+    return 1;
+  } finally {
+    if (stateDir !== undefined) await rm(stateDir, { recursive: true, force: true });
+  }
+}
+
+async function runPhase(phase, stateDir, mode, options) {
+  if (mode === "real" || mode === "real-rehearsal") {
+    await runRealPhase(phase, stateDir, {
+      live: mode === "real",
+      rehearsal: mode === "real-rehearsal",
+      caps: options.caps,
+      apiKeyEnv: options.apiKeyEnv,
+    });
+    return;
+  }
   const evidencePath = join(
     stateDir,
     phase === "first" ? PHASE1_EVIDENCE : phase === "reopen" ? PHASE2_EVIDENCE : BUDGET_EVIDENCE,
@@ -929,7 +1638,7 @@ async function runPhase(phase, stateDir) {
 // Runner
 // ---------------------------------------------------------------------------
 
-function runChild(args, cwd) {
+function runChild(args, cwd, timeoutMs = CHILD_TIMEOUT_MS) {
   return new Promise((done) => {
     const started = Date.now();
     const child = spawn(process.execPath, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -948,7 +1657,7 @@ function runChild(args, cwd) {
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
-    }, CHILD_TIMEOUT_MS);
+    }, timeoutMs);
     const finish = (code, signal, error) => {
       clearTimeout(timer);
       done({ code, signal, error, timedOut, stdout, stderr, durationMs: Date.now() - started });
@@ -966,7 +1675,7 @@ async function readEvidence(stateDir, name) {
   }
 }
 
-async function run() {
+async function runOffline() {
   const started = Date.now();
   const checks = [];
   const record = (id, ok, detail) => {
@@ -1071,12 +1780,19 @@ async function run() {
 
 const phase = argValue("--phase=");
 const stateDir = argValue("--state=");
+const mode = argValue("--mode=") ?? "offline-synthetic";
 if (phase === undefined) {
-  const code = await run();
-  process.exit(code);
+  if (mode === "offline-synthetic") process.exit(await runOffline());
+  if (mode === "real-rehearsal") process.exit(await runReal({ live: false }));
+  if (mode === "real") process.exit(await runReal({ live: true }));
+  process.stderr.write(`core-acceptance: unknown --mode=${mode}\n`);
+  process.exit(2);
 }
 if (stateDir === undefined) {
   process.stderr.write("core-acceptance: --phase requires --state\n");
   process.exit(2);
 }
-await runPhase(phase, stateDir);
+await runPhase(phase, stateDir, mode, {
+  caps: realCapsFromArgs(),
+  apiKeyEnv: argValue("--api-key-env="),
+});

@@ -6,7 +6,8 @@ it — can carry one conversation through context discovery, an on-demand skill,
 topic-memory read/write under expiring grants, native compaction and a
 fresh-process reopen.
 
-It is not a unit-test suite and it is not real-model or A/B acceptance.
+It is not a unit-test suite. The default and rehearsal modes are offline and
+make no provider call; `--mode=real` is the separately authorized live path.
 
 ## Run
 
@@ -46,7 +47,8 @@ the phase-1 context and in the phase-2 request that contains the fact. In phase 
 the raw sentinel, the topic body marker and the skill body are absent until their
 own tool results load them.
 
-The faux provider is the only model endpoint. The summarizer request is real
+The faux provider is the only model endpoint in offline and rehearsal modes.
+The summarizer request is real
 (native Durable compaction); the runner extracts the early-turn fact and topic
 locator from that request before answering it. If extraction or the per-message
 isolation check fails, the run fails rather than supplying the fact from a
@@ -84,68 +86,104 @@ Only synthetic markers and relative workspace labels appear in the report. The
 generated workspace, SQLite store and evidence files are deleted at the end of
 the run; no output is written into the repository by default.
 
-## Real-model budget feasibility (2026-10-28: blocked)
+## Real-model acceptance (2026-10-28: 600,000 cap, offline rehearsal)
 
-The budget guard is implemented and self-probed, but real mode is not enabled.
-The authorized cap cannot be enforced as a guaranteed upper bound for the
-required compaction path.
+The owner raised the conservative input cap to 600,000 token-equivalents
+(20 requests, 20,000 output, one synthetic run). The real flow is implemented
+but has not made a live provider call. `--mode=real-rehearsal` runs the exact
+flow with the faux provider and no network; `--mode=real` additionally requires
+`--api-key-env=NAME` and first runs that rehearsal as a preflight.
 
-Durable's manual compaction keeps about 20,000 estimated recent tokens, so the
-transcript needs roughly 70,000 ASCII characters of filler before the early fact
-is compacted. In the offline flow with one 70,000-character filler turn, the
-fourteen payloads measured 519,845 characters in total (phase 1:
-4,387/5,439/6,086/6,629/7,515/8,009/8,835/79,277/79,757/80,533 and a 3,225
-summary; phase 2: 75,651/76,478/78,024). Repeated context dominates.
+The flow uses one 70,000-character filler turn so Durable's manual compaction
+has an old prefix, then the measured full sequence:
 
-The guard's conservative bound is the UTF-8 payload bytes plus 4,096 framing
-tokens per request: 519,845 + 14 × 4,096 = 577,189 tokens, above the authorized
-320,000. The usual ~3.5 characters/token estimate would put actual usage near
-148,500, but that is an estimate, not a pre-dispatch guarantee. Enforcing the
-estimate would violate the budget contract; enforcing the byte bound makes the
-required path fail closed before completion.
+- phase 1: skill load + early fact (2 requests), topic write (2), topic read
+  (2), one filler turn (1), native compaction summary (1);
+- phase 2: fresh process, one recall + skill + topic-read turn (2).
 
-Two provider-side limits remain. `max_tokens` is the only pre-dispatch output
-control; whether the proxy counts reasoning tokens inside it is documented API
-behavior, not a locally provable fact. The provider tokenizer and any
-proxy-added framing are not observable before dispatch, so the 4,096-token
-framing reserve is a conservative allowance, not a proof about those additions.
+A real summary may quote the raw-turn sentinel inside the summary itself. The
+real flow therefore rejects a sentinel outside the summary (a raw replay), not
+a sentinel quoted by the summarizer. The offline scripted summary never quotes
+it, so its stricter check remains.
 
-Options, all requiring an owner decision:
+The rehearsal measured **10 requests**, a conservative input reservation of
+about **316,800 tokens** (about 156,300 in phase 1, 160,500 in phase 2), an
+output reservation of **15,360**, reported faux input usage of **102,808** and
+output usage of **232**. The measured full flow therefore fits the 600,000 cap with
+substantial room for longer live responses, and the guard still enforces each
+request against the remaining ledger.
 
-1. Raise the authorized input cap to at least 600,000 for this conservative
-   guard (actual usage should stay near 150,000).
-2. Accept an estimate-based input guard (for example the ~3.5 characters/token
-   estimator Durable uses), explicitly not a hard guarantee.
-3. Make the Gateway compaction policy configurable for acceptance and lower
-   `keepRecentTokens`, shrinking the required transcript and repeated context
-   enough to fit 320,000 under the conservative bound. This is a product change,
-   not part of this batch.
-4. Use a provider that exposes a pre-dispatch token-count endpoint (opencode-go
-   does not), then reserve that exact count.
+Run:
 
-Until one is chosen, no live provider call is made and the runner stays
-offline-only. The guard self-probe proves the refusal paths, ledger persistence
-and lock exclusion with faux models.
+```bash
+npm run build
+node scripts/core-acceptance.mjs --mode=real-rehearsal
+node scripts/core-acceptance.mjs --mode=real --api-key-env=OPENCODE_API_KEY
+```
+
+The second command is the one owner-authorized live run and is **not run** by
+this batch. Live mode runs the offline rehearsal first and refuses to start if
+it fails or if its measured bound exceeds the caps. Only after that gate does a
+child read the named environment variable, and it passes only that variable to
+`createProviderModels`; no owner config, ambient environment, personal
+workspace or non-auth credential is read. A phase-1 failure skips phase 2 so a
+failed attempt cannot turn into a second run.
+
+Review points before the single live call:
+
+- `scripts/core-acceptance-budget.mjs`: reserve-before-dispatch, persisted ledger,
+  exclusive lock, serialized mutations, output clamp, unsupported-payload/API
+  refusal, and actual-usage overrun checks. The self-probe covers them.
+- `scripts/core-acceptance.mjs`: `runReal`, `runRealFirstPhase`,
+  `runRealSecondPhase`, and `realGatewayConfig`. Confirm the preflight gate, the
+  isolated one-variable provider environment, the phase-2 skip after a failed
+  phase 1, and that the live child reads the credential only after the budget
+  lock is held.
+- The report carries `assumptions`, `caps`, per-request `budget.records`
+  (bytes, bounds, hashes, usage), `observations`, and phase timings. It carries
+  no transcript, fact/body marker, credential or host path.
+
+## Guard assumptions (explicit, not proven from source)
+
+- The input reservation is the UTF-8 payload byte length plus 4,096 framing
+tokens per request. Payload bytes bound tokens only if every provider token
+covers at least one byte (a byte-level tokenizer). The opencode-go tokenizer is
+not verified from source.
+- The 4,096-token framing reserve is a conservative allowance for chat-template
+  and proxy-added framing. It is not a proof that the provider adds no more.
+- The output reservation assumes the provider honours `max_tokens` as the total
+  generated-token cap, including reasoning. opencode-go's reasoning accounting
+  is not verified from source.
+- The guard sees pi-ai's pre-dispatch payload. Provider- or proxy-internal
+  transformations after that hook are unobservable.
+- The rehearsal measures a faux synthetic payload. The live run re-reserves the
+  native adapter payload, so the measured bound is a preflight floor, not the
+  live exact bound. The live guard can still fail closed mid-run if real
+  responses are larger than the rehearsal.
+
+These assumptions are repeated in every real-mode report. If any input or
+output payload lacks a recognised limit, or the adapter has no pre-dispatch
+hook, the guard refuses before dispatch. A live run therefore remains an
+acceptance experiment, not a proof about provider accounting.
 
 ## Bounds
 
-- Each child process is killed at 120 s; compaction waits at most 20 s and each
-  turn is bounded by the child timeout. The guard injects the same per-request
-  timeout for a future real run.
-- All state is created under one owned temp directory and removed in `finally`.
-- No provider request, credential lookup, personal workspace, external fixture,
-  channel send or persistent repository artifact is involved.
+- Offline children are killed at 120 s. Real children are killed at 900 s; each
+  provider request is also capped at 120 s by the guard.
 - Real mode reserves 4,096 framing tokens per request on top of the exact
-  payload byte length, clamps the payload output limit, persists the ledger and
-  holds an exclusive lock; an unfillable or unsupported bound is refused before
-  dispatch.
+  payload byte length, clamps the payload output limit to the remaining output
+  budget (at most 1,536 per request), persists the ledger and holds an exclusive
+  lock; an unfillable or unsupported bound is refused before dispatch.
+- All state is created under one owned temp directory and removed in `finally`.
+- Offline mode makes no provider request, credential lookup, personal workspace
+  access, external fixture call or channel send. Live mode is opt-in and reads
+  only the named credential variable.
 
 ## Not covered
 
-Real-model summarization fidelity, A/B fixture comparison, provider/fallback
-matrices, channels and scheduled delivery, credentials, the owner's real
-workspace, Bubblewrap, and deployment are **not run**. Passing this runner is
-evidence of plumbing over the real Gateway, not of model-quality or Python
-parity. Real-model acceptance remains an owner-approved later step; the
-feasibility section above records why the current cap cannot yet be enforced as
-a guaranteed bound.
+A live model-quality result, real-model summarization fidelity, A/B fixture
+comparison, provider/fallback matrices, channels and scheduled delivery, the
+owner's real workspace, Bubblewrap, and deployment are **not run** in this
+batch. Passing the rehearsal is evidence that the real flow and guard are wired
+and fit the cap, not evidence of model behaviour or Python parity. Review the
+guard and the real flow before the single live call.

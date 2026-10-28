@@ -377,6 +377,7 @@ function syntheticPayload(model, context, options) {
  */
 export function wrapModels(models, budget, options = {}) {
   const allowUnobserved = options.allowUnobserved === true;
+  const onRequest = options.onRequest;
   const bindings = new Map();
   const prepare = (operation, model, context, requestOptions) => {
     const api = model?.api;
@@ -385,6 +386,9 @@ export function wrapModels(models, budget, options = {}) {
         throw new BudgetError(`provider API ${String(api)} has no pre-dispatch payload hook; refusing an unbounded request`, "unbounded");
       }
     }
+    // Observation happens before dispatch and before the payload reserve, so the
+    // acceptance checks see exactly the context the provider will receive.
+    if (onRequest !== undefined) onRequest({ operation, model, context });
     const gate = newGate();
     if (!SUPPORTED_APIS.has(api)) {
       gate.reserving = true;
