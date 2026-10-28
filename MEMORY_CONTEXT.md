@@ -12,7 +12,9 @@ entry's workspace-relative path, and writes it with the existing native
 `write`/`edit` tools. This module never creates, writes, renames, or deletes a
 file, including a missing `memory/` directory.
 
-Host wiring is not included in this slice.
+The host opt-in is `workspaceContext.memoryManifest: true`. The configured
+`workspaceContext.memoryFiles` remain the injected memory sources and are also
+the manifest's `loadedFiles`; topic bodies stay on disk.
 
 ## API
 
@@ -46,7 +48,8 @@ The result contains:
   frontmatter-stripped body length in Unicode code points.
 - `manifest`: `# Memory Tree` text with the Python intro line and one line per
   entry: ``- `memory/x.md` (topic, 123 chars): description``. More than the entry
-  cap adds `- … N more memory files`.
+  cap, a short character budget, or a stopped directory scan adds a visible
+  `more memory files` line; entries are never dropped without that line.
 - `document`: a frozen `{ source: "memory:manifest", content: manifest }` for
   `ConversationContextSnapshot.memory`; absent when the manifest is empty.
 
@@ -72,16 +75,23 @@ Under `<workspaceRoot>/memory/`, recursively:
 | Symlinked file or directory | Skipped, not followed. |
 | Non-regular file, non-`.md` file | Ignored. |
 | Unsafe/oversized segment name | Ignored. |
+| Workspace-relative path over 246 characters | Ignored; provenance would not fit. |
 
 Only files explicitly named in `loadedFiles` are read outside that topic set.
 Each must exist and be a regular, non-symlinked, single-link file; a missing or
 invalid explicitly named file rejects the whole load. A supplied loaded file is
-always listed even when the entry cap is reached.
+always listed even when the entry cap is reached; only the manifest character
+budget can shorten the list, and that omission is counted visibly.
 
 Entries are sorted by path with code-unit comparison, so ordering is stable
 across locales. Every file is re-read on each call; a topic written by the native
 `write` tool is therefore visible to the next discovery pass and after restart.
 Each call returns new frozen objects; there is no module cache.
+
+Loaded-file parents are checked too: each component below the workspace root
+must be a real directory, so a configured `memory/topics/x.md` cannot traverse
+`memory/topics -> /outside`. A symlinked workspace root is still accepted
+because the host named it explicitly.
 
 Descriptions come from flat frontmatter `description:` when present, otherwise
 the first Markdown heading, otherwise `(missing description)`. A description is
@@ -92,21 +102,33 @@ the flat `key: value` subset used by memory files (CRLF is tolerated).
 ## Bounds and failure behaviour
 
 `MEMORY_CONTEXT_LIMITS` is exported: 80 manifest entries, 32 explicit loaded
-files, 64 KiB per file, 1 MiB aggregate, 15,488 manifest code points
-(`sectionChars - 512` reserved for the renderer heading and provenance), 240
-description code points, 246-character paths, 8 path segments, 64 characters per
-segment, 4,096 inspected directory entries, and 4,096-character roots.
+files, 64 KiB per file, 5 MiB aggregate (80 files at the per-file cap),
+15,488 manifest code points (`sectionChars - 512` reserved for the renderer
+heading and provenance), 240 description code points, 246-character paths, 8
+path segments, 64 characters per segment, 4,096 inspected directory entries,
+and 4,096-character roots.
 
-Discovery fails closed with `MemoryContextBoundsError`, `MemoryContextFileError`
-(a stable kind and workspace-relative source, never an absolute path or file
-body), or `MemoryContextInputError`. This includes oversized files, an excessive
-tree, invalid UTF-8, a symlinked or non-regular named file, a disappeared file
-mid-read, a changed file, and a manifest over budget. No partial result is
-returned. A missing `memory/` directory is not an error and is never created.
+The entry cap and byte aggregate are practical for a real workspace: the byte
+aggregate is exactly the entry cap times the per-file cap, so it cannot reject a
+load that the entry cap accepts, and peak memory stays at one file because
+bodies are discarded. An over-budget manifest is shortened, not rejected, and a
+directory tree beyond the inspected-entry bound stops discovery with a visible
+manifest line. Neither case silently drops entries or fails an ordinary
+workspace.
+
+Other failures fail closed with `MemoryContextBoundsError`,
+`MemoryContextFileError` (a stable kind and workspace-relative source, never an
+absolute path or file body), or `MemoryContextInputError`. This includes an
+oversized file, invalid UTF-8, a symlinked or non-regular named file, a
+disappeared file mid-read, and a changed file. No partial result is returned. A
+missing `memory/` directory is not an error and is never created.
 
 The manifest is bounded on its own, not together with other memory documents.
 A host adding it beside many other memory sources must keep the shared renderer
-section budget; the helper does not see those sources.
+section budget; the helper does not see those sources. `workspace-host.ts`
+appends the manifest after the configured memory files, matching Python's order,
+so a combined memory section that exceeds the renderer budget is clipped with
+the renderer's visible truncation marker.
 
 ## Safety and limitations
 
@@ -132,28 +154,43 @@ The helper deliberately does not duplicate the native tools:
 
 This is the memory-discovery foundation, not full Python `MemoryStore` parity.
 It does not implement `get_memory_context()` system/legacy paragraph
-deduplication, always-loaded memory injection, `history.jsonl`, archived
-summaries, Dream, cursor/usage state, ranking or retrieval, `memory_read`/
-`memory_write`/`memory_search` tool actions, or the memory-tree description
-format's Python truncation suffix. It does not include topic bodies, follow
-symlinks, or create `memory/` directories. Python's tree slices the combined
-file list to 80; this helper always includes explicitly loaded files first so a
-named file cannot be silently hidden by the cap.
+deduplication, automatic `MEMORY.md`/`memory/system/` injection, `history.jsonl`,
+archived summaries, Dream, cursor/usage state, ranking or retrieval,
+`memory_read`/`memory_write`/`memory_search` tool actions, or the memory-tree
+description format's Python truncation suffix. The host injects only the
+explicitly configured files, not every file Python would mark loaded. It does
+not include topic bodies, follow symlinks, or create `memory/` directories.
+Python's tree slices the combined file list to 80; this helper always includes
+explicitly loaded files first so a named file cannot be silently hidden by the
+cap.
 
-## Missing host integration and plan
+Memory writes still use the native `write`/`edit` tools without a topic-path
+wrapper; `validateMemoryTopicPath()` is available for a future tool-policy
+slice.
 
-Nothing calls this helper yet: `workspaceContextGatewayOptions()`,
-`workspaceContext` config, `openGateway`, and the coding-tool extension are
-unchanged. Concrete integration:
+## Host integration
 
-1. Add `memoryManifest?: boolean` (or equivalent) and reuse the existing
-   `memoryFiles` as `loadedFiles` after `validateMemoryLoadedFiles()`.
-2. In `workspace-host.ts`, call `loadMemoryContext()` while constructing the
-   per-conversation snapshot, then append `result.document` to the snapshot's
-   `memory` array. The loader must still run per conversation; no cache.
-3. Optionally wrap `write`/`edit` with `validateMemoryTopicPath()` so a
-   memory-scoped write cannot name `MEMORY.md`, `memory/system/`, history, or a
-   hidden path. That is a tool-policy change and belongs to a separate slice.
-4. Add a behavioral probe that observes a native topic write before and after a
-   fresh load. The synthetic probes used for this slice were temporary and are
-   not committed.
+`workspaceContextGatewayOptions()` reads `workspaceContext.memoryManifest`.
+When it is `true`:
+
+- configuration rejects non-boolean values and more than 31 `memoryFiles`, since
+  the manifest needs one of the 32 memory source slots;
+- config parsing also applies `validateMemoryLoadedFiles()` so manifest and
+  workspace selections agree at startup;
+- each conversation snapshot loads `loadWorkspaceContextSnapshot()` and
+  `loadMemoryContext()` without a cache, then appends the manifest document
+  after the configured memory documents;
+- the snapshot provider is re-run on every gateway open, so a topic write made
+  through the granted native tools is present after reopen;
+- a loader error rejects conversation setup instead of installing a partial
+  snapshot. Shortened manifests and stopped scans are not errors.
+
+The gateway `read`/`edit`/`write` grants are unchanged and still come from the
+Durable tool-grant document, so restart keeps both the grants and the
+file-backed memory. Compaction and per-conversation snapshot capture are also
+unchanged: the snapshot is host context, not transcript state.
+
+Synthetic probes for this slice exercised a fresh gateway read, a native topic
+write, close/reopen, grant persistence, manifest reload, 200 topics, 80
+maximum-size files, a >4,096-entry tree, and a loaded-file parent symlink. They
+used temporary directories only and were not committed.

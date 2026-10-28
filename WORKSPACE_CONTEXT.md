@@ -19,6 +19,7 @@ snapshot provider and `openGateway` installs no context extension.
   "workspace": "./workspace",
   "workspaceContext": {
     "memoryFiles": ["memory/MEMORY.md", "memory/system/preferences.md"],
+    "memoryManifest": true,
     "skills": {
       "builtinSkillsRoot": "/opt/nanobot/skills",
       "disabledSkills": ["clawhub"]
@@ -32,6 +33,12 @@ snapshot provider and `openGateway` installs no context extension.
 - `memoryFiles` is an explicit ordered list of `memory/**/*.md` paths and
   defaults to `[]`. No memory file is discovered. Paths are validated with the
   loader's rules at config parse time and again before reading.
+- `memoryManifest` is absent or `false` by default. When `true`, each snapshot
+  also appends the bounded `# Memory Tree` manifest from
+  [`MEMORY_CONTEXT.md`](./MEMORY_CONTEXT.md); the configured `memoryFiles` are
+  its `loaded` entries and every other topic is read on demand with the granted
+  native `read` tool. The manifest uses one of the 32 memory source slots, so at
+  most 31 `memoryFiles` are accepted in that mode.
 - `skills` is absent by default and adds no discovery. When present,
   `builtinSkillsRoot` must be an absolute path to an existing directory and
   `disabledSkills` is an explicit name list validated per entry, with no count
@@ -40,7 +47,8 @@ snapshot provider and `openGateway` installs no context extension.
   `<workspace>/skills`; there is no package, home-directory, or other default
   builtin root. See [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md) for metadata,
   requirement and port-builtin-curation rules.
-- Unknown `workspaceContext` or `workspaceContext.skills` fields are rejected.
+- Unknown `workspaceContext`, `workspaceContext.memoryManifest`, or
+  `workspaceContext.skills` fields are rejected.
   There is no bootstrap-file selection, include glob, implicit default memory
   file, or skill auto-selection.
 - **Identity is omitted.** The host does not render the Python identity template
@@ -235,7 +243,9 @@ does **not** implement or claim parity with:
 
 - `MemoryStore.get_memory_context()` system/legacy paragraph deduplication or
   the bundled `MEMORY.md` template check;
-- `get_memory_tree_context()` topic discovery/descriptions;
+- `get_memory_tree_context()` topic discovery/descriptions; the opt-in host
+  manifest lives in [`MEMORY_CONTEXT.md`](./MEMORY_CONTEXT.md) and is a separate
+  helper, not part of this snapshot loader;
 - `history.jsonl`, archived summaries, session/Dream cursors, usage deltas, or
   Dream;
 - Python's complete `SkillsLoader` behaviour: YAML block metadata, `os` gating,

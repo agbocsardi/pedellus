@@ -163,10 +163,11 @@ The source-backed mapping is:
 - `MemoryStore.get_memory_context()` loads system memory and non-template legacy
   `MEMORY.md` material with paragraph deduplication; `get_memory_tree_context()`
   indexes topic files. This extension only inserts memory snapshots explicitly
-  supplied by the host. It does not discover/deduplicate topics, rank or retrieve
-  them, build a memory tree, access `history.jsonl`, filter archived context by
-  session/Dream cursor, or implement memory writes, archive/usage deltas, or Dream.
-  Those semantics remain P4 work.
+  supplied by the host; the opt-in workspace host can append the bounded tree
+  from [`MEMORY_CONTEXT.md`](./MEMORY_CONTEXT.md). The extension itself does not
+  discover/deduplicate topics, rank or retrieve them, build a memory tree, access
+  `history.jsonl`, filter archived context by session/Dream cursor, or implement
+  memory writes, archive/usage deltas, or Dream.
 - Python's manifest retrieval mode, recent history injection, and subagent-specific
   prompt construction are also not ported. Durable compaction is not memory archive
   or Dream and is not changed here.

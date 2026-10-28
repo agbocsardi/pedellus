@@ -1,6 +1,12 @@
 import { readFile } from "node:fs/promises";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { dirname, isAbsolute, resolve } from "node:path";
+import { CONTEXT_LIMITS } from "./context/index.js";
+import {
+  MemoryContextBoundsError,
+  MemoryContextInputError,
+  validateMemoryLoadedFiles,
+} from "./context/memory.js";
 import {
   WorkspaceContextBoundsError,
   WorkspaceContextInputError,
@@ -47,6 +53,12 @@ export interface WorkspaceSkillsConfig {
 export interface WorkspaceContextConfig {
   /** Explicit workspace-relative `memory/**\/*.md` files, in output order. Defaults to none. */
   readonly memoryFiles: readonly string[];
+  /**
+   * Opt-in topic memory manifest. The named `memoryFiles` are marked loaded and
+   * the remaining `memory/**\/*.md` topics are listed for on-demand reads.
+   * Absent or false leaves the snapshot unchanged.
+   */
+  readonly memoryManifest?: boolean;
   /** Explicit opt-in for workspace/builtin skill discovery; absent means no skills are read. */
   readonly skills?: WorkspaceSkillsConfig;
 }
@@ -156,8 +168,14 @@ function skillNames(value: unknown, label: string): readonly string[] {
 function workspaceContextConfig(value: unknown): WorkspaceContextConfig {
   const raw = object(value, "workspaceContext");
   for (const key of Object.keys(raw)) {
-    if (key !== "memoryFiles" && key !== "skills") throw new Error(`Unknown workspaceContext field: ${key}`);
+    if (key !== "memoryFiles" && key !== "memoryManifest" && key !== "skills") {
+      throw new Error(`Unknown workspaceContext field: ${key}`);
+    }
   }
+  if (raw.memoryManifest !== undefined && typeof raw.memoryManifest !== "boolean") {
+    throw new Error("workspaceContext.memoryManifest must be a boolean");
+  }
+  const memoryManifest = raw.memoryManifest === true;
   let memoryFiles: readonly string[] = Object.freeze([]);
   if (raw.memoryFiles !== undefined) {
     try {
@@ -169,8 +187,27 @@ function workspaceContextConfig(value: unknown): WorkspaceContextConfig {
       throw error;
     }
   }
+  if (memoryManifest) {
+    // The manifest is appended as one more memory source, so the configured
+    // files must leave a source slot for it and use names the loader accepts.
+    if (memoryFiles.length >= CONTEXT_LIMITS.maxMemorySources) {
+      throw new Error(
+        `workspaceContext.memoryFiles must name at most ${CONTEXT_LIMITS.maxMemorySources - 1} files ` +
+        "when workspaceContext.memoryManifest is enabled",
+      );
+    }
+    try {
+      validateMemoryLoadedFiles(memoryFiles);
+    } catch (error) {
+      if (error instanceof MemoryContextInputError || error instanceof MemoryContextBoundsError) {
+        throw new Error(`workspaceContext.memoryFiles is invalid for the memory manifest: ${error.message}`);
+      }
+      throw error;
+    }
+  }
   return Object.freeze({
     memoryFiles,
+    ...(memoryManifest ? { memoryManifest: true } : {}),
     ...(raw.skills === undefined ? {} : { skills: workspaceSkillsConfig(raw.skills) }),
   });
 }

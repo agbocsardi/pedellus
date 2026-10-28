@@ -48,8 +48,13 @@ export const MEMORY_CONTEXT_LIMITS = Object.freeze({
   maxLoadedFiles: CONTEXT_LIMITS.maxMemorySources,
   /** Bytes read from one memory file while deriving its manifest entry. */
   maxFileBytes: 64 * 1024,
-  /** Bytes read across all discovered and loaded files in one call. */
-  maxTotalBytes: 1024 * 1024,
+  /**
+   * Bytes read across all discovered and loaded files in one call. The entry
+   * cap is the practical bound: every listed file may use the per-file cap, so
+   * the manifest never fails only because an ordinary workspace has many
+   * entries. Peak memory stays at one file because bodies are discarded.
+   */
+  maxTotalBytes: 80 * 64 * 1024,
   /** Manifest code points. Leaves room for the renderer heading/provenance. */
   maxManifestChars: CONTEXT_LIMITS.sectionChars - 512,
   /** Description code points, matching Python's memory-tree description cap. */
@@ -144,6 +149,7 @@ export class MemoryContextFileError extends Error {
 
 interface ScanState {
   scanned: number;
+  truncated: boolean;
 }
 
 interface ReadState {
@@ -347,6 +353,7 @@ async function scanTopics(
   state: ScanState,
   found: string[],
 ): Promise<void> {
+  if (state.truncated) return;
   let entries;
   try {
     entries = await readdir(memoryDirPath, { withFileTypes: true });
@@ -357,12 +364,15 @@ async function scanTopics(
     if (code === "ENOENT") return;
     throw new MemoryContextFileError("unreadable", directorySource(segments));
   }
-  state.scanned += entries.length;
-  if (state.scanned > MEMORY_CONTEXT_LIMITS.maxScannedEntries) {
-    throw new MemoryContextBoundsError("maxScannedEntries");
-  }
 
   for (const entry of entries) {
+    if (state.scanned >= MEMORY_CONTEXT_LIMITS.maxScannedEntries) {
+      // A very large tree stops discovery instead of failing the load; the
+      // manifest reports that further entries were not inspected.
+      state.truncated = true;
+      return;
+    }
+    state.scanned++;
     const name = entry.name;
     // Dirent methods do not follow symlinks; a symlinked entry is skipped
     // rather than read through a link outside the workspace.
@@ -380,7 +390,11 @@ async function scanTopics(
       continue;
     }
     if (!entry.isFile() || !name.endsWith(".md") || PROTECTED_NAMES.has(name)) continue;
-    found.push(directorySource([...segments, name]));
+    const path = directorySource([...segments, name]);
+    // The provenance label must fit the renderer's source bound; an
+    // over-long workspace path is not a usable topic locator.
+    if (path.length > MEMORY_CONTEXT_LIMITS.maxPathChars) continue;
+    found.push(path);
   }
 }
 
@@ -464,7 +478,25 @@ async function readManifestEntry(
   path: string,
   state: ReadState,
 ): Promise<{ description: string; bodyChars: number }> {
-  const absolute = join(rootPath, ...path.split("/"));
+  const segments = path.split("/");
+  // Check every ancestor below the workspace root. `lstat` on the full path
+  // would resolve an intermediate symlink and read through it; a symlinked
+  // `memory/` or `memory/system/` must be refused instead. The root itself is
+  // accepted because the host named it explicitly.
+  let parentPath = rootPath;
+  for (const segment of segments.slice(0, -1)) {
+    parentPath = join(parentPath, segment);
+    let parentInfo;
+    try {
+      parentInfo = await lstat(parentPath);
+    } catch (error) {
+      throw fileFailure(error, path);
+    }
+    if (parentInfo.isSymbolicLink()) throw new MemoryContextFileError("symlink", path);
+    if (!parentInfo.isDirectory()) throw new MemoryContextFileError("not-directory", path);
+  }
+
+  const absolute = join(rootPath, ...segments);
   let info;
   try {
     info = await lstat(absolute);
@@ -526,8 +558,11 @@ function comparePaths(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function buildManifest(entries: readonly MemoryTopicEntry[], more: number): string {
-  if (entries.length === 0) return "";
+function composeManifest(
+  entries: readonly MemoryTopicEntry[],
+  more: number,
+  scanTruncated: boolean,
+): string {
   const lines = [
     "# Memory Tree",
     "Files marked loaded are already included in context. Other files are topic memories; use their descriptions to decide what may be relevant.",
@@ -535,7 +570,31 @@ function buildManifest(entries: readonly MemoryTopicEntry[], more: number): stri
       `- \`${entry.path}\` (${entry.state}, ${entry.bodyChars} chars): ${entry.description}`),
   ];
   if (more > 0) lines.push(`- \u2026 ${more} more memory files`);
+  if (scanTruncated) {
+    lines.push("- \u2026 more memory files were not inspected (directory-entry bound reached)");
+  }
   return lines.join("\n");
+}
+
+/**
+ * Fit the manifest to its character budget by showing fewer entries, never by
+ * failing the load. Every hidden entry, whether hidden by the entry cap or by
+ * this budget, is counted in the visible `more memory files` line.
+ */
+function buildManifest(
+  entries: readonly MemoryTopicEntry[],
+  capOmitted: number,
+  scanTruncated: boolean,
+): string {
+  if (entries.length === 0 && capOmitted === 0 && !scanTruncated) return "";
+  for (let shown = entries.length; shown >= 0; shown--) {
+    const omitted = capOmitted + (entries.length - shown);
+    const manifest = composeManifest(entries.slice(0, shown), omitted, scanTruncated);
+    if (codePointCount(manifest) <= MEMORY_CONTEXT_LIMITS.maxManifestChars) return manifest;
+  }
+  // A header plus one `more` line is far inside the budget, so this is
+  // unreachable; return the smallest manifest rather than a partial one.
+  return composeManifest([], entries.length + capOmitted, scanTruncated);
 }
 
 /**
@@ -546,8 +605,9 @@ function buildManifest(entries: readonly MemoryTopicEntry[], more: number): stri
  *
  * A missing `memory/` directory yields no entries. A missing or invalid
  * explicitly named loaded file rejects the whole load. Oversized files, an
- * excessive tree, invalid UTF-8, symlinked entries, and an over-budget manifest
- * fail closed; no partial result is returned.
+ * excessive tree, and invalid UTF-8 fail closed; no partial result is returned.
+ * An over-budget manifest is shortened, and every hidden entry is counted in a
+ * visible `more memory files` line rather than failing the load.
  */
 export async function loadMemoryContext(request: MemoryContextRequest): Promise<MemoryContextResult> {
   if (!isRecord(request)) {
@@ -559,7 +619,7 @@ export async function loadMemoryContext(request: MemoryContextRequest): Promise<
   const loaded = new Set(loadedFiles);
 
   await assertWorkspaceDirectory(rootPath);
-  const state: ScanState = { scanned: 0 };
+  const state: ScanState = { scanned: 0, truncated: false };
   const topics: string[] = [];
   if (await hasMemoryDirectory(rootPath)) {
     await scanTopics(join(rootPath, MEMORY_DIR), [], state, topics);
@@ -586,10 +646,7 @@ export async function loadMemoryContext(request: MemoryContextRequest): Promise<
     }));
   }
 
-  const manifest = buildManifest(entries, more);
-  if (codePointCount(manifest) > MEMORY_CONTEXT_LIMITS.maxManifestChars) {
-    throw new MemoryContextBoundsError("maxManifestChars");
-  }
+  const manifest = buildManifest(entries, more, state.truncated);
   const document = manifest.length === 0
     ? undefined
     : Object.freeze({ source: MANIFEST_SOURCE, content: manifest });

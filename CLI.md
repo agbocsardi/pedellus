@@ -10,7 +10,8 @@ When Telegram is configured, the CLI keeps the existing Telegram path; otherwise
 it opens the local `cli:default` Durable conversation. Workspace context is off
 unless the config contains `workspaceContext`; when enabled it applies the same
 fixed bootstrap and explicit `memoryFiles` selection to every session key and
-adds no identity. See [workspace context](./WORKSPACE_CONTEXT.md). Model text
+adds no identity. Adding `workspaceContext.memoryManifest: true` also appends the
+bounded topic manifest for on-demand native reads. See [workspace context](./WORKSPACE_CONTEXT.md). Model text
 streams only from committed `pi.live` snapshots, filtered to assistant text
 blocks. The
 initial watch snapshot is not replayed. After a submission settles, the CLI

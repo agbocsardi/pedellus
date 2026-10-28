@@ -53,7 +53,8 @@ need a **fresh extension and dedicated registry per Harness/storage**: conversat
 IDs collide across stores. `openGateway` can also accept an opt-in host snapshot
 provider and reconstructs snapshots before resume; it does not load files itself.
 An opt-in [workspace loader](./WORKSPACE_CONTEXT.md) supplies fixed bootstrap files
-and explicitly selected memory files to such a provider. Skill discovery is also
+and explicitly selected memory files to such a provider; it can also append a
+bounded topic-memory manifest for on-demand reads ([MEMORY_CONTEXT.md](./MEMORY_CONTEXT.md)). Skill discovery is also
 opt-in through `workspaceContext.skills`: it reads only `<workspace>/skills` and an
 explicitly configured builtin skills root, fails closed on metadata it cannot
 parse, never executes a skill, and supports progressive loading — a prompt
@@ -61,7 +62,8 @@ summary plus a read-only `skill` tool that serves a discovered workspace or
 builtin body on demand ([details](./SKILLS_CONTEXT.md)). Neither loader
 provides full Python memory or skills parity. The local CLI/gateway host opts in
 only when the config contains a `workspaceContext` section
-(`workspaceContext.memoryFiles`, default off); it contributes no identity. Prepared requests containing old Nanobot context
+(`workspaceContext.memoryFiles` and optional `workspaceContext.memoryManifest`,
+default off); it contributes no identity. Prepared requests containing old Nanobot context
 conservatively block recovery. With the gateway stopped and an existing database, an
 owner can inspect blocked task IDs/fingerprints and explicitly cancel them without
 resuming or rewriting the prepared request; see
