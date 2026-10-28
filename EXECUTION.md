@@ -149,6 +149,47 @@ adapter.
   hard-link aliases are rejected before their content is copied. Guest-created
   links remain within the private mounted workspace/scratch namespace.
 
+## Shared policy and guarded host backend (W1 foundation)
+
+`src/execution/policy.ts` is the shared execution policy. It owns the ported
+shell deny patterns, the environment allowlist, the default and maximum shell
+timeout, shell command/allowlist filtering, and the filesystem containment check.
+`src/execution/host.ts` imports it; the bubblewrap backend is expected to import
+the same policy when its W2 integration lands. The host backend is not enabled by
+the Gateway and no runtime/config/barrel file was changed for it.
+
+`createHostExecutionEnv({ workspaceRoot, allowedRoots?, shell?, cwd?,
+  tempDirectory? })` wraps the native `NodeExecutionEnv`:
+
+- Filesystem methods reject lexical `..`/absolute escapes and paths that resolve
+  through a symlink outside the configured roots. The guard returns the original
+  path to the operation, never the canonical probe path. `followFinalLink`
+  follows operation semantics: reads/writes/watch follow a final symlink, while
+  `remove`, `renameFile`, `fileInfo`, `exists` and `createDir` act on the link or
+  parent and are not refused merely because the link target is outside. A link
+  that cannot be resolved is refused rather than guessed. A check/use race
+  remains, so this is a damage-reduction guard, not a security boundary.
+- Shell commands are filtered by the shared deny/allow patterns, run with only
+  the policy environment (`HOME` is the workspace, `TMPDIR` is a private scratch
+  directory, `PATH`/`LANG`/`TERM` and explicit `allowedEnvKeys` are the only
+  forwarded host values), and always receive the policy timeout. Caller `env`
+  and `inheritEnv` are ignored. Detached descendants are torn down by the native
+  `NodeExecutionEnv` process-group kill on timeout, abort and cleanup.
+- The native bash tool keeps its own output window, streaming callbacks, spill
+  file and structured output. The host env passes those options and results
+  through unchanged; it adds no second truncation pass. Spill/temp files are
+  created under the private scratch root, which is also an allowed read root so
+  `read` can recover the full output.
+
+Host shell execution is **not** confinement. Deny patterns and the environment
+allowlist reduce accidental damage and stop a command from inheriting secrets
+implicitly, but a permitted command can still read host files, including
+credentials, and can make network requests. The filesystem API guard does not
+change that. Do not enable Gateway tools on this backend as a security boundary;
+use the bubblewrap backend when the v2 damage model must hold against untrusted
+commands, and keep the host backend for a trusted caller operating in an
+dedicated workspace.
+
 ## Remaining security blockers
 
 The managed-root, import, and owner invariants passed bounded synthetic probes,
@@ -170,6 +211,21 @@ unsafe fallback, config-store access, or deployment changes were introduced.
 
 ## Bounded synthetic evidence
 
+- `npm run test:behavior --prefix packages/pi-nanobot` (155 checks) and
+  `npm run test:execution --prefix packages/pi-nanobot` (9 checks) passed
+  unchanged after the host policy slice.
+- Bounded host probes (private, no repository tests added) created a temporary
+  workspace and outside sentinel and exercised the shared policy through
+  `createHostExecutionEnv`: lexical and symlink escapes were refused on read,
+  write, canonicalize and shell cwd; removing/renaming an outside-pointing link
+  was allowed as a link operation and the sentinel was unchanged; missing nested
+  writes succeeded; deny patterns, allow-pattern override, environment allowlist,
+  caller-env ignoring, policy timeout and process-group teardown were observed;
+  a 60 KiB output command spilled intact and the spill was readable through the
+  guard; a private temp file was readable; and a shell `cat` of the outside
+  sentinel succeeded, confirming the documented non-confinement limitation.
+  The native `createEnvConformance` suite passed 24/24 cases against the host
+  backend (temp-only, cleaned up).
 - `npm ci --prefix packages/pi-nanobot --ignore-scripts`
 - `npm run typecheck --prefix packages/pi-nanobot`
 - `npm run build --prefix packages/pi-nanobot`
