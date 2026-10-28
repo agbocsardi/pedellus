@@ -44,9 +44,10 @@ review. This bounded batch supersedes the consolidation pause only for the work 
 - [x] Complete one independent review and one blocker-fix pass; merge the reviewed result.
 - [x] Run existing typecheck, behavior and execution checks; record results and remaining W4 gates.
 
-The owner separately authorized an offline cron authority hardening slice in parallel: reauthorize
-background-run coding calls against the origin's current grants without widening their copied grant.
-Implementation and independent review are in progress in separate worktrees; no channels or live calls.
+The owner separately authorized and completed an offline cron authority hardening slice in parallel:
+background-run coding calls are bounded by both their copied grants and the origin's current grants,
+including pre-resume pruning. Independent review and upgrade/restart probes passed; no channels or
+live calls.
 
 No product-provider calls, credential loading, personal workspace access, channel sends, permanent
 regression suite expansion, A/B parity claims or deployment. Keep the runner offline-only in this
@@ -103,7 +104,7 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 | Context / memory | Opt-in bootstrap and selected files, topic manifest, on-demand read/write through granted tools | Markdown authoritative; context fixed until new session/reopen; unreadable memory directory can block reopen |
 | Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool; curated port builtins in `skills` (memory, memory-defrag, skill-creator, github, cron) behind an explicit `builtinSkillsRoot` | `my` has no port runtime; no inventory-count cap, but finite prompt/output bounds visibly truncate |
 | Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
-| Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling; a background run gets the origin's workspace context and `skill` tool | No channel delivery or silence policy; copied grants survive origin revocation until their own expiry; disabling cron leaves persisted timers blocked; a run whose snapshot was evicted at the cap proceeds without context |
+| Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling; a background run gets the origin's workspace context and `skill` tool; copied grants are bounded by current origin grants | No channel delivery or silence policy; disabling cron leaves persisted timers blocked; a run whose snapshot was evicted at the cap proceeds without context; some fenced terminal paths retain bounded grants until reopen |
 | Telegram | Restricted allowlisted inbound/reply adapter with streaming, durable send intent, unknown-send quarantine | Existing adapter only; scheduled outbound candidate is unmerged; no general pairing or media parity |
 | Code Mode / delegation | Reviewed opt-in QuickJS Code Mode/tool-search SDK | Not Gateway-installed; no product background-subagent or worker interface |
 | Other surfaces | Read-only usage and inert archival helpers exist | Discord candidates parked; Email/WebSocket, MCP, web/media tools not integrated |
@@ -476,6 +477,17 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-28 — cron origin authority reauthorization
+
+Owner selected this slice in parallel with acceptance tooling. Integrated `8011821` and `00d7aff`:
+background coding grants are bounded by the origin's current grants at call time and pruned before
+resume; normal completion and abort retire them. Independent review reproduced an upgrade/restart
+failure on the first commit and verified the follow-up fails closed for pre-upgrade targets, preserves
+valid new targets, and handles terminal targets. Native coding tool execute intents are unsafe to
+replay. Some cancelled/superseded early-return paths retain bounded grants until reopen; documentation
+records this limitation. Parent reran typecheck, 52 synthetic acceptance checks, 155 behavior and
+9 execution checks. No real provider, channel, personal workspace or permanent tests were used.
 
 ### 2026-10-28 — offline acceptance tooling integrated
 

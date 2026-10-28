@@ -116,12 +116,12 @@ resolves without them. Two rules keep that closed:
   `Tool <name> was interrupted and may have partially run`. Pruning before resume
   means an interrupted copy has no authority left either way.
 
-The run's authority also ends with the run: `finishRun` (normal completion or a
-recorded error) and the run task's abort handler retire the target's copied grant
-document and rewrite its tools to none in the same commit that records the
-terminal result. The origin link is kept, so a re-created grant document for that
-target still has to satisfy the origin check. A finished run's conversation keeps
-no coding authority even if a host later submits to it directly.
+On normal completion or a recorded error, `finishRun` and the run task's abort
+handler retire the target's copied grants and tools in the terminal commit. Some
+cancelled or superseded early-return paths leave them until the next reopen; a
+direct host submission in that interval remains bounded by the origin hook. The
+origin link is kept, so a re-created grant document for that target still has to
+satisfy the origin check.
 
 Every native conversation creation goes through the Durable `conversationCreated`
 hook, which retires any grant document and writes empty `tools`/`modelTools`
