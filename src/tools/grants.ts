@@ -119,18 +119,24 @@ export function createToolGrantHook(
       if (!allowed.has(call.name)) {
         return { block: `Tool ${call.name} is outside the host tool ceiling` };
       }
-      const document = await api.snapshot(ToolGrantDoc, api.conversationId, context);
-      const expiresAt = document?.grants[call.name];
-      if (expiresAt === undefined) {
-        return { block: `Tool ${call.name} has no grant for this conversation` };
+      try {
+        const document = await api.snapshot(ToolGrantDoc, api.conversationId, context);
+        const expiresAt = document?.grants[call.name];
+        if (expiresAt === undefined) {
+          return { block: `Tool ${call.name} has no grant for this conversation` };
+        }
+        if (!Number.isSafeInteger(expiresAt)) {
+          return { block: `Tool ${call.name} has a malformed grant` };
+        }
+        if (expiresAt <= now()) {
+          return { block: `Tool ${call.name} grant expired at ${new Date(expiresAt).toISOString()}` };
+        }
+        return undefined;
+      } catch {
+        // Durable treats a throwing hook as a block, but a rejected hook must never read as allowed.
+        // Keep the model-visible reason generic: storage errors can carry paths or internal detail.
+        return { block: `Tool ${call.name} grant state could not be read; refusing the call` };
       }
-      if (!Number.isSafeInteger(expiresAt)) {
-        return { block: `Tool ${call.name} has a malformed grant` };
-      }
-      if (expiresAt <= now()) {
-        return { block: `Tool ${call.name} grant expired at ${new Date(expiresAt).toISOString()}` };
-      }
-      return undefined;
     },
   });
 }

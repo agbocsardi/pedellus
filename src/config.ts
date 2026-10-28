@@ -21,6 +21,12 @@ const CREDENTIAL_PROVIDERS = [
 
 export type CredentialProvider = typeof CREDENTIAL_PROVIDERS[number];
 
+/**
+ * Largest default shell timeout the native host environment can represent:
+ * `2_147_483_647` ms. Config values are integer seconds.
+ */
+export const TOOL_TIMEOUT_MAX_SECONDS = 2_147_483;
+
 export interface ModelReference {
   provider: string;
   modelId: string;
@@ -73,6 +79,15 @@ function envName(value: unknown, name: string): string {
   const result = nonempty(value, name);
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(result)) throw new Error(`${name} must be an environment variable name`);
   return result;
+}
+
+/** Validate the config-level shell default before any provider, storage or tool setup. */
+export function parseToolTimeoutSeconds(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > TOOL_TIMEOUT_MAX_SECONDS) {
+    throw new Error(`toolTimeoutSeconds must be an integer from 0 to ${TOOL_TIMEOUT_MAX_SECONDS}`);
+  }
+  return value;
 }
 
 function modelReference(value: unknown, name: string): ModelReference {
@@ -142,12 +157,8 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
     }
   }
   config.toolAllowlist = toolAllowlist;
-  if (raw.toolTimeoutSeconds !== undefined) {
-    if (typeof raw.toolTimeoutSeconds !== "number" || !Number.isSafeInteger(raw.toolTimeoutSeconds) || raw.toolTimeoutSeconds < 0) {
-      throw new Error("toolTimeoutSeconds must be a non-negative integer number of seconds");
-    }
-    Object.assign(config, { toolTimeoutSeconds: raw.toolTimeoutSeconds });
-  }
+  const toolTimeoutSeconds = parseToolTimeoutSeconds(raw.toolTimeoutSeconds);
+  if (toolTimeoutSeconds !== undefined) Object.assign(config, { toolTimeoutSeconds });
   if (raw.workspaceContext !== undefined) {
     Object.assign(config, { workspaceContext: workspaceContextConfig(raw.workspaceContext) });
   }

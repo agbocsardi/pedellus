@@ -25,17 +25,38 @@ export interface CodingToolExtensionOptions {
 }
 
 /**
- * The output message of the native bash tool names the timeout it requested. When the caller omits
- * one and the host policy default fires, that value is `undefined`; keep native output, spill and
- * execution semantics, and only replace that one user-visible message with the configured default.
+ * Native bash names the timeout it requested. When the caller omits one and the host policy default
+ * fires, that value is `undefined`, and the native schema says "no default timeout". Declare the host
+ * default and keep native output, spill and execution semantics; only that one timeout message changes.
  */
-function withDefaultTimeoutMessage<T extends ToolRegistration>(
+function withHostTimeoutDeclaration<T extends ToolRegistration>(
   tool: T,
   defaultTimeoutSeconds: number,
 ): T {
   if (defaultTimeoutSeconds <= 0) return tool;
+  const parameters = tool.parameters as unknown as {
+    readonly properties?: Record<string, unknown>;
+  };
+  const timeout = parameters.properties?.timeout;
+  const declaredParameters =
+    parameters.properties === undefined || timeout === null || typeof timeout !== "object"
+      ? tool.parameters
+      : {
+          ...parameters,
+          properties: {
+            ...parameters.properties,
+            timeout: {
+              ...(timeout as Record<string, unknown>),
+              description: `Timeout in seconds (optional; host default ${defaultTimeoutSeconds} seconds)`,
+            },
+          },
+        };
   return {
     ...tool,
+    description:
+      `${tool.description} A host default timeout of ${defaultTimeoutSeconds} seconds applies ` +
+      "when no timeout is given.",
+    parameters: declaredParameters,
     async execute(...callArgs: Parameters<T["execute"]>) {
       const [args, api, context] = callArgs;
       try {
@@ -73,7 +94,7 @@ export function createCodingToolExtension(options: CodingToolExtensionOptions): 
     else {
       const bash = createBashTool();
       tools.push(bash);
-      wraps.push(wrapTool(bash, (tool) => withDefaultTimeoutMessage(tool, options.defaultTimeoutSeconds)));
+      wraps.push(wrapTool(bash, (tool) => withHostTimeoutDeclaration(tool, options.defaultTimeoutSeconds)));
     }
   }
 

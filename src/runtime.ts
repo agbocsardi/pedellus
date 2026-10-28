@@ -5,7 +5,7 @@ import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type Extension, type Harness as HarnessType, type ModelRef, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ConversationContextSnapshot } from "./context/index.js";
-import type { ModelReference, PortConfig } from "./config.js";
+import { parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
 import { prepareDataDirectory } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
@@ -141,6 +141,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     );
   }
   const toolsEnabled = toolAllowlist.length > 0;
+  // Fail at startup, not at the first tool call, when the default cannot be represented by the host shell.
+  const toolTimeoutSeconds = parseToolTimeoutSeconds(config.toolTimeoutSeconds);
   const allowedModels = config.allowedModels ?? [config.model];
   const prepared = options.models
     ? { models: options.models, model: nativeModelReference(config.model) }
@@ -170,7 +172,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   };
   const now = () => Date.now();
   // Mirrors the shared policy's config-level default so a host-default timeout reports its duration.
-  const defaultTimeoutSeconds = config.toolTimeoutSeconds ?? 60;
+  const defaultTimeoutSeconds = toolTimeoutSeconds ?? 60;
   const toolExtension: Extension | undefined = toolsEnabled
     ? createCodingToolExtension({
         tools: toolAllowlist as readonly CodingToolName[],
@@ -183,7 +185,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ? createToolEnvironments({
         workspaceRoot: workspace,
         allowedRoots: extraRoots,
-        ...(config.toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: config.toolTimeoutSeconds }),
+        ...(toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: toolTimeoutSeconds }),
       })
     : undefined;
   const fallbackThinkingLevel = (choice: ResolvedModelChoice): ModelThinkingLevel =>
@@ -236,9 +238,23 @@ export async function openGateway(config: PortConfig, context: Context, options:
     tx: Tx,
     conversationId: ConversationId,
   ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
-    if (!toolExtension) return { tools: [], modelTools: [] };
+    if (!toolExtension) {
+      // Retire instead of creating an empty document: a disabled ceiling must durably remove
+      // previously granted tools so re-enabling it cannot resurrect them.
+      await tx.retireDoc(ToolGrantDoc, conversationId);
+      return { tools: [], modelTools: [] };
+    }
     const document = await tx.doc(ToolGrantDoc, conversationId);
     return toolFilterFromNames(pruneToolGrants(document, toolAllowlist, now()));
+  };
+  const denyNewConversation = async (
+    tx: Tx,
+    conversation: { readonly id: ConversationId },
+  ): Promise<void> => {
+    // Every native creation path, including forks and raw/task-created conversations, starts denied.
+    // The grant document is retired so a fork's copied agent state can never inherit authority.
+    await tx.retireDoc(ToolGrantDoc, conversation.id);
+    await configure(tx, conversation.id, { tools: [], modelTools: [] });
   };
   const publicChoice = (choice: ResolvedModelChoice): GatewayModelChoice => ({
     ...choice.configured,
@@ -271,6 +287,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const harnessOptions = {
       models,
       registry,
+      conversationCreated: denyNewConversation,
       ...(toolEnvironments === undefined
         ? {}
         : {

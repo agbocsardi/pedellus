@@ -31,7 +31,9 @@ slice.
   provider or storage setup. The ceiling does not itself grant anything.
 - `toolTimeoutSeconds` is the config-level default for the host shell. Absent
   keeps the shared policy default (60 s); `0` disables the default timeout. A
-  caller-supplied per-call timeout is capped by the shared policy at 600 s.
+  caller-supplied per-call timeout is capped by the shared policy at 600 s. The
+  value must be an integer from `0` to `2_147_483`; an unrepresentable value is
+  rejected at startup rather than failing on the first `bash` call.
 - `extraAllowedDirs` remains an explicit list of additional canonical
   filesystem roots. They are not created, and the data directory must stay
   disjoint from them.
@@ -63,10 +65,19 @@ The conversation must already exist (`conversationFor`). A grant does not widen
 the ceiling, and another conversation's grants have no effect on this one:
 agent tool filters are read from that conversation's own document.
 
-Disabling tools by emptying `toolAllowlist` suppresses the extension and host
-environment immediately, but does not delete persisted grant documents. An
-unexpired grant can therefore become effective again if the same ceiling is
-re-enabled before it expires. Use `revokeTools` when the intent is revocation.
+Every native conversation creation goes through the Durable `conversationCreated`
+hook, which retires any grant document and writes empty `tools`/`modelTools`
+filters before the optional `agent` convenience. This covers raw ownerless
+creation, forks (whose agent state is copied from the parent), and task-created
+conversations, so they are not offered inherited tools in the first place. A
+fork's grant document is `fork: "initial"` as a second layer. Durable still
+applies a caller-supplied `ConversationCreateOptions.agent` after this hook; the
+Gateway does not pass one that re-adds tools.
+
+Emptying `toolAllowlist` retires the grant document of every conversation before
+resume. Re-enabling the ceiling therefore starts from default-deny again instead
+of resurrecting a previously granted tool. An absent document is not created by
+this retirement pass.
 
 ## Replay and reopen
 
@@ -81,7 +92,9 @@ that current policy, so a prepared call for a removed tool settles as
 A `beforeTool` hook rechecks the grant document at call time, so expiry between
 reopen and a call blocks before intent with `Tool <name> grant expired ...`.
 Revocation also reapplies the agent filter immediately, so later calls are no
-longer offered the tool.
+longer offered the tool. The hook returns an explicit `block` if the grant read
+fails; it does not rely on Durable treating a throwing hook as denied, and it
+keeps storage error detail out of the model-visible reason.
 
 The native coding tools have no `replay: "safe"` marker, so Durable treats them
 as unsafe: recovery never reruns an interrupted execution body. The existing
@@ -115,10 +128,11 @@ built by `createHostExecutionEnv`:
   releases the store lock.
 - Tool definitions, truncation, retained tail, streaming and spill behavior are
   the native Durable implementations. `read`/`write`/`edit` are unchanged. The
-  only `bash` wrapper replaces the native user-visible
-  `Command timed out after undefined seconds` message with the configured
-  default duration when the host default fires; execution, output and spill are
-  untouched.
+  `bash` wrapper declares the configured host default in the tool and timeout
+  descriptions and replaces the native user-visible
+  `Command timed out after undefined seconds` message with that duration when
+  the host default fires; execution, output and spill are untouched. With
+  `toolTimeoutSeconds: 0` no default is declared or applied.
 
 ## Non-claims and remaining gaps
 
@@ -153,6 +167,13 @@ Bounded temporary probes (not committed as tests) used a faux provider, a
 temporary workspace/data directory and the real `openGateway`:
 
 - default-deny before a grant; grants are conversation-scoped;
+- forks and raw ownerless conversations received no tools before any explicit
+  configure call;
+- emptying the ceiling retired the persisted grant document, and re-enabling did
+  not resurrect the tool;
+- a throwing grant snapshot produced a block result rather than an exception;
+- an impossible `toolTimeoutSeconds` was rejected at config/openGateway startup,
+  and the bash declaration named the configured host default;
 - `read`, `write`, `edit` and `bash` worked from real turns;
 - lexical `../` and symlink escapes were refused for file tools, and the outside
   sentinel was unchanged;
