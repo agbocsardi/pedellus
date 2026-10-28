@@ -289,6 +289,14 @@ retirement of the Python service with a tagged readable reference kept.
 - Existing behavioral suite stays green. New permanent tests only for behaviour that
   would otherwise silently regress.
 
+## Consolidation pause — 2026-10-28
+
+Finish and verify the in-flight cron calendar feature, then stop starting new
+implementation slices. Do not begin Gateway cron-tool, grant, outbox, channel or
+other feature wiring after that. Run a consolidation round instead: reconcile the
+plan with what is actually integrated, verify the core path end to end, clean
+worktrees/branches/probes, and agree priorities with the owner before more work.
+
 ## Cron foundation status
 
 Cron replacement `072ed6d2d`, `340c26b54`, `6dc74fac4` passed independent final
