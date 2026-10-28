@@ -8,7 +8,7 @@ Date: 2026-10-27. Branch: `feat/pi-durable-rebuild`.
 - [x] Prove two provider API families and the bad-model error path (W0).
 - [ ] Freeze the shared W1/W2 contract and resolve backend differences.
 - [x] Deliver the tool layer and durable per-conversation grants (W1).
-- [ ] Deliver the selectable sandbox backend against the same contract (W2).
+- [x] Deliver the selectable Python-like shell sandbox (W2).
 - [ ] Decide memory authority and complete memory, context and compaction (W3).
 - [ ] Record the A/B and harness-specific acceptance results (W4).
 - [ ] Complete automation and channels item by item (W5).
@@ -357,3 +357,14 @@ for background-process teardown; host temp/spill visibility and home toolchains
 remain documented integration constraints. The initial reviewer performed a DNS
 lookup despite the no-network assignment; no credentials were involved. The final
 review used no network.
+
+W2 integration `e5abbf56e` passed independent review (`pi-4d1c7b32`) and was
+cherry-picked as `2319b9679`; the privacy-only follow-up was already applied on
+this branch. Parent typecheck, 155 behavior checks and 9 execution checks pass.
+An owner-authorized real `opencode-go/deepseek-v4.1-flash` high-thinking turn
+with `toolSandbox: bwrap` successfully used write, edit, read and bash in a
+disposable workspace; the expected file contents were observed and the temporary
+workspace and store were removed. Shell bwrap operates on the actual workspace;
+filesystem tools use the host guard. Full bash spill remains readable via `read`
+while the environment lives, but not from inside the sandbox's private `/tmp`.
+No production deployment or real user workspace was involved.
