@@ -291,6 +291,15 @@ retirement of the Python service with a tagged readable reference kept.
 
 ## Parked
 
+`pi-d2c45589` (`eef7f480f`, `93365737a`): cron timer foundation parked after
+final review found a recurring-job task can fault when its plan phase returns the
+same checkpoint after advancing a previously settled occurrence. The job then
+appears scheduled but never fires. Fix the plan transition and stale outcome
+summary before further integration; do not ship as-is. Review budget exhausted.
+The design and Durable contract probes established fresh isolated conversations,
+origin busy retry, authorized tools and durable outbox feasibility; no arbitrary
+job-count, interval or horizon limits were approved.
+
 `archival-*` (source, preparation, rehearsal, persist, search, renderer, staging,
 publication), memory-search-over-snapshots, the gateway grant synthetic fixture and
 the WebUI inventory. Branches stay; no new work and no reviews until a concrete need
