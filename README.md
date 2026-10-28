@@ -46,15 +46,16 @@ default, wraps shell commands only, and falls back to neither the host shell nor
 managed copy. See [coding tools and grants](./TOOLS.md) and
 [direct Bubblewrap shell](./DIRECT_BWRAP.md).
 
-## Internal cron foundation (not activated)
+## Internal cron (opt-in)
 
 [`CRON.md`](./CRON.md) describes finite timer/run tasks, `at`/`every`/calendar
 schedules and IANA time zones. Timers arm their successors independently of model
-execution. The module is not installed by `openGateway` or exported through the SDK
-barrel; the agent-callable tool, per-run authorization, outbound/silent delivery and
-runtime lifecycle wiring remain missing. The user asks the agent to schedule work;
-no direct cron UI or user scheduling commands are required. The unmerged Telegram outbound candidate is
-not part of this checkout's runtime.
+execution. Setting `cron: { enabled: true }` installs the foundation and a
+model-callable `cron` tool (`add`/`list`/`remove`) in `openGateway`; both are also
+exported through the SDK barrel. The agent schedules work when the user asks; there
+is no direct cron UI or user scheduling command. Outbound/silent channel delivery
+remains missing, and the unmerged Telegram outbound candidate is not part of this
+checkout's runtime.
 
 ## Opt-in Code Mode SDK
 

@@ -1,19 +1,19 @@
 # Cron: deterministic timer plus finite run
 
-This replaces the parked recurring-task foundation. It is **not wired** into the gateway,
-channels, config, tools, delivery, or a command/tool surface. Calendar expressions and IANA time
-zones are schedule math; parsing user text or ISO datetimes stays outside. Nothing here sends a
-message outside the Durable conversation it submits to.
+This replaces the parked recurring-task foundation. The opt-in `cron` config installs it in the
+gateway together with a model-callable `cron` tool (`add`/`list`/`remove`); there is no channel
+delivery, silence policy, or command surface. Calendar expressions and IANA time zones are schedule
+math; parsing user text or ISO datetimes stays outside. Nothing here sends a message outside the
+Durable conversation it submits to.
 
-Cron is intended as an internal agent capability: the user asks the agent, and the
-agent calls the scheduling tool. No direct user cron UI or scheduling commands are
-required. The missing surface is a model-callable tool plus runtime, authorization
-and delivery wiring, not a user-facing scheduler.
+Cron is an internal agent capability: the user asks the agent, and the agent calls the scheduling
+tool. No direct user cron UI or scheduling commands are required, and none exist.
 
 Files:
 
 - `src/automation/cron.ts` — job document, timer task, run task, controller API.
 - `src/automation/cron-schedule.ts` — one-shot, interval, and calendar schedule math.
+- `src/automation/cron-tool.ts` — the model-facing `cron` tool.
 - This document.
 
 ## Why two tasks
@@ -170,15 +170,19 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
 ## Not included / limitations
 
 - No migration of the parked probe document versions or stores. They are not supported.
-- No gateway, channel, config, command/tool surface, ISO/text-to-`at` parsing, delivery, silence,
-  model selection, or misfire policy.
+- No channel/outbound delivery, silence policy, model selection, or misfire policy. Scheduled work
+  submits one agent input to a Durable conversation; it does not send a chat message.
+- The `cron` tool parses only ISO 8601 timestamps with an explicit UTC offset for `at`; parsing
+  natural-language user text stays outside.
 - Background runs are owned by the run task, so cancelling the job aborts that run. In `origin` mode
   an already-placed origin run is not owned by the run task; cancellation still fences both
   pointers and withdraws a still-queued input, but cannot retract an already-placed run.
 - Origin-mode runs use the origin conversation's current agent, tool selection, and grants at
   request preparation. Background runs provision a fresh task-owned conversation through the
-  trusted `prepare` callback, but inherit the origin's agent selection before preparation. The host
-  must apply deny-by-default and recheck current authorization; this slice does not copy grant records.
+  trusted `prepare` callback, but inherit the origin's agent selection before preparation. The
+  Gateway's `prepare` copies the origin's still-valid coding-tool grants and offers exactly those
+  tools, so a run cannot schedule another job or widen authority; a different host must apply the
+  same deny-by-default rule. The foundation alone does not copy grant records.
 - A non-terminal run task, including a parked one, blocks new work with visible skips until it is
   retried or cancelled. Cancellation may remain pending if an owned model request ignores abort.
 - In origin mode, the displayed target generation may belong to another input while the cron input
@@ -195,7 +199,10 @@ moving backwards during a run; restart during a run and after execution with the
 armed; cancellation before due and during a run; one-shot origin completion; timer and execution
 fault visibility; parked target generation visibility; owner scoping; and dedupe. Additional
 review probes covered: a queued origin input withdrawn on cancel, the already-placed limitation,
-unhealthy-timer status dominance, and overflow rejection before job creation.
+unhealthy-timer status dominance, and overflow rejection before job creation. A later gateway probe
+drove the real `openGateway` path with a faux provider and covered the config gate, model-issued
+`add`, isolated and origin runs, copied grants, `list`/`remove`/terminal/unknown IDs, invalid
+schedules, restart with a pending one-shot, and a background run that is offered no `cron` tool.
 
 Calendar probes covered `at`/`every`/`cron` parsing, the `once` alias, UTC default, invalid zones
 and offsets, invalid expressions, no-future-occurrence rejection, strict advancement after an exact
