@@ -80,7 +80,7 @@ Contract both backends must satisfy:
   workspace root.
 - `bash` keeps the ported deny patterns (destructive `rm`, disk and power commands,
   writes to runtime state files) and the `allowedEnvKeys` environment allowlist, so a
-  command cannot read `secrets.env` implicitly.
+  credentials are not implicitly inherited by commands.
 - Runaway protection: command timeout plus process-group kill. A runaway is damage
   even with no attacker.
 - Default-deny tool policy per conversation; grants carry expiry, are revocable, and
@@ -296,7 +296,7 @@ against accidental damage, not adversarial shell behavior. W1 Gateway activation
 no longer waits for optional W2; the host shell is an honest guardrail, not a
 confinement boundary.
 
-W0: the owner authorized `~/.nanobot/secrets.env` and selected OpenCode Go
+W0: the owner authorized a local credential source and selected OpenCode Go
 DeepSeek V4.1 Flash, then Umans for the second family. A parent-only bounded
 `pi-ai` 1.4.0 completion through the port's `createProviderModels` with
 `opencode-go/deepseek-v4.1-flash`, high reasoning, max 256 tokens, and request

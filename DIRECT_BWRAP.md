@@ -141,8 +141,8 @@ Bubblewrap 0.9.0. All 32 checks passed, plus separate `--new-session` and
 - a workspace path and cwd containing spaces survive argv handling unchanged;
 - workspace writes are visible on the host, and a relative cwd under the
   workspace is used;
-- a sibling `config.json` and `secrets.env`, and an unrelated host `/tmp` marker,
-  are hidden from the sandbox;
+- sibling configuration and credential fixtures, and an unrelated host `/tmp`
+  marker, are hidden from the sandbox;
 - `/tmp` is a private tmpfs and `/usr` is mounted `ro`;
 - `/etc/passwd`, `/etc/group`, `/etc/hosts`, and `/etc/localtime` are readable
   when present on the host;
