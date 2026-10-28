@@ -368,3 +368,12 @@ workspace and store were removed. Shell bwrap operates on the actual workspace;
 filesystem tools use the host guard. Full bash spill remains readable via `read`
 while the environment lives, but not from inside the sandbox's private `/tmp`.
 No production deployment or real user workspace was involved.
+
+W3 skill discovery foundation `6510e0185` and fix `166646281` passed independent
+final review (`pi-6b6be142`) and were cherry-picked as `d3e6a5a97` and
+`4768681e9`. Parent typecheck, 155 behavior and 9 execution checks pass; the
+reviewer additionally compared all 13 shipped skills with Python and ran 28
+synthetic assertions. This helper is not yet wired into the Gateway. Before
+wiring, handle oversized or unsupported metadata without silently dropping
+requirement gates, check executable requirements do not accept directories,
+and decide how to surface skipped skills and load builtin skills on demand.
