@@ -170,9 +170,9 @@ export interface CronPreparation {
 export type CronPrepare = (preparation: CronPreparation, context: Context) => void | Promise<void>;
 /**
  * One run's durable retirement of an already-prepared target, in the same commit that records the
- * run's terminal result or cancellation. Retirement is target-scoped: `job` is `null` when the
- * terminal commit could no longer read the job record (so `occurrence` may be the synthetic zero
- * input), and a host that gave the target authority must retire it anyway. `background` is true
+ * run's terminal result or cancellation. Retirement is target-scoped: `job` may be `null` when
+ * the record is missing or the terminal path does not supply it (and `occurrence` may be a synthetic
+ * zero input); a host that gave the target authority must retire it anyway. `background` is true
  * when the target is a separate conversation, so an origin-mode run's own conversation is never
  * finalized.
  */
