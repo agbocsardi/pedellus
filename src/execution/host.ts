@@ -31,12 +31,18 @@ import {
 } from "./policy.js";
 
 /**
- * A guarded host environment. It is a foundation, not a confinement boundary: the filesystem methods refuse paths
- * that are lexically or through a symbolic link outside the configured roots, but a host shell command can still read
- * or write anything the process user can, and the deny list and environment allowlist only reduce accidental damage.
+ * A guarded host environment for accidental-damage protection, not confinement. Filesystem methods refuse lexical and
+ * symlink escapes from the configured roots, but:
+ *
+ * - a host shell command can still read or write anything the process user can, and networking remains available;
+ * - a hard link inside a root to an outside inode is indistinguishable by path and is allowed, so writes or removals
+ *   through it affect the outside inode;
+ * - a dangling symlink is refused even when its textual target is inside, because resolution cannot be authorized;
+ * - `NodeExecutionEnv` kills the command's process group on timeout, abort and cleanup, but a descendant that creates a
+ *   new session/process group (for example with `setsid`) escapes that teardown; there is no namespace here to catch it.
  *
  * The shell timeout, environment allowlist, command filters and filesystem checks all come from `./policy.ts`; the
- * same policy is intended to be imported by the bubblewrap backend.
+ * same policy is intended to be imported by the optional bubblewrap backend.
  */
 export interface HostExecutionOptions {
 	/** Existing directory that is the workspace root. It is canonicalized once at creation. */
@@ -49,7 +55,9 @@ export interface HostExecutionOptions {
 	cwd?: string;
 	/**
 	 * Scratch directory for spills and temp files. Defaults to a private, owner-only directory under the host temp
-	 * root. It is always an allowed root so the native bash spill path remains readable by the guarded tools.
+	 * root. It is always an allowed root so the native bash spill path remains readable while the environment lives.
+	 * Spill/temp paths last only for the environment lifetime: the owned default is removed on `cleanup`, and an
+	 * explicit directory stays caller-owned. Never treat a spill path as durable storage.
 	 */
 	tempDirectory?: string;
 }
@@ -248,8 +256,12 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 	}
 
 	override async cleanup(context: Context): Promise<void> {
-		await super.cleanup(context);
-		if (this.#ownsTempRoot) await rm(this.#tempRoot, { recursive: true, force: true }).catch(() => undefined);
+		try {
+			await super.cleanup(context);
+		} finally {
+			// Owned spill/temp paths are environment-lifetime only; never treat them as durable storage.
+			if (this.#ownsTempRoot) await rm(this.#tempRoot, { recursive: true, force: true }).catch(() => undefined);
+		}
 	}
 
 	override async exec(
@@ -258,16 +270,16 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		context: Context,
 	): Promise<Result<ShellExecResult, ExecutionError>> {
 		if (context.abortSignal?.aborted) return err(new ExecutionError("aborted", "aborted"));
-		const denied = this.#policy.checkCommand(command);
-		if (denied !== undefined) return err(new ExecutionError("spawn_error", denied));
-		const timeout = this.#policy.resolveShellTimeout(options?.timeout);
-		if (!timeout.ok) return err(timeout.error);
 		const cwd = await this.#absolutePath(options?.cwd ?? this.cwd, context);
 		if (!cwd.ok) return err(new ExecutionError("spawn_error", cwd.error.message, cwd.error));
 		const deniedCwd = await this.#policy.checkFilesystemPath(cwd.value, await this.#probe(context), true);
 		if (deniedCwd !== undefined) {
 			return err(new ExecutionError("spawn_error", deniedCwd.message, deniedCwd));
 		}
+		const denied = this.#policy.checkCommand(command, { cwd: cwd.value });
+		if (denied !== undefined) return err(new ExecutionError("spawn_error", denied));
+		const timeout = this.#policy.resolveShellTimeout(options?.timeout);
+		if (!timeout.ok) return err(timeout.error);
 		const safe: ShellExecOptions = {
 			...(options ?? {}),
 			cwd: cwd.value,
@@ -283,32 +295,42 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 
 /** Create a guarded host environment. The root, allowed roots, cwd and default scratch directory are canonicalized once. */
 export async function createHostExecutionEnv(options: HostExecutionOptions): Promise<HostExecutionEnv> {
+	// Roots reach the policy only after this one canonicalization so the policy itself can stay usable with virtual
+	// sandbox paths and never needs to call realpath.
 	const root = await canonicalDirectory(options.workspaceRoot, "workspaceRoot");
 	const allowedRoots: string[] = [];
 	for (const allowed of options.allowedRoots ?? []) {
 		allowedRoots.push(await canonicalDirectory(allowed, "allowedRoots entry"));
 	}
-	let tempRoot: string;
+	let tempRoot: string | undefined;
 	let ownsTempRoot = false;
-	if (options.tempDirectory === undefined) {
-		tempRoot = await realpath(await mkdtemp(join(tmpdir(), "nanobot-host-exec-")));
-		ownsTempRoot = true;
-	} else {
-		tempRoot = resolve(options.tempDirectory);
-		await mkdir(tempRoot, { recursive: true, mode: 0o700 });
-		tempRoot = await canonicalDirectory(tempRoot, "tempDirectory");
+	try {
+		if (options.tempDirectory === undefined) {
+			tempRoot = await realpath(await mkdtemp(join(tmpdir(), "nanobot-host-exec-")));
+			ownsTempRoot = true;
+		} else {
+			tempRoot = resolve(options.tempDirectory);
+			await mkdir(tempRoot, { recursive: true, mode: 0o700 });
+			tempRoot = await canonicalDirectory(tempRoot, "tempDirectory");
+		}
+		const roots = [...new Set([root, ...allowedRoots, tempRoot])];
+		const cwd = await initialCwd(options.cwd, root, roots);
+		const shell: ShellPolicyOptions = {
+			...options.shell,
+			environment: {
+				...defaultShellEnvironment(root, tempRoot, options.shell?.hostEnvironment ?? process.env),
+				...options.shell?.environment,
+			},
+		};
+		const policy = createExecutionPolicy({ roots, shell });
+		return new HostExecutionEnv({ cwd, policy, tempRoot, ownsTempRoot });
+	} catch (error) {
+		// A failure after scratch creation must not leave an owned private directory behind.
+		if (ownsTempRoot && tempRoot !== undefined) {
+			await rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
+		}
+		throw error;
 	}
-	const roots = [...new Set([root, ...allowedRoots, tempRoot])];
-	const cwd = await initialCwd(options.cwd, root, roots);
-	const shell: ShellPolicyOptions = {
-		...options.shell,
-		environment: {
-			...defaultShellEnvironment(root, tempRoot, options.shell?.hostEnvironment ?? process.env),
-			...options.shell?.environment,
-		},
-	};
-	const policy = createExecutionPolicy({ roots, shell });
-	return new HostExecutionEnv({ cwd, policy, tempRoot, ownsTempRoot });
 }
 
 async function canonicalDirectory(path: string, label: string): Promise<string> {

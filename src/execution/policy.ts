@@ -32,30 +32,66 @@ export const DEFAULT_SHELL_DENY_PATTERNS: readonly string[] = [
 ];
 
 const DEFAULT_TIMEOUT_SECONDS = 60;
-const DEFAULT_MAX_TIMEOUT_SECONDS = 600;
+const PYTHON_MAX_CALL_TIMEOUT_SECONDS = 600;
 const SHELL_SEGMENT_OPERATORS = new Set([";", "|"]);
 const SHELL_CHAIN_OPERATORS = ["&&", "||"];
 const ENVIRONMENT_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SHELL_BOUNDARY_NOTE =
+	"\n\nNote: this is a hard policy boundary, not a transient failure. " +
+	"Do NOT retry with shell tricks (symlinks, base64 piping, alternative " +
+	"tools, working_dir overrides). If the user genuinely needs this " +
+	"resource, tell them you cannot reach it under the current " +
+	"restrict_to_workspace policy and ask how to proceed.";
+const BENIGN_DEVICE_PATHS = new Set([
+	"/dev/null",
+	"/dev/zero",
+	"/dev/full",
+	"/dev/random",
+	"/dev/urandom",
+	"/dev/stdin",
+	"/dev/stdout",
+	"/dev/stderr",
+	"/dev/tty",
+]);
 
 export interface ShellPolicyOptions {
-	/** Hard default when the caller omits a timeout. 0 disables the default. */
+	/**
+	 * Config-level default when the caller omits a timeout. 0 disables the timeout entirely. This value is not capped,
+	 * matching Python's config default (a configured 900 s stays 900 s).
+	 */
 	timeoutSeconds?: number;
-	/** Upper bound applied to a caller-supplied timeout. 0 disables the cap. */
+	/**
+	 * Per-call cap, matching Python's fixed 600 s. The policy only lets a backend tighten it; values above 600 are
+	 * clamped to 600. The config-level `timeoutSeconds` is not subject to this cap.
+	 */
 	maxTimeoutSeconds?: number;
-	/** Host environment keys copied into the shell environment after `environment`. */
+	/**
+	 * Host environment keys the backend resolves at creation. A backend that discards caller `options.env` and
+	 * `inheritEnv` (the sandbox) must apply these resolved values to its own shell environment instead.
+	 */
 	allowedEnvKeys?: readonly string[];
 	/** Patterns that allow every top-level segment despite the deny list. */
 	allowPatterns?: readonly string[];
 	/** Extra deny patterns appended to the ported defaults. */
 	denyPatterns?: readonly string[];
-	/** Explicit values passed to every command. These are the only non-allowlisted values. */
+	/** Explicit values every backend applies, including a sandbox's fixed HOME/PATH/TMPDIR/LANG. */
 	environment?: Readonly<Record<string, string>>;
-	/** Source for `allowedEnvKeys`; defaults to `process.env`. */
+	/** Source for `allowedEnvKeys`; defaults to `process.env`. Resolved by the owning process, not by shell text. */
 	hostEnvironment?: Readonly<Record<string, string | undefined>>;
+	/**
+	 * Apply Python's practical shell path guard: reject textual `../`/`..\` and absolute or home paths outside
+	 * `roots`. This is an accidental-damage guardrail, not confinement.
+	 */
+	restrictToWorkspace?: boolean;
 }
 
 export interface ExecutionPolicyOptions {
-	/** Absolute roots the backend may operate in. The first root is the workspace root. */
+	/**
+	 * Canonical absolute roots the backend may operate in. The first root is the workspace root. The host backend
+	 * resolves these with `realpath` once; a sandbox passes its canonical virtual roots (for example `/workspace`).
+	 * The policy normalizes separators/`..` but deliberately does not call `realpath`, so it remains usable with
+	 * sandbox-virtual paths.
+	 */
 	roots: readonly string[];
 	shell?: ShellPolicyOptions;
 }
@@ -80,8 +116,15 @@ export interface ExecutionPolicy {
 		probe: FilesystemPathProbe,
 		followFinalLink: boolean,
 	): Promise<FileError | undefined>;
-	/** Return a human-readable denial for a shell command, or undefined when it may run. */
-	checkCommand(command: string | readonly string[]): string | undefined;
+	/**
+	 * Return a human-readable denial for a shell command, or undefined when it may run. Does not implement Python's
+	 * exec URL scan; that remains a recorded parity gap, separate from the deny/path guards.
+	 */
+	checkCommand(command: string | readonly string[], options?: { cwd?: string }): string | undefined;
+	/**
+	 * Resolve the shell environment once. Backends that cannot inherit the host environment must apply this result
+	 * inside their own namespace; caller `options.env`/`inheritEnv` is not the transport for allowed keys.
+	 */
 	shellEnvironment(): Record<string, string>;
 	resolveShellTimeout(requested: number | undefined): Result<number | undefined, ExecutionError>;
 }
@@ -198,25 +241,71 @@ function commandText(command: string | readonly string[]): string {
 
 function normalizeRoots(roots: readonly string[]): string[] {
 	if (roots.length === 0) throw new Error("Execution policy requires at least one root");
+	for (const root of roots) {
+		if (!isAbsolute(root)) throw new Error(`Execution policy root must be absolute: ${root}`);
+	}
 	return [...new Set(roots.map((root) => resolve(root)))];
+}
+
+function isBenignDevicePath(path: string): boolean {
+	return BENIGN_DEVICE_PATHS.has(path) || path.startsWith("/dev/fd/");
+}
+
+function expandVariables(value: string, environment: Readonly<Record<string, string>>): string {
+	return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (match, braced, bare) => {
+		const key = braced ?? bare;
+		return environment[key] ?? match;
+	});
+}
+
+function extractAbsolutePaths(command: string): string[] {
+	const paths: string[] = [];
+	for (const pattern of [
+		/(?:^|[\s|>'"])(\/[^\s"'>;|<]+)/g,
+		/(?:^|[\s>'"])(~[^\s"'>;|<]*)/g,
+	]) {
+		for (const match of command.matchAll(pattern)) {
+			const path = match[1]?.replace(/[),;:\]}]+$/, "");
+			if (path !== undefined && path !== "") paths.push(path);
+		}
+	}
+	if (process.platform === "win32") {
+		for (const match of command.matchAll(
+			/(?<![A-Za-z])(?:[A-Za-z]:[\\/][^\s"'|><;]*|\\\\[^\s"'|><;]+(?:\\[^\s"'|><;]+)*)/g,
+		)) {
+			const path = match[0]?.replace(/[),;:\]}]+$/, "");
+			if (path !== undefined && path !== "") paths.push(path);
+		}
+	}
+	return paths;
 }
 
 export function createExecutionPolicy(options: ExecutionPolicyOptions): ExecutionPolicy {
 	const roots = normalizeRoots(options.roots);
 	const shell = options.shell ?? {};
 	const timeoutSeconds = positiveNumber(shell.timeoutSeconds, DEFAULT_TIMEOUT_SECONDS, "timeoutSeconds", true);
-	const maxTimeoutSeconds = positiveNumber(
-		shell.maxTimeoutSeconds,
-		DEFAULT_MAX_TIMEOUT_SECONDS,
-		"maxTimeoutSeconds",
-		true,
+	const maxCallTimeoutSeconds = Math.min(
+		positiveNumber(
+			shell.maxTimeoutSeconds,
+			PYTHON_MAX_CALL_TIMEOUT_SECONDS,
+			"maxTimeoutSeconds",
+			false,
+		),
+		PYTHON_MAX_CALL_TIMEOUT_SECONDS,
 	);
+	const restrictToWorkspace = shell.restrictToWorkspace === true;
 	const allowedEnvKeys = [...(shell.allowedEnvKeys ?? [])];
 	for (const key of allowedEnvKeys) {
 		if (!ENVIRONMENT_KEY.test(key)) throw new Error(`Invalid allowed environment key: ${key}`);
 	}
 	const environment = { ...(shell.environment ?? {}) };
 	const hostEnvironment = shell.hostEnvironment ?? process.env;
+	// Resolve allowlisted values once: a sandbox must receive a fixed set at launch, not a live host-env view.
+	const allowedEnvironment: Record<string, string> = {};
+	for (const key of allowedEnvKeys) {
+		const value = hostEnvironment[key];
+		if (value !== undefined) allowedEnvironment[key] = value;
+	}
 	const allowPatterns = (shell.allowPatterns ?? []).map(escapePattern);
 	const denyPatterns = [...DEFAULT_SHELL_DENY_PATTERNS, ...(shell.denyPatterns ?? [])].map(
 		(pattern) => new RegExp(pattern),
@@ -253,7 +342,7 @@ export function createExecutionPolicy(options: ExecutionPolicyOptions): Executio
 			);
 		},
 
-		checkCommand(command: string | readonly string[]): string | undefined {
+		checkCommand(command: string | readonly string[], options?: { cwd?: string }): string | undefined {
 			const text = commandText(command);
 			const lower = text.trim().toLowerCase();
 			const segments = splitShellSegments(lower);
@@ -267,16 +356,38 @@ export function createExecutionPolicy(options: ExecutionPolicyOptions): Executio
 				}
 				if (allowPatterns.length > 0) return "Command blocked by allowlist filter (not in allowlist)";
 			}
+			if (!restrictToWorkspace) return undefined;
+			const trimmed = text.trim();
+			if (trimmed.includes("../") || trimmed.includes("..\\")) {
+				return `Error: Command blocked by safety guard (path traversal detected)${SHELL_BOUNDARY_NOTE}`;
+			}
+			const environment = policy.shellEnvironment();
+			const base = resolve(options?.cwd ?? roots[0]!);
+			for (const raw of extractAbsolutePaths(trimmed)) {
+				const expanded = expandVariables(raw, environment);
+				if (isBenignDevicePath(expanded)) continue;
+				let target: string;
+				if (expanded === "~") {
+					target = environment.HOME ?? roots[0]!;
+				} else if (expanded.startsWith("~/") || expanded.startsWith("~\\")) {
+					target = resolve(environment.HOME ?? roots[0]!, expanded.slice(2));
+				} else if (expanded.startsWith("~")) {
+					// An unknown user home cannot be authorized lexically; fail closed.
+					return `Error: Command blocked by safety guard (path outside working dir) [target_path="${expanded}"]${SHELL_BOUNDARY_NOTE}`;
+				} else if (isAbsolute(expanded)) {
+					target = resolve(expanded);
+				} else {
+					target = resolve(base, expanded);
+				}
+				if (isBenignDevicePath(target)) continue;
+				if (roots.some((root) => isPathWithin(root, target))) continue;
+				return `Error: Command blocked by safety guard (path outside working dir) [target_path="${target}"]${SHELL_BOUNDARY_NOTE}`;
+			}
 			return undefined;
 		},
 
 		shellEnvironment(): Record<string, string> {
-			const result = { ...environment };
-			for (const key of allowedEnvKeys) {
-				const value = hostEnvironment[key];
-				if (value !== undefined) result[key] = value;
-			}
-			return result;
+			return { ...environment, ...allowedEnvironment };
 		},
 
 		resolveShellTimeout(requested: number | undefined): Result<number | undefined, ExecutionError> {
@@ -289,10 +400,10 @@ export function createExecutionPolicy(options: ExecutionPolicyOptions): Executio
 						),
 					);
 				}
-				return ok(maxTimeoutSeconds > 0 ? Math.min(requested, maxTimeoutSeconds) : requested);
+				return ok(Math.min(requested, maxCallTimeoutSeconds));
 			}
-			if (timeoutSeconds === 0) return ok(undefined);
-			return ok(maxTimeoutSeconds > 0 ? Math.min(timeoutSeconds, maxTimeoutSeconds) : timeoutSeconds);
+			// Python's config-level default is not capped; zero disables the timeout.
+			return ok(timeoutSeconds === 0 ? undefined : timeoutSeconds);
 		},
 	};
 	return policy;

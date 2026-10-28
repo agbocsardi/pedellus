@@ -152,43 +152,80 @@ adapter.
 ## Shared policy and guarded host backend (W1 foundation)
 
 `src/execution/policy.ts` is the shared execution policy. It owns the ported
-shell deny patterns, the environment allowlist, the default and maximum shell
-timeout, shell command/allowlist filtering, and the filesystem containment check.
-`src/execution/host.ts` imports it; the bubblewrap backend is expected to import
-the same policy when its W2 integration lands. The host backend is not enabled by
-the Gateway and no runtime/config/barrel file was changed for it.
+shell deny patterns, the environment allowlist, the Python timeout rules, shell
+command/allowlist/path filtering, and the filesystem containment check.
+`src/execution/host.ts` imports it; the optional bubblewrap backend is expected
+to import the same policy when its W2 integration lands. This slice does not
+activate Gateway tools and no runtime/config/barrel file was changed. Per the
+owner clarification, bwrap is an optional W2 backend: W1 protects the actual
+workspace against accidental damage and does not require hostile isolation.
 
 `createHostExecutionEnv({ workspaceRoot, allowedRoots?, shell?, cwd?,
   tempDirectory? })` wraps the native `NodeExecutionEnv`:
 
+- Roots contract: roots are canonical absolute paths supplied by the backend.
+  The policy checks absoluteness and normalizes separators/`..`, but deliberately
+  does not call `realpath`. The host resolves `workspaceRoot`, each allowed root,
+  `cwd` and the scratch root with `realpath` once at creation; a sandbox passes
+  canonical virtual roots such as `/workspace`. This keeps virtual sandbox paths
+  usable without a host syscall.
 - Filesystem methods reject lexical `..`/absolute escapes and paths that resolve
   through a symlink outside the configured roots. The guard returns the original
   path to the operation, never the canonical probe path. `followFinalLink`
   follows operation semantics: reads/writes/watch follow a final symlink, while
   `remove`, `renameFile`, `fileInfo`, `exists` and `createDir` act on the link or
   parent and are not refused merely because the link target is outside. A link
-  that cannot be resolved is refused rather than guessed. A check/use race
-  remains, so this is a damage-reduction guard, not a security boundary.
-- Shell commands are filtered by the shared deny/allow patterns, run with only
-  the policy environment (`HOME` is the workspace, `TMPDIR` is a private scratch
-  directory, `PATH`/`LANG`/`TERM` and explicit `allowedEnvKeys` are the only
-  forwarded host values), and always receive the policy timeout. Caller `env`
-  and `inheritEnv` are ignored. Detached descendants are torn down by the native
-  `NodeExecutionEnv` process-group kill on timeout, abort and cleanup.
+  that cannot be resolved is refused rather than guessed; this includes a
+  dangling symlink whose textual target is inside the workspace. A check/use race
+  remains, so this is a damage-reduction guard, not a security boundary. A hard
+  link inside a root to an outside inode is not detectable by path and is
+  allowed; writing or removing through it affects the outside inode.
+- Timeouts match the Python tool: the config-level `timeoutSeconds` is the
+  default, is not capped (a configured 900 s stays 900 s), and `0` disables the
+  timeout. A caller-supplied timeout is capped at 600 s; a backend may only
+  tighten that cap.
+- Shell commands run with only the policy environment (`HOME` is the workspace,
+  `TMPDIR` is the private scratch directory, and `PATH`/`LANG`/`TERM` plus
+  snapshotted `allowedEnvKeys` are the only forwarded host values). Caller `env`
+  and `inheritEnv` are ignored. Allowed keys are resolved once by the owning
+  process; a backend that discards caller env must apply that fixed set inside
+  its own namespace. Networking remains available, as in the Python wrapper.
+- When `shell.restrictToWorkspace` is enabled, the policy applies Python's
+  practical guard: textual `../`/`..\` and absolute or home paths outside the
+  roots are refused with the workspace-boundary note. This is an
+  accidental-damage guardrail, not confinement; command substitution, shell
+  expansion and permitted programs can still reach outside paths.
 - The native bash tool keeps its own output window, streaming callbacks, spill
   file and structured output. The host env passes those options and results
   through unchanged; it adds no second truncation pass. Spill/temp files are
   created under the private scratch root, which is also an allowed read root so
-  `read` can recover the full output.
+  `read` can recover the full output while the environment lives. Spill is not
+  durable: the owned scratch root is removed on `cleanup` (including setup
+  rollback), and a caller-supplied `tempDirectory` stays caller-owned. The
+  optional sandbox has the same lifetime shape: outer `/tmp` spill is readable
+  through the environment while live, unavailable to nested bash, and lost on
+  cleanup. Neither backend may assume the spill survives.
 
-Host shell execution is **not** confinement. Deny patterns and the environment
-allowlist reduce accidental damage and stop a command from inheriting secrets
-implicitly, but a permitted command can still read host files, including
-credentials, and can make network requests. The filesystem API guard does not
-change that. Do not enable Gateway tools on this backend as a security boundary;
-use the bubblewrap backend when the v2 damage model must hold against untrusted
-commands, and keep the host backend for a trusted caller operating in an
-dedicated workspace.
+Host shell execution is **not** confinement. Deny patterns, the environment
+allowlist and the optional path guard reduce accidental damage and stop a command
+from inheriting secrets implicitly, but a permitted command can still read host
+files, including credentials, and can use the network. The filesystem API guard
+does not change that. `NodeExecutionEnv` kills the command's process group on
+timeout, abort and cleanup, but a descendant that creates a new session/process
+group (for example with `setsid`) escapes that teardown. The host backend has no
+namespace to contain it.
+
+Python's exec URL guard is not ported into the shared policy or the host backend.
+A URL in shell text is not scanned here, so the host backend does not claim
+Python parity for that check; the gap is recorded rather than replaced by a
+weaker approximation. The deny list and path guard do not close it.
+
+W2 source note: an earlier review overstated canonical rewriting in the
+bubblewrap `checked()` helper. A later trace showed it authorizes the canonical
+target and then passes the candidate path to the operation; escaping and dangling
+final symlink operations remain refused. That difference from the host path
+guard must still be reconciled against this shared policy when W2 imports it,
+not treated as already parity.
 
 ## Remaining security blockers
 
@@ -205,9 +242,12 @@ does not clear it), and once the supervisor pid is gone the implementation relie
 on Linux PID-namespace teardown (bounded probing observed the supervisor stays
 alive while a guest runs and killing it kills the guest). The parent still owns runtime/config
 integration, conversation-to-workspace persistence, and any automatic orphan
-garbage collection; the lock only prevents concurrent owners. Keep tools disabled
-until those limits and integration contracts are reviewed. No Python daemon, VM,
-unsafe fallback, config-store access, or deployment changes were introduced.
+garbage collection; the lock only prevents concurrent owners. This slice does not
+enable tools; the optional managed-copy bwrap adapter stays disabled until those
+limits are reviewed. The owner clarification makes optional bwrap non-blocking for
+the direct-workspace W1 path, which still requires its own review and durable
+grants. No Python daemon, VM, unsafe fallback, config-store access, or deployment
+changes were introduced.
 
 ## Bounded synthetic evidence
 
@@ -220,12 +260,26 @@ unsafe fallback, config-store access, or deployment changes were introduced.
   write, canonicalize and shell cwd; removing/renaming an outside-pointing link
   was allowed as a link operation and the sentinel was unchanged; missing nested
   writes succeeded; deny patterns, allow-pattern override, environment allowlist,
-  caller-env ignoring, policy timeout and process-group teardown were observed;
+  caller-env ignoring, policy timeout and process-group timeout teardown were
+  observed;
   a 60 KiB output command spilled intact and the spill was readable through the
   guard; a private temp file was readable; and a shell `cat` of the outside
   sentinel succeeded, confirming the documented non-confinement limitation.
   The native `createEnvConformance` suite passed 24/24 cases against the host
   backend (temp-only, cleaned up).
+- Fix-pass probe (private, temp-only, no repository tests): config default 900 s
+  survived uncapped while a 1200 s caller timeout clamped to 600 s and a 0 config
+  disabled the timeout; relative roots were rejected; a symlinked workspace root
+  canonicalized once to its real path; Python-style `../`, outside absolute,
+  outside home and `~other` commands were refused while inside absolute, `~/`,
+  `$HOME/`, `/dev/null` and a URL text remained allowed; caller env was ignored
+  and the allowlist snapshot survived a later host-env change; spill was readable
+  while live and gone after cleanup; cwd and invalid-policy setup failures left no
+  owned scratch root; a `setsid` descendant survived process-group teardown; a
+  workspace hard link wrote the outside inode; and a dangling inside-target
+  symlink was refused for read/write but removable as a link. The conformance
+  suite still passed 24/24, and `npm run test:behavior` (155) plus
+  `npm run test:execution` (9) stayed green.
 - `npm ci --prefix packages/pi-nanobot --ignore-scripts`
 - `npm run typecheck --prefix packages/pi-nanobot`
 - `npm run build --prefix packages/pi-nanobot`
