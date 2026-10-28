@@ -47,6 +47,11 @@ standing authorization to implement or deploy them.
 - [ ] Finish curated builtin skill compatibility/package review (parked).
 - [ ] Record real-model memory/skill/compaction acceptance and A/B fixture results (W4).
 - [ ] Connect internal agent cron: model-callable tool, runtime lifecycle, authorization and delivery.
+      First pass committed (`79748d0ad`): `cron` add/list/remove tool, opt-in config, Gateway install and
+      background-run preparation. Unverified; one worker pass and one independent review are running.
+- [ ] Give a scheduled background run the workspace context snapshot (AGENTS.md/memory/skills); today it
+      can only read those files with granted tools.
+- [ ] Deliver scheduled results beyond the origin conversation turn (channel outbox) once a channel is accepted.
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
 - [ ] Complete requested channels individually after core acceptance.
 - [ ] Agree the next bounded implementation scope with the owner; no automatic restart.
@@ -420,6 +425,21 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-28 — agent-callable cron, first pass
+
+Owner resumed implementation and asked for coordination through subagents. Committed the first
+pass of internal agent cron as `79748d0ad`: a `cron` tool with add/list/remove, `cron.enabled`
+opt-in config, Gateway install-before-resume, and background-run preparation that copies the origin
+conversation's still-valid grants with their original expiries. The tool is exempt from the coding
+tool grant document because it grants no filesystem or shell authority, and a scheduled background
+conversation does not receive it.
+
+Two children are running from that commit: `pi-fe0fd520` (verification probe plus fixes) and
+`pi-89c0ac7d` (independent read-only review of authority, owner scoping, replay, lifecycle, failure
+visibility and doc accuracy). Nothing is integrated or claimed verified until both report. Known
+open gaps recorded above: no workspace context snapshot in a background run, and no delivery beyond
+the origin conversation.
 
 ### 2026-10-28 — cron interface clarification
 
