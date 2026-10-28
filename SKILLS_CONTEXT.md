@@ -15,7 +15,6 @@ const skills = await loadSkillsContext({
   workspaceRoot: "/srv/workspace",
   builtinSkillsRoot: "/srv/nanobot/skills", // optional, explicit
   disabledSkills: ["clawhub"],
-  selectedSkills: ["project-guide"],
   environment: { PATH: process.env.PATH }, // optional; defaults to process.env
 });
 
@@ -35,25 +34,24 @@ before disabled-skill filtering, matching Python's `SkillsLoader` precedence.
 
 The result contains:
 
-- `skills`: snapshots for `ConversationContextSnapshot.skills`.
-- `selectedSkills`: requested names that were discovered and enabled.
+- `skills`: snapshots for `ConversationContextSnapshot.skills`, a table for the
+  on-demand tool. Bodies here are never rendered in a prompt.
 - `discovered`: name, provenance, optional workspace-relative `path`, content,
-  parsed metadata, `metadataStatus`, `always`, `disabled`, `available`,
+  parsed metadata, `metadataStatus`, `modelInvocable`, `disabled`, `available`,
   `enabled`, and requirement details.
 - `skipped`: directory entries refused before their body was read, with a stable
   reason (`unsafe-name`, `name-too-long`, `symlinked-skill`, `symlinked-file`).
   A refused skill is therefore visible to the host instead of silently absent.
-- `summary`: Python-style progressive `name — description — path` lines.
-  Unavailable skills are marked with their missing gates or unsupported
-  metadata, disabled skills are omitted, enabled `always` skills are omitted
-  (their bodies are already in context), and refused directory entries are
-  listed once.
+- `summary`: the progressive `name — description — locator` lines, prefixed by
+  loading guidance. Unavailable skills are marked with their missing gates or
+  unsupported metadata; disabled and `disable-model-invocation` entries are
+  omitted; refused directory entries are listed once. Bodies are never included.
 
-The existing context extension still decides inclusion: an enabled skill is
-rendered only when frontmatter marks it `always` (top-level, `metadata.nanobot`,
-or `metadata.openclaw`) or the host names it in `selectedSkills`. Disabled or
-requirement-unavailable entries carry `enabled: false` and never render.
-Frontmatter is stripped by the extension, not here.
+The context extension renders only the host summary. It never renders a skill
+body: `always` frontmatter, prior config selection, and enabled state cannot put
+instructions into the prompt. `enabled` still gates whether the on-demand tool
+may return a body. Frontmatter is stripped when the tool returns a body, not
+here.
 
 ## Progressive loading (gateway)
 
@@ -61,11 +59,11 @@ Two pieces make progressive loading real instead of config preselection:
 
 1. **Summary in the prompt.** The host passes `summary` as
    `ConversationContextSnapshot.skillSummary`; the context extension renders it
-   at the top of `nanobot_skills` as `## Available skills`. Enabled `always`
-   skills are omitted from the summary because their bodies are already in the
-   section. Unavailable skills are marked with the missing gate or unsupported
-   metadata, and refused directory entries appear in one `Skipped skill entries:`
-   line. Nothing about an unselected skill body reaches the prompt.
+   as the entire `nanobot_skills` section (`## Available skills`, then names,
+   descriptions and locators). No skill body is included for any skill —
+   `always`, previously selected, or selected by config. Unavailable skills are
+   marked with the missing gate or unsupported metadata, and refused directory
+   entries appear in one `Skipped skill entries:` line.
 2. **`skill` tool.** When the host supplied a snapshot, the gateway installs one
    read-only model-facing tool, `skill`. With no argument it returns the same
    listing; with `name` it returns that skill's Markdown body (frontmatter
@@ -74,6 +72,14 @@ Two pieces make progressive loading real instead of config preselection:
    or restarted conversation can load any discovered workspace **or builtin**
    skill without a config change — including builtin files that the `read` tool
    cannot reach because they are outside the workspace.
+
+   The returned body states how to resolve relative paths: a workspace skill
+   resolves them against `skills/<name>/` and its bundled files can be read with
+   the ordinary granted `read` tool; a builtin skill's other files are outside
+   the workspace and are not readable with workspace tools. Honoring the Agent
+   Skills `disable-model-invocation: true` flag hides that skill from both the
+   summary and the tool table (there is no `/skill:name` command path here, so
+   such a skill is not model-usable).
 
 The tool is context delivery, not execution or privilege:
 
@@ -107,8 +113,9 @@ host decision, and the owner's 2026-10-28 selection is:
   summary, and the `skill` tool refuses them.
 - **Retained, pending compatibility review**: `memory`, `memory-defrag`, `cron`,
   `skill-creator`, `github`, `my`. Retained is not enabled. Note that the Python
-  `memory` and `my` files carry `always: true`, so merely enabling them places
-  Python-only tool instructions in the prompt. Until port-compatible rewrites
+  `memory` and `my` files carry `always: true`, so they are listed in the summary
+  as soon as they are enabled; their bodies still load only on demand, but they
+  reference Python-only tools. Until port-compatible rewrites
   exist, keep them disabled as well or point at a curated copy that does not
   claim `always`.
 - The Python reference tree (`nanobot/skills/`) and any user workspace skills are
@@ -132,15 +139,15 @@ the config contains an explicit section (see
     "memoryFiles": [],
     "skills": {
       "builtinSkillsRoot": "/opt/nanobot/skills",
-      "disabledSkills": ["summarize", "weather", "image-generation", "tmux", "clawhub", "update-setup", "long-goal"],
-      "selectedSkills": []
+      "disabledSkills": ["summarize", "weather", "image-generation", "tmux", "clawhub", "update-setup", "long-goal"]
     }
   }
 }
 ```
 
 - Absent `skills` means no skill discovery at all. There is no default builtin
-  root and no ambient read.
+  root and no ambient read. There is deliberately no `selectedSkills`: the
+  prompt never includes a body, so a selection list would be inert.
 - Each conversation receives its own detached snapshot: the loaders run once per
   session key on open/create, an existing conversation keeps the snapshot
   captured for it, and reopening the gateway reconstructs every mapped session
@@ -153,9 +160,9 @@ the config contains an explicit section (see
   not the gateway's full environment. A `requires.env` entry for a credential or
   other host-only name therefore stays unmet instead of being satisfied by a
   value the tools never see.
-- Discovery and prompt inclusion are not execution. The model sees a selected
-  skill body and decides what to do with the already-granted `read`/`bash`
-  tools; nothing in this module runs a skill, its scripts, or its references.
+- Discovery and prompt listing are not execution. The model loads a body on
+  demand and decides what to do with the already-granted `read`/`bash` tools;
+  nothing in this module runs a skill, its scripts, or its references.
 
 ## Requirements and metadata honesty
 
@@ -167,7 +174,7 @@ rejects directories). Environment variables are checked against the supplied
 
 The frontmatter parser is a flat, bounded subset of YAML, so a gate can be
 unreadable. Rather than dropping it silently, the result reports it and the
-skill fails closed (`enabled: false`, excluded from `selectedSkills`):
+skill fails closed (`enabled: false`, so the tool refuses it):
 
 | Situation | `metadataStatus` / `requirements` |
 | --- | --- |
@@ -189,7 +196,7 @@ YAML `null` → Python's empty payload.
 128-code-unit names, 64 KiB per `SKILL.md`, 16 KiB frontmatter, 8 KiB metadata
 value, 256-character requirement entries, and 4,096-character roots. There is
 **no inventory count cap and no aggregate byte cap**: every discovered
-`SKILL.md` is reported, every requested selected/disabled name is accepted, and
+`SKILL.md` is reported, every requested disabled name is accepted, and
 every refused directory entry is listed once. A realistic workspace plus builtin
 inventory (for example 55 workspace skills and 13 builtins with one duplicate)
 loads completely. Discovery fails closed only on unreadable files, invalid
@@ -230,8 +237,8 @@ and loaded on demand.
   only `requires.bins` and `requires.env` are evaluated.
 - Python silently ignores an unparseable `metadata` value; this loader fails
   that skill closed instead, so a broken gate cannot look satisfied.
-- Unknown selected names are ignored, matching the loader's lookup behaviour.
-  Disabled skills still shadow a builtin with the same name.
+- Disabled names that match nothing are harmless. Disabled skills still shadow a
+  builtin with the same name.
 - The loader itself injects no section and offers no tool; the gateway wiring
   above places the summary and installs the read-only loader. A builtin skill's
   body is loadable through that tool, but its sibling reference files stay

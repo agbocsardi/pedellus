@@ -21,8 +21,7 @@ snapshot provider and `openGateway` installs no context extension.
     "memoryFiles": ["memory/MEMORY.md", "memory/system/preferences.md"],
     "skills": {
       "builtinSkillsRoot": "/opt/nanobot/skills",
-      "disabledSkills": ["clawhub"],
-      "selectedSkills": ["project-guide"]
+      "disabledSkills": ["clawhub"]
     }
   }
 }
@@ -35,8 +34,9 @@ snapshot provider and `openGateway` installs no context extension.
   loader's rules at config parse time and again before reading.
 - `skills` is absent by default and adds no discovery. When present,
   `builtinSkillsRoot` must be an absolute path to an existing directory and
-  `disabledSkills`/`selectedSkills` are explicit name lists validated per entry,
-  with no count cap (default `[]`). Workspace skills are read from
+  `disabledSkills` is an explicit name list validated per entry, with no count
+  cap (default `[]`). There is no `selectedSkills`: skill bodies are never
+  injected into the prompt, so selection would be inert. Workspace skills are read from
   `<workspace>/skills`; there is no package, home-directory, or other default
   builtin root. See [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md) for metadata,
   requirement and port-builtin-curation rules.
@@ -58,12 +58,11 @@ snapshot provider and `openGateway` installs no context extension.
   root, observable replacement, missing builtin skills root) rejects gateway
   startup or `conversationFor`. No partial context is installed, and a retry
   re-runs the loader.
-- A selected skill body is prompt content, not code: the host discovers and
-  renders it, and only the conversation's already-granted tools can act. The
-  host also passes the loader's progressive summary as `skillSummary`, so the
-  gateway can list unselected workspace and builtin skills and serve a body on
-  demand through its read-only `skill` tool; see
-  [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md).
+- Skill bodies are never prompt content: the host passes the loader's
+  name/description summary as `skillSummary`, and the gateway serves a body only
+  when the model calls its read-only `skill` tool. Workspace bundled files stay
+  readable with the ordinary granted `read` tool; builtin files are outside the
+  workspace and are not. See [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md).
 - Skill requirements are checked against the non-secret variables the guarded
   shell exports (`PATH`, `HOME`, `TMPDIR`, `LANG`, `TERM`, `PYTHONUNBUFFERED`,
   from the shared shell policy). The gateway's other environment variables,

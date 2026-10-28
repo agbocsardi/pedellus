@@ -62,7 +62,6 @@ export const CONTEXT_LIMITS = Object.freeze({
   toolVisibilityChars: 2_000,
   sourceChars: 256,
   maxMemorySources: 32,
-  maxSkills: 32,
   maxSkillNameCodeUnits: 128,
   maxToolNames: 128,
   descriptionChars: 1_024,
@@ -82,15 +81,18 @@ export interface ContextDocumentSnapshot {
   readonly content: string;
 }
 
-/** Parsed skill frontmatter supplied by the host; no skill file is discovered or parsed here. */
+/**
+ * Host-supplied skill record. The prompt renders only `skillSummary`; these
+ * entries feed the gateway's on-demand skill tool, and `content` must never be
+ * placed in a prompt section. No skill file is discovered or parsed here.
+ */
 export interface ContextSkillSnapshot {
   readonly name: string;
   readonly source: string;
+  /** Raw SKILL.md body, served only by the on-demand skill tool. */
   readonly content: string;
   /** Host has approved/enabled the skill and evaluated any requirements. False or absent is fail-closed. */
   readonly enabled: boolean;
-  /** Parsed SKILL.md frontmatter. Only `description` and Python Nanobot/OpenClaw `always` are consumed. */
-  readonly metadata?: unknown;
 }
 
 /**
@@ -106,15 +108,14 @@ export interface ConversationContextSnapshot {
   readonly user?: ContextDocumentSnapshot;
   /** Memory content the host has explicitly selected for this conversation. */
   readonly memory?: readonly ContextDocumentSnapshot[];
+  /** On-demand skill table for the gateway tool; never rendered in a prompt section. */
   readonly skills?: readonly ContextSkillSnapshot[];
   /**
-   * Host-rendered progressive skill summary (name, description, provenance,
-   * availability). It is rendered at the top of the skills section so the model
-   * can learn that unloaded skills exist without their bodies being included.
+   * Host-rendered progressive skill summary (name, description, locator,
+   * availability). It is the only skills content placed in the prompt; bodies are
+   * never included, whatever `always` or config selection says.
    */
   readonly skillSummary?: string;
-  /** Selected names (each at most 128 UTF-16 code units) for enabled non-always skills; no count cap. */
-  readonly selectedSkills?: readonly string[];
 }
 
 interface PreparedContext {
@@ -200,43 +201,6 @@ function buildContextExtension(contexts: ReadonlyMap<ConversationId, PreparedCon
 }
 
 function prepareContext(snapshot: unknown): PreparedContext {
-  // No inventory count cap: every supplied skill is inspected. Only the number of
-  // rendered bodies is budgeted, with an explicit omission note.
-  const rawSelected = readAll(ownValue(snapshot, "selectedSkills"));
-  const selected = new Set(rawSelected.filter((name): name is string =>
-    typeof name === "string" && name.length <= CONTEXT_LIMITS.maxSkillNameCodeUnits,
-  ));
-  const rawSkills = readAll(ownValue(snapshot, "skills"));
-  const skillNames = new Set<string>();
-  const activeSkills: { name: string; source: string; description: string; content: string }[] = [];
-  let omittedSkills = 0;
-
-  for (const raw of rawSkills) {
-    const name = ownString(raw, "name");
-    if (!name || name.length > CONTEXT_LIMITS.maxSkillNameCodeUnits) continue;
-    if (skillNames.has(name)) throw new TypeError(`Duplicate skill name in context snapshot: ${name}`);
-    skillNames.add(name);
-
-    // A skill is usable only when the host explicitly enabled it. Read metadata
-    // only after this check so disabled metadata can never activate it.
-    if (ownValue(raw, "enabled") !== true) continue;
-    const metadata = ownValue(raw, "metadata");
-    const always = skillIsAlways(metadata);
-    if (!always && !selected.has(name)) continue;
-
-    if (activeSkills.length >= CONTEXT_LIMITS.maxSkills) {
-      omittedSkills++;
-      continue;
-    }
-    const content = ownString(raw, "content");
-    if (content === undefined) continue;
-    activeSkills.push({
-      name,
-      source: sourceLabel(ownString(raw, "source")),
-      description: boundedText(ownString(metadata, "description") ?? name, CONTEXT_LIMITS.descriptionChars),
-      content: stripSkillFrontmatter(content),
-    });
-  }
 
   const sections: Partial<Record<keyof typeof CONTEXT_SECTION_KEYS, string>> = {};
   let remaining = CONTEXT_LIMITS.contextChars;
@@ -272,24 +236,15 @@ function prepareContext(snapshot: unknown): PreparedContext {
   }
   add("memory", renderDocuments(memories.map((document, index) => [`Memory ${index + 1}`, document]), CONTEXT_LIMITS.sectionChars));
 
-  const skillRecords = activeSkills.map((skill) => [
-    `Skill ${safeInline(skill.name)} — ${safeInline(skill.description)}`,
-    { source: skill.source, content: skill.content },
-  ] as [string, ContextDocumentSnapshot]);
+  // Skills are names/descriptions/locators only. Bodies come from the on-demand tool, so
+  // no `always`, selected name, or host-supplied body can enter the prompt stack.
   const skillSummary = ownString(snapshot, "skillSummary");
   if (skillSummary !== undefined && skillSummary.trim().length > 0) {
-    skillRecords.unshift([
-      "Available skills",
-      { source: "host snapshot (skill summary)", content: skillSummary },
-    ]);
+    add("skills", renderDocuments(
+      [["Available skills", { source: "host snapshot (skill summary)", content: skillSummary }]],
+      CONTEXT_LIMITS.sectionChars,
+    ));
   }
-  if (omittedSkills > 0) {
-    skillRecords.push(["Skills omitted", {
-      source: "host snapshot (omitted entries)",
-      content: `${omittedSkills} additional skill entries omitted by skill-count bounds.`,
-    }]);
-  }
-  add("skills", renderDocuments(skillRecords, CONTEXT_LIMITS.sectionChars));
 
   return { sections: Object.freeze(sections) };
 }
@@ -351,25 +306,6 @@ function renderToolVisibility(tools: readonly { readonly name: string }[]): stri
   return `${prefix}${list}${omittedNote}${suffix}`;
 }
 
-function skillIsAlways(metadata: unknown): boolean {
-  if (ownValue(metadata, "always") === true) return true;
-  const nested = ownValue(metadata, "metadata");
-  const payload = parseMetadataObject(nested);
-  const namespace = hasOwnData(payload, "nanobot")
-    ? ownValue(payload, "nanobot")
-    : ownValue(payload, "openclaw");
-  return ownValue(namespace, "always") === true;
-}
-
-function parseMetadataObject(value: unknown): unknown {
-  if (typeof value !== "string" || value.length > 4_096) return value;
-  try {
-    return JSON.parse(value) as unknown;
-  } catch {
-    return undefined;
-  }
-}
-
 export function stripSkillFrontmatter(content: string): string {
   const prefix = content.slice(0, CONTEXT_LIMITS.sectionChars + 1);
   const match = SKILL_FRONTMATTER.exec(prefix);
@@ -420,10 +356,6 @@ function arrayLength(value: unknown): number {
   return typeof length === "number" && Number.isSafeInteger(length) && length > 0 ? length : 0;
 }
 
-function readAll(value: unknown): unknown[] {
-  return readArray(value, arrayLength(value));
-}
-
 function readArray(value: unknown, limit: number): unknown[] {
   const length = Math.min(arrayLength(value), Math.max(0, limit));
   const items: unknown[] = [];
@@ -437,16 +369,6 @@ function readArray(value: unknown, limit: number): unknown[] {
 function ownString(value: unknown, key: string): string | undefined {
   const found = ownValue(value, key);
   return typeof found === "string" ? found : undefined;
-}
-
-function hasOwnData(value: unknown, key: string): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    return descriptor !== undefined && Object.hasOwn(descriptor, "value");
-  } catch {
-    return false;
-  }
 }
 
 /** Read only own data properties: never invoke inherited metadata or accessor getters. */

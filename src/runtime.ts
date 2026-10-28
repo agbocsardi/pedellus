@@ -101,7 +101,7 @@ function bindContextSnapshot(
 ): ConversationContextSnapshot {
   const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   if (value !== undefined) {
-    for (const key of ["identity", "agents", "soul", "user", "memory", "skills", "skillSummary", "selectedSkills"]) {
+    for (const key of ["identity", "agents", "soul", "user", "memory", "skills", "skillSummary"]) {
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (descriptor && Object.hasOwn(descriptor, "value")) snapshot[key] = descriptor.value;
     }

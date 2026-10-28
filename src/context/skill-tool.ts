@@ -157,10 +157,13 @@ export function createSkillTool(): SkillTool {
           isError: true,
         };
       }
+      const location = skill.source.startsWith("workspace:skills/")
+        ? "Relative paths in this skill resolve against its workspace directory (skills/<name>/) and can be read with the read tool."
+        : "This is a builtin skill: its other files are outside the workspace and cannot be read with workspace tools.";
       return {
         output: [{
           type: "text" as const,
-          text: `# Skill: ${skill.name}\nSource: ${skill.source}\n\n${stripSkillFrontmatter(skill.content)}`,
+          text: `# Skill: ${skill.name}\nSource: ${skill.source}\n${location}\n\n${stripSkillFrontmatter(skill.content)}`,
         }],
         details: { name: skill.name, source: skill.source },
       };

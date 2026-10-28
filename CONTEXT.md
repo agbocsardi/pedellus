@@ -25,11 +25,9 @@ const context = createContextExtension([{
     name: "project-guide",
     source: "workspace:skills/project-guide/SKILL.md",
     enabled: true, // host has applied disabled-skill and availability policy
-    metadata: { description: "Project-specific instructions", always: true },
-    content: skillMarkdown,
+    content: skillMarkdown, // served only by the on-demand skill tool
   }],
   skillSummary: "- **weather** — Get current weather  `builtin:skills/weather/SKILL.md`",
-  selectedSkills: [],
 }]);
 ```
 
@@ -37,7 +35,7 @@ When using `createContextExtension()` directly, the host installs/selects the
 returned extension explicitly; `openGateway` manages that lifecycle when its provider
 option is set. The extension copies and pre-renders snapshot values when constructed;
 later mutations to caller objects do not change prompt content. Recreate/reinstall it
-when host-owned snapshots or selected skills change. A snapshot with no matching
+when host-owned snapshots or skill files change. A snapshot with no matching
 conversation ID contributes no identity, document, memory, or skill content. There is no fallback to another
 conversation, a parent/fork, or a default workspace. In the gateway, the host opts in
 with `contextSnapshotProvider(sessionKey, conversationId, context)`, returning the
@@ -107,39 +105,29 @@ tool names are copied into the prompt.
 
 The exported `CONTEXT_LIMITS` documents hard bounds: 256 conversation snapshots;
 **per conversation**, 48,000 Unicode code points for context section values,
-16,000 per context section, and 2,000 for tool visibility; 32 memory sources; 32
-included skill bodies; 128 listed tool names; 256 code points per provenance
-label; and 1,024 per skill description. There is no skill-record inspection cap
-and no selected-skill-name count cap: every supplied record is inspected, and
-every name of at most 128 UTF-16 code units is accepted (longer names are
-ignored before set insertion). Skill bodies beyond the 32-body budget are not
-rendered, but the omission is stated in the section; section and total
+16,000 per context section, and 2,000 for tool visibility; 32 memory sources;
+128 listed tool names; 256 code points per provenance label; and 1,024 per
+description. There is no skill-record inspection cap: the summary is rendered in
+full subject to the section bound, and truncation is marked. Section and total
 truncation is marked, and slicing preserves Unicode code points. The
 50,000-code-point section-value bound (48,000 context + 2,000 tool visibility) is
 also **per conversation**, not an aggregate across the 256 snapshots. The
 snapshot-count cap limits fan-out; aggregate retained strings across all
 snapshots can be larger.
 
-An optional host-rendered `skillSummary` is rendered first in the skills section
-as `## Available skills`, so the model learns which unselected skills exist
-without their bodies being included. The section still contains only the summary
-and the enabled `always`/selected bodies the host supplied.
+An optional host-rendered `skillSummary` is the entire skills section
+(`## Available skills`): names, descriptions and locators. Skill bodies are
+never rendered, whatever `always`, selection or enabled state says; they are
+served on demand by the gateway's read-only `skill` tool. `skills` snapshots are
+the tool's table only.
 
-A skill must have `enabled: true` from the host to appear; absent, false, or
-non-boolean values are disabled. The host is responsible for applying Nanobot's
-disabled-skill configuration and requirement checks (Python checks binaries and
-environment variables). The opt-in host wiring does that with the bounded
-loader in [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md); this extension still only
-reads the supplied snapshots. For enabled skills, `always: true` in parsed frontmatter,
-`metadata.nanobot.always`, or `metadata.openclaw.always` includes full content on
-every prompt. Otherwise the host must name the skill in `selectedSkills` to include
-its body. Disabled/unselected skill bodies are not included. This extension still offers
-no tool of its own: the gateway's separate read-only `skill` loader serves
-bodies from the host snapshot (see [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md)),
-and nothing here claims that an omitted body is available without that loader.
-Only own data properties are read from metadata; inherited/accessor `always` or
-enabled values cannot grant a skill. Skill frontmatter is stripped from included
-Markdown using a bounded delimiter check; YAML is not parsed here.
+An enabled skill's body is never placed in a prompt by this extension: `always`
+frontmatter, a config selection or `enabled: true` only decide whether the
+gateway's separate read-only `skill` tool may return that body on demand. The
+host applies Nanobot's disabled-skill configuration and requirement checks with
+the bounded loader in [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md); this extension
+reads only the supplied summary and tool table. Skill frontmatter is stripped
+when the tool returns a body; YAML is not parsed here.
 
 ## Python semantic reference and deliberate gaps
 
@@ -165,12 +153,13 @@ The source-backed mapping is:
   configured-disabled and requirement-unavailable entries, supports top-level or
   Nanobot/OpenClaw `always`, strips frontmatter from loaded bodies, and builds a
   progressive description/path summary. This extension does no discovery of its
-  own: the host supplies provenance, already-decided `enabled`, parsed metadata,
-  and body. The opt-in [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md) loader performs
-the bounded explicit-root discovery, requirement checks and selection that the
-host passes in; no ambient roots are scanned, no paths are loaded here, and no
-progressive loading is advertised. Duplicate skill names in one supplied
-snapshot are rejected.
+  own: the host supplies the summary and an on-demand body table, and the
+  extension renders neither `always` bodies nor any other skill body. The opt-in
+  [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md) loader performs the bounded
+  explicit-root discovery, requirement checks and summary that the host passes
+  in; no ambient roots are scanned and no paths are loaded here. Duplicate skill
+  names in one supplied snapshot no longer need to be rejected because nothing is
+  rendered; the on-demand tool keeps the first occurrence.
 - `MemoryStore.get_memory_context()` loads system memory and non-template legacy
   `MEMORY.md` material with paragraph deduplication; `get_memory_tree_context()`
   indexes topic files. This extension only inserts memory snapshots explicitly

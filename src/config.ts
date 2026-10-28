@@ -42,8 +42,6 @@ export interface WorkspaceSkillsConfig {
   readonly builtinSkillsRoot?: string;
   /** Configured-disabled names; discovered but never enabled. */
   readonly disabledSkills: readonly string[];
-  /** Explicit names whose bodies the context extension includes. */
-  readonly selectedSkills: readonly string[];
 }
 
 export interface WorkspaceContextConfig {
@@ -126,7 +124,7 @@ function modelKey(model: ModelReference): string {
 function workspaceSkillsConfig(value: unknown): WorkspaceSkillsConfig {
   const raw = object(value, "workspaceContext.skills");
   for (const key of Object.keys(raw)) {
-    if (key !== "builtinSkillsRoot" && key !== "disabledSkills" && key !== "selectedSkills") {
+    if (key !== "builtinSkillsRoot" && key !== "disabledSkills") {
       throw new Error(`Unknown workspaceContext.skills field: ${key}`);
     }
   }
@@ -141,7 +139,6 @@ function workspaceSkillsConfig(value: unknown): WorkspaceSkillsConfig {
   return Object.freeze({
     ...(builtinSkillsRoot === undefined ? {} : { builtinSkillsRoot }),
     disabledSkills: skillNames(raw.disabledSkills, "workspaceContext.skills.disabledSkills"),
-    selectedSkills: skillNames(raw.selectedSkills, "workspaceContext.skills.selectedSkills"),
   });
 }
 

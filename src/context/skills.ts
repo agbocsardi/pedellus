@@ -6,9 +6,10 @@
  * `<builtinSkillsRoot>/<name>/SKILL.md` are read. No home directory, package
  * path, environment variable, or filesystem-wide search supplies a root.
  *
- * The loader returns the existing `ContextSkillSnapshot` shape plus the
- * selected-skill names the context extension expects. Markdown files remain
- * authoritative; runtime state is not stored here.
+ * The loader returns the existing `ContextSkillSnapshot` shape plus a
+ * name/description/locator summary. Markdown files remain authoritative; bodies
+ * are served on demand by the gateway's read-only skill tool and are never
+ * rendered into the system prompt. Runtime state is not stored here.
  *
  * Metadata is parsed as a bounded subset of YAML. When a requirement-bearing
  * form cannot be read (an indented `metadata:` mapping, oversized or malformed
@@ -61,8 +62,6 @@ export interface SkillsContextRequest {
   readonly builtinSkillsRoot?: string;
   /** Configured-disabled skill names. Disabled entries stay discovered but are never enabled. */
   readonly disabledSkills?: readonly string[];
-  /** Explicit names whose bodies should be included by the context extension. */
-  readonly selectedSkills?: readonly string[];
   /**
    * Environment for `requires.env` and `PATH` lookups. Defaults to
    * `process.env`, matching Python's `shutil.which`/`os.environ` checks.
@@ -134,7 +133,8 @@ export interface DiscoveredSkill {
   /** Whether the frontmatter metadata could be represented at all. */
   readonly metadataStatus: SkillMetadataReport;
   readonly description: string;
-  readonly always: boolean;
+  /** False when frontmatter sets `disable-model-invocation: true`; such a skill is never shown or loaded. */
+  readonly modelInvocable: boolean;
   readonly disabled: boolean;
   readonly available: boolean;
   readonly enabled: boolean;
@@ -142,10 +142,8 @@ export interface DiscoveredSkill {
 }
 
 export interface SkillsContextResult {
-  /** Ready to spread into a `ConversationContextSnapshot`. */
+  /** Ready to spread into a `ConversationContextSnapshot`; bodies are served on demand, never rendered. */
   readonly skills: readonly ContextSkillSnapshot[];
-  /** Requested names that are discovered and enabled, in request order. */
-  readonly selectedSkills: readonly string[];
   readonly discovered: readonly DiscoveredSkill[];
   /** Directory entries refused before reading; empty when nothing was skipped. */
   readonly skipped: readonly SkippedSkill[];
@@ -266,7 +264,7 @@ function validatedNames(value: unknown, label: string): readonly string[] {
   return Object.freeze([...seen]);
 }
 
-/** Validate an explicit selected/disabled skill-name list without touching the filesystem. */
+/** Validate an explicit disabled/selected skill-name list without touching the filesystem. */
 export function validateSkillNames(value: unknown, label: string): readonly string[] {
   return validatedNames(value, label);
 }
@@ -479,8 +477,9 @@ function nanobotPayload(metadata: Readonly<Record<string, unknown>> | undefined)
   return { payload: namespace };
 }
 
-function skillIsAlways(metadata: Readonly<Record<string, unknown>> | undefined): boolean {
-  return metadata?.always === true || nanobotPayload(metadata).payload.always === true;
+/** Pi/Agent Skills `disable-model-invocation`: hide from the model entirely (no command path exists here). */
+function disableModelInvocation(metadata: Readonly<Record<string, unknown>> | undefined): boolean {
+  return metadata?.["disable-model-invocation"] === true;
 }
 
 interface RequirementNames {
@@ -680,18 +679,18 @@ async function scanSkillRoot(
 }
 
 /**
- * Python-style progressive summary. Enabled `always` skills are omitted because
- * the renderer already includes their bodies; disabled skills are omitted and
- * requirement-unavailable ones are marked. Refused directory entries are listed
- * once so a host (and a model that saw the name referenced) can tell that they
- * were skipped rather than missing.
+ * Progressive summary: names, descriptions and a minimal locator only. Bodies are
+ * never included here; the model loads one on demand through the `skill` tool.
+ * Disabled and model-hidden skills are omitted; requirement-unavailable ones are
+ * marked. Refused directory entries are listed once so a host (and a model that
+ * saw the name referenced) can tell that they were skipped rather than missing.
  */
 function formatSummary(
   discovered: readonly DiscoveredSkill[],
   skipped: readonly SkippedSkill[],
 ): string {
   const lines = discovered
-    .filter((skill) => !skill.disabled && !(skill.always && skill.enabled))
+    .filter((skill) => !skill.disabled && skill.modelInvocable)
     .map((skill) => {
       const missing = [
         ...skill.requirements.missingBins.map((name) => `CLI: ${name}`),
@@ -703,6 +702,14 @@ function formatSummary(
         : ` (unavailable${missing.length > 0 ? `: ${missing.join(", ")}` : ""})`;
       return `- **${skill.name}** — ${skill.description}${suffix}  \`${skill.path ?? skill.source}\``;
     });
+  if (lines.length > 0) {
+    lines.unshift(
+      "Load a skill with the `skill` tool by name; bodies are not included here. " +
+      "Relative paths in a workspace skill resolve against its directory (`skills/<name>/`) " +
+      "and can be read with the read tool. A builtin skill's other files are outside the workspace " +
+      "and are not readable with workspace tools.",
+    );
+  }
   if (skipped.length > 0) {
     lines.push(
       `Skipped skill entries: ${skipped.map((entry) => `${entry.name} (${entry.reason})`).join(", ")}`,
@@ -740,10 +747,6 @@ export async function loadSkillsContext(
     ownDataField(request, "disabledSkills", "Skills context request").value,
     "disabledSkills",
   ));
-  const selected = validatedNames(
-    ownDataField(request, "selectedSkills", "Skills context request").value,
-    "selectedSkills",
-  );
   const environment = validatedEnvironment(
     ownDataField(request, "environment", "Skills context request").value,
   );
@@ -774,7 +777,7 @@ export async function loadSkillsContext(
       ...(record.metadata !== undefined ? { metadata: record.metadata } : {}),
       metadataStatus: record.metadataStatus,
       description,
-      always: skillIsAlways(record.metadata),
+      modelInvocable: !disableModelInvocation(record.metadata),
       disabled: isDisabled,
       available,
       enabled: available && !isDisabled,
@@ -782,19 +785,17 @@ export async function loadSkillsContext(
     }));
   }
 
-  const skills: ContextSkillSnapshot[] = discovered.map((skill) => Object.freeze({
-    name: skill.name,
-    source: skill.source,
-    content: skill.content,
-    enabled: skill.enabled,
-    ...(skill.metadata !== undefined ? { metadata: skill.metadata } : {}),
-  }));
-  const enabledNames = new Set(discovered.filter((skill) => skill.enabled).map((skill) => skill.name));
-  const selectedSkills = Object.freeze(selected.filter((name) => enabledNames.has(name)));
+  const skills: ContextSkillSnapshot[] = discovered
+    .filter((skill) => skill.modelInvocable)
+    .map((skill) => Object.freeze({
+      name: skill.name,
+      source: skill.source,
+      content: skill.content,
+      enabled: skill.enabled,
+    }));
 
   return Object.freeze({
     skills: Object.freeze(skills),
-    selectedSkills,
     discovered: Object.freeze(discovered),
     skipped: Object.freeze([...state.skipped]),
     summary: formatSummary(discovered, state.skipped),

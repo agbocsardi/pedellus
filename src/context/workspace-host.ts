@@ -47,7 +47,6 @@ export function workspaceContextGatewayOptions(
     workspaceRoot: config.workspace,
     ...(skills.builtinSkillsRoot === undefined ? {} : { builtinSkillsRoot: skills.builtinSkillsRoot }),
     disabledSkills: Object.freeze([...skills.disabledSkills]),
-    selectedSkills: Object.freeze([...skills.selectedSkills]),
     // Gates see exactly the non-secret variables the guarded shell exports (PATH, HOME,
     // TMPDIR, LANG, TERM, PYTHONUNBUFFERED); no other host variable, so a `requires.env`
     // entry for a secret or host-only name stays unmet. TMPDIR here is the host temp root
@@ -66,7 +65,6 @@ export function workspaceContextGatewayOptions(
         // unselected workspace and builtin skills exist, then loads a body on demand.
         ...(discovered.summary.length === 0 ? {} : { skillSummary: discovered.summary }),
         skills: discovered.skills,
-        selectedSkills: discovered.selectedSkills,
       };
     },
   };

@@ -82,16 +82,18 @@ test("snapshots map only to their conversation and are copied at construction", 
   assert.equal(render("nanobot_memory", 2), "");
 });
 
-test("skill inclusion is explicitly enabled/selected and tool visibility does not enable tools", () => {
+test("skills render as a name/description summary only, never bodies, and tools stay visibility-only", () => {
   const extension = createContextExtension([{
     conversationId: 7,
     skills: [
-      { name: "always-guide", source: "synthetic:always", enabled: true, metadata: { always: true }, content: "---\ndescription: guide\n---\nAlways body" },
-      { name: "picked-guide", source: "synthetic:picked", enabled: true, metadata: { description: "Picked" }, content: "Picked body" },
-      { name: "unselected-guide", source: "synthetic:unselected", enabled: true, content: "Unselected body" },
-      { name: "disabled-guide", source: "synthetic:disabled", enabled: false, metadata: { always: true }, content: "Disabled body" },
+      { name: "always-guide", source: "synthetic:always", enabled: true, content: "---\ndescription: guide\n---\nAlways body" },
+      { name: "plain-guide", source: "synthetic:plain", enabled: true, content: "Plain body" },
+      { name: "disabled-guide", source: "synthetic:disabled", enabled: false, content: "Disabled body" },
     ],
-    selectedSkills: ["picked-guide"],
+    skillSummary: [
+      "- **always-guide** — Always guide  `skills/always-guide/SKILL.md`",
+      "- **plain-guide** — Plain guide  `skills/plain-guide/SKILL.md`",
+    ].join("\n"),
   }]);
   const render = (key, agent = { tools: [] }) => {
     const promptSection = extension.sections.find(({ key: sectionKey }) => sectionKey === key);
@@ -100,9 +102,10 @@ test("skill inclusion is explicitly enabled/selected and tool visibility does no
   };
 
   const skills = render("nanobot_skills");
-  assert.match(skills, /Always body/);
-  assert.match(skills, /Picked body/);
-  assert.doesNotMatch(skills, /Unselected body|Disabled body|description: guide/);
+  assert.match(skills, /## Available skills/);
+  assert.match(skills, /always-guide/);
+  assert.match(skills, /plain-guide/);
+  assert.doesNotMatch(skills, /Always body|Plain body|Disabled body|description: guide|disabled-guide/);
   const tools = render("nanobot_tools", { tools: [{ name: "host_read" }] });
   assert.match(tools, /host_read/);
   assert.match(tools, /does not enable tools/);
