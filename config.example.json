@@ -13,8 +13,7 @@
   "toolTimeoutSeconds": 60,
   "toolSandbox": "host",
   "cron": {
-    "enabled": true,
-    "timeZone": "UTC"
+    "enabled": false
   },
   "credentials": {
     "anthropic": "ANTHROPIC_API_KEY",
