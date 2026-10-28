@@ -487,8 +487,12 @@ provider output cap depend on explicitly reported assumptions. Reviewed runner i
 24,996 input tokens (plus cached input) and 1,050 output tokens; no budget violation. Skill discovery
 and on-demand loading, topic memory write and read, and native compaction completed. The summarizer
 request contained the early fact, but the placed summary did not: the check failed and the fresh-process
-recall phase was skipped. This is a failed acceptance result, not proof of general model failure;
-no retry or A/B fixtures were run. W4 remains open. Temporary synthetic state was removed.
+recall phase was skipped. The summary input checks verified the early fact and sentinel in the same
+user turn. This exact-string failure is confounded: that turn also instructed the model not to repeat
+or quote the code, and the report cannot distinguish omission from normalization or reasoning-only
+placement. A reviewer confirmed output truncation is not a plausible cause at the reported usage.
+Fresh-process recall is unproven, not failed. No retry or A/B fixtures were run; W4 remains open.
+Temporary synthetic state was removed.
 
 ### 2026-10-28 — cron origin authority reauthorization
 
