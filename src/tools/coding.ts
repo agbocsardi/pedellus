@@ -1,0 +1,86 @@
+import {
+  defineExtension,
+  wrapTool,
+  type Extension,
+  type ToolRegistration,
+  type Wrap,
+} from "@earendil-works/pi-durable";
+import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import { createToolGrantHook } from "./grants.js";
+
+/** Native coding tools this slice can register, in ceiling order. */
+export const CODING_TOOL_NAMES = Object.freeze(["read", "write", "edit", "bash"] as const);
+
+export type CodingToolName = (typeof CODING_TOOL_NAMES)[number];
+
+export interface CodingToolExtensionOptions {
+  /** Tools to register; must be a non-empty subset of `CODING_TOOL_NAMES`. */
+  readonly tools: readonly CodingToolName[];
+  /** Host-owned ceiling the grant hook enforces; normally the configured allowlist. */
+  readonly ceiling: readonly string[];
+  /** Effective config-level shell timeout, for a meaningful message when the host default fires. */
+  readonly defaultTimeoutSeconds: number;
+  /** Grant-clock override; defaults to `Date.now`. */
+  readonly now?: () => number;
+}
+
+/**
+ * The output message of the native bash tool names the timeout it requested. When the caller omits
+ * one and the host policy default fires, that value is `undefined`; keep native output, spill and
+ * execution semantics, and only replace that one user-visible message with the configured default.
+ */
+function withDefaultTimeoutMessage<T extends ToolRegistration>(
+  tool: T,
+  defaultTimeoutSeconds: number,
+): T {
+  if (defaultTimeoutSeconds <= 0) return tool;
+  return {
+    ...tool,
+    async execute(...callArgs: Parameters<T["execute"]>) {
+      const [args, api, context] = callArgs;
+      try {
+        return await tool.execute(args, api, context);
+      } catch (error) {
+        if (error instanceof Error && error.message === "Command timed out after undefined seconds") {
+          throw new Error(`Command timed out after ${defaultTimeoutSeconds} seconds`, { cause: error });
+        }
+        throw error;
+      }
+    },
+  } as T;
+}
+
+/**
+ * Register the native read/write/edit/bash tools over the guarded host environment. No tool is
+ * offered unless the conversation has an explicit unexpired grant, and the grant hook rechecks that
+ * at call time. Tool definitions, limits, output windows and spill behavior stay native.
+ */
+export function createCodingToolExtension(options: CodingToolExtensionOptions): Extension {
+  const selected = new Set(options.tools);
+  const unknown = [...selected].filter(
+    (name) => !(CODING_TOOL_NAMES as readonly string[]).includes(name),
+  );
+  if (unknown.length > 0) throw new Error(`Unknown coding tools: ${unknown.join(", ")}`);
+  if (selected.size === 0) throw new Error("A coding tool extension requires at least one tool");
+
+  const tools: ToolRegistration[] = [];
+  const wraps: Wrap[] = [];
+  for (const name of CODING_TOOL_NAMES) {
+    if (!selected.has(name)) continue;
+    if (name === "read") tools.push(createReadTool());
+    else if (name === "write") tools.push(createWriteTool());
+    else if (name === "edit") tools.push(createEditTool());
+    else {
+      const bash = createBashTool();
+      tools.push(bash);
+      wraps.push(wrapTool(bash, (tool) => withDefaultTimeoutMessage(tool, options.defaultTimeoutSeconds)));
+    }
+  }
+
+  return defineExtension({
+    name: "nanobot-coding-tools",
+    tools,
+    wraps,
+    hooks: [createToolGrantHook(options.ceiling, options.now ?? Date.now)],
+  });
+}

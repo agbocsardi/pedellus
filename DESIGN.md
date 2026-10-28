@@ -89,13 +89,14 @@ appropriately confined environment, not a raw NodeExecutionEnv. Identity must
 preserve upstream per-file serialization across environments addressing the same
 files.
 
-**Current integration decision:** the execution spike has unresolved filesystem
-TOCTOU and hardlink escape risks. The gateway must remain tool-less: do not install
-CodingTools, do not start an execution environment, and force `tools: []` on every
-existing/new conversation before resuming work. No unsafe opt-in configuration.
-The standalone experimental execution factory is not a production-safe capability.
-This preserves a useful chat/Telegram slice without pretending the security gate
-has passed.
+**Current integration decision:** bwrap execution remains unresolved and is not
+installed by the Gateway. The reviewed W1 coding tools instead run over the
+guarded `HostExecutionEnv` on the actual workspace, disabled by default and
+requiring explicit expiring per-conversation grants; see
+[`TOOLS.md`](./TOOLS.md). That path is accidental-damage protection, not
+confinement, and it does not make the standalone managed-copy execution factory
+a production-safe capability. Host shell execution can still read host files and
+use the network; Python's exec URL guard is not ported.
 
 `src/extensions/codemode.ts` provides the opt-in `createCodeModeIntegration`
 factory, budgets and lifecycle/types, also exported by `src/index.ts`. Native

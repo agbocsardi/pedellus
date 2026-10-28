@@ -90,4 +90,19 @@ export {
   type PreparedContextCancelResult,
 } from "./recovery/index.js";
 export { openGateway, type Gateway, type GatewayContextSnapshotProvider, type OpenGatewayOptions } from "./runtime.js";
+export {
+  CODING_TOOL_NAMES,
+  createCodingToolExtension,
+  createToolEnvironments,
+  ToolGrantDoc,
+  activeToolGrants,
+  normalizeToolGrants,
+  pruneToolGrants,
+  type CodingToolExtensionOptions,
+  type CodingToolName,
+  type GatewayToolGrant,
+  type ToolEnvironmentOptions,
+  type ToolEnvironments,
+  type ToolGrantDocument,
+} from "./tools/index.js";
 export { main } from "./cli.js";

@@ -3,13 +3,25 @@ import type { Context } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
-import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type Extension, type Harness as HarnessType, type ModelRef, type Storage } from "@earendil-works/pi-durable";
+import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type Extension, type Harness as HarnessType, type ModelRef, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ConversationContextSnapshot } from "./context/index.js";
 import type { ModelReference, PortConfig } from "./config.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
 import { prepareDataDirectory } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
+import {
+  CODING_TOOL_NAMES,
+  ToolGrantDoc,
+  activeToolGrants,
+  createCodingToolExtension,
+  createToolEnvironments,
+  normalizeToolGrants,
+  pruneToolGrants,
+  type CodingToolName,
+  type GatewayToolGrant,
+  type ToolEnvironments,
+} from "./tools/index.js";
 
 const SessionMap = defineDoc<{ sessions: Record<string, number> }>({
   kind: "nanobot.session-map", version: 1, scope: "conversation", history: "latest", fork: "initial",
@@ -58,6 +70,15 @@ export interface Gateway {
   listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
   /** Persists a native pi.agent choice; rejects ConversationBusy atomically without changing it. */
   selectModel(sessionKey: string, selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection>;
+  /** Active, unexpired grants for a known session; empty when tools are disabled. */
+  listToolGrants(sessionKey: string, context: Context): Promise<readonly GatewayToolGrant[]>;
+  /**
+   * Adds explicit expiring grants for a known session. Every name must be inside the host ceiling and
+   * every expiry must be in the future; a conversation never receives an implicit or permanent grant.
+   */
+  grantTools(sessionKey: string, grants: unknown, context: Context): Promise<readonly GatewayToolGrant[]>;
+  /** Revokes grants by name. Revocation is persisted and survives reopen; unknown names are ignored. */
+  revokeTools(sessionKey: string, names: readonly string[], context: Context): Promise<readonly GatewayToolGrant[]>;
   close(context: Context): Promise<void>;
 }
 
@@ -107,11 +128,19 @@ function isModelSelection(value: unknown): value is GatewayModelSelectionRequest
 }
 
 export async function openGateway(config: PortConfig, context: Context, options: OpenGatewayOptions = {}): Promise<Gateway> {
-  // A config name is not a Durable registration identity or an authorization grant. Until the
-  // gateway installs reviewed registrations, fail closed rather than silently accepting grants.
-  if ((config.toolAllowlist ?? []).length > 0) {
-    throw new Error("toolAllowlist is non-empty, but this gateway has no approved registered tools");
+  // A config name is not a Durable registration identity or an authorization grant. Only the four
+  // native coding tools have reviewed registrations; anything else fails closed before setup.
+  const toolAllowlist = config.toolAllowlist ?? [];
+  const unavailableTools = toolAllowlist.filter(
+    (name) => !(CODING_TOOL_NAMES as readonly string[]).includes(name),
+  );
+  if (unavailableTools.length > 0) {
+    throw new Error(
+      `toolAllowlist names unsupported tools: ${unavailableTools.join(", ")} ` +
+      "(no approved registered tools)",
+    );
   }
+  const toolsEnabled = toolAllowlist.length > 0;
   const allowedModels = config.allowedModels ?? [config.model];
   const prepared = options.models
     ? { models: options.models, model: nativeModelReference(config.model) }
@@ -130,13 +159,33 @@ export async function openGateway(config: PortConfig, context: Context, options:
     throw new TypeError("contextSnapshotProvider must be a function");
   }
   const defaultThinkingLevel = config.thinkingLevel ?? "off";
-  const { workspace, dbPath } = await prepareDataDirectory(config);
-  const hostPolicy: AgentChange = { cwd: workspace, tools: [], modelTools: [] };
+  const { workspace, extraRoots, dbPath } = await prepareDataDirectory(config);
+  const hostPolicy: AgentChange = { cwd: workspace };
   const defaultAgentPolicy: AgentChange = {
     ...hostPolicy,
     model,
     thinkingLevel: defaultThinkingLevel,
+    tools: [],
+    modelTools: [],
   };
+  const now = () => Date.now();
+  // Mirrors the shared policy's config-level default so a host-default timeout reports its duration.
+  const defaultTimeoutSeconds = config.toolTimeoutSeconds ?? 60;
+  const toolExtension: Extension | undefined = toolsEnabled
+    ? createCodingToolExtension({
+        tools: toolAllowlist as readonly CodingToolName[],
+        ceiling: toolAllowlist,
+        defaultTimeoutSeconds,
+        now,
+      })
+    : undefined;
+  const toolEnvironments: ToolEnvironments | undefined = toolsEnabled
+    ? createToolEnvironments({
+        workspaceRoot: workspace,
+        allowedRoots: extraRoots,
+        ...(config.toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: config.toolTimeoutSeconds }),
+      })
+    : undefined;
   const fallbackThinkingLevel = (choice: ResolvedModelChoice): ModelThinkingLevel =>
     config.thinkingLevel !== undefined && choice.thinkingLevels.includes(config.thinkingLevel)
       ? config.thinkingLevel
@@ -155,11 +204,41 @@ export async function openGateway(config: PortConfig, context: Context, options:
   let contextExtension: Extension | undefined;
   const contextExtensionBuilder = createContextExtensionBuilder();
   const contextConversations = new Set<ConversationId>();
-  const contextAgentPolicy = (conversationId: ConversationId): AgentChange => {
-    if (!options.contextSnapshotProvider || !contextExtension) return { extensions: [] };
-    return contextConversations.has(conversationId)
-      ? { extensions: { add: [contextExtension] } }
-      : { extensions: { remove: [contextExtension] } };
+  const extensionsPolicy = (conversationId: ConversationId): AgentChange => {
+    const add: Extension[] = [];
+    const remove: Extension[] = [];
+    if (toolExtension) add.push(toolExtension);
+    if (options.contextSnapshotProvider && contextExtension) {
+      if (contextConversations.has(conversationId)) add.push(contextExtension);
+      else remove.push(contextExtension);
+    }
+    if (add.length === 0 && remove.length === 0) return { extensions: [] };
+    return {
+      extensions: {
+        ...(add.length === 0 ? {} : { add }),
+        ...(remove.length === 0 ? {} : { remove }),
+      },
+    };
+  };
+  const toolRegistrations = new Map<string, ToolRegistration>(
+    (toolExtension?.tools ?? []).map((tool) => [tool.name, tool]),
+  );
+  const toolFilterFromNames = (
+    names: readonly string[],
+  ): Pick<AgentChange, "tools" | "modelTools"> => {
+    const tools = names.flatMap((name) => {
+      const tool = toolRegistrations.get(name);
+      return tool === undefined ? [] : [tool];
+    });
+    return { tools, modelTools: tools };
+  };
+  const toolFilterFor = async (
+    tx: Tx,
+    conversationId: ConversationId,
+  ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
+    if (!toolExtension) return { tools: [], modelTools: [] };
+    const document = await tx.doc(ToolGrantDoc, conversationId);
+    return toolFilterFromNames(pruneToolGrants(document, toolAllowlist, now()));
   };
   const publicChoice = (choice: ResolvedModelChoice): GatewayModelChoice => ({
     ...choice.configured,
@@ -173,7 +252,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
   async function applyConversationPolicy(conversation: Conversation, ctx: Context): Promise<void> {
     await conversation.commit(async (tx) => {
       const state = await tx.doc(AgentDoc, conversation.id);
-      await configure(tx, conversation.id, { ...policyForState(state), ...contextAgentPolicy(conversation.id) });
+      const toolFilter = await toolFilterFor(tx, conversation.id);
+      await configure(tx, conversation.id, {
+        ...policyForState(state),
+        ...extensionsPolicy(conversation.id),
+        ...toolFilter,
+      });
     }, ctx);
   }
   const releaseLock = await processLock(`nanobot:${dbPath}`);
@@ -182,8 +266,19 @@ export async function openGateway(config: PortConfig, context: Context, options:
   let closed = false;
   try {
     const registry = createRegistry();
+    if (toolExtension) registry.install(toolExtension);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
-    harness = await Harness.open(storage, { models, registry }, context);
+    const harnessOptions = {
+      models,
+      registry,
+      ...(toolEnvironments === undefined
+        ? {}
+        : {
+            env: (target: { readonly conversationId: ConversationId }, ctx: Context) =>
+              toolEnvironments.forConversation(target.conversationId, ctx),
+          }),
+    };
+    harness = await Harness.open(storage, harnessOptions, context);
     const root = await harness.root(context, { agent: defaultAgentPolicy });
 
     const contextSnapshotLoads = new Map<ConversationId, Promise<void>>();
@@ -275,14 +370,20 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
     }
 
-    // Apply host security and context selection only after every prepared dispatch passes the replay guard.
+    // Apply host security, grants and context selection only after every prepared dispatch passes the replay guard.
+    // Pruning expired/revoked grants before resume is what keeps a revoked tool from replaying.
     await root.commit(async (tx) => {
       let cursor: Cursor | undefined;
       do {
         const page = await tx.scanConversations({}, 1000, cursor);
         for (const conversation of page.items) {
           const state = await tx.doc(AgentDoc, conversation.id);
-          await configure(tx, conversation.id, { ...policyForState(state), ...contextAgentPolicy(conversation.id) });
+          const toolFilter = await toolFilterFor(tx, conversation.id);
+          await configure(tx, conversation.id, {
+            ...policyForState(state),
+            ...extensionsPolicy(conversation.id),
+            ...toolFilter,
+          });
         }
         cursor = page.next;
       } while (cursor !== undefined);
@@ -303,7 +404,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
             throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
           }
           const created = await tx.createConversation({ ownership: { kind: "ownerless" } });
-          await configure(tx, created.id, { ...defaultAgentPolicy, ...contextAgentPolicy(created.id) });
+          const toolFilter = await toolFilterFor(tx, created.id);
+          await configure(tx, created.id, {
+            ...defaultAgentPolicy,
+            ...extensionsPolicy(created.id),
+            ...toolFilter,
+          });
           map.sessions[key] = created.id as number;
           conversationId = created.id;
         }, ctx);
@@ -346,16 +452,60 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const nextLevel = requestedLevel ?? (changed
             ? fallbackThinkingLevel(target)
             : target.thinkingLevels.includes(currentLevel) ? currentLevel : fallbackThinkingLevel(target));
-          await configure(tx, conversation.id, { ...hostPolicy, model: target.native, thinkingLevel: nextLevel });
+          const toolFilter = await toolFilterFor(tx, conversation.id);
+          await configure(tx, conversation.id, {
+            ...hostPolicy,
+            model: target.native,
+            thinkingLevel: nextLevel,
+            ...toolFilter,
+          });
           return nextLevel;
         }, ctx);
         return publicSelection(target, level);
       },
+      async listToolGrants(sessionKey, ctx) {
+        if (!toolExtension) return [];
+        const conversation = await existingConversationFor(sessionKey, ctx);
+        const document = await harness!.snapshot(ToolGrantDoc, conversation.id, ctx);
+        return document === undefined ? [] : activeToolGrants(document, toolAllowlist, now());
+      },
+      async grantTools(sessionKey, grants, ctx) {
+        if (!toolExtension) throw new Error("Tools are disabled: toolAllowlist is empty");
+        const normalized = normalizeToolGrants(grants, toolAllowlist, now());
+        const conversation = await existingConversationFor(sessionKey, ctx);
+        return conversation.commit(async (tx) => {
+          const document = await tx.doc(ToolGrantDoc, conversation.id);
+          for (const grant of normalized) document.grants[grant.name] = grant.expiresAt;
+          const timestamp = now();
+          const active = pruneToolGrants(document, toolAllowlist, timestamp);
+          await configure(tx, conversation.id, toolFilterFromNames(active));
+          return activeToolGrants(document, toolAllowlist, timestamp);
+        }, ctx);
+      },
+      async revokeTools(sessionKey, names, ctx) {
+        if (!toolExtension) throw new Error("Tools are disabled: toolAllowlist is empty");
+        if (!Array.isArray(names) || names.some((name) => typeof name !== "string" || name.length === 0)) {
+          throw new TypeError("Tool revocations must be an array of non-empty tool names");
+        }
+        const conversation = await existingConversationFor(sessionKey, ctx);
+        return conversation.commit(async (tx) => {
+          const document = await tx.doc(ToolGrantDoc, conversation.id);
+          for (const name of new Set(names)) delete document.grants[name];
+          const timestamp = now();
+          const active = pruneToolGrants(document, toolAllowlist, timestamp);
+          await configure(tx, conversation.id, toolFilterFromNames(active));
+          return activeToolGrants(document, toolAllowlist, timestamp);
+        }, ctx);
+      },
       async close(ctx) {
         if (closed) return;
         closed = true;
-        try { await harness!.close(withoutAbortSignal(ctx)); }
-        finally { await releaseLock(); }
+        const cleanup = withoutAbortSignal(ctx);
+        try { await harness!.close(cleanup); }
+        finally {
+          try { await toolEnvironments?.close(cleanup); }
+          finally { await releaseLock(); }
+        }
       },
     };
     async function existingConversationFor(sessionKey: string, ctx: Context): Promise<Conversation> {
@@ -371,11 +521,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
     harness.resume();
     return gateway;
   } catch (error) {
+    const cleanup = withoutAbortSignal(context);
     try {
-      const cleanup = withoutAbortSignal(context);
       if (harness) await harness.close(cleanup);
       else await storage?.close(cleanup);
-    } finally { await releaseLock(); }
+    } finally {
+      await toolEnvironments?.close(cleanup).catch(() => undefined);
+      await releaseLock();
+    }
     throw error;
   }
 }

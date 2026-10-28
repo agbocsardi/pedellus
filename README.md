@@ -22,7 +22,14 @@ One process acquires Chord's kernel-backed `processLock` using the canonical SQL
 
 The gateway upgrades upstream SQLite's NORMAL default to **WAL `synchronous=FULL` on its actual connection**, verifying both settings before and after native schema initialization and failing closed on mismatch. Parent crash/reopen and injected setup/readback/migration-failure probes passed; this is not proof of physical power/host-loss survival. Backup/restore, disk-full and broader storage acceptance remain open. See [storage policy and evidence](./STORAGE.md).
 
-`toolAllowlist` is the host-owned **global ceiling** and defaults to `[]`. Conversations may only narrow such a ceiling; they cannot widen it. The gateway currently has no approved registered tools, so any nonempty list makes startup fail closed. This field neither names installed registration identities nor represents human approval, and it does not activate tools.
+`toolAllowlist` is the host-owned **global ceiling** and defaults to `[]`.
+Conversations may only narrow such a ceiling; they cannot widen it. An empty ceiling
+keeps the gateway tool-less. A non-empty ceiling may name only the native
+`read`, `write`, `edit` and `bash` tools; the gateway registers them over a guarded
+host environment on the actual workspace, and every conversation still needs an
+explicit per-conversation grant with an expiry. Revoked and expired grants are
+reapplied before resume, and a `beforeTool` hook rechecks them at call time. This
+field is not an approval UI. See [coding tools and grants](./TOOLS.md).
 
 ## Opt-in Code Mode SDK
 
@@ -77,10 +84,12 @@ large-corpus index, or completed real-history rehearsal.
 Run `npm run typecheck` and `npm run test:behavior` for offline Nanobot-owned
 contracts using synthetic providers, temporary SQLite stores and crash/reopen
 fixtures. These do not establish full parity or production security. The standalone
-experimental sandbox is not installed in the Gateway; resource quotas, approvals,
-replay policy and filesystem confinement remain open. [Tool replay checks](./TOOL_REPLAY.md)
-exercise synthetic direct tools only. The Gateway remains tool-less and rejects
-nonempty `toolAllowlist`.
+experimental sandbox is not installed in the Gateway; resource quotas, approvals and
+filesystem confinement remain open. The opt-in
+[coding tools and grants](./TOOLS.md) register native tools over the guarded host
+environment on the actual workspace; they are disabled by default and are not
+confinement. [Tool replay checks](./TOOL_REPLAY.md) exercise synthetic direct tools
+and the native replay/grant boundary.
 
 For earlier Telegram reliability and scripted smoke evidence, see [TELEGRAM.md](./TELEGRAM.md).
 Real-provider acceptance, backup/restore and owner-approved cutover remain open;

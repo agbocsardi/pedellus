@@ -1,10 +1,10 @@
-# Managed Bubblewrap execution spike — not enabled
+# Managed Bubblewrap execution spike — standalone, not enabled in the Gateway
 
-`src/execution/index.ts` is standalone. `runtime.ts` does not import it, the
-Gateway remains tool-less, and this is **not** approval to register coding tools.
-The owner-approved initial contract is an application-managed private workspace
-with explicit copy-in imports: arbitrary host workspace/extra-root binds are
-rejected, and there is no publication or copy-back.
+`src/execution/index.ts` is standalone. `runtime.ts` does not import it, and this
+managed-copy adapter is **not** the Gateway's tool backend. The owner-approved
+W1 path is the separate guarded host environment on the actual workspace
+([`TOOLS.md`](./TOOLS.md)); optional direct-workspace bubblewrap remains W2. The
+managed-copy contract below is not approval to substitute it silently.
 
 ## API and lifecycle
 
@@ -155,10 +155,10 @@ adapter.
 shell deny patterns, the environment allowlist, the Python timeout rules, shell
 command/allowlist/path filtering, and the filesystem containment check.
 `src/execution/host.ts` imports it; the optional bubblewrap backend is expected
-to import the same policy when its W2 integration lands. This slice does not
-activate Gateway tools and no runtime/config/barrel file was changed. Per the
-owner clarification, bwrap is an optional W2 backend: W1 protects the actual
-workspace against accidental damage and does not require hostile isolation.
+to import the same policy when its W2 integration lands. The Gateway's opt-in
+coding tools use `HostExecutionEnv` over the actual workspace and per-conversation
+durable grants; see [`TOOLS.md`](./TOOLS.md). That is accidental-damage
+protection, not hostile isolation.
 
 `createHostExecutionEnv({ workspaceRoot, allowedRoots?, shell?, cwd?,
   tempDirectory? })` wraps the native `NodeExecutionEnv`:

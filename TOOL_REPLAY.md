@@ -70,7 +70,8 @@ against another built checkout.
   exactly-once semantics, or fingerprint / definition compatibility.
 - Nested Code Mode coverage lives in
   [`NESTED_CODEMODE_REPLAY.md`](./NESTED_CODEMODE_REPLAY.md).
-- The Gateway's nonempty `toolAllowlist` fail-closed behavior is unchanged and
-  not bypassed. This test uses a raw Harness because the Gateway deliberately
-  has no approved registered tools to grant.
+- The Gateway now has four opt-in native coding tools, but this fixture still
+  uses a raw Harness so it can control synthetic `replay` classifications. The
+  Gateway's default-deny ceiling and per-conversation grant path are covered by
+  [`TOOLS.md`](./TOOLS.md), not bypassed here.
 - This test does not activate production tools or change runtime policy.

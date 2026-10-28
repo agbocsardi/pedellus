@@ -43,8 +43,13 @@ export interface PortConfig {
   model: ModelReference;
   /** Explicit finite model choices. Missing means the legacy singleton [model]. */
   allowedModels?: readonly ModelReference[];
-  /** Host-owned global ceiling; conversations may only narrow it. No tools are currently registered. */
+  /** Host-owned global ceiling; conversations may only narrow it. Empty means tools are disabled. */
   toolAllowlist?: readonly string[];
+  /**
+   * Config-level default shell timeout in seconds for the host tool environment. `0` disables the
+   * timeout. Absent keeps the shared policy default. This is not the per-call cap.
+   */
+  toolTimeoutSeconds?: number;
   thinkingLevel?: ModelThinkingLevel;
   extraAllowedDirs?: readonly string[];
   bwrapPath?: string;
@@ -137,6 +142,12 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
     }
   }
   config.toolAllowlist = toolAllowlist;
+  if (raw.toolTimeoutSeconds !== undefined) {
+    if (typeof raw.toolTimeoutSeconds !== "number" || !Number.isSafeInteger(raw.toolTimeoutSeconds) || raw.toolTimeoutSeconds < 0) {
+      throw new Error("toolTimeoutSeconds must be a non-negative integer number of seconds");
+    }
+    Object.assign(config, { toolTimeoutSeconds: raw.toolTimeoutSeconds });
+  }
   if (raw.workspaceContext !== undefined) {
     Object.assign(config, { workspaceContext: workspaceContextConfig(raw.workspaceContext) });
   }
