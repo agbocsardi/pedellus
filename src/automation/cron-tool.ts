@@ -27,11 +27,13 @@ import {
 } from "@earendil-works/pi-durable";
 import {
   type CronActor,
+  type CronCancellation,
   type CronConversationWriter,
   type CronFoundation,
   type CronJobView,
   type CronOwner,
   type CronScheduleInput,
+  type CronScheduleReceipt,
   type CronWithdrawal,
 } from "./cron.js";
 import { CRON_DEFAULT_TIME_ZONE } from "./cron-schedule.js";
@@ -62,7 +64,7 @@ interface CronToolArguments {
   readonly action: (typeof ACTIONS)[number];
   readonly message?: string;
   readonly name?: string;
-  readonly at?: string | number;
+  readonly at?: string;
   readonly every_seconds?: number;
   readonly cron_expr?: string;
   readonly tz?: string;
@@ -75,6 +77,8 @@ const text = (value: string, isError = false) => ({
   ...(isError ? { isError: true } : {}),
 });
 
+const reasonText = (error: unknown): string => error instanceof Error ? error.message : String(error);
+
 function iso(ms: number | null): string {
   return ms === null ? "none" : new Date(ms).toISOString();
 }
@@ -84,24 +88,18 @@ function iso(ms: number | null): string {
  * zone-offset arithmetic the calendar schedule avoids, and silently guessing is worse than asking
  * the caller for an unambiguous instant.
  */
-function parseAt(value: unknown): number {
-  if (typeof value === "number") {
-    if (!Number.isSafeInteger(value) || value <= 0) {
-      throw new TypeError("at must be a positive integer epoch-millisecond time or an ISO 8601 timestamp");
-    }
-    return value;
-  }
-  if (typeof value !== "string" || value.trim() === "") {
+function parseAt(raw: string): number {
+  const value = raw.trim();
+  if (value === "") {
     throw new TypeError("at must be an ISO 8601 timestamp with a UTC offset, for example 2026-11-01T09:00:00+01:00");
   }
-  const raw = value.trim();
-  if (!/(?:Z|[+-]\d{2}:\d{2})$/i.test(raw)) {
+  if (!/(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) {
     throw new TypeError(
-      `at must include an explicit UTC offset or Z (got "${raw}"); use cron_expr with tz for a local wall time`,
+      `at must include an explicit UTC offset or Z (got "${value}"); use cron_expr with tz for a local wall time`,
     );
   }
-  const parsed = Date.parse(raw);
-  if (!Number.isSafeInteger(parsed)) throw new TypeError(`at is not a valid ISO 8601 timestamp: ${raw}`);
+  const parsed = Date.parse(value);
+  if (!Number.isSafeInteger(parsed)) throw new TypeError(`at is not a valid ISO 8601 timestamp: ${value}`);
   return parsed;
 }
 
@@ -211,7 +209,9 @@ export function createCronTool(options: CronToolOptions): CronTool {
           "(for example 0 0 9 * * 1-5 at 09:00 on weekdays).",
       })),
       tz: Type.Optional(Type.String({
-        description: "add: IANA time zone for cron_expr, for example Europe/Budapest. Defaults to the host zone.",
+        description:
+          "add: IANA time zone for cron_expr, for example Europe/Budapest. Defaults to the configured " +
+          "cron.timeZone, or UTC when unset.",
       })),
       isolated: Type.Optional(Type.Boolean({
         description:
@@ -222,6 +222,11 @@ export function createCronTool(options: CronToolOptions): CronTool {
         description: "remove: the job ID from `list`.",
       })),
     }),
+    // Every action is safe to rerun after an interrupted execution: `add` dedupes a retry on the
+    // tool call ID, `list` only reads, and `remove` is idempotent because a second cancel reports
+    // `already_terminal`. Declaring it safe keeps the call ID stable across recovery, which is what
+    // makes `tool:<callId>` dedupe a commit that succeeded without a committed result.
+    replay: "safe",
     outputLimits: { maxBytes: 64 * 1024, maxLines: 1_000, retain: "head" },
     async execute(args, api, context) {
       const owner = options.ownerFor(api.conversationId, context);
@@ -240,57 +245,74 @@ export function createCronTool(options: CronToolOptions): CronTool {
         commit: <T>(change: (tx: Tx) => T | Promise<T>, ctx: Context) => harness.commit(change, ctx),
       };
       const request = args as unknown as CronToolArguments;
+      if (request.action === "list") {
+        let views: CronJobView[];
+        try {
+          views = await options.foundation.list(harness, api.conversationId, actor, context);
+        } catch (error) {
+          return text(`Could not read scheduled jobs: ${reasonText(error)}`, true);
+        }
+        if (views.length === 0) return text("No scheduled jobs in this conversation.");
+        return text(views.map(describe).join("\n\n"));
+      }
+      if (request.action === "remove") {
+        const jobId = typeof request.job_id === "string" ? request.job_id.trim() : "";
+        if (jobId === "") return text("remove requires job_id; use action `list` to see the IDs.", true);
+        let result: CronCancellation;
+        try {
+          result = await options.foundation.cancel(harness, api.conversationId, jobId, actor, context);
+        } catch (error) {
+          // Only pre-commit failures reach here; the durable cancellation result is rendered below.
+          return text(`Could not remove scheduled job ${jobId}: ${reasonText(error)}`, true);
+        }
+        if (result.status === "not_found") return text(`No scheduled job ${jobId} in this conversation.`, true);
+        if (result.status === "forbidden") return text(`Scheduled job ${jobId} belongs to another owner.`, true);
+        if (result.status === "already_terminal") {
+          return text(`Scheduled job ${jobId} is already finished or cancelled; nothing to remove.`);
+        }
+        const abortNote = result.abortError === null
+          ? ""
+          : ` The cancellation is recorded, but signalling its queued work failed: ${result.abortError}`;
+        return text(
+          `Cancelled ${jobId} (${result.job.name}).` +
+          (result.job.lastOutcome === null ? "" : " Its last recorded run is kept for reference.") +
+          withdrawalText(result.withdrawn) + abortNote,
+        );
+      }
+      if (request.action !== "add") {
+        return text(`Unknown action; use one of ${ACTIONS.join(", ")}.`, true);
+      }
+      const message = typeof request.message === "string" ? request.message.trim() : "";
+      if (message === "") return text("add requires a non-empty message to run when the job fires.", true);
+      if (request.name !== undefined && typeof request.name !== "string") {
+        return text("name must be a string when provided.", true);
+      }
+      let receipt: CronScheduleReceipt;
       try {
-        if (request.action === "list") {
-          const views = await options.foundation.list(harness, api.conversationId, actor, context);
-          if (views.length === 0) return text("No scheduled jobs in this conversation.");
-          return text(views.map(describe).join("\n\n"));
-        }
-        if (request.action === "remove") {
-          const jobId = typeof request.job_id === "string" ? request.job_id.trim() : "";
-          if (jobId === "") return text("remove requires job_id; use action `list` to see the IDs.", true);
-          const result = await options.foundation.cancel(
-            harness, api.conversationId, jobId, actor, context,
-          );
-          if (result.status === "not_found") return text(`No scheduled job ${jobId} in this conversation.`, true);
-          if (result.status === "forbidden") return text(`Scheduled job ${jobId} belongs to another owner.`, true);
-          if (result.status === "already_terminal") {
-            return text(`Scheduled job ${jobId} is already finished or cancelled; nothing to remove.`);
-          }
-          return text(
-            `Cancelled ${jobId} (${result.job.name}).` +
-            (result.job.lastOutcome === null ? "" : " Its last recorded run is kept for reference.") +
-            withdrawalText(result.withdrawn),
-          );
-        }
-        if (request.action !== "add") {
-          return text(`Unknown action; use one of ${ACTIONS.join(", ")}.`, true);
-        }
-        const message = typeof request.message === "string" ? request.message.trim() : "";
-        if (message === "") return text("add requires a non-empty message to run when the job fires.", true);
-        if (request.name !== undefined && typeof request.name !== "string") {
-          return text("name must be a string when provided.", true);
-        }
         // A call ID is stable across a retried call, so a replay cannot create a second job.
-        const receipt = await options.foundation.schedule(actor, writer, {
+        receipt = await options.foundation.schedule(actor, writer, {
           message,
           ...(request.name === undefined ? {} : { name: request.name }),
           schedule: scheduleOf(request, zone),
           mode: request.isolated === false ? "origin" : "background",
           idempotencyKey: `tool:${api.callId}`,
         }, context);
-        const view = await options.foundation.inspect(
-          harness, api.conversationId, receipt.jobId, actor, context,
-        );
-        const when = iso(receipt.nextAtMs);
-        if (view !== undefined) return text(`Scheduled.\n\n${describe(view)}`);
-        return text(`Scheduled ${receipt.jobId}; first run at ${when}.`);
       } catch (error) {
         // Model-visible scheduling errors are actionable (bad expression, past time). They carry no
         // credentials or host paths: the schedule parser and request validator own the message text.
-        const reason = error instanceof Error ? error.message : String(error);
-        return text(`Scheduling failed: ${reason}`, true);
+        return text(`Scheduling failed: ${reasonText(error)}`, true);
       }
+      // The job is durably created from here on. A failed follow-up read must not be reported as a
+      // scheduling failure, because a retry would look like a new request (a new call ID).
+      const when = iso(receipt.nextAtMs);
+      let view: CronJobView | undefined;
+      try {
+        view = await options.foundation.inspect(harness, api.conversationId, receipt.jobId, actor, context);
+      } catch {
+        view = undefined;
+      }
+      if (view !== undefined) return text(`Scheduled.\n\n${describe(view)}`);
+      return text(`Scheduled ${receipt.jobId}; first run at ${when}.`);
     },
   });
 

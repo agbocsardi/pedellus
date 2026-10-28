@@ -178,6 +178,11 @@ export type CronCancellation =
       readonly execution: "marked" | "terminal" | null;
       /** Result of withdrawing this occurrence's origin/target submission, when one was known. */
       readonly withdrawn: CronWithdrawal | null;
+      /**
+       * Post-commit failure while signalling a task or withdrawing queued work. The cancellation
+       * itself is durably recorded; callers must not report the operation as failed.
+       */
+      readonly abortError: string | null;
       readonly job: CronJob;
     }
   | { readonly status: "already_terminal"; readonly job: CronJob }
@@ -975,17 +980,30 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       ]);
       let withdrawn: CronWithdrawal | null = null;
       const pending = withdrawal;
-      if (pending !== undefined) {
-        const record = await harness.commit(
-          (tx) => tx.submissionByRequest(pending.conversationId, pending.requestId),
-          context,
-        );
-        withdrawn = record === undefined
-          ? "not_found"
-          : await harness.abortSubmission(record.id, context, pending.conversationId);
+      try {
+        if (pending !== undefined) {
+          const record = await harness.commit(
+            (tx) => tx.submissionByRequest(pending.conversationId, pending.requestId),
+            context,
+          );
+          withdrawn = record === undefined
+            ? "not_found"
+            : await harness.abortSubmission(record.id, context, pending.conversationId);
+        }
+      } catch (error) {
+        failures.push(error);
       }
-      if (failures.length > 0) throw failures[0];
-      return { status: "cancelled", timer, execution, withdrawn, job: decision.job };
+      // The cancellation commit above is final, and every timer/run commit checks the generation,
+      // so a post-commit signalling failure cannot resurrect the job. Report it in the result; a
+      // thrown error here would tell the caller the removal failed and invite a retry.
+      return {
+        status: "cancelled",
+        timer,
+        execution,
+        withdrawn,
+        abortError: failures.length === 0 ? null : errorText(failures[0]),
+        job: decision.job,
+      };
     },
 
     async inspect(harness, conversationId, jobId, actor, context) {
