@@ -12,7 +12,11 @@ the core, with actual use and sequencing to be discussed. Do not port the Python
 sustained goal/tasks interface, intent/keyword-triggered features, or a dedicated
 heartbeat feature: an ordinary cron job can serve the heartbeat use case. Defer
 WebUI and migration until the owner discusses them. Existing work is not a
-commitment to activate it.
+commitment to activate it. Exclude these Python built-in skills from the port:
+`summarize`, `weather`, `image-generation`, `tmux`, `clawhub`, `update-setup`,
+and `long-goal`. Retain `memory`, `memory-defrag`, `cron`, `skill-creator`,
+`github`, and `my` for compatibility review. Do not delete the Python reference
+or the owner's workspace skills as part of this selection.
 Complete and validate the core/memory/cron path first; compaction is core context
 continuity. The broader W4–W6 descriptions below are historical options, not
 standing authorization to implement or deploy them.
