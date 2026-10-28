@@ -185,6 +185,14 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
   Gateway's `prepare` copies the origin's still-valid coding-tool grants and offers exactly those
   tools, so a **background** run cannot schedule another job or widen authority; a different host
   must apply the same deny-by-default rule. The foundation alone does not copy grant records.
+  When a context snapshot provider is configured, `prepare` also installs the origin's snapshot
+  for the target conversation — bootstrap/AGENTS files, memory, the skill summary — and the
+  read-only `skill` tool, so a scheduled turn renders the same workspace context as a normal turn.
+- A background run's target conversation deliberately has no SessionMap entry, so it cannot become
+  a cron owner. After a reopen the Gateway restores that target's snapshot from the non-terminal
+  run task's checkpoint before applying conversation policy. At the 256-snapshot cap it evicts the
+  oldest idle background target rather than failing the run; a mapped session's snapshot, the cron
+  tool and the cron foundation are never added to a background run.
 - An `origin`-mode run answers in the origin conversation, so it still holds that conversation's
   `cron` tool and can schedule further jobs. Only a background run's fresh conversation is denied
   cron.

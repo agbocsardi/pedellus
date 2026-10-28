@@ -6,7 +6,7 @@ import type { Models } from "@earendil-works/pi-ai/models";
 import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type Extension, type Harness as HarnessType, type ModelRef, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ConversationContextSnapshot } from "./context/index.js";
 import { createSkillTool, SKILL_TOOL_NAME } from "./context/skill-tool.js";
-import { createCronFoundation } from "./automation/cron.js";
+import { CRON_RUN_TASK_NAME, createCronFoundation } from "./automation/cron.js";
 import { createCronTool, CRON_TOOL_NAME } from "./automation/cron-tool.js";
 import type { CronOwner } from "./automation/cron.js";
 import { parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
@@ -121,6 +121,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/** A live cron run's background target, recovered from its durable checkpoint. */
+interface CronBackgroundTarget {
+  readonly originConversationId: ConversationId;
+  readonly targetConversationId: ConversationId;
+}
+
+/**
+ * The target of one non-terminal cron run whose checkpoint already chose it. A background run's
+ * target is task-owned and deliberately absent from the SessionMap, so it is restored from the run
+ * task itself. An origin-mode run's target is the origin, which the map already restores.
+ */
+function cronBackgroundTarget(task: unknown): CronBackgroundTarget | undefined {
+  if (!isRecord(task) || task.kind !== CRON_RUN_TASK_NAME) return undefined;
+  const { conversationId, state } = task;
+  if (!Number.isSafeInteger(conversationId) || (conversationId as number) < 1) return undefined;
+  if (!isRecord(state) || state.status === "terminal" || state.status === "completing") return undefined;
+  if (!isRecord(state.checkpoint)) return undefined;
+  const targetConversationId = state.checkpoint.targetConversationId;
+  if (!Number.isSafeInteger(targetConversationId) || (targetConversationId as number) < 1) return undefined;
+  if (targetConversationId === conversationId) return undefined;
+  return {
+    originConversationId: conversationId as ConversationId,
+    targetConversationId: targetConversationId as ConversationId,
+  };
+}
+
 function isModelSelection(value: unknown): value is GatewayModelSelectionRequest {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -225,6 +251,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const skillTool = options.contextSnapshotProvider === undefined ? undefined : createSkillTool();
   const skillToolRegistration = skillTool?.extension.tools?.[0];
   const skillConversations = new Set<ConversationId>();
+  // Mapped session keys own their snapshot. A scheduled run's target is tracked separately in
+  // insertion order so the cap can drop an idle target instead of failing the run, and never a
+  // mapped session's snapshot.
+  const sessionConversations = new Set<ConversationId>();
+  const backgroundTargets: ConversationId[] = [];
   // Always an explicit selection, never an add/remove edit: Durable's edit form resolves against the
   // extensions installed at read time, so a later dynamic install (a new conversation's context
   // extension) would otherwise be selected by unrelated conversations.
@@ -249,6 +280,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // so it cannot schedule further jobs. Owners are keyed by the mapped session key.
   const cronOwners = new Map<ConversationId, CronOwner>();
   const harnessRef: { current?: HarnessType } = {};
+  // The snapshot-install path, late-bound because cron's `prepare` can only call it once
+  // Harness.open() has run. It reports whether skills were installed for that conversation.
+  const contextInstallerRef: {
+    current?: (sessionKey: string, conversationId: ConversationId, ctx: Context) => Promise<boolean>;
+  } = {};
   const cronFoundation = cronEnabled
     ? createCronFoundation({
         now,
@@ -256,7 +292,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // origin conversation's still-valid grants so the run has exactly the authority that
         // scheduled it, bounded by those grants' own expiries. An origin-mode run needs nothing:
         // it answers inside the conversation that already holds them.
-        prepare: async ({ tx, originConversationId, targetConversationId, background }) => {
+        prepare: async ({ tx, originConversationId, targetConversationId, background }, ctx) => {
           if (!background) return;
           const origin = await tx.doc(ToolGrantDoc, originConversationId);
           const target = await tx.doc(ToolGrantDoc, targetConversationId);
@@ -269,15 +305,28 @@ export async function openGateway(config: PortConfig, context: Context, options:
               granted.push(name);
             }
           }
-          const tools = granted.flatMap((name) => {
-            const tool = toolRegistrations.get(name);
-            return tool === undefined ? [] : [tool];
-          });
-          await configure(tx, targetConversationId, {
-            tools,
-            modelTools: tools,
-            extensions: toolExtension === undefined ? [] : [toolExtension],
-          });
+          // The run's fresh conversation is default-deny, so it also receives the origin's workspace
+          // context through the same snapshot path: bootstrap/AGENTS, the memory manifest, the skill
+          // summary and the read-only `skill` tool. An origin with no known owner skips this and keeps
+          // grants-only preparation. The cron tool and foundation are never offered here.
+          const owner = cronOwners.get(originConversationId);
+          const skillsInstalled = owner !== undefined && contextInstallerRef.current !== undefined
+            ? await contextInstallerRef.current(owner.sessionKey, targetConversationId, ctx)
+            : false;
+          const tools = [
+            ...granted.flatMap((name) => {
+              const tool = toolRegistrations.get(name);
+              return tool === undefined ? [] : [tool];
+            }),
+            ...(skillsInstalled && skillToolRegistration !== undefined ? [skillToolRegistration] : []),
+          ];
+          const extensions: Extension[] = [];
+          if (toolExtension !== undefined) extensions.push(toolExtension);
+          if (contextConversations.has(targetConversationId) && contextExtension !== undefined) {
+            extensions.push(contextExtension);
+          }
+          if (skillsInstalled && skillTool !== undefined) extensions.push(skillTool.extension);
+          await configure(tx, targetConversationId, { tools, modelTools: tools, extensions });
         },
       })
     : undefined;
@@ -385,43 +434,78 @@ export async function openGateway(config: PortConfig, context: Context, options:
     harnessRef.current = harness;
     const root = await harness.root(context, { agent: defaultAgentPolicy });
 
-    const contextSnapshotLoads = new Map<ConversationId, Promise<void>>();
+    // At the snapshot cap, drop the oldest installed background target that is not running and not a
+    // mapped session. Without an evictable target the builder's RangeError stays the last resort.
+    const makeSnapshotRoom = async (ctx: Context): Promise<void> => {
+      if (contextConversations.size < CONTEXT_LIMITS.maxConversations) return;
+      for (const candidate of backgroundTargets.slice()) {
+        if (sessionConversations.has(candidate) || !contextConversations.has(candidate)) continue;
+        const live = await harnessRef.current!.snapshot(LiveDoc, candidate, ctx);
+        if (live?.run !== undefined) continue;
+        backgroundTargets.splice(backgroundTargets.indexOf(candidate), 1);
+        contextConversations.delete(candidate);
+        skillConversations.delete(candidate);
+        skillTool?.removeConversation(candidate);
+        contextExtension = contextExtensionBuilder.remove(candidate);
+        registry.install(contextExtension);
+        return;
+      }
+    };
+    const contextSnapshotLoads = new Map<ConversationId, Promise<boolean>>();
+    const installContextSnapshot = async (
+      sessionKey: string,
+      conversationId: ConversationId,
+      ctx: Context,
+      backgroundTarget: boolean,
+    ): Promise<boolean> => {
+      if (!options.contextSnapshotProvider) return false;
+      const loading = contextSnapshotLoads.get(conversationId);
+      if (loading !== undefined) return loading;
+      if (contextConversations.has(conversationId)) return skillConversations.has(conversationId);
+      if (backgroundTarget && !backgroundTargets.includes(conversationId)) {
+        backgroundTargets.push(conversationId);
+      }
+      const pending = Promise.resolve()
+        .then(() => options.contextSnapshotProvider!(sessionKey, conversationId, ctx))
+        .then(async (supplied) => {
+          if (supplied !== undefined && !isRecord(supplied)) {
+            throw new TypeError("Context snapshot provider must return an object or undefined");
+          }
+          const snapshot = bindContextSnapshot(supplied, conversationId);
+          if (backgroundTarget) await makeSnapshotRoom(ctx);
+          const extension = contextExtensionBuilder.add(snapshot);
+          contextConversations.add(conversationId);
+          let skillsPresent = false;
+          if (skillTool !== undefined) {
+            if (skillTool.setConversation(conversationId, snapshot) > 0) {
+              skillConversations.add(conversationId);
+              skillsPresent = true;
+            } else {
+              skillConversations.delete(conversationId);
+            }
+          }
+          contextExtension = extension;
+          registry.install(extension);
+          return skillsPresent;
+        })
+        .finally(() => contextSnapshotLoads.delete(conversationId));
+      contextSnapshotLoads.set(conversationId, pending);
+      return pending;
+    };
     const ensureContextSnapshot = async (
       sessionKey: string,
       conversationId: ConversationId,
       ctx: Context,
     ): Promise<void> => {
-      if (!options.contextSnapshotProvider || contextConversations.has(conversationId)) return;
-      let pending = contextSnapshotLoads.get(conversationId);
-      if (!pending) {
-        pending = Promise.resolve()
-          .then(() => options.contextSnapshotProvider!(sessionKey, conversationId, ctx))
-          .then((supplied) => {
-            if (supplied !== undefined && !isRecord(supplied)) {
-              throw new TypeError("Context snapshot provider must return an object or undefined");
-            }
-            const snapshot = bindContextSnapshot(supplied, conversationId);
-            const extension = contextExtensionBuilder.add(snapshot);
-            contextConversations.add(conversationId);
-            if (skillTool !== undefined) {
-              if (skillTool.setConversation(conversationId, snapshot) > 0) {
-                skillConversations.add(conversationId);
-              } else {
-                skillConversations.delete(conversationId);
-              }
-            }
-            contextExtension = extension;
-            registry.install(extension);
-          })
-          .finally(() => contextSnapshotLoads.delete(conversationId));
-        contextSnapshotLoads.set(conversationId, pending);
-      }
-      await pending;
+      await installContextSnapshot(sessionKey, conversationId, ctx, false);
     };
+    contextInstallerRef.current = (sessionKey, conversationId, ctx) =>
+      installContextSnapshot(sessionKey, conversationId, ctx, true);
 
     // Restore the persisted session mapping before resume can schedule work. Cron owners come from
     // the same mapping and are restored even without a context snapshot provider: the policy pass
     // below would otherwise strip the cron tool from every persisted origin session on reopen.
+    const mappedSessionKeys = new Map<ConversationId, string>();
     if (options.contextSnapshotProvider || cronEnabled) {
       await root.commit(async (tx) => { await tx.doc(SessionMap, root.id); }, context);
       const mapping = await harness.snapshot(SessionMap, root.id, context);
@@ -453,16 +537,21 @@ export async function openGateway(config: PortConfig, context: Context, options:
           await ensureContextSnapshot(sessionKey, conversationId, context);
         }
         cronOwners.set(conversationId, { ownerId: sessionKey, sessionKey });
+        sessionConversations.add(conversationId);
+        mappedSessionKeys.set(conversationId, sessionKey);
       }
     }
 
     // Refuse unsafe prepared replays before resume; checkpoints pin historical context cutoffs.
     const preparedContextReplays: NonNullable<ReturnType<typeof preparedContextReplay>>[] = [];
+    const backgroundRunTargets: CronBackgroundTarget[] = [];
     await root.commit(async (tx) => {
       let taskCursor: Cursor | undefined;
       do {
         const page = await tx.scanTasks({}, 1000, taskCursor);
         for (const task of page.items) {
+          const backgroundTarget = cronBackgroundTarget(task);
+          if (backgroundTarget !== undefined) backgroundRunTargets.push(backgroundTarget);
           const preparedModel = preparedTaskModel(task);
           if (preparedModel !== undefined && !choicesByNative.has(modelKey(preparedModel))) {
             throw new Error(`Cannot resume ${task.kind} task ${task.id}: prepared model ${modelKey(preparedModel)} is outside allowedModels`);
@@ -473,6 +562,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
         taskCursor = page.next;
       } while (taskCursor !== undefined);
     }, context);
+
+    // A background run's target deliberately has no SessionMap entry. Restore its snapshot from the
+    // run task's checkpoint before the pre-resume policy pass, so the pass keeps the context and
+    // `skill` selections instead of stripping them. Unknown origins and missing conversations skip.
+    if (options.contextSnapshotProvider) {
+      for (const { originConversationId, targetConversationId } of backgroundRunTargets) {
+        const sessionKey = mappedSessionKeys.get(originConversationId);
+        if (sessionKey === undefined) continue;
+        if (!(await harness.conversation(targetConversationId, context))) continue;
+        await installContextSnapshot(sessionKey, targetConversationId, context, true);
+      }
+    }
 
     for (const replay of preparedContextReplays) {
       const conversation = await harness.conversation(replay.conversationId, context);
@@ -533,6 +634,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // A mapped session key is the cron owner; unmapped conversations (such as a scheduled run's
         // own background conversation) have no owner and therefore never receive the cron tool.
         cronOwners.set(conversationId!, { ownerId: sessionKey, sessionKey });
+        sessionConversations.add(conversationId!);
         const conversation = await harness!.conversation(conversationId!, ctx);
         if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
         await ensureContextSnapshot(sessionKey, conversationId!, ctx);
