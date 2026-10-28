@@ -142,20 +142,24 @@ Time-zone behavior is verified against IANA data and documented honestly:
 - **Gap (spring forward):** a nonexistent wall time is skipped to the next matching wall-clock
   time. For example, `30 2 * * *` in `America/New_York` on 2026-03-08 fires at 03:30 EDT
   (`07:30Z`). Croniter instead normalizes a gap time to the transition instant, 03:00 EDT.
-- **Fold (fall back):** croner runs the first occurrence once. If a reference falls in the second
-  repeated hour, a bounded one-minute reference advance finds the first matching slot at or after
-  the repeated interval ends instead of returning a past instant. Croniter runs both repeated
-  occurrences.
+- **Fold (fall back):** for one-hour folds such as `America/New_York` and `Europe/Berlin`,
+  croner runs the first occurrence once. If a reference falls in the second repeated hour, a
+  bounded one-minute reference advance finds the first matching slot at or after the fold ends
+  instead of returning a past instant. Croniter runs both repeated occurrences. Sub-hour folds
+  such as `Australia/Lord_Howe` (30 minutes) and two-hour folds such as `Antarctica/Troll` are
+  resolved by croner's own forward/backward search and may run both repeated occurrences; the
+  bounded advance still guarantees that the next slot is strictly after the reference.
 - Out-of-range croner dates, including references beyond JavaScript's supported date range, are
   wrapped as `CronScheduleError` rather than leaking croner's raw `TypeError`.
 - The `at` and `every` kinds have no time zone of their own; `at` is already absolute and `every`
   is a fixed elapsed interval.
 
 Invalid expressions, unknown/non-IANA zones, and expressions with no future occurrence are
-rejected before a job record or timer task is created. Stored values are safe integers; a next
-occurrence that would exceed the safe-integer range fails visibly instead of wrapping. Croner's
-own parser supports years 1-9999 and bounds its search near year 3000/9999; that is a library
-limit, not an added product cap.
+rejected before a job record or timer task is created. Validation errors can include croner's own
+internal text (for example `CronPattern` or `CronDate` messages) because that text is surfaced
+rather than rewritten. Stored values are safe integers; a next occurrence that would exceed the
+safe-integer range fails visibly instead of wrapping. Croner's own parser supports years 1-9999
+and bounds its search near year 3000/9999; that is a library limit, not an added product cap.
 
 ## Not included / limitations
 
@@ -193,6 +197,9 @@ slot, backward/forward clock jumps, and safe-integer overflow. A fake-clock Harn
 a calendar timer commits the next occurrence before a blocked model answers, plus the
 `America/New_York` spring gap and fall fold. A stress probe walked calendar occurrences across
 `America/New_York`, `Europe/Berlin`, `Australia/Lord_Howe`, `Antarctica/Troll`, and
-`Pacific/Chatham`, asserting every next instant was strictly later and monotonic. Edge probes
-covered the 1969 `America/New_York` fall fold and huge/out-of-range references, including wrapped
-`CronScheduleError` failures. No live data, credentials, network, or deployment was used.
+`Pacific/Chatham`, asserting every next instant was strictly later and monotonic. Differential
+probes covered leap-day and `W`/`LW` month-list expressions where croner's backward search can
+fail; previous-occurrence recovery is optional and falls back to the forward result. Edge probes
+covered 1-hour, 30-minute, and 2-hour folds, the 1969 `America/New_York` fold, and
+huge/out-of-range references, including wrapped `CronScheduleError` failures. No live data,
+credentials, network, or deployment was used.

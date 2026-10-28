@@ -178,6 +178,22 @@ function guardedCron<T>(action: () => T): T {
 }
 
 /**
+ * Croner's backward search can fail on valid expressions such as leap-day or W/LW month lists.
+ * Its previous occurrence is only an optional fold repair, so a failure must not reject the
+ * schedule; the strictly future forward result is always sufficient.
+ */
+function previousCronOccurrence(cron: Cron, candidate: Date): number | null {
+  try {
+    const previous = cron.previousRuns(1, candidate)[0];
+    if (previous === undefined) return null;
+    const value = previous.getTime();
+    return Number.isSafeInteger(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * First slot strictly after `afterMs`. Passed slots are skipped, not replayed. A calendar
  * expression is evaluated in its IANA time zone; `at` returns its one instant, or `null` once
  * that instant has passed.
@@ -215,6 +231,7 @@ export function nextCronOccurrence(schedule: CronSchedule, afterMs: number): num
   }
   const cron = compileCron(schedule.expr.trim(), zone);
   let reference = afterMs;
+  let advanced = false;
   for (let attempt = 0; attempt < MAX_CALENDAR_ADVANCES; attempt++) {
     const candidate = guardedCron(() => cron.nextRun(new Date(reference)));
     if (candidate === null) return null;
@@ -223,16 +240,13 @@ export function nextCronOccurrence(schedule: CronSchedule, afterMs: number): num
       throw new CronScheduleError("the next occurrence exceeds the safe integer range");
     }
     if (next > afterMs) {
-      const previous = guardedCron(() => cron.previousRuns(1, candidate)[0]);
-      if (previous !== undefined) {
-        const prior = previous.getTime();
-        if (!Number.isSafeInteger(prior)) {
-          throw new CronScheduleError("the previous occurrence exceeds the safe integer range");
-        }
-        if (prior > afterMs && prior < next) return prior;
+      if (advanced) {
+        const prior = previousCronOccurrence(cron, candidate);
+        if (prior !== null && prior > afterMs && prior < next) return prior;
       }
       return next;
     }
+    advanced = true;
     reference = Math.floor(reference / CALENDAR_ADVANCE_MS) * CALENDAR_ADVANCE_MS
       + CALENDAR_ADVANCE_MS;
   }
