@@ -419,14 +419,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
       await pending;
     };
 
-    // Restore each host snapshot against the persisted session mapping before resume can schedule work.
-    if (options.contextSnapshotProvider) {
+    // Restore the persisted session mapping before resume can schedule work. Cron owners come from
+    // the same mapping and are restored even without a context snapshot provider: the policy pass
+    // below would otherwise strip the cron tool from every persisted origin session on reopen.
+    if (options.contextSnapshotProvider || cronEnabled) {
       await root.commit(async (tx) => { await tx.doc(SessionMap, root.id); }, context);
       const mapping = await harness.snapshot(SessionMap, root.id, context);
       const sessions = mapping?.sessions;
       if (!isRecord(sessions)) throw new Error("Stored session map is malformed");
       const entries = Object.entries(sessions);
-      if (entries.length > CONTEXT_LIMITS.maxConversations) {
+      if (options.contextSnapshotProvider && entries.length > CONTEXT_LIMITS.maxConversations) {
         throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
       }
       const mappedConversationIds = new Set<ConversationId>();
@@ -444,11 +446,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
         mappedSessions.push({ sessionKey, conversationId });
       }
       for (const { sessionKey, conversationId } of mappedSessions) {
-        if (!(await harness.conversation(conversationId, context))) {
-          throw new Error("Stored session mapping points to a missing conversation");
+        if (options.contextSnapshotProvider) {
+          if (!(await harness.conversation(conversationId, context))) {
+            throw new Error("Stored session mapping points to a missing conversation");
+          }
+          await ensureContextSnapshot(sessionKey, conversationId, context);
         }
         cronOwners.set(conversationId, { ownerId: sessionKey, sessionKey });
-        await ensureContextSnapshot(sessionKey, conversationId, context);
       }
     }
 
