@@ -170,8 +170,10 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
 ## Not included / limitations
 
 - No migration of the parked probe document versions or stores. They are not supported.
-- No channel/outbound delivery, silence policy, model selection, or misfire policy. Scheduled work
-  submits one agent input to a Durable conversation; it does not send a chat message.
+- No user channel/outbound delivery, silence policy, model selection, or misfire policy. A run
+  submits one agent turn to a Durable conversation (the fresh background conversation, or the
+  origin conversation in `origin` mode); nothing is sent to Telegram, Discord, email, or another
+  channel.
 - The `cron` tool parses only ISO 8601 timestamps with an explicit UTC offset for `at`; parsing
   natural-language user text stays outside.
 - Background runs are owned by the run task, so cancelling the job aborts that run. In `origin` mode
@@ -181,8 +183,17 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
   request preparation. Background runs provision a fresh task-owned conversation through the
   trusted `prepare` callback, but inherit the origin's agent selection before preparation. The
   Gateway's `prepare` copies the origin's still-valid coding-tool grants and offers exactly those
-  tools, so a run cannot schedule another job or widen authority; a different host must apply the
-  same deny-by-default rule. The foundation alone does not copy grant records.
+  tools, so a **background** run cannot schedule another job or widen authority; a different host
+  must apply the same deny-by-default rule. The foundation alone does not copy grant records.
+- An `origin`-mode run answers in the origin conversation, so it still holds that conversation's
+  `cron` tool and can schedule further jobs. Only a background run's fresh conversation is denied
+  cron.
+- A background run's copied grants are a snapshot: revoking or expiring the origin grant after the
+  run is prepared does not remove the copy, which stays valid until its own expiry. The grant hook
+  still rechecks the copy and the host ceiling at call time.
+- Disabling cron (`cron.enabled: false`) on a store that has jobs is not a cleanup operation. Job
+  documents and grants remain, and their persisted timer/run tasks have no installed task
+  definition, so they stay blocked until cron is enabled again.
 - A non-terminal run task, including a parked one, blocks new work with visible skips until it is
   retried or cancelled. Cancellation may remain pending if an owned model request ignores abort.
 - In origin mode, the displayed target generation may belong to another input while the cron input

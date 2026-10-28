@@ -12,6 +12,10 @@
   "toolAllowlist": [],
   "toolTimeoutSeconds": 60,
   "toolSandbox": "host",
+  "cron": {
+    "enabled": true,
+    "timeZone": "UTC"
+  },
   "credentials": {
     "anthropic": "ANTHROPIC_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
