@@ -50,7 +50,9 @@ standing authorization to implement or deploy them.
       First pass committed (`79748d0ad`): `cron` add/list/remove tool, opt-in config, Gateway install and
       background-run preparation. Unverified; one worker pass and one independent review are running.
 - [ ] Give a scheduled background run the workspace context snapshot (AGENTS.md/memory/skills); today it
-      can only read those files with granted tools.
+      can only read those files with granted tools. Recon done (child `pi-6e74fa21`); the chosen shape is
+      below and is not implemented.
+
 - [ ] Deliver scheduled results beyond the origin conversation turn (channel outbox) once a channel is accepted.
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
 - [ ] Complete requested channels individually after core acceptance.
@@ -100,6 +102,29 @@ does not produce a tool-capable ordinary CLI or Telegram session.
    then channel use and order (Telegram, Discord, Email, WebSocket).
 5. **Separate owner decisions:** WebUI, migration, deployment/canary, rollback and
    Python retirement. Nothing in this checklist authorizes live data or deployment.
+
+## Next slice — background-run context (recon complete, not implemented)
+
+The run's own conversation must get a snapshot keyed by **its own** conversation id, built from the
+origin's session key (the workspace provider ignores the key today, so the snapshot is identical and
+no new document kind is needed). `prepare` already runs after `denyNewConversation` in the same commit
+that creates the target, so it can install the snapshot and write the explicit
+`tools`/`modelTools`/`extensions` array; extension choice is explicit, so no other conversation can
+select it.
+
+- `src/context/index.ts`: add a builder `remove(conversationId)` beside `add`, mirroring
+  `skill-tool.ts` `removeConversation`, and keep the 256-entry `RangeError` as the last-resort guard.
+- `src/runtime.ts`: hoist one `installContextFor` holder (same pattern as `harnessRef`) assigned inside
+  the `try`, have it report the skill count, and use it from `prepare` (grants + `skill` registration +
+  explicit extensions) and from startup. Startup restore must come from **live `nanobot.cron.run` tasks**
+  (checkpoint `targetConversationId`), never from a `SessionMap` entry: a map entry would make the run a
+  cron owner and grow the durable map against its cap.
+- Eviction: track created background targets in insertion order and evict an idle one
+  (`LiveDoc.run === undefined`) at the snapshot cap instead of failing the run.
+- Do not touch `SessionMap`, `cronOwners`, `denyNewConversation` or `extensionsPolicy`.
+
+Known costs to verify: file I/O inside the prepare commit, orphaned slots after a rolled-back prepare
+(bounded, cleared on reopen), and an evicted-but-live run losing its sections for the rest of the run.
 
 ## Evidence and limitations
 
