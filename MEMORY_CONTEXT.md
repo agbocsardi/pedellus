@@ -13,8 +13,8 @@ entry's workspace-relative path, and writes it with the existing native
 file, including a missing `memory/` directory.
 
 The host opt-in is `workspaceContext.memoryManifest: true`. The configured
-`workspaceContext.memoryFiles` remain the injected memory sources and are also
-the manifest's `loadedFiles`; topic bodies stay on disk.
+`workspaceContext.memoryFiles` are the configured memory sources; only files
+actually injected are marked loaded in the manifest. Other topic bodies stay on disk.
 
 ## API
 
@@ -91,8 +91,9 @@ budget can shorten the list, and that omission is counted visibly.
 
 A discovered topic that is unreadable, oversized, invalid UTF-8, missing after
 discovery, or changed during the read is skipped and counted in the visible
-skipped line. Discovery errors therefore do not block Gateway reopen, and no
-skipped topic is listed as if its body had been read.
+skipped line, so these file errors do not block Gateway reopen. An unreadable
+memory directory still fails discovery and can block reopen. No skipped topic is
+listed as if its body had been read.
 
 Entries are sorted by path with code-unit comparison, so ordering is stable
 across locales. Every file is re-read on each call; a topic written by the native

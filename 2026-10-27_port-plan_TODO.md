@@ -429,3 +429,11 @@ on synthetic data, native read/write/edit and reload in a separate process. This
 helper is not wired into the Gateway. Before wiring, address loaded-file parent
 symlink traversal, make manifest/total-size limits practical for real workspaces,
 ensure loaded files are actually injected, and decide how errors affect a turn.
+
+Memory Gateway wiring `ad53638fe` and fix `5496ffe95` passed independent reviews
+(`pi-60a764b0`, `pi-685d1383`) and were integrated as `5ef3a8dcd` and
+`07cd71875`. Typecheck, 155 behavior and 9 execution checks pass. Synthetic probes
+verified topic read/write, a fresh-process reload, grants, skill coexistence and
+visible reporting of bad topic files. An unreadable memory directory can still
+block discovery and Gateway reopen; it is documented. Memory and skills are
+opt-in and the copied personal workspace has not been activated.
