@@ -26,6 +26,22 @@ made. 155 behavior checks and 9 execution checks pass.
 Scope of this document is engineering only. Deployment preferences and
 product-usage decisions live outside the repository and do not gate the work below.
 
+## Owner clarification — 2026-10-28
+
+The goal is to prevent **accidental damage outside the chosen actual workspace**,
+not to withstand adversarial commands or provide hostile-tenant isolation.
+Ordinary use must operate directly on that workspace; an isolated copy requiring
+publish-back is not the ordinary workflow. Filesystem path guards, shell deny
+patterns and a filtered environment are guardrails, not confinement: a shell
+command can still access other files or the network. Do not claim otherwise.
+
+Prioritize W1 and its real Gateway turn once its practical guardrails and durable
+grants pass review and the checks below. Bubblewrap remains a separate optional W2
+backend, not a prerequisite for the direct-workspace Gateway. It must not silently
+replace the chosen workspace with a copy, and its documented backend differences
+and conformance still apply if implemented. Do not expand this scope into
+adversarial isolation, hostile-tenant quotas, or additional security frameworks.
+
 ## Why v1 needed replacing
 
 1. **Depth-first on work that is not on the critical path.** Archival import/search
@@ -266,6 +282,11 @@ grant fixture, Discord, scheduling, memory-search and archival candidates parked
 according to v2; the newer Discord and scheduling branches include their older
 candidates. Existing worktrees are clean and were not removed.
 
+The owner clarified that ordinary use targets the actual workspace and protects
+against accidental damage, not adversarial shell behavior. W1 Gateway activation
+no longer waits for optional W2; the host shell is an honest guardrail, not a
+confinement boundary.
+
 W0: the owner authorized `~/.nanobot/secrets.env` and selected OpenCode Go
 DeepSeek V4.1 Flash, then Umans for the second family. A parent-only bounded
 `pi-ai` 1.4.0 completion through the port's `createProviderModels` with
@@ -295,6 +316,6 @@ spill, environment filtering, path escape or deny patterns; supplemental bounded
 checks are needed. The first implementation slice must establish shared policy
 and host semantics before the sandbox follows. Host shell execution is not a
 confinement boundary: environment filtering and command deny patterns do not
-prevent arbitrary shell programs from reading host files. Keep Gateway tools
-disabled unless the actual damage-model boundary is met or a limitation is
-explicitly accepted; do not describe shell deny patterns as isolation.
+prevent arbitrary shell programs from reading host files. The owner accepted
+accidental-damage guardrails rather than adversarial isolation; Gateway tools
+still require W1 review, durable grants and its end-to-end checks.
