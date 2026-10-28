@@ -19,6 +19,11 @@ and `long-goal`. Retain `memory`, `memory-defrag`, `cron`, `skill-creator`,
 discovered skills or selected/disabled skill names; do not silently omit skills.
 Actual prompt context remains finite and truncation must be visible. Do not delete the Python reference
 or the owner's workspace skills as part of this selection.
+Cron must be model-callable for natural-language scheduling and preserve Python's
+per-job isolated-background (default) versus in-conversation mode. In-conversation
+jobs wait for an idle session rather than silently dropping. Support one-shot and
+recurring schedules, origin delivery, and visible failure; review any parked
+one-shot primitive as a foundation, not a complete user feature.
 Complete and validate the core/memory/cron path first; compaction is core context
 continuity. The broader W4–W6 descriptions below are historical options, not
 standing authorization to implement or deploy them.
