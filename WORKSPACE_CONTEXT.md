@@ -35,10 +35,11 @@ snapshot provider and `openGateway` installs no context extension.
   loader's rules at config parse time and again before reading.
 - `skills` is absent by default and adds no discovery. When present,
   `builtinSkillsRoot` must be an absolute path to an existing directory and
-  `disabledSkills`/`selectedSkills` are explicit bounded name lists (default
-  `[]`). Workspace skills are read from `<workspace>/skills`; there is no
-  package, home-directory, or other default builtin root. See
-  [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md) for metadata and requirement rules.
+  `disabledSkills`/`selectedSkills` are explicit name lists validated per entry,
+  with no count cap (default `[]`). Workspace skills are read from
+  `<workspace>/skills`; there is no package, home-directory, or other default
+  builtin root. See [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md) for metadata,
+  requirement and port-builtin-curation rules.
 - Unknown `workspaceContext` or `workspaceContext.skills` fields are rejected.
   There is no bootstrap-file selection, include glob, implicit default memory
   file, or skill auto-selection.

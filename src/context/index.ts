@@ -63,7 +63,6 @@ export const CONTEXT_LIMITS = Object.freeze({
   sourceChars: 256,
   maxMemorySources: 32,
   maxSkills: 32,
-  maxSkillInputs: 64,
   maxSkillNameCodeUnits: 128,
   maxToolNames: 128,
   descriptionChars: 1_024,
@@ -114,7 +113,7 @@ export interface ConversationContextSnapshot {
    * can learn that unloaded skills exist without their bodies being included.
    */
   readonly skillSummary?: string;
-  /** Up to 64 selected names (at most 128 UTF-16 code units each) for enabled non-always skills. */
+  /** Selected names (each at most 128 UTF-16 code units) for enabled non-always skills; no count cap. */
   readonly selectedSkills?: readonly string[];
 }
 
@@ -201,14 +200,16 @@ function buildContextExtension(contexts: ReadonlyMap<ConversationId, PreparedCon
 }
 
 function prepareContext(snapshot: unknown): PreparedContext {
-  const rawSelected = readArray(ownValue(snapshot, "selectedSkills"), CONTEXT_LIMITS.maxSkillInputs);
+  // No inventory count cap: every supplied skill is inspected. Only the number of
+  // rendered bodies is budgeted, with an explicit omission note.
+  const rawSelected = readAll(ownValue(snapshot, "selectedSkills"));
   const selected = new Set(rawSelected.filter((name): name is string =>
     typeof name === "string" && name.length <= CONTEXT_LIMITS.maxSkillNameCodeUnits,
   ));
-  const rawSkills = readArray(ownValue(snapshot, "skills"), CONTEXT_LIMITS.maxSkillInputs);
+  const rawSkills = readAll(ownValue(snapshot, "skills"));
   const skillNames = new Set<string>();
   const activeSkills: { name: string; source: string; description: string; content: string }[] = [];
-  let omittedSkills = Math.max(0, arrayLength(ownValue(snapshot, "skills")) - rawSkills.length);
+  let omittedSkills = 0;
 
   for (const raw of rawSkills) {
     const name = ownString(raw, "name");
@@ -417,6 +418,10 @@ function arrayLength(value: unknown): number {
   if (!Array.isArray(value)) return 0;
   const length = ownValue(value, "length");
   return typeof length === "number" && Number.isSafeInteger(length) && length > 0 ? length : 0;
+}
+
+function readAll(value: unknown): unknown[] {
+  return readArray(value, arrayLength(value));
 }
 
 function readArray(value: unknown, limit: number): unknown[] {

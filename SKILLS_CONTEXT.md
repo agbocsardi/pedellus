@@ -94,6 +94,31 @@ the shared `defaultShellEnvironment()` policy. A host-only variable (for example
 a token in the gateway process environment) never satisfies a skill gate, because
 the shell never receives it.
 
+## Port builtin curation
+
+The port ships no builtin skills directory and has no default builtin root:
+`builtinSkillsRoot` is always an explicit host value. Curation is therefore a
+host decision, and the owner's 2026-10-28 selection is:
+
+- **Excluded from the port builtin set** (do not enable): `summarize`, `weather`,
+  `image-generation`, `tmux`, `clawhub`, `update-setup`, `long-goal`. Pointing
+  `builtinSkillsRoot` at the Python tree and listing these in `disabledSkills`
+  keeps them discovered-but-disabled: they never render, are omitted from the
+  summary, and the `skill` tool refuses them.
+- **Retained, pending compatibility review**: `memory`, `memory-defrag`, `cron`,
+  `skill-creator`, `github`, `my`. Retained is not enabled. Note that the Python
+  `memory` and `my` files carry `always: true`, so merely enabling them places
+  Python-only tool instructions in the prompt. Until port-compatible rewrites
+  exist, keep them disabled as well or point at a curated copy that does not
+  claim `always`.
+- The Python reference tree (`nanobot/skills/`) and any user workspace skills are
+  untouched; curation never deletes or edits them.
+
+Packaging a port-owned curated skills directory (adapted frontmatter, port tool
+names, no `always` until reviewed) and using it as `builtinSkillsRoot` is the
+durable follow-up. It needs content review per skill, so it is not part of this
+bounded fix; the mechanisms above work today without it.
+
 ## Host wiring
 
 `workspaceContextGatewayOptions()` wires this loader into `openGateway` only when
@@ -107,8 +132,8 @@ the config contains an explicit section (see
     "memoryFiles": [],
     "skills": {
       "builtinSkillsRoot": "/opt/nanobot/skills",
-      "disabledSkills": ["clawhub"],
-      "selectedSkills": ["project-guide"]
+      "disabledSkills": ["summarize", "weather", "image-generation", "tmux", "clawhub", "update-setup", "long-goal"],
+      "selectedSkills": []
     }
   }
 }
@@ -160,24 +185,32 @@ YAML `null` → Python's empty payload.
 
 ## Bounds and file safety
 
-Limits live in `SKILLS_CONTEXT_LIMITS`: 64 actual `SKILL.md` records (candidate
-directories without one do not count), 64 selected/disabled names, 128-code-unit
-names, 64 KiB per file, 1 MiB total across all roots, 16 KiB frontmatter, 8 KiB
-metadata value, 256-character requirement entries, 64 skipped-entry reports, and
-4,096-character roots. Discovery fails closed on unreadable files, invalid UTF-8,
-or a bound violation; no partial result is returned.
+`SKILLS_CONTEXT_LIMITS` contains only per-file and per-name safety bounds:
+128-code-unit names, 64 KiB per `SKILL.md`, 16 KiB frontmatter, 8 KiB metadata
+value, 256-character requirement entries, and 4,096-character roots. There is
+**no inventory count cap and no aggregate byte cap**: every discovered
+`SKILL.md` is reported, every requested selected/disabled name is accepted, and
+every refused directory entry is listed once. A realistic workspace plus builtin
+inventory (for example 55 workspace skills and 13 builtins with one duplicate)
+loads completely. Discovery fails closed only on unreadable files, invalid
+UTF-8, or a per-file bound violation; no partial result is returned. Every body
+is held in the snapshot, so inventory size is bounded by host disk/memory rather
+than by an arbitrary count.
 
 Scope is accidental damage, not adversarial confinement. Reads use normal
-filesystem calls with size and aggregate bounds, and frontmatter parsing is
-bounded. Symlinked skill directories and symlinked `SKILL.md` files are refused
-and reported rather than followed; explicit roots are used as supplied. There is
-no `/proc/self/fd` pinning, hard-link rejection, or post-read race verification.
+filesystem calls with per-file bounds, and frontmatter parsing is bounded.
+Symlinked skill directories and symlinked `SKILL.md` files are refused and
+reported rather than followed; explicit roots are used as supplied. There is no
+`/proc/self/fd` pinning, hard-link rejection, or post-read race verification.
 
-Rendered bodies share the existing context renderer bounds (16,000 code points
-per section, 48,000 per conversation). A selected body larger than the section
-bound is clipped by the renderer with its visible
-`[context truncated at configured bounds]` marker rather than by this loader;
-keep selected skill files well below the section bound.
+Prompt size is bounded by the renderer, not by discovery: 16,000 code points per
+section and 48,000 per conversation. With a large inventory the `nanobot_skills`
+section is clipped with its visible `[context truncated at configured bounds]`
+marker, and a body larger than the remaining section budget is clipped the same
+way. Truncation is never silent. The `skill` tool remains a complete fallback:
+its listing is the full summary (bounded only by the tool's declared output
+limits), so a skill clipped out of the prompt summary can still be discovered
+and loaded on demand.
 
 ## Deliberate parity gaps
 

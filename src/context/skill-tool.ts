@@ -68,16 +68,14 @@ function ownString(value: unknown, key: string): string | undefined {
   return typeof found === "string" ? found : undefined;
 }
 
-function ownArray(value: unknown, limit: number): unknown[] {
-  if (!Array.isArray(value)) return [];
-  const length = Math.min(value.length, Math.max(0, limit));
-  return value.slice(0, length);
+function ownArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value.slice() : [];
 }
 
 function readSkills(snapshot: unknown): readonly ConversationSkill[] {
   const skills: ConversationSkill[] = [];
   const seen = new Set<string>();
-  for (const raw of ownArray(ownValue(snapshot, "skills"), CONTEXT_LIMITS.maxSkillInputs)) {
+  for (const raw of ownArray(ownValue(snapshot, "skills"))) {
     const name = ownString(raw, "name");
     const content = ownString(raw, "content");
     if (name === undefined || content === undefined ||

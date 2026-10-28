@@ -107,15 +107,18 @@ tool names are copied into the prompt.
 
 The exported `CONTEXT_LIMITS` documents hard bounds: 256 conversation snapshots;
 **per conversation**, 48,000 Unicode code points for context section values,
-16,000 per context section, and 2,000 for tool visibility; 32 memory sources; 64
-inspected skill records / 32 included skills; 64 selected-skill names of at most
-128 UTF-16 code units each; 128 listed tool names; 256 code points per provenance
-label; and 1,024 per skill description. A selected-skill name over 128 code units
-is ignored before set insertion; skill record names use the same limit. Truncation
-is marked, and slicing preserves Unicode code points. The 50,000-code-point
-section-value bound (48,000 context + 2,000 tool visibility) is also **per
-conversation**, not an aggregate across the 256 snapshots. The snapshot-count cap
-limits fan-out; aggregate retained strings across all snapshots can be larger.
+16,000 per context section, and 2,000 for tool visibility; 32 memory sources; 32
+included skill bodies; 128 listed tool names; 256 code points per provenance
+label; and 1,024 per skill description. There is no skill-record inspection cap
+and no selected-skill-name count cap: every supplied record is inspected, and
+every name of at most 128 UTF-16 code units is accepted (longer names are
+ignored before set insertion). Skill bodies beyond the 32-body budget are not
+rendered, but the omission is stated in the section; section and total
+truncation is marked, and slicing preserves Unicode code points. The
+50,000-code-point section-value bound (48,000 context + 2,000 tool visibility) is
+also **per conversation**, not an aggregate across the 256 snapshots. The
+snapshot-count cap limits fan-out; aggregate retained strings across all
+snapshots can be larger.
 
 An optional host-rendered `skillSummary` is rendered first in the skills section
 as `## Available skills`, so the model learns which unselected skills exist

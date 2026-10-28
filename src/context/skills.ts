@@ -35,20 +35,19 @@ const SAFE_SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const FRONTMATTER = /^---\s*\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n|$)/;
 const FRONTMATTER_KEY = /^[A-Za-z0-9_.-]+$/;
 
-/** Bounded discovery limits. They are enforced before content reaches the renderer. */
+/**
+ * Per-file and per-name safety limits. There is deliberately no inventory count
+ * cap and no aggregate byte cap: every discovered `SKILL.md` is reported, and a
+ * large workspace/builtin inventory must not fail discovery. Prompt size is
+ * bounded later by the renderer, which marks truncation visibly.
+ */
 export const SKILLS_CONTEXT_LIMITS = Object.freeze({
-  /** Actual `SKILL.md` records; candidate directories without one do not count. */
-  maxSkills: CONTEXT_LIMITS.maxSkillInputs,
-  maxSelectedSkills: CONTEXT_LIMITS.maxSkillInputs,
-  maxDisabledSkills: CONTEXT_LIMITS.maxSkillInputs,
   maxSkillNameCodeUnits: CONTEXT_LIMITS.maxSkillNameCodeUnits,
   maxSkillFileBytes: 64 * 1024,
-  maxTotalBytes: 1024 * 1024,
   maxFrontmatterChars: 16 * 1024,
   /** Smaller than the frontmatter bound so an oversized metadata value has its own reason. */
   maxMetadataValueChars: 8 * 1024,
   maxRequirementEntryChars: 256,
-  maxSkippedSkills: CONTEXT_LIMITS.maxSkillInputs,
   maxRootChars: 4_096,
 });
 
@@ -200,7 +199,6 @@ interface SkillRecord {
 }
 
 interface LoadState {
-  bytes: number;
   readonly records: SkillRecord[];
   readonly skipped: SkippedSkill[];
 }
@@ -254,10 +252,9 @@ function validatedRoot(value: unknown, label: string): string {
   return root;
 }
 
-function validatedNames(value: unknown, label: string, max: number): readonly string[] {
+function validatedNames(value: unknown, label: string): readonly string[] {
   if (value === undefined) return Object.freeze([]);
   const entries = ownArray(value, label);
-  if (entries.length > max) throw new SkillsContextBoundsError(label);
   const seen = new Set<string>();
   for (const entry of entries) {
     if (typeof entry !== "string" || entry.length === 0 ||
@@ -271,7 +268,7 @@ function validatedNames(value: unknown, label: string, max: number): readonly st
 
 /** Validate an explicit selected/disabled skill-name list without touching the filesystem. */
 export function validateSkillNames(value: unknown, label: string): readonly string[] {
-  return validatedNames(value, label, SKILLS_CONTEXT_LIMITS.maxSelectedSkills);
+  return validatedNames(value, label);
 }
 
 function validatedEnvironment(value: unknown): Readonly<Record<string, string | undefined>> {
@@ -597,7 +594,6 @@ async function checkRequirements(
 }
 
 function recordSkipped(state: LoadState, name: string, reason: SkippedSkillReason): void {
-  if (state.skipped.length >= SKILLS_CONTEXT_LIMITS.maxSkippedSkills) return;
   // Control characters cannot be represented in a host-facing label; such a name is ignored.
   if (CONTROL_CHARACTERS.test(name)) return;
   state.skipped.push(Object.freeze({
@@ -666,13 +662,9 @@ async function scanSkillRoot(
     if (buffer.length > SKILLS_CONTEXT_LIMITS.maxSkillFileBytes) {
       throw new SkillsContextBoundsError("maxSkillFileBytes");
     }
-    if (state.bytes + buffer.length > SKILLS_CONTEXT_LIMITS.maxTotalBytes) {
-      throw new SkillsContextBoundsError("maxTotalBytes");
-    }
 
     const content = decodeUtf8(buffer, source);
     const frontmatter = parseFrontmatter(content);
-    state.bytes += buffer.length;
     state.records.push({
       name: entry.name,
       source,
@@ -684,9 +676,6 @@ async function scanSkillRoot(
         ...(frontmatter.reason !== undefined ? { reason: frontmatter.reason } : {}),
       }),
     });
-    if (state.records.length > SKILLS_CONTEXT_LIMITS.maxSkills) {
-      throw new SkillsContextBoundsError("maxSkills");
-    }
   }
 }
 
@@ -750,19 +739,17 @@ export async function loadSkillsContext(
   const disabled = new Set(validatedNames(
     ownDataField(request, "disabledSkills", "Skills context request").value,
     "disabledSkills",
-    SKILLS_CONTEXT_LIMITS.maxDisabledSkills,
   ));
   const selected = validatedNames(
     ownDataField(request, "selectedSkills", "Skills context request").value,
     "selectedSkills",
-    SKILLS_CONTEXT_LIMITS.maxSelectedSkills,
   );
   const environment = validatedEnvironment(
     ownDataField(request, "environment", "Skills context request").value,
   );
 
   await assertDirectory(workspaceRoot, "workspaceRoot");
-  const state: LoadState = { bytes: 0, records: [], skipped: [] };
+  const state: LoadState = { records: [], skipped: [] };
   await scanSkillRoot(join(workspaceRoot, "skills"), WORKSPACE_SOURCE_PREFIX, true, state);
   if (builtinRoot !== undefined) {
     await assertDirectory(builtinRoot, "builtinSkillsRoot");
