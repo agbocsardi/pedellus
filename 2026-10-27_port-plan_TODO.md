@@ -437,3 +437,11 @@ verified topic read/write, a fresh-process reload, grants, skill coexistence and
 visible reporting of bad topic files. An unreadable memory directory can still
 block discovery and Gateway reopen; it is documented. Memory and skills are
 opt-in and the copied personal workspace has not been activated.
+
+Compaction continuity was probed on `aea2ab774` by `pi-0a9feeec` using an actual
+Durable compaction and a synthetic summarizer that extracted an early fact from
+the real summary request. A fresh process received the fact via the summary,
+not the original message; transcript, grants, memory manifest and skill summary
+remained coherent. Typecheck, 155 behavior and 9 execution checks passed. This
+proves plumbing, not real-model summarization fidelity; a real acceptance run is
+still needed. Durable defaults may be unsuitable for small context windows.
