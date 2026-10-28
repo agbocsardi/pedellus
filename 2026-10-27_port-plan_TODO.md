@@ -21,8 +21,10 @@ Only skill names and descriptions belong in the system prompt; load every full
 skill body on demand, including skills marked always or selected. Actual prompt
 context remains finite and truncation must be visible. Do not delete the Python reference
 or the owner's workspace skills as part of this selection.
-Cron must be model-callable for natural-language scheduling and preserve Python's
-per-job isolated-background (default) versus in-conversation mode. In-conversation
+Cron is an internal agent capability: the user asks the agent, and the agent calls
+the scheduling tool. No cron UI, slash commands, or direct user scheduling interface
+is required. It must be model-callable and preserve Python's per-job
+isolated-background (default) versus in-conversation mode. In-conversation
 jobs wait for an idle session rather than silently dropping. Support one-shot and
 recurring schedules, origin delivery, and visible failure; review any parked
 one-shot primitive as a foundation, not a complete user feature.
@@ -44,7 +46,7 @@ standing authorization to implement or deploy them.
 - [x] Check the combined core path offline on both host and bwrap during consolidation.
 - [ ] Finish curated builtin skill compatibility/package review (parked).
 - [ ] Record real-model memory/skill/compaction acceptance and A/B fixture results (W4).
-- [ ] Deliver user-facing cron: callable tool, runtime lifecycle, authorization and delivery.
+- [ ] Connect internal agent cron: model-callable tool, runtime lifecycle, authorization and delivery.
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
 - [ ] Complete requested channels individually after core acceptance.
 - [ ] Agree the next bounded implementation scope with the owner; no automatic restart.
@@ -83,9 +85,10 @@ does not produce a tool-capable ordinary CLI or Telegram session.
 2. **Close core acceptance:** settle curated builtin packaging/snapshot instructions;
    exercise one owner-approved real-model memory + skill + compaction path and the
    copied A/B fixtures. Existing synthetic evidence is not model-fidelity evidence.
-3. **Close cron as a user feature:** owner-scoped callable `add`/`list`/`remove`,
+3. **Connect cron for agent use:** owner-scoped model-callable `add`/`list`/`remove`,
    Gateway install-before-resume, explicit per-run context and grant reauthorization,
-   origin routing/outbound delivery, silent mode and visible errors. Prove schedule
+   origin routing/outbound delivery, silent mode and visible errors. No user UI or
+   direct scheduling commands are needed. Prove schedule
    → execution → delivery → restart without duplicate admission. Telegram delivery
    candidate must first be accepted or rejected; no exactly-once external-send claim.
 4. **Only after explicit agreement:** background subagents / Code Mode workers,
@@ -299,7 +302,8 @@ scored by reading the output. The suite's own automatic checks are partial by de
 ### W5 — automation and channels
 
 Cron timer/calendar foundation is integrated; do not resurrect superseded one-shot
-kernels. User-facing scheduling, authorization and delivery remain unwired.
+kernels. Agent-callable scheduling, runtime authorization and delivery remain unwired.
+No direct user-facing cron interface is required.
 
 Wanted after core acceptance and owner agreement: background subagents and Code Mode
 workers, then Telegram/Discord/Email/WebSocket integration. Define a bounded acceptance
@@ -412,10 +416,18 @@ old worker registry entry as proof that its worktree still exists.
 
 Tools, memory and skills work together on the port within the agreed damage model,
 a real-model acceptance suite and diffs are recorded, and the optional shell backend
-is selectable. Core foundations are integrated, but W3/W4 acceptance and user-facing
-cron remain open; this is not yet an everyday replacement or cutover approval.
+is selectable. Core foundations are integrated, but W3/W4 acceptance and internal
+agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-28 — cron interface clarification
+
+Owner clarified cron is purely internal: the agent schedules work on the user's
+behalf. Corrected "user-facing cron" wording to agent-callable tool/runtime wiring;
+no cron UI, slash commands or direct user scheduling surface is required. Existing
+execution, authorization and delivery requirements remain. Documentation only;
+implementation remains paused.
 
 ### 2026-10-28 — consolidation
 

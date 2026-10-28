@@ -5,7 +5,8 @@ TypeScript port requiring Node >=22.19 and the pinned Pi 1.4.0 packages. This is
 The [current plan and consolidation snapshot](../../2026-10-27_port-plan_TODO.md)
 are the scope/status authority. Core coding tools, durable grants, optional bwrap
 shell, opt-in memory/skills and compaction plumbing are integrated. Cron has a
-reviewed internal timer/calendar foundation, **not a user-facing scheduling tool**.
+reviewed internal timer/calendar foundation; **agent-callable scheduling is not yet
+wired**. Cron needs no user UI or direct scheduling commands.
 New implementation is paused for consolidation; WebUI, migration and cutover are
 deferred. The [older roadmap](../../2026-10-26_full-port_TODO.md) preserves evidence,
 not a standing implementation queue.
@@ -50,8 +51,9 @@ managed copy. See [coding tools and grants](./TOOLS.md) and
 [`CRON.md`](./CRON.md) describes finite timer/run tasks, `at`/`every`/calendar
 schedules and IANA time zones. Timers arm their successors independently of model
 execution. The module is not installed by `openGateway` or exported through the SDK
-barrel; callable scheduling, per-run authorization, outbound/silent delivery and
-operator-facing wiring remain missing. The unmerged Telegram outbound candidate is
+barrel; the agent-callable tool, per-run authorization, outbound/silent delivery and
+runtime lifecycle wiring remain missing. The user asks the agent to schedule work;
+no direct cron UI or user scheduling commands are required. The unmerged Telegram outbound candidate is
 not part of this checkout's runtime.
 
 ## Opt-in Code Mode SDK

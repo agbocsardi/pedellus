@@ -5,6 +5,11 @@ channels, config, tools, delivery, or a command/tool surface. Calendar expressio
 zones are schedule math; parsing user text or ISO datetimes stays outside. Nothing here sends a
 message outside the Durable conversation it submits to.
 
+Cron is intended as an internal agent capability: the user asks the agent, and the
+agent calls the scheduling tool. No direct user cron UI or scheduling commands are
+required. The missing surface is a model-callable tool plus runtime, authorization
+and delivery wiring, not a user-facing scheduler.
+
 Files:
 
 - `src/automation/cron.ts` — job document, timer task, run task, controller API.
