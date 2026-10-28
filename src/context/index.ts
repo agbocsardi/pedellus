@@ -155,6 +155,7 @@ export function createContextExtension(
 /** Build replacement extensions from prepared values without retaining mutable host snapshots. */
 export function createContextExtensionBuilder(): {
   add(snapshot: ConversationContextSnapshot): Extension;
+  remove(conversationId: ConversationId): Extension;
 } {
   const contexts = new Map<ConversationId, PreparedContext>();
   return {
@@ -170,6 +171,14 @@ export function createContextExtensionBuilder(): {
       next.set(conversationId, prepared);
       const extension = buildContextExtension(next);
       contexts.set(conversationId, prepared);
+      return extension;
+    },
+    remove(conversationId) {
+      // A missing snapshot is a no-op, so an eviction race cannot invalidate a live extension.
+      const next = new Map(contexts);
+      next.delete(conversationId);
+      const extension = buildContextExtension(next);
+      contexts.delete(conversationId);
       return extension;
     },
   };
