@@ -24,7 +24,8 @@ import {
 } from "./cron-schedule.js";
 
 export const CRON_EXTENSION_NAME = "nanobot.cron";
-export const CRON_TASK_NAME = "nanobot.cron.occurrence";
+export const CRON_TIMER_TASK_NAME = "nanobot.cron.timer";
+export const CRON_RUN_TASK_NAME = "nanobot.cron.run";
 export const CRON_JOBS_KIND = "nanobot.cron.jobs";
 const DOC_VERSION = 1;
 const TASK_VERSION = 1;
@@ -45,10 +46,26 @@ export interface CronOutcome {
   readonly error: string | null;
   readonly conversationId: number;
 }
+export interface CronSkip {
+  readonly [key: string]: JsonValue;
+  readonly scheduledAtMs: number;
+  readonly skippedAtMs: number;
+  readonly reason: string;
+  readonly executionTaskId: number | null;
+}
+export interface CronFault {
+  readonly [key: string]: JsonValue;
+  readonly taskId: number;
+  readonly scheduledAtMs: number;
+  readonly recordedAtMs: number;
+  readonly error: string;
+}
 
 /**
- * One job definition plus its live pointer and newest outcome. There is no stored next time,
- * occurrence array, or job lifecycle state machine; the active task carries all of that.
+ * One job definition plus two live pointers, its newest outcome, and its newest skip.
+ *
+ * There is no stored next time, occurrence array, or job lifecycle state machine. The timer task's
+ * immutable input carries the next slot; the execution task and its record carry the current run.
  */
 export interface CronJob {
   readonly [key: string]: JsonValue;
@@ -60,10 +77,17 @@ export interface CronJob {
   readonly schedule: CronSchedule;
   readonly idempotencyKey: string;
   readonly createdAtMs: number;
-  /** The only occurrence that may finish this job, or `null` once settled or cancelled. */
-  readonly activeTaskId: number | null;
+  /** Bumped by cancellation; every timer and run commit checks it. */
+  readonly generation: number;
+  /** The only timer allowed to arm the next slot, or `null` once cancelled/settled. */
+  readonly timerTaskId: number | null;
+  /** The newest execution task; a non-terminal one makes the next due slot skip. */
+  readonly executionTaskId: number | null;
   readonly cancelledAtMs: number | null;
   readonly lastOutcome: CronOutcome | null;
+  readonly lastSkip: CronSkip | null;
+  /** Newest execution-task fault seen by a timer before its pointer was replaced. */
+  readonly lastFault: CronFault | null;
 }
 export interface CronJobsDocument {
   readonly [key: string]: JsonValue;
@@ -77,21 +101,28 @@ export const CronJobsDoc = defineDoc<CronJobsDocument>({
   checkpointWhen: () => true,
 });
 
-/** Immutable input of one finite occurrence task. */
+/** Immutable input of both finite task kinds. */
 export interface CronOccurrenceInput {
   readonly [key: string]: JsonValue;
   readonly jobId: string;
   readonly scheduledAtMs: number;
+  readonly generation: number;
 }
-export type CronCheckpoint =
-  | { readonly phase: "wait" }
-  | {
-      readonly phase: "execute";
-      /** Chosen once, in the same commit as host preparation. */
-      readonly targetConversationId: ConversationId | null;
-      readonly attempt: number;
-    };
-export interface CronTaskResult {
+export type CronTimerCheckpoint = { readonly phase: "fire" };
+export type CronRunCheckpoint = {
+  readonly phase: "run";
+  /** Chosen once, in the same commit as host preparation, then reused after a crash. */
+  readonly targetConversationId: ConversationId | null;
+  readonly attempt: number;
+};
+export interface CronTimerResult {
+  readonly [key: string]: JsonValue;
+  readonly jobId: string;
+  readonly scheduledAtMs: number;
+  readonly outcome: "admitted" | "skipped" | "cancelled" | "superseded" | "missing";
+  readonly reason: string | null;
+}
+export interface CronRunResult {
   readonly [key: string]: JsonValue;
   readonly jobId: string;
   readonly scheduledAtMs: number;
@@ -105,7 +136,7 @@ export interface CronScheduleInput {
   /** Caller-stable retry key, scoped to the owner and origin conversation. */
   readonly idempotencyKey: string;
   readonly name?: string;
-  /** Default `background`: run in a fresh, task-owned conversation. */
+  /** Default `background`: each run gets a fresh, task-owned conversation. */
   readonly mode?: CronMode;
 }
 export interface CronActor {
@@ -120,19 +151,25 @@ export interface CronPreparation {
   readonly background: boolean;
 }
 /**
- * Optional durable preparation. It runs once, in the commit that chooses the target conversation;
- * a crash before that commit reruns it, and a crash after it does not. This slice adds no grants.
+ * Optional durable preparation for one run. It runs once, in the commit that chooses the run's
+ * target conversation; a crash before that commit reruns it, and a crash after it does not.
+ * This slice adds no context or tool grants of its own.
  */
 export type CronPrepare = (preparation: CronPreparation, context: Context) => void | Promise<void>;
 
 export interface CronScheduleReceipt {
   readonly jobId: string;
-  readonly taskId: number | null;
+  readonly timerTaskId: number | null;
   readonly nextAtMs: number | null;
   readonly deduplicated: boolean;
 }
 export type CronCancellation =
-  | { readonly status: "cancelled"; readonly task: "marked" | "terminal"; readonly job: CronJob }
+  | {
+      readonly status: "cancelled";
+      readonly timer: "marked" | "terminal" | null;
+      readonly execution: "marked" | "terminal" | null;
+      readonly job: CronJob;
+    }
   | { readonly status: "already_terminal"; readonly job: CronJob }
   | { readonly status: "not_found" }
   | { readonly status: "forbidden" };
@@ -140,16 +177,21 @@ export type CronCancellation =
 export type CronTaskStatus =
   | "pending" | "running" | "waiting" | "sleeping" | "completing"
   | "completed" | "failed" | "aborted" | "faulted" | "orphaned" | "parked" | "missing";
+export interface CronTaskSummary {
+  readonly taskId: number;
+  readonly status: CronTaskStatus;
+  readonly scheduledAtMs: number | null;
+  readonly error: string | null;
+  readonly reason: string | null;
+}
 export type CronJobStatus = CronTaskStatus | "scheduled" | "cancelled" | "stopped";
-/** Job plus state derived from its actual task, never duplicated in the job document. */
+/** Job plus state derived from its actual timer and execution tasks. */
 export interface CronJobView {
   readonly job: CronJob;
   readonly status: CronJobStatus;
-  readonly taskId: number | null;
   readonly nextAtMs: number | null;
-  /** Fault or failure text from the live or terminal task, including a parked reason's error. */
-  readonly error: string | null;
-  readonly reason: string | null;
+  readonly timer: CronTaskSummary | null;
+  readonly execution: CronTaskSummary | null;
 }
 
 export interface CronFoundationOptions {
@@ -159,7 +201,7 @@ export interface CronFoundationOptions {
   readonly now?: () => number;
 }
 export interface CronFoundation {
-  /** Install before opening or resuming the Harness; registers one finite occurrence task. */
+  /** Install before opening or resuming the Harness; registers the timer and run tasks. */
   readonly extension: Extension;
   schedule(
     actor: CronActor, conversation: Conversation, request: CronScheduleInput, context: Context,
@@ -250,27 +292,37 @@ function sameNormalizedRequest(job: CronJob, request: NormalizedRequest): boolea
 function parseOccurrenceInput(value: unknown): CronOccurrenceInput | undefined {
   if (!isRecord(value) || typeof value.jobId !== "string" || value.jobId === "") return undefined;
   if (!Number.isSafeInteger(value.scheduledAtMs)) return undefined;
-  return { jobId: value.jobId, scheduledAtMs: value.scheduledAtMs as number };
+  if (!Number.isSafeInteger(value.generation) || (value.generation as number) < 1) return undefined;
+  return {
+    jobId: value.jobId,
+    scheduledAtMs: value.scheduledAtMs as number,
+    generation: value.generation as number,
+  };
 }
 const occurrenceKey = (jobId: string, scheduledAtMs: number): string =>
   `cron:${jobId}:${scheduledAtMs}`;
 const copyJob = (job: Draft<CronJob> | CronJob): CronJob => copyJson(job) as unknown as CronJob;
-const taskResult = (
-  input: CronOccurrenceInput, outcome: CronTaskResult["outcome"], error: string | null,
-): CronTaskResult => ({
+const terminalCompleted = <S extends { phase: string }, R>(result: R): NextTaskState<S, R> =>
+  ({ status: "terminal", outcome: { status: "completed", result } });
+const terminalAborted = <S extends { phase: string }, R>(
+  result: R, reason: string,
+): NextTaskState<S, R> => ({ status: "terminal", outcome: { status: "aborted", reason, result } });
+const terminalFailed = <S extends { phase: string }, R>(
+  result: R, message: string,
+): NextTaskState<S, R> =>
+  ({ status: "terminal", outcome: { status: "failed", error: { message }, result } });
+
+const timerResult = (
+  input: CronOccurrenceInput, outcome: CronTimerResult["outcome"], reason: string | null,
+): CronTimerResult => ({
+  jobId: input.jobId, scheduledAtMs: input.scheduledAtMs, outcome, reason,
+});
+const runResult = (
+  input: CronOccurrenceInput, outcome: CronRunResult["outcome"], error: string | null,
+): CronRunResult => ({
   jobId: input.jobId, scheduledAtMs: input.scheduledAtMs, outcome, error,
 });
-
-const terminalCompleted = (result: CronTaskResult): NextTaskState<CronCheckpoint, CronTaskResult> =>
-  ({ status: "terminal", outcome: { status: "completed", result } });
-const terminalAborted = (
-  result: CronTaskResult, reason: string,
-): NextTaskState<CronCheckpoint, CronTaskResult> =>
-  ({ status: "terminal", outcome: { status: "aborted", reason, result } });
-const terminalFailed = (
-  result: CronTaskResult, message: string,
-): NextTaskState<CronCheckpoint, CronTaskResult> =>
-  ({ status: "terminal", outcome: { status: "failed", error: { message }, result } });
+const zeroInput: CronOccurrenceInput = { jobId: "", scheduledAtMs: 0, generation: 0 };
 
 interface WaitSettlement {
   readonly status: "ok" | "error";
@@ -278,11 +330,9 @@ interface WaitSettlement {
 }
 interface SettlementRecord {
   readonly status: string;
-  readonly answer?: unknown;
   readonly reason?: unknown;
   readonly detail?: unknown;
 }
-
 function outcomeOf(record: SettlementRecord): WaitSettlement {
   if (record.status === "done") return { status: "ok", error: null };
   if (record.status === "unanswered" && typeof record.reason === "string") {
@@ -296,7 +346,7 @@ function outcomeOf(record: SettlementRecord): WaitSettlement {
  * Wait for the native submission, but also notice a run that ended without answering it.
  * Durable's default `afterFailedRun: "keep"` leaves the input queued, so waiting only on
  * `submission.wait()` would never finish. Once the target is idle, a still-queued input has no
- * run left to answer it: withdraw it, record the error, and let the schedule continue.
+ * run left to answer it: withdraw it, record the error, and let the next timer continue.
  */
 async function waitForAnswer(
   submission: Submission, conversation: ConversationHandle, context: Context,
@@ -321,25 +371,34 @@ async function waitForAnswer(
     // A later unrelated input must not place and run this occurrence after it was recorded failed.
     try { await submission.abort(context); } catch { /* it may have been placed first */ }
   }
-  return { status: "error", error: `run ended before answering the occurrence (submission is ${record.status})` };
+  return { status: "error", error: `run ended before answering (submission is ${record.status})` };
 }
 
-function taskStatusOf(
-  task: TaskInspection | undefined, record: Awaited<ReturnType<Harness["getTask"]>>,
-): CronTaskStatus {
-  if (record === undefined) return "missing";
-  if (record.state.status === "terminal") return record.state.outcome.status;
-  const blocked = task?.state.kind === "blocked" ? task.state : undefined;
-  if (blocked === undefined) return record.state.status;
-  return blocked.reason === "restart_limit" ? "parked" : "missing";
-}
+const TERMINAL_TASK: ReadonlySet<CronTaskStatus> = new Set([
+  "completed", "failed", "aborted", "orphaned", "faulted", "missing",
+]);
+const UNHEALTHY_TASK: ReadonlySet<CronTaskStatus> = new Set([
+  "parked", "failed", "aborted", "orphaned", "faulted", "missing",
+]);
 
-function taskFaultOf(
-  task: TaskInspection | undefined, record: Awaited<ReturnType<Harness["getTask"]>>,
-): { error: string | null; reason: string | null } {
+function taskSummaryOf(
+  taskId: number, task: TaskInspection | undefined,
+  record: Awaited<ReturnType<Harness["getTask"]>>,
+): CronTaskSummary {
+  const state = record?.state;
   const blocked = task?.state.kind === "blocked" ? task.state : undefined;
-  const outcome = record?.state.status === "terminal" ? record.state.outcome : undefined;
+  const status: CronTaskStatus = record === undefined
+    ? "missing"
+    : state?.status === "terminal"
+      ? state.outcome.status
+      : blocked !== undefined
+        ? blocked.reason === "restart_limit" ? "parked" : "missing"
+        : state!.status;
+  const outcome = state?.status === "terminal" ? state.outcome : undefined;
   return {
+    taskId,
+    status,
+    scheduledAtMs: record === undefined ? null : parseOccurrenceInput(record.input)?.scheduledAtMs ?? null,
     error: blocked?.error !== undefined
       ? errorText(blocked.error)
       : outcome?.status === "failed" || outcome?.status === "faulted" ? outcome.error.message : null,
@@ -348,22 +407,20 @@ function taskFaultOf(
   };
 }
 
-function waitingForSlot(record: Awaited<ReturnType<Harness["getTask"]>>): boolean {
-  const state = record?.state;
-  const checkpoint = state !== undefined && "checkpoint" in state ? state.checkpoint : undefined;
-  return isRecord(checkpoint) && checkpoint.phase === "wait";
-}
-
-function jobStatusOf(job: CronJob, task: CronTaskStatus | null, waiting: boolean): CronJobStatus {
+function jobStatusOf(
+  job: CronJob, timer: CronTaskSummary | null, execution: CronTaskSummary | null,
+): CronJobStatus {
   if (job.cancelledAtMs !== null) return "cancelled";
-  if (job.activeTaskId === null) {
-    return job.schedule.kind === "once" && job.lastOutcome !== null ? "completed" : "stopped";
+  if (execution !== null) {
+    if (UNHEALTHY_TASK.has(execution.status)) return execution.status;
+    if (execution.status !== "completed" && execution.status !== "aborted") return "running";
   }
-  if (task === null) return "missing";
-  if (task === "sleeping" || (waiting && (task === "pending" || task === "running"))) {
-    return "scheduled";
+  if (timer !== null) {
+    if (UNHEALTHY_TASK.has(timer.status)) return timer.status;
+    return TERMINAL_TASK.has(timer.status) ? "stopped" : "scheduled";
   }
-  return task;
+  if (execution !== null) return execution.status === "completed" ? "completed" : execution.status;
+  return job.schedule.kind === "once" && job.lastOutcome !== null ? "completed" : "stopped";
 }
 
 async function viewsOf(
@@ -377,77 +434,50 @@ async function viewsOf(
   if (jobs.length === 0) return [];
   const live = new Map((await harness.inspect(context)).tasks.map((task) => [Number(task.record.id), task]));
   return Promise.all(jobs.map(async (job) => {
-    if (job.activeTaskId === null) {
-      return {
-        job: copyJob(job), status: jobStatusOf(job, null, false), taskId: null,
-        nextAtMs: null, error: null, reason: null,
-      };
-    }
-    const taskId = job.activeTaskId;
-    const record = await harness.getTask(taskId as TaskId<CronTaskResult>, context);
-    const status = taskStatusOf(live.get(taskId), record);
+    const timer = job.timerTaskId === null ? null : taskSummaryOf(
+      job.timerTaskId,
+      live.get(job.timerTaskId),
+      await harness.getTask(job.timerTaskId as TaskId<CronTimerResult>, context),
+    );
+    const execution = job.executionTaskId === null ? null : taskSummaryOf(
+      job.executionTaskId,
+      live.get(job.executionTaskId),
+      await harness.getTask(job.executionTaskId as TaskId<CronRunResult>, context),
+    );
     return {
-      job: copyJob(job), status: jobStatusOf(job, status, waitingForSlot(record)), taskId,
-      nextAtMs: record === undefined ? null : parseOccurrenceInput(record.input)?.scheduledAtMs ?? null,
-      ...taskFaultOf(live.get(taskId), record),
+      job: copyJob(job),
+      status: jobStatusOf(job, timer, execution),
+      nextAtMs: timer !== null && !TERMINAL_TASK.has(timer.status) ? timer.scheduledAtMs : null,
+      timer,
+      execution,
     };
   }));
 }
 
-/** Build the finite-occurrence cron controller. Gateway, tools, config and delivery stay outside. */
+/** Build the deterministic timer plus execution controller. Gateway and delivery stay outside. */
 export function createCronFoundation(options: CronFoundationOptions): CronFoundation {
   const prepare = options.prepare;
   const clock = options.now ?? (() => Date.now());
 
-  const task: Task<CronOccurrenceInput, CronCheckpoint, CronTaskResult, object> =
-    defineTask<CronOccurrenceInput, CronCheckpoint, CronTaskResult>({
-      name: CRON_TASK_NAME,
+  const runTask: Task<CronOccurrenceInput, CronRunCheckpoint, CronRunResult, object> =
+    defineTask<CronOccurrenceInput, CronRunCheckpoint, CronRunResult>({
+      name: CRON_RUN_TASK_NAME,
       version: TASK_VERSION,
-      initial: () => ({ phase: "wait" }),
+      initial: () => ({ phase: "run", targetConversationId: null, attempt: 0 }),
       phases: {
-        wait: async (running, runtime, context) => {
+        run: async (running, runtime, context) => {
           const input = parseOccurrenceInput(running.input);
           if (input === undefined) {
             await runtime.commit(
-              () => terminalFailed(taskResult({ jobId: "", scheduledAtMs: 0 }, "missing", "task input is invalid"), "task input is invalid"),
-              context,
-            );
-            return;
-          }
-          const now = runtime.now();
-          await runtime.commit(async (tx) => {
-            const doc = await tx.doc(CronJobsDoc, running.conversationId);
-            const job = doc.jobs.find((candidate) => candidate.id === input.jobId);
-            if (job === undefined) {
-              return terminalFailed(taskResult(input, "missing", "cron job record is missing"), "cron job record is missing");
-            }
-            if (job.cancelledAtMs !== null) {
-              return terminalAborted(taskResult(input, "cancelled", "cancelled before the occurrence was due"), "cancelled");
-            }
-            if (job.activeTaskId !== running.id) {
-              return terminalAborted(taskResult(input, "superseded", "job is owned by another occurrence"), "superseded");
-            }
-            const checkpoint: CronCheckpoint = {
-              phase: "execute", targetConversationId: null, attempt: 0,
-            };
-            return input.scheduledAtMs > now
-              ? { status: "sleeping", until: input.scheduledAtMs, checkpoint }
-              : { status: "running", checkpoint };
-          }, context);
-        },
-
-        execute: async (running, runtime, context) => {
-          const input = parseOccurrenceInput(running.input);
-          if (input === undefined) {
-            await runtime.commit(
-              () => terminalFailed(taskResult({ jobId: "", scheduledAtMs: 0 }, "missing", "task input is invalid"), "task input is invalid"),
+              () => terminalFailed<CronRunCheckpoint, CronRunResult>(
+                runResult(zeroInput, "missing", "task input is invalid"), "task input is invalid",
+              ),
               context,
             );
             return;
           }
           const checkpoint = running.state.checkpoint;
-          const now = runtime.now();
-          let targetConversationId: ConversationId | null = checkpoint.targetConversationId;
+          let targetConversationId = checkpoint.targetConversationId;
           let job: CronJob | undefined;
           let prepareError: string | null = null;
           let terminal = false;
@@ -458,15 +488,27 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
               const found = doc.jobs.find((candidate) => candidate.id === input.jobId);
               if (found === undefined) {
                 terminal = true;
-                return terminalFailed(taskResult(input, "missing", "cron job record is missing"), "cron job record is missing");
+                return terminalFailed<CronRunCheckpoint, CronRunResult>(
+                  runResult(input, "missing", "cron job record is missing"), "cron job record is missing",
+                );
+              }
+              if (found.generation !== input.generation) {
+                terminal = true;
+                return terminalAborted<CronRunCheckpoint, CronRunResult>(
+                  runResult(input, "superseded", "job generation changed"), "superseded",
+                );
               }
               if (found.cancelledAtMs !== null) {
                 terminal = true;
-                return terminalAborted(taskResult(input, "cancelled", "cancelled before execution"), "cancelled");
+                return terminalAborted<CronRunCheckpoint, CronRunResult>(
+                  runResult(input, "cancelled", "cancelled before execution"), "cancelled",
+                );
               }
-              if (found.activeTaskId !== running.id) {
+              if (found.executionTaskId !== running.id) {
                 terminal = true;
-                return terminalAborted(taskResult(input, "superseded", "job is owned by another occurrence"), "superseded");
+                return terminalAborted<CronRunCheckpoint, CronRunResult>(
+                  runResult(input, "superseded", "job is owned by another execution"), "superseded",
+                );
               }
               job = copyJob(found);
               if (targetConversationId === null) {
@@ -478,7 +520,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
                   await prepare({
                     tx,
                     job: copyJob(found),
-                    occurrence: { jobId: input.jobId, scheduledAtMs: input.scheduledAtMs },
+                    occurrence: input,
                     originConversationId: running.conversationId,
                     targetConversationId,
                     background: found.mode === "background",
@@ -487,7 +529,11 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
               }
               return {
                 status: "running",
-                checkpoint: { phase: "execute", targetConversationId, attempt: checkpoint.attempt + 1 },
+                checkpoint: {
+                  phase: "run",
+                  targetConversationId,
+                  attempt: checkpoint.attempt + 1,
+                },
               };
             }, context);
           } catch (error) {
@@ -499,9 +545,9 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
 
           if (terminal) return;
           if (prepareError !== null || job === undefined || targetConversationId === null) {
-            await finishOccurrence(
+            await finishRun(
               runtime, running.conversationId, running.id, input,
-              { status: "error", error: prepareError ?? "occurrence could not be prepared" },
+              { status: "error", error: prepareError ?? "execution could not be prepared" },
               targetConversationId ?? running.conversationId, context,
             );
             return;
@@ -509,7 +555,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
 
           const conversation = await runtime.conversation(targetConversationId, context);
           if (conversation === undefined) {
-            await finishOccurrence(
+            await finishRun(
               runtime, running.conversationId, running.id, input,
               { status: "error", error: "target conversation is missing" },
               targetConversationId, context,
@@ -530,7 +576,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
             settlement = { status: "error", error: errorText(error) };
           }
           if (runtime.signal.aborted) return;
-          await finishOccurrence(
+          await finishRun(
             runtime, running.conversationId, running.id, input, settlement,
             targetConversationId, context,
           );
@@ -538,47 +584,159 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       },
 
       abort: async (running, runtime, context) => {
-        const input = parseOccurrenceInput(running.input);
-        if (input === undefined) {
-          await runtime.commit(
-            () => terminalAborted(taskResult({ jobId: "", scheduledAtMs: 0 }, "missing", "task input is invalid"), "cancelled"),
-            context,
-          );
-          return;
-        }
-        const now = runtime.now();
-        await runtime.commit(async (tx) => {
-          const doc = await tx.doc(CronJobsDoc, running.conversationId);
-          const job = doc.jobs.find((candidate) => candidate.id === input.jobId);
-          if (job !== undefined && job.activeTaskId === running.id && job.cancelledAtMs === null) {
-            // An explicit abort of the active occurrence stops the job; never create a successor.
-            job.cancelledAtMs = now;
-            job.activeTaskId = null;
-          }
-          return terminalAborted(taskResult(input, "cancelled", "cancelled"), "cancelled");
-        }, context);
+        const input = parseOccurrenceInput(running.input) ?? zeroInput;
+        await runtime.commit(
+          () => terminalAborted<CronRunCheckpoint, CronRunResult>(
+            runResult(input, "cancelled", "cancelled"), "cancelled",
+          ),
+          context,
+        );
       },
     });
 
-  async function finishOccurrence(
-    runtime: TaskRuntime<CronOccurrenceInput, CronCheckpoint, CronTaskResult, object>,
-    conversationId: ConversationId, taskId: TaskId<CronTaskResult>, input: CronOccurrenceInput,
-    settlement: WaitSettlement, targetConversationId: ConversationId,
-    context: Context,
+  const timerTask: Task<CronOccurrenceInput, CronTimerCheckpoint, CronTimerResult, object> =
+    defineTask<CronOccurrenceInput, CronTimerCheckpoint, CronTimerResult>({
+      name: CRON_TIMER_TASK_NAME,
+      version: TASK_VERSION,
+      initial: () => ({ phase: "fire" }),
+      phases: {
+        // One phase: sleep, then rerun from the top when due and commit the atomic handoff.
+        fire: async (running, runtime, context) => {
+          const input = parseOccurrenceInput(running.input);
+          if (input === undefined) {
+            await runtime.commit(
+              () => terminalFailed<CronTimerCheckpoint, CronTimerResult>(
+                timerResult(zeroInput, "missing", "task input is invalid"),
+                "task input is invalid",
+              ),
+              context,
+            );
+            return;
+          }
+          const now = runtime.now();
+          if (input.scheduledAtMs > now) {
+            await runtime.sleepUntil(input.scheduledAtMs, { phase: "fire" }, context);
+            return;
+          }
+          await runtime.commit(async (tx) => {
+            const doc = await tx.doc(CronJobsDoc, running.conversationId);
+            const job = doc.jobs.find((candidate) => candidate.id === input.jobId);
+            if (job === undefined) {
+              return terminalFailed<CronTimerCheckpoint, CronTimerResult>(
+                timerResult(input, "missing", "cron job record is missing"),
+                "cron job record is missing",
+              );
+            }
+            if (job.generation !== input.generation) {
+              return terminalAborted<CronTimerCheckpoint, CronTimerResult>(
+                timerResult(input, "superseded", "job generation changed"), "superseded",
+              );
+            }
+            if (job.cancelledAtMs !== null) {
+              return terminalAborted<CronTimerCheckpoint, CronTimerResult>(
+                timerResult(input, "cancelled", "cancelled before the slot fired"), "cancelled",
+              );
+            }
+            if (job.timerTaskId !== running.id) {
+              return terminalAborted<CronTimerCheckpoint, CronTimerResult>(
+                timerResult(input, "superseded", "job is owned by another timer"), "superseded",
+              );
+            }
+
+            const prior = job.executionTaskId === null
+              ? undefined
+              : await tx.task(job.executionTaskId as TaskId<CronRunResult>);
+            const busy = prior !== undefined && prior.state.status !== "terminal";
+            const nextAtMs = job.schedule.kind === "once"
+              ? null
+              : nextCronOccurrence(job.schedule, Math.max(now, input.scheduledAtMs));
+            let executionTaskId: number | null = null;
+
+            if (busy) {
+              job.lastSkip = {
+                scheduledAtMs: input.scheduledAtMs,
+                skippedAtMs: now,
+                reason: "previous occurrence is still active",
+                executionTaskId: job.executionTaskId,
+              };
+            } else {
+              if (prior?.state.status === "terminal") {
+                const outcome = prior.state.outcome;
+                if (outcome.status === "failed" || outcome.status === "faulted" || outcome.status === "orphaned") {
+                  job.lastFault = {
+                    taskId: Number(prior.id),
+                    scheduledAtMs: parseOccurrenceInput(prior.input)?.scheduledAtMs ?? 0,
+                    recordedAtMs: now,
+                    error: outcome.status === "failed" || outcome.status === "faulted"
+                      ? outcome.error.message
+                      : outcome.reason,
+                  };
+                }
+              }
+              executionTaskId = await tx.createTask(
+                runTask,
+                { jobId: job.id, scheduledAtMs: input.scheduledAtMs, generation: job.generation },
+                { ownership: { kind: "conversation" }, conversationId: running.conversationId, background: true },
+              );
+              job.executionTaskId = executionTaskId;
+            }
+
+            job.timerTaskId = nextAtMs === null
+              ? null
+              : await tx.createTask(
+                  timerTask,
+                  { jobId: job.id, scheduledAtMs: nextAtMs, generation: job.generation },
+                  { ownership: { kind: "conversation" }, conversationId: running.conversationId, background: true },
+                );
+
+            const reason = busy ? "previous occurrence is still active" : null;
+            return terminalCompleted<CronTimerCheckpoint, CronTimerResult>(
+              timerResult(input, busy ? "skipped" : "admitted", reason),
+            );
+          }, context);
+        },
+      },
+
+      abort: async (running, runtime, context) => {
+        const input = parseOccurrenceInput(running.input) ?? zeroInput;
+        await runtime.commit(
+          () => terminalAborted<CronTimerCheckpoint, CronTimerResult>(
+            timerResult(input, "cancelled", "cancelled"), "cancelled",
+          ),
+          context,
+        );
+      },
+    });
+
+  async function finishRun(
+    runtime: TaskRuntime<CronOccurrenceInput, CronRunCheckpoint, CronRunResult, object>,
+    conversationId: ConversationId, taskId: TaskId<CronRunResult>, input: CronOccurrenceInput,
+    settlement: WaitSettlement, targetConversationId: ConversationId, context: Context,
   ): Promise<void> {
     const now = runtime.now();
     await runtime.commit(async (tx) => {
       const doc = await tx.doc(CronJobsDoc, conversationId);
       const job = doc.jobs.find((candidate) => candidate.id === input.jobId);
       if (job === undefined) {
-        return terminalFailed(taskResult(input, "missing", "cron job record is missing"), "cron job record is missing");
+        return terminalFailed<CronRunCheckpoint, CronRunResult>(
+          runResult(input, "missing", "cron job record is missing"), "cron job record is missing",
+        );
       }
-      // The cancellation fence: a cancelled job or a replaced pointer never gets a successor.
+      // The run records only its result. It never computes or creates a schedule.
+      if (job.generation !== input.generation) {
+        return terminalAborted<CronRunCheckpoint, CronRunResult>(
+          runResult(input, "superseded", "job generation changed"), "superseded",
+        );
+      }
       if (job.cancelledAtMs !== null) {
-        return terminalAborted(taskResult(input, "cancelled", "cancelled before the occurrence finished"), "cancelled");
+        return terminalAborted<CronRunCheckpoint, CronRunResult>(
+          runResult(input, "cancelled", "cancelled before the run finished"), "cancelled",
+        );
       }
-      if (job.activeTaskId !== taskId) {
-        return terminalAborted(taskResult(input, "superseded", "job is owned by another occurrence"), "superseded");
+      if (job.executionTaskId !== taskId) {
+        return terminalAborted<CronRunCheckpoint, CronRunResult>(
+          runResult(input, "superseded", "job is owned by another execution"), "superseded",
+        );
       }
       job.lastOutcome = {
         scheduledAtMs: input.scheduledAtMs,
@@ -587,24 +745,23 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
         error: settlement.error,
         conversationId: targetConversationId,
       };
-      const result = taskResult(input, settlement.status === "ok" ? "ok" : "error", settlement.error);
-      if (job.schedule.kind === "once") {
-        job.activeTaskId = null;
-        return terminalCompleted(result);
-      }
-      // Never schedule the slot that just finished again, even if the host clock moved backwards.
-      const nextAtMs = nextCronOccurrence(job.schedule, Math.max(now, input.scheduledAtMs));
-      job.activeTaskId = await tx.createTask(
-        task,
-        { jobId: job.id, scheduledAtMs: nextAtMs },
-        { ownership: { kind: "conversation" }, conversationId, background: true },
+      return terminalCompleted<CronRunCheckpoint, CronRunResult>(
+        runResult(input, settlement.status === "ok" ? "ok" : "error", settlement.error),
       );
-      return terminalCompleted(result);
     }, context);
   }
 
+  async function abortOne(
+    harness: Pick<Harness, "abortTask" | "waitForTask">,
+    taskId: TaskId, context: Context,
+  ): Promise<"marked" | "terminal"> {
+    const result = await harness.abortTask(taskId, context);
+    if (result === "marked") await harness.waitForTask(taskId, context);
+    return result;
+  }
+
   return {
-    extension: defineExtension({ name: CRON_EXTENSION_NAME, tasks: [task] }),
+    extension: defineExtension({ name: CRON_EXTENSION_NAME, tasks: [timerTask, runTask] }),
 
     async schedule(actor, conversation, request, context) {
       const now = clock();
@@ -621,13 +778,13 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           if (!sameNormalizedRequest(existing, value)) {
             throw new TypeError("idempotencyKey already names a different cron job");
           }
-          const active = existing.activeTaskId === null
+          const timer = existing.timerTaskId === null
             ? undefined
-            : await tx.task(existing.activeTaskId as TaskId<CronTaskResult>);
+            : await tx.task(existing.timerTaskId as TaskId<CronTimerResult>);
           return {
             jobId: existing.id,
-            taskId: existing.activeTaskId,
-            nextAtMs: active === undefined ? null : parseOccurrenceInput(active.input)?.scheduledAtMs ?? null,
+            timerTaskId: existing.timerTaskId,
+            nextAtMs: timer === undefined ? null : parseOccurrenceInput(timer.input)?.scheduledAtMs ?? null,
             deduplicated: true,
           };
         }
@@ -639,9 +796,10 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
         }
         const firstAtMs = schedule.kind === "once" ? schedule.at : schedule.anchorMs;
         const jobId = `cron-${randomUUID()}`;
-        const taskId = await tx.createTask(
-          task,
-          { jobId, scheduledAtMs: firstAtMs },
+        const generation = 1;
+        const timerTaskId = await tx.createTask(
+          timerTask,
+          { jobId, scheduledAtMs: firstAtMs, generation },
           { ownership: { kind: "conversation" }, conversationId: conversation.id, background: true },
         );
         doc.jobs.push({
@@ -653,38 +811,75 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           schedule,
           idempotencyKey: value.idempotencyKey,
           createdAtMs: now,
-          activeTaskId: taskId,
+          generation,
+          timerTaskId,
+          executionTaskId: null,
           cancelledAtMs: null,
           lastOutcome: null,
+          lastSkip: null,
+          lastFault: null,
         });
-        return { jobId, taskId, nextAtMs: firstAtMs, deduplicated: false };
+        return { jobId, timerTaskId, nextAtMs: firstAtMs, deduplicated: false };
       }, context);
     },
 
     async cancel(harness, conversationId, jobId, actor, context) {
       const caller = ownerOf(actor);
       const now = clock();
-      let taskId: TaskId<CronTaskResult> | undefined;
+      let timerTaskId: TaskId<CronTimerResult> | undefined;
+      let executionTaskId: TaskId<CronRunResult> | undefined;
+
       const decision = await harness.commit(async (tx) => {
         const doc = await tx.doc(CronJobsDoc, conversationId);
         const job = doc.jobs.find((candidate) => candidate.id === jobId);
         if (job === undefined) return { status: "not_found" } as const;
         if (!sameOwner(job.owner, caller)) return { status: "forbidden" } as const;
-        if (job.cancelledAtMs !== null || job.activeTaskId === null) {
+        if (job.cancelledAtMs !== null) {
           return { status: "already_terminal", job: copyJob(job) } as const;
         }
-        taskId = job.activeTaskId as TaskId<CronTaskResult>;
-        // Fence first: a finish commit after this sees no active task and creates no successor.
+        const timerRecord = job.timerTaskId === null
+          ? undefined
+          : await tx.task(job.timerTaskId as TaskId<CronTimerResult>);
+        const executionRecord = job.executionTaskId === null
+          ? undefined
+          : await tx.task(job.executionTaskId as TaskId<CronRunResult>);
+        const live = [timerRecord, executionRecord]
+          .some((record) => record !== undefined && record.state.status !== "terminal");
+        const settledOnce = job.schedule.kind === "once"
+          && job.lastOutcome !== null
+          && job.timerTaskId === null
+          && executionRecord?.state.status === "terminal";
+        if (settledOnce) return { status: "already_terminal", job: copyJob(job) } as const;
+        if (!live && job.timerTaskId === null && job.executionTaskId === null) {
+          return { status: "already_terminal", job: copyJob(job) } as const;
+        }
+        timerTaskId = job.timerTaskId === null
+          ? undefined : job.timerTaskId as TaskId<CronTimerResult>;
+        executionTaskId = job.executionTaskId === null
+          ? undefined : job.executionTaskId as TaskId<CronRunResult>;
         job.cancelledAtMs = now;
-        job.activeTaskId = null;
+        job.generation += 1;
+        job.timerTaskId = null;
+        job.executionTaskId = null;
         return { status: "to_cancel", job: copyJob(job) } as const;
       }, context);
 
       if (decision.status !== "to_cancel") return decision;
-      if (taskId === undefined) throw new Error("cron job has no task to cancel");
-      const abort = await harness.abortTask(taskId, context);
-      if (abort === "marked") await harness.waitForTask(taskId, context);
-      return { status: "cancelled", task: abort, job: decision.job };
+      let timer: "marked" | "terminal" | null = null;
+      let execution: "marked" | "terminal" | null = null;
+      const failures: unknown[] = [];
+      await Promise.all([
+        timerTaskId === undefined
+          ? undefined
+          : abortOne(harness, timerTaskId, context)
+            .then((result) => { timer = result; }, (error: unknown) => { failures.push(error); }),
+        executionTaskId === undefined
+          ? undefined
+          : abortOne(harness, executionTaskId, context)
+            .then((result) => { execution = result; }, (error: unknown) => { failures.push(error); }),
+      ]);
+      if (failures.length > 0) throw failures[0];
+      return { status: "cancelled", timer, execution, job: decision.job };
     },
 
     async inspect(harness, conversationId, jobId, actor, context) {
