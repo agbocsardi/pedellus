@@ -32,6 +32,22 @@ Complete and validate the core/memory/cron path first; compaction is core contex
 continuity. The broader W4–W6 descriptions below are historical options, not
 standing authorization to implement or deploy them.
 
+## Approved next batch — 2026-10-28: offline core acceptance tooling
+
+The owner resumed work and selected acceptance tooling, not live acceptance or channel/delegation
+implementation. Use `opencode-go/deepseek-v4.1-flash`, high thinking, for implementation and independent
+review. This bounded batch supersedes the consolidation pause only for the work below.
+
+- [ ] Implement a reproducible disposable core acceptance runner using the actual Gateway, Markdown
+      memory, on-demand skills, native compaction and fresh-process reopen, with machine-readable evidence.
+- [ ] Validate the runner offline with synthetic provider responses and generated synthetic workspace data.
+- [ ] Complete one independent review; allow one blocker-fix pass, then merge or park with reasons.
+- [ ] Run existing typecheck, behavior and execution checks; record results and remaining W4 gates.
+
+No product-provider calls, credential loading, personal workspace access, channel sends, permanent
+regression suite expansion, A/B parity claims or deployment. Keep the runner offline-only in this
+batch; live-provider modes and external fixture adapters need a later scope/budget decision.
+
 ## Current checklist — consolidated 2026-10-28
 
 - [x] Verify typecheck, 155 behavioral and 9 execution checks.
@@ -109,7 +125,7 @@ does not produce a tool-capable ordinary CLI or Telegram session.
 5. **Separate owner decisions:** WebUI, migration, deployment/canary, rollback and
    Python retirement. Nothing in this checklist authorizes live data or deployment.
 
-## Next slice — background-run context (recon complete, not implemented)
+## Previous slice — background-run context (integrated; historical design)
 
 The run's conversation gets a snapshot keyed by **its own** conversation id, built from the origin's
 session key, installed by `prepare` in the same commit that creates the target alongside the explicit
@@ -456,6 +472,13 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-28 — offline acceptance tooling authorized
+
+Owner requested a plan and orchestrated implementation/review with OpenCode Go DeepSeek Flash at
+high thinking. Clean extracted checkout at `6382af4`; selected the offline acceptance-tooling option.
+Plan: one implementation worker plus one independent reviewer, disposable synthetic inputs only,
+one blocker-fix pass, existing checks, then record evidence without marking real-model W4 complete.
 
 ### 2026-10-28 — extracted into its own repository
 
