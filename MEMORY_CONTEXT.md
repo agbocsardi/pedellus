@@ -50,6 +50,9 @@ The result contains:
   entry: ``- `memory/x.md` (topic, 123 chars): description``. More than the entry
   cap, a short character budget, or a stopped directory scan adds a visible
   `more memory files` line; entries are never dropped without that line.
+  Discovered files that cannot be read add a visible `N memory files skipped
+  (unreadable, oversized, or invalid)` line instead of an entry, so the
+  manifest never claims their bodies were read.
 - `document`: a frozen `{ source: "memory:manifest", content: manifest }` for
   `ConversationContextSnapshot.memory`; absent when the manifest is empty.
 
@@ -57,8 +60,10 @@ The result contains:
 hidden entries, non-`.md` paths, `..`, backslashes, absolute paths, and anything
 outside `memory/`. It is a naming guard only: it cannot confirm expected prior
 content or make the native write atomic. `validateMemoryLoadedFiles()` validates
-an explicit loaded-file list for host config parsing; `MEMORY.md` and
-`memory/system/**` are allowed there.
+an explicit injected-file list for host config parsing. It is decoupled from the
+write guard: protected names such as `HISTORY.md`, `memory/MEMORY.md` and
+`memory/system/MEMORY.md` are allowed there, because injected files are read-only
+context, not topics.
 
 ## Discovery rules
 
@@ -78,10 +83,16 @@ Under `<workspaceRoot>/memory/`, recursively:
 | Workspace-relative path over 246 characters | Ignored; provenance would not fit. |
 
 Only files explicitly named in `loadedFiles` are read outside that topic set.
-Each must exist and be a regular, non-symlinked, single-link file; a missing or
-invalid explicitly named file rejects the whole load. A supplied loaded file is
+Each must exist and be a regular, non-symlinked, single-link file; a missing,
+unreadable, oversized, or non-UTF-8 explicitly named file rejects the whole load
+so configured content is never silently replaced. A supplied loaded file is
 always listed even when the entry cap is reached; only the manifest character
 budget can shorten the list, and that omission is counted visibly.
+
+A discovered topic that is unreadable, oversized, invalid UTF-8, missing after
+discovery, or changed during the read is skipped and counted in the visible
+skipped line. Discovery errors therefore do not block Gateway reopen, and no
+skipped topic is listed as if its body had been read.
 
 Entries are sorted by path with code-unit comparison, so ordering is stable
 across locales. Every file is re-read on each call; a topic written by the native
@@ -116,12 +127,12 @@ directory tree beyond the inspected-entry bound stops discovery with a visible
 manifest line. Neither case silently drops entries or fails an ordinary
 workspace.
 
-Other failures fail closed with `MemoryContextBoundsError`,
+Explicitly loaded file failures fail closed with `MemoryContextBoundsError`,
 `MemoryContextFileError` (a stable kind and workspace-relative source, never an
-absolute path or file body), or `MemoryContextInputError`. This includes an
-oversized file, invalid UTF-8, a symlinked or non-regular named file, a
-disappeared file mid-read, and a changed file. No partial result is returned. A
-missing `memory/` directory is not an error and is never created.
+absolute path or file body), or `MemoryContextInputError`. A missing `memory/`
+directory is not an error and is never created. Discovered-topic failures of the
+same kinds are skipped and counted as above, so one stale topic cannot prevent
+startup or reopen.
 
 The manifest is bounded on its own, not together with other memory documents.
 A host adding it beside many other memory sources must keep the shared renderer
@@ -177,20 +188,28 @@ When it is `true`:
   the manifest needs one of the 32 memory source slots;
 - config parsing also applies `validateMemoryLoadedFiles()` so manifest and
   workspace selections agree at startup;
-- each conversation snapshot loads `loadWorkspaceContextSnapshot()` and
-  `loadMemoryContext()` without a cache, then appends the manifest document
-  after the configured memory documents;
+- each conversation snapshot loads `loadWorkspaceContextSnapshot()` first, then
+  `loadMemoryContext()` without a cache, and appends the manifest document after
+  the configured memory documents;
+- only configured files actually present in that snapshot are passed as
+  `loadedFiles`. The workspace loader omits empty files, so an empty configured
+  file is not falsely marked `loaded`; if it remains discoverable it is shown as
+  a zero-body topic;
 - the snapshot provider is re-run on every gateway open, so a topic write made
   through the granted native tools is present after reopen;
-- a loader error rejects conversation setup instead of installing a partial
-  snapshot. Shortened manifests and stopped scans are not errors.
+- a loaded-file error rejects conversation setup instead of installing false
+  content. Broken discovered topics, shortened manifests, and stopped scans are
+  not errors; each has a visible manifest line.
 
 The gateway `read`/`edit`/`write` grants are unchanged and still come from the
 Durable tool-grant document, so restart keeps both the grants and the
 file-backed memory. Compaction and per-conversation snapshot capture are also
 unchanged: the snapshot is host context, not transcript state.
 
-Synthetic probes for this slice exercised a fresh gateway read, a native topic
-write, close/reopen, grant persistence, manifest reload, 200 topics, 80
-maximum-size files, a >4,096-entry tree, and a loaded-file parent symlink. They
-used temporary directories only and were not committed.
+Synthetic probes exercised a fresh gateway read, a native topic write,
+close/reopen, grant persistence, manifest reload, oversized/invalid-UTF-8/
+unreadable discovered topics across reopen, loud loaded-file failures, empty
+configured files, protected injected names (`HISTORY.md`,
+`memory/system/MEMORY.md`), 200 topics, 80 maximum-size files, a >4,096-entry
+tree, and a loaded-file parent symlink. They used temporary directories only and
+were not committed.

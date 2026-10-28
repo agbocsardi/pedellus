@@ -52,12 +52,6 @@ export function workspaceContextGatewayOptions(
       contextSnapshotProvider: createWorkspaceContextSnapshotProvider(() => workspace),
     };
   }
-  const memoryRequest = memoryManifest
-    ? Object.freeze({
-        workspaceRoot: config.workspace,
-        loadedFiles: Object.freeze([...(workspace.memoryFiles ?? [])]),
-      })
-    : undefined;
   const skillsRequest: SkillsContextRequest | undefined = skills === undefined
     ? undefined
     : Object.freeze({
@@ -72,10 +66,15 @@ export function workspaceContextGatewayOptions(
       });
   return {
     contextSnapshotProvider: async () => {
-      const [snapshot, discovered, memory] = await Promise.all([
-        loadWorkspaceContextSnapshot(workspace),
+      const snapshot = await loadWorkspaceContextSnapshot(workspace);
+      const [discovered, memory] = await Promise.all([
         skillsRequest === undefined ? undefined : loadSkillsContext(skillsRequest),
-        memoryRequest === undefined ? undefined : loadMemoryContext(memoryRequest),
+        memoryManifest
+          ? loadMemoryContext({
+              workspaceRoot: config.workspace,
+              loadedFiles: injectedMemoryFiles(snapshot, workspace.memoryFiles ?? []),
+            })
+          : undefined,
       ]);
       return {
         ...withMemoryManifest(snapshot, memory),
@@ -88,6 +87,18 @@ export function workspaceContextGatewayOptions(
       };
     },
   };
+}
+
+/**
+ * Only configured files present in the snapshot were injected. An empty file is
+ * omitted by the workspace loader, so the manifest must not mark it `loaded`.
+ */
+function injectedMemoryFiles(
+  snapshot: WorkspaceContextSnapshot,
+  memoryFiles: readonly string[],
+): readonly string[] {
+  const injected = new Set((snapshot.memory ?? []).map((document) => document.source));
+  return Object.freeze(memoryFiles.filter((path) => injected.has(`workspace:${path}`)));
 }
 
 /** Append the manifest beside, not instead of, the configured memory documents. */

@@ -35,10 +35,12 @@ snapshot provider and `openGateway` installs no context extension.
   loader's rules at config parse time and again before reading.
 - `memoryManifest` is absent or `false` by default. When `true`, each snapshot
   also appends the bounded `# Memory Tree` manifest from
-  [`MEMORY_CONTEXT.md`](./MEMORY_CONTEXT.md); the configured `memoryFiles` are
-  its `loaded` entries and every other topic is read on demand with the granted
-  native `read` tool. The manifest uses one of the 32 memory source slots, so at
-  most 31 `memoryFiles` are accepted in that mode.
+  [`MEMORY_CONTEXT.md`](./MEMORY_CONTEXT.md); configured `memoryFiles` that
+  were actually injected are its `loaded` entries and every other topic is read
+  on demand with the granted native `read` tool. An empty configured file is
+  omitted by this loader, so the manifest does not mark it `loaded`. The
+  manifest uses one of the 32 memory source slots, so at most 31 `memoryFiles`
+  are accepted in that mode.
 - `skills` is absent by default and adds no discovery. When present,
   `builtinSkillsRoot` must be an absolute path to an existing directory and
   `disabledSkills` is an explicit name list validated per entry, with no count

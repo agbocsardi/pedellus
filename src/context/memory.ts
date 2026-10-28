@@ -223,7 +223,7 @@ function validatedRoot(value: unknown): string {
 /**
  * Validate one workspace-relative `memory/**\/*.md` path without touching the
  * filesystem. A topic path may not name an always-loaded or protected surface;
- * a loaded path may additionally name `memory/MEMORY.md` and `memory/system/`.
+ * a loaded path is host-selected injection, so it may name those files too.
  */
 function validatedMemoryPath(value: unknown, loaded: boolean): string {
   const kind = loaded ? "loadedFiles" : "topic";
@@ -245,10 +245,8 @@ function validatedMemoryPath(value: unknown, loaded: boolean): string {
     }
   }
   const name = segments[segments.length - 1]!;
-  if (PROTECTED_NAMES.has(name)) {
-    if (!loaded || name !== "MEMORY.md" || segments.length !== 2) {
-      throw new MemoryContextInputError(`${name} is not a writable topic memory file`);
-    }
+  if (!loaded && PROTECTED_NAMES.has(name)) {
+    throw new MemoryContextInputError(`${name} is not a writable topic memory file`);
   }
   if (!loaded && segments.includes(SYSTEM_DIR)) {
     throw new MemoryContextInputError("memory/system/ is always loaded and not a topic memory location");
@@ -269,7 +267,9 @@ export function validateMemoryTopicPath(value: unknown): string {
 /**
  * Validate an explicit list of memory files the host already injected into
  * context. Hosts can use this while parsing configuration; the loader applies
- * the same rules again before reading.
+ * the same rules again before reading. These are injected files, not topics,
+ * so protected names such as `HISTORY.md` and `memory/system/MEMORY.md` are
+ * allowed; topic-write restrictions live in `validateMemoryTopicPath()`.
  */
 export function validateMemoryLoadedFiles(value: unknown): readonly string[] {
   if (value === undefined) return Object.freeze([]);
@@ -561,6 +561,7 @@ function comparePaths(left: string, right: string): number {
 function composeManifest(
   entries: readonly MemoryTopicEntry[],
   more: number,
+  skipped: number,
   scanTruncated: boolean,
 ): string {
   const lines = [
@@ -570,6 +571,9 @@ function composeManifest(
       `- \`${entry.path}\` (${entry.state}, ${entry.bodyChars} chars): ${entry.description}`),
   ];
   if (more > 0) lines.push(`- \u2026 ${more} more memory files`);
+  if (skipped > 0) {
+    lines.push(`- \u2026 ${skipped} memory files skipped (unreadable, oversized, or invalid)`);
+  }
   if (scanTruncated) {
     lines.push("- \u2026 more memory files were not inspected (directory-entry bound reached)");
   }
@@ -584,17 +588,18 @@ function composeManifest(
 function buildManifest(
   entries: readonly MemoryTopicEntry[],
   capOmitted: number,
+  skipped: number,
   scanTruncated: boolean,
 ): string {
-  if (entries.length === 0 && capOmitted === 0 && !scanTruncated) return "";
+  if (entries.length === 0 && capOmitted === 0 && skipped === 0 && !scanTruncated) return "";
   for (let shown = entries.length; shown >= 0; shown--) {
     const omitted = capOmitted + (entries.length - shown);
-    const manifest = composeManifest(entries.slice(0, shown), omitted, scanTruncated);
+    const manifest = composeManifest(entries.slice(0, shown), omitted, skipped, scanTruncated);
     if (codePointCount(manifest) <= MEMORY_CONTEXT_LIMITS.maxManifestChars) return manifest;
   }
   // A header plus one `more` line is far inside the budget, so this is
   // unreachable; return the smallest manifest rather than a partial one.
-  return composeManifest([], entries.length + capOmitted, scanTruncated);
+  return composeManifest([], entries.length + capOmitted, skipped, scanTruncated);
 }
 
 /**
@@ -604,10 +609,12 @@ function buildManifest(
  * written, created, cached, or stored outside the caller's workspace.
  *
  * A missing `memory/` directory yields no entries. A missing or invalid
- * explicitly named loaded file rejects the whole load. Oversized files, an
- * excessive tree, and invalid UTF-8 fail closed; no partial result is returned.
- * An over-budget manifest is shortened, and every hidden entry is counted in a
- * visible `more memory files` line rather than failing the load.
+ * explicitly named loaded file rejects the whole load, so configured content
+ * is never silently replaced. A discovered topic that is unreadable,
+ * oversized, or not valid UTF-8 is skipped and counted in the manifest; a
+ * missing/vanished or changed topic is skipped the same way. An over-budget
+ * manifest is shortened, and every hidden entry is counted in a visible
+ * `more memory files` line rather than failing the load.
  */
 export async function loadMemoryContext(request: MemoryContextRequest): Promise<MemoryContextResult> {
   if (!isRecord(request)) {
@@ -635,18 +642,31 @@ export async function loadMemoryContext(request: MemoryContextRequest): Promise<
 
   const readState: ReadState = { bytes: 0 };
   const entries: MemoryTopicEntry[] = [];
+  let skipped = 0;
   for (const path of shown) {
-    const parsed = await readManifestEntry(rootPath, path, readState);
+    const isLoaded = loaded.has(path);
+    let parsed: { description: string; bodyChars: number };
+    try {
+      parsed = await readManifestEntry(rootPath, path, readState);
+    } catch (error) {
+      // A discovered topic may be stale, unreadable, oversized or not UTF-8;
+      // that must not block Gateway reopen. Explicitly loaded files stay loud.
+      if (!isLoaded && (error instanceof MemoryContextFileError || error instanceof MemoryContextBoundsError)) {
+        skipped++;
+        continue;
+      }
+      throw error;
+    }
     entries.push(Object.freeze({
       path,
       source: `${WORKSPACE_SOURCE_PREFIX}${path}`,
-      state: loaded.has(path) ? "loaded" : "topic",
+      state: isLoaded ? "loaded" : "topic",
       description: parsed.description,
       bodyChars: parsed.bodyChars,
     }));
   }
 
-  const manifest = buildManifest(entries, more, state.truncated);
+  const manifest = buildManifest(entries, more, skipped, state.truncated);
   const document = manifest.length === 0
     ? undefined
     : Object.freeze({ source: MANIFEST_SOURCE, content: manifest });
