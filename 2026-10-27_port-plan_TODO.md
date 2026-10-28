@@ -55,9 +55,10 @@ standing authorization to implement or deploy them.
       durable reopen bug it caught (cron owners restored only under a context provider) is fixed.
       Verified by a worker probe and a parent smoke on the merged tree.
 - [ ] Deliver scheduled results beyond the run's own agent turn (channel outbox), and decide silence.
-- [ ] Give a scheduled background run the workspace context snapshot (AGENTS.md/memory/skills); today it
-      can only read those files with granted tools. Recon done (child `pi-6e74fa21`); the chosen shape is
-      below and is not implemented.
+- [x] Give a scheduled background run the workspace context snapshot (AGENTS.md/memory/skills).
+      Integrated `91915c5e9`: prepare installs the origin's snapshot for the run's own conversation, startup
+      restores it from live run tasks (never a `SessionMap` entry), and an idle background target is evicted
+      at the snapshot cap instead of failing the run.
 
 - [ ] Deliver scheduled results beyond the origin conversation turn (channel outbox) once a channel is accepted.
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
@@ -82,7 +83,7 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 | Context / memory | Opt-in bootstrap and selected files, topic manifest, on-demand read/write through granted tools | Markdown authoritative; context fixed until new session/reopen; unreadable memory directory can block reopen |
 | Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool; curated port builtins in `packages/pi-nanobot/skills` (memory, memory-defrag, skill-creator, github, cron) behind an explicit `builtinSkillsRoot` | `my` has no port runtime; no inventory-count cap, but finite prompt/output bounds visibly truncate |
 | Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
-| Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling | No channel delivery or silence policy; a background run has no workspace context snapshot; copied grants survive origin revocation until their own expiry; disabling cron leaves persisted timers blocked |
+| Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling; a background run gets the origin's workspace context and `skill` tool | No channel delivery or silence policy; copied grants survive origin revocation until their own expiry; disabling cron leaves persisted timers blocked; a run whose snapshot was evicted at the cap proceeds without context |
 | Telegram | Restricted allowlisted inbound/reply adapter with streaming, durable send intent, unknown-send quarantine | Existing adapter only; scheduled outbound candidate is unmerged; no general pairing or media parity |
 | Code Mode / delegation | Reviewed opt-in QuickJS Code Mode/tool-search SDK | Not Gateway-installed; no product background-subagent or worker interface |
 | Other surfaces | Read-only usage and inert archival helpers exist | Discord candidates parked; Email/WebSocket, MCP, web/media tools not integrated |
@@ -110,11 +111,9 @@ does not produce a tool-capable ordinary CLI or Telegram session.
 
 ## Next slice — background-run context (recon complete, not implemented)
 
-The run's own conversation must get a snapshot keyed by **its own** conversation id, built from the
-origin's session key (the workspace provider ignores the key today, so the snapshot is identical and
-no new document kind is needed). `prepare` already runs after `denyNewConversation` in the same commit
-that creates the target, so it can install the snapshot and write the explicit
-`tools`/`modelTools`/`extensions` array; extension choice is explicit, so no other conversation can
+The run's conversation gets a snapshot keyed by **its own** conversation id, built from the origin's
+session key, installed by `prepare` in the same commit that creates the target alongside the explicit
+`tools`/`modelTools`/`extensions` array. Extension choice stays explicit, so no other conversation can
 select it.
 
 - `src/context/index.ts`: add a builder `remove(conversationId)` beside `add`, mirroring
@@ -128,8 +127,9 @@ select it.
   (`LiveDoc.run === undefined`) at the snapshot cap instead of failing the run.
 - Do not touch `SessionMap`, `cronOwners`, `denyNewConversation` or `extensionsPolicy`.
 
-Known costs to verify: file I/O inside the prepare commit, orphaned slots after a rolled-back prepare
-(bounded, cleared on reopen), and an evicted-but-live run losing its sections for the rest of the run.
+Accepted costs, verified by probe: file I/O inside the prepare commit; orphaned slots after a
+rolled-back prepare (bounded, cleared on reopen, evictable); and a prepared-but-not-yet-started target
+that can be evicted at the cap, after which that run proceeds without context rather than failing.
 
 ## Evidence and limitations
 
@@ -456,6 +456,21 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-28 — background-run context and curated skills
+
+Integrated the curated builtin skills (`memory`, `memory-defrag`, `skill-creator`, `github`, `cron`)
+after a hand-port onto current code; `my` stays out because there is no self-state runtime, and the
+`skill-creator` same-conversation verification defect is fixed in the content itself. Then integrated
+workspace context for scheduled background runs: `prepare` installs the origin's snapshot for the
+run's own conversation, startup restores live run targets from their task checkpoints without a
+`SessionMap` entry, and an idle background target is evicted at the snapshot cap.
+
+Verification: worker probes for both slices plus a parent probe on the merged tree — a background run
+rendered AGENTS bootstrap, the memory manifest, the memory topic line and the skill description, kept
+the skill body out of the prompt, loaded it through `skill` on demand, offered only its granted coding
+tools plus `skill`, and refused a `cron` call. Typecheck, 155 behavior and 9 execution checks green.
+
 
 ### 2026-10-28 — agent cron integrated
 
