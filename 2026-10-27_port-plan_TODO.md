@@ -250,9 +250,9 @@ retirement of the Python service with a tagged readable reference kept.
 
 ## Open design questions
 
-1. **Memory source of truth** — port nanobot's file layout and semantics closely, or
-   keep Markdown files authoritative and let Durable own runtime state only. Blocks
-   W3; the largest unresolved design question in the port.
+1. **Memory source of truth — decided:** Markdown files are authoritative for
+   memory; Durable owns runtime state, transcripts and compaction. Preserve the
+   useful Python layout and behavior without introducing a second memory store.
 2. **SQLite ancestor-swap race** — Node's SQLite has no safe pinned-open API.
    `pi-b54f4507` (tmpfs staging) and `pi-ba6fe170` (create-only publication) build
    machinery for it. Decide whether the remaining window is acceptable for a
@@ -392,3 +392,12 @@ synthetic assertions. This helper is not yet wired into the Gateway. Before
 wiring, handle oversized or unsupported metadata without silently dropping
 requirement gates, check executable requirements do not accept directories,
 and decide how to surface skipped skills and load builtin skills on demand.
+
+W3 memory manifest foundation `6bd2d38cf` passed independent review
+(`pi-2c56da78`) and was cherry-picked as `050a91ca7`. Markdown remains the memory
+authority; Durable owns runtime state and transcripts. Parent typecheck, 155
+behavior and 9 execution checks pass. The reviewer verified Python manifest parity
+on synthetic data, native read/write/edit and reload in a separate process. This
+helper is not wired into the Gateway. Before wiring, address loaded-file parent
+symlink traversal, make manifest/total-size limits practical for real workspaces,
+ensure loaded files are actually injected, and decide how errors affect a turn.
