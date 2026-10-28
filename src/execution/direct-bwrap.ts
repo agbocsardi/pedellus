@@ -1,4 +1,5 @@
-import { accessSync, constants, realpathSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { accessSync, constants, existsSync, realpathSync, statSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /**
@@ -17,7 +18,7 @@ export interface DirectBwrapOptions {
 	cwd?: string;
 	/** Absolute Bubblewrap executable. Defaults to `/usr/bin/bwrap`, then PATH. A configured value never falls back. */
 	bwrapPath?: string;
-	/** Optional host directory (Python's media directory) mounted read-only at the same path. Must not be the workspace or its parent. */
+	/** Optional host directory (Python's media directory) mounted read-only at the same path. Must not overlap the workspace. */
 	mediaDirectory?: string;
 	/** Exact argv to execute inside the sandbox, e.g. `["/bin/sh", "-c", command]`. */
 	command: readonly string[];
@@ -33,7 +34,13 @@ const OPTIONAL_SYSTEM_RO_BINDS = [
 	"/etc/ssl/certs",
 	"/etc/resolv.conf",
 	"/etc/ld.so.cache",
+	"/etc/passwd",
+	"/etc/group",
+	"/etc/hosts",
+	"/etc/localtime",
 ] as const;
+
+const validatedBwrap = new Set<string>();
 
 function requireAbsolute(path: string, label: string): string {
 	if (typeof path !== "string" || !isAbsolute(path) || path.includes("\0")) {
@@ -57,12 +64,36 @@ function isWithin(root: string, path: string): boolean {
 	return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
+/** Validate identity and version once per canonical binary path; never fall back to another executable. */
+function validateBwrapBinary(binary: string, label: string): string {
+	if (validatedBwrap.has(binary)) return binary;
+	if (!isExecutableFile(binary)) throw new Error(`${label} is not an executable file: ${binary}`);
+	const result = spawnSync(binary, ["--version"], {
+		encoding: "utf8",
+		env: { PATH: "/usr/bin:/bin", LANG: "C" },
+		timeout: 5000,
+	});
+	const match = /^bubblewrap (\d+)\.(\d+)\.(\d+)/.exec((result.stdout ?? "").trim());
+	if (result.error || result.status !== 0 || !match) {
+		throw new Error(
+			`Bubblewrap validation failed at ${binary}: ${(result.stderr || result.error?.message || result.stdout || "unexpected version").trim()}`,
+		);
+	}
+	if (Number(match[1]) === 0 && Number(match[2]) < 9) {
+		throw new Error(`Bubblewrap ${match[0].replace("bubblewrap ", "")} at ${binary} is too old; 0.9 or newer is required`);
+	}
+	validatedBwrap.add(binary);
+	return binary;
+}
+
 /**
  * Resolve the Bubblewrap executable without an unsandboxed fallback.
  *
- * An explicitly configured path must resolve to an executable file. Without a
- * configured path, prefer the distro binary (the AppArmor profile on this host
- * is pinned to `/usr/bin/bwrap`) and then search PATH.
+ * An explicitly configured path must resolve to a valid `bubblewrap` binary of
+ * version 0.9 or newer. Without a configured path, prefer the distro binary (the
+ * AppArmor profile on this host is pinned to `/usr/bin/bwrap`) and then search
+ * PATH. A distro binary that exists but fails validation throws rather than
+ * silently selecting an unprofiled PATH build. There is no unsandboxed fallback.
  */
 export function resolveDirectBwrapPath(configured?: string): string {
 	if (process.platform !== "linux") {
@@ -76,25 +107,29 @@ export function resolveDirectBwrapPath(configured?: string): string {
 		} catch {
 			throw new Error(`Configured Bubblewrap does not exist: ${requested}`);
 		}
-		if (!isExecutableFile(binary)) throw new Error(`Configured Bubblewrap is not executable: ${requested}`);
-		return binary;
+		return validateBwrapBinary(binary, "Configured Bubblewrap");
 	}
 
-	try {
-		const distroBinary = realpathSync(DEFAULT_BWRAP);
-		if (isExecutableFile(distroBinary)) return distroBinary;
-	} catch {
-		// Fall through to PATH only for the unconfigured default.
+	if (existsSync(DEFAULT_BWRAP)) {
+		let distroBinary: string;
+		try {
+			distroBinary = realpathSync(DEFAULT_BWRAP);
+		} catch {
+			throw new Error(`Distro Bubblewrap cannot be resolved: ${DEFAULT_BWRAP}`);
+		}
+		return validateBwrapBinary(distroBinary, "Distro Bubblewrap");
 	}
 	for (const directory of (process.env.PATH ?? "").split(delimiter)) {
 		if (!directory || !isAbsolute(directory)) continue;
 		const candidate = join(directory, "bwrap");
 		if (!isExecutableFile(candidate)) continue;
+		let binary: string;
 		try {
-			return realpathSync(candidate);
+			binary = realpathSync(candidate);
 		} catch {
-			// A dangling PATH entry is not a usable candidate.
+			continue;
 		}
+		return validateBwrapBinary(binary, "PATH Bubblewrap");
 	}
 	throw new Error("Bubblewrap was not found; install bwrap or configure an absolute bwrapPath");
 }
@@ -130,11 +165,13 @@ function resolveWorkspaceCwd(workspace: string, requested?: string): string {
  * Return the Bubblewrap argv for one shell command over the actual workspace.
  *
  * The workspace is bound read-write at its real path. It is not copied,
- * imported, staged, or published back. `/usr` and the existing optional system
- * paths are read-only, `/tmp` is a private tmpfs, and the workspace parent is
- * masked so sibling files such as a config file are not visible. Networking is
- * not unshared, matching the Python wrapper. This function writes nothing and
- * creates no sandbox state.
+ * imported, staged, or published back. `/usr`, the existing optional system
+ * paths, and the normal passwd/group/hosts/localtime files are read-only,
+ * `/tmp` is a private tmpfs, and the workspace parent is masked so sibling
+ * files such as a config file are not visible. Networking is not unshared,
+ * matching the Python wrapper. The PID namespace is unshared so background
+ * descendants die with the sandbox instead of outliving the command. This
+ * function writes nothing and creates no sandbox state.
  */
 export function buildDirectBwrapArgs(options: DirectBwrapOptions): string[] {
 	const bwrap = resolveDirectBwrapPath(options.bwrapPath);
@@ -151,8 +188,8 @@ export function buildDirectBwrapArgs(options: DirectBwrapOptions): string[] {
 		if (mediaInput === sep) throw new Error("mediaDirectory must not be the host filesystem root");
 		media = canonicalDirectory(mediaInput, "mediaDirectory");
 		if (media === sep) throw new Error("mediaDirectory must not resolve to the host filesystem root");
-		if (isWithin(media, workspace)) {
-			throw new Error("mediaDirectory must not be the workspace or one of its parents");
+		if (isWithin(media, workspace) || isWithin(workspace, media)) {
+			throw new Error("mediaDirectory must not overlap the workspace");
 		}
 	}
 
@@ -166,7 +203,7 @@ export function buildDirectBwrapArgs(options: DirectBwrapOptions): string[] {
 		}
 	}
 
-	const args = [bwrap, "--new-session", "--die-with-parent", "--setenv", "HOME", workspace];
+	const args = [bwrap, "--new-session", "--die-with-parent", "--unshare-pid", "--setenv", "HOME", workspace];
 	for (const path of REQUIRED_SYSTEM_RO_BINDS) args.push("--ro-bind", path, path);
 	for (const path of OPTIONAL_SYSTEM_RO_BINDS) args.push("--ro-bind-try", path, path);
 	args.push("--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp");
