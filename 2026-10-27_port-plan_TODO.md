@@ -7,7 +7,7 @@ Date: 2026-10-27. Branch: `feat/pi-durable-rebuild`.
 - [x] Verify the existing typecheck, behavioral and execution baselines.
 - [x] Prove two provider API families and the bad-model error path (W0).
 - [ ] Freeze the shared W1/W2 contract and resolve backend differences.
-- [ ] Deliver the tool layer and durable per-conversation grants (W1).
+- [x] Deliver the tool layer and durable per-conversation grants (W1).
 - [ ] Deliver the selectable sandbox backend against the same contract (W2).
 - [ ] Decide memory authority and complete memory, context and compaction (W3).
 - [ ] Record the A/B and harness-specific acceptance results (W4).
@@ -337,8 +337,16 @@ not yet registered in the Gateway. Its lexical shell guard does not implement
 Python's exec URL guard, and cannot fully confine shell, hard links or detached
 processes; these are documented limitations, not claims of isolation. Native bash
 may report an undefined duration when a host-default timeout fires; integration
-must check/fix that user-visible error. Next: wire reviewed tools and durable
-conversation grants.
+must check/fix that user-visible error. W1 Gateway integration `62da62b17` and fix `13900cd4e` passed final review
+(`pi-39e78946`) and were cherry-picked as `2c90f2158` and `e8d750275`. Parent
+reran typecheck, 155 behavior and 9 execution checks. Synthetic real-Gateway
+probes covered default deny, all four tools, traversal/symlink refusal, timeout,
+expiry, revoke/reopen and unsafe interrupted replay. The owner-authorized real
+`opencode-go/deepseek-v4.1-flash` high-thinking turn used all four native tools
+successfully in a disposable workspace: write `ALPHA`, edit to `BETA`, read, and
+bash `printf CHECK`; the final file was `BETA\n`. The temporary workspace and
+store were removed. W1 is complete for the clarified accidental-damage scope;
+no production deployment or real user data was involved.
 
 Direct-workspace bwrap builder `8db828970` plus fix `8446957d1` passed final
 independent review (`pi-96ca0073`) and were cherry-picked as `5913b0ba2` and
