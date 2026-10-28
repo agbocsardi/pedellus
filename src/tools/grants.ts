@@ -2,6 +2,7 @@ import {
   ToolTask,
   defineDoc,
   hook,
+  type ConversationId,
   type HookRegistration,
   type ToolHookCall,
 } from "@earendil-works/pi-durable";
@@ -28,6 +29,28 @@ export const ToolGrantDoc = defineDoc<ToolGrantDocument>({
   history: "latest",
   fork: "initial",
   initial: () => ({ grants: {} }),
+  checkpointWhen: () => true,
+});
+
+/**
+ * The origin conversation whose grants bound a scheduled background run's copied grants.
+ *
+ * The document is written only by cron `prepare`, in the same commit that copies the grants, so its
+ * presence marks a conversation holding a copy rather than authority of its own. A copied grant is a
+ * ceiling on what the run was allowed when it was prepared, never a replacement for the origin:
+ * the grant hook intersects it with the origin's current grant at call time. `0` (the initial value)
+ * is not a conversation and blocks every effectful call, so a malformed link fails closed.
+ */
+export type ToolGrantOriginDocument = {
+  readonly originConversationId: number;
+};
+export const ToolGrantOriginDoc = defineDoc<ToolGrantOriginDocument>({
+  kind: "nanobot.tool-grant-origin",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({ originConversationId: 0 }),
   checkpointWhen: () => true,
 });
 
@@ -135,8 +158,29 @@ export function createToolGrantHook(
         if (!Number.isSafeInteger(expiresAt)) {
           return { block: `Tool ${call.name} has a malformed grant` };
         }
-        if (expiresAt <= now()) {
+        const timestamp = now();
+        if (expiresAt <= timestamp) {
           return { block: `Tool ${call.name} grant expired at ${new Date(expiresAt).toISOString()}` };
+        }
+        // A scheduled background run's grant document is a copy. The copy stays capped by its own
+        // expiry, and the origin's current grant must still cover the name: revoking or expiring it
+        // at the origin takes effect here, and a later origin grant cannot widen this run.
+        const link = await api.snapshot(ToolGrantOriginDoc, api.conversationId, context);
+        if (link === undefined) return undefined;
+        const originId = link.originConversationId;
+        if (!Number.isSafeInteger(originId) || originId < 1) {
+          return { block: `Tool ${call.name} grant has an invalid origin link; refusing the call` };
+        }
+        const origin = await api.snapshot(ToolGrantDoc, originId as ConversationId, context);
+        const originExpiresAt = origin?.grants[call.name];
+        if (originExpiresAt === undefined) {
+          return { block: `Tool ${call.name} grant was revoked at its origin conversation` };
+        }
+        if (!Number.isSafeInteger(originExpiresAt)) {
+          return { block: `Tool ${call.name} grant has a malformed origin grant` };
+        }
+        if (originExpiresAt <= timestamp) {
+          return { block: `Tool ${call.name} origin grant expired at ${new Date(originExpiresAt).toISOString()}` };
         }
         return undefined;
       } catch {

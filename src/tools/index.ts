@@ -10,8 +10,10 @@ export {
   normalizeToolGrants,
   pruneToolGrants,
   ToolGrantDoc,
+  ToolGrantOriginDoc,
   type GatewayToolGrant,
   type ToolGrantDocument,
+  type ToolGrantOriginDocument,
 } from "./grants.js";
 export {
   createToolEnvironments,

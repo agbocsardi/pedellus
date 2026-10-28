@@ -84,6 +84,21 @@ The conversation must already exist (`conversationFor`). A grant does not widen
 the ceiling, and another conversation's grants have no effect on this one:
 agent tool filters are read from that conversation's own document.
 
+### Copied grants of a scheduled background run
+
+A cron `prepare` copies the origin conversation's still-valid coding-tool grants
+into the fresh, task-owned background conversation and records the origin in the
+latest-only `nanobot.tool-grant-origin` document (`{ originConversationId }`) in
+the same commit. The copy is a cap, not authority of its own: the grant hook
+requires the origin's current document to still grant the name, and blocks once
+either expiry passes. Revoking or expiring the origin grant therefore takes
+effect on the run's next call, including after a crash and reopen, and a later
+origin grant cannot widen the copy past its own expiry. A link that is present
+but malformed, or an origin grant document that is missing, blocks the call; a
+conversation without the link (an ordinary session, including an origin-mode
+run) is unaffected. When the origin cannot be attributed to a known owner at
+preparation, `prepare` copies nothing and the run stays default-deny.
+
 Every native conversation creation goes through the Durable `conversationCreated`
 hook, which retires any grant document and writes empty `tools`/`modelTools`
 filters before the optional `agent` convenience. This covers raw ownerless
@@ -111,9 +126,12 @@ that current policy, so a prepared call for a removed tool settles as
 A `beforeTool` hook rechecks the grant document at call time, so expiry between
 reopen and a call blocks before intent with `Tool <name> grant expired ...`.
 Revocation also reapplies the agent filter immediately, so later calls are no
-longer offered the tool. The hook returns an explicit `block` if the grant read
-fails; it does not rely on Durable treating a throwing hook as denied, and it
-keeps storage error detail out of the model-visible reason.
+longer offered the tool. For a scheduled background run's copied grants the
+same recheck also reads the origin's current grant document, so a revocation or
+expiry at the origin blocks a call that recovery re-dispatches. The hook returns
+an explicit `block` if the grant read fails; it does not rely on Durable
+treating a throwing hook as denied, and it keeps storage error detail out of the
+model-visible reason.
 
 The native coding tools have no `replay: "safe"` marker, so Durable treats them
 as unsafe: recovery never reruns an interrupted execution body. The existing

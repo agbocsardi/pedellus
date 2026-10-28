@@ -17,6 +17,7 @@ import { createProviderModels, nativeModelReference, resolveModelChoices, type R
 import {
   CODING_TOOL_NAMES,
   ToolGrantDoc,
+  ToolGrantOriginDoc,
   activeToolGrants,
   createCodingToolExtension,
   createToolEnvironments,
@@ -290,26 +291,33 @@ export async function openGateway(config: PortConfig, context: Context, options:
         now,
         // A background run is a fresh, task-owned conversation that starts default-deny. Copy the
         // origin conversation's still-valid grants so the run has exactly the authority that
-        // scheduled it, bounded by those grants' own expiries. An origin-mode run needs nothing:
-        // it answers inside the conversation that already holds them.
+        // scheduled it, bounded by those grants' own expiries, and record the origin beside them so
+        // the grant hook can hold the copy to the origin's current grants. An origin-mode run needs
+        // nothing: it answers inside the conversation that already holds them.
         prepare: async ({ tx, originConversationId, targetConversationId, background }, ctx) => {
           if (!background) return;
-          const origin = await tx.doc(ToolGrantDoc, originConversationId);
-          const target = await tx.doc(ToolGrantDoc, targetConversationId);
-          const timestamp = now();
+          // Fail closed on a run whose origin cannot be attributed to a known owner: it gets no
+          // copied grants and no origin link, so every effectful call stays denied.
+          const owner = cronOwners.get(originConversationId);
           const granted: string[] = [];
-          for (const name of toolAllowlist) {
-            const expiresAt = origin.grants[name];
-            if (typeof expiresAt === "number" && Number.isSafeInteger(expiresAt) && expiresAt > timestamp) {
-              target.grants[name] = expiresAt;
-              granted.push(name);
+          if (owner !== undefined) {
+            const origin = await tx.doc(ToolGrantDoc, originConversationId);
+            const target = await tx.doc(ToolGrantDoc, targetConversationId);
+            const link = await tx.doc(ToolGrantOriginDoc, targetConversationId);
+            link.originConversationId = originConversationId;
+            const timestamp = now();
+            for (const name of toolAllowlist) {
+              const expiresAt = origin.grants[name];
+              if (typeof expiresAt === "number" && Number.isSafeInteger(expiresAt) && expiresAt > timestamp) {
+                target.grants[name] = expiresAt;
+                granted.push(name);
+              }
             }
           }
           // The run's fresh conversation is default-deny, so it also receives the origin's workspace
           // context through the same snapshot path: bootstrap/AGENTS, the memory manifest, the skill
           // summary and the read-only `skill` tool. An origin with no known owner skips this and keeps
-          // grants-only preparation. The cron tool and foundation are never offered here.
-          const owner = cronOwners.get(originConversationId);
+          // the run default-deny. The cron tool and foundation are never offered here.
           const skillsInstalled = owner !== undefined && contextInstallerRef.current !== undefined
             ? await contextInstallerRef.current(owner.sessionKey, targetConversationId, ctx)
             : false;

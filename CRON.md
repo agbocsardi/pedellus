@@ -184,7 +184,10 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
   trusted `prepare` callback, but inherit the origin's agent selection before preparation. The
   Gateway's `prepare` copies the origin's still-valid coding-tool grants and offers exactly those
   tools, so a **background** run cannot schedule another job or widen authority; a different host
-  must apply the same deny-by-default rule. The foundation alone does not copy grant records.
+  must apply the same deny-by-default rule. The foundation alone does not copy grant records. The
+  copy is recorded together with the origin conversation and stays capped by that origin's current
+  grants (see the bounded-copy limitation below); when the origin has no known owner, `prepare`
+  copies nothing and the run stays default-deny.
   When a context snapshot provider is configured, `prepare` also installs the origin's snapshot
   for the target conversation — bootstrap/AGENTS files, memory, the skill summary — and the
   read-only `skill` tool, so a scheduled turn renders the same workspace context as a normal turn.
@@ -196,9 +199,14 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
 - An `origin`-mode run answers in the origin conversation, so it still holds that conversation's
   `cron` tool and can schedule further jobs. Only a background run's fresh conversation is denied
   cron.
-- A background run's copied grants are a snapshot: revoking or expiring the origin grant after the
-  run is prepared does not remove the copy, which stays valid until its own expiry. The grant hook
-  still rechecks the copy and the host ceiling at call time.
+- A background run's copied grants are bounded, not independent. The grant hook requires both the
+  copied grant and the origin's current grant for the name, and blocks once **either** expiry
+  passes: revoking or expiring at the origin takes effect on the run's next call, including after a
+  crash and reopen, and a later origin grant cannot extend the copy. A present-but-malformed origin
+  link, or a missing origin grant document, fails closed. The copy still drives tool selection, so a
+  run may be offered a tool the origin revoked until its policy is next rewritten; the call itself
+  is blocked. As for any granted call, one that already passed the hook and recorded intent can
+  still execute.
 - Disabling cron (`cron.enabled: false`) on a store that has jobs is not a cleanup operation. Job
   documents and grants remain, and their persisted timer/run tasks have no installed task
   definition, so they stay blocked until cron is enabled again.
@@ -222,6 +230,13 @@ unhealthy-timer status dominance, and overflow rejection before job creation. A 
 drove the real `openGateway` path with a faux provider and covered the config gate, model-issued
 `add`, isolated and origin runs, copied grants, `list`/`remove`/terminal/unknown IDs, invalid
 schedules, restart with a pending one-shot, and a background run that is offered no `cron` tool.
+A later bounded-authority probe drove the same path with a faux provider and covered the origin link
+written beside the copied grants, a copied grant usable while the origin still grants it, a missing
+origin grant document, revocation after preparation, a shortened origin expiry beating the still
+valid copy, and a later longer origin grant that could not extend the copy past its own expiry;
+another probe SIGKILLed the prepared run's in-flight model request, revoked at the origin, reopened
+the store, and confirmed the recovered call was blocked by the origin's current grants while the
+copy and link survived the restart. An origin-mode conversation with no link was unaffected.
 
 Calendar probes covered `at`/`every`/`cron` parsing, the `once` alias, UTC default, invalid zones
 and offsets, invalid expressions, no-future-occurrence rejection, strict advancement after an exact
