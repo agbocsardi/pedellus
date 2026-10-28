@@ -101,19 +101,30 @@ has an old prefix, then the measured full sequence:
   (2), one filler turn (1), native compaction summary (1);
 - phase 2: fresh process, one recall + skill + topic-read turn (2).
 
-The early user instruction tells the model not to echo the fact or sentinel.
-The real flow still records fact/sentinel occurrences inside and outside the
-placed summary, so a model echo is distinguishable from genuine leakage. It
-rejects a fact outside the summary or a sentinel outside the summary, not a
-value quoted by the summarizer. The offline scripted summary never quotes them,
-so its stricter checks remain.
+The early user instruction scopes its no-echo rule to that turn's conversational
+acknowledgement only, and explicitly tells the model that if the conversation is
+summarized or compacted it must keep the acceptance code verbatim as a fact in
+the summary. The real flow still records fact/sentinel occurrences inside and
+outside the placed summary, so a model echo is distinguishable from genuine
+leakage. It rejects a fact outside the summary or a sentinel outside the summary,
+not a value quoted by the summarizer. The offline scripted summary never quotes
+them, so its stricter checks remain.
+
+The exact-marker pass rule is unchanged. To distinguish omission from reformatting
+without recording transcript text, real-mode observations classify the placed
+summary text (and, in phase 2, the recall answer) as `exact`, `normalized`
+(case/separator variant), `digits-only` or `absent`, with a character count and a
+bounded hash. These are observations only: no check accepts a variant. Phase
+observations and bounded per-request hashes are recorded as soon as they are
+computed, and the `finally` block still writes them when a later check fails, so
+an early exit keeps the failure evidence.
 
 The rehearsal measured **10 requests**, a conservative input reservation of
-about **317,600 tokens** (about 157,000 in phase 1, 160,500 in phase 2), an
-output reservation of **17,920**, reported faux input usage of **103,024** and
-output usage of **232**. The measured full flow therefore fits the 600,000 cap
-with substantial room for longer live responses, and the guard still enforces
-each request against the remaining ledger.
+about **319,600 tokens** across both phases, an output reservation of
+**17,920**, reported faux input usage of **103,618** and output usage of **232**.
+The measured full flow therefore fits the 600,000 cap with substantial room for
+longer live responses, and the guard still enforces each request against the
+remaining ledger.
 
 Run:
 
@@ -149,8 +160,9 @@ Review points before the single live call:
 - `scripts/core-acceptance.mjs`: `runReal`, `runRealFirstPhase`,
   `runRealSecondPhase`, and `realGatewayConfig`. Confirm the preflight gate, the
   isolated one-variable provider environment, the phase-2 skip after a failed
-  phase 1, and that the live child reads the credential only after the budget
-  lock is held.
+  phase 1, that the live child reads the credential only after the budget
+  lock is held, and that observations are recorded before the checks and in
+  `finally` so an early exit still leaves evidence.
 - The report carries `assumptions`, `caps`, per-request `budget.records`
   (bytes, bounds, hashes, usage), `observations`, and phase timings. It carries
   no transcript, fact/body marker, credential or host path.

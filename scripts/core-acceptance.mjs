@@ -53,7 +53,7 @@ const COMPACTION_PREFIX = "The conversation history before this point was compac
 
 const NOT_RUN = Object.freeze([
   "real-model provider calls (offline faux provider only)",
-  "a live run under the authorized 320000-input-token cap: the conservative pre-dispatch bound exceeds it (see ACCEPTANCE.md)",
+  "a live provider run under the authorized 20-request/600000-input-token cap (opt-in --mode=real; not part of this offline run)",
   "A/B harness fixture comparison and parity claims",
   "channels, Telegram delivery and scheduled outbound sends",
   "credentials, personal workspace and live data",
@@ -211,6 +211,33 @@ function sentinelOutsideSummary(requestText) {
   return texts.some((text, index) => !summaryIndexes.includes(index) && text.includes(SENTINEL));
 }
 
+/** Digits of the acceptance fact, used only to classify alternate formatting. */
+const FACT_DIGITS = FACT.replace(/[^0-9]/g, "");
+
+function compactForm(text) {
+  return String(text).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+/**
+ * Classify how text carries the fact without recording it: exact marker, a
+ * case/separator variant, digits only, or absent. Booleans, a character count
+ * and a bounded hash only; the pass rule stays an exact marker match.
+ */
+function factFidelity(text) {
+  const compact = compactForm(text);
+  const exact = text.includes(FACT);
+  const normalized = compact.includes(compactForm(FACT));
+  const digitsPresent = FACT_DIGITS.length > 0 && compact.includes(FACT_DIGITS);
+  return {
+    exact,
+    normalized,
+    digitsPresent,
+    variant: exact ? "exact" : normalized ? "normalized" : digitsPresent ? "digits-only" : "absent",
+    chars: text.length,
+    sha256Prefix: sha256(text).slice(0, 16),
+  };
+}
+
 /** Count fact/sentinel occurrences inside and outside the placed summary. */
 function occurrenceIsolation(requestText) {
   const texts = messageTexts(requestText);
@@ -225,6 +252,7 @@ function occurrenceIsolation(requestText) {
     factOutsideSummary: count(FACT) - summaryFacts,
     sentinelInSummary: summarySentinels,
     sentinelOutsideSummary: count(SENTINEL) - summarySentinels,
+    factFidelityInSummary: factFidelity(summaryText),
   };
 }
 
@@ -1169,6 +1197,21 @@ function analyzeSummaryRequest(entry) {
   };
 }
 
+/**
+ * The early turn is the only source of the acceptance fact. The no-echo rule is
+ * scoped to this turn's conversational acknowledgement so it cannot be read as a
+ * summarization instruction; the summarizer is told to retain the code verbatim.
+ */
+function realEarlyInstruction() {
+  return `Early acceptance instruction: remember the acceptance code ${FACT}. This raw early turn also contains ${SENTINEL}. ` +
+    "In your conversational reply to this message only, do not repeat or quote the acceptance code or the sentinel; " +
+    "a short acknowledgement is enough. " +
+    "That no-echo restriction applies only to your acknowledgement here, not to summarization: if this conversation is " +
+    "summarized or compacted, keep the acceptance code verbatim as a fact in the summary so it survives. " +
+    `Call the skill tool with name "${SKILL_NAME}" so its instructions are loaded. Then reply with one short sentence. ` +
+    "Do not call any other tool.";
+}
+
 function createRealDriver(core, probe, recorder, requestPrefix, rehearsal) {
   const state = { script: [], summary: undefined };
   let turn = 0;
@@ -1291,14 +1334,10 @@ async function runRealFirstPhase(core, stateDir, evidence, options, budget) {
 
     const topicContent = realTopicContent();
     let turnStart = recorder.requests.length;
-    await driver.send(conversation, context,
-      `Early acceptance instruction: remember the acceptance code ${FACT}. This raw early turn also contains ${SENTINEL}. ` +
-        "Do not repeat or quote the acceptance code or the sentinel in your replies; just remember them. " +
-        `Call the skill tool with name "${SKILL_NAME}" so its instructions are loaded. Then reply with one short sentence. ` +
-        "Do not call any other tool.", [
-        core.fauxAssistantMessage([core.fauxToolCall("skill", { name: SKILL_NAME })], { stopReason: "toolUse" }),
-        core.fauxAssistantMessage("Skill instructions loaded; the early code is recorded."),
-      ]);
+    await driver.send(conversation, context, realEarlyInstruction(), [
+      core.fauxAssistantMessage([core.fauxToolCall("skill", { name: SKILL_NAME })], { stopReason: "toolUse" }),
+      core.fauxAssistantMessage("Skill instructions loaded; the early code is recorded."),
+    ]);
     let turnRequests = recorder.requests.slice(turnStart);
     const first = turnRequests[0];
     require("fact_in_first_request", first !== undefined && first.text.includes(FACT) && first.text.includes(SENTINEL));
@@ -1360,6 +1399,14 @@ async function runRealFirstPhase(core, stateDir, evidence, options, budget) {
     require("compaction.summary_request_observed", summaryRequests.length === 1, String(summaryRequests.length));
     const summary = analyzeSummaryRequest(summaryRequests.at(-1));
     evidence.summary = summary;
+    evidence.observations = {
+      ...(evidence.observations ?? {}),
+      summaryRequestChars: summary.requestChars,
+      summaryRequestSha256Prefix: summary.requestSha256.slice(0, 16),
+      summaryRequestFactOccurrences: summary.provenance.factOccurrences,
+      summaryRequestSentinelOccurrences: summary.provenance.sentinelOccurrences,
+      summaryRequestFactAndSentinelInEarlyTurn: summary.provenance.factAndSentinelInEarlyUserTurn,
+    };
     require("compaction.fact_extracted_from_request", summary.extractedFact === FACT,
       summary.extractedFact === FACT ? "matched" : "missing");
     require("compaction.topic_extracted_from_request", summary.extractedTopic === TOPIC_PATH,
@@ -1373,6 +1420,7 @@ async function runRealFirstPhase(core, stateDir, evidence, options, budget) {
     const budgetSnapshot = budget.snapshot();
     const summaryRecord = budgetSnapshot.records.find((record) => record.kind === "completeSimple");
     absoluteSummaryReserve = summaryRecord?.outputReserve;
+    evidence.observations = { ...(evidence.observations ?? {}), summaryOutputReserve: absoluteSummaryReserve };
     require("compaction.summary_output_reserve",
       summaryRecord !== undefined && summaryRecord.outputReserve > 0,
       `${summaryRecord?.outputReserve ?? "missing"} (summary cap ${budgetSnapshot.maxOutputPerRequestByOperation.completeSimple})`);
@@ -1389,25 +1437,28 @@ async function runRealFirstPhase(core, stateDir, evidence, options, budget) {
     }
     const messages = JSON.stringify(view?.messages ?? []);
     const isolation = factIsolation(messages);
-    require("compaction.summary_head_placed", view?.head !== undefined);
-    require("compaction.summary_message_has_fact", isolation.summaryCount === 1 && isolation.summaryHasFact, JSON.stringify(isolation));
-    require("compaction.fact_only_in_summary_message", isolation.summaryCount === 1 && !isolation.othersHaveFact, JSON.stringify(isolation));
-    require("compaction.original_turn_absent", !sentinelOutsideSummary(messages));
+    const isolationCounts = occurrenceIsolation(messages);
     evidence.observations = {
       ...(evidence.observations ?? {}),
+      summaryHeadPlaced: view?.head !== undefined,
       summaryFactOccurrences: isolation.factOccurrences,
-      summaryRequestFactOccurrences: summary.provenance.factOccurrences,
-      summaryRequestSentinelOccurrences: summary.provenance.sentinelOccurrences,
-      summaryOutputReserve: absoluteSummaryReserve,
       topicMarkerInPlacedContext: messages.includes(TOPIC_MARKER),
-      ...occurrenceIsolation(messages),
+      ...isolationCounts,
     };
-
-    evidence.requests = recorder.requests.map(({ kind, chars, sha256: digest }) => ({ kind, chars, sha256: digest }));
+    require("compaction.summary_head_placed", view?.head !== undefined);
+    require("compaction.summary_message_has_fact", isolation.summaryCount === 1 && isolation.summaryHasFact,
+      JSON.stringify({ ...isolation, ...isolationCounts }));
+    require("compaction.fact_only_in_summary_message", isolation.summaryCount === 1 && !isolation.othersHaveFact,
+      JSON.stringify(isolation));
+    require("compaction.original_turn_absent", !sentinelOutsideSummary(messages));
   } finally {
-    if (gateway) await gateway.close(context);
-    evidence.checks = checks;
-    evidence.status = collectorStatus(checks);
+    try {
+      if (gateway) await gateway.close(context);
+    } finally {
+      evidence.requests = recorder.requests.map(({ kind, chars, sha256: digest }) => ({ kind, chars, sha256: digest }));
+      evidence.checks = checks;
+      evidence.status = collectorStatus(checks);
+    }
   }
 }
 
@@ -1452,25 +1503,32 @@ async function runRealSecondPhase(core, stateDir, evidence, options, budget) {
     const first = turnRequests[0];
     require("reopen.request_observed", first !== undefined);
     const isolation = factIsolation(first.text);
-    require("reopen.compaction_summary_present", isolation.summaryCount === 1, JSON.stringify(isolation));
-    require("reopen.summary_message_has_fact", isolation.summaryHasFact, JSON.stringify(isolation));
-    require("reopen.fact_only_in_summary_message", !isolation.othersHaveFact, JSON.stringify(isolation));
-    require("reopen.raw_turn_absent", !sentinelOutsideSummary(first.text));
+    const isolationCounts = occurrenceIsolation(first.text);
     evidence.observations = {
       ...(evidence.observations ?? {}),
       firstRequestFactOccurrences: isolation.factOccurrences,
-      ...occurrenceIsolation(first.text),
+      ...isolationCounts,
       topicMarkerInFirstRequest: first.text.includes(TOPIC_MARKER),
       skillBodyInFirstRequest: first.text.includes(SKILL_BODY),
     };
-    require("reopen.fact_not_in_system_prompt", !first.prompt.includes(FACT));
-    require("reopen.bootstrap_rediscovered", first.prompt.includes(BOOTSTRAP_MARKER));
-    require("reopen.loaded_memory_present", first.prompt.includes(MEMORY_MARKER));
-    require("reopen.memory_manifest_rediscovered",
-      first.prompt.includes(`\`${TOPIC_PATH}\` (topic`) && first.prompt.includes(TOPIC_DESCRIPTION));
-    require("reopen.skill_summary_present", first.prompt.includes(SKILL_NAME) && first.prompt.includes(SKILL_DESCRIPTION));
-    // The summary may legitimately quote a body; record it instead of failing.
-    evidence.observations = { ...(evidence.observations ?? {}), skillSummaryPresent: first.prompt.includes(SKILL_NAME) };
+    require("reopen.compaction_summary_present", isolation.summaryCount === 1, JSON.stringify(isolation));
+    require("reopen.summary_message_has_fact", isolation.summaryHasFact,
+      JSON.stringify({ ...isolation, ...isolationCounts }));
+    require("reopen.fact_only_in_summary_message", !isolation.othersHaveFact, JSON.stringify(isolation));
+    require("reopen.raw_turn_absent", !sentinelOutsideSummary(first.text));
+    const promptFlags = {
+      factInSystemPrompt: first.prompt.includes(FACT),
+      bootstrapInPrompt: first.prompt.includes(BOOTSTRAP_MARKER),
+      loadedMemoryInPrompt: first.prompt.includes(MEMORY_MARKER),
+      memoryManifestInPrompt: first.prompt.includes(`\`${TOPIC_PATH}\` (topic`) && first.prompt.includes(TOPIC_DESCRIPTION),
+      skillSummaryPresent: first.prompt.includes(SKILL_NAME) && first.prompt.includes(SKILL_DESCRIPTION),
+    };
+    evidence.observations = { ...(evidence.observations ?? {}), ...promptFlags };
+    require("reopen.fact_not_in_system_prompt", !promptFlags.factInSystemPrompt);
+    require("reopen.bootstrap_rediscovered", promptFlags.bootstrapInPrompt);
+    require("reopen.loaded_memory_present", promptFlags.loadedMemoryInPrompt);
+    require("reopen.memory_manifest_rediscovered", promptFlags.memoryManifestInPrompt);
+    require("reopen.skill_summary_present", promptFlags.skillSummaryPresent);
 
     const results = turnRequests.flatMap((entry) => toolResultsOf(entry.text));
     const skillResults = results.filter((result) => result.toolName === "skill" && !result.isError);
@@ -1483,13 +1541,17 @@ async function runRealSecondPhase(core, stateDir, evidence, options, budget) {
 
     const view = await conversation.context(context);
     const answer = lastAssistantText(view);
-    require("reopen.recall_in_answer", answer.includes(FACT), sha256(answer).slice(0, 16));
     evidence.answerSha256 = sha256(answer);
-    evidence.requests = recorder.requests.map(({ kind, chars, sha256: digest }) => ({ kind, chars, sha256: digest }));
+    evidence.observations = { ...(evidence.observations ?? {}), answerFidelity: factFidelity(answer) };
+    require("reopen.recall_in_answer", answer.includes(FACT), sha256(answer).slice(0, 16));
   } finally {
-    if (gateway) await gateway.close(context);
-    evidence.checks = checks;
-    evidence.status = collectorStatus(checks);
+    try {
+      if (gateway) await gateway.close(context);
+    } finally {
+      evidence.requests = recorder.requests.map(({ kind, chars, sha256: digest }) => ({ kind, chars, sha256: digest }));
+      evidence.checks = checks;
+      evidence.status = collectorStatus(checks);
+    }
   }
 }
 
@@ -1942,7 +2004,7 @@ async function runOffline() {
         counts: counts(budgetEvidence?.checks ?? []),
         framingTokensPerRequest: INPUT_FRAMING_TOKENS_PER_REQUEST,
         enforcement: "reserve payload bytes + framing and clamped output limit before dispatch; persisted ledger and exclusive lock",
-        realMode: "not enabled: the conservative pre-dispatch input bound exceeds the authorized 320000-token cap for the required compaction path (see ACCEPTANCE.md)",
+        realMode: "not run here: real mode is opt-in (--mode=real), owner-authorized per run under the 20-request/600000-input-token cap, and gated by the offline rehearsal (see ACCEPTANCE.md)",
       },
       limits: { childTimeoutMs: CHILD_TIMEOUT_MS, compactionWaitMs: COMPACTION_WAIT_MS, budgetFramingTokensPerRequest: INPUT_FRAMING_TOKENS_PER_REQUEST },
       durationMs: Date.now() - started,
