@@ -169,12 +169,28 @@ export interface CronPreparation {
  */
 export type CronPrepare = (preparation: CronPreparation, context: Context) => void | Promise<void>;
 /**
+ * One run's durable retirement of an already-prepared target, in the same commit that records the
+ * run's terminal result or cancellation. Retirement is target-scoped: `job` is `null` when the
+ * terminal commit could no longer read the job record (so `occurrence` may be the synthetic zero
+ * input), and a host that gave the target authority must retire it anyway. `background` is true
+ * when the target is a separate conversation, so an origin-mode run's own conversation is never
+ * finalized.
+ */
+export interface CronFinalization {
+  readonly tx: Tx;
+  readonly job: CronJob | null;
+  readonly occurrence: CronOccurrenceInput;
+  readonly originConversationId: ConversationId;
+  readonly targetConversationId: ConversationId;
+  readonly background: boolean;
+}
+/**
  * Optional durable finalization of one run's target, in the same commit that records the run's
  * terminal result or cancellation. A host that gave the target authority should retire it here; the
- * foundation itself changes no tool state. `background` is true when the target is a separate
- * conversation, so an origin-mode run's own conversation is never finalized.
+ * foundation itself changes no tool state. Every terminal path of a run that already prepared a
+ * separate target calls this, so a finished, failed, superseded or cancelled run keeps no copy.
  */
-export type CronFinalize = (finalization: CronPreparation, context: Context) => void | Promise<void>;
+export type CronFinalize = (finalization: CronFinalization, context: Context) => void | Promise<void>;
 
 export interface CronScheduleReceipt {
   readonly jobId: string;
@@ -537,6 +553,25 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
   const finalize = options.finalize;
   const clock = options.now ?? (() => Date.now());
 
+  /**
+   * Retire one already-prepared target inside the commit that ends its run. The target is the run
+   * task's own conversation, chosen once in its checkpoint, so it cannot belong to a newer run; an
+   * origin-mode target is the origin conversation itself and is deliberately left alone.
+   */
+  const retireTarget = async (
+    tx: Tx,
+    originConversationId: ConversationId,
+    targetConversationId: ConversationId,
+    job: CronJob | null,
+    occurrence: CronOccurrenceInput,
+    context: Context,
+  ): Promise<void> => {
+    if (finalize === undefined || targetConversationId === originConversationId) return;
+    await finalize({
+      tx, job, occurrence, originConversationId, targetConversationId, background: true,
+    }, context);
+  };
+
   const runTask: Task<CronOccurrenceInput, CronRunCheckpoint, CronRunResult, object> =
     defineTask<CronOccurrenceInput, CronRunCheckpoint, CronRunResult>({
       name: CRON_RUN_TASK_NAME,
@@ -546,12 +581,19 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
         run: async (running, runtime, context) => {
           const input = parseOccurrenceInput(running.input);
           if (input === undefined) {
-            await runtime.commit(
-              () => terminalFailed<CronRunCheckpoint, CronRunResult>(
+            await runtime.commit(async (tx) => {
+              // A checkpoint only advances together with a parsed input, so a prepared target here
+              // means a damaged record; retire it rather than leave its copy alive.
+              const preparedTarget = running.state.checkpoint.targetConversationId;
+              if (preparedTarget !== null) {
+                await retireTarget(
+                  tx, running.conversationId, preparedTarget, null, zeroInput, context,
+                );
+              }
+              return terminalFailed<CronRunCheckpoint, CronRunResult>(
                 runResult(zeroInput, "missing", "task input is invalid"), "task input is invalid",
-              ),
-              context,
-            );
+              );
+            }, context);
             return;
           }
           const checkpoint = running.state.checkpoint;
@@ -628,7 +670,15 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
             const snapshot = await runtime.snapshot(CronJobsDoc, running.conversationId, context);
             const rejected = inspectJob(snapshot?.jobs.find((candidate) => candidate.id === input.jobId));
             if (rejected !== undefined) {
-              await runtime.commit(() => rejected, context);
+              // This run is fenced out, but its target was already prepared: retire it in the same
+              // commit that records the rejection.
+              const preparedTarget = targetConversationId;
+              await runtime.commit(async (tx) => {
+                await retireTarget(
+                  tx, running.conversationId, preparedTarget, null, input, context,
+                );
+                return rejected;
+              }, context);
             }
           }
 
@@ -683,25 +733,20 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       },
 
       abort: async (running, runtime, context) => {
-        const input = parseOccurrenceInput(running.input) ?? zeroInput;
+        const parsed = parseOccurrenceInput(running.input);
+        const input = parsed ?? zeroInput;
         const targetConversationId = running.state.checkpoint.targetConversationId;
         await runtime.commit(async (tx) => {
           // A cancelled run gives up its target's authority in this same commit: an abort is not a
           // reason to leave a prepared copy alive for a later admission.
-          if (finalize !== undefined
-            && targetConversationId !== null && targetConversationId !== running.conversationId) {
+          if (finalize !== undefined && targetConversationId !== null
+            && targetConversationId !== running.conversationId) {
             const doc = await tx.doc(CronJobsDoc, running.conversationId);
-            const job = doc.jobs.find((candidate) => candidate.id === input.jobId);
-            if (job !== undefined) {
-              await finalize({
-                tx,
-                job: copyJob(job),
-                occurrence: input,
-                originConversationId: running.conversationId,
-                targetConversationId,
-                background: true,
-              }, context);
-            }
+            const job = doc.jobs.find((candidate) => candidate.id === parsed?.jobId);
+            await retireTarget(
+              tx, running.conversationId, targetConversationId,
+              job === undefined ? null : copyJob(job), parsed ?? zeroInput, context,
+            );
           }
           return terminalAborted<CronRunCheckpoint, CronRunResult>(
             runResult(input, "cancelled", "cancelled"), "cancelled",
@@ -834,22 +879,27 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       const doc = await tx.doc(CronJobsDoc, conversationId);
       const job = doc.jobs.find((candidate) => candidate.id === input.jobId);
       if (job === undefined) {
+        await retireTarget(tx, conversationId, targetConversationId, null, input, context);
         return terminalFailed<CronRunCheckpoint, CronRunResult>(
           runResult(input, "missing", "cron job record is missing"), "cron job record is missing",
         );
       }
-      // The run records only its result. It never computes or creates a schedule.
+      // The run records only its result. It never computes or creates a schedule. A fenced-out run
+      // still retires its already-prepared target in this same commit.
       if (job.generation !== input.generation) {
+        await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, context);
         return terminalAborted<CronRunCheckpoint, CronRunResult>(
           runResult(input, "superseded", "job generation changed"), "superseded",
         );
       }
       if (job.cancelledAtMs !== null) {
+        await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, context);
         return terminalAborted<CronRunCheckpoint, CronRunResult>(
           runResult(input, "cancelled", "cancelled before the run finished"), "cancelled",
         );
       }
       if (job.executionTaskId !== taskId) {
+        await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, context);
         return terminalAborted<CronRunCheckpoint, CronRunResult>(
           runResult(input, "superseded", "job is owned by another execution"), "superseded",
         );
@@ -863,16 +913,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       };
       // The run's authority ends with the run, in this same terminal commit. The origin-mode target
       // is the origin conversation itself and is deliberately left alone.
-      if (finalize !== undefined && targetConversationId !== conversationId) {
-        await finalize({
-          tx,
-          job: copyJob(job),
-          occurrence: input,
-          originConversationId: conversationId,
-          targetConversationId,
-          background: true,
-        }, context);
-      }
+      await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, context);
       return terminalCompleted<CronRunCheckpoint, CronRunResult>(
         runResult(input, settlement.status === "ok" ? "ok" : "error", settlement.error),
       );

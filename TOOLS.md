@@ -116,12 +116,16 @@ resolves without them. Two rules keep that closed:
   `Tool <name> was interrupted and may have partially run`. Pruning before resume
   means an interrupted copy has no authority left either way.
 
-On normal completion or a recorded error, `finishRun` and the run task's abort
-handler retire the target's copied grants and tools in the terminal commit. Some
-cancelled or superseded early-return paths leave them until the next reopen; a
-direct host submission in that interval remains bounded by the origin hook. The
-origin link is kept, so a re-created grant document for that target still has to
-satisfy the origin check.
+Every terminal commit of a run that already prepared a separate target retires
+that target's copied grants and tools in the same commit: normal completion or a
+recorded error, a missing target conversation, a missing job record, a generation
+change or cancellation, and ownership fencing, plus the run task's abort handler.
+A completed, failed, cancelled or superseded run therefore leaves no copy behind
+for a later admission. A phase fault or a crash before that terminal commit still
+leaves the copy until the next reopen, where the pre-resume pass retires a target
+whose run already ended; a direct host submission in that interval remains
+bounded by the origin hook. The origin link is kept, so a re-created grant
+document for that target still has to satisfy the origin check.
 
 Every native conversation creation goes through the Durable `conversationCreated`
 hook, which retires any grant document and writes empty `tools`/`modelTools`
@@ -277,7 +281,12 @@ temporary workspace/data directory and the real `openGateway`:
   pruned before the next resume;
 - a SIGKILL during a real `bash` effect with a grant revoked before reopen left
   exactly one effect, settled the call as interrupted, and removed the tool
-  before resume.
+  before resume;
+- every terminal path of a prepared background cron run (normal completion, a
+  job generation change, a missing job record, an execution-ownership change,
+  model-issued cancellation, and a resumed early return after a SIGKILL) left
+  the target with no grant document and no offered tools, while an origin-mode
+  run left its own conversation's authority in place.
 
 The optional bwrap shell was checked separately with bounded temporary workspaces
 and a real Bubblewrap 0.9.0 binary: config validation, fail-closed startup for a

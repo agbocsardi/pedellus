@@ -187,8 +187,10 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
   must apply the same deny-by-default rule. The foundation alone does not copy grant records. The
   copy is recorded together with the origin conversation in the same commit that creates and
   configures the target, and stays capped by that origin's current grants; the foundation's optional
-  `finalize` callback lets the host retire the target's authority in the normal terminal or abort
-  commit; some fenced early returns defer retirement until reopen (see below). When the origin has no known
+  `finalize` callback lets the host retire the target's authority in every terminal commit of the
+  run (normal completion or error, target missing, job record missing, generation change or
+  cancellation, and ownership fencing) and in the abort handler; only a phase fault or a crash
+  before that commit defers retirement to the next reopen (see below). When the origin has no known
   owner, `prepare` copies nothing and the run stays default-deny.
   When a context snapshot provider is configured, `prepare` also installs the origin's snapshot
   for the target conversation — bootstrap/AGENTS files, memory, the skill summary — and the
@@ -210,9 +212,12 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
   `resume()`: it intersects the copy with the origin's current grants and clears a copy whose durable
   link, origin owner or origin document is missing or mismatched, so a new admission after a revoke
   is not offered the tool. A committed `execute` intent for a native coding tool is `unsafe` and
-  settles as interrupted rather than rerunning. Normal completion and the abort handler retire the
-  target's copied grants and tools atomically. Some cancelled or superseded early-return paths leave
-  them until the next reopen; until then a direct host submission remains bounded by the origin hook.
+  settles as interrupted rather than rerunning. Every terminal commit of a run that already prepared
+  a separate target retires that target's copied grants and tools in the same commit, as does the
+  abort handler, so a completed, failed, cancelled or superseded run leaves no copy behind for a
+  later admission. A phase fault or a crash before the terminal commit still leaves the copy until
+  the next reopen, where the pre-resume pass retires it; in that interval a direct host submission
+  remains bounded by the origin hook.
   The copy still drives tool selection during the run,
   so it may be offered a tool the origin just revoked; the call itself is blocked. As for any granted
   call, one that already passed the hook and recorded intent can still execute.
@@ -251,6 +256,15 @@ denied. Another SIGKILL probe interrupted a native `bash` call **after** its exe
 revoked the origin grant while the command was running, and reopened: the call settled as interrupted
 without rerunning, the killed command's later effect never appeared, and the target's authority was
 already pruned before resume. An origin-mode conversation with no link was unaffected.
+A later retirement probe drove the same path with a faux provider and asserted, for each terminal
+path of a run whose target was already prepared, that the target's grant document is retired and
+that it offers no tools: normal completion (plus a denied direct host submission), a job generation
+change, a missing job record and an execution-ownership change while the run was live, cancellation
+by the model-issued `remove` tool, and a SIGKILL after preparation whose resumed early return was
+fenced by a generation change written through a raw Harness commit before reopen. The same probe
+confirmed an origin-mode run leaves its own conversation's grants and tools untouched. A control
+build without the new retirements failed exactly the generation, missing-record, ownership and
+resume probes while normal completion and the abort handler still passed.
 
 Calendar probes covered `at`/`every`/`cron` parsing, the `once` alias, UTC default, invalid zones
 and offsets, invalid expressions, no-future-occurrence rejection, strict advancement after an exact

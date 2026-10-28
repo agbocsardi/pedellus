@@ -63,6 +63,7 @@ export {
   type CronActor,
   type CronCancellation,
   type CronConversationWriter,
+  type CronFinalization,
   type CronFoundation,
   type CronFoundationOptions,
   type CronJob,
