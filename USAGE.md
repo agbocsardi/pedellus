@@ -147,7 +147,7 @@ child conversations, and concurrent turns, before writing history.
 
 ## Compatibility references
 
-- Root roadmap: `../../2026-10-26_full-port_TODO.md` (P4 usage/archive requirement).
+- Root roadmap: `plan/2026-10-26_full-port_TODO.md` (P4 usage/archive requirement).
 - Python behavior reference: `nanobot/utils/usage.py`,
   `nanobot/agent/memory.py`, `nanobot/command/builtin.py`, and
   `nanobot/session/manager.py`. Python increments `requests` per normalized

@@ -103,11 +103,11 @@ the shell never receives it.
 ## Port builtin curation
 
 The port ships a curated builtin skills directory at
-`packages/pi-nanobot/skills/`. `builtinSkillsRoot` remains an explicit host
+`skills/`. `builtinSkillsRoot` remains an explicit host
 value, so using it — or pointing at another directory — is a host decision. The
 owner's 2026-10-28 selection is:
 
-- **Shipped** in `packages/pi-nanobot/skills/`, adapted to the implemented tool
+- **Shipped** in `skills/`, adapted to the implemented tool
   surface (`read`, `write`, `edit`, `bash` when granted, plus the read-only
   `skill` tool and the opt-in `cron` tool):
   - `memory` — workspace Markdown topic files. A host-injected read-only topic
@@ -137,7 +137,7 @@ owner's 2026-10-28 selection is:
 - The Python reference tree (`nanobot/skills/`) and any user workspace skills are
   untouched; curation never deletes or edits them.
 
-Point `builtinSkillsRoot` at the absolute path of `packages/pi-nanobot/skills/`
+Point `builtinSkillsRoot` at the absolute path of `skills/`
 to use the curated set; do not use the Python tree as a substitute. See
 [`SKILLS_BUILTIN.md`](./SKILLS_BUILTIN.md) for the package-local record.
 

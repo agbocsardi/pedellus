@@ -6,7 +6,7 @@ The [current plan and consolidation snapshot](2026-10-27_port-plan_TODO.md) gove
 scope, status and stop rules. Native coding tools/grants and opt-in memory/skills
 are now integrated; the old tool-less-slice description is historical. The
 [spike checklist](2026-10-26_pi-durable-rebuild_TODO.md) and
-[package design](packages/pi-nanobot/DESIGN.md) retain earlier rationale.
+[package design](DESIGN.md) retain earlier rationale.
 
 ## Milestone checklist
 
@@ -275,7 +275,7 @@ tabs without force; the branches were retained.
 | `pi-0d64c0d6` | `w24:p1` / `w24` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-0d64c0d6` | src/cli.ts, new src/terminal/**, CLI.md |
 | `pi-4b9c165f` | `w25:p1` / `w25` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-4b9c165f` | new src/migration/**, MIGRATION.md |
 
-Ownership paths are relative to packages/pi-nanobot. No manifest/lock changes or
+Ownership paths are relative to the repository root. No manifest/lock changes or
 new dependencies assigned; request review if concretely needed. Python and pinned
 `/tmp/pi-durable-reference-1.4.0` remain read-only references. No live/paid/network
 requests, real credentials/history/config, host/deployment changes, push or cleanup.
@@ -326,7 +326,7 @@ root roadmap, public exports/integration and acceptance.
 | `pi-1db6d944` | `w21:p1` / `w21` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-1db6d944` | new `src/context/**`, CONTEXT.md |
 | `pi-a34c1f70` | `w22:p1` / `w22` | `/home/gergo/.herdr/worktrees/pi-nanobot/pi-a34c1f70` | new `src/usage/**`, USAGE.md |
 
-Paths in ownership column are relative to `packages/pi-nanobot`. No manifest/lock
+Paths in ownership column are relative to the package root. No manifest/lock
 changes assigned; request any necessary dependency rather than editing shared
 ownership. Python and pinned `/tmp/pi-durable-reference-1.4.0` are read-only
 references. No live credentials/data, paid/live calls, host/deployment changes,
@@ -430,8 +430,8 @@ rollback drill pass; operations no longer require the Python agent service.
 - Execution spike exists, but realpath/check-then-use and hard-link aliasing remain
   blockers. It is not installed in the gateway. Tool replay is not yet proven.
 - No real fork-provider acceptance, full feature parity, migration, or deployment.
-  See [Telegram evidence](packages/pi-nanobot/TELEGRAM.md) and
-  [execution limitations](packages/pi-nanobot/EXECUTION.md).
+  See [Telegram evidence](TELEGRAM.md) and
+  [execution limitations](EXECUTION.md).
 
 ## Reuse policy: dependency first, small adapter second, copy last
 
@@ -978,7 +978,7 @@ worker artifacts: `/tmp/pi-nanobot-parent-storage-crash.mjs` (70s/512 MB; adapta
 of worker probe with explicit parent imports) passes actual SIGKILL/reopen,
 WAL/FULL, owner exclusion, dedupe and setup-failure cleanup. Parent's independently
 written `/tmp/pi-nanobot-parent-storage-failclosed.mjs` (45s/256 MB), selected with
-`PI_STORAGE_CANDIDATE=/home/gergo/projects/pi-nanobot/packages/pi-nanobot`, passes
+`PI_STORAGE_CANDIDATE=/home/gergo/projects/pi-nanobot`, passes
 all six failure scenarios and real non-WAL rejection. No paid/live requests.
 
 B3's bounded policy task is accepted. Backups/restores, real disk-full/VFS/schema

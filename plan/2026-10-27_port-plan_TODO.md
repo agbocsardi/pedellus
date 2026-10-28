@@ -81,7 +81,7 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 | Coding tools | Native `read`/`write`/`edit`/`bash`, host ceiling, expiring/revocable per-session grants | Ceiling defaults empty; grant/revoke is an SDK host API, not a CLI/Telegram approval command |
 | Shell backend | Guarded actual workspace; optional `toolSandbox: bwrap`, off by default | Network remains available; file tools stay guarded host APIs; no hostile isolation/quota claim |
 | Context / memory | Opt-in bootstrap and selected files, topic manifest, on-demand read/write through granted tools | Markdown authoritative; context fixed until new session/reopen; unreadable memory directory can block reopen |
-| Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool; curated port builtins in `packages/pi-nanobot/skills` (memory, memory-defrag, skill-creator, github, cron) behind an explicit `builtinSkillsRoot` | `my` has no port runtime; no inventory-count cap, but finite prompt/output bounds visibly truncate |
+| Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool; curated port builtins in `skills` (memory, memory-defrag, skill-creator, github, cron) behind an explicit `builtinSkillsRoot` | `my` has no port runtime; no inventory-count cap, but finite prompt/output bounds visibly truncate |
 | Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
 | Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling; a background run gets the origin's workspace context and `skill` tool | No channel delivery or silence policy; copied grants survive origin revocation until their own expiry; disabling cron leaves persisted timers blocked; a run whose snapshot was evicted at the cap proceeds without context |
 | Telegram | Restricted allowlisted inbound/reply adapter with streaming, durable send intent, unknown-send quarantine | Existing adapter only; scheduled outbound candidate is unmerged; no general pairing or media parity |
@@ -290,7 +290,7 @@ Bwrap adds process namespace teardown, not hostile-tenant resource quotas.
 
 Host spill files are readable through `read` during the environment lifetime, not
 inside bwrap's private `/tmp`. Extra mount/toolchain limitations are documented in
-`packages/pi-nanobot/DIRECT_BWRAP.md` and `TOOLS.md`. This replaces the old managed-copy,
+`DIRECT_BWRAP.md` and `TOOLS.md`. This replaces the old managed-copy,
 all-operations-confined design; it does not claim shell/file isolation parity.
 
 Exit met: reviewed config-selectable backend, synthetic checks and an authorized real
@@ -456,6 +456,20 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-28 — extracted into its own repository
+
+The port moved out of the Python fork into this repository at
+`~/projects/durable-nanobot`. History was rewritten with `git filter-repo`: only
+`packages/pi-nanobot/` (now the repository root) and the three dated plan
+documents were kept, and every branch including the parked `pi-*` candidates came
+along. The package prefix was dropped from documentation and the plan documents
+moved under `plan/`.
+
+The Python fork keeps `feat/pi-durable-rebuild` as a frozen archive branch; it is
+no longer the integration line. Do not push this repository back to the fork, and
+do not merge the fork's `main` into it.
+
 
 ### 2026-10-28 — background-run context and curated skills
 
@@ -657,7 +671,7 @@ in-session verification of newly created or updated skills, despite snapshots
 remaining fixed until a new conversation or Gateway reopen. It is superseded by
 `feat/curated-builtin-skills`, based on `e326bc364`: the curated set now ships
 `memory`, `memory-defrag`, `skill-creator`, `github` and `cron` in
-`packages/pi-nanobot/skills`, adapted to the shipped `read`/`write`/`edit`/`bash`,
+`skills`, adapted to the shipped `read`/`write`/`edit`/`bash`,
 read-only `skill` and opt-in `cron` tools. skill-creator now states the fixed
 snapshot instead of instructing same-conversation verification, and `my` remains
 out because no self-state runtime exists. `builtinSkillsRoot` is still an

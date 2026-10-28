@@ -49,9 +49,9 @@ unknown and must not be retried merely because the database retained its intent.
 
 ## Offline verification
 
-`npm ci --prefix packages/pi-nanobot --ignore-scripts`, followed by
-`npm run typecheck --prefix packages/pi-nanobot` and
-`npm run build --prefix packages/pi-nanobot`, succeeded. The private bounded probe
+`npm ci --ignore-scripts`, followed by
+`npm run typecheck` and
+`npm run build`, succeeded. The private bounded probe
 at `/tmp/pi-nanobot-storage-probe.mjs` uses injected Faux Models and temporary
 SQLite files; it observed `journal_mode=wal` and `synchronous=2` twice on each of
 four actual gateway adapter connections (before and after Durable initialization).

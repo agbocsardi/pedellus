@@ -44,7 +44,7 @@ promise exactly-once external effects for safe tools.
 ## Run it
 
 ```bash
-cd packages/pi-nanobot
+cd "$(git rev-parse --show-toplevel)"
 npm run build
 node --test tests/tool-replay-revocation.behavior.test.mjs
 ```
@@ -58,7 +58,7 @@ environment are not passed to it. Cleanup kills and awaits the child if needed,
 closes the parent Harness, and removes the temporary directory. The test is
 included in `test:behavior`.
 
-Set `PI_TOOL_REPLAY_CANDIDATE=/path/to/packages/pi-nanobot` to run the test
+Set `PI_TOOL_REPLAY_CANDIDATE=/path/to/durable-nanobot` to run the test
 against another built checkout.
 
 ## Scope and non-claims

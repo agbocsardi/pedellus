@@ -4,7 +4,7 @@
 
 This package is the new TypeScript build target. The Python tree is read-only
 reference; the live fork and deployment are not changed. This document specifies Gate 1 of the root spike TODO. The owner subsequently
-requested the comprehensive [full-port roadmap](../../2026-10-26_full-port_TODO.md)
+requested the comprehensive [full-port roadmap](plan/2026-10-26_full-port_TODO.md)
 (existing WebUI included, QuickJS-only Code Mode, Linux only, Pi SDK-first reuse
 and bwrap preferred; no new UI framework or micro-VM requirement).
 Those future milestones do not relax this slice's tool-less/security constraints

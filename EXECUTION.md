@@ -271,8 +271,8 @@ introduced.
 
 ## Bounded synthetic evidence
 
-- `npm run test:behavior --prefix packages/pi-nanobot` (155 checks) and
-  `npm run test:execution --prefix packages/pi-nanobot` (9 checks) passed
+- `npm run test:behavior` (155 checks) and
+  `npm run test:execution` (9 checks) passed
   unchanged after the host policy slice.
 - Bounded host probes (private, no repository tests added) created a temporary
   workspace and outside sentinel and exercised the shared policy through
@@ -300,9 +300,9 @@ introduced.
   symlink was refused for read/write but removable as a link. The conformance
   suite still passed 24/24, and `npm run test:behavior` (155) plus
   `npm run test:execution` (9) stayed green.
-- `npm ci --prefix packages/pi-nanobot --ignore-scripts`
-- `npm run typecheck --prefix packages/pi-nanobot`
-- `npm run build --prefix packages/pi-nanobot`
+- `npm ci --ignore-scripts`
+- `npm run typecheck`
+- `npm run build`
 - `timeout --signal=TERM --kill-after=5s 90s node --max-old-space-size=256 --max-semi-space-size=32 /tmp/pi-nanobot-managed-probe.mjs`
   (private probe; no repository tests were added at that time).
 - Probe evidence: native FS readers/listing/watch/temp/spill/rename; explicit file
@@ -345,7 +345,7 @@ Unix auth socket, a loopback listener, and a synthetic outside sentinel; it
 removes all temporary data on exit. No real credentials, live bot, provider,
 Python deployment, or host package install was used.
 
-- `npm run --prefix packages/pi-nanobot test:execution` builds and runs
+- `npm run test:execution` builds and runs
   `node --test tests/execution-lifecycle.test.mjs` (5 tests, 120 s per-test
   budget). Nanobot-owned behavior only: a second live `openExecutionEnv` and a
   `removeExecutionWorkspace` attempt both fail closed while an owner exists;

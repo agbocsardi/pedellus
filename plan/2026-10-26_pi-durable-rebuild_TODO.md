@@ -5,7 +5,7 @@ real Telegram/scripted-model slice verified; execution, tool replay, and real
 provider gates remain open. Full-port roadmap/scope now recorded in
 [`2026-10-26_full-port_TODO.md`](2026-10-26_full-port_TODO.md); that is the forward
 plan, this file retains spike evidence. Production cutover remains unapproved.
-Package design and worker boundaries: `packages/pi-nanobot/DESIGN.md`.
+Package design and worker boundaries: `DESIGN.md`.
 Scope: replace nanobot's Python harness (`agent/loop.py`, `agent/runner.py`,
 `session/`, tool durability, subagents) with `@earendil-works/pi-durable` 1.4.0,
 porting the product surface to TypeScript.
@@ -128,7 +128,7 @@ use the evidence-gated full-port roadmap, not these numbers, for planning.
 Owner authorized initial port and Codex Luna high-reasoning implementation
 subagents. Parent owns design/review/integration; workers get separate managed
 worktrees for runtime, execution security, and Telegram. New package lives in
-`packages/pi-nanobot`; Python and live deployments remain unchanged. Pin Pi 1.4.0.
+the package root; Python and live deployments remain unchanged. Pin Pi 1.4.0.
 No live credentials, paid requests, or real Telegram polling in this initial batch.
 Security/recovery evidence gates remain open until independently checked.
 Scaffold/design commit: `6f2057944`; dependency install audited 93 packages with
@@ -238,7 +238,7 @@ porting with retained notice/provenance. Its private Telegram plugin is tightly
 coupled to OpenClaw's SDK/routing/queues and spans a much larger feature surface.
 Recommendation: grammY client/types plus selective transport-policy ports, while
 keeping our thin Durable admission/watch/state boundary. No dependency switch or
-code copying implemented yet. See `packages/pi-nanobot/OPENCLAW-ASSESSMENT.md`.
+code copying implemented yet. See `OPENCLAW-ASSESSMENT.md`.
 Shared relevant source paths with the active native worker without broadening its
 assigned fixes. No upstream install/execution or live bot request.
 

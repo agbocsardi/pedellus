@@ -208,7 +208,7 @@ built by `createHostExecutionEnv`:
 The change was validated with the existing offline suites:
 
 ```bash
-cd packages/pi-nanobot
+cd "$(git rev-parse --show-toplevel)"
 npm run typecheck
 npm run test:behavior   # 155 checks
 npm run test:execution  # 9 checks

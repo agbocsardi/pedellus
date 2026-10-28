@@ -121,9 +121,9 @@ probe imports this checkout's module, uses a faux Durable Harness/persistent
 JSONL storage, and mocks `fetch` (the shared probe was not modified):
 
 ```sh
-npm ci --prefix packages/pi-nanobot --ignore-scripts
-npm run typecheck --prefix packages/pi-nanobot
-npm run build --prefix packages/pi-nanobot
+npm ci --ignore-scripts
+npm run typecheck
+npm run build
 timeout 220s node --max-old-space-size=512 --experimental-strip-types /tmp/tgprobe/pi-e078edd8-followup.mts
 ```
 

@@ -84,7 +84,7 @@ harmless append-only log, not an external service.
 ## Run it
 
 ```bash
-cd packages/pi-nanobot
+cd "$(git rev-parse --show-toplevel)"
 npm run build
 node --test tests/nested-codemode-replay-revocation.behavior.test.mjs
 ```
@@ -97,7 +97,7 @@ credentials in the parent environment are not passed to it. Cleanup kills and
 awaits the child if needed, closes the parent Harness, closes the Code Mode
 integration, and removes the temporary directory.
 
-Set `PI_CODEMODE_REPLAY_CANDIDATE=/path/to/packages/pi-nanobot` to run against
+Set `PI_CODEMODE_REPLAY_CANDIDATE=/path/to/durable-nanobot` to run against
 another built checkout.
 
 The test is included in `test:behavior`; it can also be run directly as above.

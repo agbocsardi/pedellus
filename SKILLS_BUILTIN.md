@@ -1,6 +1,6 @@
 # Curated builtin skills
 
-`packages/pi-nanobot/skills/` is the port-owned builtin skills root. Point
+`skills/` is the port-owned builtin skills root. Point
 `workspaceContext.skills.builtinSkillsRoot` at this directory's absolute path
 when builtin skills are wanted. The root is explicit: there is no package
 default and no fallback to `nanobot/skills/`. Loader behavior and config shape

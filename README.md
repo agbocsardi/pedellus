@@ -2,13 +2,13 @@
 
 TypeScript port requiring Node >=22.19 and the pinned Pi 1.4.0 packages. This is not a production-ready replacement for the Python fork.
 
-The [current plan and consolidation snapshot](../../2026-10-27_port-plan_TODO.md)
+The [current plan and consolidation snapshot](plan/2026-10-27_port-plan_TODO.md)
 are the scope/status authority. Core coding tools, durable grants, optional bwrap
 shell, opt-in memory/skills and compaction plumbing are integrated. Cron has a
 reviewed internal timer/calendar foundation; **agent-callable scheduling is not yet
 wired**. Cron needs no user UI or direct scheduling commands.
 New implementation is paused for consolidation; WebUI, migration and cutover are
-deferred. The [older roadmap](../../2026-10-26_full-port_TODO.md) preserves evidence,
+deferred. The [older roadmap](plan/2026-10-26_full-port_TODO.md) preserves evidence,
 not a standing implementation queue.
 
 ## Run
