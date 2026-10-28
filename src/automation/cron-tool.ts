@@ -262,8 +262,23 @@ export function createCronTool(options: CronToolOptions): CronTool {
         try {
           result = await options.foundation.cancel(harness, api.conversationId, jobId, actor, context);
         } catch (error) {
-          // Only pre-commit failures reach here; the durable cancellation result is rendered below.
-          return text(`Could not remove scheduled job ${jobId}: ${reasonText(error)}`, true);
+          // A thrown cancel may still have committed the cancellation before a task-abort or
+          // withdrawal failure. Re-read the job before claiming failure: reporting a durable
+          // cancellation as failed invites a pointless retry.
+          const reason = reasonText(error);
+          let view: CronJobView | undefined;
+          try {
+            view = await options.foundation.inspect(harness, api.conversationId, jobId, actor, context);
+          } catch {
+            view = undefined;
+          }
+          if (view !== undefined && view.job.cancelledAtMs !== null) {
+            return text(
+              `Cancelled ${jobId} (${view.job.name}). The cancellation is recorded, but cleaning up ` +
+              `its queued work failed: ${reason}`,
+            );
+          }
+          return text(`Could not remove scheduled job ${jobId}: ${reason}`, true);
         }
         if (result.status === "not_found") return text(`No scheduled job ${jobId} in this conversation.`, true);
         if (result.status === "forbidden") return text(`Scheduled job ${jobId} belongs to another owner.`, true);
