@@ -37,10 +37,13 @@ command can still access other files or the network. Do not claim otherwise.
 
 Prioritize W1 and its real Gateway turn once its practical guardrails and durable
 grants pass review and the checks below. Bubblewrap remains a separate optional W2
-backend, not a prerequisite for the direct-workspace Gateway. It must not silently
-replace the chosen workspace with a copy, and its documented backend differences
-and conformance still apply if implemented. Do not expand this scope into
-adversarial isolation, hostile-tenant quotas, or additional security frameworks.
+backend, not a prerequisite for the direct-workspace Gateway. The owner selected
+Python-like bwrap behavior: shell commands operate on the actual workspace mounted
+read-write, system paths are read-only, temporary space is private, and networking
+remains available as in the Python wrapper. File operations use the shared guarded
+host environment. Do not silently substitute a managed copy. Review practical
+backend differences and preserve native execution semantics; do not expand this
+scope into adversarial isolation, hostile-tenant quotas, or extra frameworks.
 
 ## Why v1 needed replacing
 
@@ -144,6 +147,12 @@ out of the workspace are refused; a runaway command is killed; a revoked grant s
 revoked across reopen.
 
 ### W2 — sandbox backend
+
+> **Owner clarification, 2026-10-28:** The managed-copy, all-operations-confined
+> design below is superseded. Implement an optional Python-like shell bwrap mode
+> over the actual read-write workspace, with host-side filesystem guards. The
+> owner wants accidental-damage protection, not hostile isolation; network stays
+> available. W2 does not gate W1 Gateway activation.
 
 An `ExecutionEnv` implementation that confines filesystem and shell, finished to
 parity with the host-side tool layer rather than abandoned as a spike. Bubblewrap is
