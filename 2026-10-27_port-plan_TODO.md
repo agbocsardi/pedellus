@@ -44,7 +44,11 @@ standing authorization to implement or deploy them.
 - [x] Integrate deterministic cron timer/run foundation and calendar/timezone math.
 - [x] Reconcile the plan, current Gateway wiring and parked branch inventory.
 - [x] Check the combined core path offline on both host and bwrap during consolidation.
-- [ ] Finish curated builtin skill compatibility/package review (parked).
+- [x] Finish curated builtin skill compatibility/package review (parked).
+      Landed on `feat/curated-builtin-skills`: `memory`, `memory-defrag`, `skill-creator`,
+      `github`, `cron` adapted to shipped tools; `my` stays out with no runtime. The
+      skill-creator same-conversation verification defect is fixed: a new skill is only
+      visible in a new conversation or after a Gateway reopen.
 - [ ] Record real-model memory/skill/compaction acceptance and A/B fixture results (W4).
 - [x] Connect internal agent cron: model-callable tool, runtime lifecycle and authorization.
       Integrated `287a5fbf5`. An independent review plus one worker fix pass found no blocker; the
@@ -76,7 +80,7 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 | Coding tools | Native `read`/`write`/`edit`/`bash`, host ceiling, expiring/revocable per-session grants | Ceiling defaults empty; grant/revoke is an SDK host API, not a CLI/Telegram approval command |
 | Shell backend | Guarded actual workspace; optional `toolSandbox: bwrap`, off by default | Network remains available; file tools stay guarded host APIs; no hostile isolation/quota claim |
 | Context / memory | Opt-in bootstrap and selected files, topic manifest, on-demand read/write through granted tools | Markdown authoritative; context fixed until new session/reopen; unreadable memory directory can block reopen |
-| Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool | No packaged curated port builtins; no inventory-count cap, but finite prompt/output bounds visibly truncate |
+| Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool; curated port builtins in `packages/pi-nanobot/skills` (memory, memory-defrag, skill-creator, github, cron) behind an explicit `builtinSkillsRoot` | `my` has no port runtime; no inventory-count cap, but finite prompt/output bounds visibly truncate |
 | Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
 | Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling | No channel delivery or silence policy; a background run has no workspace context snapshot; copied grants survive origin revocation until their own expiry; disabling cron leaves persisted timers blocked |
 | Telegram | Restricted allowlisted inbound/reply adapter with streaming, durable send intent, unknown-send quarantine | Existing adapter only; scheduled outbound candidate is unmerged; no general pairing or media parity |
@@ -91,9 +95,8 @@ does not produce a tool-capable ordinary CLI or Telegram session.
 
 1. **Consolidation decision:** review this snapshot and explicitly choose the next scope.
    Preserve unmerged work; do not start new workers or fixes automatically.
-2. **Close core acceptance:** settle curated builtin packaging/snapshot instructions;
-   exercise one owner-approved real-model memory + skill + compaction path and the
-   copied A/B fixtures. Existing synthetic evidence is not model-fidelity evidence.
+2. **Close core acceptance:** exercise one owner-approved real-model memory + skill + compaction
+   path and the copied A/B fixtures. Existing synthetic evidence is not model-fidelity evidence.
 3. **Connect cron for agent use:** owner-scoped model-callable `add`/`list`/`remove`,
    Gateway install-before-resume, explicit per-run context and grant reauthorization,
    origin routing/outbound delivery, silent mode and visible errors. No user UI or
@@ -419,7 +422,7 @@ turn. Stored task records have no platform retention yet.
 | Candidate | State / reason | Consolidation disposition |
 | --- | --- | --- |
 | `pi-818cb00c` / `b986d5adb` | Scheduled Telegram outbound path; existing independent review told to stop after its current command and report | Unmerged; collect findings only, no more probes/fixes/runtime wiring |
-| `pi-e796f4e1` / `bd5442e2d` | Curated builtin skills: skill-creator wrongly requires same-session verification despite fixed snapshots | Preserve branch; not enabled or accepted |
+| `pi-e796f4e1` / `bd5442e2d` | Curated builtin skills candidate, superseded: its skill-creator required same-conversation verification despite fixed snapshots | Superseded by `feat/curated-builtin-skills`, which fixes that instruction, adds `cron`, and drops `my` |
 | `pi-d2c45589` / `93365737a` | Old recurring cron kernel faults on no-progress checkpoint | Superseded by integrated finite timer/run design; do not revive |
 | `pi-cbf84ad6` / `f03f75c9c`, `pi-23d2bdf0` / `9cc565dc3` | Earlier one-shot scheduling kernels | Superseded; reference only |
 | `pi-acb8f4a0`, `pi-71c6dac3` | Discord candidates, not integrated | Preserve until channel scope agreed |
@@ -633,11 +636,17 @@ pass; the final reviewer exercised 250 synthetic skills and grant/reopen behavio
 The six retained Python builtins still need port-specific adaptation and packaging;
 non-SKILL.md builtin assets are not accessible through the workspace read tool.
 The copied personal skill inventory has not been activated or sent to a provider.
-Curated builtin candidate branch `pi-e796f4e1` (`d73d907e7`, `bd5442e2d`) is
-parked after its final review found that skill-creator incorrectly instructs
+Curated builtin candidate branch `pi-e796f4e1` (`d73d907e7`, `bd5442e2d`) was
+parked after its final review found that skill-creator incorrectly instructed
 in-session verification of newly created or updated skills, despite snapshots
-remaining fixed until a new conversation or Gateway reopen. Correct this when
-resuming; do not activate the candidate as-is.
+remaining fixed until a new conversation or Gateway reopen. It is superseded by
+`feat/curated-builtin-skills`, based on `e326bc364`: the curated set now ships
+`memory`, `memory-defrag`, `skill-creator`, `github` and `cron` in
+`packages/pi-nanobot/skills`, adapted to the shipped `read`/`write`/`edit`/`bash`,
+read-only `skill` and opt-in `cron` tools. skill-creator now states the fixed
+snapshot instead of instructing same-conversation verification, and `my` remains
+out because no self-state runtime exists. `builtinSkillsRoot` is still an
+explicit host value, so nothing is enabled by shipping the directory.
 
 W3 memory manifest foundation `6bd2d38cf` passed independent review
 (`pi-2c56da78`) and was cherry-picked as `050a91ca7`. Markdown remains the memory

@@ -102,29 +102,44 @@ the shell never receives it.
 
 ## Port builtin curation
 
-The port ships no builtin skills directory and has no default builtin root:
-`builtinSkillsRoot` is always an explicit host value. Curation is therefore a
-host decision, and the owner's 2026-10-28 selection is:
+The port ships a curated builtin skills directory at
+`packages/pi-nanobot/skills/`. `builtinSkillsRoot` remains an explicit host
+value, so using it — or pointing at another directory — is a host decision. The
+owner's 2026-10-28 selection is:
 
+- **Shipped** in `packages/pi-nanobot/skills/`, adapted to the implemented tool
+  surface (`read`, `write`, `edit`, `bash` when granted, plus the read-only
+  `skill` tool and the opt-in `cron` tool):
+  - `memory` — workspace Markdown topic files. A host-injected read-only topic
+    manifest may list topics with descriptions or heading fallback; topic bodies
+    are included only when explicitly selected. There is no memory-tree/search
+    tool, Dream, or history.
+  - `memory-defrag` — reorganizes topic files with read/write/edit/bash; no
+    subagents or Dream state.
+  - `skill-creator` — this loader's frontmatter, metadata and
+    progressive-loading contract, including the fixed per-conversation snapshot
+    (a new skill appears in the next conversation or after a Gateway reopen, not
+    in the current one); no Python packaging scripts or `.skill` archive.
+  - `github` — `gh` through a granted shell, gated on
+    `requires.bins: ["gh"]`; checks authentication first and stops rather than
+    placing secrets in the workspace.
+  - `cron` — the opt-in `cron` tool (`add`/`list`/`remove`) behind
+    `cron.enabled`, with `at`/`every_seconds`/`cron_expr`, IANA `tz`, isolated or
+    origin mode, no channel delivery, and no per-job timeout argument.
+- **Deferred** (retained in the owner selection, but no runtime): `my` — there is
+  no self-state tool, scratchpad, or model-adjustable runtime state; model and
+  context settings are host configuration.
 - **Excluded from the port builtin set** (do not enable): `summarize`, `weather`,
   `image-generation`, `tmux`, `clawhub`, `update-setup`, `long-goal`. Pointing
   `builtinSkillsRoot` at the Python tree and listing these in `disabledSkills`
   keeps them discovered-but-disabled: they never render, are omitted from the
   summary, and the `skill` tool refuses them.
-- **Retained, pending compatibility review**: `memory`, `memory-defrag`, `cron`,
-  `skill-creator`, `github`, `my`. Retained is not enabled. Note that the Python
-  `memory` and `my` files carry `always: true`, so they are listed in the summary
-  as soon as they are enabled; their bodies still load only on demand, but they
-  reference Python-only tools. Until port-compatible rewrites
-  exist, keep them disabled as well or point at a curated copy that does not
-  claim `always`.
 - The Python reference tree (`nanobot/skills/`) and any user workspace skills are
   untouched; curation never deletes or edits them.
 
-Packaging a port-owned curated skills directory (adapted frontmatter, port tool
-names, no `always` until reviewed) and using it as `builtinSkillsRoot` is the
-durable follow-up. It needs content review per skill, so it is not part of this
-bounded fix; the mechanisms above work today without it.
+Point `builtinSkillsRoot` at the absolute path of `packages/pi-nanobot/skills/`
+to use the curated set; do not use the Python tree as a substitute. See
+[`SKILLS_BUILTIN.md`](./SKILLS_BUILTIN.md) for the package-local record.
 
 ## Host wiring
 

@@ -1,0 +1,71 @@
+---
+name: cron
+description: Schedule one-shot or recurring work with the cron tool. Use when the user asks for a reminder, a periodic check, or a calendar-based task.
+---
+
+# Cron
+
+The `cron` tool is an internal agent capability: it exists only when the host
+config sets `cron.enabled`. There is no user scheduler, slash command, or
+channel delivery. A due job submits one agent turn — into a fresh background
+conversation, or into this conversation — and nothing is sent to Telegram,
+Discord, or email.
+
+## Actions
+
+- `add` creates a job. `message` is required and is the instruction the agent
+  receives when the job fires, so write it as a self-contained task. `name` is an
+  optional short label.
+- `list` shows this conversation's jobs with schedule, mode, status, next run,
+  last run, last skip, and last failure. There is no job-count cap.
+- `remove` cancels one job by `job_id`. It is idempotent: a finished or cancelled
+  job reports that there is nothing to remove, and the record's last outcome is
+  kept.
+
+Retrying the same `add` call cannot create a second job, because the job is
+deduplicated on the tool call ID. Call `list` when you need job IDs.
+
+## Schedule arguments
+
+Provide exactly one schedule:
+
+| Argument | Meaning |
+| --- | --- |
+| `at` | One-shot instant as ISO 8601 with an explicit UTC offset or `Z`, for example `2026-11-01T09:00:00+01:00`. It must be in the future. A naive local time is rejected. |
+| `every_seconds` | Fixed interval in whole seconds, anchored at creation, so the phase survives restarts. |
+| `cron_expr` | Calendar expression, plus optional `tz`. |
+
+`cron_expr` takes 5, 6, or 7 fields — `minute hour day-of-month month
+day-of-week`, with seconds first when six fields are given (`0 0 9 * * 1-5` is
+09:00 on weekdays) and year last. Nicknames such as `@daily` work. `tz` is an
+IANA zone name and defaults to the configured `cron.timeZone`, or `UTC` when
+unset; fixed offsets such as `+02:00` are rejected.
+
+Do not guess at parsing user text: compute an offset-qualified ISO instant for
+`at`, or map a wall-clock request onto `cron_expr` plus `tz`.
+
+## Mode
+
+`isolated` defaults to `true`: the job runs in a fresh background conversation
+and answers there. `isolated: false` runs it here, once this conversation is
+idle. Jobs are owner-scoped to the conversation that created them, so another
+conversation's jobs are invisible and its IDs are refused.
+
+Say which mode will run and where the answer appears. In background mode the
+user does not see the answer in this conversation.
+
+## Authority and limits
+
+- A run inherits this conversation's current tool grants when it is prepared and
+  never gains new ones. Effectful work inside a run needs those grants, exactly
+  like an ordinary turn.
+- A background run is offered no `cron` tool, so it cannot schedule more jobs.
+  An origin-mode run still holds this conversation's `cron` tool.
+- There is no per-job timeout argument: a run is an ordinary agent turn under
+  the normal run limits.
+- Busy slots are skipped, not queued or replayed, and the skip is recorded as
+  `last skipped`. Slots missed while the Gateway was down are skipped the same
+  way.
+- A one-shot job is not deleted when it fires; it stays listed until `remove`.
+- Setting `cron.enabled` to false is not a cleanup. Persisted jobs and their
+  timers stay blocked until cron is enabled again.
