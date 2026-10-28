@@ -478,6 +478,18 @@ agent cron wiring remain open; this is not yet an everyday replacement or cutove
 
 ## Session log
 
+### 2026-10-28 — real-model core acceptance: compaction fidelity failed
+
+Owner authorized one synthetic DeepSeek Flash run at low thinking, with at most 20 provider requests,
+600,000 conservative input-token equivalents and 20,000 output tokens; the byte-based accounting and
+provider output cap depend on explicitly reported assumptions. Reviewed runner integrated as
+`b35eb74`, `a36a358`, `6f7e972`; offline rehearsal passed. One live run made 8 requests, reported
+24,996 input tokens (plus cached input) and 1,050 output tokens; no budget violation. Skill discovery
+and on-demand loading, topic memory write and read, and native compaction completed. The summarizer
+request contained the early fact, but the placed summary did not: the check failed and the fresh-process
+recall phase was skipped. This is a failed acceptance result, not proof of general model failure;
+no retry or A/B fixtures were run. W4 remains open. Temporary synthetic state was removed.
+
 ### 2026-10-28 — cron origin authority reauthorization
 
 Owner selected this slice in parallel with acceptance tooling. Integrated `8011821` and `00d7aff`:
