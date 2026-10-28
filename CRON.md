@@ -71,7 +71,10 @@ the run phase waits directly.
 `createCronFoundation({ prepare })` accepts one optional host callback. It receives the origin and
 target conversation IDs, the job, and the occurrence. It runs inside the commit that chooses the
 run's target conversation, so its writes and the target choice are atomic. It is the only place to
-add context or tool grants; without it this slice adds none. It must be durable and idempotent
+configure context and tool authorization. Durable initializes a task-owned conversation from
+the origin's agent, including its selected tools and extensions; this slice does not itself copy
+grant records. The host must apply its own deny-by-default policy and recheck authorization, not
+assume the new conversation has no capabilities. The callback must be durable and idempotent
 because a crash before that commit reruns it.
 
 The run stores that target choice once in its checkpoint. A resume after that commit does not
@@ -127,10 +130,12 @@ interval, horizon, lateness, or history cap is added.
   pointers and withdraws a still-queued input, but cannot retract an already-placed run.
 - Origin-mode runs use the origin conversation's current agent, tool selection, and grants at
   request preparation. Background runs provision a fresh task-owned conversation through the
-  trusted `prepare` callback. A host that needs equivalent authorization must recheck current
-  grants during that preparation; this slice does not copy or invent grants.
+  trusted `prepare` callback, but inherit the origin's agent selection before preparation. The host
+  must apply deny-by-default and recheck current authorization; this slice does not copy grant records.
 - A non-terminal run task, including a parked one, blocks new work with visible skips until it is
-  retried or cancelled.
+  retried or cancelled. Cancellation may remain pending if an owned model request ignores abort.
+- In origin mode, the displayed target generation may belong to another input while the cron input
+  is queued; it describes conversation health, not necessarily that occurrence.
 - A timer fault leaves its pointer in place and stops the chain visibly; an execution fault is
   surfaced and retained in `lastFault` while the timer chain continues.
 

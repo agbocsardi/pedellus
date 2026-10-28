@@ -289,6 +289,18 @@ retirement of the Python service with a tagged readable reference kept.
 - Existing behavioral suite stays green. New permanent tests only for behaviour that
   would otherwise silently regress.
 
+## Cron foundation status
+
+Cron replacement `072ed6d2d`, `340c26b54`, `6dc74fac4` passed independent final
+review (`pi-c2787ba0`) and was integrated as `a9e788a56`, `022162fd0`,
+`8a8213bf6`. Finite timers arm successors before model work; a separate run task
+reattaches using native submission IDs. Fake-provider crash, cancellation and
+hung-run probes passed; parent typecheck, 155 behavior and 9 execution checks
+pass. This is an unwired foundation: calendar schedules, Gateway tool, grant
+reauthorization, outbox and channel delivery are still required. Cancellation may
+wait for a model that ignores abort; origin cancellation cannot retract a placed
+turn. Stored task records have no platform retention yet.
+
 ## Parked
 
 `pi-d2c45589` (`eef7f480f`, `93365737a`): cron timer foundation parked after
