@@ -264,7 +264,7 @@ function validatedNames(value: unknown, label: string): readonly string[] {
   return Object.freeze([...seen]);
 }
 
-/** Validate an explicit disabled/selected skill-name list without touching the filesystem. */
+/** Validate an explicit disabled skill-name list without touching the filesystem. */
 export function validateSkillNames(value: unknown, label: string): readonly string[] {
   return validatedNames(value, label);
 }
@@ -706,7 +706,7 @@ function formatSummary(
     lines.unshift(
       "Load a skill with the `skill` tool by name; bodies are not included here. " +
       "Relative paths in a workspace skill resolve against its directory (`skills/<name>/`) " +
-      "and can be read with the read tool. A builtin skill's other files are outside the workspace " +
+      "and can be read with the read tool when granted. A builtin skill's other files are outside the workspace " +
       "and are not readable with workspace tools.",
     );
   }
@@ -725,7 +725,7 @@ function formatSummary(
  * Workspace skills take precedence over builtin skills with the same directory
  * name. Disabled and requirement-unavailable skills stay discovered with
  * `enabled: false`; the context renderer therefore never includes their bodies.
- * Selected names are filtered to discovered, enabled skills. A missing
+ * A missing
  * `<workspaceRoot>/skills` directory means no workspace skills; a supplied
  * `builtinSkillsRoot` must exist.
  */

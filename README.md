@@ -48,7 +48,7 @@ MCP and product failure-verification gates remain separate.
 ## Opt-in context SDK
 
 `createContextExtension` composes bounded, host-supplied identity/bootstrap,
-memory and selected-skill snapshots through native Durable sections. Direct callers
+memory and skill summaries through native Durable sections. Direct callers
 need a **fresh extension and dedicated registry per Harness/storage**: conversation
 IDs collide across stores. `openGateway` can also accept an opt-in host snapshot
 provider and reconstructs snapshots before resume; it does not load files itself.

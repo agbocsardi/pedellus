@@ -158,7 +158,7 @@ export function createSkillTool(): SkillTool {
         };
       }
       const location = skill.source.startsWith("workspace:skills/")
-        ? "Relative paths in this skill resolve against its workspace directory (skills/<name>/) and can be read with the read tool."
+        ? "Relative paths in this skill resolve against its workspace directory (skills/<name>/) and can be read with the read tool when granted."
         : "This is a builtin skill: its other files are outside the workspace and cannot be read with workspace tools.";
       return {
         output: [{

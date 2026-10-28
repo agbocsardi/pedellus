@@ -213,8 +213,7 @@ reported rather than followed; explicit roots are used as supplied. There is no
 Prompt size is bounded by the renderer, not by discovery: 16,000 code points per
 section and 48,000 per conversation. With a large inventory the `nanobot_skills`
 section is clipped with its visible `[context truncated at configured bounds]`
-marker, and a body larger than the remaining section budget is clipped the same
-way. Truncation is never silent. The `skill` tool remains a complete fallback:
+marker. Skill bodies are not included in the prompt. Truncation is never silent. The `skill` tool remains a complete fallback:
 its listing is the full summary (bounded only by the tool's declared output
 limits), so a skill clipped out of the prompt summary can still be discovered
 and loaded on demand.
