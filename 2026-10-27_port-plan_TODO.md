@@ -338,4 +338,14 @@ Python's exec URL guard, and cannot fully confine shell, hard links or detached
 processes; these are documented limitations, not claims of isolation. Native bash
 may report an undefined duration when a host-default timeout fires; integration
 must check/fix that user-visible error. Next: wire reviewed tools and durable
-conversation grants; independently review the direct-workspace bwrap builder.
+conversation grants.
+
+Direct-workspace bwrap builder `8db828970` plus fix `8446957d1` passed final
+independent review (`pi-96ca0073`) and were cherry-picked as `5913b0ba2` and
+`37d8777a1`. Parent reran typecheck, 155 behavior and 9 execution checks. The
+builder is standalone, not a configured backend or Gateway activation. It binds
+the real workspace read-write, keeps network available, and uses a PID namespace
+for background-process teardown; host temp/spill visibility and home toolchains
+remain documented integration constraints. The initial reviewer performed a DNS
+lookup despite the no-network assignment; no credentials were involved. The final
+review used no network.
