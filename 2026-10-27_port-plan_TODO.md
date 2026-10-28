@@ -17,7 +17,9 @@ commitment to activate it. Exclude these Python built-in skills from the port:
 and `long-goal`. Retain `memory`, `memory-defrag`, `cron`, `skill-creator`,
 `github`, and `my` for compatibility review. No fixed cap on the number of
 discovered skills or selected/disabled skill names; do not silently omit skills.
-Actual prompt context remains finite and truncation must be visible. Do not delete the Python reference
+Only skill names and descriptions belong in the system prompt; load every full
+skill body on demand, including skills marked always or selected. Actual prompt
+context remains finite and truncation must be visible. Do not delete the Python reference
 or the owner's workspace skills as part of this selection.
 Cron must be model-callable for natural-language scheduling and preserve Python's
 per-job isolated-background (default) versus in-conversation mode. In-conversation
