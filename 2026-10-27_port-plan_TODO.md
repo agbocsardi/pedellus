@@ -302,7 +302,10 @@ atomically creates its successor and updates the job pointer, and uses native
 idempotent agent submissions instead of a generic callback claim. No recurring
 plan-phase loop or migration of unshipped synthetic stores is required. Assess the
 extra task-record retention honestly; confirm restart, cancellation and fault
-visibility before integration.
+visibility before integration. Owner approval requires deterministic rescheduling
+independent of LLM calls: arm the next timer durably before invoking a model, not
+in a model-success completion path. Slow or failed model work must not stop the
+schedule; preserve non-overlapping executions with visible skipped/busy outcomes.
 The design and Durable contract probes established fresh isolated conversations,
 origin busy retry, authorized tools and durable outbox feasibility; no arbitrary
 job-count, interval or horizon limits were approved.
