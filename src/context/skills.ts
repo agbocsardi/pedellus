@@ -11,25 +11,18 @@
  * authoritative; runtime state is not stored here. Host wiring is not part of
  * this module.
  *
- * File handling is Linux-first and fails closed: roots are traversed with
- * `O_DIRECTORY | O_NOFOLLOW`, files are opened with `O_NOFOLLOW`, extra hard
- * links are rejected, reads are size-bounded and must be stable, and selected
- * paths are rechecked before a result is returned. This is not a defence
- * against a privileged/kernel adversary.
+ * Scope is accidental damage, not adversarial confinement: reads are bounded,
+ * UTF-8 failures are rejected, and symlinked skill entries are skipped. There
+ * is no `/proc/self/fd` pinning or post-read race verification.
  */
 import { constants } from "node:fs";
-import type { BigIntStats } from "node:fs";
-import { access, lstat, open, opendir } from "node:fs/promises";
-import type { FileHandle } from "node:fs/promises";
+import { access, lstat, readFile, readdir, stat } from "node:fs/promises";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CONTEXT_LIMITS, type ContextSkillSnapshot } from "./index.js";
 
 /** Deterministic provenance prefixes. */
 const WORKSPACE_SOURCE_PREFIX = "workspace:skills/";
 const BUILTIN_SOURCE_PREFIX = "builtin:skills/";
-const PROC_FD = "/proc/self/fd";
-const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
-const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const RESTRICTED_ROOTS = Object.freeze(["/proc", "/sys", "/dev"]);
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const SAFE_SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -38,6 +31,7 @@ const FRONTMATTER_KEY = /^[A-Za-z0-9_.-]+$/;
 
 /** Bounded discovery limits. They are enforced before content reaches the renderer. */
 export const SKILLS_CONTEXT_LIMITS = Object.freeze({
+  /** Actual `SKILL.md` records; candidate directories without one do not count. */
   maxSkills: CONTEXT_LIMITS.maxSkillInputs,
   maxSelectedSkills: CONTEXT_LIMITS.maxSkillInputs,
   maxDisabledSkills: CONTEXT_LIMITS.maxSkillInputs,
@@ -102,16 +96,7 @@ export interface SkillsContextResult {
   readonly summary: string;
 }
 
-export type SkillFileFailureKind =
-  | "missing"
-  | "symlink"
-  | "hardlink"
-  | "not-regular"
-  | "not-directory"
-  | "unreadable"
-  | "changed"
-  | "encoding"
-  | "io";
+export type SkillFileFailureKind = "unreadable" | "encoding" | "io";
 
 export class SkillsContextInputError extends TypeError {
   readonly code = "skills_context_input_invalid";
@@ -153,10 +138,6 @@ interface SkillRecord {
   readonly path?: string;
   readonly content: string;
   readonly metadata?: Readonly<Record<string, unknown>>;
-  readonly rootPath: string;
-  readonly segments: readonly string[];
-  readonly directoryStat: BigIntStats;
-  readonly fileStat: BigIntStats;
 }
 
 interface LoadState {
@@ -238,26 +219,9 @@ function validatedEnvironment(value: unknown): Readonly<Record<string, string | 
   return Object.freeze(environment);
 }
 
-function procFdPath(fd: number): string {
-  return `${PROC_FD}/${fd}`;
-}
-
 function failureKind(code: string | undefined): SkillFileFailureKind {
-  switch (code) {
-    case "ENOENT":
-      return "missing";
-    case "ELOOP":
-      return "symlink";
-    case "EACCES":
-    case "EPERM":
-      return "unreadable";
-    case "ENOTDIR":
-      return "not-directory";
-    case "EISDIR":
-      return "not-regular";
-    default:
-      return "io";
-  }
+  if (code === "EACCES" || code === "EPERM") return "unreadable";
+  return "io";
 }
 
 function fileFailure(error: unknown, source: string): SkillsContextFileError {
@@ -265,94 +229,18 @@ function fileFailure(error: unknown, source: string): SkillsContextFileError {
   return new SkillsContextFileError(failureKind((error as NodeJS.ErrnoException | null)?.code), source);
 }
 
-function rootFailure(error: unknown, label: string): SkillsContextInputError {
-  if (error instanceof SkillsContextInputError) return error;
-  const code = (error as NodeJS.ErrnoException | null)?.code;
-  if (code === "ENOENT") return new SkillsContextInputError(`${label} must exist`);
-  if (code === "ELOOP") return new SkillsContextInputError(`${label} must not contain symlink components`);
-  if (code === "EACCES" || code === "EPERM") return new SkillsContextInputError(`${label} is not readable`);
-  if (code === "ENOTDIR") return new SkillsContextInputError(`${label} must be a directory`);
-  return new SkillsContextInputError(`${label} cannot be opened safely`);
-}
-
-async function openAbsoluteDirectoryNoFollow(path: string, label: string): Promise<FileHandle> {
-  const components = path.slice(1).split(sep).filter(Boolean);
-  if (components.length === 0) {
-    throw new SkillsContextInputError(`${label} must be a directory below the filesystem root`);
-  }
-  let current: FileHandle;
+async function assertDirectory(path: string, label: string): Promise<void> {
+  let info;
   try {
-    current = await open(sep, DIRECTORY_FLAGS);
+    info = await stat(path);
   } catch (error) {
-    throw rootFailure(error, label);
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "ENOENT") throw new SkillsContextInputError(`${label} must exist`);
+    if (code === "EACCES" || code === "EPERM") throw new SkillsContextInputError(`${label} is not readable`);
+    if (code === "ENOTDIR") throw new SkillsContextInputError(`${label} must be a directory`);
+    throw new SkillsContextInputError(`${label} cannot be read`);
   }
-  try {
-    for (const component of components) {
-      let next: FileHandle;
-      try {
-        next = await open(join(procFdPath(current.fd), component), DIRECTORY_FLAGS);
-      } catch (error) {
-        throw rootFailure(error, label);
-      }
-      await current.close();
-      current = next;
-    }
-    return current;
-  } catch (error) {
-    await current.close().catch(() => undefined);
-    throw error;
-  }
-}
-
-async function openPinned(
-  parent: FileHandle,
-  name: string,
-  flags: number,
-  source: string,
-): Promise<FileHandle> {
-  const path = join(procFdPath(parent.fd), name);
-  try {
-    return await open(path, flags);
-  } catch (error) {
-    const kind = failureKind((error as NodeJS.ErrnoException | null)?.code);
-    // O_NOFOLLOW + O_DIRECTORY can report ENOTDIR when the final component is a
-    // symlink. Classify it without following the link.
-    if (kind === "not-directory") {
-      try {
-        const info = await lstat(path, { bigint: true });
-        if (info.isSymbolicLink()) throw new SkillsContextFileError("symlink", source);
-      } catch (classificationError) {
-        if (classificationError instanceof SkillsContextFileError) throw classificationError;
-      }
-    }
-    throw new SkillsContextFileError(kind, source);
-  }
-}
-
-function sameFile(left: BigIntStats, right: BigIntStats): boolean {
-  return left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.size === right.size &&
-    left.mode === right.mode &&
-    left.nlink === right.nlink &&
-    left.mtimeNs === right.mtimeNs &&
-    left.ctimeNs === right.ctimeNs;
-}
-
-function sameDirectory(left: BigIntStats, right: BigIntStats): boolean {
-  return left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.size === right.size &&
-    left.mtimeNs === right.mtimeNs &&
-    left.ctimeNs === right.ctimeNs;
-}
-
-async function statHandle(handle: FileHandle, source: string): Promise<BigIntStats> {
-  try {
-    return await handle.stat({ bigint: true });
-  } catch (error) {
-    throw fileFailure(error, source);
-  }
+  if (!info.isDirectory()) throw new SkillsContextInputError(`${label} must be a directory`);
 }
 
 function decodeUtf8(buffer: Buffer, source: string): string {
@@ -360,52 +248,6 @@ function decodeUtf8(buffer: Buffer, source: string): string {
     return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
   } catch {
     throw new SkillsContextFileError("encoding", source);
-  }
-}
-
-async function readPinnedFile(
-  parent: FileHandle,
-  name: string,
-  source: string,
-  state: LoadState,
-): Promise<{ content: string; stat: BigIntStats }> {
-  const handle = await openPinned(parent, name, FILE_FLAGS, source);
-  try {
-    const before = await statHandle(handle, source);
-    if (!before.isFile()) throw new SkillsContextFileError("not-regular", source);
-    if (before.nlink !== 1n) throw new SkillsContextFileError("hardlink", source);
-    if (before.size > BigInt(SKILLS_CONTEXT_LIMITS.maxSkillFileBytes)) {
-      throw new SkillsContextBoundsError("maxSkillFileBytes");
-    }
-    const size = Number(before.size);
-    if (state.bytes + size > SKILLS_CONTEXT_LIMITS.maxTotalBytes) {
-      throw new SkillsContextBoundsError("maxTotalBytes");
-    }
-
-    const buffer = Buffer.alloc(size);
-    let offset = 0;
-    while (offset < size) {
-      let bytesRead: number;
-      try {
-        ({ bytesRead } = await handle.read(buffer, offset, size - offset, offset));
-      } catch (error) {
-        throw fileFailure(error, source);
-      }
-      if (bytesRead === 0) throw new SkillsContextFileError("changed", source);
-      offset += bytesRead;
-    }
-
-    const after = await statHandle(handle, source);
-    if (!sameFile(before, after)) throw new SkillsContextFileError("changed", source);
-    const pathInfo = await lstat(join(procFdPath(parent.fd), name), { bigint: true }).catch(() => undefined);
-    if (pathInfo === undefined || !sameFile(before, pathInfo)) {
-      throw new SkillsContextFileError("changed", source);
-    }
-
-    state.bytes += size;
-    return { content: decodeUtf8(buffer, source), stat: before };
-  } finally {
-    await handle.close().catch(() => undefined);
   }
 }
 
@@ -456,11 +298,6 @@ function parseScalar(value: string): unknown {
   return value;
 }
 
-/**
- * Parse only the flat frontmatter subset used by Nanobot skills. `metadata` is
- * a JSON object (as in the shipped skills); YAML block mappings, anchors,
- * tags, and multi-line scalars are deliberately unsupported.
- */
 function parseMetadataField(raw: string): Record<string, unknown> | undefined {
   const value = parseScalar(raw);
   if (typeof value === "string") return parseJsonObject(value);
@@ -468,6 +305,11 @@ function parseMetadataField(raw: string): Record<string, unknown> | undefined {
   return undefined;
 }
 
+/**
+ * Parse only the flat frontmatter subset used by Nanobot skills. `metadata` is
+ * a JSON object (as in the shipped skills); YAML block mappings, anchors,
+ * tags, and multi-line scalars are deliberately unsupported.
+ */
 function parseFrontmatter(content: string): Readonly<Record<string, unknown>> | undefined {
   if (!content.startsWith("---")) return undefined;
   const match = FRONTMATTER.exec(content.slice(0, SKILLS_CONTEXT_LIMITS.maxFrontmatterChars));
@@ -519,7 +361,10 @@ function stringList(value: unknown): string[] {
   );
 }
 
-async function commandAvailable(command: string, environment: Readonly<Record<string, string | undefined>>): Promise<boolean> {
+async function commandAvailable(
+  command: string,
+  environment: Readonly<Record<string, string | undefined>>,
+): Promise<boolean> {
   const candidates = command.includes("/") || command.includes("\\")
     ? [resolve(command)]
     : (environment.PATH ?? environment.Path ?? "")
@@ -557,139 +402,70 @@ async function checkRequirements(
   });
 }
 
-async function scanSkillDirectories(
-  directory: FileHandle,
+async function scanSkillRoot(
   rootPath: string,
-  prefixSegments: readonly string[],
   sourcePrefix: string,
   workspaceRelative: boolean,
   state: LoadState,
+  skipNames: ReadonlySet<string> = new Set(),
 ): Promise<void> {
-  const names: string[] = [];
-  for await (const entry of await opendir(procFdPath(directory.fd))) {
+  let entries;
+  try {
+    entries = await readdir(rootPath, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return;
+    throw new SkillsContextFileError("unreadable", sourcePrefix);
+  }
+  entries.sort((left, right) => left.name.localeCompare(right.name));
+
+  for (const entry of entries) {
+    // A symlinked or non-directory candidate is ignored rather than failing the
+    // whole discovery pass.
+    if (!entry.isDirectory()) continue;
     if (entry.name.length > SKILLS_CONTEXT_LIMITS.maxSkillNameCodeUnits ||
-        !SAFE_SKILL_NAME.test(entry.name)) {
+        !SAFE_SKILL_NAME.test(entry.name) || skipNames.has(entry.name)) {
       continue;
     }
-    if (entry.isSymbolicLink()) {
-      throw new SkillsContextFileError("symlink", `${sourcePrefix}${entry.name}/SKILL.md`);
-    }
-    if (!entry.isDirectory()) continue;
-    names.push(entry.name);
-    if (names.length > SKILLS_CONTEXT_LIMITS.maxSkills) {
-      throw new SkillsContextBoundsError("maxSkills");
-    }
-  }
-  names.sort();
 
-  for (const name of names) {
-    if (state.records.length >= SKILLS_CONTEXT_LIMITS.maxSkills) {
-      throw new SkillsContextBoundsError("maxSkills");
-    }
-    const source = `${sourcePrefix}${name}/SKILL.md`;
-    let skillDirectory: FileHandle;
+    const source = `${sourcePrefix}${entry.name}/SKILL.md`;
+    const skillFile = join(rootPath, entry.name, "SKILL.md");
+    let info;
     try {
-      skillDirectory = await openPinned(directory, name, DIRECTORY_FLAGS, source);
+      info = await lstat(skillFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") continue;
+      throw fileFailure(error, source);
+    }
+    if (!info.isFile() || info.isSymbolicLink()) continue;
+    if (info.size > SKILLS_CONTEXT_LIMITS.maxSkillFileBytes) {
+      throw new SkillsContextBoundsError("maxSkillFileBytes");
+    }
+
+    let buffer: Buffer;
+    try {
+      buffer = await readFile(skillFile);
     } catch (error) {
       throw fileFailure(error, source);
     }
-    try {
-      const directoryStat = await statHandle(skillDirectory, source);
-      let file;
-      try {
-        file = await readPinnedFile(skillDirectory, "SKILL.md", source, state);
-      } catch (error) {
-        if (error instanceof SkillsContextFileError && error.kind === "missing") continue;
-        throw error;
-      }
-      const metadata = parseFrontmatter(file.content);
-      const record: SkillRecord = {
-        name,
-        source,
-        ...(workspaceRelative ? { path: `skills/${name}/SKILL.md` } : {}),
-        content: file.content,
-        ...(metadata !== undefined ? { metadata } : {}),
-        rootPath,
-        segments: Object.freeze([...prefixSegments, name]),
-        directoryStat,
-        fileStat: file.stat,
-      };
-      state.records.push(record);
-    } finally {
-      await skillDirectory.close().catch(() => undefined);
+    if (buffer.length > SKILLS_CONTEXT_LIMITS.maxSkillFileBytes) {
+      throw new SkillsContextBoundsError("maxSkillFileBytes");
     }
-  }
-}
-
-async function scanWorkspaceSkills(
-  workspaceRoot: string,
-  state: LoadState,
-): Promise<void> {
-  const root = await openAbsoluteDirectoryNoFollow(workspaceRoot, "workspaceRoot");
-  try {
-    let skills: FileHandle;
-    try {
-      skills = await openPinned(root, "skills", DIRECTORY_FLAGS, "skills");
-    } catch (error) {
-      if (error instanceof SkillsContextFileError && error.kind === "missing") return;
-      throw error;
+    if (state.bytes + buffer.length > SKILLS_CONTEXT_LIMITS.maxTotalBytes) {
+      throw new SkillsContextBoundsError("maxTotalBytes");
     }
-    try {
-      await scanSkillDirectories(skills, workspaceRoot, ["skills"], WORKSPACE_SOURCE_PREFIX, true, state);
-    } finally {
-      await skills.close().catch(() => undefined);
-    }
-  } finally {
-    await root.close().catch(() => undefined);
-  }
-}
 
-async function scanBuiltinSkills(
-  builtinRoot: string,
-  state: LoadState,
-): Promise<void> {
-  const root = await openAbsoluteDirectoryNoFollow(builtinRoot, "builtinSkillsRoot");
-  try {
-    await scanSkillDirectories(root, builtinRoot, [], BUILTIN_SOURCE_PREFIX, false, state);
-  } finally {
-    await root.close().catch(() => undefined);
-  }
-}
-
-/**
- * Re-open each accepted skill through its declared root and compare the
- * directory and file identities captured during the read. Detects renames or
- * replacements that would otherwise leave provenance pointing at new content.
- */
-async function verifyRecords(state: LoadState): Promise<void> {
-  for (const record of state.records) {
-    let root: FileHandle | null = null;
-    let parent: FileHandle | null = null;
-    const opened: FileHandle[] = [];
-    try {
-      root = await openAbsoluteDirectoryNoFollow(record.rootPath, "skill root");
-      parent = root;
-      for (const segment of record.segments) {
-        const next = await openPinned(parent, segment, DIRECTORY_FLAGS, record.source);
-        opened.push(next);
-        parent = next;
-      }
-      const directoryNow = await statHandle(parent, record.source);
-      if (!sameDirectory(directoryNow, record.directoryStat)) {
-        throw new SkillsContextFileError("changed", record.source);
-      }
-      const fileNow = await lstat(join(procFdPath(parent.fd), "SKILL.md"), { bigint: true });
-      if (!sameFile(fileNow, record.fileStat)) {
-        throw new SkillsContextFileError("changed", record.source);
-      }
-    } catch (error) {
-      throw fileFailure(
-        error instanceof SkillsContextFileError ? error : new SkillsContextFileError("changed", record.source),
-        record.source,
-      );
-    } finally {
-      for (const handle of opened.reverse()) await handle.close().catch(() => undefined);
-      if (root !== null) await root.close().catch(() => undefined);
+    const content = decodeUtf8(buffer, source);
+    const metadata = parseFrontmatter(content);
+    state.bytes += buffer.length;
+    state.records.push({
+      name: entry.name,
+      source,
+      ...(workspaceRelative ? { path: `skills/${entry.name}/SKILL.md` } : {}),
+      content,
+      ...(metadata !== undefined ? { metadata } : {}),
+    });
+    if (state.records.length > SKILLS_CONTEXT_LIMITS.maxSkills) {
+      throw new SkillsContextBoundsError("maxSkills");
     }
   }
 }
@@ -724,9 +500,6 @@ function formatSummary(discovered: readonly DiscoveredSkill[]): string {
 export async function loadSkillsContext(
   request: SkillsContextRequest,
 ): Promise<SkillsContextResult> {
-  if (typeof constants.O_NOFOLLOW !== "number" || typeof constants.O_DIRECTORY !== "number") {
-    throw new SkillsContextInputError("Skills discovery requires O_NOFOLLOW and O_DIRECTORY support");
-  }
   if (!isRecord(request)) {
     throw new SkillsContextInputError("Skills context request must be an object");
   }
@@ -752,22 +525,14 @@ export async function loadSkillsContext(
     ownDataField(request, "environment", "Skills context request").value,
   );
 
+  await assertDirectory(workspaceRoot, "workspaceRoot");
   const state: LoadState = { bytes: 0, records: [] };
-  await scanWorkspaceSkills(workspaceRoot, state);
+  await scanSkillRoot(join(workspaceRoot, "skills"), WORKSPACE_SOURCE_PREFIX, true, state);
   if (builtinRoot !== undefined) {
+    await assertDirectory(builtinRoot, "builtinSkillsRoot");
     const workspaceNames = new Set(state.records.map((record) => record.name));
-    const builtinState: LoadState = { bytes: state.bytes, records: [] };
-    await scanBuiltinSkills(builtinRoot, builtinState);
-    state.bytes = builtinState.bytes;
-    for (const record of builtinState.records) {
-      if (workspaceNames.has(record.name)) continue;
-      if (state.records.length >= SKILLS_CONTEXT_LIMITS.maxSkills) {
-        throw new SkillsContextBoundsError("maxSkills");
-      }
-      state.records.push(record);
-    }
+    await scanSkillRoot(builtinRoot, BUILTIN_SOURCE_PREFIX, false, state, workspaceNames);
   }
-  await verifyRecords(state);
 
   const discovered: DiscoveredSkill[] = [];
   for (const record of state.records) {
@@ -777,7 +542,7 @@ export async function loadSkillsContext(
     const description = typeof record.metadata?.description === "string" && record.metadata.description.length > 0
       ? clipCodePoints(record.metadata.description, CONTEXT_LIMITS.descriptionChars)
       : record.name;
-    const skill: DiscoveredSkill = Object.freeze({
+    discovered.push(Object.freeze({
       name: record.name,
       source: record.source,
       ...(record.path !== undefined ? { path: record.path } : {}),
@@ -789,8 +554,7 @@ export async function loadSkillsContext(
       available,
       enabled: available && !isDisabled,
       requirements,
-    });
-    discovered.push(skill);
+    }));
   }
 
   const skills: ContextSkillSnapshot[] = discovered.map((skill) => Object.freeze({

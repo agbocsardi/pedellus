@@ -64,17 +64,17 @@ assumed readable by workspace tools.
 
 ## Bounds and file safety
 
-Limits live in `SKILLS_CONTEXT_LIMITS`: 64 skills, 64 selected/disabled names,
+Limits live in `SKILLS_CONTEXT_LIMITS`: 64 actual `SKILL.md` records (candidate
+directories without one do not count), 64 selected/disabled names,
 128-code-unit names, 64 KiB per file, 1 MiB total across all roots, 16 KiB
-frontmatter, and 4,096-character roots. All discovered skills are verified again
-before return; any replacement or rename is a `changed` failure and no partial
-result is returned.
+frontmatter, and 4,096-character roots. Discovery fails closed on unreadable
+files, invalid UTF-8, or a bound violation; no partial result is returned.
 
-Roots and directories are traversed through `/proc/self/fd` with
-`O_DIRECTORY | O_NOFOLLOW`; files use `O_NOFOLLOW`, extra hard links
-(`nlink != 1`) are rejected, UTF-8 decoding is fatal, and reads must be stable.
-This is not a defence against a privileged/kernel adversary or coarse
-filesystem metadata.
+Scope is accidental damage, not adversarial confinement. Reads use normal
+filesystem calls with size and aggregate bounds, and frontmatter parsing is
+bounded. Symlinked skill directories and symlinked `SKILL.md` files are skipped
+rather than followed; explicit roots are used as supplied. There is no
+`/proc/self/fd` pinning, hard-link rejection, or post-read race verification.
 
 ## Deliberate parity gaps
 
@@ -84,12 +84,15 @@ filesystem metadata.
   skills use the supported form.
 - Skill names come from directory names, as in Python; frontmatter `name` is not
   authoritative. Directory names that are unsafe or exceed the context limit are
-  skipped. Entries that are symlinks fail the load instead of being followed.
+  skipped. Directory entries that are symlinks or not directories are skipped,
+  as are symlinked `SKILL.md` files.
 - `metadata.nanobot.os` gating and install hints are parsed but not acted on;
   only `requires.bins` and `requires.env` are evaluated.
 - Unknown selected names are ignored, matching the loader's lookup behaviour.
   Disabled skills still shadow a builtin with the same name.
 - The summary is returned for the host to place; this module does not inject a
   separate summary section, add a skill-loading tool, or claim that unselected
-  bodies are available at runtime.
+  bodies are available at runtime. Progressive loading (summary first, then read
+  the file) is reliable only for workspace skills whose files are reachable; a
+  builtin skill must be selected or marked `always` to load its body.
 - Memory, Dream, history, compaction, and tool policy are unchanged.
