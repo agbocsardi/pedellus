@@ -4,10 +4,11 @@ Date: 2026-10-27. Branch: `feat/pi-durable-rebuild`.
 
 ## Owner scope update — 2026-10-28
 
-Prioritize the core agent, memory, tools and cron. Do not port the Python
-sustained goal/tasks interface or intent/keyword-triggered features. Pause skill
-wiring and defer other features, automation, channels, WebUI and migration until
-the owner discusses them. Existing work is not a commitment to activate it.
+Prioritize the core agent, memory, skills, tools and cron. The owner confirmed
+skill wiring is essential. Do not port the Python sustained goal/tasks interface
+or intent/keyword-triggered features. Defer other automation, channels, WebUI and
+migration until the owner discusses them. Existing work is not a commitment to
+activate it.
 Complete and validate the core/memory/cron path first; compaction is core context
 continuity. The broader W4–W6 descriptions below are historical options, not
 standing authorization to implement or deploy them.
