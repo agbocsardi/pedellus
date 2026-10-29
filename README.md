@@ -3,7 +3,7 @@
 TypeScript port requiring Node >=22.19 and the pinned Pi 1.4.0 packages. This is not a production-ready replacement for the Python fork.
 
 The [assistant tree plan](2026-10-29_assistant-tree_TODO.md) is the current scope
-and work-order authority: CLI + Telegram first, then tools, delegation and channels. Core coding tools, durable grants, optional bwrap
+and work-order authority: CLI + Telegram first, then tools, delegation and channels. Config-selected coding tools, optional bwrap
 shell, opt-in memory/skills and compaction plumbing are integrated. Agent-callable
 cron scheduling and isolated Telegram delivery are available. WebUI, migration and cutover are
 deferred. The [older roadmap](plan/2026-10-26_full-port_TODO.md) preserves evidence,
@@ -12,8 +12,8 @@ not a standing implementation queue.
 ## Run
 
 [`SETUP.md`](./SETUP.md) is the short walkthrough: build, create a synthetic
-workspace with memory and skills, grant finite tool authority through the local
-CLI, then add Telegram as a separate step. It does not claim live-model success.
+workspace with memory and skills, enable tools in the config, then add Telegram
+as a separate step. It does not claim live-model success.
 
 Copy `config.example.json` to a private explicit config file and edit the workspace, model, and environment-variable *names*. The config contains no credentials. The nine supported provider aliases and their `credentials` fields are listed in [provider support and migration notes](./PROVIDERS.md). Credential references and `telegram.tokenEnv` must be environment-variable names, not values or `${...}` expressions; the runtime does not read Nanobot/Pi user config or perform live credential discovery. Native catalogs/routes are not drop-in Python-provider parity, and real-provider acceptance remains open. SDK hosts may pass an explicit pi-ai `Models` instance as `openGateway(config, context, { models })` for offline/custom use; the CLI never installs a faux provider.
 
@@ -38,24 +38,25 @@ One process acquires Chord's kernel-backed `processLock` using the canonical SQL
 
 The gateway upgrades upstream SQLite's NORMAL default to **WAL `synchronous=FULL` on its actual connection**, verifying both settings before and after native schema initialization and failing closed on mismatch. Parent crash/reopen and injected setup/readback/migration-failure probes passed; this is not proof of physical power/host-loss survival. Backup/restore, disk-full and broader storage acceptance remain open. See [storage policy and evidence](./STORAGE.md).
 
-`toolAllowlist` is the host-owned **global ceiling** and defaults to `[]`.
-Conversations may only narrow such a ceiling; they cannot widen it. An empty ceiling
-disables coding tools (the opt-in read-only `skill` tool is separate). A non-empty
-ceiling may name only the native
-`read`, `write`, `edit` and `bash` tools; the gateway registers them over a guarded
-host environment on the actual workspace, and every conversation still needs an
-explicit per-conversation grant with an expiry. Revoked and expired grants are
-reapplied before resume, and a `beforeTool` hook rechecks them at call time. This
-field is not an approval UI. The local CLI exposes explicit owner commands
-`/tools`, `/grant <tool[,tool]> <duration>` and `/revoke <tool[,tool]|all>`; they
-act on `cli:default` and still grant only inside the ceiling, with a required finite
-duration. The SDK `grantTools`/`revokeTools`/`listToolGrants` API remains for other
-hosts. The Telegram adapter has no grant command, so setting the ceiling alone does
-not enable coding tools there. A deployment may select the optional
-direct-workspace Bubblewrap shell with `toolSandbox: "bwrap"`; it is off by
-default, wraps shell commands only, and falls back to neither the host shell nor a
-managed copy. See [coding tools and grants](./TOOLS.md) and
-[direct Bubblewrap shell](./DIRECT_BWRAP.md).
+`toolAllowlist` is the **config-owned tool authority** for the shipped CLI and
+Telegram assistant and defaults to `[]`. A non-empty list may name only the native
+`read`, `write`, `edit` and `bash` tools; the gateway enables exactly those for
+authenticated mapped ordinary chats (not root, internal, forked or task-owned
+conversations) over a guarded host environment on the actual workspace. Empty or
+absent disables coding tools; the opt-in read-only `skill` tool is separate.
+Scheduled isolated runs inherit a bounded subset captured from an authenticated
+origin and stay bounded by current host config, so narrowing the list and
+reopening also narrows those runs; pending calls for a removed tool fail closed
+rather than being restored by older grant records. There is no per-chat grant,
+approval or expiry step — every Telegram user in `allowFrom` shares the configured
+workspace and tool authority, so allowlist only trusted users. SDK hosts can keep
+the legacy expiring-grant mode (`toolAuthorization: "grants"`, the default for
+existing SDK callers) with `grantTools`/`revokeTools`/`listToolGrants` and its
+revoke/expiry replay checks. The local CLI's `/tools` is a read-only diagnostic. A
+deployment may select the optional direct-workspace Bubblewrap shell with
+`toolSandbox: "bwrap"`; it is off by default, wraps shell commands only, and falls
+back to neither the host shell nor a managed copy. See
+[coding tools](./TOOLS.md) and [direct Bubblewrap shell](./DIRECT_BWRAP.md).
 
 ## Internal cron (opt-in)
 

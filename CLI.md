@@ -1,7 +1,7 @@
 # Interactive CLI
 
-For a first-time walkthrough of workspace, memory, skills and grants, start with
-[setup](./SETUP.md).
+For a first-time walkthrough of workspace, memory, skills and config-enabled
+tools, start with [setup](./SETUP.md).
 
 Run the configured local conversation with the existing explicit config path:
 
@@ -96,13 +96,13 @@ fail-closed and is not remotely cancelled. See
 | `/episode [--session <sessionKey>] <startEntryId> [--limit 1-30]` | Open one episode's bounded first window of message/tool entries from an existing mapped chat session. |
 | `/entry [--session <sessionKey>] <entryId> [--radius 0-5]` | Open one entry plus at most five neighboring entry IDs on each side, showing only user/assistant text and tool calls/results. `--session` must be an existing mapped chat session. |
 | `/model` | List the current host-selected model and finite allowed choices, including supported thinking levels. In the integrated CLI, select with `/model <provider> <modelId> [thinkingLevel]`; the pair must exactly match the host allowlist. A busy conversation rejects selection atomically; retry when idle. Standalone terminal callers without a host callback remain read-only. |
-| `/tools` | List the host tool ceiling and this conversation's active coding-tool grants with expiry. Reports a disabled ceiling instead of offering a grant. |
-| `/grant <tool[,tool]> <duration>` | Grant one or more ceiling tools to this `cli:default` conversation with an explicit finite duration (for example `/grant read,bash 30m`). No duration, an unknown unit, an out-of-ceiling name or a disabled ceiling is rejected; there is no default or permanent grant. |
-| `/revoke <tool[,tool]\|all>` | Revoke named grants or every active grant in this conversation. Revocation is persisted and survives reopen. |
+| `/tools` | Read-only diagnostic: lists the config-selected coding tools and any legacy grant-mode entries for this conversation. |
+| `/grant <tool[,tool]> <duration>` | Legacy expiring-grant mode only: grant ceiling tools to this `cli:default` conversation for an explicit finite duration. Not used by the shipped config-authorized setup. |
+| `/revoke <tool[,tool]\|all>` | Legacy expiring-grant mode only: revoke named grants or all grants in this conversation. |
 | `/refresh` | Re-read the configured workspace bootstrap, memory files, manifest and skill inventory for this `cli:default` conversation. Requires `workspaceContext`; rejected while the conversation is busy. The refreshed summary and skill table apply to the next model request. |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
-| `/new` | Admit native `Conversation.reset(undefined)`: the same conversation starts a new context with no handoff. No archive, summary, usage reset or extra model call is produced; earlier entries stay stored and remain visible to `/history`, and conversation-scoped tool grants are unchanged. While busy it is placed at the next safe boundary and ends that run there instead of interrupting the current model turn; inputs queued before or after it in the same busy window run in the new context. A queued `/new` is a write, so `/abort` withdraws queued inputs but not the pending reset. |
+| `/new` | Admit native `Conversation.reset(undefined)`: the same conversation starts a new context with no handoff. No archive, summary, usage reset or extra model call is produced; earlier entries stay stored and remain visible to `/history`, and configured tools plus any legacy grants are unchanged. While busy it is placed at the next safe boundary and ends that run there instead of interrupting the current model turn; inputs queued before or after it in the same busy window run in the new context. A queued `/new` is a write, so `/abort` withdraws queued inputs but not the pending reset. |
 
 ## History search and browsing
 
@@ -113,7 +113,8 @@ equivalent.
 Search uses `Gateway.historySearch`; episode listing/open uses
 `Gateway.listHistoryEpisodes` and `Gateway.historyEpisode`; `/entry` and the
 episode-entry window use `Gateway.historyEntries`, a bounded raw-entry page over
-an existing mapped chat session. No control writes a transcript, changes a grant,
+an existing mapped chat session. No control writes a transcript, changes tool
+authority,
 or starts a model turn.
 
 ```text
@@ -196,38 +197,30 @@ scope, the derived index is rebuildable and disposable, and tool output remains
 untrusted data rather than instructions. Opening a full episode or arbitrary
 surrounding transcript beyond these bounds is not implemented.
 
-## Coding-tool grants
+## Coding tools
 
-The CLI opens the host `toolAllowlist` ceiling and, when it is non-empty, offers
-explicit local grant controls for the `cli:default` conversation. Grants are not
-requested by the model and are never inferred from config: a non-empty ceiling
-still grants nothing until `/grant` is issued.
+`toolAllowlist` in the config is the tool authority. The shipped CLI opens the
+Gateway in config-authorized mode, so a non-empty list enables exactly those
+native `read`/`write`/`edit`/`bash` tools for authenticated mapped ordinary
+chats; `[]` or absent disables them. No grant step, expiry or per-chat approval
+is involved, and `/tools` is only a read-only diagnostic:
 
 ```text
 /tools
-/grant read 30m
-/grant read,bash 2h
-/revoke bash
-/revoke all
 ```
 
-- Durations require a unit: integer seconds (`s`), minutes (`m`) or hours (`h`).
-  The expiry is `now + duration`; there is no default duration and no permanent
-  grant.
-- A name outside the host ceiling is rejected, and an empty ceiling reports the
-  config gap instead of accepting a grant. `/revoke` is idempotent for names that
-  are not currently granted.
-- Grants are conversation-scoped and persisted in Durable. They reappear after a
-  Gateway reopen until their expiry; expired grants are pruned and are never
-  resurrected by re-enabling the ceiling.
-- `/grant` takes effect for the next model request. A request already in progress
-  keeps its current tool list, and a call that already passed the grant check is
-  not cancelled retroactively. `/revoke` similarly bounds later calls, not a
-  command already running.
+Restart after editing `toolAllowlist`; there is no hot reload. Narrowing the list
+limits later requests and pending calls fail closed rather than being restored by
+old records.
 
-The commands are local controls, not a model-facing tool or an approval channel.
-Unknown slash commands are never sent to the model. This CLI surface has no
-Telegram equivalent; see [coding tools and grants](./TOOLS.md).
+Explicit SDK/host callers can keep the legacy **expiring-grant mode**
+(`toolAuthorization: "grants"`, the default for existing SDK callers). That mode
+keeps its own `/grant <tool[,tool]> <duration>` and `/revoke <tool[,tool]|all>`
+controls, finite `s`/`m`/`h` durations, Durable-persisted per-conversation grants
+and revoke/expiry checks before replay and at call time. Those controls are local
+utilities, not a model-facing tool or approval channel, and they are not part of
+the shipped setup. Unknown slash commands are never sent to the model. This CLI
+surface has no Telegram command equivalent; see [coding tools](./TOOLS.md).
 
 ## Workspace refresh
 
@@ -247,7 +240,7 @@ When the config contains `workspaceContext`, `/refresh` re-captures the current
   never enter the prompt.
 - It is rejected while the conversation is busy; retry when idle. A provider or
   loader failure leaves the previous snapshot in effect. `/refresh` adds no
-  tool grant, workspace root or shell authority.
+  tool authority, workspace root or shell authority.
 - Without `workspaceContext`, or for standalone terminal callers without the
   host callback, `/refresh` reports that workspace context is unavailable.
 

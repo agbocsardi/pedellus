@@ -1,8 +1,12 @@
 # Set up the assistant
 
-A short, CLI-first walkthrough on a synthetic workspace: build, enable memory and
-skills, grant finite tool authority, then add Telegram as a separate step. It
-does not claim live-model success; what you can verify offline is in
+A short, CLI-first walkthrough on a synthetic workspace: build, configure memory,
+skills and tool authority in the config, then add Telegram as a separate step.
+The config owns persistent settings and policy; the CLI and Telegram are utility
+surfaces over it. Changing the config takes effect on restart — there is no hot
+reload, and no command is a prerequisite for enabling a capability.
+
+This does not claim live-model success; what you can verify offline is in
 [Current status and checks](./README.md#current-status-and-checks).
 
 ## 1. Build
@@ -29,9 +33,8 @@ cp -R skills/memory skills/skill-creator skills/cron demo/workspace/skills/
 ```
 
 `workspace/skills` is the only skill root the example reads; `github` is not
-copied because it needs a granted `bash` tool and `gh`, and builtin skills are
-not enabled here. Then create the fixed bootstrap file and the memory file the
-config names:
+copied because it needs a shell and `gh`, and builtin skills are not enabled
+here. Then create the fixed bootstrap file and the memory file the config names:
 
 ```sh
 cat > demo/workspace/AGENTS.md <<'EOF'
@@ -47,7 +50,9 @@ EOF
 ```
 
 There is no default workspace, memory file, or skill root: every path is either
-the config's `workspace` or an explicit file under it.
+the config's `workspace` or an explicit file under it. Markdown is the memory and
+skill source of truth; the conversation transcript and runtime state live in
+Durable's SQLite database under `dataDir`.
 
 ## 3. Configure
 
@@ -56,11 +61,11 @@ The shipped [`config.example.json`](./config.example.json) is the starting point
 | Key | Meaning here |
 | --- | --- |
 | `workspace` / `dataDir` | Workspace root and private state directory, both relative to the config file. |
-| `model` / `allowedModels` | Host allowlist; `/model` can switch only inside it. The pair must exist in the pinned catalog, so change both together ([providers](./PROVIDERS.md)). |
+| `model` / `allowedModels` | Host default and allowlist. The pair must exist in the pinned catalog, so change both together ([providers](./PROVIDERS.md)). A chat's persisted `/model` choice can keep overriding the config default after a restart; clearing that choice is not a config edit. |
 | `workspaceContext.memoryFiles` | `["memory/MEMORY.md"]` is loaded into every turn; a missing named file fails closed. |
 | `workspaceContext.memoryManifest` | Lists the other `memory/*.md` topics for on-demand `read`; their bodies stay out of the prompt. |
 | `workspaceContext.skills.disabledSkills` | `[]`; workspace skills are discovered only because this section exists. |
-| `toolAllowlist` | The host ceiling: `read`, `write`, `edit`. It is not a grant and enables nothing by itself. |
+| `toolAllowlist` | Config authority: these coding tools are enabled for authenticated mapped chats. `[]` or absent disables them. |
 | `cron` | Installs the model-facing `cron` tool; `timeZone: "UTC"` interprets calendar expressions without an explicit zone. |
 | `episodeSummary` | Closed episodes are summarized in the background with the conversation's current model. That makes provider calls and costs money; set `enabled: false` to turn it off. |
 | `credentials` | Environment-variable *names* only. No secret value belongs in this file. |
@@ -71,6 +76,12 @@ Export the key named by `credentials.openai` (or whichever alias you allow):
 export OPENAI_API_KEY=...
 ```
 
+Configured tools apply to validated mapped ordinary chats — not to arbitrary
+internal or forked conversations — and still run over the guarded workspace
+environment. Scheduled runs inherit a bounded subset from an authenticated
+channel origin, so they never exceed what that origin had; narrowing
+`toolAllowlist` and restarting also narrows those runs.
+
 ## 4. First run
 
 ```sh
@@ -78,16 +89,8 @@ node dist/cli.js --config demo/config.json
 ```
 
 Without a `telegram` section the CLI opens the local `cli:default` conversation
-and prints a prompt. Now grant tools for this conversation:
-
-```text
-/tools
-/grant read,write,edit 30m
-```
-
-`/tools` shows the ceiling and no active grants. A non-empty ceiling still grants
-nothing until `/grant`; the duration is required and finite, and grants are
-re-checked at call time and survive a restart until they expire. Then ask for one
+and prints a prompt. No grant step exists: `toolAllowlist` in the config is the
+tool authority. `/tools` is an optional read-only diagnostic of it. Ask for one
 round trip:
 
 ```text
@@ -95,7 +98,8 @@ Load the memory skill, then write the fact "the demo workspace is for setup chec
 to memory/topics/setup.md with a one-line description and read it back.
 ```
 
-The `skill` tool needs no grant; the actual write and read do.
+The `skill` tool is context, not authority; the write and read use the configured
+`write` and `read` tools.
 
 ## 5. Refresh, reset, restart
 
@@ -108,10 +112,10 @@ created or when the gateway reopens. Editing `AGENTS.md`, `MEMORY.md`, or a
 ```
 
 `/refresh` re-reads bootstrap files, selected memory, the manifest and skills
-together in the same conversation; it adds no grant. `/new` is different: it
-starts a fresh model context with no handoff and does **not** re-read files. A
-gateway restart re-reads them, because startup reloads the config selection for
-every persisted session mapping.
+together in the same conversation. `/new` is different: it starts a fresh model
+context with no handoff and does **not** re-read files. A gateway restart applies
+config edits and re-reads the files, because startup reloads the config selection
+for every persisted session mapping.
 
 Restart (Ctrl-D or Ctrl-C, then the same command) and retrieve what happened:
 
@@ -134,7 +138,6 @@ example. Add `telegram` as a top-level key beside the existing ones in
 "telegram": {
   "tokenEnv": "TELEGRAM_BOT_TOKEN",
   "allowFrom": ["123456789"],
-  "toolGrantFrom": ["123456789"],
   "pollTimeoutSeconds": 30
 }
 ```
@@ -142,50 +145,43 @@ example. Add `telegram` as a top-level key beside the existing ones in
 - `tokenEnv` is an environment-variable name; export the token, never paste it
   into the file.
 - `allowFrom` is a non-empty list of decimal Telegram user IDs allowed to talk to
-  the bot. Only private chats reach the assistant.
-- `toolGrantFrom` is an optional admin list of decimal user IDs; it must be a
-  subset of `allowFrom` and defaults to empty. It enables the in-chat grant
-  commands and nothing else. Config alone grants nothing, and grants still stay
-  inside `toolAllowlist`.
+  the bot, and only private chats reach the assistant.
+- **Every user in `allowFrom` shares the configured workspace and tool
+  authority.** Listing a user is the authorization; there is no per-chat
+  permission step, so allowlist only people you would let use those tools.
 - Adding the section switches the same gateway to Telegram polling instead of the
   local prompt. CLI and Telegram are alternative modes of one process, not
-  simultaneous clients; the conversations are separate, so grants and context
-  snapshots are per chat.
+  simultaneous clients; each chat has its own conversation, context snapshot and
+  persisted model choice, but the same workspace and config ceiling.
 
 In an allowed private chat:
 
 ```text
-/tools
-/grant read,write,edit 30m
-/revoke edit
+/help
+Load the memory skill and remember that the demo bot is for setup checks.
 remind me in ten minutes to stretch, then put today's reminder in memory/topics/demo.md
 ```
 
-`/grant`/`/revoke` require both a listed admin sender and the chat's own
-authentication; they never widen the host ceiling. `/new`, `/abort` and `/help`
-are the other controls; any other slash command gets a bounded notice and is not
-sent to the model (`//help` sends it as text). Limits: private chats only, and the
-adapter is text-only — an attachment gets a fixed unsupported-attachment notice
-(caption text is still passed as input), and groups or other bots never reach the
-assistant. Controls only apply to text messages.
+`/new`, `/abort` and `/help` are the channel controls. Context refresh in
+Telegram is a gateway restart; there is no Telegram refresh command, and `/new`
+does not re-read files. The adapter is text-only: an attachment gets a fixed
+unsupported-attachment notice (caption text is still passed as input), and
+groups or other bots never reach the assistant.
 
-Reminders are ordinary agent scheduling through the `cron` tool. A default
-isolated run answers in its own background conversation and its result is
+Reminders are ordinary agent scheduling through the configured `cron` tool. A
+default isolated run answers in its own background conversation and its result is
 delivered back to the chat that asked. An `origin`-mode job instead answers inside
 the origin conversation and creates no outbound send: that answer is visible to
 an attached local CLI or through history, not pushed to Telegram. Failures are
 not pushed either; ask the agent to `list` cron jobs and read the reported
 failure/delivery fault. See [cron](./CRON.md).
 
-Context refresh in Telegram is a gateway restart, not a chat command; `/new` does
-not re-read files. If the running build predates the chat grant commands, `/grant`
-is refused in chat and grants remain CLI-only.
-
 ## 7. Optional: shell, sandbox, builtin skills
 
-- `bash`: add `"bash"` to `toolAllowlist` and `/grant bash 30m`. It runs on the
-  real workspace over a guarded environment; `toolTimeoutSeconds` is the default
-  timeout. See [coding tools and grants](./TOOLS.md).
+- `bash`: add `"bash"` to `toolAllowlist` and restart. It runs on the real
+  workspace over a guarded environment; `toolTimeoutSeconds` is the default
+  timeout. Configure it only for users and channels you trust with a shell. See
+  [coding tools](./TOOLS.md).
 - `toolSandbox`: `"bwrap"` (with an absolute `bwrapPath`) runs shell commands in
   a direct-workspace Bubblewrap view and fails closed when unavailable. It wraps
   the shell only, and it is accidental-damage protection, not hostile-tenant
@@ -195,4 +191,4 @@ is refused in chat and grants remain CLI-only.
   See [curated builtin skills](./SKILLS_BUILTIN.md).
 - Memory topics, manifest bounds and skill frontmatter are described in
   [memory context](./MEMORY_CONTEXT.md) and [skills context](./SKILLS_CONTEXT.md);
-  local commands are in [the CLI](./CLI.md).
+  local utility commands are in [the CLI](./CLI.md).

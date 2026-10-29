@@ -37,7 +37,7 @@ snapshot provider and `openGateway` installs no context extension.
   also appends the bounded `# Memory Tree` manifest from
   [`MEMORY_CONTEXT.md`](./MEMORY_CONTEXT.md); configured `memoryFiles` that
   were actually injected are its `loaded` entries and every other topic is read
-  on demand with the granted native `read` tool. An empty configured file is
+  on demand with the configured native `read` tool. An empty configured file is
   omitted by this loader, so the manifest does not mark it `loaded`. The
   manifest uses one of the 32 memory source slots, so at most 31 `memoryFiles`
   are accepted in that mode.
@@ -75,7 +75,7 @@ snapshot provider and `openGateway` installs no context extension.
 - Skill bodies are never prompt content: the host passes the loader's
   name/description summary as `skillSummary`, and the gateway serves a body only
   when the model calls its read-only `skill` tool. Workspace bundled files stay
-  readable with the ordinary granted `read` tool; builtin files are outside the
+  readable with the ordinary configured `read` tool; builtin files are outside the
   workspace and are not. See [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md).
 - Skill requirements are checked against the non-secret variables the guarded
   shell exports (`PATH`, `HOME`, `TMPDIR`, `LANG`, `TERM`, `PYTHONUNBUFFERED`,
