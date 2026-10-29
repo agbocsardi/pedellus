@@ -56,9 +56,9 @@ described below; Code Mode is not part of this slice.
   tools: it is not in this ceiling, cannot be granted or revoked, accepts no
   filesystem path, and executes nothing. See
   [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md).
-- When the host opts in with `agentHistory: true`, the gateway offers one
-  read-only `history` tool to mapped chat conversations. The local CLI/Telegram
-  host sets this option; a bare gateway does not. The tool can search prior
+- Every Gateway offers one read-only `history` tool to mapped chat conversations
+  by default. The local CLI/Telegram path uses that default; a host can pass
+  `agentHistory: false` for a bare gateway. The tool can search prior
   user/assistant message text across those mapped chats, explicitly opt into tool
   names/arguments/results, and open a bounded window around a source entry. It is
   not in the coding-tool ceiling, cannot be granted or revoked, accepts no path or

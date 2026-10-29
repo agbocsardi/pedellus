@@ -204,7 +204,7 @@ test("context remains absent and tool policy remains empty without opt-in", asyn
   const config = gatewayConfig(workspace, dataDir, "context-off");
   let gateway;
   try {
-    gateway = await openGateway(config, context, { models });
+    gateway = await openGateway(config, context, { models, agentHistory: false });
     const conversation = await gateway.conversationFor("plain-session", context);
     const agent = await conversation.agent(context);
     assert.deepEqual(agent.tools, []);
@@ -401,6 +401,7 @@ test("opt-in context follows session mappings across conversations, stores, and 
     const models = setupModels(store.providerId, store.captured);
     const gateway = await openGateway(gatewayConfig(store.workspace, store.dataDir, store.providerId), context, {
       models,
+      agentHistory: false,
       contextSnapshotProvider(sessionKey, conversationId) {
         store.providerCalls.push({ sessionKey, conversationId });
         const snapshot = {

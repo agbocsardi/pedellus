@@ -57,7 +57,7 @@ const models = createModels();
 models.setProvider(provider.provider);
 let gateway;
 try {
-  gateway = await openGateway(config, context, { models });
+  gateway = await openGateway(config, context, { models, agentHistory: false });
   const conversation = await gateway.conversationFor("policy-session", context);
   assert.deepEqual((await gateway.listModels("policy-session", context)).selected, {
     provider: "fixture", modelId: "alpha", thinkingLevel: "high",
@@ -90,12 +90,12 @@ try {
   gateway = undefined;
 
   // Native pi.agent selection and thinking survive reopen; revoked choices recover to default.
-  gateway = await openGateway(config, context, { models });
+  gateway = await openGateway(config, context, { models, agentHistory: false });
   assert.deepEqual((await gateway.listModels("policy-session", context)).selected, {
     provider: "fixture", modelId: "beta", thinkingLevel: "high",
   });
   await gateway.close(context);
-  gateway = await openGateway(parseConfig({ ...raw, allowedModels: [raw.model] }, temp), context, { models });
+  gateway = await openGateway(parseConfig({ ...raw, allowedModels: [raw.model] }, temp), context, { models, agentHistory: false });
   const recovered = await gateway.conversationFor("policy-session", context);
   const state = await gateway.harness.snapshot(AgentDoc, recovered.id, context);
   assert.deepEqual(state.model, { provider: "fixture", modelId: "alpha" });

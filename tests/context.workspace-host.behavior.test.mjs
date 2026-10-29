@@ -127,7 +127,7 @@ test("explicit host config drives the Gateway path for every session and across 
   const models = setupModels("fixture", captured);
   let gateway;
   try {
-    gateway = await openGateway(config, context, { models, ...workspaceContextGatewayOptions(config) });
+    gateway = await openGateway(config, context, { models, agentHistory: false, ...workspaceContextGatewayOptions(config) });
     const alpha = await send(gateway, "cli:default", "alpha-1", "first");
     assert.match(captured[0], /AGENTS-ALPHA/);
     assert.match(captured[0], /SOUL-ALPHA/);

@@ -7,10 +7,10 @@ is always available and its derived rows are bound to the store's committed
 `nanobot.store-identity`; there is no host-injected identity option. Episode
 summaries and summary search are not implemented. The local CLI exposes bounded
 search, episode listing and entry windows over these reads; see
-[CLI history search and browsing](./CLI.md#history-search-and-browsing). When a
-host opts in with `agentHistory: true` (the local CLI/Telegram host does), a
-read-only model-facing `history` tool exposes search and bounded entry opening to
-the assistant; see [Agent-facing tool](#agent-facing-history-tool).
+[CLI history search and browsing](./CLI.md#history-search-and-browsing). The
+same Gateway offers a read-only model-facing `history` tool to mapped chat
+conversations by default; the assistant can search and open prior discussion
+without a separate CLI session. See [Agent-facing tool](#agent-facing-history-tool).
 
 ## Authority, identity and storage
 
@@ -230,13 +230,13 @@ no longer exists or no longer matches its fingerprint.
 
 ## Agent-facing history tool
 
-`openGateway(config, context, { agentHistory: true })` installs one read-only,
-model-facing tool named `history` for mapped chat conversations. It is not in the
-coding-tool ceiling, cannot be granted or revoked, accepts no filesystem path or
-shell command, executes nothing, modifies no transcript and creates no
-conversation. A bare gateway keeps no extra tool; the local CLI/Telegram host
-opts in explicitly, and another host must do the same after deciding that the
-agent may read its mapped chat history under the single-tenant policy.
+`openGateway` installs one read-only, model-facing tool named `history` for mapped
+chat conversations by default. It is not in the coding-tool ceiling, cannot be
+granted or revoked, accepts no filesystem path or shell command, executes nothing,
+modifies no transcript and creates no conversation. A host that needs a bare
+gateway can pass `agentHistory: false`; the local CLI/Telegram path uses the
+default. The tool reads only conversations already mapped by the host, so channel
+authentication and the single-tenant session policy still decide what exists.
 
 The tool calls the same `Gateway.historySearch` and `Gateway.historyEntries`
 surface as trusted host code. It has two actions:

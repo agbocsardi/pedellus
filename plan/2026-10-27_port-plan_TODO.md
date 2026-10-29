@@ -92,8 +92,8 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
       `HISTORY.md`.
 - [ ] Implement the episode summary index and episode catalog with durable post-reset summaries, retry and reconciliation.
 - [x] Expose message/tool search and episode/entry browsing in the local CLI.
-- [x] Expose history search and source-entry opening through a host-approved, read-only agent-facing tool;
-      the local CLI/Telegram host opts in. Telegram/web command surfaces remain unimplemented.
+- [x] Expose history search and source-entry opening through a default read-only agent-facing tool for
+      mapped chats (`agentHistory: false` opts out). Telegram/web command surfaces remain unimplemented.
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
 - [ ] Complete requested channels individually after core acceptance.
 - [ ] Agree the next bounded implementation scope with the owner; no automatic restart.
@@ -117,7 +117,7 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 | Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool; curated port builtins in `skills` (memory, memory-defrag, skill-creator, github, cron) behind an explicit `builtinSkillsRoot` | `my` has no port runtime; no inventory-count cap, but finite prompt/output bounds visibly truncate |
 | Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
 | Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling; a background run gets the origin's workspace context and `skill` tool; copied grants are bounded by current origin grants | No channel delivery or silence policy; disabling cron leaves persisted timers blocked; a run whose snapshot was evicted at the cap proceeds without context; a phase fault or crash before the terminal commit can retain bounded grants until reopen |
-| History | Durable store identity, reset-delimited episode reads and a rebuildable message/tool search index; CLI `/search`, `/episodes`, `/episode`, `/entry`; host-approved read-only model-facing `history` tool | No episode summaries, titles or summary search; no Telegram/web browsing command; a clone or restored backup keeps the same identity, so stale rows are caught only by per-conversation entry anchors |
+| History | Durable store identity, reset-delimited episode reads and a rebuildable message/tool search index; CLI `/search`, `/episodes`, `/episode`, `/entry`; default read-only model-facing `history` tool (host can disable) | No episode summaries, titles or summary search; no Telegram/web browsing command; a clone or restored backup keeps the same identity, so stale rows are caught only by per-conversation entry anchors |
 | Telegram | Restricted allowlisted inbound/reply adapter with streaming, durable send intent, unknown-send quarantine | Existing adapter only; scheduled outbound candidate is unmerged; no general pairing or media parity |
 | Code Mode / delegation | Reviewed opt-in QuickJS Code Mode/tool-search SDK | Not Gateway-installed; no product background-subagent or worker interface |
 | Other surfaces | Read-only usage and inert archival helpers exist | Discord candidates parked; Email/WebSocket, MCP, web/media tools not integrated |
@@ -666,11 +666,12 @@ agent cron wiring remain open; this is not yet an everyday replacement or cutove
 
 ### 2026-10-29 — agent-facing history tool
 
-Added one host-approved, read-only model-facing `history` tool and left bare
-gateways unchanged: `OpenGatewayOptions.agentHistory` defaults off, while the local
-CLI/Telegram host opts in. The tool searches user/assistant message text across the
-mapped chat conversations by default, accepts explicit `tools`/`all` scopes for tool
-names, arguments and results, and opens a bounded entry window around a source hit.
+Added one read-only model-facing `history` tool to the default Gateway for mapped
+chat conversations. `OpenGatewayOptions.agentHistory` defaults on and is a host
+off-switch for a bare deployment; the local CLI/Telegram path uses the default. The
+tool searches user/assistant message text across the mapped chat conversations by
+default, accepts explicit `tools`/`all` scopes for tool names, arguments and results,
+and opens a bounded entry window around a source hit.
 It calls the existing `Gateway.historySearch`/`historyEntries` host surface, so it
 creates no conversation, writes no transcript, grants no filesystem or shell
 authority and rejects state-only/task-owned sources through the same validator. Output
@@ -679,8 +680,8 @@ completeness/lag/truncation, and offers an opaque validated cursor. It explicitl
 says episode summaries are not searchable. Offline faux-provider Gateway probes
 covered cross-session message search, explicit tool scope, pagination, open/radius,
 malformed and changed-query cursors, reset-handoff exclusion, injection strings,
-abort and the bare-gateway opt-in boundary; typecheck, 155 behaviour checks and 9
-execution checks pass. No summary code, test file, live provider, network or personal
+abort and the `agentHistory: false` opt-out boundary; typecheck, 155 behaviour
+checks and 9 execution checks pass. No summary code, test file, live provider, network or personal
 data was involved.
 
 ### 2026-10-29 — local history browsing

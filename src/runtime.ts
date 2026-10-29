@@ -100,9 +100,9 @@ export interface OpenGatewayOptions {
   /** Explicit host-owned context snapshots; absent means no context extension is installed. */
   readonly contextSnapshotProvider?: GatewayContextSnapshotProvider;
   /**
-   * Host approval for the read-only model-facing `history` tool. Absent keeps the bare
-   * gateway default of no extra tools; the local CLI/Telegram host opts in explicitly.
-   * The tool reads only the already-mapped chat conversations under the host's
+   * Host switch for the read-only model-facing `history` tool. It is on by default for
+   * mapped chat conversations; pass `false` for a bare gateway that should expose no
+   * extra tool. The tool reads only already-mapped chat conversations under the host's
    * single-tenant policy, creates no conversation, writes no transcript and grants no
    * filesystem or shell authority.
    */
@@ -392,7 +392,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // shell, no transcript write and no conversation creation. The host surface is late-bound so the
   // extension can be registered before Harness.open() while the index itself is created afterwards.
   const historyToolHostRef: { current: HistoryToolHost | undefined } = { current: undefined };
-  const historyTool = options.agentHistory === true ? createHistoryTool({ host: () => historyToolHostRef.current }) : undefined;
+  const historyTool = options.agentHistory === false ? undefined : createHistoryTool({ host: () => historyToolHostRef.current });
   const historyToolRegistration = historyTool?.extension.tools?.[0];
   const historyConversations = new Set<ConversationId>();
   // Mapped session keys own their snapshot. A scheduled run's target is tracked separately in
