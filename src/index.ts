@@ -60,6 +60,32 @@ export {
 } from "./context/index.js";
 export { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 export {
+  EPISODE_CATALOG_KIND,
+  EPISODE_KIND,
+  EPISODE_LIMITS,
+  EPISODE_SUMMARIZER_VERSION,
+  createEpisodeCatalog,
+  type EpisodeCatalog,
+  type EpisodeCatalogOptions,
+  type EpisodeReconcileReport,
+  type HistoryEpisode,
+  type HistoryEpisodePage,
+  type HistoryEpisodeQuery,
+  type HistoryEpisodeSummary,
+} from "./history/episodes.js";
+export {
+  CHANNEL_STATE_SESSION_SUFFIX,
+  isChatSessionKey,
+  type HistoryChatSession,
+} from "./history/scope.js";
+export {
+  STORE_IDENTITY_FORMAT,
+  STORE_IDENTITY_VERSION,
+  ensureStoreIdentity,
+  parseStoreIdentity,
+  type StoreIdentity,
+} from "./history/store-identity.js";
+export {
   CRON_EXTENSION_NAME,
   CRON_JOBS_KIND,
   CRON_RUN_TASK_NAME,

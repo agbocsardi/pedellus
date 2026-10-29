@@ -82,8 +82,9 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
 
 - [ ] Deliver scheduled results beyond the origin conversation turn (channel outbox) once a channel is accepted.
 - [x] Agree transcript/episode/search design (2026-10-29; W3 below).
+- [x] Store identity, reset-delimited episode boundaries and durable pending-summary state (2026-10-29; foundation only, no summary pass).
 - [ ] Implement read-only transcript retrieval and rebuildable message/tool and episode-summary indexes.
-- [ ] Implement episode catalog and durable post-reset summaries with retry/reconciliation.
+- [ ] Generate episode summaries: claim `pending` episodes by deterministic job identity, bounded long-episode coverage, persisted retry/backoff.
 - [ ] Expose history browsing/search through memory tooling and accepted channel interfaces.
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
 - [ ] Complete requested channels individually after core acceptance.
@@ -395,6 +396,68 @@ originals. Resolve parked cursor/reporting findings before reusing candidate cod
 Design agreement is not authorization to resume implementation or launch agents;
 the owner requested convergence and discussion.
 
+#### Episode catalog foundation — 2026-10-29 (implemented, summaries not started)
+
+Landing the durable half of W3 without model calls, tasks or scheduling:
+
+- `src/history/store-identity.ts` — one session-scoped `nanobot.store-identity`
+  document (`format`, `version`, `storeId`, `createdAt`), minted on the first
+  gateway open and only ever read afterwards, so repeated opens converge on the
+  first committed value. `ensureStoreIdentity()` is idempotent and needs no scan.
+  A derived index must persist `storeId` and discard its rows when the value
+  changes; a file path or inode cannot tell a replaced store from the old one.
+- `src/history/episodes.ts` — episode boundaries derived from committed
+  `pi.reset` entries only (`conversation.reset()` and the `handoff` tool control
+  both write one; a handoff's user message is part of the reset entry). An
+  episode is `[startEntryId, endEntryId]` inclusive, starting at its reset entry
+  or at the conversation's first entry. Two consecutive resets create no
+  episode. Compaction (`pi.compaction`) and system entries stay inside an
+  episode: only a reset closes one.
+- Durable state: one fixed-size `nanobot.episode-catalog` progress document per
+  conversation (scan cursor, open-episode start/reset/end, counters) and one
+  small `nanobot.episode` document per closed, non-empty episode, keyed by its
+  start entry ID. Episode documents and the cursor commit together, so a crash
+  neither loses a closed episode nor records it twice; an existing closed
+  episode is never rewritten. Nothing grows with entry count: progress is
+  O(1), an episode is O(1), and empty episodes are never stored.
+- A closed episode records `summary.status = "pending"`,
+  `summarizerVersion = 1`, `attempts = 0`. That is durable state for a later
+  summary pass, deliberately not a schedule: no task, model call, retry or
+  notification exists yet. The future job identity is
+  `conversationId:startEntryId:summarizerVersion`.
+- Reconciliation is incremental: ascending entry batches from the persisted
+  cursor, committed in bounded groups (`EPISODE_LIMITS`), rescheduled until
+  caught up, retried a bounded number of times in-process, surfaced by the
+  explicit `reconcileHistoryEpisodes()` call, and deferred past gateway open so
+  a long history blocks neither startup nor a turn. It triggers on committed
+  reset entries through the public `Session.subscribeCommits()` listener (an
+  acknowledgment, not a poll) and catches up on reopen, including resets another
+  process committed while this one was gone. It never changes native reset/busy
+  ordering: only entries that are already committed are read.
+- Scope is single-tenant mapped chat: the values of `nanobot.session-map` minus
+  keys ending in `:channel-state` (the channel bookkeeping convention in
+  `src/history/scope.ts`). Task-owned and otherwise unmapped conversations
+  (a scheduled run's background target) and the root are never catalogued,
+  because they are not in that map. Hosts authenticate before naming a session
+  key; the read API rejects a state-only session key rather than guessing.
+- Host API (additive on `Gateway`): `historyIdentity()`, `listHistoryEpisodes(sessionKey,
+  { limit?, before? })`, `historyEpisode(sessionKey, startEntryId)`,
+  `reconcileHistoryEpisodes(sessionKey)`. Listing reads entries and episode
+  documents and writes nothing: it derives exact boundaries and counts even for
+  a boundary reconciliation has not recorded yet, reporting
+  `summary.status = "unknown"` there. `next.before` is a durable entry ID (an
+  episode start), so pagination is stable across appends and reopen, and any
+  other bound is rejected instead of mislabelled. An open episode's counts are
+  null unless the same read derived them.
+
+Known gaps, deliberately not claimed: episodes carry no wall-clock dates
+(Durable entries have no timestamp; only entry IDs order them), no titles, and no
+summary text. Summaries, retry/backoff, long-episode coverage bounds, summary
+search, message/tool full-text search, and any CLI/Telegram browsing command are
+later slices. Episode documents are not enumerated by the catalog itself; a
+future summary scheduler needs a durable work queue or an index over `pending`
+episodes rather than a document scan per pass.
+
 ### W4 — acceptance suite
 
 The gate that makes later cutover decisions defensible, and the only place where the
@@ -543,6 +606,22 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-29 — durable store identity and episode catalog foundation
+
+Implemented the durable half of W3 with no model calls, tasks or scheduling: one
+immutable store identity document, reset-delimited episode boundaries derived from
+committed `pi.reset` entries, one fixed-size progress document plus one small document
+per closed episode with durable `pending` summary state, and a narrow host read API
+(`historyIdentity`, `listHistoryEpisodes`, `historyEpisode`, `reconcileHistoryEpisodes`).
+Reconciliation is incremental, batched, crash-resumable, triggered by the public
+commit subscription and caught up on reopen; the mapped single-tenant chat scope
+excludes channel-state, task-owned and unmapped conversations. Offline synthetic probe
+covered idle, consecutive and handoff resets, a queued busy reset, pagination, reopen,
+an offline-committed reset, background and startup catch-up, idempotent writes and
+scope exclusion; `typecheck`, 155 behaviour checks, 9 execution checks and core
+acceptance still pass. Known gaps: no dates, titles, summary generation, retry or
+search yet.
 
 ### 2026-10-29 — history design agreement; implementation remains paused
 

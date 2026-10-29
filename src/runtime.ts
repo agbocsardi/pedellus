@@ -9,6 +9,16 @@ import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./conte
 import { CRON_RUN_TASK_NAME, createCronFoundation } from "./automation/cron.js";
 import { createCronTool, CRON_TOOL_NAME } from "./automation/cron-tool.js";
 import type { CronOwner } from "./automation/cron.js";
+import {
+  createEpisodeCatalog,
+  type EpisodeCatalog,
+  type EpisodeReconcileReport,
+  type HistoryEpisode,
+  type HistoryEpisodePage,
+  type HistoryEpisodeQuery,
+} from "./history/episodes.js";
+import { isChatSessionKey, type HistoryChatSession } from "./history/scope.js";
+import { ensureStoreIdentity, type StoreIdentity } from "./history/store-identity.js";
 import { parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
 import { prepareDataDirectory } from "./store.js";
@@ -84,6 +94,34 @@ export interface Gateway {
   selectModel(sessionKey: string, selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection>;
   /** Active, unexpired grants for a known session; empty when tools are disabled. */
   listToolGrants(sessionKey: string, context: Context): Promise<readonly GatewayToolGrant[]>;
+  /**
+   * Immutable identity of this SQLite store. A derived index persists `storeId` and refuses
+   * its own rows when it changes, so a rebuilt or replaced store cannot mix two histories.
+   * It carries no access: the host still authenticates the reader.
+   */
+  historyIdentity(context: Context): Promise<StoreIdentity>;
+  /**
+   * Episodes of one mapped chat session: discussions bounded by committed reset entries,
+   * newest first. Read-only over Durable's transcript; nothing is summarized or indexed and
+   * no model runs. A state-only channel conversation is not history and is rejected.
+   *
+   * `next.before` is a durable entry ID, so a continuation stays stable across appends and
+   * reopen. `summary.status` reports `open`, `pending`, `ready`, `failed`, or `unknown` when
+   * reconciliation has not reached that boundary yet; the original entries are always the
+   * authority and remain readable through the conversation handle.
+   */
+  listHistoryEpisodes(
+    sessionKey: string,
+    query: HistoryEpisodeQuery,
+    context: Context,
+  ): Promise<HistoryEpisodePage>;
+  /** One episode by its start entry ID, or undefined when it is not a known boundary. */
+  historyEpisode(sessionKey: string, startEntryId: number, context: Context): Promise<HistoryEpisode | undefined>;
+  /**
+   * Catch this session's episode catalog up now. Idempotent, bounded, and never schedules a
+   * summary; the same work also runs in the background after resets and on reopen.
+   */
+  reconcileHistoryEpisodes(sessionKey: string, context: Context): Promise<EpisodeReconcileReport>;
   /**
    * Re-runs the configured context snapshot provider for one existing session and applies it to the
    * next turn. Rejects an unknown session, a live run, or a gateway opened without a provider.
@@ -474,6 +512,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const releaseLock = await processLock(`nanobot:${dbPath}`);
   let harness: HarnessType | undefined;
   let storage: Storage | undefined;
+  let episodeCatalog: EpisodeCatalog | undefined;
   let closed = false;
   try {
     const registry = createRegistry();
@@ -496,6 +535,39 @@ export async function openGateway(config: PortConfig, context: Context, options:
     harness = await Harness.open(storage, harnessOptions, context);
     harnessRef.current = harness;
     const root = await harness.root(context, { agent: defaultAgentPolicy });
+
+    // One immutable identity document per store, minted on first open. A derived index binds
+    // its rows to this value instead of to a file path, which a replaced store can reuse.
+    const storeIdentity = await ensureStoreIdentity(harness!, context, { now });
+
+    // History scope: mapped chat sessions only. A channel's own state conversation, an
+    // unmapped conversation (a scheduled run's task-owned target) and the root are not chat
+    // history. The host has already authenticated the session key before naming it.
+    const mappedChatSessions = async (ctx: Context): Promise<readonly HistoryChatSession[]> => {
+      const mapping = await harness!.snapshot(SessionMap, root.id, ctx);
+      if (mapping === undefined) return [];
+      const sessions = mapping.sessions;
+      if (!isRecord(sessions)) throw new Error("Stored session map is malformed");
+      const mapped: HistoryChatSession[] = [];
+      const seen = new Set<ConversationId>();
+      for (const [encodedKey, rawId] of Object.entries(sessions)) {
+        const sessionKey = decodedSessionKey(encodedKey);
+        if (!Number.isSafeInteger(rawId) || rawId < 1 || rawId === root.id) {
+          throw new Error("Stored session map contains an invalid conversation ID");
+        }
+        const conversationId = rawId as ConversationId;
+        if (seen.has(conversationId)) {
+          throw new Error("Stored session map maps multiple session keys to one conversation");
+        }
+        seen.add(conversationId);
+        if (isChatSessionKey(sessionKey)) mapped.push({ sessionKey, conversationId });
+      }
+      return mapped;
+    };
+    // Bounded, background-only derived state: reset-delimited episode boundaries and their
+    // durable summary status. It reads committed entries only and changes no reset or busy
+    // ordering; a closed episode is recorded as pending, and nothing schedules a summary yet.
+    episodeCatalog = createEpisodeCatalog({ harness: harness!, sessions: mappedChatSessions, context });
 
     // At the snapshot cap, drop the oldest installed background target that is not running and not a
     // mapped session. Without an evictable target the builder's RangeError stays the last resort.
@@ -900,6 +972,21 @@ export async function openGateway(config: PortConfig, context: Context, options:
         const document = await harness!.snapshot(ToolGrantDoc, conversation.id, ctx);
         return document === undefined ? [] : activeToolGrants(document, toolAllowlist, now());
       },
+      historyIdentity() {
+        return Promise.resolve(storeIdentity);
+      },
+      async listHistoryEpisodes(sessionKey, query, ctx) {
+        const conversationId = await chatConversationIdFor(sessionKey, ctx);
+        return episodeCatalog!.list(conversationId, query, ctx);
+      },
+      async historyEpisode(sessionKey, startEntryId, ctx) {
+        const conversationId = await chatConversationIdFor(sessionKey, ctx);
+        return episodeCatalog!.episode(conversationId, startEntryId as EntryId, ctx);
+      },
+      async reconcileHistoryEpisodes(sessionKey, ctx) {
+        const conversationId = await chatConversationIdFor(sessionKey, ctx);
+        return episodeCatalog!.reconcile(conversationId, ctx);
+      },
       async refreshContext(sessionKey, ctx) {
         if (!options.contextSnapshotProvider) {
           throw new Error("Context refresh requires a configured contextSnapshotProvider");
@@ -937,6 +1024,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (closed) return;
         closed = true;
         const cleanup = withoutAbortSignal(ctx);
+        // Stop derived background work before the session stops accepting commits.
+        episodeCatalog?.close();
         try { await harness!.close(cleanup); }
         finally {
           try { await toolEnvironments?.close(cleanup); }
@@ -944,6 +1033,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
         }
       },
     };
+    async function chatConversationIdFor(sessionKey: string, ctx: Context): Promise<ConversationId> {
+      // State-only conversations hold channel bookkeeping, not discussion: they are not history.
+      if (!isChatSessionKey(sessionKey)) throw new Error("State-only conversations are not chat history");
+      return (await existingConversationFor(sessionKey, ctx)).id;
+    }
     async function existingConversationFor(sessionKey: string, ctx: Context): Promise<Conversation> {
       const key = encodedSessionKey(sessionKey);
       const map = await harness!.snapshot(SessionMap, root.id, ctx);
@@ -958,6 +1052,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     return gateway;
   } catch (error) {
     const cleanup = withoutAbortSignal(context);
+    // A failed open must not leave deferred cataloguing attached to a closed session.
+    episodeCatalog?.close();
     try {
       if (harness) await harness.close(cleanup);
       else await storage?.close(cleanup);

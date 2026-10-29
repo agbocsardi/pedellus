@@ -30,6 +30,9 @@ npm start -- --config config.json   # local CLI against a config file
 - `src/automation/` — cron timer/run tasks and the model-facing `cron` tool.
 - `src/execution/` — guarded host environment and the optional Bubblewrap shell.
 - `src/context/` — bootstrap/memory/skills snapshots, skill tool, workspace host.
+- `src/history/` — durable store identity and reset-delimited episode catalog with
+  durable pending-summary state. Boundaries come from committed resets; no summary
+  task, index or search lives here yet.
 - `src/channels/` — Telegram adapter; other channels are not ported.
 - `plan/` — dated roadmap, spike history and the current plan. The port plan is
   the scope/status authority; older plans are evidence, not a work queue.

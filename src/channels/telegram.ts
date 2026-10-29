@@ -7,6 +7,7 @@ import type { ApiClientOptions } from "grammy";
 import type { Update } from "grammy/types";
 import type { Conversation, SubmissionId } from "@earendil-works/pi-durable";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 
 const API = "https://api.telegram.org";
 const TELEGRAM_LIMIT = 4096;
@@ -94,7 +95,10 @@ export async function runTelegram(
   const me = await apiCall(api, "getMe", signal, (callSignal) => api.getMe(toGrammySignal(callSignal)), { throttle: pollThrottle });
   if (!me) throw new Error("Telegram getMe returned no result");
   const identity = String(me.id);
-  const stateConversation = await gateway.conversationFor(`telegram:${identity}:channel-state`, context);
+  const stateConversation = await gateway.conversationFor(
+    `telegram:${identity}${CHANNEL_STATE_SESSION_SUFFIX}`,
+    context,
+  );
   let state = await stateConversation.commit(async (tx) =>
     copyJson(await tx.doc(TelegramState, stateConversation.id)) as unknown as ChannelState,
   context);
