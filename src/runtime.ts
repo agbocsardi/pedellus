@@ -214,9 +214,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+const CHANNEL_STATE_SESSION_SUFFIX = ":channel-state";
+
 interface MappedSession {
   readonly sessionKey: string;
   readonly conversationId: ConversationId;
+}
+
+/** Channel adapters use this conversation for bookkeeping; it is never chat history. */
+function isChannelStateSessionKey(sessionKey: string): boolean {
+  return sessionKey.endsWith(CHANNEL_STATE_SESSION_SUFFIX);
 }
 
 function parseSessionMap(sessions: unknown, rootId: ConversationId): MappedSession[] {
@@ -639,7 +646,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const historySessions = async (ctx: Context): Promise<readonly HistorySession[]> => {
       const mapping = await harnessRef.current!.snapshot(SessionMap, root.id, ctx);
       if (mapping === undefined) return [];
-      const mappedSessions = parseSessionMap(mapping.sessions, root.id);
+      const mappedSessions = parseSessionMap(mapping.sessions, root.id)
+        .filter(({ sessionKey }) => !isChannelStateSessionKey(sessionKey));
       if (mappedSessions.length > HISTORY_INDEX_LIMITS.maxMappedSessions) {
         throw new Error(
           `History search supports at most ${HISTORY_INDEX_LIMITS.maxMappedSessions} mapped chat sessions; ` +
@@ -662,6 +670,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ? undefined
       : createHistoryIndex({
           indexPath: historyIndexPath(dbPath),
+          sourcePath: dbPath,
           storeId: options.historyStoreId,
           sessions: historySessions,
           scan: (ctx, read) => root.commit(read, ctx),

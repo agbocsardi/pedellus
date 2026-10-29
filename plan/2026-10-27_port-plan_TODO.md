@@ -686,12 +686,15 @@ search yet.
 Added a rebuildable SQLite FTS5 index over Durable-retained user/assistant messages,
 tool names/arguments/results and committed reset boundaries, exposed as
 `Gateway.historySearch` (no UI, no episode summaries, no candidate reuse). The index
-lives in a separate `history-index.sqlite` file, reconciles bounded forward from
-persisted entry fingerprints and progress, reports lag/coverage, chunks long text,
-and rejects stale/replaced-store/mapping-changed cursors. Offline synthetic probes
-covered scopes, role filters, reset boundaries, long-text chunks, tool-call IDs,
-pagination under appends, store-identity rotation, explicit lag, file mode, reopen
-and a real faux-provider Gateway with an injected store ID. Typecheck, 155 behavior, 9 execution and 88 offline
+lives in a separate `nanobot-history-index.sqlite` file, reconciles bounded forward from
+persisted entry fingerprints and progress, reports lag/coverage/truncation/edits,
+chunks long text with bounded per-entry generation and per-entry writes, and rejects
+stale/replaced-store/mapping-changed cursors. `:channel-state` remains explicitly
+excluded in addition to positive chat-history classification. Offline synthetic
+probes covered scopes, role filters, reset boundaries, long-text chunks, tool-call
+IDs, pagination under appends, store-identity rotation, explicit lag and byte/time
+bounds, file mode, source-path alias guard, reopen and a real faux-provider Gateway
+with an injected store ID and a populated channel-state conversation. Typecheck, 155 behavior, 9 execution and 88 offline
 acceptance checks passed. Episode catalog/summary work and summary search remain open.
 
 ### 2026-10-29 — history design agreement; implementation remains paused
