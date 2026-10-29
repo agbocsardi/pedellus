@@ -60,6 +60,14 @@ export interface TerminalToolGrantsHost {
   revoke(names: readonly string[]): Promise<readonly TerminalToolGrant[]>;
 }
 
+/** Optional host-owned workspace-context refresh for the current conversation. */
+export interface TerminalContextRefreshHost {
+  /** False when the gateway has no configured context snapshot provider. */
+  readonly available: boolean;
+  /** Re-capture this conversation's host snapshot; resolves with its skill count. */
+  refresh(): Promise<{ readonly skills: number }>;
+}
+
 export interface TerminalIO {
   /** Each item is a completed line; the source owns any memory bound before yielding it. */
   readonly input: AsyncIterable<string>;
@@ -73,6 +81,8 @@ export interface TerminalIO {
   readonly modelSelection?: TerminalModelSelectionHost;
   /** Optional host-owned coding-tool grants; standalone terminal callers remain read-only without it. */
   readonly toolGrants?: TerminalToolGrantsHost;
+  /** Optional host-owned workspace-context refresh; standalone callers leave /refresh unavailable. */
+  readonly contextRefresh?: TerminalContextRefreshHost;
 }
 
 type InboxView = { items?: readonly { mode?: string }[] };
@@ -494,6 +504,30 @@ export async function runTerminalConversation(
     }
   };
 
+  const refreshContext = async (args: string): Promise<void> => {
+    if (args.trim()) { await notice("Usage: /refresh", true); return; }
+    const host = io.contextRefresh;
+    if (!host || !host.available) {
+      await notice("Workspace context is not configured; /refresh is unavailable. Set workspaceContext in the config and restart.", true);
+      return;
+    }
+    let skills: number;
+    try {
+      ({ skills } = await host.refresh());
+    } catch (error) {
+      if (error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy")) {
+        await notice("Context refresh rejected: this conversation is busy. Retry when it is idle.", true);
+      } else {
+        await notice("Context refresh failed; the previous snapshot is still in effect.", true);
+      }
+      return;
+    }
+    await notice([
+      `Workspace context refreshed for this conversation: ${skills} skill(s) in the on-demand table.`,
+      "The refreshed summary and skill table apply to the next model request; skill bodies remain on demand.",
+    ].join("\n"));
+  };
+
   const showTools = async (args: string): Promise<void> => {
     if (args.trim()) { await notice("Usage: /tools", true); return; }
     const host = io.toolGrants;
@@ -666,11 +700,12 @@ export async function runTerminalConversation(
     switch (name) {
       case "help":
         await notice([
-          "Local commands: /help /status /history [count] /model [provider modelId [thinkingLevel]] /tools /grant <tool[,tool]> <duration> /revoke <tool[,tool]|all> /compact /abort /steer TEXT /after TEXT",
+          "Local commands: /help /status /history [count] /model [provider modelId [thinkingLevel]] /tools /grant <tool[,tool]> <duration> /revoke <tool[,tool]|all> /refresh /compact /abort /steer TEXT /after TEXT",
           "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
           "/abort uses native Durable semantics: it cancels foreground work and withdraws queued inputs.",
           io.modelSelection ? "/model lists the host allowlist; select with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
           io.toolGrants ? "/grant needs an explicit finite duration (for example /grant read,bash 30m); /tools lists ceiling and grants." : "Coding-tool grants are host-controlled and unavailable here.",
+          io.contextRefresh?.available ? "/refresh re-reads workspace context and skills for this conversation when it is idle." : "/refresh is unavailable without configured workspace context.",
         ].join("\n"));
         return;
       case "status":
@@ -685,6 +720,9 @@ export async function runTerminalConversation(
         return;
       case "tools":
         await showTools(args);
+        return;
+      case "refresh":
+        await refreshContext(args);
         return;
       case "grant":
         await grantTools(args);

@@ -96,6 +96,10 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
             gateway!.grantTools("cli:default", names.map((name) => ({ name, expiresAt })), context),
           revoke: (names) => gateway!.revokeTools("cli:default", names, context),
         },
+        contextRefresh: {
+          available: config.workspaceContext !== undefined,
+          refresh: () => gateway!.refreshContext("cli:default", context),
+        },
       });
     }
   } finally {

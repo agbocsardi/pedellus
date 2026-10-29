@@ -12,11 +12,11 @@ and locator; the body arrives only when the model calls the `skill` tool.
 
 Each conversation captures its skill snapshot once, when it is created or the
 Gateway reopens. A skill created or edited now is **not** visible in the current
-conversation unless the host offers an explicit refresh for it: the summary and
-the `skill` tool keep serving the captured set. Never assume such a control
-exists, and never try to verify a new skill here. The host must also have enabled
-discovery with `workspaceContext.skills`; without it, no workspace skill appears
-anywhere.
+conversation unless the host offers an explicit refresh for it (the local CLI
+exposes `/refresh`): the summary and the `skill` tool keep serving the captured
+set. Never assume such a control exists, and never try to verify a new skill
+here. The host must also have enabled discovery
+with `workspaceContext.skills`; without it, no workspace skill appears anywhere.
 
 ## Create a workspace skill
 
@@ -35,8 +35,8 @@ anywhere.
    tool for it when this conversation's captured set cannot contain it.
 6. Tell the user the skill is not available yet. It becomes visible in a new
    conversation, after the Gateway is reopened, or, only if the host exposes an
-   explicit refresh control, after that refresh; a conversation never re-reads
-   the skill directory on its own.
+   explicit refresh control (the local CLI's `/refresh`), after that refresh; a
+   conversation never re-reads the skill directory on its own.
 
 ## Frontmatter this port accepts
 
@@ -83,5 +83,5 @@ metadata: {"nanobot":{"requires":{"bins":["ssh"]}}}
 - Do not claim the skill is active in this conversation, automatic discovery,
   `always` bodies, YAML block metadata, or subagent execution.
 - The real test is the next conversation (or this one after a host-exposed
-  explicit refresh): its summary should list the skill and the `skill` tool
-  should return the body. Say so instead of asserting it now.
+  explicit refresh such as `/refresh`): its summary should list the skill and
+  the `skill` tool should return the body. Say so instead of asserting it now.

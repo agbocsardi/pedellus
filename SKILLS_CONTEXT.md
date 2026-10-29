@@ -129,10 +129,10 @@ control:
   refreshable; it keeps its snapshot until the next run or Gateway reopen.
 
 The trigger belongs to the host. This Gateway API does not watch files or
-refresh on its own, and the local CLI wiring is separate from this runtime
-change: a terminal control can call `gateway.refreshContext("cli:default",
-context)` between submissions to make a newly created skill usable in the same
-conversation.
+refresh on its own. The local CLI exposes it as `/refresh` for `cli:default`
+when `workspaceContext` is configured; the terminal calls
+`gateway.refreshContext("cli:default", context)` between submissions, so a newly
+created skill becomes usable in the same conversation without a restart.
 
 `requires.env` is evaluated against the environment the guarded shell actually
 exports — `PATH`, `HOME`, `TMPDIR`, `LANG`, `TERM`, `PYTHONUNBUFFERED` — built by

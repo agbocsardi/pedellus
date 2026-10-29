@@ -87,7 +87,9 @@ builtin body on demand ([details](./SKILLS_CONTEXT.md)). Neither loader
 provides full Python memory or skills parity. The local CLI/gateway host opts in
 only when the config contains a `workspaceContext` section
 (`workspaceContext.memoryFiles` and optional `workspaceContext.memoryManifest`,
-default off); it contributes no identity. Prepared requests containing old Nanobot context
+default off); it contributes no identity. The local CLI exposes `/refresh` to
+re-capture that conversation's context and skills when it is idle. Prepared
+requests containing old Nanobot context
 conservatively block recovery. With the gateway stopped and an existing database, an
 owner can inspect blocked task IDs/fingerprints and explicitly cancel them without
 resuming or rewriting the prepared request; see
