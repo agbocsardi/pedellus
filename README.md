@@ -4,10 +4,8 @@ TypeScript port requiring Node >=22.19 and the pinned Pi 1.4.0 packages. This is
 
 The [current plan and consolidation snapshot](plan/2026-10-27_port-plan_TODO.md)
 are the scope/status authority. Core coding tools, durable grants, optional bwrap
-shell, opt-in memory/skills and compaction plumbing are integrated. Cron has a
-reviewed internal timer/calendar foundation; **agent-callable scheduling is not yet
-wired**. Cron needs no user UI or direct scheduling commands.
-New implementation is paused for consolidation; WebUI, migration and cutover are
+shell, opt-in memory/skills and compaction plumbing are integrated. Agent-callable
+cron scheduling and isolated Telegram delivery are available. WebUI, migration and cutover are
 deferred. The [older roadmap](plan/2026-10-26_full-port_TODO.md) preserves evidence,
 not a standing implementation queue.
 
@@ -22,6 +20,13 @@ node dist/cli.js --config /path/to/config.json
 ```
 
 Without Telegram settings, the CLI starts a single local prompt session. With Telegram enabled, it delegates to the restricted adapter (explicit decimal user allowlist only). Do not use live bot polling for offline checks. Known startup/configuration failures print fixed, value-free diagnostics; unexpected failures stay suppressed. See [interactive CLI](./CLI.md#startup-diagnostics).
+
+Closed episodes are summarized in the background by default using the conversation's current
+model when the job starts. This makes provider calls and can incur costs. To use a different
+model from `allowedModels`, set `episodeSummary.model` to `{ "provider": "...", "modelId": "..." }`;
+set `episodeSummary.enabled` to `false` to disable summaries. Already-closed episodes are not
+backfilled automatically. Short cache retention is requested, but cache reuse is not guaranteed;
+see [episode summaries](./HISTORY.md#episode-summaries).
 
 ## Runtime/recovery
 
@@ -55,9 +60,8 @@ schedules and IANA time zones. Timers arm their successors independently of mode
 execution. Setting `cron: { enabled: true }` installs the foundation and a
 model-callable `cron` tool (`add`/`list`/`remove`) in `openGateway`; both are also
 exported through the SDK barrel. The agent schedules work when the user asks; there
-is no direct cron UI or user scheduling command. Outbound/silent channel delivery
-remains missing, and the unmerged Telegram outbound candidate is not part of this
-checkout's runtime.
+is no direct cron UI or user scheduling command. Successful isolated runs can deliver through
+the durable Telegram outbox; origin-mode channel delivery and live-channel acceptance remain open.
 
 ## Opt-in Code Mode SDK
 

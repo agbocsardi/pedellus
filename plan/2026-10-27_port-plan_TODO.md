@@ -85,7 +85,7 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
 - [x] Store identity, reset-delimited episode boundaries and durable pending-summary state (2026-10-29; foundation only, no summary pass).
 - [x] Implement rebuildable message/tool search over the read-only transcript, with committed reset boundaries (2026-10-29; no episode-summary index yet).
 - [x] Implement and independently review the opt-in background-summary task: malformed source handling, version migration, durable retry/backoff across abort, and chat-scope enforcement.
-- [ ] Wire a validated summary model/spend policy into the normal assistant path; generate post-reset summaries with visible coverage, retry and explicit backfill policy.
+- [x] Enable post-reset summaries by default using the conversation's current model when the job starts; allow an explicit model override or disabling in config. Existing closed episodes are not automatically backfilled.
 - [x] Index ready episode titles/summaries in the rebuildable derived index and expose cross-source topic
       discovery plus summary reading with provenance and original-source drilldown through the agent-facing
       `history` tool (2026-10-29; summary text is derived navigation, original entries remain the evidence;
@@ -115,7 +115,7 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 
 | Area | Integrated / usable | Missing or limited |
 | --- | --- | --- |
-| CLI / Gateway / SQLite | Local streaming CLI, persisted sessions/model choices, recovery controls, native `/new` context reset, exclusive store lock and WAL/FULL | `/new` retains entries; summaries require host API opt-in, not normal startup; no everyday-assistant acceptance or backup/restore drill |
+| CLI / Gateway / SQLite | Local streaming CLI, persisted sessions/model choices, recovery controls, native `/new` context reset, exclusive store lock and WAL/FULL | `/new` retains entries; background summaries can incur provider costs; no everyday-assistant acceptance or backup/restore drill |
 | Providers | Nine configured native aliases; real OpenCode Go Gateway tool turns; Anthropic-family Umans proof | Umans proof is not Gateway support; full provider/fallback matrix unproven |
 | Coding tools | Native `read`/`write`/`edit`/`bash`, host ceiling, expiring/revocable per-session grants; local CLI `/tools`, `/grant` and `/revoke` | Ceiling defaults empty; Telegram has no grant command |
 | Shell backend | Guarded actual workspace; optional `toolSandbox: bwrap`, off by default | Network remains available; file tools stay guarded host APIs; no hostile isolation/quota claim |
@@ -123,7 +123,7 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 | Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool; curated port builtins in `skills` (memory, memory-defrag, skill-creator, github, cron) behind an explicit `builtinSkillsRoot` | `my` has no port runtime; no inventory-count cap, but finite prompt/output bounds visibly truncate |
 | Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
 | Cron | Opt-in `cron.enabled`: agent-callable scheduling, origin or isolated runs, bounded grants, workspace context and durable Telegram delivery for successful isolated runs | Origin-mode channel delivery absent; failures and empty results silent externally; disabled cron blocks timers; live acceptance remains open |
-| History | Durable store identity, reset-delimited episode reads, opt-in durable background summaries, message/tool/summary search and default agent-facing browsing | Summaries require host API opt-in; no real-model fidelity evidence; no cross-source episode pagination; clone/restore provenance limitations remain |
+| History | Durable store identity, reset-delimited episode reads, default background summaries, message/tool/summary search and agent-facing browsing | Summaries use the current model unless overridden; no real-model fidelity evidence or cross-source episode pagination; clone/restore provenance limitations remain |
 | Telegram | Restricted allowlisted inbound/reply adapter, `/new`/`/abort`/`/help`, durable send intent and isolated-cron outbox | No live channel acceptance, origin-mode cron delivery, general pairing or media parity; unknown sends require reconciliation |
 | Code Mode / delegation | Reviewed opt-in QuickJS Code Mode/tool-search SDK | Not Gateway-installed; no product background-subagent or worker interface |
 | Other surfaces | Read-only usage and inert archival helpers exist | Discord candidates parked; Email/WebSocket, MCP, web/media tools not integrated |
@@ -704,6 +704,15 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-29 — current-model summary default
+
+Enabled background summaries by default. Each job captures the conversation's current
+model when it starts and retains it across retries; `episodeSummary.model` overrides it
+and `episodeSummary.enabled: false` disables it. Default activation includes the open
+episode but not already-closed history. Short provider cache retention is requested;
+cache hits and real-model fidelity remain unverified. Synthetic model-selection,
+config override and activation checks passed.
 
 ### 2026-10-29 — Telegram controls and isolated cron delivery
 

@@ -28,13 +28,10 @@
  *   own concern: the native restart limit parks the task, which `drainEpisodeSummaries` reports (with
  *   the task ID) so a host can call `Harness.retryTask()`.
  *
- * Opt-in and backfill policy:
- * - Without `OpenGatewayOptions.episodeSummary` this module does not exist: no extension, no job and
- *   no provider call is possible.
- * - Enabling summaries records a durable per-conversation watermark (the newest entry at that moment).
- *   Episodes that started at or before it are never queued automatically, so turning the pass on
- *   cannot spend on history that was already there, including history the catalog had not yet
- *   reconciled.
+ * Activation and backfill policy:
+ * - The host can disable this module; when disabled it queues no new work or provider calls.
+ * - Activation records a durable per-conversation watermark. The default host policy includes the
+ *   currently open episode but does not automatically backfill already-closed episodes.
  * - `backfill: "pending"` (or an explicit `backfillEpisodeSummaries` call) is the separate, deliberate
  *   opt-in to already-closed episodes: a bounded, resumable scan of the catalog's own episode listing
  *   queues every closed episode without a ready summary, whether it was catalogued before opt-in or
@@ -42,7 +39,7 @@
  * - `retryEpisodeSummary` recreates a job from the closed episode document, so a failed or evicted job
  *   is never unrecoverable.
  *
- * Deliberately absent: CLI/channel surfaces, summary search, a summary index, and any default model.
+ * The host supplies the model policy; each started job persists its choice across retries.
  */
 import type { Context, JsonValue } from "@earendil-works/chord";
 import type { AssistantMessage, Message, ModelThinkingLevel } from "@earendil-works/pi-ai";
@@ -108,6 +105,7 @@ export interface EpisodeSummaryJobInput {
   readonly [key: string]: JsonValue;
   readonly startEntryId: number;
   readonly summarizerVersion: number;
+  readonly selectedModel?: { readonly [key: string]: JsonValue; readonly provider: string; readonly modelId: string; readonly thinkingLevel: string | null };
 }
 
 export interface EpisodeSummaryJobResult {
@@ -326,14 +324,21 @@ export type EpisodeSummaryRetry =
 
 export interface EpisodeSummaryOptions {
   /**
-   * Explicit, host-approved provider and model. There is no default: without one this module is never
-   * created, so no job exists and no provider call is possible.
+   * Fallback or explicit host-approved provider and model for this task extension.
    */
   readonly model: {
     readonly provider: string;
     readonly modelId: string;
     readonly thinkingLevel?: ModelThinkingLevel;
   };
+  /** Resolve the model when a job first starts; its selection is persisted across retries. */
+  readonly resolveModel?: (tx: Tx, conversationId: ConversationId) => Promise<{
+    readonly provider: string; readonly modelId: string; readonly thinkingLevel: ModelThinkingLevel | null;
+  }>;
+  /** Recheck the host's current model allowlist before each provider call. */
+  readonly allowModel?: (provider: string, modelId: string) => boolean;
+  /** Include the currently open episode on activation without backfilling already-closed episodes. */
+  readonly includeOpenAtActivation?: boolean;
   /** How already-closed episodes enter the queue. Default `none`. */
   readonly backfill?: EpisodeSummaryBackfillMode;
   /**
@@ -472,6 +477,15 @@ export function createEpisodeSummaries(options: EpisodeSummaryOptions): EpisodeS
     ...(model.thinkingLevel === undefined ? {} : { thinkingLevel: model.thinkingLevel }),
   };
 
+  const modelFor = (input: EpisodeSummaryJobInput) => {
+    const selected = input.selectedModel;
+    return selected === undefined ? configured : {
+      provider: selected.provider,
+      modelId: selected.modelId,
+      ...(selected.thinkingLevel === null ? {} : { thinkingLevel: selected.thinkingLevel as ModelThinkingLevel }),
+    };
+  };
+
   /** Read the episode document this job may write; the catalog alone creates family members. */
   const episodeDoc = (tx: Tx, conversationId: ConversationId, startEntryId: number) => {
     const key = String(startEntryId);
@@ -535,9 +549,13 @@ export function createEpisodeSummaries(options: EpisodeSummaryOptions): EpisodeS
     reviveOrphanedClaims(queue, (taskId) => outcomes.get(taskId) ?? "gone", now);
     const next = nextQueuedJob(queue);
     if (next === undefined) return { taskId: null, started: false };
+    const selectedModel = next.selectedModel ?? (options.resolveModel === undefined
+      ? { provider: configured.provider, modelId: configured.modelId, thinkingLevel: configured.thinkingLevel ?? null }
+      : await options.resolveModel(tx, conversationId));
+    next.selectedModel = selectedModel;
     const taskId = await tx.createTask(
       summaryTask,
-      { startEntryId: next.startEntryId, summarizerVersion: next.summarizerVersion },
+      { startEntryId: next.startEntryId, summarizerVersion: next.summarizerVersion, selectedModel },
       { ownership: { kind: "conversation" }, conversationId, background: true },
     );
     next.status = "claimed";
@@ -736,8 +754,10 @@ export function createEpisodeSummaries(options: EpisodeSummaryOptions): EpisodeS
     record.endEntryId = episode.endEntryId;
     record.summarizerVersion = input.summarizerVersion;
     record.status = "ready";
-    record.provider = configured.provider;
-    record.modelId = configured.modelId;
+    if (input.selectedModel !== undefined || record.attempts === 0) {
+      record.provider = modelFor(input).provider;
+      record.modelId = modelFor(input).modelId;
+    }
     record.title = title;
     record.summary = stored;
     record.coverage = checkpoint.coverage;
@@ -768,8 +788,10 @@ export function createEpisodeSummaries(options: EpisodeSummaryOptions): EpisodeS
     record.endEntryId = episode.endEntryId;
     record.summarizerVersion = input.summarizerVersion;
     record.status = "failed";
-    record.provider = configured.provider;
-    record.modelId = configured.modelId;
+    if (input.selectedModel !== undefined || record.attempts === 0) {
+      record.provider = modelFor(input).provider;
+      record.modelId = modelFor(input).modelId;
+    }
     record.title = null;
     record.summary = null;
     record.coverage = checkpoint.coverage;
@@ -928,7 +950,17 @@ export function createEpisodeSummaries(options: EpisodeSummaryOptions): EpisodeS
           return;
         }
         const chunk = state.chunks[state.chunkIndex]!;
-        const selected = runtime.models.getModel(configured.provider, configured.modelId);
+        // Older persisted tasks did not carry a model in their input. Once an attempt has
+        // started, keep its recorded model rather than changing models mid-summary on upgrade.
+        const previous = task.input.selectedModel === undefined
+          ? await runtime.snapshot(EpisodeSummaryDoc, runtime.conversationId,
+            episodeSummaryKey(task.input.startEntryId, task.input.summarizerVersion), context)
+          : undefined;
+        const configured = previous !== undefined && previous.attempts > 0 && previous.provider && previous.modelId
+          ? { provider: previous.provider, modelId: previous.modelId, thinkingLevel: modelFor(task.input).thinkingLevel }
+          : modelFor(task.input);
+        const selected = options.allowModel !== undefined && !options.allowModel(configured.provider, configured.modelId)
+          ? undefined : runtime.models.getModel(configured.provider, configured.modelId);
         const levels = selected === undefined ? [] : getSupportedThinkingLevels(selected);
         const unsupported = selected !== undefined
           && configured.thinkingLevel !== undefined
@@ -1049,7 +1081,7 @@ export function createEpisodeSummaries(options: EpisodeSummaryOptions): EpisodeS
         let responseLost = false;
         try {
           message = await runtime.models.completeSimple(selected, { messages }, {
-            cacheRetention: "none",
+            cacheRetention: "short",
             maxTokens: EPISODE_SUMMARY_SOURCE_LIMITS.maxTokens,
             signal: runtime.signal,
             telemetry: context.telemetry,
@@ -1294,7 +1326,10 @@ export function createEpisodeSummaries(options: EpisodeSummaryOptions): EpisodeS
   return {
     extension: defineExtension({ name: EPISODE_SUMMARY_EXTENSION_NAME, tasks: [summaryTask] }),
 
-    initialize(harness, conversationId, context) {
+    async initialize(harness, conversationId, context) {
+      const open = options.includeOpenAtActivation && options.listEpisodes !== undefined
+        ? (await options.listEpisodes(conversationId, { limit: 1 }, context)).episodes.find((episode) => episode.status === "open")
+        : undefined;
       return harness.commit(async (tx) => {
         const queue = await tx.doc(EpisodeSummaryQueueDoc, conversationId);
         if (queue.sinceEntryId !== null) return;
@@ -1302,7 +1337,7 @@ export function createEpisodeSummaries(options: EpisodeSummaryOptions): EpisodeS
           { conversationId, order: "descending" },
           1,
         );
-        queue.sinceEntryId = tail.items[0]?.id ?? 0;
+        queue.sinceEntryId = open === undefined ? (tail.items[0]?.id ?? 0) : Math.max(0, open.startEntryId - 1);
       }, context);
     },
 
@@ -1455,9 +1490,9 @@ export function createEpisodeSummaries(options: EpisodeSummaryOptions): EpisodeS
         currentTaskId,
         blocked,
         stalled,
-        provider: configured.provider,
-        modelId: configured.modelId,
-        thinkingLevel: configured.thinkingLevel ?? null,
+        provider: options.resolveModel === undefined ? configured.provider : "conversation",
+        modelId: options.resolveModel === undefined ? configured.modelId : "current",
+        thinkingLevel: options.resolveModel === undefined ? configured.thinkingLevel ?? null : null,
         summarizerVersion: EPISODE_SUMMARIZER_VERSION,
         backfill: backfillMode,
         sinceEntryId: document?.sinceEntryId ?? null,

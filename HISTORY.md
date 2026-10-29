@@ -2,7 +2,7 @@
 
 Two derived layers sit over Durable's retained transcript:
 
-- `src/history/summary-task.ts` is an opt-in host-configured durable background summary pass.
+- `src/history/summary-task.ts` is a durable background summary pass, enabled by default.
 - `src/history/index.ts` is a rebuildable message/tool and episode-summary index bound to the
   committed store identity.
 
@@ -470,18 +470,22 @@ record; the number of rows still grows with the number of episodes, like the mes
 ## Episode summaries
 
 `src/history/summary-task.ts` runs one durable background task chain per mapped chat
-conversation and writes a derived summary for each closed, non-empty episode. It is
-host-opt-in: `OpenGatewayOptions.episodeSummary` must name an explicit provider/model that is
-already in `allowedModels`, otherwise the extension is never installed, no job is queued, and no
-provider call is possible. There is no config field, CLI or channel surface, and no default model.
+conversation and writes a derived summary for each closed, non-empty episode. Summaries are enabled
+by default and use the conversation's selected model when a job starts. The choice is persisted for
+that job's retries and rechecked against `allowedModels` before every call. Set
+`"episodeSummary": { "model": { "provider": "...", "modelId": "..." } }` to use an allowed
+model instead, or `"episodeSummary": { "enabled": false }` to disable summary work. The Gateway's
+explicit `OpenGatewayOptions.episodeSummary` remains a host override.
 
-**Opt-in and backfill policy.**
+Provider requests use short cache retention where supported, but this separate summary prompt does
+not necessarily share a prefix with the conversation; cache hits are not guaranteed. Background
+summaries can incur provider costs.
 
-- Enabling summaries records a durable per-conversation watermark (`sinceEntryId`, the newest entry
-  at that moment; `0` for a conversation created afterwards). Episodes that started at or before it
-  are never queued automatically, so turning the pass on cannot spend on history that was already
-  there — including history the catalog had not reconciled yet. Consequence: the episode that is
-  open at opt-in keeps its older start and is not summarized automatically.
+**Activation and backfill policy.**
+
+- Default activation includes the currently open episode when it closes, but does not automatically
+  summarize already-closed episodes. A durable per-conversation watermark preserves this boundary.
+  The explicit Gateway host override retains its prior activation watermark behavior.
 - `backfill: "none"` (default) keeps that boundary. `backfill: "pending"`, or an explicit
   `backfillEpisodeSummaries` call, is the deliberate opt-in to already-closed episodes: a bounded,
   resumable scan of the catalog's own episode listing (`backfillBeforeEntryId`, four pages per pass)
@@ -501,8 +505,8 @@ provider call is possible. There is no config field, CLI or channel surface, and
   as obsolete in its first commit, so the call says so instead of promising work it cannot do, and it
   leaves both the queue and the episode record untouched.
 - `historySummaryQueue` reports the policy (`backfill`, `sinceEntryId`, `backfillBeforeEntryId`,
-  `backfillCompleteAtMs`), the counters, the configured model, any blocked chain and any stranded
-  chain, so an operator can see why nothing is being summarized.
+  `backfillCompleteAtMs`), the counters, the model policy (`conversation/current` for the default),
+  any blocked chain and any stranded chain, so an operator can see why nothing is being summarized.
 
 **Durability and ordering.**
 
@@ -664,8 +668,8 @@ session key, and the summary text is model output over untrusted source.
   ready summary is not replaced after a summarizer version bump.
 - A ready episode is never re-summarized, at any summarizer version. Replacing a ready summary after a
   version bump would need an explicit re-summarize operation, which does not exist yet.
-- The opt-in watermark means history is summarized only through an explicit backfill; the episode
-  open at opt-in is included only that way.
+- Already-closed history is summarized only through explicit backfill or retry. Default activation
+  includes the currently open episode; the explicit Gateway override keeps its older watermark behavior.
 - A parked chain keeps its jobs claimed until a host calls `Harness.retryTask(taskId)` or retries the
   failed job; nothing revives a parked task automatically.
 - Backfill is bounded and resumable rather than exhaustive in one call; a full queue, a catalog that

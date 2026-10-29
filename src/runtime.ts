@@ -145,9 +145,8 @@ export interface OpenGatewayOptions {
    */
   readonly agentHistory?: boolean;
   /**
-   * Explicit opt-in for the durable episode-summary pass. There is no default and no config
-   * field: a host must name a provider/model that is already in `allowedModels`, otherwise no
-   * summary extension is installed, nothing is queued and no provider call can happen.
+   * Optional host override for the durable episode-summary pass. Without an override, summaries
+   * use the current conversation model; `episodeSummary.enabled: false` in config disables them.
    */
   readonly episodeSummary?: {
     readonly provider: string;
@@ -238,7 +237,7 @@ export interface Gateway {
   reconcileHistoryEpisodes(sessionKey: string, context: Context): Promise<EpisodeReconcileReport>;
   /**
    * One closed episode's derived summary record (status, coverage, usage, text), or undefined when
-   * no pass finished for it. Requires `OpenGatewayOptions.episodeSummary`; without it this fails
+   * no pass finished for it. Requires summaries to be enabled; when disabled this fails
    * closed. The record is derived data: the original entries stay the authority, and the text is
    * model output over untrusted transcript content.
    */
@@ -448,10 +447,17 @@ export async function openGateway(config: PortConfig, context: Context, options:
     throw new TypeError("agentHistory must be a boolean");
   }
   const defaultThinkingLevel = config.thinkingLevel ?? "off";
-  // Episode summaries are host-opt-in and default to nothing: the named provider/model must
-  // already be an approved choice in `allowedModels`, so a summary can never spend on a model an
-  // operator did not approve, and a host that names nothing gets no summary extension at all.
-  const episodeSummaryModel = options.episodeSummary;
+  // A configured override must be allowed. Otherwise each job captures the conversation's
+  // current model when it starts; old history is not backfilled automatically.
+  const configuredSummaryChoice = config.episodeSummary?.model === undefined
+    ? undefined : choicesByConfigured.get(modelKey(config.episodeSummary.model));
+  if (config.episodeSummary?.model !== undefined && configuredSummaryChoice === undefined) {
+    throw new StartupDiagnosticError("model", { detail: "episodeSummary.model must be included in allowedModels" });
+  }
+  if (options.episodeSummary === null) throw new StartupDiagnosticError("model", { detail: "episodeSummary must be an object" });
+  const episodeSummaryModel: OpenGatewayOptions["episodeSummary"] = options.episodeSummary ?? (config.episodeSummary?.enabled === false
+    ? undefined : configuredSummaryChoice?.native ?? defaultChoice.native);
+  const useConversationSummaryModel = options.episodeSummary === undefined && configuredSummaryChoice === undefined;
   if (episodeSummaryModel !== undefined) {
     if (episodeSummaryModel === null || typeof episodeSummaryModel !== "object"
       || Array.isArray(episodeSummaryModel)) {
@@ -826,6 +832,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
               : { thinkingLevel: episodeSummaryModel.thinkingLevel }),
           },
           ...(episodeSummaryModel.backfill === undefined ? {} : { backfill: episodeSummaryModel.backfill }),
+          ...(useConversationSummaryModel ? {
+            resolveModel: async (tx: Tx, conversationId: ConversationId) => {
+              const state = await tx.doc(AgentDoc, conversationId);
+              const selected = choiceFromState(state) ?? defaultChoice;
+              return { ...selected.native, thinkingLevel: null };
+            },
+          } : {}),
+          allowModel: (provider: string, modelId: string) => choicesByNative.has(modelKey({ provider, modelId })),
+          includeOpenAtActivation: options.episodeSummary === undefined,
           // Backstop: a job whose conversation is not chat scope never reaches a provider call.
           scope: (tx: Tx, conversationId: ConversationId): Promise<ChatScopeExclusion | undefined> =>
             readChatScope((id) => tx.conversation(id), conversationId, root.id),

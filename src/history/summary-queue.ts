@@ -106,6 +106,8 @@ export interface EpisodeSummaryJob {
   retryAtMs: number | null;
   /** Last classified failure of this job, or null. Never provider text. */
   lastError: EpisodeSummaryFailure | null;
+  /** Model fixed when this job first starts, retained across retries and restarts. */
+  selectedModel?: { readonly [key: string]: JsonValue; readonly provider: string; readonly modelId: string; readonly thinkingLevel: string | null };
   /** Worker tasks that ended in a runtime fault; bounds automatic recovery. */
   faults: number;
   updatedAtMs: number;

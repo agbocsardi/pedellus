@@ -15,6 +15,9 @@
   "cron": {
     "enabled": false
   },
+  "episodeSummary": {
+    "enabled": true
+  },
   "credentials": {
     "anthropic": "ANTHROPIC_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",

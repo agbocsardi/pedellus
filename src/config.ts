@@ -97,6 +97,8 @@ export interface PortConfig {
   toolSandbox?: "host" | "bwrap";
   /** Internal agent scheduling. Absent or disabled leaves the runtime without cron. */
   cron?: CronConfig;
+  /** Automatic episode summaries; by default use the conversation's current model. */
+  episodeSummary?: { readonly enabled?: boolean; readonly model?: ModelReference };
   thinkingLevel?: ModelThinkingLevel;
   extraAllowedDirs?: readonly string[];
   bwrapPath?: string;
@@ -288,6 +290,23 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   }
   if (raw.cron !== undefined) {
     Object.assign(config, { cron: cronConfig(raw.cron) });
+  }
+  if (raw.episodeSummary !== undefined) {
+    const summary = object(raw.episodeSummary, "episodeSummary");
+    for (const key of Object.keys(summary)) {
+      if (key !== "enabled" && key !== "model") throw new Error(`Unknown episodeSummary field: ${key}`);
+    }
+    if (summary.enabled !== undefined && typeof summary.enabled !== "boolean") {
+      throw new Error("episodeSummary.enabled must be a boolean");
+    }
+    const summaryModel = summary.model === undefined ? undefined : modelReference(summary.model, "episodeSummary.model");
+    if (summaryModel !== undefined && !allowedModels.some((choice) => modelKey(choice) === modelKey(summaryModel))) {
+      throw new Error("episodeSummary.model must be included in allowedModels");
+    }
+    config.episodeSummary = {
+      ...(summary.enabled === undefined ? {} : { enabled: summary.enabled }),
+      ...(summaryModel === undefined ? {} : { model: summaryModel }),
+    };
   }
   if (raw.thinkingLevel !== undefined) {
     if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(raw.thinkingLevel))) throw new Error("Invalid thinkingLevel");
