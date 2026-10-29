@@ -487,8 +487,10 @@ currently makes no summary. Independent synthetic review verified busy ordering,
 SQLite reopen and authority. Owner prefers native retention, message-only search and
 browsing across all authenticated channels in this single-tenant system, with a
 summary generated after each `/new`; summary scheduling/search remain future work.
-Owner also requested Telegram `/restart` with automatic build and a separate admin
-allowlist; design and implementation are in progress, not yet integrated.
+Origin-mode scheduled turns observed by the attached CLI now display their final
+answers (`6c72388`, `dd84509`); isolated runs still have no outbox. Owner also
+requested Telegram `/restart` with automatic build and a separate admin allowlist;
+design and implementation are in progress, not yet integrated.
 
 ### 2026-10-29 — local CLI grants and context refresh
 

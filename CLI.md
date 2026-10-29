@@ -42,14 +42,15 @@ loading for a recovery invocation still uses the fixed startup messages above.
 An `origin`-mode cron job submits its turn into the same `cli:default`
 conversation. When an attached CLI observes a run whose inputs were not admitted
 by this terminal process, it prints that run's committed final assistant text
-once when the run ends. This also covers a run resumed by a CLI started after it
-was admitted, and queued turns that hand over directly to the next run without
-an idle frame: each run is attributed by its own inputs and generation task, so
+once when the run ends. This includes queued turns that hand over directly to
+the next run without an idle frame: each observed run is attributed by its own
+inputs and generation task, so
 an earlier answer is not replaced by a later one.
 
 The CLI does not stream an external run's partial text, and it does not replay an
-already-settled answer at startup; `/history` shows settled entries. A run that
-ends with a model error, an abort, a tool-only answer, no text, or no attributable
+already-settled answer at startup; a run already active at attachment may also
+be missed if no live update is observed. `/history` shows settled entries. A run that
+ends with a model error, an abort, a tool-call answer (even with narration), no text, or no attributable
 assistant entry produces a local notice instead of guessed text. The terminal
 does not retry or reorder queued turns; Durable's normal failed-run policy still
 governs whether a later queued turn runs after a failure. This is
