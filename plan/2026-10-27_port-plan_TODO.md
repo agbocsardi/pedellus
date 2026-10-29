@@ -489,8 +489,14 @@ browsing across all authenticated channels in this single-tenant system, with a
 summary generated after each `/new`; summary scheduling/search remain future work.
 Origin-mode scheduled turns observed by the attached CLI now display their final
 answers (`6c72388`, `dd84509`); isolated runs still have no outbox. Owner also
-requested Telegram `/restart` with automatic build and a separate admin allowlist;
-design and implementation are in progress, not yet integrated.
+requested Telegram `/restart` with automatic build and a separate admin allowlist.
+The unintegrated restart candidate `worker-tg-restart-ab803a34` (`8b06ec7`) is parked:
+repeat restarts fail, Node build isolation is weaker than claimed, and source stability
+and power-loss durability need design. The unintegrated message-history candidate
+`worker-history-read-252d9447` (`87bd269`) is also parked: cursors can cross a replaced
+store at the same path and Unicode normalization can invalidate continuations. Further
+history bounds and reporting issues are in its review. Both worktrees are preserved;
+no new fix pass was started after the owner requested convergence.
 
 ### 2026-10-29 — local CLI grants and context refresh
 
