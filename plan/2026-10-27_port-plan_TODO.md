@@ -68,8 +68,7 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
 - [x] Finish curated builtin skill compatibility/package review (parked).
       Landed on `feat/curated-builtin-skills`: `memory`, `memory-defrag`, `skill-creator`,
       `github`, `cron` adapted to shipped tools; `my` stays out with no runtime. The
-      skill-creator same-conversation verification defect is fixed: a new skill is only
-      visible in a new conversation or after a Gateway reopen.
+      skill-creator now documents explicit same-conversation refresh for new skills.
 - [ ] Record real-model memory/skill/compaction acceptance and A/B fixture results (W4).
 - [x] Connect internal agent cron: model-callable tool, runtime lifecycle and authorization.
       Integrated `287a5fbf5`. An independent review plus one worker fix pass found no blocker; the
@@ -99,9 +98,9 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 | --- | --- | --- |
 | CLI / Gateway / SQLite | Local streaming CLI, persisted sessions/model choices, recovery controls, exclusive store lock and WAL/FULL | `/new` deliberately unsupported; no everyday-assistant acceptance or backup/restore drill |
 | Providers | Nine configured native aliases; real OpenCode Go Gateway tool turns; Anthropic-family Umans proof | Umans proof is not Gateway support; full provider/fallback matrix unproven |
-| Coding tools | Native `read`/`write`/`edit`/`bash`, host ceiling, expiring/revocable per-session grants | Ceiling defaults empty; grant/revoke is an SDK host API, not a CLI/Telegram approval command |
+| Coding tools | Native `read`/`write`/`edit`/`bash`, host ceiling, expiring/revocable per-session grants; local CLI `/tools`, `/grant` and `/revoke` | Ceiling defaults empty; Telegram has no grant command |
 | Shell backend | Guarded actual workspace; optional `toolSandbox: bwrap`, off by default | Network remains available; file tools stay guarded host APIs; no hostile isolation/quota claim |
-| Context / memory | Opt-in bootstrap and selected files, topic manifest, on-demand read/write through granted tools | Markdown authoritative; context fixed until new session/reopen; unreadable memory directory can block reopen |
+| Context / memory | Opt-in bootstrap and selected files, topic manifest, on-demand read/write through granted tools; explicit local `/refresh` | Markdown authoritative; edits do not refresh automatically; unreadable memory directory can block reopen |
 | Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool; curated port builtins in `skills` (memory, memory-defrag, skill-creator, github, cron) behind an explicit `builtinSkillsRoot` | `my` has no port runtime; no inventory-count cap, but finite prompt/output bounds visibly truncate |
 | Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
 | Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling; a background run gets the origin's workspace context and `skill` tool; copied grants are bounded by current origin grants | No channel delivery or silence policy; disabling cron leaves persisted timers blocked; a run whose snapshot was evicted at the cap proceeds without context; a phase fault or crash before the terminal commit can retain bounded grants until reopen |
@@ -111,7 +110,8 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 
 An enabled skill tool supplies instructions only and does not require coding-tool grants.
 All effectful coding work still requires its own grant. Configuring a tool ceiling alone
-does not produce a tool-capable ordinary CLI or Telegram session.
+does not by itself produce a tool-capable ordinary CLI or Telegram session; local CLI users
+can explicitly grant tools within that ceiling for a finite duration.
 
 ## Remaining gates — ordered proposal, not a launch queue
 
@@ -321,8 +321,8 @@ provider turn using all four tools. Default remains host/off; W2 does not gate W
 
 Markdown is the memory source of truth; Durable owns runtime state, transcripts and
 compaction. Opt-in loaded context, topic manifest and file read/write, plus summary-only
-skills with on-demand bodies are integrated. Snapshots refresh at creation/reopen,
-not after an in-session file edit.
+skills with on-demand bodies are integrated. Snapshots refresh at creation/reopen
+or on explicit host refresh (local CLI `/refresh`), not automatically after an edit.
 
 Foundation verified: topic writes survive restart, skill discovery/body loading works,
 and an early fact crosses native compaction into a fresh process via a faux summarizer.
@@ -477,6 +477,17 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-29 — local CLI grants and context refresh
+
+Integrated local CLI `/tools`, `/grant` and `/revoke` controls (`d7e1d15`): grants
+remain explicit, expiring, ceiling-bounded and local to the CLI conversation. Added
+explicit Gateway context refresh and CLI `/refresh` (`e4b848b`, `57c6980`, `61a868e`),
+so skills created during a conversation can be discovered without reopening. Refresh
+rejects busy conversations and preserves grants. Independent reviews and synthetic
+probes covered authorization, refresh rollback, concurrent loads and CLI behavior;
+workers ran typecheck, 155 behavior, 9 execution and 88 offline acceptance checks.
+No live provider, credentials, personal workspace or channels were used.
 
 ### 2026-10-28 — real-model synthetic core acceptance passed on revised prompt
 
