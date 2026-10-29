@@ -12,13 +12,9 @@
   "workspaceContext": {
     "memoryFiles": ["memory/MEMORY.md"],
     "memoryManifest": true,
-    "skills": {
-      "disabledSkills": []
-    }
+    "skills": {}
   },
   "toolAllowlist": ["read", "write", "edit"],
-  "toolTimeoutSeconds": 60,
-  "toolSandbox": "host",
   "cron": {
     "enabled": true,
     "timeZone": "UTC"

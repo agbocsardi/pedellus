@@ -133,7 +133,7 @@ contracts using synthetic providers, temporary SQLite stores and crash/reopen
 fixtures. These do not establish full parity or production security. The
 standalone managed-copy experimental sandbox is not installed in the Gateway;
 resource quotas, approvals and filesystem confinement remain open. The opt-in
-[coding tools and grants](./TOOLS.md) register native tools over the guarded host
+[coding tools](./TOOLS.md) register native tools over the guarded host
 environment on the actual workspace; they are disabled by default and are not
 confinement. The optional [direct Bubblewrap shell](./DIRECT_BWRAP.md) narrows
 the shell mount view but is not a quota or hostile-tenant boundary.

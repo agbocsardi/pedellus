@@ -61,10 +61,11 @@ The shipped [`config.example.json`](./config.example.json) is the starting point
 | Key | Meaning here |
 | --- | --- |
 | `workspace` / `dataDir` | Workspace root and private state directory, both relative to the config file. |
-| `model` / `allowedModels` | Host default and allowlist. The pair must exist in the pinned catalog, so change both together ([providers](./PROVIDERS.md)). A chat's persisted `/model` choice can keep overriding the config default after a restart; clearing that choice is not a config edit. |
+| `model` / `allowedModels` | Host default and allowlist. The pair must exist in the pinned catalog, so change both together ([providers](./PROVIDERS.md)). A chat's persisted `/model` choice keeps overriding the config default after a restart, and a config change does not reset existing chat choices. |
+| `thinkingLevel` | Requested reasoning level where the allowed model supports it; it affects latency and cost. |
 | `workspaceContext.memoryFiles` | `["memory/MEMORY.md"]` is loaded into every turn; a missing named file fails closed. |
 | `workspaceContext.memoryManifest` | Lists the other `memory/*.md` topics for on-demand `read`; their bodies stay out of the prompt. |
-| `workspaceContext.skills.disabledSkills` | `[]`; workspace skills are discovered only because this section exists. |
+| `workspaceContext.skills` | Its presence opts into workspace skill discovery; `disabledSkills` can hide names. |
 | `toolAllowlist` | Config authority: these coding tools are enabled for authenticated mapped chats. `[]` or absent disables them. |
 | `cron` | Installs the model-facing `cron` tool; `timeZone: "UTC"` interprets calendar expressions without an explicit zone. |
 | `episodeSummary` | Closed episodes are summarized in the background with the conversation's current model. That makes provider calls and costs money; set `enabled: false` to turn it off. |
@@ -152,7 +153,7 @@ example. Add `telegram` as a top-level key beside the existing ones in
 - Adding the section switches the same gateway to Telegram polling instead of the
   local prompt. CLI and Telegram are alternative modes of one process, not
   simultaneous clients; each chat has its own conversation, context snapshot and
-  persisted model choice, but the same workspace and config ceiling.
+  persisted model choice, but the same workspace and configured tools.
 
 In an allowed private chat:
 
@@ -179,13 +180,13 @@ failure/delivery fault. See [cron](./CRON.md).
 ## 7. Optional: shell, sandbox, builtin skills
 
 - `bash`: add `"bash"` to `toolAllowlist` and restart. It runs on the real
-  workspace over a guarded environment; `toolTimeoutSeconds` is the default
-  timeout. Configure it only for users and channels you trust with a shell. See
-  [coding tools](./TOOLS.md).
-- `toolSandbox`: `"bwrap"` (with an absolute `bwrapPath`) runs shell commands in
-  a direct-workspace Bubblewrap view and fails closed when unavailable. It wraps
-  the shell only, and it is accidental-damage protection, not hostile-tenant
-  isolation. See [direct Bubblewrap](./DIRECT_BWRAP.md).
+  workspace over a guarded environment; add `toolTimeoutSeconds` (integer seconds)
+  when you want a different default timeout. Configure it only for users and
+  channels you trust with a shell. See [coding tools](./TOOLS.md).
+- `toolSandbox`: set `"toolSandbox": "bwrap"` with an absolute `bwrapPath` to run
+  shell commands in a direct-workspace Bubblewrap view; it fails closed when
+  unavailable. It wraps the shell only, and it is accidental-damage protection,
+  not hostile-tenant isolation. See [direct Bubblewrap](./DIRECT_BWRAP.md).
 - Builtin skills: `workspaceContext.skills.builtinSkillsRoot` needs an absolute
   path, so copying curated skills into `workspace/skills` is the portable route.
   See [curated builtin skills](./SKILLS_BUILTIN.md).
