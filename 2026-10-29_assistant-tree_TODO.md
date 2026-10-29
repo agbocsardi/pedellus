@@ -188,6 +188,12 @@ the setup now accepts “in ten minutes” without a model clock. Combined check
 Both Node test phases have an external 60s deadline with forced kill after 5s.
 Preset tests passed review and are registered; fixed their leaked deadline timer
 and the same leak in an older model-policy test. Combined suite: 165 behavior
-checks in 6.3s, 9 execution in 12s and 88 core acceptance checks. Origin-mode
-Telegram delivery is the last in-flight slice. No further work is starting this
-session; live-model/channel acceptance remains open.
+checks in 6.3s, 9 execution in 12s and 88 core acceptance checks.
+
+Integrated independently reviewed successful origin-mode Telegram delivery via
+the existing outbox, plus three focused tests. The final merged tree passes 168
+behavior checks in 8.4s, 9 execution checks in 12s and 88 core acceptance checks;
+the synthetic actual-Gateway/mocked-Telegram skill, memory, history and preset
+smoke also passes. No live provider or channel calls were made. T3 remains open:
+failed/empty job outcomes are not pushed, and live delivery/restart acceptance
+still needs owner approval. No further work is starting this session.

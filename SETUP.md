@@ -180,13 +180,11 @@ unsupported-attachment notice (caption text is still passed as input), and
 groups or other bots never reach the assistant.
 
 Reminders are ordinary agent scheduling through the configured `cron` tool. A
-default isolated run answers in its own background conversation; a successful,
-non-empty result may be delivered back to the originating Telegram private chat,
-while errors and empty answers are not pushed. An `origin`-mode job instead
-answers inside the origin conversation and creates no outbound send: that answer is visible to
-an attached local CLI or through history, not pushed to Telegram. Failures are
-not pushed either; ask the agent to `list` cron jobs and read the reported
-failure/delivery fault. See [cron](./CRON.md).
+default isolated run answers in its own background conversation; an `origin`-mode
+job answers inside the original conversation. In either mode a successful,
+non-empty result may be delivered to the originating Telegram private chat.
+Errors and empty answers are not pushed; ask the agent to `list` cron jobs and
+read the reported failure/delivery fault. See [cron](./CRON.md).
 
 ## 7. Optional: shell, sandbox, builtin skills
 

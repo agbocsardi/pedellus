@@ -6,7 +6,7 @@ The [assistant tree plan](2026-10-29_assistant-tree_TODO.md) is the current scop
 and work-order authority: CLI + Telegram first, then tools, delegation and channels.
 Config-selected coding tools, named model presets, optional bwrap shell, opt-in
 memory/skills and compaction plumbing are integrated. Agent-callable
-cron scheduling and isolated Telegram delivery are available. WebUI, migration and cutover are
+cron scheduling and Telegram delivery are available. WebUI, migration and cutover are
 deferred. The [older roadmap](plan/2026-10-26_full-port_TODO.md) preserves evidence,
 not a standing implementation queue.
 
@@ -70,7 +70,7 @@ execution. Setting `cron: { enabled: true }` installs the foundation and a
 model-callable `cron` tool (`add`/`list`/`remove`) in `openGateway`; both are also
 exported through the SDK barrel. The agent schedules work when the user asks; there
 is no direct cron UI or user scheduling command. Successful isolated runs can deliver through
-the durable Telegram outbox; origin-mode channel delivery and live-channel acceptance remain open.
+the durable Telegram outbox, including origin-mode runs. Live-channel acceptance remains open.
 
 ## Opt-in Code Mode SDK
 
