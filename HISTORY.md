@@ -194,18 +194,18 @@ entries needs about `n/5` page reads spread across `n/500`-ish searches. A
 - **Clone or restored backup** (SQLite file copied, identity included): the copy
   has the *same* `storeId`, so identity comparison cannot detect it. Each
   conversation's first/last entry fingerprints are the fallback anchor. After a
-  copy is restored over a live path, the indexed tail entry of every affected
-  conversation no longer exists or no longer matches, so that conversation's rows
-  are cleared and rebuilt from entry 1 on the next search. Conversations untouched
-  by the restore keep valid rows.
+  copy is restored and the gateway reopened, an indexed first or last entry that
+  no longer exists or matches causes that conversation's rows to be cleared and
+  rebuilt on the next search. Divergence between unchanged anchors can go undetected.
 - **Same-store rollback** to an earlier copy therefore normally drops the future
   hits of that conversation and rejects continuations bound past the new tail.
 - The fallback is not proof. A replacement tail whose identity fields and first
   1M characters of model/data are identical to the old tail can share a
   fingerprint, and entries that are byte-identical in both lineages are rightly
   kept. Treat the derived file as disposable: delete it after restoring a backup if
-  exact provenance matters. The fixture has no per-entry sequence or store-wide
-  content hash.
+  exact provenance matters. Replacement requires reopening the gateway; identity is
+  resolved at open, not when a file is swapped under a running process. The fixture
+  has no per-entry sequence or store-wide content hash.
 
 ## Pagination and mapping stability
 
@@ -239,7 +239,8 @@ as untrusted quoted data.
 
 See `HISTORY_INDEX_LIMITS`: 500 query characters, 16 terms, 20 hits by default
 (50 maximum), 8,000-character chunks with 256-character overlap, 64 chunks per
-entry, 256 mapped sessions (the same cap as context snapshots), 5 entries per scan,
+entry, 256 mapped chat sessions (context snapshots have a separate cap over all
+mapped sessions), 5 entries per scan,
 1M tool-argument units, 500 entries / 8 MiB / 1.5 s per reconciliation pass, and 100
 pending entries counted. Long records can produce more than one hit, one per
 matched chunk.
