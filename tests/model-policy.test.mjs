@@ -56,6 +56,9 @@ provider.setResponses([
 const models = createModels();
 models.setProvider(provider.provider);
 let gateway;
+// Declared outside the try so the deadline handle is always cleared, including on an assertion
+// failure between the race and its original inline cleanup.
+let providerDeadline;
 try {
   gateway = await openGateway(config, context, { models, agentHistory: false });
   const conversation = await gateway.conversationFor("policy-session", context);
@@ -65,7 +68,14 @@ try {
 
   const submission = await conversation.submit({ type: "input", content: "hold", requestId: "policy-1" }, context);
   const waiting = submission.wait(context);
-  await Promise.race([entered, new Promise((_, reject) => setTimeout(() => reject(new Error("provider timeout")), 5000))]);
+  try {
+    await Promise.race([entered, new Promise((_, reject) => {
+      providerDeadline = setTimeout(() => reject(new Error("provider timeout")), 5000);
+    })]);
+  } finally {
+    // The race settles on `entered` normally: clear the handle or it keeps the process alive.
+    clearTimeout(providerDeadline);
+  }
   await assert.rejects(
     gateway.selectModel("policy-session", { provider: "fixture", modelId: "beta" }, context),
     /busy/i,
@@ -105,6 +115,7 @@ try {
   assert.deepEqual(dispatched, ["alpha"]);
   console.log("PASS: atomic busy rejection, thinking persistence/reset, reopen, and allowlist revocation use synthetic models only");
 } finally {
+  releaseRequest();
   if (gateway) await gateway.close(context);
   await rm(temp, { recursive: true, force: true });
 }
