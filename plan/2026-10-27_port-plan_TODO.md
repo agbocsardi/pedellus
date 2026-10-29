@@ -91,7 +91,8 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
       no caller-injected identity remains. Still no episode summaries or CLI/channel browsing UI. See
       `HISTORY.md`.
 - [ ] Implement the episode summary index and episode catalog with durable post-reset summaries, retry and reconciliation.
-- [ ] Expose history browsing/search through memory tooling and accepted channel interfaces (today only trusted host code calls `Gateway.historySearch`; there is no CLI/Telegram/web surface).
+- [x] Expose message/tool search and episode/entry browsing in the local CLI.
+- [ ] Expose history browsing/search through memory tooling and accepted channel interfaces (no Telegram/web surface yet).
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
 - [ ] Complete requested channels individually after core acceptance.
 - [ ] Agree the next bounded implementation scope with the owner; no automatic restart.
@@ -115,7 +116,7 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 | Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool; curated port builtins in `skills` (memory, memory-defrag, skill-creator, github, cron) behind an explicit `builtinSkillsRoot` | `my` has no port runtime; no inventory-count cap, but finite prompt/output bounds visibly truncate |
 | Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
 | Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling; a background run gets the origin's workspace context and `skill` tool; copied grants are bounded by current origin grants | No channel delivery or silence policy; disabling cron leaves persisted timers blocked; a run whose snapshot was evicted at the cap proceeds without context; a phase fault or crash before the terminal commit can retain bounded grants until reopen |
-| History | Durable store identity, reset-delimited episode reads (`listHistoryEpisodes`, `historyEpisode`) and a rebuildable message/tool search index behind `Gateway.historySearch`, bound to the committed identity | No episode summaries, titles or summary search; no CLI/Telegram/web browsing; a clone or restored backup keeps the same identity, so stale rows are caught only by per-conversation entry anchors |
+| History | Durable store identity, reset-delimited episode reads and a rebuildable message/tool search index; CLI `/search`, `/episodes`, `/episode`, `/entry` | No episode summaries, titles or summary search; no Telegram/web browsing; a clone or restored backup keeps the same identity, so stale rows are caught only by per-conversation entry anchors |
 | Telegram | Restricted allowlisted inbound/reply adapter with streaming, durable send intent, unknown-send quarantine | Existing adapter only; scheduled outbound candidate is unmerged; no general pairing or media parity |
 | Code Mode / delegation | Reviewed opt-in QuickJS Code Mode/tool-search SDK | Not Gateway-installed; no product background-subagent or worker interface |
 | Other surfaces | Read-only usage and inert archival helpers exist | Discord candidates parked; Email/WebSocket, MCP, web/media tools not integrated |
@@ -652,6 +653,13 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-29 — local history browsing
+
+Integrated independently reviewed CLI message/tool search and cross-session episode/entry
+browsing (`3d2fa58`, `b845e21`, `c2a0110`). The terminal reports incomplete index
+coverage and bounded output; session hints require exact identifier round-tripping.
+Summary work remains unmerged and under review. No live channel/provider validation.
 
 ### 2026-10-29 — episode catalog consistency fixes after review
 
