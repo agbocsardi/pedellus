@@ -387,13 +387,9 @@ document; and a reopened gateway repeated none of them as a faulting loop. A ful
 returned `full`, retained every pending record and recorded a deduped overflow fault. No permanent
 test, live bot, credential or network request was involved.
 
-Relative-reminder probes (temporary and uncommitted) drove the real foundation with a fake clock,
-and the real `openGateway` path with a faux provider. They covered: `after` resolving once to the
-admission instant plus the delay and storing the ordinary `at` form; rejection of zero, negative,
-fractional, `NaN`, unsafe and epoch/Date-overflow delays plus mixed schedule fields before any job
-exists; a replayed request deduping the original deadline after the deadline passed, after a
-backwards clock jump, and after reopen; a fired one-shot remaining one job with no second timer and
-the replay still deduping its original instant; a same-key different delay refused with the record
-unchanged; equivalent absolute `at` deduping the same instant; unchanged `at`/`every`/`cron`
-semantics; and a model-issued `cron add` with `after_seconds` reporting the stored next instant.
-No permanent test, live provider, credential or workspace was involved.
+Relative-reminder regression coverage is permanent in `tests/cron-relative.behavior.test.mjs`.
+With an injected foundation clock it checks that `after` resolves once to admission plus the delay
+and that a replay after a clock advance and reopen dedupes that stored deadline and timer; that a
+fired short one-shot retry still dedupes its original instant with no new job or timer; and that a
+real Gateway turn issuing `cron add` with `after_seconds` stores and acknowledges the expected
+once-at deadline. Invalid and same-key changed requests are asserted to leave the record unchanged.

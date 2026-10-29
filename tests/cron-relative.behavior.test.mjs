@@ -83,11 +83,13 @@ test("relative one-shot keeps its admitted deadline across retries, clock jumps 
       { kind: "after", afterMs: 0 },
       { kind: "after", afterMs: 1.5 },
       { kind: "after", afterMs: Number.NaN },
+      { kind: "after", afterMs: 9e15 },
+      { kind: "after", afterMs: Number.MAX_SAFE_INTEGER },
       { kind: "after", afterMs: 600_000, at: admission + 1_000 },
     ]) {
       await assert.rejects(
         () => foundation.schedule(owner, writer, { ...base, schedule, idempotencyKey: `tool:bad-${String(schedule.afterMs)}` }, context),
-        /after schedule requires a positive integer afterMs|an after schedule must not carry/,
+        /after schedule requires a positive integer afterMs|an after schedule must not carry|the relative one-shot exceeds the safe integer range|the relative one-shot is beyond the representable date range/,
       );
     }
     const unchanged = await readJobs(harness, conversation.id);
