@@ -73,8 +73,6 @@ fail-closed and is not remotely cancelled. See
 | `/refresh` | Re-read the configured workspace bootstrap, memory files, manifest and skill inventory for this `cli:default` conversation. Requires `workspaceContext`; rejected while the conversation is busy. The refreshed summary and skill table apply to the next model request. |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
-| `/steer TEXT` | Submit with native `whenBusy: "steer"`; while busy it joins the run at a native safe boundary. |
-| `/after TEXT` | Submit as a native follow-up for a fresh run after current work. |
 
 ## Coding-tool grants
 
@@ -139,16 +137,17 @@ their next run or Gateway reopen.
 `/stop` is deliberately not an alias for `/abort`: native abort withdraws queued
 inputs, while Python stop preserves queued work. `/new`, `/restart`, `/goal`,
 `/interrupt`, `/btw`, task/policy/receipt/skill, memory/Dream and pairing
-commands are not implemented here. Unsupported slash commands are reported
-locally and are never silently sent as model prompts. Prefix a prompt with `//`
-to send one literal leading slash (for example, `//help` sends `/help` to the
-model).
+commands are not implemented here. `/steer` and `/after` were removed; normal
+input is admitted by the native conversation in input order. Unsupported slash
+commands are reported locally and are never silently sent as model prompts.
+Prefix a prompt with `//` to send one literal leading slash (for example,
+`//help` sends `/help` to the model).
 
-Normal input, `/steer`, and `/after` are admitted in input order by the native
-conversation. Controls are ordered between those admissions: a control observes
-all earlier durable submissions, and later inputs cannot overtake a mutating
-control such as `/abort`. This boundary waits for submission admission and the
-control operation, never for model completion (except native `/abort` itself).
+Normal input is admitted in input order by the native conversation. Controls
+are ordered between those admissions: a control observes all earlier durable
+submissions, and later inputs cannot overtake a mutating control such as
+`/abort`. This boundary waits for submission admission and the control
+operation, never for model completion (except native `/abort` itself).
 Durable owns the busy inbox; this CLI does not create a second agent queue. At
 most 64 locally admitted inputs may remain unsettled, and at most 16 local
 control operations may be pending. Only completed lines up to 32,000 UTF-16

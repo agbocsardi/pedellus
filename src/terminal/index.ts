@@ -399,7 +399,7 @@ export async function runTerminalConversation(
     waits.add(task);
   };
 
-  const queueInput = (content: string, whenBusy?: "steer" | "followUp"): Promise<void> => {
+  const queueInput = (content: string): Promise<void> => {
     if (reservedInputs >= MAX_PENDING_INPUTS) {
       return notice(`Input limit reached (${MAX_PENDING_INPUTS} unsettled submissions). Wait for a turn or use /abort.`, true);
     }
@@ -407,7 +407,7 @@ export async function runTerminalConversation(
     const operation = admissionTail.then(async () => {
       if (signal?.aborted) throw signal.reason;
       const submission = await conversation.submit(
-        { type: "input", content, ...(whenBusy === undefined ? {} : { whenBusy }) },
+        { type: "input", content },
         operationContext,
       );
       submissions.set(submission.id, { id: submission.id, submission });
@@ -700,7 +700,7 @@ export async function runTerminalConversation(
     switch (name) {
       case "help":
         await notice([
-          "Local commands: /help /status /history [count] /model [provider modelId [thinkingLevel]] /tools /grant <tool[,tool]> <duration> /revoke <tool[,tool]|all> /refresh /compact /abort /steer TEXT /after TEXT",
+          "Local commands: /help /status /history [count] /model [provider modelId [thinkingLevel]] /tools /grant <tool[,tool]> <duration> /revoke <tool[,tool]|all> /refresh /compact /abort",
           "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
           "/abort uses native Durable semantics: it cancels foreground work and withdraws queued inputs.",
           io.modelSelection ? "/model lists the host allowlist; select with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
@@ -748,6 +748,8 @@ export async function runTerminalConversation(
           await notice("/new is unsupported: native reset does not implement Nanobot archive/usage-reset semantics.", true);
         } else if (name === "restart") {
           await notice("/restart is unsupported: process restart belongs to the deployment owner.", true);
+        } else if (name === "steer" || name === "after") {
+          await notice(`/${name} was removed from this CLI; the line was not sent to the model.`, true);
         } else if (["goal", "interrupt", "btw", "skill", "policy", "receipt", "tasks", "task", "dream", "dream-log", "dream-restore", "remember", "pairing"].includes(name)) {
           await notice(`/${name} is not implemented in this CLI; it was not sent to the model.`, true);
         } else {
@@ -805,10 +807,7 @@ export async function runTerminalConversation(
         else {
           const name = parsed[1]!.toLowerCase();
           const args = parsed[2] ?? "";
-          if (name === "steer" || name === "after") {
-            if (!args.trim()) await notice(`Usage: /${name.toUpperCase()} TEXT`, true);
-            else await queueInput(args.trim(), name === "steer" ? "steer" : "followUp");
-          } else await localCommand(name, args);
+          await localCommand(name, args);
         }
       } else {
         await queueInput(line);
