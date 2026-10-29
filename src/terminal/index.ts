@@ -80,6 +80,16 @@ export interface TerminalToolGrant {
 }
 
 /**
+ * Read-only view of a host whose coding-tool authority comes from configuration. There is no grant
+ * or expiry here: the configured names are what authenticated chats may use, and changing them is a
+ * host configuration change, not a chat command.
+ */
+export interface TerminalToolPolicyHost {
+  readonly mode: "config";
+  readonly tools: readonly string[];
+}
+
+/**
  * Optional host-owned coding-tool policy. The ceiling is the fixed host allowlist; grants are always
  * explicit, finite and conversation-scoped. Without this host the local tool commands stay read-only.
  */
@@ -131,6 +141,8 @@ export interface TerminalIO {
   readonly modelSelection?: TerminalModelSelectionHost;
   /** Optional host-owned coding-tool grants; standalone terminal callers remain read-only without it. */
   readonly toolGrants?: TerminalToolGrantsHost;
+  /** Optional read-only configured tool authority; when present, no grant UI is offered. */
+  readonly toolPolicy?: TerminalToolPolicyHost;
   /** Optional host-owned workspace-context refresh; standalone callers leave /refresh unavailable. */
   readonly contextRefresh?: TerminalContextRefreshHost;
   /** Optional host-owned history search/episode reads; standalone callers leave /search and /episodes unavailable. */
@@ -969,6 +981,23 @@ export async function runTerminalConversation(
 
   const showTools = async (args: string): Promise<void> => {
     if (args.trim()) { await notice("Usage: /tools", true); return; }
+    const policy = io.toolPolicy;
+    if (policy !== undefined) {
+      if (policy.tools.length === 0) {
+        await notice([
+          "Coding tools are disabled: config toolAllowlist is empty, so no coding tool is offered in any chat.",
+          "Add the intended names to toolAllowlist and restart. This conversation has no grant or expiry.",
+        ].join("\n"));
+        return;
+      }
+      await notice([
+        `Coding tools configured for authenticated chats: ${policy.tools.join(", ")}.`,
+        "Configuration (toolAllowlist) is the authority: the next model request may offer exactly these tools; " +
+        "there is no per-conversation grant or expiry here.",
+        "Change toolAllowlist in the configuration and restart; chat commands do not change tool authority.",
+      ].join("\n"));
+      return;
+    }
     const host = io.toolGrants;
     if (!host) {
       await notice("Coding-tool grants are host-controlled and unavailable here.", true);
@@ -1006,6 +1035,13 @@ export async function runTerminalConversation(
   };
 
   const grantTools = async (args: string): Promise<void> => {
+    if (io.toolPolicy !== undefined) {
+      await notice([
+        "Tool authority is configured in config.json (toolAllowlist), not by chat commands, so /grant does nothing here.",
+        "Nothing was changed. Edit toolAllowlist and restart the CLI to change which coding tools the assistant may use.",
+      ].join("\n"), true);
+      return;
+    }
     const parts = args.trim() ? args.trim().split(/\s+/) : [];
     if (parts.length !== 2) {
       await notice("Usage: /grant <tool[,tool]> <duration> — duration is required, for example /grant read,bash 30m.", true);
@@ -1051,6 +1087,13 @@ export async function runTerminalConversation(
   };
 
   const revokeTools = async (args: string): Promise<void> => {
+    if (io.toolPolicy !== undefined) {
+      await notice([
+        "Tool authority is configured in config.json (toolAllowlist), not by chat commands, so /revoke does nothing here.",
+        "Nothing was changed. Edit toolAllowlist and restart the CLI to change which coding tools the assistant may use.",
+      ].join("\n"), true);
+      return;
+    }
     const parts = args.trim() ? args.trim().split(/\s+/) : [];
     if (parts.length !== 1) {
       await notice("Usage: /revoke <tool[,tool]|all>", true);
@@ -1139,7 +1182,9 @@ export async function runTerminalConversation(
     switch (name) {
       case "help":
         await notice([
-          "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /grant <tool[,tool]> <duration> /revoke <tool[,tool]|all] /refresh /compact /abort /new",
+          io.toolPolicy
+            ? "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /refresh /compact /abort /new"
+            : "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /grant <tool[,tool]> <duration> /revoke <tool[,tool]|all] /refresh /compact /abort /new",
           SEARCH_USAGE,
           EPISODES_USAGE,
           EPISODE_USAGE,
@@ -1148,7 +1193,11 @@ export async function runTerminalConversation(
           "/abort uses native Durable semantics: it cancels foreground work and withdraws queued inputs.",
           io.history ? "/search --next continues the last successful query; cursors stay in this process and are never printed. History sessions default to cli:default; use --session with a key reported by /search." : "History search and episode browsing are host-controlled and unavailable here. /entry <entryId> [--radius N] still opens a bounded window in this terminal's default conversation; --session requires a history host.",
           io.modelSelection ? "/model lists the host allowlist; select with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
-          io.toolGrants ? "/grant needs an explicit finite duration (for example /grant read,bash 30m); /tools lists ceiling and grants." : "Coding-tool grants are host-controlled and unavailable here.",
+          io.toolPolicy
+            ? "Coding tools are configured by toolAllowlist and apply to authenticated chats; /tools is read-only diagnostics and chat commands never change tool authority."
+            : io.toolGrants
+              ? "/grant needs an explicit finite duration (for example /grant read,bash 30m); /tools lists ceiling and grants."
+              : "Coding-tool grants are host-controlled and unavailable here.",
           io.contextRefresh?.available ? "/refresh re-reads workspace context and skills for this conversation when it is idle." : "/refresh is unavailable without configured workspace context.",
         ].join("\n"));
         return;
@@ -1200,7 +1249,7 @@ export async function runTerminalConversation(
       case "new":
         if (args.trim()) { await notice("Usage: /new", true); return; }
         await conversation.reset(undefined, operationContext);
-        await notice("Native Durable context reset admitted for this same conversation: no handoff, summary or extra model call, earlier entries stay stored and listed by /history, and tool grants are unchanged. While busy it lands at the next safe boundary; queued inputs placed with it run in the new context.");
+        await notice("Native Durable context reset admitted for this same conversation: no handoff, summary or extra model call, earlier entries stay stored and listed by /history, and tool authority is unchanged. While busy it lands at the next safe boundary; queued inputs placed with it run in the new context.");
         return;
       default:
         if (name === "stop") {

@@ -1,11 +1,13 @@
 import {
   defineExtension,
   wrapTool,
+  type ConversationId,
   type Extension,
   type ToolRegistration,
   type Wrap,
 } from "@earendil-works/pi-durable";
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import { createConfigToolHook } from "./config-authority.js";
 import { createToolGrantHook } from "./grants.js";
 
 /** Native coding tools this slice can register, in ceiling order. */
@@ -27,6 +29,12 @@ export interface CodingToolExtensionOptions {
   readonly defaultTimeoutSeconds: number;
   /** Grant-clock override; defaults to `Date.now`. */
   readonly now?: () => number;
+  /**
+   * Config-mode host predicate: true only for conversations the host has authenticated as ordinary
+   * mapped chats. When present, the ceiling is authority for those conversations and scheduled-run
+   * captures are checked at call time instead of expiring grants.
+   */
+  readonly authenticatedChat?: (conversationId: ConversationId) => boolean;
 }
 
 /**
@@ -77,9 +85,11 @@ function withHostTimeoutDeclaration<T extends ToolRegistration>(
 }
 
 /**
- * Register the native read/write/edit/bash tools over the guarded host environment. No tool is
- * offered unless the conversation has an explicit unexpired grant, and the grant hook rechecks that
- * at call time. Tool definitions, limits, output windows and spill behavior stay native.
+ * Register the native read/write/edit/bash tools over the guarded host environment. In the default
+ * grant mode no tool is offered unless the conversation has an explicit unexpired grant, and the
+ * grant hook rechecks that at call time. In config mode the host passes its authenticated-chat
+ * predicate and the same ceiling directly authorizes those conversations, with scheduled-run
+ * captures bounded by it. Tool definitions, limits, output windows and spill behavior stay native.
  */
 export function createCodingToolExtension(options: CodingToolExtensionOptions): Extension {
   const selected = new Set(options.tools);
@@ -111,6 +121,10 @@ export function createCodingToolExtension(options: CodingToolExtensionOptions): 
     name: "nanobot-coding-tools",
     tools,
     wraps,
-    hooks: [createToolGrantHook(options.ceiling, options.now ?? Date.now, contextTools)],
+    hooks: [
+      options.authenticatedChat === undefined
+        ? createToolGrantHook(options.ceiling, options.now ?? Date.now, contextTools)
+        : createConfigToolHook(options.ceiling, options.authenticatedChat, contextTools),
+    ],
   });
 }

@@ -5,6 +5,12 @@ export {
   type CodingToolName,
 } from "./coding.js";
 export {
+  boundedCapturedTools,
+  ConfigToolCaptureDoc,
+  createConfigToolHook,
+  type ConfigToolCaptureDocument,
+} from "./config-authority.js";
+export {
   activeToolGrants,
   createToolGrantHook,
   normalizeToolGrants,

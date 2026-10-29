@@ -65,7 +65,12 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       stdout.write(`${JSON.stringify(result)}\n`);
       return;
     }
-    gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
+    // Shipped CLI/Telegram authority comes from the configuration: toolAllowlist enables the
+    // configured coding tools for authenticated mapped chats. The legacy SDK default stays grants.
+    gateway = await openGateway(config, context, {
+      ...workspaceContextGatewayOptions(config),
+      toolAuthorization: "config",
+    });
     if (config.telegram) {
       const token = process.env[config.telegram.tokenEnv];
       if (!token) throw new StartupDiagnosticError("telegramToken");
@@ -90,13 +95,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
           list: () => gateway!.listModels("cli:default", context),
           select: (selection) => gateway!.selectModel("cli:default", selection, context),
         },
-        toolGrants: {
-          ceiling: config.toolAllowlist ?? [],
-          list: () => gateway!.listToolGrants("cli:default", context),
-          grant: (names, expiresAt) =>
-            gateway!.grantTools("cli:default", names.map((name) => ({ name, expiresAt })), context),
-          revoke: (names) => gateway!.revokeTools("cli:default", names, context),
-        },
+        toolPolicy: { mode: "config", tools: config.toolAllowlist ?? [] },
         contextRefresh: {
           available: config.workspaceContext !== undefined,
           refresh: () => gateway!.refreshContext("cli:default", context),

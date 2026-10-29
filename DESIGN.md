@@ -90,8 +90,10 @@ preserve upstream per-file serialization across environments addressing the same
 files.
 
 **Current integration decision:** the reviewed W1 coding tools run over the
-guarded `HostExecutionEnv` on the actual workspace, disabled by default and
-requiring explicit expiring per-conversation grants; see
+guarded `HostExecutionEnv` on the actual workspace, disabled by default. The
+shipped CLI and Telegram path authorize the configured `toolAllowlist` directly
+for validated mapped chats (config authorization); explicit SDK hosts keep the
+legacy default of explicit, expiring per-conversation grants. See
 [`TOOLS.md`](./TOOLS.md). A Gateway instance may additionally select the optional
 direct-workspace Bubblewrap shell with `toolSandbox: "bwrap"`, which wraps only
 the shell, keeps the native guarded filesystem on the same workspace, and stays

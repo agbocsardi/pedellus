@@ -31,7 +31,7 @@ never reaches it. `message.text` (not a caption) is classified:
 
 `/new` calls Durable's native `Conversation.reset(undefined, context)` on the
 same mapped conversation: fresh model context, no handoff text, no summary, no
-model call, unchanged conversation identity, tool grants and cron ownership.
+model call, unchanged conversation identity, tool authority and cron ownership.
 Reset placement while busy is Durable's own next-boundary ordering; the adapter
 does not reorder a reset, and queued messages are kept and run in the new
 context. Episode boundaries that the history catalog derives from committed
@@ -46,6 +46,23 @@ chats' conversations, background subtrees and cron run tasks (created with
 without the generic failure text, one per input; the same applies to a turn
 ended by a queued reset (reason `reset`). Other settlement reasons keep the
 fixed failure text.
+
+## Coding tools
+
+The adapter has no tool-authority commands. The shipped Gateway opens in config
+authorization mode, so `config toolAllowlist` enables exactly those coding tools
+for each authenticated private chat; `[]` or absent disables them. Every sender
+admitted by `telegram.allowFrom` shares the configured workspace and tool
+authority in its private chat. Admission is not per-tool authority, and there is
+no grant, expiry, approval prompt or startup re-grant.
+
+Tool authority comes from the configuration: editing `toolAllowlist` and
+restarting is the only way to change it. `/tools`, `/grant`, `/revoke` and other
+grant or approval commands do not exist in this adapter, and the model cannot
+request or change tool authority. The same scope rules as the CLI apply: only a
+validated ordinary mapped chat conversation is authorized, and scheduled
+isolated runs get a captured subset bounded by the current config and origin.
+See [`TOOLS.md`](./TOOLS.md#config-authorization-shipped-cli-and-telegram).
 
 Acknowledgements are ordinary channel-state pending records with `notice: true`.
 They go through the same bounded chunk send, flood gate, write-ahead send intent
@@ -138,9 +155,10 @@ migrate with an empty `controls` list.
 State version 4 accepts both historical version-3 shapes and preserves any present
 `controls` and authenticated origin bindings. Invalid stored shapes fail closed.
 
-Not implemented here: `/restart`, tool-grant or approval commands, history
-commands, `/stop` aliasing, and any command that would widen grants. A Telegram
-coding-tool approval path is still an open product decision.
+Not implemented here: `/restart`, tool-authority or approval commands, history
+commands, `/stop` aliasing, and any command that would widen tool authority. Tool
+authority is configured by the owner, not requested in chat: this adapter
+exposes no grant or approval commands and the model cannot ask for one.
 
 ## Behavior
 

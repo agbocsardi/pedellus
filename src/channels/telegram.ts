@@ -1345,7 +1345,7 @@ type TelegramControl = "new" | "abort" | "help";
 const CONTROL_ACK: Record<"new" | "abort", string> = {
   new:
     "Context reset applied for this chat (native Durable reset, no handoff text, no summary). " +
-    "Stored entries and tool grants are unchanged; queued messages are kept and run in the new context.",
+    "Stored entries and tool authority are unchanged; queued messages are kept and run in the new context.",
   abort:
     "Abort applied for this chat: it is idle now. Queued messages were withdrawn and any running turn was stopped; " +
     "other chats, cron jobs and background work are unaffected.",
@@ -1353,7 +1353,7 @@ const CONTROL_ACK: Record<"new" | "abort", string> = {
 
 const CONTROL_PENDING: Record<"new" | "abort", string> = {
   new:
-    "Context reset is still pending for this chat: Durable has not admitted it yet. Stored entries, tool grants and " +
+    "Context reset is still pending for this chat: Durable has not admitted it yet. Stored entries, tool authority and " +
     "queued messages are unchanged, and this chat keeps waiting instead of losing the request.",
   abort:
     "Abort is still pending for this chat: Durable has not finished stopping the current turn, so the provider may be " +
@@ -1367,10 +1367,10 @@ const UNCONFIRMED_CONTROL =
 
 const CONTROL_HELP = [
   "Controls for this chat (other messages go to the assistant):",
-  "/new - native context reset for this conversation: fresh model context, no summary or handoff; stored history and tool grants unchanged; queued messages are kept.",
+  "/new - native context reset for this conversation: fresh model context, no summary or handoff; stored history and tool authority unchanged; queued messages are kept.",
   "/abort - withdraw queued messages and stop the current turn here; other chats, cron jobs and background work are unaffected.",
   "/help - this list.",
-  "Limits: text only (attachments are not read); no tool-grant, history, restart or media commands. Other slash commands are refused; prefix // to send a leading slash literally.",
+  "Limits: text only (attachments are not read); no tool-authority, history, restart or media commands. Other slash commands are refused; prefix // to send a leading slash literally.",
 ].join("\n");
 
 const TELEGRAM_COMMAND = new RegExp(
