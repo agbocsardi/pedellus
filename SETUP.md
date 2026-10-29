@@ -50,9 +50,11 @@ EOF
 ```
 
 There is no default workspace, memory file, or skill root: every path is either
-the config's `workspace` or an explicit file under it. Markdown is the memory and
-skill source of truth; the conversation transcript and runtime state live in
-Durable's SQLite database under `dataDir`.
+the config's `workspace` or an explicit file under it. `memory/MEMORY.md` is the
+explicitly selected bootstrap memory loaded on every turn; durable topic facts
+belong in `memory/topics/*.md`, which the manifest lists and the agent reads on
+demand. Markdown is the memory and skill source of truth; the conversation
+transcript and runtime state live in Durable's SQLite database under `dataDir`.
 
 ## 3. Configure
 
@@ -64,7 +66,7 @@ The shipped [`config.example.json`](./config.example.json) is the starting point
 | `model` / `allowedModels` | Host default and allowlist. The pair must exist in the pinned catalog, so change both together ([providers](./PROVIDERS.md)). A chat's persisted `/model` choice keeps overriding the config default after a restart, and a config change does not reset existing chat choices. |
 | `thinkingLevel` | Requested reasoning level where the allowed model supports it; it affects latency and cost. |
 | `workspaceContext.memoryFiles` | `["memory/MEMORY.md"]` is loaded into every turn; a missing named file fails closed. |
-| `workspaceContext.memoryManifest` | Lists the other `memory/*.md` topics for on-demand `read`; their bodies stay out of the prompt. |
+| `workspaceContext.memoryManifest` | Lists the other `memory/**/*.md` topics recursively for on-demand `read`; their bodies stay out of the prompt. |
 | `workspaceContext.skills` | Its presence opts into workspace skill discovery; `disabledSkills` can hide names. |
 | `toolAllowlist` | Config authority: these coding tools are enabled for authenticated mapped chats. `[]` or absent disables them. |
 | `cron` | Installs the model-facing `cron` tool; `timeZone: "UTC"` interprets calendar expressions without an explicit zone. |
@@ -145,8 +147,9 @@ example. Add `telegram` as a top-level key beside the existing ones in
 
 - `tokenEnv` is an environment-variable name; export the token, never paste it
   into the file.
-- `allowFrom` is a non-empty list of decimal Telegram user IDs allowed to talk to
-  the bot, and only private chats reach the assistant.
+- `allowFrom` is a non-empty list of decimal Telegram user IDs, written as JSON
+  strings (for example `"123456789"`, not unquoted numbers), allowed to talk to
+  the bot; only private chats reach the assistant.
 - **Every user in `allowFrom` shares the configured workspace and tool
   authority.** Listing a user is the authorization; there is no per-chat
   permission step, so allowlist only people you would let use those tools.
@@ -160,8 +163,15 @@ In an allowed private chat:
 ```text
 /help
 Load the memory skill and remember that the demo bot is for setup checks.
-remind me in ten minutes to stretch, then put today's reminder in memory/topics/demo.md
+Use the cron tool to remind me at <FUTURE-ISO-INSTANT> to stretch, then save that
+reminder in memory/topics/demo.md.
 ```
+
+Replace `<FUTURE-ISO-INSTANT>` with a real future timestamp that includes `Z` or
+a UTC offset, for example a specific date and time you choose. The `cron` tool
+rejects relative times and naive local timestamps, and the assistant has no clock
+source, so state the absolute instant instead of asking for "in ten minutes";
+relative-time requests remain a usability gap.
 
 `/new`, `/abort` and `/help` are the channel controls. Context refresh in
 Telegram is a gateway restart; there is no Telegram refresh command, and `/new`
@@ -170,9 +180,10 @@ unsupported-attachment notice (caption text is still passed as input), and
 groups or other bots never reach the assistant.
 
 Reminders are ordinary agent scheduling through the configured `cron` tool. A
-default isolated run answers in its own background conversation and its result is
-delivered back to the chat that asked. An `origin`-mode job instead answers inside
-the origin conversation and creates no outbound send: that answer is visible to
+default isolated run answers in its own background conversation; a successful,
+non-empty result may be delivered back to the originating Telegram private chat,
+while errors and empty answers are not pushed. An `origin`-mode job instead
+answers inside the origin conversation and creates no outbound send: that answer is visible to
 an attached local CLI or through history, not pushed to Telegram. Failures are
 not pushed either; ask the agent to `list` cron jobs and read the reported
 failure/delivery fault. See [cron](./CRON.md).

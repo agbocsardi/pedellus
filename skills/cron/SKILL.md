@@ -6,10 +6,12 @@ description: Schedule one-shot or recurring work with the cron tool. Use when th
 # Cron
 
 The `cron` tool is an internal agent capability: it exists only when the host
-config sets `cron.enabled`. There is no user scheduler, slash command, or
-channel delivery. A due job submits one agent turn — into a fresh background
-conversation, or into this conversation — and nothing is sent to Telegram,
-Discord, or email.
+config sets `cron.enabled`. There is no user scheduler or slash command. A due
+job submits one agent turn — into a fresh background conversation, or into this
+conversation. A successful, non-empty result from a background run may be
+delivered to the authenticated Telegram private chat that created the job when
+the Telegram adapter is enabled; no other channel delivers results, and errors,
+cancellations or empty answers send nothing.
 
 ## Actions
 
@@ -52,13 +54,17 @@ idle. Jobs are owner-scoped to the conversation that created them, so another
 conversation's jobs are invisible and its IDs are refused.
 
 Say which mode will run and where the answer appears. In background mode the
-user does not see the answer in this conversation.
+answer appears in a separate conversation; with a Telegram origin, a successful
+non-empty answer is also delivered to that private chat, while errors and empty
+answers are not sent. With `isolated: false` the answer appears here, and no
+channel send is attempted.
 
 ## Authority and limits
 
-- A run inherits this conversation's current tool grants when it is prepared and
-  never gains new ones. Effectful work inside a run needs those grants, exactly
-  like an ordinary turn.
+- A run gets the origin's enabled tools captured when it is prepared, never
+  more, and stays bounded by current host policy. Effectful work inside a run
+  uses those tools exactly like an ordinary turn; a host with no configured
+  tools gives the run none.
 - A background run is offered no `cron` tool, so it cannot schedule more jobs.
   An origin-mode run still holds this conversation's `cron` tool.
 - There is no per-job timeout argument: a run is an ordinary agent turn under
