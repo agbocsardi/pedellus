@@ -17,8 +17,10 @@
  * caller supplies the currently mapped chat sessions after its own channel
  * authentication. State-only conversations and task-owned background runs are
  * excluded by that mapping. Results include source session/conversation/entry
- * provenance, which is sensitive and must not be exposed to an untrusted model.
+ * provenance, which is sensitive and stays inside the trusted host/agent boundary;
+ * the host-approved model-facing `history` tool quotes it as untrusted data.
  */
+import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, stat } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -79,6 +81,8 @@ export const HISTORY_INDEX_LIMITS = Object.freeze({
   maxPendingScanEntries: 100,
   /** Excerpt size for an empty (browse) query. */
   excerptChars: 280,
+  /** Opaque cursor token accepted from a host or model-facing caller. */
+  maxCursorTokenChars: 4_096,
   /** FTS snippet token window for a matched query. */
   snippetTokens: 24,
 });
@@ -222,6 +226,31 @@ export interface HistoryPage {
   readonly hits: readonly HistoryHit[];
   readonly next?: HistoryCursor;
   readonly coverage: HistoryCoverage;
+}
+
+/**
+ * Serialize a continuation as one opaque, copyable token. The token is host state,
+ * not authorization: `decodeHistoryCursor` validates its shape and the search
+ * re-checks every binding (query, index generation, store identity, mapping,
+ * source entry) before using it.
+ */
+export function encodeHistoryCursor(cursor: HistoryCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+/** Parse an opaque continuation token and reject malformed or unsupported shapes. */
+export function decodeHistoryCursor(token: string): HistoryCursor {
+  if (typeof token !== "string" || token.length === 0 || token.length > HISTORY_INDEX_LIMITS.maxCursorTokenChars) {
+    throw new TypeError("History cursor token is invalid");
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(token)) throw new TypeError("History cursor token is invalid");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(token, "base64url").toString("utf8"));
+  } catch {
+    throw new TypeError("History cursor token is invalid");
+  }
+  return readCursor(parsed);
 }
 
 export interface HistoryIndex {

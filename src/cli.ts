@@ -65,7 +65,12 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       stdout.write(`${JSON.stringify(result)}\n`);
       return;
     }
-    gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
+    gateway = await openGateway(config, context, {
+      ...workspaceContextGatewayOptions(config),
+      // The local CLI/Telegram host approves agent-facing history retrieval for its already-mapped
+      // chat conversations. This adds a read-only tool, not a coding-tool grant.
+      agentHistory: true,
+    });
     if (config.telegram) {
       const token = process.env[config.telegram.tokenEnv];
       if (!token) throw new StartupDiagnosticError("telegramToken");

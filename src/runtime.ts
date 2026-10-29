@@ -17,6 +17,7 @@ import {
   type HistoryQuery,
   type HistorySession,
 } from "./history/index.js";
+import { createHistoryTool, type HistoryToolHost } from "./history/tool.js";
 import type { CronOwner } from "./automation/cron.js";
 import {
   createEpisodeCatalog,
@@ -98,6 +99,14 @@ export interface OpenGatewayOptions {
   readonly models?: Models;
   /** Explicit host-owned context snapshots; absent means no context extension is installed. */
   readonly contextSnapshotProvider?: GatewayContextSnapshotProvider;
+  /**
+   * Host approval for the read-only model-facing `history` tool. Absent keeps the bare
+   * gateway default of no extra tools; the local CLI/Telegram host opts in explicitly.
+   * The tool reads only the already-mapped chat conversations under the host's
+   * single-tenant policy, creates no conversation, writes no transcript and grants no
+   * filesystem or shell authority.
+   */
+  readonly agentHistory?: boolean;
 }
 
 /** Read-only query for a bounded page of one mapped chat session's raw transcript entries. */
@@ -313,6 +322,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
   if (options.contextSnapshotProvider !== undefined && typeof options.contextSnapshotProvider !== "function") {
     throw new TypeError("contextSnapshotProvider must be a function");
   }
+  if (options.agentHistory !== undefined && typeof options.agentHistory !== "boolean") {
+    throw new TypeError("agentHistory must be a boolean");
+  }
   const defaultThinkingLevel = config.thinkingLevel ?? "off";
   let preparedDataDirectory: Awaited<ReturnType<typeof prepareDataDirectory>>;
   try {
@@ -376,6 +388,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const skillTool = options.contextSnapshotProvider === undefined ? undefined : createSkillTool();
   const skillToolRegistration = skillTool?.extension.tools?.[0];
   const skillConversations = new Set<ConversationId>();
+  // Read-only prior-conversation retrieval for the assistant. It is not a coding tool: no path, no
+  // shell, no transcript write and no conversation creation. The host surface is late-bound so the
+  // extension can be registered before Harness.open() while the index itself is created afterwards.
+  const historyToolHostRef: { current: HistoryToolHost | undefined } = { current: undefined };
+  const historyTool = options.agentHistory === true ? createHistoryTool({ host: () => historyToolHostRef.current }) : undefined;
+  const historyToolRegistration = historyTool?.extension.tools?.[0];
+  const historyConversations = new Set<ConversationId>();
   // Mapped session keys own their snapshot. A scheduled run's target is tracked separately in
   // insertion order so the cap can drop an idle target instead of failing the run, and never a
   // mapped session's snapshot.
@@ -393,6 +412,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (skillTool && contextConversations.has(conversationId) && skillConversations.has(conversationId)) {
       selected.push(skillTool.extension);
     }
+    if (historyTool && historyConversations.has(conversationId)) selected.push(historyTool.extension);
     if (cronFoundation && cronTool && cronOwners.has(conversationId)) {
       selected.push(cronFoundation.extension, cronTool.extension);
     }
@@ -505,7 +525,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const cronTools = cronToolRegistration !== undefined && cronOwners.has(conversationId)
       ? [cronToolRegistration]
       : [];
-    return [...skillTools, ...cronTools];
+    // History retrieval is host-approved, read-only, and limited to mapped chat conversations.
+    const historyTools = historyToolRegistration !== undefined && historyConversations.has(conversationId)
+      ? [historyToolRegistration]
+      : [];
+    return [...skillTools, ...cronTools, ...historyTools];
   };
   /**
    * The grant-derived tool filter. A scheduled background run passes `copiedGrantBound`, the
@@ -578,6 +602,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const registry = createRegistry();
     if (toolExtension) registry.install(toolExtension);
     if (skillTool) registry.install(skillTool.extension);
+    if (historyTool) registry.install(historyTool.extension);
     if (cronFoundation) registry.install(cronFoundation.extension);
     if (cronTool) registry.install(cronTool.extension);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
@@ -809,6 +834,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // the same mapping and are restored even without a context snapshot provider: the policy pass
     // below would otherwise strip the cron tool from every persisted origin session on reopen.
     const mappedSessionKeys = new Map<ConversationId, string>();
+    // History retrieval is independent of the context snapshot opt-in: every mapped chat
+    // conversation can read history, while state-only bookkeeping conversations cannot.
+    const initialMapping = historyTool === undefined
+      ? undefined
+      : await harness.snapshot(SessionMap, root.id, context);
+    if (historyTool && initialMapping !== undefined) {
+      for (const { sessionKey, conversationId } of readMappedSessions(initialMapping.sessions, root.id)) {
+        if (isChatSessionKey(sessionKey)) historyConversations.add(conversationId);
+      }
+    }
     if (options.contextSnapshotProvider || cronEnabled) {
       await root.commit(async (tx) => { await tx.doc(SessionMap, root.id); }, context);
       const mapping = await harness.snapshot(SessionMap, root.id, context);
@@ -986,6 +1021,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (!Number.isSafeInteger(conversationId)) throw new Error("Stored conversation mapping has an invalid ID");
         // A mapped session key is the cron owner; unmapped conversations (such as a scheduled run's
         // own background conversation) have no owner and therefore never receive the cron tool.
+        if (isChatSessionKey(sessionKey)) historyConversations.add(conversationId!);
         cronOwners.set(conversationId!, { ownerId: sessionKey, sessionKey });
         sessionConversations.add(conversationId!);
         const conversation = await harness!.conversation(conversationId!, ctx);
@@ -1168,6 +1204,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
       return conversation;
     }
     // Scheduling begins only after registry and all persisted conversation policies are ready.
+    historyToolHostRef.current = historyTool === undefined ? undefined : {
+      search: (query, ctx) => gateway.historySearch(query, ctx),
+      entries: (sessionKey, query, limit, cursor, ctx) => gateway.historyEntries(sessionKey, query, limit, cursor, ctx),
+    };
     harness.resume();
     return gateway;
   } catch (error) {

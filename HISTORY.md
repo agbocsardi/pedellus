@@ -7,7 +7,10 @@ is always available and its derived rows are bound to the store's committed
 `nanobot.store-identity`; there is no host-injected identity option. Episode
 summaries and summary search are not implemented. The local CLI exposes bounded
 search, episode listing and entry windows over these reads; see
-[CLI history search and browsing](./CLI.md#history-search-and-browsing).
+[CLI history search and browsing](./CLI.md#history-search-and-browsing). When a
+host opts in with `agentHistory: true` (the local CLI/Telegram host does), a
+read-only model-facing `history` tool exposes search and bounded entry opening to
+the assistant; see [Agent-facing tool](#agent-facing-history-tool).
 
 ## Authority, identity and storage
 
@@ -225,6 +228,44 @@ changes, the index or store identity is replaced, the session mapping changes,
 the mapped set no longer contains the source, or the source entry at the boundary
 no longer exists or no longer matches its fingerprint.
 
+## Agent-facing history tool
+
+`openGateway(config, context, { agentHistory: true })` installs one read-only,
+model-facing tool named `history` for mapped chat conversations. It is not in the
+coding-tool ceiling, cannot be granted or revoked, accepts no filesystem path or
+shell command, executes nothing, modifies no transcript and creates no
+conversation. A bare gateway keeps no extra tool; the local CLI/Telegram host
+opts in explicitly, and another host must do the same after deciding that the
+agent may read its mapped chat history under the single-tenant policy.
+
+The tool calls the same `Gateway.historySearch` and `Gateway.historyEntries`
+surface as trusted host code. It has two actions:
+
+- `search` (default): user and assistant message text across every mapped chat
+  conversation. `scope: "tools"` searches tool names, arguments and result text
+  only, and `scope: "all"` combines both; tool records are never included
+  implicitly. `role` narrows message scopes to `user` or `assistant`. Pages are
+  1-20 hits with an opaque cursor from the previous result.
+- `open`: a bounded window (radius 0-5) around one source entry, addressed by the
+  exact `session` source label and `entryId` from a search hit. The default
+  message scope omits tool calls/results; `scope: "tools"` or `"all"` includes
+  them only when asked.
+
+Output is explicit about provenance and limits: each hit names its source session,
+entry, role, kind, episode start and tool/call identity; each opened entry is
+quoted and marked selected/raw. Results report index completeness, lag, omitted
+text, malformed records and the captured boundary, and say when a no-hit answer is
+incomplete. Historical text is sanitized and JSON-quoted as untrusted data because
+prior user text or tool output can contain instructions for a later model. The
+rendered result is bounded (20,000 characters, then the tool output limiter), and
+pagination says whether a fresh search is required for later entries.
+
+This is not summary search: episode summaries and titles do not exist yet, so the
+tool says so and searches only raw message/tool records. Tool hits are records,
+never execution authority or a grant. The tool exposes no raw conversation ID and
+accepts no conversation ID; `open` resolves its session source through the same
+mapped-chat validator as every other history read.
+
 ## Authorization boundary
 
 The Gateway search and episode methods accept no conversation ID. The host
@@ -238,10 +279,11 @@ bounded raw entries, so the caller must filter system, reset, compaction and
 thinking content before display. This is a trusted host surface, not an
 untrusted-channel API. Search results include `sessionKey`, `conversationId`,
 `entryId`, `entryKind`, role, tool name/call identity, timestamp, episode boundary,
-chunk position and a bounded excerpt, so they must not be exposed directly to an
-untrusted model or channel. Tool hits are records, never execution authority and
-never a grant. Stored tool output can contain hostile instructions; treat excerpts
-as untrusted quoted data.
+chunk position and a bounded excerpt. The host-approved model-facing `history`
+tool is part of the agent's trusted context, but its results must not be forwarded
+to an untrusted channel as an API or command surface. Tool hits are records, never
+execution authority and never a grant. Stored tool output can contain hostile
+instructions; treat excerpts as untrusted quoted data.
 
 ## Limits
 
@@ -251,7 +293,9 @@ entry, 256 mapped chat sessions (context snapshots have a separate cap over all
 mapped sessions), 5 entries per scan,
 1M tool-argument units, 500 entries / 8 MiB / 1.5 s per reconciliation pass, and 100
 pending entries counted. Long records can produce more than one hit, one per
-matched chunk.
+matched chunk. `HISTORY_TOOL_LIMITS` additionally bounds the model-facing tool: 8
+hits by default (20 maximum), radius 2 by default (5 maximum), 1,200 characters per
+opened entry, 400 per excerpt, and 20,000 rendered characters per result.
 
 ## Not implemented
 
@@ -261,9 +305,10 @@ matched chunk.
 - Relevance ranking: results are deterministic recency order so keyset pagination
   stays stable while FTS corpus statistics change.
 - Fetching surrounding entries by hit through a summary or excerpt API; the local
-  CLI's `/entry` and `/episode` windows use `Gateway.historyEntries`, which returns
-  bounded raw entry pages for existing mapped chat sessions. Any other caller can
-  use the source IDs with Durable.
-- Any Telegram or other channel history browsing/search command, a model-facing
-  history tool, or an untrusted-channel result surface. Only trusted host code can
-  call `Gateway.historySearch`; the local CLI is a trusted single-tenant surface.
+  CLI's `/entry` and `/episode` windows and the agent-facing `history` tool's
+  `open` action use `Gateway.historyEntries`, which returns bounded raw entry pages
+  for existing mapped chat sessions. Any other caller can use the source IDs with
+  Durable.
+- Any Telegram or other channel history command, a web surface, or an
+  untrusted-channel result API. The model-facing `history` tool is host-approved
+  and read-only, and it is not a channel command or an authorization surface.
