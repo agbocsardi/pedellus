@@ -24,6 +24,7 @@ const HISTORY_PAGE_SIZE = 100;
 const HISTORY_ENTRY_LIMIT = 2_000;
 const MAX_REMEMBERED_ANSWERS = 256;
 const MAX_REMEMBERED_LOCAL_INPUTS = 1_024;
+const MAX_EXTERNAL_RUNS = 64;
 const MAX_STATUS_QUEUE_SCAN = 2_000;
 const MAX_MESSAGE_BLOCK_SCAN = 2_048;
 const LITERAL_SLASH_PREFIX = "//";
@@ -104,8 +105,10 @@ type GenerationOutput = {
 };
 type RunOutput = { generation?: GenerationOutput };
 type ExternalRun = {
-  /** Newest assistant entry when this terminal first observed the external run. */
-  readonly baselineAnswerId: number;
+  /** First input of one logical run; it survives post-tool and onYield generation handovers. */
+  readonly rootInput: number;
+  /** Current generation task that owns the run and will write its final answer. */
+  taskId: number;
 };
 
 /** Observe one existing Durable conversation and present its committed model text in a local terminal. */
@@ -210,10 +213,13 @@ export async function runTerminalConversation(
     }
   };
 
-  const latestAssistantEntry = (entries: readonly EntryRecord[]): EntryRecord | undefined => {
+  const latestExternalAnswer = (
+    entries: readonly EntryRecord[],
+    taskId: number,
+  ): EntryRecord | undefined => {
     for (let index = entries.length - 1; index >= 0; index--) {
       const entry = entries[index]!;
-      if (AssistantEntry.is(entry)) return entry;
+      if (AssistantEntry.is(entry) && entry.byTaskId === taskId) return entry;
     }
     return undefined;
   };
@@ -221,39 +227,92 @@ export async function runTerminalConversation(
   /**
    * A run admitted by another host path (for example a scheduled origin-mode cron turn) has no local
    * Submission to wait on. Print its committed final answer once when the run ends, and never replay
-   * an already-completed run at startup. Live partials stay local-submission-only so this terminal
-   * never renders a revision it cannot reconcile against a settlement.
+   * an already-completed run at startup. Attribution uses the generation task that wrote the answer,
+   * so an immediate successor run in the same commit cannot steal or suppress the previous answer.
+   * Live partials stay local-submission-only so this terminal never renders a revision it cannot
+   * reconcile against a settlement.
    */
-  const finalizeExternalRuns = async (view: ConversationView): Promise<void> => {
-    if (externalRuns.size === 0) return;
-    const answer = latestAssistantEntry(view.entries);
-    for (const [taskId, state] of [...externalRuns]) {
-      externalRuns.delete(taskId);
-      if (answer === undefined || answer.id <= state.baselineAnswerId) {
-        await rawNotice(
-          "A turn admitted before or outside this terminal ended without a committed assistant reply; use /history to inspect the conversation.",
-          true,
-        );
+  const finalizeExternalRun = async (
+    view: ConversationView,
+    external: ExternalRun,
+  ): Promise<void> => {
+    const answer = latestExternalAnswer(view.entries, external.taskId);
+    if (answer === undefined) {
+      await rawNotice(
+        "A turn admitted before or outside this terminal ended without an attributable assistant reply; use /history to inspect the conversation.",
+        true,
+      );
+      return;
+    }
+    if (!rememberAnswer(answer.id)) return;
+    const message = answer.model?.[0];
+    const stopReason = message?.role === "assistant" ? message.stopReason : undefined;
+    const finalText = sanitizeTerminalText(assistantText(message as AssistantMessage));
+    if (stopReason === "error" || stopReason === "aborted") {
+      await rawNotice(
+        `A turn admitted before or outside this terminal ended ${stopReason === "error" ? "with a model error" : "after being aborted"}; use /history to inspect it.`,
+        true,
+      );
+    } else if (stopReason === "toolUse") {
+      await rawNotice(
+        "A turn admitted before or outside this terminal ended without a final text answer; use /history to inspect it.",
+        true,
+      );
+    } else if (finalText.length === 0) {
+      await rawNotice(
+        "A turn admitted before or outside this terminal ended with no text; use /history to inspect it.",
+        true,
+      );
+    } else {
+      await rawNotice(limitResponse(finalText));
+    }
+  };
+
+  const dropExternalRunFor = (inputs: readonly number[]): void => {
+    for (const [key, external] of [...externalRuns]) {
+      if (inputs.includes(external.rootInput)) externalRuns.delete(key);
+    }
+  };
+
+  /**
+   * Track external runs by their first input and current generation task, not by `live.run.taskId`
+   * alone. That task changes during tool rounds and onYield handovers, and Durable can end one run
+   * and start its queued successor in one commit, so waiting for an idle frame would merge or lose
+   * adjacent answers. A frame showing different input IDs finalizes the previous run before the new
+   * one is classified.
+   */
+  const reconcileExternalRuns = async (
+    view: ConversationView,
+    run: RunView | undefined,
+  ): Promise<void> => {
+    const currentInputs = run?.inputs ?? [];
+    for (const [key, external] of [...externalRuns]) {
+      const stillCurrent = currentInputs.includes(external.rootInput);
+      if (run === undefined || !stillCurrent) {
+        externalRuns.delete(key);
+        await finalizeExternalRun(view, external);
         continue;
       }
-      if (!rememberAnswer(answer.id)) continue;
-      const message = answer.model?.[0];
-      const finalText = sanitizeTerminalText(assistantText(message as AssistantMessage));
-      if (finalText.length === 0) {
-        const stopReason = message?.role === "assistant" ? message.stopReason : undefined;
-        const outcome = stopReason === "error"
-          ? "with a model error"
-          : stopReason === "aborted"
-            ? "after being aborted"
-            : "with no text";
-        await rawNotice(
-          `A turn admitted before or outside this terminal ended ${outcome}; use /history to inspect it.`,
-          true,
-        );
-      } else {
-        await rawNotice(limitResponse(finalText));
+      // A local input joined this run (or a local admission was observed late): local settlement
+      // owns the answer and partial rendering for the whole run.
+      if (currentInputs.some((id) => localInputIds.has(id))) {
+        externalRuns.delete(key);
+        continue;
       }
+      external.taskId = run.taskId;
     }
+    if (run === undefined || currentInputs.length === 0) return;
+    if (currentInputs.some((id) => localInputIds.has(id))) return;
+    if ([...externalRuns.values()].some((external) => currentInputs.includes(external.rootInput))) return;
+    if (externalRuns.size >= MAX_EXTERNAL_RUNS) {
+      const oldest = externalRuns.keys().next().value;
+      if (oldest !== undefined) externalRuns.delete(oldest);
+      await rawNotice("External run tracking limit reached; use /history to inspect earlier turns.", true);
+    }
+    externalRuns.set(currentInputs[0]!, {
+      rootInput: currentInputs[0]!,
+      taskId: run.taskId,
+    });
   };
 
   const responseState = (taskId: number): GenerationOutput => {
@@ -279,9 +338,10 @@ export async function runTerminalConversation(
     if (run === undefined) {
       // Keep the final streamed line open until the submission receipt is reconciled below.
       for (const state of runOutputs.values()) if (state.generation?.active) state.generation.active = false;
-      await finalizeExternalRuns(view);
+      await reconcileExternalRuns(view, undefined);
       return;
     }
+    await reconcileExternalRuns(view, run);
     // Delayed watch snapshots may predate the settled assistant entry reconciled below.
     if (runOutputs.get(run.taskId)?.generation?.finalized) return;
 
@@ -290,12 +350,6 @@ export async function runTerminalConversation(
       return submission !== undefined && !submission.finalized;
     });
     if (ownedInputs.length === 0) {
-      if (run.inputs.length > 0
-        && run.inputs.every((id) => !localInputIds.has(id))
-        && !externalRuns.has(run.taskId)) {
-        const baseline = latestAssistantEntry(view.entries);
-        externalRuns.set(run.taskId, { baselineAnswerId: baseline?.id ?? 0 });
-      }
       for (const state of runOutputs.values()) {
         if (state.generation?.active) {
           state.generation.active = false;
@@ -321,7 +375,7 @@ export async function runTerminalConversation(
     for (const id of ownedInputs) submissions.get(id)!.runTaskId = run.taskId;
     // A watch frame can arrive before the local admission promise records its ID. If this run turns
     // out to own a local input after all, local settlement owns its answer and partial rendering.
-    externalRuns.delete(run.taskId);
+    dropExternalRunFor(run.inputs);
     const state = responseState(run.taskId);
     const generation = live?.generation;
     if (state.finalized && (generation === undefined || state.attempt === generation.attempt)) return;
