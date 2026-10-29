@@ -785,18 +785,24 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (skillsInstalled && skillTool !== undefined) extensions.push(skillTool.extension);
           await configure(tx, targetConversationId, { tools, modelTools: tools, extensions });
         },
-        // The run's captured authority ends with it. Retire its grant/capture documents and stop
-        // offering its tools in the same commit that records the terminal outcome, so a finished or
-        // cancelled run cannot be used for a later admission. An origin link is kept: any re-created
-        // document for that target still has to satisfy the hook's origin check.
-        finalize: async ({ tx, job, occurrence, originConversationId, targetConversationId, delivery }) => {
-          if (targetConversationId === originConversationId) return;
-          await tx.retireDoc(ToolGrantDoc, targetConversationId);
-          await tx.retireDoc(ConfigToolCaptureDoc, targetConversationId);
-          await configure(tx, targetConversationId, { tools: [], modelTools: [] });
-          // Queue the successful final text in the same commit as the terminal run outcome. A failed,
-          // cancelled or superseded run, and an empty answer, is silence: `lastOutcome` remains the
-          // actionable failure record and nothing is sent externally.
+        // A separate run target's captured authority ends with the run: retire its grant/capture
+        // documents and stop offering its tools in the same commit that records the terminal
+        // outcome, so a finished or cancelled run cannot be used for a later admission. An
+        // origin-mode run answers in the origin conversation itself, so that conversation keeps its
+        // configured tools, cron ownership and context, and none of its documents are retired.
+        finalize: async ({ tx, job, occurrence, originConversationId, targetConversationId, background, delivery }) => {
+          if (background) {
+            await tx.retireDoc(ToolGrantDoc, targetConversationId);
+            await tx.retireDoc(ConfigToolCaptureDoc, targetConversationId);
+            await configure(tx, targetConversationId, { tools: [], modelTools: [] });
+          }
+          // Queue the successful final text in the same commit as the terminal run outcome, for a
+          // separate target and for an origin-mode answer alike. A failed, cancelled or superseded
+          // run, and an empty answer, is silence: `lastOutcome` remains the actionable failure
+          // record and nothing is sent externally. Delivery text is the committed answer entry the
+          // scheduled submission settled with, so no model turn is rerun and no nearby user answer
+          // is substituted for it. The origin session key is also the channel locator: a key outside
+          // an enabled delivery prefix is never queued.
           if (delivery === null || delivery.status !== "ok" || delivery.answerEntryId === null) return;
           if (job === null || !isChatSessionKey(job.owner.sessionKey)) return;
           if (!cronDeliveryPrefixes.some((prefix) => job.owner.sessionKey.startsWith(prefix))) return;

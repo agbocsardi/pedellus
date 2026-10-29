@@ -178,12 +178,11 @@ export interface CronPreparation {
  */
 export type CronPrepare = (preparation: CronPreparation, context: Context) => void | Promise<void>;
 /**
- * One run's durable retirement of an already-prepared target, in the same commit that records the
- * run's terminal result or cancellation. Retirement is target-scoped: `job` may be `null` when
- * the record is missing or the terminal path does not supply it (and `occurrence` may be a synthetic
- * zero input); a host that gave the target authority must retire it anyway. `background` is true
- * when the target is a separate conversation, so an origin-mode run's own conversation is never
- * finalized.
+ * One run's durable settlement in the same commit that records its terminal result or cancellation,
+ * whether the target is the origin conversation (origin mode) or a separate task-owned one. It is
+ * called for every terminal path that already prepared a target, so a host can retire that target's
+ * captured authority when `background` is true, and can durably admit delivery for either mode. The
+ * foundation itself changes no tool state and performs no external send.
  */
 export interface CronFinalization {
   readonly tx: Tx;
@@ -209,10 +208,10 @@ export interface CronRunDelivery {
   readonly answerEntryId: EntryId | null;
 }
 /**
- * Optional durable finalization of one run's target, in the same commit that records the run's
- * terminal result or cancellation. A host that gave the target authority should retire it here; the
- * foundation itself changes no tool state. Every terminal path of a run that already prepared a
- * separate target calls this, so a finished, failed, superseded or cancelled run keeps no copy.
+ * Optional finalization of one run's target in the same commit that records its terminal result or
+ * cancellation. A host retires a separate target's authority when `background` is true; an
+ * origin-mode target keeps the origin's own policy. Either mode may admit a successful final answer
+ * to durable delivery here, without another model turn.
  */
 export type CronFinalize = (finalization: CronFinalization, context: Context) => void | Promise<void>;
 
@@ -275,7 +274,11 @@ export interface CronJobView {
 export interface CronFoundationOptions {
   /** Optional durable preparation. Without it no context or tool grant is added. */
   readonly prepare?: CronPrepare;
-  /** Optional durable finalization in the run's terminal commit; called only for a separate target. */
+  /**
+   * Optional durable finalization in the run's terminal commit. A separate target's authority is
+   * retired when `background` is true; a successful final answer of either mode may be admitted to
+   * durable delivery here.
+   */
   readonly finalize?: CronFinalize;
   /** The Harness clock (`HarnessOptions.now`); default `Date.now`. */
   readonly now?: () => number;
@@ -599,9 +602,11 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
   const clock = options.now ?? (() => Date.now());
 
   /**
-   * Retire one already-prepared target inside the commit that ends its run. The target is the run
-   * task's own conversation, chosen once in its checkpoint, so it cannot belong to a newer run; an
-   * origin-mode target is the origin conversation itself and is deliberately left alone.
+   * Finish one already-prepared target inside the commit that ends its run. The target is the run
+   * task's own conversation, chosen once in its checkpoint, so it cannot belong to a newer run.
+   * `background` tells the host whether that target is a separate, task-owned conversation whose
+   * captured authority is retired; an origin-mode target is the origin conversation itself and the
+   * host leaves its policy alone. Delivery admission is offered for either mode.
    */
   const retireTarget = async (
     tx: Tx,
@@ -612,9 +617,11 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
     delivery: CronRunDelivery | null,
     context: Context,
   ): Promise<void> => {
-    if (finalize === undefined || targetConversationId === originConversationId) return;
+    if (finalize === undefined) return;
     await finalize({
-      tx, job, occurrence, originConversationId, targetConversationId, background: true, delivery,
+      tx, job, occurrence, originConversationId, targetConversationId,
+      background: targetConversationId !== originConversationId,
+      delivery,
     }, context);
   };
 
@@ -785,8 +792,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
         await runtime.commit(async (tx) => {
           // A cancelled run gives up its target's authority in this same commit: an abort is not a
           // reason to leave a prepared copy alive for a later admission.
-          if (finalize !== undefined && targetConversationId !== null
-            && targetConversationId !== running.conversationId) {
+          if (finalize !== undefined && targetConversationId !== null) {
             const doc = await tx.doc(CronJobsDoc, running.conversationId);
             const job = doc.jobs.find((candidate) => candidate.id === parsed?.jobId);
             await retireTarget(
@@ -957,8 +963,8 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
         error: settlement.error,
         conversationId: targetConversationId,
       };
-      // The run's authority ends with the run, in this same terminal commit. The origin-mode target
-      // is the origin conversation itself and is deliberately left alone.
+      // The run's authority ends with the run, in this same terminal commit. A separate target is
+      // retired; the origin-mode target is the origin conversation itself and keeps its policy.
       await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, {
         status: settlement.status,
         error: settlement.error,
