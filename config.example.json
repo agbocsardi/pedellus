@@ -9,11 +9,19 @@
     { "provider": "openai", "modelId": "gpt-6-sol" },
     { "provider": "openai", "modelId": "gpt-6-luna" }
   ],
-  "toolAllowlist": [],
+  "workspaceContext": {
+    "memoryFiles": ["memory/MEMORY.md"],
+    "memoryManifest": true,
+    "skills": {
+      "disabledSkills": []
+    }
+  },
+  "toolAllowlist": ["read", "write", "edit"],
   "toolTimeoutSeconds": 60,
   "toolSandbox": "host",
   "cron": {
-    "enabled": false
+    "enabled": true,
+    "timeZone": "UTC"
   },
   "episodeSummary": {
     "enabled": true
@@ -29,10 +37,5 @@
     "opencode_go": "OPENCODE_API_KEY",
     "xiaomi_mimo": "XIAOMIMIMO_API_KEY"
   },
-  "thinkingLevel": "high",
-  "telegram": {
-    "tokenEnv": "TELEGRAM_BOT_TOKEN",
-    "allowFrom": ["123456789"],
-    "pollTimeoutSeconds": 30
-  }
+  "thinkingLevel": "high"
 }

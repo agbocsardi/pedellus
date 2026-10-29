@@ -11,6 +11,10 @@ not a standing implementation queue.
 
 ## Run
 
+[`SETUP.md`](./SETUP.md) is the short walkthrough: build, create a synthetic
+workspace with memory and skills, grant finite tool authority through the local
+CLI, then add Telegram as a separate step. It does not claim live-model success.
+
 Copy `config.example.json` to a private explicit config file and edit the workspace, model, and environment-variable *names*. The config contains no credentials. The nine supported provider aliases and their `credentials` fields are listed in [provider support and migration notes](./PROVIDERS.md). Credential references and `telegram.tokenEnv` must be environment-variable names, not values or `${...}` expressions; the runtime does not read Nanobot/Pi user config or perform live credential discovery. Native catalogs/routes are not drop-in Python-provider parity, and real-provider acceptance remains open. SDK hosts may pass an explicit pi-ai `Models` instance as `openGateway(config, context, { models })` for offline/custom use; the CLI never installs a faux provider.
 
 ```sh
@@ -91,7 +95,8 @@ builtin body on demand ([details](./SKILLS_CONTEXT.md)). Neither loader
 provides full Python memory or skills parity. The local CLI/gateway host opts in
 only when the config contains a `workspaceContext` section
 (`workspaceContext.memoryFiles` and optional `workspaceContext.memoryManifest`,
-default off); it contributes no identity. The local CLI exposes `/refresh` to
+default off); the shipped example enables it, and leaving the section out keeps
+it off. It contributes no identity. The local CLI exposes `/refresh` to
 re-capture that conversation's context and skills when it is idle. Prepared
 requests containing old Nanobot context
 conservatively block recovery. With the gateway stopped and an existing database, an

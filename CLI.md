@@ -1,5 +1,8 @@
 # Interactive CLI
 
+For a first-time walkthrough of workspace, memory, skills and grants, start with
+[setup](./SETUP.md).
+
 Run the configured local conversation with the existing explicit config path:
 
 ```sh

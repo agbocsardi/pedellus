@@ -90,8 +90,9 @@ snapshot provider and `openGateway` installs no context extension.
 - Context-enabled gateways are limited to 256 mapped sessions, including channel
   state sessions; opening or creating sessions beyond that limit fails closed.
 
-The example `config.example.json` intentionally omits `workspaceContext` so the
-shipped default stays off.
+The shipped `config.example.json` opts in with `memoryFiles: ["memory/MEMORY.md"]`,
+`memoryManifest: true` and a `skills` section so the documented CLI setup works;
+leaving `workspaceContext` out keeps every context loader off.
 
 ## SDK usage
 
