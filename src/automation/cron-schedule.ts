@@ -6,11 +6,14 @@ export const CRON_DEFAULT_TIME_ZONE = "UTC";
 
 /**
  * Schedules this slice accepts. `at` is Python's one-shot schedule; `once` remains an accepted
- * alias so callers written against the first foundation keep working.
+ * alias so callers written against the first foundation keep working. `after` is a relative
+ * one-shot request: it is resolved once, from the controller clock at admission, into the same
+ * stored `at` form, so a stored job never carries a relative deadline.
  */
 export type CronScheduleRequest =
   | { readonly kind: "at"; readonly at: number }
   | { readonly kind: "once"; readonly at: number }
+  | { readonly kind: "after"; readonly afterMs: number }
   | { readonly kind: "every"; readonly everyMs: number }
   | { readonly kind: "cron"; readonly expr: string; readonly timeZone?: string };
 
@@ -50,6 +53,29 @@ export class CronScheduleError extends RangeError {
 
 const errorText = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
+/** The largest epoch-millisecond value a JavaScript `Date` can represent. */
+const MAX_DATE_MS = 8.64e15;
+
+function validAfterMs(afterMs: unknown): number {
+  if (!Number.isSafeInteger(afterMs) || (afterMs as number) <= 0) {
+    throw new CronScheduleError("after schedule requires a positive integer afterMs");
+  }
+  return afterMs as number;
+}
+
+/** The single instant a relative request resolves to, without ever recalculating it. */
+function afterInstant(afterMs: number, now: number): number {
+  validAfterMs(afterMs);
+  const at = now + afterMs;
+  if (!Number.isSafeInteger(at) || at <= now) {
+    throw new CronScheduleError("the relative one-shot exceeds the safe integer range");
+  }
+  if (Math.abs(at) > MAX_DATE_MS) {
+    throw new CronScheduleError("the relative one-shot is beyond the representable date range");
+  }
+  return at;
+}
 
 /** Validate an IANA time zone, rejecting fixed UTC offsets masquerading as zone names. */
 function validateTimeZone(timeZone: string): string {
@@ -100,6 +126,12 @@ export function parseCronScheduleRequest(request: CronScheduleRequest): CronSche
     }
     return { kind: "at", at: request.at };
   }
+  if (request.kind === "after") {
+    if ("at" in request || "everyMs" in request || "expr" in request || "timeZone" in request) {
+      throw new CronScheduleError("an after schedule must not carry at, everyMs, expr, or timeZone");
+    }
+    return { kind: "after", afterMs: validAfterMs(request.afterMs) };
+  }
   if (request.kind === "every") {
     if ("at" in request || "expr" in request || "timeZone" in request) {
       throw new CronScheduleError("an every schedule must not carry at, expr, or timeZone");
@@ -119,7 +151,7 @@ export function parseCronScheduleRequest(request: CronScheduleRequest): CronSche
     );
     return normalized;
   }
-  throw new CronScheduleError("schedule kind must be 'at', 'every', or 'cron'");
+  throw new CronScheduleError("schedule kind must be 'at', 'after', 'every', or 'cron'");
 }
 
 /** Freeze a request into its stored form; a one-shot must still be in the future. */
@@ -138,6 +170,11 @@ export function materializeCronSchedule(
       throw new CronScheduleError("a one-shot schedule must be in the future");
     }
     return { kind: "at", at: request.at };
+  }
+  if (request.kind === "after") {
+    // A relative request is resolved exactly once, here, from the controller clock. Callers must
+    // dedupe a replay against the stored instant instead of re-deriving a new one.
+    return { kind: "at", at: afterInstant(request.afterMs, now) };
   }
   if (request.kind === "every") {
     if (!Number.isSafeInteger(request.everyMs) || request.everyMs <= 0) {

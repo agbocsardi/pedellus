@@ -359,7 +359,16 @@ function normalizeRequest(actor: CronActor, request: CronScheduleInput): Normali
   };
 }
 
-function sameScheduleRequest(left: CronSchedule, right: CronScheduleRequest): boolean {
+function sameScheduleRequest(job: CronJob, right: CronScheduleRequest): boolean {
+  const left = job.schedule;
+  if (right.kind === "after") {
+    // The relative request was resolved once, at admission, so a replay names the original stored
+    // deadline: createdAtMs is that admission and the stored at is already frozen. Comparing it
+    // this way keeps a retry deduplicated after the deadline passes, and after a reopen, without
+    // recalculating the deadline from the current clock.
+    const replayAt = job.createdAtMs + right.afterMs;
+    return left.kind === "at" && Number.isSafeInteger(replayAt) && left.at === replayAt;
+  }
   if (left.kind === "at" && (right.kind === "at" || right.kind === "once")) {
     return left.at === right.at;
   }
@@ -374,7 +383,7 @@ function sameNormalizedRequest(job: CronJob, request: NormalizedRequest): boolea
   return job.message === request.message
     && job.name === request.name
     && job.mode === request.mode
-    && sameScheduleRequest(job.schedule, request.schedule);
+    && sameScheduleRequest(job, request.schedule);
 }
 function parseOccurrenceInput(value: unknown): CronOccurrenceInput | undefined {
   if (!isRecord(value) || typeof value.jobId !== "string" || value.jobId === "") return undefined;

@@ -123,17 +123,31 @@ operation even though the run itself completed.
 
 ## Schedule math
 
-Supported request kinds are Python-like `at`, `every`, and `cron`:
+Supported request kinds are Python-like `at`, `every`, and `cron`, plus a relative one-shot
+`after`:
 
 - `at` is one absolute epoch-millisecond instant. `once` is accepted and normalized to `at` for
   callers written against the first foundation. Stored jobs use `at`, `every`, or `cron`; a stored
   `once` record from an unshipped probe is not migrated. The instant must be in the future when
   the job is created.
+- `after` is a one-shot elapsed delay (`afterMs`). It is not an interval and not a date-parsing
+  heuristic: it resolves once, in the commit that creates the job, from the controller clock, and
+  is stored as the ordinary `at` instant. `createdAtMs` already records that admission, so no
+  stored schedule kind or schema is added. The delay, the epoch addition, and the resulting
+  representable `Date` are validated before the commit, so a stored deadline cannot fail later
+  formatting.
 - `every` is an interval anchored at creation. Every later occurrence is `anchorMs + k * everyMs`,
   so the grid survives restarts and a backward clock jump. This differs from Python's
   `now + interval` recomputation, which resets the phase on restart.
 - `cron` is a calendar expression evaluated in an IANA time zone. `timeZone` defaults to `UTC`,
   matching the Python tool's default. Fixed UTC offsets such as `+02:00` are rejected.
+
+Scheduling is idempotent on the caller's key. A retried relative request is deduplicated against
+the original stored deadline (stored `at` equal to `createdAtMs + afterMs`), so a replay after a
+long delay, a reopen, or a fired one-shot never recomputes the deadline from the current clock,
+creates a second job, or arms a second timer. An absolute request naming that same stored instant
+is the same schedule. A same-key request with a different delay, message, name, or mode is refused
+before any mutation.
 
 Calendar parsing and recurrence use `croner` 10.0.1. Expressions may have 5, 6, or 7 fields:
 `minute hour day-of-month month day-of-week`, with optional leading `second` and trailing `year`.
@@ -372,3 +386,14 @@ sanitized durable delivery fault visible in the job list; a malformed pending re
 document; and a reopened gateway repeated none of them as a faulting loop. A full all-pending outbox
 returned `full`, retained every pending record and recorded a deduped overflow fault. No permanent
 test, live bot, credential or network request was involved.
+
+Relative-reminder probes (temporary and uncommitted) drove the real foundation with a fake clock,
+and the real `openGateway` path with a faux provider. They covered: `after` resolving once to the
+admission instant plus the delay and storing the ordinary `at` form; rejection of zero, negative,
+fractional, `NaN`, unsafe and epoch/Date-overflow delays plus mixed schedule fields before any job
+exists; a replayed request deduping the original deadline after the deadline passed, after a
+backwards clock jump, and after reopen; a fired one-shot remaining one job with no second timer and
+the replay still deduping its original instant; a same-key different delay refused with the record
+unchanged; equivalent absolute `at` deduping the same instant; unchanged `at`/`every`/`cron`
+semantics; and a model-issued `cron add` with `after_seconds` reporting the stored next instant.
+No permanent test, live provider, credential or workspace was involved.

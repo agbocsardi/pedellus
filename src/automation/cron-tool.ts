@@ -5,15 +5,16 @@
  * There is no user scheduler, slash command, or UI. Every operation is owner-scoped to the calling
  * conversation's job document, and the tool never widens authority:
  *
- * - a job inherits the origin conversation's grants when its run starts, so scheduling cannot grant
- *   a tool the conversation does not already hold;
- * - a `background` run gets a fresh task-owned conversation with those grants copied and nothing
+ * - a job gets the origin conversation's enabled tools when its run is prepared, so scheduling
+ *   cannot grant a tool the conversation does not already hold;
+ * - a `background` run gets a fresh task-owned conversation with that authority copied and nothing
  *   else, so a scheduled turn cannot reach another conversation's state;
  * - `origin` runs answer in the conversation that scheduled them.
  *
  * The tool itself is not grant-gated and is not part of the host coding-tool ceiling: it can only
  * write owner-scoped job records in the calling conversation, and it executes no filesystem or shell
- * work. Reading, writing and shell work inside a scheduled run still needs that run's copied grants.
+ * work. Reading, writing and shell work inside a scheduled run still needs that run's inherited
+ * authority.
  */
 import type { Context } from "@earendil-works/chord";
 import { Type } from "@earendil-works/pi-ai";
@@ -58,13 +59,14 @@ export interface CronTool {
 }
 
 const ACTIONS = ["add", "list", "remove"] as const;
-const SCHEDULE_FIELDS = ["at", "every_seconds", "cron_expr"] as const;
+const SCHEDULE_FIELDS = ["at", "after_seconds", "every_seconds", "cron_expr"] as const;
 
 interface CronToolArguments {
   readonly action: (typeof ACTIONS)[number];
   readonly message?: string;
   readonly name?: string;
   readonly at?: string;
+  readonly after_seconds?: number;
   readonly every_seconds?: number;
   readonly cron_expr?: string;
   readonly tz?: string;
@@ -106,12 +108,24 @@ function parseAt(raw: string): number {
 function scheduleOf(args: CronToolArguments, zone: string): CronScheduleInput["schedule"] {
   const present = SCHEDULE_FIELDS.filter((field) => args[field] !== undefined);
   if (present.length === 0) {
-    throw new TypeError("add requires exactly one of at, every_seconds or cron_expr");
+    throw new TypeError("add requires exactly one of at, after_seconds, every_seconds or cron_expr");
   }
   if (present.length > 1) {
     throw new TypeError(`add accepts one schedule, not ${present.join(" + ")}`);
   }
   if (args.at !== undefined) return { kind: "at", at: parseAt(args.at) };
+  if (args.after_seconds !== undefined) {
+    const seconds = args.after_seconds;
+    if (!Number.isSafeInteger(seconds) || seconds <= 0) {
+      throw new TypeError("after_seconds must be a positive whole number of seconds");
+    }
+    const afterMs = seconds * 1000;
+    if (!Number.isSafeInteger(afterMs)) throw new TypeError("after_seconds is too large");
+    // The foundation resolves this once, at admission, against its own clock. The tool never
+    // reads a clock, so a safe replay carries the same relative request and dedupes against the
+    // original stored deadline.
+    return { kind: "after", afterMs };
+  }
   if (args.every_seconds !== undefined) {
     const seconds = args.every_seconds;
     if (!Number.isSafeInteger(seconds) || seconds <= 0) {
@@ -183,8 +197,8 @@ export function createCronTool(options: CronToolOptions): CronTool {
       "reports). Actions: `add` creates a job whose message you will receive as a new turn when due; " +
       "`list` shows this conversation's jobs, their status and next run; `remove` cancels one job. " +
       "A job runs in an isolated background conversation by default, or in this conversation when " +
-      "`isolated` is false. Scheduled runs inherit this conversation's current tool grants; they never " +
-      "gain new ones.",
+      "`isolated` is false. Scheduled runs inherit this conversation's enabled tools; they never " +
+      "gain more.",
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("add"),
@@ -200,7 +214,13 @@ export function createCronTool(options: CronToolOptions): CronTool {
       at: Type.Optional(Type.String({
         description:
           "add: one-shot time as an ISO 8601 timestamp with an explicit UTC offset or Z, " +
-          "for example 2026-11-01T09:00:00+01:00.",
+          "for example 2026-11-01T09:00:00+01:00. Use after_seconds instead for a relative reminder.",
+      })),
+      after_seconds: Type.Optional(Type.Integer({
+        description:
+          "add: one-shot delay in whole seconds from now, for example 600 for ten minutes. Use this " +
+          "for relative reminders instead of computing an absolute at time.",
+        minimum: 1,
       })),
       every_seconds: Type.Optional(Type.Integer({
         description: "add: fixed interval in seconds, for example 3600 for hourly.",

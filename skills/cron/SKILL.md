@@ -33,7 +33,8 @@ Provide exactly one schedule:
 
 | Argument | Meaning |
 | --- | --- |
-| `at` | One-shot instant as ISO 8601 with an explicit UTC offset or `Z`, for example `2026-11-01T09:00:00+01:00`. It must be in the future. A naive local time is rejected. |
+| `after_seconds` | One-shot delay in whole seconds from now, for example `600` for ten minutes. Use this for relative reminders such as "in ten minutes"; it is an elapsed duration, independent of time zone. |
+| `at` | One-shot instant as ISO 8601 with an explicit UTC offset or `Z`, for example `2026-11-01T09:00:00+01:00`. Use it only when the user states an exact instant. It must be in the future. A naive local time is rejected. |
 | `every_seconds` | Fixed interval in whole seconds, anchored at creation, so the phase survives restarts. |
 | `cron_expr` | Calendar expression, plus optional `tz`. |
 
@@ -43,8 +44,10 @@ day-of-week`, with seconds first when six fields are given (`0 0 9 * * 1-5` is
 IANA zone name and defaults to the configured `cron.timeZone`, or `UTC` when
 unset; fixed offsets such as `+02:00` are rejected.
 
-Do not guess at parsing user text: compute an offset-qualified ISO instant for
-`at`, or map a wall-clock request onto `cron_expr` plus `tz`.
+Do not guess at parsing user text: for a relative request such as "remind me in ten
+minutes", pass `after_seconds: 600`; for an exact instant the user states, pass an
+offset-qualified `at`; for a recurring wall-clock request, map it onto `cron_expr` plus
+`tz`.
 
 ## Mode
 
