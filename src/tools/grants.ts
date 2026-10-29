@@ -132,9 +132,10 @@ export function pruneToolGrants(
  * still resolved for the conversation, so reopening also rechecks grants by pruning them before
  * `resume()`; this hook catches expiry between reopen and the call.
  *
- * `contextTools` names non-effectful context tools (such as the read-only skill loader). They are
- * exempt from the grant document and the ceiling because they cannot change state; everything else
- * still needs an explicit unexpired grant.
+ * `contextTools` names non-effectful context tools (the read-only skill loader, the
+ * owner-scoped cron tool and the read-only mapped-chat history tool). They are exempt
+ * from the grant document and the ceiling because they cannot change state; everything
+ * else still needs an explicit unexpired grant.
  */
 export function createToolGrantHook(
   ceiling: readonly string[],

@@ -70,9 +70,11 @@ described below; Code Mode is not part of this slice.
   entry. It can also discover ready derived episode summaries (`summaries`) and read
   one summary with provenance and drilldown (`summary`), but it never generates or
   backfills a summary, and original entries remain the evidence. It is not in the
-  coding-tool ceiling, cannot be granted or revoked, accepts no path or shell
-  command, modifies no transcript and creates no conversation. Its output is
-  bounded, source-labeled, and quoted as untrusted historical data. See
+  coding-tool ceiling, cannot be granted or revoked, and the coding-tool call
+  hook exempts it like the `skill` tool, so enabling coding tools never
+  suppresses it. It accepts no path or shell command, modifies no transcript and
+  creates no conversation. Its output is bounded, source-labeled, and quoted as
+  untrusted historical data. See
   [`HISTORY.md`](./HISTORY.md#agent-facing-history-tool).
 
 ## Config authorization (shipped CLI and Telegram)
@@ -100,8 +102,9 @@ manage.
   never new authority: the call-time check still requires each name in the
   current `toolAllowlist` and the recorded origin to still be an authenticated
   mapped chat. Reopening re-filters both the run target and its capture against
-  the current config before resume; a finished, cancelled or otherwise unknown
-  target has its capture retired and keeps no tool.
+  the current config before resume; a finished target's capture is retired at
+  its terminal commit and keeps no tool, while a denied or reconciled target can
+  keep an emptied capture that names no tool.
 - Grant documents from the SDK grant mode are never read in this mode, so an old
   unexpired grant cannot restore a tool that was removed from the configuration.
 - The workspace guard, `extraAllowedDirs`, `toolSandbox` and the rest of the
@@ -142,7 +145,10 @@ the ceiling, and another conversation's grants have no effect on this one:
 agent tool filters are read from that conversation's own document. A Gateway
 opened in config mode returns an empty list from `listToolGrants` and rejects
 `grantTools`/`revokeTools` with a fixed configuration error: the two modes never
-silently share authority.
+silently share authority. Config mode leaves grant documents in place, so
+explicitly reopening the same store in legacy grant mode re-honors grants that
+are still unexpired and inside the then-current ceiling; the shipped CLI never
+selects grant mode.
 
 ### Local CLI controls
 
@@ -252,9 +258,12 @@ re-bounded: the gateway intersects the capture with the current `toolAllowlist`
 and the validated origin, writes the intersection back, and the pre-resume
 policy pass offers only that subset. An ended run, a missing or mismatched link
 or capture, an unknown origin and an unmapped or non-chat origin all yield an
-empty bound and a retired capture. The target keeps no tool after its terminal
-commit. A capture found on a conversation that is not a validated live run
-target is retired by the policy pass instead of being honored.
+empty bound, so the target keeps no tool after its terminal commit. Finalize
+retires that target's capture; a denied or reconciled target can instead keep an
+emptied capture (`tools: []`), which authorizes nothing because every call
+still requires the name in both the current ceiling and the capture, plus an
+authenticated origin. A capture found on a conversation that is not a validated
+live run target is retired by the policy pass instead of being honored.
 
 ## Replay and reopen
 

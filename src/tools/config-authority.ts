@@ -56,7 +56,8 @@ export function boundedCapturedTools(
  * ceiling, and a scheduled run's target may use only its captured names while its recorded origin
  * is still an authenticated mapped chat. Anything else (the root, a channel-state conversation, a
  * fork, a raw or task-owned conversation without a valid capture) is denied, so agent state that
- * still names a removed tool can never call it.
+ * still names a removed tool can never call it. `contextTools` (skill, cron, history) are exempt in
+ * both modes because they carry no filesystem or shell authority.
  */
 export function createConfigToolHook(
   ceiling: readonly string[],

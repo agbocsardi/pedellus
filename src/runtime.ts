@@ -35,7 +35,7 @@ import {
   readEpisodeDocument,
   type HistorySummaryView,
 } from "./history/summary-view.js";
-import { createHistoryTool, type HistoryToolHost } from "./history/tool.js";
+import { createHistoryTool, HISTORY_TOOL_NAME, type HistoryToolHost } from "./history/tool.js";
 import type { CronOwner } from "./automation/cron.js";
 import {
   EpisodeDoc,
@@ -542,6 +542,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const now = () => Date.now();
   // Mirrors the shared policy's config-level default so a host-default timeout reports its duration.
   const defaultTimeoutSeconds = toolTimeoutSeconds ?? 60;
+  // The read-only history tool is on by default; its name is fixed before the tool extension exists so
+  // the coding hook can exempt it from the ceiling like the skill loader.
+  const historyEnabled = options.agentHistory !== false;
   // Config authorization names only mapped ordinary chat conversations (loaded map + scope checked).
   // The call-time hook consults this set; the policy filter reads the same rule from committed state.
   const authorizedChatConversations = new Set<ConversationId>();
@@ -552,6 +555,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
         contextTools: [
           ...(options.contextSnapshotProvider === undefined ? [] : [SKILL_TOOL_NAME]),
           ...(cronEnabled ? [CRON_TOOL_NAME] : []),
+          // History retrieval is read-only over mapped chats and has its own scope checks, so neither
+          // authorization mode may let the ceiling suppress it when coding tools are enabled.
+          ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
         ],
         defaultTimeoutSeconds,
         now,
@@ -596,7 +602,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // shell, no transcript write and no conversation creation. The host surface is late-bound so the
   // extension can be registered before Harness.open() while the index itself is created afterwards.
   const historyToolHostRef: { current: HistoryToolHost | undefined } = { current: undefined };
-  const historyTool = options.agentHistory === false ? undefined : createHistoryTool({ host: () => historyToolHostRef.current });
+  const historyTool = historyEnabled ? createHistoryTool({ host: () => historyToolHostRef.current }) : undefined;
   const historyToolRegistration = historyTool?.extension.tools?.[0];
   const historyConversations = new Set<ConversationId>();
   // Mapped session keys own their snapshot. A scheduled run's target is tracked separately in
