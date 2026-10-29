@@ -698,6 +698,25 @@ agent cron wiring remain open; this is not yet an everyday replacement or cutove
 
 ## Session log
 
+### 2026-10-29 — authorized implementation batch: recall reliability and Telegram controls
+
+Owner approved committing the priority plan (`ffa6b71`) and coordinating 2–3 Umans
+DeepSeek Flash/high agents. Active bounded assignments:
+
+- `worker-summary-task-e10a8d20` (`w2R:p1`): close summary renderer/version/retry
+  blockers; commit a stable candidate for independent re-review. Existing summary
+  reviewer holds prior findings and awaits that candidate.
+- `worker-tg-controls-0d903ab6` (`w2V:p1`, worktree/branch of the same name, base
+  `ffa6b71`): implement authenticated `/new`, `/abort`, `/help` via native APIs,
+  preserving per-chat authority and durable update/reply handling.
+- `reviewer-tg-controls-66707c9b` (`w2D:p3B`): preflight authentication, admission,
+  reset/abort and redelivery constraints, then review the stable implementation.
+
+Summary discovery/indexing follows a reviewed summary contract; cron delivery comes
+later. No live model/channel calls, credentials, personal data, deployment or
+permanent tests are authorized by this batch. Integrate only reviewed commits and
+validate the combined tree; record limitations rather than imply acceptance.
+
 ### 2026-10-29 — prioritize finishing agent-facing recall
 
 Recorded the next-value order: finish the reviewed summary candidate and normal-path
