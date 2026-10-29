@@ -50,7 +50,8 @@ export function parseStoreIdentity(value: unknown): StoreIdentity {
   if (typeof createdAt !== "number" || !Number.isSafeInteger(createdAt) || createdAt <= 0) {
     throw new Error("Store identity document has an invalid creation time");
   }
-  return { format: STORE_IDENTITY_FORMAT, version: STORE_IDENTITY_VERSION, storeId, createdAt };
+  // Frozen: the value may be handed to several hosts and must not be mutable by any of them.
+  return Object.freeze({ format: STORE_IDENTITY_FORMAT, version: STORE_IDENTITY_VERSION, storeId, createdAt });
 }
 
 /**

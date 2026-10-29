@@ -108,7 +108,10 @@ export interface Gateway {
    * `next.before` is a durable entry ID, so a continuation stays stable across appends and
    * reopen. `summary.status` reports `open`, `pending`, `ready`, `failed`, or `unknown` when
    * reconciliation has not reached that boundary yet; the original entries are always the
-   * authority and remain readable through the conversation handle.
+   * authority and remain readable through the conversation handle. Boundaries and counts are
+   * the same before and after reconciliation. Empty episodes are omitted: an episode whose
+   * only entry is its own reset marker is not a discussion. A reset handoff is synthetic
+   * context, so `messages` counts ordinary user and assistant entries only.
    */
   listHistoryEpisodes(
     sessionKey: string,

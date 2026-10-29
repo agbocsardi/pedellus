@@ -12,15 +12,33 @@
  * - The per-conversation progress document is a fixed set of counters and cannot grow
  *   with history length.
  * - One small document per closed, non-empty episode holds its summary state. An empty
- *   episode (two consecutive resets) is never recorded, so a reset never creates a
- *   phantom discussion.
+ *   episode is never recorded and never listed, so a reset never creates a phantom
+ *   discussion. An episode is empty when it holds no entry other than its own reset
+ *   marker; a reset carrying only handoff text is empty, because that text is part of
+ *   the reset entry, not an ordinary message.
  * - Catch-up runs in committed background batches and resumes from persisted progress
  *   after a crash. It never blocks gateway open or a model turn, and it changes no
  *   native reset/busy ordering: it only reads entries that are already committed.
  *
+ * Contract of the derived records:
+ * - Boundaries are entry IDs, so they are stable for the life of the store.
+ * - `entries` counts every entry in the inclusive range, including the episode's reset
+ *   entry. `messages` counts only ordinary user and assistant entries and never a reset
+ *   handoff; `toolResults` counts tool result entries. System and compaction entries are
+ *   entries but not messages.
+ * - A reset's `model` user message is synthetic handoff context, so it is not a message
+ *   and not episode content. It may later be exposed as separate episode metadata.
+ * - Reads are bounded by pages, not by a hard cap: listing reads entries until it has
+ *   filled a page of episodes (for a conversation without resets that is the whole
+ *   conversation), and reading one episode reads only that episode's entries. The
+ *   fast paths cost one entry read plus one document read per episode when the catalog
+ *   has caught up. Nothing here writes on a read.
+ *
  * Deliberately not here: summary generation, retries, summary search, and message/tool
  * indexes. A closed episode is recorded as `summary.status = "pending"`; nothing claims
- * it yet, and no schedule is implied.
+ * it yet, and no schedule is implied. There is also no durable enumeration of pending
+ * episodes yet: a future summary pass needs its own work queue or an index over those
+ * documents rather than a document scan per pass.
  */
 import {
   defineDoc,
@@ -72,7 +90,12 @@ export interface HistoryEpisodeSummary {
   readonly title: string | null;
 }
 
-/** One episode: a discussion bounded by committed resets inside a conversation. */
+/**
+ * One episode: a discussion bounded by committed resets inside a conversation.
+ *
+ * Only non-empty episodes exist: an episode whose only entry is its own reset marker
+ * (two consecutive resets, or a reset carrying only handoff text) is omitted.
+ */
 export interface HistoryEpisode {
   readonly conversationId: ConversationId;
   /** First entry of the episode: the reset entry, or the conversation's first entry. */
@@ -82,9 +105,11 @@ export interface HistoryEpisode {
   readonly status: "open" | "closed";
   /** Reset entry that starts the episode; null for a conversation's pre-reset segment. */
   readonly resetEntryId: EntryId | null;
-  /** Entries in the inclusive boundary range; null when this read did not derive them. */
+  /** Entries in the inclusive boundary range, including the reset marker; null when uncounted. */
   readonly entries: number | null;
+  /** Ordinary user and assistant entries only: a reset handoff is not a message. */
   readonly messages: number | null;
+  /** Tool result entries in the range; null when uncounted. */
   readonly toolResults: number | null;
   readonly summary: HistoryEpisodeSummary;
 }
@@ -206,6 +231,20 @@ interface ClosedEpisodeBoundary extends EntryTotals {
 
 const EMPTY_TOTALS: EntryTotals = { entries: 0, messages: 0, toolResults: 0 };
 
+const OPEN_SUMMARY: HistoryEpisodeSummary = Object.freeze({
+  status: "open",
+  summarizerVersion: null,
+  attempts: 0,
+  title: null,
+});
+
+const UNRECORDED_SUMMARY: HistoryEpisodeSummary = Object.freeze({
+  status: "unknown",
+  summarizerVersion: null,
+  attempts: 0,
+  title: null,
+});
+
 const EMPTY_PROGRESS: CatalogProgress = {
   scannedThroughEntryId: null,
   openStartEntryId: null,
@@ -290,6 +329,14 @@ function isMessageEntry(entry: EntryRecord): boolean {
   return entry.kind === USER_ENTRY_KIND || entry.kind === ASSISTANT_ENTRY_KIND;
 }
 
+/**
+ * Entries other than the episode's own reset marker. A reset's handoff message is part of
+ * the reset entry, so a reset carrying only handoff text is an empty episode.
+ */
+function contentEntries(entries: number, resetEntryId: EntryId | null): number {
+  return resetEntryId === null ? entries : entries - 1;
+}
+
 function isToolResultEntry(entry: EntryRecord): boolean {
   return entry.kind === TOOL_RESULT_ENTRY_KIND;
 }
@@ -308,9 +355,8 @@ function scanBatch(
   const closeOpenEpisode = (): void => {
     if (state.openStartEntryId === null || state.openEndEntryId === null) return;
     // A reset-started episode also holds its reset entry; with nothing else it is empty
-    // (two consecutive resets) and is not an episode at all.
-    const content = state.openResetEntryId === null ? state.entries : state.entries - 1;
-    if (content <= 0) return;
+    // (two consecutive resets, or a reset carrying only handoff text) and is no episode.
+    if (contentEntries(state.entries, state.openResetEntryId) <= 0) return;
     closed.push({
       startEntryId: state.openStartEntryId,
       resetEntryId: state.openResetEntryId,
@@ -561,9 +607,27 @@ export function createEpisodeCatalog(options: EpisodeCatalogOptions): EpisodeCat
       entries: totals?.entries ?? null,
       messages: totals?.messages ?? null,
       toolResults: totals?.toolResults ?? null,
-      summary: open
-        ? { status: "open", summarizerVersion: null, attempts: 0, title: null }
-        : { status: "unknown", summarizerVersion: null, attempts: 0, title: null },
+      summary: open ? OPEN_SUMMARY : UNRECORDED_SUMMARY,
+    };
+  };
+
+  /** The open episode as the reconciled catalog recorded it, omitted while it is empty. */
+  const openEpisodeFromProgress = (
+    conversationId: ConversationId,
+    progress: CatalogProgress,
+  ): HistoryEpisode | undefined => {
+    if (progress.openStartEntryId === null) return undefined;
+    if (contentEntries(progress.entries, progress.openResetEntryId) <= 0) return undefined;
+    return {
+      conversationId,
+      startEntryId: progress.openStartEntryId,
+      endEntryId: null,
+      status: "open",
+      resetEntryId: progress.openResetEntryId,
+      entries: progress.entries,
+      messages: progress.messages,
+      toolResults: progress.toolResults,
+      summary: OPEN_SUMMARY,
     };
   };
 
@@ -608,29 +672,24 @@ export function createEpisodeCatalog(options: EpisodeCatalogOptions): EpisodeCat
         if (scanBelow < 1) return { episodes: [] };
       } else if (progress.openStartEntryId !== null) {
         // Fast path: when progress reaches the tail, its open start is the current episode,
-        // so serving the open episode costs no scan. A reset placed since the last pass
-        // leaves progress behind the tail, and the scan below derives boundaries instead.
+        // so serving the open episode costs one entry read. A reset placed since the last
+        // pass leaves progress behind the tail, and the scan below derives boundaries.
         const tail = (await conversation.entries({ order: "descending" }, 1, undefined, ctx)).items[0];
         const caughtUp =
           tail === undefined ||
           (progress.scannedThroughEntryId !== null && tail.id <= progress.scannedThroughEntryId);
         if (caughtUp) {
-          episodes.push(
-            await derivedEpisode(
-              conversationId,
-              progress.openStartEntryId,
-              null,
-              true,
-              progress.openResetEntryId,
-              undefined,
-              ctx,
-            ),
-          );
-          if (episodes.length >= limit) {
-            return progress.openStartEntryId > 1
-              ? { episodes, next: { before: progress.openStartEntryId } }
-              : { episodes };
+          const current = openEpisodeFromProgress(conversationId, progress);
+          if (current !== undefined) {
+            episodes.push(current);
+            if (episodes.length >= limit) {
+              return progress.openStartEntryId > 1
+                ? { episodes, next: { before: progress.openStartEntryId } }
+                : { episodes };
+            }
           }
+          // An empty current episode (a reset with no content yet) is omitted, but the
+          // reset still closed the segment below it.
           sawReset = true;
           scanBelow = (progress.openStartEntryId - 1) as EntryId;
           if (scanBelow < 1) return { episodes };
@@ -660,9 +719,13 @@ export function createEpisodeCatalog(options: EpisodeCatalogOptions): EpisodeCat
         for (const entry of page.items) {
           oldest = entry.id;
           if (entry.kind === RESET_ENTRY_KIND) {
-            // This reset starts the episode above it: inclusive [reset, newest above].
+            // This reset starts the episode above it: inclusive [reset, newest above]. The
+            // scan reaches resets newest first, so only the first one leaves that episode
+            // open; every later reset closed the segment above it, including when that
+            // segment is empty and therefore omitted.
+            const open = !sawReset;
+            sawReset = true;
             if (newest !== null) {
-              const open = !sawReset;
               episodes.push(
                 await derivedEpisode(
                   conversationId,
@@ -674,7 +737,6 @@ export function createEpisodeCatalog(options: EpisodeCatalogOptions): EpisodeCat
                   ctx,
                 ),
               );
-              sawReset = true;
               if (episodes.length >= limit) {
                 full = true;
                 break;
@@ -716,30 +778,92 @@ export function createEpisodeCatalog(options: EpisodeCatalogOptions): EpisodeCat
       if (typeof startEntryId !== "number" || !Number.isSafeInteger(startEntryId) || startEntryId < 1) {
         throw new TypeError("Episode start must be a positive entry ID");
       }
+      // A recorded closed episode is immutable, so it is the same answer before and after
+      // reconciliation.
       const recorded = await recordedEpisode(conversationId, startEntryId, ctx);
       if (recorded !== undefined) return recorded;
       const conversation = await harness.conversation(conversationId, ctx);
       if (conversation === undefined) return undefined;
       const progress = progressOf(await harness.snapshot(EpisodeCatalogDoc, conversationId, ctx));
-      if (progress.openStartEntryId !== startEntryId) return undefined;
-      // The open episode is only claimed while progress reaches the tail: a reset placed since
-      // the last pass would otherwise be reported as still open. list() derives that case.
-      const tail = (await conversation.entries({ order: "descending" }, 1, undefined, ctx)).items[0];
-      if (
-        tail !== undefined &&
-        (progress.scannedThroughEntryId === null || tail.id > progress.scannedThroughEntryId)
-      ) {
-        return undefined;
+
+      // Derive exactly like list() does, so an unreconciled boundary is not reported as
+      // unknown: a start is a reset entry, or the conversation's oldest entry.
+      const marker = (
+        await conversation.entries(
+          { order: "ascending", minEntryId: startEntryId, maxEntryId: startEntryId },
+          1,
+          undefined,
+          ctx,
+        )
+      ).items[0];
+      if (marker === undefined) return undefined;
+      const resetEntryId = marker.kind === RESET_ENTRY_KIND ? startEntryId : null;
+      if (resetEntryId === null) {
+        const below = (
+          await conversation.entries(
+            { order: "descending", ...(startEntryId > 1 ? { maxEntryId: (startEntryId - 1) as EntryId } : {}) },
+            1,
+            undefined,
+            ctx,
+          )
+        ).items[0];
+        // A non-reset entry starts an episode only when nothing precedes it.
+        if (below !== undefined) return undefined;
       }
-      return derivedEpisode(
+
+      // While the catalog reaches the tail, its open episode is exact and costs one read.
+      const tail = (await conversation.entries({ order: "descending" }, 1, undefined, ctx)).items[0];
+      if (tail === undefined) return undefined;
+      if (
+        progress.scannedThroughEntryId !== null &&
+        tail.id <= progress.scannedThroughEntryId &&
+        progress.openStartEntryId === startEntryId
+      ) {
+        return openEpisodeFromProgress(conversationId, progress);
+      }
+
+      // Otherwise walk this episode only: from its start to the next reset or the tail.
+      let totals: EntryTotals = EMPTY_TOTALS;
+      let lastEntryId: EntryId | null = null;
+      let open = true;
+      let from: EntryId = startEntryId;
+      while (true) {
+        const page = await conversation.entries(
+          { order: "ascending", minEntryId: from },
+          EPISODE_LIMITS.entriesPerPage,
+          undefined,
+          ctx,
+        );
+        if (page.items.length === 0) break;
+        let closed = false;
+        for (const entry of page.items) {
+          if (entry.id !== startEntryId && entry.kind === RESET_ENTRY_KIND) {
+            open = false;
+            closed = true;
+            break;
+          }
+          lastEntryId = entry.id;
+          totals = {
+            entries: totals.entries + 1,
+            messages: totals.messages + (isMessageEntry(entry) ? 1 : 0),
+            toolResults: totals.toolResults + (isToolResultEntry(entry) ? 1 : 0),
+          };
+        }
+        if (closed || page.next === undefined) break;
+        from = (page.items[page.items.length - 1]!.id + 1) as EntryId;
+      }
+      if (lastEntryId === null || contentEntries(totals.entries, resetEntryId) <= 0) return undefined;
+      return {
         conversationId,
         startEntryId,
-        null,
-        true,
-        progress.openResetEntryId,
-        undefined,
-        ctx,
-      );
+        endEntryId: open ? null : lastEntryId,
+        status: open ? "open" : "closed",
+        resetEntryId,
+        entries: totals.entries,
+        messages: totals.messages,
+        toolResults: totals.toolResults,
+        summary: open ? OPEN_SUMMARY : UNRECORDED_SUMMARY,
+      };
     },
 
     reconcile,

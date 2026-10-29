@@ -410,9 +410,21 @@ Landing the durable half of W3 without model calls, tasks or scheduling:
   `pi.reset` entries only (`conversation.reset()` and the `handoff` tool control
   both write one; a handoff's user message is part of the reset entry). An
   episode is `[startEntryId, endEntryId]` inclusive, starting at its reset entry
-  or at the conversation's first entry. Two consecutive resets create no
-  episode. Compaction (`pi.compaction`) and system entries stay inside an
-  episode: only a reset closes one.
+  or at the conversation's first entry. Compaction (`pi.compaction`) and system
+  entries stay inside an episode: only a reset closes one.
+- Empty episodes are omitted everywhere, by the same rule: an episode is empty
+  when it holds no entry other than its own reset marker. That covers two
+  consecutive resets, a reset carrying only handoff text, and a reset that closed
+  a segment before any content was committed. An empty episode is never recorded,
+  never listed and never returned by the single-episode read, so the tail cannot
+  show a phantom open discussion.
+- A reset handoff is synthetic context, not an ordinary user message: the text
+  lives in the reset entry's own `model` payload, so it is never counted in
+  `messages` and never makes an episode exist (`messages` counts only
+  `pi.user`/`pi.assistant` entries). `entries` counts every entry in the inclusive
+  range including the reset marker, and `toolResults` counts `pi.tool-result`
+  entries; system and compaction entries are entries but not messages. The
+  handoff text may later be exposed as separate episode metadata.
 - Durable state: one fixed-size `nanobot.episode-catalog` progress document per
   conversation (scan cursor, open-episode start/reset/end, counters) and one
   small `nanobot.episode` document per closed, non-empty episode, keyed by its
@@ -443,20 +455,31 @@ Landing the durable half of W3 without model calls, tasks or scheduling:
 - Host API (additive on `Gateway`): `historyIdentity()`, `listHistoryEpisodes(sessionKey,
   { limit?, before? })`, `historyEpisode(sessionKey, startEntryId)`,
   `reconcileHistoryEpisodes(sessionKey)`. Listing reads entries and episode
-  documents and writes nothing: it derives exact boundaries and counts even for
-  a boundary reconciliation has not recorded yet, reporting
-  `summary.status = "unknown"` there. `next.before` is a durable entry ID (an
-  episode start), so pagination is stable across appends and reopen, and any
-  other bound is rejected instead of mislabelled. An open episode's counts are
-  null unless the same read derived them.
+  documents and writes nothing. Reads agree before and after reconciliation,
+  because `list` and `historyEpisode` derive boundaries from committed entries
+  with the same rules; reconciliation only turns an `unknown` summary state into
+  `pending` and makes a closed episode's document authoritative (it is immutable
+  and answers identically before and after). Exact counts come from the same
+  scan, or from the progress counters when they reach the tail. A tail reset
+  closes the episode above it in every path. `next.before` is a durable entry ID
+  (an episode start), so pagination is stable across appends and reopen, and any
+  other bound is rejected instead of mislabelled.
+- Read bounds are page bounds, not a hard cap: a page reads entries in groups of
+  `EPISODE_LIMITS.entriesPerPage` until it has filled a page of episodes (so a
+  conversation without resets costs one full scan), the single-episode read walks
+  only that episode's entries, and the caught-up fast paths cost one entry read
+  plus one document read per episode. No read writes anything. Empty episodes and
+  `unknown` summary states make omissions visible; original entries remain the
+  authority.
 
 Known gaps, deliberately not claimed: episodes carry no wall-clock dates
 (Durable entries have no timestamp; only entry IDs order them), no titles, and no
 summary text. Summaries, retry/backoff, long-episode coverage bounds, summary
 search, message/tool full-text search, and any CLI/Telegram browsing command are
-later slices. Episode documents are not enumerated by the catalog itself; a
-future summary scheduler needs a durable work queue or an index over `pending`
-episodes rather than a document scan per pass.
+later slices. There is also no durable enumeration of pending summaries: episode
+documents are not scanned by this module, so a future summary pass needs its own
+work queue or an index over `pending` episodes, and nothing schedules one today.
+The store identity document itself is frozen and never updated.
 
 ### W4 — acceptance suite
 
@@ -606,6 +629,27 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-29 — episode catalog consistency fixes after review
+
+Fixed a reset at the tail being reported as the open episode whenever it followed
+content: the descending derivation now marks the scan as reset-bounded at every reset
+entry it meets, including a reset with no content above it. One rule now decides
+emptiness for reconciliation, listing and the single-episode read (no entry other than
+the reset marker), so consecutive resets, resets carrying only handoff text and resets
+closed before any content are all omitted instead of appearing as an empty open
+discussion. `historyEpisode` derives the same boundary as `list` before reconciliation
+(marker validation plus a walk over that episode's entries, with the caught-up fast
+path using the progress counters), so reads agree before and after a pass and only the
+summary state moves from `unknown` to `pending`. The store identity object is frozen.
+Documented the handoff-is-synthetic rule (handoff text is neither a message nor
+episode content), the counts contract, the page-bounded read cost, and the remaining
+pending-summary enumeration gap: no work queue or index over pending episodes exists,
+and nothing schedules a summary. Offline probes covered pre-/post-reconciliation tail
+resets, consecutive and handoff-only resets, busy/queued resets, pagination before and
+after reconciliation, background and startup catch-up, scope exclusion, and that
+derived documents match the listed view; the 155 behaviour, 9 execution and core
+acceptance checks still pass.
 
 ### 2026-10-29 — durable store identity and episode catalog foundation
 
