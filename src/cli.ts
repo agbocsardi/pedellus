@@ -102,9 +102,12 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
           refresh: () => gateway!.refreshContext("cli:default", context),
         },
         history: {
+          defaultSession: "cli:default",
           search: (query, ctx) => gateway!.historySearch(query, ctx),
-          listEpisodes: (query, ctx) => gateway!.listHistoryEpisodes("cli:default", query, ctx),
-          episode: (startEntryId, ctx) => gateway!.historyEpisode("cli:default", startEntryId, ctx),
+          listEpisodes: (sessionKey, query, ctx) => gateway!.listHistoryEpisodes(sessionKey, query, ctx),
+          episode: (sessionKey, startEntryId, ctx) => gateway!.historyEpisode(sessionKey, startEntryId, ctx),
+          entries: (sessionKey, query, limit, cursor, ctx) =>
+            gateway!.historyEntries(sessionKey, query, limit, cursor, ctx),
         },
       });
     }

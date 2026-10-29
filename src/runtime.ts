@@ -3,7 +3,7 @@ import type { Context } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
-import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type Extension, type Harness as HarnessType, type ModelRef, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
+import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type ModelRef, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ContextExtensionReplacement, type ConversationContextSnapshot } from "./context/index.js";
 import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./context/skill-tool.js";
 import { CRON_RUN_TASK_NAME, createCronFoundation } from "./automation/cron.js";
@@ -100,6 +100,21 @@ export interface OpenGatewayOptions {
   readonly contextSnapshotProvider?: GatewayContextSnapshotProvider;
 }
 
+/** Read-only query for a bounded page of one mapped chat session's raw transcript entries. */
+export interface HistoryEntryQuery {
+  readonly minEntryId?: EntryId;
+  readonly maxEntryId?: EntryId;
+  readonly order?: "ascending" | "descending";
+}
+
+/** Read-only page of raw entries; the caller is responsible for filtering internal content. */
+export interface HistoryEntryPage {
+  readonly conversationId: ConversationId;
+  readonly sessionKey: string;
+  readonly items: readonly EntryRecord[];
+  readonly next?: Cursor;
+}
+
 export interface Gateway {
   readonly harness: HarnessType;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
@@ -135,6 +150,19 @@ export interface Gateway {
   ): Promise<HistoryEpisodePage>;
   /** One episode by its start entry ID, or undefined when it is not a known boundary. */
   historyEpisode(sessionKey: string, startEntryId: number, context: Context): Promise<HistoryEpisode | undefined>;
+  /**
+   * Bounded read-only page of one existing mapped chat session's raw entries. This never creates
+   * a conversation, writes a transcript, starts a model or accepts a conversation ID. State-only
+   * channel conversations are rejected. Callers must filter internal kinds themselves before
+   * displaying anything; this is a trusted host surface, not an untrusted-channel API.
+   */
+  historyEntries(
+    sessionKey: string,
+    query: HistoryEntryQuery,
+    limit: number,
+    cursor: Cursor | undefined,
+    context: Context,
+  ): Promise<HistoryEntryPage>;
   /**
    * Catch this session's episode catalog up now. Idempotent, bounded, and never schedules a
    * summary; the same work also runs in the background after resets and on reopen.
@@ -1023,6 +1051,45 @@ export async function openGateway(config: PortConfig, context: Context, options:
       },
       async historySearch(query, ctx) {
         return historyIndex!.search(query, ctx);
+      },
+      async historyEntries(sessionKey, query, limit, cursor, ctx) {
+        if (typeof sessionKey !== "string" || sessionKey.length === 0) {
+          throw new TypeError("History entry session key must be a non-empty string");
+        }
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+          throw new TypeError("History entry page limit must be an integer from 1 to 200");
+        }
+        if (query === null || typeof query !== "object" || Array.isArray(query)) {
+          throw new TypeError("History entry query must be an object");
+        }
+        const allowed = new Set(["minEntryId", "maxEntryId", "order"]);
+        for (const key of Object.keys(query)) {
+          if (!allowed.has(key)) throw new TypeError(`History entry query has an unsupported field: ${key}`);
+        }
+        const minEntryId = query.minEntryId;
+        const maxEntryId = query.maxEntryId;
+        for (const [name, value] of [["minEntryId", minEntryId], ["maxEntryId", maxEntryId]] as const) {
+          if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
+            throw new TypeError(`History entry ${name} must be a positive entry ID`);
+          }
+        }
+        const order = query.order;
+        if (order !== undefined && order !== "ascending" && order !== "descending") {
+          throw new TypeError("History entry order must be ascending or descending");
+        }
+        if (!isChatSessionKey(sessionKey)) throw new Error("State-only conversations are not chat history");
+        const conversation = await existingConversationFor(sessionKey, ctx);
+        const page = await conversation.entries({
+          ...(minEntryId === undefined ? {} : { minEntryId }),
+          ...(maxEntryId === undefined ? {} : { maxEntryId }),
+          ...(order === undefined ? {} : { order }),
+        }, limit, cursor, ctx);
+        return {
+          conversationId: conversation.id,
+          sessionKey,
+          items: page.items,
+          ...(page.next === undefined ? {} : { next: page.next }),
+        };
       },
       async refreshContext(sessionKey, ctx) {
         if (!options.contextSnapshotProvider) {

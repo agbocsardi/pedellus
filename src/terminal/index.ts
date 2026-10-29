@@ -25,6 +25,7 @@ import {
   type HistoryRole,
   type HistoryScope,
 } from "../history/index.js";
+import type { HistoryEntryPage, HistoryEntryQuery } from "../runtime.js";
 
 const MAX_PENDING_INPUTS = 64;
 const MAX_ACTIVE_COMMANDS = 16;
@@ -103,9 +104,18 @@ export interface TerminalContextRefreshHost {
  * are read-only derived views, never transcript writes or tool authority.
  */
 export interface TerminalHistoryHost {
+  /** Session used when a history command omits --session; normally cli:default. */
+  readonly defaultSession: string;
   search(query: HistoryQuery, context: Context): Promise<HistoryPage>;
-  listEpisodes(query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage>;
-  episode(startEntryId: EntryId, context: Context): Promise<HistoryEpisode | undefined>;
+  listEpisodes(sessionKey: string, query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage>;
+  episode(sessionKey: string, startEntryId: EntryId, context: Context): Promise<HistoryEpisode | undefined>;
+  entries(
+    sessionKey: string,
+    query: HistoryEntryQuery,
+    limit: number,
+    cursor: Cursor | undefined,
+    context: Context,
+  ): Promise<HistoryEntryPage>;
 }
 
 export interface TerminalIO {
@@ -643,7 +653,7 @@ export async function runTerminalConversation(
       return;
     }
     if (parsed.kind === "next" && pendingSearch === undefined) {
-      await notice("No search to continue. Run /search first.", true);
+      await notice("No search continuation is held. Run /search again; cursors are process-local and are never printed.", true);
       return;
     }
 
@@ -675,7 +685,7 @@ export async function runTerminalConversation(
       if (signal?.aborted) return;
       if (parsed.kind === "next") {
         pendingSearch = undefined;
-        await notice("Search continuation rejected: the query, index, store or session mapping changed. Run /search again.", true);
+        await notice("Search continuation rejected: the query, index, store or session mapping changed. Run /search again; cursors are process-local and are never printed.", true);
       } else {
         await notice(`History search failed (${errorName(error)}).`, true);
       }
@@ -693,21 +703,19 @@ export async function runTerminalConversation(
     const lines = [
       `History search${parsed.kind === "next" ? " (continued)" : ""}: ${base.text ? `text=${safeLabel(base.text, 120)}` : "(browse)"}; scope=${scopeLabel}; ${target}; limit=${base.limit}.`,
     ];
-    if (page.hits.length === 0) {
-      lines.push("No hits in the indexed records for this query and scope.");
-    } else {
-      lines.push(`${page.hits.length} hit(s), newest first:`);
-      for (let index = 0; index < page.hits.length; index++) {
-        lines.push(formatHistoryHit(page.hits[index]!, index + 1));
-      }
-    }
-    lines.push(...formatHistoryCoverage(page.coverage));
+    const coverageComplete = historyCoverageComplete(page.coverage);
+    const footer = [
+      page.hits.length === 0
+        ? "No hits in the indexed records for this query and scope."
+        : `${page.hits.length} hit(s), newest first:`,
+      ...formatHistoryCoverage(page.coverage),
+    ];
     if (page.next !== undefined) {
-      lines.push("More results: /search --next (the same query and session mapping; entries appended after this page need a fresh search).");
-    } else if (!page.coverage.complete) {
-      lines.push("No further hits in this indexed window; the index is incomplete, so retry later for newly indexed entries.");
+      footer.push("More results: /search --next (the same query and session mapping; entries appended after this page need a fresh search). Cursors are process-local and are never printed.");
+    } else if (!coverageComplete) {
+      footer.push("No further hits in this indexed window; the index is incomplete, so retry later for newly indexed entries.");
     }
-    await notice(boundedHistoryView(lines));
+    await notice(formatBoundedHistory(lines, footer, page.hits.map((hit, index) => formatHistoryHit(hit, index + 1))));
   };
 
   const showEpisodes = async (args: string): Promise<void> => {
@@ -721,30 +729,33 @@ export async function runTerminalConversation(
       await notice(EPISODES_USAGE, true);
       return;
     }
+    const sessionKey = parsed.session ?? host.defaultSession;
     let page: HistoryEpisodePage;
     try {
-      page = await host.listEpisodes(parsed.query, operationContext);
+      page = await host.listEpisodes(sessionKey, parsed.query, operationContext);
     } catch (error) {
       if (!signal?.aborted) await notice(`Episode listing failed (${errorName(error)}).`, true);
       return;
     }
     if (page.episodes.length === 0) {
       await notice(parsed.query.before === undefined
-        ? "No non-empty episodes recorded yet."
-        : "No more non-empty episodes below that boundary.");
+        ? `No non-empty episodes recorded yet for session ${safeLabel(sessionKey, 120)}.`
+        : `No more non-empty episodes below that boundary for session ${safeLabel(sessionKey, 120)}.`);
       return;
     }
+    const rows = page.episodes.map((episode) => {
+      const end = episode.endEntryId === null ? "open" : String(episode.endEntryId);
+      return `  #${episode.startEntryId}-${end} ${episode.status}; entries=${episode.entries ?? "uncounted"} messages=${episode.messages ?? "uncounted"} tools=${episode.toolResults ?? "uncounted"}; ${episode.resetEntryId === null ? "pre-reset segment" : `reset=${episode.resetEntryId}`}; summary=${episode.summary.status}`;
+    });
     const lines = [
-      `Episodes (newest first), ${page.episodes.length} shown:`,
-      ...page.episodes.map((episode) => {
-        const end = episode.endEntryId === null ? "open" : String(episode.endEntryId);
-        return `  #${episode.startEntryId}-${end} ${episode.status}; entries=${episode.entries ?? "uncounted"} messages=${episode.messages ?? "uncounted"} tools=${episode.toolResults ?? "uncounted"}; ${episode.resetEntryId === null ? "pre-reset segment" : `reset=${episode.resetEntryId}`}; summary=${episode.summary.status}`;
-      }),
+      `Episodes for session ${safeLabel(sessionKey, 120)} (newest first), ${page.episodes.length} shown:`,
+    ];
+    const footer = [
       "Summary text is not generated or shown; only the recorded summary status is reported.",
     ];
-    if (page.next !== undefined) lines.push(`Older episodes: /episodes --before ${page.next.before}`);
-    lines.push("Open one with /episode <startEntryId>, or a bounded window around any entry with /entry <entryId>.");
-    await notice(boundedHistoryView(lines));
+    if (page.next !== undefined) footer.push(`Older episodes: /episodes --session ${safeLabel(sessionKey, 120)} --before ${page.next.before}`);
+    footer.push(`Open one with /episode --session ${safeLabel(sessionKey, 120)} <startEntryId>, or a bounded window around any entry with /entry --session ${safeLabel(sessionKey, 120)} <entryId>.`);
+    await notice(formatBoundedHistory(lines, footer, rows));
   };
 
   const showEpisode = async (args: string): Promise<void> => {
@@ -758,15 +769,16 @@ export async function runTerminalConversation(
       await notice(EPISODE_USAGE, true);
       return;
     }
+    const sessionKey = parsed.session ?? host.defaultSession;
     let episode: HistoryEpisode | undefined;
     try {
-      episode = await host.episode(parsed.startEntryId, operationContext);
+      episode = await host.episode(sessionKey, parsed.startEntryId, operationContext);
     } catch (error) {
       if (!signal?.aborted) await notice(`Episode read failed (${errorName(error)}).`, true);
       return;
     }
     if (episode === undefined) {
-      await notice(`No non-empty episode starts at entry #${parsed.startEntryId}. Use /episodes to list episode starts.`, true);
+      await notice(`No non-empty episode starts at entry #${parsed.startEntryId} in session ${safeLabel(sessionKey, 120)}. Use /episodes to list episode starts.`, true);
       return;
     }
 
@@ -777,7 +789,7 @@ export async function runTerminalConversation(
     try {
       while (rows.length < parsed.limit && scanned < MAX_EPISODE_SCAN_ENTRIES) {
         const take = Math.min(EPISODE_ENTRY_PAGE_SIZE, MAX_EPISODE_SCAN_ENTRIES - scanned);
-        const page = await conversation.entries({
+        const page = await host.entries(sessionKey, {
           order: "ascending",
           minEntryId: episode.startEntryId,
           ...(episode.endEntryId === null ? {} : { maxEntryId: episode.endEntryId }),
@@ -805,25 +817,35 @@ export async function runTerminalConversation(
 
     const end = episode.endEntryId === null ? "open" : String(episode.endEntryId);
     const lines = [
-      `Episode #${episode.startEntryId}-${end} (${episode.status}; summary=${episode.summary.status}); conversation=${conversation.id}; entries=${episode.entries ?? "uncounted"} messages=${episode.messages ?? "uncounted"} tools=${episode.toolResults ?? "uncounted"}.`,
+      `Episode #${episode.startEntryId}-${end} for session ${safeLabel(sessionKey, 120)} (${episode.status}; summary=${episode.summary.status}); conversation=${episode.conversationId}; entries=${episode.entries ?? "uncounted"} messages=${episode.messages ?? "uncounted"} tools=${episode.toolResults ?? "uncounted"}.`,
     ];
     if (episode.resetEntryId !== null) lines.push(`Reset boundary: entry #${episode.resetEntryId} (reset handoff text is not shown).`);
+    const footer: string[] = [];
     if (rows.length === 0) {
-      lines.push(`No displayable message/tool entry in the first ${scanned} scanned entr${scanned === 1 ? "y" : "ies"}.`);
+      footer.push(`No displayable message/tool entry in the first ${scanned} scanned entr${scanned === 1 ? "y" : "ies"}.`);
     } else {
-      lines.push(...rows);
-      lines.push(`Showing ${rows.length} message/tool entr${rows.length === 1 ? "y" : "ies"}; scanned ${scanned} entr${scanned === 1 ? "y" : "ies"}${episode.entries === null ? "" : ` of ${episode.entries}`}.`);
+      footer.push(`Showing ${rows.length} message/tool entr${rows.length === 1 ? "y" : "ies"}; scanned ${scanned} entr${scanned === 1 ? "y" : "ies"}${episode.entries === null ? "" : ` of ${episode.entries}`}.`);
     }
-    if (!exhausted && rows.length >= parsed.limit) lines.push(`[Episode view limited to ${parsed.limit} displayable entries; use /entry <entryId> for another window.]`);
-    if (!exhausted && scanned >= MAX_EPISODE_SCAN_ENTRIES) lines.push(`[Episode scan capped at ${MAX_EPISODE_SCAN_ENTRIES} entries.]`);
-    lines.push("System, reset, compaction and thinking content is not shown; raw stored entries are not modified.");
-    await notice(boundedHistoryView(lines));
+    if (!exhausted && rows.length >= parsed.limit) footer.push(`[Episode view limited to ${parsed.limit} displayable entries; use /entry --session ${safeLabel(sessionKey, 120)} <entryId> for another window.]`);
+    if (!exhausted && scanned >= MAX_EPISODE_SCAN_ENTRIES) footer.push(`[Episode scan capped at ${MAX_EPISODE_SCAN_ENTRIES} entries.]`);
+    footer.push("System, reset, compaction and thinking content is not shown; raw stored entries are not modified.");
+    await notice(formatBoundedHistory(lines, footer, rows));
   };
 
   const showEntry = async (args: string): Promise<void> => {
+    const host = io.history;
     const parsed = parseEntryArguments(args);
     if (parsed.kind === "usage") {
       await notice(ENTRY_USAGE, true);
+      return;
+    }
+    const sessionKey = parsed.session ?? host?.defaultSession ?? "cli:default";
+    if (parsed.session !== undefined && host === undefined) {
+      await notice("Cross-session entry browsing is host-controlled and unavailable here.", true);
+      return;
+    }
+    if (host === undefined && sessionKey !== "cli:default") {
+      await notice("Entry browsing is limited to the default session without a history host.", true);
       return;
     }
     const minEntryId = Math.max(1, parsed.entryId - parsed.radius) as EntryId;
@@ -831,12 +853,15 @@ export async function runTerminalConversation(
     let rows: string[];
     let hidden = 0;
     let selectedSeen = false;
+    let conversationId: number;
     try {
-      const page = await conversation.entries({
-        order: "ascending",
-        minEntryId,
-        maxEntryId,
-      }, parsed.radius * 2 + 1, undefined, operationContext);
+      const page: HistoryEntryPage = host === undefined
+        ? await (async () => {
+          const result = await conversation.entries({ order: "ascending", minEntryId, maxEntryId }, parsed.radius * 2 + 1, undefined, operationContext);
+          return { conversationId: conversation.id, sessionKey, items: result.items };
+        })()
+        : await host.entries(sessionKey, { order: "ascending", minEntryId, maxEntryId }, parsed.radius * 2 + 1, undefined, operationContext);
+      conversationId = page.conversationId;
       rows = [];
       for (const entry of page.items) {
         if (entry.id === parsed.entryId) selectedSeen = true;
@@ -850,14 +875,14 @@ export async function runTerminalConversation(
     }
 
     const lines = [
-      `Entry window #${minEntryId}-${maxEntryId} in conversation ${conversation.id}; selected=#${parsed.entryId}; radius=${parsed.radius}.`,
+      `Entry window #${minEntryId}-${maxEntryId} for session ${safeLabel(sessionKey, 120)} in conversation ${conversationId}; selected=#${parsed.entryId}; radius=${parsed.radius}.`,
     ];
-    if (!selectedSeen) lines.push(`Entry #${parsed.entryId} was not found in the visible transcript.`);
-    if (rows.length === 0) lines.push("No displayable message/tool entry in this window.");
-    else lines.push(...rows);
-    if (hidden > 0) lines.push(`${hidden} entr${hidden === 1 ? "y" : "ies"} in the window had no displayable message/tool text and were not shown.`);
-    lines.push("System, reset, compaction and thinking content is not shown; raw stored entries are not modified.");
-    await notice(boundedHistoryView(lines));
+    const footer: string[] = [];
+    if (!selectedSeen) footer.push(`Entry #${parsed.entryId} was not found in the visible transcript.`);
+    if (rows.length === 0) footer.push("No displayable message/tool entry in this window.");
+    if (hidden > 0) footer.push(`${hidden} entr${hidden === 1 ? "y" : "ies"} in the window had no displayable message/tool text and were not shown.`);
+    footer.push("System, reset, compaction and thinking content is not shown; raw stored entries are not modified.");
+    await notice(formatBoundedHistory(lines, footer, rows));
   };
 
   const showModel = async (args: string): Promise<void> => {
@@ -1108,7 +1133,7 @@ export async function runTerminalConversation(
           ENTRY_USAGE,
           "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
           "/abort uses native Durable semantics: it cancels foreground work and withdraws queued inputs.",
-          io.history ? "/search and /episodes read the host-bound local history index; incomplete coverage is reported, never hidden." : "History search and episode browsing are host-controlled and unavailable here.",
+          io.history ? "/search --next continues the last successful query; cursors stay in this process and are never printed. History sessions default to cli:default; use --session with a key reported by /search." : "History search and episode browsing are host-controlled and unavailable here.",
           io.modelSelection ? "/model lists the host allowlist; select with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
           io.toolGrants ? "/grant needs an explicit finite duration (for example /grant read,bash 30m); /tools lists ceiling and grants." : "Coding-tool grants are host-controlled and unavailable here.",
           io.contextRefresh?.available ? "/refresh re-reads workspace context and skills for this conversation when it is idle." : "/refresh is unavailable without configured workspace context.",
@@ -1318,9 +1343,9 @@ function formatHistoryMessage(message: Message): string | undefined {
 
 const SEARCH_USAGE =
   "Usage: /search [--scope messages|tools|all] [--role user|assistant] [--limit 1-50] [--next] [--] [query] — default scope is messages; empty text browses the selected scope.";
-const EPISODES_USAGE = "Usage: /episodes [--limit 1-50] [--before <entryId>]";
-const EPISODE_USAGE = "Usage: /episode <startEntryId> [--limit 1-30]";
-const ENTRY_USAGE = "Usage: /entry <entryId> [--radius 0-5]";
+const EPISODES_USAGE = "Usage: /episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>] — --session defaults to cli:default.";
+const EPISODE_USAGE = "Usage: /episode [--session <sessionKey>] <startEntryId> [--limit 1-30] — --session defaults to cli:default.";
+const ENTRY_USAGE = "Usage: /entry [--session <sessionKey>] <entryId> [--radius 0-5] — --session defaults to cli:default.";
 
 type SearchArguments =
   | { readonly kind: "usage" }
@@ -1335,15 +1360,15 @@ type SearchArguments =
 
 type EpisodesArguments =
   | { readonly kind: "usage" }
-  | { readonly kind: "list"; readonly query: HistoryEpisodeQuery };
+  | { readonly kind: "list"; readonly query: HistoryEpisodeQuery; readonly session?: string };
 
 type EpisodeArguments =
   | { readonly kind: "usage" }
-  | { readonly kind: "open"; readonly startEntryId: EntryId; readonly limit: number };
+  | { readonly kind: "open"; readonly startEntryId: EntryId; readonly limit: number; readonly session?: string };
 
 type EntryArguments =
   | { readonly kind: "usage" }
-  | { readonly kind: "entry"; readonly entryId: EntryId; readonly radius: number };
+  | { readonly kind: "entry"; readonly entryId: EntryId; readonly radius: number; readonly session?: string };
 
 function parseSearchArguments(input: string): SearchArguments {
   let rest = input.trim();
@@ -1353,12 +1378,17 @@ function parseSearchArguments(input: string): SearchArguments {
   let limit = DEFAULT_SEARCH_LIMIT;
   let explicit = false;
   let next = false;
+  let sawLimit = false;
+  let endOfOptions = false;
   while (rest.startsWith("--")) {
     const token = /^(\S+)(?:\s+([\s\S]*))?$/.exec(rest);
     if (token === null) return { kind: "usage" };
     const flag = token[1]!;
     rest = (token[2] ?? "").trimStart();
-    if (flag === "--") break;
+    if (flag === "--") {
+      endOfOptions = true;
+      break;
+    }
     if (flag === "--next") {
       if (next) return { kind: "usage" };
       next = true;
@@ -1378,13 +1408,15 @@ function parseSearchArguments(input: string): SearchArguments {
       if (role !== undefined || (raw !== "user" && raw !== "assistant")) return { kind: "usage" };
       role = raw;
     } else {
-      if (!/^[1-9][0-9]*$/.test(raw) || Number(raw) > MAX_SEARCH_LIMIT) return { kind: "usage" };
+      if (sawLimit || !/^[1-9][0-9]*$/.test(raw) || Number(raw) > MAX_SEARCH_LIMIT) return { kind: "usage" };
       limit = Number(raw);
+      sawLimit = true;
     }
   }
   const text = rest.trim();
+  if (endOfOptions && !text) return { kind: "usage" };
   if (next) {
-    return text || scope !== undefined || role !== undefined || limit !== DEFAULT_SEARCH_LIMIT
+    return endOfOptions || text || scope !== undefined || role !== undefined || sawLimit
       ? { kind: "usage" }
       : { kind: "next" };
   }
@@ -1403,8 +1435,10 @@ function parseEpisodesArguments(input: string): EpisodesArguments {
   const tokens = input.trim() ? input.trim().split(/\s+/) : [];
   let limit = DEFAULT_EPISODE_LIST_LIMIT;
   let before: EntryId | undefined;
+  let session: string | undefined;
   let sawLimit = false;
   let sawBefore = false;
+  let sawSession = false;
   for (let index = 0; index < tokens.length; index++) {
     const token = tokens[index]!;
     if (token === "--limit") {
@@ -1419,45 +1453,94 @@ function parseEpisodesArguments(input: string): EpisodesArguments {
       if (parsed === undefined) return { kind: "usage" };
       before = parsed;
       sawBefore = true;
+    } else if (token === "--session") {
+      if (sawSession) return { kind: "usage" };
+      const parsed = parseSessionKey(tokens[++index]);
+      if (parsed === undefined) return { kind: "usage" };
+      session = parsed;
+      sawSession = true;
     } else {
       return { kind: "usage" };
     }
   }
-  return { kind: "list", query: { limit, ...(before === undefined ? {} : { before }) } };
+  return {
+    kind: "list",
+    query: { limit, ...(before === undefined ? {} : { before }) },
+    ...(session === undefined ? {} : { session }),
+  };
 }
 
 function parseEpisodeArguments(input: string): EpisodeArguments {
   const tokens = input.trim() ? input.trim().split(/\s+/) : [];
-  const startEntryId = parsePositiveEntryId(tokens[0]);
-  if (startEntryId === undefined) return { kind: "usage" };
+  let startEntryId: EntryId | undefined;
   let limit = DEFAULT_EPISODE_ENTRY_LIMIT;
+  let session: string | undefined;
   let sawLimit = false;
-  for (let index = 1; index < tokens.length; index++) {
+  let sawSession = false;
+  for (let index = 0; index < tokens.length; index++) {
     const token = tokens[index]!;
-    if (token !== "--limit" || sawLimit) return { kind: "usage" };
-    const raw = tokens[++index];
-    if (raw === undefined || !/^[1-9][0-9]*$/.test(raw) || Number(raw) > MAX_EPISODE_ENTRY_LIMIT) return { kind: "usage" };
-    limit = Number(raw);
-    sawLimit = true;
+    if (token === "--limit") {
+      if (sawLimit) return { kind: "usage" };
+      const raw = tokens[++index];
+      if (raw === undefined || !/^[1-9][0-9]*$/.test(raw) || Number(raw) > MAX_EPISODE_ENTRY_LIMIT) return { kind: "usage" };
+      limit = Number(raw);
+      sawLimit = true;
+    } else if (token === "--session") {
+      if (sawSession) return { kind: "usage" };
+      const parsed = parseSessionKey(tokens[++index]);
+      if (parsed === undefined) return { kind: "usage" };
+      session = parsed;
+      sawSession = true;
+    } else if (token.startsWith("--") || startEntryId !== undefined) {
+      return { kind: "usage" };
+    } else {
+      startEntryId = parsePositiveEntryId(token);
+      if (startEntryId === undefined) return { kind: "usage" };
+    }
   }
-  return { kind: "open", startEntryId, limit };
+  if (startEntryId === undefined) return { kind: "usage" };
+  return { kind: "open", startEntryId, limit, ...(session === undefined ? {} : { session }) };
 }
 
 function parseEntryArguments(input: string): EntryArguments {
   const tokens = input.trim() ? input.trim().split(/\s+/) : [];
-  const entryId = parsePositiveEntryId(tokens[0]);
-  if (entryId === undefined) return { kind: "usage" };
+  let entryId: EntryId | undefined;
   let radius = 1;
+  let session: string | undefined;
   let sawRadius = false;
-  for (let index = 1; index < tokens.length; index++) {
+  let sawSession = false;
+  for (let index = 0; index < tokens.length; index++) {
     const token = tokens[index]!;
-    if (token !== "--radius" || sawRadius) return { kind: "usage" };
-    const raw = tokens[++index];
-    if (raw === undefined || !/^[0-9]$/.test(raw) || Number(raw) > ENTRY_VIEW_MAX_RADIUS) return { kind: "usage" };
-    radius = Number(raw);
-    sawRadius = true;
+    if (token === "--radius") {
+      if (sawRadius) return { kind: "usage" };
+      const raw = tokens[++index];
+      if (raw === undefined || !/^[0-9]$/.test(raw) || Number(raw) > ENTRY_VIEW_MAX_RADIUS) return { kind: "usage" };
+      radius = Number(raw);
+      sawRadius = true;
+    } else if (token === "--session") {
+      if (sawSession) return { kind: "usage" };
+      const parsed = parseSessionKey(tokens[++index]);
+      if (parsed === undefined) return { kind: "usage" };
+      session = parsed;
+      sawSession = true;
+    } else if (token.startsWith("--") || entryId !== undefined) {
+      return { kind: "usage" };
+    } else {
+      entryId = parsePositiveEntryId(token);
+      if (entryId === undefined) return { kind: "usage" };
+    }
   }
-  return { kind: "entry", entryId, radius };
+  if (entryId === undefined) return { kind: "usage" };
+  return { kind: "entry", entryId, radius, ...(session === undefined ? {} : { session }) };
+}
+
+function parseSessionKey(value: string | undefined): string | undefined {
+  return value !== undefined
+    && value.length > 0
+    && value.length <= 200
+    && !/[\s\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u206f]/u.test(value)
+    ? value
+    : undefined;
 }
 
 function parsePositiveEntryId(value: string | undefined): EntryId | undefined {
@@ -1483,11 +1566,20 @@ function formatHistoryHit(hit: HistoryHit, ordinal: number): string {
   const flags: string[] = [];
   if (hit.excerptTruncated) flags.push("excerpt truncated");
   if (hit.bodyTruncated) flags.push("body truncated in index");
+  const sessionToken = cliSessionToken(hit.sessionKey);
+  const navigation = sessionToken === undefined
+    ? "   navigate: session key is not a single CLI token; use a session reported by /search."
+    : `   open: /entry --session ${sessionToken} ${hit.entryId} --radius 1; episode: /episode --session ${sessionToken} ${hit.episodeStartEntryId}`;
   return [
     `${ordinal}. [${hit.role}] ${meta.join(" ")}`,
     `   ${excerpt.replace(/\n/g, "\n   ")}`,
     ...(flags.length === 0 ? [] : [`   (${flags.join("; ")})`]),
+    navigation,
   ].join("\n");
+}
+
+function historyCoverageComplete(coverage: HistoryCoverage): boolean {
+  return coverage.complete && coverage.malformedEntries === 0 && coverage.malformedMessages === 0;
 }
 
 function formatHistoryCoverage(coverage: HistoryCoverage): string[] {
@@ -1508,7 +1600,7 @@ function formatHistoryCoverage(coverage: HistoryCoverage): string[] {
   if (coverage.malformedEntries > 0 || coverage.malformedMessages > 0) {
     lines.push(`Malformed stored records: ${coverage.malformedEntries} entr${coverage.malformedEntries === 1 ? "y" : "ies"}, ${coverage.malformedMessages} message${coverage.malformedMessages === 1 ? "" : "s"}.`);
   }
-  lines.push(coverage.complete
+  lines.push(historyCoverageComplete(coverage)
     ? "Index: complete for this store snapshot and captured boundary; a later entry needs a fresh search."
     : "Index: INCOMPLETE — results are a bounded partial view and a no-hit answer does not prove absence.");
   return lines;
@@ -1588,11 +1680,30 @@ function countLabel(count: number, singular: string, plural = `${singular}s`): s
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
-function boundedHistoryView(lines: readonly string[]): string {
-  const text = lines.join("\n");
-  return text.length <= HISTORY_VIEW_CHARS
-    ? text
-    : `${completePrefix(text, HISTORY_VIEW_CHARS)}\n[History view truncated by the terminal output bound.]`;
+function formatBoundedHistory(
+  header: readonly string[],
+  footer: readonly string[],
+  rows: readonly string[],
+): string {
+  const reserve = 160;
+  const metadata = [...header, ...footer].join("\n");
+  if (metadata.length > HISTORY_VIEW_CHARS - reserve) {
+    return `${completePrefix(metadata, HISTORY_VIEW_CHARS - reserve)}\n[History metadata truncated by the terminal output bound; view limits were still applied.]`;
+  }
+  const visible: string[] = [];
+  let used = metadata.length;
+  for (const row of rows) {
+    if (used + row.length + 2 > HISTORY_VIEW_CHARS - reserve) break;
+    visible.push(row);
+    used += row.length + 1;
+  }
+  const lines = [...header, ...footer];
+  if (visible.length > 0) lines.push("", ...visible);
+  const omitted = rows.length - visible.length;
+  if (omitted > 0) {
+    lines.push(`[${omitted} additional row(s) omitted by the terminal output bound; narrow the view or lower the limit.]`);
+  }
+  return lines.join("\n");
 }
 
 function splitToolNames(value: string): readonly string[] | undefined {
@@ -1623,7 +1734,15 @@ function formatGrantExpiry(expiresAt: number, now: number): string {
 }
 
 function safeLabel(value: string, max: number): string {
-  return completePrefix(sanitizeTerminalText(value), max) || "(empty)";
+  return completePrefix(sanitizeTerminalText(value).replace(/\s+/gu, " ").trim(), max) || "(empty)";
+}
+
+function cliSessionToken(value: string): string | undefined {
+  return value.length > 0
+    && value.length <= 200
+    && !/[\s\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u206f]/u.test(value)
+    ? value
+    : undefined;
 }
 
 function modelLabel(model: { provider: string; modelId: string } | undefined): string {

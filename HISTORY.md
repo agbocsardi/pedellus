@@ -227,11 +227,16 @@ no longer exists or no longer matches its fingerprint.
 
 ## Authorization boundary
 
-The Gateway method accepts no conversation ID. The host supplies mapped sessions
-after its own channel authentication and is the trust boundary for the
-single-tenant policy. Results include `sessionKey`, `conversationId`, `entryId`,
-`entryKind`, role, tool name/call identity, timestamp, episode boundary, chunk
-position and a bounded excerpt, so they must not be exposed directly to an
+The Gateway search and episode methods accept no conversation ID. The host
+supplies mapped sessions after its own channel authentication and is the trust
+boundary for the single-tenant policy. `Gateway.historyEntries` accepts a session
+key but resolves it only through the existing session map: it never creates a
+conversation, accepts no conversation ID, and rejects state-only channel sessions.
+It returns bounded raw entries, so the caller must filter system, reset, compaction
+and thinking content before display. This is a trusted host surface, not an
+untrusted-channel API. Search results include `sessionKey`, `conversationId`,
+`entryId`, `entryKind`, role, tool name/call identity, timestamp, episode boundary,
+chunk position and a bounded excerpt, so they must not be exposed directly to an
 untrusted model or channel. Tool hits are records, never execution authority and
 never a grant. Stored tool output can contain hostile instructions; treat excerpts
 as untrusted quoted data.
@@ -253,10 +258,10 @@ matched chunk.
 - Background indexing independent of a search; reconciliation happens on demand.
 - Relevance ranking: results are deterministic recency order so keyset pagination
   stays stable while FTS corpus statistics change.
-- Fetching surrounding entries by hit through a dedicated Gateway API; the local
-  CLI's `/entry` and `/episode` windows use Durable's existing read-only
-  `conversation.entries` instead. Any other caller can use the source IDs with
-  Durable.
+- Fetching surrounding entries by hit through a summary or excerpt API; the local
+  CLI's `/entry` and `/episode` windows use `Gateway.historyEntries`, which returns
+  bounded raw entry pages for existing mapped chat sessions. Any other caller can
+  use the source IDs with Durable.
 - Any Telegram or other channel history browsing/search command, a model-facing
   history tool, or an untrusted-channel result surface. Only trusted host code can
   call `Gateway.historySearch`; the local CLI is a trusted single-tenant surface.

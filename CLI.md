@@ -89,9 +89,9 @@ fail-closed and is not remotely cancelled. See
 | `/status` | Show the conversation's current host-selected model, native run/inbox state, and Durable-recorded per-model/tool usage. Provider-side charges or unrecorded spend remain unknown. |
 | `/history [count]` | Show the latest user/assistant text messages only (default 10, max 50), using Durable entry pagination; each snippet is limited to 200 characters and the scan to 2,000 entries. Reasoning, tool, and non-text blocks are omitted; synthetic user-role reset or compaction messages may also appear. |
 | `/search [--scope messages\|tools\|all] [--role user\|assistant] [--limit 1-50] [--next] [--] [query]` | Search or browse the local history index. Default scope is messages; `--scope tools` searches tool names, arguments and result text only, and `--scope all` combines messages and tools. Empty text browses the selected scope. See [history search and browsing](#history-search-and-browsing). |
-| `/episodes [--limit 1-50] [--before <entryId>]` | List reset-delimited episodes newest first, with entry ranges, counts and recorded summary status only. No summary text is generated or shown. |
-| `/episode <startEntryId> [--limit 1-30]` | Open one episode's bounded first window of message/tool entries. |
-| `/entry <entryId> [--radius 0-5]` | Open one entry plus at most five neighboring entry IDs on each side, showing only user/assistant text and tool calls/results. |
+| `/episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>]` | List reset-delimited episodes newest first, with entry ranges, counts and recorded summary status only. `--session` must name an existing mapped chat session; the default is `cli:default`. No summary text is generated or shown. |
+| `/episode [--session <sessionKey>] <startEntryId> [--limit 1-30]` | Open one episode's bounded first window of message/tool entries from an existing mapped chat session. |
+| `/entry [--session <sessionKey>] <entryId> [--radius 0-5]` | Open one entry plus at most five neighboring entry IDs on each side, showing only user/assistant text and tool calls/results. `--session` must be an existing mapped chat session. |
 | `/model` | List the current host-selected model and finite allowed choices, including supported thinking levels. In the integrated CLI, select with `/model <provider> <modelId> [thinkingLevel]`; the pair must exactly match the host allowlist. A busy conversation rejects selection atomically; retry when idle. Standalone terminal callers without a host callback remain read-only. |
 | `/tools` | List the host tool ceiling and this conversation's active coding-tool grants with expiry. Reports a disabled ceiling instead of offering a grant. |
 | `/grant <tool[,tool]> <duration>` | Grant one or more ceiling tools to this `cli:default` conversation with an explicit finite duration (for example `/grant read,bash 30m`). No duration, an unknown unit, an out-of-ceiling name or a disabled ceiling is rejected; there is no default or permanent grant. |
@@ -103,18 +103,21 @@ fail-closed and is not remotely cancelled. See
 
 ## History search and browsing
 
-These are local, host-bound, read-only controls over the same `cli:default`
-conversation. They are not model-facing tools and have no Telegram equivalent.
+These are local, host-bound, read-only controls over the mapped chat sessions
+of this single-tenant store. Browse commands default to `cli:default`; search
+spans the mapped sessions. They are not model-facing tools and have no Telegram
+equivalent.
 Search uses `Gateway.historySearch`; episode listing/open uses
 `Gateway.listHistoryEpisodes` and `Gateway.historyEpisode`; `/entry` and the
-episode-entry window use Durable's existing read-only `conversation.entries`.
-No control writes a transcript, changes a grant, or starts a model turn.
+episode-entry window use `Gateway.historyEntries`, a bounded raw-entry page over
+an existing mapped chat session. No control writes a transcript, changes a grant,
+or starts a model turn.
 
 ```text
 /search [--scope messages|tools|all] [--role user|assistant] [--limit 1-50] [--next] [--] [query]
-/episodes [--limit 1-50] [--before <entryId>]
-/episode <startEntryId> [--limit 1-30]
-/entry <entryId> [--radius 0-5]
+/episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>]
+/episode [--session <sessionKey>] <startEntryId> [--limit 1-30]
+/entry [--session <sessionKey>] <entryId> [--radius 0-5]
 ```
 
 - `/search` defaults to `messages` and both roles; `--role` narrows messages.
@@ -122,8 +125,9 @@ No control writes a transcript, changes a grant, or starts a model turn.
   `--role`; `--scope all` combines messages and tools, with `--role` filtering
   messages only. Omitting the query browses the selected scope. Options must come
   before the query; `--` ends options, so `/search -- --tools` searches for the
-  literal text `--tools`. The default page size is 10 and the maximum is 50;
-  query text is capped at 500 characters (the index limit).
+  literal text `--tools`; `--` must be followed by query text, and duplicate
+  options are rejected. The default page size is 10 and the maximum is 50; query
+  text is capped at 500 characters (the index limit).
 - Matching is the index's token/prefix matching, not substring matching. Terms are
   ANDed and the last term is a prefix; punctuation-only text has no terms. Hits are
   newest first. A long record can produce more than one hit (one per overlapping
@@ -133,15 +137,21 @@ No control writes a transcript, changes a grant, or starts a model turn.
   index, store identity, session mapping or boundary entry changed. Entries
   appended after the first page require a fresh search. Cursors are held in this
   terminal process only and are never printed; restart the search after a
-  reconnect or a mapping change.
+  reconnect or a mapping change. Without a held cursor, `/search --next` reports
+  that no continuation exists.
 - Each hit shows the role, entry ID, session key, conversation ID, episode start
   entry, entry kind, timestamp and tool/call identity when present, plus a
   sanitized excerpt. Terminal escape/C1 controls, carriage returns and bidi
-  controls are removed; excerpts are untrusted quoted text.
+  controls are removed, and labels collapse whitespace so a stored name cannot
+  forge an extra output line; excerpts are untrusted quoted text. Every hit also
+  prints an actionable `/entry --session <key> <entryId>` and
+  `/episode --session <key> <episodeStartEntryId>` hint when the session key is a
+  safe single CLI token.
 - Coverage is always reported. `Index: complete` describes the captured store
   boundary; a later entry still needs a fresh search. `Index: INCOMPLETE` lists
   the reason (reconciliation bound, pending lag, omitted long text, unsupported
-  context edits or malformed records). An incomplete no-hit answer does not prove
+  context edits or malformed records). Malformed counts force `INCOMPLETE` even if
+  the index API reports `complete`. An incomplete no-hit answer does not prove
   absence. Large backlogs are caught up across calls, not inside one unbounded
   scan.
 - `/episodes` lists only non-empty reset-delimited episodes and reports the
@@ -155,6 +165,15 @@ No control writes a transcript, changes a grant, or starts a model turn.
   400. Entries carrying unsupported context edits are shown as raw stored text
   with that fact noted. `/history` is unchanged and still scans only the latest
   user/assistant text messages.
+- `/episodes`, `/episode` and `/entry` default to `cli:default`. `--session` must
+  name an existing mapped chat session; the host resolves the mapping without
+  creating a conversation, and state-only channel conversations are rejected. A
+  search hit prints the session key to use. The default is documented in each
+  usage line.
+- Required metadata (search coverage, continuation, episode bounds and the
+  hidden-content footer) is printed before bounded hit/entry rows. Rows that do
+  not fit the 48,000-code-unit history view bound are omitted with an explicit
+  count; metadata is never silently dropped in favor of rows.
 - Search and browse commands are serialized with other local controls, so they
   observe earlier admissions without waiting for model completion. They can run
   while a turn is active; they do not queue, retry or alter that turn. SIGINT,
