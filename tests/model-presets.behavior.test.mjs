@@ -32,12 +32,13 @@ function deferred() {
 
 /** Race one promise against a hard deadline so a wedged provider fails the test instead of hanging it. */
 async function within(promise, ms, label) {
-  const timer = deferred();
-  const timeout = setTimeout(() => timer.reject(new Error(`timeout after ${ms}ms: ${label}`)), ms);
+  const expired = deferred();
+  const deadline = setTimeout(() => expired.reject(new Error(`timeout after ${ms}ms: ${label}`)), ms);
   try {
-    return await Promise.race([promise, timer.promise]);
+    return await Promise.race([promise, expired.promise]);
   } finally {
-    clearTimeout(timer);
+    // Clear the handle itself, not the deferred: a surviving timer holds the process open.
+    clearTimeout(deadline);
   }
 }
 
