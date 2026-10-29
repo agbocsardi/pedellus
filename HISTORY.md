@@ -264,8 +264,8 @@ code. It has four actions:
   `Gateway.historyEntries` in ascending pages, hides reset handoff, system,
   compaction, thinking and image-only content by the same rules as `open`, and
   lets `scope` select messages, tools or both. An open episode is pinned to a tail
-  entry read at call time; the result says so, and entries appended or a reset
-  placed after that snapshot are excluded. A later passage is reached through
+  entry read at call time; when the result remains open, it says so, and entries
+  appended or a reset placed after that snapshot are excluded. A later passage is reached through
   `search` and `open`; this action has no continuation cursor.
 
 Output is explicit about provenance and limits: each hit names its source session,
