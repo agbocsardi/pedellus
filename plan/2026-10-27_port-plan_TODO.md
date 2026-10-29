@@ -81,6 +81,10 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
       at the snapshot cap instead of failing the run.
 
 - [ ] Deliver scheduled results beyond the origin conversation turn (channel outbox) once a channel is accepted.
+- [x] Agree transcript/episode/search design (2026-10-29; W3 below).
+- [ ] Implement read-only transcript retrieval and rebuildable message/tool and episode-summary indexes.
+- [ ] Implement episode catalog and durable post-reset summaries with retry/reconciliation.
+- [ ] Expose history browsing/search through memory tooling and accepted channel interfaces.
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
 - [ ] Complete requested channels individually after core acceptance.
 - [ ] Agree the next bounded implementation scope with the owner; no automatic restart.
@@ -329,6 +333,68 @@ and an early fact crosses native compaction into a fresh process via a faux summ
 Remaining acceptance: curated builtin compatibility and real-model use of memory,
 skills and compaction. No claim of full Python memory/search/usage parity.
 
+#### Agreed history design — 2026-10-29 (not implemented)
+
+**Authority and terminology.** Durable's Session is the storage/runtime container;
+a Conversation is a persistent transcript. Our Telegram adapter maps each bot + chat
+to a conversation, not all Telegram users to one; the CLI has its own. An **episode**
+is a discussion bounded by committed resets within a conversation. `/new` starts
+fresh model context without deleting entries or changing conversation identity.
+Compaction changes working context within an episode; it does not close that episode
+or remove originals. Telegram `/new` still needs command wiring.
+
+Durable is the canonical transcript source, untouchable by memory tooling: retrieval
+is read-only. Markdown remains authoritative for curated long-term knowledge.
+Unlike Python's clear-active-session + archive pipeline, do not maintain another
+full-transcript archive. Indexes may duplicate searchable text internally, but are
+rebuildable derived data, not a second transcript authority.
+
+**Three layers:**
+
+1. Original Durable entries with stable source references.
+2. Episode catalog: identity, exact entry boundaries, dates, message count, title,
+   LLM summary (topics, decisions, outcomes, open questions), pending/ready/failed
+   status, source references and summarizer version. Summaries aid discovery; the
+   original messages establish what was said.
+3. Rebuildable full-text indexes over message text, tool activity, and episode
+   titles/summaries. Start with SQLite full-text search; defer embeddings unless
+   keyword-plus-summary retrieval proves insufficient. The parked scan-based history
+   API is not this index and is not accepted by this design decision.
+
+**Search contract:**
+
+- Default: user/assistant message text, optionally filtered by role.
+- Optional scopes: tools only (names, arguments, results), or messages + tools.
+- Thinking and system instructions stay excluded from these search scopes; synthetic
+  reset handoffs and compaction summaries are not ordinary messages. These are query
+  filters, not deletion from storage. Episode summaries are separately searchable.
+- Support topic discovery through summaries and detail lookup through messages/tools.
+  Results identify their source, show matching excerpts, and link to the original
+  entry and surrounding discussion.
+- Index active episodes too: message search must not require a reset or successful
+  summary. All authenticated channels may browse mapped chat conversations under
+  the single-tenant policy; hosts authenticate access. State-only conversations are
+  not chat history. Optional tool search exposes records, never execution authority.
+
+**Reset and summary lifecycle.** Derive episode boundaries from actual committed
+reset entries, not command receipt time: busy resets can be queued. Summarize the
+closed episode in the background without delaying fresh context. Prefer incremental
+reconciliation with persisted progress and idempotent episode/job identity, catching
+up on reopen, over changing native reset ordering. A crash between reset and job
+creation must delay, not permanently lose, a summary. Persist status and retry
+handling; provider success is not guaranteed. Use the original message range, not
+only the latest compacted context; long episodes need bounded processing with
+explicit coverage rather than silent truncation. Raw message search remains available
+when summarization fails.
+
+**Open implementation gates.** Confirm supported incremental indexing/scheduling
+APIs, index freshness/rebuild behavior, long-episode summarization and tool-record
+coverage. Require source/store identity and query-bound cursors, stable pagination
+under appends/reopen, visible limits/omissions/index lag, and continued access to
+originals. Resolve parked cursor/reporting findings before reusing candidate code.
+Design agreement is not authorization to resume implementation or launch agents;
+the owner requested convergence and discussion.
+
 ### W4 — acceptance suite
 
 The gate that makes later cutover decisions defensible, and the only place where the
@@ -478,15 +544,25 @@ agent cron wiring remain open; this is not yet an everyday replacement or cutove
 
 ## Session log
 
+### 2026-10-29 — history design agreement; implementation remains paused
+
+Recorded the agreed canonical transcripts, reset-delimited episodes with background
+LLM summaries, and rebuildable full-text indexes. Search defaults to user/assistant
+text with optional tool names/arguments/results and links to original entries/context.
+Added the W3 contract and unchecked delivery tasks. Documentation only; no new code
+or agents. Next: agree a bounded implementation scope before resuming.
+
 ### 2026-10-29 — local usability and history direction
 
 Integrated reviewed fixed, value-free startup diagnostics (`c0b4465`, `0027f3e`), removed
 local `/steer` and `/after` at the owner's request (`387b4fa`), and added native CLI
 `/new` reset (`9321d20`). Reset retains Durable entries and conversation grants; it
 currently makes no summary. Independent synthetic review verified busy ordering,
-SQLite reopen and authority. Owner prefers native retention, message-only search and
-browsing across all authenticated channels in this single-tenant system, with a
-summary generated after each `/new`; summary scheduling/search remain future work.
+SQLite reopen and authority. Owner prefers native retention and browsing across all
+authenticated channels in this single-tenant system, with a summary after each `/new`;
+summary scheduling/search remain future work. The subsequent W3 agreement makes
+message text the default search scope, adds tool-only or combined search, and adds
+an episode-summary discovery index.
 Origin-mode scheduled turns observed by the attached CLI now display their final
 answers (`6c72388`, `dd84509`); isolated runs still have no outbox. Owner also
 requested Telegram `/restart` with automatic build and a separate admin allowlist.
