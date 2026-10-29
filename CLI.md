@@ -37,6 +37,21 @@ remain governed by recovery's existing disclosure contract, not this startup
 policy. This section does not broaden or change that behavior. Configuration
 loading for a recovery invocation still uses the fixed startup messages above.
 
+## Scheduled results
+
+An `origin`-mode cron job submits its turn into the same `cli:default`
+conversation. When an attached CLI observes a run whose inputs were not admitted
+by this terminal process, it prints that run's committed final assistant text
+once when the run ends. This also covers a run resumed by a CLI started after it
+was admitted.
+
+The CLI does not stream an external run's partial text, and it does not replay an
+already-settled answer at startup; `/history` shows settled entries. This is
+presentation of one Durable conversation, not a delivery outbox or an exactly-once
+external send. A default isolated/background cron run uses its own task-owned
+conversation and is not shown in the CLI; there is no silence policy or channel
+delivery. See [cron](./CRON.md).
+
 ## Recovery
 
 Startup fails closed when a prepared model dispatch still pins historical Nanobot
@@ -169,4 +184,5 @@ close/reap its Harness.
 This remains a text-only local surface, not a complete Python command port or
 interactive terminal UI. Model selection delegates to Gateway's allowlist and
 persists in native Durable `pi.agent`; it adds no agent runner, queue, session
-store, or parallel model state.
+store, or parallel model state. Scheduled origin-mode answers are rendered from
+the same conversation's committed entries; the terminal adds no delivery queue.

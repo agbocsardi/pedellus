@@ -173,7 +173,11 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
 - No user channel/outbound delivery, silence policy, model selection, or misfire policy. A run
   submits one agent turn to a Durable conversation (the fresh background conversation, or the
   origin conversation in `origin` mode); nothing is sent to Telegram, Discord, email, or another
-  channel.
+  channel. An origin-mode answer becomes part of the origin transcript, so an attached local CLI
+  prints its committed final text once when the run ends (see [the CLI](./CLI.md)). That is
+  conversation presentation, not a delivery layer: isolated runs stay in their own conversation,
+  there is no outbox, retry or exactly-once claim, and a CLI started after the run settled does not
+  replay it.
 - The `cron` tool parses only ISO 8601 timestamps with an explicit UTC offset for `at`; parsing
   natural-language user text stays outside.
 - Background runs are owned by the run task, so cancelling the job aborts that run. In `origin` mode

@@ -7,6 +7,7 @@ import type {
   Conversation,
   ConversationView,
   Cursor,
+  EntryRecord,
   LiveState,
   UsageState,
 } from "@earendil-works/pi-durable";
@@ -22,6 +23,7 @@ const HISTORY_TEXT_CHARS = 200;
 const HISTORY_PAGE_SIZE = 100;
 const HISTORY_ENTRY_LIMIT = 2_000;
 const MAX_REMEMBERED_ANSWERS = 256;
+const MAX_REMEMBERED_LOCAL_INPUTS = 1_024;
 const MAX_STATUS_QUEUE_SCAN = 2_000;
 const MAX_MESSAGE_BLOCK_SCAN = 2_048;
 const LITERAL_SLASH_PREFIX = "//";
@@ -101,6 +103,10 @@ type GenerationOutput = {
   finalized: boolean;
 };
 type RunOutput = { generation?: GenerationOutput };
+type ExternalRun = {
+  /** Newest assistant entry when this terminal first observed the external run. */
+  readonly baselineAnswerId: number;
+};
 
 /** Observe one existing Durable conversation and present its committed model text in a local terminal. */
 export async function runTerminalConversation(
@@ -119,6 +125,11 @@ export async function runTerminalConversation(
   const runOutputs = new Map<number, RunOutput>();
   const answerIds = new Set<number>();
   const answerOrder: number[] = [];
+  /** Every input this terminal admitted, so a run with no local input is classified as external. */
+  const localInputIds = new Set<number>();
+  const localInputOrder: number[] = [];
+  /** Runs admitted by another host path, with no local Submission to wait on. */
+  const externalRuns = new Map<number, ExternalRun>();
   const watchCallbacks = new Set<Promise<void>>();
   const waits = new Set<Promise<void>>();
   const commands = new Set<Promise<void>>();
@@ -179,6 +190,72 @@ export async function runTerminalConversation(
   const notice = (text: string, toError = false): Promise<void> =>
     serializeRender(() => rawNotice(text, toError));
 
+  const rememberAnswer = (id: number): boolean => {
+    if (answerIds.has(id)) return false;
+    answerIds.add(id);
+    answerOrder.push(id);
+    while (answerOrder.length > MAX_REMEMBERED_ANSWERS) {
+      const oldest = answerOrder.shift();
+      if (oldest !== undefined) answerIds.delete(oldest);
+    }
+    return true;
+  };
+
+  const rememberLocalInput = (id: number): void => {
+    localInputIds.add(id);
+    localInputOrder.push(id);
+    while (localInputOrder.length > MAX_REMEMBERED_LOCAL_INPUTS) {
+      const oldest = localInputOrder.shift();
+      if (oldest !== undefined) localInputIds.delete(oldest);
+    }
+  };
+
+  const latestAssistantEntry = (entries: readonly EntryRecord[]): EntryRecord | undefined => {
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const entry = entries[index]!;
+      if (AssistantEntry.is(entry)) return entry;
+    }
+    return undefined;
+  };
+
+  /**
+   * A run admitted by another host path (for example a scheduled origin-mode cron turn) has no local
+   * Submission to wait on. Print its committed final answer once when the run ends, and never replay
+   * an already-completed run at startup. Live partials stay local-submission-only so this terminal
+   * never renders a revision it cannot reconcile against a settlement.
+   */
+  const finalizeExternalRuns = async (view: ConversationView): Promise<void> => {
+    if (externalRuns.size === 0) return;
+    const answer = latestAssistantEntry(view.entries);
+    for (const [taskId, state] of [...externalRuns]) {
+      externalRuns.delete(taskId);
+      if (answer === undefined || answer.id <= state.baselineAnswerId) {
+        await rawNotice(
+          "A turn admitted before or outside this terminal ended without a committed assistant reply; use /history to inspect the conversation.",
+          true,
+        );
+        continue;
+      }
+      if (!rememberAnswer(answer.id)) continue;
+      const message = answer.model?.[0];
+      const finalText = sanitizeTerminalText(assistantText(message as AssistantMessage));
+      if (finalText.length === 0) {
+        const stopReason = message?.role === "assistant" ? message.stopReason : undefined;
+        const outcome = stopReason === "error"
+          ? "with a model error"
+          : stopReason === "aborted"
+            ? "after being aborted"
+            : "with no text";
+        await rawNotice(
+          `A turn admitted before or outside this terminal ended ${outcome}; use /history to inspect it.`,
+          true,
+        );
+      } else {
+        await rawNotice(limitResponse(finalText));
+      }
+    }
+  };
+
   const responseState = (taskId: number): GenerationOutput => {
     const run = runOutputs.get(taskId) ?? {};
     if (run.generation === undefined) {
@@ -202,6 +279,7 @@ export async function runTerminalConversation(
     if (run === undefined) {
       // Keep the final streamed line open until the submission receipt is reconciled below.
       for (const state of runOutputs.values()) if (state.generation?.active) state.generation.active = false;
+      await finalizeExternalRuns(view);
       return;
     }
     // Delayed watch snapshots may predate the settled assistant entry reconciled below.
@@ -212,6 +290,12 @@ export async function runTerminalConversation(
       return submission !== undefined && !submission.finalized;
     });
     if (ownedInputs.length === 0) {
+      if (run.inputs.length > 0
+        && run.inputs.every((id) => !localInputIds.has(id))
+        && !externalRuns.has(run.taskId)) {
+        const baseline = latestAssistantEntry(view.entries);
+        externalRuns.set(run.taskId, { baselineAnswerId: baseline?.id ?? 0 });
+      }
       for (const state of runOutputs.values()) {
         if (state.generation?.active) {
           state.generation.active = false;
@@ -235,6 +319,9 @@ export async function runTerminalConversation(
       }
     }
     for (const id of ownedInputs) submissions.get(id)!.runTaskId = run.taskId;
+    // A watch frame can arrive before the local admission promise records its ID. If this run turns
+    // out to own a local input after all, local settlement owns its answer and partial rendering.
+    externalRuns.delete(run.taskId);
     const state = responseState(run.taskId);
     const generation = live?.generation;
     if (state.finalized && (generation === undefined || state.attempt === generation.attempt)) return;
@@ -296,17 +383,6 @@ export async function runTerminalConversation(
       watchCallbacks.delete(callback);
     }
   });
-
-  const rememberAnswer = (id: number): boolean => {
-    if (answerIds.has(id)) return false;
-    answerIds.add(id);
-    answerOrder.push(id);
-    while (answerOrder.length > MAX_REMEMBERED_ANSWERS) {
-      const oldest = answerOrder.shift();
-      if (oldest !== undefined) answerIds.delete(oldest);
-    }
-    return true;
-  };
 
   const cleanupRun = (taskId: number | undefined): void => {
     if (taskId === undefined) return;
@@ -411,6 +487,7 @@ export async function runTerminalConversation(
         operationContext,
       );
       submissions.set(submission.id, { id: submission.id, submission });
+      rememberLocalInput(submission.id);
       waitForSubmission(submission.id, submission);
     });
     admissionTail = operation.catch(async (error: unknown) => {
