@@ -84,13 +84,13 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
 - [x] Agree transcript/episode/search design (2026-10-29; W3 below).
 - [x] Store identity, reset-delimited episode boundaries and durable pending-summary state (2026-10-29; foundation only, no summary pass).
 - [x] Implement rebuildable message/tool search over the read-only transcript, with committed reset boundaries (2026-10-29; no episode-summary index yet).
-- [ ] Implement the episode-summary index and summary search.
-- [ ] Generate episode summaries: claim `pending` episodes by deterministic job identity, bounded long-episode coverage, persisted retry/backoff.
+- [ ] Finish and independently approve the current background-summary candidate before integration: malformed source handling, version migration, durable retry/backoff across abort, and chat-scope enforcement.
+- [ ] Wire a validated summary model/spend policy into the normal assistant path; generate post-reset summaries with visible coverage, retry and explicit backfill policy.
+- [ ] Index episode titles/summaries and expose topic discovery plus original-source drilldown through the agent-facing `history` tool.
 - [x] Wire the rebuildable message/tool full-text index and reset boundaries to the durable store
       identity. `Gateway.historySearch` is on by default, bound to the committed `nanobot.store-identity`;
-      no caller-injected identity remains. Still no episode summaries or CLI/channel browsing UI. See
-      `HISTORY.md`.
-- [ ] Implement the episode summary index and episode catalog with durable post-reset summaries, retry and reconciliation.
+      no caller-injected identity remains. Episode summaries are not integrated; CLI diagnostics and
+      agent-facing retrieval are available. See `HISTORY.md`.
 - [x] Expose message/tool search and episode/entry browsing in the local CLI.
 - [x] Expose history search and source-entry opening through a default read-only agent-facing tool for
       mapped chats (`agentHistory: false` opts out). Telegram/web command surfaces remain unimplemented.
@@ -127,22 +127,56 @@ All effectful coding work still requires its own grant. Configuring a tool ceili
 does not by itself produce a tool-capable ordinary CLI or Telegram session; local CLI users
 can explicitly grant tools within that ceiling for a finite duration.
 
-## Remaining gates — ordered proposal, not a launch queue
+## Highest-value next steps — 2026-10-29
 
-1. **Consolidation decision:** review this snapshot and explicitly choose the next scope.
-   Preserve unmerged work; do not start new workers or fixes automatically.
-2. **Close core acceptance:** exercise one owner-approved real-model memory + skill + compaction
-   path and the copied A/B fixtures. Existing synthetic evidence is not model-fidelity evidence.
-3. **Connect cron for agent use:** owner-scoped model-callable `add`/`list`/`remove`,
-   Gateway install-before-resume, explicit per-run context and grant reauthorization,
-   origin routing/outbound delivery, silent mode and visible errors. No user UI or
-   direct scheduling commands are needed. Prove schedule
-   → execution → delivery → restart without duplicate admission. Telegram delivery
-   candidate must first be accepted or rejected; no exactly-once external-send claim.
-4. **Only after explicit agreement:** background subagents / Code Mode workers,
-   then channel use and order (Telegram, Discord, Email, WebSocket).
-5. **Separate owner decisions:** WebUI, migration, deployment/canary, rollback and
-   Python retirement. Nothing in this checklist authorizes live data or deployment.
+The owner wants capabilities the assistant uses, not more user-operated history
+commands. CLI history controls are optional diagnostics. Prefer finishing a small
+usable retrieval loop over expanding command surfaces, providers or infrastructure.
+This section sets priorities; it does not launch new agents or authorize live calls.
+Current summary implementation/review may finish under the existing assignment.
+New agents use `umans-openai/umans-deepseek-v4.1-flash`, high thinking.
+
+1. **Finish reliable background summaries (current work).** Close review blockers
+   before merging the candidate. Required: malformed content cannot strand the
+   queue; summary-version changes have a recovery path; abort cannot reset retry
+   budgets or skip backoff; backfill under queue pressure remains resumable; scope
+   excludes internal/task-owned/forked conversations. Keep coverage, pending/failed/
+   blocked state and unknown interrupted-call spend honest. Then wire the approved
+   model/thinking/spend policy into the actual assistant startup path: an SDK-only
+   option is not a delivered product feature. Preserve native reset ordering and
+   make the existing-open-episode activation/backfill policy explicit.
+2. **Complete agent-facing episodic recall.** Index generated titles/summaries in
+   the rebuildable search database and extend `history` for topic/episode discovery,
+   summary reading and original-entry drilldown. Keep default message search and
+   optional tool scopes intact. Summary failures must never block raw retrieval;
+   summaries remain derived navigation, not evidence or automatic curated memory.
+   No additional history slash commands are needed.
+3. **Prove the useful loop before adding breadth.** Offline end-to-end first:
+   discuss facts/decisions, reset, summarize, restart, ask a differently phrased
+   question, let the agent discover the episode and cite original entries. Include
+   absent summary, failed provider, large episode and index rebuild cases. Then
+   obtain explicit approval for one bounded real-model run on synthetic data to
+   evaluate summary fidelity and actual tool selection; passing faux-provider
+   checks alone does not demonstrate useful recall. Keep the broader memory/skill/
+   compaction acceptance and A/B fixture gates open until actually exercised.
+4. **Make the existing Telegram assistant practical.** After recall works, add the
+   minimal authenticated control dispatcher: `/new`, `/abort`, `/help` (never model
+   prompts). Telegram `/new` must produce the same committed episode/summary flow.
+   Keep tool grants default-deny; decide an owner approval path before claiming
+   Telegram coding-tool usability. Do not prioritize Telegram history commands—the
+   assistant already has the retrieval tool. `/restart` remains parked pending a
+   simpler explicit trusted-build/recovery design; it is not a prerequisite for recall.
+5. **Finish proactive usefulness: cron result delivery.** The scheduling tool,
+   origin mode and isolated-run execution are integrated; do not rebuild them.
+   Add the missing channel delivery/outbox, silence policy and actionable failure
+   status. Verify schedule → run → delivery → reopen with idempotent admission and
+   honest ambiguous-send recovery, not an exactly-once external-send claim.
+
+Defer more channels, background-subagent/Code Mode product interfaces, embeddings,
+WebUI, migration and deployment until the core assistant loop is useful. Provider
+changes for coding subagents do not silently change the product summarizer model.
+No live credentials, personal workspace, channel sends, cutover or Python retirement
+are authorized by this prioritization.
 
 ## Previous slice — background-run context (integrated; historical design)
 
@@ -663,6 +697,15 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-29 — prioritize finishing agent-facing recall
+
+Recorded the next-value order: finish the reviewed summary candidate and normal-path
+model policy, index summaries for agent topic discovery, prove recall across reset/
+reopen, then minimal Telegram controls and cron channel delivery. Consolidated duplicate
+history checklist items and corrected the stale no-CLI status. Agent-facing retrieval
+is the product interface; no more history commands planned. Summary code remains
+unmerged; no new agents or live runs started for this planning update.
 
 ### 2026-10-29 — agent-facing history tool
 
