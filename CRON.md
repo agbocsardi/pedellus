@@ -3,8 +3,8 @@
 This replaces the parked recurring-task foundation. The opt-in `cron` config installs it in the
 gateway together with a model-callable `cron` tool (`add`/`list`/`remove`); there is no command
 surface. Calendar expressions and IANA time zones are schedule math; parsing user text or ISO
-datetimes stays outside. A completed isolated-background result is also queued in a durable,
-channel-neutral outbox for an enabled channel; the run itself still writes only its Durable
+datetimes stays outside. A completed successful result, isolated or origin, is also queued in a
+durable, channel-neutral outbox for an enabled channel; the run itself still writes only its Durable
 conversation and sends no external message.
 
 Cron is an internal agent capability: the user asks the agent, and the agent calls the scheduling
@@ -15,7 +15,7 @@ Files:
 - `src/automation/cron.ts` — job document, timer task, run task, controller API.
 - `src/automation/cron-schedule.ts` — one-shot, interval, and calendar schedule math.
 - `src/automation/cron-tool.ts` — the model-facing `cron` tool.
-- `src/automation/cron-delivery.ts` — channel-neutral durable outbox for completed background results.
+- `src/automation/cron-delivery.ts` — channel-neutral durable outbox for completed successful results.
 - This document.
 
 ## Why two tasks
@@ -187,12 +187,17 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
 
 ## Channel outbox
 
-The normal terminal commit of a background run carries its settlement and final assistant entry ID
-to the host's optional `finalize` callback. When cron is enabled and the origin session belongs to a
+The normal terminal commit of a successful run, isolated or origin, carries its settlement and
+final assistant entry ID to the host's optional `finalize` callback. A separate task-owned target's
+captured authority is retired there; an origin-mode run answers in the origin conversation, so that
+conversation keeps its configured tools, cron ownership and context and none of its documents are
+retired. When cron is enabled and the origin session belongs to a
 channel enabled in the configuration (currently `telegram:` when `telegram` is configured), the
 gateway writes one record to the origin conversation's `nanobot.cron.deliveries` document in that
 same commit. The record is keyed by `cron:<jobId>:<scheduledAtMs>` and stores the final text, so a
-retried terminal commit cannot admit the same occurrence twice. No model turn is rerun for delivery.
+retried terminal commit cannot admit the same occurrence twice. The text is read from the answer
+entry the scheduled submission settled with, so no model turn is rerun and no nearby user answer is
+substituted for it.
 
 The channel adapter owns external-send state in that record: a bounded chunk cursor, a write-ahead
 intent, and an ambiguous-outcome quarantine. Delivery authorization uses durable admission
@@ -228,10 +233,13 @@ eviction candidates.
 
 Silence policy: only a successful, non-empty final answer is queued. An empty answer, run error,
 cancellation or superseded run sends nothing externally; its actionable status stays in
-`lastOutcome` and `list()`; no failure notification is sent. An origin-mode run answers inside the
-origin conversation and creates no outbox record, so it is not delivered twice. Telegram origin-mode
-delivery remains unsolved: no unsolicited send is attempted, and only a local CLI attached to that
-conversation prints the answer. With the channel absent from the configuration, no
+`lastOutcome` and `list()`; no failure notification is sent. An origin-mode successful answer is
+queued through the same record and authorization path as an isolated one, so it reaches its
+authenticated originating chat in addition to remaining the origin conversation's answer for a
+locally attached CLI. Delivery uses the committed answer entry of that scheduled submission; when
+native admission batches several inputs into one run, they settle on the same answer entry, so that
+batched answer can describe more than the scheduled message. There is no separate delivery service,
+config key or per-chat permission. With the channel absent from the configuration, no
 record is created at all; an existing record is not redirected to another channel. The bounded
 outbox (1000 records per origin, 200 terminal records retained) never evicts pending, withheld or
 ambiguous records. A full outbox does not queue the new result and records a durable, sanitized
@@ -248,13 +256,13 @@ fault document is itself ignored rather than replacing job or outbox data.
 - No user-facing channel command surface, model selection, or misfire policy. One run submits one
   agent turn to a Durable conversation (the fresh background conversation, or the origin conversation
   in `origin` mode).
-- Delivery is background-only and currently only consumed by the Telegram adapter. An origin-mode
+- Delivery covers both modes and is currently only consumed by the Telegram adapter. An origin-mode
   answer becomes part of the origin transcript, so an attached local CLI prints its committed final
-  text once when the run ends (see [the CLI](./CLI.md)); Telegram does not send an unsolicited origin-mode
-  turn. Queued origin turns that hand over directly to a successor are attributed per run, so a later
-  run neither steals nor suppresses an earlier answer. That is conversation presentation, not a
-  delivery layer: there is no retry or exactly-once claim, and a CLI started after the run settled
-  does not replay it.
+  text once when the run ends (see [the CLI](./CLI.md)); the same answer is also queued for its
+  authenticated private chat. Queued origin turns that hand over directly to a successor are
+  attributed per run, so a later run neither steals nor suppresses an earlier answer. That is
+  conversation presentation, not a delivery layer: there is no retry or exactly-once claim, and a
+  CLI started after the run settled does not replay it.
 - A pending outbox record has no age limit. A channel enabled later can deliver an older queued
   result once; an ambiguous record stays quarantined until an operator resolves it through the
   adapter's documented channel-state/outbox record.

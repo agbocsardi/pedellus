@@ -59,8 +59,9 @@ conversation's jobs are invisible and its IDs are refused.
 Say which mode will run and where the answer appears. In background mode the
 answer appears in a separate conversation; with a Telegram origin, a successful
 non-empty answer is also delivered to that private chat, while errors and empty
-answers are not sent. With `isolated: false` the answer appears here, and no
-channel send is attempted.
+answers are not sent. With `isolated: false` the answer appears here; a
+successful non-empty answer is also delivered to that same authenticated private
+chat, while errors and empty answers are not sent.
 
 ## Authority and limits
 

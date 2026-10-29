@@ -332,9 +332,9 @@ after a reopen.
 ## Scheduled cron delivery
 
 The adapter also consumes the durable, channel-neutral cron outbox
-(`nanobot.cron.deliveries` in the origin chat conversation). A completed isolated-background run
-writes its final text there in the same terminal commit as its outcome; no model turn is rerun to
-resend. On startup and every few seconds the adapter enumerates already-mapped chat sessions and
+(`nanobot.cron.deliveries` in the origin chat conversation). A completed successful run, isolated or
+origin, writes its final text there in the same terminal commit as its outcome; no model turn is
+rerun to resend. On startup and every few seconds the adapter enumerates already-mapped chat sessions and
 accepts only candidate keys for its own bot ID (`telegram:<bot id>:chat:<chatId>`). That key is a
 locator, not authentication: before any send the adapter requires durable admission evidence for
 that private chat, written before the message was mapped or submitted. The evidence records the
@@ -378,9 +378,12 @@ or when the whole document cannot be read, the adapter writes a sanitized entry 
 outbound request. Raw error text, provider text and record contents are not logged or persisted as
 the reason.
 
-Origin-mode cron delivery remains unsolved: an `origin` run answers inside the existing origin
-conversation and creates no outbox record, so this adapter sends no unsolicited origin-mode turn.
-Only a local CLI attached to that conversation prints its committed final text.
+An origin-mode successful answer uses the same record, authorization and send path, so it reaches the
+same authenticated private chat while remaining the origin conversation's answer for a locally
+attached CLI. Delivery text is the committed answer entry of the scheduled submission; no duplicate
+ordinary reply is produced, because the adapter sends only records from this outbox for work it did
+not submit itself. When native admission batches several inputs into one run they settle on the same
+answer entry, so a batched answer can describe more than the scheduled message.
 
 Reconciliation for scheduled records uses the origin conversation's `CronDeliveriesDoc` token rather
 than `TelegramState`. Stop the adapter first. If Telegram accepted the exact intended text, advance
