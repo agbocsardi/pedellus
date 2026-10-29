@@ -149,7 +149,8 @@ Bounded owner-authorized real-provider proofs and OpenCode Go tool turns passed
 on host and bwrap in disposable workspaces. These do not establish full-provider,
 real-memory/skill/compaction or scheduled-delivery acceptance. Offline consolidation
 also checked the combined Gateway memory/skills/four-tool path and revoke/reopen
-on both backends with a faux provider. The 155 behavior and 9 execution checks do
-not include dedicated permanent coverage for every newer slice; focused temporary
-probes are described in their documents. Backup/restore, A/B acceptance and
+on both backends with a faux provider. The behavior suite includes focused config-tool regression tests, but does not
+cover every newer slice; additional temporary probes are described in feature docs.
+Behavior/execution Node test phases use GNU `timeout`: 60 seconds, followed by a
+forced kill after 5 seconds if necessary, so leaked handles cannot wait forever. Backup/restore, A/B acceptance and
 owner-approved cutover remain open; no production cutover has been performed.

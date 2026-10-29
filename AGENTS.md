@@ -14,7 +14,7 @@ a real workspace or channel yet.
 npm ci --offline          # install the pinned dependency tree
 npm run typecheck         # tsc --noEmit
 npm run build             # tsc -> dist/
-npm run test:behavior     # 155 behaviour checks (builds first)
+npm run test:behavior     # 158 behaviour checks (builds first)
 npm run test:execution    # 9 execution/sandbox checks (builds first)
 npm run --silent test:core-acceptance  # offline core acceptance JSON (builds first; see ACCEPTANCE.md)
 npm start -- --config config.json   # local CLI against a config file
@@ -67,6 +67,7 @@ npm start -- --config config.json   # local CLI against a config file
 - New tests use synthetic providers/controlled clocks, explicit timeouts and guaranteed
   cleanup. No sleep-based schedule waits or abandoned gates/timers/subscriptions.
   Validate new files under an outer process timeout; register them in the npm suite.
+  Behavior/execution test phases use GNU timeout: 60s, then forced kill after 5s.
 - Keep documentation honest about what is missing; a documented gap beats an
   implied capability.
 - Never write credential filenames, tokens or host paths into documentation.
