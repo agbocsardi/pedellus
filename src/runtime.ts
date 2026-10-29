@@ -4,8 +4,8 @@ import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type Extension, type Harness as HarnessType, type ModelRef, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
-import { CONTEXT_LIMITS, createContextExtensionBuilder, type ConversationContextSnapshot } from "./context/index.js";
-import { createSkillTool, SKILL_TOOL_NAME } from "./context/skill-tool.js";
+import { CONTEXT_LIMITS, createContextExtensionBuilder, type ContextExtensionReplacement, type ConversationContextSnapshot } from "./context/index.js";
+import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./context/skill-tool.js";
 import { CRON_RUN_TASK_NAME, createCronFoundation } from "./automation/cron.js";
 import { createCronTool, CRON_TOOL_NAME } from "./automation/cron-tool.js";
 import type { CronOwner } from "./automation/cron.js";
@@ -499,7 +499,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         return;
       }
     };
-    const contextSnapshotLoads = new Map<ConversationId, Promise<boolean>>();
+    const contextSnapshotLoads = new Map<ConversationId, Promise<unknown>>();
     const installContextSnapshot = async (
       sessionKey: string,
       conversationId: ConversationId,
@@ -508,7 +508,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ): Promise<boolean> => {
       if (!options.contextSnapshotProvider) return false;
       const loading = contextSnapshotLoads.get(conversationId);
-      if (loading !== undefined) return loading;
+      if (loading !== undefined) {
+        await loading;
+        return skillConversations.has(conversationId);
+      }
       if (contextConversations.has(conversationId)) return skillConversations.has(conversationId);
       if (backgroundTarget && !backgroundTargets.includes(conversationId)) {
         backgroundTargets.push(conversationId);
@@ -525,7 +528,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           contextConversations.add(conversationId);
           let skillsPresent = false;
           if (skillTool !== undefined) {
-            if (skillTool.setConversation(conversationId, snapshot) > 0) {
+            if (skillTool.setConversation(conversationId, snapshot).skills > 0) {
               skillConversations.add(conversationId);
               skillsPresent = true;
             } else {
@@ -536,7 +539,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
           registry.install(extension);
           return skillsPresent;
         })
-        .finally(() => contextSnapshotLoads.delete(conversationId));
+        .finally(() => {
+          if (contextSnapshotLoads.get(conversationId) === pending) contextSnapshotLoads.delete(conversationId);
+        });
       contextSnapshotLoads.set(conversationId, pending);
       return pending;
     };
@@ -555,40 +560,76 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // leaves the captured snapshot untouched. Refresh changes no grant: it re-renders the skills
     // summary and replaces the on-demand skill table, while the normal policy pass only prunes grants
     // as before. Background cron targets are not reachable here because they have no session key.
+    // The refresh registers in contextSnapshotLoads so an install for the same conversation cannot
+    // build a competing snapshot; any failed commit restores the prior in-memory extension/table.
     const refreshContextSnapshot = async (
       sessionKey: string,
       conversationId: ConversationId,
       ctx: Context,
     ): Promise<number> => {
-      const loading = contextSnapshotLoads.get(conversationId);
-      if (loading !== undefined) await loading;
-      const conversation = await harnessRef.current!.conversation(conversationId, ctx);
-      if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
-      // Refuse an obvious live run before re-reading skill files; the commit below rechecks atomically.
-      if ((await harnessRef.current!.snapshot(LiveDoc, conversationId, ctx))?.run !== undefined) {
-        throw new ConversationBusy(conversationId);
+      // Serialize with an in-flight install or a previous refresh for this conversation.
+      for (;;) {
+        const loading = contextSnapshotLoads.get(conversationId);
+        if (loading === undefined) break;
+        await loading;
       }
-      const supplied = await options.contextSnapshotProvider!(sessionKey, conversationId, ctx);
-      if (supplied !== undefined && !isRecord(supplied)) {
-        throw new TypeError("Context snapshot provider must return an object or undefined");
+      const pending = (async () => {
+        const conversation = await harnessRef.current!.conversation(conversationId, ctx);
+        if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
+        // Refuse an obvious live run before re-reading skill files; the commit below rechecks atomically.
+        if ((await harnessRef.current!.snapshot(LiveDoc, conversationId, ctx))?.run !== undefined) {
+          throw new ConversationBusy(conversationId);
+        }
+        const supplied = await options.contextSnapshotProvider!(sessionKey, conversationId, ctx);
+        if (supplied !== undefined && !isRecord(supplied)) {
+          throw new TypeError("Context snapshot provider must return an object or undefined");
+        }
+        const snapshot = bindContextSnapshot(supplied, conversationId);
+        const hadContext = contextConversations.has(conversationId);
+        const hadSkills = skillConversations.has(conversationId);
+        const previousExtension = contextExtension;
+        let replacement: ContextExtensionReplacement | undefined;
+        let table: SkillTableUpdate | undefined;
+        try {
+          return await conversation.commit(async (tx) => {
+            const live = await tx.doc(LiveDoc, conversationId);
+            if (live.run !== undefined) throw new ConversationBusy(conversationId);
+            replacement ??= contextExtensionBuilder.replace(snapshot);
+            table ??= skillTool?.setConversation(conversationId, snapshot);
+            const count = table?.skills ?? 0;
+            contextExtension = replacement.extension;
+            contextConversations.add(conversationId);
+            if (count > 0) skillConversations.add(conversationId);
+            else skillConversations.delete(conversationId);
+            // Publish synchronously inside the commit: a deferred install could race a builder change
+            // from another conversation and publish an older superset under the same extension name.
+            registry.install(replacement.extension);
+            const toolFilter = await toolFilterFor(tx, conversationId);
+            await configure(tx, conversationId, { ...extensionsPolicy(conversationId), ...toolFilter });
+            return count;
+          }, ctx);
+        } catch (error) {
+          table?.restore();
+          if (hadContext) contextConversations.add(conversationId);
+          else contextConversations.delete(conversationId);
+          if (hadSkills) skillConversations.add(conversationId);
+          else skillConversations.delete(conversationId);
+          if (replacement !== undefined) {
+            const restoredExtension = replacement.restore();
+            contextExtension = restoredExtension;
+            registry.install(restoredExtension);
+          } else {
+            contextExtension = previousExtension;
+          }
+          throw error;
+        }
+      })();
+      contextSnapshotLoads.set(conversationId, pending);
+      try {
+        return await pending;
+      } finally {
+        if (contextSnapshotLoads.get(conversationId) === pending) contextSnapshotLoads.delete(conversationId);
       }
-      const snapshot = bindContextSnapshot(supplied, conversationId);
-      let extension: Extension | undefined;
-      const skills = await conversation.commit(async (tx) => {
-        const live = await tx.doc(LiveDoc, conversationId);
-        if (live.run !== undefined) throw new ConversationBusy(conversationId);
-        extension = contextExtensionBuilder.replace(snapshot);
-        contextExtension = extension;
-        contextConversations.add(conversationId);
-        const count = skillTool?.setConversation(conversationId, snapshot) ?? 0;
-        if (count > 0) skillConversations.add(conversationId);
-        else skillConversations.delete(conversationId);
-        const toolFilter = await toolFilterFor(tx, conversationId);
-        await configure(tx, conversationId, { ...extensionsPolicy(conversationId), ...toolFilter });
-        return count;
-      }, ctx);
-      registry.install(extension!);
-      return skills;
     };
 
     // Restore the persisted session mapping before resume can schedule work. Cron owners come from

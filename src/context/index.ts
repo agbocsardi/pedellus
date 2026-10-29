@@ -152,11 +152,18 @@ export function createContextExtension(
   return buildContextExtension(contexts);
 }
 
+/** Result of replacing one conversation's prepared snapshot, with a rollback for a failed apply. */
+export interface ContextExtensionReplacement {
+  readonly extension: Extension;
+  /** Restore the prior prepared entry and return an extension built from the restored map. */
+  restore(): Extension;
+}
+
 /** Build replacement extensions from prepared values without retaining mutable host snapshots. */
 export function createContextExtensionBuilder(): {
   add(snapshot: ConversationContextSnapshot): Extension;
   /** Replace one conversation's prepared snapshot, or add it when absent. */
-  replace(snapshot: ConversationContextSnapshot): Extension;
+  replace(snapshot: ConversationContextSnapshot): ContextExtensionReplacement;
   remove(conversationId: ConversationId): Extension;
 } {
   const contexts = new Map<ConversationId, PreparedContext>();
@@ -175,17 +182,26 @@ export function createContextExtensionBuilder(): {
       contexts.set(conversationId, prepared);
       return extension;
     },
-    replace(snapshot: ConversationContextSnapshot): Extension {
+    replace(snapshot: ConversationContextSnapshot): ContextExtensionReplacement {
       // Explicit host refresh: replace or add one conversation without disturbing the others.
       const [conversationId, prepared] = prepareSnapshot(snapshot);
-      if (!contexts.has(conversationId) && contexts.size >= CONTEXT_LIMITS.maxConversations) {
+      const hadPrevious = contexts.has(conversationId);
+      if (!hadPrevious && contexts.size >= CONTEXT_LIMITS.maxConversations) {
         throw new RangeError(`At most ${CONTEXT_LIMITS.maxConversations} conversation snapshots are accepted`);
       }
+      const previous = contexts.get(conversationId);
       const next = new Map(contexts);
       next.set(conversationId, prepared);
       const extension = buildContextExtension(next);
       contexts.set(conversationId, prepared);
-      return extension;
+      return {
+        extension,
+        restore() {
+          if (previous === undefined) contexts.delete(conversationId);
+          else contexts.set(conversationId, previous);
+          return buildContextExtension(contexts);
+        },
+      };
     },
     remove(conversationId) {
       // A missing snapshot is a no-op, so an eviction race cannot invalidate a live extension.

@@ -68,10 +68,11 @@ Two pieces make progressive loading real instead of config preselection:
    read-only model-facing tool, `skill`. With no argument it returns the same
    listing; with `name` it returns that skill's Markdown body (frontmatter
    stripped) from the per-conversation snapshot table. The table is populated
-   when the snapshot is bound and rebuilt from the provider on reopen, so a new
-   or restarted conversation can load any discovered workspace **or builtin**
-   skill without a config change — including builtin files that the `read` tool
-   cannot reach because they are outside the workspace.
+   when the snapshot is bound and rebuilt from the provider on reopen or on an
+   explicit refresh, so a new or restarted conversation can load any discovered
+   workspace **or builtin** skill without a config change — including builtin
+   files that the `read` tool cannot reach because they are outside the
+   workspace.
 
    The returned body states how to resolve relative paths: a workspace skill
    resolves them against `skills/<name>/` and its bundled files can be read with

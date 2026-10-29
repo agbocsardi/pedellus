@@ -49,6 +49,7 @@ export {
   stripSkillFrontmatter,
   type NanobotIdentityValues,
   type ContextDocumentSnapshot,
+  type ContextExtensionReplacement,
   type ContextSkillSnapshot,
   type ConversationContextSnapshot,
 } from "./context/index.js";

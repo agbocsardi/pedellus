@@ -17,7 +17,7 @@ body loads on demand.
 | --- | --- |
 | `memory` | Workspace Markdown topic files. A host-injected read-only manifest may list topics with descriptions or heading fallback; topic bodies are included only when explicitly selected. There is no memory-tree/search tool, Dream, or history. |
 | `memory-defrag` | Reorganizes those files with read/write/edit/bash; no subagents or Dream state. |
-| `skill-creator` | Authoring and loading skills with this loader's flat frontmatter subset, and the fixed per-conversation snapshot: a new skill appears in the next conversation or after a Gateway reopen, never the current one. No packaging scripts. |
+| `skill-creator` | Authoring and loading skills with this loader's flat frontmatter subset, and the fixed per-conversation snapshot: a new skill appears in the next conversation, after a Gateway reopen, or after a host-exposed explicit refresh of the current conversation. No packaging scripts. |
 | `github` | `gh` through granted `bash`, gated on `requires.bins: ["gh"]`. Authentication may be unavailable in the filtered shell, so the skill checks first and stops rather than placing secrets in the workspace. |
 | `cron` | The opt-in `cron` tool (`add`/`list`/`remove`) with `at`/`every_seconds`/`cron_expr`, IANA `tz`, isolated or origin mode, no channel delivery, and no per-job timeout argument. |
 

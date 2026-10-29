@@ -40,13 +40,21 @@ interface ConversationSkills {
   readonly skills: readonly ConversationSkill[];
 }
 
+/** Result of replacing one conversation's skill table, with a rollback for a failed apply. */
+export interface SkillTableUpdate {
+  /** Discovered skills, including unavailable ones; 0 means the table was removed. */
+  readonly skills: number;
+  /** Restore this conversation's prior table, including absence. */
+  restore(): void;
+}
+
 export interface SkillTool {
   readonly extension: Extension;
   /**
-   * Replace one conversation's table from the host snapshot. Returns the number
-   * of discovered skills, including unavailable ones; 0 removes the table.
+   * Replace one conversation's table from the host snapshot. The skill count
+   * includes unavailable ones; 0 removes the table.
    */
-  setConversation(conversationId: ConversationId, snapshot: unknown): number;
+  setConversation(conversationId: ConversationId, snapshot: unknown): SkillTableUpdate;
   removeConversation(conversationId: ConversationId): void;
 }
 
@@ -173,17 +181,23 @@ export function createSkillTool(): SkillTool {
   return {
     extension: defineExtension({ name: "nanobot-skill-tool", tools: [tool] }),
     setConversation(conversationId, snapshot) {
+      const previous = conversations.get(conversationId);
       const skills = readSkills(snapshot);
-      if (skills.length === 0) {
-        conversations.delete(conversationId);
-        return 0;
+      if (skills.length === 0) conversations.delete(conversationId);
+      else {
+        const summary = ownString(snapshot, "skillSummary");
+        conversations.set(conversationId, Object.freeze({
+          ...(summary !== undefined && summary.trim().length > 0 ? { summary } : {}),
+          skills,
+        }));
       }
-      const summary = ownString(snapshot, "skillSummary");
-      conversations.set(conversationId, Object.freeze({
-        ...(summary !== undefined && summary.trim().length > 0 ? { summary } : {}),
-        skills,
-      }));
-      return skills.length;
+      return {
+        skills: skills.length,
+        restore() {
+          if (previous === undefined) conversations.delete(conversationId);
+          else conversations.set(conversationId, previous);
+        },
+      };
     },
     removeConversation(conversationId) {
       conversations.delete(conversationId);
