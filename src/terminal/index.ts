@@ -700,7 +700,7 @@ export async function runTerminalConversation(
     switch (name) {
       case "help":
         await notice([
-          "Local commands: /help /status /history [count] /model [provider modelId [thinkingLevel]] /tools /grant <tool[,tool]> <duration> /revoke <tool[,tool]|all> /refresh /compact /abort",
+          "Local commands: /help /status /history [count] /model [provider modelId [thinkingLevel]] /tools /grant <tool[,tool]> <duration> /revoke <tool[,tool]|all> /refresh /compact /abort /new",
           "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
           "/abort uses native Durable semantics: it cancels foreground work and withdraws queued inputs.",
           io.modelSelection ? "/model lists the host allowlist; select with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
@@ -741,11 +741,14 @@ export async function runTerminalConversation(
         await conversation.abort(operationContext);
         await notice("Native Durable conversation abort completed; queued inputs were withdrawn. This does not implement Python sustained-goal abort.");
         return;
+      case "new":
+        if (args.trim()) { await notice("Usage: /new", true); return; }
+        await conversation.reset(undefined, operationContext);
+        await notice("Native Durable context reset admitted for this same conversation: no handoff, summary or extra model call, earlier entries stay stored and listed by /history, and tool grants are unchanged. While busy it lands at the next safe boundary; queued inputs placed with it run in the new context.");
+        return;
       default:
         if (name === "stop") {
           await notice("/stop is unsupported: it is not aliased to native /abort, which withdraws queued inputs.", true);
-        } else if (name === "new") {
-          await notice("/new is unsupported: native reset does not implement Nanobot archive/usage-reset semantics.", true);
         } else if (name === "restart") {
           await notice("/restart is unsupported: process restart belongs to the deployment owner.", true);
         } else if (name === "steer" || name === "after") {

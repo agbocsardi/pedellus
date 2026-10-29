@@ -73,6 +73,7 @@ fail-closed and is not remotely cancelled. See
 | `/refresh` | Re-read the configured workspace bootstrap, memory files, manifest and skill inventory for this `cli:default` conversation. Requires `workspaceContext`; rejected while the conversation is busy. The refreshed summary and skill table apply to the next model request. |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
+| `/new` | Admit native `Conversation.reset(undefined)`: the same conversation starts a new context with no handoff. No archive, summary, usage reset or extra model call is produced; earlier entries stay stored and remain visible to `/history`, and conversation-scoped tool grants are unchanged. While busy it is placed at the next safe boundary and ends that run there instead of interrupting the current model turn; inputs queued with it run in the new context. A queued `/new` is a write, so `/abort` withdraws queued inputs but not the pending reset. |
 
 ## Coding-tool grants
 
@@ -135,7 +136,7 @@ runs have no session key and are not refreshed; they pick up the snapshot on
 their next run or Gateway reopen.
 
 `/stop` is deliberately not an alias for `/abort`: native abort withdraws queued
-inputs, while Python stop preserves queued work. `/new`, `/restart`, `/goal`,
+inputs, while Python stop preserves queued work. `/restart`, `/goal`,
 `/interrupt`, `/btw`, task/policy/receipt/skill, memory/Dream and pairing
 commands are not implemented here. `/steer` and `/after` were removed; normal
 input is admitted by the native conversation in input order. Unsupported slash
