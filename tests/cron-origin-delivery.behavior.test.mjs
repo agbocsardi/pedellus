@@ -37,37 +37,58 @@ const WAIT_MS = 10_000;
 
 async function syntheticGateway(label, options = {}) {
   const directory = await mkdtemp(join(tmpdir(), `nanobot-cron-origin-${label}-`));
-  const workspace = join(directory, 'workspace');
-  const dataDir = join(directory, 'state');
-  await mkdir(workspace);
-  await writeFile(join(workspace, 'note.txt'), 'ORIGIN-READ-CONTENT\n');
-  const faux = fauxProvider({ provider: 'cron-origin', models: [{ id: 'synthetic', name: 'Synthetic' }] });
-  const models = createModels();
-  models.setProvider(faux.provider);
-  const model = { provider: 'cron-origin', modelId: 'synthetic' };
-  const config = parseConfig({
-    workspace,
-    dataDir,
-    model,
-    allowedModels: [model],
-    toolAllowlist: options.toolAllowlist ?? [],
-    cron: { enabled: true },
-    ...(options.telegram === false
-      ? {}
-      : { telegram: { tokenEnv: 'SYNTHETIC_TELEGRAM_TOKEN', allowFrom: ['501'] } }),
-  }, directory);
-  const gateway = await openGateway(config, context, { models, toolAuthorization: 'config' });
-  return { directory, faux, gateway };
+  try {
+    const workspace = join(directory, 'workspace');
+    const dataDir = join(directory, 'state');
+    await mkdir(workspace);
+    await writeFile(join(workspace, 'note.txt'), 'ORIGIN-READ-CONTENT\n');
+    const faux = fauxProvider({ provider: 'cron-origin', models: [{ id: 'synthetic', name: 'Synthetic' }] });
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const model = { provider: 'cron-origin', modelId: 'synthetic' };
+    const config = parseConfig({
+      workspace,
+      dataDir,
+      model,
+      allowedModels: [model],
+      toolAllowlist: options.toolAllowlist ?? [],
+      cron: { enabled: true },
+      ...(options.telegram === false
+        ? {}
+        : { telegram: { tokenEnv: 'SYNTHETIC_TELEGRAM_TOKEN', allowFrom: ['501'] } }),
+    }, directory);
+    const gateway = await openGateway(config, context, { models, toolAuthorization: 'config' });
+    return { directory, config, faux, gateway };
+  } catch (error) {
+    // Setup failed before the test owned a gateway to close; still remove this store's directory.
+    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
-/** Resolve on the next commit that matches, with a bounded deadline; unsubscribe in `stop`. */
+/**
+ * Resolve on the next commit that matches, with a bounded deadline. `stop()` always clears that
+ * deadline and cancels the observer, whether the watcher settled, failed or was never awaited.
+ */
 function changeWatcher(harness, predicate, label) {
+  let settled = false;
   let settle;
+  let timer;
   const promise = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), WAIT_MS);
+    timer = setTimeout(() => settle.reject(new Error(`timed out waiting for ${label}`)), WAIT_MS);
     settle = {
-      resolve: (publication) => { clearTimeout(timer); resolve(publication); },
-      reject: (error) => { clearTimeout(timer); reject(error); },
+      resolve: (publication) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(publication);
+      },
+      reject: (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
     };
   });
   // A failing test may stop before awaiting; keep that rejection from surfacing as unhandled.
@@ -79,7 +100,14 @@ function changeWatcher(harness, predicate, label) {
       settle.reject(error);
     }
   });
-  return { promise, stop: unsubscribe };
+  return {
+    promise,
+    stop() {
+      settled = true;
+      clearTimeout(timer);
+      unsubscribe();
+    },
+  };
 }
 
 const deliveriesChanged = (conversationId) => (changes) => changes.some((change) =>
@@ -302,7 +330,9 @@ test('an origin-mode scheduled answer is delivered once through the durable outb
 
 test('a non-Telegram origin never queues an origin-mode result', { timeout: 20_000 }, async () => {
   const origin = 'sdk:local-origin';
-  const store = await syntheticGateway('nonchannel');
+  // Telegram delivery is enabled in this store; only the origin's session-key prefix keeps it silent.
+  const store = await syntheticGateway('nonchannel', { telegram: true });
+  assert.notEqual(store.config.telegram, undefined, 'delivery channel is enabled for this guard');
   const chat = await store.gateway.conversationFor(origin, context);
   const scheduledMessage = 'deliver the local reminder';
   let toolCallIssued = false;
