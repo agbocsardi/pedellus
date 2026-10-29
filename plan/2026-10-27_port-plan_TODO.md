@@ -85,7 +85,7 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
 - [x] Store identity, reset-delimited episode boundaries and durable pending-summary state (2026-10-29; foundation only, no summary pass).
 - [ ] Implement read-only transcript retrieval and rebuildable message/tool and episode-summary indexes.
 - [ ] Generate episode summaries: claim `pending` episodes by deterministic job identity, bounded long-episode coverage, persisted retry/backoff.
-- [x] Implement the rebuildable message/tool full-text index and committed reset boundaries (2026-10-29; first bounded slice, see `HISTORY.md`).
+- [ ] Wire the rebuildable message/tool full-text index and reset boundaries into an exposed capability. The implementation is dark/unwired: it requires a caller-injected durable store identity, exposes no default UI/channel path, and catalog identity integration is parent-led. See `HISTORY.md`.
 - [ ] Implement the episode summary index and episode catalog with durable post-reset summaries, retry and reconciliation.
 - [ ] Expose history browsing/search through memory tooling and accepted channel interfaces.
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
@@ -336,7 +336,7 @@ and an early fact crosses native compaction into a fresh process via a faux summ
 Remaining acceptance: curated builtin compatibility and real-model use of memory,
 skills and compaction. No claim of full Python memory/search/usage parity.
 
-#### Agreed history design — 2026-10-29 (first message/tool slice implemented)
+#### Agreed history design — 2026-10-29 (dark/unwired message/tool slice implemented)
 
 **Authority and terminology.** Durable's Session is the storage/runtime container;
 a Conversation is a persistent transcript. Our Telegram adapter maps each bot + chat
@@ -483,10 +483,12 @@ documents are not scanned by this module, so a future summary pass needs its own
 work queue or an index over `pending` episodes, and nothing schedules one today.
 The store identity document itself is frozen and never updated.
 
-**First bounded slice — 2026-10-29.** `src/history/index.ts` implements the
-message/tool FTS5 index, committed reset boundaries, bounded incremental
-reconciliation, caller-injected store identity and query-bound stable pagination
-behind `Gateway.historySearch`. It does not implement episode summaries or summary
+**First bounded slice — 2026-10-29 (dark/unwired).** `src/history/index.ts`
+implements the message/tool FTS5 index, committed reset boundaries, bounded
+incremental reconciliation, caller-injected store identity and query-bound stable
+pagination behind `Gateway.historySearch`. It is not exposed by default: no
+store-identity document or UI/channel wiring is included, so history search fails
+closed until the parent-led catalog identity integration supplies `storeId`. It does not implement episode summaries or summary
 search. The index is a separate `0600` rebuildable file and never writes Durable;
 long text is chunked and lag, coverage and omitted chunks are visible. `storeId`
 comes from the planned durable `nanobot.store-identity` document and is injected
@@ -685,8 +687,9 @@ search yet.
 
 Added a rebuildable SQLite FTS5 index over Durable-retained user/assistant messages,
 tool names/arguments/results and committed reset boundaries, exposed as
-`Gateway.historySearch` (no UI, no episode summaries, no candidate reuse). The index
-lives in a separate `nanobot-history-index.sqlite` file, reconciles bounded forward from
+`Gateway.historySearch` (no UI, no episode summaries, no candidate reuse). It is
+dark/unwired: requires an injected durable store identity and has no default
+exposure. The index lives in a separate `nanobot-history-index.sqlite` file, reconciles bounded forward from
 persisted entry fingerprints and progress, reports lag/coverage/truncation/edits,
 chunks long text with bounded per-entry generation and per-entry writes, and rejects
 stale/replaced-store/mapping-changed cursors. `:channel-state` remains explicitly

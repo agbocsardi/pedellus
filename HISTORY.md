@@ -82,8 +82,10 @@ Only these entry kinds contribute searchable records:
 - `pi.user` and `nanobot.cron`: user text.
 - `pi.assistant`: text blocks become assistant records; `toolCall` blocks become
   separate tool records with name, bounded canonical arguments JSON,
-  `argumentsError` when present, and `toolCallId`. Arguments beyond the 1M-unit
-  budget are truncated explicitly and make the part count as truncated.
+  `argumentsError` when present, and `toolCallId`. The serializer budget is 1M
+  output units. A string consumes budget directly, but JSON escaping can exhaust
+  it before the source string does; any truncation is explicit and makes the part
+  count as truncated.
 - `pi.tool-result`: tool name plus rendered text content, with `toolCallId` when
   present. `details`, nested-call metadata and image data are not indexed.
 
@@ -113,7 +115,10 @@ Each search reconciles a bounded slice before querying:
    they contain plausible entries. A mapped session then becomes chat history only
    after at least one message/tool record exists in the index.
 2. For each session, verify the first and last indexed entry fingerprints. A
-   mismatch clears only that conversation's derived rows and reindexes it.
+   mismatch clears only that conversation's derived rows and reindexes it. The
+  fingerprint hashes identity fields exactly but bounds model/data content; a
+  replacement differing only beyond that budget can share a fingerprint. The
+  caller-supplied store identity remains the primary replacement authority.
 3. Scan forward from the persisted entry ID in pages of at most 5 entries. Each
    entry is extracted and written in its own index transaction with bounded
    generation; a pass stops at 500 entries, 8 MiB of prepared document text, or
@@ -126,9 +131,11 @@ A large backlog does not fail a search. `coverage` reports mapped sessions, the
 session cap, chat sessions, indexed sessions, indexed entries, reset boundaries,
 truncated parts, unsupported edits, the page boundary, pending entries, whether the
 pending count is complete, malformed stored shapes, and reconciliation bytes/time.
-`complete` is true only when no lag was observed, no text was omitted, and no edits
-were skipped. A no-hit result with `complete: false` is explicitly incomplete. The
-next call continues where the previous one stopped.
+`complete` is the authoritative completeness signal: it is false when a budget
+stopped reconciliation, pending counting was capped, text was omitted, or
+unsupported edits exist. `pendingEntries === 0` does not by itself mean complete.
+A no-hit result with `complete: false` is explicitly incomplete. The next call
+continues where the previous one stopped.
 
 A crash between a Durable append and an index write loses no source data: progress
 was not advanced, so the next search replays that range. A crash during an index

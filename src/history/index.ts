@@ -122,7 +122,9 @@ export interface HistoryQuery {
    * may extend to a longer word beginning with it. This is not literal substring
    * matching. Terms must occur in the same chunk; the 256-unit overlap reduces but
    * does not eliminate chunk-boundary misses. Contiguous CJK runs are one token,
-   * so only a full run or a prefix of it matches. Empty text browses the scope.
+   * so only a full run or a prefix of it matches. Overlapping chunks can yield
+   * multiple hits for one part; dedupe with `(entryId, partIndex)` and treat each
+   * excerpt as a chunk fragment. Empty text browses the scope.
    */
   readonly text?: string;
   /** Default `messages`. `tools` is tools only; `all` is messages plus tools. */
@@ -153,6 +155,8 @@ export interface HistoryHit {
   readonly excerptTruncated: boolean;
   /** Full source body length in UTF-16 code units before chunking. */
   readonly bodyLength: number;
+  /** Message/tool part ordinal within the source entry. */
+  readonly partIndex: number;
   /** Chunk ordinal within this message/tool part. */
   readonly chunkIndex: number;
   /** UTF-16 code-unit offset of this chunk's start in the full body. */
@@ -195,11 +199,16 @@ export interface HistoryCoverage {
   readonly resetBoundaries: number;
   /** Entries at or below this ID were eligible for this page. */
   readonly boundaryEntryId: number;
-  /** Source entries newer than index progress, bounded by `maxPendingScanEntries`. */
+  /** Lag count only, bounded by `maxPendingScanEntries`; zero does not imply `complete`. */
   readonly pendingEntries: number;
   /** False when the pending count hit its bound and is a lower bound. */
   readonly pendingComplete: boolean;
-  /** True only when caught up, no lag/omitted text, and no unsupported edits were observed. */
+  /**
+   * The authoritative completeness signal. True only when reconciliation caught
+   * up, no lag was observed, no text was omitted and no unsupported edits exist.
+   * `pendingEntries === 0` alone is not sufficient (pending may be capped at zero,
+   * or omitted text/edits may remain).
+   */
   readonly complete: boolean;
   readonly malformedEntries: number;
   readonly malformedMessages: number;
@@ -314,6 +323,7 @@ interface DocRow {
   readonly tool_call_id: string | null;
   readonly timestamp: number | null;
   readonly episode_start_entry_id: number;
+  readonly part_index: number;
   readonly chunk_index: number;
   readonly char_start: number;
   readonly body_length: number;
@@ -486,7 +496,9 @@ function readCursor(value: unknown): HistoryCursor {
 /**
  * Content-addressed identity for one immutable Durable entry. Identity fields
  * are hashed exactly; model/data are bounded so a huge entry cannot force a full
- * in-memory JSON copy here. The store identity remains the primary authority.
+ * in-memory JSON copy here. This is a secondary anchor only: two stores whose
+ * content differs solely beyond the fingerprint budget can share a fingerprint.
+ * Caller-supplied `storeId` remains the primary replacement authority.
  */
 function entryFingerprint(entry: EntryRecord): string {
   const hash = createHash("sha256");
@@ -551,21 +563,25 @@ function boundedJson(value: unknown, maxChars: number, maxDepth = 64): BoundedJs
     }
     if (node === null) return append("null");
     if (typeof node === "string") {
-      const remaining = Math.max(0, maxChars - output.length);
-      const sliceLength = Math.max(0, Math.floor(remaining / 6));
-      const source = node.length > sliceLength ? node.slice(0, sliceLength) : node;
-      const encoded = JSON.stringify(source);
-      if (encoded.length > remaining) {
-        output += encoded.slice(0, remaining);
-        truncated = true;
-        return false;
+      if (!append('"')) return false;
+      let start = 0;
+      while (start < node.length) {
+        const remaining = Math.max(0, maxChars - output.length - 1);
+        if (remaining === 0) {
+          truncated = true;
+          return false;
+        }
+        const take = Math.min(node.length - start, remaining);
+        const encoded = JSON.stringify(node.slice(start, start + take)).slice(1, -1);
+        if (encoded.length > remaining) {
+          output += encoded.slice(0, remaining);
+          truncated = true;
+          return false;
+        }
+        output += encoded;
+        start += take;
       }
-      output += encoded;
-      if (source.length < node.length) {
-        truncated = true;
-        return false;
-      }
-      return true;
+      return append('"');
     }
     if (typeof node === "number" || typeof node === "boolean") return append(String(node));
     if (Array.isArray(node)) {
@@ -1434,7 +1450,8 @@ async function queryDocuments(
   if (query.terms.length === 0) {
     return db.all<DocRow>(
       `SELECT d.doc_id, d.conversation_id, d.entry_id, d.entry_kind, d.role,
-              d.tool_name, d.tool_call_id, d.timestamp, d.episode_start_entry_id, d.chunk_index,
+              d.tool_name, d.tool_call_id, d.timestamp, d.episode_start_entry_id,
+              d.part_index, d.chunk_index,
               d.char_start, d.body_length, d.truncated, d.entry_fingerprint,
               substr(d.body, 1, ?) AS excerpt
          FROM history_documents d
@@ -1455,7 +1472,8 @@ async function queryDocuments(
   }).join(" ");
   return db.all<DocRow>(
     `SELECT d.doc_id, d.conversation_id, d.entry_id, d.entry_kind, d.role,
-            d.tool_name, d.tool_call_id, d.timestamp, d.episode_start_entry_id, d.chunk_index,
+            d.tool_name, d.tool_call_id, d.timestamp, d.episode_start_entry_id,
+            d.part_index, d.chunk_index,
             d.char_start, d.body_length, d.truncated, d.entry_fingerprint,
             snippet(history_fts, 0, '[', ']', '…', ?) AS excerpt
        FROM history_fts
@@ -1694,6 +1712,7 @@ export function createHistoryIndex(options: HistoryIndexOptions): HistoryIndex {
             excerpt: row.excerpt,
             excerptTruncated: row.body_length > excerptLength,
             bodyLength: row.body_length,
+            partIndex: row.part_index,
             chunkIndex: row.chunk_index,
             charStart: row.char_start,
             bodyTruncated: row.truncated === 1,
