@@ -47,9 +47,19 @@ already integrated. Start by using them together, not rebuilding them.
 ### T1 — Ready to use
 
 Provide a clear setup path that enables memory, skills and cron deliberately.
-Keep the existing CLI grants; choose and implement the smallest explicit owner
-approval/provisioning path for Telegram tools, without weakening default-deny.
+For the ordinary CLI and Telegram assistant, `toolAllowlist` in config selects
+its coding tools directly; an empty list disables them. No grant/revoke workflow.
+Only trusted Telegram users should be admitted: they share the configured tools
+and workspace. Keep raw/forked conversations denied and cron bounded by its origin.
 Make context refresh and background-summary costs understandable in setup.
+
+Use named model presets as the next configuration slice: provider, model and
+thinking settings defined once, selected by name for the assistant and summary
+model. Runtime switching is an explicit temporary utility, not a hidden persistent
+settings layer; restart returns to the configured selection. Keep existing direct
+model configs working. Presets do not change tool authority or implicitly enable
+fallbacks. Owner authorized a separate presets worker while tool authority is in
+flight; integrate against the final config-only product path.
 
 **Done:** a fresh synthetic workspace can be configured from the docs, and the
 assistant can use a skill and perform an authorized workspace task through both
@@ -121,6 +131,12 @@ alone does not put it back in scope.
 
 ## Working rules
 
+- Config owns persistent settings and policy: tools, model/thinking defaults,
+  workspace/skills, channels, summaries and cron enablement. CLI/Telegram commands
+  are utilities, not required configuration steps. Any runtime override must be
+  explicit and visible, never a hidden replacement for configuration.
+- Keep actual conversation/job state in SQLite and memory/skill content in Markdown;
+  config-first does not mean storing every reminder or learned fact in config.
 - Work on one trunk outcome or major branch at a time. Fix a blocking dependency;
   park unrelated improvements instead of recursively expanding the task.
 - Keep this plan short: outcome, done condition, status. Put technical findings
@@ -139,3 +155,11 @@ and additional channels. Superseded the sprawling v2 plan without deleting its
 implementation evidence. Baseline review passed typecheck, 155 behavior checks,
 9 execution checks and 88 offline core acceptance checks; real-model core and
 live-channel acceptance remain open. Next: T1, using T2's story to guide setup.
+
+Started two OpenCode Go / DeepSeek Flash high workers for setup and tool authority.
+Owner simplified the design: product tool access comes directly from config, not
+manual grant/revoke controls. Redirected both assignments accordingly; legacy SDK
+grant contracts remain separate. Setup received independent review and a bounded
+fix pass; config-only tool execution still needs implementation/integration proof.
+Owner authorized rotating workers and starting model presets in parallel within T1.
+Keep at most two implementation slices active and review each before integration.
