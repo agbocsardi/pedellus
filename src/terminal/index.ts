@@ -730,6 +730,7 @@ export async function runTerminalConversation(
       return;
     }
     const sessionKey = parsed.session ?? host.defaultSession;
+    const sessionToken = historySessionToken(sessionKey);
     let page: HistoryEpisodePage;
     try {
       page = await host.listEpisodes(sessionKey, parsed.query, operationContext);
@@ -748,13 +749,19 @@ export async function runTerminalConversation(
       return `  #${episode.startEntryId}-${end} ${episode.status}; entries=${episode.entries ?? "uncounted"} messages=${episode.messages ?? "uncounted"} tools=${episode.toolResults ?? "uncounted"}; ${episode.resetEntryId === null ? "pre-reset segment" : `reset=${episode.resetEntryId}`}; summary=${episode.summary.status}`;
     });
     const lines = [
-      `Episodes for session ${safeLabel(sessionKey, 120)} (newest first), ${page.episodes.length} shown:`,
+      `Episodes for session ${safeLabel(sessionKey, 120)} (newest first), ${page.episodes.length} selected:`,
     ];
     const footer = [
       "Summary text is not generated or shown; only the recorded summary status is reported.",
     ];
-    if (page.next !== undefined) footer.push(`Older episodes: /episodes --session ${safeLabel(sessionKey, 120)} --before ${page.next.before}`);
-    footer.push(`Open one with /episode --session ${safeLabel(sessionKey, 120)} <startEntryId>, or a bounded window around any entry with /entry --session ${safeLabel(sessionKey, 120)} <entryId>.`);
+    if (page.next !== undefined) {
+      footer.push(sessionToken === undefined
+        ? "Older episodes exist; the continuation hint is suppressed because this session key is not exactly representable as a CLI token."
+        : `Older episodes: /episodes --session ${sessionToken} --before ${page.next.before}`);
+    }
+    footer.push(sessionToken === undefined
+      ? "Drilldown hints are suppressed: this session key contains whitespace, control/bidi marks, an unpaired surrogate, or exceeds 200 code units."
+      : `Open one with /episode --session ${sessionToken} <startEntryId>, or a bounded window around any entry with /entry --session ${sessionToken} <entryId>.`);
     await notice(formatBoundedHistory(lines, footer, rows));
   };
 
@@ -770,6 +777,7 @@ export async function runTerminalConversation(
       return;
     }
     const sessionKey = parsed.session ?? host.defaultSession;
+    const sessionToken = historySessionToken(sessionKey);
     let episode: HistoryEpisode | undefined;
     try {
       episode = await host.episode(sessionKey, parsed.startEntryId, operationContext);
@@ -824,10 +832,15 @@ export async function runTerminalConversation(
     if (rows.length === 0) {
       footer.push(`No displayable message/tool entry in the first ${scanned} scanned entr${scanned === 1 ? "y" : "ies"}.`);
     } else {
-      footer.push(`Showing ${rows.length} message/tool entr${rows.length === 1 ? "y" : "ies"}; scanned ${scanned} entr${scanned === 1 ? "y" : "ies"}${episode.entries === null ? "" : ` of ${episode.entries}`}.`);
+      footer.push(`Selected ${rows.length} message/tool entr${rows.length === 1 ? "y" : "ies"}; scanned ${scanned} entr${scanned === 1 ? "y" : "ies"}${episode.entries === null ? "" : ` of ${episode.entries}`}.`);
     }
-    if (!exhausted && rows.length >= parsed.limit) footer.push(`[Episode view limited to ${parsed.limit} displayable entries; use /entry --session ${safeLabel(sessionKey, 120)} <entryId> for another window.]`);
+    if (!exhausted && rows.length >= parsed.limit) {
+      footer.push(sessionToken === undefined
+        ? `[Episode view limited to ${parsed.limit} displayable entries; the continuation hint is suppressed because this session key is not exactly representable as a CLI token.]`
+        : `[Episode view limited to ${parsed.limit} displayable entries; use /entry --session ${sessionToken} <entryId> for another window.]`);
+    }
     if (!exhausted && scanned >= MAX_EPISODE_SCAN_ENTRIES) footer.push(`[Episode scan capped at ${MAX_EPISODE_SCAN_ENTRIES} entries.]`);
+    if (sessionToken === undefined) footer.push("Drilldown hints are suppressed: this session key contains whitespace, control/bidi marks, an unpaired surrogate, or exceeds 200 code units.");
     footer.push("System, reset, compaction and thinking content is not shown; raw stored entries are not modified.");
     await notice(formatBoundedHistory(lines, footer, rows));
   };
@@ -1133,7 +1146,7 @@ export async function runTerminalConversation(
           ENTRY_USAGE,
           "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
           "/abort uses native Durable semantics: it cancels foreground work and withdraws queued inputs.",
-          io.history ? "/search --next continues the last successful query; cursors stay in this process and are never printed. History sessions default to cli:default; use --session with a key reported by /search." : "History search and episode browsing are host-controlled and unavailable here.",
+          io.history ? "/search --next continues the last successful query; cursors stay in this process and are never printed. History sessions default to cli:default; use --session with a key reported by /search." : "History search and episode browsing are host-controlled and unavailable here. /entry <entryId> [--radius N] still opens a bounded window in this terminal's default conversation; --session requires a history host.",
           io.modelSelection ? "/model lists the host allowlist; select with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
           io.toolGrants ? "/grant needs an explicit finite duration (for example /grant read,bash 30m); /tools lists ceiling and grants." : "Coding-tool grants are host-controlled and unavailable here.",
           io.contextRefresh?.available ? "/refresh re-reads workspace context and skills for this conversation when it is idle." : "/refresh is unavailable without configured workspace context.",
@@ -1345,7 +1358,7 @@ const SEARCH_USAGE =
   "Usage: /search [--scope messages|tools|all] [--role user|assistant] [--limit 1-50] [--next] [--] [query] — default scope is messages; empty text browses the selected scope.";
 const EPISODES_USAGE = "Usage: /episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>] — --session defaults to cli:default.";
 const EPISODE_USAGE = "Usage: /episode [--session <sessionKey>] <startEntryId> [--limit 1-30] — --session defaults to cli:default.";
-const ENTRY_USAGE = "Usage: /entry [--session <sessionKey>] <entryId> [--radius 0-5] — --session defaults to cli:default.";
+const ENTRY_USAGE = "Usage: /entry [--session <sessionKey>] <entryId> [--radius 0-5] — --session defaults to cli:default with a history host.";
 
 type SearchArguments =
   | { readonly kind: "usage" }
@@ -1535,12 +1548,7 @@ function parseEntryArguments(input: string): EntryArguments {
 }
 
 function parseSessionKey(value: string | undefined): string | undefined {
-  return value !== undefined
-    && value.length > 0
-    && value.length <= 200
-    && !/[\s\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u206f]/u.test(value)
-    ? value
-    : undefined;
+  return historySessionToken(value);
 }
 
 function parsePositiveEntryId(value: string | undefined): EntryId | undefined {
@@ -1566,9 +1574,9 @@ function formatHistoryHit(hit: HistoryHit, ordinal: number): string {
   const flags: string[] = [];
   if (hit.excerptTruncated) flags.push("excerpt truncated");
   if (hit.bodyTruncated) flags.push("body truncated in index");
-  const sessionToken = cliSessionToken(hit.sessionKey);
+  const sessionToken = historySessionToken(hit.sessionKey);
   const navigation = sessionToken === undefined
-    ? "   navigate: session key is not a single CLI token; use a session reported by /search."
+    ? "   navigate: drilldown suppressed; the exact session key contains whitespace, control/bidi marks, an unpaired surrogate, or exceeds 200 code units."
     : `   open: /entry --session ${sessionToken} ${hit.entryId} --radius 1; episode: /episode --session ${sessionToken} ${hit.episodeStartEntryId}`;
   return [
     `${ordinal}. [${hit.role}] ${meta.join(" ")}`,
@@ -1737,12 +1745,12 @@ function safeLabel(value: string, max: number): string {
   return completePrefix(sanitizeTerminalText(value).replace(/\s+/gu, " ").trim(), max) || "(empty)";
 }
 
-function cliSessionToken(value: string): string | undefined {
-  return value.length > 0
-    && value.length <= 200
-    && !/[\s\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u206f]/u.test(value)
-    ? value
-    : undefined;
+function historySessionToken(value: string | undefined): string | undefined {
+  if (value === undefined || value.length === 0 || value.length > 200) return undefined;
+  if (/\s/u.test(value)) return undefined;
+  // The exact key must survive terminal sanitization unchanged: LRM/RLM/ALM, bidi
+  // isolates, C0/C1 controls and unpaired surrogates would otherwise change it.
+  return sanitizeTerminalText(value) === value ? value : undefined;
 }
 
 function modelLabel(model: { provider: string; modelId: string } | undefined): string {

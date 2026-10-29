@@ -608,6 +608,22 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const mapping = await harness!.snapshot(SessionMap, root.id, ctx);
       return mapping === undefined ? [] : readChatSessions(mapping.sessions, root.id);
     };
+    // A mapped chat session is ownerless and unforked. Search and every entry/episode read share
+    // this check so a task-owned background transcript or an inherited fork cannot be exposed
+    // under a chat session's name.
+    const assertMappedChatConversations = async (
+      conversationIds: readonly ConversationId[],
+      ctx: Context,
+    ): Promise<void> => {
+      await root.commit(async (tx) => {
+        for (const conversationId of conversationIds) {
+          const conversation = await tx.conversation(conversationId);
+          if (conversation === undefined) throw new Error("Stored session mapping points to a missing conversation");
+          if (conversation.owner !== undefined) throw new Error("Stored session mapping points to a task-owned conversation");
+          if (conversation.parent !== undefined) throw new Error("Stored session mapping points to a forked conversation");
+        }
+      }, ctx);
+    };
     // Bounded, background-only derived state: reset-delimited episode boundaries and their
     // durable summary status. It reads committed entries only and changes no reset or busy
     // ordering; a closed episode is recorded as pending, and nothing schedules a summary yet.
@@ -628,14 +644,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
       // A mapped chat session is ownerless and unforked. Fail loudly rather than silently indexing a
       // task-owned background transcript or an inherited fork under a chat session's name.
-      await root.commit(async (tx) => {
-        for (const { conversationId } of mappedSessions) {
-          const conversation = await tx.conversation(conversationId);
-          if (conversation === undefined) throw new Error("Stored session mapping points to a missing conversation");
-          if (conversation.owner !== undefined) throw new Error("Stored session mapping points to a task-owned conversation");
-          if (conversation.parent !== undefined) throw new Error("Stored session mapping points to a forked conversation");
-        }
-      }, ctx);
+      await assertMappedChatConversations(mappedSessions.map(({ conversationId }) => conversationId), ctx);
       return mappedSessions;
     };
     historyIndex = createHistoryIndex({
@@ -1077,8 +1086,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (order !== undefined && order !== "ascending" && order !== "descending") {
           throw new TypeError("History entry order must be ascending or descending");
         }
-        if (!isChatSessionKey(sessionKey)) throw new Error("State-only conversations are not chat history");
-        const conversation = await existingConversationFor(sessionKey, ctx);
+        const conversation = await mappedChatConversationFor(sessionKey, ctx);
         const page = await conversation.entries({
           ...(minEntryId === undefined ? {} : { minEntryId }),
           ...(maxEntryId === undefined ? {} : { maxEntryId }),
@@ -1141,9 +1149,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
       },
     };
     async function chatConversationIdFor(sessionKey: string, ctx: Context): Promise<ConversationId> {
+      return (await mappedChatConversationFor(sessionKey, ctx)).id;
+    }
+    async function mappedChatConversationFor(sessionKey: string, ctx: Context): Promise<Conversation> {
       // State-only conversations hold channel bookkeeping, not discussion: they are not history.
       if (!isChatSessionKey(sessionKey)) throw new Error("State-only conversations are not chat history");
-      return (await existingConversationFor(sessionKey, ctx)).id;
+      const conversation = await existingConversationFor(sessionKey, ctx);
+      await assertMappedChatConversations([conversation.id], ctx);
+      return conversation;
     }
     async function existingConversationFor(sessionKey: string, ctx: Context): Promise<Conversation> {
       const key = encodedSessionKey(sessionKey);

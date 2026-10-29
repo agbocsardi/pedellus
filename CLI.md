@@ -143,10 +143,13 @@ or starts a model turn.
   entry, entry kind, timestamp and tool/call identity when present, plus a
   sanitized excerpt. Terminal escape/C1 controls, carriage returns and bidi
   controls are removed, and labels collapse whitespace so a stored name cannot
-  forge an extra output line; excerpts are untrusted quoted text. Every hit also
-  prints an actionable `/entry --session <key> <entryId>` and
-  `/episode --session <key> <episodeStartEntryId>` hint when the session key is a
-  safe single CLI token.
+  forge an extra output line; excerpts are untrusted quoted text. Display labels
+  are never used as identifiers. Every hit prints an actionable
+  `/entry --session <key> <entryId>` and
+  `/episode --session <key> <episodeStartEntryId>` hint only when the exact session
+  key round-trips through `--session`: non-empty, at most 200 code units, no
+  whitespace, no C0/C1 or bidi controls (including LRM/RLM/ALM), and no unpaired
+  surrogates. Otherwise the hint is suppressed and says why.
 - Coverage is always reported. `Index: complete` describes the captured store
   boundary; a later entry still needs a fresh search. `Index: INCOMPLETE` lists
   the reason (reconciliation bound, pending lag, omitted long text, unsupported
@@ -165,11 +168,15 @@ or starts a model turn.
   400. Entries carrying unsupported context edits are shown as raw stored text
   with that fact noted. `/history` is unchanged and still scans only the latest
   user/assistant text messages.
-- `/episodes`, `/episode` and `/entry` default to `cli:default`. `--session` must
-  name an existing mapped chat session; the host resolves the mapping without
-  creating a conversation, and state-only channel conversations are rejected. A
-  search hit prints the session key to use. The default is documented in each
-  usage line.
+- `/episodes`, `/episode` and `/entry` default to `cli:default` with a history
+  host. `--session` must name an existing mapped chat session and must be exactly
+  representable as one CLI token under the same round-trip rule above; labels with
+  whitespace, controls, bidi marks, unpaired surrogates or more than 200 code units
+  cannot be used. The host resolves the existing mapping without creating a
+  conversation, and state-only, task-owned or forked conversations are rejected. A
+  search hit prints the exact session key to use. Standalone terminal callers
+  without a history host can still use `/entry` for their own default conversation;
+  `--session`, `/episodes` and `/episode` require the host.
 - Required metadata (search coverage, continuation, episode bounds and the
   hidden-content footer) is printed before bounded hit/entry rows. Rows that do
   not fit the 48,000-code-unit history view bound are omitted with an explicit

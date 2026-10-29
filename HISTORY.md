@@ -232,8 +232,10 @@ supplies mapped sessions after its own channel authentication and is the trust
 boundary for the single-tenant policy. `Gateway.historyEntries` accepts a session
 key but resolves it only through the existing session map: it never creates a
 conversation, accepts no conversation ID, and rejects state-only channel sessions.
-It returns bounded raw entries, so the caller must filter system, reset, compaction
-and thinking content before display. This is a trusted host surface, not an
+Entry and episode reads share the search validator that also rejects task-owned and
+forked conversations mapped under a chat session key. `historyEntries` returns
+bounded raw entries, so the caller must filter system, reset, compaction and
+thinking content before display. This is a trusted host surface, not an
 untrusted-channel API. Search results include `sessionKey`, `conversationId`,
 `entryId`, `entryKind`, role, tool name/call identity, timestamp, episode boundary,
 chunk position and a bounded excerpt, so they must not be exposed directly to an
