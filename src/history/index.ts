@@ -20,7 +20,8 @@
  * provenance, which is sensitive and must not be exposed to an untrusted model.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
+import { chmod } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import {
   AssistantEntry,
@@ -41,7 +42,7 @@ import {
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
 
 export const HISTORY_INDEX_FORMAT = "nanobot-history-index" as const;
-export const HISTORY_INDEX_SCHEMA_VERSION = 1 as const;
+export const HISTORY_INDEX_SCHEMA_VERSION = 2 as const;
 
 export const HISTORY_INDEX_LIMITS = Object.freeze({
   /** Normalized query text bound in Unicode code points. */
@@ -54,11 +55,9 @@ export const HISTORY_INDEX_LIMITS = Object.freeze({
   maxPageSize: 50,
   /** Mapped chat sessions accepted by one search. */
   maxMappedSessions: 256,
-  /** Indexed body cap in Unicode code points; larger text is visibly truncated. */
-  maxIndexedChars: 8_000,
-  /** Tool argument JSON cap before it is folded into the body cap. */
-  maxToolArgumentChars: 4_000,
-  /** Searchable records extracted from one entry; later records are counted as omitted. */
+  /** FTS chunk size in JavaScript UTF-16 code units; long text is chunked, never silently dropped. */
+  chunkChars: 8_000,
+  /** Searchable chunks extracted from one entry; later chunks are counted as omitted. */
   maxDocumentsPerEntry: 64,
   /** Entries requested from one Durable scan. */
   entriesPerScan: 100,
@@ -75,7 +74,7 @@ export const HISTORY_INDEX_LIMITS = Object.freeze({
 export type HistoryScope = "messages" | "tools" | "all";
 export type HistoryRole = "user" | "assistant";
 
-/** A currently mapped chat session, already authenticated and classified by the host. */
+/** A currently mapped session, already authenticated and classified by the host. */
 export interface HistorySession {
   readonly sessionKey: string;
   readonly conversationId: ConversationId;
@@ -84,18 +83,21 @@ export interface HistorySession {
 /**
  * Opaque continuation state, not authorization.
  *
- * It is bound to the normalized query, index generation, source coverage
- * boundary, and the last indexed document. A continuation is rejected when the
- * query/scope changes, the derived index is rebuilt, the mapped session set no
- * longer contains the source, or the source entry at the continuation boundary
- * no longer matches its fingerprint (for example after a store replacement at
- * the same path). Entries appended after the first page have higher entry IDs
- * and are excluded from that continuation; start a fresh query to include them.
+ * It is bound to the normalized query, index generation, caller-supplied store
+ * identity, mapped conversation-ID set, source coverage boundary, and the last
+ * indexed document. A continuation is rejected when the query/scope changes, the
+ * derived index or store identity is replaced, the session mapping changes, the
+ * mapped set no longer contains the source, or the source entry at the boundary
+ * no longer matches its fingerprint. Entries appended after the first page have
+ * higher entry IDs and are excluded from that continuation; start a fresh query
+ * to include them.
  */
 export interface HistoryCursor {
   readonly version: 1;
   readonly querySha256: string;
   readonly generation: string;
+  /** Hash of the mapped conversation-ID set captured on the first page. */
+  readonly mappingSha256: string;
   /** Highest indexed source entry ID that this chain may return. */
   readonly boundaryEntryId: number;
   readonly lastEntryId: number;
@@ -104,7 +106,11 @@ export interface HistoryCursor {
 }
 
 export interface HistoryQuery {
-  /** Literal terms; FTS tokenization applies. Empty text browses the selected scope. */
+  /**
+   * Token/prefix terms; FTS `unicode61` tokenization applies, and the last term
+   * may extend to a longer word beginning with it. This is not literal substring
+   * matching. Empty text browses the selected scope.
+   */
   readonly text?: string;
   /** Default `messages`. `tools` is tools only; `all` is messages plus tools. */
   readonly scope?: HistoryScope;
@@ -121,15 +127,21 @@ export interface HistoryHit {
   readonly entryKind: string;
   readonly role: HistoryRole | "tool";
   readonly toolName?: string;
+  /** Tool call identity, when this hit came from a tool call or its result. */
+  readonly toolCallId?: string;
   readonly timestamp?: number;
   /** Entry ID that begins the reset-delimited episode containing this record. */
   readonly episodeStartEntryId: EntryId;
-  /** Bounded excerpt; matches are wrapped in `[...]` for a text query. */
+  /** Bounded excerpt from one indexed chunk; matches are wrapped in `[...]`. */
   readonly excerpt: string;
   readonly excerptTruncated: boolean;
-  /** Full indexed body length before snippet selection. */
+  /** Full source body length in UTF-16 code units before chunking. */
   readonly bodyLength: number;
-  /** True when indexing capped this body at `maxIndexedChars`. */
+  /** Chunk ordinal within this message/tool part. */
+  readonly chunkIndex: number;
+  /** UTF-16 code-unit offset of this chunk's start in the full body. */
+  readonly charStart: number;
+  /** True when the per-entry chunk cap omitted some of this part's chunks. */
   readonly bodyTruncated: boolean;
 }
 
@@ -144,8 +156,12 @@ export interface HistorySyncReport {
 }
 
 export interface HistoryCoverage {
-  /** Mapped chat sessions considered. */
+  /** Mapped sessions considered after task-owned/forked exclusions. */
   readonly sessions: number;
+  /** Host cap on mapped sessions accepted by one search. */
+  readonly sessionLimit: number;
+  /** Sessions with at least one indexed message or tool record, i.e. chat history. */
+  readonly chatSessions: number;
   /** Sessions with committed index progress. */
   readonly indexedSessions: number;
   /** Source entries represented by the index, summed over mapped sessions. */
@@ -162,8 +178,8 @@ export interface HistoryCoverage {
   readonly complete: boolean;
   readonly malformedEntries: number;
   readonly malformedMessages: number;
-  /** Records omitted by the per-entry document cap, across mapped sessions. */
-  readonly omittedDocuments: number;
+  /** Chunks omitted by the per-entry chunk cap, across mapped sessions. */
+  readonly omittedChunks: number;
   readonly sync: HistorySyncReport;
 }
 
@@ -188,15 +204,17 @@ export interface HistoryIndexOptions {
   /** Derived SQLite path. `:memory:` is supported for synthetic probes. */
   readonly indexPath: string;
   /**
-   * Canonical Durable SQLite path. Its device/inode identity is persisted so a
-   * replaced store at the same path rebuilds the index and invalidates cursors.
-   * Omit for synthetic probes that do not use the filesystem.
+   * Stable identity of the Durable store, injected by the caller from the
+   * planned durable `nanobot.store-identity` document. Never a path or inode.
+   * The index stores it and rebuilds/rotates generations when it changes; a
+   * function is re-evaluated before each search so a replaced store is noticed.
    */
-  readonly sourcePath?: string;
+  readonly storeId: string | ((context: Context) => Promise<string>);
   /**
-   * Current mapped chat sessions after host authentication. This callback is
-   * trusted host code: it must exclude state-only pseudo-sessions and reject
-   * task-owned or forked conversations.
+   * Current mapped sessions after host authentication. This callback is trusted
+   * host code: it must reject task-owned or forked conversations. The index then
+   * applies a positive rule, treating a session as chat history only once it has
+   * at least one indexed message or tool record.
    */
   readonly sessions: (context: Context) => Promise<readonly HistorySession[]>;
   /** Read-only Durable transaction surface, normally `root.commit`. */
@@ -204,13 +222,10 @@ export interface HistoryIndexOptions {
   readonly now?: () => number;
 }
 
-/** `<data>/nanobot.sqlite` -> `<data>/nanobot-history.sqlite`. */
+/** `<data>/nanobot.sqlite` -> `<data>/history-index.sqlite`. */
 export function historyIndexPath(dbPath: string): string {
   if (dbPath === ":memory:") return ":memory:";
-  const suffix = ".sqlite";
-  return dbPath.endsWith(suffix)
-    ? `${dbPath.slice(0, -suffix.length)}-history.sqlite`
-    : `${dbPath}.history.sqlite`;
+  return join(dirname(dbPath), "history-index.sqlite");
 }
 
 interface ParsedQuery {
@@ -234,13 +249,17 @@ interface ConversationProgress {
   readonly indexed_entry_count: number;
   readonly malformed_entries: number;
   readonly malformed_messages: number;
-  readonly omitted_documents: number;
+  readonly omitted_chunks: number;
 }
 
 interface DocDraft {
   readonly role: HistoryHit["role"];
   readonly toolName?: string;
+  readonly toolCallId?: string;
   readonly timestamp?: number;
+  readonly partIndex: number;
+  readonly chunkIndex: number;
+  readonly charStart: number;
   readonly body: string;
   readonly bodyLength: number;
   readonly truncated: boolean;
@@ -250,7 +269,7 @@ interface Extraction {
   readonly docs: readonly DocDraft[];
   readonly malformedEntries: number;
   readonly malformedMessages: number;
-  readonly omittedDocuments: number;
+  readonly omittedChunks: number;
 }
 
 interface DocRow {
@@ -260,8 +279,11 @@ interface DocRow {
   readonly entry_kind: string;
   readonly role: string;
   readonly tool_name: string | null;
+  readonly tool_call_id: string | null;
   readonly timestamp: number | null;
   readonly episode_start_entry_id: number;
+  readonly chunk_index: number;
+  readonly char_start: number;
   readonly body_length: number;
   readonly truncated: number;
   readonly entry_fingerprint: string;
@@ -386,7 +408,7 @@ function readQuery(query: unknown): ParsedQuery {
 function readCursor(value: unknown): HistoryCursor {
   if (!isRecord(value)) throw new TypeError("History cursor must be an object");
   const allowed = new Set([
-    "version", "querySha256", "generation", "boundaryEntryId",
+    "version", "querySha256", "generation", "mappingSha256", "boundaryEntryId",
     "lastEntryId", "lastDocumentId", "lastEntryFingerprint",
   ]);
   for (const key of Object.keys(value)) {
@@ -398,6 +420,9 @@ function readCursor(value: unknown): HistoryCursor {
   }
   if (typeof value.generation !== "string" || value.generation.length === 0 || value.generation.length > 128) {
     throw new TypeError("History cursor generation is invalid");
+  }
+  if (typeof value.mappingSha256 !== "string" || !SHA256_HEX.test(value.mappingSha256)) {
+    throw new TypeError("History cursor mapping digest is invalid");
   }
   for (const key of ["boundaryEntryId", "lastEntryId", "lastDocumentId"] as const) {
     const number = value[key];
@@ -412,6 +437,7 @@ function readCursor(value: unknown): HistoryCursor {
     version: 1,
     querySha256: value.querySha256,
     generation: value.generation,
+    mappingSha256: value.mappingSha256,
     boundaryEntryId: value.boundaryEntryId as number,
     lastEntryId: value.lastEntryId as number,
     lastDocumentId: value.lastDocumentId as number,
@@ -448,9 +474,20 @@ function timestampOf(message: Record<string, unknown>): number | undefined {
   return typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
+function sortedJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortedJson);
+  if (isRecord(value)) {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) sorted[key] = sortedJson(value[key]);
+    return sorted;
+  }
+  return value;
+}
+
+/** Canonical JSON for tool arguments, so a reindex sees the same text. */
 function safeJson(value: unknown): string {
   try {
-    return JSON.stringify(value) ?? "";
+    return JSON.stringify(sortedJson(value)) ?? "";
   } catch {
     return "";
   }
@@ -464,76 +501,83 @@ function clampCodeUnits(value: string, max: number): string {
   return value.slice(0, end);
 }
 
-/** Truncate by Unicode code points without splitting a surrogate pair. */
-function clampBody(value: string, max: number): { body: string; bodyLength: number; truncated: boolean } {
-  const bodyLength = value.length;
-  if (bodyLength <= max) return { body: value, bodyLength, truncated: false };
-  let body = "";
-  let count = 0;
-  let truncated = false;
-  for (const character of value) {
-    if (count >= max) {
-      truncated = true;
-      break;
-    }
-    body += character;
-    count++;
-  }
-  return { body, bodyLength, truncated };
+interface TextChunk {
+  readonly body: string;
+  readonly charStart: number;
 }
 
-function addDoc(
-  docs: DocDraft[],
-  role: HistoryHit["role"],
-  text: string,
-  timestamp: number | undefined,
-  toolName?: string,
-): boolean {
-  if (text.trim().length === 0) return false;
-  const clamped = clampBody(text, HISTORY_INDEX_LIMITS.maxIndexedChars);
-  docs.push({
-    role,
-    ...(toolName === undefined ? {} : { toolName }),
-    ...(timestamp === undefined ? {} : { timestamp }),
-    body: clamped.body,
-    bodyLength: clamped.bodyLength,
-    truncated: clamped.truncated,
-  });
-  return true;
+/** Split at code-point boundaries so a surrogate pair is never cut between chunks. */
+function textChunks(text: string, maxChars: number): TextChunk[] {
+  if (text.length === 0) return [];
+  const chunks: TextChunk[] = [];
+  let body = "";
+  let charStart = 0;
+  let offset = 0;
+  for (const character of text) {
+    if (body.length > 0 && body.length + character.length > maxChars) {
+      chunks.push({ body, charStart });
+      charStart = offset;
+      body = "";
+    }
+    body += character;
+    offset += character.length;
+  }
+  if (body.length > 0) chunks.push({ body, charStart });
+  return chunks;
 }
 
 /**
  * Extract only the searchable projections of one entry. Reset/system/compaction
- * entries yield no documents; reset boundaries are handled by the caller.
+ * entries yield no documents; reset boundaries are handled by the caller. Long
+ * message and tool text is chunked, and any chunk omitted by the per-entry cap is
+ * counted in `omittedChunks` and marked `truncated` on the part's stored chunks.
  */
 function extractDocuments(entry: EntryRecord): Extraction {
   const docs: DocDraft[] = [];
   let malformedEntries = 0;
   let malformedMessages = 0;
-  let omittedDocuments = 0;
+  let omittedChunks = 0;
+  let partIndex = 0;
   const pushDoc = (
     role: HistoryHit["role"],
     text: string,
     timestamp: number | undefined,
     toolName?: string,
+    toolCallId?: string,
   ): void => {
     if (text.trim().length === 0) return;
-    if (docs.length >= HISTORY_INDEX_LIMITS.maxDocumentsPerEntry) {
-      omittedDocuments++;
-      return;
+    const chunks = textChunks(text, HISTORY_INDEX_LIMITS.chunkChars);
+    const available = Math.max(0, HISTORY_INDEX_LIMITS.maxDocumentsPerEntry - docs.length);
+    const accepted = Math.min(available, chunks.length);
+    const truncated = accepted < chunks.length;
+    for (let index = 0; index < accepted; index++) {
+      const chunk = chunks[index]!;
+      docs.push({
+        role,
+        ...(toolName === undefined ? {} : { toolName }),
+        ...(toolCallId === undefined ? {} : { toolCallId }),
+        ...(timestamp === undefined ? {} : { timestamp }),
+        partIndex,
+        chunkIndex: index,
+        charStart: chunk.charStart,
+        body: chunk.body,
+        bodyLength: text.length,
+        truncated,
+      });
     }
-    addDoc(docs, role, text, timestamp, toolName);
+    omittedChunks += chunks.length - accepted;
+    partIndex++;
   };
   if (entry.kind === ResetEntry.kind || entry.kind === SystemEntry.kind || entry.kind === CompactionEntry.kind) {
-    return { docs, malformedEntries, malformedMessages, omittedDocuments };
+    return { docs, malformedEntries, malformedMessages, omittedChunks };
   }
   const userKind = entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND;
   const assistantKind = entry.kind === AssistantEntry.kind;
   const toolKind = entry.kind === ToolResultEntry.kind;
-  if (!userKind && !assistantKind && !toolKind) return { docs, malformedEntries, malformedMessages, omittedDocuments };
-  if (entry.model === undefined) return { docs, malformedEntries, malformedMessages, omittedDocuments };
+  if (!userKind && !assistantKind && !toolKind) return { docs, malformedEntries, malformedMessages, omittedChunks };
+  if (entry.model === undefined) return { docs, malformedEntries, malformedMessages, omittedChunks };
   if (!Array.isArray(entry.model)) {
-    return { docs, malformedEntries: 1, malformedMessages, omittedDocuments };
+    return { docs, malformedEntries: 1, malformedMessages, omittedChunks };
   }
 
   for (const raw of entry.model) {
@@ -564,29 +608,31 @@ function extractDocuments(entry: EntryRecord): Extraction {
         if (!isRecord(block) || block.type !== "toolCall" || typeof block.name !== "string" || block.name.length === 0) {
           continue;
         }
-        const args = clampCodeUnits(safeJson(block.arguments), HISTORY_INDEX_LIMITS.maxToolArgumentChars);
+        const args = safeJson(block.arguments);
         const failure = typeof block.argumentsError === "string" && block.argumentsError.length > 0
-          ? `\nargumentsError: ${clampCodeUnits(block.argumentsError, 1_000)}`
+          ? `\nargumentsError: ${block.argumentsError}`
           : "";
-        pushDoc("tool", `${block.name}\n${args}${failure}`, timestamp, block.name);
+        const toolCallId = typeof block.id === "string" && block.id.length > 0 ? block.id : undefined;
+        pushDoc("tool", `${block.name}\n${args}${failure}`, timestamp, block.name, toolCallId);
       }
       continue;
     }
     if (raw.role !== "toolResult") continue;
     const toolName = typeof raw.toolName === "string" && raw.toolName.length > 0 ? raw.toolName : undefined;
+    const toolCallId = typeof raw.toolCallId === "string" && raw.toolCallId.length > 0 ? raw.toolCallId : undefined;
     if (typeof raw.content !== "string" && !Array.isArray(raw.content)) {
       malformedMessages++;
       continue;
     }
     const text = messageText(raw.content);
     if (text === undefined) {
-      if (toolName !== undefined) pushDoc("tool", toolName, timestamp, toolName);
+      if (toolName !== undefined) pushDoc("tool", toolName, timestamp, toolName, toolCallId);
       continue;
     }
     const body = toolName === undefined ? text : `${toolName}\n${text}`;
-    pushDoc("tool", body, timestamp, toolName);
+    pushDoc("tool", body, timestamp, toolName, toolCallId);
   }
-  return { docs, malformedEntries, malformedMessages, omittedDocuments };
+  return { docs, malformedEntries, malformedMessages, omittedChunks };
 }
 
 async function createSchema(db: NodeSqliteDatabase): Promise<void> {
@@ -605,7 +651,7 @@ async function createSchema(db: NodeSqliteDatabase): Promise<void> {
       indexed_entry_count INTEGER NOT NULL,
       malformed_entries INTEGER NOT NULL,
       malformed_messages INTEGER NOT NULL,
-      omitted_documents INTEGER NOT NULL,
+      omitted_chunks INTEGER NOT NULL,
       indexed_at INTEGER NOT NULL
     ) STRICT;
     CREATE TABLE IF NOT EXISTS history_episodes (
@@ -621,12 +667,17 @@ async function createSchema(db: NodeSqliteDatabase): Promise<void> {
       entry_kind TEXT NOT NULL,
       role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool')),
       tool_name TEXT,
+      tool_call_id TEXT,
       timestamp REAL,
       episode_start_entry_id INTEGER NOT NULL,
+      part_index INTEGER NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      char_start INTEGER NOT NULL,
       body TEXT NOT NULL,
       body_length INTEGER NOT NULL,
       truncated INTEGER NOT NULL CHECK (truncated IN (0, 1)),
-      entry_fingerprint TEXT NOT NULL
+      entry_fingerprint TEXT NOT NULL,
+      UNIQUE(conversation_id, entry_id, part_index, chunk_index)
     ) STRICT;
     CREATE INDEX IF NOT EXISTS history_documents_by_entry
       ON history_documents (conversation_id, entry_id, doc_id);
@@ -650,7 +701,7 @@ async function createSchema(db: NodeSqliteDatabase): Promise<void> {
       ON CONFLICT(key) DO NOTHING;
     INSERT INTO history_meta (key, value) VALUES ('generation', '${randomUUID()}')
       ON CONFLICT(key) DO NOTHING;
-    INSERT INTO history_meta (key, value) VALUES ('source_identity', '')
+    INSERT INTO history_meta (key, value) VALUES ('store_id', '')
       ON CONFLICT(key) DO NOTHING;
   `);
 }
@@ -669,18 +720,18 @@ async function dropSchema(db: NodeSqliteDatabase): Promise<void> {
 }
 
 
-async function sourceIdentity(sourcePath: string | undefined): Promise<string | undefined> {
-  if (sourcePath === undefined || sourcePath === ":memory:") return undefined;
-  try {
-    const info = await stat(sourcePath);
-    return `${info.dev}:${info.ino}`;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
+async function resolveStoreId(
+  storeId: HistoryIndexOptions["storeId"],
+  context: Context,
+): Promise<string> {
+  const value = typeof storeId === "function" ? await storeId(context) : storeId;
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+    throw new Error("History store identity is unavailable or invalid");
   }
+  return value;
 }
 
-async function resetDerivedIndex(db: NodeSqliteDatabase, identity: string): Promise<string> {
+async function resetDerivedIndex(db: NodeSqliteDatabase, storeId: string): Promise<string> {
   const generation = randomUUID();
   await db.transaction(async (tx) => {
     await tx.run("DELETE FROM history_documents");
@@ -688,9 +739,9 @@ async function resetDerivedIndex(db: NodeSqliteDatabase, identity: string): Prom
     await tx.run("DELETE FROM history_conversations");
     await tx.run("UPDATE history_meta SET value = ? WHERE key = 'generation'", generation);
     await tx.run(
-      `INSERT INTO history_meta (key, value) VALUES ('source_identity', ?)
+      `INSERT INTO history_meta (key, value) VALUES ('store_id', ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-      identity,
+      storeId,
     );
   });
   return generation;
@@ -699,27 +750,36 @@ async function resetDerivedIndex(db: NodeSqliteDatabase, identity: string): Prom
 interface OpenHistoryIndex {
   readonly db: NodeSqliteDatabase;
   generation: string;
+  storeId: string;
 }
 
-/** Re-check the source file identity on every search, not only at first open. */
-async function reconcileSourceIdentity(open: OpenHistoryIndex, sourcePath: string | undefined): Promise<void> {
-  const identity = await sourceIdentity(sourcePath);
-  if (identity === undefined) return;
-  const stored = await open.db.get<{ value: string }>(
-    "SELECT value FROM history_meta WHERE key = 'source_identity'",
-  );
-  if (stored === undefined || stored.value.length === 0) {
-    await open.db.run(
-      `INSERT INTO history_meta (key, value) VALUES ('source_identity', ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-      identity,
-    );
+/** Keep the derived index bound to the caller-owned store identity. */
+async function reconcileStoreId(open: OpenHistoryIndex, storeId: string): Promise<void> {
+  if (open.storeId === storeId) return;
+  if (open.storeId === "") {
+    await open.db.run("UPDATE history_meta SET value = ? WHERE key = 'store_id'", storeId);
+    open.storeId = storeId;
     return;
   }
-  if (stored.value !== identity) open.generation = await resetDerivedIndex(open.db, identity);
+  // A different store now owns the source. Discard derived rows and rotate the
+  // generation so every cursor from the old store is rejected.
+  open.generation = await resetDerivedIndex(open.db, storeId);
+  open.storeId = storeId;
 }
 
-async function migrate(db: NodeSqliteDatabase): Promise<string> {
+/** The index contains private transcript text. Keep the file and SQLite sidecars owner-only. */
+async function secureIndexFiles(indexPath: string): Promise<void> {
+  if (indexPath === ":memory:") return;
+  for (const target of [indexPath, `${indexPath}-wal`, `${indexPath}-shm`]) {
+    try {
+      await chmod(target, 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
+async function migrate(db: NodeSqliteDatabase): Promise<{ generation: string; storeId: string }> {
   const existing = await db.get<{ name: string }>(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'history_meta'",
   );
@@ -736,14 +796,17 @@ async function migrate(db: NodeSqliteDatabase): Promise<string> {
   if (generation === undefined || generation.value.length === 0) {
     throw new Error("History index generation is missing");
   }
-  return generation.value;
+  const storeId = await db.get<{ value: string }>(
+    "SELECT value FROM history_meta WHERE key = 'store_id'",
+  );
+  return { generation: generation.value, storeId: storeId?.value ?? "" };
 }
 
 async function readProgress(db: NodeSqliteDatabase, conversationId: ConversationId): Promise<ConversationProgress | undefined> {
   return db.get<ConversationProgress>(
     `SELECT conversation_id, first_entry_id, first_fingerprint, indexed_entry_id,
             indexed_fingerprint, episode_start_entry_id, indexed_entry_count,
-            malformed_entries, malformed_messages, omitted_documents
+            malformed_entries, malformed_messages, omitted_chunks
        FROM history_conversations WHERE conversation_id = ?`,
     conversationId,
   );
@@ -816,7 +879,7 @@ interface PageWrite {
   readonly episodeStartEntryId: number;
   readonly malformedEntries: number;
   readonly malformedMessages: number;
-  readonly omittedDocuments: number;
+  readonly omittedChunks: number;
 }
 
 async function writePage(
@@ -839,16 +902,21 @@ async function writePage(
     for (const doc of page.docs) {
       await tx.run(
         `INSERT INTO history_documents
-           (conversation_id, entry_id, entry_kind, role, tool_name, timestamp,
-            episode_start_entry_id, body, body_length, truncated, entry_fingerprint)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (conversation_id, entry_id, entry_kind, role, tool_name, tool_call_id, timestamp,
+            episode_start_entry_id, part_index, chunk_index, char_start,
+            body, body_length, truncated, entry_fingerprint)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         conversationId,
         doc.entryId,
         doc.entryKind,
         doc.role,
         doc.toolName ?? null,
+        doc.toolCallId ?? null,
         doc.timestamp ?? null,
         doc.episodeStartEntryId,
+        doc.partIndex,
+        doc.chunkIndex,
+        doc.charStart,
         doc.body,
         doc.bodyLength,
         doc.truncated ? 1 : 0,
@@ -859,7 +927,7 @@ async function writePage(
       `INSERT INTO history_conversations
          (conversation_id, first_entry_id, first_fingerprint, indexed_entry_id,
           indexed_fingerprint, episode_start_entry_id, indexed_entry_count,
-          malformed_entries, malformed_messages, omitted_documents, indexed_at)
+          malformed_entries, malformed_messages, omitted_chunks, indexed_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(conversation_id) DO UPDATE SET
          indexed_entry_id = excluded.indexed_entry_id,
@@ -868,7 +936,7 @@ async function writePage(
          indexed_entry_count = history_conversations.indexed_entry_count + excluded.indexed_entry_count,
          malformed_entries = history_conversations.malformed_entries + excluded.malformed_entries,
          malformed_messages = history_conversations.malformed_messages + excluded.malformed_messages,
-         omitted_documents = history_conversations.omitted_documents + excluded.omitted_documents,
+         omitted_chunks = history_conversations.omitted_chunks + excluded.omitted_chunks,
          indexed_at = excluded.indexed_at`,
       conversationId,
       page.firstEntryId,
@@ -879,7 +947,7 @@ async function writePage(
       page.entries.length,
       page.malformedEntries,
       page.malformedMessages,
-      page.omittedDocuments,
+      page.omittedChunks,
       indexedAt,
     );
   });
@@ -927,7 +995,7 @@ async function syncConversation(
     const entries: { entry: EntryRecord; fingerprint: string }[] = [];
     let malformedEntries = 0;
     let malformedMessages = 0;
-    let omittedDocuments = 0;
+    let omittedChunks = 0;
     for (const entry of own) {
       const fingerprint = entryFingerprint(entry);
       entries.push({ entry, fingerprint });
@@ -947,7 +1015,7 @@ async function syncConversation(
       const extraction = extractDocuments(entry);
       malformedEntries += extraction.malformedEntries;
       malformedMessages += extraction.malformedMessages;
-      omittedDocuments += extraction.omittedDocuments;
+      omittedChunks += extraction.omittedChunks;
       for (const doc of extraction.docs) {
         grouped.push({
           ...doc,
@@ -978,7 +1046,7 @@ async function syncConversation(
       episodeStartEntryId: currentEpisode,
       malformedEntries,
       malformedMessages,
-      omittedDocuments,
+      omittedChunks,
     }, (options.now ?? Date.now)());
 
     const last = own[own.length - 1]!;
@@ -1055,6 +1123,20 @@ async function indexedBoundary(
   return row?.boundary ?? 0;
 }
 
+async function indexedConversationIds(
+  db: NodeSqliteDatabase,
+  conversationIds: readonly number[],
+): Promise<number[]> {
+  if (conversationIds.length === 0) return [];
+  const placeholders = conversationIds.map(() => "?").join(",");
+  const rows = await db.all<{ conversation_id: number }>(
+    `SELECT DISTINCT conversation_id FROM history_documents
+      WHERE conversation_id IN (${placeholders})`,
+    ...conversationIds,
+  );
+  return rows.map((row) => row.conversation_id);
+}
+
 async function coverageCounts(
   db: NodeSqliteDatabase,
   conversationIds: readonly number[],
@@ -1064,12 +1146,12 @@ async function coverageCounts(
   resetBoundaries: number;
   malformedEntries: number;
   malformedMessages: number;
-  omittedDocuments: number;
+  omittedChunks: number;
 }> {
   if (conversationIds.length === 0) {
     return {
       indexedSessions: 0, indexedEntries: 0, resetBoundaries: 0,
-      malformedEntries: 0, malformedMessages: 0, omittedDocuments: 0,
+      malformedEntries: 0, malformedMessages: 0, omittedChunks: 0,
     };
   }
   const placeholders = conversationIds.map(() => "?").join(",");
@@ -1078,13 +1160,13 @@ async function coverageCounts(
     entries: number | null;
     malformed_entries: number | null;
     malformed_messages: number | null;
-    omitted_documents: number | null;
+    omitted_chunks: number | null;
   }>(
     `SELECT COUNT(*) AS sessions,
             COALESCE(SUM(indexed_entry_count), 0) AS entries,
             COALESCE(SUM(malformed_entries), 0) AS malformed_entries,
             COALESCE(SUM(malformed_messages), 0) AS malformed_messages,
-            COALESCE(SUM(omitted_documents), 0) AS omitted_documents
+            COALESCE(SUM(omitted_chunks), 0) AS omitted_chunks
        FROM history_conversations WHERE conversation_id IN (${placeholders})`,
     ...conversationIds,
   );
@@ -1099,7 +1181,7 @@ async function coverageCounts(
     resetBoundaries: episodes?.resets ?? 0,
     malformedEntries: progress?.malformed_entries ?? 0,
     malformedMessages: progress?.malformed_messages ?? 0,
-    omittedDocuments: progress?.omitted_documents ?? 0,
+    omittedChunks: progress?.omitted_chunks ?? 0,
   };
 }
 
@@ -1158,8 +1240,8 @@ async function queryDocuments(
   if (query.terms.length === 0) {
     return db.all<DocRow>(
       `SELECT d.doc_id, d.conversation_id, d.entry_id, d.entry_kind, d.role,
-              d.tool_name, d.timestamp, d.episode_start_entry_id, d.body_length,
-              d.truncated, d.entry_fingerprint,
+              d.tool_name, d.tool_call_id, d.timestamp, d.episode_start_entry_id, d.chunk_index,
+              d.char_start, d.body_length, d.truncated, d.entry_fingerprint,
               substr(d.body, 1, ?) AS excerpt
          FROM history_documents d
         WHERE 1 = 1${filter}
@@ -1170,11 +1252,17 @@ async function queryDocuments(
       ...tail,
     );
   }
-  const match = query.terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(" ");
+  // Token/prefix semantics, never literal substring: each term is quoted, and
+  // the final term may extend to a longer word beginning with it.
+  const lastTerm = query.terms.length - 1;
+  const match = query.terms.map((term, index) => {
+    const quoted = `"${term.replaceAll('"', '""')}"`;
+    return index === lastTerm ? `${quoted}*` : quoted;
+  }).join(" ");
   return db.all<DocRow>(
     `SELECT d.doc_id, d.conversation_id, d.entry_id, d.entry_kind, d.role,
-            d.tool_name, d.timestamp, d.episode_start_entry_id, d.body_length,
-            d.truncated, d.entry_fingerprint,
+            d.tool_name, d.tool_call_id, d.timestamp, d.episode_start_entry_id, d.chunk_index,
+            d.char_start, d.body_length, d.truncated, d.entry_fingerprint,
             snippet(history_fts, 0, '[', ']', '…', ?) AS excerpt
        FROM history_fts
        JOIN history_documents d ON d.doc_id = history_fts.rowid
@@ -1195,10 +1283,8 @@ export function createHistoryIndex(options: HistoryIndexOptions): HistoryIndex {
   if (typeof options.sessions !== "function" || typeof options.scan !== "function") {
     throw new TypeError("History index requires sessions and scan callbacks");
   }
-  if (options.sourcePath !== undefined
-    && options.sourcePath !== ":memory:"
-    && options.indexPath === options.sourcePath) {
-    throw new TypeError("History index path must differ from the Durable source path");
+  if (typeof options.storeId !== "string" && typeof options.storeId !== "function") {
+    throw new TypeError("History index requires a caller-supplied storeId");
   }
 
   let openPromise: Promise<OpenHistoryIndex> | undefined;
@@ -1206,38 +1292,24 @@ export function createHistoryIndex(options: HistoryIndexOptions): HistoryIndex {
   let closed = false;
   let tail: Promise<unknown> = Promise.resolve();
 
-  const ensureOpen = async (): Promise<OpenHistoryIndex> => {
+  const ensureOpen = async (storeId: string): Promise<OpenHistoryIndex> => {
     if (closed) throw new Error("History index is closed");
     openPromise ??= (async () => {
       const db = await openNodeSqliteDatabase(options.indexPath);
       try {
         // The derived index is rebuildable: WAL with normal sync is enough. A lost
         // commit loses progress and documents together, so the next search replays it.
-        let generation = await migrate(db);
-        const identity = await sourceIdentity(options.sourcePath);
-        if (identity !== undefined) {
-          const stored = await db.get<{ value: string }>(
-            "SELECT value FROM history_meta WHERE key = 'source_identity'",
-          );
-          if (stored === undefined || stored.value.length === 0) {
-            await db.run(
-              `INSERT INTO history_meta (key, value) VALUES ('source_identity', ?)
-               ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-              identity,
-            );
-          } else if (stored.value !== identity) {
-            // The path now names a different store. Discard derived rows and rotate
-            // the generation so every cursor from the old store is rejected.
-            generation = await resetDerivedIndex(db, identity);
-          }
-        }
-        return { db, generation };
+        const migrated = await migrate(db);
+        await secureIndexFiles(options.indexPath);
+        return { db, generation: migrated.generation, storeId: migrated.storeId };
       } catch (error) {
         await db.close().catch(() => undefined);
         throw error;
       }
     })();
-    return openPromise;
+    const open = await openPromise;
+    await reconcileStoreId(open, storeId);
+    return open;
   };
 
   const serialized = <T>(operation: () => Promise<T>): Promise<T> => {
@@ -1273,12 +1345,15 @@ export function createHistoryIndex(options: HistoryIndexOptions): HistoryIndex {
           );
         }
         const conversationIds = sessions.map((session) => session.conversationId as number);
+        const mappingSha256 = sha256(JSON.stringify([...conversationIds].sort((left, right) => left - right)));
         if (sessions.length === 0) {
           if (query.cursor !== undefined) throw new Error("History cursor does not belong to the current mapped sessions");
           return {
             hits: [],
             coverage: {
               sessions: 0,
+              sessionLimit: HISTORY_INDEX_LIMITS.maxMappedSessions,
+              chatSessions: 0,
               indexedSessions: 0,
               indexedEntries: 0,
               resetBoundaries: 0,
@@ -1288,7 +1363,7 @@ export function createHistoryIndex(options: HistoryIndexOptions): HistoryIndex {
               complete: true,
               malformedEntries: 0,
               malformedMessages: 0,
-              omittedDocuments: 0,
+              omittedChunks: 0,
               sync: {
                 entriesScanned: 0,
                 entriesIndexed: 0,
@@ -1299,14 +1374,17 @@ export function createHistoryIndex(options: HistoryIndexOptions): HistoryIndex {
           };
         }
 
-        const open = await ensureOpen();
-        await reconcileSourceIdentity(open, options.sourcePath);
+        const storeId = await resolveStoreId(options.storeId, context);
+        const open = await ensureOpen(storeId);
         if (query.cursor !== undefined) {
           if (query.cursor.generation !== open.generation) {
             throw new Error("History cursor belongs to a replaced derived index");
           }
           if (query.cursor.querySha256 !== query.querySha256) {
             throw new Error("History cursor does not match the requested query");
+          }
+          if (query.cursor.mappingSha256 !== mappingSha256) {
+            throw new Error("History cursor does not match the current session mapping");
           }
           await verifyCursor(open, options, query.cursor, conversationIds, context);
         }
@@ -1328,24 +1406,36 @@ export function createHistoryIndex(options: HistoryIndexOptions): HistoryIndex {
           if (!conversationCaughtUp) caughtUp = false;
         }
 
+        await secureIndexFiles(options.indexPath);
+        // Positive chat-history rule: a mapped conversation contributes only after at least one
+        // searchable message/tool record exists. This excludes channel-state bookkeeping without
+        // reserving a session-key suffix and survives new adapters.
+        const activeConversationIds = await indexedConversationIds(open.db, conversationIds);
+        const activeSet = new Set(activeConversationIds);
+        const activeSessions = sessions.filter((session) => activeSet.has(session.conversationId as number));
+        if (activeConversationIds.length === 0 && query.cursor !== undefined) {
+          throw new Error("History cursor does not belong to the current indexed chat sessions");
+        }
         if (query.cursor !== undefined) {
           // Reconciliation may have rebuilt a conversation and reassigned document IDs.
-          await verifyCursor(open, options, query.cursor, conversationIds, context);
+          await verifyCursor(open, options, query.cursor, activeConversationIds, context);
         }
-        const boundaryEntryId = query.cursor?.boundaryEntryId ?? await indexedBoundary(open.db, conversationIds);
+        const boundaryEntryId = query.cursor?.boundaryEntryId ?? await indexedBoundary(open.db, activeConversationIds);
         if (query.cursor !== undefined) {
-          const currentBoundary = await indexedBoundary(open.db, conversationIds);
+          const currentBoundary = await indexedBoundary(open.db, activeConversationIds);
           if (query.cursor.boundaryEntryId > currentBoundary) {
             throw new Error("History cursor boundary is no longer covered by the derived index");
           }
         }
         if (boundaryEntryId === 0) {
-          const counts = await coverageCounts(open.db, conversationIds);
+          const counts = await coverageCounts(open.db, activeConversationIds);
           const lag = await measureLag(open, options, sessions, context);
           return {
             hits: [],
             coverage: {
               sessions: sessions.length,
+              sessionLimit: HISTORY_INDEX_LIMITS.maxMappedSessions,
+              chatSessions: activeSessions.length,
               ...counts,
               boundaryEntryId: 0,
               pendingEntries: lag.entries,
@@ -1361,12 +1451,12 @@ export function createHistoryIndex(options: HistoryIndexOptions): HistoryIndex {
           };
         }
 
-        const rows = await queryDocuments(open.db, query, conversationIds, boundaryEntryId, query.cursor);
+        const rows = await queryDocuments(open.db, query, activeConversationIds, boundaryEntryId, query.cursor);
         const hasMore = rows.length > query.limit;
         const visible = hasMore ? rows.slice(0, query.limit) : rows;
-        const counts = await coverageCounts(open.db, conversationIds);
+        const counts = await coverageCounts(open.db, activeConversationIds);
         const lag = await measureLag(open, options, sessions, context);
-        const sessionsById = new Map(sessions.map((session) => [session.conversationId as number, session.sessionKey]));
+        const sessionsById = new Map(activeSessions.map((session) => [session.conversationId as number, session.sessionKey]));
         const hits: HistoryHit[] = visible.map((row) => {
           const role = row.role as HistoryHit["role"];
           if (!READABLE_ROLES.has(role)) throw new Error("History index contains an unsupported role");
@@ -1380,11 +1470,14 @@ export function createHistoryIndex(options: HistoryIndexOptions): HistoryIndex {
             entryKind: row.entry_kind,
             role,
             ...(row.tool_name === null ? {} : { toolName: row.tool_name }),
+            ...(row.tool_call_id === null ? {} : { toolCallId: row.tool_call_id }),
             ...(row.timestamp === null ? {} : { timestamp: row.timestamp }),
             episodeStartEntryId: row.episode_start_entry_id as EntryId,
             excerpt: row.excerpt,
             excerptTruncated: row.body_length > excerptLength,
             bodyLength: row.body_length,
+            chunkIndex: row.chunk_index,
+            charStart: row.char_start,
             bodyTruncated: row.truncated === 1,
           };
         });
@@ -1397,6 +1490,7 @@ export function createHistoryIndex(options: HistoryIndexOptions): HistoryIndex {
             version: 1,
             querySha256: query.querySha256,
             generation: open.generation,
+            mappingSha256,
             boundaryEntryId,
             lastEntryId: lastRow.entry_id,
             lastDocumentId: lastRow.doc_id,
@@ -1408,6 +1502,8 @@ export function createHistoryIndex(options: HistoryIndexOptions): HistoryIndex {
           ...(next === undefined ? {} : { next }),
           coverage: {
             sessions: sessions.length,
+            sessionLimit: HISTORY_INDEX_LIMITS.maxMappedSessions,
+            chatSessions: activeSessions.length,
             ...counts,
             boundaryEntryId,
             pendingEntries: lag.entries,

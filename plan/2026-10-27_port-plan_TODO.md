@@ -485,12 +485,15 @@ The store identity document itself is frozen and never updated.
 
 **First bounded slice — 2026-10-29.** `src/history/index.ts` implements the
 message/tool FTS5 index, committed reset boundaries, bounded incremental
-reconciliation, source/store identity and query-bound stable pagination behind
-`Gateway.historySearch`. It does not implement episode summaries or summary search.
-The index is a separate rebuildable file and never writes Durable; lag, coverage and
-body caps are visible. See `HISTORY.md` for the interface, authorization boundary,
-receipts and remaining limits. This is not acceptance of the parked scan candidate
-`worker-history-read-252d9447`; no code from it was reused.
+reconciliation, caller-injected store identity and query-bound stable pagination
+behind `Gateway.historySearch`. It does not implement episode summaries or summary
+search. The index is a separate `0600` rebuildable file and never writes Durable;
+long text is chunked and lag, coverage and omitted chunks are visible. `storeId`
+comes from the planned durable `nanobot.store-identity` document and is injected
+through `OpenGatewayOptions.historyStoreId`; absent identity fails closed. See
+`HISTORY.md` for the interface, authorization boundary and remaining limits. This
+is not acceptance of the parked scan candidate `worker-history-read-252d9447`; no
+code from it was reused.
 
 ### W4 — acceptance suite
 
@@ -683,11 +686,12 @@ search yet.
 Added a rebuildable SQLite FTS5 index over Durable-retained user/assistant messages,
 tool names/arguments/results and committed reset boundaries, exposed as
 `Gateway.historySearch` (no UI, no episode summaries, no candidate reuse). The index
-lives in a separate `<db>-history.sqlite` file, reconciles bounded forward from
-persisted entry fingerprints and progress, reports lag/coverage and rejects stale or
-replaced-store cursors. Offline synthetic probes covered scopes, role filters, reset
-boundaries, pagination under appends, source replacement, explicit lag, reopen and a
-real faux-provider Gateway. Typecheck, 155 behavior, 9 execution and 88 offline
+lives in a separate `history-index.sqlite` file, reconciles bounded forward from
+persisted entry fingerprints and progress, reports lag/coverage, chunks long text,
+and rejects stale/replaced-store/mapping-changed cursors. Offline synthetic probes
+covered scopes, role filters, reset boundaries, long-text chunks, tool-call IDs,
+pagination under appends, store-identity rotation, explicit lag, file mode, reopen
+and a real faux-provider Gateway with an injected store ID. Typecheck, 155 behavior, 9 execution and 88 offline
 acceptance checks passed. Episode catalog/summary work and summary search remain open.
 
 ### 2026-10-29 — history design agreement; implementation remains paused

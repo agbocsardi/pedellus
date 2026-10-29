@@ -91,6 +91,12 @@ export interface OpenGatewayOptions {
   readonly models?: Models;
   /** Explicit host-owned context snapshots; absent means no context extension is installed. */
   readonly contextSnapshotProvider?: GatewayContextSnapshotProvider;
+  /**
+   * Caller-owned stable identity from the planned durable `nanobot.store-identity` document.
+   * Required to enable `Gateway.historySearch`; when absent that method fails closed instead of
+   * inventing a path-based identity. A function is re-evaluated before each search.
+   */
+  readonly historyStoreId?: string | ((context: Context) => Promise<string>);
 }
 
 export interface Gateway {
@@ -136,8 +142,10 @@ export interface Gateway {
   /**
    * Search the rebuildable SQLite index over Durable-retained entries.
    *
-   * Durable is the canonical transcript. This method never mutates it, accepts no conversation ID, and
-   * reads only the mapped chat sessions supplied by the host. The host is the authorization boundary:
+   * Requires `OpenGatewayOptions.historyStoreId`, the caller-owned identity from the planned durable
+   * `nanobot.store-identity` document; without it this method fails closed. Durable is the canonical
+   * transcript. This method never mutates it, accepts no conversation ID, and reads only the mapped
+   * chat sessions supplied by the host. The host is the authorization boundary:
    * call it only from trusted host code after its own channel authentication, and do not expose the
    * results (which include session keys) directly to an untrusted model or channel.
    *
@@ -148,10 +156,11 @@ export interface Gateway {
    *
    * Each call reconciles a bounded slice of new Durable entries before querying. `coverage` reports
    * index lag rather than silently omitting it: a large backlog is visible and continues on the next
-   * call. Pages are ordered newest-first by Durable entry ID and resume with a query-bound cursor;
-   * entries appended after the first page stay out of that continuation, and a rebuilt index or a
-   * replaced source store at the same path rejects the cursor. The derived index may be deleted at
-   * any time and is rebuilt from Durable.
+   * call. Long message/tool text is chunked and remains searchable up to the documented per-entry
+   * cap; omitted chunks are counted. Pages are ordered newest-first by Durable entry ID and resume
+   * with a query-, mapping-, generation- and source-bound cursor; entries appended after the first
+   * page stay out of that continuation, and a rebuilt index or changed store identity rejects the
+   * cursor. The derived index may be deleted at any time and is rebuilt from Durable.
    */
   historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage>;
   /**
@@ -205,16 +214,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-const CHANNEL_STATE_SESSION_SUFFIX = ":channel-state";
-
 interface MappedSession {
   readonly sessionKey: string;
   readonly conversationId: ConversationId;
-}
-
-/** Channel adapters use their state conversation for bookkeeping, never chat history. */
-function isChatSessionKey(sessionKey: string): boolean {
-  return !sessionKey.endsWith(CHANNEL_STATE_SESSION_SUFFIX);
 }
 
 function parseSessionMap(sessions: unknown, rootId: ConversationId): MappedSession[] {
@@ -637,31 +639,33 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const historySessions = async (ctx: Context): Promise<readonly HistorySession[]> => {
       const mapping = await harnessRef.current!.snapshot(SessionMap, root.id, ctx);
       if (mapping === undefined) return [];
-      const chatSessions = parseSessionMap(mapping.sessions, root.id).filter(({ sessionKey }) => isChatSessionKey(sessionKey));
-      if (chatSessions.length > HISTORY_INDEX_LIMITS.maxMappedSessions) {
+      const mappedSessions = parseSessionMap(mapping.sessions, root.id);
+      if (mappedSessions.length > HISTORY_INDEX_LIMITS.maxMappedSessions) {
         throw new Error(
           `History search supports at most ${HISTORY_INDEX_LIMITS.maxMappedSessions} mapped chat sessions; ` +
-          `${chatSessions.length} are present`,
+          `${mappedSessions.length} are present`,
         );
       }
       // A mapped chat session is ownerless and unforked. Fail loudly rather than silently indexing a
       // task-owned background transcript or an inherited fork under a chat session's name.
       await root.commit(async (tx) => {
-        for (const { conversationId } of chatSessions) {
+        for (const { conversationId } of mappedSessions) {
           const conversation = await tx.conversation(conversationId);
           if (conversation === undefined) throw new Error("Stored session mapping points to a missing conversation");
           if (conversation.owner !== undefined) throw new Error("Stored session mapping points to a task-owned conversation");
           if (conversation.parent !== undefined) throw new Error("Stored session mapping points to a forked conversation");
         }
       }, ctx);
-      return chatSessions;
+      return mappedSessions;
     };
-    const historyIndex = createHistoryIndex({
-      indexPath: historyIndexPath(dbPath),
-      sourcePath: dbPath,
-      sessions: historySessions,
-      scan: (ctx, read) => root.commit(read, ctx),
-    });
+    const historyIndex = options.historyStoreId === undefined
+      ? undefined
+      : createHistoryIndex({
+          indexPath: historyIndexPath(dbPath),
+          storeId: options.historyStoreId,
+          sessions: historySessions,
+          scan: (ctx, read) => root.commit(read, ctx),
+        });
 
     // At the snapshot cap, drop the oldest installed background target that is not running and not a
     // mapped session. Without an evictable target the builder's RangeError stays the last resort.
@@ -1081,7 +1085,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
         const conversationId = await chatConversationIdFor(sessionKey, ctx);
         return episodeCatalog!.reconcile(conversationId, ctx);
       },
-      historySearch(query, ctx) {
+      async historySearch(query, ctx) {
+        if (historyIndex === undefined) {
+          throw new Error("History search requires a host-provided Durable store identity");
+        }
         return historyIndex.search(query, ctx);
       },
       async refreshContext(sessionKey, ctx) {
@@ -1125,7 +1132,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         episodeCatalog?.close();
         try { await harness!.close(cleanup); }
         finally {
-          try { await historyIndex.close(); }
+          try { await historyIndex?.close(); }
           finally {
             try { await toolEnvironments?.close(cleanup); }
             finally { await releaseLock(); }
