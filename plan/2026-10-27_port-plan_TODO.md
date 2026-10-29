@@ -74,13 +74,13 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
       Integrated `287a5fbf5`. An independent review plus one worker fix pass found no blocker; the
       durable reopen bug it caught (cron owners restored only under a context provider) is fixed.
       Verified by a worker probe and a parent smoke on the merged tree.
-- [ ] Deliver scheduled results beyond the run's own agent turn (channel outbox), and decide silence.
+- [x] Deliver successful isolated-background cron results to the originating Telegram chat via a durable outbox; empty/error outcomes remain silent, with status visible to the agent. Origin-mode channel delivery remains open.
 - [x] Give a scheduled background run the workspace context snapshot (AGENTS.md/memory/skills).
       Integrated `91915c5e9`: prepare installs the origin's snapshot for the run's own conversation, startup
       restores it from live run tasks (never a `SessionMap` entry), and an idle background target is evicted
       at the snapshot cap instead of failing the run.
 
-- [ ] Deliver scheduled results beyond the origin conversation turn (channel outbox) once a channel is accepted.
+- [ ] Complete origin-mode channel delivery and owner-approved live channel acceptance.
 - [x] Agree transcript/episode/search design (2026-10-29; W3 below).
 - [x] Store identity, reset-delimited episode boundaries and durable pending-summary state (2026-10-29; foundation only, no summary pass).
 - [x] Implement rebuildable message/tool search over the read-only transcript, with committed reset boundaries (2026-10-29; no episode-summary index yet).
@@ -99,7 +99,7 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
       mapped chats (`agentHistory: false` opts out). Telegram/web command surfaces remain unimplemented.
 - [x] Expose source-scoped reset-delimited episode listing and bounded episode drilldown through the
       default agent-facing `history` tool (2026-10-29; search remains the cross-source discovery path;
-      no generated titles or summary text exposed, and no cross-source episode pagination).
+      summary text is available through separate summary actions; no cross-source episode pagination).
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
 - [ ] Complete requested channels individually after core acceptance.
 - [ ] Agree the next bounded implementation scope with the owner; no automatic restart.
@@ -122,9 +122,9 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 | Context / memory | Opt-in bootstrap and selected files, topic manifest, on-demand read/write through granted tools; explicit local `/refresh` | Markdown authoritative; edits do not refresh automatically; unreadable memory directory can block reopen |
 | Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool; curated port builtins in `skills` (memory, memory-defrag, skill-creator, github, cron) behind an explicit `builtinSkillsRoot` | `my` has no port runtime; no inventory-count cap, but finite prompt/output bounds visibly truncate |
 | Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
-| Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling; a background run gets the origin's workspace context and `skill` tool; copied grants are bounded by current origin grants | No channel delivery or silence policy; disabling cron leaves persisted timers blocked; a run whose snapshot was evicted at the cap proceeds without context; a phase fault or crash before the terminal commit can retain bounded grants until reopen |
-| History | Durable store identity, reset-delimited episode reads, opt-in durable background summaries, message/tool search and default agent-facing episode browsing | Summaries require host API opt-in and are not indexed or exposed to the agent; no real-model fidelity evidence; no cross-source episode pagination; clone/restore provenance limitations remain |
-| Telegram | Restricted allowlisted inbound/reply adapter with streaming, durable send intent, unknown-send quarantine | Existing adapter only; scheduled outbound candidate is unmerged; no general pairing or media parity |
+| Cron | Opt-in `cron.enabled`: agent-callable scheduling, origin or isolated runs, bounded grants, workspace context and durable Telegram delivery for successful isolated runs | Origin-mode channel delivery absent; failures and empty results silent externally; disabled cron blocks timers; live acceptance remains open |
+| History | Durable store identity, reset-delimited episode reads, opt-in durable background summaries, message/tool/summary search and default agent-facing browsing | Summaries require host API opt-in; no real-model fidelity evidence; no cross-source episode pagination; clone/restore provenance limitations remain |
+| Telegram | Restricted allowlisted inbound/reply adapter, `/new`/`/abort`/`/help`, durable send intent and isolated-cron outbox | No live channel acceptance, origin-mode cron delivery, general pairing or media parity; unknown sends require reconciliation |
 | Code Mode / delegation | Reviewed opt-in QuickJS Code Mode/tool-search SDK | Not Gateway-installed; no product background-subagent or worker interface |
 | Other surfaces | Read-only usage and inert archival helpers exist | Discord candidates parked; Email/WebSocket, MCP, web/media tools not integrated |
 
@@ -704,6 +704,17 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-29 — Telegram controls and isolated cron delivery
+
+Integrated reviewed Telegram controls and the independently reviewed isolated-cron
+outbox. Joint channel-state v4 preserves v1/v2 and both v3 candidate shapes; malformed
+legacy container types fail closed. Both branches were reviewed independently, and the
+combined controls/migration received independent review; after subagent cleanup the
+parent ran the combined faux-provider/mocked-Telegram end-to-end, sender/revocation,
+withheld/unknown recovery and ordering probes. Typecheck, 155 behavior, 9 execution
+and offline core acceptance passed. Full independent review of all cross-feature cases
+was interrupted by cleanup. No real channel/provider calls or permanent tests.
 
 ### 2026-10-29 — reviewed episode browsing and background summaries
 

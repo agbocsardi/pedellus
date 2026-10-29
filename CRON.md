@@ -1,10 +1,11 @@
 # Cron: deterministic timer plus finite run
 
 This replaces the parked recurring-task foundation. The opt-in `cron` config installs it in the
-gateway together with a model-callable `cron` tool (`add`/`list`/`remove`); there is no channel
-delivery, silence policy, or command surface. Calendar expressions and IANA time zones are schedule
-math; parsing user text or ISO datetimes stays outside. Nothing here sends a message outside the
-Durable conversation it submits to.
+gateway together with a model-callable `cron` tool (`add`/`list`/`remove`); there is no command
+surface. Calendar expressions and IANA time zones are schedule math; parsing user text or ISO
+datetimes stays outside. A completed isolated-background result is also queued in a durable,
+channel-neutral outbox for an enabled channel; the run itself still writes only its Durable
+conversation and sends no external message.
 
 Cron is an internal agent capability: the user asks the agent, and the agent calls the scheduling
 tool. No direct user cron UI or scheduling commands are required, and none exist.
@@ -14,6 +15,7 @@ Files:
 - `src/automation/cron.ts` — job document, timer task, run task, controller API.
 - `src/automation/cron-schedule.ts` — one-shot, interval, and calendar schedule math.
 - `src/automation/cron-tool.ts` — the model-facing `cron` tool.
+- `src/automation/cron-delivery.ts` — channel-neutral durable outbox for completed background results.
 - This document.
 
 ## Why two tasks
@@ -115,7 +117,9 @@ job view reports it instead of a false-healthy running state. An unhealthy timer
 canonical status over a still-running run. A faulted run is visible while it is the active execution
 and is retained in `lastFault` when the timer later replaces its pointer. A parked timer or run is
 shown as parked; this slice invents no cron retry policy, so use Durable's normal
-`harness.retryTask()` or cancel.
+`harness.retryTask()` or cancel. The view also carries the newest sanitized delivery fault for the
+job (`deliveryFault`), so a malformed or full outbox is visible through the model-facing `list`
+operation even though the run itself completed.
 
 ## Schedule math
 
@@ -167,18 +171,79 @@ rather than rewritten. Stored values are safe integers; a next occurrence that w
 safe-integer range fails visibly instead of wrapping. Croner's own parser supports years 1-9999
 and bounds its search near year 3000/9999; that is a library limit, not an added product cap.
 
+## Channel outbox
+
+The normal terminal commit of a background run carries its settlement and final assistant entry ID
+to the host's optional `finalize` callback. When cron is enabled and the origin session belongs to a
+channel enabled in the configuration (currently `telegram:` when `telegram` is configured), the
+gateway writes one record to the origin conversation's `nanobot.cron.deliveries` document in that
+same commit. The record is keyed by `cron:<jobId>:<scheduledAtMs>` and stores the final text, so a
+retried terminal commit cannot admit the same occurrence twice. No model turn is rerun for delivery.
+
+The channel adapter owns external-send state in that record: a bounded chunk cursor, a write-ahead
+intent, and an ambiguous-outcome quarantine. Delivery authorization uses durable admission
+evidence, not the origin session string or a chat-ID/allowlist shortcut: the adapter requires a
+binding for the same bot and private chat naming the original authenticated sender, then rechecks
+that sender against its live allowlist. A missing/inconsistent binding is a nonterminal `withheld`
+hold with no send; a fresh authenticated admission for that private chat restores/refreshes the
+binding and returns those records to `pending`, so a cap eviction or an old migrated store does not
+permanently lose a result. A binding whose sender is no longer allowed settles `unauthorized` with
+no send and is not released by a later admission. An unresolved intent after a crash reopens as
+`unknown` and is never auto-resent; an explicit rejection settles `failed`; rate-limit and proven
+pre-connect outcomes stay pending for a later scan. This is deliberate
+reconciliation-over-retransmission, not an exactly-once claim.
+
+Network writes for one chat are serialized and use the same bot flood gate, and only one scheduled
+record per chat is active at a time. That prevents overlapping network sends and scheduled-record
+reordering, but it is not a whole-message lock: chunks of a multi-chunk message can interleave with
+another same-chat send between chunks.
+
+State version 4 starts an empty admission-binding map when migrating v1/v2 or a controls-only v3
+channel state; a v3 state with bindings retains them. Pending replies are preserved. Prior queued cron results are not failed or discarded: they are withheld
+until that private chat admits one fresh message, which restores the binding and releases them.
+The adapter does not infer a sender binding from a chat ID or an old session string.
+
+The v4 migration accepts v1/v2 and both historical v3 channel-state shapes, preserving controls,
+origin bindings and pending replies. Cron outbox records are separate. Downgrading to a reader
+predating `withheld` can fail held records; upgrades must be forward-only.
+
+Binding capacity is bounded (1000 origins). Eviction is observable through a sanitized fact record
+and warning; an evicted chat's withheld result remains nonterminal and a fresh admission restores
+it. Every valid admission refreshes that binding's recency, so active chats are not the first
+eviction candidates.
+
+Silence policy: only a successful, non-empty final answer is queued. An empty answer, run error,
+cancellation or superseded run sends nothing externally; its actionable status stays in
+`lastOutcome` and `list()`; no failure notification is sent. An origin-mode run answers inside the
+origin conversation and creates no outbox record, so it is not delivered twice. Telegram origin-mode
+delivery remains unsolved: no unsolicited send is attempted, and only a local CLI attached to that
+conversation prints the answer. With the channel absent from the configuration, no
+record is created at all; an existing record is not redirected to another channel. The bounded
+outbox (1000 records per origin, 200 terminal records retained) never evicts pending, withheld or
+ambiguous records. A full outbox does not queue the new result and records a durable, sanitized
+delivery fault; the run still completes. The same fault path covers a stored outbox whose
+`deliveries` value is not an array or whose entries are not understood: a single unrecognized entry
+blocks every new admission for that origin until an operator repairs it, because the document is
+never partially rewritten. Nothing is overwritten or repaired by guess, and the terminal commit is
+not faulted. The reason is visible as `last delivery fault` in the cron `list` view. A malformed
+fault document is itself ignored rather than replacing job or outbox data.
+
 ## Not included / limitations
 
 - No migration of the parked probe document versions or stores. They are not supported.
-- No user channel/outbound delivery, silence policy, model selection, or misfire policy. A run
-  submits one agent turn to a Durable conversation (the fresh background conversation, or the
-  origin conversation in `origin` mode); nothing is sent to Telegram, Discord, email, or another
-  channel. An origin-mode answer becomes part of the origin transcript, so an attached local CLI
-  prints its committed final text once when the run ends (see [the CLI](./CLI.md)). Queued origin
-  turns that hand over directly to a successor are attributed per run, so a later run neither steals
-  nor suppresses an earlier answer. That is conversation presentation, not a delivery layer:
-  isolated runs stay in their own conversation, there is no outbox, retry or exactly-once claim, and
-  a CLI started after the run settled does not replay it.
+- No user-facing channel command surface, model selection, or misfire policy. One run submits one
+  agent turn to a Durable conversation (the fresh background conversation, or the origin conversation
+  in `origin` mode).
+- Delivery is background-only and currently only consumed by the Telegram adapter. An origin-mode
+  answer becomes part of the origin transcript, so an attached local CLI prints its committed final
+  text once when the run ends (see [the CLI](./CLI.md)); Telegram does not send an unsolicited origin-mode
+  turn. Queued origin turns that hand over directly to a successor are attributed per run, so a later
+  run neither steals nor suppresses an earlier answer. That is conversation presentation, not a
+  delivery layer: there is no retry or exactly-once claim, and a CLI started after the run settled
+  does not replay it.
+- A pending outbox record has no age limit. A channel enabled later can deliver an older queued
+  result once; an ambiguous record stays quarantined until an operator resolves it through the
+  adapter's documented channel-state/outbox record.
 - The `cron` tool parses only ISO 8601 timestamps with an explicit UTC offset for `at`; parsing
   natural-language user text stays outside.
 - Background runs are owned by the run task, so cancelling the job aborts that run. In `origin` mode
@@ -283,3 +348,27 @@ fail; previous-occurrence recovery is optional and falls back to the forward res
 covered 1-hour, 30-minute, and 2-hour folds, the 1969 `America/New_York` fold, and
 huge/out-of-range references, including wrapped `CronScheduleError` failures. No live data,
 credentials, network, or deployment was used.
+
+Channel-delivery probes (2026-10-29, temporary and uncommitted) drove the real `openGateway` and
+`runTelegram` paths with a faux provider and a mocked Telegram transport in fresh `mkdtemp` stores.
+They covered: a Telegram-origin scheduling turn, the isolated run's final text written to the
+origin outbox and sent once to the originating chat with a stored message ID and chunk cursor; a
+delivered record not resent after full gateway/store reopen; an unresolved persisted send intent
+reopening as `unknown` with no outbound request and no model call; a mapped origin removed from the
+live allowlist settling `unauthorized` with no send; a mapped origin with no durable admission
+binding entering nonterminal `withheld` with no send; two same-chat records sent in order with no
+overlapping external calls; and a gateway opened without the channel writing no outbox record for a
+completed background run. State probes covered a 1000-binding cap: the next admission evicted the
+oldest binding, recorded an observable sanitized eviction fault, left that origin's result
+`withheld`, and a fresh authenticated admission restored the binding, released the result and sent
+it once to the origin chat. A stored version-2 channel state migrated with an empty binding
+map; a prior queued result became `withheld` without a fault flood, then a fresh admission restored
+its binding and delivered it once. A live-revoked sender stayed terminal `unauthorized`; an
+ambiguous send reopened as `unknown` and was never resent. Corruption probes covered a stored outbox
+whose `deliveries` value was not an array: the recurring
+scheduled run still committed its terminal outcome, left the stored value untouched, and recorded a
+sanitized durable delivery fault visible in the job list; a malformed pending record was settled
+`failed` without an external send; a malformed record without a usable ID was surfaced in the fault
+document; and a reopened gateway repeated none of them as a faulting loop. A full all-pending outbox
+returned `full`, retained every pending record and recorded a deduped overflow fault. No permanent
+test, live bot, credential or network request was involved.

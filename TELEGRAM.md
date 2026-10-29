@@ -135,14 +135,8 @@ again. No exactly-once claim is made for a native reset (Durable exposes no rese
 idempotency key). Version 1 and 2 state documents
 migrate with an empty `controls` list.
 
-**Unmerged overlap to resolve at integration:** the unmerged cron-delivery
-candidate on its own branch independently defines `nanobot.telegram-state` v3
-with an `origins` map for sender-to-chat admission evidence. This branch's v3
-adds `controls` and neither shape is a superset. Do not treat either as the
-authoritative v3; the parent will reconcile both with a joint v4 that accepts
-stored v1/v2 and both candidate v3 shapes, preserving pending replies,
-`controls`, origin bindings and failures. Nothing in this branch defines or
-migrates that v4.
+State version 4 accepts both historical version-3 shapes and preserves any present
+`controls` and authenticated origin bindings. Invalid stored shapes fail closed.
 
 Not implemented here: `/restart`, tool-grant or approval commands, history
 commands, `/stop` aliasing, and any command that would widen grants. A Telegram
@@ -218,12 +212,22 @@ waiter; it does not abort the Durable model work. Pending delivery records remai
 durable for restart recovery. Preview updates use one in-flight operation plus a
 latest-value coalescer; a flood wait skips replaceable previews rather than
 retaining stale calls. The channel-state document checkpoints its delta chain
-after 64 deltas using Durable's `CheckpointInfo.deltasSinceBase`. Schema version 2
-adds a durable next-final-chunk cursor, write-ahead send intent, and unknown-delivery metadata; version-1
-state migrates with a zero chunk cursor. Successful final chunks are committed
-before attempting later chunks, so an explicit later rejection does not resend
-known accepted earlier chunks. Required outcome/progress commits use an
-uncancelled cleanup context and are reaped before return.
+after 64 deltas using Durable's `CheckpointInfo.deltasSinceBase`. Schema version 4
+combines durable sender-to-chat admission evidence (`origins`) with controls,
+the next-final-chunk cursor, write-ahead send intent, and unknown-delivery metadata.
+Version-1 and version-2 state migrate with an empty `origins` map; version 1 resets
+the chunk cursor, and version 2 preserves it. Pending replies are kept, and no sender
+binding is inferred from a chat ID. Prior
+queued cron results remain in the outbox as nonterminal `withheld` records until that private chat
+admits one fresh message, which restores the binding and releases them; they are not failed or
+discarded.
+
+Downgrading to a pre-`withheld` outbox reader can fail held deliveries; upgrades must be forward-only.
+
+Successful final chunks are committed before attempting later chunks, so an
+explicit later rejection does not resend known accepted earlier chunks. Required
+outcome/progress commits use an uncancelled cleanup context and are reaped before
+return.
 
 A grammY 400 `message is not modified` error is treated as success for the exact
 short description or a bounded detailed description with that exact prefix
@@ -307,6 +311,65 @@ exactly once, and only applied records were pruned; and a hung abort followed by
 excess with a bounded notice, and reported every remaining record exactly once
 after a reopen.
 
+## Scheduled cron delivery
+
+The adapter also consumes the durable, channel-neutral cron outbox
+(`nanobot.cron.deliveries` in the origin chat conversation). A completed isolated-background run
+writes its final text there in the same terminal commit as its outcome; no model turn is rerun to
+resend. On startup and every few seconds the adapter enumerates already-mapped chat sessions and
+accepts only candidate keys for its own bot ID (`telegram:<bot id>:chat:<chatId>`). That key is a
+locator, not authentication: before any send the adapter requires durable admission evidence for
+that private chat, written before the message was mapped or submitted. The evidence records the
+admitting bot ID, `chatType: "private"`, and the original authenticated `senderId`. The adapter
+rechecks that original `senderId` against the live `allowFrom` list. It never equates `chatId`
+with the sender and never treats the session string or a model-provided value as proof of identity.
+If the evidence is missing, inconsistent, for another bot, or not private, the result enters a
+nonterminal `withheld` state with no send. A fresh authenticated admission for that private chat
+restores/refreshes the binding and returns the withheld records to `pending`; a cap eviction or a
+migrated store therefore causes delay, not permanent loss. A valid binding whose sender is no longer
+allowed settles `unauthorized` with no send and is not released by a later admission. Admission
+evidence is bounded (1000 origins per bot): every valid admission refreshes `admittedAtMs`, and an
+eviction is surfaced through a deduped sanitized fault and warning rather than silently hiding the
+lost binding.
+
+Scheduled sends share the bot flood gate, 4096-character chunking, chunk cursor, write-ahead
+`sendIntent`, and bounded retries with inbound replies. Network writes for one chat are serialized
+in request order, and only one scheduled record per chat is active at a time. That prevents
+overlapping network calls and scheduled-record reordering, but it is not a whole-message lock: the
+chunks of a multi-chunk message can interleave with another same-chat send between chunks.
+
+Delivery state lives on the outbox record, not only in this process: `pending`, `sending`,
+`unknown`, `withheld`, `delivered`, `failed`, or `unauthorized`, plus `nextChunkIndex`, `messageId`,
+`sendIntent`, `unknownSince`, `withheldSince`, `settledAt`, and a sanitized `error`. An unresolved intent at open
+becomes `unknown` and is never auto-resent; an explicit rejection becomes `failed`; 429 and proven
+pre-connect outcomes stay pending for a later scan. Only a successful, non-empty answer is queued:
+empty answers, run errors, cancellations and superseded runs are silent externally and remain
+visible through cron `lastOutcome`/`list`; there is no failure notification. If the channel is
+absent from the configuration, no record is created; an existing record is never redirected to
+another chat or channel. The outbox is bounded (1000 records per origin, 200 terminal records
+retained) and never evicts pending or ambiguous records. A full outbox does not queue the new result
+and records a durable sanitized fault; the run still completes. A stored outbox whose `deliveries`
+value is not an array, or whose entries are not understood, is left untouched and surfaced the same
+way instead of faulting the run. Cron `list` shows the newest fault as `last delivery fault`; the
+operator document is `CronDeliveryFaultsDoc`.
+
+A malformed individual outbox record is quarantined, never sent. If it has a usable ID the adapter
+settles it `failed` with a fixed reason such as `delivery record has no text`; without a usable ID,
+or when the whole document cannot be read, the adapter writes a sanitized entry to
+`CronDeliveryFaultsDoc` and logs a fixed warning. Repeated scans dedupe the same fault and make no
+outbound request. Raw error text, provider text and record contents are not logged or persisted as
+the reason.
+
+Origin-mode cron delivery remains unsolved: an `origin` run answers inside the existing origin
+conversation and creates no outbox record, so this adapter sends no unsolicited origin-mode turn.
+Only a local CLI attached to that conversation prints its committed final text.
+
+Reconciliation for scheduled records uses the origin conversation's `CronDeliveriesDoc` token rather
+than `TelegramState`. Stop the adapter first. If Telegram accepted the exact intended text, advance
+`nextChunkIndex`/`messageId` and settle `delivered`; if it was confirmed unsent, clear `sendIntent`,
+set `status: "pending"`, and preserve the chunk cursor. Never clear an unresolved intent without
+checking Telegram, and never expect exactly-once external delivery.
+
 ## Offline integration probe
 
 No live bot or credentials were used. A private temporary copy of the parent
@@ -350,6 +413,25 @@ our local crash boundary with mocked Telegram, not delivery over Telegram's netw
 No live bot or paid model call was used in the offline probes above. External
 sends remain unknown at an ambiguous boundary and require reconciliation, never
 an exactly-once claim.
+
+Scheduled-delivery probes (temporary and uncommitted) used the real Gateway and
+adapter with a faux provider and mocked Telegram transport in fresh `mkdtemp`
+stores. They covered end-to-end background-result delivery, full reopen without a
+second send, unresolved intent reopening as `unknown`, a live-revoked binding
+settling `unauthorized`, a mapped chat with no durable admission binding entering
+nonterminal `withheld`, same-chat ordering with no overlapping network writes,
+chunk cursors, an explicit rejection, and the disabled-channel boundary. State
+probes covered a 1000-binding cap: the next admission evicted the oldest binding
+with an observable sanitized fault, the evicted origin's result stayed `withheld`,
+and a fresh authenticated admission restored the binding and delivered once. A
+stored version-2 state migrated with an empty binding map; a prior queued result
+became `withheld` without a fault flood and was restored by a fresh admission.
+Corruption probes covered a stored `deliveries` value that was not an array, a
+malformed pending record with and without a usable ID, and a reopen/recurring run:
+the terminal run still completed, invalid data was left untouched, malformed
+records were quarantined or surfaced in the fault document with fixed reasons, and
+no outbound request was made. No permanent test, live bot, credential or network
+request was involved.
 
 ## Live smoke check — 2026-10-26
 

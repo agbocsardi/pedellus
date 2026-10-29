@@ -159,6 +159,9 @@ function describe(view: CronJobView): string {
   if (view.job.lastFault !== null) {
     parts.push(`  last failure: ${iso(view.job.lastFault.recordedAtMs)} (${view.job.lastFault.error})`);
   }
+  if (view.deliveryFault !== null) {
+    parts.push(`  last delivery fault: ${iso(view.deliveryFault.recordedAtMs)} (${view.deliveryFault.message})`);
+  }
   return parts.join("\n");
 }
 

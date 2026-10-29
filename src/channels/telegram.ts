@@ -1,5 +1,5 @@
 import { defineDoc, AssistantEntry } from "@earendil-works/pi-durable";
-import type { Context } from "@earendil-works/chord";
+import type { Context, Draft } from "@earendil-works/chord";
 import { copyJson } from "@earendil-works/chord";
 import { withCancel, withoutAbortSignal } from "@earendil-works/chord/context";
 import { Api, GrammyError, HttpError } from "grammy";
@@ -7,6 +7,8 @@ import type { ApiClientOptions } from "grammy";
 import type { Update } from "grammy/types";
 import type { Conversation, SubmissionId } from "@earendil-works/pi-durable";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
+import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 
 const API = "https://api.telegram.org";
@@ -27,6 +29,9 @@ const MAX_CONTROL_RECORDS = 64;
 /** Unresolved commands kept at most; further commands are refused so a hung or flooded chat cannot grow the log. */
 const MAX_UNRESOLVED_CONTROLS = 64;
 const MAX_NOTICE_CHARS = 1_500;
+const SCHEDULED_SCAN_INTERVAL_MS = 2_000;
+const MAX_SCHEDULED_ACTIVE = 4;
+const MAX_ORIGINS = 1_000;
 
 export type TelegramOptions = {
   token: string;
@@ -72,6 +77,16 @@ export type TelegramChannelState = {
   offset: number;
   pending: TelegramPendingDelivery[];
   controls: TelegramControlRecord[];
+  /** Durable authenticated sender-to-chat evidence keyed by decimal chat ID. */
+  origins: Record<string, TelegramOriginBinding>;
+};
+export type TelegramOriginBinding = {
+  /** Adapter identity that admitted this private chat. */
+  botId: string;
+  chatType: "private";
+  /** Original authenticated Telegram sender, not the chat ID. */
+  senderId: string;
+  admittedAtMs: number;
 };
 type PendingReply = TelegramPendingDelivery;
 type SubmissionSlot = { readonly prior: Promise<void>; release(): void };
@@ -80,32 +95,48 @@ type ChannelState = TelegramChannelState;
 // Stored alongside the adapter's stable channel conversation, not in a plaintext sidecar.
 export const TelegramState = defineDoc<ChannelState>({
   kind: "nanobot.telegram-state",
-  version: 3,
+  version: 4,
   scope: "conversation",
   history: "latest",
   fork: "initial",
   checkpointWhen: (_value, _ops, { deltasSinceBase }) => deltasSinceBase >= 64,
   migrate: (value, fromVersion) => {
-    if (fromVersion === 1) {
-      return {
-        offset: Number(value.offset ?? 0),
-        pending: (value.pending as unknown as PendingReply[]).map((item) => ({
-          ...item,
-          nextChunkIndex: 0,
-        })),
-        controls: [],
-      };
+    if (fromVersion !== 1 && fromVersion !== 2 && fromVersion !== 3) {
+      throw new Error(`Unsupported Telegram state version ${fromVersion}`);
     }
-    if (fromVersion === 2) {
-      return { offset: Number(value.offset ?? 0), pending: value.pending as unknown as PendingReply[], controls: [] };
+    if (!Array.isArray(value.pending) || value.pending.some((item) =>
+      item === null || typeof item !== "object" || Array.isArray(item))) {
+      throw new Error("Stored Telegram state contains invalid pending deliveries");
     }
-    throw new Error(`Unsupported Telegram state version ${fromVersion}`);
+    if (fromVersion === 3 && value.controls !== undefined && !Array.isArray(value.controls)) {
+      throw new Error("Stored Telegram state contains invalid controls");
+    }
+    if (fromVersion === 3 && value.origins !== undefined &&
+      (value.origins === null || typeof value.origins !== "object" || Array.isArray(value.origins))) {
+      throw new Error("Stored Telegram state contains invalid origin bindings");
+    }
+    return {
+      offset: Number(value.offset ?? 0),
+      pending: (value.pending as unknown as PendingReply[]).map((item) => ({
+        ...item,
+        nextChunkIndex: fromVersion === 1 ? 0 : Number(item.nextChunkIndex ?? 0),
+      })),
+      controls: fromVersion === 3 && Array.isArray(value.controls)
+        ? value.controls as unknown as TelegramControlRecord[] : [],
+      origins: fromVersion === 3 && value.origins !== null && typeof value.origins === "object" && !Array.isArray(value.origins)
+        ? value.origins as unknown as Record<string, TelegramOriginBinding> : {},
+    };
   },
-  initial: () => ({ offset: 0, pending: [], controls: [] }),
+  initial: () => ({ offset: 0, pending: [], controls: [], origins: {} }),
 });
 
 export interface TelegramGateway {
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
+  /**
+   * Host-authenticated durable outbox for completed background cron results. Optional so a host that
+   * only does inbound replies stays usable; absent means no scheduled delivery is attempted.
+   */
+  cronOutbox?: CronDeliveryOutbox;
 }
 
 export async function runTelegram(
@@ -190,6 +221,379 @@ export async function runTelegram(
     }
   };
 
+  const outbox = gateway.cronOutbox;
+  const scheduledActive = new Set<string>();
+  const scheduledChatActive = new Set<number>();
+  const scheduledTasks = new Set<Promise<void>>();
+  let scheduledScanning = false;
+  let scheduledTimer: ReturnType<typeof setInterval> | undefined;
+
+  // Network writes for one chat share the bot-token flood gate and do not overlap. Chunks from
+  // separate messages may interleave between writes.
+  const chatSendTails = new Map<number, Promise<void>>();
+  const withChatSendOrder = <T>(chatId: number, work: () => Promise<T>): Promise<T> => {
+    const previous = chatSendTails.get(chatId) ?? Promise.resolve();
+    const next = previous.then(work);
+    const tail = next.then(() => undefined, () => undefined);
+    chatSendTails.set(chatId, tail);
+    void tail.finally(() => {
+      if (chatSendTails.get(chatId) === tail) chatSendTails.delete(chatId);
+    });
+    return next;
+  };
+
+  // A durable origin binding is written before a message's conversation is mapped or submitted, so
+  // a cron job (and its later outbox record) can never predate the admission evidence it relies on.
+  const rememberOrigin = async (
+    chatId: number,
+    senderId: string,
+  ): Promise<{ trusted: boolean; evictedChatId: string | null }> => {
+    let trusted = false;
+    let evictedChatId: string | null = null;
+    state = await stateConversation.commit(async (tx) => {
+      const doc = await tx.doc(TelegramState, stateConversation.id);
+      const key = String(chatId);
+      const existing = doc.origins[key];
+      if (existing !== undefined) {
+        if (existing.botId === identity && existing.chatType === "private" && existing.senderId === senderId) {
+          // Refresh recency so an active private chat is not the first eviction candidate.
+          existing.admittedAtMs = Date.now();
+          trusted = true;
+        } else {
+          // Conflicting evidence for one private chat is not trustworthy: withhold it until a fresh
+          // admission writes a consistent binding.
+          delete doc.origins[key];
+        }
+        return copyJson(doc) as unknown as ChannelState;
+      }
+      if (Object.keys(doc.origins).length >= MAX_ORIGINS) {
+        const oldest = Object.entries(doc.origins)
+          .sort((left, right) => left[1].admittedAtMs - right[1].admittedAtMs)[0];
+        if (oldest !== undefined) {
+          evictedChatId = oldest[0];
+          delete doc.origins[oldest[0]];
+        }
+      }
+      doc.origins[key] = {
+        botId: identity,
+        chatType: "private",
+        senderId,
+        admittedAtMs: Date.now(),
+      };
+      trusted = true;
+      return copyJson(doc) as unknown as ChannelState;
+    }, adapterContext);
+    return { trusted, evictedChatId };
+  };
+
+  // A completed background result is sent as stored text: no submission, no preview, no model turn.
+  const scheduledSessions = async (): Promise<{ sessionKey: string; chatId: number }[]> => {
+    if (outbox === undefined) return [];
+    const prefix = `telegram:${identity}:chat:`;
+    const sessions: { sessionKey: string; chatId: number }[] = [];
+    for (const { sessionKey } of await outbox.sessions(adapterContext)) {
+      if (!sessionKey.startsWith(prefix)) continue;
+      const raw = sessionKey.slice(prefix.length);
+      if (!/^[1-9][0-9]*$/.test(raw)) continue;
+      const chatId = Number(raw);
+      if (!Number.isSafeInteger(chatId)) continue;
+      sessions.push({ sessionKey, chatId });
+    }
+    return sessions;
+  };
+
+  const updateScheduled = async (
+    sessionKey: string,
+    id: string,
+    change: (entry: Draft<CronDeliveryRecord>) => void,
+    commitContext: Context = adapterContext,
+  ): Promise<CronDeliveryRecord | undefined> => {
+    if (outbox === undefined) return undefined;
+    return outbox.update(sessionKey, id, change, commitContext);
+  };
+
+  const reportOutboxFault = async (sessionKey: string, message: string): Promise<void> => {
+    if (outbox === undefined) return;
+    await outbox.recordFault(sessionKey, message, cleanupContext).catch(() => undefined);
+  };
+
+  // A write-ahead intent may have reached Telegram before a crash. Quarantine it on open: an
+  // ambiguous external send is never auto-resent.
+  const recoverScheduled = async (): Promise<void> => {
+    if (outbox === undefined) return;
+    for (const { sessionKey } of await scheduledSessions()) {
+      let records: readonly unknown[];
+      try {
+        records = await outbox.list(sessionKey, cleanupContext);
+      } catch (error) {
+        await reportOutboxFault(sessionKey, outboxFaultMessage(error));
+        continue;
+      }
+      for (const value of records) {
+        const record = value as { id?: unknown; status?: unknown; sendIntent?: unknown };
+        if (record === null || typeof record !== "object") {
+          await reportOutboxFault(sessionKey, "delivery outbox contains an unusable record");
+          continue;
+        }
+        if (record.status !== "sending" && record.sendIntent === undefined) continue;
+        if (typeof record.id !== "string" || record.id === "") {
+          await reportOutboxFault(sessionKey, "delivery outbox contains an unusable record");
+          continue;
+        }
+        try {
+          await updateScheduled(sessionKey, record.id, (entry) => {
+            entry.status = "unknown";
+            entry.unknownSince = Date.now();
+            delete entry.sendIntent;
+          }, cleanupContext);
+        } catch (error) {
+          await reportOutboxFault(sessionKey, outboxFaultMessage(error));
+          continue;
+        }
+        console.warn(`Telegram scheduled delivery outcome unknown for ${record.id}; inspect the Durable cron outbox record.`);
+      }
+    }
+  };
+
+  const clearScheduledIntent = (sessionKey: string, id: string) =>
+    updateScheduled(sessionKey, id, (entry) => {
+      if (entry.status === "sending" || entry.sendIntent !== undefined) {
+        entry.status = "pending";
+        delete entry.sendIntent;
+      }
+    }, cleanupContext);
+
+  const sendScheduledChunk = async (
+    sessionKey: string,
+    recordId: string,
+    chatId: number,
+    chunk: string,
+    index: number,
+  ): Promise<"sent" | "retry" | "stop"> => {
+    try {
+      const sent = await apiCall(api, "sendMessage", signal, async (callSignal) => {
+        await updateScheduled(sessionKey, recordId, (entry) => {
+          entry.status = "sending";
+          entry.sendIntent = { text: chunk, chunkIndex: index, startedAt: Date.now() };
+        });
+        if (signal?.aborted) {
+          await clearScheduledIntent(sessionKey, recordId);
+          throw new TelegramApiError("sendMessage", 0, "not-sent");
+        }
+        let sent;
+        try {
+          sent = await withChatSendOrder(chatId, () => api.sendMessage(chatId, chunk, {}, toGrammySignal(callSignal)));
+        } catch (error) {
+          if ((error instanceof GrammyError && error.error_code < 500) ||
+              (error instanceof HttpError && isProvenPreConnectFailure(error.error))) {
+            await clearScheduledIntent(sessionKey, recordId);
+          }
+          throw error;
+        }
+        await updateScheduled(sessionKey, recordId, (entry) => {
+          entry.status = "pending";
+          delete entry.sendIntent;
+          delete entry.unknownSince;
+          entry.nextChunkIndex = Math.max(entry.nextChunkIndex, index + 1);
+          if (index === 0) entry.messageId = sent.message_id;
+        }, cleanupContext);
+        return sent;
+      }, { throttle: outboundThrottle });
+      return sent === undefined ? "retry" : "sent";
+    } catch (error) {
+      if (error instanceof TelegramApiError) {
+        if (error.outcome === "unknown") {
+          await updateScheduled(sessionKey, recordId, (entry) => {
+            entry.status = "unknown";
+            entry.unknownSince = Date.now();
+            delete entry.sendIntent;
+          }, cleanupContext);
+          console.warn(`Telegram scheduled delivery outcome unknown for ${recordId}; inspect the Durable cron outbox record.`);
+          return "stop";
+        }
+        if (error.outcome === "not-sent") {
+          await clearScheduledIntent(sessionKey, recordId);
+          return signal?.aborted ? "stop" : "retry";
+        }
+        if (error.status === 429) {
+          await clearScheduledIntent(sessionKey, recordId);
+          return "retry";
+        }
+        await updateScheduled(sessionKey, recordId, (entry) => {
+          entry.status = "failed";
+          entry.settledAt = Date.now();
+          delete entry.sendIntent;
+          entry.error = error.message;
+        }, cleanupContext);
+        return "stop";
+      }
+      if (signal?.aborted) {
+        // An in-flight request was abandoned; the write-ahead intent stays ambiguous.
+        await updateScheduled(sessionKey, recordId, (entry) => {
+          entry.status = "unknown";
+          entry.unknownSince = Date.now();
+          delete entry.sendIntent;
+        }, cleanupContext);
+        console.warn(`Telegram scheduled delivery outcome unknown for ${recordId}; inspect the Durable cron outbox record.`);
+        return "stop";
+      }
+      await updateScheduled(sessionKey, recordId, (entry) => {
+        entry.status = "failed";
+        entry.settledAt = Date.now();
+        delete entry.sendIntent;
+        entry.error = "Telegram delivery failed";
+      }, cleanupContext);
+      return "stop";
+    }
+  };
+
+  const deliverScheduled = async (sessionKey: string, chatId: number, record: CronDeliveryRecord) => {
+    if (outbox === undefined) return;
+    if (record.sessionKey !== sessionKey) {
+      await updateScheduled(sessionKey, record.id, (entry) => {
+        entry.status = "failed";
+        entry.settledAt = Date.now();
+        entry.error = "outbox session does not match its origin";
+      }, cleanupContext);
+      return;
+    }
+    if (record.text.trim() === "") {
+      await updateScheduled(sessionKey, record.id, (entry) => {
+        entry.status = "failed";
+        entry.settledAt = Date.now();
+        entry.error = "delivery text is empty";
+      }, cleanupContext);
+      return;
+    }
+    // The session key is only a candidate locator. Authorization comes from durable admission
+    // evidence for this bot and private chat, not from parsing the key or equating chat with sender.
+    const binding = originBindingOf(state.origins, chatId, identity);
+    if (binding === undefined) {
+      // Missing evidence is a reversible hold, not a failed delivery: a later authenticated
+      // admission for this private chat restores the binding and releases this record.
+      await updateScheduled(sessionKey, record.id, (entry) => {
+        entry.status = "withheld";
+        entry.withheldSince = Date.now();
+        entry.error = "origin chat has no durable admission evidence";
+      }, cleanupContext);
+      console.warn(`Telegram scheduled delivery withheld for ${record.id}: no durable origin admission evidence.`);
+      return;
+    }
+    // The original admitted sender is rechecked against the live allowlist for every send.
+    if (!options.allowFrom.includes(binding.senderId)) {
+      await updateScheduled(sessionKey, record.id, (entry) => {
+        entry.status = "unauthorized";
+        entry.settledAt = Date.now();
+        entry.error = "origin sender is no longer authorized";
+      }, cleanupContext);
+      return;
+    }
+    const chunks = splitTelegramText(record.text);
+    let current = record;
+    for (let index = current.nextChunkIndex; index < chunks.length; index++) {
+      const result = await sendScheduledChunk(sessionKey, record.id, chatId, chunks[index]!, index);
+      if (result !== "sent") return;
+      const next = (await outbox.list(sessionKey, adapterContext))
+        .find((entry) => entry.id === record.id);
+      if (next === undefined) return;
+      current = next;
+    }
+    await updateScheduled(sessionKey, record.id, (entry) => {
+      entry.status = "delivered";
+      entry.settledAt = Date.now();
+      delete entry.error;
+    }, cleanupContext);
+  };
+
+  const scanScheduled = async (): Promise<void> => {
+    if (outbox === undefined || stopping || signal?.aborted) return;
+    for (const { sessionKey, chatId } of await scheduledSessions()) {
+      if (stopping || signal?.aborted) return;
+      let records: readonly unknown[];
+      try {
+        records = await outbox.list(sessionKey, adapterContext);
+      } catch (error) {
+        await reportOutboxFault(sessionKey, outboxFaultMessage(error));
+        continue;
+      }
+      for (const value of records) {
+        if (stopping || signal?.aborted) return;
+        const problem = pendingRecordProblem(value);
+        if (problem !== undefined) {
+          // A record with a usable ID is quarantined durably; one without an ID can only be
+          // surfaced through the separate fault document.
+          const candidate = value as { id?: unknown };
+          if (typeof candidate.id === "string" && candidate.id !== "") {
+            try {
+              await updateScheduled(sessionKey, candidate.id, (entry) => {
+                entry.status = "failed";
+                entry.settledAt = Date.now();
+                entry.error = problem;
+              }, cleanupContext);
+            } catch (error) {
+              await reportOutboxFault(sessionKey, outboxFaultMessage(error));
+            }
+          } else {
+            await reportOutboxFault(sessionKey, problem);
+          }
+          continue;
+        }
+        const record = value as CronDeliveryRecord;
+        if (record.status !== "pending" || scheduledActive.has(record.id)) continue;
+        if (scheduledChatActive.has(chatId)) continue;
+        if (scheduledActive.size >= MAX_SCHEDULED_ACTIVE) return;
+        scheduledActive.add(record.id);
+        scheduledChatActive.add(chatId);
+        const task = Promise.resolve()
+          .then(() => deliverScheduled(sessionKey, chatId, record))
+          .catch(() => {
+            // Keep the durable record pending; the next scan retries or quarantines it.
+          })
+          .finally(() => {
+            scheduledActive.delete(record.id);
+            scheduledChatActive.delete(chatId);
+            scheduledTasks.delete(task);
+          });
+        scheduledTasks.add(task);
+      }
+    }
+  };
+
+  const requestScheduledScan = () => {
+    if (scheduledScanning || stopping || signal?.aborted) return;
+    scheduledScanning = true;
+    void scanScheduled().catch(() => {}).finally(() => { scheduledScanning = false; });
+  };
+
+  // A fresh authenticated admission restores a missing/evicted binding, then releases that chat's
+  // nonterminal withheld results. It does not release anything before the binding exists.
+  const releaseWithheld = async (sessionKey: string): Promise<void> => {
+    if (outbox === undefined || stopping || signal?.aborted) return;
+    let records: readonly unknown[];
+    try {
+      records = await outbox.list(sessionKey, adapterContext);
+    } catch {
+      return;
+    }
+    let released = false;
+    for (const value of records) {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+      const record = value as { id?: unknown; status?: unknown };
+      if (record.status !== "withheld" || typeof record.id !== "string" || record.id === "") continue;
+      try {
+        await updateScheduled(sessionKey, record.id, (entry) => {
+          entry.status = "pending";
+          delete entry.withheldSince;
+          delete entry.error;
+        }, adapterContext);
+        released = true;
+      } catch {
+        // The scan will retry or quarantine it; admission itself must still succeed.
+      }
+    }
+    if (released) requestScheduledScan();
+  };
+
   const drain = () => {
     if (stopping || signal?.aborted) return;
     const heldChats = new Set<number>();
@@ -229,7 +633,7 @@ export async function runTelegram(
   const deliver = async (item: PendingReply, slot: SubmissionSlot) => {
     if (!options.allowFrom.includes(item.senderId)) {
       if (item.messageId !== undefined) {
-        await apiCall(api, "deleteMessage", signal, (callSignal) => api.deleteMessage(item.chatId, item.messageId!, toGrammySignal(callSignal)), { throttle: outboundThrottle }).catch(() => undefined);
+        await apiCall(api, "deleteMessage", signal, (callSignal) => withChatSendOrder(item.chatId, () => api.deleteMessage(item.chatId, item.messageId!, toGrammySignal(callSignal))), { throttle: outboundThrottle }).catch(() => undefined);
       }
       await forget(item.updateId);
       return;
@@ -339,9 +743,9 @@ export async function runTelegram(
         if (index === 0 && current.messageId !== undefined) {
           if (current.lastText !== chunk) {
             try {
-              await apiCall(api, "editMessageText", signal, (callSignal) => api.editMessageText(
+              await apiCall(api, "editMessageText", signal, (callSignal) => withChatSendOrder(item.chatId, () => api.editMessageText(
                 item.chatId, current.messageId!, chunk, {}, toGrammySignal(callSignal),
-              ), { throttle: outboundThrottle });
+              )), { throttle: outboundThrottle });
             } catch (error) {
               if (isNotModified(error)) {
                 // The remote edit may have succeeded before its response was lost.
@@ -386,7 +790,7 @@ export async function runTelegram(
             }
             let sent;
             try {
-              sent = await api.sendMessage(item.chatId, text, {}, toGrammySignal(callSignal));
+              sent = await withChatSendOrder(item.chatId, () => api.sendMessage(item.chatId, text, {}, toGrammySignal(callSignal)));
             } catch (error) {
               if ((error instanceof GrammyError && error.error_code < 500) ||
                   (error instanceof HttpError && isProvenPreConnectFailure(error.error))) {
@@ -432,9 +836,9 @@ export async function runTelegram(
         if (sent) await rememberMessage(item.updateId, sent.message_id, preview);
       } else {
         try {
-          const edited = await apiCall(api, "editMessageText", signal, (callSignal) => api.editMessageText(
+          const edited = await apiCall(api, "editMessageText", signal, (callSignal) => withChatSendOrder(item.chatId, () => api.editMessageText(
             item.chatId, current.messageId!, preview, {}, toGrammySignal(callSignal),
-          ), { throttle: outboundThrottle, replaceable: true });
+          )), { throttle: outboundThrottle, replaceable: true });
           if (edited !== undefined) await rememberText(item.updateId, preview);
         } catch (error) {
           if (isNotModified(error)) {
@@ -576,12 +980,16 @@ export async function runTelegram(
     console.warn(`Telegram delivery outcome unknown for update ${item.updateId}; inspect the Durable channel-state record.`);
   }
   // Recover admitted work before polling. Each requestId safely reacquires its existing submission.
+  await recoverScheduled();
+  requestScheduledScan();
+  scheduledTimer = setInterval(requestScheduledScan, SCHEDULED_SCAN_INTERVAL_MS);
   drain();
 
   try {
     while (!signal?.aborted) {
       failedThisPoll.clear();
       drain();
+      requestScheduledScan();
       const updates = await apiCall(api, "getUpdates", signal, (callSignal) => api.getUpdates({
         offset: state.offset,
         timeout: Math.min(options.pollTimeoutSeconds ?? 30, POLL_TIMEOUT_MAX),
@@ -595,13 +1003,23 @@ export async function runTelegram(
           await persistOffset(update.update_id + 1);
           continue;
         }
+        const sessionKey = `telegram:${identity}:chat:${message!.chat.id}`;
+        // Persist authenticated admission evidence before any control or conversation action.
+        const origin = await rememberOrigin(message!.chat.id, String(message!.from!.id));
+        if (origin.evictedChatId !== null) {
+          await reportOutboxFault(
+            `telegram:${identity}:chat:${origin.evictedChatId}`,
+            "origin admission binding evicted at capacity; a fresh admission restores it",
+          );
+          console.warn("Telegram origin admission binding evicted at capacity; a fresh admission restores it.");
+        }
+        if (origin.trusted) await releaseWithheld(sessionKey);
         // Control parsing happens only after allowlist authentication and never for attachments.
         const parsed = parseTelegramInput(message.text ?? "", me.username);
         if (parsed.kind !== "input") {
           await handleControl(update, message, parsed);
           continue;
         }
-        const sessionKey = `telegram:${identity}:chat:${message.chat.id}`;
         const text = message.text !== undefined ? parsed.text : message.caption;
         // Text-only adapter: never imply that an unsupported attachment was read.
         const hasAttachment = ["photo", "document", "audio", "voice", "video", "video_note", "animation", "sticker"]
@@ -633,8 +1051,9 @@ export async function runTelegram(
     if (!signal?.aborted) throw error;
   } finally {
     stopping = true;
+    if (scheduledTimer !== undefined) clearInterval(scheduledTimer);
     scope.cancel(new DOMException("Telegram adapter stopped", "AbortError"));
-    await Promise.allSettled([...active, ...pendingControls]);
+    await Promise.allSettled([...active, ...pendingControls, ...scheduledTasks]);
   }
   if (fatal !== undefined) throw fatal;
 
@@ -847,6 +1266,53 @@ export async function runTelegram(
       return copyJson(doc) as unknown as ChannelState;
     }, adapterContext);
   }
+}
+
+const DELIVERY_STATUSES: ReadonlySet<string> = new Set([
+  "pending", "sending", "unknown", "withheld", "delivered", "failed", "unauthorized",
+]);
+
+function pendingRecordProblem(value: unknown): string | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return "delivery outbox contains an unusable record";
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.id !== "string" || record.id === "") {
+    return "delivery outbox contains an unusable record";
+  }
+  if (typeof record.status !== "string" || !DELIVERY_STATUSES.has(record.status)) {
+    return "delivery record has an invalid status";
+  }
+  if (record.status !== "pending") return undefined;
+  if (typeof record.sessionKey !== "string" || record.sessionKey === "") {
+    return "delivery record has no origin session";
+  }
+  if (typeof record.text !== "string" || record.text.trim() === "") {
+    return "delivery record has no text";
+  }
+  if (!Number.isSafeInteger(record.nextChunkIndex) || (record.nextChunkIndex as number) < 0) {
+    return "delivery record has an invalid chunk cursor";
+  }
+  return undefined;
+}
+
+function outboxFaultMessage(error: unknown): string {
+  return error instanceof CronDeliveryOutboxError
+    ? "delivery outbox is malformed"
+    : "delivery outbox could not be read";
+}
+
+function originBindingOf(
+  origins: Readonly<Record<string, TelegramOriginBinding>> | undefined,
+  chatId: number,
+  botId: string,
+): TelegramOriginBinding | undefined {
+  if (origins === undefined) return undefined;
+  const binding = origins[String(chatId)];
+  if (binding === undefined || binding.botId !== botId || binding.chatType !== "private") return undefined;
+  if (typeof binding.senderId !== "string" || !/^\d+$/.test(binding.senderId)) return undefined;
+  if (!Number.isSafeInteger(binding.admittedAtMs)) return undefined;
+  return binding;
 }
 
 function validateOptions(options: TelegramOptions): void {

@@ -126,6 +126,7 @@ export {
   type CronOwner,
   type CronPrepare,
   type CronPreparation,
+  type CronRunDelivery,
   type CronScheduleInput,
   type CronScheduleReceipt,
   type CronSkip,
@@ -144,6 +145,30 @@ export {
   type CronScheduleRequest,
 } from "./automation/cron-schedule.js";
 export { createCronTool, CRON_TOOL_NAME, type CronTool, type CronToolOptions } from "./automation/cron-tool.js";
+export {
+  CRON_DELIVERIES_KIND,
+  CRON_DELIVERY_FAULTS_KIND,
+  CRON_DELIVERY_MAX_FAULTS,
+  CRON_DELIVERY_MAX_RECORDS,
+  CRON_DELIVERY_MAX_SETTLED,
+  CRON_DELIVERY_MAX_TEXT_CHARS,
+  CronDeliveriesDoc,
+  CronDeliveryFaultsDoc,
+  CronDeliveryOutboxError,
+  admitCronDelivery,
+  copyCronDelivery,
+  latestCronDeliveryFault,
+  pruneCronDeliveries,
+  recordCronDeliveryFault,
+  type CronDeliveriesDocument,
+  type CronDeliveryAdmission,
+  type CronDeliveryFault,
+  type CronDeliveryFaultsDocument,
+  type CronDeliveryOutbox,
+  type CronDeliveryRecord,
+  type CronDeliverySendIntent,
+  type CronDeliveryStatus,
+} from "./automation/cron-delivery.js";
 export {
   createSkillTool,
   SKILL_TOOL_NAME,

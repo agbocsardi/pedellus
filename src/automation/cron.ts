@@ -4,10 +4,12 @@ import { LiveDoc, defineDoc, defineExtension, defineTask } from "@earendil-works
 import type {
   ConversationHandle,
   ConversationId,
+  EntryId,
   Extension,
   Harness,
   NextTaskState,
   Submission,
+  SubmissionRecord,
   Task,
   TaskId,
   TaskInspection,
@@ -22,6 +24,11 @@ import {
   type CronSchedule,
   type CronScheduleRequest,
 } from "./cron-schedule.js";
+import {
+  CronDeliveryFaultsDoc,
+  latestCronDeliveryFault,
+  type CronDeliveryFault,
+} from "./cron-delivery.js";
 
 export const CRON_EXTENSION_NAME = "nanobot.cron";
 /** Entry kind for a scheduled input placed by the cron run. */
@@ -185,6 +192,21 @@ export interface CronFinalization {
   readonly originConversationId: ConversationId;
   readonly targetConversationId: ConversationId;
   readonly background: boolean;
+  /**
+   * Present only for a normal run settlement (success or error); `null` for a rejected, fenced,
+   * superseded or cancelled terminal path. A host may durably record delivery here, in the same
+   * commit as `lastOutcome`, without re-running or re-reading the model.
+   */
+  readonly delivery: CronRunDelivery | null;
+}
+/**
+ * One normal run settlement. `answerEntryId` identifies the committed final assistant entry in the
+ * target conversation, so a channel host can read its text without another model turn.
+ */
+export interface CronRunDelivery {
+  readonly status: "ok" | "error";
+  readonly error: string | null;
+  readonly answerEntryId: EntryId | null;
 }
 /**
  * Optional durable finalization of one run's target, in the same commit that records the run's
@@ -246,6 +268,8 @@ export interface CronJobView {
   readonly timer: CronTaskSummary | null;
   readonly execution: CronTaskSummary | null;
   readonly target: CronTargetSummary | null;
+  /** Newest durable delivery fault for this job, sanitized; `null` when none is recorded. */
+  readonly deliveryFault: CronDeliveryFault | null;
 }
 
 export interface CronFoundationOptions {
@@ -390,19 +414,17 @@ const zeroInput: CronOccurrenceInput = { jobId: "", scheduledAtMs: 0, generation
 interface WaitSettlement {
   readonly status: "ok" | "error";
   readonly error: string | null;
+  readonly answerEntryId: EntryId | null;
 }
-interface SettlementRecord {
-  readonly status: string;
-  readonly reason?: unknown;
-  readonly detail?: unknown;
-}
-function outcomeOf(record: SettlementRecord): WaitSettlement {
-  if (record.status === "done") return { status: "ok", error: null };
+function outcomeOf(record: SubmissionRecord): WaitSettlement {
+  if (record.status === "done" && record.type === "input") {
+    return { status: "ok", error: null, answerEntryId: record.answer };
+  }
   if (record.status === "unanswered" && typeof record.reason === "string") {
     const detail = record.detail === undefined ? "" : `: ${JSON.stringify(record.detail)}`;
-    return { status: "error", error: `${record.reason}${detail}` };
+    return { status: "error", error: `${record.reason}${detail}`, answerEntryId: null };
   }
-  return { status: "error", error: "submission settled without an answer" };
+  return { status: "error", error: "submission settled without an answer", answerEntryId: null };
 }
 
 /**
@@ -434,7 +456,11 @@ async function waitForAnswer(
     // A later unrelated input must not place and run this occurrence after it was recorded failed.
     try { await submission.abort(context); } catch { /* it may have been placed first */ }
   }
-  return { status: "error", error: `run ended before answering (submission is ${record.status})` };
+  return {
+    status: "error",
+    error: `run ended before answering (submission is ${record.status})`,
+    answerEntryId: null,
+  };
 }
 
 const TERMINAL_TASK: ReadonlySet<CronTaskStatus> = new Set([
@@ -506,6 +532,13 @@ async function viewsOf(
   const jobs = doc.jobs.filter((job) => sameOwner(job.owner, caller));
   if (jobs.length === 0) return [];
   const live = new Map((await harness.inspect(context)).tasks.map((task) => [Number(task.record.id), task]));
+  // Delivery faults are derived diagnostics; a corrupt fault document must not hide the job list.
+  let deliveryFaults: unknown;
+  try {
+    deliveryFaults = await harness.snapshot(CronDeliveryFaultsDoc, conversationId, context);
+  } catch {
+    deliveryFaults = undefined;
+  }
   return Promise.all(jobs.map(async (job) => {
     const timerRecord = job.timerTaskId === null
       ? undefined
@@ -545,6 +578,7 @@ async function viewsOf(
       timer,
       execution,
       target,
+      deliveryFault: latestCronDeliveryFault(deliveryFaults, job.id),
     };
   }));
 }
@@ -566,11 +600,12 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
     targetConversationId: ConversationId,
     job: CronJob | null,
     occurrence: CronOccurrenceInput,
+    delivery: CronRunDelivery | null,
     context: Context,
   ): Promise<void> => {
     if (finalize === undefined || targetConversationId === originConversationId) return;
     await finalize({
-      tx, job, occurrence, originConversationId, targetConversationId, background: true,
+      tx, job, occurrence, originConversationId, targetConversationId, background: true, delivery,
     }, context);
   };
 
@@ -589,7 +624,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
               const preparedTarget = running.state.checkpoint.targetConversationId;
               if (preparedTarget !== null) {
                 await retireTarget(
-                  tx, running.conversationId, preparedTarget, null, zeroInput, context,
+                  tx, running.conversationId, preparedTarget, null, zeroInput, null, context,
                 );
               }
               return terminalFailed<CronRunCheckpoint, CronRunResult>(
@@ -677,7 +712,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
               const preparedTarget = targetConversationId;
               await runtime.commit(async (tx) => {
                 await retireTarget(
-                  tx, running.conversationId, preparedTarget, null, input, context,
+                  tx, running.conversationId, preparedTarget, null, input, null, context,
                 );
                 return rejected;
               }, context);
@@ -688,7 +723,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           if (prepareError !== null || job === undefined || targetConversationId === null) {
             await finishRun(
               runtime, running.conversationId, running.id, input,
-              { status: "error", error: prepareError ?? "execution could not be prepared" },
+              { status: "error", error: prepareError ?? "execution could not be prepared", answerEntryId: null },
               targetConversationId ?? running.conversationId, context,
             );
             return;
@@ -698,7 +733,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           if (conversation === undefined) {
             await finishRun(
               runtime, running.conversationId, running.id, input,
-              { status: "error", error: "target conversation is missing" },
+              { status: "error", error: "target conversation is missing", answerEntryId: null },
               targetConversationId, context,
             );
             return;
@@ -724,7 +759,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
             settlement = await waitForAnswer(submission, conversation, context);
           } catch (error) {
             if (runtime.signal.aborted) return;
-            settlement = { status: "error", error: errorText(error) };
+            settlement = { status: "error", error: errorText(error), answerEntryId: null };
           }
           if (runtime.signal.aborted) return;
           await finishRun(
@@ -747,7 +782,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
             const job = doc.jobs.find((candidate) => candidate.id === parsed?.jobId);
             await retireTarget(
               tx, running.conversationId, targetConversationId,
-              job === undefined ? null : copyJob(job), parsed ?? zeroInput, context,
+              job === undefined ? null : copyJob(job), parsed ?? zeroInput, null, context,
             );
           }
           return terminalAborted<CronRunCheckpoint, CronRunResult>(
@@ -881,7 +916,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       const doc = await tx.doc(CronJobsDoc, conversationId);
       const job = doc.jobs.find((candidate) => candidate.id === input.jobId);
       if (job === undefined) {
-        await retireTarget(tx, conversationId, targetConversationId, null, input, context);
+        await retireTarget(tx, conversationId, targetConversationId, null, input, null, context);
         return terminalFailed<CronRunCheckpoint, CronRunResult>(
           runResult(input, "missing", "cron job record is missing"), "cron job record is missing",
         );
@@ -889,19 +924,19 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       // The run records only its result. It never computes or creates a schedule. A fenced-out run
       // still retires its already-prepared target in this same commit.
       if (job.generation !== input.generation) {
-        await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, context);
+        await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, null, context);
         return terminalAborted<CronRunCheckpoint, CronRunResult>(
           runResult(input, "superseded", "job generation changed"), "superseded",
         );
       }
       if (job.cancelledAtMs !== null) {
-        await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, context);
+        await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, null, context);
         return terminalAborted<CronRunCheckpoint, CronRunResult>(
           runResult(input, "cancelled", "cancelled before the run finished"), "cancelled",
         );
       }
       if (job.executionTaskId !== taskId) {
-        await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, context);
+        await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, null, context);
         return terminalAborted<CronRunCheckpoint, CronRunResult>(
           runResult(input, "superseded", "job is owned by another execution"), "superseded",
         );
@@ -915,7 +950,11 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       };
       // The run's authority ends with the run, in this same terminal commit. The origin-mode target
       // is the origin conversation itself and is deliberately left alone.
-      await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, context);
+      await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, {
+        status: settlement.status,
+        error: settlement.error,
+        answerEntryId: settlement.answerEntryId,
+      }, context);
       return terminalCompleted<CronRunCheckpoint, CronRunResult>(
         runResult(input, settlement.status === "ok" ? "ok" : "error", settlement.error),
       );

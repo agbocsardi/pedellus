@@ -1,13 +1,24 @@
 import { processLock } from "@earendil-works/chord/node";
-import type { Context } from "@earendil-works/chord";
+import type { Context, Draft } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
-import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
-import { AgentDoc, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type ModelRef, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
+import { AgentDoc, AssistantEntry, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type ModelRef, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ContextExtensionReplacement, type ConversationContextSnapshot } from "./context/index.js";
 import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./context/skill-tool.js";
 import { CRON_RUN_TASK_NAME, createCronFoundation } from "./automation/cron.js";
 import { createCronTool, CRON_TOOL_NAME } from "./automation/cron-tool.js";
+import {
+  CRON_DELIVERY_MAX_TEXT_CHARS,
+  CronDeliveriesDoc,
+  CronDeliveryFaultsDoc,
+  CronDeliveryOutboxError,
+  admitCronDelivery,
+  copyCronDelivery,
+  recordCronDeliveryFault,
+  type CronDeliveryOutbox,
+  type CronDeliveryRecord,
+} from "./automation/cron-delivery.js";
 import {
   HISTORY_INDEX_LIMITS,
   createHistoryIndex,
@@ -169,6 +180,11 @@ export interface HistoryEntryPage {
 
 export interface Gateway {
   readonly harness: HarnessType;
+  /**
+   * Channel-neutral durable outbox of completed background cron results. Host/channel code uses it
+   * after its own authentication; it creates no conversation, starts no run and adds no authority.
+   */
+  readonly cronOutbox: CronDeliveryOutbox;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
   /** Lists the explicit allowlist and persisted selection for an already-known session key. */
   listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
@@ -397,6 +413,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // needs no filesystem authority.
   const cronConfig = config.cron;
   const cronEnabled = cronConfig?.enabled === true;
+  // A completed background result is queued only for an origin session that belongs to a channel
+  // enabled in this configuration. A disabled channel creates no record, so no later enable can
+  // deliver a stale result through a channel the host had switched off.
+  const cronDeliveryPrefixes: readonly string[] = config.telegram === undefined ? [] : ["telegram:"];
   // Fail at startup, not at the first tool call, when the default cannot be represented by the host shell.
   const toolTimeoutSeconds = parseToolTimeoutSeconds(config.toolTimeoutSeconds);
   const allowedModels = config.allowedModels ?? [config.model];
@@ -636,10 +656,54 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // offering its tools in the same commit that records the terminal outcome, so a finished or
         // cancelled run cannot be used for a later admission. The origin link is kept: any
         // re-created grant document for that target still has to satisfy the hook's origin check.
-        finalize: async ({ tx, originConversationId, targetConversationId }) => {
+        finalize: async ({ tx, job, occurrence, originConversationId, targetConversationId, delivery }) => {
           if (targetConversationId === originConversationId) return;
           await tx.retireDoc(ToolGrantDoc, targetConversationId);
           await configure(tx, targetConversationId, { tools: [], modelTools: [] });
+          // Queue the successful final text in the same commit as the terminal run outcome. A failed,
+          // cancelled or superseded run, and an empty answer, is silence: `lastOutcome` remains the
+          // actionable failure record and nothing is sent externally.
+          if (delivery === null || delivery.status !== "ok" || delivery.answerEntryId === null) return;
+          if (job === null || !isChatSessionKey(job.owner.sessionKey)) return;
+          if (!cronDeliveryPrefixes.some((prefix) => job.owner.sessionKey.startsWith(prefix))) return;
+          const answer = await tx.entry(AssistantEntry, delivery.answerEntryId);
+          const message = answer?.model?.[0] as AssistantMessage | undefined;
+          const text = (message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "").trim();
+          if (text === "") return;
+          const bounded = text.length > CRON_DELIVERY_MAX_TEXT_CHARS
+            ? `${text.slice(0, CRON_DELIVERY_MAX_TEXT_CHARS - 16)}\n\n[truncated]`
+            : text;
+          // A corrupt outbox must never fault the run's terminal commit. Invalid data is left as
+          // stored; a full outbox records an actionable fault rather than implying lossless delivery.
+          let admission: "admitted" | "duplicate" | "full" | "invalid" = "invalid";
+          try {
+            const records = await tx.doc(CronDeliveriesDoc, originConversationId);
+            admission = admitCronDelivery(records, {
+              id: `cron:${job.id}:${occurrence.scheduledAtMs}`,
+              sessionKey: job.owner.sessionKey,
+              text: bounded,
+              createdAtMs: now(),
+              status: "pending",
+              nextChunkIndex: 0,
+            });
+          } catch {
+            admission = "invalid";
+          }
+          if (admission === "full" || admission === "invalid") {
+            try {
+              const faults = await tx.doc(CronDeliveryFaultsDoc, originConversationId);
+              recordCronDeliveryFault(faults, {
+                jobId: job.id,
+                scheduledAtMs: occurrence.scheduledAtMs,
+                recordedAtMs: now(),
+                message: admission === "full"
+                  ? "delivery outbox is full; result was not queued"
+                  : "delivery outbox is malformed; result was not queued",
+              });
+            } catch {
+              // This diagnostic is derived state; it must not fault the cron run itself.
+            }
+          }
         },
       })
     : undefined;
@@ -1223,8 +1287,51 @@ export async function openGateway(config: PortConfig, context: Context, options:
       } while (cursor !== undefined);
     }, context);
 
+    // Host/channel view of the durable cron result outbox. Every access resolves an existing
+    // mapped chat session; no conversation is created and no transcript is exposed.
+    const cronOutbox: CronDeliveryOutbox = {
+      sessions: (ctx) => mappedChatSessions(ctx),
+      async list(sessionKey, ctx) {
+        const conversationId = await chatConversationIdFor(sessionKey, ctx);
+        const doc = await harness!.snapshot(CronDeliveriesDoc, conversationId, ctx);
+        if (doc === undefined) return [];
+        const value: unknown = doc.deliveries;
+        if (!Array.isArray(value)) throw new CronDeliveryOutboxError("delivery outbox is malformed");
+        return value as readonly CronDeliveryRecord[];
+      },
+      async update(sessionKey, id, change, ctx) {
+        const conversationId = await chatConversationIdFor(sessionKey, ctx);
+        return root.commit(async (tx) => {
+          const doc = await tx.doc(CronDeliveriesDoc, conversationId);
+          const value: unknown = doc.deliveries;
+          if (!Array.isArray(value)) throw new CronDeliveryOutboxError("delivery outbox is malformed");
+          const record = value.find((entry) =>
+            entry !== null && typeof entry === "object" && (entry as { id?: unknown }).id === id);
+          if (record === undefined) return undefined;
+          change(record as Draft<CronDeliveryRecord>);
+          return copyCronDelivery(record as Draft<CronDeliveryRecord>);
+        }, ctx);
+      },
+      async recordFault(sessionKey, message, ctx) {
+        const conversationId = await chatConversationIdFor(sessionKey, ctx);
+        try {
+          await root.commit(async (tx) => {
+            const doc = await tx.doc(CronDeliveryFaultsDoc, conversationId);
+            recordCronDeliveryFault(doc, {
+              jobId: null,
+              scheduledAtMs: null,
+              recordedAtMs: now(),
+              message,
+            });
+          }, ctx);
+        } catch {
+          // A best-effort diagnostic must not make the channel scan fail repeatedly.
+        }
+      },
+    };
     const gateway: Gateway = {
       harness,
+      cronOutbox,
       async conversationFor(sessionKey, ctx) {
         const key = encodedSessionKey(sessionKey);
         let conversationId: ConversationId | undefined;
