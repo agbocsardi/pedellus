@@ -86,7 +86,26 @@ export {
   type StoreIdentity,
 } from "./history/store-identity.js";
 export {
+  HISTORY_INDEX_FORMAT,
+  HISTORY_INDEX_LIMITS,
+  HISTORY_INDEX_SCHEMA_VERSION,
+  createHistoryIndex,
+  historyIndexPath,
+  type HistoryCoverage,
+  type HistoryCursor,
+  type HistoryHit,
+  type HistoryIndex,
+  type HistoryIndexOptions,
+  type HistoryPage,
+  type HistoryQuery,
+  type HistoryRole,
+  type HistoryScope,
+  type HistorySession,
+  type HistorySyncReport,
+} from "./history/index.js";
+export {
   CRON_EXTENSION_NAME,
+  CRON_INPUT_ENTRY_KIND,
   CRON_JOBS_KIND,
   CRON_RUN_TASK_NAME,
   CRON_TIMER_TASK_NAME,

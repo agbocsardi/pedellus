@@ -8,6 +8,14 @@ import { CONTEXT_LIMITS, createContextExtensionBuilder, type ContextExtensionRep
 import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./context/skill-tool.js";
 import { CRON_RUN_TASK_NAME, createCronFoundation } from "./automation/cron.js";
 import { createCronTool, CRON_TOOL_NAME } from "./automation/cron-tool.js";
+import {
+  HISTORY_INDEX_LIMITS,
+  createHistoryIndex,
+  historyIndexPath,
+  type HistoryPage,
+  type HistoryQuery,
+  type HistorySession,
+} from "./history/index.js";
 import type { CronOwner } from "./automation/cron.js";
 import {
   createEpisodeCatalog,
@@ -126,6 +134,27 @@ export interface Gateway {
    */
   reconcileHistoryEpisodes(sessionKey: string, context: Context): Promise<EpisodeReconcileReport>;
   /**
+   * Search the rebuildable SQLite index over Durable-retained entries.
+   *
+   * Durable is the canonical transcript. This method never mutates it, accepts no conversation ID, and
+   * reads only the mapped chat sessions supplied by the host. The host is the authorization boundary:
+   * call it only from trusted host code after its own channel authentication, and do not expose the
+   * results (which include session keys) directly to an untrusted model or channel.
+   *
+   * Default scope is user/assistant message text, optionally filtered by role. `tools` searches tool
+   * names, arguments and result text only; `all` combines both. Thinking, system prompts, reset
+   * handoffs and compaction summaries are never in these scopes. State-only conversations and
+   * task-owned background runs are excluded. Tool hits expose records, never execution authority.
+   *
+   * Each call reconciles a bounded slice of new Durable entries before querying. `coverage` reports
+   * index lag rather than silently omitting it: a large backlog is visible and continues on the next
+   * call. Pages are ordered newest-first by Durable entry ID and resume with a query-bound cursor;
+   * entries appended after the first page stay out of that continuation, and a rebuilt index or a
+   * replaced source store at the same path rejects the cursor. The derived index may be deleted at
+   * any time and is rebuilt from Durable.
+   */
+  historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage>;
+  /**
    * Re-runs the configured context snapshot provider for one existing session and applies it to the
    * next turn. Rejects an unknown session, a live run, or a gateway opened without a provider.
    * Prompt content stays metadata-only and no tool grant is added or widened.
@@ -174,6 +203,37 @@ function modelKey(model: ModelReference | ModelRef): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+const CHANNEL_STATE_SESSION_SUFFIX = ":channel-state";
+
+interface MappedSession {
+  readonly sessionKey: string;
+  readonly conversationId: ConversationId;
+}
+
+/** Channel adapters use their state conversation for bookkeeping, never chat history. */
+function isChatSessionKey(sessionKey: string): boolean {
+  return !sessionKey.endsWith(CHANNEL_STATE_SESSION_SUFFIX);
+}
+
+function parseSessionMap(sessions: unknown, rootId: ConversationId): MappedSession[] {
+  if (!isRecord(sessions)) throw new Error("Stored session map is malformed");
+  const mapped: MappedSession[] = [];
+  const conversationIds = new Set<ConversationId>();
+  for (const [encodedKey, rawId] of Object.entries(sessions)) {
+    const sessionKey = decodedSessionKey(encodedKey);
+    if (!Number.isSafeInteger(rawId) || (rawId as number) < 1 || rawId === rootId) {
+      throw new Error("Stored session map contains an invalid conversation ID");
+    }
+    const conversationId = rawId as ConversationId;
+    if (conversationIds.has(conversationId)) {
+      throw new Error("Stored session map maps multiple session keys to one conversation");
+    }
+    conversationIds.add(conversationId);
+    mapped.push({ sessionKey, conversationId });
+  }
+  return mapped;
 }
 
 /** A live cron run's background target, recovered from its durable checkpoint. */
@@ -571,6 +631,37 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // durable summary status. It reads committed entries only and changes no reset or busy
     // ordering; a closed episode is recorded as pending, and nothing schedules a summary yet.
     episodeCatalog = createEpisodeCatalog({ harness: harness!, sessions: mappedChatSessions, context });
+
+    // Derived, rebuildable search index. Its file is separate from Durable's store, and every Durable
+    // read goes through `root.commit` without a write. A missing index is rebuilt from retained entries.
+    const historySessions = async (ctx: Context): Promise<readonly HistorySession[]> => {
+      const mapping = await harnessRef.current!.snapshot(SessionMap, root.id, ctx);
+      if (mapping === undefined) return [];
+      const chatSessions = parseSessionMap(mapping.sessions, root.id).filter(({ sessionKey }) => isChatSessionKey(sessionKey));
+      if (chatSessions.length > HISTORY_INDEX_LIMITS.maxMappedSessions) {
+        throw new Error(
+          `History search supports at most ${HISTORY_INDEX_LIMITS.maxMappedSessions} mapped chat sessions; ` +
+          `${chatSessions.length} are present`,
+        );
+      }
+      // A mapped chat session is ownerless and unforked. Fail loudly rather than silently indexing a
+      // task-owned background transcript or an inherited fork under a chat session's name.
+      await root.commit(async (tx) => {
+        for (const { conversationId } of chatSessions) {
+          const conversation = await tx.conversation(conversationId);
+          if (conversation === undefined) throw new Error("Stored session mapping points to a missing conversation");
+          if (conversation.owner !== undefined) throw new Error("Stored session mapping points to a task-owned conversation");
+          if (conversation.parent !== undefined) throw new Error("Stored session mapping points to a forked conversation");
+        }
+      }, ctx);
+      return chatSessions;
+    };
+    const historyIndex = createHistoryIndex({
+      indexPath: historyIndexPath(dbPath),
+      sourcePath: dbPath,
+      sessions: historySessions,
+      scan: (ctx, read) => root.commit(read, ctx),
+    });
 
     // At the snapshot cap, drop the oldest installed background target that is not running and not a
     // mapped session. Without an evictable target the builder's RangeError stays the last resort.
@@ -990,6 +1081,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
         const conversationId = await chatConversationIdFor(sessionKey, ctx);
         return episodeCatalog!.reconcile(conversationId, ctx);
       },
+      historySearch(query, ctx) {
+        return historyIndex.search(query, ctx);
+      },
       async refreshContext(sessionKey, ctx) {
         if (!options.contextSnapshotProvider) {
           throw new Error("Context refresh requires a configured contextSnapshotProvider");
@@ -1031,8 +1125,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
         episodeCatalog?.close();
         try { await harness!.close(cleanup); }
         finally {
-          try { await toolEnvironments?.close(cleanup); }
-          finally { await releaseLock(); }
+          try { await historyIndex.close(); }
+          finally {
+            try { await toolEnvironments?.close(cleanup); }
+            finally { await releaseLock(); }
+          }
         }
       },
     };

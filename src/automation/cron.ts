@@ -24,6 +24,8 @@ import {
 } from "./cron-schedule.js";
 
 export const CRON_EXTENSION_NAME = "nanobot.cron";
+/** Entry kind for a scheduled input placed by the cron run. */
+export const CRON_INPUT_ENTRY_KIND = "nanobot.cron";
 export const CRON_TIMER_TASK_NAME = "nanobot.cron.timer";
 export const CRON_RUN_TASK_NAME = "nanobot.cron.run";
 export const CRON_JOBS_KIND = "nanobot.cron.jobs";
@@ -710,7 +712,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
               content: job.message,
               requestId,
               entry: {
-                kind: "nanobot.cron",
+                kind: CRON_INPUT_ENTRY_KIND,
                 data: {
                   jobId: input.jobId,
                   scheduledAtMs: input.scheduledAtMs,

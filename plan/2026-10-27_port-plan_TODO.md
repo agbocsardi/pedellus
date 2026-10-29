@@ -85,6 +85,8 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
 - [x] Store identity, reset-delimited episode boundaries and durable pending-summary state (2026-10-29; foundation only, no summary pass).
 - [ ] Implement read-only transcript retrieval and rebuildable message/tool and episode-summary indexes.
 - [ ] Generate episode summaries: claim `pending` episodes by deterministic job identity, bounded long-episode coverage, persisted retry/backoff.
+- [x] Implement the rebuildable message/tool full-text index and committed reset boundaries (2026-10-29; first bounded slice, see `HISTORY.md`).
+- [ ] Implement the episode summary index and episode catalog with durable post-reset summaries, retry and reconciliation.
 - [ ] Expose history browsing/search through memory tooling and accepted channel interfaces.
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
 - [ ] Complete requested channels individually after core acceptance.
@@ -334,7 +336,7 @@ and an early fact crosses native compaction into a fresh process via a faux summ
 Remaining acceptance: curated builtin compatibility and real-model use of memory,
 skills and compaction. No claim of full Python memory/search/usage parity.
 
-#### Agreed history design — 2026-10-29 (not implemented)
+#### Agreed history design — 2026-10-29 (first message/tool slice implemented)
 
 **Authority and terminology.** Durable's Session is the storage/runtime container;
 a Conversation is a persistent transcript. Our Telegram adapter maps each bot + chat
@@ -480,6 +482,15 @@ later slices. There is also no durable enumeration of pending summaries: episode
 documents are not scanned by this module, so a future summary pass needs its own
 work queue or an index over `pending` episodes, and nothing schedules one today.
 The store identity document itself is frozen and never updated.
+
+**First bounded slice — 2026-10-29.** `src/history/index.ts` implements the
+message/tool FTS5 index, committed reset boundaries, bounded incremental
+reconciliation, source/store identity and query-bound stable pagination behind
+`Gateway.historySearch`. It does not implement episode summaries or summary search.
+The index is a separate rebuildable file and never writes Durable; lag, coverage and
+body caps are visible. See `HISTORY.md` for the interface, authorization boundary,
+receipts and remaining limits. This is not acceptance of the parked scan candidate
+`worker-history-read-252d9447`; no code from it was reused.
 
 ### W4 — acceptance suite
 
@@ -666,6 +677,18 @@ an offline-committed reset, background and startup catch-up, idempotent writes a
 scope exclusion; `typecheck`, 155 behaviour checks, 9 execution checks and core
 acceptance still pass. Known gaps: no dates, titles, summary generation, retry or
 search yet.
+
+### 2026-10-29 — first message/tool history index slice
+
+Added a rebuildable SQLite FTS5 index over Durable-retained user/assistant messages,
+tool names/arguments/results and committed reset boundaries, exposed as
+`Gateway.historySearch` (no UI, no episode summaries, no candidate reuse). The index
+lives in a separate `<db>-history.sqlite` file, reconciles bounded forward from
+persisted entry fingerprints and progress, reports lag/coverage and rejects stale or
+replaced-store cursors. Offline synthetic probes covered scopes, role filters, reset
+boundaries, pagination under appends, source replacement, explicit lag, reopen and a
+real faux-provider Gateway. Typecheck, 155 behavior, 9 execution and 88 offline
+acceptance checks passed. Episode catalog/summary work and summary search remain open.
 
 ### 2026-10-29 — history design agreement; implementation remains paused
 
