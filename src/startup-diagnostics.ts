@@ -13,10 +13,10 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
   configInvalid:
     "invalid configuration; check required fields and documented value formats (diagnostic details suppressed)",
   provider:
-    "invalid provider configuration; check allowedModels and the supported aliases in PROVIDERS.md " +
+    "invalid provider configuration; check allowedModels and the supported provider aliases in PROVIDERS.md " +
     "(diagnostic details suppressed)",
   credential:
-    "provider credential is missing or misconfigured; set the environment variable named by credentials.<provider> " +
+    "provider credential is missing or misconfigured; set the environment variable named by credentials.<alias> " +
     "(diagnostic details suppressed)",
   model:
     "configured model or thinking level is unavailable; compare model/allowedModels with the pinned provider catalog " +
@@ -30,6 +30,12 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
 } as const);
 
 export type StartupDiagnosticCode = keyof typeof STARTUP_DIAGNOSTICS;
+
+function knownStartupDiagnosticCode(code: unknown): StartupDiagnosticCode {
+  return typeof code === "string" && Object.hasOwn(STARTUP_DIAGNOSTICS, code)
+    ? code as StartupDiagnosticCode
+    : "unexpected";
+}
 
 export interface StartupDiagnosticOptions {
   /** Underlying error retained for SDK callers; never printed by the CLI. */
@@ -47,16 +53,20 @@ export class StartupDiagnosticError extends Error {
   readonly code: StartupDiagnosticCode;
 
   constructor(code: StartupDiagnosticCode, options: StartupDiagnosticOptions = {}) {
+    const safeCode = knownStartupDiagnosticCode(code);
     super(
-      options.detail ?? STARTUP_DIAGNOSTICS[code],
+      safeCode === "unexpected" ? STARTUP_DIAGNOSTICS[safeCode] : options.detail ?? STARTUP_DIAGNOSTICS[safeCode],
       options.cause === undefined ? undefined : { cause: options.cause },
     );
-    this.code = code;
+    this.code = safeCode;
   }
 }
 
 /** Format a startup failure for the CLI using only fixed diagnostic text. */
 export function startupDiagnostic(error: unknown): string {
-  const code: StartupDiagnosticCode = error instanceof StartupDiagnosticError ? error.code : "unexpected";
-  return `nanobot: ${STARTUP_DIAGNOSTICS[code]}`;
+  const code = error instanceof StartupDiagnosticError
+    ? knownStartupDiagnosticCode(error.code)
+    : "unexpected";
+  // Usage text already names the executable; avoid a `nanobot: Usage: nanobot` prefix.
+  return code === "usage" ? STARTUP_DIAGNOSTICS.usage : `nanobot: ${STARTUP_DIAGNOSTICS[code]}`;
 }

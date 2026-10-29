@@ -1,6 +1,11 @@
 export { loadConfig, parseConfig, type CredentialProvider, type PortConfig, type WorkspaceSkillsConfig } from "./config.js";
 export { createProviderModels } from "./providers.js";
 export {
+  StartupDiagnosticError,
+  type StartupDiagnosticCode,
+  type StartupDiagnosticOptions,
+} from "./startup-diagnostics.js";
+export {
   ARCHIVAL_PREPARATION_FORMAT,
   ARCHIVAL_PREPARATION_VERSION,
   ARCHIVAL_PREPARATION_LIMITS,

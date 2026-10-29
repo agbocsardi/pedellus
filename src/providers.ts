@@ -82,7 +82,7 @@ export function createProviderModels(
     const selection = PROVIDER_ALIASES.get(configured.provider);
     if (!selection) {
       throw new StartupDiagnosticError("provider", {
-        detail: "Unsupported provider; see packages/pi-nanobot/PROVIDERS.md",
+        detail: "Unsupported provider; see PROVIDERS.md",
       });
     }
     const previous = aliases.get(selection.providerId);

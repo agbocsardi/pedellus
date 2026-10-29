@@ -25,12 +25,17 @@ formatting controls are removed; ordinary newlines and Unicode scalar values are
 The CLI fails closed with exit status 1. Known configuration and startup failures
 print one fixed, value-free message: unreadable/invalid configuration, invalid
 configuration fields, unsupported provider aliases, unavailable models or
-thinking levels, missing credential references, a missing Telegram token
+thinking levels, missing credential alias references, a missing Telegram token
 environment variable, and workspace/data-directory preparation failures. These messages
 never include configuration values, environment values, filesystem paths,
 provider/dependency error text or the underlying exception. Unexpected failures
 keep the generic `nanobot: command failed; diagnostic details suppressed`
-message. Recovery usage errors keep their dedicated `nanobot recovery:` text.
+message.
+
+Recovery operation errors keep their dedicated `nanobot recovery:` text and
+remain governed by recovery's existing disclosure contract, not this startup
+policy. This section does not broaden or change that behavior. Configuration
+loading for a recovery invocation still uses the fixed startup messages above.
 
 ## Recovery
 
