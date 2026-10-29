@@ -31,8 +31,9 @@ npm start -- --config config.json   # local CLI against a config file
 - `src/execution/` — guarded host environment and the optional Bubblewrap shell.
 - `src/context/` — bootstrap/memory/skills snapshots, skill tool, workspace host.
 - `src/history/` — durable store identity, reset-delimited episode catalog with
-  durable pending-summary state, and the rebuildable message/tool search index that
-  `Gateway.historySearch` exposes. Boundaries come from committed resets; no summary
+  durable pending-summary state, the rebuildable message/tool search index that
+  `Gateway.historySearch` exposes, and the read-only model-facing `history` tool.
+  Boundaries come from committed resets; no summary
   task, summary search or history UI lives here yet.
 - `src/channels/` — Telegram adapter; other channels are not ported.
 - `plan/` — dated roadmap, spike history and the current plan. The port plan is
@@ -41,10 +42,10 @@ npm start -- --config config.json   # local CLI against a config file
 ## Invariants worth not breaking
 
 - Coding tools are default-deny per conversation: a host ceiling plus explicit,
-  expiring grants, rechecked at call time and pruned before resume. The `skill`
-  tool and the `cron` tool are ungated because they grant no filesystem or shell
-  authority; cron jobs inherit the origin conversation's grants and never widen
-  them.
+  expiring grants, rechecked at call time and pruned before resume. The `skill`,
+  `cron` and `history` tools are ungated because they grant no filesystem or shell
+  authority: `history` is read-only over mapped chats and installed by default,
+  while cron jobs inherit the origin conversation's grants and never widen them.
 - The cron timer never calls a model, and a run never schedules: rescheduling is
   a deterministic task commit, so a slow or failed turn cannot stop the schedule.
 - Skill prompts carry names, descriptions and locators only; bodies load on

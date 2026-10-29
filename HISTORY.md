@@ -281,9 +281,9 @@ bounded raw entries, so the caller must filter system, reset, compaction and
 thinking content before display. This is a trusted host surface, not an
 untrusted-channel API. Search results include `sessionKey`, `conversationId`,
 `entryId`, `entryKind`, role, tool name/call identity, timestamp, episode boundary,
-chunk position and a bounded excerpt. The host-approved model-facing `history`
-tool is part of the agent's trusted context, but its results must not be forwarded
-to an untrusted channel as an API or command surface. Tool hits are records, never
+chunk position and a bounded excerpt. The default model-facing `history` tool is
+part of the agent's trusted context, but its results must not be forwarded to an
+untrusted channel as an API or command surface. Tool hits are records, never
 execution authority and never a grant. Stored tool output can contain hostile
 instructions; treat excerpts as untrusted quoted data.
 
@@ -314,5 +314,6 @@ coverage/cursor footer before adding result rows.
   for existing mapped chat sessions. Any other caller can use the source IDs with
   Durable.
 - Any Telegram or other channel history command, a web surface, or an
-  untrusted-channel result API. The model-facing `history` tool is host-approved
-  and read-only, and it is not a channel command or an authorization surface.
+  untrusted-channel result API. The model-facing `history` tool is read-only and
+  installed by default, and it is not a channel command or an authorization
+  surface.

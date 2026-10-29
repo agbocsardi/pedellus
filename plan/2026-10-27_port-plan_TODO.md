@@ -490,7 +490,7 @@ Landing the durable half of W3 without model calls, tasks or scheduling:
 Known gaps, deliberately not claimed: episodes carry no wall-clock dates
 (Durable entries have no timestamp; only entry IDs order them), no titles, and no
 summary text. Summaries, retry/backoff, long-episode coverage bounds and summary
-search are later slices. Message/tool search, CLI browsing and a host-approved
+search are later slices. Message/tool search, CLI browsing and a default
 agent-facing `history` tool now exist; there is no Telegram/web command surface.
 There is also no durable enumeration of pending summaries: episode
 documents are not scanned by this module, so a future summary pass needs its own
@@ -504,8 +504,8 @@ behind `Gateway.historySearch`. The slice is wired: `openGateway` resolves the
 committed `nanobot.store-identity` with `ensureStoreIdentity` and binds the index
 to that `storeId`, so the method is available on every Gateway and there is no
 caller-injected identity option. It does not implement episode summaries or
-summary search. The local CLI browses these reads and the CLI/Telegram host can
-opt into the read-only agent-facing `history` tool; no Telegram or web command
+summary search. The local CLI browses these reads and the read-only agent-facing
+`history` tool is installed by default for mapped chats; no Telegram or web command
 surface exists. The
 index is a separate `0600` rebuildable file and never writes Durable; long text is
 chunked and lag, coverage and omitted chunks are visible. Identity is copied with
