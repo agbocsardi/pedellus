@@ -117,7 +117,7 @@ test('config mode runs read and history in a mapped chat while other scopes get 
   }
 });
 
-test('config reopen drops narrowed coding tools and legacy grant documents cannot resurrect them', { timeout: 10_000 }, async () => {
+test('config reopen follows the configured ceiling, not the legacy granted state', { timeout: 10_000 }, async () => {
   const store = await workspaceStore('reopen');
   const key = 'telegram:7:chat:601';
   let gateway;
@@ -126,20 +126,27 @@ test('config reopen drops narrowed coding tools and legacy grant documents canno
     await gateway.conversationFor(key, context);
     const granted = await gateway.grantTools(key, [
       { name: 'read', expiresAt: Date.now() + 3_600_000 },
-      { name: 'bash', expiresAt: Date.now() + 3_600_000 },
     ], context);
-    assert.deepEqual(granted.map((grant) => grant.name).sort(), ['bash', 'read']);
+    assert.deepEqual(granted.map((grant) => grant.name), ['read']);
+    await gateway.close(context);
+    gateway = undefined;
+
+    // Config authority, not the grant document: bash was never granted, yet the configured ceiling
+    // offers it. A fallback to grants would show only read here.
+    gateway = await openGateway(store.config(['read', 'bash']), context, { models: syntheticModels().models, toolAuthorization: 'config' });
+    const configured = await gateway.conversationFor(key, context);
+    assert.deepEqual(codingNames(await configured.agent(context)), ['bash', 'read']);
+    assert.deepEqual(await gateway.listToolGrants(key, context), []);
+    await assert.rejects(
+      gateway.grantTools(key, [{ name: 'bash', expiresAt: Date.now() + 60_000 }], context),
+      /authorized by configuration/,
+    );
     await gateway.close(context);
     gateway = undefined;
 
     gateway = await openGateway(store.config(['read']), context, { models: syntheticModels().models, toolAuthorization: 'config' });
     const narrowed = await gateway.conversationFor(key, context);
     assert.deepEqual(codingNames(await narrowed.agent(context)), ['read']);
-    assert.deepEqual(await gateway.listToolGrants(key, context), []);
-    await assert.rejects(
-      gateway.grantTools(key, [{ name: 'bash', expiresAt: Date.now() + 60_000 }], context),
-      /authorized by configuration/,
-    );
     await gateway.close(context);
     gateway = undefined;
 
@@ -153,7 +160,7 @@ test('config reopen drops narrowed coding tools and legacy grant documents canno
   }
 });
 
-test('captured config authority is bounded by the current ceiling and a validated chat origin', async () => {
+test('captured config authority is bounded by the current ceiling and a validated chat origin', { timeout: 5_000 }, async () => {
   const chatId = 11;
   const rawId = 12;
   const hook = createConfigToolHook(['read', 'bash'], (id) => id === chatId, ['history']);
