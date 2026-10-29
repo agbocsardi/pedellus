@@ -94,6 +94,9 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
 - [x] Expose message/tool search and episode/entry browsing in the local CLI.
 - [x] Expose history search and source-entry opening through a default read-only agent-facing tool for
       mapped chats (`agentHistory: false` opts out). Telegram/web command surfaces remain unimplemented.
+- [x] Expose source-scoped reset-delimited episode listing and bounded episode drilldown through the
+      default agent-facing `history` tool (2026-10-29; search remains the cross-source discovery path;
+      no generated titles or summary text, and no cross-source episode pagination).
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
 - [ ] Complete requested channels individually after core acceptance.
 - [ ] Agree the next bounded implementation scope with the owner; no automatic restart.
@@ -117,7 +120,7 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 | Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool; curated port builtins in `skills` (memory, memory-defrag, skill-creator, github, cron) behind an explicit `builtinSkillsRoot` | `my` has no port runtime; no inventory-count cap, but finite prompt/output bounds visibly truncate |
 | Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
 | Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling; a background run gets the origin's workspace context and `skill` tool; copied grants are bounded by current origin grants | No channel delivery or silence policy; disabling cron leaves persisted timers blocked; a run whose snapshot was evicted at the cap proceeds without context; a phase fault or crash before the terminal commit can retain bounded grants until reopen |
-| History | Durable store identity, reset-delimited episode reads and a rebuildable message/tool search index; CLI `/search`, `/episodes`, `/episode`, `/entry`; default read-only model-facing `history` tool (host can disable) | No episode summaries, titles or summary search; no Telegram/web browsing command; a clone or restored backup keeps the same identity, so stale rows are caught only by per-conversation entry anchors |
+| History | Durable store identity, reset-delimited episode reads and a rebuildable message/tool search index; CLI `/search`, `/episodes`, `/episode`, `/entry`; default read-only model-facing `history` tool with search/open plus source-scoped episode listing and bounded episode drilldown (host can disable) | No episode summaries, titles or summary search; no cross-source episode listing/pagination; no Telegram/web browsing command; a clone or restored backup keeps the same identity, so stale rows are caught only by per-conversation entry anchors |
 | Telegram | Restricted allowlisted inbound/reply adapter with streaming, durable send intent, unknown-send quarantine | Existing adapter only; scheduled outbound candidate is unmerged; no general pairing or media parity |
 | Code Mode / delegation | Reviewed opt-in QuickJS Code Mode/tool-search SDK | Not Gateway-installed; no product background-subagent or worker interface |
 | Other surfaces | Read-only usage and inert archival helpers exist | Discord candidates parked; Email/WebSocket, MCP, web/media tools not integrated |
@@ -539,8 +542,9 @@ committed `nanobot.store-identity` with `ensureStoreIdentity` and binds the inde
 to that `storeId`, so the method is available on every Gateway and there is no
 caller-injected identity option. It does not implement episode summaries or
 summary search. The local CLI browses these reads and the read-only agent-facing
-`history` tool is installed by default for mapped chats; no Telegram or web command
-surface exists. The
+`history` tool is installed by default for mapped chats, including source-scoped
+episode listing and bounded episode drilldown; no Telegram or web command surface
+exists. The
 index is a separate `0600` rebuildable file and never writes Durable; long text is
 chunked and lag, coverage and omitted chunks are visible. Identity is copied with
 the store file, so a clone or restored backup keeps the same `storeId`; detection
@@ -697,6 +701,30 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-29 — agent-facing episode listing and drilldown
+
+Extended the default read-only `history` tool with `episodes` and `episode` actions
+over the existing `Gateway.listHistoryEpisodes`, `Gateway.historyEpisode` and
+`Gateway.historyEntries` methods. `episodes` lists reset-delimited boundaries for
+one exact source label, newest first, with durable `before` continuation from
+`next.before`; `episode` opens one start boundary and its first bounded window of
+displayable message/tool entries. No new Gateway scope or cross-conversation
+pagination was invented: `search` remains the discovery path because its hits
+already carry session labels and episode starts, while episode listing stays
+source-scoped and claims no total count. Both actions share the mapped-chat,
+ownerless/unforked validator; state-only, unknown, task-owned and unmapped sources
+remain rejected. Output quotes and sanitizes entry text, hides reset handoff/system/
+compaction/thinking/image-only content, respects the 48 KiB UTF-8 bound, and reports
+partial scans, omitted entries, open episodes and `unknown` summary state honestly.
+No titles or generated summaries are fabricated, and summary status is metadata only.
+Offline faux-provider probes covered reset boundaries and recorded `pending`
+summary state, per-source pagination and rejected arbitrary bounds, state-only/
+unknown source rejection, search discovery with state-only exclusion, pre-reset and
+post-reset drilldown, Gateway reopen stability, the runtime-installed tool,
+injection-like U+2028 text and multibyte bounds. Typecheck, build and the existing
+behaviour, execution and core acceptance commands pass; no permanent test, live
+provider, network, credentials or personal data was used.
 
 ### 2026-10-29 — authorized implementation batch: recall reliability and Telegram controls
 

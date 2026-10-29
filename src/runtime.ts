@@ -1207,6 +1207,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     historyToolHostRef.current = historyTool === undefined ? undefined : {
       search: (query, ctx) => gateway.historySearch(query, ctx),
       entries: (sessionKey, query, limit, cursor, ctx) => gateway.historyEntries(sessionKey, query, limit, cursor, ctx),
+      listEpisodes: (sessionKey, query, ctx) => gateway.listHistoryEpisodes(sessionKey, query, ctx),
+      episode: (sessionKey, startEntryId, ctx) => gateway.historyEpisode(sessionKey, startEntryId, ctx),
     };
     harness.resume();
     return gateway;

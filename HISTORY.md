@@ -9,8 +9,9 @@ summaries and summary search are not implemented. The local CLI exposes bounded
 search, episode listing and entry windows over these reads; see
 [CLI history search and browsing](./CLI.md#history-search-and-browsing). The
 same Gateway offers a read-only model-facing `history` tool to mapped chat
-conversations by default; the assistant can search and open prior discussion
-without a separate CLI session. See [Agent-facing tool](#agent-facing-history-tool).
+conversations by default; the assistant can search, open prior discussion, and
+browse reset-delimited episodes without a separate CLI session. See
+[Agent-facing tool](#agent-facing-history-tool).
 
 ## Authority, identity and storage
 
@@ -238,8 +239,9 @@ gateway can pass `agentHistory: false`; the local CLI/Telegram path uses the
 default. The tool reads only conversations already mapped by the host, so channel
 authentication and the single-tenant session policy still decide what exists.
 
-The tool calls the same `Gateway.historySearch` and `Gateway.historyEntries`
-surface as trusted host code. It has two actions:
+The tool calls the same `Gateway.historySearch`, `Gateway.historyEntries`,
+`Gateway.listHistoryEpisodes` and `Gateway.historyEpisode` surface as trusted host
+code. It has four actions:
 
 - `search` (default): user and assistant message text across every mapped chat
   conversation. `scope: "tools"` searches tool names, arguments and result text
@@ -250,6 +252,19 @@ surface as trusted host code. It has two actions:
   exact `session` source label and `entryId` from a search hit. The default
   message scope omits tool calls/results; `scope: "tools"` or `"all"` includes
   them only when asked.
+- `episodes`: reset-delimited episodes for one source, newest first, with entry
+  bounds, open/closed state, entry/message/tool-result counts, reset boundary and
+  recorded summary status only. `before` must be the exact `next.before` entry ID
+  from the previous page. Listing is source-scoped because no host API enumerates
+  mapped conversations for a cross-source episode page; `search` is the discovery
+  path across mapped chats, and every search hit carries its session label and
+  episode start. No total episode count and no cross-source ordering are claimed.
+- `episode`: one episode by its start entry ID, plus the first bounded window of
+  its displayable message/tool entries. It reads the episode range through
+  `Gateway.historyEntries` in ascending pages, hides reset handoff, system,
+  compaction, thinking and image-only content by the same rules as `open`, and
+  lets `scope` select messages, tools or both. A later passage is reached through
+  `search` and `open`; this action has no continuation cursor.
 
 Output is explicit about provenance and limits: each hit names its source session,
 entry, role, kind, episode start and tool/call identity; each opened entry is
@@ -263,10 +278,12 @@ mandatory coverage/cursor footer reserved before rows are admitted, and
 pagination says whether a fresh search is required for later entries.
 
 This is not summary search: episode summaries and titles do not exist yet, so the
-tool says so and searches only raw message/tool records. Tool hits are records,
+tool says so and searches only raw message/tool records. Episode listing reports
+only the catalog's recorded summary status, and episode drilldown returns quoted
+original entries as evidence rather than generated prose. Tool hits are records,
 never execution authority or a grant. The tool exposes no raw conversation ID and
-accepts no conversation ID; `open` resolves its session source through the same
-mapped-chat validator as every other history read.
+accepts no conversation ID; `open`, `episodes` and `episode` resolve their session
+source through the same mapped-chat validator as every other history read.
 
 ## Authorization boundary
 
@@ -297,7 +314,8 @@ mapped sessions), 5 entries per scan,
 pending entries counted. Long records can produce more than one hit, one per
 matched chunk. `HISTORY_TOOL_LIMITS` additionally bounds the model-facing tool: 8
 hits by default (20 maximum), radius 2 by default (5 maximum), 1,200 characters per
-opened entry, 400 per excerpt, and 48 KiB of rendered UTF-8 bytes per result. Quoted
+opened entry, 400 per excerpt, 50 raw entries per episode page and 200 scanned
+entries per episode drilldown, and 48 KiB of rendered UTF-8 bytes per result. Quoted
 fields escape U+2028 and U+2029, and the output byte budget reserves the mandatory
 coverage/cursor footer before adding result rows.
 
@@ -310,9 +328,13 @@ coverage/cursor footer before adding result rows.
   stays stable while FTS corpus statistics change.
 - Fetching surrounding entries by hit through a summary or excerpt API; the local
   CLI's `/entry` and `/episode` windows and the agent-facing `history` tool's
-  `open` action use `Gateway.historyEntries`, which returns bounded raw entry pages
-  for existing mapped chat sessions. Any other caller can use the source IDs with
-  Durable.
+  `open` and `episode` actions use `Gateway.historyEntries`, which returns bounded
+  raw entry pages for existing mapped chat sessions. Any other caller can use the
+  source IDs with Durable.
+- Cross-conversation episode enumeration or pagination. `history` lists episodes
+  for one exact source label and discovers sources/episode starts through search
+  hits; it does not merge episode pages from several conversations or claim a
+  total count.
 - Any Telegram or other channel history command, a web surface, or an
   untrusted-channel result API. The model-facing `history` tool is read-only and
   installed by default, and it is not a channel command or an authorization
