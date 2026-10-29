@@ -2,8 +2,8 @@
 
 Date: 2026-10-26. Branch: `feat/pi-durable-rebuild`.
 Status: **historical roadmap/evidence; implementation is partial, not production-ready**.
-The [current plan and consolidation snapshot](2026-10-27_port-plan_TODO.md) govern
-scope, status and stop rules. Native coding tools/grants and opt-in memory/skills
+The [assistant tree plan](../2026-10-29_assistant-tree_TODO.md) governs current
+scope and work order; the [v2 plan](2026-10-27_port-plan_TODO.md) is also historical. Native coding tools/grants and opt-in memory/skills
 are now integrated; the old tool-less-slice description is historical. The
 [spike checklist](2026-10-26_pi-durable-rebuild_TODO.md) and
 [package design](DESIGN.md) retain earlier rationale.

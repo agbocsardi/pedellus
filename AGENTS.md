@@ -30,14 +30,13 @@ npm start -- --config config.json   # local CLI against a config file
 - `src/automation/` — cron timer/run tasks and the model-facing `cron` tool.
 - `src/execution/` — guarded host environment and the optional Bubblewrap shell.
 - `src/context/` — bootstrap/memory/skills snapshots, skill tool, workspace host.
-- `src/history/` — durable store identity, reset-delimited episode catalog with
-  durable pending-summary state, the rebuildable message/tool search index that
-  `Gateway.historySearch` exposes, and the read-only model-facing `history` tool.
-  Boundaries come from committed resets; no summary
-  task, summary search or history UI lives here yet.
+- `src/history/` — durable store identity, reset-delimited episodes, background
+  summaries, rebuildable message/tool/summary search, and the read-only
+  model-facing `history` tool. Original transcript entries remain authoritative.
 - `src/channels/` — Telegram adapter; other channels are not ported.
-- `plan/` — dated roadmap, spike history and the current plan. The port plan is
-  the scope/status authority; older plans are evidence, not a work queue.
+- `2026-10-29_assistant-tree_TODO.md` — current scope and work-order authority:
+  CLI + Telegram trunk, then tools, delegation and more channels.
+- `plan/` — historical roadmaps and implementation evidence, not a work queue.
 
 ## Invariants worth not breaking
 

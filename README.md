@@ -2,8 +2,8 @@
 
 TypeScript port requiring Node >=22.19 and the pinned Pi 1.4.0 packages. This is not a production-ready replacement for the Python fork.
 
-The [current plan and consolidation snapshot](plan/2026-10-27_port-plan_TODO.md)
-are the scope/status authority. Core coding tools, durable grants, optional bwrap
+The [assistant tree plan](2026-10-29_assistant-tree_TODO.md) is the current scope
+and work-order authority: CLI + Telegram first, then tools, delegation and channels. Core coding tools, durable grants, optional bwrap
 shell, opt-in memory/skills and compaction plumbing are integrated. Agent-callable
 cron scheduling and isolated Telegram delivery are available. WebUI, migration and cutover are
 deferred. The [older roadmap](plan/2026-10-26_full-port_TODO.md) preserves evidence,
