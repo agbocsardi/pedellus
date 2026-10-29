@@ -16,10 +16,18 @@ import {
   type HistoryPage,
   type HistoryQuery,
   type HistorySession,
+  type HistorySummaryPage,
+  type HistorySummaryQuery,
 } from "./history/index.js";
+import {
+  normalizeReadySummary,
+  readEpisodeDocument,
+  type HistorySummaryView,
+} from "./history/summary-view.js";
 import { createHistoryTool, type HistoryToolHost } from "./history/tool.js";
 import type { CronOwner } from "./automation/cron.js";
 import {
+  EpisodeDoc,
   createEpisodeCatalog,
   type EpisodeCatalog,
   type EpisodeReconcileReport,
@@ -35,7 +43,11 @@ import {
   type EpisodeSummaryQueueView,
   type EpisodeSummaryRetry,
 } from "./history/summary-task.js";
-import { EPISODE_SUMMARY_QUEUE_LIMITS } from "./history/summary-queue.js";
+import {
+  EPISODE_SUMMARY_QUEUE_LIMITS,
+  EpisodeSummaryDoc,
+  episodeSummaryKey,
+} from "./history/summary-queue.js";
 import type { EpisodeSummaryRecord } from "./history/summary-queue.js";
 import {
   chatScopeMessage,
@@ -265,6 +277,33 @@ export interface Gateway {
    * cursor. The derived index may be deleted at any time and is rebuilt from Durable.
    */
   historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage>;
+  /**
+   * Discover ready derived episode summaries across mapped chat conversations.
+   *
+   * This is navigation over already-generated summaries: it never plans, queues, retries or backfills
+   * a summary, never calls a model, and never writes Durable. The same bounded episode reconciliation
+   * as `historySearch` runs first, then a bounded slice of stored summary records is re-read. Only a
+   * `ready` record whose episode boundary, summarizer version and text agree is searchable; a missing,
+   * failed or corrupt summary removes at most its own derived row and cannot block raw search.
+   *
+   * Summary text is model output over untrusted stored conversation. Treat it as derived, quoted
+   * navigation; original Durable entries remain the authority and are reached with `historyEpisode`
+   * or `historyEntries`. Pages are newest-first by episode start entry ID with a query-, mapping-,
+   * generation- and snapshot-bound cursor; summaries written after a page are excluded from that
+   * continuation.
+   */
+  historySummarySearch(query: HistorySummaryQuery, context: Context): Promise<HistorySummaryPage>;
+  /**
+   * Read one episode's stored summary by its exact start entry ID through the same validated mapped-chat
+   * session scope as every other history read.
+   *
+   * Unlike `historyEpisodeSummary`, this read does not require the summary pass to be enabled for this
+   * open: it reads the derived catalog/summary documents directly and never calls a model. It returns a
+   * classified view (`ready`, `not-ready`, `missing`, `malformed`, `unreadable`) instead of throwing for
+   * stored state, so a corrupt summary never blocks transcript retrieval. Ready text is model output over
+   * untrusted stored conversation: quote it and treat the original entries as the authority.
+   */
+  historySummary(sessionKey: string, startEntryId: number, context: Context): Promise<HistorySummaryView>;
   /**
    * Re-runs the configured context snapshot provider for one existing session and applies it to the
    * next turn. Rejects an unknown session, a live run, or a gateway opened without a provider.
@@ -806,6 +845,43 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ...(episodeSummaries === undefined ? {} : { summaryJobs: { enqueue: episodeSummaries.enqueue } }),
     });
 
+    // Read-only view of one derived episode summary. The catalog's episode document is the authority
+    // for the closed boundary and the authoritative summarizer version; the version-keyed summary
+    // record supplies the text. Both are read as untrusted JSON through public document snapshots,
+    // and a missing, malformed or unreadable record is classified instead of thrown, so summary
+    // discovery can never block raw transcript search. This reads derived docs only: no model call,
+    // no summary job, no Durable write.
+    async function readEpisodeSummary(
+      conversationId: ConversationId,
+      startEntryId: EntryId,
+      ctx: Context,
+    ): Promise<HistorySummaryView> {
+      let episode: unknown;
+      try {
+        episode = await harness!.snapshot(EpisodeDoc, conversationId, String(startEntryId), ctx);
+      } catch {
+        return { state: "unreadable" };
+      }
+      const classified = readEpisodeDocument(episode, startEntryId);
+      if (classified.kind !== "ready") {
+        return classified.kind === "not-ready"
+          ? { state: "not-ready", status: classified.status }
+          : { state: classified.kind };
+      }
+      let record: unknown;
+      try {
+        record = await harness!.snapshot(
+          EpisodeSummaryDoc,
+          conversationId,
+          episodeSummaryKey(startEntryId, classified.version),
+          ctx,
+        );
+      } catch {
+        return { state: "unreadable" };
+      }
+      return normalizeReadySummary(classified.body, record, classified.version);
+    }
+
     // Derived, rebuildable search index. Its file is separate from Durable's store, and every Durable
     // read goes through `root.commit` without a write. A missing index is rebuilt from retained entries.
     // It is bound to this store's committed identity, so a replaced store file clears every derived row.
@@ -829,6 +905,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
       storeId: storeIdentity.storeId,
       sessions: historySessions,
       scan: (ctx, read) => root.commit(read, ctx),
+      readSummary: (ctx, conversationId, startEntryId) =>
+        readEpisodeSummary(conversationId, startEntryId, ctx),
     });
 
     // At the snapshot cap, drop the oldest installed background target that is not running and not a
@@ -1302,6 +1380,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
       async historySearch(query, ctx) {
         return historyIndex!.search(query, ctx);
       },
+      async historySummarySearch(query, ctx) {
+        return historyIndex!.searchSummaries(query, ctx);
+      },
+      async historySummary(sessionKey, startEntryId, ctx) {
+        if (!Number.isSafeInteger(startEntryId) || startEntryId < 1) {
+          throw new TypeError("Episode start must be a positive entry ID");
+        }
+        const conversationId = await chatConversationIdFor(sessionKey, ctx);
+        return readEpisodeSummary(conversationId, startEntryId as EntryId, ctx);
+      },
       async historyEntries(sessionKey, query, limit, cursor, ctx) {
         if (typeof sessionKey !== "string" || sessionKey.length === 0) {
           throw new TypeError("History entry session key must be a non-empty string");
@@ -1445,6 +1533,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // Scheduling begins only after registry and all persisted conversation policies are ready.
     historyToolHostRef.current = historyTool === undefined ? undefined : {
       search: (query, ctx) => gateway.historySearch(query, ctx),
+      summaries: (query, ctx) => gateway.historySummarySearch(query, ctx),
+      summary: (sessionKey, startEntryId, ctx) => gateway.historySummary(sessionKey, startEntryId, ctx),
       entries: (sessionKey, query, limit, cursor, ctx) => gateway.historyEntries(sessionKey, query, limit, cursor, ctx),
       listEpisodes: (sessionKey, query, ctx) => gateway.listHistoryEpisodes(sessionKey, query, ctx),
       episode: (sessionKey, startEntryId, ctx) => gateway.historyEpisode(sessionKey, startEntryId, ctx),

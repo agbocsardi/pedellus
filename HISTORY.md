@@ -3,10 +3,13 @@
 Two derived layers sit over Durable's retained transcript:
 
 - `src/history/summary-task.ts` is an opt-in host-configured durable background summary pass.
-- `src/history/index.ts` is a rebuildable message/tool index bound to the committed store identity.
+- `src/history/index.ts` is a rebuildable message/tool and episode-summary index bound to the
+  committed store identity.
 
-The default agent-facing `history` tool searches and browses episodes and original entries;
-summary text is not indexed or exposed by that tool. CLI diagnostics are described in
+The default agent-facing `history` tool searches raw messages/tools, browses episodes and original
+entries, discovers ready derived summaries across mapped chats, and reads one summary with
+provenance and drilldown. Summary text is derived navigation; original entries remain the evidence.
+CLI diagnostics are described in
 [CLI history search and browsing](./CLI.md#history-search-and-browsing).
 
 ## Authority, identity and storage
@@ -235,9 +238,9 @@ gateway can pass `agentHistory: false`; the local CLI/Telegram path uses the
 default. The tool reads only conversations already mapped by the host, so channel
 authentication and the single-tenant session policy still decide what exists.
 
-The tool calls the same `Gateway.historySearch`, `Gateway.historyEntries`,
-`Gateway.listHistoryEpisodes` and `Gateway.historyEpisode` surface as trusted host
-code. It has four actions:
+The tool calls the same `Gateway.historySearch`, `Gateway.historySummarySearch`,
+`Gateway.historySummary`, `Gateway.historyEntries`, `Gateway.listHistoryEpisodes` and
+`Gateway.historyEpisode` surface as trusted host code. It has six actions:
 
 - `search` (default): user and assistant message text across every mapped chat
   conversation. `scope: "tools"` searches tool names, arguments and result text
@@ -263,6 +266,17 @@ code. It has four actions:
   entry read at call time; when the result remains open, it says so, and entries
   appended or a reset placed after that snapshot are excluded. A later passage is reached through
   `search` and `open`; this action has no continuation cursor.
+- `summaries`: cross-source topic discovery over the rebuildable summary index. It searches
+  `ready` summary titles and bodies only (empty text browses newest), pages 1-20 hits with an
+  opaque snapshot-bound cursor, and reports refresh coverage, lag and clamped text. It never
+  generates, queues, retries or backfills a summary; pending, failed and corrupt summaries are
+  absent and counted, not synthesized, and raw search is unaffected.
+- `summary`: one summary by the exact `session` source label and episode-start `entryId`, read
+  live from the stored derived documents (not from the index) with provenance: source, episode
+  bounds, reset boundary, summarizer version, completion time, coverage of the recorded range and
+  clamped-text notice. It then names the drilldown: `episode` for the first bounded window of
+  original entries, and `search`+`open` for later passages or exact wording. A missing, pending,
+  failed, malformed or unreadable summary is stated explicitly and never blocks the drilldown.
 
 Output is explicit about provenance and limits: each hit names its source session,
 entry, role, kind, episode start and tool/call identity; each opened entry is
@@ -279,13 +293,109 @@ rows culled by the byte bound are counted in both that line and the omission
 notice. A limit reached inside a raw page reports the unexamined rows and whether
 more raw pages remain instead of claiming the episode was exhausted.
 
-This is not summary search: episode summaries and titles do not exist yet, so the
-tool says so and searches only raw message/tool records. Episode listing reports
-only the catalog's recorded summary status, and episode drilldown returns quoted
-original entries as evidence rather than generated prose. Tool hits are records,
-never execution authority or a grant. The tool exposes no raw conversation ID and
-accepts no conversation ID; `open`, `episodes` and `episode` resolve their session
-source through the same mapped-chat validator as every other history read.
+Summary text is model output over untrusted stored conversation, so it is quoted and framed as
+derived navigation, not evidence. Episode listing reports only the catalog's recorded summary
+status; episode drilldown returns quoted original entries as evidence rather than generated prose.
+Tool hits are records, never execution authority or a grant. The tool exposes no raw conversation
+ID and accepts no conversation ID; `open`, `episodes`, `episode` and `summary` resolve their session
+source through the same mapped-chat validator as every other history read. `scope: "tools"` remains
+an explicit opt-in for raw tool records and is rejected for summary discovery, whose scope is fixed
+to ready summary text.
+
+## Summary discovery index
+
+The summary index lives in the same rebuildable SQLite file as the message/tool index
+(`history_summaries`, an FTS5 table over title and body, and `history_summary_sweep`), so it shares
+one store identity, one generation, one serialized connection and one delete-and-rebuild lifecycle.
+It adds no second connection to Durable and writes no Durable document. The summary read goes through
+public document snapshots only: no model request, no summary job, no retry/backfill and no
+catalog/episode/transcript write. Store-identity replacement, conversation anchor mismatch and
+conversation clearing delete the affected summary rows, and a `schema_version` bump drops and
+rebuilds all derived tables. Message/tool tables are created and migrated independently from the
+summary tables: if summary table creation or any later summary read/index step fails, this open
+reports the summary index as unavailable and raw message/tool search keeps working. The next open
+retries the summary schema.
+
+**Readiness is decided from stored documents, not from the index.** The runtime reads the
+catalog's `nanobot.episode` document (authoritative closed boundary, lifecycle status and
+summarizer version) and the version-keyed `nanobot.episode-summary` record through public
+`Harness.snapshot` reads. `src/history/summary-view.ts` normalizes both as untrusted JSON. Only a
+`ready` record whose start, end, reset boundary and version agree with the episode document and
+whose text is non-empty is exposed; `open`, `pending`, `failed`, missing, malformed and unreadable
+states are classified instead of thrown. This read works whether or not the summary pass is enabled
+for this open, and it never calls a model, queues a job, retries or backfills. The `summary` tool
+action uses the same read directly, so it always shows current stored text, while the index rows
+are navigation only.
+
+**Bounded refresh.** `Gateway.historySummarySearch` first runs the same bounded message/tool
+reconciliation as raw search, so episode boundaries are current, then re-reads a bounded slice of
+summary state only for conversations with indexed message records. Refreshing happens on a summary
+search, not on every raw message search, so raw retrieval cost and semantics are unchanged. Both
+passes write only the derived file: message reconciliation commits indexed documents/progress within
+its documented 500-entry/8 MiB/1.5 s pass, and the summary sweep commits summary rows and its cursor
+within 64 reads/1.5 s. Neither pass writes Durable, appends an entry, changes a grant, creates a task
+or invokes the episode catalog; a catalog that has not recorded a boundary simply leaves that episode
+reported as missing.
+
+The per-conversation slice reserves part of every multi-read quota for older episodes instead of
+spending it all on the newest few: up to half of a session's quota (at most the newest four, at
+least one when any quota remains) is newest, and the rest continues a durable older round-robin cursor. With a
+one-read quota, each conversation alternates between its newest page and its
+older cursor, so a one-read source still indexes every episode instead of
+re-reading only the newest. One pass reads at most 64 summaries across mapped
+chats and stops at 1.5 s. Sessions are
+processed in conversation-ID order from a durable cross-session rotation cursor, so when there are
+more sessions than the read budget, later sessions get a turn on the next pass instead of being
+starved indefinitely. A `13 sessions x 4 closed episodes` history therefore re-reads all 52
+episodes in one pass and can report `complete`; `13 x 12` reaches every episode across passes but
+never claims per-pass completeness; `65 x 1` reaches sessions beyond the first 64 on later passes
+while honestly reporting partial per-pass coverage.
+
+A summary whose record is no longer ready loses its row and is counted. An unreadable document also
+loses its row and is counted, because a retained row could present stale summary text as current;
+the next successful read re-adds it. A summary search never fails because one stored summary is bad.
+`coverage` reports known closed episodes (excluding each conversation's open episode), distinct
+episodes re-read in this pass, ready/not-ready/missing/malformed/unreadable counts, removed stale
+rows, clamped text, omitted rows, sessions swept and pending. `complete` is per-pass and
+conservative: it requires caught-up episode reconciliation, every known closed episode re-read in
+this pass, no partially checked source, no malformed/unreadable records, no clamped text and no
+omitted rows. A bounded sweep that re-reads only part of the history can never claim `complete`, and
+its no-hit result says absence is not proven. A summary written inside a bounded fold can exceed the
+8,000-character stored cap only through a hand-edited or legacy record; indexing clamps it to 20,000
+code units and 32 KiB of UTF-8 (title 500 code units and 1 KiB), with an explicit flag, and the
+whole-index body budget is 64 MiB. A new row beyond that budget is not stored; a **replacement** that no longer
+fits removes the previous row instead of leaving its text in place as if current. The omission (and
+removal, if any) is counted for that pass (`summariesOmitted`, `summariesRemoved`) and the full
+budget is reported as `indexFull` with `indexBytes`, so it is never silent. The byte counter is
+recomputed from stored rows when the summary schema is created or repaired, so a stale counter
+cannot make an empty content table look full. A rebuild starts from empty and can admit the same
+history again.
+
+**Integrity.** Before every summary page, the summary schema object types and columns (content
+table, FTS table, all three triggers, sweep table) are checked, and FTS5 `integrity-check` compares
+the index with the content table. A deleted FTS table/trigger, a wrong-shaped sweep table, or a
+logical FTS mismatch triggers repair: the FTS/triggers are recreated, the index is rebuilt from
+stored content, and the byte counter is recomputed. A wrongly shaped content table is dropped and
+recreated empty so later bounded sweeps can repopulate it. If repair fails, or any summary SQL error
+escapes, the summary index is reported `indexReady: false` and `complete: false` and raw
+message/tool search continues normally. Repair keeps a valid content table, so stored summary rows
+are preserved when only the FTS layer or sweep state is missing. The integrity check runs on demand,
+not on raw search, and is bounded by the 64 MiB summary-index budget.
+
+**Snapshot pagination.** Summary pages are newest-first by episode start entry ID then conversation
+ID. The opaque cursor binds the normalized query, schema generation (which rotates on store-identity
+replacement), the mapped conversation-ID hash, a captured `summary_id` watermark, the number of rows
+at or below that watermark, and the last row's start entry, conversation and content fingerprint.
+Every content change is a delete+insert, never an in-place update, so a row at or below the watermark
+cannot be rewritten in place: the snapshot row count changes if any snapshot member is deleted or
+replaced, and the cursor is rejected with an explicit "snapshot changed" error instead of silently
+omitting older matching summaries. A changed boundary row, query or mapping, a rebuilt index or a
+replaced store rejects the cursor the same way. Newly indexed rows after the first page receive a higher
+`summary_id`; they are excluded from that continuation and reported as `summariesAfterSnapshot` with
+`snapshotCurrent: false`, so a partial page never implies those newer summaries do not exist.
+Replacing or removing any row that belongs to the snapshot changes the snapshot row count and
+rejects the cursor rather than silently omitting it from the continuation. A fresh summary search is
+required for a current view.
 
 ## Scope validation (shared rule)
 
@@ -333,12 +443,26 @@ entry, 256 mapped chat sessions (context snapshots have a separate cap over all
 mapped sessions), 5 entries per scan,
 1M tool-argument units, 500 entries / 8 MiB / 1.5 s per reconciliation pass, and 100
 pending entries counted. Long records can produce more than one hit, one per
-matched chunk. `HISTORY_TOOL_LIMITS` additionally bounds the model-facing tool: 8
-hits by default (20 maximum), radius 2 by default (5 maximum), 1,200 characters per
-opened entry, 400 per excerpt, 50 raw entries per episode page and 200 scanned
-entries per episode drilldown, and 48 KiB of rendered UTF-8 bytes per result. Quoted
-fields escape U+2028 and U+2029, and the output byte budget reserves the mandatory
-coverage/cursor footer before adding result rows.
+matched chunk. `HISTORY_SUMMARY_LIMITS` bounds summary discovery: 500 query
+characters and 16 terms (the same FTS tokenizer), 8 hits by default (20 maximum),
+400-character browse excerpts, 20,000 code units and 32 KiB of UTF-8 per summary
+body, 500 code units and 1 KiB per title (the summary pass itself stores at most
+8,000 and 120), up to half of each session's quota reserved for the newest
+episodes (at most four) and the rest for the older round-robin, at most eight
+episodes per source per pass, a durable cross-session rotation cursor, a 64 MiB
+whole-index body budget with reported omissions and `indexFull`/`indexBytes`,
+the newest four episodes per source plus at most eight per source per pass, 64
+summary reads across mapped chats per pass, and 1.5 s. `HISTORY_TOOL_LIMITS` additionally bounds the
+model-facing tool: 8 hits by default (20 maximum), radius 2 by default (5 maximum),
+1,200 characters per opened entry, 400 per excerpt, 200 per summary title, 4,000 per
+summary body, 50 raw entries per episode page and 200 scanned entries per episode
+drilldown, and 48 KiB of rendered UTF-8 bytes per result. Quoted fields escape
+U+2028 and U+2029, and the output byte budget reserves the mandatory
+coverage/cursor footer before adding result rows. Tool errors for summary reads and searches are
+fixed text: stored-record failures are classified, and host paths, provider text and exception
+messages are never rendered into the tool result. Index size is bounded by the per-body/title byte
+clamps and the whole-index budget, so a derived summary file cannot grow through one hand-edited
+record; the number of rows still grows with the number of episodes, like the message/tool index.
 
 ## Episode summaries
 
@@ -529,7 +653,12 @@ session key, and the summary text is model output over untrusted source.
   privately. The CLI usage view therefore excludes summarization.
 - An attempt that was in flight and is settled as interrupted is counted, not priced: its token and
   cost contribution is unknown by definition, so `usage` is a lower bound on spend.
-- No summary search or summary index, no CLI/channel surface, no title/date index.
+- Summary discovery is bounded and on-demand: it refreshes only on a summary search, and with many
+  episodes a newly ready summary can take several searches to appear. There is no readiness
+  notification, no background summary-index refresh, no CLI/channel summary surface and no date
+  index; dates are unavailable because Durable entries have none.
+- A summary refers to the derived record's stored text; there is no re-summarize operation, so a
+  ready summary is not replaced after a summarizer version bump.
 - A ready episode is never re-summarized, at any summarizer version. Replacing a ready summary after a
   version bump would need an explicit re-summarize operation, which does not exist yet.
 - The opt-in watermark means history is summarized only through an explicit backfill; the episode
@@ -544,8 +673,10 @@ session key, and the summary text is model output over untrusted source.
 
 ## Not implemented
 
-- Episode-summary indexing or agent-facing summary search (summaries are stored per episode).
-- Background indexing independent of a search; reconciliation happens on demand.
+- Background indexing independent of a search; message reconciliation and the summary sweep both
+  happen on demand, and summary rows refresh only on a summary search.
+- Summary ranking beyond recency: summary pages are newest-first by episode start, with no relevance
+  score or cross-source date ordering.
 - Relevance ranking: results are deterministic recency order so keyset pagination
   stays stable while FTS corpus statistics change.
 - Fetching surrounding entries by hit through a summary or excerpt API; the local
@@ -555,8 +686,8 @@ session key, and the summary text is model output over untrusted source.
   source IDs with Durable.
 - Cross-conversation episode enumeration or pagination. `history` lists episodes
   for one exact source label and discovers sources/episode starts through search
-  hits; it does not merge episode pages from several conversations or claim a
-  total count.
+  or summary hits; it does not merge episode pages from several conversations or
+  claim a total count.
 - Any Telegram or other channel history command, a web surface, or an
   untrusted-channel result API. The model-facing `history` tool is read-only and
   installed by default, and it is not a channel command or an authorization

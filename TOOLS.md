@@ -60,11 +60,13 @@ described below; Code Mode is not part of this slice.
   by default. The local CLI/Telegram path uses that default; a host can pass
   `agentHistory: false` for a bare gateway. The tool can search prior
   user/assistant message text across those mapped chats, explicitly opt into tool
-  names/arguments/results, and open a bounded window around a source entry. It is
-  not in the coding-tool ceiling, cannot be granted or revoked, accepts no path or
-  shell command, modifies no transcript and creates no conversation. Its output is
-  bounded, source-labeled, and quoted as untrusted historical data. Episode
-  summaries are not searchable. See
+  names/arguments/results, list episodes, and open a bounded window around a source
+  entry. It can also discover ready derived episode summaries (`summaries`) and read
+  one summary with provenance and drilldown (`summary`), but it never generates or
+  backfills a summary, and original entries remain the evidence. It is not in the
+  coding-tool ceiling, cannot be granted or revoked, accepts no path or shell
+  command, modifies no transcript and creates no conversation. Its output is
+  bounded, source-labeled, and quoted as untrusted historical data. See
   [`HISTORY.md`](./HISTORY.md#agent-facing-history-tool).
 
 ## Per-conversation grants

@@ -86,7 +86,10 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
 - [x] Implement rebuildable message/tool search over the read-only transcript, with committed reset boundaries (2026-10-29; no episode-summary index yet).
 - [x] Implement and independently review the opt-in background-summary task: malformed source handling, version migration, durable retry/backoff across abort, and chat-scope enforcement.
 - [ ] Wire a validated summary model/spend policy into the normal assistant path; generate post-reset summaries with visible coverage, retry and explicit backfill policy.
-- [ ] Index episode titles/summaries and expose topic discovery plus original-source drilldown through the agent-facing `history` tool.
+- [x] Index ready episode titles/summaries in the rebuildable derived index and expose cross-source topic
+      discovery plus summary reading with provenance and original-source drilldown through the agent-facing
+      `history` tool (2026-10-29; summary text is derived navigation, original entries remain the evidence;
+      refresh is bounded and on-demand, never a model call or backfill).
 - [x] Wire the rebuildable message/tool full-text index and reset boundaries to the durable store
       identity. `Gateway.historySearch` is on by default, bound to the committed `nanobot.store-identity`;
       no caller-injected identity remains. CLI diagnostics and agent-facing retrieval are available;
@@ -1250,3 +1253,46 @@ not the original message; transcript, grants, memory manifest and skill summary
 remained coherent. Typecheck, 155 behavior and 9 execution checks passed. This
 proves plumbing, not real-model summarization fidelity; a real acceptance run is
 still needed. Durable defaults may be unsuitable for small context windows.
+
+Agent-facing episodic recall by `worker-summary-search-7e4cdd2c` (branch commit)
+adds a rebuildable summary title/body index to the existing derived SQLite file
+and `summaries`/`summary` actions to the default read-only `history` tool. It
+indexes only ready records whose episode document, summarizer version, boundary
+and text agree; refresh is on-demand and bounded (newest episodes plus a durable
+older cursor), never a model call, catalog write or backfill, and a missing,
+failed or malformed summary can only remove its own derived row. `complete` is
+per-pass and conservative: a sweep that re-reads only part of the history never
+claims complete coverage or absence. Summary pagination uses a snapshot
+watermark plus snapshot row count: replacing or removing a member rejects the
+cursor, while newer rows are excluded and explicitly reported. Summary schema
+creation is isolated from message schema creation, so a summary-index failure
+leaves raw message search available. Bodies are bounded per row (20,000 code
+units / 32 KiB, titles 1 KiB) and by a 64 MiB whole-index budget with reported
+omissions; tool errors are fixed text and do not include host paths. Focused re-review fixes add: one-read quota alternation (a source reads its newest page,
+then its older cursor, so 33x2 indexes 66/66 across two passes); byte-counter recomputation
+when the summary schema is created/repaired (a fake high counter or missing content table
+cannot make the index look full); FTS `integrity-check` plus schema-shape validation before
+every summary page (post-open logical FTS row loss, deleted FTS/trigger/sweep and
+wrong-shaped sweep are repaired from content; wrong-shaped content is recreated or marked
+unavailable); and removal of a replaced summary that no longer fits the budget instead of
+retaining stale text. Summary SQL failures return `indexReady:false`/`complete:false`
+without affecting raw search. Earlier review hardening adds a durable cross-session rotation cursor (later sessions
+are reached on later passes instead of starving beyond the first 64), reserves
+part of each session's quota for older episodes, deletes rows for unreadable as
+well as unready records, refreshes the now-stale search/episodes/episode
+guidance, and verifies/repairs the summary FTS layer from stored content if the
+FTS table or triggers disappear (marking the summary index unavailable if repair
+fails) without touching raw search. Synthetic offline probes covered exact
+13x12 (52 reads/pass, all 156 reachable across passes, never complete), 13x4
+(52/52 complete in one pass), 65x1 (first pass 64/65, rotation reaches the
+last session next), 33x2 (33 newest then 33 older, 66/66 indexed), 1x12
+(8/pass, incomplete, all 12 indexed), deleted FTS/trigger/sweep repair,
+post-open logical FTS row deletion repair, wrong-shaped schema recovery,
+fake counter/missing content counter recovery, oversize replacement removal,
+and raw search intact throughout,
+unreadable/malformed summary views, cross-source discovery, absent unready
+summaries, malformed and byte-clamped records, non-boundary snapshot replacement
+rejection, newer-row snapshot flagging, reopen, index-deletion rebuild, scope
+rejection, path scrubbing and tool injection quoting. Typecheck, 155 behaviour
+and 9 execution checks pass. Normal-startup summary model/spend policy,
+background index refresh and a CLI/channel summary surface remain open.
