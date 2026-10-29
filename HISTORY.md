@@ -256,8 +256,10 @@ entry, role, kind, episode start and tool/call identity; each opened entry is
 quoted and marked selected/raw. Results report index completeness, lag, omitted
 text, malformed records and the captured boundary, and say when a no-hit answer is
 incomplete. Historical text is sanitized and JSON-quoted as untrusted data because
-prior user text or tool output can contain instructions for a later model. The
-rendered result is bounded (20,000 characters, then the tool output limiter), and
+prior user text or tool output can contain instructions for a later model; U+2028
+and U+2029 are escaped so they cannot create raw line breaks in tool output. The
+rendered result is bounded by UTF-8 bytes (48 KiB, then the 64 KiB tool output limiter), with the
+mandatory coverage/cursor footer reserved before rows are admitted, and
 pagination says whether a fresh search is required for later entries.
 
 This is not summary search: episode summaries and titles do not exist yet, so the
@@ -295,7 +297,9 @@ mapped sessions), 5 entries per scan,
 pending entries counted. Long records can produce more than one hit, one per
 matched chunk. `HISTORY_TOOL_LIMITS` additionally bounds the model-facing tool: 8
 hits by default (20 maximum), radius 2 by default (5 maximum), 1,200 characters per
-opened entry, 400 per excerpt, and 20,000 rendered characters per result.
+opened entry, 400 per excerpt, and 48 KiB of rendered UTF-8 bytes per result. Quoted
+fields escape U+2028 and U+2029, and the output byte budget reserves the mandatory
+coverage/cursor footer before adding result rows.
 
 ## Not implemented
 

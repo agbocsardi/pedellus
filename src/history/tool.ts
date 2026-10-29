@@ -21,6 +21,7 @@
  * explicitly selects the `tools` or `all` scope.
  */
 import type { Context } from "@earendil-works/chord";
+import { Buffer } from "node:buffer";
 import { Type } from "@earendil-works/pi-ai";
 import {
   AssistantEntry,
@@ -62,8 +63,10 @@ export const HISTORY_TOOL_LIMITS = Object.freeze({
   excerptChars: 400,
   /** Characters retained from tool-call arguments on a tool-scoped open. */
   toolArgumentChars: 800,
-  /** Overall rendered result bound, leaving room for the tool output limiter. */
-  outputChars: 20_000,
+  /** Overall rendered result byte budget, below the 64 KiB tool output limiter. */
+  outputBytes: 48 * 1024,
+  /** Bytes reserved so a row-omission note always fits after the mandatory footer. */
+  omissionReserveBytes: 256,
   /** Session-key and other metadata label bound. */
   labelChars: 160,
 });
@@ -151,11 +154,28 @@ function clampCodeUnits(value: string, max: number): string {
   return value.slice(0, end);
 }
 
+/** Clamp to a UTF-8 byte budget without splitting a surrogate pair. */
+function clampUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let output = "";
+  let used = 0;
+  for (const character of value) {
+    const bytes = Buffer.byteLength(character, "utf8");
+    if (used + bytes > maxBytes) break;
+    output += character;
+    used += bytes;
+  }
+  return output;
+}
+
 /** A bounded, quoted field. JSON escaping keeps newlines and quotes inside the value. */
 function quoted(value: string, max: number): string {
   const clean = sanitizeHistoryText(value);
   const bounded = clampCodeUnits(clean, max);
-  return `${JSON.stringify(bounded)}${bounded.length < clean.length ? " [truncated]" : ""}`;
+  const encoded = JSON.stringify(bounded)
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+  return `${encoded}${bounded.length < clean.length ? " [truncated]" : ""}`;
 }
 
 function label(value: string, max: number = HISTORY_TOOL_LIMITS.labelChars): string {
@@ -185,20 +205,31 @@ function messageText(content: unknown): string {
 }
 
 function renderBounded(header: readonly string[], footer: readonly string[], rows: readonly string[]): string {
-  const max = HISTORY_TOOL_LIMITS.outputChars;
-  const reserve = 600;
-  const metadata = [...header, ...footer].join("\n");
-  if (metadata.length > max - reserve) {
-    return `${clampCodeUnits(metadata, max - reserve)}\n[History metadata truncated by the tool output bound.]`;
+  const max = HISTORY_TOOL_LIMITS.outputBytes;
+  const reserve = HISTORY_TOOL_LIMITS.omissionReserveBytes;
+  // The footer carries coverage, the continuation cursor and mandatory notices. It is
+  // never dropped or truncated: fit the header and rows around its exact UTF-8 size.
+  const footerText = footer.join("\n");
+  const footerBytes = Buffer.byteLength(footerText, "utf8");
+  if (footerBytes > max) return footerText;
+  const headerBudget = Math.max(0, max - footerBytes - reserve - 2);
+  const headerMarker = "\n[History header truncated by the byte bound.]";
+  const headerMarkerBytes = Buffer.byteLength(headerMarker, "utf8");
+  let headerText = header.join("\n");
+  if (Buffer.byteLength(headerText, "utf8") > headerBudget) {
+    headerText = headerBudget <= headerMarkerBytes
+      ? ""
+      : `${clampUtf8(headerText, headerBudget - headerMarkerBytes)}${headerMarker}`;
   }
+  let used = Buffer.byteLength(headerText, "utf8") + 1 + footerBytes;
   const visible: string[] = [];
-  let used = metadata.length;
   for (const row of rows) {
-    if (used + row.length + 2 > max - reserve) break;
+    const rowBytes = Buffer.byteLength(row, "utf8") + (visible.length === 0 ? 2 : 1);
+    if (used + rowBytes > max - reserve) break;
     visible.push(row);
-    used += row.length + 2;
+    used += rowBytes;
   }
-  const lines = [...header, ...footer];
+  const lines = headerText.length === 0 ? [footerText] : [headerText, footerText];
   if (visible.length > 0) lines.push("", ...visible);
   const omitted = rows.length - visible.length;
   if (omitted > 0) {
@@ -345,7 +376,7 @@ function browsedEntry(entry: EntryRecord, scope: HistoryScope): BrowsedEntry | u
   let labelText: string | undefined;
   const parts: string[] = [];
   const messages = Array.isArray(entry.model) ? entry.model : [];
-  if (entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND) {
+  if ((entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND) && scope !== "tools") {
     for (const raw of messages) {
       if (raw === null || typeof raw !== "object" || (raw as { readonly role?: unknown }).role !== "user") continue;
       const text = messageText((raw as { readonly content?: unknown }).content);

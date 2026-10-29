@@ -684,6 +684,19 @@ abort and the `agentHistory: false` opt-out boundary; typecheck, 155 behaviour
 checks and 9 execution checks pass. No summary code, test file, live provider, network or personal
 data was involved.
 
+### 2026-10-29 — history tool review hardening
+
+Review fixes for the default agent-facing tool: `open` with `scope: "tools"` no
+longer returns user/cron text and counts those entries as omitted; quoted fields
+escape U+2028/U+2029 so they cannot inject raw line breaks; and the rendered result
+now budgets UTF-8 bytes (48 KiB) instead of UTF-16 characters, reserving the
+mandatory coverage/cursor footer before admitting rows so the 64 KiB tool limiter
+cannot truncate it for multibyte text. Synthetic probes covered open scopes
+`tools`/`all` and omitted counts, quoted separators, a forced multibyte byte-bound
+with an intact cursor/footer and visible row omission, and multibyte cursor resume.
+Typecheck, 155 behaviour checks, 9 execution checks and 88 core-acceptance checks
+pass; no permanent test or live data involved.
+
 ### 2026-10-29 — local history browsing
 
 Integrated independently reviewed CLI message/tool search and cross-session episode/entry
