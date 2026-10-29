@@ -473,8 +473,9 @@ record; the number of rows still grows with the number of episodes, like the mes
 conversation and writes a derived summary for each closed, non-empty episode. Summaries are enabled
 by default and use the conversation's selected model when a job starts. The choice is persisted for
 that job's retries and rechecked against `allowedModels` before every call. Set
-`"episodeSummary": { "model": { "provider": "...", "modelId": "..." } }` to use an allowed
-model instead, or `"episodeSummary": { "enabled": false }` to disable summary work. The Gateway's
+`"episodeSummary": { "preset": "fast" }` to reuse a configured named preset, including its
+thinking setting. Legacy direct configs can use `"episodeSummary": { "model": { "provider": "...",
+"modelId": "..." } }` instead. Set `"episodeSummary": { "enabled": false }` to disable work. The Gateway's
 explicit `OpenGatewayOptions.episodeSummary` remains a host override.
 
 Provider requests use short cache retention where supported, but this separate summary prompt does

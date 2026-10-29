@@ -1,15 +1,14 @@
-# Model allowlist and persisted selection
+# Model presets and selection
 
-This is the bounded P3 model-selection slice, not Python preset parity. The
-runtime accepts only a finite allowlist, uses the pinned Pi AI 1.4.0 model
-catalog, and stores each conversation's choice in Durable's native `pi.agent`
-document. The local CLI exposes that existing Gateway list/select policy; it adds no
-second selection store, model discovery, catalog refresh, or fallback chain.
+Named presets are the config-first model surface; direct model/allowlist configs
+remain supported. Both use the pinned Pi AI 1.4.0 catalog and Durable's native
+`pi.agent` state. There is no second selection store, automatic model discovery,
+catalog refresh or fallback chain.
 
 ## Configuration
 
-`model` remains the default selection. Add `allowedModels` to permit additional
-choices:
+For legacy direct configs, `model` is the default and `allowedModels` permits
+additional choices. For named configs, use [presets](#named-presets) instead:
 
 ```json
 {
@@ -66,7 +65,9 @@ direct surface: the configured preset supplies `model`, and the deduped set of
 provider/model pairs supplies the internal allowlist. Users do not repeat the
 catalog in `allowedModels`. Two presets that differ only by thinking level share
 one allowed model pair, which is explicitly valid; a preset without
-`thinkingLevel` selects `off`. Startup validates every name, reference, native
+`thinkingLevel` selects `off` for conversation selection. A summary preset without
+that field leaves the provider's native reasoning default unchanged. Startup
+validates every name, reference, native
 model and thinking level against the pinned catalog before storage opens.
 
 `episodeSummary.preset` references the same catalog and is mutually exclusive

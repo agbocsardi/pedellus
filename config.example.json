@@ -1,14 +1,11 @@
 {
   "workspace": "./workspace",
   "dataDir": "./.nanobot-data",
-  "model": {
-    "provider": "openai",
-    "modelId": "gpt-6-sol"
+  "modelPresets": {
+    "fast": { "provider": "openai", "modelId": "gpt-6-luna", "thinkingLevel": "off" },
+    "deep": { "provider": "openai", "modelId": "gpt-6-sol", "thinkingLevel": "high" }
   },
-  "allowedModels": [
-    { "provider": "openai", "modelId": "gpt-6-sol" },
-    { "provider": "openai", "modelId": "gpt-6-luna" }
-  ],
+  "modelPreset": "deep",
   "workspaceContext": {
     "memoryFiles": ["memory/MEMORY.md"],
     "memoryManifest": true,
@@ -32,6 +29,5 @@
     "opencode_zen": "OPENCODE_API_KEY",
     "opencode_go": "OPENCODE_API_KEY",
     "xiaomi_mimo": "XIAOMIMIMO_API_KEY"
-  },
-  "thinkingLevel": "high"
+  }
 }

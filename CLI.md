@@ -59,8 +59,9 @@ does not retry or reorder queued turns; Durable's normal failed-run policy still
 governs whether a later queued turn runs after a failure. This is
 presentation of one Durable conversation, not a delivery outbox or an exactly-once
 external send. A default isolated/background cron run uses its own task-owned
-conversation and is not shown in the CLI; there is no silence policy or channel
-delivery. See [cron](./CRON.md).
+conversation and is not shown in the CLI. Successful non-empty isolated results
+can be delivered to a Telegram origin; origin-mode Telegram delivery remains
+unimplemented. See [cron](./CRON.md).
 
 ## Recovery
 
@@ -95,12 +96,16 @@ fail-closed and is not remotely cancelled. See
 | `/episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>]` | List reset-delimited episodes newest first, with entry ranges, counts and recorded summary status only. `--session` must name an existing mapped chat session; the default is `cli:default`. This command does not generate or show summary text. |
 | `/episode [--session <sessionKey>] <startEntryId> [--limit 1-30]` | Open one episode's bounded first window of message/tool entries from an existing mapped chat session. |
 | `/entry [--session <sessionKey>] <entryId> [--radius 0-5]` | Open one entry plus at most five neighboring entry IDs on each side, showing only user/assistant text and tool calls/results. `--session` must be an existing mapped chat session. |
-| `/model` | List the current host-selected model and finite allowed choices, including supported thinking levels. In the integrated CLI, select with `/model <provider> <modelId> [thinkingLevel]`; the pair must exactly match the host allowlist. A busy conversation rejects selection atomically; retry when idle. Standalone terminal callers without a host callback remain read-only. |
+| `/model` | List named presets and the current/default choice. `/model <name>` temporarily selects one; `/model default` or restart returns to the configured preset. Direct-model configs retain `/model <provider> <modelId> [thinkingLevel]` and persisted selection. Busy selection is rejected atomically; retry when idle. Standalone terminal callers without a host callback remain read-only. |
 | `/tools` | Read-only diagnostic of the config-selected coding tools for this conversation. |
 | `/refresh` | Re-read the configured workspace bootstrap, memory files, manifest and skill inventory for this `cli:default` conversation. Requires `workspaceContext`; rejected while the conversation is busy. The refreshed summary and skill table apply to the next model request. |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
 | `/new` | Admit native `Conversation.reset(undefined)`: the same conversation starts a new context with no handoff. No archive, summary, usage reset or extra model call is produced; earlier entries stay stored and remain visible to `/history`, and configured tools are unchanged. While busy it is placed at the next safe boundary and ends that run there instead of interrupting the current model turn; inputs queued before or after it in the same busy window run in the new context. A queued `/new` is a write, so `/abort` withdraws queued inputs but not the pending reset. |
+
+Equivalent presets can both show as selected because the marker matches the actual
+provider/model/thinking settings, not a separately stored preset identity. A legacy
+pair selection may match no preset. See [model selection](./MODELS.md).
 
 ## History search and browsing
 

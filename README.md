@@ -3,8 +3,9 @@
 TypeScript port requiring Node >=22.19 and the pinned Pi 1.4.0 packages. This is not a production-ready replacement for the Python fork.
 
 The [assistant tree plan](2026-10-29_assistant-tree_TODO.md) is the current scope
-and work-order authority: CLI + Telegram first, then tools, delegation and channels. Config-selected coding tools, optional bwrap
-shell, opt-in memory/skills and compaction plumbing are integrated. Agent-callable
+and work-order authority: CLI + Telegram first, then tools, delegation and channels.
+Config-selected coding tools, named model presets, optional bwrap shell, opt-in
+memory/skills and compaction plumbing are integrated. Agent-callable
 cron scheduling and isolated Telegram delivery are available. WebUI, migration and cutover are
 deferred. The [older roadmap](plan/2026-10-26_full-port_TODO.md) preserves evidence,
 not a standing implementation queue.
@@ -13,7 +14,9 @@ not a standing implementation queue.
 
 [`SETUP.md`](./SETUP.md) is the short walkthrough: build, create a synthetic
 workspace with memory and skills, enable tools in the config, then add Telegram
-as a separate step. It does not claim live-model success.
+as a separate step. The example uses named `fast`/`deep` model presets; the default
+comes from config, and local `/model <name>` switching lasts until restart. It does
+not claim live-model success.
 
 Copy `config.example.json` to a private explicit config file and edit the workspace, model, and environment-variable *names*. The config contains no credentials. The nine supported provider aliases and their `credentials` fields are listed in [provider support and migration notes](./PROVIDERS.md). Credential references and `telegram.tokenEnv` must be environment-variable names, not values or `${...}` expressions; the runtime does not read Nanobot/Pi user config or perform live credential discovery. Native catalogs/routes are not drop-in Python-provider parity, and real-provider acceptance remains open. SDK hosts may pass an explicit pi-ai `Models` instance as `openGateway(config, context, { models })` for offline/custom use; the CLI never installs a faux provider.
 
@@ -27,7 +30,8 @@ Without Telegram settings, the CLI starts a single local prompt session. With Te
 
 Closed episodes are summarized in the background by default using the conversation's current
 model when the job starts. This makes provider calls and can incur costs. To use a different
-model from `allowedModels`, set `episodeSummary.model` to `{ "provider": "...", "modelId": "..." }`;
+model, set `episodeSummary.preset` to a configured preset name. Legacy direct configs
+can set `episodeSummary.model` to an allowed `{ "provider": "...", "modelId": "..." }`;
 set `episodeSummary.enabled` to `false` to disable summaries. Already-closed episodes are not
 backfilled automatically. Short cache retention is requested, but cache reuse is not guaranteed;
 see [episode summaries](./HISTORY.md#episode-summaries).

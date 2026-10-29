@@ -3,7 +3,8 @@
 ## Checklist
 
 - [x] Agree the tree: CLI + Telegram trunk; tools, delegation, then more channels.
-- [ ] T1 — Make the existing assistant straightforward to configure and use.
+- [x] T1 — Make the existing assistant straightforward to configure and use (offline verified).
+  - [ ] Preserve config-tool and preset behavior in focused, reviewed permanent tests.
 - [ ] T2 — Prove memory and recall through a complete conversation lifecycle.
 - [ ] T3 — Make reminders and scheduled work useful end to end.
 - [ ] T4 — Prove restart, failure handling and basic backup/restore.
@@ -53,13 +54,12 @@ Only trusted Telegram users should be admitted: they share the configured tools
 and workspace. Keep raw/forked conversations denied and cron bounded by its origin.
 Make context refresh and background-summary costs understandable in setup.
 
-Use named model presets as the next configuration slice: provider, model and
-thinking settings defined once, selected by name for the assistant and summary
-model. Runtime switching is an explicit temporary utility, not a hidden persistent
-settings layer; restart returns to the configured selection. Keep existing direct
-model configs working. Presets do not change tool authority or implicitly enable
-fallbacks. Owner authorized a separate presets worker while tool authority is in
-flight; integrate against the final config-only product path.
+Named model presets define provider/model/thinking once, selected by name for
+the assistant and summary model. Runtime switching is a temporary utility;
+restart returns to the configured selection. Existing direct-model configs still
+work with their legacy persisted choices. Presets never change tool authority or
+implicitly enable fallbacks. Setup, config-only tools and presets are integrated
+and independently reviewed; combined synthetic CLI/Telegram execution passed.
 
 **Done:** a fresh synthetic workspace can be configured from the docs, and the
 assistant can use a skill and perform an authorized workspace task through both
@@ -142,7 +142,10 @@ alone does not put it back in scope.
 - Keep this plan short: outcome, done condition, status. Put technical findings
   in feature docs; add a new checklist item only if it changes the tree.
 - Prefer a working vertical slice over another standalone SDK helper.
-- Use the existing checks; add permanent tests only when explicitly requested.
+- Implementation workers add a few focused permanent regression tests; reviewers
+  verify meaningful coverage and reliability. Use synthetic providers/controlled
+  clocks, explicit timeouts and guaranteed cleanup, not real-time sleeps or
+  sprawling matrices. Validate new tests under an outer process timeout.
 - Real provider spend, live channel sends and personal-data pilots need explicit
   owner approval before execution. This planning update does not authorize them.
 
@@ -163,3 +166,18 @@ grant contracts remain separate. Setup received independent review and a bounded
 fix pass; config-only tool execution still needs implementation/integration proof.
 Owner authorized rotating workers and starting model presets in parallel within T1.
 Keep at most two implementation slices active and review each before integration.
+
+Integrated the reviewed setup, config-only tool policy and named presets. Fixed
+the review-discovered history/coding-hook composition bug. Updated the shipped
+example and setup to use presets. Combined checks passed: typecheck, 155 behavior,
+9 execution and 88 core acceptance checks; a temporary actual-Gateway smoke also
+executed skill/write/read/history through CLI chat and the real Telegram adapter
+with mocked transport, verified preset switch/reopen and empty-config denial.
+T1 is offline-complete; no live provider/channel acceptance is implied. Relative
+one-shot reminders are the next bounded worker slice. Keep workers available until
+their review fixes and integration are finished; only then close their sessions.
+
+Owner explicitly requested permanent regression coverage. Config-tool and preset
+workers now own focused tests for their integrated changes; the relative-reminder
+worker includes tests in its slice. Reviewers check coverage and hang resistance.
+This replaces the earlier no-permanent-tests restriction for implementation work.

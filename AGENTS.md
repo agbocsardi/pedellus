@@ -40,11 +40,17 @@ npm start -- --config config.json   # local CLI against a config file
 
 ## Invariants worth not breaking
 
-- Coding tools are default-deny per conversation: a host ceiling plus explicit,
-  expiring grants, rechecked at call time and pruned before resume. The `skill`,
-  `cron` and `history` tools are ungated because they grant no filesystem or shell
-  authority: `history` is read-only over mapped chats and installed by default,
-  while cron jobs inherit the origin conversation's grants and never widen them.
+- Shipped CLI/Telegram coding tools come directly from config `toolAllowlist`;
+  empty disables them. Only validated mapped chats receive this authority, and
+  every admitted Telegram user shares the configured workspace/tools. Raw, root,
+  forked and state conversations remain denied. Isolated cron runs capture an
+  origin subset bounded by current config and lose it on completion. Legacy SDK
+  hosts default to separate expiring-grant authorization; the CLI selects config
+  mode. The `skill`, `cron` and `history` tools carry no filesystem/shell authority
+  and are exempt from both coding hooks; history remains read-only over mapped chats.
+- Named model presets define provider/model/thinking in config. CLI preset switches
+  are temporary: reopening restores the configured preset without rewriting prepared
+  dispatches. Legacy direct-model SDK selection retains its persisted semantics.
 - The cron timer never calls a model, and a run never schedules: rescheduling is
   a deterministic task commit, so a slow or failed turn cannot stop the schedule.
 - Skill prompts carry names, descriptions and locators only; bodies load on
@@ -56,7 +62,11 @@ npm start -- --config config.json   # local CLI against a config file
 
 ## Conventions
 
-- Verify with the scripts above; add permanent tests only when asked.
+- Implementation workers own small permanent regression tests for their changes;
+  reviewers check their coverage and reliability. Avoid exhaustive low-value matrices.
+- New tests use synthetic providers/controlled clocks, explicit timeouts and guaranteed
+  cleanup. No sleep-based schedule waits or abandoned gates/timers/subscriptions.
+  Validate new files under an outer process timeout; register them in the npm suite.
 - Keep documentation honest about what is missing; a documented gap beats an
   implied capability.
 - Never write credential filenames, tokens or host paths into documentation.
