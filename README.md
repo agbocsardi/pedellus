@@ -21,7 +21,7 @@ npm run build
 node dist/cli.js --config /path/to/config.json
 ```
 
-Without Telegram settings, the CLI starts a single local prompt session. With Telegram enabled, it delegates to the restricted adapter (explicit decimal user allowlist only). Do not use live bot polling for offline checks.
+Without Telegram settings, the CLI starts a single local prompt session. With Telegram enabled, it delegates to the restricted adapter (explicit decimal user allowlist only). Do not use live bot polling for offline checks. Known startup/configuration failures print fixed, value-free diagnostics; unexpected failures stay suppressed. See [interactive CLI](./CLI.md#startup-diagnostics).
 
 ## Runtime/recovery
 

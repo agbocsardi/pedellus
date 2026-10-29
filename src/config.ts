@@ -17,6 +17,7 @@ import {
   SkillsContextInputError,
   validateSkillNames,
 } from "./context/skills.js";
+import { StartupDiagnosticError } from "./startup-diagnostics.js";
 
 const CREDENTIAL_PROVIDERS = [
   "anthropic",
@@ -327,6 +328,7 @@ export async function loadConfig(path: string): Promise<PortConfig> {
   const absolute = resolve(path);
   let value: unknown;
   try { value = JSON.parse(await readFile(absolute, "utf8")); }
-  catch (error) { throw new Error(`Cannot load config ${absolute}: ${error instanceof Error ? error.message : String(error)}`); }
-  return parseConfig(value, dirname(absolute));
+  catch (cause) { throw new StartupDiagnosticError("configFile", { cause }); }
+  try { return parseConfig(value, dirname(absolute)); }
+  catch (cause) { throw new StartupDiagnosticError("configInvalid", { cause }); }
 }

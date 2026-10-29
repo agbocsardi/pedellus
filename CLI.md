@@ -20,6 +20,18 @@ committed partial. Reasoning blocks, system entries, tool calls/arguments, and
 tool output are not printed. ESC/C1 terminal controls, carriage returns, and bidi
 formatting controls are removed; ordinary newlines and Unicode scalar values are preserved.
 
+## Startup diagnostics
+
+The CLI fails closed with exit status 1. Known configuration and startup failures
+print one fixed, value-free message: unreadable/invalid configuration, invalid
+configuration fields, unsupported provider aliases, unavailable models or
+thinking levels, missing credential references, a missing Telegram token
+environment variable, and workspace/data-directory preparation failures. These messages
+never include configuration values, environment values, filesystem paths,
+provider/dependency error text or the underlying exception. Unexpected failures
+keep the generic `nanobot: command failed; diagnostic details suppressed`
+message. Recovery usage errors keep their dedicated `nanobot recovery:` text.
+
 ## Recovery
 
 Startup fails closed when a prepared model dispatch still pins historical Nanobot

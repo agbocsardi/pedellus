@@ -7,6 +7,7 @@ import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { cancelPreparedContextBlock, listPreparedContextBlocks, PreparedContextRecoveryError } from "./recovery/index.js";
 import { runTerminalConversation } from "./terminal/index.js";
 import { openGateway } from "./runtime.js";
+import { StartupDiagnosticError, startupDiagnostic } from "./startup-diagnostics.js";
 
 const RECOVERY_USAGE =
   "Usage: nanobot recovery --config <path> [--cancel <taskId> --fingerprint <sha256>]";
@@ -16,7 +17,7 @@ type RecoveryInvocation =
   | { readonly kind: "cancel"; readonly configPath: string; readonly taskId: number; readonly fingerprint: string };
 
 function configPath(args: string[]): string {
-  if (args.length !== 2 || args[0] !== "--config" || !args[1]) throw new Error("Usage: nanobot --config <path>");
+  if (args.length !== 2 || args[0] !== "--config" || !args[1]) throw new StartupDiagnosticError("usage");
   return args[1];
 }
 
@@ -67,7 +68,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
     if (config.telegram) {
       const token = process.env[config.telegram.tokenEnv];
-      if (!token) throw new Error(`Missing Telegram token environment variable: ${config.telegram.tokenEnv}`);
+      if (!token) throw new StartupDiagnosticError("telegramToken");
       const { runTelegram } = await import("./channels/telegram.js");
       await runTelegram(gateway, {
         token,
@@ -115,8 +116,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     if (error instanceof PreparedContextRecoveryError) {
       console.error(`nanobot recovery: ${error.message}`);
     } else {
-      // Dependency/config errors may embed credentials or paths; never print arbitrary messages here.
-      console.error("nanobot: command failed; diagnostic details suppressed");
+      // Known startup failures use fixed text; everything else stays suppressed because
+      // dependency/config errors may embed credentials or paths.
+      console.error(startupDiagnostic(error));
     }
     process.exitCode = 1;
   });

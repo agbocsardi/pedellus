@@ -10,6 +10,7 @@ import { opencodeProvider } from "@earendil-works/pi-ai/providers/opencode";
 import { opencodeGoProvider } from "@earendil-works/pi-ai/providers/opencode-go";
 import { xiaomiProvider } from "@earendil-works/pi-ai/providers/xiaomi";
 import type { CredentialProvider, ModelReference, PortConfig } from "./config.js";
+import { StartupDiagnosticError } from "./startup-diagnostics.js";
 
 type ProviderAlias = {
   providerId: string;
@@ -56,10 +57,18 @@ export function resolveModelChoices(models: Models, allowed: readonly ModelRefer
   return allowed.map((configured) => {
     const native = nativeModelReference(configured);
     const key = modelKey(native);
-    if (seen.has(key)) throw new Error("allowedModels contains aliases for the same native model");
+    if (seen.has(key)) {
+      throw new StartupDiagnosticError("model", {
+        detail: "allowedModels contains aliases for the same native model",
+      });
+    }
     seen.add(key);
     const model = models.getModel(native.provider, native.modelId);
-    if (!model) throw new Error(`Unknown model ${native.provider}/${native.modelId} in the configured Models catalog`);
+    if (!model) {
+      throw new StartupDiagnosticError("model", {
+        detail: `Unknown model ${native.provider}/${native.modelId} in the configured Models catalog`,
+      });
+    }
     return { configured: { ...configured }, native, model, thinkingLevels: getSupportedThinkingLevels(model) };
   });
 }
@@ -71,10 +80,16 @@ export function createProviderModels(
   const aliases = new Map<string, ProviderAlias>();
   for (const configured of config.allowedModels ?? [config.model]) {
     const selection = PROVIDER_ALIASES.get(configured.provider);
-    if (!selection) throw new Error("Unsupported provider; see packages/pi-nanobot/PROVIDERS.md");
+    if (!selection) {
+      throw new StartupDiagnosticError("provider", {
+        detail: "Unsupported provider; see packages/pi-nanobot/PROVIDERS.md",
+      });
+    }
     const previous = aliases.get(selection.providerId);
     if (previous && previous.credential !== selection.credential) {
-      throw new Error("Configured aliases cannot share a native provider with different credentials");
+      throw new StartupDiagnosticError("provider", {
+        detail: "Configured aliases cannot share a native provider with different credentials",
+      });
     }
     aliases.set(selection.providerId, selection);
   }
@@ -89,16 +104,24 @@ export function createProviderModels(
       ? credentials[selection.credential]
       : undefined;
     if (typeof keyName !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyName)) {
-      throw new Error(`Invalid environment variable reference: credentials.${selection.credential}`);
+      throw new StartupDiagnosticError("credential", {
+        detail: `Invalid environment variable reference: credentials.${selection.credential}`,
+      });
     }
     const apiKey = Object.hasOwn(env, keyName) ? env[keyName] : undefined;
     if (!apiKey?.trim()) {
-      throw new Error(`Missing credential: set the environment variable named by credentials.${selection.credential}`);
+      throw new StartupDiagnosticError("credential", {
+        detail: `Missing credential: set the environment variable named by credentials.${selection.credential}`,
+      });
     }
 
     const nativeProvider = selection.create();
     const nativeApiKey = nativeProvider.auth.apiKey;
-    if (!nativeApiKey) throw new Error("Selected provider has no environment API-key authentication");
+    if (!nativeApiKey) {
+      throw new StartupDiagnosticError("provider", {
+        detail: "Selected provider has no environment API-key authentication",
+      });
+    }
     models.setProvider({
       ...nativeProvider,
       auth: {
@@ -112,11 +135,17 @@ export function createProviderModels(
         },
       },
     });
-    if (providerId !== nativeProvider.id) throw new Error("Native provider alias identity changed unexpectedly");
+    if (providerId !== nativeProvider.id) {
+      throw new StartupDiagnosticError("provider", {
+        detail: "Native provider alias identity changed unexpectedly",
+      });
+    }
   }
 
   const choices = resolveModelChoices(models, config.allowedModels ?? [config.model]);
   const defaultChoice = choices.find((choice) => modelKey(choice.configured) === modelKey(config.model));
-  if (!defaultChoice) throw new Error("Default model must be included in allowedModels");
+  if (!defaultChoice) {
+    throw new StartupDiagnosticError("model", { detail: "Default model must be included in allowedModels" });
+  }
   return { models, model: defaultChoice.native };
 }

@@ -14,6 +14,7 @@ import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } 
 import { prepareDataDirectory } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
+import { StartupDiagnosticError } from "./startup-diagnostics.js";
 import {
   CODING_TOOL_NAMES,
   ToolGrantDoc,
@@ -178,10 +179,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     (name) => !(CODING_TOOL_NAMES as readonly string[]).includes(name),
   );
   if (unavailableTools.length > 0) {
-    throw new Error(
-      `toolAllowlist names unsupported tools: ${unavailableTools.join(", ")} ` +
-      "(no approved registered tools)",
-    );
+    throw new StartupDiagnosticError("configInvalid", {
+      detail: `toolAllowlist names unsupported tools: ${unavailableTools.join(", ")} ` +
+        "(no approved registered tools)",
+    });
   }
   const toolsEnabled = toolAllowlist.length > 0;
   // Internal agent scheduling: opt-in, and independent of the coding-tool ceiling so a reminder job
@@ -199,16 +200,30 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const choicesByConfigured = new Map(choices.map((choice) => [modelKey(choice.configured), choice]));
   const choicesByNative = new Map(choices.map((choice) => [modelKey(choice.native), choice]));
   const defaultChoice = choicesByConfigured.get(modelKey(config.model));
-  if (!defaultChoice) throw new Error("Default model must be included in allowedModels");
-  if (modelKey(model) !== modelKey(defaultChoice.native)) throw new Error("Resolved default model does not match its configured choice");
+  if (!defaultChoice) {
+    throw new StartupDiagnosticError("model", { detail: "Default model must be included in allowedModels" });
+  }
+  if (modelKey(model) !== modelKey(defaultChoice.native)) {
+    throw new StartupDiagnosticError("model", {
+      detail: "Resolved default model does not match its configured choice",
+    });
+  }
   if (config.thinkingLevel !== undefined && !defaultChoice.thinkingLevels.includes(config.thinkingLevel)) {
-    throw new Error(`Unsupported thinkingLevel ${config.thinkingLevel} for default model ${config.model.provider}/${config.model.modelId}`);
+    throw new StartupDiagnosticError("model", {
+      detail: `Unsupported thinkingLevel ${config.thinkingLevel} for default model ${config.model.provider}/${config.model.modelId}`,
+    });
   }
   if (options.contextSnapshotProvider !== undefined && typeof options.contextSnapshotProvider !== "function") {
     throw new TypeError("contextSnapshotProvider must be a function");
   }
   const defaultThinkingLevel = config.thinkingLevel ?? "off";
-  const { workspace, extraRoots, dbPath } = await prepareDataDirectory(config);
+  let preparedDataDirectory: Awaited<ReturnType<typeof prepareDataDirectory>>;
+  try {
+    preparedDataDirectory = await prepareDataDirectory(config);
+  } catch (cause) {
+    throw new StartupDiagnosticError("workspace", { cause });
+  }
+  const { workspace, extraRoots, dbPath } = preparedDataDirectory;
   const hostPolicy: AgentChange = { cwd: workspace };
   const defaultAgentPolicy: AgentChange = {
     ...hostPolicy,
