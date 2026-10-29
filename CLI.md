@@ -50,10 +50,46 @@ fail-closed and is not remotely cancelled. See
 | `/status` | Show the conversation's current host-selected model, native run/inbox state, and Durable-recorded per-model/tool usage. Provider-side charges or unrecorded spend remain unknown. |
 | `/history [count]` | Show the latest user/assistant text messages only (default 10, max 50), using Durable entry pagination; each snippet is limited to 200 characters and the scan to 2,000 entries. System, reasoning, tool, and non-text blocks are omitted. |
 | `/model` | List the current host-selected model and finite allowed choices, including supported thinking levels. In the integrated CLI, select with `/model <provider> <modelId> [thinkingLevel]`; the pair must exactly match the host allowlist. A busy conversation rejects selection atomically; retry when idle. Standalone terminal callers without a host callback remain read-only. |
+| `/tools` | List the host tool ceiling and this conversation's active coding-tool grants with expiry. Reports a disabled ceiling instead of offering a grant. |
+| `/grant <tool[,tool]> <duration>` | Grant one or more ceiling tools to this `cli:default` conversation with an explicit finite duration (for example `/grant read,bash 30m`). No duration, an unknown unit, an out-of-ceiling name or a disabled ceiling is rejected; there is no default or permanent grant. |
+| `/revoke <tool[,tool]\|all>` | Revoke named grants or every active grant in this conversation. Revocation is persisted and survives reopen. |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
 | `/steer TEXT` | Submit with native `whenBusy: "steer"`; while busy it joins the run at a native safe boundary. |
 | `/after TEXT` | Submit as a native follow-up for a fresh run after current work. |
+
+## Coding-tool grants
+
+The CLI opens the host `toolAllowlist` ceiling and, when it is non-empty, offers
+explicit local grant controls for the `cli:default` conversation. Grants are not
+requested by the model and are never inferred from config: a non-empty ceiling
+still grants nothing until `/grant` is issued.
+
+```text
+/tools
+/grant read 30m
+/grant read,bash 2h
+/revoke bash
+/revoke all
+```
+
+- Durations require a unit: integer seconds (`s`), minutes (`m`) or hours (`h`).
+  The expiry is `now + duration`; there is no default duration and no permanent
+  grant.
+- A name outside the host ceiling is rejected, and an empty ceiling reports the
+  config gap instead of accepting a grant. `/revoke` is idempotent for names that
+  are not currently granted.
+- Grants are conversation-scoped and persisted in Durable. They reappear after a
+  Gateway reopen until their expiry; expired grants are pruned and are never
+  resurrected by re-enabling the ceiling.
+- `/grant` takes effect for the next model request. A request already in progress
+  keeps its current tool list, and a call that already passed the grant check is
+  not cancelled retroactively. `/revoke` similarly bounds later calls, not a
+  command already running.
+
+The commands are local controls, not a model-facing tool or an approval channel.
+Unknown slash commands are never sent to the model. This CLI surface has no
+Telegram equivalent; see [coding tools and grants](./TOOLS.md).
 
 `/stop` is deliberately not an alias for `/abort`: native abort withdraws queued
 inputs, while Python stop preserves queued work. `/new`, `/restart`, `/goal`,

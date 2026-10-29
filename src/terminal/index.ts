@@ -44,6 +44,22 @@ export interface TerminalModelSelectionHost {
   select(selection: { provider: string; modelId: string; thinkingLevel?: ModelThinkingLevel }): Promise<TerminalModelSelection>;
 }
 
+export interface TerminalToolGrant {
+  readonly name: string;
+  readonly expiresAt: number;
+}
+
+/**
+ * Optional host-owned coding-tool policy. The ceiling is the fixed host allowlist; grants are always
+ * explicit, finite and conversation-scoped. Without this host the local tool commands stay read-only.
+ */
+export interface TerminalToolGrantsHost {
+  readonly ceiling: readonly string[];
+  list(): Promise<readonly TerminalToolGrant[]>;
+  grant(names: readonly string[], expiresAt: number): Promise<readonly TerminalToolGrant[]>;
+  revoke(names: readonly string[]): Promise<readonly TerminalToolGrant[]>;
+}
+
 export interface TerminalIO {
   /** Each item is a completed line; the source owns any memory bound before yielding it. */
   readonly input: AsyncIterable<string>;
@@ -55,6 +71,8 @@ export interface TerminalIO {
   readonly closeInput?: () => void;
   /** Optional host-owned model policy; standalone terminal callers remain read-only without it. */
   readonly modelSelection?: TerminalModelSelectionHost;
+  /** Optional host-owned coding-tool grants; standalone terminal callers remain read-only without it. */
+  readonly toolGrants?: TerminalToolGrantsHost;
 }
 
 type InboxView = { items?: readonly { mode?: string }[] };
@@ -476,6 +494,131 @@ export async function runTerminalConversation(
     }
   };
 
+  const showTools = async (args: string): Promise<void> => {
+    if (args.trim()) { await notice("Usage: /tools", true); return; }
+    const host = io.toolGrants;
+    if (!host) {
+      await notice("Coding-tool grants are host-controlled and unavailable here.", true);
+      return;
+    }
+    if (host.ceiling.length === 0) {
+      await notice([
+        "Coding tools: disabled. The host ceiling (config toolAllowlist) is empty, so no grant is accepted.",
+        "Add the intended names to toolAllowlist and restart; the ceiling still grants nothing by itself.",
+      ].join("\n"));
+      return;
+    }
+    let grants: readonly TerminalToolGrant[];
+    try {
+      grants = await host.list();
+    } catch { await notice("Could not read coding-tool grants.", true); return; }
+    const granted = new Map(grants.map((grant) => [grant.name, grant.expiresAt]));
+    const rows: string[] = [];
+    let grantedCount = 0;
+    for (const name of host.ceiling) {
+      const expiresAt = granted.get(name);
+      const label = safeLabel(name, 40);
+      if (expiresAt === undefined) {
+        rows.push(`  ${label} — not granted`);
+      } else {
+        grantedCount++;
+        rows.push(`  ${label} — expires ${formatGrantExpiry(expiresAt, Date.now())}`);
+      }
+    }
+    await notice([
+      `Coding tools for this conversation: ${grantedCount} of ${host.ceiling.length} granted.`,
+      ...rows,
+      "Grants are per conversation, explicit and finite. Use /grant <tool[,tool]> <duration> or /revoke <tool[,tool]|all>.",
+    ].join("\n"));
+  };
+
+  const grantTools = async (args: string): Promise<void> => {
+    const parts = args.trim() ? args.trim().split(/\s+/) : [];
+    if (parts.length !== 2) {
+      await notice("Usage: /grant <tool[,tool]> <duration> — duration is required, for example /grant read,bash 30m.", true);
+      return;
+    }
+    const names = splitToolNames(parts[0]!);
+    if (names === undefined) {
+      await notice("Grant names must be a comma-separated list of tool names.", true);
+      return;
+    }
+    const durationMs = parseGrantDuration(parts[1]!);
+    if (durationMs === undefined) {
+      await notice("Grant duration must be a finite value with a unit, for example 30s, 15m or 2h.", true);
+      return;
+    }
+    const host = io.toolGrants;
+    if (!host) {
+      await notice("Coding-tool grants are host-controlled and unavailable here.", true);
+      return;
+    }
+    if (host.ceiling.length === 0) {
+      await notice("Coding tools are disabled: set config toolAllowlist to the intended tools and restart.", true);
+      return;
+    }
+    const outside = names.filter((name) => !host.ceiling.includes(name));
+    if (outside.length > 0) {
+      await notice(`Outside the host tool ceiling: ${outside.join(", ")}. Ceiling: ${host.ceiling.join(", ")}.`, true);
+      return;
+    }
+    const expiresAt = Date.now() + durationMs;
+    let active: readonly TerminalToolGrant[];
+    try {
+      active = await host.grant(names, expiresAt);
+    } catch { await notice("Grant failed; check /tools before retrying.", true); return; }
+    const granted = new Set(active.map((grant) => grant.name));
+    const applied = names.filter((name) => granted.has(name));
+    await notice([
+      applied.length === 0
+        ? "No grant was applied."
+        : `Granted for this conversation until ${formatGrantExpiry(expiresAt, Date.now())}: ${applied.join(", ")}.`,
+      "The next model request may offer these tools; a request already in progress keeps its current tool list.",
+    ].join("\n"));
+  };
+
+  const revokeTools = async (args: string): Promise<void> => {
+    const parts = args.trim() ? args.trim().split(/\s+/) : [];
+    if (parts.length !== 1) {
+      await notice("Usage: /revoke <tool[,tool]|all>", true);
+      return;
+    }
+    const host = io.toolGrants;
+    if (!host) {
+      await notice("Coding-tool grants are host-controlled and unavailable here.", true);
+      return;
+    }
+    if (host.ceiling.length === 0) {
+      await notice("Coding tools are disabled; this conversation holds no grants.", true);
+      return;
+    }
+    let names: readonly string[];
+    if (parts[0] === "all") {
+      let active: readonly TerminalToolGrant[];
+      try {
+        active = await host.list();
+      } catch { await notice("Could not read coding-tool grants.", true); return; }
+      names = active.map((grant) => grant.name);
+      if (names.length === 0) { await notice("No active grants to revoke."); return; }
+    } else {
+      const parsed = splitToolNames(parts[0]!);
+      if (parsed === undefined) {
+        await notice("Revoke names must be a comma-separated list of tool names, or all.", true);
+        return;
+      }
+      const outside = parsed.filter((name) => !host.ceiling.includes(name));
+      if (outside.length > 0) {
+        await notice(`Outside the host tool ceiling: ${outside.join(", ")}. Nothing was revoked.`, true);
+        return;
+      }
+      names = parsed;
+    }
+    try {
+      await host.revoke(names);
+    } catch { await notice("Revocation failed; check /tools for the current grants.", true); return; }
+    await notice(`Revoked for this conversation: ${names.join(", ")}.`);
+  };
+
   const showStatus = async (): Promise<void> => {
     const agent = await conversation.agent(operationContext);
     const viewState = await conversation.viewState(operationContext);
@@ -523,10 +666,11 @@ export async function runTerminalConversation(
     switch (name) {
       case "help":
         await notice([
-          "Local commands: /help /status /history [count] /model [provider modelId [thinkingLevel]] /compact /abort /steer TEXT /after TEXT",
+          "Local commands: /help /status /history [count] /model [provider modelId [thinkingLevel]] /tools /grant <tool[,tool]> <duration> /revoke <tool[,tool]|all> /compact /abort /steer TEXT /after TEXT",
           "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
           "/abort uses native Durable semantics: it cancels foreground work and withdraws queued inputs.",
           io.modelSelection ? "/model lists the host allowlist; select with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
+          io.toolGrants ? "/grant needs an explicit finite duration (for example /grant read,bash 30m); /tools lists ceiling and grants." : "Coding-tool grants are host-controlled and unavailable here.",
         ].join("\n"));
         return;
       case "status":
@@ -538,6 +682,15 @@ export async function runTerminalConversation(
         return;
       case "model":
         await showModel(args);
+        return;
+      case "tools":
+        await showTools(args);
+        return;
+      case "grant":
+        await grantTools(args);
+        return;
+      case "revoke":
+        await revokeTools(args);
         return;
       case "compact": {
         if (args.trim()) { await notice("Usage: /compact", true); return; }
@@ -703,6 +856,33 @@ function formatHistoryMessage(message: Message): string | undefined {
     ? `${characters.slice(0, HISTORY_TEXT_CHARS).join("")}…`
     : cleaned;
   return `${message.role === "user" ? "You" : "Assistant"}: ${snippet}`;
+}
+
+function splitToolNames(value: string): readonly string[] | undefined {
+  const names = value.split(",");
+  if (names.length === 0 || names.some((name) => !/^[A-Za-z0-9_-]{1,64}$/.test(name))) return undefined;
+  return [...new Set(names)];
+}
+
+/** Only an explicit duration with a unit; there is no implicit or indefinite grant. */
+function parseGrantDuration(value: string): number | undefined {
+  const match = /^(\d{1,9})([smh])$/.exec(value);
+  if (match === null) return undefined;
+  const unit = match[2] === "s" ? 1_000 : match[2] === "m" ? 60_000 : 3_600_000;
+  const duration = Number(match[1]) * unit;
+  return Number.isSafeInteger(duration) && duration > 0 ? duration : undefined;
+}
+
+function formatGrantExpiry(expiresAt: number, now: number): string {
+  const remainingMs = expiresAt - now;
+  const remaining = remainingMs <= 0
+    ? "expired"
+    : remainingMs < 60_000
+      ? `in ${Math.ceil(remainingMs / 1_000)}s`
+      : remainingMs < 3_600_000
+        ? `in ${Math.ceil(remainingMs / 60_000)}m`
+        : `in ${Math.ceil(remainingMs / 3_600_000)}h`;
+  return `${new Date(expiresAt).toISOString()} (${remaining})`;
 }
 
 function safeLabel(value: string, max: number): string {

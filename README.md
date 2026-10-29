@@ -37,10 +37,12 @@ ceiling may name only the native
 host environment on the actual workspace, and every conversation still needs an
 explicit per-conversation grant with an expiry. Revoked and expired grants are
 reapplied before resume, and a `beforeTool` hook rechecks them at call time. This
-field is not an approval UI. Grant/revoke currently requires the SDK host API;
-the ordinary CLI and Telegram adapter have no approval/grant command, so setting
-the ceiling alone does not enable coding tools in those sessions. A deployment may
-select the optional
+field is not an approval UI. The local CLI exposes explicit owner commands
+`/tools`, `/grant <tool[,tool]> <duration>` and `/revoke <tool[,tool]|all>`; they
+act on `cli:default` and still grant only inside the ceiling, with a required finite
+duration. The SDK `grantTools`/`revokeTools`/`listToolGrants` API remains for other
+hosts. The Telegram adapter has no grant command, so setting the ceiling alone does
+not enable coding tools there. A deployment may select the optional
 direct-workspace Bubblewrap shell with `toolSandbox: "bwrap"`; it is off by
 default, wraps shell commands only, and falls back to neither the host shell nor a
 managed copy. See [coding tools and grants](./TOOLS.md) and

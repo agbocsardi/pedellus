@@ -84,6 +84,36 @@ The conversation must already exist (`conversationFor`). A grant does not widen
 the ceiling, and another conversation's grants have no effect on this one:
 agent tool filters are read from that conversation's own document.
 
+### Local CLI controls
+
+The local CLI wires its `cli:default` conversation to that API with three local
+slash commands. They run in the terminal process, are ordered with normal
+admissions, and are never sent to the model.
+
+| Command | Effect |
+| --- | --- |
+| `/tools` | Show the host ceiling, each ceiling tool's active grant and its expiry. |
+| `/grant <tool[,tool]> <duration>` | Add explicit grants with `now + duration` expiry. |
+| `/revoke <tool[,tool]\|all>` | Remove named grants, or every active grant. |
+
+Durations require a unit: integer `s`, `m` or `h`. A missing duration, a
+malformed or zero duration, an out-of-ceiling name, or an empty ceiling is
+rejected before any commit, with a local error that names the usable ceiling or
+the config gap where applicable. There is no default duration, no "grant all"
+shortcut and no grant on conversation creation. `/revoke` is idempotent for a
+ceiling name with no active grant and reports the names it processed; use
+`/tools` to confirm state.
+
+Grants are the same durable conversation document used by the SDK API: they
+survive a Gateway reopen, are re-checked at call time, and are pruned when
+expired. The next model request after a grant may offer the tool; a request
+already in progress keeps its tool list, and revocation bounds later calls
+rather than cancelling an execution already underway.
+
+This is an explicit owner control, not a human-approval flow or model-requested
+authorization: the model cannot call these commands, and the ceiling alone still
+grants nothing. The Telegram adapter does not expose them.
+
 ### Copied grants of a scheduled background run
 
 A cron `prepare` copies the origin conversation's still-valid coding-tool grants
@@ -286,7 +316,12 @@ temporary workspace/data directory and the real `openGateway`:
   job generation change, a missing job record, an execution-ownership change,
   model-issued cancellation, and a resumed early return after a SIGKILL) left
   the target with no grant document and no offered tools, while an origin-mode
-  run left its own conversation's authority in place.
+  run left its own conversation's authority in place;
+- the local CLI `/tools`, `/grant` and `/revoke` controls ran against a real
+  gateway with a faux provider: they rejected a missing/zero duration and an
+  out-of-ceiling name before commit, reported an empty ceiling as disabled, made
+  a granted `read` usable on the next model turn, removed it from the offered
+  tools on `/revoke all`, and showed a persisted grant after a Gateway reopen.
 
 The optional bwrap shell was checked separately with bounded temporary workspaces
 and a real Bubblewrap 0.9.0 binary: config validation, fail-closed startup for a
