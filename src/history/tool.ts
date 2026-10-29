@@ -68,6 +68,8 @@ export const HISTORY_TOOL_LIMITS = Object.freeze({
   outputBytes: 48 * 1024,
   /** Bytes reserved so a row-omission note always fits after the mandatory footer. */
   omissionReserveBytes: 256,
+  /** Bytes reserved for the caller's actual displayed/omitted row count line. */
+  rowCountReserveBytes: 512,
   /** Session-key and other metadata label bound. */
   labelChars: 160,
   /** Raw entries read per page while opening an episode's first window. */
@@ -186,9 +188,13 @@ function quoted(value: string, max: number): string {
   return `${encoded}${bounded.length < clean.length ? " [truncated]" : ""}`;
 }
 
+/** One-line label text: controls removed and all whitespace collapsed, never quoted. */
+function plainLabel(value: string): string {
+  return sanitizeHistoryText(value).replace(/\s+/gu, " ").trim();
+}
+
 function label(value: string, max: number = HISTORY_TOOL_LIMITS.labelChars): string {
-  const clean = sanitizeHistoryText(value).replace(/\s+/gu, " ").trim();
-  return quoted(clean, max);
+  return quoted(plainLabel(value), max);
 }
 
 function boundedJson(value: unknown, max: number): string {
@@ -212,15 +218,35 @@ function messageText(content: unknown): string {
   return parts.join("\n");
 }
 
+interface BoundedRender {
+  readonly text: string;
+  readonly shownRows: number;
+  readonly omittedRows: number;
+}
+
 function renderBounded(header: readonly string[], footer: readonly string[], rows: readonly string[]): string {
+  return renderBoundedInfo(header, footer, rows).text;
+}
+
+function renderBoundedInfo(
+  header: readonly string[],
+  footer: readonly string[],
+  rows: readonly string[],
+  counts?: (shown: number, omitted: number) => string,
+): BoundedRender {
   const max = HISTORY_TOOL_LIMITS.outputBytes;
   const reserve = HISTORY_TOOL_LIMITS.omissionReserveBytes;
+  const countReserve = counts === undefined ? 0 : HISTORY_TOOL_LIMITS.rowCountReserveBytes;
   // The footer carries coverage, the continuation cursor and mandatory notices. It is
   // never dropped or truncated: fit the header and rows around its exact UTF-8 size.
+  // A caller-supplied count line is reserved separately so it can describe the rows that
+  // survived byte culling instead of claiming every selected row was displayed.
   const footerText = footer.join("\n");
   const footerBytes = Buffer.byteLength(footerText, "utf8");
-  if (footerBytes > max) return footerText;
-  const headerBudget = Math.max(0, max - footerBytes - reserve - 2);
+  if (footerBytes + countReserve > max) {
+    return { text: footerText, shownRows: 0, omittedRows: rows.length };
+  }
+  const headerBudget = Math.max(0, max - footerBytes - countReserve - reserve - 2);
   const headerMarker = "\n[History header truncated by the byte bound.]";
   const headerMarkerBytes = Buffer.byteLength(headerMarker, "utf8");
   let headerText = header.join("\n");
@@ -229,7 +255,7 @@ function renderBounded(header: readonly string[], footer: readonly string[], row
       ? ""
       : `${clampUtf8(headerText, headerBudget - headerMarkerBytes)}${headerMarker}`;
   }
-  let used = Buffer.byteLength(headerText, "utf8") + 1 + footerBytes;
+  let used = Buffer.byteLength(headerText, "utf8") + 1 + footerBytes + countReserve;
   const visible: string[] = [];
   for (const row of rows) {
     const rowBytes = Buffer.byteLength(row, "utf8") + (visible.length === 0 ? 2 : 1);
@@ -238,12 +264,17 @@ function renderBounded(header: readonly string[], footer: readonly string[], row
     used += rowBytes;
   }
   const lines = headerText.length === 0 ? [footerText] : [headerText, footerText];
-  if (visible.length > 0) lines.push("", ...visible);
   const omitted = rows.length - visible.length;
+  if (counts !== undefined) {
+    const countText = clampUtf8(counts(visible.length, omitted), Math.max(0, countReserve - 2));
+    if (countText.length > 0) lines.push(countText);
+  }
+  if (visible.length > 0) lines.push("", ...visible);
   if (omitted > 0) {
     lines.push(`[${omitted} additional record(s) omitted by the tool output bound; lower the limit or narrow the scope.]`);
   }
-  return lines.join("\n");
+  const text = lines.join("\n");
+  return { text, shownRows: visible.length, omittedRows: omitted };
 }
 
 function coverageLines(coverage: HistoryPage["coverage"]): string[] {
@@ -427,7 +458,7 @@ function browsedEntry(entry: EntryRecord, scope: HistoryScope): BrowsedEntry | u
     const toolName = first !== null && typeof first === "object" && typeof (first as { readonly toolName?: unknown }).toolName === "string"
       ? (first as { readonly toolName: string }).toolName
       : "tool";
-    labelText = `tool ${sanitizeHistoryText(toolName)}`;
+    labelText = `tool ${clampCodeUnits(plainLabel(toolName), 80)}`;
   }
   if (labelText === undefined) return undefined;
   const text = parts.join("\n").trim();
@@ -445,7 +476,7 @@ function openRow(entry: BrowsedEntry, selected: boolean): string {
   if (selected) flags.push("selected");
   if (entry.edits) flags.push("raw stored entry; context edits not applied");
   return [
-    `#${entry.id} [${entry.label}]${flags.length === 0 ? "" : ` (${flags.join("; ")})`}`,
+    `#${entry.id} [${clampCodeUnits(plainLabel(entry.label), 100)}]${flags.length === 0 ? "" : ` (${flags.join("; ")})`}`,
     `  text=${quoted(entry.text, HISTORY_TOOL_LIMITS.entryChars)}`,
   ].join("\n");
 }
@@ -564,14 +595,6 @@ async function runOpen(host: HistoryToolHost, args: HistoryToolArguments, contex
     `Selected entry #${entryId} found in the window: ${selectedSeen ? "yes" : "no"}.`,
   ];
   const footer: string[] = [];
-  if (rows.length === 0) {
-    footer.push("No displayable entry text in this window for the selected scope.");
-  } else {
-    footer.push(
-      `Showed ${rows.length} displayable entr${rows.length === 1 ? "y" : "ies"} from ${page.items.length} entr` +
-      `${page.items.length === 1 ? "y" : "ies"} in the window.`,
-    );
-  }
   if (hidden > 0) {
     footer.push(
       `${hidden} entr${hidden === 1 ? "y" : "ies"} omitted: system, reset, compaction, thinking, image-only, ` +
@@ -582,7 +605,13 @@ async function runOpen(host: HistoryToolHost, args: HistoryToolArguments, contex
     footer.push("Tool calls/results were omitted by scope=\"messages\"; repeat with scope=\"tools\" or \"all\" to include tool records.");
   }
   footer.push("Read-only: the transcript was not modified and no conversation was created.");
-  return renderBounded(header, footer, rows);
+  const rendered = renderBoundedInfo(header, footer, rows, (shown, omitted) => {
+    const selected = shown + omitted;
+    if (selected === 0) return "No displayable entry text in this window for the selected scope.";
+    return `Showed ${shown} of ${selected} displayable entr${selected === 1 ? "y" : "ies"} from ${page.items.length} entr` +
+      `${page.items.length === 1 ? "y" : "ies"} in the window; ${omitted} culled by the byte bound.`;
+  });
+  return rendered.text;
 }
 
 function episodeRow(episode: HistoryEpisode, ordinal: number): string {
@@ -675,12 +704,54 @@ async function runEpisode(host: HistoryToolHost, args: HistoryToolArguments, con
     ], [], []);
   }
 
+  let maxEntryId = episode.endEntryId;
+  let snapshotTailEntryId: EntryId | null = null;
+  if (maxEntryId === null) {
+    // Pin an open episode to one tail entry before reading any content. A reset placed
+    // after this snapshot has a higher entry ID and is excluded, so drilldown cannot
+    // spill into the next episode while the conversation continues.
+    try {
+      const tail = await host.entries(session, { order: "descending" }, 1, undefined, context);
+      const tailEntryId = tail.items[0]?.id;
+      const confirmed = await host.episode(session, startEntryId, context);
+      if (tailEntryId === undefined || confirmed === undefined || confirmed.startEntryId !== startEntryId) {
+        return renderBounded([
+          "The episode changed or disappeared while it was being read; no entries were returned.",
+          "Retry action=\"episode\" with the same source and start entry ID.",
+        ], [], []);
+      }
+      episode = confirmed;
+      if (episode.endEntryId === null) {
+        if (tailEntryId < episode.startEntryId) {
+          return renderBounded([
+            "The episode changed while it was being read; no entries were returned.",
+            "Retry action=\"episode\" with the same source and start entry ID.",
+          ], [], []);
+        }
+        maxEntryId = tailEntryId;
+        snapshotTailEntryId = tailEntryId;
+      } else {
+        maxEntryId = episode.endEntryId;
+      }
+    } catch (error) {
+      if (context.abortSignal?.aborted) throw new Error("Operation aborted");
+      return renderBounded([
+        "Could not pin the episode to a consistent read snapshot; no entries were returned.",
+        "Retry action=\"episode\" with the same source and start entry ID.",
+      ], [], []);
+    }
+    if (context.abortSignal?.aborted) throw new Error("Operation aborted");
+  }
+
   const rows: string[] = [];
   let cursor: Cursor | undefined;
   let scanned = 0;
+  let examined = 0;
   let exhausted = false;
   let hidden = 0;
   let toolDataOmitted = false;
+  let remainingRawInPage = 0;
+  let moreRawPages = false;
   try {
     while (rows.length < limit && scanned < HISTORY_TOOL_LIMITS.episodeScanEntries) {
       const take = Math.min(
@@ -690,14 +761,16 @@ async function runEpisode(host: HistoryToolHost, args: HistoryToolArguments, con
       const page = await host.entries(session, {
         order: "ascending",
         minEntryId: episode.startEntryId,
-        ...(episode.endEntryId === null ? {} : { maxEntryId: episode.endEntryId }),
+        ...(maxEntryId === null ? {} : { maxEntryId }),
       }, take, cursor, context);
       if (page.items.length === 0) {
         exhausted = true;
         break;
       }
       scanned += page.items.length;
-      for (const entry of page.items) {
+      for (let index = 0; index < page.items.length; index += 1) {
+        const entry = page.items[index]!;
+        examined += 1;
         const display = browsedEntry(entry, scope);
         if (display === undefined) {
           hidden++;
@@ -705,8 +778,16 @@ async function runEpisode(host: HistoryToolHost, args: HistoryToolArguments, con
           continue;
         }
         rows.push(openRow(display, entry.id === episode.startEntryId));
-        if (rows.length >= limit) break;
+        if (rows.length >= limit) {
+          // Limit reached: only the final page position can prove there is nothing left.
+          // Unprocessed rows in this page or a continuation mean this is a partial view.
+          remainingRawInPage = page.items.length - (index + 1);
+          moreRawPages = page.next !== undefined;
+          exhausted = remainingRawInPage === 0 && !moreRawPages;
+          break;
+        }
       }
+      if (rows.length >= limit) break;
       cursor = page.next;
       if (cursor === undefined) {
         exhausted = true;
@@ -733,16 +814,11 @@ async function runEpisode(host: HistoryToolHost, args: HistoryToolArguments, con
     episode.resetEntryId === null
       ? "This is the pre-reset segment; it has no reset boundary."
       : `Reset boundary: #${episode.resetEntryId} (reset handoff text is not shown).`,
+    ...(snapshotTailEntryId === null
+      ? []
+      : [`Open-episode read snapshot: bounded at entry #${snapshotTailEntryId}; entries appended or a reset placed after that snapshot are excluded.`]),
   ];
   const footer: string[] = [];
-  if (rows.length === 0) {
-    footer.push(`No displayable entry text in the first ${scanned} scanned entr${scanned === 1 ? "y" : "ies"} for this scope.`);
-  } else {
-    footer.push(
-      `Showed ${rows.length} displayable entr${rows.length === 1 ? "y" : "ies"} from ${scanned} scanned entr` +
-      `${scanned === 1 ? "y" : "ies"}${episode.entries === null ? "" : ` of ${episode.entries} in the episode`}.`,
-    );
-  }
   if (hidden > 0) {
     footer.push(
       `${hidden} entr${hidden === 1 ? "y" : "ies"} omitted: system, reset, compaction, thinking, image-only, ` +
@@ -753,9 +829,13 @@ async function runEpisode(host: HistoryToolHost, args: HistoryToolArguments, con
     footer.push("Tool calls/results were omitted by scope=\"messages\"; repeat with scope=\"tools\" or \"all\" to include tool records.");
   }
   if (!exhausted && rows.length >= limit) {
+    const unexamined = remainingRawInPage > 0
+      ? `${remainingRawInPage} raw entr${remainingRawInPage === 1 ? "y" : "ies"} in the current page ${remainingRawInPage === 1 ? "was" : "were"} not examined`
+      : "the current page was fully examined";
     footer.push(
-      `Episode view limited to ${limit} displayable entries. This is the first window, not the whole episode; ` +
-      "use action=\"search\" to find a later passage and action=\"open\" around its source entry.",
+      `Episode view limited to ${limit} displayable entries; ${unexamined}${moreRawPages ? " and more raw pages remain" : ""}. ` +
+      "This is the first window, not the whole episode; use action=\"search\" to find a later passage and " +
+      "action=\"open\" around its source entry.",
     );
   }
   if (!exhausted && scanned >= HISTORY_TOOL_LIMITS.episodeScanEntries) {
@@ -771,7 +851,16 @@ async function runEpisode(host: HistoryToolHost, args: HistoryToolArguments, con
     footer.push("The episode is open and may continue at the tail; this view stops at the current tail or the scan bound.");
   }
   footer.push("Read-only: the transcript was not modified and no conversation was created.");
-  return renderBounded(header, footer, rows);
+  const rendered = renderBoundedInfo(header, footer, rows, (shown, omitted) => {
+    const selected = shown + omitted;
+    if (selected === 0) {
+      return `No displayable entry text in the first ${examined} examined raw entr${examined === 1 ? "y" : "ies"} for this scope.`;
+    }
+    return `Showed ${shown} of ${selected} displayable entr${selected === 1 ? "y" : "ies"} from ${examined} examined raw entr` +
+      `${examined === 1 ? "y" : "ies"}${episode.entries === null ? "" : ` of ${episode.entries} in the episode`}; ` +
+      `${omitted} culled by the byte bound.`;
+  });
+  return rendered.text;
 }
 
 /** Build the `history` extension and its late-bound host. */

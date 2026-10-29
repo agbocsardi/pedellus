@@ -702,6 +702,23 @@ agent cron wiring remain open; this is not yet an everyday replacement or cutove
 
 ## Session log
 
+### 2026-10-29 — episode drilldown review hardening
+
+Review fixes on the agent-facing episode slice: a display limit reached inside the
+final raw page no longer marks the episode exhausted; the footer reports the actual
+unexamined rows and any remaining raw pages. `open` and `episode` now report the
+rows actually displayed versus selected, with byte-culled rows counted consistently
+in the count line and omission notice. Stored tool labels are collapsed to one
+sanitized line before display, so a newline in a tool name cannot forge a result
+line. Open-episode drilldown is pinned to a tail entry read at call time and
+re-confirms the episode before reading content, so a concurrent reset or append
+cannot spill into the next episode; the result reports the snapshot bound. Offline
+probes covered closed 11-entry/limit-8 and 30-entry/limit-3 final pages, forced
+48 KiB multibyte culling for `episode` and `open` with matching counts, newline
+tool-name spoofing, concurrent reset interleaving, source isolation and no network
+or permanent test. Typecheck and the existing behaviour, execution and core
+acceptance suites pass.
+
 ### 2026-10-29 — agent-facing episode listing and drilldown
 
 Extended the default read-only `history` tool with `episodes` and `episode` actions

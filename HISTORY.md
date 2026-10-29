@@ -263,7 +263,9 @@ code. It has four actions:
   its displayable message/tool entries. It reads the episode range through
   `Gateway.historyEntries` in ascending pages, hides reset handoff, system,
   compaction, thinking and image-only content by the same rules as `open`, and
-  lets `scope` select messages, tools or both. A later passage is reached through
+  lets `scope` select messages, tools or both. An open episode is pinned to a tail
+  entry read at call time; the result says so, and entries appended or a reset
+  placed after that snapshot are excluded. A later passage is reached through
   `search` and `open`; this action has no continuation cursor.
 
 Output is explicit about provenance and limits: each hit names its source session,
@@ -275,7 +277,11 @@ prior user text or tool output can contain instructions for a later model; U+202
 and U+2029 are escaped so they cannot create raw line breaks in tool output. The
 rendered result is bounded by UTF-8 bytes (48 KiB, then the 64 KiB tool output limiter), with the
 mandatory coverage/cursor footer reserved before rows are admitted, and
-pagination says whether a fresh search is required for later entries.
+pagination says whether a fresh search is required for later entries. `open` and
+`episode` report the rows actually displayed separately from the rows selected;
+rows culled by the byte bound are counted in both that line and the omission
+notice. A limit reached inside a raw page reports the unexamined rows and whether
+more raw pages remain instead of claiming the episode was exhausted.
 
 This is not summary search: episode summaries and titles do not exist yet, so the
 tool says so and searches only raw message/tool records. Episode listing reports
