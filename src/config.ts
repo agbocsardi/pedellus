@@ -44,6 +44,13 @@ export interface ModelReference {
   modelId: string;
 }
 
+/** One named model choice: provider, native model ID, and an optional thinking level. */
+export interface ModelPreset extends ModelReference {
+  readonly thinkingLevel?: ModelThinkingLevel;
+}
+
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
 export interface WorkspaceSkillsConfig {
   /** Explicit absolute builtin skills root; absent means workspace skills only. */
   readonly builtinSkillsRoot?: string;
@@ -79,10 +86,23 @@ export interface PortConfig {
    * installs no context extension; there is no implicit workspace discovery.
    */
   workspaceContext?: WorkspaceContextConfig;
-  /** Default selection; retained for backward compatibility with single-model configs. */
+  /**
+   * Normalized default selection. In named-preset mode this is the configured preset's
+   * provider/model pair; direct configs keep their explicit `model`.
+   */
   model: ModelReference;
-  /** Explicit finite model choices. Missing means the legacy singleton [model]. */
+  /**
+   * Explicit finite model choices. Missing means the legacy singleton [model]. Named-preset
+   * mode derives this from the catalog, so users never repeat preset entries here.
+   */
   allowedModels?: readonly ModelReference[];
+  /**
+   * Named model catalog. Present only in named-preset mode, together with `modelPreset`.
+   * The catalog is the source of both the default and the allowed provider/model pairs.
+   */
+  modelPresets?: Readonly<Record<string, ModelPreset>>;
+  /** Configured default preset name; absent means legacy direct `model` selection. */
+  modelPreset?: string;
   /** Host-owned global ceiling; conversations may only narrow it. Empty means tools are disabled. */
   toolAllowlist?: readonly string[];
   /**
@@ -97,8 +117,15 @@ export interface PortConfig {
   toolSandbox?: "host" | "bwrap";
   /** Internal agent scheduling. Absent or disabled leaves the runtime without cron. */
   cron?: CronConfig;
-  /** Automatic episode summaries; by default use the conversation's current model. */
-  episodeSummary?: { readonly enabled?: boolean; readonly model?: ModelReference };
+  /**
+   * Automatic episode summaries; by default use the conversation's current model.
+   * `model` is the legacy direct selector; `preset` names an entry in `modelPresets`.
+   */
+  episodeSummary?: {
+    readonly enabled?: boolean;
+    readonly model?: ModelReference;
+    readonly preset?: string;
+  };
   thinkingLevel?: ModelThinkingLevel;
   extraAllowedDirs?: readonly string[];
   bwrapPath?: string;
@@ -143,6 +170,45 @@ function modelReference(value: unknown, name: string): ModelReference {
 
 function modelKey(model: ModelReference): string {
   return JSON.stringify([model.provider, model.modelId]);
+}
+
+function modelThinkingLevel(value: unknown, name: string): ModelThinkingLevel {
+  if (typeof value !== "string" || !(THINKING_LEVELS as readonly string[]).includes(value)) {
+    throw new Error(`${name} must be one of ${THINKING_LEVELS.join(", ")}`);
+  }
+  return value as ModelThinkingLevel;
+}
+
+function modelPresetName(value: unknown, name: string): string {
+  const result = nonempty(value, name);
+  // `default` is the selection command that returns to the configured preset, not a catalog entry.
+  if (result === "default") throw new Error(`${name} must not use the reserved name "default"`);
+  if (/[\s\u0000-\u001f\u007f]/.test(result)) {
+    throw new Error(`${name} must not contain whitespace or control characters`);
+  }
+  return result;
+}
+
+function modelPresetsConfig(value: unknown): Readonly<Record<string, ModelPreset>> {
+  const raw = object(value, "modelPresets");
+  if (Object.keys(raw).length === 0) throw new Error("modelPresets must contain at least one preset");
+  const presets: Record<string, ModelPreset> = Object.create(null) as Record<string, ModelPreset>;
+  for (const [rawName, entry] of Object.entries(raw)) {
+    const name = modelPresetName(rawName, "modelPresets name");
+    const preset = object(entry, `modelPresets.${name}`);
+    for (const key of Object.keys(preset)) {
+      if (key !== "provider" && key !== "modelId" && key !== "thinkingLevel") {
+        throw new Error(`Unknown modelPresets.${name} field: ${key}`);
+      }
+    }
+    presets[name] = Object.freeze({
+      ...modelReference(preset, `modelPresets.${name}`),
+      ...(preset.thinkingLevel === undefined
+        ? {}
+        : { thinkingLevel: modelThinkingLevel(preset.thinkingLevel, `modelPresets.${name}.thinkingLevel`) }),
+    });
+  }
+  return Object.freeze(presets);
 }
 
 function workspaceSkillsConfig(value: unknown): WorkspaceSkillsConfig {
@@ -243,24 +309,58 @@ function cronConfig(value: unknown): CronConfig {
 
 export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig {
   const raw = object(value, "config");
-  const model = modelReference(raw.model, "model");
+  const presetMode = raw.modelPreset !== undefined || raw.modelPresets !== undefined;
+  let model: ModelReference;
   let allowedModels: ModelReference[];
-  if (raw.allowedModels === undefined) {
-    allowedModels = [model];
-  } else {
-    if (!Array.isArray(raw.allowedModels) || raw.allowedModels.length === 0) {
-      throw new Error("allowedModels must be a non-empty array");
+  let modelPresets: Readonly<Record<string, ModelPreset>> | undefined;
+  let modelPreset: string | undefined;
+  if (presetMode) {
+    // One clear alternative to the legacy direct fields: the catalog names everything, so a
+    // parallel default/allowed list would only create an ambiguous second source of truth.
+    if (raw.modelPresets === undefined) throw new Error("modelPreset requires modelPresets");
+    if (raw.modelPreset === undefined) throw new Error("modelPresets requires modelPreset to select the default");
+    for (const key of ["model", "allowedModels", "thinkingLevel"]) {
+      if (raw[key] !== undefined) {
+        throw new Error(`modelPresets mode does not accept ${key}; configure it inside modelPresets instead`);
+      }
     }
-    allowedModels = raw.allowedModels.map((entry, index) => modelReference(entry, `allowedModels[${index}]`));
-    const keys = allowedModels.map(modelKey);
-    if (new Set(keys).size !== keys.length) throw new Error("allowedModels must not contain duplicate models");
-    if (!keys.includes(modelKey(model))) throw new Error("model must be included in allowedModels");
+    modelPresets = modelPresetsConfig(raw.modelPresets);
+    modelPreset = modelPresetName(raw.modelPreset, "modelPreset");
+    const selected = Object.hasOwn(modelPresets, modelPreset) ? modelPresets[modelPreset] : undefined;
+    if (selected === undefined) throw new Error("modelPreset must name an entry in modelPresets");
+    model = { provider: selected.provider, modelId: selected.modelId };
+    // The catalog is the allowlist: one pair per provider/model even when two presets differ only
+    // by thinking level, because native selection is keyed by the model pair.
+    const seen = new Set<string>();
+    allowedModels = [];
+    for (const preset of Object.values(modelPresets)) {
+      const reference = { provider: preset.provider, modelId: preset.modelId };
+      const key = modelKey(reference);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      allowedModels.push(reference);
+    }
+  } else {
+    model = modelReference(raw.model, "model");
+    if (raw.allowedModels === undefined) {
+      allowedModels = [model];
+    } else {
+      if (!Array.isArray(raw.allowedModels) || raw.allowedModels.length === 0) {
+        throw new Error("allowedModels must be a non-empty array");
+      }
+      allowedModels = raw.allowedModels.map((entry, index) => modelReference(entry, `allowedModels[${index}]`));
+      const keys = allowedModels.map(modelKey);
+      if (new Set(keys).size !== keys.length) throw new Error("allowedModels must not contain duplicate models");
+      if (!keys.includes(modelKey(model))) throw new Error("model must be included in allowedModels");
+    }
   }
   const config: PortConfig = {
     workspace: resolve(baseDir, nonempty(raw.workspace, "workspace")),
     dataDir: resolve(baseDir, nonempty(raw.dataDir, "dataDir")),
     model,
     allowedModels,
+    ...(modelPresets === undefined ? {} : { modelPresets }),
+    ...(modelPreset === undefined ? {} : { modelPreset }),
   };
   let toolAllowlist: string[] = [];
   if (raw.toolAllowlist !== undefined) {
@@ -294,23 +394,36 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   if (raw.episodeSummary !== undefined) {
     const summary = object(raw.episodeSummary, "episodeSummary");
     for (const key of Object.keys(summary)) {
-      if (key !== "enabled" && key !== "model") throw new Error(`Unknown episodeSummary field: ${key}`);
+      if (key !== "enabled" && key !== "model" && key !== "preset") {
+        throw new Error(`Unknown episodeSummary field: ${key}`);
+      }
     }
     if (summary.enabled !== undefined && typeof summary.enabled !== "boolean") {
       throw new Error("episodeSummary.enabled must be a boolean");
+    }
+    if (summary.model !== undefined && summary.preset !== undefined) {
+      throw new Error("episodeSummary.model and episodeSummary.preset are mutually exclusive");
     }
     const summaryModel = summary.model === undefined ? undefined : modelReference(summary.model, "episodeSummary.model");
     if (summaryModel !== undefined && !allowedModels.some((choice) => modelKey(choice) === modelKey(summaryModel))) {
       throw new Error("episodeSummary.model must be included in allowedModels");
     }
+    let summaryPreset: string | undefined;
+    if (summary.preset !== undefined) {
+      if (modelPresets === undefined) throw new Error("episodeSummary.preset requires named modelPresets");
+      summaryPreset = modelPresetName(summary.preset, "episodeSummary.preset");
+      if (!Object.hasOwn(modelPresets, summaryPreset)) {
+        throw new Error("episodeSummary.preset must name an entry in modelPresets");
+      }
+    }
     config.episodeSummary = {
       ...(summary.enabled === undefined ? {} : { enabled: summary.enabled }),
       ...(summaryModel === undefined ? {} : { model: summaryModel }),
+      ...(summaryPreset === undefined ? {} : { preset: summaryPreset }),
     };
   }
   if (raw.thinkingLevel !== undefined) {
-    if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(raw.thinkingLevel))) throw new Error("Invalid thinkingLevel");
-    Object.assign(config, { thinkingLevel: raw.thinkingLevel });
+    config.thinkingLevel = modelThinkingLevel(raw.thinkingLevel, "thinkingLevel");
   }
   if (raw.extraAllowedDirs !== undefined) {
     if (!Array.isArray(raw.extraAllowedDirs)) throw new Error("extraAllowedDirs must be an array");

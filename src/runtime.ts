@@ -114,9 +114,21 @@ export interface GatewayModelSelection extends ModelReference {
   thinkingLevel: ModelThinkingLevel;
 }
 
+/** One named preset from config, using the provider spelling accepted by Gateway selection. */
+export interface GatewayModelPreset {
+  readonly name: string;
+  readonly provider: string;
+  readonly modelId: string;
+  readonly thinkingLevel?: ModelThinkingLevel;
+}
+
 export interface GatewayModelList {
   models: readonly GatewayModelChoice[];
   selected: GatewayModelSelection;
+  /** Named presets; absent in legacy direct-model mode. Omitting thinking means `off` when selected. */
+  presets?: readonly GatewayModelPreset[];
+  /** Configured default preset in named-preset mode. */
+  defaultPreset?: string;
 }
 
 export type GatewayContextSnapshotProvider = (
@@ -199,6 +211,13 @@ export interface Gateway {
   listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
   /** Persists a native pi.agent choice; rejects ConversationBusy atomically without changing it. */
   selectModel(sessionKey: string, selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection>;
+  /**
+   * Temporarily selects a configured named preset in this conversation, using its provider/model
+   * and its thinking level (or `off`). `default` returns to the configured preset. Named-preset
+   * conversations also reset to the configured preset on the next gateway open. Rejects with
+   * ConversationBusy atomically and fails for unknown names or in legacy direct-model mode.
+   */
+  selectModelPreset(sessionKey: string, name: string, context: Context): Promise<GatewayModelSelection>;
   /**
    * Active, unexpired grants for a known session; empty when tools are disabled and always empty in
    * config authorization mode, which has no expiring grants.
@@ -441,7 +460,37 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const choices = resolveModelChoices(models, allowedModels);
   const choicesByConfigured = new Map(choices.map((choice) => [modelKey(choice.configured), choice]));
   const choicesByNative = new Map(choices.map((choice) => [modelKey(choice.native), choice]));
-  const defaultChoice = choicesByConfigured.get(modelKey(config.model));
+  // Named presets are a config-level catalog over the same finite model choices. Validate every
+  // reference and thinking level before storage or dispatch, so a bad preset fails at startup.
+  const configuredPresetName = config.modelPreset;
+  const presetCatalog = new Map<string, { readonly choice: ResolvedModelChoice; readonly thinkingLevel?: ModelThinkingLevel }>();
+  if (configuredPresetName !== undefined) {
+    if (config.modelPresets === undefined || Object.keys(config.modelPresets).length === 0) {
+      throw new StartupDiagnosticError("model", { detail: "modelPreset requires a non-empty modelPresets catalog" });
+    }
+    for (const [name, preset] of Object.entries(config.modelPresets)) {
+      const choice = choicesByConfigured.get(modelKey(preset));
+      if (choice === undefined) {
+        throw new StartupDiagnosticError("model", {
+          detail: `Model preset ${name} is outside the configured model catalog`,
+        });
+      }
+      if (preset.thinkingLevel !== undefined && !choice.thinkingLevels.includes(preset.thinkingLevel)) {
+        throw new StartupDiagnosticError("model", {
+          detail: `Unsupported thinkingLevel ${preset.thinkingLevel} for model preset ${name}`,
+        });
+      }
+      presetCatalog.set(name, {
+        choice,
+        ...(preset.thinkingLevel === undefined ? {} : { thinkingLevel: preset.thinkingLevel }),
+      });
+    }
+    if (!presetCatalog.has(configuredPresetName)) {
+      throw new StartupDiagnosticError("model", { detail: "modelPreset must name a configured model preset" });
+    }
+  }
+  const defaultPreset = configuredPresetName === undefined ? undefined : presetCatalog.get(configuredPresetName);
+  const defaultChoice = defaultPreset?.choice ?? choicesByConfigured.get(modelKey(config.model));
   if (!defaultChoice) {
     throw new StartupDiagnosticError("model", { detail: "Default model must be included in allowedModels" });
   }
@@ -469,18 +518,42 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const configAuthorized = toolAuthorization === "config";
   const configGrantApiError =
     'Coding tools are authorized by configuration (toolAuthorization: "config"); expiring grant APIs are unavailable';
-  const defaultThinkingLevel = config.thinkingLevel ?? "off";
-  // A configured override must be allowed. Otherwise each job captures the conversation's
-  // current model when it starts; old history is not backfilled automatically.
-  const configuredSummaryChoice = config.episodeSummary?.model === undefined
-    ? undefined : choicesByConfigured.get(modelKey(config.episodeSummary.model));
-  if (config.episodeSummary?.model !== undefined && configuredSummaryChoice === undefined) {
-    throw new StartupDiagnosticError("model", { detail: "episodeSummary.model must be included in allowedModels" });
+  const defaultThinkingLevel = defaultPreset?.thinkingLevel ?? config.thinkingLevel ?? "off";
+  // A configured summary override must be allowed. `preset` resolves through the named catalog and
+  // supplies its thinking level to real summary jobs; `model` keeps the legacy direct form.
+  // Otherwise each job captures the conversation's current model when it starts; old history is not
+  // backfilled automatically.
+  let configuredSummary: { readonly model: ModelReference; readonly thinkingLevel?: ModelThinkingLevel } | undefined;
+  if (config.episodeSummary?.preset !== undefined) {
+    const summaryPreset = presetCatalog.get(config.episodeSummary.preset);
+    if (summaryPreset === undefined) {
+      throw new StartupDiagnosticError("model", {
+        detail: "episodeSummary.preset must name a configured model preset",
+      });
+    }
+    configuredSummary = {
+      model: summaryPreset.choice.native,
+      ...(summaryPreset.thinkingLevel === undefined ? {} : { thinkingLevel: summaryPreset.thinkingLevel }),
+    };
+  } else if (config.episodeSummary?.model !== undefined) {
+    const summaryChoice = choicesByConfigured.get(modelKey(config.episodeSummary.model));
+    if (summaryChoice === undefined) {
+      throw new StartupDiagnosticError("model", { detail: "episodeSummary.model must be included in allowedModels" });
+    }
+    configuredSummary = { model: summaryChoice.native };
   }
   if (options.episodeSummary === null) throw new StartupDiagnosticError("model", { detail: "episodeSummary must be an object" });
   const episodeSummaryModel: OpenGatewayOptions["episodeSummary"] = options.episodeSummary ?? (config.episodeSummary?.enabled === false
-    ? undefined : configuredSummaryChoice?.native ?? defaultChoice.native);
-  const useConversationSummaryModel = options.episodeSummary === undefined && configuredSummaryChoice === undefined;
+    ? undefined
+    : configuredSummary === undefined
+      ? defaultChoice.native
+      : {
+          ...configuredSummary.model,
+          ...(configuredSummary.thinkingLevel === undefined
+            ? {}
+            : { thinkingLevel: configuredSummary.thinkingLevel }),
+        });
+  const useConversationSummaryModel = options.episodeSummary === undefined && configuredSummary === undefined;
   if (episodeSummaryModel !== undefined) {
     if (episodeSummaryModel === null || typeof episodeSummaryModel !== "object"
       || Array.isArray(episodeSummaryModel)) {
@@ -576,13 +649,19 @@ export async function openGateway(config: PortConfig, context: Context, options:
       })
     : undefined;
   const fallbackThinkingLevel = (choice: ResolvedModelChoice): ModelThinkingLevel =>
-    config.thinkingLevel !== undefined && choice.thinkingLevels.includes(config.thinkingLevel)
-      ? config.thinkingLevel
-      : "off";
+    choice.thinkingLevels.includes(defaultThinkingLevel) ? defaultThinkingLevel : "off";
   const choiceFromState = (state: Readonly<AgentState> | undefined): ResolvedModelChoice | undefined =>
     state?.model === undefined ? undefined : choicesByNative.get(modelKey(state.model));
-  const policyForState = (state: Readonly<AgentState> | undefined): AgentChange => {
-    const existing = choiceFromState(state);
+  /**
+   * Reapply host policy to a persisted conversation. Named-preset mode additionally resets a
+   * selection left by a previous run to the configured preset on startup, so a temporary CLI
+   * switch never survives a restart or a configuration reload.
+   */
+  const policyForState = (
+    state: Readonly<AgentState> | undefined,
+    resetToConfiguredPreset = false,
+  ): AgentChange => {
+    const existing = resetToConfiguredPreset ? undefined : choiceFromState(state);
     const choice = existing ?? defaultChoice;
     const modelWasRevoked = existing === undefined;
     const thinkingLevel = !modelWasRevoked && state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
@@ -878,6 +957,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ...choice.configured,
     thinkingLevel,
   });
+  const publicPresets: readonly GatewayModelPreset[] = [...presetCatalog].map(([name, preset]) => ({
+    name,
+    ...preset.choice.configured,
+    ...(preset.thinkingLevel === undefined ? {} : { thinkingLevel: preset.thinkingLevel }),
+  }));
   async function applyConversationPolicy(conversation: Conversation, ctx: Context): Promise<void> {
     await conversation.commit(async (tx) => {
       const state = await tx.doc(AgentDoc, conversation.id);
@@ -1391,7 +1475,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const state = await tx.doc(AgentDoc, conversation.id);
           const toolFilter = await toolFilterFor(tx, conversation.id, backgroundToolBounds.get(conversation.id));
           await configure(tx, conversation.id, {
-            ...policyForState(state),
+            // Named-preset mode owns the startup default; direct mode preserves its persisted choice.
+            ...policyForState(state, configuredPresetName !== undefined),
             ...extensionsPolicy(conversation.id),
             ...toolFilter,
           });
@@ -1441,6 +1526,43 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // A best-effort diagnostic must not make the channel scan fail repeatedly.
         }
       },
+    };
+    /** Shared atomic selection path for direct choices and named presets. */
+    const selectConversationModel = async (
+      sessionKey: string,
+      selection: GatewayModelSelectionRequest,
+      ctx: Context,
+    ): Promise<GatewayModelSelection> => {
+      if (!isModelSelection(selection)) throw new Error("Model selection requires provider and modelId strings");
+      const target = choicesByConfigured.get(modelKey(selection));
+      if (!target) throw new Error("Model is not in the configured allowlist");
+      const requestedLevel = Object.hasOwn(selection, "thinkingLevel") ? selection.thinkingLevel : undefined;
+      if (requestedLevel !== undefined && !target.thinkingLevels.includes(requestedLevel)) {
+        throw new Error(`Unsupported thinkingLevel ${requestedLevel} for ${selection.provider}/${selection.modelId}`);
+      }
+      const conversation = await existingConversationFor(sessionKey, ctx);
+      const level = await conversation.commit(async (tx) => {
+        const state = await tx.doc(AgentDoc, conversation.id);
+        const current = choiceFromState(state);
+        const live = await tx.doc(LiveDoc, conversation.id);
+        if (live.run !== undefined) throw new ConversationBusy(conversation.id);
+        const changed = current === undefined || modelKey(current.native) !== modelKey(target.native);
+        const currentLevel = current !== undefined && state.thinkingLevel !== undefined && current.thinkingLevels.includes(state.thinkingLevel)
+          ? state.thinkingLevel
+          : fallbackThinkingLevel(current ?? defaultChoice);
+        const nextLevel = requestedLevel ?? (changed
+          ? fallbackThinkingLevel(target)
+          : target.thinkingLevels.includes(currentLevel) ? currentLevel : fallbackThinkingLevel(target));
+        const toolFilter = await toolFilterFor(tx, conversation.id);
+        await configure(tx, conversation.id, {
+          ...hostPolicy,
+          model: target.native,
+          thinkingLevel: nextLevel,
+          ...toolFilter,
+        });
+        return nextLevel;
+      }, ctx);
+      return publicSelection(target, level);
     };
     const gateway: Gateway = {
       harness,
@@ -1506,39 +1628,33 @@ export async function openGateway(config: PortConfig, context: Context, options:
         const level = state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
           ? state.thinkingLevel
           : fallbackThinkingLevel(choice);
-        return { models: choices.map(publicChoice), selected: publicSelection(choice, level) };
+        return {
+          models: choices.map(publicChoice),
+          selected: publicSelection(choice, level),
+          ...(configuredPresetName === undefined
+            ? {}
+            : { presets: publicPresets, defaultPreset: configuredPresetName }),
+        };
       },
       async selectModel(sessionKey, selection, ctx) {
-        if (!isModelSelection(selection)) throw new Error("Model selection requires provider and modelId strings");
-        const target = choicesByConfigured.get(modelKey(selection));
-        if (!target) throw new Error("Model is not in the configured allowlist");
-        const requestedLevel = Object.hasOwn(selection, "thinkingLevel") ? selection.thinkingLevel : undefined;
-        if (requestedLevel !== undefined && !target.thinkingLevels.includes(requestedLevel)) {
-          throw new Error(`Unsupported thinkingLevel ${requestedLevel} for ${selection.provider}/${selection.modelId}`);
+        return selectConversationModel(sessionKey, selection, ctx);
+      },
+      async selectModelPreset(sessionKey, name, ctx) {
+        if (configuredPresetName === undefined) {
+          throw new Error("Named model presets are not configured; use the direct model selection");
         }
-        const conversation = await existingConversationFor(sessionKey, ctx);
-        const level = await conversation.commit(async (tx) => {
-          const state = await tx.doc(AgentDoc, conversation.id);
-          const current = choiceFromState(state);
-          const live = await tx.doc(LiveDoc, conversation.id);
-          if (live.run !== undefined) throw new ConversationBusy(conversation.id);
-          const changed = current === undefined || modelKey(current.native) !== modelKey(target.native);
-          const currentLevel = current !== undefined && state.thinkingLevel !== undefined && current.thinkingLevels.includes(state.thinkingLevel)
-            ? state.thinkingLevel
-            : fallbackThinkingLevel(current ?? defaultChoice);
-          const nextLevel = requestedLevel ?? (changed
-            ? fallbackThinkingLevel(target)
-            : target.thinkingLevels.includes(currentLevel) ? currentLevel : fallbackThinkingLevel(target));
-          const toolFilter = await toolFilterFor(tx, conversation.id);
-          await configure(tx, conversation.id, {
-            ...hostPolicy,
-            model: target.native,
-            thinkingLevel: nextLevel,
-            ...toolFilter,
-          });
-          return nextLevel;
+        if (typeof name !== "string" || name.length === 0) {
+          throw new Error("Model preset name must be a non-empty string");
+        }
+        const resolvedName = name === "default" ? configuredPresetName : name;
+        const preset = presetCatalog.get(resolvedName);
+        if (preset === undefined) throw new Error("Unknown model preset");
+        // A preset always supplies a concrete thinking level, so selecting it is deterministic even
+        // when two names share the same provider/model pair.
+        return selectConversationModel(sessionKey, {
+          ...preset.choice.configured,
+          thinkingLevel: preset.thinkingLevel ?? "off",
         }, ctx);
-        return publicSelection(target, level);
       },
       async listToolGrants(sessionKey, ctx) {
         // Config authorization has no expiring grants; the configured ceiling is the authority.

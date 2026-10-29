@@ -69,9 +69,26 @@ export interface TerminalModelSelection {
   thinkingLevel: ModelThinkingLevel;
 }
 
+export interface TerminalModelPreset {
+  name: string;
+  provider: string;
+  modelId: string;
+  thinkingLevel?: ModelThinkingLevel;
+}
+
+export interface TerminalModelList {
+  models: readonly TerminalModelChoice[];
+  selected: TerminalModelSelection;
+  /** Named presets are present only when the host configures them. */
+  presets?: readonly TerminalModelPreset[];
+  defaultPreset?: string;
+}
+
 export interface TerminalModelSelectionHost {
-  list(): Promise<{ models: readonly TerminalModelChoice[]; selected: TerminalModelSelection }>;
+  list(): Promise<TerminalModelList>;
   select(selection: { provider: string; modelId: string; thinkingLevel?: ModelThinkingLevel }): Promise<TerminalModelSelection>;
+  /** Optional named-preset selection; absent for legacy direct-model hosts. */
+  selectPreset?(name: string): Promise<TerminalModelSelection>;
 }
 
 export interface TerminalToolGrant {
@@ -925,6 +942,25 @@ export async function runTerminalConversation(
     if (parts.length === 0) {
       const listing = await host.list();
       const maxChoices = 50;
+      const presets = listing.presets ?? [];
+      if (presets.length > 0) {
+        const rows = presets.slice(0, maxChoices).map((preset) => {
+          const selected = preset.provider === listing.selected.provider
+            && preset.modelId === listing.selected.modelId
+            && (preset.thinkingLevel ?? "off") === listing.selected.thinkingLevel;
+          const isDefault = preset.name === listing.defaultPreset;
+          const level = safeLabel(preset.thinkingLevel ?? "off", 32);
+          return `  ${selected ? "* " : "  "}${safeLabel(preset.name, 80)} — ${safeLabel(preset.provider, 80)} ${safeLabel(preset.modelId, 160)} [thinking: ${level}]${isDefault ? " (default)" : ""}`;
+        });
+        if (presets.length > maxChoices) rows.push(`  … ${presets.length - maxChoices} more named presets omitted`);
+        await notice([
+          `Current model: ${modelLabel(listing.selected)} (thinking: ${safeLabel(listing.selected.thinkingLevel, 32)}).`,
+          ...(listing.defaultPreset === undefined ? [] : [`Configured default preset: ${safeLabel(listing.defaultPreset, 80)}.`]),
+          "Named model presets (use /model <name>, or /model default for the configured preset):",
+          ...rows,
+        ].join("\n"));
+        return;
+      }
       const rows = listing.models.slice(0, maxChoices).map((choice) => {
         const selected = choice.provider === listing.selected.provider && choice.modelId === listing.selected.modelId;
         const levels = choice.thinkingLevels.map((level) => safeLabel(level, 32)).join(", ");
@@ -938,7 +974,24 @@ export async function runTerminalConversation(
       ].join("\n"));
       return;
     }
-    if (parts.length < 2 || parts.length > 3 || parts.some((part) => !part)) {
+    if (parts.length === 1) {
+      if (host.selectPreset) {
+        try {
+          const selected = await host.selectPreset(parts[0]!);
+          await notice(`Selected preset ${safeLabel(parts[0]!, 80)}: ${modelLabel(selected)} (thinking: ${safeLabel(selected.thinkingLevel, 32)}).`);
+        } catch (error) {
+          if (error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy")) {
+            await notice("Model preset selection rejected: this conversation is busy. Retry when it is idle.", true);
+          } else {
+            await notice("Model preset selection rejected: unknown name, unsupported thinking, or presets are not configured. Use /model to list named presets.", true);
+          }
+        }
+        return;
+      }
+      await notice("Usage: /model <provider> <modelId> [thinkingLevel]. Use /model to list allowed choices.", true);
+      return;
+    }
+    if (parts.length > 3 || parts.some((part) => !part)) {
       await notice("Usage: /model <provider> <modelId> [thinkingLevel]. Use /model to list allowed choices.", true);
       return;
     }
@@ -1192,7 +1245,7 @@ export async function runTerminalConversation(
           "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
           "/abort uses native Durable semantics: it cancels foreground work and withdraws queued inputs.",
           io.history ? "/search --next continues the last successful query; cursors stay in this process and are never printed. History sessions default to cli:default; use --session with a key reported by /search." : "History search and episode browsing are host-controlled and unavailable here. /entry <entryId> [--radius N] still opens a bounded window in this terminal's default conversation; --session requires a history host.",
-          io.modelSelection ? "/model lists the host allowlist; select with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
+          io.modelSelection ? "/model lists host model choices; named-preset configs select with /model <name> (or /model default), direct configs with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
           io.toolPolicy
             ? "Coding tools are configured by toolAllowlist and apply to authenticated chats; /tools is read-only diagnostics and chat commands never change tool authority."
             : io.toolGrants

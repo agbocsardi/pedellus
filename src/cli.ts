@@ -94,6 +94,9 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
         modelSelection: {
           list: () => gateway!.listModels("cli:default", context),
           select: (selection) => gateway!.selectModel("cli:default", selection, context),
+          ...(config.modelPreset === undefined
+            ? {}
+            : { selectPreset: (name: string) => gateway!.selectModelPreset("cli:default", name, context) }),
         },
         toolPolicy: { mode: "config", tools: config.toolAllowlist ?? [] },
         contextRefresh: {

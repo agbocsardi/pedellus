@@ -2,12 +2,15 @@
 
 This is a bounded P3/P8 slice, not provider-parity acceptance. It uses the pinned
 Pi AI `1.4.0` provider factories and their model catalogs. Only provider aliases
-referenced by the explicit `allowedModels` list are registered (legacy configs
-implicitly allow only `model`); every allowed model must exist in its pinned
-catalog. No model discovery, custom/dynamic endpoint configuration, catalog
-refresh, fallback chains, or legacy presets are added. No live provider, paid
-request, or real credential was used to validate it. See [MODELS.md](./MODELS.md)
-for allowlist, persisted selection, thinking levels, and revocation behavior.
+referenced by the explicit `allowedModels` list, or by the deduped catalog
+derived from named `modelPresets`, are registered (legacy configs implicitly
+allow only `model`); every allowed model must exist in its pinned catalog. No
+model discovery, custom/dynamic endpoint configuration, catalog refresh, fallback
+chains, or legacy presets are added. Named `modelPresets` are only names for the
+same finite allowed choices; see [MODELS.md](./MODELS.md). No live provider,
+paid request, or real credential was used to validate it. See
+[MODELS.md](./MODELS.md) for allowlist, persisted selection, thinking levels, and
+revocation behavior.
 
 ## Credentials and selection
 
@@ -21,7 +24,8 @@ Configuration contains environment-variable **names**, never API keys:
 ```
 
 Credential references (and `telegram.tokenEnv`) must match
-`[A-Za-z_][A-Za-z0-9_]*`. Every alias used by `allowedModels` must have an explicit
+`[A-Za-z_][A-Za-z0-9_]*`. Every alias used by `allowedModels`, or by the catalog
+derived from named `modelPresets`, must have an explicit
 credential reference whose environment variable is set and nonblank before the
 gateway opens. Other aliases in `credentials` need not be configured unless
 allowlisted. Credentials are not inferred from provider defaults.

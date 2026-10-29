@@ -36,14 +36,50 @@ Every allowlisted model exposes exactly the native supported levels in the
 Gateway listing. `off` is always supported; `max` is accepted only for models
 whose native metadata includes it.
 
-Only providers referenced by the allowlist are registered. For normal config,
-each referenced alias must have its own explicit credential reference and a
-nonblank value before startup. The adapter does not discover credentials from
-other environment variables, auth files, OAuth, or catalog refresh. An SDK host
-may inject a `Models` instance to use synthetic/offline providers; configured
-model IDs are resolved against that instance without auth checks or network
-requests. Authentication behavior of an injected provider remains the host's
-responsibility.
+### Named presets
+
+`modelPresets` defines the provider, model and optional thinking level once, and
+`modelPreset` selects the configured default by name:
+
+```json
+{
+  "modelPresets": {
+    "fast": { "provider": "opencode_go", "modelId": "deepseek-v4.1-flash", "thinkingLevel": "off" },
+    "deep": { "provider": "opencode_go", "modelId": "deepseek-v4.1-flash", "thinkingLevel": "high" }
+  },
+  "modelPreset": "fast",
+  "episodeSummary": { "preset": "deep" }
+}
+```
+
+Named mode requires both keys and is an alternative to the direct `model`,
+`allowedModels` and top-level `thinkingLevel` fields; supplying any of those
+together with `modelPresets`/`modelPreset` fails config parsing. Each preset must
+have `provider` and `modelId`, may add only `thinkingLevel`, and rejects every
+other field: this slice has no temperature, output or context budgets, fallback
+chains, inheritance, provider auto-detection, tool policy or run-role knobs.
+Preset names are exact, whitespace-free and may not be `default`, which is
+reserved for returning to the configured selection.
+
+The catalog is normalized into the same native provider/model choices as the
+direct surface: the configured preset supplies `model`, and the deduped set of
+provider/model pairs supplies the internal allowlist. Users do not repeat the
+catalog in `allowedModels`. Two presets that differ only by thinking level share
+one allowed model pair, which is explicitly valid; a preset without
+`thinkingLevel` selects `off`. Startup validates every name, reference, native
+model and thinking level against the pinned catalog before storage opens.
+
+`episodeSummary.preset` references the same catalog and is mutually exclusive
+with the legacy `episodeSummary.model`. The named preset's provider, model and
+thinking level are passed to real summary jobs, not stored as display metadata;
+unknown references fail startup instead of falling back to another preset.
+Without a configured summary override, summaries keep using the conversation's
+current model, and `enabled: false` still disables them. Direct
+`episodeSummary.model` continues to work in direct configs.
+
+Only providers referenced by the allowlist are registered; preset mode derives
+that list from the catalog and uses the same explicit credential references as
+direct mode.
 
 ## Gateway API
 
@@ -61,6 +97,16 @@ pair; no `provider/model` string parsing is used. Neither method creates a
 session; call `conversationFor()` first. Unknown keys and disallowed models are
 rejected.
 
+In named-preset mode the same listing adds `presets: readonly GatewayModelPreset[]`
+(`{ name, provider, modelId, thinkingLevel? }`) and `defaultPreset`, and
+`Gateway.selectModelPreset(sessionKey, name, context)` selects a preset.
+`default` selects the configured preset, and a preset without `thinkingLevel`
+selects `off`, so two names over one model pair stay distinguishable. Preset
+selection reuses the same busy-checked native transaction and persists only in
+`pi.agent`; it adds no second selection store. It never changes tools or
+authority. The local CLI is the only shipped temporary-switch UI in this slice:
+Telegram runs on the configured default preset and has no `/model` command.
+
 If `thinkingLevel` is omitted while selecting the same model, a still-supported
 current level is preserved; otherwise the configured default is used when that
 target supports it, falling back to `off`. If `thinkingLevel` is omitted while
@@ -69,7 +115,10 @@ target, otherwise `off` (including when no default is configured). An explicit
 unsupported level is rejected
 without changing the conversation. Choices and thinking levels survive Durable
 reopen because they live in native `pi.agent`; transcripts, entries, request IDs,
-and usage are not rewritten by selection.
+and usage are not rewritten by selection. This omitted-level behavior is the
+legacy direct `selectModel` contract and remains available to SDK hosts; in
+named-preset mode such a host can hold a selection that matches no preset,
+because preset selection itself always supplies a concrete thinking level.
 
 Selection and the busy check share one native conversation transaction: it reads
 `pi.live.run` and `pi.agent`, rejects with `ConversationBusy` when a run is
@@ -87,6 +136,16 @@ persisted allowed model and supported thinking choice are preserved; missing or
 invalid thinking state is normalized to the configured default when supported,
 else `off`. This includes the root conversation: its initial agent policy is
 create-only, so opening an existing root does not replace an allowed choice.
+
+In named-preset mode this same pre-resume pass instead replaces a persisted
+conversation selection with the configured default preset and its thinking level
+(or `off`). A temporary `/model <name>` switch therefore does not survive a
+restart or a configuration reload; changing `modelPreset` and reopening selects
+the new configured default. Direct-mode conversations keep the preserve-allowed
+behavior described above. Neither path rewrites entries, usage, request IDs or
+checkpointed task dispatches: already prepared requests keep their original
+allowed model and thinking level, and the removed-model guard below still fails
+closed.
 
 Before applying policy, startup scans active native Durable task checkpoints. If
 a prepared generation `request`/`poll` or compaction `summarize`/`retry` refers
