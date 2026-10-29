@@ -525,7 +525,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const cronTools = cronToolRegistration !== undefined && cronOwners.has(conversationId)
       ? [cronToolRegistration]
       : [];
-    // History retrieval is host-approved, read-only, and limited to mapped chat conversations.
+    // History retrieval is enabled by default, read-only, and limited to mapped chat conversations.
     const historyTools = historyToolRegistration !== undefined && historyConversations.has(conversationId)
       ? [historyToolRegistration]
       : [];

@@ -18,7 +18,7 @@
  * authentication. State-only conversations and task-owned background runs are
  * excluded by that mapping. Results include source session/conversation/entry
  * provenance, which is sensitive and stays inside the trusted host/agent boundary;
- * the host-approved model-facing `history` tool quotes it as untrusted data.
+ * the default model-facing `history` tool quotes it as untrusted data.
  */
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
