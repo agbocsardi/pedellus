@@ -101,6 +101,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
           available: config.workspaceContext !== undefined,
           refresh: () => gateway!.refreshContext("cli:default", context),
         },
+        history: {
+          search: (query, ctx) => gateway!.historySearch(query, ctx),
+          listEpisodes: (query, ctx) => gateway!.listHistoryEpisodes("cli:default", query, ctx),
+          episode: (startEntryId, ctx) => gateway!.historyEpisode("cli:default", startEntryId, ctx),
+        },
       });
     }
   } finally {

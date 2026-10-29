@@ -5,8 +5,9 @@ retained entries. It is the first bounded slice of the agreed W3 history design:
 message and tool search plus committed reset boundaries. `Gateway.historySearch`
 is always available and its derived rows are bound to the store's committed
 `nanobot.store-identity`; there is no host-injected identity option. Episode
-summaries, summary search and any history browsing UI or channel command are not
-implemented.
+summaries and summary search are not implemented. The local CLI exposes bounded
+search, episode listing and entry windows over these reads; see
+[CLI history search and browsing](./CLI.md#history-search-and-browsing).
 
 ## Authority, identity and storage
 
@@ -252,6 +253,10 @@ matched chunk.
 - Background indexing independent of a search; reconciliation happens on demand.
 - Relevance ranking: results are deterministic recency order so keyset pagination
   stays stable while FTS corpus statistics change.
-- Fetching surrounding entries by hit; callers can use the source IDs with Durable.
-- Any CLI, Telegram or other channel history browsing/search command. Only trusted
-  host code can call `Gateway.historySearch` today.
+- Fetching surrounding entries by hit through a dedicated Gateway API; the local
+  CLI's `/entry` and `/episode` windows use Durable's existing read-only
+  `conversation.entries` instead. Any other caller can use the source IDs with
+  Durable.
+- Any Telegram or other channel history browsing/search command, a model-facing
+  history tool, or an untrusted-channel result surface. Only trusted host code can
+  call `Gateway.historySearch`; the local CLI is a trusted single-tenant surface.

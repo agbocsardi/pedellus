@@ -2,16 +2,29 @@ import type { Context } from "@earendil-works/chord";
 import { withAbortSignal } from "@earendil-works/chord/context";
 import type { Writable } from "node:stream";
 import { stripVTControlCharacters } from "node:util";
-import { AssistantEntry, ConversationBusy } from "@earendil-works/pi-durable";
+import { AssistantEntry, ConversationBusy, ToolResultEntry, UserEntry } from "@earendil-works/pi-durable";
 import type {
   Conversation,
   ConversationView,
   Cursor,
+  EntryId,
   EntryRecord,
   LiveState,
   UsageState,
 } from "@earendil-works/pi-durable";
 import type { AssistantMessage, Message, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
+import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "../history/episodes.js";
+import {
+  HISTORY_INDEX_LIMITS,
+  type HistoryCoverage,
+  type HistoryCursor,
+  type HistoryHit,
+  type HistoryPage,
+  type HistoryQuery,
+  type HistoryRole,
+  type HistoryScope,
+} from "../history/index.js";
 
 const MAX_PENDING_INPUTS = 64;
 const MAX_ACTIVE_COMMANDS = 16;
@@ -22,6 +35,19 @@ const DEFAULT_HISTORY_COUNT = 10;
 const HISTORY_TEXT_CHARS = 200;
 const HISTORY_PAGE_SIZE = 100;
 const HISTORY_ENTRY_LIMIT = 2_000;
+const DEFAULT_SEARCH_LIMIT = 10;
+const MAX_SEARCH_LIMIT = 50;
+const SEARCH_EXCERPT_CHARS = 600;
+const ENTRY_TEXT_CHARS = 2_000;
+const ENTRY_TOOL_ARGS_CHARS = 400;
+const ENTRY_VIEW_MAX_RADIUS = 5;
+const DEFAULT_EPISODE_LIST_LIMIT = 10;
+const MAX_EPISODE_LIST_LIMIT = 50;
+const DEFAULT_EPISODE_ENTRY_LIMIT = 10;
+const MAX_EPISODE_ENTRY_LIMIT = 30;
+const EPISODE_ENTRY_PAGE_SIZE = 100;
+const MAX_EPISODE_SCAN_ENTRIES = 300;
+const HISTORY_VIEW_CHARS = 48_000;
 const MAX_REMEMBERED_ANSWERS = 256;
 const MAX_REMEMBERED_LOCAL_INPUTS = 1_024;
 const MAX_EXTERNAL_RUNS = 64;
@@ -71,6 +97,17 @@ export interface TerminalContextRefreshHost {
   refresh(): Promise<{ readonly skills: number }>;
 }
 
+/**
+ * Optional host-owned history read surface. The host supplies authenticated session scope; the
+ * terminal never chooses a conversation or session key for search. Search results and episodes
+ * are read-only derived views, never transcript writes or tool authority.
+ */
+export interface TerminalHistoryHost {
+  search(query: HistoryQuery, context: Context): Promise<HistoryPage>;
+  listEpisodes(query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage>;
+  episode(startEntryId: EntryId, context: Context): Promise<HistoryEpisode | undefined>;
+}
+
 export interface TerminalIO {
   /** Each item is a completed line; the source owns any memory bound before yielding it. */
   readonly input: AsyncIterable<string>;
@@ -86,6 +123,8 @@ export interface TerminalIO {
   readonly toolGrants?: TerminalToolGrantsHost;
   /** Optional host-owned workspace-context refresh; standalone callers leave /refresh unavailable. */
   readonly contextRefresh?: TerminalContextRefreshHost;
+  /** Optional host-owned history search/episode reads; standalone callers leave /search and /episodes unavailable. */
+  readonly history?: TerminalHistoryHost;
 }
 
 type InboxView = { items?: readonly { mode?: string }[] };
@@ -143,6 +182,8 @@ export async function runTerminalConversation(
   let outputTail: Promise<void> = Promise.resolve();
   let renderTail: Promise<void> = Promise.resolve();
   let outputFailure: unknown;
+  /** Last successful search base and cursor; the cursor is opaque and never printed. */
+  let pendingSearch: { readonly query: HistoryQuery; readonly cursor: HistoryCursor } | undefined;
 
   const serializeRender = <T>(operation: () => Promise<T>): Promise<T> => {
     const task = renderTail.then(operation);
@@ -590,6 +631,235 @@ export async function runTerminalConversation(
     await notice(`Last ${messages.length} text message(s):\n${messages.join("\n")}${capped ? "\n[History scan capped.]" : ""}`);
   };
 
+  const showSearch = async (args: string): Promise<void> => {
+    const host = io.history;
+    if (!host) {
+      await notice("History search is host-controlled and unavailable here.", true);
+      return;
+    }
+    const parsed = parseSearchArguments(args);
+    if (parsed.kind === "usage") {
+      await notice(SEARCH_USAGE, true);
+      return;
+    }
+    if (parsed.kind === "next" && pendingSearch === undefined) {
+      await notice("No search to continue. Run /search first.", true);
+      return;
+    }
+
+    let base: HistoryQuery;
+    let query: HistoryQuery;
+    if (parsed.kind === "next") {
+      base = pendingSearch!.query;
+      query = { ...base, cursor: pendingSearch!.cursor };
+    } else {
+      base = {
+        text: parsed.text,
+        scope: parsed.scope,
+        limit: parsed.limit,
+        ...(parsed.role === undefined ? {} : { roles: [parsed.role] }),
+      };
+      query = base;
+      // A fresh query replaces any older continuation, even if this one fails.
+      pendingSearch = undefined;
+    }
+    if ([...(base.text ?? "")].length > HISTORY_INDEX_LIMITS.maxQueryChars) {
+      await notice(`Search query must be at most ${HISTORY_INDEX_LIMITS.maxQueryChars} characters.`, true);
+      return;
+    }
+
+    let page: HistoryPage;
+    try {
+      page = await host.search(query, operationContext);
+    } catch (error) {
+      if (signal?.aborted) return;
+      if (parsed.kind === "next") {
+        pendingSearch = undefined;
+        await notice("Search continuation rejected: the query, index, store or session mapping changed. Run /search again.", true);
+      } else {
+        await notice(`History search failed (${errorName(error)}).`, true);
+      }
+      return;
+    }
+    pendingSearch = page.next === undefined ? undefined : { query: base, cursor: page.next };
+
+    const scopeLabel = base.scope ?? "messages";
+    const rolesLabel = base.roles === undefined ? "user+assistant messages" : `messages from ${base.roles.join(",")}`;
+    const target = scopeLabel === "tools"
+      ? "tool names, arguments and result text"
+      : scopeLabel === "all"
+        ? `${rolesLabel} plus tools`
+        : rolesLabel;
+    const lines = [
+      `History search${parsed.kind === "next" ? " (continued)" : ""}: ${base.text ? `text=${safeLabel(base.text, 120)}` : "(browse)"}; scope=${scopeLabel}; ${target}; limit=${base.limit}.`,
+    ];
+    if (page.hits.length === 0) {
+      lines.push("No hits in the indexed records for this query and scope.");
+    } else {
+      lines.push(`${page.hits.length} hit(s), newest first:`);
+      for (let index = 0; index < page.hits.length; index++) {
+        lines.push(formatHistoryHit(page.hits[index]!, index + 1));
+      }
+    }
+    lines.push(...formatHistoryCoverage(page.coverage));
+    if (page.next !== undefined) {
+      lines.push("More results: /search --next (the same query and session mapping; entries appended after this page need a fresh search).");
+    } else if (!page.coverage.complete) {
+      lines.push("No further hits in this indexed window; the index is incomplete, so retry later for newly indexed entries.");
+    }
+    await notice(boundedHistoryView(lines));
+  };
+
+  const showEpisodes = async (args: string): Promise<void> => {
+    const host = io.history;
+    if (!host) {
+      await notice("Episode browsing is host-controlled and unavailable here.", true);
+      return;
+    }
+    const parsed = parseEpisodesArguments(args);
+    if (parsed.kind === "usage") {
+      await notice(EPISODES_USAGE, true);
+      return;
+    }
+    let page: HistoryEpisodePage;
+    try {
+      page = await host.listEpisodes(parsed.query, operationContext);
+    } catch (error) {
+      if (!signal?.aborted) await notice(`Episode listing failed (${errorName(error)}).`, true);
+      return;
+    }
+    if (page.episodes.length === 0) {
+      await notice(parsed.query.before === undefined
+        ? "No non-empty episodes recorded yet."
+        : "No more non-empty episodes below that boundary.");
+      return;
+    }
+    const lines = [
+      `Episodes (newest first), ${page.episodes.length} shown:`,
+      ...page.episodes.map((episode) => {
+        const end = episode.endEntryId === null ? "open" : String(episode.endEntryId);
+        return `  #${episode.startEntryId}-${end} ${episode.status}; entries=${episode.entries ?? "uncounted"} messages=${episode.messages ?? "uncounted"} tools=${episode.toolResults ?? "uncounted"}; ${episode.resetEntryId === null ? "pre-reset segment" : `reset=${episode.resetEntryId}`}; summary=${episode.summary.status}`;
+      }),
+      "Summary text is not generated or shown; only the recorded summary status is reported.",
+    ];
+    if (page.next !== undefined) lines.push(`Older episodes: /episodes --before ${page.next.before}`);
+    lines.push("Open one with /episode <startEntryId>, or a bounded window around any entry with /entry <entryId>.");
+    await notice(boundedHistoryView(lines));
+  };
+
+  const showEpisode = async (args: string): Promise<void> => {
+    const host = io.history;
+    if (!host) {
+      await notice("Episode browsing is host-controlled and unavailable here.", true);
+      return;
+    }
+    const parsed = parseEpisodeArguments(args);
+    if (parsed.kind === "usage") {
+      await notice(EPISODE_USAGE, true);
+      return;
+    }
+    let episode: HistoryEpisode | undefined;
+    try {
+      episode = await host.episode(parsed.startEntryId, operationContext);
+    } catch (error) {
+      if (!signal?.aborted) await notice(`Episode read failed (${errorName(error)}).`, true);
+      return;
+    }
+    if (episode === undefined) {
+      await notice(`No non-empty episode starts at entry #${parsed.startEntryId}. Use /episodes to list episode starts.`, true);
+      return;
+    }
+
+    const rows: string[] = [];
+    let cursor: Cursor | undefined;
+    let scanned = 0;
+    let exhausted = false;
+    try {
+      while (rows.length < parsed.limit && scanned < MAX_EPISODE_SCAN_ENTRIES) {
+        const take = Math.min(EPISODE_ENTRY_PAGE_SIZE, MAX_EPISODE_SCAN_ENTRIES - scanned);
+        const page = await conversation.entries({
+          order: "ascending",
+          minEntryId: episode.startEntryId,
+          ...(episode.endEntryId === null ? {} : { maxEntryId: episode.endEntryId }),
+        }, take, cursor, operationContext);
+        if (page.items.length === 0) {
+          exhausted = true;
+          break;
+        }
+        scanned += page.items.length;
+        for (const entry of page.items) {
+          const display = formatBrowsedEntry(entry, entry.id === parsed.startEntryId);
+          if (display !== undefined) rows.push(display);
+          if (rows.length >= parsed.limit) break;
+        }
+        cursor = page.next;
+        if (cursor === undefined) {
+          exhausted = true;
+          break;
+        }
+      }
+    } catch (error) {
+      if (!signal?.aborted) await notice(`Could not read episode entries (${errorName(error)}).`, true);
+      return;
+    }
+
+    const end = episode.endEntryId === null ? "open" : String(episode.endEntryId);
+    const lines = [
+      `Episode #${episode.startEntryId}-${end} (${episode.status}; summary=${episode.summary.status}); conversation=${conversation.id}; entries=${episode.entries ?? "uncounted"} messages=${episode.messages ?? "uncounted"} tools=${episode.toolResults ?? "uncounted"}.`,
+    ];
+    if (episode.resetEntryId !== null) lines.push(`Reset boundary: entry #${episode.resetEntryId} (reset handoff text is not shown).`);
+    if (rows.length === 0) {
+      lines.push(`No displayable message/tool entry in the first ${scanned} scanned entr${scanned === 1 ? "y" : "ies"}.`);
+    } else {
+      lines.push(...rows);
+      lines.push(`Showing ${rows.length} message/tool entr${rows.length === 1 ? "y" : "ies"}; scanned ${scanned} entr${scanned === 1 ? "y" : "ies"}${episode.entries === null ? "" : ` of ${episode.entries}`}.`);
+    }
+    if (!exhausted && rows.length >= parsed.limit) lines.push(`[Episode view limited to ${parsed.limit} displayable entries; use /entry <entryId> for another window.]`);
+    if (!exhausted && scanned >= MAX_EPISODE_SCAN_ENTRIES) lines.push(`[Episode scan capped at ${MAX_EPISODE_SCAN_ENTRIES} entries.]`);
+    lines.push("System, reset, compaction and thinking content is not shown; raw stored entries are not modified.");
+    await notice(boundedHistoryView(lines));
+  };
+
+  const showEntry = async (args: string): Promise<void> => {
+    const parsed = parseEntryArguments(args);
+    if (parsed.kind === "usage") {
+      await notice(ENTRY_USAGE, true);
+      return;
+    }
+    const minEntryId = Math.max(1, parsed.entryId - parsed.radius) as EntryId;
+    const maxEntryId = Math.min(Number.MAX_SAFE_INTEGER, parsed.entryId + parsed.radius) as EntryId;
+    let rows: string[];
+    let hidden = 0;
+    let selectedSeen = false;
+    try {
+      const page = await conversation.entries({
+        order: "ascending",
+        minEntryId,
+        maxEntryId,
+      }, parsed.radius * 2 + 1, undefined, operationContext);
+      rows = [];
+      for (const entry of page.items) {
+        if (entry.id === parsed.entryId) selectedSeen = true;
+        const display = formatBrowsedEntry(entry, entry.id === parsed.entryId);
+        if (display === undefined) hidden++;
+        else rows.push(display);
+      }
+    } catch (error) {
+      if (!signal?.aborted) await notice(`Could not read entries (${errorName(error)}).`, true);
+      return;
+    }
+
+    const lines = [
+      `Entry window #${minEntryId}-${maxEntryId} in conversation ${conversation.id}; selected=#${parsed.entryId}; radius=${parsed.radius}.`,
+    ];
+    if (!selectedSeen) lines.push(`Entry #${parsed.entryId} was not found in the visible transcript.`);
+    if (rows.length === 0) lines.push("No displayable message/tool entry in this window.");
+    else lines.push(...rows);
+    if (hidden > 0) lines.push(`${hidden} entr${hidden === 1 ? "y" : "ies"} in the window had no displayable message/tool text and were not shown.`);
+    lines.push("System, reset, compaction and thinking content is not shown; raw stored entries are not modified.");
+    await notice(boundedHistoryView(lines));
+  };
+
   const showModel = async (args: string): Promise<void> => {
     const host = io.modelSelection;
     if (!host) {
@@ -831,9 +1101,14 @@ export async function runTerminalConversation(
     switch (name) {
       case "help":
         await notice([
-          "Local commands: /help /status /history [count] /model [provider modelId [thinkingLevel]] /tools /grant <tool[,tool]> <duration> /revoke <tool[,tool]|all> /refresh /compact /abort /new",
+          "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /grant <tool[,tool]> <duration> /revoke <tool[,tool]|all] /refresh /compact /abort /new",
+          SEARCH_USAGE,
+          EPISODES_USAGE,
+          EPISODE_USAGE,
+          ENTRY_USAGE,
           "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
           "/abort uses native Durable semantics: it cancels foreground work and withdraws queued inputs.",
+          io.history ? "/search and /episodes read the host-bound local history index; incomplete coverage is reported, never hidden." : "History search and episode browsing are host-controlled and unavailable here.",
           io.modelSelection ? "/model lists the host allowlist; select with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
           io.toolGrants ? "/grant needs an explicit finite duration (for example /grant read,bash 30m); /tools lists ceiling and grants." : "Coding-tool grants are host-controlled and unavailable here.",
           io.contextRefresh?.available ? "/refresh re-reads workspace context and skills for this conversation when it is idle." : "/refresh is unavailable without configured workspace context.",
@@ -845,6 +1120,18 @@ export async function runTerminalConversation(
         return;
       case "history":
         await showHistory(args);
+        return;
+      case "search":
+        await showSearch(args);
+        return;
+      case "episodes":
+        await showEpisodes(args);
+        return;
+      case "episode":
+        await showEpisode(args);
+        return;
+      case "entry":
+        await showEntry(args);
         return;
       case "model":
         await showModel(args);
@@ -1027,6 +1314,285 @@ function formatHistoryMessage(message: Message): string | undefined {
     ? `${characters.slice(0, HISTORY_TEXT_CHARS).join("")}…`
     : cleaned;
   return `${message.role === "user" ? "You" : "Assistant"}: ${snippet}`;
+}
+
+const SEARCH_USAGE =
+  "Usage: /search [--scope messages|tools|all] [--role user|assistant] [--limit 1-50] [--next] [--] [query] — default scope is messages; empty text browses the selected scope.";
+const EPISODES_USAGE = "Usage: /episodes [--limit 1-50] [--before <entryId>]";
+const EPISODE_USAGE = "Usage: /episode <startEntryId> [--limit 1-30]";
+const ENTRY_USAGE = "Usage: /entry <entryId> [--radius 0-5]";
+
+type SearchArguments =
+  | { readonly kind: "usage" }
+  | { readonly kind: "next" }
+  | {
+    readonly kind: "search";
+    readonly text: string;
+    readonly scope: HistoryScope;
+    readonly role?: HistoryRole;
+    readonly limit: number;
+  };
+
+type EpisodesArguments =
+  | { readonly kind: "usage" }
+  | { readonly kind: "list"; readonly query: HistoryEpisodeQuery };
+
+type EpisodeArguments =
+  | { readonly kind: "usage" }
+  | { readonly kind: "open"; readonly startEntryId: EntryId; readonly limit: number };
+
+type EntryArguments =
+  | { readonly kind: "usage" }
+  | { readonly kind: "entry"; readonly entryId: EntryId; readonly radius: number };
+
+function parseSearchArguments(input: string): SearchArguments {
+  let rest = input.trim();
+  if (!rest) return { kind: "usage" };
+  let scope: HistoryScope | undefined;
+  let role: HistoryRole | undefined;
+  let limit = DEFAULT_SEARCH_LIMIT;
+  let explicit = false;
+  let next = false;
+  while (rest.startsWith("--")) {
+    const token = /^(\S+)(?:\s+([\s\S]*))?$/.exec(rest);
+    if (token === null) return { kind: "usage" };
+    const flag = token[1]!;
+    rest = (token[2] ?? "").trimStart();
+    if (flag === "--") break;
+    if (flag === "--next") {
+      if (next) return { kind: "usage" };
+      next = true;
+      explicit = true;
+      continue;
+    }
+    if (next || (flag !== "--scope" && flag !== "--role" && flag !== "--limit")) return { kind: "usage" };
+    const value = /^(\S+)(?:\s+([\s\S]*))?$/.exec(rest);
+    if (value === null) return { kind: "usage" };
+    const raw = value[1]!;
+    rest = (value[2] ?? "").trimStart();
+    explicit = true;
+    if (flag === "--scope") {
+      if (scope !== undefined || (raw !== "messages" && raw !== "tools" && raw !== "all")) return { kind: "usage" };
+      scope = raw;
+    } else if (flag === "--role") {
+      if (role !== undefined || (raw !== "user" && raw !== "assistant")) return { kind: "usage" };
+      role = raw;
+    } else {
+      if (!/^[1-9][0-9]*$/.test(raw) || Number(raw) > MAX_SEARCH_LIMIT) return { kind: "usage" };
+      limit = Number(raw);
+    }
+  }
+  const text = rest.trim();
+  if (next) {
+    return text || scope !== undefined || role !== undefined || limit !== DEFAULT_SEARCH_LIMIT
+      ? { kind: "usage" }
+      : { kind: "next" };
+  }
+  if (scope === "tools" && role !== undefined) return { kind: "usage" };
+  if (!text && !explicit) return { kind: "usage" };
+  return {
+    kind: "search",
+    text,
+    scope: scope ?? "messages",
+    ...(role === undefined ? {} : { role }),
+    limit,
+  };
+}
+
+function parseEpisodesArguments(input: string): EpisodesArguments {
+  const tokens = input.trim() ? input.trim().split(/\s+/) : [];
+  let limit = DEFAULT_EPISODE_LIST_LIMIT;
+  let before: EntryId | undefined;
+  let sawLimit = false;
+  let sawBefore = false;
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index]!;
+    if (token === "--limit") {
+      if (sawLimit) return { kind: "usage" };
+      const raw = tokens[++index];
+      if (raw === undefined || !/^[1-9][0-9]*$/.test(raw) || Number(raw) > MAX_EPISODE_LIST_LIMIT) return { kind: "usage" };
+      limit = Number(raw);
+      sawLimit = true;
+    } else if (token === "--before") {
+      if (sawBefore) return { kind: "usage" };
+      const parsed = parsePositiveEntryId(tokens[++index]);
+      if (parsed === undefined) return { kind: "usage" };
+      before = parsed;
+      sawBefore = true;
+    } else {
+      return { kind: "usage" };
+    }
+  }
+  return { kind: "list", query: { limit, ...(before === undefined ? {} : { before }) } };
+}
+
+function parseEpisodeArguments(input: string): EpisodeArguments {
+  const tokens = input.trim() ? input.trim().split(/\s+/) : [];
+  const startEntryId = parsePositiveEntryId(tokens[0]);
+  if (startEntryId === undefined) return { kind: "usage" };
+  let limit = DEFAULT_EPISODE_ENTRY_LIMIT;
+  let sawLimit = false;
+  for (let index = 1; index < tokens.length; index++) {
+    const token = tokens[index]!;
+    if (token !== "--limit" || sawLimit) return { kind: "usage" };
+    const raw = tokens[++index];
+    if (raw === undefined || !/^[1-9][0-9]*$/.test(raw) || Number(raw) > MAX_EPISODE_ENTRY_LIMIT) return { kind: "usage" };
+    limit = Number(raw);
+    sawLimit = true;
+  }
+  return { kind: "open", startEntryId, limit };
+}
+
+function parseEntryArguments(input: string): EntryArguments {
+  const tokens = input.trim() ? input.trim().split(/\s+/) : [];
+  const entryId = parsePositiveEntryId(tokens[0]);
+  if (entryId === undefined) return { kind: "usage" };
+  let radius = 1;
+  let sawRadius = false;
+  for (let index = 1; index < tokens.length; index++) {
+    const token = tokens[index]!;
+    if (token !== "--radius" || sawRadius) return { kind: "usage" };
+    const raw = tokens[++index];
+    if (raw === undefined || !/^[0-9]$/.test(raw) || Number(raw) > ENTRY_VIEW_MAX_RADIUS) return { kind: "usage" };
+    radius = Number(raw);
+    sawRadius = true;
+  }
+  return { kind: "entry", entryId, radius };
+}
+
+function parsePositiveEntryId(value: string | undefined): EntryId | undefined {
+  if (value === undefined || !/^[1-9][0-9]*$/.test(value)) return undefined;
+  const id = Number(value);
+  return Number.isSafeInteger(id) ? id as EntryId : undefined;
+}
+
+function formatHistoryHit(hit: HistoryHit, ordinal: number): string {
+  const meta = [
+    `entry=${hit.entryId}`,
+    `session=${safeLabel(hit.sessionKey, 80)}`,
+    `conversation=${hit.conversationId}`,
+    `episode=${hit.episodeStartEntryId}`,
+    `kind=${safeLabel(hit.entryKind, 40)}`,
+  ];
+  if (hit.toolName !== undefined) meta.push(`tool=${safeLabel(hit.toolName, 80)}`);
+  if (hit.toolCallId !== undefined) meta.push(`call=${safeLabel(hit.toolCallId, 80)}`);
+  if (hit.timestamp !== undefined) meta.push(`time=${formatHistoryTimestamp(hit.timestamp)}`);
+  if (hit.partIndex > 0) meta.push(`part=${hit.partIndex}`);
+  if (hit.chunkIndex > 0) meta.push(`chunk=${hit.chunkIndex}`);
+  const excerpt = completePrefix(sanitizeTerminalText(hit.excerpt), SEARCH_EXCERPT_CHARS) || "(empty excerpt)";
+  const flags: string[] = [];
+  if (hit.excerptTruncated) flags.push("excerpt truncated");
+  if (hit.bodyTruncated) flags.push("body truncated in index");
+  return [
+    `${ordinal}. [${hit.role}] ${meta.join(" ")}`,
+    `   ${excerpt.replace(/\n/g, "\n   ")}`,
+    ...(flags.length === 0 ? [] : [`   (${flags.join("; ")})`]),
+  ].join("\n");
+}
+
+function formatHistoryCoverage(coverage: HistoryCoverage): string[] {
+  const lines = [
+    `Index: ${countLabel(coverage.indexedEntries, "indexed entry", "indexed entries")} across ${countLabel(coverage.chatSessions, "chat session")}; ${countLabel(coverage.resetBoundaries, "reset boundary", "reset boundaries")}; boundary entry ${coverage.boundaryEntryId}.`,
+  ];
+  if (coverage.pendingEntries > 0 || !coverage.pendingComplete) {
+    const pending = `${coverage.pendingEntries}${coverage.pendingComplete ? "" : "+"}`;
+    lines.push(`Lag: ${pending} pending entr${coverage.pendingEntries === 1 && coverage.pendingComplete ? "y" : "ies"} (${coverage.pendingComplete ? "counted" : "lower bound"}).`);
+  }
+  if (!coverage.sync.caughtUp) {
+    lines.push(`Reconciliation stopped at ${coverage.sync.entriesScanned}/${coverage.sync.entryLimit} entries in this pass; the next search continues.`);
+  }
+  if (coverage.truncatedParts > 0) lines.push(`Text omitted in the index: ${countLabel(coverage.truncatedParts, "truncated part")}.`);
+  if (coverage.editsUnsupported > 0) {
+    lines.push(`Context edits are not projected: ${countLabel(coverage.editsUnsupported, "entry", "entries")} search as raw stored text.`);
+  }
+  if (coverage.malformedEntries > 0 || coverage.malformedMessages > 0) {
+    lines.push(`Malformed stored records: ${coverage.malformedEntries} entr${coverage.malformedEntries === 1 ? "y" : "ies"}, ${coverage.malformedMessages} message${coverage.malformedMessages === 1 ? "" : "s"}.`);
+  }
+  lines.push(coverage.complete
+    ? "Index: complete for this store snapshot and captured boundary; a later entry needs a fresh search."
+    : "Index: INCOMPLETE — results are a bounded partial view and a no-hit answer does not prove absence.");
+  return lines;
+}
+
+function formatBrowsedEntry(entry: EntryRecord, selected: boolean): string | undefined {
+  const body = browsedEntryBody(entry);
+  if (body === undefined) return undefined;
+  const text = completePrefix(sanitizeTerminalText(body.text), ENTRY_TEXT_CHARS).trim();
+  if (!text) return undefined;
+  const flags: string[] = [];
+  if (selected) flags.push("selected");
+  if (entry.edits !== undefined) flags.push("raw entry; context edits not applied");
+  return [
+    `#${entry.id} [${body.label}] kind=${safeLabel(entry.kind, 40)}${flags.length === 0 ? "" : ` (${flags.join("; ")})`}`,
+    `  ${text.replace(/\n/g, "\n  ")}`,
+  ].join("\n");
+}
+
+function browsedEntryBody(entry: EntryRecord): { readonly label: string; readonly text: string } | undefined {
+  const message = entry.model?.[0];
+  if (entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND) {
+    if (message?.role !== "user") return undefined;
+    const text = messageText(message.content);
+    return text.trim() ? { label: entry.kind === CRON_INPUT_ENTRY_KIND ? "user (cron)" : "user", text } : undefined;
+  }
+  if (AssistantEntry.is(entry)) {
+    if (message?.role !== "assistant") return undefined;
+    let text = "";
+    for (let index = 0; index < message.content.length && index < MAX_MESSAGE_BLOCK_SCAN; index++) {
+      const part = message.content[index]!;
+      if (part.type === "text") text += part.text;
+      else if (part.type === "toolCall") {
+        const args = boundedJson(part.arguments, ENTRY_TOOL_ARGS_CHARS);
+        text += `\n[tool call ${safeLabel(part.name, 80)}${args === undefined ? "" : ` ${args}`}]`;
+      }
+    }
+    return text.trim() ? { label: "assistant", text } : undefined;
+  }
+  if (ToolResultEntry.is(entry)) {
+    if (message?.role !== "toolResult") return undefined;
+    const text = messageText(message.content);
+    return { label: `tool ${safeLabel(message.toolName, 80)}`, text: text.trim() ? text : "(no text content)" };
+  }
+  return undefined;
+}
+
+function messageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  let text = "";
+  for (let index = 0; index < content.length && index < MAX_MESSAGE_BLOCK_SCAN; index++) {
+    const part: unknown = content[index];
+    if (part === null || typeof part !== "object") continue;
+    const block = part as { readonly type?: unknown; readonly text?: unknown };
+    if (block.type === "text" && typeof block.text === "string") text += block.text;
+  }
+  return text;
+}
+
+function boundedJson(value: unknown, maxChars: number): string | undefined {
+  try {
+    const json = JSON.stringify(value);
+    return json === undefined ? undefined : completePrefix(sanitizeTerminalText(json), maxChars);
+  } catch {
+    return "(unserializable)";
+  }
+}
+
+function formatHistoryTimestamp(value: number): string {
+  if (!Number.isFinite(value)) return "invalid";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "invalid" : date.toISOString();
+}
+
+function countLabel(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function boundedHistoryView(lines: readonly string[]): string {
+  const text = lines.join("\n");
+  return text.length <= HISTORY_VIEW_CHARS
+    ? text
+    : `${completePrefix(text, HISTORY_VIEW_CHARS)}\n[History view truncated by the terminal output bound.]`;
 }
 
 function splitToolNames(value: string): readonly string[] | undefined {
