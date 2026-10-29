@@ -94,6 +94,45 @@ The tool is context delivery, not execution or privilege:
   requirement-unavailable skills can be listed but loading one is refused with a
   reason.
 
+## Explicit refresh of one conversation
+
+A conversation keeps the snapshot captured when it was created or when the
+Gateway reopened, so a skill created or edited mid-conversation stays invisible
+by default. A host can re-capture **one existing session** without restarting:
+
+```ts
+const { skills } = await gateway.refreshContext("cli:default", context);
+```
+
+The call is safe for an ordinary local surface to expose as an explicit refresh
+control:
+
+- It runs the same `contextSnapshotProvider` as creation and reopen, so the
+  workspace bootstrap/memory/manifest documents and the skill inventory are
+  re-read together. Disabled names and `requires` gates are re-evaluated.
+- The refreshed `skillSummary` replaces `nanobot_skills` on the next turn, and
+  the on-demand `skill` table is replaced in the same call. Bodies remain out of
+  the prompt; Markdown on disk stays authoritative.
+- Only an existing mapped session can be refreshed. An unknown session key, a
+  gateway opened without `contextSnapshotProvider`, and a live run
+  (`ConversationBusy`) are rejected. Retry a busy session when it is idle.
+- A provider or loader failure rejects the refresh and leaves the working
+  snapshot and tool table in place. A successful refresh returns the number of
+  discovered skills; `0` removes the conversation's skill table and tool.
+- It adds no authority: no tool grant is created or widened, the host ceiling,
+  workspace roots and shell environment are unchanged, and the normal policy
+  pass only prunes already-expired grants. Durable transcript and resume
+  behavior are unchanged; the refreshed snapshot is host state, not persisted
+  conversation state.
+- A scheduled background-run conversation has no session key and is not
+  refreshable; it keeps its snapshot until the next run or Gateway reopen.
+
+The trigger belongs to the host. This Gateway API does not watch files or
+refresh on its own, and the local CLI wiring is separate from this runtime
+change: a terminal control can call `gateway.refreshContext("cli:default",
+context)` between submissions to make a newly created skill usable in the same
+conversation.
+
 `requires.env` is evaluated against the environment the guarded shell actually
 exports — `PATH`, `HOME`, `TMPDIR`, `LANG`, `TERM`, `PYTHONUNBUFFERED` — built by
 the shared `defaultShellEnvironment()` policy. A host-only variable (for example
@@ -118,8 +157,9 @@ owner's 2026-10-28 selection is:
     subagents or Dream state.
   - `skill-creator` — this loader's frontmatter, metadata and
     progressive-loading contract, including the fixed per-conversation snapshot
-    (a new skill appears in the next conversation or after a Gateway reopen, not
-    in the current one); no Python packaging scripts or `.skill` archive.
+    (a new skill appears in the next conversation, after an explicit host
+    refresh of the current one, or after a Gateway reopen); no Python packaging
+    scripts or `.skill` archive.
   - `github` — `gh` through a granted shell, gated on
     `requires.bins: ["gh"]`; checks authentication first and stops rather than
     placing secrets in the workspace.
@@ -165,9 +205,12 @@ the config contains an explicit section (see
   prompt never includes a body, so a selection list would be inert.
 - Each conversation receives its own detached snapshot: the loaders run once per
   session key on open/create, an existing conversation keeps the snapshot
-  captured for it, and reopening the gateway reconstructs every mapped session
-  before `harness.resume()` (the same lifecycle as bootstrap/memory context, so
-  the prepared-context recovery guard applies unchanged).
+  captured for it unless the host explicitly refreshes that session, and
+  reopening the gateway reconstructs every mapped session before
+  `harness.resume()` (the same lifecycle as bootstrap/memory context, so the
+  prepared-context recovery guard applies unchanged). `gateway.refreshContext()`
+  is the only same-conversation re-capture; see
+  [Explicit refresh](#explicit-refresh-of-one-conversation).
 - A loader failure rejects that conversation's setup and installs no partial
   context; a retry re-runs the loader.
 - Requirement gates are evaluated against the non-secret environment the guarded

@@ -62,6 +62,12 @@ export type GatewayContextSnapshotProvider = (
   | undefined
   | Promise<Omit<ConversationContextSnapshot, "conversationId"> | undefined>;
 
+/** Result of an explicit, per-session context refresh. */
+export interface GatewayContextRefresh {
+  /** Skills in the refreshed snapshot; 0 removes this conversation's on-demand skill table. */
+  readonly skills: number;
+}
+
 export interface OpenGatewayOptions {
   readonly models?: Models;
   /** Explicit host-owned context snapshots; absent means no context extension is installed. */
@@ -77,6 +83,12 @@ export interface Gateway {
   selectModel(sessionKey: string, selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection>;
   /** Active, unexpired grants for a known session; empty when tools are disabled. */
   listToolGrants(sessionKey: string, context: Context): Promise<readonly GatewayToolGrant[]>;
+  /**
+   * Re-runs the configured context snapshot provider for one existing session and applies it to the
+   * next turn. Rejects an unknown session, a live run, or a gateway opened without a provider.
+   * Prompt content stays metadata-only and no tool grant is added or widened.
+   */
+  refreshContext(sessionKey: string, context: Context): Promise<GatewayContextRefresh>;
   /**
    * Adds explicit expiring grants for a known session. Every name must be inside the host ceiling and
    * every expiry must be in the future; a conversation never receives an implicit or permanent grant.
@@ -538,6 +550,47 @@ export async function openGateway(config: PortConfig, context: Context, options:
     contextInstallerRef.current = (sessionKey, conversationId, ctx) =>
       installContextSnapshot(sessionKey, conversationId, ctx, true);
 
+    // Explicit same-conversation refresh: re-run the host provider and apply the new snapshot to the
+    // next turn. It is opt-in, per session key, and refuses a live run. Provider or loader failure
+    // leaves the captured snapshot untouched. Refresh changes no grant: it re-renders the skills
+    // summary and replaces the on-demand skill table, while the normal policy pass only prunes grants
+    // as before. Background cron targets are not reachable here because they have no session key.
+    const refreshContextSnapshot = async (
+      sessionKey: string,
+      conversationId: ConversationId,
+      ctx: Context,
+    ): Promise<number> => {
+      const loading = contextSnapshotLoads.get(conversationId);
+      if (loading !== undefined) await loading;
+      const conversation = await harnessRef.current!.conversation(conversationId, ctx);
+      if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
+      // Refuse an obvious live run before re-reading skill files; the commit below rechecks atomically.
+      if ((await harnessRef.current!.snapshot(LiveDoc, conversationId, ctx))?.run !== undefined) {
+        throw new ConversationBusy(conversationId);
+      }
+      const supplied = await options.contextSnapshotProvider!(sessionKey, conversationId, ctx);
+      if (supplied !== undefined && !isRecord(supplied)) {
+        throw new TypeError("Context snapshot provider must return an object or undefined");
+      }
+      const snapshot = bindContextSnapshot(supplied, conversationId);
+      let extension: Extension | undefined;
+      const skills = await conversation.commit(async (tx) => {
+        const live = await tx.doc(LiveDoc, conversationId);
+        if (live.run !== undefined) throw new ConversationBusy(conversationId);
+        extension = contextExtensionBuilder.replace(snapshot);
+        contextExtension = extension;
+        contextConversations.add(conversationId);
+        const count = skillTool?.setConversation(conversationId, snapshot) ?? 0;
+        if (count > 0) skillConversations.add(conversationId);
+        else skillConversations.delete(conversationId);
+        const toolFilter = await toolFilterFor(tx, conversationId);
+        await configure(tx, conversationId, { ...extensionsPolicy(conversationId), ...toolFilter });
+        return count;
+      }, ctx);
+      registry.install(extension!);
+      return skills;
+    };
+
     // Restore the persisted session mapping before resume can schedule work. Cron owners come from
     // the same mapping and are restored even without a context snapshot provider: the policy pass
     // below would otherwise strip the cron tool from every persisted origin session on reopen.
@@ -790,6 +843,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
         const conversation = await existingConversationFor(sessionKey, ctx);
         const document = await harness!.snapshot(ToolGrantDoc, conversation.id, ctx);
         return document === undefined ? [] : activeToolGrants(document, toolAllowlist, now());
+      },
+      async refreshContext(sessionKey, ctx) {
+        if (!options.contextSnapshotProvider) {
+          throw new Error("Context refresh requires a configured contextSnapshotProvider");
+        }
+        const conversation = await existingConversationFor(sessionKey, ctx);
+        return { skills: await refreshContextSnapshot(sessionKey, conversation.id, ctx) };
       },
       async grantTools(sessionKey, grants, ctx) {
         if (!toolExtension) throw new Error("Tools are disabled: toolAllowlist is empty");

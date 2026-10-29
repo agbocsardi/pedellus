@@ -154,7 +154,7 @@ export {
   type PreparedContextBlockTarget,
   type PreparedContextCancelResult,
 } from "./recovery/index.js";
-export { openGateway, type Gateway, type GatewayContextSnapshotProvider, type OpenGatewayOptions } from "./runtime.js";
+export { openGateway, type Gateway, type GatewayContextRefresh, type GatewayContextSnapshotProvider, type OpenGatewayOptions } from "./runtime.js";
 export {
   CODING_TOOL_NAMES,
   createCodingToolExtension,

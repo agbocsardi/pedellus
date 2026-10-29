@@ -155,6 +155,8 @@ export function createContextExtension(
 /** Build replacement extensions from prepared values without retaining mutable host snapshots. */
 export function createContextExtensionBuilder(): {
   add(snapshot: ConversationContextSnapshot): Extension;
+  /** Replace one conversation's prepared snapshot, or add it when absent. */
+  replace(snapshot: ConversationContextSnapshot): Extension;
   remove(conversationId: ConversationId): Extension;
 } {
   const contexts = new Map<ConversationId, PreparedContext>();
@@ -166,6 +168,18 @@ export function createContextExtensionBuilder(): {
       const [conversationId, prepared] = prepareSnapshot(snapshot);
       if (contexts.has(conversationId)) {
         throw new TypeError(`Duplicate context snapshot for conversation ${conversationId}`);
+      }
+      const next = new Map(contexts);
+      next.set(conversationId, prepared);
+      const extension = buildContextExtension(next);
+      contexts.set(conversationId, prepared);
+      return extension;
+    },
+    replace(snapshot: ConversationContextSnapshot): Extension {
+      // Explicit host refresh: replace or add one conversation without disturbing the others.
+      const [conversationId, prepared] = prepareSnapshot(snapshot);
+      if (!contexts.has(conversationId) && contexts.size >= CONTEXT_LIMITS.maxConversations) {
+        throw new RangeError(`At most ${CONTEXT_LIMITS.maxConversations} conversation snapshots are accepted`);
       }
       const next = new Map(contexts);
       next.set(conversationId, prepared);

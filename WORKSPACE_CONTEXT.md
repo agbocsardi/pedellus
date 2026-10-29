@@ -60,10 +60,14 @@ snapshot provider and `openGateway` installs no context extension.
 - The same fixed selection applies to every session key, including `cli:default`
   and channel keys. Each conversation loads the files afresh and keeps its own
   detached snapshot; a later session sees later file contents while an earlier
-  conversation keeps the snapshot captured for it.
+  conversation keeps the snapshot captured for it until the host explicitly
+  refreshes that session with `gateway.refreshContext()` or the Gateway reopens.
 - Startup/recovery reloads the config selection for every persisted session
-  mapping before resume. Reopening therefore reconstructs workspace context
-  from the current files, not from a cached copy.
+  mapping before resume. Reopening, or an explicit per-session refresh,
+  reconstructs workspace context from the current files, not from a cached copy.
+  Refresh is available only for an existing mapped session, rejects a live run,
+  and leaves the working snapshot in place if a loader fails; see
+  [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md#explicit-refresh-of-one-conversation).
 - A loader failure (missing selected file, symlink/hardlink, bounds, unsafe
   root, observable replacement, missing builtin skills root) rejects gateway
   startup or `conversationFor`. No partial context is installed, and a retry

@@ -59,7 +59,11 @@ and calling the provider before `harness.resume()`. It also binds a new conversa
 snapshot and installs the replacement extension before returning that conversation,
 so the caller cannot submit first. The provider is called once per mapped session on
 open and once for each new session; host changes to existing snapshots take effect
-when the gateway is reopened. The callback receives the mapped session key and
+when the gateway is reopened, or after an explicit
+`gateway.refreshContext(sessionKey, context)` for that session. Refresh re-runs the
+provider, replaces the captured summary and skill table on the next turn, adds no
+tool authority, and is rejected for a live run; a provider failure leaves the working
+snapshot in place. The callback receives the mapped session key and
 Durable ID established by the gateway. When context is opted out on reopen, the
 runtime clears extension selection before resume; native section replay removes old
 context from the effective prompt, but stored transcript history is not erased. Before
