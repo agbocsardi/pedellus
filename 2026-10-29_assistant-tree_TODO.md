@@ -4,7 +4,7 @@
 
 - [x] Agree the tree: CLI + Telegram trunk; tools, delegation, then more channels.
 - [x] T1 — Make the existing assistant straightforward to configure and use (offline verified).
-  - [ ] Preserve config-tool and preset behavior in focused, reviewed permanent tests.
+  - [x] Preserve config-tool and preset behavior in focused, reviewed permanent tests.
 - [ ] T2 — Prove memory and recall through a complete conversation lifecycle.
 - [ ] T3 — Make reminders and scheduled work useful end to end.
 - [ ] T4 — Prove restart, failure handling and basic backup/restore.
@@ -186,5 +186,8 @@ standard suite. Relative one-shot reminders and their reviewed tests are integra
 the setup now accepts “in ten minutes” without a model clock. Combined checks pass:
 161 behavior checks in 8.5s, 9 execution in 12s and 88 core acceptance checks.
 Both Node test phases have an external 60s deadline with forced kill after 5s.
-Preset tests are in their bounded cleanup fix pass; origin-mode Telegram delivery
-is the next implementation slice. Live-model/channel acceptance remains open.
+Preset tests passed review and are registered; fixed their leaked deadline timer
+and the same leak in an older model-policy test. Combined suite: 165 behavior
+checks in 6.3s, 9 execution in 12s and 88 core acceptance checks. Origin-mode
+Telegram delivery is the last in-flight slice. No further work is starting this
+session; live-model/channel acceptance remains open.
