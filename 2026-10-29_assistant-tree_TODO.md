@@ -181,8 +181,10 @@ Owner explicitly requested permanent regression coverage. Config-tool and preset
 workers now own focused tests for their integrated changes; the relative-reminder
 worker includes tests in its slice. Reviewers check coverage and hang resistance.
 This replaces the earlier no-permanent-tests restriction for implementation work.
-Config-tool tests passed independent review plus a sensitivity fix, are registered
-in the standard suite, and pass on the integrated tree: 158 behavior checks in
-8.2s and 9 execution checks in 12.1s. Both Node test phases now have an external
-60s deadline with forced termination after a further 5s; preset/reminder coverage
-is still in review.
+Config-tool tests passed independent review plus a sensitivity fix and are in the
+standard suite. Relative one-shot reminders and their reviewed tests are integrated;
+the setup now accepts “in ten minutes” without a model clock. Combined checks pass:
+161 behavior checks in 8.5s, 9 execution in 12s and 88 core acceptance checks.
+Both Node test phases have an external 60s deadline with forced kill after 5s.
+Preset tests are in their bounded cleanup fix pass; origin-mode Telegram delivery
+is the next implementation slice. Live-model/channel acceptance remains open.

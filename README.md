@@ -64,8 +64,8 @@ back to neither the host shell nor a managed copy. See
 
 ## Internal cron (opt-in)
 
-[`CRON.md`](./CRON.md) describes finite timer/run tasks, `at`/`every`/calendar
-schedules and IANA time zones. Timers arm their successors independently of model
+[`CRON.md`](./CRON.md) describes finite timer/run tasks, relative one-shot
+reminders (`after_seconds`), absolute/recurring/calendar schedules and IANA zones. Timers arm their successors independently of model
 execution. Setting `cron: { enabled: true }` installs the foundation and a
 model-callable `cron` tool (`add`/`list`/`remove`) in `openGateway`; both are also
 exported through the SDK barrel. The agent schedules work when the user asks; there

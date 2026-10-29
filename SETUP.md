@@ -165,15 +165,13 @@ In an allowed private chat:
 ```text
 /help
 Load the memory skill and remember that the demo bot is for setup checks.
-Use the cron tool to remind me at <FUTURE-ISO-INSTANT> to stretch, then save that
-reminder in memory/topics/demo.md.
+Remind me in ten minutes to stretch, then save that reminder in memory/topics/demo.md.
 ```
 
-Replace `<FUTURE-ISO-INSTANT>` with a real future timestamp that includes `Z` or
-a UTC offset, for example a specific date and time you choose. The `cron` tool
-rejects relative times and naive local timestamps, and the assistant has no clock
-source, so state the absolute instant instead of asking for "in ten minutes";
-relative-time requests remain a usability gap.
+For a relative one-shot reminder the agent uses `after_seconds` (600 for ten
+minutes). The gateway fixes the deadline from its own clock once, so the model
+needs no clock tool and retries never push it back. For an exact instant, use an
+ISO timestamp with `Z` or a UTC offset; naive local timestamps remain rejected.
 
 `/new`, `/abort` and `/help` are the channel controls. Context refresh in
 Telegram is a gateway restart; there is no Telegram refresh command, and `/new`
