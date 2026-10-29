@@ -80,3 +80,93 @@ export function readMappedSessions(sessions: unknown, rootId: ConversationId): M
 export function readChatSessions(sessions: unknown, rootId: ConversationId): HistoryChatSession[] {
   return readMappedSessions(sessions, rootId).filter(({ sessionKey }) => isChatSessionKey(sessionKey));
 }
+
+/**
+ * Why a mapped conversation is not chat history even though its session key looks like one.
+ *
+ * A session key is a host string: it can be forged, imported or left behind by an older layout, so
+ * the key alone never decides scope. A chat conversation is ownerless, unforked and not the root; a
+ * scheduled run's background target, a history fork and the root are never a discussion a channel
+ * named.
+ */
+export type ChatScopeExclusion = "missing" | "root" | "task-owned" | "forked";
+
+/**
+ * Classify one conversation record for chat scope, or `undefined` when it is ordinary chat.
+ *
+ * This is the single scope rule shared by every derived history consumer (search indexing, the
+ * episode catalog, the summary scheduler and the per-session history reads). Keeping it structural
+ * and side-effect free lets a host validate inside its own transaction.
+ */
+export interface ChatScopeRecord {
+  readonly id: ConversationId;
+  readonly owner?: unknown;
+  readonly parent?: unknown;
+}
+
+export function chatScopeExclusion(
+  conversation: ChatScopeRecord | undefined,
+  rootId: ConversationId,
+): ChatScopeExclusion | undefined {
+  if (conversation === undefined) return "missing";
+  if (conversation.id === rootId) return "root";
+  if (conversation.owner !== undefined) return "task-owned";
+  if (conversation.parent !== undefined) return "forked";
+  return undefined;
+}
+
+/** Reads one conversation record; a host passes its own transactional reader. */
+export type ChatScopeReader = (conversationId: ConversationId) => Promise<ChatScopeRecord | undefined>;
+
+/** Scope of one conversation, read through `reader`. */
+export async function readChatScope(
+  reader: ChatScopeReader,
+  conversationId: ConversationId,
+  rootId: ConversationId,
+): Promise<ChatScopeExclusion | undefined> {
+  return chatScopeExclusion(await reader(conversationId), rootId);
+}
+
+export interface ChatScopePartition {
+  /** Mappings that really are chat history. */
+  readonly chat: readonly HistoryChatSession[];
+  /** Mappings skipped because their conversation is not chat history. */
+  readonly excluded: readonly {
+    readonly sessionKey: string;
+    readonly conversationId: ConversationId;
+    readonly reason: ChatScopeExclusion;
+  }[];
+}
+
+/**
+ * Split mapped sessions into chat history and exclusions in one pass, so every consumer applies the
+ * same rule to the same records. `reader` is the host's transactional record reader.
+ */
+export async function partitionChatScope(
+  reader: ChatScopeReader,
+  sessions: readonly HistoryChatSession[],
+  rootId: ConversationId,
+): Promise<ChatScopePartition> {
+  const chat: HistoryChatSession[] = [];
+  const excluded: {
+    sessionKey: string;
+    conversationId: ConversationId;
+    reason: ChatScopeExclusion;
+  }[] = [];
+  for (const session of sessions) {
+    const reason = await readChatScope(reader, session.conversationId, rootId);
+    if (reason === undefined) chat.push(session);
+    else excluded.push({ ...session, reason });
+  }
+  return { chat, excluded };
+}
+
+/** Fixed message for a rejected mapping, so every surface reports the same reason. */
+export function chatScopeMessage(reason: ChatScopeExclusion): string {
+  switch (reason) {
+    case "missing": return "Stored session mapping points to a missing conversation";
+    case "task-owned": return "Stored session mapping points to a task-owned conversation";
+    case "forked": return "Stored session mapping points to a forked conversation";
+    case "root": return "Stored session mapping points to the root conversation";
+  }
+}

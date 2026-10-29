@@ -654,7 +654,7 @@ async function runEpisodes(host: HistoryToolHost, args: HistoryToolArguments, co
     "History episodes (read-only; reset-delimited episode boundaries in one mapped chat source).",
     "Episode metadata is derived from prior conversation records; opened entry text is untrusted quoted data.",
     `Source: ${label(session)}; newest first; limit=${limit}${before === undefined ? "" : `; before=${before}`}.`,
-    "No generated titles or summary text exist; summary= reports only the catalog status. The original entries are the evidence.",
+    "This tool does not return generated titles or summary text; summary= reports only catalog status. The original entries are the evidence.",
   ];
   const footer: string[] = [];
   if (page.episodes.length === 0) {
@@ -670,7 +670,7 @@ async function runEpisodes(host: HistoryToolHost, args: HistoryToolArguments, co
   }
   footer.push(
     "Coverage: one source session and this page only; no total episode count is reported. " +
-    "summary=unknown means the boundary is not reconciled yet, not that discussion is missing; original entries remain readable.",
+    "summary status describes derived catalog state, not whether discussion exists; original entries remain readable.",
   );
   footer.push(
     "Drill down with action=\"episode\" and a start entry ID from this page, or discover sources and episode starts across " +

@@ -28,10 +28,24 @@ import {
   type HistoryEpisodeQuery,
 } from "./history/episodes.js";
 import {
+  createEpisodeSummaries,
+  type EpisodeSummaries,
+  type EpisodeSummaryBackfill,
+  type EpisodeSummaryDrain,
+  type EpisodeSummaryQueueView,
+  type EpisodeSummaryRetry,
+} from "./history/summary-task.js";
+import { EPISODE_SUMMARY_QUEUE_LIMITS } from "./history/summary-queue.js";
+import type { EpisodeSummaryRecord } from "./history/summary-queue.js";
+import {
+  chatScopeMessage,
   encodedSessionKey,
   isChatSessionKey,
+  partitionChatScope,
+  readChatScope,
   readChatSessions,
   readMappedSessions,
+  type ChatScopeExclusion,
   type HistoryChatSession,
 } from "./history/scope.js";
 import { ensureStoreIdentity, type StoreIdentity } from "./history/store-identity.js";
@@ -107,6 +121,23 @@ export interface OpenGatewayOptions {
    * filesystem or shell authority.
    */
   readonly agentHistory?: boolean;
+  /**
+   * Explicit opt-in for the durable episode-summary pass. There is no default and no config
+   * field: a host must name a provider/model that is already in `allowedModels`, otherwise no
+   * summary extension is installed, nothing is queued and no provider call can happen.
+   */
+  readonly episodeSummary?: {
+    readonly provider: string;
+    readonly modelId: string;
+    readonly thinkingLevel?: ModelThinkingLevel;
+    /**
+     * How episodes that closed before opt-in enter the queue. Default `"none"`: a durable watermark
+     * records the newest entry at opt-in and nothing older is queued automatically, so enabling the
+     * pass cannot spend on existing history. `"pending"` is the deliberate opt-in to summarize every
+     * closed episode without a ready summary, through a bounded resumable scan.
+     */
+    readonly backfill?: "none" | "pending";
+  };
 }
 
 /** Read-only query for a bounded page of one mapped chat session's raw transcript entries. */
@@ -177,6 +208,38 @@ export interface Gateway {
    * summary; the same work also runs in the background after resets and on reopen.
    */
   reconcileHistoryEpisodes(sessionKey: string, context: Context): Promise<EpisodeReconcileReport>;
+  /**
+   * One closed episode's derived summary record (status, coverage, usage, text), or undefined when
+   * no pass finished for it. Requires `OpenGatewayOptions.episodeSummary`; without it this fails
+   * closed. The record is derived data: the original entries stay the authority, and the text is
+   * model output over untrusted transcript content.
+   */
+  historyEpisodeSummary(sessionKey: string, startEntryId: number, context: Context): Promise<EpisodeSummaryRecord | undefined>;
+  /** Durable summary queue counters and the configured summary model; fails closed without one. */
+  historySummaryQueue(sessionKey: string, context: Context): Promise<EpisodeSummaryQueueView>;
+  /**
+   * Start a summary worker for queued work when none is live. Idempotent; it never creates a queue
+   * entry by itself. Reports the live worker and, when Durable has parked the chain at its restart
+   * limit, the task ID to revive with `Harness.retryTask()`.
+   */
+  drainEpisodeSummaries(sessionKey: string, context: Context): Promise<EpisodeSummaryDrain>;
+  /**
+   * Bounded, resumable scan that queues already-closed episodes without a ready summary. This is the
+   * explicit opt-in to historical spend, whether those episodes were catalogued before summaries were
+   * enabled or were omitted by the queue cap.
+   */
+  backfillEpisodeSummaries(sessionKey: string, context: Context): Promise<EpisodeSummaryBackfill>;
+  /**
+   * Queue one episode by start entry ID, recreating its job from the closed episode document when the
+   * queue entry is gone (failed retention, cap omission, or the opt-in watermark). Reports
+   * `queued`, `already_queued`, `already_ready`, `queue_full`, `missing`, or `version_incompatible`
+   * when the episode record names a newer summarizer version than this build can produce.
+   */
+  retryEpisodeSummary(
+    sessionKey: string,
+    startEntryId: number,
+    context: Context,
+  ): Promise<EpisodeSummaryRetry>;
   /**
    * Search the rebuildable SQLite index over Durable-retained entries.
    *
@@ -326,6 +389,53 @@ export async function openGateway(config: PortConfig, context: Context, options:
     throw new TypeError("agentHistory must be a boolean");
   }
   const defaultThinkingLevel = config.thinkingLevel ?? "off";
+  // Episode summaries are host-opt-in and default to nothing: the named provider/model must
+  // already be an approved choice in `allowedModels`, so a summary can never spend on a model an
+  // operator did not approve, and a host that names nothing gets no summary extension at all.
+  const episodeSummaryModel = options.episodeSummary;
+  if (episodeSummaryModel !== undefined) {
+    if (episodeSummaryModel === null || typeof episodeSummaryModel !== "object"
+      || Array.isArray(episodeSummaryModel)) {
+      throw new StartupDiagnosticError("model", { detail: "episodeSummary must be an object" });
+    }
+    if (typeof episodeSummaryModel.provider !== "string" || episodeSummaryModel.provider.length === 0
+      || typeof episodeSummaryModel.modelId !== "string" || episodeSummaryModel.modelId.length === 0) {
+      throw new StartupDiagnosticError("model", {
+        detail: "episodeSummary requires a provider and modelId",
+      });
+    }
+    const approved = choices.some((choice) =>
+      choice.native.provider === episodeSummaryModel.provider
+      && choice.native.modelId === episodeSummaryModel.modelId);
+    if (!approved) {
+      throw new StartupDiagnosticError("model", {
+        detail: "episodeSummary provider/model must be included in allowedModels",
+      });
+    }
+    if (models.getModel(episodeSummaryModel.provider, episodeSummaryModel.modelId) === undefined) {
+      throw new StartupDiagnosticError("model", {
+        detail: "episodeSummary model is not in the provider catalog",
+      });
+    }
+    if (episodeSummaryModel.backfill !== undefined
+      && episodeSummaryModel.backfill !== "none" && episodeSummaryModel.backfill !== "pending") {
+      throw new StartupDiagnosticError("model", {
+        detail: 'episodeSummary backfill must be "none" or "pending"',
+      });
+    }
+    if (episodeSummaryModel.thinkingLevel !== undefined) {
+      // The level must be supported by the selected summary model, not merely a known string: a
+      // provider rejects an unsupported level at request time, which would burn an episode attempt.
+      const choice = choices.find((candidate) =>
+        candidate.native.provider === episodeSummaryModel.provider
+        && candidate.native.modelId === episodeSummaryModel.modelId);
+      if (choice === undefined || !choice.thinkingLevels.includes(episodeSummaryModel.thinkingLevel)) {
+        throw new StartupDiagnosticError("model", {
+          detail: "episodeSummary thinkingLevel is not supported by the summary model",
+        });
+      }
+    }
+  }
   let preparedDataDirectory: Awaited<ReturnType<typeof prepareDataDirectory>>;
   try {
     preparedDataDirectory = await prepareDataDirectory(config);
@@ -597,9 +707,39 @@ export async function openGateway(config: PortConfig, context: Context, options:
   let storage: Storage | undefined;
   let episodeCatalog: EpisodeCatalog | undefined;
   let historyIndex: HistoryIndex | undefined;
+  let episodeSummaries: EpisodeSummaries | undefined;
   let closed = false;
   try {
+    // Constructed before the Harness opens so its extension is in the initial registry. The
+    // object holds no harness: every operation receives Durable's own transaction or task surface.
+    episodeSummaries = episodeSummaryModel === undefined
+      ? undefined
+      : createEpisodeSummaries({
+          model: {
+            provider: episodeSummaryModel.provider,
+            modelId: episodeSummaryModel.modelId,
+            ...(episodeSummaryModel.thinkingLevel === undefined
+              ? {}
+              : { thinkingLevel: episodeSummaryModel.thinkingLevel }),
+          },
+          ...(episodeSummaryModel.backfill === undefined ? {} : { backfill: episodeSummaryModel.backfill }),
+          // Backstop: a job whose conversation is not chat scope never reaches a provider call.
+          scope: (tx: Tx, conversationId: ConversationId): Promise<ChatScopeExclusion | undefined> =>
+            readChatScope((id) => tx.conversation(id), conversationId, root.id),
+          // Resolved lazily: the catalog is created after this object so its extension can be
+          // installed in the initial registry.
+          listEpisodes: (conversationId, query, ctx) =>
+            episodeCatalog!.list(
+              conversationId,
+              query.before === undefined
+                ? { limit: query.limit }
+                : { limit: query.limit, before: query.before as EntryId },
+              ctx,
+            ),
+          now,
+        });
     const registry = createRegistry();
+    if (episodeSummaries !== undefined) registry.install(episodeSummaries.extension);
     if (toolExtension) registry.install(toolExtension);
     if (skillTool) registry.install(skillTool.extension);
     if (historyTool) registry.install(historyTool.extension);
@@ -625,34 +765,46 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // its rows to this value instead of to a file path, which a replaced store can reuse.
     const storeIdentity = await ensureStoreIdentity(harness!, context, { now });
 
-    // One shared reader validates the stored session map; history scope is the chat subset of it.
-    // A channel's own state conversation, an unmapped conversation (a scheduled run's task-owned
-    // target) and the root are not chat history. The host has already authenticated the session key
-    // before naming it.
-    const mappedChatSessions = async (ctx: Context): Promise<readonly HistoryChatSession[]> => {
-      const mapping = await harness!.snapshot(SessionMap, root.id, ctx);
-      return mapping === undefined ? [] : readChatSessions(mapping.sessions, root.id);
-    };
-    // A mapped chat session is ownerless and unforked. Search and every entry/episode read share
-    // this check so a task-owned background transcript or an inherited fork cannot be exposed
-    // under a chat session's name.
+    // History scope: mapped chat sessions only. A channel's own state conversation, an unmapped
+    // conversation (a scheduled run's task-owned target) and the root are not chat history, and the
+    // host has already authenticated the session key before naming it. A mapped chat session is also
+    // ownerless and unforked: search, every entry/episode read and the background episode/summary work
+    // share that check, so a forged or stale map entry cannot expose or summarize a task-owned
+    // transcript, an inherited fork or the root.
     const assertMappedChatConversations = async (
       conversationIds: readonly ConversationId[],
       ctx: Context,
     ): Promise<void> => {
       await root.commit(async (tx) => {
         for (const conversationId of conversationIds) {
-          const conversation = await tx.conversation(conversationId);
-          if (conversation === undefined) throw new Error("Stored session mapping points to a missing conversation");
-          if (conversation.owner !== undefined) throw new Error("Stored session mapping points to a task-owned conversation");
-          if (conversation.parent !== undefined) throw new Error("Stored session mapping points to a forked conversation");
+          const reason = await readChatScope((id) => tx.conversation(id), conversationId, root.id);
+          if (reason !== undefined) throw new Error(chatScopeMessage(reason));
         }
+      }, ctx);
+    };
+    // Background scope is decided by the conversation record, never by the session key alone. An
+    // out-of-scope mapping is skipped instead of failing the whole pass, so one forged entry cannot
+    // stop cataloguing or summarizing the conversations that really are chat history. The per-session
+    // history surface still rejects such a mapping loudly.
+    const mappedChatSessions = async (ctx: Context): Promise<readonly HistoryChatSession[]> => {
+      const mapping = await harness!.snapshot(SessionMap, root.id, ctx);
+      if (mapping === undefined) return [];
+      const candidates = readChatSessions(mapping.sessions, root.id);
+      return root.commit(async (tx) => {
+        const { chat } = await partitionChatScope((id) => tx.conversation(id), candidates, root.id);
+        return chat;
       }, ctx);
     };
     // Bounded, background-only derived state: reset-delimited episode boundaries and their
     // durable summary status. It reads committed entries only and changes no reset or busy
-    // ordering; a closed episode is recorded as pending, and nothing schedules a summary yet.
-    episodeCatalog = createEpisodeCatalog({ harness: harness!, sessions: mappedChatSessions, context });
+    // ordering. A closed episode is recorded as pending; with summaries opted in, the same
+    // commit queues its summary job, and without them nothing schedules or calls a provider.
+    episodeCatalog = createEpisodeCatalog({
+      harness: harness!,
+      sessions: mappedChatSessions,
+      context,
+      ...(episodeSummaries === undefined ? {} : { summaryJobs: { enqueue: episodeSummaries.enqueue } }),
+    });
 
     // Derived, rebuildable search index. Its file is separate from Durable's store, and every Durable
     // read goes through `root.commit` without a write. A missing index is rebuilt from retained entries.
@@ -667,8 +819,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           `${mappedSessions.length} are present`,
         );
       }
-      // A mapped chat session is ownerless and unforked. Fail loudly rather than silently indexing a
-      // task-owned background transcript or an inherited fork under a chat session's name.
+      // Fail loudly rather than silently indexing a task-owned transcript or inherited fork.
       await assertMappedChatConversations(mappedSessions.map(({ conversationId }) => conversationId), ctx);
       return mappedSessions;
     };
@@ -840,8 +991,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
     if (historyTool && initialMapping !== undefined) {
-      for (const { sessionKey, conversationId } of readMappedSessions(initialMapping.sessions, root.id)) {
-        if (isChatSessionKey(sessionKey)) historyConversations.add(conversationId);
+      for (const { conversationId } of await mappedChatSessions(context)) {
+        historyConversations.add(conversationId);
       }
     }
     if (options.contextSnapshotProvider || cronEnabled) {
@@ -999,6 +1150,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       async conversationFor(sessionKey, ctx) {
         const key = encodedSessionKey(sessionKey);
         let conversationId: ConversationId | undefined;
+        let createdNow: ConversationId | undefined;
         await root.commit(async (tx) => {
           const map = await tx.doc(SessionMap, root.id);
           if (Object.hasOwn(map.sessions, key)) {
@@ -1009,6 +1161,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
             throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
           }
           const created = await tx.createConversation({ ownership: { kind: "ownerless" } });
+          createdNow = created.id as ConversationId;
           const toolFilter = await toolFilterFor(tx, created.id);
           await configure(tx, created.id, {
             ...defaultAgentPolicy,
@@ -1021,7 +1174,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (!Number.isSafeInteger(conversationId)) throw new Error("Stored conversation mapping has an invalid ID");
         // A mapped session key is the cron owner; unmapped conversations (such as a scheduled run's
         // own background conversation) have no owner and therefore never receive the cron tool.
-        if (isChatSessionKey(sessionKey)) historyConversations.add(conversationId!);
+        if (isChatSessionKey(sessionKey)) {
+          const reason = await root.commit((tx) => readChatScope((id) => tx.conversation(id), conversationId!, root.id), ctx);
+          if (reason === undefined) historyConversations.add(conversationId!);
+          else historyConversations.delete(conversationId!);
+        }
+        if (createdNow !== undefined && episodeSummaries !== undefined) {
+          try {
+            await episodeSummaries.initialize(harness!, createdNow, ctx);
+          } catch {
+            // The startup policy pass and the defensive enqueue path both record a missing watermark.
+          }
+        }
         cronOwners.set(conversationId!, { ownerId: sessionKey, sessionKey });
         sessionConversations.add(conversationId!);
         const conversation = await harness!.conversation(conversationId!, ctx);
@@ -1093,6 +1257,47 @@ export async function openGateway(config: PortConfig, context: Context, options:
       async reconcileHistoryEpisodes(sessionKey, ctx) {
         const conversationId = await chatConversationIdFor(sessionKey, ctx);
         return episodeCatalog!.reconcile(conversationId, ctx);
+      },
+      async historyEpisodeSummary(sessionKey, startEntryId, ctx) {
+        if (episodeSummaries === undefined) {
+          throw new Error("Episode summaries require an explicit provider/model choice");
+        }
+        if (!Number.isSafeInteger(startEntryId) || startEntryId < 1) {
+          throw new TypeError("Episode start must be a positive entry ID");
+        }
+        const conversationId = await chatConversationIdFor(sessionKey, ctx);
+        return episodeSummaries.record(harness!, conversationId, startEntryId, ctx);
+      },
+      async historySummaryQueue(sessionKey, ctx) {
+        if (episodeSummaries === undefined) {
+          throw new Error("Episode summaries require an explicit provider/model choice");
+        }
+        const conversationId = await chatConversationIdFor(sessionKey, ctx);
+        return episodeSummaries.queue(harness!, conversationId, ctx);
+      },
+      async drainEpisodeSummaries(sessionKey, ctx) {
+        if (episodeSummaries === undefined) {
+          throw new Error("Episode summaries require an explicit provider/model choice");
+        }
+        const conversationId = await chatConversationIdFor(sessionKey, ctx);
+        return episodeSummaries.drain(harness!, conversationId, ctx);
+      },
+      async backfillEpisodeSummaries(sessionKey, ctx) {
+        if (episodeSummaries === undefined) {
+          throw new Error("Episode summaries require an explicit provider/model choice");
+        }
+        const conversationId = await chatConversationIdFor(sessionKey, ctx);
+        return episodeSummaries.backfill(harness!, conversationId, ctx);
+      },
+      async retryEpisodeSummary(sessionKey, startEntryId, ctx) {
+        if (episodeSummaries === undefined) {
+          throw new Error("Episode summaries require an explicit provider/model choice");
+        }
+        if (!Number.isSafeInteger(startEntryId) || startEntryId < 1) {
+          throw new TypeError("Episode start must be a positive entry ID");
+        }
+        const conversationId = await chatConversationIdFor(sessionKey, ctx);
+        return episodeSummaries.retry(harness!, conversationId, startEntryId, ctx);
       },
       async historySearch(query, ctx) {
         return historyIndex!.search(query, ctx);
@@ -1202,6 +1407,40 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const conversation = await harness!.conversation(id as ConversationId, ctx);
       if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
       return conversation;
+    }
+    // Summary policy and cut-chain repair. The opt-in watermark is recorded before any catalog pass
+    // can enqueue history, so enabling summaries never spends on episodes that already existed. A
+    // queue with no live task means the chain was cut by an abort, a fault or a crash before the
+    // terminal commit; repairing it is deterministic, at most one task per mapped session.
+    if (episodeSummaries !== undefined) {
+      const backfillEnabled = episodeSummaryModel?.backfill === "pending";
+      // A backfill scan lists episode documents, so the catalog must record those boundaries first:
+      // an unrecorded boundary is not work and must not be skipped or called complete.
+      const settleCatalog = async (conversationId: ConversationId, passes: number): Promise<boolean> => {
+        for (let pass = 0; pass < passes; pass += 1) {
+          const report = await episodeCatalog!.reconcile(conversationId, context);
+          if (report.caughtUp) return true;
+        }
+        return false;
+      };
+      for (const session of await mappedChatSessions(context)) {
+        try {
+          await episodeSummaries.initialize(harness, session.conversationId, context);
+          await settleCatalog(session.conversationId, EPISODE_SUMMARY_QUEUE_LIMITS.startupCatalogPasses);
+          if (backfillEnabled) {
+            for (let pass = 0; pass < EPISODE_SUMMARY_QUEUE_LIMITS.backfillPassesPerRun; pass += 1) {
+              const report = await episodeSummaries.backfill(harness, session.conversationId, context);
+              if (report.complete) break;
+              if (report.reason !== "catalog-behind") break;
+              // More history to record before its boundaries can be queued; one bounded round.
+              await settleCatalog(session.conversationId, 2);
+            }
+          }
+          await episodeSummaries.drain(harness, session.conversationId, context);
+        } catch {
+          // A policy/repair failure is derived work; the durable queue keeps the jobs for a later drain.
+        }
+      }
     }
     // Scheduling begins only after registry and all persisted conversation policies are ready.
     historyToolHostRef.current = historyTool === undefined ? undefined : {

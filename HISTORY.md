@@ -1,17 +1,13 @@
-# History search index
+# History: episode summaries and search index
 
-`src/history/index.ts` is a rebuildable SQLite full-text index over Durable's
-retained entries. It is the first bounded slice of the agreed W3 history design:
-message and tool search plus committed reset boundaries. `Gateway.historySearch`
-is always available and its derived rows are bound to the store's committed
-`nanobot.store-identity`; there is no host-injected identity option. Episode
-summaries and summary search are not implemented. The local CLI exposes bounded
-search, episode listing and entry windows over these reads; see
-[CLI history search and browsing](./CLI.md#history-search-and-browsing). The
-same Gateway offers a read-only model-facing `history` tool to mapped chat
-conversations by default; the assistant can search, open prior discussion, and
-browse reset-delimited episodes without a separate CLI session. See
-[Agent-facing tool](#agent-facing-history-tool).
+Two derived layers sit over Durable's retained transcript:
+
+- `src/history/summary-task.ts` is an opt-in host-configured durable background summary pass.
+- `src/history/index.ts` is a rebuildable message/tool index bound to the committed store identity.
+
+The default agent-facing `history` tool searches and browses episodes and original entries;
+summary text is not indexed or exposed by that tool. CLI diagnostics are described in
+[CLI history search and browsing](./CLI.md#history-search-and-browsing).
 
 ## Authority, identity and storage
 
@@ -291,6 +287,25 @@ never execution authority or a grant. The tool exposes no raw conversation ID an
 accepts no conversation ID; `open`, `episodes` and `episode` resolve their session
 source through the same mapped-chat validator as every other history read.
 
+## Scope validation (shared rule)
+
+A session key is a host string and can be forged, imported or left behind by an older
+layout, so the key alone never decides scope: `chatScopeExclusion` in `src/history/scope.ts`
+classifies the conversation record (`missing`, `root`, `task-owned`, `forked`) and every derived
+history consumer uses it. Search, entry reads and episode reads fail loudly with "Stored session
+mapping points to a task-owned conversation" / "… forked conversation". The episode catalog and the
+summary scheduler instead skip such a mapping, so one forged entry cannot stop cataloguing or
+summarizing the conversations that really are chat history, and the summary worker re-checks scope in
+its first commit: a job whose conversation is out of scope fails with `conversation-out-of-scope` and
+creates no summary record, so a task-owned background run's transcript or an inherited fork can never
+be summarized into chat history or reach a provider through this pass.
+The rule itself and the read pattern live in one place: `chatScopeExclusion` (classify one record),
+`readChatScope` (read one), `partitionChatScope` (split a mapped set) and `chatScopeMessage` (the fixed
+rejection text) in `src/history/scope.ts`. `assertMappedChatConversations`, the catalog's
+`mappedChatSessions` and the summary worker's `scope` hook all call those, so the three consumers cannot
+drift apart. `assertMappedChatConversations` in `runtime.ts` is the same check main's shared validator
+uses; the coordinator's version supersedes this one at merge time.
+
 ## Authorization boundary
 
 The Gateway search and episode methods accept no conversation ID. The host
@@ -325,10 +340,211 @@ entries per episode drilldown, and 48 KiB of rendered UTF-8 bytes per result. Qu
 fields escape U+2028 and U+2029, and the output byte budget reserves the mandatory
 coverage/cursor footer before adding result rows.
 
+## Episode summaries
+
+`src/history/summary-task.ts` runs one durable background task chain per mapped chat
+conversation and writes a derived summary for each closed, non-empty episode. It is
+host-opt-in: `OpenGatewayOptions.episodeSummary` must name an explicit provider/model that is
+already in `allowedModels`, otherwise the extension is never installed, no job is queued, and no
+provider call is possible. There is no config field, CLI or channel surface, and no default model.
+
+**Opt-in and backfill policy.**
+
+- Enabling summaries records a durable per-conversation watermark (`sinceEntryId`, the newest entry
+  at that moment; `0` for a conversation created afterwards). Episodes that started at or before it
+  are never queued automatically, so turning the pass on cannot spend on history that was already
+  there — including history the catalog had not reconciled yet. Consequence: the episode that is
+  open at opt-in keeps its older start and is not summarized automatically.
+- `backfill: "none"` (default) keeps that boundary. `backfill: "pending"`, or an explicit
+  `backfillEpisodeSummaries` call, is the deliberate opt-in to already-closed episodes: a bounded,
+  resumable scan of the catalog's own episode listing (`backfillBeforeEntryId`, four pages per pass)
+  queues every closed episode whose record is not ready, whether it was catalogued before opt-in or
+  omitted by the queue cap.
+- That scan advances its durable cursor **only** when the whole page was queued and the catalog had
+  recorded every boundary on it. Queue capacity delays candidates instead of dropping them: they are
+  not counted in `overflow`, the cursor stays where it was, and the next call re-lists the same page
+  (identity dedupe makes the already-queued ones free). The result reports `{queued, pages, complete,
+  reason}` with `queue-full`, `catalog-behind` or `bounded`, so an incomplete scan is never presented
+  as finished and `backfillCompleteAtMs` is only written after a full pass. At startup the catalog
+  reconciles (bounded) before the scan runs, because an unrecorded boundary is not work yet.
+- `retryEpisodeSummary(startEntryId)` recreates a job from the closed episode document, so a failed,
+  retained-out, cap-omitted or watermark-excluded episode is never unrecoverable. It reports
+  `queued`, `already_queued`, `already_ready`, `queue_full`, `missing`, or `version_incompatible` when
+  the episode record names a *newer* summarizer version than this build: such a job would be retired
+  as obsolete in its first commit, so the call says so instead of promising work it cannot do, and it
+  leaves both the queue and the episode record untouched.
+- `historySummaryQueue` reports the policy (`backfill`, `sinceEntryId`, `backfillBeforeEntryId`,
+  `backfillCompleteAtMs`), the counters, the configured model, any blocked chain and any stranded
+  chain, so an operator can see why nothing is being summarized.
+
+**Durability and ordering.**
+
+- The episode catalog queues a job inside the commit that records a closed episode, and that same
+  commit creates the worker task. A crash can neither lose a closed episode nor queue it twice.
+- Episode documents are a Durable document family keyed by start entry ID, and this Durable version
+  cannot enumerate a family. A conversation-scoped `nanobot.episode-summary-queue` document is
+  therefore the enumerable work list: `(startEntryId, summarizerVersion)` is the job identity, so a
+  retry is always the same job, never a second entry.
+- One conversation runs at most one summary task. A task owns exactly one job and its final commit
+  starts the next queued job, so the chain is ordered and bounded, with no provider fan-out. Every
+  terminal path — ready, failed, superseded, aborted — clears this task's chain pointer and hands
+  the queue on, so no branch can strand the queue behind a dead task. An abort stops the current
+  attempt, settles its spend and returns the job to the queue; the chain continues with the oldest
+  queued job (usually the same one), so an abort never leaves queued work without a worker. A pointer
+  that is nevertheless terminal or missing while jobs wait — or that is absent while jobs wait — is
+  reported as `stalled: { reason: "no-worker", startEntryId }` (derived from the task record, re-read
+  to avoid a hand-off race) and `drainEpisodeSummaries` restarts it. Job removal is per
+  `(startEntryId, summarizerVersion)`, so one version's completion never deletes another version's
+  queued job.
+- The catalog's background scheduler now keeps a mid-pass request flag: a reset that commits while a
+  pass is running arms another pass instead of being dropped as "caught up" until the next reset or
+  reopen. The pure decision is `catalogWorkAction` in `episodes.ts`.
+- Source entries are read from committed entries only, through the immutable boundary the episode
+  document recorded (`[startEntryId, endEntryId]`), never from the current compacted context. The
+  pass appends no entry, resets nothing, reorders nothing, calls no tool and touches no grant. It
+  only writes its own derived documents and makes one provider request per fold chunk.
+- A summary record is keyed `<startEntryId>:<summarizerVersion>`, so a summarizer version bump writes
+  a distinct record instead of overwriting another version's history. The episode document records
+  which version is authoritative, and `historyEpisodeSummary` reads that version's record.
+  - An episode that is **not ready** adopts a newer job's version: the job rewrites the episode
+    document's `summarizerVersion` in the same commit that claims it, and summarizes normally. A
+    version bump therefore migrates history forward through `retryEpisodeSummary` or
+    `backfillEpisodeSummaries` instead of stranding it, and the older version's derived record stays
+    addressable under its own key.
+  - An episode recorded at a **newer** version makes an older job obsolete; that job is retired, and
+    the newer version's own live job or record covers the work.
+  - An episode that is already **ready** is never re-summarized automatically, whatever the version.
+    Replacing a ready summary with a newer summarizer version would need an explicit operation that
+    does not exist yet (see limitations).
+- A chain that Durable parks at its restart limit is reported, not hidden:
+  `drainEpisodeSummaries` and `historySummaryQueue` return
+  `blocked: { taskId, reason }`, and the host revives it with `Harness.retryTask(taskId)`.
+
+**Provider accounting and failure reporting.**
+
+- `attempts` counts provider requests that were started and is committed *before* each request, so a
+  crash cannot erase the fact that spend may have happened. `usage` sums only answers that arrived.
+  `pendingAttempt` records that one attempt is outstanding, and it is durable on the summary record
+  rather than in the task checkpoint, so an explicit abort (which discards the checkpoint) cannot lose
+  it. Whoever resolves it — the next attempt, the abort handler, or a terminal decision — settles it
+  as `interruptedCalls`, keeping
+  `attempts === usage.calls + interruptedCalls + (pendingAttempt ? 1 : 0)` true at every point.
+  Both counters survive retries, aborts and reopen.
+- The per-chunk provider budget is durable for the same reason: `chunkAttempts` and `retryAtMs` live
+  on the summary record, not in the task checkpoint. A worker that starts with a pending deadline
+  enters a `backoff` phase and sleeps durably until it, and a fold refuses to start a request once
+  `chunkAttempts` has reached the budget. **An abort is not a pause**: it settles the outstanding
+  attempt, keeps the spent chunk budget and records a fresh deadline, so restarting a job can neither
+  refill its budget nor skip its delay. The budget resets only when a chunk completes.
+  Verified: an abort during a hung request settles as one interrupted attempt and the next start is
+  delayed by the recorded backoff; a normal provider-failure run ends after exactly four attempts,
+  four observed provider errors, no pending attempt, and a terminal `provider-error-transient` with the
+  queue settled (a normal-failure terminal check, run separately from the abort case). An independent
+  review subsequently exercised the *abort* loop to its own terminal state over four rounds, which is
+  the abort-specific terminal evidence this note previously lacked. Not verified: a worker that
+  actually faults in integration — the `worker-faulted` recovery path is exercised only through the
+  pure claim-settling helper, never by a real faulted task in a running harness.
+- Only a fixed, classified failure vocabulary is persisted (`EPISODE_SUMMARY_FAILURES`):
+  `model-unavailable`, `unsupported-thinking-level`, `provider-error-transient`,
+  `provider-error-permanent`, `provider-aborted`, `output-limit`, `empty-summary`, `empty-source`,
+  `source-unrenderable`, `worker-faulted`, `episode-boundary-missing`,
+  `episode-summarizer-version-changed`, `episode-already-ready`, `job-not-queued`,
+  `job-claimed-by-another-task`, `conversation-out-of-scope`. Provider exception text, request payloads, headers,
+  tokens, cookies and JWTs are never written to durable state; a host that wants the provider's own
+  words reads `HarnessOptions.onReport` (`task_error`), which stays in process.
+- A retryable provider error sleeps with exponential backoff (2 s doubling to 60 s) up to 4 attempts
+  per chunk, then records the classified failure. A request that throws instead of answering
+  (transport error, timeout, SDK rejection) is classified the same way, as
+  `provider-error-transient` with its attempt counted as interrupted, rather than as a permanent
+  provider verdict. A raw crash loop is Durable's own concern.
+- The configured `thinkingLevel` is validated at open against the selected model's supported levels
+  and re-checked at each dispatch; an unsupported level fails the episode as
+  `unsupported-thinking-level` instead of burning a provider request. A `null`/non-object
+  `episodeSummary` is rejected as a startup diagnostic, and a missing or empty model is a type error.
+
+**Source, coverage, chunking and untrusted text** (`summary-source.ts`).
+
+- `pi.user` and `nanobot.cron` entries contribute their user text; `pi.assistant` entries contribute
+  visible text and a compact tool-call list; `pi.tool-result` entries contribute tool name plus text.
+  Thinking blocks are omitted. `pi.reset` (including handoff text), `pi.system` and `pi.compaction`
+  entries are skipped but counted: they are synthetic context, not discussion. `entry.edits` are not
+  applied, so a summary describes the stored transcript.
+- Rendering is total over stored data. An entry is JSON, not a typed API call: a legacy, imported or
+  hand-written entry can hold any shape a store accepts, so a non-array `model`, a `null` element, a
+  numeric or missing `text`, a `null` block or message, an unknown role, a nameless tool call, circular
+  tool arguments and a missing or non-string `kind` are all normalized (skipped, stringified or
+  described as `unknown-tool`) instead of thrown. `renderEntries` renders a page with one part per
+  entry, so the chunk boundaries `collect` computes and the text `fold` sends stay identical.
+  - A residual read failure is a property of the episode, not a transient fault: it is classified as
+    `source-unrenderable`, recorded in the queue, the episode document and the summary record, and the
+    chain is handed on. It does not throw out of a phase, because a task fault would strand every
+    later job behind it. This is a safety net: because rendering is total, no stored shape tested so
+    far reaches it, so the classification path itself has not been triggered end to end.
+  - If a worker ever does fault anyway, `reviveOrphanedClaims` bounds recovery: a faulted claim counts
+    one `faults` on the job, retries up to `maxWorkerFaults` (3), and then fails the job as
+    `worker-faulted` instead of retrying forever. The counter is normalized first (`safeCount`), so a
+    legacy, hand-edited or forged job with a missing, `null`, `NaN`, negative, fractional or string
+    `faults` counts from zero instead of becoming `NaN` — and since every `NaN >= cap` comparison is
+    false, that normalization is what keeps the cap effective. On failure the counter is clamped to the
+    cap, so the durable value stays a small exact integer that always serializes cleanly.
+- One entry keeps at most 2,000 characters with a visible truncation marker. Chunks close at 24,000
+  characters or 400 entries (also at each read page), at most 12 chunks per episode, and each chunk is
+  folded through a separate provider request that carries the previous answer forward.
+- `coverage` records the source bounds and counts from the episode document, the entries
+  read/included/skipped/truncated, characters, chunks, and the uncovered count with the last covered
+  entry ID. `complete` is true only when every entry in the range was read; an uncovered tail is
+  explicit, never silent. Per-entry shortening does not flip `complete` and is counted separately.
+- Untrusted text is framed, not trusted: the transcript and every earlier summary are wrapped in
+  `«transcript»…«/transcript»` / `«summary»…«/summary»` fences after every `«` and `»` in the text is
+  neutralized to `‹`/`›`, so stored text cannot close or open a fence, or speak as the prompt around
+  it. Only those two characters are rewritten, so code, commands, paths and URLs stay exact. No tools
+  are offered, the system prompt says the fenced text is data, and a summary is never execution
+  authority and never a grant.
+
+**Stored records.**
+
+- `nanobot.episode-summary-queue` holds pending, claimed and (bounded) failed jobs, the single live
+  task pointer, the opt-in watermark, the backfill cursor and an explicit `overflow` counter. Each job
+  also carries `attempts`, `faults`, `retryAtMs` and a classified `lastError`. It keeps at most 256
+  jobs and 20 failed jobs; a job beyond the cap is not queued and the omission is counted.
+  The episode stays `pending`, so the gap is visible in `listHistoryEpisodes` and recoverable through
+  backfill or retry.
+- `nanobot.episode-summary` holds status (`running`/`ready`/`failed`), provider/model, summarizer
+  version, title, bounded summary text, `attempts`, `interruptedCalls`, `pendingAttempt`,
+  `chunkAttempts`, `retryAtMs`, `coverage`, aggregated `usage`, `completedAtMs` and the classified
+  `error`. A failed pass stores no summary text.
+- The episode document mirrors `summary.status`, `attempts`, `title` and the summarizer version, so
+  `listHistoryEpisodes` shows the lifecycle without reading summary records.
+
+**Host API (dark unless opted in).** `historyEpisodeSummary(sessionKey, startEntryId)`,
+`historySummaryQueue(sessionKey)`, `drainEpisodeSummaries(sessionKey)`,
+`backfillEpisodeSummaries(sessionKey)` and `retryEpisodeSummary(sessionKey, startEntryId)`. All fail
+closed without an opted-in model. Reading a summary is host-authoritative: the host authenticates the
+session key, and the summary text is model output over untrusted source.
+
+**Known limitations.**
+
+- Provider spend is recorded on the summary record only, not in Durable's conversation `pi.usage`
+  ledger: pi-durable 1.4.0 does not export `recordUsage`, and this slice does not write that document
+  privately. The CLI usage view therefore excludes summarization.
+- An attempt that was in flight and is settled as interrupted is counted, not priced: its token and
+  cost contribution is unknown by definition, so `usage` is a lower bound on spend.
+- No summary search or summary index, no CLI/channel surface, no title/date index.
+- A ready episode is never re-summarized, at any summarizer version. Replacing a ready summary after a
+  version bump would need an explicit re-summarize operation, which does not exist yet.
+- The opt-in watermark means history is summarized only through an explicit backfill; the episode
+  open at opt-in is included only that way.
+- A parked chain keeps its jobs claimed until a host calls `Harness.retryTask(taskId)` or retries the
+  failed job; nothing revives a parked task automatically.
+- Backfill is bounded and resumable rather than exhaustive in one call; a full queue, a catalog that
+  has not recorded a page yet, or the per-call page budget stops it with `complete: false` and a
+  reason, and the same page is retried later.
+- Model fidelity and real-provider behavior are unverified: only a faux provider over temporary
+  synthetic data has been used.
+
 ## Not implemented
 
-- Episode summary generation, episode titles and summary search. The episode
-  catalog records closed episodes as `pending`; nothing claims or summarizes them.
+- Episode-summary indexing or agent-facing summary search (summaries are stored per episode).
 - Background indexing independent of a search; reconciliation happens on demand.
 - Relevance ranking: results are deterministic recency order so keyset pagination
   stays stable while FTS corpus statistics change.

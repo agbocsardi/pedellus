@@ -48,6 +48,7 @@ import {
   type EntryId,
   type EntryRecord,
   type Harness,
+  type Tx,
 } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import type { HistoryChatSession } from "./scope.js";
@@ -159,7 +160,7 @@ type EpisodeSummaryDocument = {
   title: string | null;
 };
 
-type EpisodeDocument = {
+export type EpisodeDocument = {
   /** 0 marks a freshly created document; a real boundary is always a positive entry ID. */
   readonly startEntryId: number;
   readonly resetEntryId: number | null;
@@ -170,7 +171,7 @@ type EpisodeDocument = {
   summary: EpisodeSummaryDocument;
 };
 
-const EpisodeCatalogDoc = defineDoc<EpisodeCatalogDocument>({
+export const EpisodeCatalogDoc = defineDoc<EpisodeCatalogDocument>({
   kind: EPISODE_CATALOG_KIND,
   version: 1,
   scope: "conversation",
@@ -188,7 +189,7 @@ const EpisodeCatalogDoc = defineDoc<EpisodeCatalogDocument>({
   checkpointWhen: () => true,
 });
 
-const EpisodeDoc = defineDocFamily<EpisodeDocument, string>({
+export const EpisodeDoc = defineDocFamily<EpisodeDocument, string>({
   kind: EPISODE_KIND,
   version: 1,
   scope: "conversation",
@@ -409,6 +410,18 @@ export interface EpisodeCatalogOptions {
   /** Background work lifetime; cancelling it stops pending passes. */
   readonly context: Context;
   readonly now?: () => number;
+  /**
+   * Optional summary queue. It is called inside the commit that records a closed episode, so the
+   * episode document and its summary job can never be separated by a crash. Without it episodes
+   * close as `pending` and nothing queues or summarizes them.
+   */
+  readonly summaryJobs?: {
+    /**
+     * Episode starts closed by one commit. All of them arrive in one call so the callee can order
+     * its task reads before its task writes, which Durable requires, and create at most one worker.
+     */
+    enqueue(tx: Tx, conversationId: ConversationId, startEntryIds: readonly number[]): Promise<void>;
+  };
 }
 
 export interface EpisodeCatalog {
@@ -428,11 +441,35 @@ export interface EpisodeCatalog {
   close(): void;
 }
 
+/**
+ * What one finished background pass should do next.
+ *
+ * The `requested` input is the fix for a reset that commits while a pass is running: the pass has
+ * already read its cursor, so a schedule request that arrives mid-pass must arm another pass instead
+ * of being dropped as "caught up". `delayMs` is the pass's own need to continue (a bound was hit, or a
+ * retry is due); `requested` is new work seen during the pass.
+ */
+export function catalogWorkAction(
+  state: { readonly requested: boolean; readonly delayMs: number | undefined; readonly timerArmed: boolean },
+): "arm-delay" | "arm-now" | "drop" | "keep" {
+  if (state.delayMs !== undefined) return "arm-delay";
+  if (state.requested) return "arm-now";
+  return state.timerArmed ? "keep" : "drop";
+}
+
 export function createEpisodeCatalog(options: EpisodeCatalogOptions): EpisodeCatalog {
   const { harness, sessions, context } = options;
   let closed = false;
   const inFlight = new Map<ConversationId, Promise<EpisodeReconcileReport>>();
-  const queued = new Map<ConversationId, { timer: ReturnType<typeof setTimeout> | undefined; attempts: number }>();
+  interface CatalogWork {
+    timer: ReturnType<typeof setTimeout> | undefined;
+    attempts: number;
+    /** A schedule request arrived while a pass was running. */
+    requested: boolean;
+    running: boolean;
+  }
+
+  const queued = new Map<ConversationId, CatalogWork>();
 
   const reconcilePass = async (
     conversationId: ConversationId,
@@ -461,6 +498,7 @@ export function createEpisodeCatalog(options: EpisodeCatalogOptions): EpisodeCat
       await conversation.commit(async (tx) => {
         // Episode documents and the progress cursor land in one commit: a crash between
         // them can neither lose a closed episode nor record one twice.
+        const closedStarts: number[] = [];
         for (const boundary of boundaries) {
           const key = String(boundary.startEntryId);
           const document = await tx.doc(EpisodeDoc, conversationId, key, key);
@@ -477,7 +515,11 @@ export function createEpisodeCatalog(options: EpisodeCatalogOptions): EpisodeCat
           document.summary.summarizerVersion = EPISODE_SUMMARIZER_VERSION;
           document.summary.attempts = 0;
           document.summary.title = null;
+          closedStarts.push(boundary.startEntryId as number);
         }
+        // The summary jobs and their worker task land in this same commit, so a crash can
+        // neither lose a closed episode's summary nor queue one twice.
+        if (closedStarts.length > 0) await options.summaryJobs?.enqueue(tx, conversationId, closedStarts);
         const catalog = await tx.doc(EpisodeCatalogDoc, conversationId);
         catalog.scannedThroughEntryId =
           next.scannedThroughEntryId === null ? null : (next.scannedThroughEntryId as number);
@@ -509,44 +551,13 @@ export function createEpisodeCatalog(options: EpisodeCatalogOptions): EpisodeCat
     return mapped.some((session) => session.conversationId === conversationId);
   };
 
-  const drain = async (
+  /** Arm one timer. A running pass is never armed twice; `requested` carries the next need. */
+  const arm = (
     conversationId: ConversationId,
-    work: { timer: ReturnType<typeof setTimeout> | undefined; attempts: number },
-  ): Promise<void> => {
-    if (closed) {
-      queued.delete(conversationId);
-      return;
-    }
-    try {
-      if (!(await inScope(conversationId))) {
-        queued.delete(conversationId);
-        return;
-      }
-      const report = await reconcile(conversationId, context);
-      work.attempts = 0;
-      if (!report.caughtUp) {
-        schedule(conversationId, 1);
-      } else if (work.timer === undefined) {
-        queued.delete(conversationId);
-      }
-    } catch {
-      // A pass is derived, idempotent work: a failure only delays it. The explicit
-      // reconcile() call surfaces the error, and a later reset or reopen retries even
-      // after this process gives up.
-      work.attempts += 1;
-      if (closed || context.abortSignal?.aborted || work.attempts >= EPISODE_LIMITS.maxRetries) {
-        queued.delete(conversationId);
-        return;
-      }
-      schedule(conversationId, EPISODE_LIMITS.retryDelayMs);
-    }
-  };
-
-  const schedule = (conversationId: ConversationId, delayMs: number): void => {
-    if (closed) return;
-    const work = queued.get(conversationId) ?? { timer: undefined, attempts: 0 };
-    queued.set(conversationId, work);
-    if (work.timer !== undefined) return;
+    work: CatalogWork,
+    delayMs: number,
+  ): void => {
+    if (closed || work.running || work.timer !== undefined) return;
     const timer = setTimeout(() => {
       work.timer = undefined;
       void drain(conversationId, work);
@@ -554,6 +565,69 @@ export function createEpisodeCatalog(options: EpisodeCatalogOptions): EpisodeCat
     // Cataloguing must never keep a host process alive on its own.
     timer.unref?.();
     work.timer = timer;
+  };
+
+  const schedule = (conversationId: ConversationId, delayMs: number): void => {
+    if (closed) return;
+    const work = queued.get(conversationId) ?? { timer: undefined, attempts: 0, requested: false, running: false };
+    queued.set(conversationId, work);
+    // A reset committed while a pass is in flight must schedule another pass, not be swallowed by
+    // the pass that already read its cursor. Without this flag the queue is dropped as "caught up"
+    // and the reset waits for the next reset or reopen.
+    work.requested = true;
+    arm(conversationId, work, delayMs);
+  };
+
+  const drain = async (conversationId: ConversationId, work: CatalogWork): Promise<void> => {
+    if (closed) {
+      queued.delete(conversationId);
+      return;
+    }
+    work.running = true;
+    work.requested = false;
+    let delayMs: number | undefined;
+    try {
+      if (!(await inScope(conversationId))) {
+        // Not mapped chat history: drop the entry unless a request arrives during this pass.
+      } else {
+        const report = await reconcile(conversationId, context);
+        work.attempts = 0;
+        if (!report.caughtUp) delayMs = 1;
+      }
+    } catch {
+      // A pass is derived, idempotent work: a failure only delays it. The explicit reconcile()
+      // call surfaces the error, and a later reset or reopen retries even after this process
+      // gives up on the pass.
+      work.attempts += 1;
+      if (!(closed || context.abortSignal?.aborted || work.attempts >= EPISODE_LIMITS.maxRetries)) {
+        delayMs = EPISODE_LIMITS.retryDelayMs;
+      }
+    } finally {
+      work.running = false;
+    }
+    if (closed) {
+      queued.delete(conversationId);
+      return;
+    }
+    switch (catalogWorkAction({
+      requested: work.requested,
+      delayMs,
+      timerArmed: work.timer !== undefined,
+    })) {
+      case "arm-delay":
+        schedule(conversationId, delayMs!);
+        return;
+      case "arm-now":
+        // A reset that committed while this pass was running gets its own pass; otherwise the entry
+        // above its cursor stays uncatalogued until the next reset or reopen.
+        schedule(conversationId, 0);
+        return;
+      case "drop":
+        queued.delete(conversationId);
+        return;
+      case "keep":
+        return;
+    }
   };
 
   const unsubscribe = harness.subscribeCommits((publication) => {
