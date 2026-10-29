@@ -96,7 +96,7 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 
 | Area | Integrated / usable | Missing or limited |
 | --- | --- | --- |
-| CLI / Gateway / SQLite | Local streaming CLI, persisted sessions/model choices, recovery controls, exclusive store lock and WAL/FULL | `/new` deliberately unsupported; no everyday-assistant acceptance or backup/restore drill |
+| CLI / Gateway / SQLite | Local streaming CLI, persisted sessions/model choices, recovery controls, native `/new` context reset, exclusive store lock and WAL/FULL | `/new` retains entries but does not generate summaries; no everyday-assistant acceptance or backup/restore drill |
 | Providers | Nine configured native aliases; real OpenCode Go Gateway tool turns; Anthropic-family Umans proof | Umans proof is not Gateway support; full provider/fallback matrix unproven |
 | Coding tools | Native `read`/`write`/`edit`/`bash`, host ceiling, expiring/revocable per-session grants; local CLI `/tools`, `/grant` and `/revoke` | Ceiling defaults empty; Telegram has no grant command |
 | Shell backend | Guarded actual workspace; optional `toolSandbox: bwrap`, off by default | Network remains available; file tools stay guarded host APIs; no hostile isolation/quota claim |
@@ -477,6 +477,18 @@ is selectable. Core foundations are integrated, but W3/W4 acceptance and interna
 agent cron wiring remain open; this is not yet an everyday replacement or cutover approval.
 
 ## Session log
+
+### 2026-10-29 — local usability and history direction
+
+Integrated reviewed fixed, value-free startup diagnostics (`c0b4465`, `0027f3e`), removed
+local `/steer` and `/after` at the owner's request (`387b4fa`), and added native CLI
+`/new` reset (`9321d20`). Reset retains Durable entries and conversation grants; it
+currently makes no summary. Independent synthetic review verified busy ordering,
+SQLite reopen and authority. Owner prefers native retention, message-only search and
+browsing across all authenticated channels in this single-tenant system, with a
+summary generated after each `/new`; summary scheduling/search remain future work.
+Owner also requested Telegram `/restart` with automatic build and a separate admin
+allowlist; design and implementation are in progress, not yet integrated.
 
 ### 2026-10-29 — local CLI grants and context refresh
 
