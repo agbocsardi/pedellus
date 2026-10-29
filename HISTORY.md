@@ -380,7 +380,10 @@ recreated empty so later bounded sweeps can repopulate it. If repair fails, or a
 escapes, the summary index is reported `indexReady: false` and `complete: false` and raw
 message/tool search continues normally. Repair keeps a valid content table, so stored summary rows
 are preserved when only the FTS layer or sweep state is missing. The integrity check runs on demand,
-not on raw search, and is bounded by the 64 MiB summary-index budget.
+not on raw search, and is bounded by the 64 MiB summary-index budget. An offline synthetic
+review measured roughly 0.44–0.49 seconds per summary page at that cap. A view occupying a summary
+schema name can prevent repair across reopen; the summary index remains unavailable until the
+rebuildable index is deleted and rebuilt.
 
 **Snapshot pagination.** Summary pages are newest-first by episode start entry ID then conversation
 ID. The opaque cursor binds the normalized query, schema generation (which rotates on store-identity
