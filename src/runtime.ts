@@ -12,6 +12,7 @@ import {
   HISTORY_INDEX_LIMITS,
   createHistoryIndex,
   historyIndexPath,
+  type HistoryIndex,
   type HistoryPage,
   type HistoryQuery,
   type HistorySession,
@@ -25,7 +26,13 @@ import {
   type HistoryEpisodePage,
   type HistoryEpisodeQuery,
 } from "./history/episodes.js";
-import { isChatSessionKey, type HistoryChatSession } from "./history/scope.js";
+import {
+  encodedSessionKey,
+  isChatSessionKey,
+  readChatSessions,
+  readMappedSessions,
+  type HistoryChatSession,
+} from "./history/scope.js";
 import { ensureStoreIdentity, type StoreIdentity } from "./history/store-identity.js";
 import { parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
@@ -91,12 +98,6 @@ export interface OpenGatewayOptions {
   readonly models?: Models;
   /** Explicit host-owned context snapshots; absent means no context extension is installed. */
   readonly contextSnapshotProvider?: GatewayContextSnapshotProvider;
-  /**
-   * Caller-owned stable identity from the planned durable `nanobot.store-identity` document.
-   * Required to enable `Gateway.historySearch`; when absent that method fails closed instead of
-   * inventing a path-based identity. A function is re-evaluated before each search.
-   */
-  readonly historyStoreId?: string | ((context: Context) => Promise<string>);
 }
 
 export interface Gateway {
@@ -142,9 +143,10 @@ export interface Gateway {
   /**
    * Search the rebuildable SQLite index over Durable-retained entries.
    *
-   * Requires `OpenGatewayOptions.historyStoreId`, the caller-owned identity from the planned durable
-   * `nanobot.store-identity` document; without it this method fails closed. Durable is the canonical
-   * transcript. This method never mutates it, accepts no conversation ID, and reads only the mapped
+   * The index is bound to this store's immutable `nanobot.store-identity` document, minted on the
+   * first open and only read afterwards, so a replaced store file never sees another store's rows.
+   * Durable is the canonical transcript. This method never mutates it, accepts no conversation ID,
+   * and reads only the mapped
    * chat sessions supplied by the host. The host is the authorization boundary:
    * call it only from trusted host code after its own channel authentication, and do not expose the
    * results (which include session keys) directly to an untrusted model or channel.
@@ -179,18 +181,6 @@ export interface Gateway {
   close(context: Context): Promise<void>;
 }
 
-function encodedSessionKey(key: string): string {
-  if (!key) throw new Error("sessionKey must not be empty");
-  return `k:${Buffer.from(key, "utf8").toString("base64url")}`;
-}
-
-function decodedSessionKey(key: string): string {
-  if (!key.startsWith("k:")) throw new Error("Stored session map contains an invalid session key");
-  const decoded = Buffer.from(key.slice(2), "base64url").toString("utf8");
-  if (encodedSessionKey(decoded) !== key) throw new Error("Stored session map contains an invalid session key");
-  return decoded;
-}
-
 function bindContextSnapshot(
   value: object | undefined,
   conversationId: ConversationId,
@@ -212,37 +202,6 @@ function modelKey(model: ModelReference | ModelRef): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-const CHANNEL_STATE_SESSION_SUFFIX = ":channel-state";
-
-interface MappedSession {
-  readonly sessionKey: string;
-  readonly conversationId: ConversationId;
-}
-
-/** Channel adapters use this conversation for bookkeeping; it is never chat history. */
-function isChannelStateSessionKey(sessionKey: string): boolean {
-  return sessionKey.endsWith(CHANNEL_STATE_SESSION_SUFFIX);
-}
-
-function parseSessionMap(sessions: unknown, rootId: ConversationId): MappedSession[] {
-  if (!isRecord(sessions)) throw new Error("Stored session map is malformed");
-  const mapped: MappedSession[] = [];
-  const conversationIds = new Set<ConversationId>();
-  for (const [encodedKey, rawId] of Object.entries(sessions)) {
-    const sessionKey = decodedSessionKey(encodedKey);
-    if (!Number.isSafeInteger(rawId) || (rawId as number) < 1 || rawId === rootId) {
-      throw new Error("Stored session map contains an invalid conversation ID");
-    }
-    const conversationId = rawId as ConversationId;
-    if (conversationIds.has(conversationId)) {
-      throw new Error("Stored session map maps multiple session keys to one conversation");
-    }
-    conversationIds.add(conversationId);
-    mapped.push({ sessionKey, conversationId });
-  }
-  return mapped;
 }
 
 /** A live cron run's background target, recovered from its durable checkpoint. */
@@ -585,6 +544,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   let harness: HarnessType | undefined;
   let storage: Storage | undefined;
   let episodeCatalog: EpisodeCatalog | undefined;
+  let historyIndex: HistoryIndex | undefined;
   let closed = false;
   try {
     const registry = createRegistry();
@@ -612,29 +572,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // its rows to this value instead of to a file path, which a replaced store can reuse.
     const storeIdentity = await ensureStoreIdentity(harness!, context, { now });
 
-    // History scope: mapped chat sessions only. A channel's own state conversation, an
-    // unmapped conversation (a scheduled run's task-owned target) and the root are not chat
-    // history. The host has already authenticated the session key before naming it.
+    // One shared reader validates the stored session map; history scope is the chat subset of it.
+    // A channel's own state conversation, an unmapped conversation (a scheduled run's task-owned
+    // target) and the root are not chat history. The host has already authenticated the session key
+    // before naming it.
     const mappedChatSessions = async (ctx: Context): Promise<readonly HistoryChatSession[]> => {
       const mapping = await harness!.snapshot(SessionMap, root.id, ctx);
-      if (mapping === undefined) return [];
-      const sessions = mapping.sessions;
-      if (!isRecord(sessions)) throw new Error("Stored session map is malformed");
-      const mapped: HistoryChatSession[] = [];
-      const seen = new Set<ConversationId>();
-      for (const [encodedKey, rawId] of Object.entries(sessions)) {
-        const sessionKey = decodedSessionKey(encodedKey);
-        if (!Number.isSafeInteger(rawId) || rawId < 1 || rawId === root.id) {
-          throw new Error("Stored session map contains an invalid conversation ID");
-        }
-        const conversationId = rawId as ConversationId;
-        if (seen.has(conversationId)) {
-          throw new Error("Stored session map maps multiple session keys to one conversation");
-        }
-        seen.add(conversationId);
-        if (isChatSessionKey(sessionKey)) mapped.push({ sessionKey, conversationId });
-      }
-      return mapped;
+      return mapping === undefined ? [] : readChatSessions(mapping.sessions, root.id);
     };
     // Bounded, background-only derived state: reset-delimited episode boundaries and their
     // durable summary status. It reads committed entries only and changes no reset or busy
@@ -643,11 +587,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
 
     // Derived, rebuildable search index. Its file is separate from Durable's store, and every Durable
     // read goes through `root.commit` without a write. A missing index is rebuilt from retained entries.
+    // It is bound to this store's committed identity, so a replaced store file clears every derived row.
     const historySessions = async (ctx: Context): Promise<readonly HistorySession[]> => {
       const mapping = await harnessRef.current!.snapshot(SessionMap, root.id, ctx);
       if (mapping === undefined) return [];
-      const mappedSessions = parseSessionMap(mapping.sessions, root.id)
-        .filter(({ sessionKey }) => !isChannelStateSessionKey(sessionKey));
+      const mappedSessions = readChatSessions(mapping.sessions, root.id);
       if (mappedSessions.length > HISTORY_INDEX_LIMITS.maxMappedSessions) {
         throw new Error(
           `History search supports at most ${HISTORY_INDEX_LIMITS.maxMappedSessions} mapped chat sessions; ` +
@@ -666,15 +610,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }, ctx);
       return mappedSessions;
     };
-    const historyIndex = options.historyStoreId === undefined
-      ? undefined
-      : createHistoryIndex({
-          indexPath: historyIndexPath(dbPath),
-          sourcePath: dbPath,
-          storeId: options.historyStoreId,
-          sessions: historySessions,
-          scan: (ctx, read) => root.commit(read, ctx),
-        });
+    historyIndex = createHistoryIndex({
+      indexPath: historyIndexPath(dbPath),
+      sourcePath: dbPath,
+      storeId: storeIdentity.storeId,
+      sessions: historySessions,
+      scan: (ctx, read) => root.commit(read, ctx),
+    });
 
     // At the snapshot cap, drop the oldest installed background target that is not running and not a
     // mapped session. Without an evictable target the builder's RangeError stays the last resort.
@@ -834,24 +776,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
       await root.commit(async (tx) => { await tx.doc(SessionMap, root.id); }, context);
       const mapping = await harness.snapshot(SessionMap, root.id, context);
       const sessions = mapping?.sessions;
-      if (!isRecord(sessions)) throw new Error("Stored session map is malformed");
-      const entries = Object.entries(sessions);
-      if (options.contextSnapshotProvider && entries.length > CONTEXT_LIMITS.maxConversations) {
+      const mappedSessions = readMappedSessions(sessions, root.id);
+      if (options.contextSnapshotProvider && mappedSessions.length > CONTEXT_LIMITS.maxConversations) {
         throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
-      }
-      const mappedConversationIds = new Set<ConversationId>();
-      const mappedSessions: { sessionKey: string; conversationId: ConversationId }[] = [];
-      for (const [encodedKey, rawId] of entries) {
-        const sessionKey = decodedSessionKey(encodedKey);
-        if (!Number.isSafeInteger(rawId) || rawId < 1 || rawId === root.id) {
-          throw new Error("Stored session map contains an invalid conversation ID");
-        }
-        const conversationId = rawId as ConversationId;
-        if (mappedConversationIds.has(conversationId)) {
-          throw new Error("Stored session map maps multiple session keys to one conversation");
-        }
-        mappedConversationIds.add(conversationId);
-        mappedSessions.push({ sessionKey, conversationId });
       }
       for (const { sessionKey, conversationId } of mappedSessions) {
         if (options.contextSnapshotProvider) {
@@ -1095,10 +1022,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         return episodeCatalog!.reconcile(conversationId, ctx);
       },
       async historySearch(query, ctx) {
-        if (historyIndex === undefined) {
-          throw new Error("History search requires a host-provided Durable store identity");
-        }
-        return historyIndex.search(query, ctx);
+        return historyIndex!.search(query, ctx);
       },
       async refreshContext(sessionKey, ctx) {
         if (!options.contextSnapshotProvider) {
@@ -1168,13 +1092,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
     return gateway;
   } catch (error) {
     const cleanup = withoutAbortSignal(context);
-    // A failed open must not leave deferred cataloguing attached to a closed session.
+    // A failed open must not leave deferred cataloguing attached to a closed session, nor a
+    // derived index handle open behind a failed gateway.
     episodeCatalog?.close();
     try {
       if (harness) await harness.close(cleanup);
       else await storage?.close(cleanup);
     } finally {
-      await toolEnvironments?.close(cleanup).catch(() => undefined);
+      try { await historyIndex?.close(); }
+      catch { /* a derived index close failure leaves a rebuildable file, not source data */ }
+      finally { await toolEnvironments?.close(cleanup).catch(() => undefined); }
       await releaseLock();
     }
     throw error;

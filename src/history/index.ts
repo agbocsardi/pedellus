@@ -41,6 +41,7 @@ import {
 } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
 import { canonicalFuturePath } from "../store.js";
+import { CHANNEL_STATE_SESSION_SUFFIX } from "./scope.js";
 
 export const HISTORY_INDEX_FORMAT = "nanobot-history-index" as const;
 export const HISTORY_INDEX_SCHEMA_VERSION = 3 as const;
@@ -124,7 +125,9 @@ export interface HistoryQuery {
    * does not eliminate chunk-boundary misses. Contiguous CJK runs are one token,
    * so only a full run or a prefix of it matches. Overlapping chunks can yield
    * multiple hits for one part; dedupe with `(entryId, partIndex)` and treat each
-   * excerpt as a chunk fragment. Empty text browses the scope.
+   * excerpt as a chunk fragment. Chunks are cut on code-unit boundaries, so a
+   * prefix match can be a fragment of a longer word that the cut split. Empty text
+   * browses the scope.
    */
   readonly text?: string;
   /** Default `messages`. `tools` is tools only; `all` is messages plus tools. */
@@ -236,10 +239,10 @@ export interface HistoryIndexOptions {
   /** Derived SQLite path. `:memory:` is supported for synthetic probes. */
   readonly indexPath: string;
   /**
-   * Stable identity of the Durable store, injected by the caller from the
-   * planned durable `nanobot.store-identity` document. Never a path or inode.
-   * The index stores it and rebuilds/rotates generations when it changes; a
-   * function is re-evaluated before each search so a replaced store is noticed.
+   * Stable identity of the Durable store, from its committed
+   * `nanobot.store-identity` document. Never a path or inode. The index stores it
+   * and rebuilds/rotates generations when it changes; a function is re-evaluated
+   * before each search so a replaced store is noticed.
    */
   readonly storeId: string | ((context: Context) => Promise<string>);
   /**
@@ -250,9 +253,9 @@ export interface HistoryIndexOptions {
   /**
    * Current mapped sessions after host authentication. This callback is trusted
    * host code: it must reject task-owned or forked conversations and channel-state
-   * sessions. The index also rejects `:channel-state` keys, then applies a positive
-   * rule, treating a session as chat history only once it has at least one indexed
-   * message or tool record.
+   * sessions (`readChatSessions` in `scope.ts` is the shared reader). The index also
+   * rejects `:channel-state` keys, then applies a positive rule, treating a session
+   * as chat history only once it has at least one indexed message or tool record.
    */
   readonly sessions: (context: Context) => Promise<readonly HistorySession[]>;
   /** Read-only Durable transaction surface, normally `root.commit`. */
@@ -355,7 +358,6 @@ const MESSAGE_ROLES: readonly HistoryRole[] = ["assistant", "user"];
 const ALL_ROLES: readonly HistoryHit["role"][] = ["assistant", "user", "tool"];
 const READABLE_ROLES: ReadonlySet<HistoryHit["role"]> = new Set(ALL_ROLES);
 const SHA256_HEX = /^[0-9a-f]{64}$/;
-const CHANNEL_STATE_SESSION_SUFFIX = ":channel-state";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);

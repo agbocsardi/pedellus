@@ -83,11 +83,15 @@ batch; live-provider modes and external fixture adapters need a later scope/budg
 - [ ] Deliver scheduled results beyond the origin conversation turn (channel outbox) once a channel is accepted.
 - [x] Agree transcript/episode/search design (2026-10-29; W3 below).
 - [x] Store identity, reset-delimited episode boundaries and durable pending-summary state (2026-10-29; foundation only, no summary pass).
-- [ ] Implement read-only transcript retrieval and rebuildable message/tool and episode-summary indexes.
+- [x] Implement rebuildable message/tool search over the read-only transcript, with committed reset boundaries (2026-10-29; no episode-summary index yet).
+- [ ] Implement the episode-summary index and summary search.
 - [ ] Generate episode summaries: claim `pending` episodes by deterministic job identity, bounded long-episode coverage, persisted retry/backoff.
-- [ ] Wire the rebuildable message/tool full-text index and reset boundaries into an exposed capability. The implementation is dark/unwired: it requires a caller-injected durable store identity, exposes no default UI/channel path, and catalog identity integration is parent-led. See `HISTORY.md`.
+- [x] Wire the rebuildable message/tool full-text index and reset boundaries to the durable store
+      identity. `Gateway.historySearch` is on by default, bound to the committed `nanobot.store-identity`;
+      no caller-injected identity remains. Still no episode summaries or CLI/channel browsing UI. See
+      `HISTORY.md`.
 - [ ] Implement the episode summary index and episode catalog with durable post-reset summaries, retry and reconciliation.
-- [ ] Expose history browsing/search through memory tooling and accepted channel interfaces.
+- [ ] Expose history browsing/search through memory tooling and accepted channel interfaces (today only trusted host code calls `Gateway.historySearch`; there is no CLI/Telegram/web surface).
 - [ ] Agree background-subagent / Code Mode worker shape before implementation.
 - [ ] Complete requested channels individually after core acceptance.
 - [ ] Agree the next bounded implementation scope with the owner; no automatic restart.
@@ -111,6 +115,7 @@ consolidation. The port is experimental, not deployed or approved for cutover.
 | Skills | Opt-in discovery, names/descriptions/locators only in prompt, on-demand read-only `skill` tool; curated port builtins in `skills` (memory, memory-defrag, skill-creator, github, cron) behind an explicit `builtinSkillsRoot` | `my` has no port runtime; no inventory-count cap, but finite prompt/output bounds visibly truncate |
 | Compaction | Native Durable summary/transcript plumbing; synthetic fresh-process continuity verified | Real-model fidelity and small-context behavior unverified; fixed upstream budgets |
 | Cron | Opt-in `cron.enabled`: agent-callable `add`/`list`/`remove`, `at`/`every`/`cron` with IANA zones, isolated-background or origin mode, owner-scoped jobs, busy/restart/cancel handling; a background run gets the origin's workspace context and `skill` tool; copied grants are bounded by current origin grants | No channel delivery or silence policy; disabling cron leaves persisted timers blocked; a run whose snapshot was evicted at the cap proceeds without context; a phase fault or crash before the terminal commit can retain bounded grants until reopen |
+| History | Durable store identity, reset-delimited episode reads (`listHistoryEpisodes`, `historyEpisode`) and a rebuildable message/tool search index behind `Gateway.historySearch`, bound to the committed identity | No episode summaries, titles or summary search; no CLI/Telegram/web browsing; a clone or restored backup keeps the same identity, so stale rows are caught only by per-conversation entry anchors |
 | Telegram | Restricted allowlisted inbound/reply adapter with streaming, durable send intent, unknown-send quarantine | Existing adapter only; scheduled outbound candidate is unmerged; no general pairing or media parity |
 | Code Mode / delegation | Reviewed opt-in QuickJS Code Mode/tool-search SDK | Not Gateway-installed; no product background-subagent or worker interface |
 | Other surfaces | Read-only usage and inert archival helpers exist | Discord candidates parked; Email/WebSocket, MCP, web/media tools not integrated |
@@ -336,7 +341,7 @@ and an early fact crosses native compaction into a fresh process via a faux summ
 Remaining acceptance: curated builtin compatibility and real-model use of memory,
 skills and compaction. No claim of full Python memory/search/usage parity.
 
-#### Agreed history design — 2026-10-29 (dark/unwired message/tool slice implemented)
+#### Agreed history design — 2026-10-29 (message/tool slice wired; summaries not started)
 
 **Authority and terminology.** Durable's Session is the storage/runtime container;
 a Conversation is a persistent transcript. Our Telegram adapter maps each bot + chat
@@ -483,19 +488,21 @@ documents are not scanned by this module, so a future summary pass needs its own
 work queue or an index over `pending` episodes, and nothing schedules one today.
 The store identity document itself is frozen and never updated.
 
-**First bounded slice — 2026-10-29 (dark/unwired).** `src/history/index.ts`
-implements the message/tool FTS5 index, committed reset boundaries, bounded
-incremental reconciliation, caller-injected store identity and query-bound stable
-pagination behind `Gateway.historySearch`. It is not exposed by default: no
-store-identity document or UI/channel wiring is included, so history search fails
-closed until the parent-led catalog identity integration supplies `storeId`. It does not implement episode summaries or summary
-search. The index is a separate `0600` rebuildable file and never writes Durable;
-long text is chunked and lag, coverage and omitted chunks are visible. `storeId`
-comes from the planned durable `nanobot.store-identity` document and is injected
-through `OpenGatewayOptions.historyStoreId`; absent identity fails closed. See
-`HISTORY.md` for the interface, authorization boundary and remaining limits. This
-is not acceptance of the parked scan candidate `worker-history-read-252d9447`; no
-code from it was reused.
+**First bounded slice — 2026-10-29 (identity-wired; no summaries, no UI).**
+`src/history/index.ts` implements the message/tool FTS5 index, committed reset
+boundaries, bounded incremental reconciliation and query-bound stable pagination
+behind `Gateway.historySearch`. The slice is wired: `openGateway` resolves the
+committed `nanobot.store-identity` with `ensureStoreIdentity` and binds the index
+to that `storeId`, so the method is available on every Gateway and there is no
+caller-injected identity option. It does not implement episode summaries or
+summary search, and no CLI, Telegram or web history browsing command exists. The
+index is a separate `0600` rebuildable file and never writes Durable; long text is
+chunked and lag, coverage and omitted chunks are visible. Identity is copied with
+the store file, so a clone or restored backup keeps the same `storeId`; detection
+there relies on the per-conversation first/last entry fingerprints, which rebuild a
+conversation whose tail no longer matches, and only imperfectly (see `HISTORY.md`
+for the rollback caveat and scan costs). This is not acceptance of the parked scan
+candidate `worker-history-read-252d9447`; no code from it was reused.
 
 ### W4 — acceptance suite
 
@@ -683,13 +690,34 @@ scope exclusion; `typecheck`, 155 behaviour checks, 9 execution checks and core
 acceptance still pass. Known gaps: no dates, titles, summary generation, retry or
 search yet.
 
+### 2026-10-29 — history search wired to the durable store identity
+
+`Gateway.historySearch` is now on by default instead of dark: `openGateway` passes
+the committed `nanobot.store-identity` `storeId` to the derived index and the
+`OpenGatewayOptions.historyStoreId` injection point is gone, so no caller can
+re-bind a stale index with an arbitrary string. The Gateway's restore pass, episode
+scope and search scope now read the persisted session map through one shared
+validator in `src/history/scope.ts` (`readMappedSessions`/`readChatSessions`),
+keeping the task-owned/fork rejection and the 256-session cap; the index imports the
+same `:channel-state` constant instead of a third copy. A failed open and a close
+now close the derived index handle. `HISTORY.md` and this plan were corrected:
+identity is now the committed document, the clone/restored-backup rollback caveat
+and the per-conversation fingerprint fallback are explicit, steady-state and cold
+rebuild scan costs are stated, and the last-term prefix/chunk-fragment false
+positives are documented. Summaries, summary search and any history UI remain
+unimplemented. Disposable synthetic Gateway probes covered message/tool search,
+role and scope rejection, state-only exclusion, reset boundaries and episodes,
+reopen without reindex, clone, same-store rollback, store replacement with index
+rebinding, a failed-open cleanup path and search-after-close; typecheck, 155
+behaviour checks, 9 execution checks and 88 offline core-acceptance checks pass.
+
 ### 2026-10-29 — first message/tool history index slice
 
 Added a rebuildable SQLite FTS5 index over Durable-retained user/assistant messages,
 tool names/arguments/results and committed reset boundaries, exposed as
-`Gateway.historySearch` (no UI, no episode summaries, no candidate reuse). It is
-dark/unwired: requires an injected durable store identity and has no default
-exposure. The index lives in a separate `nanobot-history-index.sqlite` file, reconciles bounded forward from
+`Gateway.historySearch` (no UI, no episode summaries, no candidate reuse). At that
+point it was dark/unwired: it required an injected durable store identity and had
+no default exposure. The index lives in a separate `nanobot-history-index.sqlite` file, reconciles bounded forward from
 persisted entry fingerprints and progress, reports lag/coverage/truncation/edits,
 chunks long text with bounded per-entry generation and per-entry writes, and rejects
 stale/replaced-store/mapping-changed cursors. `:channel-state` remains explicitly

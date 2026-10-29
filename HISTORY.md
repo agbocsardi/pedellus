@@ -2,8 +2,11 @@
 
 `src/history/index.ts` is a rebuildable SQLite full-text index over Durable's
 retained entries. It is the first bounded slice of the agreed W3 history design:
-message and tool search plus committed reset boundaries. Episode summaries and
-summary search are not implemented.
+message and tool search plus committed reset boundaries. `Gateway.historySearch`
+is always available and its derived rows are bound to the store's committed
+`nanobot.store-identity`; there is no host-injected identity option. Episode
+summaries, summary search and any history browsing UI or channel command are not
+implemented.
 
 ## Authority, identity and storage
 
@@ -15,43 +18,54 @@ summary search are not implemented.
   directory cannot collide). The file is created `0600` before SQLite opens it and
   its WAL/SHM sidecars are tightened immediately after; it can be deleted while the
   Gateway is stopped, and the next search rebuilds it from Durable.
-- The index is bound to a caller-supplied `storeId`, never a path or inode. The
-  planned durable `nanobot.store-identity` document is the authority for that
-  value; `HistoryIndexOptions.storeId` accepts a string or an async resolver that
-  is re-checked before each search. A changed store ID clears the derived rows,
-  rotates the index generation and invalidates every old cursor.
+- The index is bound to the store's `storeId`, never a path or inode. `openGateway`
+  resolves the committed `nanobot.store-identity` document once with
+  `ensureStoreIdentity` and passes its `storeId` to the index, so the value is the
+  same one `Gateway.historyIdentity()` reports. A changed store ID clears the
+  derived rows, rotates the index generation and invalidates every old cursor. The
+  index is opened on the first search that has at least one mapped chat session; a
+  search with none returns an empty page without opening the file, and the next
+  mapped search rebinds it.
+- The identity is not a secret and is not a store fingerprint: it is copied with
+  the SQLite file. A **clone or restored backup** therefore carries the *same*
+  `storeId`, and store-identity replacement alone cannot separate the two lineages.
+  That case is covered by the per-conversation anchors below, and only imperfectly
+  (see "Replacement, clone and rollback").
 - The index stores `conversation_id`, entry IDs and searchable text, but not raw
   `sessionKey` values. Channel labels are resolved from the current session map
   at query time. The derived file still contains private transcript text and must
-  stay inside the host trust boundary.
+  stay inside the host trust boundary; its `0600` mode is the same protection a
+  Durable store copy already needs, not an additional isolation claim.
 - Why a separate file: sharing Durable's connection or writing its file would be
   uncoordinated mutation. A second writable connection can block behind Durable's
   write transaction. Index writes are therefore eventual, idempotent and derived.
 
 ## Integration interface
 
-The index accepts the caller-owned identity directly:
+`openGateway` wires the index itself:
 
 ```ts
+ensureStoreIdentity(harness, context)   // -> frozen { storeId, createdAt }
 createHistoryIndex({
-  indexPath,              // dataDir/<store>-history-index.sqlite
-  storeId,                // string, or (context) => Promise<string> from nanobot.store-identity
-  sessions: (context) => Promise<readonly HistorySession[]>,
-  scan: (context, read) => Promise<T>, // root.commit(read, context), read-only
+  indexPath: historyIndexPath(dbPath),
+  sourcePath: dbPath,                   // alias guard only, never an identity
+  storeId: identity.storeId,            // resolved once, immutable for this open
+  sessions: mappedChatSessions,         // validated chat scope, host-authenticated
+  scan: (ctx, read) => root.commit(read, ctx),
 })
 ```
 
-`openGateway` exposes the same injection point as
-`OpenGatewayOptions.historyStoreId` (string or async resolver). Without it,
-`Gateway.historySearch` fails closed rather than inventing a path/inode identity.
-The coordinator can resolve the durable identity document after the harness root
-is available and supply either form.
+There is no `OpenGatewayOptions` override: an arbitrary caller-supplied identity
+string could silently re-bind a stale index to a different store, so the durable
+document is the only source. The module still accepts `storeId` as a string or
+resolver because it is reusable and testable on its own, and because a resolver is
+re-checked before each search.
 
 ## Search scopes and query semantics
 
-`gateway.historySearch(query, context)` requires the Gateway to be opened with a
-`historyStoreId`; without one it fails closed instead of inventing identity.
-Default scope is user and assistant message text; `roles` narrows that to `user`
+`gateway.historySearch(query, context)` needs no host configuration: the index is
+bound to this store's identity when the Gateway opens. Default scope is user and
+assistant message text; `roles` narrows that to `user`
 and/or `assistant`. `scope: "tools"` searches tool names, arguments and result
 text only and rejects roles. `scope: "all"` combines messages and tools; `roles`
 filters message records only, while tool records are always included.
@@ -60,6 +74,10 @@ Query text uses FTS5 `unicode61 remove_diacritics 2` tokenization. Terms are
 ANDed, each term is quoted/bound, and the last term is a prefix (`deploy` also
 matches `deployed`). This is token/prefix matching, **not substring matching**;
 punctuation-only text returns no hits and empty text browses the selected scope.
+Prefix matching also matches unrelated longer tokens that merely start with the
+last term (`cat` finds `category`), and long text can return several hits for one
+part, one per overlapping chunk; dedupe with `(entryId, partIndex)` and treat each
+excerpt as a chunk fragment rather than a whole message.
 
 Known tokenizer/chunk limits are explicit:
 - contiguous CJK runs are one token, so only a full run or a prefix of it matches;
@@ -67,6 +85,13 @@ Known tokenizer/chunk limits are explicit:
 - terms must occur in the same chunk. Adjacent chunks overlap by 256 UTF-16 units,
   which reduces boundary misses but does not eliminate a multi-term query whose
   terms fall on opposite sides of that overlap.
+- chunks are cut on code-unit boundaries, not word boundaries, so a chunk can end
+  (and the next can begin) inside a word. The last-term prefix rule then matches a
+  fragment token: a hit may be a part of a longer word rather than a word, and an
+  excerpt can start or end mid-word. A word longer than the 256-unit overlap is
+  split in every chunk, so the whole word is not a token anywhere. Excerpts are
+  quoted fragments; verify against the source entry before relying on exact
+  wording.
 
 Thinking blocks, system instructions, reset handoffs, compaction summaries,
 images and payload metadata are never in these scopes. They remain in Durable;
@@ -110,15 +135,20 @@ claiming the search reflects the active edited context.
 
 Each search reconciles a bounded slice before querying:
 
-1. Read the current mapped sessions. Task-owned and forked conversations are
-   rejected, and `:channel-state` session keys are excluded explicitly even if
-   they contain plausible entries. A mapped session then becomes chat history only
-   after at least one message/tool record exists in the index.
+1. Read the current mapped sessions through the one shared session-map reader
+   (`src/history/scope.ts`), which rejects a malformed map, an invalid or root
+   conversation ID and two keys sharing one conversation. Chat scope drops
+   `:channel-state` keys there, so the index never sees them; the module still
+   refuses such a session defensively. The host callback also rejects task-owned
+   and forked conversations and more than the session cap before indexing. A
+   mapped session
+   then becomes chat history only after at least one message/tool record exists in
+   the index.
 2. For each session, verify the first and last indexed entry fingerprints. A
    mismatch clears only that conversation's derived rows and reindexes it. The
   fingerprint hashes identity fields exactly but bounds model/data content; a
   replacement differing only beyond that budget can share a fingerprint. The
-  caller-supplied store identity remains the primary replacement authority.
+  store identity remains the primary replacement authority.
 3. Scan forward from the persisted entry ID in pages of at most 5 entries. Each
    entry is extracted and written in its own index transaction with bounded
    generation; a pass stops at 500 entries, 8 MiB of prepared document text, or
@@ -143,13 +173,47 @@ write rolls back documents and progress together. Durable entry IDs are globally
 monotonic, so a page cannot skip a lower-ID entry appended later. There is no
 `commitSeq` on entry scans and the index does not need one.
 
+### Scan cost
+
+Steady state is cheap but not free: every search opens the derived file, then for
+each mapped chat session reads the first and last indexed entries to verify the
+anchors and the newest entry to measure lag. A caught-up search therefore costs a
+few Durable reads per session plus the FTS query, and indexes nothing. Catching up
+reads entries in pages of at most 5, one index transaction per entry, and stops at
+500 entries, 8 MiB of prepared text or 1.5 s per pass, so a cold rebuild of `n`
+entries needs about `n/5` page reads spread across `n/500`-ish searches. A
+256-session map costs 256 anchor checks per search even when nothing changed.
+
+### Replacement, clone and rollback
+
+- **New store file at the same path** (deleted, recreated or initialized from
+  scratch): `ensureStoreIdentity` mints a new `storeId`, and the first search with
+  a mapped chat session discards every derived row and rebinds the file. A search
+  with no mapped session returns an empty page without opening the index, so old
+  rows can sit in the file until the next mapped search; they are never returned.
+- **Clone or restored backup** (SQLite file copied, identity included): the copy
+  has the *same* `storeId`, so identity comparison cannot detect it. Each
+  conversation's first/last entry fingerprints are the fallback anchor. After a
+  copy is restored over a live path, the indexed tail entry of every affected
+  conversation no longer exists or no longer matches, so that conversation's rows
+  are cleared and rebuilt from entry 1 on the next search. Conversations untouched
+  by the restore keep valid rows.
+- **Same-store rollback** to an earlier copy therefore normally drops the future
+  hits of that conversation and rejects continuations bound past the new tail.
+- The fallback is not proof. A replacement tail whose identity fields and first
+  1M characters of model/data are identical to the old tail can share a
+  fingerprint, and entries that are byte-identical in both lineages are rightly
+  kept. Treat the derived file as disposable: delete it after restoring a backup if
+  exact provenance matters. The fixture has no per-entry sequence or store-wide
+  content hash.
+
 ## Pagination and mapping stability
 
 Pages are newest-first by Durable entry ID and then document ID. The cursor is
 opaque host state, not authorization. It is bound to:
 
 - the normalized query, scope and roles;
-- the derived index generation and the caller-supplied store identity;
+- the derived index generation and the store identity;
 - the hash of the mapped conversation-ID set captured on the first page;
 - the source coverage boundary;
 - the last document and its entry fingerprint.
@@ -158,7 +222,7 @@ Entries appended after the first page have higher entry IDs and stay out of that
 continuation; a fresh query sees them. The cursor is rejected when the query
 changes, the index or store identity is replaced, the session mapping changes,
 the mapped set no longer contains the source, or the source entry at the boundary
-no longer matches its fingerprint.
+no longer exists or no longer matches its fingerprint.
 
 ## Authorization boundary
 
@@ -175,16 +239,18 @@ as untrusted quoted data.
 
 See `HISTORY_INDEX_LIMITS`: 500 query characters, 16 terms, 20 hits by default
 (50 maximum), 8,000-character chunks with 256-character overlap, 64 chunks per
-entry, 256 mapped sessions, 5 entries per scan, 1M tool-argument units, 500 entries / 8 MiB / 1.5 s per
-reconciliation pass, and 100 pending entries counted. Long records can produce
-more than one hit, one per matched chunk.
+entry, 256 mapped sessions (the same cap as context snapshots), 5 entries per scan,
+1M tool-argument units, 500 entries / 8 MiB / 1.5 s per reconciliation pass, and 100
+pending entries counted. Long records can produce more than one hit, one per
+matched chunk.
 
 ## Not implemented
 
-- Episode catalog rows with titles, summaries, status and retry.
-- Episode-summary indexing or search.
+- Episode summary generation, episode titles and summary search. The episode
+  catalog records closed episodes as `pending`; nothing claims or summarizes them.
 - Background indexing independent of a search; reconciliation happens on demand.
 - Relevance ranking: results are deterministic recency order so keyset pagination
   stays stable while FTS corpus statistics change.
 - Fetching surrounding entries by hit; callers can use the source IDs with Durable.
-- Channel or CLI history browsing UI.
+- Any CLI, Telegram or other channel history browsing/search command. Only trusted
+  host code can call `Gateway.historySearch` today.
