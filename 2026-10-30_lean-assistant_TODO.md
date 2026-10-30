@@ -510,6 +510,28 @@ product Code Mode wiring is accepted and integrated (see the MCP entry above).
 Product background workers are under active research and coding implementation;
 the spawning agent (not the user) is notified whether each implementer uses a
 shared checkout or a worktree, and scheduled memory curation remains later work.
-Native web search (Brave) plus fetch are in implementation under the web worker;
-any owner-bounded live permission is handled only by that worker, and none of
-those branches is imported into this accepted MCP slice.
+Native web search (Brave) plus fetch and the general Code Mode compositor are a
+candidate on a combined branch awaiting fresh review; none of those branches is
+imported into this accepted MCP slice, and product web search remains unverified
+live.
+
+### 2026-10-30 — Web + Code Mode compositor candidate (not published)
+
+Combined current main `4dbc71e` (docs over `199de08`) with the web branch
+(`b9e3339`) in this retained worktree. Resolution kept both `web` and
+`media`/`mcp` config, selected MCP and Code Mode only for mapped ordinary chats,
+made Code Mode enableable without MCP (`codemode.enabled`) while preserving MCP
+auto-enablement, and kept web tools in the same mapped set. The coding ceiling
+now delegates `codemode`/`tool_search` to an independent Code Mode authority hook
+and `mcp__*` to the MCP hook; nested scripts compose the conversation's actual
+callable set (coding, history, skill, cron, web, MCP, Telegram actions) through
+native `executeTool()`/`ToolTask` hooks with no new authority. The Telegram
+action tool accepts nested Code Mode callers while keeping its host,
+observed-target, journal and task-binding denials.
+
+Checks on this candidate: typecheck/build, 151 behavior checks (142 main + 9 web,
+including the actual gateway MCP/Code Mode nested path, no-MCP composition and a
+nested Telegram action), 2 execution and 83 core acceptance. No live Brave,
+site, provider, Telegram, credential or network run. The candidate is **not**
+merged or published; a fresh combined runtime/config/authority review is required
+first. Product Brave search remains unverified live.

@@ -99,19 +99,22 @@ host process owned by the gateway; `toolSandbox: "bwrap"` applies only to the
 shell backend and does **not** wrap MCP servers. There is no additional MCP
 confinement layer, so treat a server command as host-level authority.
 
-MCP tools and their Code Mode/tool-search tools are enabled **only in
-authenticated mapped ordinary chat conversations** — the same set that may use
-`toolAllowlist`. That set does not require a nonempty `toolAllowlist`: MCP and
-Code Mode work with `toolAllowlist: []`, which simply leaves no coding tools
-available to scripts. The root conversation, state-only channel conversations, forks,
-raw or task-owned conversations and isolated scheduled cron runs receive no MCP
-tool, no `codemode` and no `tool_search`. A scheduled run has no bounded MCP
-capture; that capability is deliberately not implemented.
+MCP tools are enabled **only in authenticated mapped ordinary chat
+conversations** — the same set that may use `toolAllowlist`. That set does not
+require a nonempty `toolAllowlist`: MCP tools work with `toolAllowlist: []`,
+which simply leaves no coding tools available to scripts. Code Mode itself can
+also be enabled independently of MCP (`codemode.enabled`), but the same
+mapped-chat restriction applies to it. The root conversation, state-only channel
+conversations, forks, raw or task-owned conversations and isolated scheduled
+cron runs receive no MCP tool, no `codemode` and no `tool_search`. A scheduled
+run has no bounded MCP capture; that capability is deliberately not implemented.
 
 The ceiling is enforced twice: the tool filter enables the tools per
 conversation, and a call-time `ToolTask` hook rechecks the conversation and the
-server's live state on every call. The hook also covers `codemode` and
-`tool_search`, which the coding-tool ceiling delegates to it. A call from a
+server's live state on every call. When MCP is installed, the hook also covers
+`codemode` and `tool_search`; an independent Code Mode authority hook covers
+them when only Code Mode is enabled. The coding-tool ceiling delegates each
+fixed name only to the hook that is actually installed. A call from a
 conversation that lost authorization, a nested call naming a tool the current
 scope no longer has, a persisted selection or a prepared replay therefore fails
 closed. Nested calls to tools still in the current scope succeed. Coding tools
@@ -152,7 +155,8 @@ script and is reported as an error result for a direct model call. Input
 schemas are forced to object schemas; a schema over 16 KiB is replaced with an
 unconstrained object so declarations stay bounded and the tool stays callable.
 
-With MCP disabled there is no Code Mode in the gateway at all. See
+With MCP disabled, Code Mode appears only when `codemode.enabled` explicitly
+enables it; otherwise the gateway installs no Code Mode. See
 [CODEMODE.md](./CODEMODE.md) for the native bundle's contract, budgets and
 replay semantics.
 
@@ -166,7 +170,8 @@ through the gateway's `mcp.servers` status; the gateway still opens.
 Whether anything is installed is decided before connecting:
 `mcpHasEnabledServers` requires `mcp.enabled: true` **and at least one server
 entry that is not `enabled: false`**. With no block, `enabled: false`, or only
-disabled entries, no client starts and no Code Mode is installed. When at least
+disabled entries, no MCP client starts and no MCP-fed Code Mode is installed; an
+independent `codemode.enabled` still applies on its own. When at least
 one server is enabled but every enabled server fails, the MCP extension has no
 tools and Code Mode is still installed with `tool_search` but **zero MCP
 namespaces** for authenticated mapped chats. The status
