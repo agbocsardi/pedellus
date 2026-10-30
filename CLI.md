@@ -191,10 +191,12 @@ same refusal; this adds no fallback path or local media reader.
 The CLI only names an operator path. The gateway, which already owns storage,
 resolves the file, reads it bounded, stores the original under
 `<workspace>/<media.directory>` (default `media/`) and composes the ordinary turn.
-The CLI does not open storage, read the file, or receive its bytes, and the model
-receives only a workspace-relative locator plus bounded metadata, never the
-operator's absolute path. Paths are operator input, not model input, and no tool
-authority is added.
+The private owner-only local socket is the authorization boundary: the gateway
+reads the named path with its own OS user's privileges, so it can read any file
+that user can read. The CLI does not open storage, read the file, or receive its
+bytes, and the model receives only a workspace-relative locator plus bounded
+metadata, never the operator's absolute path. Paths are operator input, not model
+input, and no tool authority is added.
 
 - A path must be absolute or is resolved by the CLI process against its own
   working directory; it is capped at 4,096 code units and rejected if it contains
@@ -211,8 +213,10 @@ authority is added.
 - The shared store enforces 20 MB per file. Empty, unreadable, non-regular,
   oversized and mislabeled-image files are refused with fixed, value-free text
   before anything is submitted. A stored identity comes from the file's bytes, so
-  attaching the same content twice reuses one original. Stored originals are not
-  deleted automatically and there is no total-disk cap.
+  the same content with the same detected kind and extension reuses one stored
+  original; the same bytes named `.txt` and `.md` are separate document locators,
+  because the locator carries the extension. Stored originals are not deleted
+  automatically and there is no total-disk cap.
 
 A successful command prints the stored kind, workspace-relative locator and byte
 count, then admits one ordinary submission. It counts against the same 64

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { open, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
 import { basename, extname, isAbsolute } from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { MediaRejected, sanitizeOriginalName, type MediaKind, type MediaStore, type StoredMedia } from "./attachments.js";
@@ -104,27 +105,25 @@ function looksLikeImage(mimeType: string, bytes: Buffer): boolean {
   return false;
 }
 
-/** Read at most the store's byte limit; a growing file is refused instead of truncated. */
+/**
+ * Read at most the store's byte limit; a growing file is refused instead of truncated.
+ *
+ * Opening non-blocking means a path swapped to a FIFO after admission cannot park the
+ * gateway's serial local connection. The opened handle is then the only authority: a
+ * regular-file check, size check and the bounded read all apply to that same fd.
+ */
 async function readBounded(path: string, maxBytes: number, signal?: AbortSignal): Promise<Buffer> {
-  let initial;
-  try {
-    initial = await stat(path);
-  } catch {
-    throw new LocalAttachmentError("unreadable");
-  }
-  if (!initial.isFile()) throw new LocalAttachmentError("unreadable");
-  if (initial.size === 0) throw new LocalAttachmentError("empty");
-  if (initial.size > maxBytes) throw new LocalAttachmentError("too-large");
-
   let handle;
   try {
-    handle = await open(path, "r");
+    handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
   } catch {
     throw new LocalAttachmentError("unreadable");
   }
   try {
     const current = await handle.stat();
     if (!current.isFile()) throw new LocalAttachmentError("unreadable");
+    if (current.size === 0) throw new LocalAttachmentError("empty");
+    if (current.size > maxBytes) throw new LocalAttachmentError("too-large");
     const chunks: Buffer[] = [];
     let total = 0;
     for (;;) {
@@ -177,9 +176,12 @@ function attachmentContextText(stored: StoredMedia, kind: LocalAttachmentKind): 
 /**
  * Store one operator-named local file and build its ordinary turn content.
  *
- * The identity is derived from the stored bytes, so attaching the same file twice
- * reuses the same stored original and never creates a second copy. A refusal is a
- * `LocalAttachmentError` with a fixed reason; the caller decides how to report it.
+ * The identity is derived from the stored bytes, so re-attaching the same content
+ * with the same detected kind and extension reuses one stored original. The locator
+ * also encodes the extension, so the same bytes named .txt and .md are separate
+ * document locators; nothing here normalizes or rewrites one into the other.
+ * A refusal is a `LocalAttachmentError` with a fixed reason; the caller decides how
+ * to report it.
  */
 export async function prepareLocalAttachment(store: MediaStore, request: LocalAttachmentRequest): Promise<LocalAttachment> {
   const path = request.path;

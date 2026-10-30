@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Writable } from "node:stream";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import test from "node:test";
 
 const pkg = process.env.PI_MODEL_CANDIDATE ?? join(import.meta.dirname, "..");
@@ -347,6 +347,31 @@ function runAgentCli(configFile, stdinText) {
       resolveRun({ code, signal, stdout, stderr });
     });
     child.stdin.end(stdinText);
+  });
+}
+
+test("opening a FIFO path cannot park the local request", { timeout: 10_000 }, async (t) => {
+  const { directory, workspace } = await makeEnvironment(t);
+  const store = createMediaStore({ workspace });
+  const fifo = join(directory, "swapped.jpg");
+  try {
+    await mkfifo(fifo);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      t.skip("mkfifo is unavailable");
+      return;
+    }
+    throw error;
+  }
+  // The non-blocking open reaches the opened-fd regular-file refusal without waiting
+  // for a FIFO writer; the outer test timeout would catch a regression that blocks.
+  await assert.rejects(prepareLocalAttachment(store, { path: fifo }),
+    (error) => error instanceof LocalAttachmentError && error.rejection === "unreadable");
+});
+
+function mkfifo(path) {
+  return new Promise((resolveFifo, rejectFifo) => {
+    execFile("mkfifo", [path], (error) => (error ? rejectFifo(error) : resolveFifo()));
   });
 }
 
