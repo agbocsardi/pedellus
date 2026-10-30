@@ -30,7 +30,11 @@ daemon. `openGateway` already owns shared runtime/storage; the executable curren
 chooses Telegram or terminal. Improve the host so CLI and Telegram can use the
 same owner, with Discord/Email as later adapters. Do not create a database owner
 per channel, a second agent loop or a general-purpose operations framework.
-Persistent workspace/config/launch decisions still need owner agreement.
+Owner confirmed the shape: the gateway is the single agent/runtime owner;
+CLI/TUI, Telegram and future Discord/Email are conversation surfaces, not runtime
+owners. CLI connects to the running gateway and may disconnect without stopping
+it. Conversations are separate by default and share workspace/Markdown memory.
+Keep explicit config/workspace paths; no deployment or automatic service install.
 
 Owner's annotation feedback sets these next product requirements (plan first,
 not permission to start every branch or run live integrations):
@@ -39,8 +43,15 @@ not permission to start every branch or run live integrations):
   `edit`; make snapshot/manifest freshness explicit using the existing refresh
   path. Python-named `memory_read`/`memory_write`/`memory_search` are not present;
   add a dedicated operation only when it does more than wrap existing tools.
+- [ ] Single-owner gateway host plus independently attachable local CLI, preserving
+  existing terminal commands, Durable controls, tool authority and recovery.
 - [ ] Native Telegram command menu/autocomplete for commands actually implemented;
   reuse `setMyCommands`, with no speculative command router or dead menu entries.
+- [ ] Telegram incoming replies/quotes with bounded, labeled source context;
+  agent-selected native replies and reactions restricted to observed messages in
+  the authenticated current chat. Ordinary answers remain unthreaded by default.
+- [ ] Authenticated Telegram reaction changes trigger ordinary agent turns, with
+  durable update dedupe and explicit added/removed reaction context.
 - [ ] Wire configured MCP connections into the actual gateway and expose their
   registered tools through Code Mode/tool discovery. The current SDK-only Code
   Mode bundle is not MCP connectivity and is not installed by the shipped host.
@@ -52,12 +63,17 @@ not permission to start every branch or run live integrations):
   be an ordinary cron job using those workers and the existing Markdown tools,
   not a standalone Dream subsystem.
 
-First bounded implementation batch: channel-neutral host/CLI attachment and
-Telegram command-menu registration can proceed independently. In parallel, settle
-the shared media/transcription ingress and first backend before implementing
-voice support. Python defaults to local faster-whisper; a local backend or one
-explicit hosted transcription endpoint are the candidates, not a copied registry.
-No cloud-audio upload or new runtime service is authorized by this planning step.
+Approved first implementation batch: channel-neutral gateway/local CLI attachment
+and Telegram menu/reply/quote/reaction support. These are two independently owned
+slices, with offline regression checks and independent review before integration.
+Use a minimal local connection protocol, not a new agent loop or general service
+framework. CLI disconnect leaves gateway/Telegram alive. Preserve explicit memory
+refresh and document snapshot/manifest freshness rather than adding memory tools.
+
+The owner selected local faster-whisper for the subsequent shared media ingress
+slice, Telegram first; photos/documents remain high priority. No cloud-audio
+upload, backend installation/model download or live integration is authorized by
+this implementation batch.
 
 Then wire product Code Mode + MCP, followed by bounded background workers and
 ordinary scheduled memory curation. Photos/documents remain in the high-priority
@@ -74,23 +90,56 @@ One personal assistant, CLI or Telegram, one configured workspace. Config select
 
 This follows the useful trunk of the [old assistant tree](plan/2026-10-29_assistant-tree_TODO.md) after the [completed removal pass](plan/2026-10-30_simplification_TODO.md). `plan/` is historical evidence, not competing instructions. Do not revive feature-for-feature Python parity, migration/archival SDKs, managed-copy execution or expiring tool grants.
 
-No new service layer, agent loop, queue, retry framework, configuration mode, dashboard, backup subsystem or general-purpose acceptance harness. A short integration check is better than a test platform. Prefer deleting obsolete work and fixing observed failures over speculative restructuring. Keep data integrity and provenance; never trade them for fewer lines.
+The approved local gateway/client transport is the only new host boundary. No
+additional service layer, agent loop, queue, retry framework, configuration mode,
+dashboard, backup subsystem or general-purpose acceptance harness. A short integration check is better than a test platform. Prefer deleting obsolete work and fixing observed failures over speculative restructuring. Keep data integrity and provenance; never trade them for fewer lines.
 
 The implementation batch is offline. A separately owner-approved live acceptance run may use only an explicitly named runtime credential, synthetic data and the existing budget guard; no credential-file discovery or value output. No security audit, personal data, migration, deployment or cutover. Live Telegram activity is limited to a separately owner-approved single-user synthetic pilot. The completed pilot batch does not itself enable web/MCP, product delegation or more channels. No standalone Dream engine will return: its desired memory-curation behavior is planned as an ordinary scheduled background job using the same worker/tools path. Standing intents, dedicated heartbeat and sustained goals remain excluded.
 
 ## Batch ownership and finish line
 
-Use `opencode-go / deepseek-v4.1-flash`, thinking `high`, 2–3 implementation workers in separate Herdr worktrees. Independent review before integration; at most three active children including reviewers/fix passes. Parent owns work orders, shared manifest/root exports, integration and final checks. Workers commit bounded results and report exact checks and limitations. Small permanent regression checks are appropriate for changed behavior; no sleep-based schedule waits or leaked gates/timers/subscriptions.
+Use `opencode-go / deepseek-v4.1-flash`, thinking `high`, two implementation
+workers in separate worktrees. Independent review before integration; at most
+three active children including reviewers. Parent owns this plan, shared
+manifest/root exports, integration and final checks. Workers commit bounded
+results and report exact checks and limitations. Add focused permanent regression
+checks; no sleep-based schedule waits or leaked gates/timers/subscriptions.
 
-- **worker-memory-story:** history/context and one focused lifecycle regression. Reuse existing fixtures/patterns. Do not change runtime/CLI; report any integration hunk required. No new memory tools, ranking or history commands.
-- **worker-cron-outcomes:** existing cron/outbox and runtime's cron finalization region; a few focused scheduled-outcome checks. Failed/empty runs get fixed text, never raw provider errors. Cancelled/superseded/missing jobs remain silent. Preserve existing success delivery and authority retirement.
-- **worker-recovery-help:** startup diagnostics, recovery, CLI and runtime lock/prepared-replay failure sites only; a small stopped-backup/reopen check and concise storage instructions. No automatic cancellation, live-store copying, schema/data repair or new backup command.
+- **worker-gateway-surfaces:** local gateway server/client, CLI launch/attachment,
+  terminal transport boundary, CLI/setup documentation and focused checks. Owns
+  `src/cli.ts`, `src/terminal/`, new local transport modules, `CLI.md`, `SETUP.md`.
+  Does not edit `src/runtime.ts` or Telegram files. No second Durable owner or
+  remote/public listener; terminal disconnect does not stop gateway work.
+- **worker-telegram-interactions:** menu registration, incoming reply/quote context,
+  authenticated reaction turns, model-callable native reply/reaction actions and
+  focused checks. Owns Telegram/new interaction modules, narrowly required runtime
+  tool integration, `TELEGRAM.md`. Restrict actions to authenticated current-chat
+  observed targets; no raw chat selector, inherited fork/cron authority or blind
+  replay of ambiguous external sends. Preserve existing outbox/control behavior.
 
-Workers sharing `runtime.ts` own disjoint regions: cron finalization vs startup lock/replay failures. Do not reformat unrelated code or edit each other's region. New test file registration is a parent integration request, not permission for concurrent manifest edits.
+New test registration and root exports are parent integration requests. No
+unrelated reformatting or edits to the other worker's region.
 
-Done for this batch means the retained assistant has a reproducible offline story, scheduled failures are no longer silent, recovery gives the owner a clear next action, and a disposable stopped-store restore works. It does not mean deployment or real-model acceptance is complete.
+Done means offline checks demonstrate one gateway serving an independently
+connecting/disconnecting CLI plus Telegram, separate conversations, implemented
+command menu, preserved quote/reply context, agent-selected reply/reaction actions
+and reaction-triggered turns with durable dedupe/recovery. Existing terminal
+commands, config tool ceiling, outbox unknown-send handling and memory refresh
+remain intact. No deployment or live-delivery claim; no live model/bot run.
 
 ## Session log
+
+### 2026-10-30 — channel surfaces and Telegram interactions
+
+Owner clarified that the gateway itself is the single agent/Durable owner and
+CLI/TUI is another conversation surface alongside Telegram and future channels.
+Python's standalone CLI runtime is not the desired ownership model. Agreed
+separate conversations by default, shared workspace/memory, and local
+faster-whisper for later media work. Owner approved implementation and added
+Telegram replies/quotes/reactions: agent chooses native reply threading; incoming
+user reaction changes trigger turns. This batch is offline gateway/CLI plus
+Telegram interactions; media/MCP/workers remain subsequent work. Replaced the
+completed L1–L3 assignments with two bounded work orders and independent review.
 
 ### 2026-10-30
 
