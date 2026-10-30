@@ -45,13 +45,14 @@ not permission to start every branch or run live integrations):
   add a dedicated operation only when it does more than wrap existing tools.
 - [ ] Single-owner gateway host plus independently attachable local CLI, preserving
   existing terminal commands, Durable controls, tool authority and recovery.
-- [ ] Native Telegram command menu/autocomplete for commands actually implemented;
+- [x] Native Telegram command menu/autocomplete for commands actually implemented;
   reuse `setMyCommands`, with no speculative command router or dead menu entries.
-- [ ] Telegram incoming replies/quotes with bounded, labeled source context;
+- [x] Telegram incoming replies/quotes with bounded, labeled source context;
   agent-selected native replies and reactions restricted to observed messages in
   the authenticated current chat. Ordinary answers remain unthreaded by default.
-- [ ] Authenticated Telegram reaction changes trigger ordinary agent turns, with
-  durable update dedupe and explicit added/removed reaction context.
+- [x] Handle authenticated Telegram reaction changes as ordinary agent turns,
+  with durable update dedupe and explicit added/removed context. Offline handler
+  verified; private-chat reaction-update delivery remains unverified live.
 - [ ] Wire configured MCP connections into the actual gateway and expose their
   registered tools through Code Mode/tool discovery. The current SDK-only Code
   Mode bundle is not MCP connectivity and is not installed by the shipped host.
@@ -140,6 +141,21 @@ Telegram replies/quotes/reactions: agent chooses native reply threading; incomin
 user reaction changes trigger turns. This batch is offline gateway/CLI plus
 Telegram interactions; media/MCP/workers remain subsequent work. Replaced the
 completed L1–L3 assignments with two bounded work orders and independent review.
+
+Telegram worker completed `a16c962`; independent Pi / OpenCode Go / DeepSeek Flash
+high-thinking review passed, independently checking 7 new interaction checks,
+82 existing behavior, 2 execution and offline core acceptance. Parent fixed the
+review's call-id collision finding at the root: action identity derives from the
+Durable tool task id, with chat/target/payload-bound duplicate results. Parent also
+kept unknown outcomes non-evictable to retain reconciliation evidence, clarified
+retained-record dedupe, additional-message reply semantics and the private-chat
+reaction-delivery uncertainty. Focused collision/unknown-retention checks added;
+9 interaction plus 5 existing transport/typing checks pass with typecheck/build.
+Integrated as `30d34f1` + `59c15d7`; manifest and authority docs updated by parent.
+No broad optional test matrix or settled-text compaction added: bounded records
+remain inspectable and the targeted changes cover the material findings. No live
+bot/provider run. Gateway worker completed `5712c98`; independent review is in
+progress before integration.
 
 ### 2026-10-30
 
