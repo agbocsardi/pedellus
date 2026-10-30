@@ -110,9 +110,10 @@ re-grant or per-channel permission list to manage.
   are enabled, not how far their filesystem or shell reach goes.
 
 CLI `/tools` is read-only diagnostics: it lists the configured tool names and
-states that configuration is the authority. `/grant` and `/revoke` are not
-offered: they answer that they were removed and that nothing was changed. The
-Telegram adapter has no tool-authority commands at all.
+states that configuration is the authority. There are no `/grant` or `/revoke`
+commands: like any other unknown slash command they are rejected locally and
+never sent to the model. The Telegram adapter has no tool-authority commands at
+all.
 
 ### Captured tools of a scheduled isolated run
 
@@ -254,13 +255,13 @@ built by `createHostExecutionEnv`:
 
 ## Checks
 
-Validated with the committed offline suites:
+Validated with the committed offline suites on this branch:
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
 npm run typecheck
-npm run test:behavior   # 168 checks
-npm run test:execution  # 9 checks
+npm run test:behavior
+npm run test:execution
 ```
 
 `tests/config-tool-authorization.behavior.test.mjs` covers configured authority

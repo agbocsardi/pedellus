@@ -1122,12 +1122,6 @@ export async function runTerminalConversation(
       default:
         if (name === "stop") {
           await notice("/stop is unsupported: it is not aliased to native /abort, which withdraws queued inputs.", true);
-        } else if (name === "grant" || name === "revoke") {
-          await notice(
-            `/${name} was removed from this CLI: coding-tool authority comes from config toolAllowlist. ` +
-            "Edit the configuration and restart; nothing was changed.",
-            true,
-          );
         } else if (name === "restart") {
           await notice("/restart is unsupported: process restart belongs to the deployment owner.", true);
         } else if (name === "steer" || name === "after") {
