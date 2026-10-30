@@ -228,7 +228,8 @@ nothing. Cancelled, superseded and missing-job runs are not pushed; ask the agen
 ## 8. Optional: attachments and voice
 
 Attachment ingress is opt-in, shared by channels and currently wired into the
-Telegram adapter. Add a top-level `media` key beside the existing ones:
+Telegram adapter and the local CLI. Add a top-level `media` key beside the
+existing ones:
 
 ```json
 "media": {
@@ -250,11 +251,17 @@ Telegram adapter. Add a top-level `media` key beside the existing ones:
   Documents are stored unread: no text extraction, OCR, PDF/Office conversion or
   dependency is involved, so reading one is the agent's job with the configured
   tools. Video and stickers get an explicit unsupported notice.
-- Bounds: 20 MB per file (Telegram's ordinary Bot API `getFile` limit), a 60s
-  download timeout, two concurrent attachment jobs, a 180s transcription timeout
-  and a 120s audio-duration limit by default. Stored originals are never deleted
-  by the adapter and there is no total-disk cap, so the media directory is yours
-  to monitor and prune.
+- The local CLI submits one operator-named file per `/attach` command through the
+  running gateway. A known image extension with matching bytes becomes image
+  content (the configured vision handoff applies as usual); every other file,
+  including audio, is stored as an opaque original with a locator only. The CLI
+  adds no document extraction or audio transcription, and the model never
+  receives the operator's absolute path. See [the CLI](./CLI.md#local-attachments).
+- Bounds: 20 MB per file (also Telegram's ordinary Bot API `getFile` limit), a
+  60s Telegram download timeout, two concurrent attachment jobs, a 180s
+  transcription timeout and a 120s audio-duration limit by default. Stored
+  originals are never deleted by the adapter and there is no total-disk cap, so
+  the media directory is yours to monitor and prune.
 
 Local speech needs a one-time provisioning step; the runtime never installs or
 downloads anything while handling a message. The helper is

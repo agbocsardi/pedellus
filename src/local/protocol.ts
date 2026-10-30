@@ -22,6 +22,8 @@ export const LOCAL_PROTOCOL_LIMITS = Object.freeze({
   maxOutboundBytes: 8 * 1024 * 1024,
   /** Admitted prompt length, matching the terminal's own line bound. */
   maxInputChars: 32_000,
+  /** One operator-supplied attachment path; the CLI may send a workspace-independent absolute path. */
+  maxAttachmentPathChars: 4_096,
   maxEntryPage: 200,
   maxHistoryLimit: 50,
   maxConversationTokenChars: 32,
