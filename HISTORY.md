@@ -745,7 +745,14 @@ the claimed chunk from the committed transcript before one commit:
   entry.
 
 A malformed or forged batch is therefore rejected instead of corrupting the cursor, so no
-acknowledgement can advance the frontier past evidence the transcript does not support. A batch with
+acknowledgement can advance the frontier past evidence the transcript does not support. The gap
+check above is bounded: at most one read's scan budget (4,000 entries) between the previous frontier
+and a fresh episode start is examined. A longer gap is refused with an error rather than assumed, so
+evidence is never silently skipped. The practical consequence is explicit: a conversation with more
+than 4,000 consecutive empty `pi.reset` markers before its next closed episode could not be
+acknowledged by this slice and would refuse loudly with the cursor unchanged. Normal chats have one
+or two resets between episodes; if real history ever produces such a run, the bound needs revisiting
+rather than silent acceptance. A batch with
 no evidence (nothing worth remembering, or an episode of non-evidence entries) is still
 acknowledged and counts as processed; a failure or restart before acknowledgement replays the same
 chunk. `DIGEST_LIMITS` bounds a batch (80 entries and strictly 24,000 evidence characters) and a read
