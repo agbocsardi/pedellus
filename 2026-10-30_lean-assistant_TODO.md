@@ -114,20 +114,24 @@ not permission to start every branch or run live integrations):
     reviewed (`86cd25e` + fixes `3043160`, fresh reviewer PASS) and integrated;
     it does not own the Telegram adapter, CLI media options or transcription
     config.
-- [ ] Add bounded ordinary background workers; scheduled memory curation may then
-  be an ordinary cron job using those workers and the existing Markdown tools,
-  not a standalone Dream subsystem. Product workers support research plus coding:
-  the spawning agent explicitly chooses shared workspace or isolated worktree
-  per task. Completion/results notify the spawning agent, not the user directly.
-  - [ ] Bounded ordinary workers on native Durable tasks: opt-in `workers` config,
+- [x] Add bounded ordinary background workers. Product workers support research
+  plus coding: the spawning agent explicitly chooses shared workspace or isolated
+  worktree per task. Completion/results notify the spawning agent, not the user
+  directly. Scheduled memory curation remains a separate deferred item below.
+  - [x] Bounded ordinary workers on native Durable tasks: opt-in `workers` config,
     model-facing `worker` start/list/inspect/cancel, explicit shared-or-worktree
     workspace, captured tool ceiling, one internal result event to the spawning
-    agent. Independent review passed on `74b9355` (no material findings); merged
-    with the current web/Code Mode main for combined review. Owner scope
-    correction (authorized): a worker child also composes its captured tools
-    through native Code Mode/tool_search, but never gets the `worker` tool or
-    MCP/web/Telegram/cron/history grants. Memory curation stays deferred and this
-    branch contains none of it.
+    agent. Accepted: review fixes `2fbcd6b`/`4fcd9b6`/`74b9355`, integration merge
+    `72a20f0` (current web/Code Mode main `dceb23f`), child Code Mode correction
+    `d27e3e7`, final combined review PASS, published to main by this metadata
+    commit. A worker child composes **only its captured tools** through native
+    Code Mode/tool_search and never gets the `worker` tool or recursive
+    delegation, nor implicit MCP/web/Telegram/cron/history grants. 16 focused
+    worker checks; 177 combined registered behavior checks. Memory curation is
+    not implemented here (deferred below).
+    Carried cosmetic limitation (docs only, no source change): config parsing
+    accepts non-coding `toolAllowlist` names, while gateway startup rejects names
+    with no approved registration.
 - [ ] After background workers are accepted, add opt-in periodic digestion of
   previously unprocessed conversations/episodes into long-term memory, following
   the deferred scope below. Do not implement or activate curation yet.
@@ -370,7 +374,7 @@ findings. Front-door metadata/docs were reconciled for publication and the work
 merged by fast-forward into main. No live MCP server, provider, credential or
 production data was used; the carried limits above still hold.
 
-### 2026-10-30 — bounded background workers (reviewed; merged for combined review)
+### 2026-10-30 — bounded background workers (accepted and integrated)
 
 Implemented bounded ordinary background workers as native Durable tasks on
 `t3/durable-background-workers`: `nanobot.worker-run` task kind, `worker` tool
@@ -409,6 +413,18 @@ a narrowed reopen leaves a live child composing only what the capture still
 allows; stale nested or prepared calls fail closed through the existing hook and
 replay guards. Two focused regressions cover a real nested `read` composition
 with a denied nested spawn, and the narrowed-reopen callable/deferred state.
+
+Acceptance: the final combined runtime/config/authority review passed `d27e3e7`
+with no material findings, independently verifying the merge union (no main
+behavior deleted), the child Code Mode authority/retirement/narrowed-reopen
+rules, the docs, and the reviewed worker source remaining byte-identical to
+`74b9355`. Checks at that tip: typecheck/build, 177 registered behavior checks
+(16 worker checks run three times under the 60s outer bound), 2 execution and 83
+offline core acceptance. Publication was a fast-forward of main to this
+metadata commit; no functional source, test or dependency changed after
+`d27e3e7`. Curation remains deferred with the owner's simpler shape (an editable
+agent-owned workspace prompt plus a simple digestion cursor, no hash/version
+machinery); no cron/worker MCP composition and no live run is claimed.
 
 Integration candidate merges current main `dceb23f` (Telegram owner controls,
 media ingress, vision, MCP, general Code Mode, web tools) into this branch.
