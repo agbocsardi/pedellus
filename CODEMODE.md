@@ -201,8 +201,11 @@ The prior MCP-only wiring was accepted: standalone review passed `4d61f50` with
 documentation corrections in `1c38146`, and a fresh combined
 runtime/config/authority review passed the integration with `555d34c` with no
 material findings. The independent-composition generalisation and the Telegram
-caller change are a newer candidate change and are **not** part of that
-acceptance; they require a fresh combined review before publication.
+caller widening were later reviewed with the web integration in a fresh combined
+runtime/config/authority review of `1204226` and accepted for publication. Cron
+and background-worker composition remain deliberately later work (the worker
+branch is still in review); the Telegram owner-command slice was published
+separately and does not use Code Mode for host commands.
 
 `gateway.close()` closes the Harness first, then this bundle (stopping admission
 and waiting for sandbox workers), then every MCP client. An open that fails after

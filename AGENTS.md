@@ -84,12 +84,25 @@ npm start -- agent --config config.json     # attach a terminal
   demand through the read-only `skill` tool.
 - Markdown in the workspace is the memory source of truth. Durable owns the
   transcript, runtime state and compaction.
+- Native web tools are default-off and separate from `toolAllowlist`: `web.search`
+  names the Brave credential environment variable, and `web.fetch` enables the
+  public reader. Both are limited to authenticated mapped chats. Public fetch
+  refuses userinfo and private/loopback/link-local/reserved targets, pins the
+  validated DNS answer, revalidates redirects, sends no credentials or cookies,
+  bounds time/bytes/text, and never executes page scripts. Product Brave search
+  remains live-unverified.
+- Native Code Mode is independently opt-in (`codemode.enabled`) or follows MCP
+  auto-enablement when that block is absent. Scripts compose only the current
+  conversation's callable set through native `executeTool`/`ToolTask` hooks: no
+  new authority, no recursion, no host-only owner commands, and no composition in
+  root, state, fork, raw/task-owned or isolated cron conversations.
 - MCP is a separate, default-off connection authority from `toolAllowlist`:
   `mcp.enabled` plus at least one enabled server connects it, and only
-  authenticated mapped chats receive MCP tools, `codemode` and `tool_search`.
-  Root, state, fork, raw/task-owned and isolated cron conversations get none.
-  A configured stdio server is a native host process, not covered by
-  `toolSandbox: "bwrap"`. Secrets are referenced by environment variable name.
+  authenticated mapped chats receive MCP tools; Code Mode follows its own switch
+  and the same mapped-chat rule. Root, state, fork, raw/task-owned and isolated
+  cron conversations get none. A configured stdio server is a native host
+  process, not covered by `toolSandbox: "bwrap"`. Secrets are referenced by
+  environment variable name.
 - Media ingress is opt-in (`media` config) and owned by the gateway. Photos are
   native pi-ai image content plus a workspace-relative locator; configured vision
   handoff describes them for flagged text-only presets. Documents are stored

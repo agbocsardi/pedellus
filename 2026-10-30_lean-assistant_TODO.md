@@ -62,7 +62,7 @@ not permission to start every branch or run live integrations):
   Standalone review passed with no material code defects (`4d61f50`, docs
   corrected in `1c38146`); a fresh combined runtime/config/authority review
   passed `555d34c` with no material findings. Accepted and integrated into main.
-- [ ] Generalize native Code Mode into the agent's general compositor: scripts may
+- [x] Generalize native Code Mode into the agent's general compositor: scripts may
   compose every tool the current agent is authorized to call (coding, history,
   skill, cron, web, MCP, Telegram actions, and worker tools once accepted), not
   only MCP tools. No new authority: each nested call still passes its normal
@@ -72,7 +72,19 @@ not permission to start every branch or run live integrations):
   raw/root/state/fork targets keep no composition authority. Code Mode must be
   enableable without a dummy MCP server. Background children keep no worker tool
   (no recursive delegation) and only compose tools already captured for them.
-  In implementation and review; not yet accepted.
+  Accepted after the combined runtime/config/authority review of `1204226` and
+  published with the web integration. Cron and background-worker composition
+  remain deliberately later: the worker branch is still in review, and no implicit
+  cron/worker grant exists.
+- [x] Native Brave web search plus safe public web fetch: one configured provider,
+  fixed HTTPS endpoint, key by environment-variable name, explicit default-off
+  config, mapped-chat-only authority, public unicast DNS pinning, per-hop redirect
+  revalidation, credential/cookie-free headers, bounded time/bytes/text, no script
+  execution, and untrusted labeled results. Accepted after standalone reviews
+  (`0a6abb6`, `b9e3339`) and the combined review of `1204226`; integrated with
+  Code Mode composition. Product Brave search remains **live-unverified** (only
+  one bounded implemented fetch smoke to example.com; no live provider query or
+  account).
 - [x] Implement channel-neutral attachment/voice media ingress: shared transcription
   configuration/processing, Telegram ingress first, native image content for
   photos with configured vision handoff, and document saving without extraction.
@@ -510,10 +522,9 @@ product Code Mode wiring is accepted and integrated (see the MCP entry above).
 Product background workers are under active research and coding implementation;
 the spawning agent (not the user) is notified whether each implementer uses a
 shared checkout or a worktree, and scheduled memory curation remains later work.
-Native web search (Brave) plus fetch and the general Code Mode compositor are a
-candidate on a combined branch awaiting fresh review; none of those branches is
-imported into this accepted MCP slice, and product web search remains unverified
-live.
+Native web search (Brave) plus fetch and the general Code Mode compositor were
+later accepted (see the publication entry below); product web search remains
+live-unverified.
 
 ### 2026-10-30 — Web + Code Mode compositor candidate (not published)
 
@@ -535,3 +546,25 @@ nested Telegram action), 2 execution and 83 core acceptance. No live Brave,
 site, provider, Telegram, credential or network run. The candidate is **not**
 merged or published; a fresh combined runtime/config/authority review is required
 first. Product Brave search remains unverified live.
+
+### 2026-10-30 — Native web + Code Mode compositor accepted and published
+
+A fresh combined runtime/config/authority review of `1204226` passed with no
+material findings, covering the merged MCP/media/vision/Telegram sources, mapped
+chat authority, nested composition, the Telegram caller widening, cron/worker
+non-grants, lifecycle and dependency union. Main advanced to the Telegram
+owner-controls publication (`578dc20`); merging it preserved `/model`, `/status`,
+`/new`, `/stop` and full-process `/restart`, the reset-with-rebuild path and the
+restart host code while keeping both command parsing/menu and the web/Code Mode
+tool wiring. Package test registration is the union (161 behavior checks: 152
+main + 9 web), with
+pinned `pi-mcp`, `htmlparser2` and `ipaddr.js` and no unrelated upgrades.
+
+Small review-hygiene fixes only: corrected the stale `mcp` config comment, removed
+a duplicated JSDoc opener, and moved web-test temp cleanup so failures also clean
+up. Checks on the merged tip: typecheck/build, 161 behavior checks, 2 execution
+and 83 core acceptance. Published by fast-forward merge after confirming main was
+clean and the validated tip's ancestor. Product Brave search remains
+live-unverified (one bounded example.com implemented fetch smoke only); cron and
+background-worker composition remain deliberately later, and the worker branch is
+still in review. No new live provider, Telegram, credential or network run.

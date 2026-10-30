@@ -6,8 +6,10 @@ tools, are not named by `toolAllowlist`, and grant no filesystem or shell
 authority. With no `web` configuration the gateway installs neither the
 extension nor a tool, and makes no external call.
 
-Status: experimental. No acceptance run here has used a live provider account,
-a personal query or a private page. The behavior checks use synthetic
+Status: accepted after standalone reviews (`0a6abb6`, `b9e3339`) and a fresh
+combined review (`1204226`). Product Brave search remains **live-unverified**: no
+live provider account or query was used. The only implemented live fetch was one
+bounded `https://example.com/` smoke. The behavior checks use synthetic
 providers, a controlled resolver and mock transports only.
 
 ## Configuration

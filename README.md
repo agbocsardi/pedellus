@@ -5,8 +5,9 @@ TypeScript port requiring Node >=22.19 and the pinned Pi 1.4.0 packages. This is
 The [lean assistant plan](2026-10-30_lean-assistant_TODO.md) is the current scope
 and work-order authority: CLI + Telegram first, then tools, delegation and channels.
 Config-selected coding tools, named model presets, optional bwrap shell, opt-in
-memory/skills, compaction plumbing, configured vision handoff, MCP through
-product Code Mode, and opt-in Telegram media ingress are integrated.
+memory/skills, compaction plumbing, configured vision handoff, MCP, native Code
+Mode composition, native Brave web search plus safe public fetch, and opt-in
+Telegram media ingress are integrated.
 Agent-callable
 cron scheduling and Telegram delivery are available. WebUI, migration and cutover are
 deferred. The [older roadmap](plan/2026-10-26_full-port_TODO.md) preserves evidence,
@@ -122,6 +123,14 @@ and the CLI `main`. Other subsystems are imported directly from their modules.
 
 ## Code Mode and MCP
 
+Native Code Mode is independently opt-in with `codemode: { enabled: true }`; with
+no `codemode` block it is installed when MCP is configured, as before. Scripts
+compose every tool the current authenticated mapped-chat conversation is already
+authorized to call, through native `executeTool` validation and `ToolTask` hooks.
+Code Mode adds no authority, is not recursive, and grants nothing to root, state,
+fork, raw/task-owned or isolated cron conversations. See
+[Code Mode contract](./CODEMODE.md).
+
 MCP is **off by default**. Configuring `mcp: { enabled: true, servers: {...} }` with
 at least one enabled stdio or Streamable HTTP server makes the shipped gateway
 connect them and install the native Durable QuickJS Code Mode/tool-search bundle.
@@ -137,6 +146,22 @@ implicit `mcp.json` discovery, resources/prompts tools, hot reload or CLI status
 startup failures surface only as fixed codes on the SDK `gateway.mcp` surface. See
 [MCP servers and Code Mode](./MCP.md) and [Code Mode contract and verified
 boundaries](./CODEMODE.md).
+
+## Web search and public fetch (opt-in)
+
+`web: { search: { keyEnv: "BRAVE_SEARCH_API_KEY" }, fetch: true }` installs two
+native tools, both off by default: `web_search` uses the fixed
+`https://api.search.brave.com` endpoint and reads its key from the named
+environment variable once at startup, and `web_fetch` reads one public HTML,
+plain-text or JSON URL. Fetch is limited to `http`/`https`, refuses userinfo and
+private, loopback, link-local, reserved and mapped addresses, pins the validated
+DNS answer, revalidates every redirect, sends no credentials or cookies, bounds
+time/bytes/text, parses HTML without executing scripts, and reports original/final
+URLs, MIME, retrieval time and explicit truncation. Neither tool grants filesystem
+or shell authority, and both are offered only in authenticated mapped chats. There
+is no login, cookie jar, browser automation, crawling, PDF/Office extraction or
+retrieval cache. Product Brave search remains **live-unverified**; the implemented
+fetch has one bounded `example.com` smoke. See [WEB.md](./WEB.md).
 
 ## Opt-in context SDK
 
