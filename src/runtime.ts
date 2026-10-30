@@ -87,6 +87,18 @@ import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
 import {
+  createMcpIntegration,
+  mcpHasEnabledServers,
+  type McpIntegration,
+  type McpServerStatus,
+} from "./mcp/index.js";
+import {
+  CODEMODE_TOOL_NAME,
+  createCodeModeIntegration,
+  TOOL_SEARCH_TOOL_NAME,
+  type CodeModeIntegration,
+} from "./extensions/codemode.js";
+import {
   boundedCapturedTools,
   CODING_TOOL_NAMES,
   ConfigToolCaptureDoc,
@@ -178,6 +190,11 @@ export interface OpenGatewayOptions {
   };
 }
 
+/** MCP servers configured for this open, with their connection state at the last read. */
+export interface GatewayMcpStatus {
+  readonly servers: readonly McpServerStatus[];
+}
+
 /** Read-only query for a bounded page of one mapped chat session's raw transcript entries. */
 export interface HistoryEntryQuery {
   readonly minEntryId?: EntryId;
@@ -206,6 +223,11 @@ export interface Gateway {
    * no live channel can send. Present only when `config.telegram` is configured.
    */
   readonly telegramActions?: TelegramActionRegistry;
+  /**
+   * MCP server connection state; absent when MCP is not configured and enabled. A failed server has
+   * no tools; its status carries a fixed failure code, never a transport message or configured value.
+   */
+  readonly mcp: GatewayMcpStatus | undefined;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
   /** Lists the explicit allowlist and persisted selection for an already-known session key. */
   listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
@@ -424,6 +446,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
     });
   }
   const toolsEnabled = toolAllowlist.length > 0;
+  // MCP is a separate, explicit connection authority. Connecting starts external clients, so the
+  // config switch must be on and at least one server enabled; otherwise nothing is created and no
+  // product Code Mode appears.
+  const mcpConfig = config.mcp;
+  const mcpConfigured = mcpHasEnabledServers(mcpConfig);
+  // Late-bound so the coding ceiling hook can delegate MCP/Code Mode names to the MCP hook that is
+  // created after it. Absent (MCP not configured) means the ceiling blocks those names instead.
+  const mcpRef: { current: McpIntegration | undefined } = { current: undefined };
+  const codeModeRef: { current: CodeModeIntegration | undefined } = { current: undefined };
   // Internal agent scheduling: opt-in, and independent of the coding-tool ceiling so a reminder job
   // needs no filesystem authority.
   const cronConfig = config.cron;
@@ -624,6 +655,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
         ],
         defaultTimeoutSeconds,
         authenticatedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
+        // MCP server tools and the Code Mode tools that reach them are gated by the MCP extension's
+        // own call-time hook. The predicate is false unless that hook is installed, so a stale
+        // persisted selection cannot turn this exemption into authority.
+        delegatedTools: (name: string) =>
+          mcpRef.current !== undefined
+          && (name === CODEMODE_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME || mcpRef.current.ownsTool(name)),
       })
     : undefined;
   const toolEnvironments: ToolEnvironments | undefined = toolsEnabled
@@ -682,6 +719,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const extensionsPolicy = (conversationId: ConversationId): AgentChange => {
     const selected: Extension[] = [];
     if (toolExtension) selected.push(toolExtension);
+    // MCP tools and their Code Mode/tool-search siblings exist only in an authenticated mapped
+    // chat conversation, and only while the MCP integration is live for this open.
+    if (mcpRef.current !== undefined && authorizedChatConversations.has(conversationId)) {
+      selected.push(mcpRef.current.extension);
+      if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
+    }
     if (options.contextSnapshotProvider && contextExtension && contextConversations.has(conversationId)) {
       selected.push(contextExtension);
     }
@@ -875,9 +918,27 @@ export async function openGateway(config: PortConfig, context: Context, options:
     backgroundTools?: ReadonlySet<string>,
   ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
     const contextTools = contextToolsFor(conversationId);
+    // MCP server tools and the Code Mode/tool-search tools only hold enabled authority in an
+    // authenticated mapped chat conversation. MCP tools stay deferred: enabled for nested calls and
+    // discovery, but never declared until `tool_search` loads them or a script names them.
+    const authorized = authorizedChatConversations.has(conversationId);
+    const offered = authorized && codeModeRef.current !== undefined
+      ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]
+      : [];
+    const deferred = authorized && mcpRef.current !== undefined ? [...mcpRef.current.toolNames] : [];
     const withContext = (names: readonly string[]): Pick<AgentChange, "tools" | "modelTools"> => {
-      const tools = [...toolFilterFromNames(names).tools, ...contextTools];
-      return { tools, modelTools: tools };
+      const tools = [
+        ...toolFilterFromNames(names).tools,
+        ...toolFilterFromNames(offered).tools,
+        ...toolFilterFromNames(deferred).tools,
+        ...contextTools,
+      ];
+      const modelTools = [
+        ...toolFilterFromNames(names).tools,
+        ...toolFilterFromNames(offered).tools,
+        ...contextTools,
+      ];
+      return { tools, modelTools };
     };
     if (!toolExtension) {
       // Retire instead of creating an empty document: a disabled ceiling must durably remove
@@ -989,9 +1050,29 @@ export async function openGateway(config: PortConfig, context: Context, options:
             ),
           now,
         });
+    // MCP connects before the registry is built so every discovered tool is in the initial
+    // registry. A failed server contributes nothing and is reported through `gateway.mcp`; the
+    // whole open fails only for an internal error, and the catch below tears down whatever started.
+    if (mcpConfigured && mcpConfig !== undefined) {
+      const integration = await createMcpIntegration({
+        config: mcpConfig,
+        workspace,
+        isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
+        delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
+      });
+      mcpRef.current = integration;
+      codeModeRef.current = createCodeModeIntegration({ namespaces: integration.namespaces });
+      for (const extension of [integration.extension, ...codeModeRef.current.extensions]) {
+        for (const tool of extension.tools ?? []) toolRegistrations.set(tool.name, tool);
+      }
+    }
     const registry = createRegistry();
     if (episodeSummaries !== undefined) registry.install(episodeSummaries.extension);
     if (toolExtension) registry.install(toolExtension);
+    if (mcpRef.current !== undefined) registry.install(mcpRef.current.extension);
+    if (codeModeRef.current !== undefined) {
+      for (const extension of codeModeRef.current.extensions) registry.install(extension);
+    }
     if (skillTool) registry.install(skillTool.extension);
     if (historyTool) registry.install(historyTool.extension);
     if (telegramTool) registry.install(telegramTool.extension);
@@ -1280,7 +1361,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // History retrieval is independent of the context snapshot opt-in: every mapped chat
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
-    const initialMapping = historyTool === undefined && !toolsEnabled && telegramTool === undefined
+    // The mapped-chat set feeds history, config tool authority, channel actions and MCP authority,
+    // so it is restored whenever any of them is installed.
+    const initialMapping = historyTool === undefined && !toolsEnabled && telegramTool === undefined && !mcpConfigured
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
     if (initialMapping !== undefined) {
@@ -1516,6 +1599,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
       harness,
       cronOutbox,
       ...(telegramActions === undefined ? {} : { telegramActions }),
+      get mcp() {
+        return mcpRef.current === undefined ? undefined : { servers: mcpRef.current.status };
+      },
       async conversationFor(sessionKey, ctx) {
         const key = encodedSessionKey(sessionKey);
         let conversationId: ConversationId | undefined;
@@ -1738,10 +1824,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
         episodeCatalog?.close();
         try { await harness!.close(cleanup); }
         finally {
-          try { await historyIndex?.close(); }
+          // Code Mode first: it owns sandbox workers that may be calling MCP tools. Then the MCP
+          // clients, whose native transports tear down their server process groups.
+          try { await codeModeRef.current?.close(); }
           finally {
-            try { await toolEnvironments?.close(cleanup); }
-            finally { await releaseLock(); }
+            try { await mcpRef.current?.close(); }
+            finally {
+              try { await historyIndex?.close(); }
+              finally {
+                try { await toolEnvironments?.close(cleanup); }
+                finally { await releaseLock(); }
+              }
+            }
           }
         }
       },
@@ -1819,6 +1913,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
       if (harness) await harness.close(cleanup);
       else await storage?.close(cleanup);
     } finally {
+      try { await codeModeRef.current?.close(); }
+      catch { /* a sandbox close failure must not mask the startup error */ }
+      try { await mcpRef.current?.close(); }
+      catch { /* a failed server connection is already closed; never mask the startup error */ }
       try { await historyIndex?.close(); }
       catch { /* a derived index close failure leaves a rebuildable file, not source data */ }
       finally { await toolEnvironments?.close(cleanup).catch(() => undefined); }

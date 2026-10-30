@@ -18,6 +18,7 @@ import {
   validateSkillNames,
 } from "./context/skills.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
+import { parseMcpConfig, type McpConfig } from "./mcp/config.js";
 
 const CREDENTIAL_PROVIDERS = [
   "anthropic",
@@ -117,6 +118,12 @@ export interface PortConfig {
   toolSandbox?: "host" | "bwrap";
   /** Internal agent scheduling. Absent or disabled leaves the runtime without cron. */
   cron?: CronConfig;
+  /**
+   * Explicit MCP servers and the switch that connects them. This is a separate authority from
+   * `toolAllowlist`: naming a server connects it, and its tools still reach only authenticated
+   * mapped chat conversations. Absent or disabled installs no MCP client and no Code Mode.
+   */
+  mcp?: McpConfig;
   /**
    * Automatic episode summaries; by default use the conversation's current model.
    * `model` is the legacy direct selector; `preset` names an entry in `modelPresets`.
@@ -388,6 +395,10 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   }
   if (raw.workspaceContext !== undefined) {
     Object.assign(config, { workspaceContext: workspaceContextConfig(raw.workspaceContext) });
+  }
+  // Parsed after the workspace is resolved: a stdio server's cwd is confined to it.
+  if (raw.mcp !== undefined) {
+    Object.assign(config, { mcp: parseMcpConfig(raw.mcp, config.workspace) });
   }
   if (raw.cron !== undefined) {
     Object.assign(config, { cron: cronConfig(raw.cron) });

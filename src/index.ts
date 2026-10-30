@@ -25,10 +25,23 @@ export {
 export { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 export {
   CODEMODE_BUDGETS,
+  CODEMODE_TOOL_NAME,
   createCodeModeIntegration,
+  TOOL_SEARCH_TOOL_NAME,
   type CodeModeIntegration,
   type CodeModeIntegrationOptions,
 } from "./extensions/codemode.js";
+export {
+  MCP_LIMITS,
+  mcpHasEnabledServers,
+  parseMcpConfig,
+  type McpConfig,
+  type McpHttpServerConfig,
+  type McpServerBase,
+  type McpServerConfig,
+  type McpServerStatus,
+  type McpStdioServerConfig,
+} from "./mcp/index.js";
 export {
   cancelPreparedContextBlock,
   listPreparedContextBlocks,
@@ -43,6 +56,7 @@ export {
   type Gateway,
   type GatewayContextRefresh,
   type GatewayContextSnapshotProvider,
+  type GatewayMcpStatus,
   type OpenGatewayOptions,
 } from "./runtime.js";
 export { main } from "./cli.js";

@@ -7,7 +7,7 @@ import {
   createCodemodeExtension,
   type CodemodeNamespace,
 } from "@earendil-works/pi-durable/codemode";
-import { createToolSearchExtension } from "@earendil-works/pi-durable/tool-search";
+import { createToolSearchExtension, TOOL_SEARCH_TOOL_NAME } from "@earendil-works/pi-durable/tool-search";
 import {
   defineExtension,
   type Extension,
@@ -29,6 +29,9 @@ export interface CodeModeIntegrationOptions {
   /** Explicitly opt into Durable's non-LLM models.* capabilities. Default false. */
   readonly models?: boolean;
 }
+
+/** The native tool names a host may need when it gates or delegates Code Mode authority. */
+export { TOOL_SEARCH_TOOL_NAME, CODEMODE_TOOL_NAME };
 
 /** Install these extensions explicitly; close the Harness before closing this host. */
 export interface CodeModeIntegration {
