@@ -47,10 +47,10 @@ bounded newline-delimited JSON protocol over that socket:
   rejected. Rejections carry a fixed code and no dependency, path or credential
   text. Command and admission serialization stays in the terminal, not in a new
   gateway queue.
-- Snapshot delivery is bounded: the CLI keeps at most 64 pending frames and
-  awaits each render in order, while the server drops only frames Durable's own
-  watch already coalesces and disconnects a socket that queues more than 8 MiB.
-  A disconnected or stalled client never grows unbounded buffers.
+- Snapshot delivery is bounded: the CLI keeps at most 64 pending frames
+  (dropping the oldest) and awaits each render in order, while the gateway
+  disconnects a socket that queues more than 8 MiB. A disconnected or stalled
+  client never grows unbounded buffers.
 - Exactly one gateway serves the configured store. The Durable store lock is the
   owner; a stale socket file is removed only after a connection attempt fails, and
   a live listener is refused rather than replaced. Binding failures, including a
@@ -153,7 +153,7 @@ fail-closed and is not remotely cancelled. See
 | `/episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>]` | List reset-delimited episodes newest first, with entry ranges, counts and recorded summary status only. `--session` must name an existing mapped chat session; the default is this attachment's session key (normally `cli:default`). This command does not generate or show summary text. |
 | `/episode [--session <sessionKey>] <startEntryId> [--limit 1-30]` | Open one episode's bounded first window of message/tool entries from an existing mapped chat session. |
 | `/entry [--session <sessionKey>] <entryId> [--radius 0-5]` | Open one entry plus at most five neighboring entry IDs on each side, showing only user/assistant text and tool calls/results. `--session` must be an existing mapped chat session. |
-| `/model` | List named presets and the current/default choice. `/model <name>` temporarily selects one; `/model default` or restart returns to the configured preset. Direct-model configs retain `/model <provider> <modelId> [thinkingLevel]` and persisted selection. Busy selection is rejected atomically; retry when idle. Standalone terminal callers without a host callback remain read-only. |
+| `/model` | List named presets and the current/default choice. `/model <name>` temporarily selects one; `/model default` returns to the configured preset. A CLI reattach keeps the temporary selection; a gateway restart also returns to the configured preset. Direct-model configs retain `/model <provider> <modelId> [thinkingLevel]` and persisted selection. Busy selection is rejected atomically; retry when idle. In-process/SDK terminal callers without a host callback remain read-only. |
 | `/tools` | Read-only diagnostic of the config-selected coding tools for this conversation. |
 | `/refresh` | Re-read the configured workspace bootstrap, memory files, manifest and skill inventory for this attached CLI conversation. Requires `workspaceContext`; rejected while the conversation is busy. The refreshed summary and skill table apply to the next model request. |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |

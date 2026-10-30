@@ -154,6 +154,12 @@ export async function runTerminalConversation(
   const observerContext = withAbortSignal(observerController.signal, operationContext);
   const signal = operationContext.abortSignal;
   const observerSignal = observerContext.abortSignal;
+  // Prime the input source before any awaited remote setup. Readline and similar
+  // async iterables only attach their line listener on the first next(), so an
+  // immediate piped line or EOF would otherwise be lost while the watch attaches.
+  // Only one item is pulled early; later lines stay in the source's own buffer
+  // until the loop consumes them.
+  const input = primedInput(io.input);
   const watch = await conversation.watch(observerContext);
   const submissions = new Map<number, LocalSubmission>();
   const runOutputs = new Map<number, RunOutput>();
@@ -1115,7 +1121,7 @@ export async function runTerminalConversation(
 
   try {
     io.prompt?.();
-    for await (const line of io.input) {
+    for await (const line of input) {
       if (signal?.aborted) break;
       // This bounds admitted content after the source yields a complete line, not its ingress buffer.
       if (line.length > MAX_ADMITTED_LINE_CODE_UNITS) {
@@ -1185,6 +1191,43 @@ export async function runTerminalConversation(
     await renderTail;
   }
   if (outputFailure !== undefined) throw outputFailure;
+}
+
+/**
+ * Start one source read immediately, then yield it before iterating normally.
+ *
+ * The early read is kept awaitable for the terminal loop and marked handled so a
+ * failure before the loop starts cannot surface as an unhandled rejection. The
+ * generator's finally releases the source iterator if the loop is abandoned.
+ */
+function primedInput(source: AsyncIterable<string>): AsyncIterable<string> {
+  const iterator = source[Symbol.asyncIterator]();
+  const first = iterator.next();
+  first.catch(() => undefined);
+  return {
+    [Symbol.asyncIterator]() {
+      return (async function* () {
+        try {
+          const initial = await first;
+          if (initial.done === true) return;
+          yield initial.value;
+          while (true) {
+            const next = await iterator.next();
+            if (next.done === true) return;
+            yield next.value;
+          }
+        } finally {
+          if (iterator.return !== undefined) {
+            try {
+              await iterator.return();
+            } catch {
+              // Closing an input source is best effort; read failures propagate through next().
+            }
+          }
+        }
+      })();
+    },
+  };
 }
 
 function formatHistoryMessage(message: TerminalMessage): string | undefined {

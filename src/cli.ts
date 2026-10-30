@@ -169,6 +169,7 @@ async function runAgent(
   const stop = new AbortController();
   const context = withAbortSignal(stop.signal, BACKGROUND_CONTEXT);
   let input: ReturnType<typeof createInterface> | undefined;
+  let inputClosed = false;
   const shutdown = () => {
     stop.abort();
     input?.close();
@@ -185,12 +186,22 @@ async function runAgent(
     });
     // Readline's post-line size check bounds admission, not its pre-newline input buffer.
     input = createInterface({ input: stdin, output: stdout, terminal: Boolean(stdin.isTTY && stdout.isTTY) });
+    input.once("close", () => { inputClosed = true; });
     input.setPrompt("> ");
     await runTerminalConversation(client, context, {
       input,
       output: stdout,
       errorOutput: stderr,
-      prompt: () => input?.prompt(),
+      // A piped stdin can already be closed before the remote watch attaches;
+      // prompting then throws ERR_USE_AFTER_CLOSE. Prompts are interactive-only.
+      prompt: () => {
+        if (inputClosed || input?.terminal !== true) return;
+        try {
+          input.prompt();
+        } catch {
+          inputClosed = true;
+        }
+      },
       closeInput: () => input?.close(),
       modelSelection: {
         list: () => client!.listModels(context),

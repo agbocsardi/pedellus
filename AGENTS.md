@@ -17,7 +17,8 @@ npm run build             # tsc -> dist/
 npm run test:behavior     # behaviour checks (builds first; count grows with coverage)
 npm run test:execution    # 2 guarded host policy checks (builds first)
 npm run --silent test:core-acceptance  # offline core acceptance JSON (builds first; see ACCEPTANCE.md)
-npm start -- --config config.json   # local CLI against a config file
+npm start -- gateway --config config.json   # single local owner
+npm start -- agent --config config.json     # attach a terminal
 ```
 
 ## Layout
@@ -51,7 +52,8 @@ npm start -- --config config.json   # local CLI against a config file
   `cron` and `history` tools carry no filesystem/shell authority and are exempt
   from the coding-tool hook; history remains read-only over mapped chats.
 - Named model presets define provider/model/thinking in config. CLI preset switches
-  are temporary: reopening restores the configured preset without rewriting prepared
+  are temporary: a CLI reattach keeps the temporary selection, while a gateway
+  restart or reopen restores the configured preset without rewriting prepared
   dispatches. Direct-model (non-preset) selection retains its persisted semantics.
 - The cron timer never calls a model, and a run never schedules: rescheduling is
   a deterministic task commit, so a slow or failed turn cannot stop the schedule.

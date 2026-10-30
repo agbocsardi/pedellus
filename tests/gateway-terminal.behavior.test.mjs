@@ -49,9 +49,9 @@ async function makeEnvironment(t) {
   await mkdir(workspace);
   await mkdir(join(workspace, "memory"));
   await writeFile(join(workspace, "memory", "MEMORY.md"), "# Memory\n\nsynthetic fixture memory\n");
-  const config = parseConfig({
-    workspace,
-    dataDir,
+  const configValues = {
+    workspace: "workspace",
+    dataDir: "state",
     model: { provider: "fixture", modelId: "alpha" },
     allowedModels: [
       { provider: "fixture", modelId: "alpha" },
@@ -60,7 +60,10 @@ async function makeEnvironment(t) {
     toolAllowlist: ["read"],
     episodeSummary: { enabled: false },
     workspaceContext: { memoryFiles: ["memory/MEMORY.md"] },
-  }, directory);
+  };
+  const configFile = join(directory, "config.json");
+  await writeFile(configFile, JSON.stringify(configValues));
+  const config = parseConfig(configValues, directory);
   const provider = fauxProvider({
     provider: "fixture",
     tokensPerSecond: 1000,
@@ -90,7 +93,7 @@ async function makeEnvironment(t) {
     await gateway.close(context);
     await rm(directory, { recursive: true, force: true });
   });
-  return { gateway, provider, socketPath };
+  return { gateway, provider, socketPath, configFile };
 }
 
 function terminalIO(client, input) {
@@ -337,6 +340,56 @@ test("default --config and agent attach instead of opening another runtime", { t
   assert.equal(rejectedName.code, 1);
   assert.match(rejectedName.stderr, /Usage: nanobot/);
 });
+
+test("real agent piped input is not lost while the watch attaches", { timeout: 30_000 }, async (t) => {
+  const { configFile } = await makeEnvironment(t);
+
+  const immediate = await runAgentCli(configFile, "/status\n");
+  assert.deepEqual({ code: immediate.code, signal: immediate.signal }, { code: 0, signal: null }, immediate.stderr);
+  assert.match(immediate.stdout, /Run: idle/);
+  assert.equal(immediate.stderr, "");
+
+  const empty = await runAgentCli(configFile, "");
+  assert.deepEqual({ code: empty.code, signal: empty.signal }, { code: 0, signal: null }, empty.stderr);
+  assert.equal(empty.stderr, "");
+  assert.equal(empty.stdout, "");
+
+  const ordered = await runAgentCli(configFile, "/status\n/tools\n/model\n/status\n");
+  assert.deepEqual({ code: ordered.code, signal: ordered.signal }, { code: 0, signal: null }, ordered.stderr);
+  const firstStatus = ordered.stdout.indexOf("Run: idle");
+  const tools = ordered.stdout.indexOf("Coding tools configured for authenticated chats: read");
+  const model = ordered.stdout.indexOf("Current model: fixture/alpha");
+  const lastStatus = ordered.stdout.lastIndexOf("Run: idle");
+  assert.ok(firstStatus >= 0 && tools > firstStatus && model > tools && lastStatus > model,
+    `immediate commands were dropped or reordered:\n${ordered.stdout}`);
+  assert.equal(ordered.stderr, "");
+});
+
+/** Run the real built agent against the already-listening test gateway. */
+function runAgentCli(configFile, stdinText) {
+  return new Promise((resolveRun) => {
+    const child = spawn(process.execPath, [join(pkg, "dist", "cli.js"), "agent", "--config", configFile], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stdin.on("error", () => undefined);
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      resolveRun({ code: null, signal: null, stdout, stderr: `${stderr}${String(error)}` });
+    });
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolveRun({ code, signal, stdout, stderr });
+    });
+    child.stdin.end(stdinText);
+  });
+}
 
 function runCli(args) {
   return new Promise((resolveRun) => {

@@ -340,10 +340,18 @@ function messageText(content: unknown): string {
 function boundedJson(value: unknown, maxChars: number): string | undefined {
   try {
     const json = JSON.stringify(value);
-    return json === undefined ? undefined : json.slice(0, maxChars);
+    if (json === undefined) return undefined;
+    let length = Math.min(json.length, Math.max(0, maxChars));
+    // Never cut a surrogate pair; the terminal would otherwise print a replacement char.
+    if (length > 0 && isHighSurrogate(json.charCodeAt(length - 1))) length--;
+    return json.slice(0, length);
   } catch {
     return "(unserializable)";
   }
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
 }
 
 function projectSettlement(settled: SettledSubmissionRecord): TerminalSettlement {
