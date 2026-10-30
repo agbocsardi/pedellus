@@ -1,43 +1,19 @@
-# Initial Durable port — 2026-10-26
+# Durable Nanobot design
 
-## Scope and decision
+## Scope
 
-This package is the new TypeScript build target. The Python tree is read-only
-reference; the live fork and deployment are not changed. This document specifies Gate 1 of the root spike TODO. The owner subsequently
-requested the comprehensive [full-port roadmap](plan/2026-10-26_full-port_TODO.md)
-(existing WebUI included, QuickJS-only Code Mode, Linux only, Pi SDK-first reuse
-and bwrap preferred; no new UI framework or micro-VM requirement).
-Those future milestones do not relax this slice's tool-less/security constraints
-or authorize production cutover. Use Node >=22.19 and exact Pi 1.4.0
-dependencies. No WebUI/API server, memory migration, Dream, cron, MCP, or custom
-scheduler in this slice. The original spike excluded new tests; the owner later
-authorized focused Nanobot-owned behavioral and integration tests, not wholesale
-copies of the Python or Pi Durable suites.
+This package is the current TypeScript build target for Nanobot on the Pi 1.4.0
+stack (`@earendil-works/pi-ai`, `pi-durable`, `chord`). The Python fork is a
+read-only reference; the live fork, deployment and real user data are not
+changed. Nothing here is deployed, and this document does not authorize a
+production cutover. Use Node >= 22.19 and the exact pinned dependencies.
 
-The original assessment's LOC/time estimates and API equivalences are hypotheses,
-not measured savings. Native durable commits do not make external side effects
-exactly-once; request IDs deduplicate admissions only.
-
-## Ownership
-
-- Parent: design, scaffold, integration, review, acceptance notes.
-- Execution worker: `src/execution/**` and `EXECUTION.md` only.
-- Runtime worker: `src/config.ts`, `src/providers.ts`, `src/runtime.ts`,
-  `src/cli.ts`, `src/index.ts`, `config.example.json`, `README.md` only.
-- Telegram worker: `src/channels/**` and `TELEGRAM.md` only.
-- Package manifest, lockfile, tsconfig and this design normally belong to the parent.
-  For the approved grammY migration, `pi-e078edd8` also owns manifest/lock changes
-  limited to adding the exact-pinned grammY dependency, plus package-local
-  `THIRD_PARTY_NOTICES.md`. The parent does not edit these concurrently.
-
-These are the historical spike assignments. Current P1/P2 ownership, including
-exclusive manifest/lock ownership, is recorded in the full-port roadmap's active
-batch and supersedes these assignments for that batch.
-
-Do not modify the Python tree, root instructions, shared reference checkout, or
-another worker's files. Workers commit their code on separate branches; the parent
-reviews and cherry-picks. No deployment, real bot polling, or paid model call
-without explicit authorization. Never read/copy credentials from live config.
+The [assistant tree plan](2026-10-29_assistant-tree_TODO.md) is the current scope
+and work-order authority; [plan/](plan/) preserves historical roadmaps and
+implementation evidence, not a work queue. Out of scope: WebUI/API server,
+migration or archival import, MCP, and a custom scheduler. Coding tools run on
+the actual workspace through the guarded host, or through the optional
+direct-workspace Bubblewrap shell.
 
 ## Architecture
 
@@ -60,98 +36,75 @@ The gateway enforces WAL/FULL on the native storage connection and verifies it
 before and after schema initialization, before opening Harness. See `STORAGE.md`
 for fail-closed/reopen evidence and the still-open host-loss/storage-fault gates.
 
-### Integration contracts
+### Gateway and host surface
 
-The owner approved a managed isolated workspace with explicit imports for the
-next execution implementation, rejecting arbitrary writable host/extra roots and
-omitting automatic publish-back. The legacy standalone spike contract below is
-not that future gateway contract; revised API/security proof is pending worker
-review. No execution capability is currently installed in the gateway.
+`src/runtime.ts` exports `openGateway(config, context, options)` and the
+`Gateway` handle. The gateway exposes conversation access, model listing and
+selection, history reads, context refresh and the durable cron delivery outbox.
+Host options may supply an explicit pi-ai `Models` instance, an opt-in context
+snapshot provider, the read-only history tool switch and an episode-summary
+override; they cannot expand tool authority beyond the configuration.
 
-`src/execution/index.ts` exports:
+The package root (`src/index.ts`) is a small host entry surface: config loading
+and types, `openGateway` and its host option types,
+`workspaceContextGatewayOptions`, the opt-in context and Code Mode factories,
+prepared-context recovery operations, and the CLI `main`. Other subsystems are
+imported directly from their modules.
 
-```ts
-interface ExecutionOptions {
-  workspace: string;
-  cwd?: string;
-  extraAllowedDirs?: readonly string[];
-  bwrapPath?: string; // absolute trusted binary; default /usr/bin/bwrap
-}
-// Async setup probes sandbox availability and validates roots.
-function createExecutionEnv(options: ExecutionOptions): Promise<ExecutionEnv>;
-```
+`PortConfig` is owned by `src/config.ts`; its normalized fields include workspace,
+dataDir, model with optional allowed models/presets and thinking level, the
+config-owned `toolAllowlist`, tool timeout and sandbox selection, optional
+workspace context, cron and episode-summary settings, `extraAllowedDirs`,
+`bwrapPath`, credential environment-variable names and optional telegram
+`{ tokenEnv, allowFrom, pollTimeoutSeconds? }`. Configuration JSON contains
+environment-variable *names*, never secrets. No implicit import of Python config
+or Pi credential store. Fail clearly on malformed config, unknown provider/model
+or missing credential, with fixed value-free diagnostics. Support scripted faux
+providers ONLY through SDK injection for offline validation, never as a silent
+production fallback.
 
-`ExecutionEnv` is the upstream interface from `@earendil-works/pi-durable/env`.
-When coding tools are approved, the runtime will await setup before Harness.open,
-reuse environments for their lifetime, validate configured cwd, and call cleanup
-after Harness.close. If a conversation's cwd changes, construct/cache an
-appropriately confined environment, not a raw NodeExecutionEnv. Identity must
-preserve upstream per-file serialization across environments addressing the same
-files.
+### Tool authority
 
-**Current integration decision:** the reviewed W1 coding tools run over the
-guarded `HostExecutionEnv` on the actual workspace, disabled by default. The
-shipped CLI and Telegram path authorize the configured `toolAllowlist` directly
-for validated mapped chats (config authorization); explicit SDK hosts keep the
-legacy default of explicit, expiring per-conversation grants. See
-[`TOOLS.md`](./TOOLS.md). A Gateway instance may additionally select the optional
+The configured `toolAllowlist` is the sole coding-tool authority for every
+gateway caller. It is empty by default, which installs no coding tools; a
+non-empty list may name only `read`, `write`, `edit` and `bash`. Authority is
+limited to authenticated mapped ordinary chat conversations. The root
+conversation, channel-state conversations, forks, raw and task-owned
+conversations are denied, and the call-time hook fails closed if agent state
+names a tool that is no longer configured. A scheduled isolated cron run captures
+a bounded subset of its authenticated origin's current tools and loses it when
+the run finishes; each call must also remain inside the current config, so
+narrowing the list and reopening narrows pending runs.
+
+Coding tools run over `HostExecutionEnv` on the actual workspace: filesystem
+paths are confined, the shell is the guarded host shell, and this is
+accidental-damage protection, not confinement. A gateway may select the optional
 direct-workspace Bubblewrap shell with `toolSandbox: "bwrap"`, which wraps only
-the shell, keeps the native guarded filesystem on the same workspace, and stays
-off by default; see [`DIRECT_BWRAP.md`](./DIRECT_BWRAP.md). Both paths are
-accidental-damage protection, not confinement, and neither makes the standalone
-managed-copy execution factory a production-safe capability. Shell execution can
-still use the network; Python's exec URL guard is not ported.
+the shell, keeps the native guarded filesystem on the same workspace and stays
+off by default. See [`TOOLS.md`](./TOOLS.md) and
+[`DIRECT_BWRAP.md`](./DIRECT_BWRAP.md).
 
-`src/extensions/codemode.ts` provides the opt-in `createCodeModeIntegration`
-factory, budgets and lifecycle/types, also exported by `src/index.ts`. Native
-Code Mode/tool-search stays uninstalled in the gateway. SDK hosts must establish
-native default-deny extension/tool state before scheduling, grant tools explicitly,
-and reapply/revoke persisted selections before resume; `modelTools` is not the
-nested-call authorization boundary. See `CODEMODE.md` for reviewed host setup,
-budgets/replay/cancellation evidence and remaining product/security limitations.
+Code Mode is opt-in and uninstalled. `src/extensions/codemode.ts` provides the
+`createCodeModeIntegration` factory, fixed budgets and lifecycle/types, also
+exported by the package root. Native Code Mode/tool-search stays uninstalled in
+the gateway. SDK hosts must establish native default-deny extension/tool state
+before scheduling, grant tools explicitly, and reapply persisted selections
+before resume; `modelTools` is not the nested-call authorization boundary. See
+`CODEMODE.md` for reviewed host setup, budgets/replay/cancellation evidence and
+remaining limitations.
 
-`src/runtime.ts` exports:
+Context snapshots are opt-in host data. `workspaceContextGatewayOptions` supplies
+the local host's bounded bootstrap/memory/skills snapshot; importing it installs
+nothing.
 
-```ts
-interface Gateway {
-  readonly harness: Harness;
-  conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
-  close(context: Context): Promise<void>;
-}
-function openGateway(config: PortConfig, context: Context): Promise<Gateway>;
-```
+### Telegram
 
-Use upstream Context/Harness/Conversation types. `PortConfig` is owned by runtime;
-its normalized fields include workspace, dataDir, model `{provider, modelId}`,
-optional thinkingLevel, extraAllowedDirs, bwrapPath, and optional telegram
-`{tokenEnv: string, allowFrom: readonly string[], pollTimeoutSeconds?: number}`.
-Configuration JSON contains environment-variable *names*, never secrets. No
-implicit import of Python config or Pi credential store. Provide explicit config
-file path in CLI. Fail clearly on malformed config, unknown provider/model or
-missing credential. Implement OpenAI and the fork's OpenCode Zen/Go aliases using
-native pi-ai providers where possible; avoid a custom provider until needed.
-Support scripted faux provider ONLY through SDK injection for offline validation,
-never as a silent production fallback.
-
-`src/channels/telegram.ts` exports:
-
-```ts
-interface TelegramOptions {
-  token: string;
-  allowFrom: readonly string[]; // decimal Telegram user IDs, no wildcard
-  pollTimeoutSeconds?: number;
-}
-function runTelegram(
-  gateway: Pick<Gateway, "conversationFor">,
-  options: TelegramOptions,
-  context: Context,
-): Promise<void>;
-```
-
-It runs until cancellation. It must work with an AbortSignal-derived Context;
-CLI arranges SIGINT/SIGTERM cancellation and cleanup. Use `import type` for Gateway
-to allow independent development. CLI may import the Telegram module once it lands;
-report a missing parallel module as expected, not a reason to add stub code.
+`src/channels/telegram.ts` exports `runTelegram(gateway, options, context)` with
+`options: { token, allowFrom, pollTimeoutSeconds? }`. `allowFrom` is an explicit
+list of decimal Telegram user IDs, no wildcard; private messages only. It runs
+until cancellation. The CLI arranges SIGINT/SIGTERM cancellation and cleanup.
+Unknown users are ignored before creating sessions or sending input. See
+[`TELEGRAM.md`](./TELEGRAM.md) for durability and delivery semantics.
 
 ## Security and deliberately limited functionality
 
@@ -160,50 +113,30 @@ report a missing parallel module as expected, not a reason to add stub code.
   absolute Bubblewrap binary over the actual workspace, read-only system paths,
   a private `/tmp`, PID-namespace teardown, a sanitized environment, no
   host-home/config mounts, and no unsandboxed fallback; like Python, it keeps the
-  host network namespace and is not a quota or hostile-tenant boundary. The
-  standalone managed-copy bwrap adapter remains uninstalled.
+  host network namespace and is not a quota or hostile-tenant boundary.
 - Filesystem paths are confined equivalently to the Python `_resolve_path`,
   including traversal, sibling-prefix, symlink escapes, and nonexistent write
   destinations. Check every public FileSystem entry point (both rename paths,
   readers, cwd, temp/spill paths). Never expose an unrestricted base object.
   Preserve Result/error and abort contracts. Reuse NodeExecutionEnv facilities
-  without claiming realpath checks alone are race-proof. Investigate concurrent
-  symlink replacement and hardlink limitations, implement an OS boundary if
-  necessary or report a blocker; do not mark the security gate proven prematurely.
+  without claiming realpath checks alone are race-proof. Concurrent symlink
+  replacement and hardlink limits remain a documented limitation rather than a
+  proven OS boundary.
 - Shell must not inherit bot/provider tokens or host auth sockets. Do not mount
-  dataDir in the shell. Runtime rejects dataDir under workspace or extra roots.
-- No web/search/MCP HTTP tools in this slice, so no unguarded agent HTTP surface.
-  Network isolation intentionally means shell network access is unavailable.
-  Fixed Telegram API and configured model providers are host integrations, not
-  arbitrary model-controlled URL fetchers. Future HTTP tools require the SSRF gate.
+  dataDir in the shell. Runtime rejects dataDir under the workspace or an extra
+  allowed root.
+- No web/search/MCP HTTP tools are ported, so there is no model-controlled HTTP
+  surface. The guarded shell and Bubblewrap backend both retain host network
+  access; neither is a network boundary. Fixed Telegram API and configured model
+  providers are host integrations, not arbitrary model-controlled fetchers.
+  Future HTTP tools require the SSRF gate.
 - Telegram uses a nonempty explicit numeric allowlist, private messages only,
-  no groups, no wildcard, and no username authorization. Unknown users are ignored
-  before creating sessions or sending input. No pairing UI in the spike.
+  no groups, no wildcard, and no username authorization. Unknown users are
+  ignored before creating sessions or sending input. No pairing UI.
 - Never log token-bearing URLs, raw provider errors with credentials, or thinking
-  blocks to Telegram. Text-only Telegram; unsupported attachments are not silently
-  described as seen. Bound message size, long-poll processing and delivery retries.
-
-## Approved Telegram transport direction
-
-Use grammY's typed API client in place of hand-written Bot API request/response
-plumbing. Preserve manually controlled `getUpdates` and the existing runTelegram
-contract: no polling runner may acknowledge an update before Durable admission
-and its recovery metadata are committed. Durable remains the sole state/session
-owner; do not import OpenClaw runtime, SDK, or ingress/outbound queues.
-
-Selectively adapt OpenClaw's bot-scoped flood policy, replaceable-preview
-coalescing, edit error classification, and lifecycle separation. Keep protocol
-adaptations narrow and preserve full MIT notice plus exact source provenance for
-copied code. See `OPENCLAW-ASSESSMENT.md`. Adding grammY does not prove sendMessage retry safety or exactly-once external
-delivery. Independent review requires a specific unknown-send policy: an ambiguous
-timeout/reset/5xx on sendMessage must retain an explicit durable unknown-delivery
-marker, not enter automatic resend/drain or claim success. Persist each send intent
-with exact intended text BEFORE network dispatch; unresolved intents after a crash
-must also be held as unknown. Atomically clear intent with known outcome/progress;
-a failed intent commit must prevent the request. Preserve known accepted
-chunk progress and expose sanitized status for operator inspection/reconciliation
-through existing Durable state/SDK. Known rejections (e.g.429) and proven no-send
-failures can retry under policy. No new retry UI/operator framework is in scope.
+  blocks to Telegram. Text-only Telegram; unsupported attachments are not
+  silently described as seen. Bound message size, long-poll processing and
+  delivery retries.
 
 ## Telegram durability and output
 
@@ -219,16 +152,18 @@ and watch backpressure without leaking historic replies or reasoning.
 Document the external send boundary honestly: Telegram sendMessage has no
 idempotency key, so exactly-once sends across a crash cannot be guaranteed. If
 outbound state/cursors are persisted, use Durable documents, never token-bearing
-plaintext sidecar state. Explicitly document restart recovery of undelivered final
-answers; if not implemented it remains a failed Gate 1 criterion, not completion.
+plaintext sidecar state. Restart recovery of undelivered final answers is
+documented in `TELEGRAM.md`; unproven conditions remain open rather than being
+called complete.
 
-## Acceptance (parent review before any cutover)
+## Acceptance
 
-- `npm ci`, `npm run typecheck`, `npm run build` in this package.
+- `npm ci --offline`, `npm run typecheck`, `npm run build` in this package.
 - Bounded offline model run -> committed transcript; reopen same session key;
   requestId deduplication; kill -9/reopen evidence for safe/unsafe tools.
-- Workspace traversal/symlink/missing-leaf rejections; sandbox rejects outside
-  writes/host secrets/network; abort and timeouts stop descendants.
+- Workspace traversal/symlink/missing-leaf rejections; the optional Bubblewrap
+  shell rejects outside writes and host secrets and fails closed when the binary
+  or namespace setup is unavailable; abort and timeouts stop descendants.
 - Telegram adapter checked with a fixed mock transport where feasible, no live
   polling. A real Telegram and fork-provider check remains owner-run unless
   authorized. Record each unproven condition rather than calling the gate passed.

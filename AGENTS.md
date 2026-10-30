@@ -6,7 +6,7 @@ TypeScript port of Nanobot on the Pi 1.4.0 stack (`@earendil-works/pi-ai`,
 it, and port individual changes by hand.
 
 Status is experimental. Nothing here is deployed, and no acceptance run has used
-a real workspace or channel yet.
+production data or a live user workspace.
 
 ## Commands
 
@@ -14,19 +14,21 @@ a real workspace or channel yet.
 npm ci --offline          # install the pinned dependency tree
 npm run typecheck         # tsc --noEmit
 npm run build             # tsc -> dist/
-npm run test:behavior     # 168 behaviour checks (builds first)
-npm run test:execution    # 9 execution/sandbox checks (builds first)
+npm run test:behavior     # behaviour checks (builds first; count grows with coverage)
+npm run test:execution    # 2 guarded host policy checks (builds first)
 npm run --silent test:core-acceptance  # offline core acceptance JSON (builds first; see ACCEPTANCE.md)
 npm start -- --config config.json   # local CLI against a config file
 ```
 
 ## Layout
 
-- `src/runtime.ts` — `openGateway`: storage, policies, grants, context, cron and
-  the conversation-facing host API.
+- `src/runtime.ts` — `openGateway`: storage, config-scoped tool policy,
+  context, cron and the conversation-facing host API.
 - `src/cli.ts` — local terminal client, model selection, recovery command.
   The agent loop itself is Durable's; this repository is the nanobot-specific
   layer around it (context, tools, execution, automation, channels, providers).
+- `src/index.ts` — small host entry surface (config, gateway, workspace host,
+  opt-in context/Code Mode, recovery, CLI main); import subsystems directly.
 - `src/automation/` — cron timer/run tasks and the model-facing `cron` tool.
 - `src/execution/` — guarded host environment and the optional Bubblewrap shell.
 - `src/context/` — bootstrap/memory/skills snapshots, skill tool, workspace host.
@@ -41,13 +43,13 @@ npm start -- --config config.json   # local CLI against a config file
 ## Invariants worth not breaking
 
 - Shipped CLI/Telegram coding tools come directly from config `toolAllowlist`;
-  empty disables them. Only validated mapped chats receive this authority, and
+  empty disables them. The same config is the only tool authority for SDK
+  gateway callers. Only validated mapped chats receive this authority, and
   every admitted Telegram user shares the configured workspace/tools. Raw, root,
   forked and state conversations remain denied. Isolated cron runs capture an
-  origin subset bounded by current config and lose it on completion. Legacy SDK
-  hosts default to separate expiring-grant authorization; the CLI selects config
-  mode. The `skill`, `cron` and `history` tools carry no filesystem/shell authority
-  and are exempt from both coding hooks; history remains read-only over mapped chats.
+  origin subset bounded by current config and lose it on completion. The `skill`,
+  `cron` and `history` tools carry no filesystem/shell authority and are exempt
+  from the coding-tool hook; history remains read-only over mapped chats.
 - Named model presets define provider/model/thinking in config. CLI preset switches
   are temporary: reopening restores the configured preset without rewriting prepared
   dispatches. Legacy direct-model SDK selection retains its persisted semantics.

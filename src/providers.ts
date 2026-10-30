@@ -9,7 +9,7 @@ import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import { opencodeProvider } from "@earendil-works/pi-ai/providers/opencode";
 import { opencodeGoProvider } from "@earendil-works/pi-ai/providers/opencode-go";
 import { xiaomiProvider } from "@earendil-works/pi-ai/providers/xiaomi";
-import type { CredentialProvider, ModelReference, PortConfig } from "./config.js";
+import { modelKey, type CredentialProvider, type ModelReference, type PortConfig } from "./config.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
 
 type ProviderAlias = {
@@ -38,10 +38,6 @@ export interface ResolvedModelChoice {
   native: ModelReference;
   model: Model<Api>;
   thinkingLevels: readonly ModelThinkingLevel[];
-}
-
-function modelKey(model: ModelReference): string {
-  return JSON.stringify([model.provider, model.modelId]);
 }
 
 export function nativeModelReference(model: ModelReference): ModelReference {

@@ -168,7 +168,8 @@ function modelReference(value: unknown, name: string): ModelReference {
   };
 }
 
-function modelKey(model: ModelReference): string {
+/** Stable identity for a provider/model pair; shared by config validation and provider resolution. */
+export function modelKey(model: ModelReference): string {
   return JSON.stringify([model.provider, model.modelId]);
 }
 

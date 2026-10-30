@@ -42,24 +42,21 @@ One process acquires Chord's kernel-backed `processLock` using the canonical SQL
 
 The gateway upgrades upstream SQLite's NORMAL default to **WAL `synchronous=FULL` on its actual connection**, verifying both settings before and after native schema initialization and failing closed on mismatch. Parent crash/reopen and injected setup/readback/migration-failure probes passed; this is not proof of physical power/host-loss survival. Backup/restore, disk-full and broader storage acceptance remain open. See [storage policy and evidence](./STORAGE.md).
 
-`toolAllowlist` is the **config-owned tool authority** for the shipped CLI and
-Telegram assistant and defaults to `[]`. A non-empty list may name only the native
-`read`, `write`, `edit` and `bash` tools; the gateway enables exactly those for
-authenticated mapped ordinary chats (not root, internal, forked or task-owned
+`toolAllowlist` is the **config-owned tool authority** for every gateway caller
+(CLI, Telegram and SDK) and defaults to `[]`. A non-empty list may name only the
+native `read`, `write`, `edit` and `bash` tools; the gateway enables exactly those
+for authenticated mapped ordinary chats (not root, internal, forked or task-owned
 conversations) over a guarded host environment on the actual workspace. Empty or
 absent disables coding tools; the opt-in read-only `skill` tool is separate.
 Scheduled isolated runs inherit a bounded subset captured from an authenticated
 origin and stay bounded by current host config, so narrowing the list and
-reopening also narrows those runs; pending calls for a removed tool fail closed
-rather than being restored by older grant records. There is no per-chat grant,
-approval or expiry step — every Telegram user in `allowFrom` shares the configured
-workspace and tool authority, so allowlist only trusted users. SDK hosts can keep
-the legacy expiring-grant mode (`toolAuthorization: "grants"`, the default for
-existing SDK callers) with `grantTools`/`revokeTools`/`listToolGrants` and its
-revoke/expiry replay checks. The local CLI's `/tools` is a read-only diagnostic. A
-deployment may select the optional direct-workspace Bubblewrap shell with
-`toolSandbox: "bwrap"`; it is off by default, wraps shell commands only, and falls
-back to neither the host shell nor a managed copy. See
+reopening also narrows those runs; pending calls for a removed tool fail closed.
+There is no per-chat approval, grant or expiry step — every Telegram user in
+`allowFrom` shares the configured workspace and tool authority, so allowlist only
+trusted users. The local CLI's `/tools` is a read-only diagnostic. A deployment
+may select the optional direct-workspace Bubblewrap shell with
+`toolSandbox: "bwrap"`; it is off by default, wraps shell commands only, and
+never falls back to the unconfined host shell. See
 [coding tools](./TOOLS.md) and [direct Bubblewrap shell](./DIRECT_BWRAP.md).
 
 ## Internal cron (opt-in)
@@ -67,16 +64,21 @@ back to neither the host shell nor a managed copy. See
 [`CRON.md`](./CRON.md) describes finite timer/run tasks, relative one-shot
 reminders (`after_seconds`), absolute/recurring/calendar schedules and IANA zones. Timers arm their successors independently of model
 execution. Setting `cron: { enabled: true }` installs the foundation and a
-model-callable `cron` tool (`add`/`list`/`remove`) in `openGateway`; both are also
-exported through the SDK barrel. The agent schedules work when the user asks; there
-is no direct cron UI or user scheduling command. Successful isolated runs can deliver through
+model-callable `cron` tool (`add`/`list`/`remove`) in `openGateway`. The agent
+schedules work when the user asks; there is no direct cron UI or user scheduling
+command. Successful isolated runs can deliver through
 the durable Telegram outbox, including origin-mode runs. Live-channel acceptance remains open.
+
+The package root (`src/index.ts`) is a small host entry surface: config loading and
+types, `openGateway` and its host option types, `workspaceContextGatewayOptions`,
+the opt-in context and Code Mode factories, prepared-context recovery operations,
+and the CLI `main`. Other subsystems are imported directly from their modules.
 
 ## Opt-in Code Mode SDK
 
-The SDK barrel exports `createCodeModeIntegration`, fixed budgets and types for
+The package root exports `createCodeModeIntegration`, fixed budgets and types for
 native Durable QuickJS Code Mode/tool-search. It does **not** install them in the
-gateway. Hosts must establish explicit default-deny grants and reapply persisted
+gateway. Hosts must establish native default-deny extension/tool state and reapply persisted
 policy before scheduling; see [Code Mode contract and verified boundaries](./CODEMODE.md).
 The bounded SDK bundle passed independent review and parent-built sandbox,
 activation, cancellation and safe/unsafe crash-replay probes. Execution, approvals,
@@ -120,22 +122,20 @@ note](./MIGRATION.md).
 
 Run `npm run typecheck` and `npm run test:behavior` for offline Nanobot-owned
 contracts using synthetic providers, temporary SQLite stores and crash/reopen
-fixtures. These do not establish full parity or production security. The
-standalone managed-copy experimental sandbox is not installed in the Gateway;
-resource quotas, approvals and filesystem confinement remain open. The opt-in
+fixtures. These do not establish full parity or production security. The opt-in
 [coding tools](./TOOLS.md) register native tools over the guarded host
 environment on the actual workspace; they are disabled by default and are not
 confinement. The optional [direct Bubblewrap shell](./DIRECT_BWRAP.md) narrows
 the shell mount view but is not a quota or hostile-tenant boundary.
 [Tool replay checks](./TOOL_REPLAY.md) exercise synthetic direct tools and the
-native replay/grant boundary.
+native replay/tool-policy boundary.
 
 For earlier Telegram reliability and scripted smoke evidence, see [TELEGRAM.md](./TELEGRAM.md).
 Bounded owner-authorized real-provider proofs and OpenCode Go tool turns passed
 on host and bwrap in disposable workspaces. These do not establish full-provider,
 real-memory/skill/compaction or scheduled-delivery acceptance. Offline consolidation
-also checked the combined Gateway memory/skills/four-tool path and revoke/reopen
-on both backends with a faux provider. The behavior suite includes focused config-tool regression tests, but does not
+also checked the combined Gateway memory/skills/four-tool path on both backends
+with a faux provider. The behavior suite includes focused config-tool regression tests, but does not
 cover every newer slice; additional temporary probes are described in feature docs.
 Behavior/execution Node test phases use GNU `timeout`: 60 seconds, followed by a
 forced kill after 5 seconds if necessary, so leaked handles cannot wait forever. Backup/restore, A/B acceptance and
