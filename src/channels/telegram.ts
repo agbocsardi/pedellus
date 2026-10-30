@@ -234,8 +234,8 @@ export async function runTelegram(
   let scheduledScanning = false;
   let scheduledTimer: ReturnType<typeof setInterval> | undefined;
 
-  // Network writes for one chat share the bot-token flood gate and do not overlap. Chunks from
-  // separate messages may interleave between writes.
+  // Message sends/edits for one chat are ordered; chunks from separate messages may interleave.
+  // Disposable typing actions bypass this ordering but share the bot-token flood gate.
   const chatSendTails = new Map<number, Promise<void>>();
   const withChatSendOrder = <T>(chatId: number, work: () => Promise<T>): Promise<T> => {
     const previous = chatSendTails.get(chatId) ?? Promise.resolve();
