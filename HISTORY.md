@@ -679,6 +679,30 @@ session key, and the summary text is model output over untrusted source.
 - Model fidelity and real-provider behavior are unverified: only a faux provider over temporary
   synthetic data has been used.
 
+## Offline lifecycle evidence
+
+`tests/history-lifecycle.behavior.test.mjs` is one bounded, checked-in regression over the actual
+`openGateway` and Durable Harness, a faux provider, and a disposable synthetic workspace. It covers a
+single continuous story rather than a new harness:
+
+1. an early fact/decision turn, an on-demand `skill` body, and a topic-memory `write` to
+   `memory/topics/...`;
+2. native Durable manual compaction, with the early fact placed in the summary and the raw early turn
+   removed from active context;
+3. `conversation.reset()` closing the episode, then the real episode-summary pass reading the original
+transcript (including the pre-compaction early turn) and storing a ready summary;
+4. close/reopen of the same store, then `historySearch` and the model-facing `history` tool's
+   `search`/`open` actions returning the original early user entry, including the marker that no
+   longer existed in active context and was deliberately absent from the derived summary;
+5. a second closed episode whose summary pass fails with the classified `empty-summary` error, after
+   which raw search/open still returns that episode's original decision.
+
+This is evidence that the lifecycle is wired through the real Gateway and that a failed derived summary
+does not block raw transcript recall. It is not evidence of useful recall with a real model, and it
+uses no live provider, channel, credential or personal workspace. It is a bounded behavior test; after
+`npm run build`, run it directly with `node --test tests/history-lifecycle.behavior.test.mjs` under
+an outer timeout (or through the behavior suite once it is registered there).
+
 ## Not implemented
 
 - Background indexing independent of a search; message reconciliation and the summary sweep both
