@@ -345,8 +345,9 @@ Runtime behavior of this route, all in one bounded operation:
   duration metadata cannot smuggle an over-long file through.
 - The 20 MiB input cap applies to every caller of this backend, not only the
   Telegram download path.
-- Decoding accepts the intended local input only (`-protocol_whitelist file`) and
-  writes one private temporary WAV that is removed on success, failure, timeout
+- Decoding blocks network protocols (`-protocol_whitelist file`), but permits
+  local file references within playlist containers; this is not filesystem
+  isolation. It writes one private temporary WAV removed on success, failure, timeout
   and cancellation.
 - Children see a small fixed environment (locale and temporary-directory keys
   only). Hugging Face and `uv` variables are not inherited on this route, and
