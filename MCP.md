@@ -9,6 +9,12 @@ package; Code Mode and deferred discovery are the native
 [`src/extensions/codemode.ts`](./src/extensions/codemode.ts). This port does not
 implement a parallel client, tool registry, runner, queue or retry layer.
 
+Status: implemented and independently reviewed (`4d61f50`, documentation
+corrections in `1c38146`). It is merged with current main only as an integration
+candidate on its worktree branch (`44c7385`) and is pending a fresh combined
+runtime/config/authority review; it is not integrated into main and is not an
+accepted capability. All coverage is offline and synthetic.
+
 MCP is **off unless explicitly configured**. With no `mcp` block,
 `"enabled": false`, or no enabled server entry, the gateway starts no MCP client,
 registers no MCP tool and does not install Code Mode: the shipped CLI keeps

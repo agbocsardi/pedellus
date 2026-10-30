@@ -56,8 +56,13 @@ not permission to start every branch or run live integrations):
   with durable update dedupe and explicit added/removed context. Offline handler
   verified; private-chat reaction-update delivery remains unverified live.
 - [ ] Wire configured MCP connections into the actual gateway and expose their
-  registered tools through Code Mode/tool discovery. The current SDK-only Code
-  Mode bundle is not MCP connectivity and is not installed by the shipped host.
+  registered tools through Code Mode/tool discovery. Implemented as `4d61f50`
+  (pinned `@earendil-works/pi-mcp` client plus the existing native Code Mode
+  bundle, installed by the shipped host only when `mcp` is explicitly enabled).
+  Independent review passed with no material code defects; documentation
+  corrections only, in `1c38146`. Merged with current main as integration
+  candidate `44c7385`; the combined semantic review and main integration are
+  still pending.
 - [ ] Implement channel-neutral attachment/voice media next: shared transcription
   configuration/processing, Telegram ingress first, native image content for
   photos with configured vision handoff, and document saving without extraction.
@@ -157,6 +162,42 @@ commands, config tool ceiling, outbox unknown-send handling and memory refresh
 remain intact. No deployment or live-delivery claim; no live model/bot run.
 
 ## Session log
+
+### 2026-10-30 — MCP connections through product Code Mode (review passed, integration candidate)
+
+The MCP worker wired explicit `mcp` config (stdio and Streamable HTTP, env-name
+secrets, no OAuth/`mcp.json`/hot reload) to the pinned
+`@earendil-works/pi-mcp@1.4.0` client and exposed discovered tools as deferred
+native `mcp__<server>__<tool>` registrations through the existing Code
+Mode/tool-search bundle (`4d61f50`). Authority is default-deny: mapped
+authenticated chats only, call-time hook plus per-conversation tool filter,
+coding ceiling preserved for nested calls, no scheduled-run MCP authority.
+Independent review passed with no material code defects after verifying native
+hook scopes, connection withdrawal handling, startup-timeout cleanup and no
+retry; only three documentation corrections were requested, fixed in `1c38146`
+(scoped nested-call wording, the real install gate, and the `content`/
+`structuredContent`/`isError` result shape with `_meta` dropped). The same
+correction pass documents that a configured stdio server is a native host
+process not covered by `toolSandbox: "bwrap"`, labels cancellation evidence
+honestly (script deadline tested, native request timeout code-read), and notes
+that a `tool_search`-loaded tool can need rediscovery after a policy reapply.
+
+Integration candidate `44c7385` merges current main (`c6474ee`: reviewed
+gateway/local CLI plus reviewed vision handoff) into the MCP branch. Conflicts
+were only `package.json` (test registration union, 22 files) and `src/config.ts`
+(both import/field families kept). `src/runtime.ts` auto-merged and was checked
+for semantic overlap: the vision hook keeps its all-conversation selection,
+`denyNewConversation` and cron-prepare inclusion, prepared-dispatch pin and hook
+order; MCP keeps its default-deny tool filter, call-time hook delegation,
+connection lifecycle, status surface and close/catch teardown, and cron targets
+receive no MCP authority. Combined offline checks: typecheck/build, 116
+registered behavior checks (107 main plus 9 MCP), 2 execution and 83 core
+acceptance. Carried limits: no OAuth/browser sign-in or token store, no
+`mcp.json` discovery or resources/prompts tools, no hot reload or lazy
+reconnect, tools added after open need a reopen, and no CLI notice for a failed
+server (fixed codes on the SDK `gateway.mcp` surface only). Not integrated into
+main and not accepted here; a fresh combined runtime/config/authority review is
+the next step.
 
 ### 2026-10-30 — media ingress and configured vision handoff
 
@@ -312,4 +353,6 @@ implementers are retained through review and fix rounds rather than replaced.
 Parent orchestrates only. The vision handoff passed fresh independent review and
 is integrated with this gateway tip. Media adapter/transcription work remains
 under the original media implementer's review fixes, and native MCP plus product
-Code Mode wiring is forthcoming; neither is complete or accepted here.
+Code Mode wiring is implemented and reviewed as an integration candidate (see
+the MCP entry above) but not yet merged into main; neither is complete or
+accepted here.
