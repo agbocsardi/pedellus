@@ -5,7 +5,9 @@ TypeScript port requiring Node >=22.19 and the pinned Pi 1.4.0 packages. This is
 The [lean assistant plan](2026-10-30_lean-assistant_TODO.md) is the current scope
 and work-order authority: CLI + Telegram first, then tools, delegation and channels.
 Config-selected coding tools, named model presets, optional bwrap shell, opt-in
-memory/skills and compaction plumbing are integrated. Agent-callable
+memory/skills, compaction plumbing, configured vision handoff, MCP through
+product Code Mode, and opt-in Telegram media ingress are integrated.
+Agent-callable
 cron scheduling and Telegram delivery are available. WebUI, migration and cutover are
 deferred. The [older roadmap](plan/2026-10-26_full-port_TODO.md) preserves evidence,
 not a standing implementation queue.
@@ -47,6 +49,21 @@ set `episodeSummary.enabled` to `false` to disable summaries. Already-closed epi
 backfilled automatically. Short cache retention is requested, but cache reuse is not guaranteed;
 see [episode summaries](./HISTORY.md#episode-summaries).
 
+## Media
+
+Attachment ingress is opt-in with a top-level `media` config, and the gateway owns
+it. Photos arrive as native pi-ai image content plus a labeled workspace-relative
+locator, so a preset marked `needsVisionHandoff` is described by the configured
+describer preset instead of receiving raw bytes. Documents are saved unread under
+the workspace media directory: no PDF, OCR or Office extraction. Voice/audio uses
+the local uv/faster-whisper helper (CPU, `small`, `int8`); provision it explicitly
+before use, because handling a message never installs the helper, downloads a
+model or calls a cloud provider. Stored originals are ordinary workspace files
+readable through the configured tools: no extra tool authority, no automatic
+deletion and no total-disk cap. See
+[setup](./SETUP.md#8-optional-attachments-and-voice) and
+[Telegram media](./TELEGRAM.md#attachments-and-local-transcription).
+
 ## Runtime/recovery
 
 One process acquires Chord's kernel-backed `processLock` using the canonical SQLite database path before opening storage. The lock is released when the owning process exits, including an uncatchable kill; a second live owner fails closed. SQLite, under `dataDir/nanobot.sqlite`, stores the Durable transcript and work state. The root conversation's `nanobot.session-map` document commits external session-key-to-conversation mappings atomically. Reopening the database reuses the same conversation without resetting its transcript; pending durable tasks are resumed after extensions are installed. Data directory is private (`0700`) and rejected when it resolves inside the workspace or any extra allowed root; it is not exposed to the shell environment.
@@ -85,18 +102,26 @@ acceptance remains open.
 
 The package root (`src/index.ts`) is a small host entry surface: config loading and
 types, `openGateway` and its host option types, `workspaceContextGatewayOptions`,
-the opt-in context and Code Mode factories, prepared-context recovery operations,
+the context and Code Mode factories, prepared-context recovery operations,
 and the CLI `main`. Other subsystems are imported directly from their modules.
 
-## Opt-in Code Mode SDK
+## Code Mode and MCP
 
-The package root exports `createCodeModeIntegration`, fixed budgets and types for
-native Durable QuickJS Code Mode/tool-search. It does **not** install them in the
-gateway. Hosts must establish native default-deny extension/tool state and reapply persisted
-policy before scheduling; see [Code Mode contract and verified boundaries](./CODEMODE.md).
-The bounded SDK bundle passed independent review and parent-built sandbox,
-activation, cancellation and safe/unsafe crash-replay probes. Execution, approvals,
-MCP and product failure-verification gates remain separate.
+MCP is **off by default**. Configuring `mcp: { enabled: true, servers: {...} }` with
+at least one enabled stdio or Streamable HTTP server makes the shipped gateway
+connect them and install the native Durable QuickJS Code Mode/tool-search bundle.
+Discovered tools are deferred `mcp__<server>__<tool>` registrations reachable from
+Code Mode scripts and `tool_search`, and only in authenticated mapped chat
+conversations; root, state, forked and isolated cron/task conversations get no MCP
+tool and no Code Mode. `toolAllowlist` still names only the coding tools
+(`read`/`write`/`edit`/`bash`), independently of MCP.
+
+MCP is a separate explicit connection authority. A configured stdio server runs as
+a native host process, not under `toolSandbox: "bwrap"`. This slice has no OAuth,
+implicit `mcp.json` discovery, resources/prompts tools, hot reload or CLI status UI;
+startup failures surface only as fixed codes on the SDK `gateway.mcp` surface. See
+[MCP servers and Code Mode](./MCP.md) and [Code Mode contract and verified
+boundaries](./CODEMODE.md).
 
 ## Opt-in context SDK
 

@@ -17,7 +17,9 @@ import {
   SkillsContextInputError,
   validateSkillNames,
 } from "./context/skills.js";
+import { validateMediaDirectory } from "./media/attachments.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
+import { parseMcpConfig, type McpConfig } from "./mcp/config.js";
 import { VISION_HANDOFF_DEFAULTS, VISION_HANDOFF_LIMITS } from "./media/vision.js";
 import { parseWebConfig, type WebConfig } from "./web/config.js";
 
@@ -89,6 +91,16 @@ export interface CronConfig {
   readonly timeZone?: string;
 }
 
+export interface CodeModeConfig {
+  /**
+   * Explicit native Code Mode switch. Present `true` installs the native bundle even
+   * without MCP; absent keeps the legacy rule (installed only when MCP is configured);
+   * present `false` disables it even when MCP is configured. This grants no tool that
+   * the conversation does not already hold.
+   */
+  readonly enabled: boolean;
+}
+
 export interface WorkspaceContextConfig {
   /** Explicit workspace-relative `memory/**\/*.md` files, in output order. Defaults to none. */
   readonly memoryFiles: readonly string[];
@@ -100,6 +112,26 @@ export interface WorkspaceContextConfig {
   readonly memoryManifest?: boolean;
   /** Explicit opt-in for workspace/builtin skill discovery; absent means no skills are read. */
   readonly skills?: WorkspaceSkillsConfig;
+}
+
+export interface MediaTranscriptionConfig {
+  /** Absent or true enables local faster-whisper transcription of stored audio. */
+  readonly enabled?: boolean;
+  /** Language hint for the local helper; absent means auto-detect. */
+  readonly language?: string;
+  /** Audio longer than this is not transcribed; defaults to 120 seconds. */
+  readonly maxDurationSeconds?: number;
+}
+
+/**
+ * Channel-neutral attachment storage. Originals stay under the configured
+ * workspace so the ordinary coding-tool policy applies to them; they are never
+ * written to `dataDir` or an arbitrary external root.
+ */
+export interface MediaConfig {
+  /** Workspace-relative directory for originals; default `media`. */
+  readonly directory: string;
+  readonly transcription?: MediaTranscriptionConfig;
 }
 
 export interface PortConfig {
@@ -147,6 +179,14 @@ export interface PortConfig {
   /** Internal agent scheduling. Absent or disabled leaves the runtime without cron. */
   cron?: CronConfig;
   /**
+   * Explicit MCP servers and the switch that connects them. This is a separate authority from
+   * `toolAllowlist`: naming a server connects it, and its tools still reach only authenticated
+   * mapped chat conversations. Absent or disabled installs no MCP client and no Code Mode.
+   */
+  mcp?: McpConfig;
+  /** Native Code Mode composition; absent follows MCP auto-enablement. */
+  codemode?: CodeModeConfig;
+  /**
    * Automatic episode summaries; by default use the conversation's current model.
    * `model` is the legacy direct selector; `preset` names an entry in `modelPresets`.
    */
@@ -160,11 +200,17 @@ export interface PortConfig {
   bwrapPath?: string;
   credentials?: Partial<Record<CredentialProvider, string>>;
   /**
+  /**
    * Native public web capabilities. Absent installs no web tool; `search` and
    * `fetch` enable independently. This is separate authority from `toolAllowlist`
    * and never grants filesystem or shell access.
    */
   web?: WebConfig;
+  /**
+   * Opt-in attachment ingress (photos, voice/audio, documents) for channels that
+   * can download them. Absent means a channel keeps its attachment-disabled behavior.
+   */
+  media?: MediaConfig;
   telegram?: { tokenEnv: string; allowFrom: readonly string[]; pollTimeoutSeconds?: number };
 }
 
@@ -417,6 +463,59 @@ function cronConfig(value: unknown): CronConfig {
   return { enabled: true, timeZone };
 }
 
+function mediaTranscriptionConfig(value: unknown): MediaTranscriptionConfig {
+  const raw = object(value, "media.transcription");
+  for (const key of Object.keys(raw)) {
+    if (key !== "enabled" && key !== "language" && key !== "maxDurationSeconds") {
+      throw new Error(`Unknown media.transcription field: ${key}`);
+    }
+  }
+  if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") {
+    throw new Error("media.transcription.enabled must be a boolean");
+  }
+  let language: string | undefined;
+  if (raw.language !== undefined) {
+    if (typeof raw.language !== "string" || !/^[A-Za-z0-9_-]{1,35}$/.test(raw.language)) {
+      throw new Error("media.transcription.language must be a short language code");
+    }
+    language = raw.language;
+  }
+  let maxDurationSeconds: number | undefined;
+  if (raw.maxDurationSeconds !== undefined) {
+    if (typeof raw.maxDurationSeconds !== "number" || !Number.isInteger(raw.maxDurationSeconds) ||
+        raw.maxDurationSeconds < 1 || raw.maxDurationSeconds > 3_600) {
+      throw new Error("media.transcription.maxDurationSeconds must be an integer from 1 to 3600");
+    }
+    maxDurationSeconds = raw.maxDurationSeconds;
+  }
+  return Object.freeze({
+    ...(raw.enabled === undefined ? {} : { enabled: raw.enabled }),
+    ...(language === undefined ? {} : { language }),
+    ...(maxDurationSeconds === undefined ? {} : { maxDurationSeconds }),
+  });
+}
+
+function codeModeConfig(value: unknown): CodeModeConfig {
+  const raw = object(value, "codemode");
+  for (const key of Object.keys(raw)) {
+    if (key !== "enabled") throw new Error(`Unknown codemode field: ${key}`);
+  }
+  if (typeof raw.enabled !== "boolean") throw new Error("codemode.enabled must be a boolean");
+  return Object.freeze({ enabled: raw.enabled });
+}
+
+function mediaConfig(value: unknown): MediaConfig {
+  const raw = object(value, "media");
+  for (const key of Object.keys(raw)) {
+    if (key !== "directory" && key !== "transcription") throw new Error(`Unknown media field: ${key}`);
+  }
+  const directory = validateMediaDirectory(raw.directory);
+  return Object.freeze({
+    directory,
+    ...(raw.transcription === undefined ? {} : { transcription: mediaTranscriptionConfig(raw.transcription) }),
+  });
+}
+
 export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig {
   const raw = object(value, "config");
   const presetMode = raw.modelPreset !== undefined || raw.modelPresets !== undefined;
@@ -498,8 +597,18 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   if (raw.workspaceContext !== undefined) {
     Object.assign(config, { workspaceContext: workspaceContextConfig(raw.workspaceContext) });
   }
+  // Parsed after the workspace is resolved: a stdio server's cwd is confined to it.
+  if (raw.mcp !== undefined) {
+    Object.assign(config, { mcp: parseMcpConfig(raw.mcp, config.workspace) });
+  }
   if (raw.cron !== undefined) {
     Object.assign(config, { cron: cronConfig(raw.cron) });
+  }
+  if (raw.codemode !== undefined) {
+    Object.assign(config, { codemode: codeModeConfig(raw.codemode) });
+  }
+  if (raw.media !== undefined) {
+    Object.assign(config, { media: mediaConfig(raw.media) });
   }
   if (raw.episodeSummary !== undefined) {
     const summary = object(raw.episodeSummary, "episodeSummary");

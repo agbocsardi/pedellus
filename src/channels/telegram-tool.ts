@@ -98,8 +98,10 @@ export function createTelegramTool(options: TelegramToolOptions): { readonly ext
     name: TELEGRAM_TOOL_NAME,
     // An interrupted external send is ambiguous; Durable must not rerun this tool on recovery.
     replay: "unsafe",
-    // Only the model may request a channel effect; Code Mode scripts cannot start one.
-    callers: ["model"],
+    // The model and nested Code Mode calls may request a channel effect. The host's live
+    // adapter, current private-chat admission, observed-target check, write-ahead action record
+    // and task-id binding remain the authority; Code Mode adds no grant.
+    callers: ["model", "tools"],
     description:
       "Interact with the authenticated Telegram private chat this conversation belongs to. Ordinary answers " +
       "are already delivered automatically and unthreaded; use this tool only when a native reply or a " +

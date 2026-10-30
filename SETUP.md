@@ -192,9 +192,12 @@ ISO timestamp with `Z` or a UTC offset; naive local timestamps remain rejected.
 
 `/new`, `/abort` and `/help` are the channel controls. Context refresh in
 Telegram is a gateway restart; there is no Telegram refresh command, and `/new`
-does not re-read files. The adapter is text-only: an attachment gets a fixed
-unsupported-attachment notice (caption text is still passed as input), and
-groups or other bots never reach the assistant.
+does not re-read files. Without a `media` section the adapter is text-only: an
+attachment gets a fixed unsupported-attachment notice (caption text is still
+passed as input). With `media`, photos, voice/audio and documents are stored under
+the workspace and the turn is told exactly what arrived—see
+[8. Optional: attachments and voice](#8-optional-attachments-and-voice). Groups or
+other bots never reach the assistant.
 
 Reminders are ordinary agent scheduling through the configured `cron` tool. A
 default isolated run answers in its own background conversation; an `origin`-mode
@@ -221,3 +224,53 @@ nothing. Cancelled, superseded and missing-job runs are not pushed; ask the agen
 - Memory topics, manifest bounds and skill frontmatter are described in
   [memory context](./MEMORY_CONTEXT.md) and [skills context](./SKILLS_CONTEXT.md);
   local utility commands are in [the CLI](./CLI.md).
+
+## 8. Optional: attachments and voice
+
+Attachment ingress is opt-in, shared by channels and currently wired into the
+Telegram adapter. Add a top-level `media` key beside the existing ones:
+
+```json
+"media": {
+  "directory": "media",
+  "transcription": { "language": "en", "maxDurationSeconds": 120 }
+}
+```
+
+- `directory` is workspace-relative and defaults to `media`. Originals are stored
+  there byte-for-byte, so the ordinary configured coding tools (`read`, `bash`,
+  and so on) are how the agent opens them. Storing a file grants no tool
+  authority. Nothing is written to `dataDir` or outside the workspace. A
+  configured workspace that is itself a symlink is accepted and resolved once to
+  its canonical path; symlinks below it are refused.
+- `transcription.enabled` (default `true`) turns local speech recognition on or
+  off; `language` is an optional hint and `maxDurationSeconds` (default `120`)
+  refuses longer audio. There is no cloud speech provider and no API key.
+- Photos arrive as native image content plus a workspace-relative locator.
+  Documents are stored unread: no text extraction, OCR, PDF/Office conversion or
+  dependency is involved, so reading one is the agent's job with the configured
+  tools. Video and stickers get an explicit unsupported notice.
+- Bounds: 20 MB per file (Telegram's ordinary Bot API `getFile` limit), a 60s
+  download timeout, two concurrent attachment jobs, a 180s transcription timeout
+  and a 120s audio-duration limit by default. Stored originals are never deleted
+  by the adapter and there is no total-disk cap, so the media directory is yours
+  to monitor and prune.
+
+Local speech needs a one-time provisioning step; the runtime never installs or
+downloads anything while handling a message. The helper is
+`scripts/local-transcribe.py`, a PEP 723 script pinned to `faster-whisper==1.1.1`
+with the model/device/compute type fixed to `small`/`cpu`/`int8`. Provision it
+explicitly (this is the only step that may use the network):
+
+```bash
+# One-time provisioning: creates the helper environment, downloads the model and
+# transcribes once. The adapter never passes this flag.
+uv run --script scripts/local-transcribe.py sample.oga --max-duration-seconds 5 --allow-model-download
+```
+
+The adapter then runs the helper as `uv run --script --offline …` with Hugging
+Face hub offline mode forced. If the environment or model is not cached,
+transcription fails and says so truthfully: the stored audio is still on disk,
+the caption is preserved, and the turn is never told that the speech was
+understood. Use `--language` in the helper call when you want to check a
+specific language by hand.
