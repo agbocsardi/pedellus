@@ -6,10 +6,25 @@ import { Api, GrammyError, HttpError } from "grammy";
 import type { ApiClientOptions } from "grammy";
 import type { MessageReactionUpdated, ReactionType, ReactionTypeEmoji, Update } from "grammy/types";
 import type { Conversation, SubmissionId } from "@earendil-works/pi-durable";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
 import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
+import { MEDIA_LIMITS, MediaRejected, createMediaStore, type MediaRejectionReason, type MediaStore, type StoredMedia } from "../media/attachments.js";
+import { createTranscriber, type Transcriber, type TranscriptionFailure } from "../media/transcription.js";
+import {
+  TELEGRAM_FILE_ORIGIN,
+  TELEGRAM_MEDIA_LIMITS,
+  attachmentContextText,
+  boundedFileBody,
+  disabledAttachmentText,
+  planTelegramMedia,
+  telegramFilePath,
+  telegramFileUrl,
+  unsupportedAttachmentText,
+  type AttachmentSpeech,
+  type TelegramPendingAttachment,
+} from "./telegram-media.js";
 import {
   TELEGRAM_ACTION_LIMITS,
   TELEGRAM_TARGET_LIMITS,
@@ -54,13 +69,44 @@ const MAX_NOTICE_CHARS = 1_500;
 const SCHEDULED_SCAN_INTERVAL_MS = 2_000;
 const MAX_SCHEDULED_ACTIVE = 4;
 const MAX_ORIGINS = 1_000;
+/** Recognized speech is bounded untrusted input, like any other message text. */
+const MAX_TRANSCRIPT_CHARS = 8_000;
 /** Telegram typing actions expire after about five seconds; refresh before that while a turn is active. */
 const TYPING_REFRESH_MS = 4_000;
+
+export type TelegramMediaTranscriptionOptions = {
+  readonly enabled?: boolean;
+  readonly language?: string;
+  readonly maxDurationSeconds?: number;
+  /** Advanced: override the uv executable or the helper script path (offline checks). */
+  readonly uvPath?: string;
+  readonly helperPath?: string;
+  readonly timeoutMs?: number;
+};
+
+/**
+ * Attachment ingress for this adapter. Originals live under the configured
+ * workspace and stay readable through the ordinary coding-tool policy; nothing
+ * is written to `dataDir` or an arbitrary external root.
+ */
+export type TelegramMediaOptions = {
+  readonly workspace: string;
+  /** Workspace-relative directory; default `media`. */
+  readonly directory?: string;
+  readonly transcription?: TelegramMediaTranscriptionOptions;
+};
 
 export type TelegramOptions = {
   token: string;
   allowFrom: readonly string[];
   pollTimeoutSeconds?: number;
+  /** Absent keeps the previous attachment-disabled behavior for SDK callers. */
+  media?: TelegramMediaOptions;
+};
+
+type TelegramMediaIngress = {
+  readonly store: MediaStore;
+  readonly transcriber: Transcriber;
 };
 
 type TelegramMessage = NonNullable<Update["message"]>;
@@ -80,6 +126,12 @@ export type TelegramPendingDelivery = {
   unknownStage?: "preview" | "final";
   unknownChunkIndex?: number;
   unknownSince?: number;
+  /** Admitted original media that must be stored before this input is submitted. */
+  attachments?: TelegramPendingAttachment[];
+  /** Recognized speech for a stored audio attachment: untrusted user content. */
+  transcript?: string;
+  /** Why automatic transcription produced no text; never implies the speech was understood. */
+  transcriptionFailure?: string;
   /** A command acknowledgement: delivered as fixed text, never submitted to the model. */
   notice?: boolean;
   /** The acknowledgement is withheld until the command's native call returns (or reports that it is still pending). */
@@ -129,20 +181,20 @@ type ChannelState = TelegramChannelState;
 // Stored alongside the adapter's stable channel conversation, not in a plaintext sidecar.
 export const TelegramState = defineDoc<ChannelState>({
   kind: "nanobot.telegram-state",
-  version: 5,
+  version: 6,
   scope: "conversation",
   history: "latest",
   fork: "initial",
   checkpointWhen: (_value, _ops, { deltasSinceBase }) => deltasSinceBase >= 64,
   migrate: (value, fromVersion) => {
-    if (fromVersion !== 1 && fromVersion !== 2 && fromVersion !== 3 && fromVersion !== 4) {
+    if (fromVersion !== 1 && fromVersion !== 2 && fromVersion !== 3 && fromVersion !== 4 && fromVersion !== 5) {
       throw new Error(`Unsupported Telegram state version ${fromVersion}`);
     }
     if (!Array.isArray(value.pending) || value.pending.some((item) =>
       item === null || typeof item !== "object" || Array.isArray(item))) {
       throw new Error("Stored Telegram state contains invalid pending deliveries");
     }
-    const hasControls = fromVersion === 3 || fromVersion === 4;
+    const hasControls = fromVersion === 3 || fromVersion === 4 || fromVersion === 5;
     if (hasControls && value.controls !== undefined && !Array.isArray(value.controls)) {
       throw new Error("Stored Telegram state contains invalid controls");
     }
@@ -155,6 +207,14 @@ export const TelegramState = defineDoc<ChannelState>({
     }
     if (value.actions !== undefined && !Array.isArray(value.actions)) {
       throw new Error("Stored Telegram state contains invalid action records");
+    }
+    for (const item of value.pending as unknown as Record<string, unknown>[]) {
+      if (item.attachments !== undefined && (!Array.isArray(item.attachments) ||
+        item.attachments.some((entry: unknown) => entry === null || typeof entry !== "object" ||
+          Array.isArray(entry) || typeof (entry as Record<string, unknown>).fileId !== "string" ||
+          typeof (entry as Record<string, unknown>).identity !== "string"))) {
+        throw new Error("Stored Telegram state contains invalid attachments");
+      }
     }
     return {
       offset: Number(value.offset ?? 0),
@@ -193,6 +253,9 @@ export async function runTelegram(
   context: Context,
 ): Promise<void> {
   validateOptions(options);
+  // Attachment-disabled SDK callers keep the previous behavior: no store, no download, no transcription.
+  const mediaIngress = createMediaIngress(options.media);
+  const mediaWork = new MediaWorkGate(MEDIA_LIMITS.maxConcurrentWork);
   const scope = withCancel(context);
   const adapterContext = scope.context;
   const cleanupContext = withoutAbortSignal(adapterContext);
@@ -982,6 +1045,9 @@ export async function runTelegram(
     // Enter this chat's submission order before any asynchronous preparation, so a slow first lookup cannot let a
     // later message submit ahead of an earlier one.
     await slot.prior;
+    // Attachment storage and local transcription happen inside this chat's admission order, before the model sees
+    // anything. A failure keeps the durable record and the ordinary retry path; other chats keep polling.
+    const content = await prepareInputContent(item);
     const conversation = await gateway.conversationFor(item.sessionKey, adapterContext);
     const requestId = requestIdFor(identity, item.updateId);
     const watch = await conversation.watch(adapterContext);
@@ -1024,7 +1090,7 @@ export async function runTelegram(
           ?.flatMap((part) => part.type === "text" && part.text ? [part.text] : []).join("");
         if (text) queuePreview(text);
       });
-      const submission = await conversation.submit({ type: "input", content: item.text, requestId }, adapterContext);
+      const submission = await conversation.submit({ type: "input", content, requestId }, adapterContext);
       // Ordering is established; free the chat's next submission place while this turn runs.
       slot.release();
       submissionId = submission.id;
@@ -1246,6 +1312,200 @@ export async function runTelegram(
     }, cleanupContext);
   };
 
+  // ── Attachments ───────────────────────────────────────────────────────────
+  // Originals are admitted with the input and stored before the model sees them.
+  // A reopen resumes from the durable attachment record instead of re-downloading,
+  // and a stored transcript is never recomputed.
+
+  const attachmentRecord = (updateId: number, identity: string): TelegramPendingAttachment | undefined =>
+    state.pending.find((entry) => entry.updateId === updateId)
+      ?.attachments?.find((candidate) => candidate.identity === identity);
+
+  const downloadAttachment = async (
+    ingress: TelegramMediaIngress,
+    current: TelegramPendingAttachment,
+  ): Promise<StoredMedia> => {
+    if (current.declaredBytes !== undefined && current.declaredBytes > ingress.store.maxFileBytes) {
+      throw new MediaRejected("too-large");
+    }
+    // The same underlying file (Telegram's content-stable unique id) may arrive in a later
+    // update: an already stored original is reused instead of downloading it again.
+    const already = await ingress.store.existing(
+      ingress.store.locator(current.identity, current.kind, current.mimeType),
+    );
+    if (already !== undefined) {
+      return {
+        ...already,
+        kind: current.kind,
+        identity: current.identity,
+        ...(current.mimeType === undefined ? {} : { mimeType: current.mimeType }),
+        ...(current.originalName === undefined ? {} : { originalName: current.originalName }),
+      };
+    }
+    let file;
+    try {
+      file = await apiCall(api, "getFile", signal,
+        (callSignal) => api.getFile(current.fileId, toGrammySignal(callSignal)), { throttle: pollThrottle });
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason ?? error;
+      // A definitive request rejection (unknown id, expired file, Bot API size limit)
+      // cannot improve on retry; anything else stays on the delivery retry path.
+      if (error instanceof TelegramApiError && error.outcome === "rejected" && error.status < 500) {
+        throw new MediaRejected("unavailable");
+      }
+      throw error;
+    }
+    if (!file) throw new Error("Telegram getFile returned no result");
+    const path = telegramFilePath(file.file_path);
+    if (path === undefined) throw new MediaRejected("unsafe-path");
+    const announced = safeAnnouncedSize(file.file_size);
+    if (announced !== undefined && announced > ingress.store.maxFileBytes) throw new MediaRejected("too-large");
+
+    const url = telegramFileUrl(options.token, path);
+    if (new URL(url).origin !== TELEGRAM_FILE_ORIGIN) throw new MediaRejected("unsafe-path");
+    const timeout = AbortSignal.timeout(TELEGRAM_MEDIA_LIMITS.downloadTimeoutMs);
+    const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
+    let response: Response;
+    try {
+      response = await globalThis.fetch(url, { method: "GET", redirect: "error", signal: combined });
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason ?? error;
+      // The URL carries the bot token: never let it reach an error message or log.
+      throw new Error("Telegram file download failed");
+    }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      if (response.status >= 400 && response.status < 500) throw new MediaRejected("unavailable");
+      throw new Error("Telegram file download failed");
+    }
+    return ingress.store.save({
+      kind: current.kind,
+      identity: current.identity,
+      ...(current.mimeType === undefined ? {} : { mimeType: current.mimeType }),
+      ...(current.originalName === undefined ? {} : { originalName: current.originalName }),
+      ...(announced === undefined ? {} : { declaredBytes: announced }),
+      body: boundedFileBody(response, ingress.store.maxFileBytes, combined),
+      ...(signal === undefined ? {} : { signal }),
+    });
+  };
+
+  const storeAttachment = async (
+    ingress: TelegramMediaIngress,
+    item: PendingReply,
+    admitted: TelegramPendingAttachment,
+  ): Promise<TelegramPendingAttachment> => {
+    const current = attachmentRecord(item.updateId, admitted.identity) ?? admitted;
+    if (current.status === "failed") return current;
+    if (current.status === "stored") {
+      // A stored original that is still present and regular is reused; one that was
+      // removed is fetched again, because the admitted attachment is not lost.
+      let present = false;
+      if (current.relativePath !== undefined) {
+        try {
+          present = (await ingress.store.existing(current.relativePath)) !== undefined;
+        } catch (error) {
+          if (!(error instanceof MediaRejected)) throw error;
+        }
+      }
+      if (present) return current;
+    }
+    try {
+      const stored = await mediaWork.run(() => downloadAttachment(ingress, current), signal);
+      const next: TelegramPendingAttachment = {
+        ...current,
+        status: "stored",
+        relativePath: stored.relativePath,
+        bytes: stored.bytes,
+      };
+      await mutatePending(item.updateId, (entry) => {
+        const target = entry.attachments?.find((candidate) => candidate.identity === next.identity);
+        if (target !== undefined) {
+          target.status = next.status;
+          target.relativePath = next.relativePath!;
+          target.bytes = next.bytes!;
+        }
+      }, cleanupContext);
+      return next;
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason ?? error;
+      if (!(error instanceof MediaRejected)) throw error;
+      const next: TelegramPendingAttachment = {
+        ...current,
+        status: "failed",
+        note: MEDIA_REJECTION_TEXT[error.reason],
+      };
+      await mutatePending(item.updateId, (entry) => {
+        const target = entry.attachments?.find((candidate) => candidate.identity === next.identity);
+        if (target !== undefined) {
+          target.status = "failed";
+          target.note = next.note!;
+        }
+      }, cleanupContext);
+      console.warn(`Telegram attachment ${next.kind} for update ${item.updateId} could not be stored: ${next.note}.`);
+      return next;
+    }
+  };
+
+  const transcribeAttachment = async (
+    ingress: TelegramMediaIngress,
+    item: PendingReply,
+    attachment: TelegramPendingAttachment,
+  ): Promise<AttachmentSpeech> => {
+    const fresh = state.pending.find((entry) => entry.updateId === item.updateId);
+    if (fresh?.transcript !== undefined) return { transcript: fresh.transcript };
+    // A failed attempt is cached too: a retried turn never re-runs local recognition.
+    if (fresh?.transcriptionFailure !== undefined) return { failure: fresh.transcriptionFailure };
+    if (!ingress.transcriber.enabled) return { disabled: true };
+    if (attachment.relativePath === undefined) return { failure: "the stored file is missing" };
+    const outcome = await mediaWork.run(
+      () => ingress.transcriber.transcribe(
+        ingress.store.absolute(attachment.relativePath!),
+        { ...(signal === undefined ? {} : { signal }) },
+      ),
+      signal,
+    );
+    if (outcome.ok) {
+      const transcript = outcome.text.slice(0, MAX_TRANSCRIPT_CHARS);
+      await mutatePending(item.updateId, (entry) => { entry.transcript = transcript; }, cleanupContext);
+      return { transcript };
+    }
+    if (outcome.reason === "cancelled") throw signal?.reason ?? new Error("Telegram transcription cancelled");
+    const failure = TRANSCRIPTION_FAILURE_TEXT[outcome.reason];
+    await mutatePending(item.updateId, (entry) => { entry.transcriptionFailure = failure; }, cleanupContext);
+    return { failure };
+  };
+
+  const prepareInputContent = async (
+    item: PendingReply,
+  ): Promise<string | (TextContent | ImageContent)[]> => {
+    const ingress = mediaIngress;
+    if (ingress === undefined || item.attachments === undefined || item.attachments.length === 0) return item.text;
+    const images: ImageContent[] = [];
+    const blocks: string[] = [];
+    for (const admitted of item.attachments) {
+      const stored = await storeAttachment(ingress, item, admitted);
+      let speech: AttachmentSpeech = {};
+      if (stored.status === "stored" && stored.kind === "audio") {
+        speech = await transcribeAttachment(ingress, item, stored);
+      }
+      blocks.push(attachmentContextText(stored, speech));
+      if (stored.kind === "photo" && stored.status === "stored" && stored.relativePath !== undefined) {
+        const bytes = await ingress.store.read(stored.relativePath);
+        images.push({
+          type: "image",
+          data: bytes.toString("base64"),
+          mimeType: stored.mimeType ?? "image/jpeg",
+        });
+      }
+    }
+    const text = [item.text, ...blocks].filter((part) => part.trim() !== "").join("\n\n");
+    if (images.length === 0) return text;
+    const parts: (TextContent | ImageContent)[] = [];
+    if (text !== "") parts.push({ type: "text", text });
+    parts.push(...images);
+    return parts;
+  };
+
   /**
    * A known Telegram rejection will not improve on retry, and a repeated failure should stay visible instead of
    * retrying on every poll. Hold the record for reconciliation; it is never resent automatically.
@@ -1375,13 +1635,30 @@ export async function runTelegram(
             await handleControl(update, message, parsed);
             continue;
           }
-          const text = message.text !== undefined ? parsed.text : message.caption;
-          // Text-only adapter: never imply that an unsupported attachment was read.
-          const hasAttachment = ["photo", "document", "audio", "voice", "video", "video_note", "animation", "sticker"]
-            .some((field) => (message as unknown as Record<string, unknown>)[field] !== undefined);
-          const notice = "[Unsupported Telegram attachment: this adapter accepts text only.]";
-          const body = hasAttachment ? `${notice}${text ? ` Caption: ${text}` : ""}`
-            : text ?? "[Unsupported Telegram message: this adapter accepts text only.]";
+          const caption = message.text !== undefined ? parsed.text : message.caption;
+          // With media configured, supported originals are admitted with the input and stored in the
+          // delivery path; without it, the previous text-only behavior is unchanged.
+          const plan = mediaIngress === undefined
+            ? undefined
+            : planTelegramMedia(message, identity, update.update_id);
+          let body: string;
+          let attachments: TelegramPendingAttachment[] | undefined;
+          if (mediaIngress === undefined) {
+            const hasAttachment = ["photo", "document", "audio", "voice", "video", "video_note", "animation", "sticker"]
+              .some((field) => (message as unknown as Record<string, unknown>)[field] !== undefined);
+            body = hasAttachment
+              ? disabledAttachmentText(caption)
+              : caption ?? "[Unsupported Telegram message: this adapter accepts text only.]";
+          } else if (plan?.kind === "attachment") {
+            // The caption stays ordinary input; the attachment block is added after storage.
+            body = caption ?? "";
+            attachments = [plan.attachment];
+          } else if (plan?.kind === "unsupported") {
+            // Video and similar kinds are never downloaded, stored or implied to have been read.
+            body = unsupportedAttachmentText(plan.label, caption);
+          } else {
+            body = caption ?? "[Empty Telegram message: no text, caption or supported attachment.]";
+          }
           const quoted = quotedMessageContext(message, identity);
           // A quoted/replied-to message contributes bounded, labeled reference context and its
           // message identity. An ordinary message keeps its exact original input; its own identity
@@ -1401,6 +1678,7 @@ export async function runTelegram(
                 sessionKey,
                 senderId: String(message.from!.id),
                 text: input,
+                ...(attachments === undefined ? {} : { attachments }),
               });
             }
             observeTarget(doc, {
@@ -1547,7 +1825,7 @@ export async function runTelegram(
       return;
     }
     if (parsed.command === "help") {
-      await admitNotice(update, message, sessionKey, CONTROL_HELP);
+      await admitNotice(update, message, sessionKey, mediaIngress === undefined ? CONTROL_HELP : CONTROL_HELP_MEDIA);
       drain();
       return;
     }
@@ -1775,6 +2053,121 @@ function validateOptions(options: TelegramOptions): void {
       (!Number.isInteger(options.pollTimeoutSeconds) || options.pollTimeoutSeconds < 0 || options.pollTimeoutSeconds > POLL_TIMEOUT_MAX)) {
     throw new Error(`pollTimeoutSeconds must be an integer from 0 to ${POLL_TIMEOUT_MAX}`);
   }
+  if (options.media !== undefined) {
+    if (typeof options.media.workspace !== "string" || options.media.workspace.trim() === "") {
+      throw new Error("telegram media requires a configured workspace");
+    }
+    const transcription = options.media.transcription;
+    if (transcription !== undefined) {
+      if (transcription.enabled !== undefined && typeof transcription.enabled !== "boolean") {
+        throw new Error("media.transcription.enabled must be a boolean");
+      }
+      if (transcription.language !== undefined && !/^[A-Za-z0-9_-]{1,35}$/.test(transcription.language)) {
+        throw new Error("media.transcription.language must be a short language code");
+      }
+      if (transcription.maxDurationSeconds !== undefined &&
+          (!Number.isInteger(transcription.maxDurationSeconds) ||
+            transcription.maxDurationSeconds < 1 || transcription.maxDurationSeconds > 3_600)) {
+        throw new Error("media.transcription.maxDurationSeconds must be an integer from 1 to 3600");
+      }
+      if (transcription.timeoutMs !== undefined &&
+          (!Number.isInteger(transcription.timeoutMs) || transcription.timeoutMs < 1 || transcription.timeoutMs > 900_000)) {
+        throw new Error("media.transcription.timeoutMs must be an integer from 1 to 900000");
+      }
+    }
+  }
+}
+
+function createMediaIngress(options: TelegramMediaOptions | undefined): TelegramMediaIngress | undefined {
+  if (options === undefined) return undefined;
+  const store = createMediaStore({
+    workspace: options.workspace,
+    ...(options.directory === undefined ? {} : { directory: options.directory }),
+    maxFileBytes: TELEGRAM_MEDIA_LIMITS.maxFileBytes,
+  });
+  const transcriber = createTranscriber({ ...(options.transcription ?? {}) });
+  return { store, transcriber };
+}
+
+function safeAnnouncedSize(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+/** Permanent attachment refusals keep their meaning in the model-facing failure note. */
+const MEDIA_REJECTION_TEXT: Record<MediaRejectionReason, string> = {
+  "too-large": "the file exceeds the configured size limit",
+  "unsafe-path": "the file locator was rejected as unsafe",
+  "unsafe-directory": "the attachment directory is not a plain directory inside the workspace",
+  empty: "the file was empty",
+  unavailable: "Telegram did not provide the file",
+};
+
+const TRANSCRIPTION_FAILURE_TEXT: Record<TranscriptionFailure, string> = {
+  unavailable: "the local speech backend or model is not provisioned",
+  timeout: "local transcription timed out",
+  cancelled: "local transcription was cancelled",
+  "too-large": "the audio exceeds the duration limit",
+  failed: "local transcription failed",
+  empty: "no speech was recognized",
+};
+
+/**
+ * Bound concurrent attachment work across chats so downloads and local
+ * transcription never starve polling. Waiters release immediately on abort.
+ */
+class MediaWorkGate {
+  readonly #max: number;
+  #active = 0;
+  readonly #waiters: {
+    resolve(): void;
+    reject(error: unknown): void;
+    readonly signal: AbortSignal | undefined;
+    onAbort: (() => void) | undefined;
+  }[] = [];
+
+  constructor(max: number) {
+    this.#max = Math.max(1, Math.trunc(max));
+  }
+
+  async run<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    await this.#acquire(signal);
+    try {
+      return await work();
+    } finally {
+      this.#release();
+    }
+  }
+
+  #acquire(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (this.#active < this.#max) {
+      this.#active += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      const waiter = { resolve, reject, signal, onAbort: undefined as (() => void) | undefined };
+      waiter.onAbort = () => {
+        const index = this.#waiters.indexOf(waiter);
+        if (index >= 0) this.#waiters.splice(index, 1);
+        reject(signal?.reason);
+      };
+      signal?.addEventListener("abort", waiter.onAbort, { once: true });
+      this.#waiters.push(waiter);
+    });
+  }
+
+  #release(): void {
+    const waiter = this.#waiters.shift();
+    if (waiter === undefined) {
+      this.#active -= 1;
+      return;
+    }
+    if (waiter.signal !== undefined && waiter.onAbort !== undefined) {
+      waiter.signal.removeEventListener("abort", waiter.onAbort);
+    }
+    // The released slot passes straight to the next waiter.
+    waiter.resolve();
+  }
 }
 
 function isAllowedPrivateMessage(
@@ -1884,6 +2277,17 @@ const CONTROL_HELP = [
   "/abort - withdraw queued messages and stop the current turn here; other chats, cron jobs and background work are unaffected.",
   "/help - this list.",
   "Limits: text only (attachments are not read); no tool-authority, history, restart or media commands. Other slash commands are refused; prefix // to send a leading slash literally.",
+].join("\n");
+
+/** The same controls when media ingress is configured; the attachment claim must stay truthful. */
+const CONTROL_HELP_MEDIA = [
+  "Controls for this chat (other messages go to the assistant):",
+  "/new - native context reset for this conversation: fresh model context, no summary or handoff; stored history and tool authority unchanged; queued messages are kept.",
+  "/abort - withdraw queued messages and stop the current turn here; other chats, cron jobs and background work are unaffected.",
+  "/help - this list.",
+  "Attachments: photos are attached as image content, voice/audio is transcribed locally when the backend is " +
+    "provisioned, and documents are stored unread on disk under the configured media directory. Video and stickers " +
+    "are not downloaded. Other slash commands are refused; prefix // to send a leading slash literally.",
 ].join("\n");
 
 const TELEGRAM_COMMAND = new RegExp(

@@ -76,6 +76,17 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
         token,
         allowFrom: config.telegram.allowFrom,
         ...(config.telegram.pollTimeoutSeconds === undefined ? {} : { pollTimeoutSeconds: config.telegram.pollTimeoutSeconds }),
+        ...(config.media === undefined
+          ? {}
+          : {
+              media: {
+                workspace: config.workspace,
+                directory: config.media.directory,
+                ...(config.media.transcription === undefined
+                  ? {}
+                  : { transcription: config.media.transcription }),
+              },
+            }),
       }, context);
     } else {
       const conversation = await gateway.conversationFor("cli:default", context);

@@ -49,6 +49,63 @@ without the generic failure text, one per input; the same applies to a turn
 ended by a queued reset (reason `reset`). Other settlement reasons keep the
 fixed failure text.
 
+## Attachments and local transcription
+
+Attachment ingress is opt-in through the top-level `media` configuration (see
+[setup](./SETUP.md#8-optional-attachments-and-voice)). Without it, the adapter keeps
+the previous text-only behavior exactly: an attachment gets a fixed
+unsupported-attachment notice and only its caption is passed as input.
+
+With `media` configured, an authenticated private message's photo, voice/audio or
+document is admitted with the input before anything is downloaded: one durable
+commit records the exact caption, the attachment identity and the polling offset.
+The delivery path then stores the original and submits the turn through the same
+per-chat order, retry and cancellation machinery as text. A crash or failed
+download keeps the admitted update instead of losing it, and a reopen resumes it.
+
+- **Storage.** Originals are written byte-for-byte under
+  `<workspace>/<media.directory>` (default `media/`) and stay readable through the
+  configured coding tools. Nothing is written to `dataDir` or an arbitrary
+  external root. Filenames are generated from the attachment kind and a hash of
+  Telegram's content-stable file identity, never from the announced filename, so
+  a retry or replay maps to the same file and a re-sent file is stored once.
+  Publication is atomic with private permissions, and a symlinked, hardlinked or
+  non-regular target path is refused rather than followed or overwritten.
+- **Photos** are submitted as native pi-ai image content (base64 + MIME) together
+  with a labeled, workspace-relative locator and bounded untrusted metadata. The
+  stored file is the authoritative original; the adapter performs no vision API
+  call and no image preprocessing. Documents are **not** submitted as image
+  content, whatever MIME they announce.
+- **Documents** have no extraction scope: the file simply exists on disk with no
+  read, OCR, PDF/Office conversion or automatic content extraction. The turn says
+  so explicitly and leaves reading it to the configured tools.
+- **Voice/audio** is stored first and then transcribed locally by the shared
+  helper (`scripts/local-transcribe.py`, faster-whisper `small` on CPU with
+  `int8`). The transcript is bounded, labeled as automatic and untrusted user
+  content, and never implies the speech was understood correctly. The caption is
+  preserved. If the backend or model is not provisioned, or transcription fails
+  or times out, the turn says that truthfully and the stored audio remains
+  available; nothing is claimed to have been heard. Transcription is a bounded
+  subprocess with a wall-clock timeout, an output cap, an audio-duration cap, and
+  a killed process group on abort or timeout. It runs through uv in offline mode
+  with local-model-only loading, so handling a message never installs or
+  downloads anything. There is no cloud fallback and no provider registry.
+- **Unsupported kinds** (video, video notes, animations, stickers) are named in a
+  fixed notice and never downloaded, stored or read.
+
+The Bot API download is authenticated first: `getFile` and the streamed body run
+only for an allowed private sender in a mapped chat. The request origin is fixed
+to `https://api.telegram.org`, redirects are errors, and the announced
+`file_path` is validated before it is interpolated into the file URL. The token
+is never written to a log, error message or document. Advertised and actual bytes
+are both bounded (Telegram's ordinary `getFile` ceiling is 20 MB), a download has
+a wall-clock timeout, and concurrent attachment work across chats is capped so
+polling is never blocked. Temporary files are removed on failure or abort.
+
+This section does not add a general media service, a durable download queue, a
+retry framework, video handling, OCR/PDF extraction, cloud speech, or a channel
+command for media.
+
 ## Coding tools
 
 The adapter has no tool-authority commands. The shipped Gateway's sole tool
@@ -156,7 +213,9 @@ migrate with an empty `controls` list.
 
 State version 5 adds bounded observed message targets and write-ahead action records.
 Version 4 state migrates with empty `targets` and `actions` lists; versions 1 and 2
-migrate with an empty `controls` list. Invalid stored shapes fail closed.
+migrate with an empty `controls` list. Version 6 adds admitted attachment records
+and the cached local transcript; earlier versions migrate with no attachments.
+Invalid stored shapes fail closed.
 
 Not implemented here: `/restart`, tool-authority or approval commands, history
 commands, `/stop` aliasing, and any command that would widen tool authority. Tool
