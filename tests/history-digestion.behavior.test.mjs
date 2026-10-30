@@ -877,7 +877,7 @@ test("an initial acknowledgement cannot start at a later episode and skip earlie
   }
 });
 
-test("a partial batch cannot persist an unverified or contentless episode end", { timeout: 20_000 }, async () => {
+test("a fresh partial batch cannot persist an unverified, contentless or cross-reset end", { timeout: 20_000 }, async () => {
   const dir = await temp("nanobot-digest-bounds-");
   const db = resolve(dir, "probe.sqlite");
   let harness;
@@ -889,13 +889,22 @@ test("a partial batch cannot persist an unverified or contentless episode end", 
     const [firstReset] = await append(harness, conversation, reset());
     const [twoUser] = await append(harness, conversation, user("BOUNDS-TWO-9012"));
     const [twoAnswer] = await append(harness, conversation, assistant("BOUNDS-TWO-ANSWER-3456"));
+    const [secondReset] = await append(harness, conversation, reset());
+    const [threeUser] = await append(harness, conversation, user("BOUNDS-THREE-7890"));
+    const [threeAnswer] = await append(harness, conversation, assistant("BOUNDS-THREE-ANSWER-2345"));
     await append(harness, conversation, reset());
+    const other = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [otherUser] = await append(harness, other, user("BOUNDS-OTHER-6789"));
+    const [otherAnswer] = await append(harness, other, assistant("BOUNDS-OTHER-ANSWER-1234"));
+    await append(harness, other, reset());
 
-    const source = createDigestSource({
-      harness,
-      sessions: async () => [{ sessionKey: "cli:bounds", conversationId: conversation.id }],
-    });
+    const sessions = async () => [
+      { sessionKey: "cli:bounds", conversationId: conversation.id },
+      { sessionKey: "telegram:bounds", conversationId: other.id },
+    ];
+    const source = createDigestSource({ harness, sessions });
     const first = batched(await source.read(context));
+    assert.deepEqual(first.entries.map((fragment) => fragment.text), ["BOUNDS-ONE-1234", "BOUNDS-ANSWER-5678"]);
     await source.acknowledge(first, context);
     const frontier = await source.cursor(conversation.id, context);
     const forged = (patch) => ({
@@ -924,16 +933,33 @@ test("a partial batch cannot persist an unverified or contentless episode end", 
       () => source.acknowledge(forged({ episodeEndEntryId: firstReset.id, complete: true }), context),
       /end is a reset marker/,
     );
+    // An otherwise valid later episode end still spans this episode's first closing reset.
+    await assert.rejects(
+      () => source.acknowledge(forged({ episodeEndEntryId: threeAnswer.id }), context),
+      /first reset that closes its start/,
+    );
     assert.deepEqual(await source.cursor(conversation.id, context), frontier);
 
-    // An honest read still sees the real closed episode only, and it can be acknowledged.
-    const second = batched(await source.read(context));
-    assert.equal(second.episodeStartEntryId, firstReset.id);
-    assert.equal(second.episodeEndEntryId, twoAnswer.id);
-    assert.deepEqual(second.entries.map((fragment) => fragment.text), ["BOUNDS-TWO-9012", "BOUNDS-TWO-ANSWER-3456"]);
-    await source.acknowledge(second, context);
-    assert.equal((await source.cursor(conversation.id, context)).throughEntryId, twoAnswer.id);
-    assert.ok(oneUser.id < oneAnswer.id && twoUser.id > firstReset.id);
+    // Both chats stay consumable after the rejection; the poisoned bounds never persisted.
+    const seen = [];
+    for (let index = 0; index < 10; index += 1) {
+      const result = await source.read(context);
+      if (result.status === "idle") {
+        assert.equal(result.caughtUp, true);
+        break;
+      }
+      const batch = batched(result);
+      seen.push([batch.sessionKey, batch.episodeStartEntryId, batch.entries.map((fragment) => fragment.text)]);
+      await source.acknowledge(batch, context);
+    }
+    assert.deepEqual(seen, [
+      ["cli:bounds", firstReset.id, ["BOUNDS-TWO-9012", "BOUNDS-TWO-ANSWER-3456"]],
+      ["cli:bounds", secondReset.id, ["BOUNDS-THREE-7890", "BOUNDS-THREE-ANSWER-2345"]],
+      ["telegram:bounds", otherUser.id, ["BOUNDS-OTHER-6789", "BOUNDS-OTHER-ANSWER-1234"]],
+    ]);
+    assert.equal((await source.cursor(conversation.id, context)).throughEntryId, threeAnswer.id);
+    assert.equal((await source.cursor(other.id, context)).throughEntryId, otherAnswer.id);
+    assert.ok(oneUser.id < oneAnswer.id && twoUser.id > firstReset.id && threeUser.id > twoAnswer.id);
   } finally {
     if (harness !== undefined) await harness.close(context).catch(() => {});
     await rm(dir, { recursive: true, force: true });

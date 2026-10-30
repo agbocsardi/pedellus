@@ -741,6 +741,13 @@ re-derives the episode bounds and the claimed chunk from the committed transcrip
 - the claimed end is validated on every acknowledgement, not only a complete one: it must be a
   committed non-reset entry whose successor is the `pi.reset` that actually closes the episode, and a
   reset-started episode must contain something besides its marker;
+- when a batch establishes *new* episode bounds, the episode is walked from its start until its first
+  closing reset, and that reset must be exactly the one after the claimed end. This proves the bounds
+  cannot span an earlier episode's reset. The walk uses the same paged episode scan (memory bounded
+  regardless of episode size) and honors cancellation; continuation chunks keep the `end+1` check but
+  do not walk again. Its cost is therefore one bounded-memory pass over each newly established
+  episode, not per fragment, and it matters only for unusually long episodes. A restart re-verifies
+  bounds independently because nothing is persisted about the verification;
 - every entry in the claimed range must exist, fit the 80-entry batch bound, and be the chunk's
   actual last entry; every evidence entry in it must be covered by exactly one fragment whose kind,
   role, length, offset and text match the transcript; no entry before the last may lose its tail;

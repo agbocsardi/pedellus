@@ -62,9 +62,11 @@
  *   and that start may hold no content, the claimed end must be a committed non-reset entry
  *   whose successor is the `pi.reset` that closes the episode, every entry in the claimed
  *   range must be covered (with the exact text at the claimed offsets), and a continued
- *   chunk must resume at the stored position. A malformed or forged batch is rejected
- *   instead of corrupting the cursor, so no acknowledgement can advance the frontier past
- *   evidence the transcript does not support.
+ *   chunk must resume at the stored position. New episode bounds are additionally proven by
+ *   walking that episode to its first closing reset (paged, bounded memory, once per new
+ *   episode), so a claimed end cannot span an earlier reset. A malformed or forged batch is
+ *   rejected instead of corrupting the cursor, so no acknowledgement can advance the
+ *   frontier past evidence the transcript does not support.
  * - A batch with no evidence (a "nothing worth remembering" episode, or an episode of
  *   non-evidence entries) is still acknowledged, which counts as processed.
  *
@@ -830,6 +832,44 @@ async function validateFreshEpisodeStart(
 }
 
 /**
+ * Establish that a newly claimed episode really is the segment its start opens: walking the
+ * episode from its start, the first reset that closes a non-empty segment must be the one
+ * just after the claimed end. Paged reads keep memory bounded and honor cancellation; the
+ * walk runs only when new episode bounds are established, not for every continuation chunk,
+ * so its total cost is one bounded-memory pass over that episode. Without it, a forged
+ * partial batch could persist an end that spans an earlier reset; later chunks would then
+ * contain that internal reset and be un-acknowledgeable forever, and the poisoned position
+ * would keep winning cross-chat priority.
+ */
+async function validateFreshEpisodeClosedRange(
+  conversation: Conversation,
+  batch: DigestBatch,
+  startEntry: EntryRecord,
+  context: Context,
+): Promise<void> {
+  if (batch.episodeEndEntryId === batch.episodeStartEntryId) {
+    // A single-entry episode is already covered by the bounds check: the next entry is its reset.
+    return;
+  }
+  const startsWithReset = startEntry.kind === ResetEntry.kind;
+  const scan = await scanForClosedEpisode(
+    conversation,
+    (batch.episodeStartEntryId + 1) as EntryId,
+    batch.episodeStartEntryId,
+    startsWithReset ? null : batch.episodeStartEntryId,
+    Number.POSITIVE_INFINITY,
+    context,
+  );
+  if (
+    scan.status !== "closed"
+    || scan.episodeStartEntryId !== batch.episodeStartEntryId
+    || scan.episodeEndEntryId !== batch.episodeEndEntryId
+  ) {
+    throw new TypeError("Digest episode end is not the first reset that closes its start");
+  }
+}
+
+/**
  * Validate the immutable episode bounds on every acknowledgement, not only a complete one.
  * The end must be a committed non-reset entry just before the `pi.reset` that actually
  * closes the episode; a reset-started episode must contain something besides its marker.
@@ -1102,6 +1142,10 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
         : await entryAt(conversation, batch.episodeStartEntryId, context);
       if (startEntry === undefined) throw new TypeError("Digest episode start is not a committed entry");
       await validateEpisodeBounds(conversation, batch, startEntry, context);
+      if (batch.cursor.episodeStartEntryId === null) {
+        // New bounds are proven complete here; continuation chunks reuse them.
+        await validateFreshEpisodeClosedRange(conversation, batch, startEntry, context);
+      }
       await validateChunkAgainstTranscript(conversation, batch, context);
       const next: DigestCursor = {
         throughEntryId: batch.throughEntryId,
