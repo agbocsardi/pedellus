@@ -38,7 +38,7 @@ Owner approved this six-slice batch after the completed channel-neutral build:
   requirements, CPU/Linux support, packaging, licensing and maintenance. Public
   documentation research is authorized, installs/downloads/provisioning are not.
   Do not silently replace faster-whisper or claim empirical quality equivalence.
-- [ ] O5 — Explicit CLI local photo/document attachment submission through the
+- [x] O5 — Explicit CLI local photo/document attachment submission through the
   single gateway/shared media pipeline. Preserve media opt-in, native image plus
   locator/vision handoff, document originals without extraction, bounded ingress
   and existing terminal controls. No separate runtime owner or model path grant.
@@ -350,6 +350,27 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Overnight — CLI attachments accepted and published
+
+O5 published by its original implementer via clean-main fast-forward to
+`19ce411` after independent initial PASS and fresh fix/union PASS. `/attach`
+submits one operator-named file through the private socket and gateway-owned
+media store: native photos plus locator/vision handoff, raw documents only.
+Review hardening made file opening nonblocking before regular-file checks;
+dedupe documentation now states the kind/extension boundary. Full candidate gate:
+typecheck/build, 183 behavior, 2 execution, 83 offline acceptance checks. Published
+main rebuild and six focused attachment checks passed; no live API/provider use.
+Optional formatter refactor and exhaustive filename-framing tests waived as
+outside scope. FIFO blocking mutation is bounded by the suite's outer process
+timeout. Worktree/branch preserved. CLI audio remains an opaque stored original.
+
+Voice scope update: owner subsequently authorized local voice dependencies/model
+downloads and best assumptions documented in branches, but prohibited live
+provider/API calls and paid operations. Research and local proof passed fresh
+review; an explicitly selected whisper.cpp + FFmpeg route is being implemented,
+retaining existing Python configuration/default compatibility. No runtime
+activation, automatic downloads or silent backend switch is authorized.
 
 ### Overnight batch authorization
 
