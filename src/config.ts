@@ -19,6 +19,7 @@ import {
 } from "./context/skills.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
 import { VISION_HANDOFF_DEFAULTS, VISION_HANDOFF_LIMITS } from "./media/vision.js";
+import { parseWebConfig, type WebConfig } from "./web/config.js";
 
 const CREDENTIAL_PROVIDERS = [
   "anthropic",
@@ -158,6 +159,12 @@ export interface PortConfig {
   extraAllowedDirs?: readonly string[];
   bwrapPath?: string;
   credentials?: Partial<Record<CredentialProvider, string>>;
+  /**
+   * Native public web capabilities. Absent installs no web tool; `search` and
+   * `fetch` enable independently. This is separate authority from `toolAllowlist`
+   * and never grants filesystem or shell access.
+   */
+  web?: WebConfig;
   telegram?: { tokenEnv: string; allowFrom: readonly string[]; pollTimeoutSeconds?: number };
 }
 
@@ -568,6 +575,9 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
       telegram.pollTimeoutSeconds = t.pollTimeoutSeconds;
     }
     Object.assign(config, { telegram });
+  }
+  if (raw.web !== undefined) {
+    Object.assign(config, { web: parseWebConfig(raw.web) });
   }
   return config;
 }

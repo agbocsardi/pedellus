@@ -23,6 +23,8 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
     "(diagnostic details suppressed)",
   telegramToken:
     "missing Telegram bot token; set the environment variable named by telegram.tokenEnv (diagnostic details suppressed)",
+  webCredential:
+    "missing web search credential; set the environment variable named by web.search.keyEnv (diagnostic details suppressed)",
   workspace:
     "cannot prepare the configured workspace or data directory; check workspace, dataDir and extraAllowedDirs " +
     "(diagnostic details suppressed)",

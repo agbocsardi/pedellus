@@ -97,6 +97,13 @@ import {
   type CodingToolName,
   type ToolEnvironments,
 } from "./tools/index.js";
+import {
+  BraveSearchClient,
+  PublicWebFetcher,
+  WEB_TOOL_NAMES,
+  createWebToolExtension,
+  type WebRuntimeOptions,
+} from "./web/index.js";
 
 const SessionMap = defineDoc<{ sessions: Record<string, number> }>({
   kind: "nanobot.session-map", version: 1, scope: "conversation", history: "latest", fork: "initial",
@@ -185,6 +192,13 @@ export interface OpenGatewayOptions {
      */
     readonly backfill?: "none" | "pending";
   };
+  /**
+   * Native web-tool seams for tests: environment snapshot, controlled resolver and
+   * transports, and a fixed clock. No config field selects these, and an absent
+   * value uses Node DNS and HTTPS. The ordinary runtime makes no external call at
+   * startup, so these cannot silently widen shipped behavior.
+   */
+  readonly web?: WebRuntimeOptions;
 }
 
 /** Read-only query for a bounded page of one mapped chat session's raw transcript entries. */
@@ -692,6 +706,45 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // Config authorization names only mapped ordinary chat conversations (loaded map + scope checked).
   // The call-time hook consults this set; the policy filter reads the same rule from committed state.
   const authorizedChatConversations = new Set<ConversationId>();
+  // Native public web tools carry network authority only: they are not coding tools, are never named by
+  // `toolAllowlist`, and are offered solely in mapped ordinary chat conversations whose scope this host
+  // validated. The search key is resolved once here; an absent value fails startup instead of quietly
+  // answering with zero results.
+  let webTool: { readonly extension: Extension } | undefined;
+  const webConfig = config.web;
+  if (webConfig !== undefined && (webConfig.search !== undefined || webConfig.fetch === true)) {
+    const searchConfig = webConfig.search;
+    let search: BraveSearchClient | undefined;
+    if (searchConfig !== undefined) {
+      const env = options.web?.env ?? process.env;
+      const key = Object.hasOwn(env, searchConfig.keyEnv) ? env[searchConfig.keyEnv] : undefined;
+      if (typeof key !== "string" || key.trim() === "") {
+        throw new StartupDiagnosticError("webCredential", {
+          detail: "Missing credential: set the environment variable named by web.search.keyEnv",
+        });
+      }
+      search = new BraveSearchClient({
+        apiKey: key.trim(),
+        ...(options.web?.searchTransport === undefined
+          ? {}
+          : { transport: options.web.searchTransport }),
+      });
+    }
+    const fetcher = webConfig.fetch === true
+      ? new PublicWebFetcher({
+          ...(options.web?.resolver === undefined ? {} : { resolver: options.web.resolver }),
+          ...(options.web?.fetchTransport === undefined ? {} : { transport: options.web.fetchTransport }),
+          ...(options.web?.now === undefined ? {} : { now: options.web.now }),
+        })
+      : undefined;
+    webTool = createWebToolExtension({
+      ...(search === undefined ? {} : { search }),
+      ...(fetcher === undefined ? {} : { fetcher }),
+      isAuthorizedChat: (conversationId) => authorizedChatConversations.has(conversationId),
+    });
+  }
+  const webToolRegistrations = webTool?.extension.tools ?? [];
+  const webConversations = new Set<ConversationId>();
   const toolExtension: Extension | undefined = toolsEnabled
     ? createCodingToolExtension({
         tools: toolAllowlist as readonly CodingToolName[],
@@ -703,6 +756,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // History retrieval is read-only over mapped chats and has its own scope checks, so the
           // ceiling must not suppress it when coding tools are enabled.
           ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
+          // Web tools are a separate config capability with their own call-time scope hook. They are
+          // exempt from the coding ceiling only while that gated extension is actually installed.
+          ...(webTool === undefined ? [] : WEB_TOOL_NAMES),
         ],
         defaultTimeoutSeconds,
         authenticatedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
@@ -774,6 +830,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       selected.push(skillTool.extension);
     }
     if (historyTool && historyConversations.has(conversationId)) selected.push(historyTool.extension);
+    if (webTool && webConversations.has(conversationId)) selected.push(webTool.extension);
     if (telegramTool && telegramChatConversations.has(conversationId)) selected.push(telegramTool.extension);
     if (cronFoundation && cronTool && cronOwners.has(conversationId)) {
       selected.push(cronFoundation.extension, cronTool.extension);
@@ -951,7 +1008,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const telegramTools = telegramToolRegistration !== undefined && telegramChatConversations.has(conversationId)
       ? [telegramToolRegistration]
       : [];
-    return [...skillTools, ...cronTools, ...historyTools, ...telegramTools];
+    const webTools = webConversations.has(conversationId) ? [...webToolRegistrations] : [];
+    return [...skillTools, ...cronTools, ...historyTools, ...telegramTools, ...webTools];
   };
   /**
    * The authority-derived tool filter. The host ceiling directly authorizes authenticated mapped
@@ -1091,6 +1149,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (skillTool) registry.install(skillTool.extension);
     if (historyTool) registry.install(historyTool.extension);
     if (telegramTool) registry.install(telegramTool.extension);
+    if (webTool) registry.install(webTool.extension);
     if (cronFoundation) registry.install(cronFoundation.extension);
     if (cronTool) registry.install(cronTool.extension);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
@@ -1377,12 +1436,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
     const initialMapping = historyTool === undefined && !toolsEnabled && telegramTool === undefined
+      && webTool === undefined
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
     if (initialMapping !== undefined) {
       for (const { sessionKey, conversationId } of await mappedChatSessions(context)) {
         if (historyTool !== undefined) historyConversations.add(conversationId);
         authorizedChatConversations.add(conversationId);
+        if (webTool !== undefined) webConversations.add(conversationId);
         sessionKeyForConversation.set(conversationId, sessionKey);
         if (telegramTool !== undefined && sessionKey.startsWith("telegram:")) {
           telegramChatConversations.add(conversationId);
@@ -1652,10 +1713,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (reason === undefined) {
             historyConversations.add(conversationId!);
             authorizedChatConversations.add(conversationId!);
+            if (webTool !== undefined) webConversations.add(conversationId!);
             mappedChat = true;
           } else {
             historyConversations.delete(conversationId!);
             authorizedChatConversations.delete(conversationId!);
+            webConversations.delete(conversationId!);
           }
         }
         // The exact host-owned session key for this conversation is what a channel action host
