@@ -679,6 +679,96 @@ session key, and the summary text is model output over untrusted source.
 - Model fidelity and real-provider behavior are unverified: only a faux provider over temporary
   synthetic data has been used.
 
+## Digestion input and cursor
+
+`src/history/digestion.ts` is the bounded, source-labeled input for the deferred
+conversation-digestion (memory curation) slice, plus its durable cursor. It is not wired into
+`openGateway` and is not activated: it calls no model, writes no memory, creates no task, schedules
+nothing, and adds no tool surface.
+
+```ts
+createDigestSource({
+  harness,                       // the same Harness openGateway already owns
+  sessions: mappedChatSessions,  // the host-validated provider the index/catalog use
+});
+const result = await source.read(context);    // DigestBatch | DigestIdle
+await source.acknowledge(batch, context);     // only after the caller consumed it
+await source.cursor(conversationId, context); // status/tests, read-only
+```
+
+A batch is one bounded chunk of one **closed** episode from one mapped chat conversation:
+`sessionKey`, `conversationId`, immutable `episodeStartEntryId`/`episodeEndEntryId`, the chunk's
+`firstEntryId`/`firstTextStart`, its `throughEntryId`/`throughChars`, `complete`, and evidence
+fragments. Each fragment carries its own `entryId`, `role` (`user`/`assistant`/`tool`), Durable
+`kind`, optional `toolName`, `text`, `textStart` and the entry's full `chars` length. Nothing is
+excerpted away: a fragment cut at the batch bound continues in the next batch from exactly that
+offset, so every character of a long entry is eventually consumable. The reader stores nothing:
+Durable stays the only transcript authority and the original entry remains the citation.
+
+Eligibility and evidence rules:
+
+- Eligible conversations are exactly the mapped chat sessions the host supplies after
+  authentication and `chatScopeExclusion`/`partitionChatScope`. The host is the authorization
+  boundary; this module does not re-derive root/fork/task ownership and only refuses a shape error
+  such as a `:channel-state` key or a repeated conversation ID. Channel-state keys, the root, forks,
+  task-owned (cron/worker) conversations and raw/unmapped transcripts never qualify when the host
+  passes the shared provider.
+- Only closed episodes are evidence. An episode closes at the `pi.reset` entry committed after it;
+  the current open segment is never returned, however often it is read. Reset-only segments are not
+  episodes. Episode ranges and `pi.reset` inclusion match the episode catalog.
+- A reset's handoff message is synthetic context, not owner speech, and is never evidence. System,
+  compaction and unknown entries are consumed as part of a range but yield no evidence item.
+  Assistant tool calls are not evidence; their `pi.tool-result` entries are.
+- `nanobot.cron` input entries keep that exact Durable `kind`, so a consumer can treat a scheduled
+  trigger as provenance rather than owner speech. Worker child transcripts are task-owned and never
+  in scope, and worker result events are not evidence.
+- Ordering is oldest first by Durable entry ID within a conversation, so timestamps never create a
+  tie to break. Across conversations the oldest discovered next position is served first; a bounded
+  scan budget can postpone discovery in a conversation, which delays evidence but never skips it.
+  The scan budget rotates its starting conversation so one busy chat cannot starve the others.
+
+Cursor semantics: one small `nanobot.digest-cursor` conversation document holds
+`throughEntryId`/`throughChars` (highest acknowledged entry and characters consumed within it) and,
+only while a large closed episode is being consumed in chunks,
+`episodeStartEntryId`/`episodeEndEntryId`. `acknowledge()` is the only writer; it compares the
+stored cursor with the batch's frontier (`DigestCursorConflictError` when it moved), then re-derives
+the claimed chunk from the committed transcript before one commit:
+
+- a fresh chunk starts at its claimed episode start, which must be a `pi.reset` or the conversation's
+  first entry, and the entries between the previous frontier and that start must carry no content
+  (otherwise an earlier closed episode would be skipped);
+- every entry in the claimed range must exist, fit the 80-entry batch bound, and be the chunk's
+  actual last entry; every evidence entry in it must be covered by exactly one fragment whose kind,
+  role, length, offset and text match the transcript; no entry before the last may lose its tail;
+- a complete chunk must end just before the `pi.reset` that closed the episode, and a partial chunk
+  must continue exactly at the stored position; a claimed range may contain no reset after its first
+  entry.
+
+A malformed or forged batch is therefore rejected instead of corrupting the cursor, so no
+acknowledgement can advance the frontier past evidence the transcript does not support. A batch with
+no evidence (nothing worth remembering, or an episode of non-evidence entries) is still
+acknowledged and counts as processed; a failure or restart before acknowledgement replays the same
+chunk. `DIGEST_LIMITS` bounds a batch (80 entries and strictly 24,000 evidence characters) and a read
+(4,000 scanned entries, 256 mapped chats); a larger closed episode or long entry is returned as
+contiguous fragments.
+
+`read()` reports `status: "batch"` when it has a chunk to consume. Otherwise it returns
+`status: "idle"` with `caughtUp`, `examinedChats`, `postponedChats`, `unfinishedChats` and
+`missingChats`: `caughtUp` is true only when every mapped chat was examined to its tail, so a caller
+can tell a genuinely empty pass from one that stopped at the scan bound or skipped a mapped
+conversation whose store is missing. A missing mapped conversation is reported, never treated as
+caught up or as evidence. The in-process scan-position cache is derived, dropped whenever that
+conversation's cursor moves, and lost on restart: losing it costs a repeated bounded scan, never
+evidence.
+
+This foundation deliberately leaves the next slice: prompt selection and the editable workspace
+curation prompt, the model run and validated memory writes, worker/cron activation, and status or
+user notification. See `tests/history-digestion.behavior.test.mjs` for the checked-in evidence over a
+real Durable Harness with synthetic entries: eligibility, ordering and scan fairness, closed-episode-only
+input, reset handoff exclusion, bounded chunking with contiguous frontiers, lossless long-entry
+continuation, ack/no-op/restart behavior, stale and forged batch rejection, and the resumable scan
+cache.
+
 ## Offline lifecycle evidence
 
 `tests/history-lifecycle.behavior.test.mjs` is one bounded, checked-in regression over the actual
@@ -705,6 +795,9 @@ an outer timeout (or through the behavior suite once it is registered there).
 
 ## Not implemented
 
+- Digesting conversations into memory: `src/history/digestion.ts` supplies the bounded,
+  source-labeled input and the durable cursor, but no prompt, model run, memory write, worker/cron
+  activation or notification is wired, and nothing reads the cursor in production.
 - Background indexing independent of a search; message reconciliation and the summary sweep both
   happen on demand, and summary rows refresh only on a summary search.
 - Summary ranking beyond recency: summary pages are newest-first by episode start, with no relevance
