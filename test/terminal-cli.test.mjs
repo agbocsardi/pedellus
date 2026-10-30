@@ -8,6 +8,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { runTerminalConversation } from "../dist/terminal/index.js";
+import { inProcessTerminalConversation } from "../dist/terminal/conversation.js";
 import { openGateway } from "../dist/runtime.js";
 import { parseConfig } from "../dist/config.js";
 import { openFullSyncNodeSqliteStorage } from "../dist/storage/sqlite.js";
@@ -56,7 +57,7 @@ test("settled final text waits for slow writable and appears exactly once", { ti
     if (firstWrite) { firstWrite = false; release = callback; entered(); }
     else callback();
   } });
-  const terminal = runTerminalConversation(conversation, withAbortSignal(controller.signal, BACKGROUND_CONTEXT), {
+  const terminal = runTerminalConversation(inProcessTerminalConversation(conversation), withAbortSignal(controller.signal, BACKGROUND_CONTEXT), {
     input: inputLines("synthetic prompt"), output,
   });
   try {
@@ -92,7 +93,7 @@ test("EOF preserves failed-run follow-up in SQLite for reopen", { timeout: timeo
     faux.setResponses([() => { throw new Error("synthetic provider failure"); }]);
     const outputChunks = [];
     const output = new Writable({ write(chunk, _encoding, callback) { outputChunks.push(chunk.toString()); callback(); } });
-    await runTerminalConversation(conversation, BACKGROUND_CONTEXT, {
+    await runTerminalConversation(inProcessTerminalConversation(conversation), BACKGROUND_CONTEXT, {
       input: inputLines("first synthetic prompt", "queued synthetic prompt"), output,
     });
     assert.match(outputChunks.join(""), /preserving 1 Durable-queued CLI input/);
@@ -145,7 +146,7 @@ test("controls execute between preceding and following admissions", { timeout: t
   } });
   const controller = new AbortController();
   const output = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
-  const terminal = runTerminalConversation(proxy, withAbortSignal(controller.signal, BACKGROUND_CONTEXT), {
+  const terminal = runTerminalConversation(inProcessTerminalConversation(proxy), withAbortSignal(controller.signal, BACKGROUND_CONTEXT), {
     input: inputLines("first", "/abort", "second"), output,
   });
   try {
@@ -176,7 +177,7 @@ test("rejected lines stop ingress while output is backpressured", { timeout: tim
   const input = (async function* () {
     for (let i = 0; i < 1000; i++) { consumed++; yield "x".repeat(32_001); }
   })();
-  const terminal = runTerminalConversation(conversation, withAbortSignal(controller.signal, BACKGROUND_CONTEXT), { input, output });
+  const terminal = runTerminalConversation(inProcessTerminalConversation(conversation), withAbortSignal(controller.signal, BACKGROUND_CONTEXT), { input, output });
   try {
     await blocked;
     await new Promise((resolve) => setImmediate(resolve));
@@ -225,7 +226,7 @@ test("local model command lists, selects, rejects invalid input without disclosu
     const conversation = await gateway.conversationFor("cli:default", BACKGROUND_CONTEXT);
     const chunks = [];
     const output = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
-    await runTerminalConversation(conversation, BACKGROUND_CONTEXT, {
+    await runTerminalConversation(inProcessTerminalConversation(conversation), BACKGROUND_CONTEXT, {
       input: inputLines("/model", "/model fixture beta high", "/model fixture SYNTHETIC-CREDENTIAL"),
       output,
       modelSelection: {
@@ -264,7 +265,7 @@ test("terminal suppresses tool/reasoning text and strips terminal control charac
   const chunks = [];
   const output = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
   try {
-    await runTerminalConversation(conversation, BACKGROUND_CONTEXT, { input: inputLines("synthetic prompt"), output });
+    await runTerminalConversation(inProcessTerminalConversation(conversation), BACKGROUND_CONTEXT, { input: inputLines("synthetic prompt"), output });
     const printed = chunks.join("");
     assert.match(printed, /visible textred/);
     assert.doesNotMatch(printed, /SECRET|\r|\u202e|\u001b/);

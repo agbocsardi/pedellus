@@ -3,38 +3,86 @@
 For a first-time walkthrough of workspace, memory, skills and config-enabled
 tools, start with [setup](./SETUP.md).
 
-Run the configured local conversation with the existing explicit config path:
+The gateway is the single agent/Durable owner. A CLI is one conversation
+surface over it, like Telegram and future channels, not a runtime:
 
 ```sh
-nanobot --config /path/to/config.json
+nanobot gateway --config /path/to/config.json   # one owner: storage, tools, cron, Telegram
+nanobot agent --config /path/to/config.json     # attach a terminal to that gateway
 ```
 
-When Telegram is configured, the CLI keeps the existing Telegram path; otherwise
-it opens the local `cli:default` Durable conversation. Workspace context is off
-unless the config contains `workspaceContext`; when enabled it applies the same
-fixed bootstrap and explicit `memoryFiles` selection to every session key and
-adds no identity. Adding `workspaceContext.memoryManifest: true` also appends the
-bounded topic manifest for on-demand native reads. See [workspace context](./WORKSPACE_CONTEXT.md). Model text
-streams only from committed `pi.live` snapshots, filtered to assistant text
-blocks. The
-initial watch snapshot is not replayed. After a submission settles, the CLI
-reads its committed assistant entry and flushes any text missing from the last
-committed partial. Reasoning blocks, system entries, tool calls/arguments, and
-tool output are not printed. ESC/C1 terminal controls, carriage returns, and bidi
-formatting controls are removed; ordinary newlines and Unicode scalar values are preserved.
+`nanobot --config /path/to/config.json` remains the historical terminal command.
+It now attaches exactly like `agent` and never opens an implicit gateway or a
+second runtime; start `gateway` with the same configuration first. Both commands
+take the existing explicit config path. `agent --conversation <name>` attaches a
+separate `cli:<name>` conversation; omitted or `default` resumes the historical
+`cli:default`.
+
+Workspace context, Markdown memory and the configured tool ceiling belong to the
+gateway, so every attached surface sees the same workspace and policy. Each
+conversation stays separate by default. Attaching resumes the conversation's
+Durable transcript, model selection and queued work; it does not create a new
+agent loop. Model text streams only from committed `pi.live` snapshots, filtered
+to assistant text blocks. The initial watch snapshot is not replayed. After a
+submission settles, the CLI reads its committed assistant entry and flushes any
+text missing from the last committed partial. Reasoning blocks, system entries,
+tool calls/arguments, and tool output are not printed. ESC/C1 terminal controls,
+carriage returns, and bidi formatting controls are removed; ordinary newlines and
+Unicode scalar values are preserved. See [workspace context](./WORKSPACE_CONTEXT.md).
+
+## Gateway and local transport
+
+The gateway serves one private Unix socket inside the configured `dataDir`
+(`gateway.sock`, created mode `0600`; the data directory is already `0700`).
+There is no public or TCP listener and no general RPC surface. The CLI speaks a
+bounded newline-delimited JSON protocol over that socket:
+
+- A connection attaches to exactly one `cli:<name>` conversation. Names are
+  validated (lowercase letters, digits, `_`, `-`; at most 32 characters); channel
+  keys such as `telegram:<id>`, the root/state/fork conversations and arbitrary
+  harness IDs are not attachable.
+- Requests are validated and bounded. Request lines are capped at 256 KiB,
+  admitted prompts at 32,000 code units, entry pages at 200 rows and history
+  pages at 50 hits; unknown methods, unknown fields and out-of-range values are
+  rejected. Rejections carry a fixed code and no dependency, path or credential
+  text. Command and admission serialization stays in the terminal, not in a new
+  gateway queue.
+- Snapshot delivery is bounded: the CLI keeps at most 64 pending frames and
+  awaits each render in order, while the server drops only frames Durable's own
+  watch already coalesces and disconnects a socket that queues more than 8 MiB.
+  A disconnected or stalled client never grows unbounded buffers.
+- Exactly one gateway serves the configured store. The Durable store lock is the
+  owner; a stale socket file is removed only after a connection attempt fails, and
+  a live listener is refused rather than replaced. Binding failures, including a
+  second gateway on the same endpoint, are reported with fixed, value-free text.
+  The socket is removed on normal shutdown.
+- Closing the CLI closes this attachment and its watch. Already admitted durable
+  turns keep running in the gateway, queued inputs stay queued, and the same
+  conversation is resumed on the next attach. The CLI never aborts work merely
+  because its terminal exited; explicit `/abort` remains the way to withdraw it.
+
+Telegram runs inside the same gateway process, so a local CLI and Telegram can be
+used at the same time. Disconnecting the CLI does not stop Telegram polling, and
+vice versa; stopping the gateway stops both.
 
 ## Startup diagnostics
 
-The CLI fails closed with exit status 1. Known configuration and startup failures
-print one fixed, value-free message: unreadable/invalid configuration, invalid
-configuration fields, unsupported provider aliases, unavailable models or
-thinking levels, missing credential alias references, a missing Telegram token
+Gateway startup fails closed with exit status 1. Known configuration and startup
+failures print one fixed, value-free message: unreadable/invalid configuration,
+invalid configuration fields, unsupported provider aliases, unavailable models
+or thinking levels, missing credential alias references, a missing Telegram token
 environment variable, workspace/data-directory preparation failures, a data
 store already owned by another live process, and a prepared model dispatch that
 pins historical Nanobot context. These messages never include configuration
 values, environment values, filesystem paths, provider/dependency error text or
 the underlying exception. Unexpected failures keep the generic
 `nanobot: command failed; diagnostic details suppressed` message.
+
+An `agent` (or legacy default) launch additionally fails closed when no gateway
+answers on the configured endpoint, or when the endpoint's socket path cannot be
+used. Its fixed message says to start `nanobot gateway --config <path>` with the
+same configuration. The CLI does not fall back to opening a store or starting a
+second runtime.
 
 For live-owner lock contention, the fixed message says to stop the other running
 nanobot/gateway process. For a blocked prepared dispatch, it says to run
@@ -49,8 +97,8 @@ loading for a recovery invocation still uses the fixed startup messages above.
 
 ## Scheduled results
 
-An `origin`-mode cron job submits its turn into the same `cli:default`
-conversation. When an attached CLI observes a run whose inputs were not admitted
+An `origin`-mode cron job submits its turn into the same CLI conversation that
+owns the job (normally `cli:default`). When an attached CLI observes a run whose inputs were not admitted
 by this terminal process, it prints that run's committed final assistant text
 once when the run ends. This includes queued turns that hand over directly to
 the next run without an idle frame: each observed run is attributed by its own
@@ -73,9 +121,9 @@ Telegram origin through its outbox; cancelled and superseded runs are not. See
 
 ## Recovery
 
-Startup fails closed when a prepared model dispatch still pins historical Nanobot
-context, with a fixed value-free message naming the recovery command below. The
-same executable exposes an owner-only recovery path that never opens
+Gateway startup fails closed when a prepared model dispatch still pins historical
+Nanobot context, with a fixed value-free message naming the recovery command
+below. The same executable exposes an owner-only recovery path that never opens
 the gateway, resumes scheduling, or requires credentials. It does require the
 existing SQLite database and the gateway process to be stopped; a live owner is
 reported as a lock conflict. Inspection may perform Durable's native
@@ -102,12 +150,12 @@ fail-closed and is not remotely cancelled. See
 | `/status` | Show the conversation's current host-selected model, native run/inbox state, and Durable-recorded per-model/tool usage. Provider-side charges or unrecorded spend remain unknown. |
 | `/history [count]` | Show the latest user/assistant text messages only (default 10, max 50), using Durable entry pagination; each snippet is limited to 200 characters and the scan to 2,000 entries. Reasoning, tool, and non-text blocks are omitted; synthetic user-role reset or compaction messages may also appear. |
 | `/search [--scope messages\|tools\|all] [--role user\|assistant] [--limit 1-50] [--next] [--] [query]` | Search or browse the local history index. Default scope is messages; `--scope tools` searches tool names, arguments and result text only, and `--scope all` combines messages and tools. Empty text browses the selected scope. See [history search and browsing](#history-search-and-browsing). |
-| `/episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>]` | List reset-delimited episodes newest first, with entry ranges, counts and recorded summary status only. `--session` must name an existing mapped chat session; the default is `cli:default`. This command does not generate or show summary text. |
+| `/episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>]` | List reset-delimited episodes newest first, with entry ranges, counts and recorded summary status only. `--session` must name an existing mapped chat session; the default is this attachment's session key (normally `cli:default`). This command does not generate or show summary text. |
 | `/episode [--session <sessionKey>] <startEntryId> [--limit 1-30]` | Open one episode's bounded first window of message/tool entries from an existing mapped chat session. |
 | `/entry [--session <sessionKey>] <entryId> [--radius 0-5]` | Open one entry plus at most five neighboring entry IDs on each side, showing only user/assistant text and tool calls/results. `--session` must be an existing mapped chat session. |
 | `/model` | List named presets and the current/default choice. `/model <name>` temporarily selects one; `/model default` or restart returns to the configured preset. Direct-model configs retain `/model <provider> <modelId> [thinkingLevel]` and persisted selection. Busy selection is rejected atomically; retry when idle. Standalone terminal callers without a host callback remain read-only. |
 | `/tools` | Read-only diagnostic of the config-selected coding tools for this conversation. |
-| `/refresh` | Re-read the configured workspace bootstrap, memory files, manifest and skill inventory for this `cli:default` conversation. Requires `workspaceContext`; rejected while the conversation is busy. The refreshed summary and skill table apply to the next model request. |
+| `/refresh` | Re-read the configured workspace bootstrap, memory files, manifest and skill inventory for this attached CLI conversation. Requires `workspaceContext`; rejected while the conversation is busy. The refreshed summary and skill table apply to the next model request. |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
 | `/new` | Admit native `Conversation.reset(undefined)`: the same conversation starts a new context with no handoff. No archive, summary, usage reset or extra model call is produced; earlier entries stay stored and remain visible to `/history`, and configured tools are unchanged. While busy it is placed at the next safe boundary and ends that run there instead of interrupting the current model turn; inputs queued before or after it in the same busy window run in the new context. A queued `/new` is a write, so `/abort` withdraws queued inputs but not the pending reset. |
@@ -119,7 +167,7 @@ pair selection may match no preset. See [model selection](./MODELS.md).
 ## History search and browsing
 
 These are local, host-bound, read-only controls over the mapped chat sessions
-of this single-tenant store. Browse commands default to `cli:default`; search
+of this single-tenant store. Browse commands default to the attached conversation's key (normally `cli:default`); search
 spans the mapped sessions. They are not model-facing tools and have no Telegram
 equivalent.
 Search uses `Gateway.historySearch`; episode listing/open uses
@@ -184,8 +232,8 @@ or starts a model turn.
   400. Entries carrying unsupported context edits are shown as raw stored text
   with that fact noted. `/history` is unchanged and still scans only the latest
   user/assistant text messages.
-- `/episodes`, `/episode` and `/entry` default to `cli:default` with a history
-  host. `--session` must name an existing mapped chat session and must be exactly
+- `/episodes`, `/episode` and `/entry` default to the attached conversation's
+  session key (normally `cli:default`) with a history host. `--session` must name an existing mapped chat session and must be exactly
   representable as one CLI token under the same round-trip rule above; labels with
   whitespace, controls, bidi marks, unpaired surrogates or more than 200 code units
   cannot be used. The host resolves the existing mapping without creating a
@@ -230,7 +278,7 @@ See [coding tools](./TOOLS.md).
 ## Workspace refresh
 
 When the config contains `workspaceContext`, `/refresh` re-captures the current
-`cli:default` conversation's host snapshot without reopening the Gateway:
+attached conversation's host snapshot through the running Gateway:
 
 ```text
 /refresh
@@ -277,16 +325,17 @@ limit, not a hard ingress-memory cap: Node `readline` buffers until newline
 before yielding a line to the check, so a very long or newline-free stdin record
 can consume memory first. Injected `TerminalIO` sources likewise own any
 pre-yield memory bound. Writable backpressure is awaited; rejected-line
-notices are also awaited rather than queued. EOF waits for this process's admitted inputs to settle before gateway
-shutdown; if a failed/ended run leaves inputs queued under Durable's default
-`afterFailedRun: "keep"`, EOF reports that state and cancels only local
-watch/wait contexts. The durable submissions remain queued for owner
-reconciliation or reopen; only explicit `/abort` withdraws them. SIGINT and
-SIGTERM cancel local waits and watches, close input, and let the gateway
-close/reap its Harness.
+notices are also awaited rather than queued. EOF waits for this attachment's
+admitted inputs to settle before it disconnects; if a failed/ended run leaves
+inputs queued under Durable's default `afterFailedRun: "keep"`, EOF reports that
+state and cancels only local watch/wait contexts. The durable submissions remain
+queued for owner reconciliation or reopen; only explicit `/abort` withdraws
+them. SIGINT and SIGTERM cancel local waits and watches and close input; they do
+not stop the gateway or its Harness.
 
 This remains a text-only local surface, not a complete Python command port or
-interactive terminal UI. Model selection delegates to Gateway's allowlist and
-persists in native Durable `pi.agent`; it adds no agent runner, queue, session
-store, or parallel model state. Scheduled origin-mode answers are rendered from
+interactive terminal UI. Model selection delegates to the gateway's allowlist
+and persists in native Durable `pi.agent`; the CLI adds no agent runner, queue,
+session store, or parallel model state, and it owns no storage or provider
+credential. Scheduled origin-mode answers are rendered from
 the same conversation's committed entries; the terminal adds no delivery queue.

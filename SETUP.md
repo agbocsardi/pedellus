@@ -86,14 +86,27 @@ channel origin, so they never exceed what that origin had; narrowing
 
 ## 4. First run
 
+The gateway owns storage, tools, cron and Telegram; the CLI attaches to it as a
+conversation surface. Start the gateway in one terminal:
+
 ```sh
-node dist/cli.js --config demo/config.json
+node dist/cli.js gateway --config demo/config.json
 ```
 
-Without a `telegram` section the CLI opens the local `cli:default` conversation
-and prints a prompt. No grant step exists: `toolAllowlist` in the config is the
-tool authority. `/tools` is an optional read-only diagnostic of it. Ask for one
-round trip:
+Then attach a terminal in another:
+
+```sh
+node dist/cli.js agent --config demo/config.json
+```
+
+The agent resumes the `cli:default` conversation and prints a prompt. The
+historical `node dist/cli.js --config demo/config.json` is the same attach; it
+fails with a fixed message when no gateway is running and never opens a second
+runtime. `agent --conversation <name>` uses a separate `cli:<name>`
+conversation in the same gateway; conversations are separate by default and
+share the workspace and Markdown memory. No grant step exists: `toolAllowlist`
+in the config is the tool authority. `/tools` is an optional read-only
+diagnostic of it. Ask for one round trip:
 
 ```text
 Load the memory skill, then write the fact "the demo workspace is for setup checks"
@@ -122,7 +135,9 @@ context with no handoff and does **not** re-read files. A gateway restart applie
 config edits and re-reads the files, because startup reloads the config selection
 for every persisted session mapping.
 
-Restart (Ctrl-D or Ctrl-C, then the same command) and retrieve what happened:
+Ctrl-D or Ctrl-C closes only that CLI attachment; already admitted turns keep
+running in the gateway. Attach again with the same command to resume the same
+conversation, then retrieve what happened:
 
 ```text
 /history
@@ -131,7 +146,8 @@ Restart (Ctrl-D or Ctrl-C, then the same command) and retrieve what happened:
 ```
 
 Earlier entries stay stored; summaries are an aid, and `/entry` or `/episode`
-opens the original entries.
+opens the original entries. Config edits and file re-reads happen when the
+gateway restarts, not when a CLI reconnects.
 
 ## 6. Telegram continuation
 
@@ -155,10 +171,11 @@ example. Add `telegram` as a top-level key beside the existing ones in
 - **Every user in `allowFrom` shares the configured workspace and tool
   authority.** Listing a user is the authorization; there is no per-chat
   permission step, so allowlist only people you would let use those tools.
-- Adding the section switches the same gateway to Telegram polling instead of the
-  local prompt. CLI and Telegram are alternative modes of one process, not
-  simultaneous clients; each chat has its own conversation, context snapshot and
-  persisted model choice, but the same workspace and configured tools.
+- Adding the section makes the same gateway poll Telegram as well as serve local
+  CLI attachments. Both can run at once: each chat and CLI conversation has its
+  own Durable conversation, context snapshot and persisted model choice, but they
+  share the workspace, Markdown memory and configured tools. Closing a CLI
+  attachment does not stop Telegram polling; stopping the gateway stops both.
 
 In an allowed private chat:
 
