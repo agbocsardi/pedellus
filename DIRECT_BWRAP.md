@@ -103,9 +103,7 @@ These are deliberate and must not be described as a confinement boundary.
   `--unshare-pid` so Bubblewrap exit tears the namespace down. The trade-off is
   that `/proc` and `ps` show only sandbox processes, and PIDs differ from host
   PIDs. The builder still omits `--unshare-ipc`, `--unshare-net`, `--clearenv`,
-  and `--cap-drop`; the managed `sandbox.ts` backend is different again because it
-  also unshares user/network/IPC namespaces, clears the environment, drops
-  capabilities, and uses a copied workspace.
+  and `--cap-drop`.
 - **Bubblewrap identity is validated.** Python's `_resolve_bwrap` prefers
   `/usr/bin/bwrap` when it exists and otherwise searches PATH. This builder runs
   `/usr/bin/bwrap --version` (or the configured/PATH candidate) once per canonical

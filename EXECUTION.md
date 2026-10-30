@@ -83,13 +83,6 @@ A URL in shell text is not scanned here, so the host backend does not claim
 Python parity for that check; the gap is recorded rather than replaced by a
 weaker approximation. The deny list and path guard do not close it.
 
-W2 source note: an earlier review overstated canonical rewriting in the
-bubblewrap `checked()` helper. A later trace showed it authorizes the canonical
-target and then passes the candidate path to the operation; escaping and dangling
-final symlink operations remain refused. The direct-workspace W2 shell does not
-use that helper: its filesystem operations are the same native guarded
-`HostExecutionEnv` path, so there is no second path policy to reconcile there.
-
 ## Checks
 
 `npm run test:behavior` covers registration and authorization of the opt-in
