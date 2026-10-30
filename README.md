@@ -41,6 +41,21 @@ live bot polling for offline checks. Known startup/configuration failures print
 fixed, value-free diagnostics; unexpected failures stay suppressed. See
 [interactive CLI](./CLI.md#startup-diagnostics).
 
+The authenticated owner also drives that gateway from a private Telegram chat:
+`/new`, `/abort` (also spelled `/stop`), `/status`, `/model` and `/restart`.
+Each host advertises only what it implements and refuses a typed command it cannot
+perform. `/model` selects one configured preset for that chat only. `/status` is
+bounded read-only metadata with no model call. `/new` starts a new context **and**
+rebuilds the assembled workspace prompt from the current files, so a host with a
+prompt snapshot refuses it while that chat has a running turn rather than
+half-applying; there is no separate `/refresh` command. `/restart` is a full
+process replacement: after the normal graceful teardown the same executable,
+argv and current environment are re-exec'd (POSIX `process.execve`), so current
+code and the re-read config load. It is not a daemon, supervisor or service
+manager, and a platform without `execve` refuses it. These controls add no tool
+authority and coexist with media ingress and MCP. See
+[Telegram controls](./TELEGRAM.md#controls).
+
 Closed episodes are summarized in the background by default using the conversation's current
 model when the job starts. This makes provider calls and can incur costs. To use a different
 model, set `episodeSummary.preset` to a configured preset name. Legacy direct configs

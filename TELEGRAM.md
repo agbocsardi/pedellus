@@ -322,9 +322,9 @@ Invalid stored shapes fail closed.
 Not implemented here: tool-authority or approval commands, history commands,
 `/tools`, and any command that would widen tool authority. `/stop` is only the
 `/abort` alias; there is no stronger cancellation, no background-worker
-cancellation and no cron mutation. The
-old `/refresh` owner command was retired in favour of `/new` rebuilding the
-prompt; it is an unsupported command and is never advertised. Tool
+cancellation and no cron mutation. A separate `/refresh` owner command was never
+implemented: `/new` rebuilds the prompt as part of starting the new context, and
+`/refresh` stays an unsupported command that is never advertised. Tool
 authority is configured by the owner, not requested in chat: this adapter
 exposes no grant or approval commands and the model cannot ask for one.
 

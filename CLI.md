@@ -160,6 +160,16 @@ fail-closed and is not remotely cancelled. See
 | `/abort` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
 | `/new` | Admit native `Conversation.reset(undefined)`: the same conversation starts a new context with no handoff. No archive, summary, usage reset or extra model call is produced; earlier entries stay stored and remain visible to `/history`, and configured tools are unchanged. While busy it is placed at the next safe boundary and ends that run there instead of interrupting the current model turn; inputs queued before or after it in the same busy window run in the new context. A queued `/new` is a write, so `/abort` withdraws queued inputs but not the pending reset. |
 
+The Telegram adapter exposes its own owner controls; they are not CLI commands.
+`/new` there also rebuilds the assembled workspace prompt from the current files,
+so a host with a prompt snapshot refuses it while that chat runs. `/abort` has a
+`/stop` alias, `/status` and `/model` are bounded per-chat views, and `/restart`
+is a host full-process replacement (the same Node executable, argv and current
+environment through POSIX `process.execve`, after normal graceful teardown), not
+a Harness close/reopen, daemon or supervisor. The CLI `/refresh` above is
+unrelated: there is no Telegram `/refresh` command. See
+[Telegram controls](./TELEGRAM.md#controls).
+
 Equivalent presets can both show as selected because the marker matches the actual
 provider/model/thinking settings, not a separately stored preset identity. A legacy
 pair selection may match no preset. See [model selection](./MODELS.md).
