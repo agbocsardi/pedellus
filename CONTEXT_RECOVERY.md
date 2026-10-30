@@ -13,8 +13,9 @@ unchanged snapshot stays blocked. This module supplies the missing owner-driven
 reconciliation: inspect exactly which dispatches are blocked, then cancel selected
 ones durably.
 
-A normal gateway start that hits this guard fails with one fixed, value-free
-message naming `nanobot recovery --config <path>` as the next action. It does not
+A normal CLI start that hits this guard fails with one fixed, value-free
+message naming `nanobot recovery --config <path>` as the next action. SDK callers
+retain the detailed error message for inspection. It does not
 print the task ID, pinned entry, path, provider/model or context text, and it does
 not cancel the task. The same configuration's recovery command is the next step.
 

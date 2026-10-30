@@ -60,8 +60,9 @@ is not a consistent backup and the copy must not be treated as one.
 Point the configuration at the restored paths and open normally. The restored
 store keeps its existing session mappings, transcript entries and durable
 admission dedupe, and the restored workspace supplies the current Markdown
-memory and bootstrap files. Restore does not repair, rewrite or migrate the
-database: a corrupt or incomplete copy is not made usable by this procedure.
+memory and bootstrap files. The copy step does not repair, rewrite or migrate
+the database; normal startup still runs Durable's schema initialization. A
+corrupt or incomplete copy is not made usable by this procedure.
 
 `tests/context-recovery.behavior.test.mjs` proves the bounded synthetic case:
 a gateway serves one turn, closes, its database and workspace are copied, the
