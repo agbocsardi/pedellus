@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -13,6 +13,7 @@ const [
   { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
   { ToolResultEntry },
   web,
+  { mcpToolNames },
 ] = await Promise.all([
   import(new URL("../dist/config.js", import.meta.url).href),
   import(new URL("../dist/runtime.js", import.meta.url).href),
@@ -20,7 +21,10 @@ const [
   import(`${modules}/pi-ai/dist/index.js`),
   import(`${modules}/pi-durable/dist/index.js`),
   import(new URL("../dist/web/index.js", import.meta.url).href),
+  import(new URL("../dist/mcp/index.js", import.meta.url).href),
 ]);
+
+const mcpFixture = join(packageRoot, "tests/fixtures/mcp-stdio-server.mjs");
 
 const { BraveSearchClient, PublicWebFetcher, WebFetchError, createWebToolExtension } = web;
 const context = BACKGROUND_CONTEXT;
@@ -160,6 +164,10 @@ test("web configuration is opt-in and a missing search key fails startup", { tim
     assert.throws(() => config(store, { web: { search: { keyEnv: "not a name" } } }), /web\.search\.keyEnv/);
     assert.throws(() => config(store, { web: { fetch: "yes" } }), /web\.fetch/);
     assert.throws(() => config(store, { web: { unknown: true } }), /Unknown web field/);
+    assert.equal(config(store).codemode, undefined);
+    assert.equal(config(store, { codemode: { enabled: true } }).codemode.enabled, true);
+    assert.throws(() => config(store, { codemode: { enabled: "yes" } }), /codemode\.enabled/);
+    assert.throws(() => config(store, { codemode: { unknown: true } }), /Unknown codemode field/);
 
     const missingKey = config(store, {
       web: { search: { keyEnv: "NANOBOT_SYNTHETIC_WEB_KEY" }, fetch: true },
@@ -625,4 +633,295 @@ test("already-aborted signals stop web requests before any transport", { timeout
   assert.equal(searchCalls.length, 0);
   assert.equal(resolverCalls.length, 0);
   assert.equal(fetchCalls.length, 0);
+});
+
+test("native Code Mode reaches configured web and MCP tools through nested hooks", { timeout: 60_000 }, async () => {
+  const store = await workspaceStore("nested");
+  const pidFile = join(store.directory, "server.pid");
+  const searchCalls = [];
+  const fetchCalls = [];
+  const echo = mcpToolNames("synthetic", ["echo"]).get("echo");
+  const { faux, models } = syntheticModels();
+  faux.setResponses([
+    fauxAssistantMessage([
+      fauxToolCall("codemode", {
+        code: [
+          'const search = await tools.web_search({ query: "example domain", count: 2 });',
+          'const page = await tools.web_fetch({ url: "https://example.com/" });',
+          `const echo = await tools.${echo}({ label: "coexist" });`,
+          "return { search, page, echo };",
+        ].join("\n"),
+      }, { id: "web-mcp-code" }),
+    ], { stopReason: "toolUse" }),
+    fauxAssistantMessage("nested answer"),
+  ]);
+  let gateway;
+  try {
+    gateway = await openGateway(
+      config(store, {
+        web: { search: { keyEnv: "NANOBOT_SYNTHETIC_WEB_KEY" }, fetch: true },
+        mcp: {
+          enabled: true,
+          servers: {
+            synthetic: {
+              command: process.execPath,
+              args: [mcpFixture, "--pid-file", pidFile],
+              cwd: store.workspace,
+            },
+          },
+        },
+      }),
+      context,
+      {
+        models,
+        web: {
+          env: { NANOBOT_SYNTHETIC_WEB_KEY: "SYNTHETIC-BRAVE-TOKEN" },
+          searchTransport: searchTransport(searchCalls, jsonResponse({
+            web: { results: [{ title: "Example Domain", url: "https://example.com/", description: "Illustrative examples." }] },
+          })),
+          resolver: publicResolver([], PUBLIC_ADDRESS),
+          fetchTransport: fetchTransport({ "https://example.com/": { body: HTML_FIXTURE } }, fetchCalls),
+        },
+      },
+    );
+    const chat = await gateway.conversationFor("telegram:3:chat:33", context);
+    const agent = await chat.agent(context);
+    const names = toolNames(agent);
+    for (const expected of ["web_search", "web_fetch", "codemode", "tool_search"]) {
+      assert.ok(names.includes(expected), `missing ${expected} in ${names}`);
+    }
+    // MCP server tools stay deferred from the direct prompt while remaining nested-callable.
+    assert.ok(!names.includes(echo), `MCP tool was declared: ${names}`);
+
+    await say(chat, "use nested web and mcp");
+    const code = await toolResult(chat, "web-mcp-code");
+    assert.equal(code.isError, false, code.text.slice(0, 600));
+    assert.match(code.text, /Web search results \(Brave\)/);
+    assert.match(code.text, /example domain/);
+    assert.match(code.text, /Example Domain/);
+    assert.match(code.text, /BEGIN UNTRUSTED PAGE CONTENT/);
+    assert.match(code.text, /illustrative examples/);
+    assert.match(code.text, /echo:coexist/);
+    assert.doesNotMatch(code.text, /SYNTHETIC-BRAVE-TOKEN/);
+    assert.equal(searchCalls.length, 1);
+    assert.equal(fetchCalls.length, 1);
+
+    // Unauthorized scopes get no part of the union, and inspecting them makes no request.
+    const raw = await gateway.harness.createConversation(
+      { ownership: { kind: "ownerless" }, agent: { model: { provider: "web-fixture", modelId: "synthetic" } } },
+      context,
+    );
+    const rawNames = toolNames(await raw.agent(context));
+    assert.ok(!rawNames.some((name) =>
+      name === "web_search" || name === "web_fetch" || name === "codemode"
+      || name === "tool_search" || name.startsWith("mcp__")), `raw tools: ${rawNames}`);
+    assert.deepEqual(toolNames(await (await gateway.harness.root(context)).agent(context)), []);
+    const state = await gateway.conversationFor("telegram:3:channel-state", context);
+    assert.deepEqual(toolNames(await state.agent(context)), []);
+    assert.equal(searchCalls.length, 1);
+    assert.equal(fetchCalls.length, 1);
+  } finally {
+    if (gateway) await gateway.close(context);
+  }
+
+  // A missing Brave key fails before MCP would open a server, so no process is stranded.
+  const latePid = join(store.directory, "late.pid");
+  await assert.rejects(
+    openGateway(
+      config(store, {
+        web: { search: { keyEnv: "NANOBOT_SYNTHETIC_WEB_KEY" }, fetch: true },
+        mcp: {
+          enabled: true,
+          servers: {
+            synthetic: {
+              command: process.execPath,
+              args: [mcpFixture, "--pid-file", latePid],
+              cwd: store.workspace,
+            },
+          },
+        },
+      }),
+      context,
+      { models: syntheticModels().models, web: { env: {} } },
+    ),
+    /Missing credential/,
+  );
+  await assert.rejects(access(latePid), /ENOENT/);
+  await rm(store.directory, { recursive: true, force: true });
+});
+
+test("Code Mode composes coding, history and web without an MCP server", { timeout: 60_000 }, async () => {
+  const store = await workspaceStore("compose");
+  await writeFile(join(store.workspace, "note.txt"), "NESTED-READ-CONTENT\n");
+  const searchCalls = [];
+  const fetchCalls = [];
+  const { faux, models } = syntheticModels();
+  let step = 0;
+  faux.setResponses(Array.from({ length: 5 }, () => (request) => {
+    const text = JSON.stringify(request.messages);
+    if (text.includes("remember the marker") && step === 0) {
+      step = 1;
+      return fauxAssistantMessage("noted");
+    }
+    if (text.includes("compose the tools") && step === 1) {
+      step = 2;
+      return fauxAssistantMessage([
+        fauxToolCall("codemode", {
+          code: [
+            'const read = await tools.read({ path: "note.txt" });',
+            'const history = await tools.history({ action: "search", query: "NESTED-MARKER" });',
+            'const search = await tools.web_search({ query: "example domain", count: 2 });',
+            'const page = await tools.web_fetch({ url: "https://example.com/" });',
+            'const writeListed = ALL_TOOLS.filter((tool) => tool.name === "write").length;',
+            'const codemodeListed = ALL_TOOLS.filter((tool) => tool.name === "codemode").length;',
+            "return { read, history, search, page, writeListed, codemodeListed };",
+          ].join("\n"),
+        }, { id: "compose-code" }),
+      ], { stopReason: "toolUse" });
+    }
+    return fauxAssistantMessage("compose answer");
+  }));
+  let gateway;
+  try {
+    gateway = await openGateway(
+      config(store, {
+        toolAllowlist: ["read"],
+        codemode: { enabled: true },
+        web: { search: { keyEnv: "NANOBOT_SYNTHETIC_WEB_KEY" }, fetch: true },
+      }),
+      context,
+      {
+        models,
+        web: {
+          env: { NANOBOT_SYNTHETIC_WEB_KEY: "SYNTHETIC-BRAVE-TOKEN" },
+          searchTransport: searchTransport(searchCalls, jsonResponse({
+            web: { results: [{ title: "Example Domain", url: "https://example.com/", description: "Illustrative examples." }] },
+          })),
+          resolver: publicResolver([], PUBLIC_ADDRESS),
+          fetchTransport: fetchTransport({ "https://example.com/": { body: HTML_FIXTURE } }, fetchCalls),
+        },
+      },
+    );
+    assert.equal(gateway.mcp, undefined);
+    const chat = await gateway.conversationFor("telegram:4:chat:44", context);
+    const names = toolNames(await chat.agent(context));
+    for (const expected of ["codemode", "tool_search", "read", "history", "web_search", "web_fetch"]) {
+      assert.ok(names.includes(expected), `missing ${expected} in ${names}`);
+    }
+    assert.ok(!names.some((name) => name.startsWith("mcp__")));
+
+    await say(chat, "remember the marker NESTED-MARKER");
+    await say(chat, "compose the tools");
+    const code = await toolResult(chat, "compose-code");
+    assert.equal(code.isError, false, code.text.slice(0, 700));
+    assert.match(code.text, /NESTED-READ-CONTENT/);
+    assert.match(code.text, /NESTED-MARKER/);
+    assert.match(code.text, /Web search results \(Brave\)/);
+    assert.match(code.text, /Example Domain/);
+    assert.match(code.text, /BEGIN UNTRUSTED PAGE CONTENT/);
+    assert.match(code.text, /"writeListed":0/);
+    assert.match(code.text, /"codemodeListed":0/);
+    assert.doesNotMatch(code.text, /SYNTHETIC-BRAVE-TOKEN/);
+    assert.equal(searchCalls.length, 1);
+    assert.equal(fetchCalls.length, 1);
+
+    const raw = await gateway.harness.createConversation(
+      { ownership: { kind: "ownerless" }, agent: { model: { provider: "web-fixture", modelId: "synthetic" } } },
+      context,
+    );
+    const rawNames = toolNames(await raw.agent(context));
+    assert.ok(!rawNames.some((name) =>
+      name === "codemode" || name === "tool_search" || name === "web_search" || name === "web_fetch"),
+    `raw tools: ${rawNames}`);
+    assert.deepEqual(toolNames(await (await gateway.harness.root(context)).agent(context)), []);
+    const entries = (await chat.entries({}, 50, undefined, context)).items;
+    const fork = await chat.fork(entries[0].id, {
+      ownership: { kind: "ownerless" },
+      agent: { model: { provider: "web-fixture", modelId: "synthetic" } },
+    }, context);
+    const forkNames = toolNames(await fork.agent(context));
+    assert.ok(!forkNames.some((name) =>
+      name === "codemode" || name === "tool_search" || name === "web_search" || name === "web_fetch"),
+    `fork tools: ${forkNames}`);
+    const state = await gateway.conversationFor("telegram:4:channel-state", context);
+    assert.deepEqual(toolNames(await state.agent(context)), []);
+  } finally {
+    if (gateway) await gateway.close(context);
+    await rm(store.directory, { recursive: true, force: true });
+  }
+});
+
+test("nested Code Mode Telegram actions keep the observed-target and host denials", { timeout: 60_000 }, async () => {
+  const store = await workspaceStore("telegram");
+  const sessionKey = "telegram:9:chat:44";
+  const observed = {
+    chatId: 44,
+    messageId: 10,
+    direction: "incoming",
+    senderId: "501",
+    text: "hello from the observed chat",
+    observedAtMs: 1_000,
+  };
+  const actions = [];
+  const { faux, models } = syntheticModels();
+  faux.setResponses([
+    fauxAssistantMessage([
+      fauxToolCall("codemode", {
+        code: [
+          'const list = await tools.telegram({ action: "targets" });',
+          'const sent = await tools.telegram({ action: "reply", messageId: 10, text: "nested-reply" });',
+          "let denied = null;",
+          'try { await tools.telegram({ action: "reply", messageId: 999, text: "blocked" }); }',
+          "catch (error) { denied = error.message; }",
+          "return { list, sent, denied };",
+        ].join("\n"),
+      }, { id: "telegram-code" }),
+    ], { stopReason: "toolUse" }),
+    fauxAssistantMessage("telegram nested answer"),
+  ]);
+  let gateway;
+  let detach;
+  try {
+    gateway = await openGateway(
+      config(store, {
+        codemode: { enabled: true },
+        telegram: { tokenEnv: "NANOBOT_SYNTHETIC_TELEGRAM_TOKEN", allowFrom: ["501"] },
+      }),
+      context,
+      { models },
+    );
+    detach = gateway.telegramActions.attach({
+      targets(key) {
+        return key === sessionKey ? [observed] : undefined;
+      },
+      async act(key, callId, request) {
+        actions.push({ key, callId, request });
+        if (key !== sessionKey) return { ok: false, text: "This chat is not authorized for actions." };
+        if (request.messageId !== observed.messageId) {
+          return { ok: false, text: "That message is not an observed target in this chat." };
+        }
+        return { ok: true, text: "synthetic nested reply sent" };
+      },
+    });
+    const chat = await gateway.conversationFor(sessionKey, context);
+    await say(chat, "use nested telegram");
+    const code = await toolResult(chat, "telegram-code");
+    assert.equal(code.isError, false, code.text.slice(0, 700));
+    assert.match(code.text, /id 10/);
+    assert.match(code.text, /synthetic nested reply sent/);
+    assert.match(code.text, /not an observed target/);
+    assert.doesNotMatch(code.text, /callers|not callable|outside the host tool ceiling/i);
+    // The host, not a blanket caller rule, decides observed-target scope: the unobserved id
+    // reaches the host and is denied there, while only the observed id is sent.
+    assert.equal(actions.length, 2);
+    assert.deepEqual(actions.map((entry) => entry.request.messageId), [10, 999]);
+    assert.ok(actions.every((entry) => entry.key === sessionKey));
+    assert.equal(actions[0].request.kind, "reply");
+    assert.equal(actions[0].request.text, "nested-reply");
+    assert.equal(actions[1].request.text, "blocked");
+  } finally {
+    if (detach) detach();
+    if (gateway) await gateway.close(context);
+    await rm(store.directory, { recursive: true, force: true });
+  }
 });
