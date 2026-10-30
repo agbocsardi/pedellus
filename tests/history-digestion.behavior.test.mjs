@@ -727,7 +727,7 @@ test("a forged episode start or chunk cannot skip evidence", { timeout: 20_000 }
           placeholder(thirdUser.id, "EPISODE-THREE-2245"),
         ],
       }), context),
-      /spans a reset boundary|not closed in the transcript/,
+      /spans a reset boundary|not closed by a reset/,
     );
     assert.ok(secondReset.id > secondAnswer.id && thirdReset.id > thirdAnswer.id);
 
@@ -770,7 +770,7 @@ test("a forged episode start or chunk cannot skip evidence", { timeout: 20_000 }
         entries: [placeholder(openTail.id, "OPEN-TAIL-4467")],
         cursor: thirdFrontier,
       }), context),
-      /not closed in the transcript/,
+      /not closed by a reset/,
     );
     assert.deepEqual(await source.cursor(conversation.id, context), thirdFrontier);
     assert.equal(idle(await source.read(context)).caughtUp, true);
@@ -810,6 +810,280 @@ test("digest refuses malformed or out-of-scope session mappings and reports miss
     assert.equal(missing.missingChats, 1);
     assert.equal(missing.caughtUp, false);
     assert.equal(idle(await make([]).read(context)).caughtUp, true);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an initial acknowledgement cannot start at a later episode and skip earlier closed ones", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-digest-initial-gap-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [oneUser] = await append(harness, conversation, user("EPISODE-ONE-1111"));
+    const [oneAnswer] = await append(harness, conversation, assistant("ANSWER-ONE-2222"));
+    await append(harness, conversation, reset());
+    await append(harness, conversation, user("EPISODE-TWO-3333"), assistant("ANSWER-TWO-4444"));
+    const [secondReset] = await append(harness, conversation, reset());
+    const [threeUser] = await append(harness, conversation, user("EPISODE-THREE-5555"));
+    const [threeAnswer] = await append(harness, conversation, assistant("ANSWER-THREE-6666"));
+    const [thirdReset] = await append(harness, conversation, reset());
+    await append(harness, conversation, user("OPEN-7777"));
+
+    const source = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:initial-gap", conversationId: conversation.id }],
+    });
+    assert.equal((await source.cursor(conversation.id, context)).throughEntryId, null);
+    const empty = {
+      throughEntryId: null,
+      throughChars: null,
+      episodeStartEntryId: null,
+      episodeEndEntryId: null,
+    };
+    // A later reset is claimed as the next episode start while episodes one and two are unconsumed.
+    await assert.rejects(
+      () => source.acknowledge({
+        status: "batch",
+        sessionKey: "cli:initial-gap",
+        conversationId: conversation.id,
+        episodeStartEntryId: secondReset.id,
+        episodeEndEntryId: threeAnswer.id,
+        firstEntryId: secondReset.id,
+        firstTextStart: 0,
+        throughEntryId: secondReset.id,
+        throughChars: 0,
+        complete: false,
+        entries: [],
+        cursor: empty,
+      }, context),
+      /skip an earlier segment with content/,
+    );
+    assert.deepEqual(await source.cursor(conversation.id, context), empty);
+
+    // The honest first episode is still available and starts at the transcript beginning.
+    const first = batched(await source.read(context));
+    assert.equal(first.episodeStartEntryId, oneUser.id);
+    assert.deepEqual(first.entries.map((fragment) => fragment.text), ["EPISODE-ONE-1111", "ANSWER-ONE-2222"]);
+    await source.acknowledge(first, context);
+    assert.equal((await source.cursor(conversation.id, context)).throughEntryId, oneAnswer.id);
+    assert.ok(threeUser.id > oneAnswer.id && thirdReset.id > threeAnswer.id && secondReset.id < threeUser.id);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a partial batch cannot persist an unverified or contentless episode end", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-digest-bounds-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [oneUser] = await append(harness, conversation, user("BOUNDS-ONE-1234"));
+    const [oneAnswer] = await append(harness, conversation, assistant("BOUNDS-ANSWER-5678"));
+    const [firstReset] = await append(harness, conversation, reset());
+    const [twoUser] = await append(harness, conversation, user("BOUNDS-TWO-9012"));
+    const [twoAnswer] = await append(harness, conversation, assistant("BOUNDS-TWO-ANSWER-3456"));
+    await append(harness, conversation, reset());
+
+    const source = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:bounds", conversationId: conversation.id }],
+    });
+    const first = batched(await source.read(context));
+    await source.acknowledge(first, context);
+    const frontier = await source.cursor(conversation.id, context);
+    const forged = (patch) => ({
+      status: "batch",
+      sessionKey: "cli:bounds",
+      conversationId: conversation.id,
+      episodeStartEntryId: firstReset.id,
+      episodeEndEntryId: firstReset.id,
+      firstEntryId: firstReset.id,
+      firstTextStart: 0,
+      throughEntryId: firstReset.id,
+      throughChars: 0,
+      complete: false,
+      entries: [],
+      cursor: frontier,
+      ...patch,
+    });
+
+    // A partial chunk from the reset marker claiming an end far beyond the transcript.
+    await assert.rejects(
+      () => source.acknowledge(forged({ episodeEndEntryId: 10_000_000 }), context),
+      /end is not a committed entry/,
+    );
+    // A reset-only "episode" whose successor reset appears to close it.
+    await assert.rejects(
+      () => source.acknowledge(forged({ episodeEndEntryId: firstReset.id, complete: true }), context),
+      /end is a reset marker/,
+    );
+    assert.deepEqual(await source.cursor(conversation.id, context), frontier);
+
+    // An honest read still sees the real closed episode only, and it can be acknowledged.
+    const second = batched(await source.read(context));
+    assert.equal(second.episodeStartEntryId, firstReset.id);
+    assert.equal(second.episodeEndEntryId, twoAnswer.id);
+    assert.deepEqual(second.entries.map((fragment) => fragment.text), ["BOUNDS-TWO-9012", "BOUNDS-TWO-ANSWER-3456"]);
+    await source.acknowledge(second, context);
+    assert.equal((await source.cursor(conversation.id, context)).throughEntryId, twoAnswer.id);
+    assert.ok(oneUser.id < oneAnswer.id && twoUser.id > firstReset.id);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a scan paused on reset markers never invents a reset-only episode", { timeout: 30_000 }, async () => {
+  const dir = await temp("nanobot-digest-reset-boundary-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const resets = await harness.commit(async (tx) => {
+      const appended = [];
+      for (let index = 0; index < DIGEST_LIMITS.scanEntriesPerRead; index += 1) {
+        appended.push(await tx.appendEntry(conversation.id, reset()));
+      }
+      return appended;
+    }, context);
+    const [nextReset] = await append(harness, conversation, reset());
+    const [content] = await append(harness, conversation, user("AFTER-BUDGET-RESETS-8134"));
+    await append(harness, conversation, reset());
+
+    const source = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:reset-boundary", conversationId: conversation.id }],
+    });
+    const firstRead = idle(await source.read(context));
+    assert.equal(firstRead.caughtUp, false);
+    assert.equal(firstRead.unfinishedChats, 1);
+    assert.equal(firstRead.examinedChats, 1);
+
+    const batch = batched(await source.read(context));
+    assert.equal(batch.episodeStartEntryId, nextReset.id, "the episode starts at the reset after the paused one");
+    assert.equal(batch.episodeEndEntryId, content.id);
+    assert.deepEqual(batch.entries.map((fragment) => fragment.text), ["AFTER-BUDGET-RESETS-8134"]);
+    assert.equal(batch.entries.every((fragment) => fragment.chars > 0), true);
+    assert.notEqual(batch.episodeStartEntryId, resets.at(-1).id);
+    // The genuine 4,000-reset gap is still verifiable, so the honest episode can be consumed.
+    await source.acknowledge(batch, context);
+    assert.equal((await source.cursor(conversation.id, context)).throughEntryId, content.id);
+    assert.equal(idle(await source.read(context)).caughtUp, true);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a gap beyond the verification bound is refused loudly and skips nothing", { timeout: 30_000 }, async () => {
+  const dir = await temp("nanobot-digest-gap-bound-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const resets = await harness.commit(async (tx) => {
+      const appended = [];
+      for (let index = 0; index < DIGEST_LIMITS.scanEntriesPerRead + 1; index += 1) {
+        appended.push(await tx.appendEntry(conversation.id, reset()));
+      }
+      return appended;
+    }, context);
+    await append(harness, conversation, reset());
+    const [content] = await append(harness, conversation, user("BEYOND-GAP-BOUND-2265"));
+    await append(harness, conversation, reset());
+
+    const source = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:gap-bound", conversationId: conversation.id }],
+    });
+    let batch;
+    for (let index = 0; index < 4; index += 1) {
+      const result = await source.read(context);
+      if (result.status === "batch") {
+        batch = result;
+        break;
+      }
+    }
+    assert.ok(batch !== undefined, "the bounded scan still reaches the closed episode");
+    assert.equal(batch.entries[0].text, "BEYOND-GAP-BOUND-2265");
+    await assert.rejects(
+      () => source.acknowledge(batch, context),
+      /too far from its cursor to verify/,
+    );
+    assert.equal((await source.cursor(conversation.id, context)).throughEntryId, null);
+    // The refusal is loud and the same evidence is offered again, never silently skipped.
+    let next;
+    for (let index = 0; index < 4; index += 1) {
+      const result = await source.read(context);
+      if (result.status === "batch") {
+        next = result;
+        break;
+      }
+    }
+    assert.ok(next !== undefined);
+    assert.deepEqual(next.entries, batch.entries);
+    assert.ok(resets.length === DIGEST_LIMITS.scanEntriesPerRead + 1 && content.id > 0);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("non-BMP text is fragmented on code-unit boundaries and survives UTF-8 encoding", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-digest-surrogate-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    // Three leading units put a high surrogate exactly on the 24,000-unit budget edge.
+    const long = `abc${"😀".repeat(20_000)}`;
+    const [longEntry] = await append(harness, conversation, user(long));
+    await append(harness, conversation, reset());
+    const source = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:surrogate", conversationId: conversation.id }],
+    });
+
+    const batches = [];
+    for (let index = 0; index < 10; index += 1) {
+      const result = await source.read(context);
+      if (result.status === "idle") break;
+      const batch = batched(result);
+      assert.ok(evidenceChars(batch) <= DIGEST_LIMITS.charsPerBatch, "strict evidence bound");
+      batches.push(batch);
+      await source.acknowledge(batch, context);
+    }
+    assert.ok(batches.length >= 2);
+    assert.equal(batches[0].entries[0].text.length, DIGEST_LIMITS.charsPerBatch - 1, "pair-safe cut shortens the fragment");
+    let rebuilt = "";
+    let offset = 0;
+    for (const batch of batches) {
+      for (const fragment of batch.entries) {
+        assert.equal(fragment.entryId, longEntry.id);
+        assert.equal(fragment.chars, long.length);
+        assert.equal(fragment.textStart, offset, "offsets continue in UTF-16 code units");
+        assert.equal(fragment.text.isWellFormed(), true, "no unpaired surrogate at a fragment edge");
+        const encoded = Buffer.from(fragment.text, "utf8");
+        assert.equal(encoded.toString("utf8"), fragment.text, "UTF-8 wire round trip is lossless");
+        assert.equal(encoded.toString("utf8").includes("\uFFFD"), false);
+        offset += fragment.text.length;
+        rebuilt += fragment.text;
+      }
+    }
+    assert.equal(rebuilt, long, "the full non-BMP entry is consumed exactly");
+    assert.equal(offset, long.length);
+    assert.equal((await source.cursor(conversation.id, context)).throughChars, long.length);
+    assert.equal(idle(await source.read(context)).caughtUp, true);
   } finally {
     if (harness !== undefined) await harness.close(context).catch(() => {});
     await rm(dir, { recursive: true, force: true });

@@ -728,36 +728,44 @@ Eligibility and evidence rules:
   The scan budget rotates its starting conversation so one busy chat cannot starve the others.
 
 Cursor semantics: one small `nanobot.digest-cursor` conversation document holds
-`throughEntryId`/`throughChars` (highest acknowledged entry and characters consumed within it) and,
-only while a large closed episode is being consumed in chunks,
-`episodeStartEntryId`/`episodeEndEntryId`. `acknowledge()` is the only writer; it compares the
-stored cursor with the batch's frontier (`DigestCursorConflictError` when it moved), then re-derives
-the claimed chunk from the committed transcript before one commit:
+`throughEntryId`/`throughChars` (highest acknowledged entry and UTF-16 code units consumed within it)
+and, only while a large closed episode is being consumed in chunks,
+`episodeStartEntryId`/`episodeEndEntryId`. `acknowledge()` is the only writer. It is a trusted
+in-process API and does not re-check the mapped chat set (the host owns authorization); it compares
+the stored cursor with the batch's frontier (`DigestCursorConflictError` when it moved), then
+re-derives the episode bounds and the claimed chunk from the committed transcript before one commit:
 
 - a fresh chunk starts at its claimed episode start, which must be a `pi.reset` or the conversation's
-  first entry, and the entries between the previous frontier and that start must carry no content
-  (otherwise an earlier closed episode would be skipped);
+  first entry, and the entries between the previous frontier (or the beginning of the conversation)
+  and that start must carry no content (otherwise an earlier closed episode would be skipped);
+- the claimed end is validated on every acknowledgement, not only a complete one: it must be a
+  committed non-reset entry whose successor is the `pi.reset` that actually closes the episode, and a
+  reset-started episode must contain something besides its marker;
 - every entry in the claimed range must exist, fit the 80-entry batch bound, and be the chunk's
   actual last entry; every evidence entry in it must be covered by exactly one fragment whose kind,
   role, length, offset and text match the transcript; no entry before the last may lose its tail;
-- a complete chunk must end just before the `pi.reset` that closed the episode, and a partial chunk
-  must continue exactly at the stored position; a claimed range may contain no reset after its first
-  entry.
+- a partial chunk must continue exactly at the stored position, and a claimed range may contain no
+  reset after its first entry.
 
 A malformed or forged batch is therefore rejected instead of corrupting the cursor, so no
 acknowledgement can advance the frontier past evidence the transcript does not support. The gap
-check above is bounded: at most one read's scan budget (4,000 entries) between the previous frontier
-and a fresh episode start is examined. A longer gap is refused with an error rather than assumed, so
-evidence is never silently skipped. The practical consequence is explicit: a conversation with more
-than 4,000 consecutive empty `pi.reset` markers before its next closed episode could not be
-acknowledged by this slice and would refuse loudly with the cursor unchanged. Normal chats have one
-or two resets between episodes; if real history ever produces such a run, the bound needs revisiting
-rather than silent acceptance. A batch with
+check above is bounded: the reset markers between the previous frontier (or the beginning of the
+conversation) and a fresh episode start are examined up to `scanEntriesPerRead` (4,000) entries. A
+gap that exceeds that bound is refused with an error rather than assumed, so evidence is never
+silently skipped; the same evidence is offered again and the cursor stays unchanged. The practical
+consequence is explicit: a conversation with more than 4,000 consecutive empty `pi.reset` markers
+before its next closed episode cannot be acknowledged by this slice and fails loudly. Normal chats
+have one or two resets between episodes; if real history ever produces such a run, the bound needs
+revisiting rather than silent acceptance. A scan paused on a reset marker never turns it into
+segment content: the derived scan cache remembers the segment's last *content* entry separately, so a
+budget boundary between consecutive resets cannot invent a reset-only episode. A batch with
 no evidence (nothing worth remembering, or an episode of non-evidence entries) is still
 acknowledged and counts as processed; a failure or restart before acknowledgement replays the same
 chunk. `DIGEST_LIMITS` bounds a batch (80 entries and strictly 24,000 evidence characters) and a read
 (4,000 scanned entries, 256 mapped chats); a larger closed episode or long entry is returned as
-contiguous fragments.
+contiguous fragments. A fragment also never ends between the two halves of a UTF-16 surrogate pair
+(the boundary moves back, or the batch ends before that entry), so sending a batch as UTF-8 cannot
+introduce a replacement character; `textStart`/`chars` stay in UTF-16 code units, not bytes.
 
 `read()` reports `status: "batch"` when it has a chunk to consume. Otherwise it returns
 `status: "idle"` with `caughtUp`, `examinedChats`, `postponedChats`, `unfinishedChats` and
