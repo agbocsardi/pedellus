@@ -110,25 +110,11 @@ resuming or rewriting the prepared request; see
 [prepared context recovery](./CONTEXT_RECOVERY.md) and the
 [context contract](./CONTEXT.md).
 
-## Read-only usage SDK
+## Migration (parked)
 
-`readUsageSnapshot` / `snapshotUsageState`, `projectUsageDelta` and
-`parseUsageArchiveCursor` expose native conversation usage and legacy model-token
-deltas without writing archives or advancing cursors. Hosts supply a persistent
-unique store namespace and trusted cursor state. Unknown spend/request counts and
-native nested-usage duplication cannot be reconstructed from cumulative totals.
-See [usage boundaries](./USAGE.md) before using a projection for accounting.
-
-## Historical import SDK
-
-The opt-in SDK has separate bounded slices for [source acquisition](./ARCHIVAL_SOURCE.md),
-[preparation](./ARCHIVAL_IMPORT.md), [inert persistence](./ARCHIVAL_PERSISTENCE.md)
-and [search](./ARCHIVAL_SEARCH.md). Acquisition requires a separately supplied
-quiescent copy and refuses the live `~/.nanobot` directory. Imported records are
-history-only: they do not create live sessions, runnable tools or tasks. Persistence
-and paginated search require exclusive host ownership of a stable store. There is
-not yet an operator-facing import command, browse UI, authenticated search cursor,
-large-corpus index, or completed real-history rehearsal.
+A future migration is a single owner-approved run, potentially outside this
+repository. There is no maintained migration or archival SDK; see [the deferral
+note](./MIGRATION.md).
 
 ## Current status and checks
 
