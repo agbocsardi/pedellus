@@ -670,6 +670,44 @@ test('/stop is the same control as /abort: same record, same effect, one chat', 
   }
 });
 
+test('a refused host restart is reported honestly and never retried', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('restart-refused');
+  let calls = 0;
+  const restart = {
+    supported: true,
+    async request() {
+      calls += 1;
+      throw new Error('host refused the replacement');
+    },
+  };
+  const firstRefused = deferred();
+  const transport = telegramMock([
+    [textUpdate(950, 950, '/restart')],
+    async () => { await firstRefused.promise; return [textUpdate(951, 951, '/restart')]; },
+  ]);
+  let harness;
+  try {
+    harness = start(store, transport, { restart });
+    // The acknowledgement was already honest: it confirmed the request, not a completed restart.
+    await until(() => transport.sent.some((entry) =>
+      /Restart requested for this gateway/.test(entry.text) &&
+      /does not confirm that the restart completed/.test(entry.text)), 'request acknowledgement');
+    await until(() => calls === 1, 'one host request');
+    await flush();
+    firstRefused.resolve();
+    await until(() => transport.sent.some((entry) =>
+      /A restart was already requested in this gateway and the host refused it/.test(entry.text)),
+    'failed request reported honestly');
+    assert.equal(calls, 1, 'a refused request is not retried by a later /restart');
+    const doc = await stateDoc(store.gateway);
+    assert.deepEqual(doc.controls.map((entry) => entry.status), ['applied']);
+  } finally {
+    firstRefused.resolve();
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
 test('the restart helper replaces the real process image with the same argv and current environment', { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'nanobot-restart-child-'));
   const restartUrl = JSON.stringify(new URL('../dist/restart.js', import.meta.url).href);

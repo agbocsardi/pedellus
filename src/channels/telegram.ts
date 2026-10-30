@@ -363,6 +363,8 @@ export async function runTelegram(
   const pendingControls = new Set<Promise<void>>();
   /** Set once this adapter asked the host to replace the process; a second `/restart` is refused. */
   let restartHostRequested = false;
+  /** Set when that one host request was refused, so a later refusal does not claim a restart is in progress. */
+  let restartHostRequestFailed = false;
   /** Consecutive delivery failures per pending record, so a permanent failure is held instead of retried forever. */
   const deliveryFailures = new Map<number, number>();
   let fatal: unknown;
@@ -1975,7 +1977,8 @@ export async function runTelegram(
         return;
       }
       if (restartHostRequested) {
-        await admitNotice(update, message, sessionKey, RESTART_ALREADY_REQUESTED);
+        await admitNotice(update, message, sessionKey,
+          restartHostRequestFailed ? RESTART_REQUEST_FAILED : RESTART_ALREADY_REQUESTED);
         drain();
         return;
       }
@@ -2147,6 +2150,7 @@ export async function runTelegram(
     if (host === undefined || !host.supported) return;
     restartHostRequested = true;
     void host.request().catch(() => {
+      restartHostRequestFailed = true;
       console.warn("Telegram /restart request was refused by the host; the gateway keeps running.");
     });
   }
@@ -2863,6 +2867,9 @@ const RESTART_UNAVAILABLE_HOST =
   "Nothing was sent to the assistant.";
 const RESTART_ALREADY_REQUESTED =
   "A restart was already requested in this gateway and is still stopping it; this /restart was not requested again.";
+const RESTART_REQUEST_FAILED =
+  "A restart was already requested in this gateway and the host refused it, so the gateway is still running. " +
+  "This /restart was not requested again; fix the host and start the gateway yourself.";
 const RESET_BUSY =
   "Context reset rejected: this chat has a running turn, so nothing was reset and the assembled workspace prompt was " +
   "not rebuilt. It was not queued; /abort this chat or retry /new when it is idle. Other chats are unaffected.";
