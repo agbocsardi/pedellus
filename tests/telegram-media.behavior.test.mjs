@@ -1186,6 +1186,84 @@ test('a transient workspace-root resolution failure does not poison the store', 
   }
 });
 
+test('a configured vision handoff describes the Telegram photo for a text-only main model', { timeout: 30_000 }, async () => {
+  // Cross-feature check: the media adapter submits native image content through the normal
+  // gateway turn, and the main vision hook (owned by the vision slice) describes it for a
+  // flagged text-only preset. No adapter-side describer and no duplicated image pipeline.
+  const directory = await mkdtemp(join(tmpdir(), 'nanobot-telegram-vision-'));
+  const workspace = join(directory, 'workspace');
+  await mkdir(workspace);
+  const provider = fauxProvider({ provider: 'tg-vision', models: [
+    { id: 'chat', name: 'Chat', reasoning: false, input: ['text'] },
+    { id: 'eyes', name: 'Eyes', reasoning: false, input: ['text', 'image'] },
+  ] });
+  const models = createModels();
+  models.setProvider(provider.provider);
+  const calls = [];
+  const dispatcher = (transcript, _options, _state, model) => {
+    const describer = model.id === 'eyes';
+    const images = transcript.messages.flatMap((message) => Array.isArray(message.content)
+      ? message.content.filter((part) => part.type === 'image')
+      : []);
+    const text = transcript.messages.flatMap((message) => Array.isArray(message.content)
+      ? message.content.filter((part) => part.type === 'text').map((part) => part.text)
+      : []).join('\n');
+    calls.push({
+      kind: describer ? 'describer' : 'generation',
+      modelId: model.id,
+      images: images.length,
+      data: images.map((part) => part.data),
+      text,
+    });
+    return fauxAssistantMessage(describer ? 'synthetic description of the telegram photo' : 'OK-VISION');
+  };
+  provider.setResponses(Array.from({ length: 80 }, () => dispatcher));
+  const config = parseConfig({
+    workspace,
+    dataDir: join(directory, 'state'),
+    modelPresets: {
+      chat: { provider: 'tg-vision', modelId: 'chat', needsVisionHandoff: true },
+      eyes: { provider: 'tg-vision', modelId: 'eyes' },
+    },
+    modelPreset: 'chat',
+    visionHandoff: { describerPreset: 'eyes' },
+    toolAllowlist: [],
+    telegram: { tokenEnv: 'TG_SYNTHETIC_TOKEN', allowFrom: ['501'] },
+    media: { directory: 'media' },
+  }, directory);
+  const gateway = await openGateway(config, context, { models });
+  const store = { directory, workspace, gateway, config };
+  const files = new Map([['photo-vision', { path: 'photos/file_vision.jpg', bytes: PHOTO_BYTES, contentType: 'image/jpeg' }]]);
+  const transport = telegramMock([[
+    photoUpdate(900, 500, { fileId: 'photo-vision', uniqueId: 'unique-vision', bytes: PHOTO_BYTES, caption: 'vision telegram photo' }),
+  ]], files);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.some((entry) => entry.text === 'OK-VISION'), 'vision main answer');
+
+    const describers = calls.filter((call) => call.kind === 'describer');
+    assert.equal(describers.length, 1, 'one describer call for the Telegram photo');
+    assert.equal(describers[0].modelId, 'eyes');
+    assert.equal(describers[0].images, 1, 'the describer received the original image');
+    assert.equal(describers[0].data[0], PHOTO_BYTES.toString('base64'));
+
+    const main = calls.filter((call) => call.kind === 'generation' && call.modelId === 'chat' &&
+      call.text.includes('[An image is attached in the conversation transcript'));
+    assert.equal(main.length, 1, 'one transformed main-conversation request');
+    assert.equal(main[0].images, 0, 'the text-only main model received no raw image');
+    assert.match(main[0].text, /synthetic description of the telegram photo/);
+    assert.match(main[0].text, /vision telegram photo/);
+    assert.match(main[0].text, /Stored file \(workspace-relative\): media\//);
+
+    const stored = await mediaFiles(workspace);
+    assert.equal(stored.length, 1, 'the authoritative original is on disk');
+    assert.deepEqual(await readFile(join(workspace, 'media', stored[0])), PHOTO_BYTES);
+  } finally {
+    await cleanup(store, harness, transport);
+  }
+});
+
 test('media config is validated and traversal directories are refused before startup', async () => {
   assert.equal(validateMediaDirectory(undefined), 'media');
   assert.equal(validateMediaDirectory('attachments/incoming'), 'attachments/incoming');

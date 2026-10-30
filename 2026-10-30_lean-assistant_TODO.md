@@ -286,6 +286,32 @@ and is covered by the focused hook regression). Media adapter/transcription work
 still belongs to the original media worker's fixes, and native MCP/product Code
 Mode has not completed independent review.
 
+### 2026-10-30 — Telegram media integration candidate (not published)
+
+The media worker's branch `t3/telegram-media-transcription` merged current main
+`4a2616e` (merge `cc26bfc`) after its standalone fixes passed at `be6afc4`, and
+adds one cross-feature check on top of the 25 focused media checks. The gateway
+process owns Telegram and media; the adapter submits photos as native pi-ai image
+content plus a labeled workspace-relative locator, stores documents unread and
+transcribes voice with the local uv/faster-whisper helper. A mocked Telegram
+photo reaches a `needsVisionHandoff` text-only preset: the configured vision
+describer receives the original image, the main request carries zero raw images
+and the labeled description, and the original stays on disk. Typecheck, build,
+142 registered behavior checks, 2 execution checks and 83 offline core checks
+pass; only faux-model/temp-store/mocked-fetch checks ran, with no live bot,
+provider, network, credential, dependency install or model download. The
+package.json union keeps all main gateway/vision/MCP registrations plus
+telegram-media; `src/config.ts`, `src/cli.ts` and `SETUP.md` were the semantic
+union points, with no functional conflict beyond the package.json test line.
+Stored originals are never auto-deleted and there is no total-disk cap. Deferred,
+reported limits: control exhaustion/reopen matrix, early-submission memory edge,
+crash hard-link window, pending-only ack after eventual apply, cached failed
+transcription, and two optional child cache-dir variables. This is a candidate
+for a fresh combined integration review, not merged into main. The background
+worker agreement is unchanged: 2–3 implementers with separate reviewers, the
+spawner chooses worktree/shared, the spawning agent is notified rather than the
+user, and scheduled memory curation remains later work.
+
 ### 2026-10-30 — channel surfaces and Telegram interactions
 
 Owner clarified that the gateway itself is the single agent/Durable owner and
