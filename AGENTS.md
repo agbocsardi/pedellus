@@ -17,16 +17,21 @@ npm run build             # tsc -> dist/
 npm run test:behavior     # behaviour checks (builds first; count grows with coverage)
 npm run test:execution    # 2 guarded host policy checks (builds first)
 npm run --silent test:core-acceptance  # offline core acceptance JSON (builds first; see ACCEPTANCE.md)
-npm start -- --config config.json   # local CLI against a config file
+npm start -- gateway --config config.json   # single local owner
+npm start -- agent --config config.json     # attach a terminal
 ```
 
 ## Layout
 
 - `src/runtime.ts` — `openGateway`: storage, config-scoped tool policy,
   context, cron and the conversation-facing host API.
-- `src/cli.ts` — local terminal client, model selection, recovery command.
+- `src/cli.ts` — launch surface: `gateway` owns the single runtime, storage,
+  tools and channels; `agent` (or legacy bare `--config`) attaches a terminal to
+  it and never opens a second runtime; also the stopped-store recovery command.
   The agent loop itself is Durable's; this repository is the nanobot-specific
   layer around it (context, tools, execution, automation, channels, providers).
+- `src/local/` — private Unix-socket protocol, gateway server and CLI client that
+  carry the bounded terminal conversation surface; no public listener.
 - `src/index.ts` — small host entry surface (config, gateway, workspace host,
   opt-in context/Code Mode, recovery, CLI main); import subsystems directly.
 - `src/automation/` — cron timer/run tasks and the model-facing `cron` tool.
@@ -54,7 +59,8 @@ npm start -- --config config.json   # local CLI against a config file
   admission and observed same-chat targets. Unknown external outcomes are retained,
   never blindly retried or evicted.
 - Named model presets define provider/model/thinking in config. CLI preset switches
-  are temporary: reopening restores the configured preset without rewriting prepared
+  are temporary: a CLI reattach keeps the temporary selection, while a gateway
+  restart or reopen restores the configured preset without rewriting prepared
   dispatches. Direct-model (non-preset) selection retains its persisted semantics.
 - The cron timer never calls a model, and a run never schedules: rescheduling is
   a deterministic task commit, so a slow or failed turn cannot stop the schedule.
