@@ -22,7 +22,7 @@
 
 Owner approved this six-slice batch after the completed channel-neutral build:
 
-- [ ] O1 — Closed-episode input and durable digestion cursor. Authenticated
+- [x] O1 — Closed-episode input and durable digestion cursor. Authenticated
   mapped CLI/Telegram chats only; bounded oldest-first backfill of existing
   reset-closed episodes. Exclude open episodes and raw/root/fork/state/task-owned,
   worker and cron transcripts. Source-label evidence; successful validated
@@ -350,6 +350,25 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Overnight — closed-episode foundation accepted; digestion starts
+
+O1 published by original implementer via clean-main fast-forward to `9b38b13`:
+functional candidate `7b9e4f6` passed fresh independent review; final change only
+corrected cancellation comments/docs. Review rounds fixed loss of truncated
+evidence, ambiguous idle results, initial/frontier and partial-bound skip holes,
+reset-scan resume and first-closing-reset verification; Unicode-safe fragments
+remain strictly bounded. Final gate: 217 behavior, 2 execution, 83 offline core,
+typecheck/build; published rebuild and 17 focused checks passed.
+
+Accepted limits: >4,000 empty-reset gap refuses loudly; first ack of each episode
+walks that episode in bounded-memory pages but is not interruptible mid-walk
+(SQLite ignores context), though aborted context cannot commit cursor advance;
+cross-chat order is best-effort under scan budgets. No deployed poisoned-cursor
+migration/repair is claimed. O2 now starts in a fresh worktree: bounded editable-
+prompt digestion, provenance, replay-safe memory edits and concurrent-edit
+protection; no commands, schedule activation or new agent loop. O3 follows its
+accepted execution interface. No paid/live provider or API calls authorized.
 
 ### Overnight — Python-free local voice accepted and published
 
