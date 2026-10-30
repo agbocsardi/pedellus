@@ -164,7 +164,8 @@ owner's 2026-10-28 selection is:
     placing secrets in the workspace.
   - `cron` — the opt-in `cron` tool (`add`/`list`/`remove`) behind
     `cron.enabled`, with `at`/`every_seconds`/`cron_expr`, IANA `tz`, isolated or
-    origin mode, no channel delivery, and no per-job timeout argument.
+    origin mode, normal results and fixed failure/empty notices through the
+    durable channel outbox, and no per-job timeout argument.
 - **Deferred** (retained in the owner selection, but no runtime): `my` — there is
   no self-state tool, scratchpad, or model-adjustable runtime state; model and
   context settings are host configuration.

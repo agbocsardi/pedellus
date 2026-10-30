@@ -8,10 +8,13 @@ description: Schedule one-shot or recurring work with the cron tool. Use when th
 The `cron` tool is an internal agent capability: it exists only when the host
 config sets `cron.enabled`. There is no user scheduler or slash command. A due
 job submits one agent turn — into a fresh background conversation, or into this
-conversation. A successful, non-empty result from a background run may be
-delivered to the authenticated Telegram private chat that created the job when
-the Telegram adapter is enabled; no other channel delivers results, and errors,
-cancellations or empty answers send nothing.
+conversation. A normal settlement in either mode is delivered to the
+authenticated Telegram private chat that created the job when the Telegram
+adapter is enabled; no other channel delivers results. Delivery is the committed
+answer, or a fixed notice carrying the generated job ID and the occurrence
+instant when the run failed or produced no answer, with `list` as the next
+step. A cancelled, superseded or otherwise abandoned run sends nothing; its
+status stays visible through `list`.
 
 ## Actions
 
@@ -57,11 +60,12 @@ idle. Jobs are owner-scoped to the conversation that created them, so another
 conversation's jobs are invisible and its IDs are refused.
 
 Say which mode will run and where the answer appears. In background mode the
-answer appears in a separate conversation; with a Telegram origin, a successful
-non-empty answer is also delivered to that private chat, while errors and empty
-answers are not sent. With `isolated: false` the answer appears here; a
-successful non-empty answer is also delivered to that same authenticated private
-chat, while errors and empty answers are not sent.
+answer appears in a separate conversation; with a Telegram origin, a normal
+settlement is also delivered to that private chat, and the same applies when
+`isolated: false` answers here: either the committed answer, or a fixed notice
+with the generated job ID and occurrence instant when the run failed or
+answered with nothing. Use `list` to inspect a failed or cancelled run.
+Cancelled, superseded and missing-job runs are never delivered.
 
 ## Authority and limits
 

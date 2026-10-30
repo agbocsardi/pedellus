@@ -462,6 +462,11 @@ test('an isolated scheduled run that errors queues one sanitized failure notice'
     assert.equal(records[0].sessionKey, origin);
     assert.equal(records[0].status, 'pending');
     assert.equal(records[0].text, cronOutcomeNotice('failed', job.id, job.lastOutcome.scheduledAtMs));
+    assert.ok(records[0].text.includes(job.id), `the notice names the job ID: ${records[0].text}`);
+    assert.ok(
+      records[0].text.includes(new Date(job.lastOutcome.scheduledAtMs).toISOString()),
+      `the notice names the occurrence instant: ${records[0].text}`,
+    );
     assert.match(records[0].text, /list scheduled jobs/, 'the notice names the next action');
     assert.ok(!records[0].text.includes(providerError), `no raw provider error text: ${records[0].text}`);
     assert.ok(!records[0].text.includes(scheduledMessage), 'no job message text in the notice');
@@ -516,6 +521,11 @@ test('an empty origin-mode answer queues one notice and stays one record after r
     const records = await store.gateway.cronOutbox.list(origin, context);
     assert.equal(records.length, 1);
     assert.equal(records[0].text, cronOutcomeNotice('empty', job.id, job.lastOutcome.scheduledAtMs));
+    assert.ok(records[0].text.includes(job.id), `the notice names the job ID: ${records[0].text}`);
+    assert.ok(
+      records[0].text.includes(new Date(job.lastOutcome.scheduledAtMs).toISOString()),
+      `the notice names the occurrence instant: ${records[0].text}`,
+    );
     assert.match(records[0].text, /without an answer/);
     assert.match(records[0].text, /list scheduled jobs/);
     const admitted = records[0];

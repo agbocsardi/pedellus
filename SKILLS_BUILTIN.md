@@ -19,7 +19,7 @@ body loads on demand.
 | `memory-defrag` | Reorganizes those files with read/write/edit/bash; no subagents or Dream state. |
 | `skill-creator` | Authoring and loading skills with this loader's flat frontmatter subset, and the fixed per-conversation snapshot: a new skill appears in the next conversation, after a Gateway reopen, or after a host-exposed explicit refresh of the current conversation. No packaging scripts. |
 | `github` | `gh` through granted `bash`, gated on `requires.bins: ["gh"]`. Authentication may be unavailable in the filtered shell, so the skill checks first and stops rather than placing secrets in the workspace. |
-| `cron` | The opt-in `cron` tool (`add`/`list`/`remove`) with `after_seconds`/`at`/`every_seconds`/`cron_expr`, IANA `tz`, and isolated or origin mode. A successful non-empty result, isolated or origin, may reach the authenticated Telegram origin through the outbox; error/empty results send nothing. No per-job timeout argument. |
+| `cron` | The opt-in `cron` tool (`add`/`list`/`remove`) with `after_seconds`/`at`/`every_seconds`/`cron_expr`, IANA `tz`, and isolated or origin mode. A normal settlement, isolated or origin, may reach the authenticated Telegram origin through the outbox: the committed answer, or a fixed notice with the generated job ID and occurrence instant for a failure or empty answer; cancelled, superseded and missing-job runs stay silent. No per-job timeout argument. |
 
 ## Deferred
 
