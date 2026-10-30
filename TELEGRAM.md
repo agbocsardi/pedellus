@@ -67,13 +67,13 @@ download keeps the admitted update instead of losing it, and a reopen resumes it
   `<workspace>/<media.directory>` (default `media/`) and stay readable through the
   configured coding tools. Nothing is written to `dataDir` or an arbitrary
   external root. A configured workspace root may itself be an operator symlink:
-  it is resolved once to its canonical path, and every level below it is still
-  checked individually. Filenames are generated from the attachment kind and a
-  hash of Telegram's content-stable file identity, never from the announced
-  filename, so a retry or replay maps to the same file and a re-sent file is
-  stored once. Publication is atomic with private permissions, and a symlinked,
-  hardlinked or non-regular target path is refused rather than followed or
-  overwritten. Stored originals are never deleted by the adapter and there is no
+  it is resolved once successfully to its canonical path; a failed attempt can be
+  retried, and every level below it is still checked individually. Filenames are
+  generated from the attachment kind and a hash of Telegram's content-stable file
+  identity, never from the announced filename, so a retry or replay maps to the
+  same file and a re-sent file is stored once. Publication is atomic with private
+  permissions, and a symlinked, hardlinked or non-regular target path is refused
+  rather than followed or overwritten. Stored originals are never deleted by the adapter and there is no
   total-disk cap; keeping the workspace media directory bounded is the
   operator's job.
 - **Photos** are submitted as native pi-ai image content (base64 + MIME) together

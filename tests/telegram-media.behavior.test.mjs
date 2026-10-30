@@ -65,6 +65,12 @@ async function telegramState(gateway) {
   }, context);
 }
 
+/** The gateway's episode-summary helper request, not a main conversation turn. */
+function isEpisodeSummaryRequest(request) {
+  return userMessages([request]).some((message) =>
+    messageText(message).startsWith('Summarize this transcript segment'));
+}
+
 async function flush(rounds = 20) {
   for (let round = 0; round < rounds; round += 1) await new Promise((resolve) => setImmediate(resolve));
 }
@@ -975,6 +981,8 @@ test('a newer control is refused while an earlier one is still applying, so rese
   }));
   let releaseDownload;
   const downloadGate = new Promise((resolve) => { releaseDownload = resolve; });
+  let releasePostReset;
+  const postResetGate = new Promise((resolve) => { releasePostReset = resolve; });
   const files = new Map([[
     'photo-hold',
     { path: 'photos/file_hold.jpg', bytes: PHOTO_BYTES, contentType: 'image/jpeg', downloadGate },
@@ -983,6 +991,7 @@ test('a newer control is refused while an earlier one is still applying, so rese
     [photoUpdate(800, 400, { fileId: 'photo-hold', uniqueId: 'unique-hold', bytes: PHOTO_BYTES, caption: 'pre-command photo' })],
     [textUpdate(801, 401, '/new')],
     [textUpdate(802, 402, '/new'), textUpdate(803, 403, '/new')],
+    async () => { await postResetGate; return [textUpdate(804, 404, 'after reset ping')]; },
   ], files);
   let harness;
   try {
@@ -1013,6 +1022,25 @@ test('a newer control is refused while an earlier one is still applying, so rese
         messageText(message).includes('pre-command photo')));
     assert.equal(photoTurns.length, 1, 'the pre-command photo turn kept its native image and ran once');
     assert.equal((await mediaFiles(store.workspace)).length, 1);
+
+    // A normal message after the reset must start a fresh episode: the actual main
+    // conversation request (not the episode-summary helper) must not carry the
+    // pre-command photo or any image content.
+    releasePostReset();
+    await until(() => transport.sent.filter((entry) => entry.chatId === CHAT_ID && entry.text === 'OK-REPLY').length === 2,
+      'post-reset answer');
+    const postResetTurns = requests.filter((request) =>
+      !isEpisodeSummaryRequest(request) &&
+      userMessages([request]).some((message) => messageText(message).includes('after reset ping')));
+    assert.equal(postResetTurns.length, 1, 'one main-conversation request for the post-reset message');
+    const postResetMessages = userMessages([postResetTurns[0]]);
+    assert.equal(postResetMessages.length, 1, 'the reset started a fresh episode');
+    assert.match(messageText(postResetMessages[0]), /after reset ping/);
+    assert.doesNotMatch(messageText(postResetMessages[0]), /pre-command photo/,
+      'the pre-command photo stayed in the pre-reset episode');
+    const postResetContent = postResetMessages[0].content;
+    assert.equal(typeof postResetContent === 'string' ? 0 : postResetContent.filter((part) => part.type === 'image').length, 0,
+      'no pre-command image content leaked into the post-reset request');
   } finally {
     await cleanup(store, harness, transport);
   }
