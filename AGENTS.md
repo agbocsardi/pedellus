@@ -33,7 +33,10 @@ npm start -- agent --config config.json     # attach a terminal
 - `src/local/` — private Unix-socket protocol, gateway server and CLI client that
   carry the bounded terminal conversation surface; no public listener.
 - `src/index.ts` — small host entry surface (config, gateway, workspace host,
-  opt-in context/Code Mode, recovery, CLI main); import subsystems directly.
+  context/Code Mode factories, recovery, CLI main); import subsystems directly.
+- `src/mcp/` — explicit MCP server config, the pinned `@earendil-works/pi-mcp`
+  client lifecycle, deferred `mcp__<server>__<tool>` registrations, namespace
+  summaries and the call-time MCP authority hook.
 - `src/automation/` — cron timer/run tasks and the model-facing `cron` tool.
 - `src/execution/` — guarded host environment and the optional Bubblewrap shell.
 - `src/context/` — bootstrap/memory/skills snapshots, skill tool, workspace host.
@@ -68,6 +71,12 @@ npm start -- agent --config config.json     # attach a terminal
   demand through the read-only `skill` tool.
 - Markdown in the workspace is the memory source of truth. Durable owns the
   transcript, runtime state and compaction.
+- MCP is a separate, default-off connection authority from `toolAllowlist`:
+  `mcp.enabled` plus at least one enabled server connects it, and only
+  authenticated mapped chats receive MCP tools, `codemode` and `tool_search`.
+  Root, state, fork, raw/task-owned and isolated cron conversations get none.
+  A configured stdio server is a native host process, not covered by
+  `toolSandbox: "bwrap"`. Secrets are referenced by environment variable name.
 - Bubblewrap is accidental-damage protection over the real workspace, not
   hostile-tenant isolation, and it is off by default.
 

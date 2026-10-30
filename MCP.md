@@ -9,11 +9,11 @@ package; Code Mode and deferred discovery are the native
 [`src/extensions/codemode.ts`](./src/extensions/codemode.ts). This port does not
 implement a parallel client, tool registry, runner, queue or retry layer.
 
-Status: implemented and independently reviewed (`4d61f50`, documentation
-corrections in `1c38146`). It is merged with current main only as an integration
-candidate on its worktree branch (`44c7385`) and is pending a fresh combined
-runtime/config/authority review; it is not integrated into main and is not an
-accepted capability. All coverage is offline and synthetic.
+Status: accepted. Independent review passed the standalone implementation
+(`4d61f50`) with documentation corrections only (`1c38146`), then a fresh
+combined runtime/config/authority review passed the integration with current main
+(`555d34c`) with no material findings. All coverage is offline and synthetic: no
+live MCP server, provider, credential or production data has been used.
 
 MCP is **off unless explicitly configured**. With no `mcp` block,
 `"enabled": false`, or no enabled server entry, the gateway starts no MCP client,
@@ -101,7 +101,9 @@ confinement layer, so treat a server command as host-level authority.
 
 MCP tools and their Code Mode/tool-search tools are enabled **only in
 authenticated mapped ordinary chat conversations** — the same set that may use
-`toolAllowlist`. The root conversation, state-only channel conversations, forks,
+`toolAllowlist`. That set does not require a nonempty `toolAllowlist`: MCP and
+Code Mode work with `toolAllowlist: []`, which simply leaves no coding tools
+available to scripts. The root conversation, state-only channel conversations, forks,
 raw or task-owned conversations and isolated scheduled cron runs receive no MCP
 tool, no `codemode` and no `tool_search`. A scheduled run has no bounded MCP
 capture; that capability is deliberately not implemented.
@@ -176,8 +178,8 @@ Tool calls pass `timeoutSeconds` (default 60) as the native per-request timeout
 and the calling turn's abort signal. The committed cancellation test covers a
 Code Mode *script deadline* aborting one pending call (one MCP cancellation, no
 retry); an expired native request timeout itself is code-read, not separately
-tested. Closing the gateway stops Code Mode admission,
-closes the sandbox and its workers, then closes every MCP client. A stdio server
+tested. Closing the gateway closes the Harness first, then stops Code Mode
+admission and closes the sandbox and its workers, then closes every MCP client. A stdio server
 is stopped per the specification — close stdin, then SIGTERM, then SIGKILL to its
 whole process group — using the native transport. `gateway.close()` waits for
 that teardown.

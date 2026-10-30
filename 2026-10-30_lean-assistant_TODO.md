@@ -55,14 +55,13 @@ not permission to start every branch or run live integrations):
 - [x] Handle authenticated Telegram reaction changes as ordinary agent turns,
   with durable update dedupe and explicit added/removed context. Offline handler
   verified; private-chat reaction-update delivery remains unverified live.
-- [ ] Wire configured MCP connections into the actual gateway and expose their
+- [x] Wire configured MCP connections into the actual gateway and expose their
   registered tools through Code Mode/tool discovery. Implemented as `4d61f50`
   (pinned `@earendil-works/pi-mcp` client plus the existing native Code Mode
   bundle, installed by the shipped host only when `mcp` is explicitly enabled).
-  Independent review passed with no material code defects; documentation
-  corrections only, in `1c38146`. Merged with current main as integration
-  candidate `44c7385`; the combined semantic review and main integration are
-  still pending.
+  Standalone review passed with no material code defects (`4d61f50`, docs
+  corrected in `1c38146`); a fresh combined runtime/config/authority review
+  passed `555d34c` with no material findings. Accepted and integrated into main.
 - [ ] Implement channel-neutral attachment/voice media next: shared transcription
   configuration/processing, Telegram ingress first, native image content for
   photos with configured vision handoff, and document saving without extraction.
@@ -163,7 +162,21 @@ remain intact. No deployment or live-delivery claim; no live model/bot run.
 
 ## Session log
 
-### 2026-10-30 — MCP connections through product Code Mode (review passed, integration candidate)
+### 2026-10-30 — MCP accepted and published
+
+A fresh combined runtime/config/authority review passed `555d34c` with no material
+findings, verifying the reviewed vision/gateway source coexists with the MCP
+slice, 116 registered behavior checks, 2 execution checks, 83 offline core checks,
+typecheck and build. Publication only reconciled front-door metadata and docs:
+the plan status, README/AGENTS statements that Code Mode was SDK-only with no MCP
+installed, and the MCP/CODEMODE accepted status. No functional source, test or
+dependency file changed relative to the reviewed tip. Current parallel work is
+recorded as: media ingestion under its final review (`be6`), product background
+workers under active implementation, and native Brave web search plus fetch newly
+owner-approved and running. None of those were imported here, and no live MCP,
+provider, credential or production run was performed for this slice.
+
+### 2026-10-30 — MCP connections through product Code Mode (accepted, integrated)
 
 The MCP worker wired explicit `mcp` config (stdio and Streamable HTTP, env-name
 secrets, no OAuth/`mcp.json`/hot reload) to the pinned
@@ -196,8 +209,10 @@ acceptance. Carried limits: no OAuth/browser sign-in or token store, no
 `mcp.json` discovery or resources/prompts tools, no hot reload or lazy
 reconnect, tools added after open need a reopen, and no CLI notice for a failed
 server (fixed codes on the SDK `gateway.mcp` surface only). Not integrated into
-main and not accepted here; a fresh combined runtime/config/authority review is
-the next step.
+main pending the combined review, which then passed `555d34c` with no material
+findings. Front-door metadata/docs were reconciled for publication and the work
+merged by fast-forward into main. No live MCP server, provider, credential or
+production data was used; the carried limits above still hold.
 
 ### 2026-10-30 — media ingress and configured vision handoff
 
@@ -335,7 +350,7 @@ The resumed pilot preserved a queued message from the allowlisted owner sent dur
 
 Recorded the narrow result in TELEGRAM.md. After owner confirmed the working interactions, cleaned the completed transport/typing workers and reviewers (4 agents, 2 clean worktrees and their patch-equivalent integrated branches). Other older unrelated resources remain untouched. A short separately approved reminder-only check was the remaining Telegram pilot item; do not repeat the whole sequence or silently renew the consumed budget.
 
-Owner subsequently accepted this as good enough and explicitly asked to update the plan and discuss what comes next. The pilot batch is now complete by owner decision. Reminder-only live verification is deferred, not marked passed. No more testing, provider spend or implementation was started. The initial recommendation was ordinary-use setup, then reach features. Owner's subsequent annotations corrected the next priorities: gateway is channel-neutral (CLI plus Telegram, future Discord/Email), native Telegram command-menu niceties, MCP through product Code Mode, and high-priority photos/documents/voice. Memory already supports on-the-fly Markdown changes via configured read/write/edit, but not the Python-named memory tools or automatic snapshot refresh after each write. Current Code Mode is an opt-in SDK bundle only; no MCP client/config or shipped gateway installation exists. Python's voice flow is channel download -> shared transcription config/service -> provider -> labeled transcript in the normal user turn. Plan the equivalent shared ingress with one initial backend, rather than copying its provider registry. Dream was parked as a special subsystem, not rejected as a behavior: ordinary cron plus bounded background workers and memory tools should provide its essence. No implementation/live calls launched for these annotations.
+Owner subsequently accepted this as good enough and explicitly asked to update the plan and discuss what comes next. The pilot batch is now complete by owner decision. Reminder-only live verification is deferred, not marked passed. No more testing, provider spend or implementation was started. The initial recommendation was ordinary-use setup, then reach features. Owner's subsequent annotations corrected the next priorities: gateway is channel-neutral (CLI plus Telegram, future Discord/Email), native Telegram command-menu niceties, MCP through product Code Mode, and high-priority photos/documents/voice. Memory already supports on-the-fly Markdown changes via configured read/write/edit, but not the Python-named memory tools or automatic snapshot refresh after each write. Current Code Mode is an opt-in SDK bundle only; no MCP client/config or shipped gateway installation exists. (Superseded: configured MCP connections through product Code Mode were later accepted and integrated; see the MCP entries above.) Python's voice flow is channel download -> shared transcription config/service -> provider -> labeled transcript in the normal user turn. Plan the equivalent shared ingress with one initial backend, rather than copying its provider registry. Dream was parked as a special subsystem, not rejected as a behavior: ordinary cron plus bounded background workers and memory tools should provide its essence. No implementation/live calls launched for these annotations.
 
 Gateway integration: combined the independently reviewed gateway/CLI slice
 (`5712c98` + `ca662bb`) with the approved Telegram interactions (`30d34f1` +
@@ -352,7 +367,8 @@ children total. Reviewers do not count against that implementer bound, and origi
 implementers are retained through review and fix rounds rather than replaced.
 Parent orchestrates only. The vision handoff passed fresh independent review and
 is integrated with this gateway tip. Media adapter/transcription work remains
-under the original media implementer's review fixes, and native MCP plus product
-Code Mode wiring is implemented and reviewed as an integration candidate (see
-the MCP entry above) but not yet merged into main; neither is complete or
-accepted here.
+under the original media implementer's final review (`be6`), and native MCP plus
+product Code Mode wiring is accepted and integrated (see the MCP entry above).
+Product background workers are under active implementation, and native web
+search (Brave) plus fetch are newly owner-approved and running; none of those is
+imported into this accepted MCP slice.

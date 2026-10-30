@@ -85,18 +85,26 @@ acceptance remains open.
 
 The package root (`src/index.ts`) is a small host entry surface: config loading and
 types, `openGateway` and its host option types, `workspaceContextGatewayOptions`,
-the opt-in context and Code Mode factories, prepared-context recovery operations,
+the context and Code Mode factories, prepared-context recovery operations,
 and the CLI `main`. Other subsystems are imported directly from their modules.
 
-## Opt-in Code Mode SDK
+## Code Mode and MCP
 
-The package root exports `createCodeModeIntegration`, fixed budgets and types for
-native Durable QuickJS Code Mode/tool-search. It does **not** install them in the
-gateway. Hosts must establish native default-deny extension/tool state and reapply persisted
-policy before scheduling; see [Code Mode contract and verified boundaries](./CODEMODE.md).
-The bounded SDK bundle passed independent review and parent-built sandbox,
-activation, cancellation and safe/unsafe crash-replay probes. Execution, approvals,
-MCP and product failure-verification gates remain separate.
+MCP is **off by default**. Configuring `mcp: { enabled: true, servers: {...} }` with
+at least one enabled stdio or Streamable HTTP server makes the shipped gateway
+connect them and install the native Durable QuickJS Code Mode/tool-search bundle.
+Discovered tools are deferred `mcp__<server>__<tool>` registrations reachable from
+Code Mode scripts and `tool_search`, and only in authenticated mapped chat
+conversations; root, state, forked and isolated cron/task conversations get no MCP
+tool and no Code Mode. `toolAllowlist` still names only the coding tools
+(`read`/`write`/`edit`/`bash`), independently of MCP.
+
+MCP is a separate explicit connection authority. A configured stdio server runs as
+a native host process, not under `toolSandbox: "bwrap"`. This slice has no OAuth,
+implicit `mcp.json` discovery, resources/prompts tools, hot reload or CLI status UI;
+startup failures surface only as fixed codes on the SDK `gateway.mcp` surface. See
+[MCP servers and Code Mode](./MCP.md) and [Code Mode contract and verified
+boundaries](./CODEMODE.md).
 
 ## Opt-in context SDK
 

@@ -180,9 +180,9 @@ delegates `mcp__*`, `codemode` and `tool_search` to the MCP extension's own
 call-time hook, which rechecks the conversation and the server's live tool list
 and fails closed for a failed, disconnected, disabled or withdrawn server.
 
-This wiring is implemented and independently reviewed (`4d61f50`, docs corrected
-in `1c38146`) and exists only as an integration candidate with current main
-(`44c7385`), pending a fresh combined review; it is not yet in main.
+This wiring is accepted: standalone review passed `4d61f50` with documentation
+corrections in `1c38146`, and a fresh combined runtime/config/authority review
+passed the integration with current main (`555d34c`) with no material findings.
 
 `gateway.close()` closes the Harness first, then this bundle (stopping admission
 and waiting for sandbox workers), then every MCP client. An open that fails after
