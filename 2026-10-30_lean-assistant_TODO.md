@@ -15,8 +15,26 @@
 - [x] Fix the demonstrated native-fetch/grammY abort-signal startup incompatibility, with independent offline regression review.
 - [x] Show best-effort Telegram typing feedback during active user turns; stop on settlement/abort/shutdown without awaiting typing in model or answer delivery.
 - [x] Complete the approved five-minute synthetic Telegram pilot and record the actual outcome; no personal workspace or broader rollout.
-- [ ] With fresh owner approval, run one reminder-only follow-up; reminder scheduling/delivery was not exercised before the pilot input cap.
+- [x] Owner accepts the pilot as sufficient. Defer the reminder-only follow-up; live reminder scheduling/delivery remains unverified, not a blocker for the next discussion.
 - [x] Clean up this batch's resources after owner confirms integration.
+
+## Current status and next priorities
+
+The owner accepted the pilot. This implementation/acceptance batch is complete;
+stop adding acceptance scaffolding or repeating timed pilots. Live reminder
+delivery is still unverified, but the extra check is deferred by owner decision.
+The test bot is stopped and completed agents are cleaned up.
+
+Recommended next step: make the retained assistant convenient for ordinary use,
+starting with a fresh workspace rather than migration. Agree its persistent
+workspace, config and launch method; reuse the normal CLI and the platform's
+service manager if an always-on Telegram process is wanted. No new operations
+framework. Then use it for a few days and fix observed friction.
+
+After that, the first useful feature candidate is web search/fetch, followed by
+MCP only for a concrete integration need. Product delegation and more channels
+stay later. This is a discussion order, not authorization to deploy, access
+personal data, spend on another run or start all feature branches.
 
 ## Product and constraints
 
@@ -76,4 +94,6 @@ Owner requested Telegram typing feedback while the agent works. Next slice is a 
 
 The resumed pilot preserved a queued message from the allowlisted owner sent during the approved test period instead of clearing updates. Real Telegram accepted 11 typing actions, 5 messages and 1 edit. The owner confirmed the interactions worked well. The local four-prompt cap stopped polling when a fifth owner message arrived; that message was not admitted. This was not timer expiry. The cap was too tight for the guided sequence; no production behavior was changed to compensate. Paused no-dispatch store inspection confirmed skill/write/reset/history search+open/cron list activity and zero cron jobs, so reminder delivery remains unverified. Model use: 11 requests, 201,609 conservative input reserved, 16,896 output reserved; no refusal/violation and no pending replies at close. Bot is stopped; no automatic restart or extra paid run.
 
-Recorded the narrow result in TELEGRAM.md. After owner confirmed the working interactions, cleaned the completed transport/typing workers and reviewers (4 agents, 2 clean worktrees and their patch-equivalent integrated branches). Other older unrelated resources remain untouched. A short separately approved reminder-only check is the only remaining Telegram pilot item; do not repeat the whole sequence or silently renew the consumed budget.
+Recorded the narrow result in TELEGRAM.md. After owner confirmed the working interactions, cleaned the completed transport/typing workers and reviewers (4 agents, 2 clean worktrees and their patch-equivalent integrated branches). Other older unrelated resources remain untouched. A short separately approved reminder-only check was the remaining Telegram pilot item; do not repeat the whole sequence or silently renew the consumed budget.
+
+Owner subsequently accepted this as good enough and explicitly asked to update the plan and discuss what comes next. The pilot batch is now complete by owner decision. Reminder-only live verification is deferred, not marked passed. No more testing, provider spend or implementation was started. Recommend ordinary-use setup with a fresh workspace, then observed-friction fixes; web search/fetch is the next feature candidate rather than more internal machinery.

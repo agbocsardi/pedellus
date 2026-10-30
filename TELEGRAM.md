@@ -499,5 +499,6 @@ so reminder scheduling/delivery is **not** a live pass.
 The run used 11 model requests, reserved 201,609 conservative input-token
 equivalents and 16,896 output tokens, with no budget violation. It closed with
 no pending replies. No webhook change, pending-update clearing, real workspace,
-deployment or security audit was performed. A separately approved reminder-only
-follow-up remains; the current bot process is stopped.
+deployment or security audit was performed. The owner accepted this pilot as
+sufficient and deferred the optional reminder-only follow-up. Live reminder
+delivery remains unverified; the current bot process is stopped.
