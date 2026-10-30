@@ -5,9 +5,11 @@
 and structured `GrammyError`/`HttpError` types. An explicit native-fetch bridge
 keeps offline probes mockable. The API root is fixed to
 `https://api.telegram.org`; the bridge forces `redirect: "error"`, disables
-sensitive grammY logs, and reads the current global `fetch` at call time. The
-adapter calls typed `getMe` before polling and never writes the token or
-token-bearing URL into an error message.
+sensitive grammY logs, and reads the current global `fetch` at call time. grammY's
+Node build supplies its own `AbortController` per call, so the bridge re-expresses
+that signal with a native one; cancellation and grammY's timeout still abort the
+in-flight request. The adapter calls typed `getMe` before polling and never
+writes the token or token-bearing URL into an error message.
 
 ## Controls
 

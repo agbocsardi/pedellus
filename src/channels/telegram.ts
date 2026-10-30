@@ -152,13 +152,11 @@ export async function runTelegram(
   if (signal?.aborted) return;
   const outboundThrottle = new TelegramFloodGate();
   const pollThrottle = new TelegramFloodGate();
-  const safeFetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
-    globalThis.fetch(input, { ...init, redirect: "error" })) as unknown as NonNullable<ApiClientOptions["fetch"]>;
   const api = new Api(options.token, {
     apiRoot: API,
     timeoutSeconds: POLL_TIMEOUT_MAX + 10,
     sensitiveLogs: false,
-    fetch: safeFetch,
+    fetch: telegramFetch as unknown as NonNullable<ApiClientOptions["fetch"]>,
   });
 
   const me = await apiCall(api, "getMe", signal, (callSignal) => api.getMe(toGrammySignal(callSignal)), { throttle: pollThrottle });
@@ -1454,6 +1452,25 @@ type GrammySignal = Parameters<Api["getMe"]>[0];
 
 function toGrammySignal(signal?: AbortSignal): GrammySignal {
   return signal as unknown as GrammySignal;
+}
+
+/**
+ * grammY's Node build creates its own `AbortController` per call, and native fetch rejects that foreign
+ * `AbortSignal`. Re-express it with a native controller so grammY's timeout and chat cancellation still
+ * abort the in-flight request. The listener lives on grammY's per-call signal, so nothing outlives the call.
+ */
+export function telegramFetch(
+  input: Parameters<typeof fetch>[0],
+  init?: Parameters<typeof fetch>[1],
+): Promise<Response> {
+  const signal: unknown = init?.signal;
+  if (signal === undefined || signal === null || signal instanceof AbortSignal) {
+    return globalThis.fetch(input, { ...init, redirect: "error" });
+  }
+  const controller = new AbortController();
+  if ((signal as AbortSignal).aborted) controller.abort();
+  else (signal as AbortSignal).addEventListener("abort", () => controller.abort(), { once: true });
+  return globalThis.fetch(input, { ...init, signal: controller.signal, redirect: "error" });
 }
 
 async function apiCall<T>(
