@@ -1852,12 +1852,13 @@ export async function runTelegram(
     }
     // Captured before the callbacks below: the remaining commands are exactly these two.
     const command: "new" | "abort" = parsed.command === "new" ? "new" : "abort";
-    // A deferred command still owns this chat's order. Refuse a newer one instead of letting
-    // it apply first; the earlier command is retried on the poll cadence.
-    if ([...deferredControls.values()].some((entry) => entry.chatId === chatId)) {
+    // An earlier command still owns this chat's order while it is applying or deferred. Refuse a
+    // newer one instead of letting it apply first; there is no queue for it.
+    if (controlPending.has(chatId) ||
+        [...deferredControls.values()].some((entry) => entry.chatId === chatId)) {
       await admitNotice(update, message, sessionKey,
-        "An earlier /new or /abort in this chat is still pending; this command was not started and was not sent " +
-        "to the assistant. Wait for it to finish or restart the adapter.");
+        "An earlier /new or /abort in this chat is still being applied or is still pending; this command was not " +
+        "started and was not sent to the assistant. Wait for it to finish or restart the adapter.");
       drain();
       return;
     }

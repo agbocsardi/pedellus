@@ -189,7 +189,8 @@ turn when it is later delivered, so it is answered exactly once. After a bounded
 number of failed attempts the command is reported as unconfirmed and the gate is
 released rather than leaving the chat unusable; a reopen reports any command
 still admitted the same honest way. A newer command in that chat is refused
-while an earlier one is deferred, so two commands cannot reorder.
+while an earlier one is still being applied or is deferred, so two commands
+cannot reorder; there is no queued-command guarantee.
 
 Per-chat model submissions keep admission order, and each chat's place is
 reserved when a delivery is dispatched, before any asynchronous

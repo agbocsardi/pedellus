@@ -211,15 +211,24 @@ export function createMediaStore(options: MediaStoreOptions): MediaStore {
    */
   let canonicalWorkspaceRoot: Promise<string> | undefined;
   const workspaceRoot = (): Promise<string> => {
-    canonicalWorkspaceRoot ??= (async () => {
-      try {
-        return await realpath(configuredWorkspaceRoot);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        await mkdir(configuredWorkspaceRoot, { recursive: true, mode: 0o700 });
-        return await realpath(configuredWorkspaceRoot);
-      }
-    })();
+    if (canonicalWorkspaceRoot === undefined) {
+      const attempt = (async () => {
+        try {
+          return await realpath(configuredWorkspaceRoot);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          await mkdir(configuredWorkspaceRoot, { recursive: true, mode: 0o700 });
+          return await realpath(configuredWorkspaceRoot);
+        }
+      })();
+      canonicalWorkspaceRoot = attempt;
+      // A transient resolution failure must not poison the store for the rest of the
+      // process. Only this failed attempt's memo is cleared; a successful canonical
+      // root stays stable forever, so a later alias repoint cannot redirect writes.
+      attempt.catch(() => {
+        if (canonicalWorkspaceRoot === attempt) canonicalWorkspaceRoot = undefined;
+      });
+    }
     return canonicalWorkspaceRoot;
   };
   const mediaRoot = async (): Promise<string> => resolve(await workspaceRoot(), ...segments);

@@ -5,7 +5,7 @@
 // temporary store, and speech recognition is a controlled helper subprocess.
 // Every wait is an explicit predicate with a deadline; no schedule sleeps.
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile, link, lstat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile, link, lstat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -46,6 +46,23 @@ async function until(predicate, label) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
     await new Promise((resolve) => setImmediate(resolve));
   }
+}
+
+async function untilAsync(predicate, label) {
+  const deadline = Date.now() + WAIT_MS;
+  while (!(await predicate())) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+/** The adapter's durable channel-state document, read without changing it. */
+async function telegramState(gateway) {
+  const conversation = await gateway.conversationFor(`telegram:${BOT_ID}:channel-state`, context);
+  return conversation.commit(async (tx) => {
+    const doc = await tx.doc(TelegramState, conversation.id);
+    return JSON.parse(JSON.stringify(doc));
+  }, context);
 }
 
 async function flush(rounds = 20) {
@@ -165,6 +182,15 @@ function textUpdate(updateId, messageId, text, chatId = CHAT_ID) {
  * `{ path, bytes, declaredSize?, getFileStatus?, hang? }`; unknown ids are a
  * rejection. getUpdates holds until abort once its batches are exhausted.
  */
+/** Reject when the adapter aborts, so mocked gates never outlive shutdown. */
+function aborted(signal) {
+  return new Promise((_, reject) => {
+    const onAbort = () => reject(new DOMException('The operation was aborted', 'AbortError'));
+    if (signal?.aborted) return onAbort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 function telegramMock(batches, files = new Map()) {
   const original = globalThis.fetch;
   const sent = [];
@@ -200,12 +226,7 @@ function telegramMock(batches, files = new Map()) {
           // A batch may be gated on a promise, so a test can let the next poll happen
           // after an asynchronous control effect without sleeping. Cancellation still
           // aborts the pending poll, so adapter shutdown never hangs.
-          const aborted = new Promise((_, reject) => {
-            const onAbort = () => reject(new DOMException('The operation was aborted', 'AbortError'));
-            if (signal?.aborted) return onAbort();
-            signal?.addEventListener('abort', onAbort, { once: true });
-          });
-          return response(await Promise.race([entry(), aborted]));
+          return response(await Promise.race([entry(), aborted(signal)]));
         }
         return response(entry);
       }
@@ -251,12 +272,11 @@ function telegramMock(batches, files = new Map()) {
         file.downloadFailures -= 1;
         return new Response('busy', { status: 503 });
       }
+      // A held download lets a test keep one control flush in flight while a later
+      // update is admitted, without sleeping. Abort still releases it.
+      if (file.downloadGate !== undefined) await Promise.race([file.downloadGate, aborted(signal)]);
       if (file.hang === true) {
-        return await new Promise((_, reject) => {
-          const aborted = () => reject(new DOMException('The operation was aborted', 'AbortError'));
-          if (signal?.aborted) return aborted();
-          signal?.addEventListener('abort', aborted, { once: true });
-        });
+        return await aborted(signal);
       }
       return new Response(file.bytes, {
         status: 200,
@@ -946,6 +966,58 @@ test('a transient attachment failure during a control flush keeps polling and de
   }
 });
 
+test('a newer control is refused while an earlier one is still applying, so resets never reorder', { timeout: 30_000 }, async () => {
+  const store = await syntheticStore('control-applying', { media: { directory: 'media' } });
+  const requests = [];
+  store.faux.setResponses(Array.from({ length: 24 }, () => (request) => {
+    requests.push({ messages: request.messages });
+    return fauxAssistantMessage('OK-REPLY');
+  }));
+  let releaseDownload;
+  const downloadGate = new Promise((resolve) => { releaseDownload = resolve; });
+  const files = new Map([[
+    'photo-hold',
+    { path: 'photos/file_hold.jpg', bytes: PHOTO_BYTES, contentType: 'image/jpeg', downloadGate },
+  ]]);
+  const transport = telegramMock([
+    [photoUpdate(800, 400, { fileId: 'photo-hold', uniqueId: 'unique-hold', bytes: PHOTO_BYTES, caption: 'pre-command photo' })],
+    [textUpdate(801, 401, '/new')],
+    [textUpdate(802, 402, '/new'), textUpdate(803, 403, '/new')],
+  ], files);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.downloads.length === 1, 'the first flush download started');
+    // Both newer commands are refused durably while the first is still applying. Their notices
+    // wait behind the first command's held acknowledgement, so inspect the durable records.
+    await untilAsync(async () => {
+      const doc = await telegramState(store.gateway);
+      const refusals = doc.pending.filter((item) => item.notice === true && item.updateId > 801 &&
+        /still being applied or is still pending/.test(item.text));
+      return refusals.length === 2 && doc.controls.length === 1;
+    }, 'both newer commands refused while the first applies');
+    assert.equal(transport.sent.filter((entry) => /Context reset applied/.test(entry.text)).length, 0,
+      'no reset is claimed while the first command is still applying');
+
+    releaseDownload();
+    await until(() => transport.sent.some((entry) => /Context reset applied/.test(entry.text)), 'the first command applied');
+    await until(() => transport.sent.some((entry) => entry.chatId === CHAT_ID && entry.text === 'OK-REPLY'), 'photo answer');
+    assert.equal(transport.sent.filter((entry) => /Context reset applied/.test(entry.text)).length, 1,
+      'exactly one reset was applied');
+    await until(() => transport.sent.filter((entry) => /still being applied or is still pending/.test(entry.text)).length === 2,
+      'both refusals were delivered after the earlier acknowledgement');
+    const photoTurns = requests.filter((request) =>
+      userMessages([request]).some((message) =>
+        Array.isArray(message.content) &&
+        message.content.some((part) => part.type === 'image') &&
+        messageText(message).includes('pre-command photo')));
+    assert.equal(photoTurns.length, 1, 'the pre-command photo turn kept its native image and ran once');
+    assert.equal((await mediaFiles(store.workspace)).length, 1);
+  } finally {
+    await cleanup(store, harness, transport);
+  }
+});
+
 test('a reopened pending record reuses the stored file and cached transcript without re-downloading', { timeout: 25_000 }, async () => {
   const store = await syntheticStore('reopen-stored', { media: { directory: 'media' } });
   const { path: uvPath, recordPath } = await fakeUv(store.directory);
@@ -1055,6 +1127,32 @@ test('concurrent stores of one identity publish one complete original', async ()
     assert.deepEqual(await store.read(first.relativePath), bytes);
     assert.deepEqual(await readdir(join(directory, 'media')), [first.relativePath.split('/').pop()],
       'one complete original and no temporary file');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a transient workspace-root resolution failure does not poison the store', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'nanobot-media-root-retry-'));
+  try {
+    const root = join(directory, 'workspace');
+    // A self-referential symlink makes realpath fail transiently (ELOOP).
+    await symlink(root, root);
+    const store = createMediaStore({ workspace: root, directory: 'media' });
+    const request = () => ({
+      kind: 'document',
+      identity: 'telegram:document:retry-root',
+      mimeType: 'text/plain',
+      body: (async function* () { yield Buffer.from('retry body'); })(),
+    });
+    await assert.rejects(store.save(request()), (error) => error instanceof Error);
+
+    // The same intended root now resolves; a poisoned memo would keep failing here.
+    await unlink(root);
+    await mkdir(root, { mode: 0o700 });
+    const saved = await store.save(request());
+    assert.match(saved.relativePath, /^media\/document-[0-9a-f]{16}\.txt$/);
+    assert.deepEqual(await store.read(saved.relativePath), Buffer.from('retry body'));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
