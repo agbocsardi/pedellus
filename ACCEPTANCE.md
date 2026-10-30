@@ -4,7 +4,8 @@
 actual built Gateway. It proves that the shipped wiring — not a test double of
 it — can carry one conversation through context discovery, an on-demand skill,
 topic-memory read/write through the configured coding tools, native compaction
-and a fresh-process reopen under a narrowed configuration.
+and, in the default offline run, a fresh-process reopen under a narrowed
+configuration.
 
 It is not a unit-test suite. The default and rehearsal modes are offline and
 make no provider call; `--mode=real` is the separately authorized live path.
@@ -29,15 +30,19 @@ directory, and runs two bounded child processes:
    `AGENTS.md`, `memory/MEMORY.md`, topic memory directory and `skills/`
    directory. It configures `read`/`write`/`edit`, proves those tools are
    offered, writes a topic memory file through the configured `write` tool, reads
-   it back through the configured `read` tool, proves a call to the unconfigured
-   `bash` tool is refused, and runs a native manual `Conversation.compact()`.
-2. **Second process** — reopens the same SQLite state and workspace, then checks
-   that the early fact arrives in a normal model request **through the placed
-   compaction summary**, that the original early turn text does not, that
-   bootstrap files, the memory manifest and the skill summary are rediscovered
-   from Markdown, and that reopening with `toolAllowlist: ["read"]` offers only
-   the configured read tool. The skill body and topic body load on demand through
-   tool results.
+   it back through the configured `read` tool, asks for the unregistered `bash`
+   tool and checks the native refusal result (this does not exercise the
+   call-time ceiling/capture hook, which `tests/config-tool-authorization`
+   covers), and runs a native manual `Conversation.compact()`.
+2. **Second process** — only in the default offline run, reopens the same SQLite
+   state and workspace with `toolAllowlist: ["read"]`, checking that only the
+   configured read tool is offered, then verifies that the early fact arrives in
+   a normal model request **through the placed compaction summary**, that the
+   original early turn text does not, and that bootstrap files, the memory
+   manifest and the skill summary are rediscovered from Markdown. The skill body
+   and topic body load on demand through tool results. `--mode=real-rehearsal`
+   and `--mode=real` run the separate real-flow phases instead, which keep the
+   full configured `read`/`write`/`edit` set and do not narrow it.
 
 The early user turn is the only source of the acceptance fact and also carries a
 distinct raw-turn sentinel. The topic memory file uses its own marker, so a topic

@@ -487,7 +487,7 @@ async function runFirstPhase(core, stateDir, evidence) {
         [core.fauxAssistantMessage(`Acknowledged synthetic filler turn ${index}.`)]);
     }
 
-    // A tool outside the configured ceiling is not callable: the model's request is refused.
+    // A tool outside the configured set is not registered; the model's request is refused.
     await driver.send(conversation, context, "Try an unconfigured tool once.",
       [
         core.fauxAssistantMessage([core.fauxToolCall("bash", { command: "true" })], { stopReason: "toolUse" }),

@@ -49,8 +49,8 @@ fixed failure text.
 
 ## Coding tools
 
-The adapter has no tool-authority commands. The shipped Gateway opens in config
-authorization mode, so `config toolAllowlist` enables exactly those coding tools
+The adapter has no tool-authority commands. The shipped Gateway's sole tool
+authority is `config toolAllowlist`, which enables exactly those coding tools
 for each authenticated private chat; `[]` or absent disables them. Every sender
 admitted by `telegram.allowFrom` shares the configured workspace and tool
 authority in its private chat. Admission is not per-tool authority, and there is
@@ -62,7 +62,7 @@ grant or approval commands do not exist in this adapter, and the model cannot
 request or change tool authority. The same scope rules as the CLI apply: only a
 validated ordinary mapped chat conversation is authorized, and scheduled
 isolated runs get a captured subset bounded by the current config and origin.
-See [`TOOLS.md`](./TOOLS.md#config-authorization-shipped-cli-and-telegram).
+See [`TOOLS.md`](./TOOLS.md#configured-authority).
 
 Acknowledgements are ordinary channel-state pending records with `notice: true`.
 They go through the same bounded chunk send, flood gate, write-ahead send intent

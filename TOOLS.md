@@ -268,9 +268,10 @@ npm run test:execution
 for a mapped chat, refusal of a call outside the configured set, no coding
 authority for forks, raw, state-only and root conversations, a reopen under a
 narrowed `toolAllowlist`, and the call-time capture hook.
-`scripts/core-acceptance.mjs` exercises configured `read`/`write`/`edit`, refusal
-of an unconfigured `bash` call, native compaction and a fresh-process reopen
-under a narrowed `toolAllowlist` with a faux provider.
+`scripts/core-acceptance.mjs` default offline run exercises configured
+`read`/`write`/`edit`, the native refusal of a `bash` call this configuration
+does not register, native compaction and a fresh-process reopen under a narrowed
+`toolAllowlist`; the real-flow rehearsal keeps the full configured set instead.
 
 Earlier bounded temporary probes (not committed as tests) used a faux provider, a
 temporary workspace/data directory and the real `openGateway`:

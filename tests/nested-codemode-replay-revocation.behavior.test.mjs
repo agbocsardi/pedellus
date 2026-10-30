@@ -38,7 +38,7 @@ const within = (promise, ms, label) => new Promise((resolve, reject) => {
 
 const count = (lines, label) => lines.filter((line) => line === label).length;
 
-test('SIGKILL mid-nested Code Mode: revoked host grant never reruns, explicit safe grant replays, unsafe downgrade stays interrupted', { timeout: 60_000 }, async () => {
+test('SIGKILL mid-nested Code Mode: deselected nested tool never reruns, selected safe tool replays, unsafe downgrade stays interrupted', { timeout: 60_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'nanobot-nested-codemode-replay-'));
   const effects = join(directory, 'effects.log');
   const stateFile = join(directory, 'state.json');
@@ -108,7 +108,7 @@ test('SIGKILL mid-nested Code Mode: revoked host grant never reruns, explicit sa
     const grantedTool = synthetic('nested_granted_effect');
     // Persisted Code Mode/nested intent says safe; the current registration says unsafe. Recovery must not rerun.
     const downgradedTool = synthetic('nested_downgraded_effect', 'unsafe');
-    // Issued only after the granted nested effect resolves, so it was still pending at SIGKILL.
+    // Issued only after the selected nested effect resolves, so it was still pending at SIGKILL.
     const pendingTool = synthetic('nested_pending_effect');
     const extension = defineExtension({
       name: 'nested-tool-replay-synthetic',
@@ -139,8 +139,8 @@ test('SIGKILL mid-nested Code Mode: revoked host grant never reruns, explicit sa
     assert.ok(mixed && granted, 'both conversations reopen');
 
     const extensions = [...integration.extensions, extension];
-    // Revoke the host grant for the revoked nested effect before scheduling resumes,
-    // while keeping the downgraded nested grant. Native Code Mode may replay its
+    // Deselect the revoked nested effect before scheduling resumes, while keeping the
+    // downgraded nested tool selected. Native Code Mode may replay its
     // script, but the canceled nested task must resolve no current tool and the
     // stored-safe/current-unsafe nested task must not rerun.
     await mixed.configure({
@@ -156,8 +156,8 @@ test('SIGKILL mid-nested Code Mode: revoked host grant never reruns, explicit sa
     const afterRevocation = (await readFile(effects, 'utf8')).trim().split('\n').filter(Boolean);
     assert.deepEqual([...afterRevocation].sort(), [...before].sort(), 'revocation itself executes nothing');
 
-    // Positive case: the explicit nested grant remains, so Code Mode's safe replay reruns the nested body once.
-    // The pending nested tool's grant is revoked before the replayed script reaches its second call.
+    // Positive case: the selected nested tool remains, so Code Mode's safe replay reruns the nested body once.
+    // The pending nested tool is deselected before the replayed script reaches its second call.
     const grantedAgent = await granted.agent(context);
     assert.ok(grantedAgent.callable.some((tool) => tool.name === 'nested_granted_effect'));
     assert.ok(grantedAgent.callable.some((tool) => tool.name === 'nested_pending_effect'));
@@ -197,7 +197,7 @@ test('SIGKILL mid-nested Code Mode: revoked host grant never reruns, explicit sa
     ]);
     // Both nested tasks were already admitted and checkpointed before SIGKILL, so
     // native recovery reports the interrupted/non-replay outcome for each. The
-    // revoked grant is observable as the absence of any current nested tool.
+    // deselected tool is observable as the absence of any current nested tool.
     assert.match(JSON.stringify(mixedView.results[0].content), /interrupted and may have partially run/i);
     const mixedCalls = new Map(nestedCalls(mixedView.results[0]).map((call) => [call.name, call]));
     assert.deepEqual([...mixedCalls.values()].map(({ name, status }) => [name, status]), [
@@ -224,7 +224,7 @@ test('SIGKILL mid-nested Code Mode: revoked host grant never reruns, explicit sa
 
     const after = (await readFile(effects, 'utf8')).trim().split('\n').filter(Boolean);
     assert.equal(count(after, 'nested_revoked_effect:revoked'), 1, 'revoked nested body never executes after revocation');
-    assert.equal(count(after, 'nested_granted_effect:granted'), 2, 'explicitly granted safe nested body reruns once');
+    assert.equal(count(after, 'nested_granted_effect:granted'), 2, 'selected safe nested body reruns once');
     assert.equal(count(after, 'nested_downgraded_effect:downgraded'), 1, 'unsafe nested downgrade must not rerun');
     assert.equal(count(after, 'nested_pending_effect:pending'), 0, 'pending revoked nested body never executes');
     assert.deepEqual(after, [...before, 'nested_granted_effect:granted']);

@@ -31,7 +31,7 @@ const within = (promise, ms, label) => new Promise((resolve, reject) => {
 
 const count = (lines, label) => lines.filter((line) => line === label).length;
 
-test('SIGKILL mid-tool: revoked grant and unsafe downgrade stay interrupted while an explicit safe grant replays', { timeout: 45_000 }, async () => {
+test('SIGKILL mid-tool: deselected tool and unsafe downgrade stay interrupted while a selected safe tool replays', { timeout: 45_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'nanobot-tool-replay-'));
   const effects = join(directory, 'effects.log');
   const stateFile = join(directory, 'state.json');
@@ -89,7 +89,7 @@ test('SIGKILL mid-tool: revoked grant and unsafe downgrade stay interrupted whil
       replay,
       execute: async ({ label }) => {
         await appendFile(effects, `${name}:${label}\n`);
-        return { output: [fauxText(`${name} replayed after an explicitly granted restart`)] };
+        return { output: [fauxText(`${name} replayed after an explicit host tool selection`)] };
       },
     });
     const revokedTool = synthetic('revoked_effect');
@@ -118,17 +118,18 @@ test('SIGKILL mid-tool: revoked grant and unsafe downgrade stay interrupted whil
     const downgraded = await harness.conversation(state.downgraded.conversation, context);
     assert.ok(revoked && granted && downgraded, 'all conversations reopen');
 
-    // The grant is revoked before scheduling resumes, so recovery must not re-execute.
+    // The tool is deselected from the host configuration before scheduling resumes, so recovery
+    // must not re-execute.
     await revoked.configure({ tools: [], modelTools: [] }, context);
     assert.ok(!(await revoked.agent(context)).tools.some((tool) => tool.name === 'revoked_effect'));
     const afterRevocation = (await readFile(effects, 'utf8')).trim().split('\n').filter(Boolean);
-    assert.deepEqual([...afterRevocation].sort(), [...before].sort(), 'revocation itself executes nothing');
+    assert.deepEqual([...afterRevocation].sort(), [...before].sort(), 'deselection itself executes nothing');
 
-    // Positive case: an explicit host grant is present before resume, so the safe call reruns.
+    // Positive case: the tool stays selected before resume, so the safe call reruns.
     assert.ok((await granted.agent(context)).tools.some((tool) => tool.name === 'granted_effect'));
     await granted.configure({ extensions: [extension], tools: [grantedTool], modelTools: [grantedTool] }, context);
 
-    // The downgraded tool keeps its grant; only its current replay classification is unsafe.
+    // The downgraded tool stays selected; only its current replay classification is unsafe.
     assert.ok((await downgraded.agent(context)).tools.some((tool) => tool.name === 'downgraded_effect'));
     assert.equal(downgradedTool.replay, 'unsafe');
     await downgraded.configure({
@@ -167,7 +168,7 @@ test('SIGKILL mid-tool: revoked grant and unsafe downgrade stay interrupted whil
     assert.deepEqual(grantedView.results.map(({ toolName, isError }) => [toolName, isError]), [
       ['granted_effect', false],
     ]);
-    assert.match(JSON.stringify(grantedView.results[0].content), /replayed after an explicitly granted restart/);
+    assert.match(JSON.stringify(grantedView.results[0].content), /replayed after an explicit host tool selection/);
     assertFinalAnswer(grantedView);
 
     const downgradedView = await toolResults(downgraded);
@@ -179,7 +180,7 @@ test('SIGKILL mid-tool: revoked grant and unsafe downgrade stay interrupted whil
 
     const after = (await readFile(effects, 'utf8')).trim().split('\n').filter(Boolean);
     assert.equal(count(after, 'revoked_effect:revoked'), 1, 'revoked body never executes after revocation');
-    assert.equal(count(after, 'granted_effect:granted'), 2, 'explicitly granted safe body reruns once after restart');
+    assert.equal(count(after, 'granted_effect:granted'), 2, 'selected safe body reruns once after restart');
     assert.equal(count(after, 'downgraded_effect:downgraded'), 1, 'unsafe downgrade must not rerun the body');
     assert.deepEqual(after, [...before, 'granted_effect:granted']);
   } finally {
