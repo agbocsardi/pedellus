@@ -38,6 +38,12 @@ import {
   type HistorySummaryView,
 } from "./history/summary-view.js";
 import { createHistoryTool, HISTORY_TOOL_NAME, type HistoryToolHost } from "./history/tool.js";
+import {
+  TELEGRAM_TOOL_NAME,
+  createTelegramActionRegistry,
+  createTelegramTool,
+  type TelegramActionRegistry,
+} from "./channels/telegram-tool.js";
 import type { CronOwner } from "./automation/cron.js";
 import {
   EpisodeDoc,
@@ -194,6 +200,12 @@ export interface Gateway {
    * after its own authentication; it creates no conversation, starts no run and adds no authority.
    */
   readonly cronOutbox: CronDeliveryOutbox;
+  /**
+   * Model-action host registry for the configured Telegram channel. The running adapter attaches
+   * here; when absent, a mapped Telegram chat still sees the tool but every call is denied because
+   * no live channel can send. Present only when `config.telegram` is configured.
+   */
+  readonly telegramActions?: TelegramActionRegistry;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
   /** Lists the explicit allowlist and persisted selection for an already-known session key. */
   listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
@@ -580,6 +592,21 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // The read-only history tool is on by default; its name is fixed before the tool extension exists so
   // the coding hook can exempt it from the ceiling like the skill loader.
   const historyEnabled = options.agentHistory !== false;
+  // Telegram interaction is a separate channel capability, not a coding-tool name. It exists only
+  // when the channel is configured; the running adapter attaches its host, and the runtime offers
+  // the tool only in a mapped Telegram chat conversation. Root, channel-state, fork, raw and
+  // task-owned cron targets are never in that set.
+  const telegramActions: TelegramActionRegistry | undefined =
+    config.telegram === undefined ? undefined : createTelegramActionRegistry();
+  const sessionKeyForConversation = new Map<ConversationId, string>();
+  const telegramChatConversations = new Set<ConversationId>();
+  const telegramTool = telegramActions === undefined
+    ? undefined
+    : createTelegramTool({
+        registry: telegramActions,
+        sessionKeyFor: (conversationId) => sessionKeyForConversation.get(conversationId),
+      });
+  const telegramToolRegistration = telegramTool?.extension.tools?.[0];
   // Config authorization names only mapped ordinary chat conversations (loaded map + scope checked).
   // The call-time hook consults this set; the policy filter reads the same rule from committed state.
   const authorizedChatConversations = new Set<ConversationId>();
@@ -590,6 +617,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         contextTools: [
           ...(options.contextSnapshotProvider === undefined ? [] : [SKILL_TOOL_NAME]),
           ...(cronEnabled ? [CRON_TOOL_NAME] : []),
+          ...(telegramTool === undefined ? [] : [TELEGRAM_TOOL_NAME]),
           // History retrieval is read-only over mapped chats and has its own scope checks, so the
           // ceiling must not suppress it when coding tools are enabled.
           ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
@@ -661,6 +689,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       selected.push(skillTool.extension);
     }
     if (historyTool && historyConversations.has(conversationId)) selected.push(historyTool.extension);
+    if (telegramTool && telegramChatConversations.has(conversationId)) selected.push(telegramTool.extension);
     if (cronFoundation && cronTool && cronOwners.has(conversationId)) {
       selected.push(cronFoundation.extension, cronTool.extension);
     }
@@ -828,7 +857,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const historyTools = historyToolRegistration !== undefined && historyConversations.has(conversationId)
       ? [historyToolRegistration]
       : [];
-    return [...skillTools, ...cronTools, ...historyTools];
+    // Telegram interaction is a scoped channel capability for one mapped private chat, not a coding
+    // tool. The live adapter rechecks the current allowlist and observed target at call time.
+    const telegramTools = telegramToolRegistration !== undefined && telegramChatConversations.has(conversationId)
+      ? [telegramToolRegistration]
+      : [];
+    return [...skillTools, ...cronTools, ...historyTools, ...telegramTools];
   };
   /**
    * The authority-derived tool filter. The host ceiling directly authorizes authenticated mapped
@@ -960,6 +994,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (toolExtension) registry.install(toolExtension);
     if (skillTool) registry.install(skillTool.extension);
     if (historyTool) registry.install(historyTool.extension);
+    if (telegramTool) registry.install(telegramTool.extension);
     if (cronFoundation) registry.install(cronFoundation.extension);
     if (cronTool) registry.install(cronTool.extension);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
@@ -1245,13 +1280,17 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // History retrieval is independent of the context snapshot opt-in: every mapped chat
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
-    const initialMapping = historyTool === undefined && !toolsEnabled
+    const initialMapping = historyTool === undefined && !toolsEnabled && telegramTool === undefined
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
     if (initialMapping !== undefined) {
-      for (const { conversationId } of await mappedChatSessions(context)) {
+      for (const { sessionKey, conversationId } of await mappedChatSessions(context)) {
         if (historyTool !== undefined) historyConversations.add(conversationId);
         authorizedChatConversations.add(conversationId);
+        sessionKeyForConversation.set(conversationId, sessionKey);
+        if (telegramTool !== undefined && sessionKey.startsWith("telegram:")) {
+          telegramChatConversations.add(conversationId);
+        }
       }
     }
     if (options.contextSnapshotProvider || cronEnabled) {
@@ -1476,6 +1515,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const gateway: Gateway = {
       harness,
       cronOutbox,
+      ...(telegramActions === undefined ? {} : { telegramActions }),
       async conversationFor(sessionKey, ctx) {
         const key = encodedSessionKey(sessionKey);
         let conversationId: ConversationId | undefined;
@@ -1503,15 +1543,26 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (!Number.isSafeInteger(conversationId)) throw new Error("Stored conversation mapping has an invalid ID");
         // A mapped session key is the cron owner; unmapped conversations (such as a scheduled run's
         // own background conversation) have no owner and therefore never receive the cron tool.
+        let mappedChat = false;
         if (isChatSessionKey(sessionKey)) {
           const reason = await root.commit((tx) => readChatScope((id) => tx.conversation(id), conversationId!, root.id), ctx);
           if (reason === undefined) {
             historyConversations.add(conversationId!);
             authorizedChatConversations.add(conversationId!);
+            mappedChat = true;
           } else {
             historyConversations.delete(conversationId!);
             authorizedChatConversations.delete(conversationId!);
           }
+        }
+        // The exact host-owned session key for this conversation is what a channel action host
+        // revalidates; it is never supplied by the model. Only a scope-checked mapped Telegram chat
+        // conversation is offered the Telegram action tool.
+        sessionKeyForConversation.set(conversationId!, sessionKey);
+        if (mappedChat && sessionKey.startsWith("telegram:")) {
+          telegramChatConversations.add(conversationId!);
+        } else {
+          telegramChatConversations.delete(conversationId!);
         }
         if (createdNow !== undefined && episodeSummaries !== undefined) {
           try {

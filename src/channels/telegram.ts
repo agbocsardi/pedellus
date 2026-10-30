@@ -4,12 +4,34 @@ import { copyJson } from "@earendil-works/chord";
 import { withCancel, withoutAbortSignal } from "@earendil-works/chord/context";
 import { Api, GrammyError, HttpError } from "grammy";
 import type { ApiClientOptions } from "grammy";
-import type { Update } from "grammy/types";
+import type { MessageReactionUpdated, ReactionType, ReactionTypeEmoji, Update } from "grammy/types";
 import type { Conversation, SubmissionId } from "@earendil-works/pi-durable";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
 import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
+import {
+  TELEGRAM_ACTION_LIMITS,
+  TELEGRAM_TARGET_LIMITS,
+  actionFor,
+  admitAction,
+  findTarget,
+  incomingContextText,
+  observeTarget,
+  reactionChangeText,
+  settleActionRecord,
+  targetsForChat,
+  unresolvedActions,
+  type TelegramActionRecord,
+  type TelegramObservedTarget,
+  type TelegramQuotedContext,
+} from "./telegram-interactions.js";
+import type {
+  TelegramActionHost,
+  TelegramActionOutcome,
+  TelegramActionRegistry,
+  TelegramActionRequest,
+} from "./telegram-tool.js";
 
 const API = "https://api.telegram.org";
 const TELEGRAM_LIMIT = 4096;
@@ -81,6 +103,10 @@ export type TelegramChannelState = {
   controls: TelegramControlRecord[];
   /** Durable authenticated sender-to-chat evidence keyed by decimal chat ID. */
   origins: Record<string, TelegramOriginBinding>;
+  /** Bounded observed message identities that a model action may target. */
+  targets: TelegramObservedTarget[];
+  /** Bounded write-ahead records of model-requested native replies and reactions. */
+  actions: TelegramActionRecord[];
 };
 export type TelegramOriginBinding = {
   /** Adapter identity that admitted this private chat. */
@@ -103,25 +129,32 @@ type ChannelState = TelegramChannelState;
 // Stored alongside the adapter's stable channel conversation, not in a plaintext sidecar.
 export const TelegramState = defineDoc<ChannelState>({
   kind: "nanobot.telegram-state",
-  version: 4,
+  version: 5,
   scope: "conversation",
   history: "latest",
   fork: "initial",
   checkpointWhen: (_value, _ops, { deltasSinceBase }) => deltasSinceBase >= 64,
   migrate: (value, fromVersion) => {
-    if (fromVersion !== 1 && fromVersion !== 2 && fromVersion !== 3) {
+    if (fromVersion !== 1 && fromVersion !== 2 && fromVersion !== 3 && fromVersion !== 4) {
       throw new Error(`Unsupported Telegram state version ${fromVersion}`);
     }
     if (!Array.isArray(value.pending) || value.pending.some((item) =>
       item === null || typeof item !== "object" || Array.isArray(item))) {
       throw new Error("Stored Telegram state contains invalid pending deliveries");
     }
-    if (fromVersion === 3 && value.controls !== undefined && !Array.isArray(value.controls)) {
+    const hasControls = fromVersion === 3 || fromVersion === 4;
+    if (hasControls && value.controls !== undefined && !Array.isArray(value.controls)) {
       throw new Error("Stored Telegram state contains invalid controls");
     }
-    if (fromVersion === 3 && value.origins !== undefined &&
+    if (hasControls && value.origins !== undefined &&
       (value.origins === null || typeof value.origins !== "object" || Array.isArray(value.origins))) {
       throw new Error("Stored Telegram state contains invalid origin bindings");
+    }
+    if (value.targets !== undefined && !Array.isArray(value.targets)) {
+      throw new Error("Stored Telegram state contains invalid observed targets");
+    }
+    if (value.actions !== undefined && !Array.isArray(value.actions)) {
+      throw new Error("Stored Telegram state contains invalid action records");
     }
     return {
       offset: Number(value.offset ?? 0),
@@ -129,13 +162,15 @@ export const TelegramState = defineDoc<ChannelState>({
         ...item,
         nextChunkIndex: fromVersion === 1 ? 0 : Number(item.nextChunkIndex ?? 0),
       })),
-      controls: fromVersion === 3 && Array.isArray(value.controls)
+      controls: hasControls && Array.isArray(value.controls)
         ? value.controls as unknown as TelegramControlRecord[] : [],
-      origins: fromVersion === 3 && value.origins !== null && typeof value.origins === "object" && !Array.isArray(value.origins)
+      origins: hasControls && value.origins !== null && typeof value.origins === "object" && !Array.isArray(value.origins)
         ? value.origins as unknown as Record<string, TelegramOriginBinding> : {},
+      targets: Array.isArray(value.targets) ? value.targets as unknown as TelegramObservedTarget[] : [],
+      actions: Array.isArray(value.actions) ? value.actions as unknown as TelegramActionRecord[] : [],
     };
   },
-  initial: () => ({ offset: 0, pending: [], controls: [], origins: {} }),
+  initial: () => ({ offset: 0, pending: [], controls: [], origins: {}, targets: [], actions: [] }),
 });
 
 export interface TelegramGateway {
@@ -145,6 +180,11 @@ export interface TelegramGateway {
    * only does inbound replies stays usable; absent means no scheduled delivery is attempted.
    */
   cronOutbox?: CronDeliveryOutbox;
+  /**
+   * Late-bound model-action host. The runtime creates it when `config.telegram` exists and offers the
+   * `telegram` tool only in mapped Telegram chat conversations; the running adapter attaches here.
+   */
+  telegramActions?: TelegramActionRegistry;
 }
 
 export async function runTelegram(
@@ -339,6 +379,236 @@ export async function runTelegram(
     return { trusted, evictedChatId };
   };
 
+  const mutateState = async (
+    change: (doc: Draft<ChannelState>) => void,
+    ctx: Context = cleanupContext,
+  ): Promise<ChannelState> => {
+    state = await stateConversation.commit(async (tx) => {
+      const doc = await tx.doc(TelegramState, stateConversation.id);
+      change(doc);
+      return copyJson(doc) as unknown as ChannelState;
+    }, ctx);
+    return state;
+  };
+
+  // An outbound message the bot actually sent becomes a durable, bounded action target. Its text is
+  // only an excerpt for the model; the identity is what a later reply/reaction is checked against.
+  // Observation is derived bookkeeping: a failed commit leaves the id unobserved (fail closed) and
+  // must never turn an already accepted external send into an ambiguous delivery.
+  const rememberOutgoingTarget = async (chatId: number, messageId: number, text: string): Promise<void> => {
+    if (!Number.isSafeInteger(messageId) || messageId < 1) return;
+    try {
+      await mutateState((doc) => {
+        observeTarget(doc, {
+          chatId,
+          messageId,
+          direction: "outgoing",
+          senderId: identity,
+          text,
+          observedAtMs: Date.now(),
+        });
+      });
+    } catch {
+      // Best effort: the send result and its durable delivery record stay authoritative.
+    }
+  };
+
+  /**
+   * The live authority for one action: the mapped session key is host-owned, and the chat must still
+   * have durable private-chat admission evidence for this bot whose sender is in the CURRENT
+   * allowlist. The model never supplies a chat or session selector.
+   */
+  const authorizedActionChat = (sessionKey: string): number | undefined => {
+    const chatId = chatIdForSession(sessionKey, identity);
+    if (chatId === undefined) return undefined;
+    const binding = originBindingOf(state.origins, chatId, identity);
+    if (binding === undefined || !options.allowFrom.includes(binding.senderId)) return undefined;
+    return chatId;
+  };
+
+  const settleAction = async (
+    callId: string,
+    status: "sent" | "unknown" | "failed" | "denied",
+    error?: string,
+  ): Promise<void> => {
+    await mutateState((doc) => {
+      settleActionRecord(doc.actions, callId, status, error === undefined ? {} : { error });
+    });
+  };
+
+  const actionOutcome = (record: TelegramActionRecord): TelegramActionOutcome => {
+    if (record.status === "sent") {
+      const ids = record.resultMessageIds ?? [];
+      return {
+        ok: true,
+        text: ids.length === 0
+          ? "This Telegram action was already applied."
+          : `This Telegram action was already applied (message id ${ids.join(", ")}).`,
+        ...(ids.length === 0 ? {} : { messageIds: ids }),
+      };
+    }
+    if (record.status === "unknown" || record.status === "sending") {
+      return { ok: false, text: "The outcome of this Telegram action is unknown; it will not be retried automatically." };
+    }
+    if (record.status === "failed") {
+      return { ok: false, text: "This Telegram action previously failed and will not be retried automatically." };
+    }
+    if (record.status === "denied") {
+      return { ok: false, text: "This Telegram action was previously denied and will not be retried automatically." };
+    }
+    return { ok: false, text: "This Telegram action was interrupted before sending and will not be retried automatically." };
+  };
+
+  /**
+   * Perform one already-admitted action. A `sending` record precedes the API call; a success records
+   * the returned ids, a known rejection fails closed, and any other outcome is quarantined as
+   * `unknown` so a later replay or reopen never resends it blindly.
+   */
+  const performAction = async (
+    chatId: number,
+    callId: string,
+    request: TelegramActionRequest,
+  ): Promise<TelegramActionOutcome> => {
+    try {
+      if (request.kind === "react") {
+        const reaction: ReactionType[] = [{
+          type: "emoji",
+          // The adapter does not hardcode Telegram's reaction allowlist; an unsupported emoji is a
+          // known rejection and fails closed without retry.
+          emoji: request.emoji as ReactionTypeEmoji["emoji"],
+        }];
+        await apiCall(api, "setMessageReaction", signal, (callSignal) => withChatSendOrder(chatId, () =>
+          api.setMessageReaction(chatId, request.messageId, reaction, {}, toGrammySignal(callSignal))),
+        { throttle: outboundThrottle });
+        await settleAction(callId, "sent");
+        return { ok: true, text: `Set the ${request.emoji} reaction on message ${request.messageId}.` };
+      }
+      const chunks = splitTelegramText(request.text);
+      const ids: number[] = [];
+      for (let index = actionFor(state.actions, callId)?.nextChunkIndex ?? 0; index < chunks.length; index++) {
+        const chunk = chunks[index]!;
+        const sent = await apiCall(api, "sendMessage", signal, (callSignal) => withChatSendOrder(chatId, () =>
+          api.sendMessage(
+            chatId,
+            chunk,
+            index === 0
+              ? { reply_parameters: { message_id: request.messageId, allow_sending_without_reply: false } }
+              : {},
+            toGrammySignal(callSignal),
+          )), { throttle: outboundThrottle });
+        if (sent === undefined) throw new Error("Telegram sendMessage returned no result");
+        ids.push(sent.message_id);
+        await mutateState((doc) => {
+          const entry = doc.actions.find((candidate) => candidate.callId === callId);
+          if (entry === undefined) return;
+          entry.nextChunkIndex = Math.max(entry.nextChunkIndex, index + 1);
+          entry.resultMessageIds = [...(entry.resultMessageIds ?? []), sent.message_id];
+        });
+        await rememberOutgoingTarget(chatId, sent.message_id, chunk);
+      }
+      await settleAction(callId, "sent");
+      return {
+        ok: true,
+        text: `Sent as a native reply to message ${request.messageId}` +
+          `${ids.length > 1 ? ` in ${ids.length} parts` : ""} (message id ${ids.join(", ")}).`,
+        messageIds: ids,
+      };
+    } catch (error) {
+      // `sendMessage` 5xx is already `unknown`. A reaction 5xx is likewise ambiguous, so only a
+      // proven pre-connect failure or a non-5xx rejection may be called a known non-send.
+      const knownNotSent = error instanceof TelegramApiError &&
+        (error.outcome === "not-sent" ||
+          (error.outcome === "rejected" && error.status > 0 && error.status < 500));
+      if (knownNotSent) {
+        await settleAction(callId, "failed", "Telegram rejected the action");
+        return {
+          ok: false,
+          text: "Telegram rejected the action; it was not applied and will not be retried automatically.",
+        };
+      }
+      await settleAction(callId, "unknown");
+      console.warn(`Telegram ${request.kind} action outcome unknown; it will not be retried automatically.`);
+      return {
+        ok: false,
+        text: "The Telegram action may or may not have been applied; it will not be retried automatically.",
+      };
+    }
+  };
+
+  const actionHost: TelegramActionHost = {
+    targets(sessionKey) {
+      if (stopping || signal?.aborted) return undefined;
+      const chatId = authorizedActionChat(sessionKey);
+      if (chatId === undefined) return undefined;
+      return targetsForChat(state.targets, chatId, TELEGRAM_TARGET_LIMITS.listing);
+    },
+    async act(sessionKey, callId, request, ctx) {
+      if (stopping || signal?.aborted || ctx.abortSignal?.aborted) {
+        return { ok: false, text: "The Telegram adapter is stopping, so no action was taken." };
+      }
+      if (typeof callId !== "string" || callId === "" || callId.length > TELEGRAM_ACTION_LIMITS.callIdChars) {
+        return { ok: false, text: "This Telegram action has no usable call identity and was not taken." };
+      }
+      const chatId = authorizedActionChat(sessionKey);
+      if (chatId === undefined) {
+        return { ok: false, text: "This chat is not currently authorized for Telegram actions." };
+      }
+      if (!Number.isSafeInteger(request.messageId) || request.messageId < 1) {
+        return { ok: false, text: "messageId must be a positive observed message id from this chat." };
+      }
+      if (findTarget(state.targets, chatId, request.messageId) === undefined) {
+        return {
+          ok: false,
+          text: `Message id ${request.messageId} is not an observed message in this chat, so it cannot be ` +
+            "targeted. Use action=targets to see the ids this chat may target.",
+        };
+      }
+      const existing = actionFor(state.actions, callId);
+      if (existing !== undefined) return actionOutcome(existing);
+
+      const record: TelegramActionRecord = {
+        callId,
+        kind: request.kind,
+        chatId,
+        targetMessageId: request.messageId,
+        ...(request.kind === "reply" ? { text: request.text } : { emoji: request.emoji }),
+        status: "intent",
+        nextChunkIndex: 0,
+        startedAtMs: Date.now(),
+      };
+      let admission: "admitted" | "duplicate" | "full" = "full";
+      await mutateState((doc) => {
+        admission = admitAction(doc.actions, record);
+      });
+      if (admission === "full") {
+        return { ok: false, text: "Too many Telegram actions are awaiting outcome; this action was not taken." };
+      }
+      if (admission === "duplicate") {
+        const duplicate = actionFor(state.actions, callId);
+        return duplicate === undefined
+          ? { ok: false, text: "This Telegram action is already recorded and will not be resent." }
+          : actionOutcome(duplicate);
+      }
+      // Preflight recheck after the durable intent: never send if the adapter stopped, the admission
+      // evidence changed, or the target was evicted between validation and the effect.
+      if (stopping || signal?.aborted || ctx.abortSignal?.aborted) {
+        await settleAction(callId, "denied", "adapter stopped before sending");
+        return { ok: false, text: "The adapter stopped before sending; no action was taken." };
+      }
+      if (authorizedActionChat(sessionKey) === undefined ||
+          findTarget(state.targets, chatId, request.messageId) === undefined) {
+        await settleAction(callId, "denied", "scope or target recheck failed");
+        return { ok: false, text: "The chat or target is no longer authorized; no action was taken." };
+      }
+      await mutateState((doc) => {
+        const entry = doc.actions.find((candidate) => candidate.callId === callId);
+        if (entry !== undefined) entry.status = "sending";
+      });
+      return performAction(chatId, callId, request);
+    },
+  };
+  let detachTelegramActions: (() => void) | undefined;
+
   // A completed background result is sent as stored text: no submission, no preview, no model turn.
   const scheduledSessions = async (): Promise<{ sessionKey: string; chatId: number }[]> => {
     if (outbox === undefined) return [];
@@ -450,6 +720,7 @@ export async function runTelegram(
           entry.nextChunkIndex = Math.max(entry.nextChunkIndex, index + 1);
           if (index === 0) entry.messageId = sent.message_id;
         }, cleanupContext);
+        await rememberOutgoingTarget(chatId, sent.message_id, chunk);
         return sent;
       }, { throttle: outboundThrottle });
       return sent === undefined ? "retry" : "sent";
@@ -774,6 +1045,7 @@ export async function runTelegram(
       }
       const sent = await sendTelegramMessage(current.text, "final", 0);
       if (sent === undefined) throw new Error("Telegram sendMessage returned no result");
+      await rememberOutgoingTarget(current.chatId, sent.message_id, current.text);
       await forget(current.updateId);
     }
 
@@ -865,6 +1137,7 @@ export async function runTelegram(
                 entry.lastText = text;
               }
             }, cleanupContext);
+            await rememberOutgoingTarget(item.chatId, sent.message_id, text);
             return sent;
           },
           { throttle: outboundThrottle, replaceable });
@@ -1034,10 +1307,20 @@ export async function runTelegram(
     await markUnknown(item.updateId, item.sendIntent?.stage ?? "final", item.sendIntent?.chunkIndex);
     console.warn(`Telegram delivery outcome unknown for update ${item.updateId}; inspect the Durable channel-state record.`);
   }
+  // A model-requested external action may have reached Telegram before a crash. Quarantine every
+  // unresolved intent/sending record as unknown: a replay or reopen must never resend it blindly.
+  for (const action of unresolvedActions(state.actions)) {
+    await settleAction(action.callId, "unknown");
+    console.warn(`Telegram ${action.kind} action was interrupted before its outcome was recorded; ` +
+      "it will not be retried automatically.");
+  }
   // Recover admitted work before polling. Each requestId safely reacquires its existing submission.
   await recoverScheduled();
+  // Cosmetic and best effort: a slow or flooded menu registration must not delay polling.
+  void registerCommandMenu();
   requestScheduledScan();
   scheduledTimer = setInterval(requestScheduledScan, SCHEDULED_SCAN_INTERVAL_MS);
+  detachTelegramActions = gateway.telegramActions?.attach(actionHost);
   drain();
 
   try {
@@ -1048,70 +1331,169 @@ export async function runTelegram(
       const updates = await apiCall(api, "getUpdates", signal, (callSignal) => api.getUpdates({
         offset: state.offset,
         timeout: Math.min(options.pollTimeoutSeconds ?? 30, POLL_TIMEOUT_MAX),
-        allowed_updates: ["message"],
+        allowed_updates: ["message", "message_reaction"],
       }, toGrammySignal(callSignal)), { throttle: pollThrottle, retryNetwork: true });
       if (!updates) throw new Error("Telegram getUpdates returned no result");
       for (const update of updates) {
         if (signal?.aborted) break;
+        // The durable offset is the admission boundary: a replayed update below it is already
+        // admitted (message or reaction) and must not create a second turn.
+        if (update.update_id < state.offset) continue;
         const message = update.message;
-        if (!isAllowedPrivateMessage(message, options.allowFrom)) {
-          await persistOffset(update.update_id + 1);
-          continue;
-        }
-        const sessionKey = `telegram:${identity}:chat:${message!.chat.id}`;
-        // Persist authenticated admission evidence before any control or conversation action.
-        const origin = await rememberOrigin(message!.chat.id, String(message!.from!.id));
-        if (origin.evictedChatId !== null) {
-          await reportOutboxFault(
-            `telegram:${identity}:chat:${origin.evictedChatId}`,
-            "origin admission binding evicted at capacity; a fresh admission restores it",
-          );
-          console.warn("Telegram origin admission binding evicted at capacity; a fresh admission restores it.");
-        }
-        if (origin.trusted) await releaseWithheld(sessionKey);
-        // Control parsing happens only after allowlist authentication and never for attachments.
-        const parsed = parseTelegramInput(message.text ?? "", me.username);
-        if (parsed.kind !== "input") {
-          await handleControl(update, message, parsed);
-          continue;
-        }
-        const text = message.text !== undefined ? parsed.text : message.caption;
-        // Text-only adapter: never imply that an unsupported attachment was read.
-        const hasAttachment = ["photo", "document", "audio", "voice", "video", "video_note", "animation", "sticker"]
-          .some((field) => (message as unknown as Record<string, unknown>)[field] !== undefined);
-        const notice = "[Unsupported Telegram attachment: this adapter accepts text only.]";
-        const input = hasAttachment ? `${notice}${text ? ` Caption: ${text}` : ""}`
-          : text ?? "[Unsupported Telegram message: this adapter accepts text only.]";
-        state = await stateConversation.commit(async (tx) => {
-          const doc = await tx.doc(TelegramState, stateConversation.id);
-          if (!doc.pending.some((entry) => entry.updateId === update.update_id)) {
-            if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
-            doc.pending.push({
-              updateId: update.update_id,
-              nextChunkIndex: 0,
-              chatId: message!.chat.id,
-              sessionKey,
-              senderId: String(message!.from!.id),
-              text: input,
-            });
+        if (message !== undefined) {
+          if (!isAllowedPrivateMessage(message, options.allowFrom)) {
+            await persistOffset(update.update_id + 1);
+            continue;
           }
-          doc.offset = Math.max(doc.offset, update.update_id + 1);
-          return copyJson(doc) as unknown as ChannelState;
-        }, adapterContext);
-        // The exact input and the offset commit before any model submission, so a crash cannot lose or duplicate it.
-        drain();
+          const sessionKey = `telegram:${identity}:chat:${message.chat.id}`;
+          // Persist authenticated admission evidence before any control or conversation action.
+          const origin = await rememberOrigin(message.chat.id, String(message.from!.id));
+          if (origin.evictedChatId !== null) {
+            await reportOutboxFault(
+              `telegram:${identity}:chat:${origin.evictedChatId}`,
+              "origin admission binding evicted at capacity; a fresh admission restores it",
+            );
+            console.warn("Telegram origin admission binding evicted at capacity; a fresh admission restores it.");
+          }
+          if (origin.trusted) await releaseWithheld(sessionKey);
+          // Control parsing happens only after allowlist authentication and never for attachments.
+          const parsed = parseTelegramInput(message.text ?? "", me.username);
+          if (parsed.kind !== "input") {
+            await handleControl(update, message, parsed);
+            continue;
+          }
+          const text = message.text !== undefined ? parsed.text : message.caption;
+          // Text-only adapter: never imply that an unsupported attachment was read.
+          const hasAttachment = ["photo", "document", "audio", "voice", "video", "video_note", "animation", "sticker"]
+            .some((field) => (message as unknown as Record<string, unknown>)[field] !== undefined);
+          const notice = "[Unsupported Telegram attachment: this adapter accepts text only.]";
+          const body = hasAttachment ? `${notice}${text ? ` Caption: ${text}` : ""}`
+            : text ?? "[Unsupported Telegram message: this adapter accepts text only.]";
+          const quoted = quotedMessageContext(message, identity);
+          // A quoted/replied-to message contributes bounded, labeled reference context and its
+          // message identity. An ordinary message keeps its exact original input; its own identity
+          // is still durably observed and reachable through the `telegram` tool's `targets` action.
+          const input = quoted === undefined
+            ? body
+            : `${incomingContextText({ messageId: message.message_id, replyTo: quoted.context })}\n${body}`;
+          const observedAtMs = Date.now();
+          state = await stateConversation.commit(async (tx) => {
+            const doc = await tx.doc(TelegramState, stateConversation.id);
+            if (!doc.pending.some((entry) => entry.updateId === update.update_id)) {
+              if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
+              doc.pending.push({
+                updateId: update.update_id,
+                nextChunkIndex: 0,
+                chatId: message.chat.id,
+                sessionKey,
+                senderId: String(message.from!.id),
+                text: input,
+              });
+            }
+            observeTarget(doc, {
+              chatId: message.chat.id,
+              messageId: message.message_id,
+              direction: "incoming",
+              senderId: String(message.from!.id),
+              text: message.text ?? message.caption ?? "",
+              observedAtMs,
+            });
+            if (quoted?.target !== undefined) observeTarget(doc, quoted.target);
+            doc.offset = Math.max(doc.offset, update.update_id + 1);
+            return copyJson(doc) as unknown as ChannelState;
+          }, adapterContext);
+          // The exact input and the offset commit before any model submission, so a crash cannot lose or duplicate it.
+          drain();
+          continue;
+        }
+        const reaction = update.message_reaction;
+        if (reaction !== undefined) {
+          await handleReaction(update, reaction);
+          continue;
+        }
+        // An unhandled update type (for example an anonymous reaction count) advances the offset
+        // without a model call.
+        await persistOffset(update.update_id + 1);
       }
     }
   } catch (error) {
     if (!signal?.aborted) throw error;
   } finally {
     stopping = true;
+    detachTelegramActions?.();
+    detachTelegramActions = undefined;
     stopAllTyping();
     if (scheduledTimer !== undefined) clearInterval(scheduledTimer);
     scope.cancel(new DOMException("Telegram adapter stopped", "AbortError"));
     await Promise.allSettled([...active, ...pendingControls, ...scheduledTasks]);
   }
   if (fatal !== undefined) throw fatal;
+
+  /**
+   * Best-effort native command menu for exactly the controls this adapter implements. A failure or a
+   * flood wait leaves typed commands working and never blocks polling; no dead menu entry is added.
+   */
+  async function registerCommandMenu(): Promise<void> {
+    try {
+      await apiCall(api, "setMyCommands", signal, (callSignal) => api.setMyCommands(
+        TELEGRAM_COMMANDS,
+        { scope: { type: "all_private_chats" } },
+        toGrammySignal(callSignal),
+      ), { throttle: outboundThrottle, replaceable: true });
+    } catch {
+      if (!signal?.aborted) {
+        console.warn("Telegram command menu registration failed; the implemented commands still work when typed.");
+      }
+    }
+  }
+
+  /**
+   * One authenticated reaction change becomes an ordinary durable input. The sender is the update's
+   * `user` (never `actor_chat`), the chat must have matching private-chat admission evidence for this
+   * bot, and the reacted message must be an observed target in that exact chat; otherwise the update
+   * only advances the offset. Pending input and offset commit together, so a replay cannot admit it
+   * twice and a crash before submission is recovered by the normal delivery path.
+   */
+  async function handleReaction(update: Update, reaction: MessageReactionUpdated): Promise<void> {
+    if (!isAllowedPrivateReaction(reaction, options.allowFrom)) {
+      await persistOffset(update.update_id + 1);
+      return;
+    }
+    const user = reaction.user;
+    const chatId = reaction.chat.id;
+    const senderId = String(user.id);
+    const binding = originBindingOf(state.origins, chatId, identity);
+    const target = findTarget(state.targets, chatId, reaction.message_id);
+    if (binding === undefined || binding.senderId !== senderId ||
+        !options.allowFrom.includes(binding.senderId) || target === undefined) {
+      await persistOffset(update.update_id + 1);
+      return;
+    }
+    const text = reactionChangeText({
+      messageId: reaction.message_id,
+      target,
+      oldReaction: reaction.old_reaction,
+      newReaction: reaction.new_reaction,
+    });
+    const sessionKey = `telegram:${identity}:chat:${chatId}`;
+    state = await stateConversation.commit(async (tx) => {
+      const doc = await tx.doc(TelegramState, stateConversation.id);
+      if (!doc.pending.some((entry) => entry.updateId === update.update_id)) {
+        if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
+        doc.pending.push({
+          updateId: update.update_id,
+          nextChunkIndex: 0,
+          chatId,
+          sessionKey,
+          senderId,
+          text,
+        });
+      }
+      doc.offset = Math.max(doc.offset, update.update_id + 1);
+      return copyJson(doc) as unknown as ChannelState;
+    }, adapterContext);
+    drain();
+  }
 
   async function handleControl(
     update: Update,
@@ -1389,6 +1771,68 @@ function isAllowedPrivateMessage(
   return message !== undefined && message.chat.type === "private" && message.from !== undefined &&
     !message.from.is_bot && allowFrom.includes(String(message.from.id));
 }
+
+/**
+ * A reaction change is a user action, not an anonymous/group one. `actor_chat` marks an anonymous
+ * actor, which this adapter never admits; a bot's reaction is never a user turn.
+ */
+function isAllowedPrivateReaction(
+  reaction: MessageReactionUpdated | undefined,
+  allowFrom: readonly string[],
+): reaction is MessageReactionUpdated & { user: NonNullable<MessageReactionUpdated["user"]> } {
+  return reaction !== undefined && reaction.chat.type === "private" && reaction.user !== undefined &&
+    !reaction.user.is_bot && allowFrom.includes(String(reaction.user.id)) &&
+    reaction.actor_chat === undefined;
+}
+
+/** The chat id encoded by this adapter's own mapped session key, never a model-supplied value. */
+function chatIdForSession(sessionKey: string, botId: string): number | undefined {
+  const prefix = `telegram:${botId}:chat:`;
+  if (!sessionKey.startsWith(prefix)) return undefined;
+  const raw = sessionKey.slice(prefix.length);
+  if (!/^[1-9][0-9]*$/.test(raw)) return undefined;
+  const chatId = Number(raw);
+  return Number.isSafeInteger(chatId) ? chatId : undefined;
+}
+
+/**
+ * Bounded reference context for a quoted/replied-to message in the same private chat. The text is
+ * untrusted reference, never authorization; an observed target is recorded only as an identity.
+ */
+function quotedMessageContext(
+  message: TelegramMessage,
+  botId: string,
+): { readonly context: TelegramQuotedContext; readonly target?: TelegramObservedTarget } | undefined {
+  const quoted = message.reply_to_message;
+  if (quoted === undefined || quoted.chat.id !== message.chat.id) return undefined;
+  const text = quoted.text ?? quoted.caption ?? "";
+  const from = quoted.from;
+  const author: TelegramQuotedContext["author"] = from === undefined
+    ? "unknown"
+    : from.is_bot
+      ? (String(from.id) === botId ? "the assistant" : "another bot")
+      : "the user";
+  const context: TelegramQuotedContext = { messageId: quoted.message_id, author, text };
+  if (!Number.isSafeInteger(quoted.message_id) || quoted.message_id < 1) return { context };
+  return {
+    context,
+    target: {
+      chatId: quoted.chat.id,
+      messageId: quoted.message_id,
+      direction: author === "the assistant" ? "outgoing" : "incoming",
+      senderId: from === undefined ? "unknown" : String(from.id),
+      text,
+      observedAtMs: Date.now(),
+    },
+  };
+}
+
+/** Only commands the adapter actually implements belong in the native menu. */
+const TELEGRAM_COMMANDS: readonly { readonly command: string; readonly description: string }[] = [
+  { command: "new", description: "Reset this conversation's context" },
+  { command: "abort", description: "Stop this turn and withdraw queued messages" },
+  { command: "help", description: "Show the available commands" },
+];
 
 type ParsedTelegramInput =
   | { readonly kind: "input"; readonly text: string }
