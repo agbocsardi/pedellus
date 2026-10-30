@@ -15,7 +15,8 @@ not a standing implementation queue.
 [`SETUP.md`](./SETUP.md) is the short walkthrough: build, create a synthetic
 workspace with memory and skills, enable tools in the config, then add Telegram
 as a separate step. The example uses named `fast`/`deep` model presets; the default
-comes from config, and local `/model <name>` switching lasts until restart.
+comes from config. A local `/model <name>` switch is temporary: reattaching a CLI
+keeps it, and a gateway restart returns to the configured preset.
 One bounded synthetic live-model core run passed; see [acceptance](./ACCEPTANCE.md#2026-10-30--one-live-run-passed).
 This is not a real-workspace or live-channel acceptance claim.
 
@@ -24,10 +25,19 @@ Copy `config.example.json` to a private explicit config file and edit the worksp
 ```sh
 npm ci
 npm run build
-node dist/cli.js --config /path/to/config.json
+node dist/cli.js gateway --config /path/to/config.json
+node dist/cli.js agent --config /path/to/config.json
 ```
 
-Without Telegram settings, the CLI starts a single local prompt session. With Telegram enabled, it delegates to the restricted adapter (explicit decimal user allowlist only). Do not use live bot polling for offline checks. Known startup/configuration failures print fixed, value-free diagnostics; unexpected failures stay suppressed. See [interactive CLI](./CLI.md#startup-diagnostics).
+The gateway is the single owner: it opens storage, config tools, cron and, when
+configured, the restricted Telegram adapter (explicit decimal user allowlist
+only). One or more `agent` CLIs attach to it as conversation surfaces; the
+historical bare `node dist/cli.js --config ...` is the same attach and never opens
+a second runtime. A CLI disconnect leaves the gateway, Telegram polling, admitted
+turns and queued work running; a gateway restart stops all of them. Do not use
+live bot polling for offline checks. Known startup/configuration failures print
+fixed, value-free diagnostics; unexpected failures stay suppressed. See
+[interactive CLI](./CLI.md#startup-diagnostics).
 
 Closed episodes are summarized in the background by default using the conversation's current
 model when the job starts. This makes provider calls and can incur costs. To use a different
@@ -43,8 +53,8 @@ One process acquires Chord's kernel-backed `processLock` using the canonical SQL
 
 The gateway upgrades upstream SQLite's NORMAL default to **WAL `synchronous=FULL` on its actual connection**, verifying both settings before and after native schema initialization and failing closed on mismatch. Parent crash/reopen and injected setup/readback/migration-failure probes passed; this is not proof of physical power/host-loss survival. Stopped-store synthetic backup/restore is verified; disk-full and broader storage acceptance remain open. See [storage policy and evidence](./STORAGE.md).
 
-`toolAllowlist` is the **config-owned tool authority** for every gateway caller
-(CLI, Telegram and SDK) and defaults to `[]`. A non-empty list may name only the
+`toolAllowlist` is the **config-owned tool authority** for every conversation
+(local CLI, Telegram and SDK hosts) and defaults to `[]`. A non-empty list may name only the
 native `read`, `write`, `edit` and `bash` tools; the gateway enables exactly those
 for authenticated mapped ordinary chats (not root, internal, forked or task-owned
 conversations) over a guarded host environment on the actual workspace. Empty or
@@ -75,18 +85,26 @@ acceptance remains open.
 
 The package root (`src/index.ts`) is a small host entry surface: config loading and
 types, `openGateway` and its host option types, `workspaceContextGatewayOptions`,
-the opt-in context and Code Mode factories, prepared-context recovery operations,
+the context and Code Mode factories, prepared-context recovery operations,
 and the CLI `main`. Other subsystems are imported directly from their modules.
 
-## Opt-in Code Mode SDK
+## Code Mode and MCP
 
-The package root exports `createCodeModeIntegration`, fixed budgets and types for
-native Durable QuickJS Code Mode/tool-search. It does **not** install them in the
-gateway. Hosts must establish native default-deny extension/tool state and reapply persisted
-policy before scheduling; see [Code Mode contract and verified boundaries](./CODEMODE.md).
-The bounded SDK bundle passed independent review and parent-built sandbox,
-activation, cancellation and safe/unsafe crash-replay probes. Execution, approvals,
-MCP and product failure-verification gates remain separate.
+MCP is **off by default**. Configuring `mcp: { enabled: true, servers: {...} }` with
+at least one enabled stdio or Streamable HTTP server makes the shipped gateway
+connect them and install the native Durable QuickJS Code Mode/tool-search bundle.
+Discovered tools are deferred `mcp__<server>__<tool>` registrations reachable from
+Code Mode scripts and `tool_search`, and only in authenticated mapped chat
+conversations; root, state, forked and isolated cron/task conversations get no MCP
+tool and no Code Mode. `toolAllowlist` still names only the coding tools
+(`read`/`write`/`edit`/`bash`), independently of MCP.
+
+MCP is a separate explicit connection authority. A configured stdio server runs as
+a native host process, not under `toolSandbox: "bwrap"`. This slice has no OAuth,
+implicit `mcp.json` discovery, resources/prompts tools, hot reload or CLI status UI;
+startup failures surface only as fixed codes on the SDK `gateway.mcp` surface. See
+[MCP servers and Code Mode](./MCP.md) and [Code Mode contract and verified
+boundaries](./CODEMODE.md).
 
 ## Opt-in context SDK
 

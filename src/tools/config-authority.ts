@@ -55,18 +55,23 @@ export function boundedCapturedTools(
  * authenticated mapped chat. Anything else (the root, a channel-state conversation, a fork, a raw
  * or task-owned conversation without a valid capture) is denied, so agent state that still names a
  * removed tool can never call it. `contextTools` (skill, cron, history) are exempt because they
- * carry no filesystem or shell authority.
+ * carry no filesystem or shell authority. `delegatedTools` names a separate authority whose own
+ * call-time hook is selected in the same conversations (MCP server tools and the Code Mode/tool
+ * search tools that reach them); they are exempt here but never unguarded: the delegating
+ * predicate must be false unless that hook is installed.
  */
 export function createConfigToolHook(
   ceiling: readonly string[],
   isAuthenticatedChat: (conversationId: ConversationId) => boolean,
   contextTools: readonly string[] = [],
+  delegatedTools?: (name: string) => boolean,
 ): HookRegistration {
   const allowed = new Set(ceiling);
   const ungated = new Set(contextTools);
   return hook(ToolTask, {
     async beforeTool(call: ToolHookCall, api, context) {
       if (ungated.has(call.name)) return undefined;
+      if (delegatedTools?.(call.name) === true) return undefined;
       if (!allowed.has(call.name)) {
         return { block: `Tool ${call.name} is outside the host tool ceiling` };
       }

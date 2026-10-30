@@ -81,11 +81,25 @@ import {
 } from "./history/scope.js";
 import { ensureStoreIdentity, type StoreIdentity } from "./history/store-identity.js";
 import { modelKey, parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
+import { createVisionHandoffExtension } from "./media/vision-hook.js";
+import { VisionHandoff, type VisionHandoffStats } from "./media/vision.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
 import { prepareDataDirectory } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
+import {
+  createMcpIntegration,
+  mcpHasEnabledServers,
+  type McpIntegration,
+  type McpServerStatus,
+} from "./mcp/index.js";
+import {
+  CODEMODE_TOOL_NAME,
+  createCodeModeIntegration,
+  TOOL_SEARCH_TOOL_NAME,
+  type CodeModeIntegration,
+} from "./extensions/codemode.js";
 import {
   boundedCapturedTools,
   CODING_TOOL_NAMES,
@@ -114,6 +128,13 @@ export interface GatewayModelSelectionRequest extends ModelReference {
 
 export interface GatewayModelSelection extends ModelReference {
   thinkingLevel: ModelThinkingLevel;
+}
+
+/** Configured vision handoff and its process-lifetime, bounded accounting. */
+export interface GatewayVisionHandoffState {
+  readonly enabled: boolean;
+  readonly describer?: ModelReference;
+  readonly stats: VisionHandoffStats;
 }
 
 /** One named preset from config, using the provider spelling accepted by Gateway selection. */
@@ -178,6 +199,11 @@ export interface OpenGatewayOptions {
   };
 }
 
+/** MCP servers configured for this open, with their connection state at the last read. */
+export interface GatewayMcpStatus {
+  readonly servers: readonly McpServerStatus[];
+}
+
 /** Read-only query for a bounded page of one mapped chat session's raw transcript entries. */
 export interface HistoryEntryQuery {
   readonly minEntryId?: EntryId;
@@ -206,6 +232,11 @@ export interface Gateway {
    * no live channel can send. Present only when `config.telegram` is configured.
    */
   readonly telegramActions?: TelegramActionRegistry;
+  /**
+   * MCP server connection state; absent when MCP is not configured and enabled. A failed server has
+   * no tools; its status carries a fixed failure code, never a transport message or configured value.
+   */
+  readonly mcp: GatewayMcpStatus | undefined;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
   /** Lists the explicit allowlist and persisted selection for an already-known session key. */
   listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
@@ -218,6 +249,11 @@ export interface Gateway {
    * ConversationBusy atomically and fails for unknown names or in legacy direct-model mode.
    */
   selectModelPreset(sessionKey: string, name: string, context: Context): Promise<GatewayModelSelection>;
+  /**
+   * Configured vision handoff and bounded counters for auxiliary describer calls. The counters are
+   * process lifetime, not per conversation; they expose spend that the main model request hides.
+   */
+  visionHandoffStats(): GatewayVisionHandoffState;
   /**
    * Immutable identity of this SQLite store. A derived index persists `storeId` and refuses
    * its own rows when it changes, so a rebuilt or replaced store cannot mix two histories.
@@ -424,6 +460,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
     });
   }
   const toolsEnabled = toolAllowlist.length > 0;
+  // MCP is a separate, explicit connection authority. Connecting starts external clients, so the
+  // config switch must be on and at least one server enabled; otherwise nothing is created and no
+  // product Code Mode appears.
+  const mcpConfig = config.mcp;
+  const mcpConfigured = mcpHasEnabledServers(mcpConfig);
+  // Late-bound so the coding ceiling hook can delegate MCP/Code Mode names to the MCP hook that is
+  // created after it. Absent (MCP not configured) means the ceiling blocks those names instead.
+  const mcpRef: { current: McpIntegration | undefined } = { current: undefined };
+  const codeModeRef: { current: CodeModeIntegration | undefined } = { current: undefined };
   // Internal agent scheduling: opt-in, and independent of the coding-tool ceiling so a reminder job
   // needs no filesystem authority.
   const cronConfig = config.cron;
@@ -493,6 +538,74 @@ export async function openGateway(config: PortConfig, context: Context, options:
     throw new TypeError("agentHistory must be a boolean");
   }
   const defaultThinkingLevel = defaultPreset?.thinkingLevel ?? config.thinkingLevel ?? "off";
+  // Vision handoff: one configured describer preset replaces or bounds image attachments in the
+  // model-bound request. It is a native generation hook, never a second agent loop, and it leaves
+  // the persisted transcript and prepared checkpoints untouched. The map records the model pinned
+  // by a live prepared dispatch so recovery cannot silently apply the reset configured preset.
+  const preparedGenerationModels = new Map<number, ModelReference>();
+  let visionHandoff: VisionHandoff | undefined;
+  let visionExtension: Extension | undefined;
+  if (config.visionHandoff !== undefined) {
+    const describerPreset = presetCatalog.get(config.visionHandoff.describerPreset);
+    if (describerPreset === undefined) {
+      throw new StartupDiagnosticError("model", {
+        detail: "visionHandoff.describerPreset must name a configured model preset",
+      });
+    }
+    if (!describerPreset.choice.model.input.includes("image")) {
+      throw new StartupDiagnosticError("model", {
+        detail: "visionHandoff.describerPreset must name a model that accepts image input",
+      });
+    }
+    const flaggedModels = new Set<string>();
+    const flagsByNativePair = new Map<string, { readonly name: string; readonly flag: boolean }>();
+    for (const [name, preset] of Object.entries(config.modelPresets ?? {})) {
+      const choice = presetCatalog.get(name);
+      if (choice === undefined) {
+        throw new StartupDiagnosticError("model", {
+          detail: `Model preset ${name} is outside the configured model catalog`,
+        });
+      }
+      const flag = preset.needsVisionHandoff === true;
+      // Requests carry the native provider/model pair, never the config alias. Compare and key
+      // flags by that native pair, so aliasing cannot silently disable a text-only flag.
+      const key = modelKey(choice.choice.native);
+      const previous = flagsByNativePair.get(key);
+      if (previous !== undefined && previous.flag !== flag) {
+        throw new StartupDiagnosticError("model", {
+          detail: `Model presets ${previous.name} and ${name} disagree on needsVisionHandoff for the same native model`,
+        });
+      }
+      flagsByNativePair.set(key, { name, flag });
+      if (!flag) continue;
+      if (name === config.visionHandoff.describerPreset) {
+        throw new StartupDiagnosticError("model", {
+          detail: "visionHandoff.describerPreset must not itself need vision handoff",
+        });
+      }
+      flaggedModels.add(key);
+    }
+    visionHandoff = new VisionHandoff({
+      describer: describerPreset.choice.native,
+      flaggedModels,
+      maxRawImages: config.visionHandoff.maxRawImages,
+      maxDescriptionTokens: config.visionHandoff.maxDescriptionTokens,
+      ...(config.visionHandoff.prompt === undefined ? {} : { prompt: config.visionHandoff.prompt }),
+    });
+    visionExtension = createVisionHandoffExtension({
+      handoff: visionHandoff,
+      defaultModel: defaultChoice.native,
+      preparedModel: (taskId) => {
+        // Consume the pin for exactly the saved dispatch that startup found. A later retry
+        // re-prepares from the reset AgentDoc model, so a stale task-lifetime pin would apply
+        // the old image policy to a different model.
+        const key = Number(taskId);
+        const model = preparedGenerationModels.get(key);
+        if (model !== undefined) preparedGenerationModels.delete(key);
+        return model;
+      },
+    });
+  }
   // A configured summary override must be allowed. `preset` resolves through the named catalog and
   // supplies its thinking level to real summary jobs; `model` keeps the legacy direct form.
   // Otherwise each job captures the conversation's current model when it starts; old history is not
@@ -624,6 +737,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
         ],
         defaultTimeoutSeconds,
         authenticatedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
+        // MCP server tools and the Code Mode tools that reach them are gated by the MCP extension's
+        // own call-time hook. The predicate is false unless that hook is installed, so a stale
+        // persisted selection cannot turn this exemption into authority.
+        delegatedTools: (name: string) =>
+          mcpRef.current !== undefined
+          && (name === CODEMODE_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME || mcpRef.current.ownsTool(name)),
       })
     : undefined;
   const toolEnvironments: ToolEnvironments | undefined = toolsEnabled
@@ -681,7 +800,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // extension) would otherwise be selected by unrelated conversations.
   const extensionsPolicy = (conversationId: ConversationId): AgentChange => {
     const selected: Extension[] = [];
+    // The vision hook carries no tool or workspace authority; selecting it everywhere keeps
+    // image bounding independent of tool allowlists and channel scope.
+    if (visionExtension) selected.push(visionExtension);
     if (toolExtension) selected.push(toolExtension);
+    // MCP tools and their Code Mode/tool-search siblings exist only in an authenticated mapped
+    // chat conversation, and only while the MCP integration is live for this open.
+    if (mcpRef.current !== undefined && authorizedChatConversations.has(conversationId)) {
+      selected.push(mcpRef.current.extension);
+      if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
+    }
     if (options.contextSnapshotProvider && contextExtension && contextConversations.has(conversationId)) {
       selected.push(contextExtension);
     }
@@ -744,6 +872,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
             ...(skillsInstalled && skillToolRegistration !== undefined ? [skillToolRegistration] : []),
           ];
           const extensions: Extension[] = [];
+          // The vision hook carries no tool authority. A scheduled background run is a fresh
+          // conversation with only captured tools, so it needs this non-authoritative extension
+          // explicitly; otherwise a read-tool image would bypass the flagged-preset handoff.
+          if (visionExtension !== undefined) extensions.push(visionExtension);
           if (toolExtension !== undefined) extensions.push(toolExtension);
           if (contextConversations.has(targetConversationId) && contextExtension !== undefined) {
             extensions.push(contextExtension);
@@ -875,9 +1007,27 @@ export async function openGateway(config: PortConfig, context: Context, options:
     backgroundTools?: ReadonlySet<string>,
   ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
     const contextTools = contextToolsFor(conversationId);
+    // MCP server tools and the Code Mode/tool-search tools only hold enabled authority in an
+    // authenticated mapped chat conversation. MCP tools stay deferred: enabled for nested calls and
+    // discovery, but never declared until `tool_search` loads them or a script names them.
+    const authorized = authorizedChatConversations.has(conversationId);
+    const offered = authorized && codeModeRef.current !== undefined
+      ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]
+      : [];
+    const deferred = authorized && mcpRef.current !== undefined ? [...mcpRef.current.toolNames] : [];
     const withContext = (names: readonly string[]): Pick<AgentChange, "tools" | "modelTools"> => {
-      const tools = [...toolFilterFromNames(names).tools, ...contextTools];
-      return { tools, modelTools: tools };
+      const tools = [
+        ...toolFilterFromNames(names).tools,
+        ...toolFilterFromNames(offered).tools,
+        ...toolFilterFromNames(deferred).tools,
+        ...contextTools,
+      ];
+      const modelTools = [
+        ...toolFilterFromNames(names).tools,
+        ...toolFilterFromNames(offered).tools,
+        ...contextTools,
+      ];
+      return { tools, modelTools };
     };
     if (!toolExtension) {
       // Retire instead of creating an empty document: a disabled ceiling must durably remove
@@ -908,7 +1058,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // Any capture document is retired so a fork's copied agent state can never inherit authority,
     // and extensions are explicit so a later dynamic install cannot be selected by default.
     await tx.retireDoc(ConfigToolCaptureDoc, conversation.id);
-    await configure(tx, conversation.id, { tools: [], modelTools: [], extensions: [] });
+    await configure(tx, conversation.id, {
+      tools: [],
+      modelTools: [],
+      // Denied conversations still get the non-authoritative vision hook so a raw, forked or
+      // task-created request cannot send unbounded raw images to a flagged text-only model.
+      extensions: visionExtension === undefined ? [] : [visionExtension],
+    });
   };
   const publicChoice = (choice: ResolvedModelChoice): GatewayModelChoice => ({
     ...choice.configured,
@@ -989,9 +1145,30 @@ export async function openGateway(config: PortConfig, context: Context, options:
             ),
           now,
         });
+    // MCP connects before the registry is built so every discovered tool is in the initial
+    // registry. A failed server contributes nothing and is reported through `gateway.mcp`; the
+    // whole open fails only for an internal error, and the catch below tears down whatever started.
+    if (mcpConfigured && mcpConfig !== undefined) {
+      const integration = await createMcpIntegration({
+        config: mcpConfig,
+        workspace,
+        isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
+        delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
+      });
+      mcpRef.current = integration;
+      codeModeRef.current = createCodeModeIntegration({ namespaces: integration.namespaces });
+      for (const extension of [integration.extension, ...codeModeRef.current.extensions]) {
+        for (const tool of extension.tools ?? []) toolRegistrations.set(tool.name, tool);
+      }
+    }
     const registry = createRegistry();
     if (episodeSummaries !== undefined) registry.install(episodeSummaries.extension);
+    if (visionExtension) registry.install(visionExtension);
     if (toolExtension) registry.install(toolExtension);
+    if (mcpRef.current !== undefined) registry.install(mcpRef.current.extension);
+    if (codeModeRef.current !== undefined) {
+      for (const extension of codeModeRef.current.extensions) registry.install(extension);
+    }
     if (skillTool) registry.install(skillTool.extension);
     if (historyTool) registry.install(historyTool.extension);
     if (telegramTool) registry.install(telegramTool.extension);
@@ -1280,7 +1457,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // History retrieval is independent of the context snapshot opt-in: every mapped chat
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
-    const initialMapping = historyTool === undefined && !toolsEnabled && telegramTool === undefined
+    // The mapped-chat set feeds history, config tool authority, channel actions and MCP authority,
+    // so it is restored whenever any of them is installed.
+    const initialMapping = historyTool === undefined && !toolsEnabled && telegramTool === undefined && !mcpConfigured
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
     if (initialMapping !== undefined) {
@@ -1344,6 +1523,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
             throw new Error(`Cannot resume ${task.kind} task ${task.id}: prepared model ${modelKey(preparedModel)} is outside allowedModels`);
           }
           const contextReplay = preparedContextReplay(task);
+          if (visionHandoff !== undefined && preparedModel !== undefined
+            && contextReplay?.kind === "pi.generation" && contextReplay.phase === "request") {
+            // Only a saved request still owes its model-bound dispatch. A poll resumes an
+            // already-sent request without beforeRequest, and a later retry re-prepares from
+            // the reset AgentDoc, so pinning those would apply a stale image policy.
+            preparedGenerationModels.set(Number(task.id), preparedModel);
+          }
           if (contextReplay !== undefined) preparedContextReplays.push(contextReplay);
         }
         taskCursor = page.next;
@@ -1516,6 +1702,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
       harness,
       cronOutbox,
       ...(telegramActions === undefined ? {} : { telegramActions }),
+      get mcp() {
+        return mcpRef.current === undefined ? undefined : { servers: mcpRef.current.status };
+      },
       async conversationFor(sessionKey, ctx) {
         const key = encodedSessionKey(sessionKey);
         let conversationId: ConversationId | undefined;
@@ -1615,6 +1804,17 @@ export async function openGateway(config: PortConfig, context: Context, options:
           ...preset.choice.configured,
           thinkingLevel: preset.thinkingLevel ?? "off",
         }, ctx);
+      },
+      visionHandoffStats() {
+        return visionHandoff === undefined
+          ? {
+              enabled: false,
+              stats: {
+                requests: 0, rawImages: 0, describedImages: 0, unavailableImages: 0,
+                describerCalls: 0, describerFailures: 0, cacheHits: 0, inputTokens: 0, outputTokens: 0,
+              },
+            }
+          : { enabled: true, describer: visionHandoff.describer, stats: visionHandoff.stats() };
       },
       historyIdentity() {
         return Promise.resolve(storeIdentity);
@@ -1738,10 +1938,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
         episodeCatalog?.close();
         try { await harness!.close(cleanup); }
         finally {
-          try { await historyIndex?.close(); }
+          // Code Mode first: it owns sandbox workers that may be calling MCP tools. Then the MCP
+          // clients, whose native transports tear down their server process groups.
+          try { await codeModeRef.current?.close(); }
           finally {
-            try { await toolEnvironments?.close(cleanup); }
-            finally { await releaseLock(); }
+            try { await mcpRef.current?.close(); }
+            finally {
+              try { await historyIndex?.close(); }
+              finally {
+                try { await toolEnvironments?.close(cleanup); }
+                finally { await releaseLock(); }
+              }
+            }
           }
         }
       },
@@ -1819,6 +2027,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
       if (harness) await harness.close(cleanup);
       else await storage?.close(cleanup);
     } finally {
+      try { await codeModeRef.current?.close(); }
+      catch { /* a sandbox close failure must not mask the startup error */ }
+      try { await mcpRef.current?.close(); }
+      catch { /* a failed server connection is already closed; never mask the startup error */ }
       try { await historyIndex?.close(); }
       catch { /* a derived index close failure leaves a rebuildable file, not source data */ }
       finally { await toolEnvironments?.close(cleanup).catch(() => undefined); }
