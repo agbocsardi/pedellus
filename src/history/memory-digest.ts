@@ -28,29 +28,40 @@
  *   never copied into a second archive or a permanent task record.
  * - A resumed attempt re-submits the same request ID, so a turn that already settled is not
  *   re-run; a crash between request and result repeats that turn at the provider, not the batch.
- * - `write` is create-only and every write is confined to `SOUL.md`, `USER.md`, `memory/**.md` and
- *   `skills/<name>/SKILL.md`. An existing file is changed only by `edit` with exact old text, so a
- *   concurrent owner change makes the edit fail instead of being overwritten. There are no hashes,
- *   versions, managed workspace copies or rollback: a partial run keeps whatever it already wrote,
- *   says so honestly in its outcome, and the unacknowledged batch is replayed idempotently.
+ * - A settled turn is validated from its own committed input entry through its own answer before the
+ *   cursor may move: any failed `pi.tool-result` in that turn fails the batch (even if the model
+ *   answered later), the answer must be a non-empty report, and the bounded paged scan must reach it.
+ *   The check reads the committed transcript, so it survives a reopen.
+ * - `write` performs one guarded `O_CREAT | O_EXCL` create through the host environment: a concurrent
+ *   create by this process or an outside editor fails the call and is never overwritten. `edit` keeps
+ *   the native exact-text semantics and its in-process serialization; an outside process changing the
+ *   file between read and write is not detected (no lock framework). Everything is confined to
+ *   `SOUL.md`, `USER.md`, `memory/**.md` and `skills/<name>/SKILL.md`. There are no hashes, versions,
+ *   managed workspace copies or rollback: a partial run keeps whatever it already wrote, says so
+ *   honestly in its outcome, and the unacknowledged batch is replayed idempotently.
  *
  * Activation is a host decision. The extension is registered so a persisted task can resume, but
  * starting a task is an explicit host call (`start`), and nothing here creates a command, tool,
  * schedule or conversation on its own. O3 wires manual invocation and ordinary cron over `start`.
  */
-import { open, stat, writeFile } from "node:fs/promises";
+import { open, writeFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Context, JsonValue } from "@earendil-works/chord";
 import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
   AssistantEntry,
+  ToolResultEntry,
   defineExtension,
   defineTask,
   hook,
+  wrapTool,
   ToolTask,
+  type Conversation,
   type ConversationHandle,
   type ConversationId,
+  type Cursor,
   type EntryId,
+  type EntryRecord,
   type Extension,
   type Harness,
   type HookRegistration,
@@ -59,8 +70,11 @@ import {
   type SubmissionRecord,
   type Task,
   type TaskRuntime,
+  type ToolRegistration,
   type Tx,
 } from "@earendil-works/pi-durable";
+import { createWriteTool } from "@earendil-works/pi-durable/tools";
+import { supportsExclusiveFileCreate } from "../execution/host.js";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
 import { loadMemoryContext } from "../context/memory.js";
 import { loadSkillsContext } from "../context/skills.js";
@@ -156,9 +170,14 @@ them.
 ## Editing
 
 - Read a file before you change it, and change one coherent piece at a time.
-- \`write\` is create-only: it is refused when the file exists. Use \`edit\` with the exact current
-  \`oldText\` for any change. If an edit reports that its text is missing, the file changed under
-  you: re-read it and decide again; never force the change.
+- \`write\` creates a new file atomically. It is refused when the path already exists; it never
+  overwrites, and a file created concurrently by someone else wins. Use \`edit\` with the exact current
+  \`oldText\` for any change to an existing file.
+- \`edit\` matches exact text and is safe against changes made through this assistant's own tools. It
+  cannot detect an outside editor changing the file between your read and your write: only edit text
+  you just saw, never force a missing match, and re-read when a match fails.
+- A failed or refused tool call fails this batch. Stop there and report what could not be saved; do
+  not try another path or a different edit in the same run. The batch will be retried later.
 - A batch may be replayed after an interrupted attempt. Before adding a fact, check whether it is
   already recorded: a replay must not duplicate or corrupt what an earlier attempt wrote.
 - Do not restructure the workspace wholesale, do not rename or delete files you were not asked to
@@ -167,7 +186,8 @@ them.
 ## Finish
 
 End with a short plain-text report: what you saved, what you changed, what you removed, and what you
-deliberately ignored. If nothing was worth keeping, write nothing and say so.
+deliberately ignored. If nothing was worth keeping, say so explicitly; an empty answer is treated as a
+failed run, never as successful work.
 `;
 
 const LIVE_STATUSES = ["pending", "running", "waiting", "sleeping", "completing"] as const;
@@ -226,25 +246,59 @@ function digestScopeHook(workspaceRoot: string): HookRegistration {
       }
       const problem = memoryDigestScopeProblem(inside.split(sep).join("/"));
       if (problem !== undefined) return { block: `Memory digestion is out of scope: ${problem}` };
-      if (call.name === "write") {
-        const existing = await stat(absolute).then(() => true, () => false);
-        if (existing) {
-          return {
-            block: "write is create-only in memory digestion: that file already exists; read it and " +
-              "use edit with the exact current oldText so a concurrent owner change is never overwritten",
-          };
-        }
-      }
       return undefined;
     },
   });
 }
 
-/** The curation-scope hook a digest target conversation needs. Carries no authority by itself. */
+/**
+ * Digest `write` is create-only for real: it performs one guarded `O_CREAT | O_EXCL` create through the
+ * host environment instead of the native truncating write. A concurrent create — by this process or by
+ * an outside editor — makes the call fail with nothing overwritten, so there is no check-then-write
+ * window. A host environment without that primitive fails the call closed rather than falling back.
+ * It does not join the platform's internal per-file mutation queue (not exported); atomic exclusivity
+ * is the property that matters here, and an existing file is never replaced. `edit` keeps its native
+ * serialized in-process behaviour; an outside process changing the file between its read and its write
+ * is not detected.
+ */
+function digestWriteWrap(): ReturnType<typeof wrapTool<ToolRegistration>> {
+  return wrapTool(createWriteTool() as ToolRegistration, (tool) => ({
+    ...tool,
+    async execute(args, api, context) {
+      const { path, content } = args as { readonly path?: unknown; readonly content?: unknown };
+      if (typeof path !== "string" || path.length === 0 || typeof content !== "string") {
+        throw new TypeError("write needs a path and content");
+      }
+      const env = api.env;
+      if (env === undefined) throw new Error("No execution environment is configured");
+      if (!supportsExclusiveFileCreate(env)) {
+        throw new Error(
+          "This environment cannot create a file exclusively, so memory digestion refuses to write it",
+        );
+      }
+      if (context.abortSignal?.aborted) throw new Error("Operation aborted");
+      const created = await env.createFileExclusive(path, content, context);
+      if (!created.ok) {
+        if (created.error.code === "invalid" && created.error.message === "the file already exists") {
+          throw new Error(
+            "write is create-only in memory digestion: that file already exists; read it and " +
+            "use edit with the exact current oldText so a concurrent owner change is never overwritten",
+          );
+        }
+        throw new Error(created.error.message);
+      }
+      if (context.abortSignal?.aborted) throw new Error("Operation aborted");
+      return { output: [{ type: "text" as const, text: `Successfully wrote to ${path}` }] };
+    },
+  }) as ToolRegistration);
+}
+
+/** The curation-scope hook and create-only writer a digest target conversation needs. */
 export function createMemoryDigestScopeExtension(workspaceRoot: string): Extension {
   return defineExtension({
     name: MEMORY_DIGEST_SCOPE_EXTENSION_NAME,
     hooks: [digestScopeHook(workspaceRoot)],
+    wraps: [digestWriteWrap()],
   });
 }
 
@@ -642,18 +696,30 @@ function terminalAborted(
 
 interface Settlement {
   readonly status: "ok" | "error";
+  /** Committed input entry of the turn, when the submission placed one. */
+  readonly entryId: EntryId | null;
   readonly answerEntryId: EntryId | null;
   readonly error: string | null;
 }
 
-function settlementOf(record: SubmissionRecord, answerEntryId: EntryId | null): Settlement {
+function settlementOf(record: SubmissionRecord): Settlement {
   if (record.status === "done" && record.type === "input") {
-    return { status: "ok", answerEntryId, error: null };
+    const placed = typeof record.entry === "number" ? record.entry as EntryId : null;
+    const answer = typeof record.answer === "number" ? record.answer as EntryId : null;
+    if (placed === null || answer === null) {
+      return { status: "error", entryId: placed, answerEntryId: answer, error: "the digest turn has no committed range" };
+    }
+    return { status: "ok", entryId: placed, answerEntryId: answer, error: null };
   }
   if (record.status === "unanswered") {
-    return { status: "error", answerEntryId: null, error: bounded(record.reason, MEMORY_DIGEST_LIMITS.maxErrorChars) };
+    return {
+      status: "error",
+      entryId: typeof record.entry === "number" ? record.entry as EntryId : null,
+      answerEntryId: null,
+      error: bounded(record.reason, MEMORY_DIGEST_LIMITS.maxErrorChars),
+    };
   }
-  return { status: "error", answerEntryId: null, error: "the digest turn settled without an answer" };
+  return { status: "error", entryId: null, answerEntryId: null, error: "the digest turn settled without an answer" };
 }
 
 /** Wait for the native submission, but notice a turn that ended without answering it. */
@@ -674,25 +740,110 @@ async function waitForAnswer(
   void idle.catch(() => undefined);
   const first = await Promise.race([settled, idle]);
   if (first.kind === "failed") throw first.error;
-  if (first.kind === "settled") {
-    const answerEntryId = first.record.type === "input" && typeof first.record.answer === "number"
-      ? first.record.answer as EntryId
-      : null;
-    return settlementOf(first.record, answerEntryId);
-  }
+  if (first.kind === "settled") return settlementOf(first.record);
   const record = await submission.status(context);
-  if (record.status === "done" && record.type === "input") {
-    return settlementOf(record, typeof record.answer === "number" ? record.answer as EntryId : null);
-  }
-  if (record.status === "unanswered") return settlementOf(record, null);
+  if (record.status === "done" || record.status === "unanswered") return settlementOf(record);
   try { await submission.abort(context); } catch { /* already placed or settled */ }
-  return { status: "error", answerEntryId: null, error: "the digest turn ended before answering its batch" };
+  return {
+    status: "error",
+    entryId: typeof record.entry === "number" ? record.entry as EntryId : null,
+    answerEntryId: null,
+    error: "the digest turn ended before answering its batch",
+  };
 }
 
 function answerText(entry: { readonly model?: readonly unknown[] } | undefined): string | null {
   const message = entry?.model?.[0] as AssistantMessage | undefined;
   const body = (message?.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("") ?? "").trim();
   return body === "" ? null : bounded(body, MEMORY_DIGEST_LIMITS.maxAnswerChars);
+}
+
+/** Fixed, value-free failure reasons: they never contain tool output, file content or model text. */
+const TURN_FAILURE_REASONS = Object.freeze({
+  toolCallFailed: "a digest tool call failed; the batch was not acknowledged",
+  noReport: "the digest turn produced no final report; the batch was not acknowledged",
+  unverifiable: "the digest turn could not be verified; the batch was not acknowledged",
+});
+
+/** One bounded paged scan of a committed turn: this task's input entry through its own answer. */
+const TURN_SCAN_LIMITS = Object.freeze({
+  entriesPerPage: 200,
+  maxEntries: 4_000,
+});
+
+type TurnCheck =
+  | { readonly status: "ok"; readonly answer: string }
+  | { readonly status: "failed"; readonly reason: string };
+
+/**
+ * Validate the committed turn before its batch may be acknowledged.
+ *
+ * The range is exactly this attempt's own transcript: from the submission's placed input entry through
+ * its own answer entry, never an earlier or later turn. Within it:
+ * - the first entry is this task's digest input (kind and `data.taskId`), so a different attempt's
+ *   turn cannot be mistaken for this one;
+ * - any `pi.tool-result` entry with a failed result fails the batch, even when the model recovered and
+ *   answered later — a refused write, a stale edit or a failed read is not a successful curation;
+ * - the answer must be a committed assistant entry with a non-empty report.
+ *
+ * The scan is bounded and paged; failing to reach the answer within the bound fails closed. It reads
+ * the committed transcript only, so the same accounting applies to a resumed attempt after a reopen.
+ */
+async function validateCommittedTurn(
+  conversation: Pick<Conversation, "entries">,
+  turn: { readonly taskId: number; readonly entryId: EntryId; readonly answerEntryId: EntryId },
+  context: Context,
+): Promise<TurnCheck> {
+  if (turn.entryId >= turn.answerEntryId) {
+    return { status: "failed", reason: TURN_FAILURE_REASONS.unverifiable };
+  }
+  let cursor: Cursor | undefined;
+  let examined = 0;
+  let sawInput = false;
+  let reachedAnswer = false;
+  let failedTool = false;
+  let answer: string | null = null;
+  while (examined < TURN_SCAN_LIMITS.maxEntries) {
+    const page = await conversation.entries(
+      { order: "ascending", minEntryId: turn.entryId, maxEntryId: turn.answerEntryId },
+      Math.min(TURN_SCAN_LIMITS.entriesPerPage, TURN_SCAN_LIMITS.maxEntries - examined),
+      cursor,
+      context,
+    );
+    if (page.items.length === 0) break;
+    for (const entry of page.items) {
+      examined += 1;
+      if (entry.id === turn.entryId) {
+        if (entry.kind !== MEMORY_DIGEST_ENTRY_KIND) return { status: "failed", reason: TURN_FAILURE_REASONS.unverifiable };
+        const data = entry.data;
+        if (!isRecord(data) || data.taskId !== turn.taskId) {
+          return { status: "failed", reason: TURN_FAILURE_REASONS.unverifiable };
+        }
+        sawInput = true;
+      }
+      if (entry.kind === ToolResultEntry.kind && hasFailedToolResult(entry)) failedTool = true;
+      if (entry.id === turn.answerEntryId) {
+        if (entry.kind !== AssistantEntry.kind) return { status: "failed", reason: TURN_FAILURE_REASONS.unverifiable };
+        reachedAnswer = true;
+        answer = answerText(entry);
+        break;
+      }
+    }
+    if (reachedAnswer) break;
+    cursor = page.next;
+    if (cursor === undefined) break;
+  }
+  if (!sawInput || !reachedAnswer) return { status: "failed", reason: TURN_FAILURE_REASONS.unverifiable };
+  if (failedTool) return { status: "failed", reason: TURN_FAILURE_REASONS.toolCallFailed };
+  if (answer === null) return { status: "failed", reason: TURN_FAILURE_REASONS.noReport };
+  return { status: "ok", answer };
+}
+
+function hasFailedToolResult(entry: EntryRecord): boolean {
+  for (const message of entry.model ?? []) {
+    if (isRecord(message) && message.role === "toolResult" && message.isError === true) return true;
+  }
+  return false;
 }
 
 export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
@@ -751,7 +902,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           let target = checkpoint.targetConversationId === null
             ? null
             : checkpoint.targetConversationId as ConversationId;
-          let settlement: Settlement = { status: "error", answerEntryId: null, error: null };
+          let settlement: Settlement = { status: "error", entryId: null, answerEntryId: null, error: null };
 
           /** Terminal commit: retire captured authority and record the bounded outcome. */
           const finish = async (
@@ -988,7 +1139,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
               try {
                 const outcome = await Promise.race([waitForAnswer(submission, conversation, context), expired]);
                 settlement = outcome === "expired"
-                  ? { status: "error", answerEntryId: null, error: "the digest turn exceeded its time budget" }
+                  ? { status: "error", entryId: null, answerEntryId: null, error: "the digest turn exceeded its time budget" }
                   : outcome;
               } finally {
                 disarm?.();
@@ -999,6 +1150,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             if (runtime.signal.aborted) return;
             settlement = {
               status: "error",
+              entryId: null,
               answerEntryId: null,
               error: bounded(error instanceof Error ? error.message : String(error), MEMORY_DIGEST_LIMITS.maxErrorChars),
             };
@@ -1010,7 +1162,37 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             return;
           }
 
-          // Only a settled, answered turn may move the frontier. The acknowledgement re-validates
+          // A settled turn alone does not prove successful curation: validate the committed turn
+          // (its own input entry through its own answer) before the frontier may move. A failed tool
+          // call, an unverifiable range or an empty report fails the batch without an acknowledgement,
+          // and the same accounting applies to a resumed attempt after a reopen.
+          if (settlement.entryId === null || settlement.answerEntryId === null) {
+            await withdrawTarget(runtime, targetId, context);
+            await failed(TURN_FAILURE_REASONS.unverifiable);
+            return;
+          }
+          let checked: TurnCheck;
+          try {
+            // The session's conversation handle can scan entries; the invocation-bound handle cannot.
+            const transcript = await options.harness().conversation(targetId, context);
+            checked = transcript === undefined
+              ? { status: "failed", reason: TURN_FAILURE_REASONS.unverifiable }
+              : await validateCommittedTurn(transcript, {
+                  taskId: Number(running.id),
+                  entryId: settlement.entryId,
+                  answerEntryId: settlement.answerEntryId,
+                }, context);
+          } catch {
+            checked = { status: "failed", reason: TURN_FAILURE_REASONS.unverifiable };
+          }
+          if (checked.status !== "ok") {
+            await withdrawTarget(runtime, targetId, context);
+            await failed(checked.reason);
+            return;
+          }
+          const report = checked.answer;
+
+          // Only a validated, settled turn may move the frontier. The acknowledgement re-validates
           // the batch against the committed transcript and refuses a moved cursor.
           try {
             await source.acknowledge(batch, context);
@@ -1035,7 +1217,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             consumed: true,
             targetConversationId: Number(targetId),
             answerEntryId: settlement.answerEntryId === null ? null : Number(settlement.answerEntryId),
-            answer: null,
+            answer: report,
           };
           await finish({ status: "completed" }, result, settlement.answerEntryId);
         },

@@ -829,10 +829,17 @@ One run, in order:
    subset, pins the origin's model and thinking level, and installs a curation-scope hook. The model
    input is the fixed trust framing, the agent-owned prompt, a read-only workspace index (memory topic
    manifest plus workspace skill summaries) and the bounded evidence fragments.
-5. A settled, answered turn acknowledges the batch; the acknowledgement re-validates the batch against
-   the committed transcript. The terminal commit retires the captured tools and hook in the same
-   commit that records the outcome. Provider error, a withdrawn input, a cancelled task or an expired
-   turn deadline leaves the frontier unchanged, so the same batch is offered again.
+5. A settled, answered turn is validated before the frontier may move. The check reads this attempt's
+   own committed range — its placed digest input entry through its own answer entry — in pages,
+   bounded to 4,000 entries. The input must be this task's input (kind and `data.taskId`), no
+   `pi.tool-result` inside the range may be an error (a refused write, a stale edit or a failed read
+   fails the batch even when the model recovered and answered later), and the answer entry must be a
+   non-empty assistant report. Only then is the batch acknowledged, re-validating it against the
+   committed transcript. The terminal commit retires the captured tools and hook in the same commit
+   that records the outcome. Provider error, a failed or refused tool call, an empty report, an
+   unverifiable range, a withdrawn input, a cancelled task or an expired turn deadline leaves the
+   frontier unchanged, so the same batch is offered again. Because the check reads the committed
+   transcript, the same accounting applies to a resumed attempt after a reopen.
 
 The model input is bounded by the O1 batch (80 entries / 24,000 evidence characters) plus limits in
 `MEMORY_DIGEST_LIMITS`: the prompt file is read up to 64 KiB and rendered to 16,000 characters,
@@ -849,13 +856,20 @@ prompt cannot grant a tool, a path or an effect.
 
 Curation scope is enforced by a hook on the digest conversation, not by the prompt: `read`, `write`
 and `edit` may only touch `SOUL.md`, `USER.md`, `memory/**/*.md` (never a `MEMORY.md` or `HISTORY.md`),
-and `skills/<name>/SKILL.md`. `write` is create-only and is refused when the file exists; existing
-files change only through native `edit` with exact old text, so a concurrent owner edit makes the call
-fail instead of being overwritten. There are no hashes, versions, managed workspace copies, rollback
-or transaction: a failed run keeps whatever it already wrote, says so honestly, and the
-unacknowledged batch is replayed idempotently. No shell, network, MCP, Code Mode, history, channel,
-worker, cron or scheduling tool is installed in a digest target, and a run never writes to the origin
-chat, a channel outbox or a schedule.
+and `skills/<name>/SKILL.md`. Digest `write` is a real create-only operation: the wrapped tool asks the
+guarded host environment for one `O_CREAT | O_EXCL` create (`HostExecutionEnv.createFileExclusive`), so
+a concurrent create by this process or an outside editor makes the call fail and nothing is
+overwritten. There is no check-then-write window, and the create stays inside the same guarded roots
+as the native `write`. The platform's internal per-file mutation queue is not exported, so the digest
+create does not join it; atomic exclusivity, not queue ordering, is the integrity property. `edit`
+keeps the native exact-text semantics and its in-process serialization: it protects against changes
+made through this assistant's tools in this process, but an outside editor changing the file between
+the read and the write is not detected — there is no lock framework, and the prompt tells the model to
+edit only text it just saw. There are no hashes, versions, managed workspace copies, rollback or
+transaction: a failed run keeps whatever it already wrote, says so honestly, and the unacknowledged
+batch is replayed idempotently. No shell, network, MCP, Code Mode, history, channel, worker, cron or
+scheduling tool is installed in a digest target, and a run never writes to the origin chat, a channel
+outbox or a schedule.
 
 Reopen is restored from the task itself: a live digest target keeps its pinned model, thinking level,
 captured Markdown tools and scope hook, and its queued turn resumes before the configured default can
@@ -869,7 +883,10 @@ resumed task re-derives its own batch instead of relying on which batch a new `r
 first acknowledgement of an episode still pays O1's bounded, non-interruptible SQLite walk; a batch
 whose frontier lies behind `DIGEST_LIMITS.scanEntriesPerRead` empty reset markers still refuses
 loudly; the scope check is a naming guard, not confinement (a symlink swapped in after the check is
-not defended, exactly like the rest of the workspace tools); a cancelled or parked digest task still
+not defended, exactly like the rest of the workspace tools, though `O_EXCL` itself never follows a
+final symlink); `edit` cannot detect an outside process changing the file between its read and its
+write, so the in-process serialization and exact-text match are the honest boundary; a turn longer
+than 4,000 committed entries cannot be verified and fails closed; a cancelled or parked digest task still
 counts as live, so `start` reports `busy` with its task ID until a host retries or aborts it rather
 than allowing a second writer; the prompt is read when an attempt first submits its turn, so an owner
 edit applies to the next accepted batch rather than to a run already in flight (a resumed attempt
@@ -877,10 +894,12 @@ re-submits its request ID, and text already admitted stays authoritative for tha
 current shipped runtime has no manual command, cron job or tool that calls `start`.
 Nothing here was exercised with a real provider, a live channel, credentials or a personal workspace.
 `tests/memory-digest.behavior.test.mjs` covers the offline evidence over the real Gateway and a faux
-provider: fact/no-op/cursor, idle and refusal, provider failure and replay without duplication,
-cancellation, the turn deadline, an existing prompt not being clobbered, scope and create-only
-refusals with a stale edit, and a reopen that keeps the pinned model and curation tools. O3 owns the
-manual command, ordinary cron wiring, completion/failure visibility and prompt freshness at
+provider: fact/no-op/cursor, idle and refusal, provider failure and a replay that reads the retained
+fact instead of duplicating it, refused/create-only/stale calls failing the batch, an empty final
+report failing the batch, a concurrent create that is never overwritten, cancellation, the turn
+deadline, an existing prompt not being clobbered, and a reopen that keeps the pinned model and
+curation tools (including a failed call before the reopen that still fails the resumed attempt). O3
+owns the manual command, ordinary cron wiring, completion/failure visibility and prompt freshness at
 invocation; the interface is `start` plus each task's durable outcome.
 
 ## Offline lifecycle evidence

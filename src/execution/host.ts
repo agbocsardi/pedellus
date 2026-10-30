@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, realpath, rm, writeFile as writeFileHost } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Context } from "@earendil-works/chord/context";
 import {
 	ExecutionError,
@@ -41,6 +41,24 @@ export interface BwrapShellOptions {
 interface BwrapShell {
 	readonly binary: string;
 	readonly interpreter: readonly [string, ...string[]];
+}
+
+/**
+ * A host environment that can create a file atomically. The digest writer uses this instead of a
+ * `stat` check plus a truncating write, so a concurrent create cannot be overwritten. A host
+ * environment without it fails that write closed instead of falling back.
+ */
+export interface ExclusiveFileCreate {
+	createFileExclusive(
+		path: string,
+		content: string | Uint8Array,
+		context: Context,
+	): Promise<Result<void, FileError>>;
+}
+
+/** True only when `env` really exposes the exclusive create this module implements. */
+export function supportsExclusiveFileCreate(env: object): env is ExclusiveFileCreate {
+	return typeof (env as Partial<ExclusiveFileCreate>).createFileExclusive === "function";
 }
 
 export interface HostExecutionOptions {
@@ -166,6 +184,37 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 
 	override writeFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
 		return this.#guarded(path, context, true, (absolute) => super.writeFile(absolute, content, context));
+	}
+
+	/**
+	 * Create a new file, failing when any directory entry already has that name.
+	 *
+	 * This is a real `O_CREAT | O_EXCL` create at the guarded absolute path, not a check followed by a
+	 * truncating write: a concurrent create by this process or by an outside editor makes the call fail
+	 * with `invalid` ("the file already exists") and nothing is overwritten. It stays inside the same
+	 * guarded roots as `writeFile`, and `O_EXCL` never follows a final symbolic link. Missing parent
+	 * directories are created first, matching the native write. It is not a lock and does not join
+	 * another tool's in-process mutation queue; callers that need ordering with a concurrent `write`
+	 * keep the exclusive result, not a substitute write.
+	 */
+	async createFileExclusive(
+		path: string,
+		content: string | Uint8Array,
+		context: Context,
+	): Promise<Result<void, FileError>> {
+		return this.#guarded(path, context, true, async (absolute) => {
+			if (context.abortSignal?.aborted) return err<void, FileError>(new FileError("aborted", "aborted", absolute));
+			try {
+				await mkdir(dirname(absolute), { recursive: true });
+				await writeFileHost(absolute, content, { flag: "wx" });
+				return ok(undefined);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException | null)?.code === "EEXIST") {
+					return err<void, FileError>(new FileError("invalid", "the file already exists", absolute));
+				}
+				return err<void, FileError>(toFileError(error));
+			}
+		});
 	}
 
 	override appendFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {

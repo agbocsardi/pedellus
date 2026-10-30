@@ -449,7 +449,7 @@ test('nothing pending starts nothing; an empty allowlist is refused, not widened
   assert.equal(await cursorDoc(empty.gateway.harness, emptyOrigin.id), undefined, 'a refusal writes no cursor');
 });
 
-test('a failed turn keeps the frontier and a replay does not duplicate the fact', { timeout: 30_000 }, async (t) => {
+test('a partial write survives a failed turn, and the replay reads and compares before completing', { timeout: 30_000 }, async (t) => {
   const fixture = await fixtureWorkspace();
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
   const state = { run: 1 };
@@ -464,11 +464,12 @@ test('a failed turn keeps the frontier and a replay does not duplicate the fact'
     }
     const input = lastUserText(request.messages);
     assert.match(input, new RegExp(FACT), 'the replayed batch carries the same evidence');
-    if (!text.includes('write is create-only in memory digestion')) {
-      // Replaying must not duplicate: the existing file refuses a second create.
-      return toolWrite('memory/topics/host.md', `- ${FACT_LINE}\n`, 'write-fact-2');
+    if (!text.includes('read-fact')) {
+      // The replay inspects what already landed instead of writing again.
+      return fauxAssistantMessage([fauxToolCall('read', { path: 'memory/topics/host.md' }, { id: 'read-fact' })], { stopReason: 'toolUse' });
     }
-    return fauxAssistantMessage('The fact was already recorded; nothing was duplicated.');
+    assert.match(text, new RegExp(FACT), 'the replay saw the retained fact');
+    return fauxAssistantMessage('The fact was already recorded in memory/topics/host.md; nothing was duplicated.');
   });
   t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
   {
@@ -490,14 +491,159 @@ test('a failed turn keeps the frontier and a replay does not duplicate the fact'
     assert.equal(second.status, 'started');
     assert.equal(second.throughEntryId, first.throughEntryId, 'the same unacknowledged batch is offered again');
     const completed = await settleTask(store.gateway.harness, second.taskId);
-    assert.equal(completed.state.outcome.status, 'completed');
+    assert.equal(completed.state.outcome.status, 'completed', JSON.stringify(completed.state.outcome));
     assert.equal(completed.state.outcome.result.outcome, 'digested');
+    assert.match(completed.state.outcome.result.answer, /already recorded/);
     const body = await readFile(join(fixture.workspace, 'memory/topics/host.md'), 'utf8');
     assert.equal(body.match(new RegExp(FACT, 'g')).length, 1, 'the replay did not duplicate the fact');
     assert.equal((await cursorDoc(store.gateway.harness, origin.id)).throughEntryId, second.throughEntryId);
     const target = await targetOf(store.gateway.harness, second.taskId);
     const results = await toolResults(store.gateway.harness, target.id);
-    assert.ok(results.some((result) => /create-only/.test(result.text)), 'the create-only refusal reached the model');
+    assert.deepEqual(results.map((result) => [result.name, result.isError]), [['read', false]],
+      'the replay succeeded by reading the retained fact, with no failed call');
+  }
+});
+
+test('a refused, create-only or stale call fails the batch, and only a clean turn advances', { timeout: 40_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const existing = 'memory/topics/deploy.md';
+  await mkdir(join(fixture.workspace, 'memory/topics'), { recursive: true });
+  await writeFile(join(fixture.workspace, existing), '---\ndescription: Deploy notes\n---\n\nOWNER-ORIGINAL\n', 'utf8');
+  await writeFile(join(fixture.workspace, 'AGENTS.md'), 'AGENT-RULES-KEEP\n', 'utf8');
+  const state = { run: 1 };
+  const store = await openStore(fixture, (request) => {
+    const text = transcriptText(request.messages);
+    if (state.run === 1) {
+      if (!text.includes('write-outside')) return toolWrite('AGENTS.md', 'REPLACED-RULES\n', 'write-outside');
+      return fauxAssistantMessage('I could not save the fact because that file is out of scope.');
+    }
+    if (state.run === 2) {
+      if (!text.includes('write-existing')) return toolWrite(existing, 'REPLACED-BY-WRITE\n', 'write-existing');
+      return fauxAssistantMessage('I could not save the fact because the file already exists.');
+    }
+    if (state.run === 3) {
+      if (!text.includes('edit-stale')) return toolEdit(existing, 'STALE-OLD-TEXT', `never\n`, 'edit-stale');
+      return fauxAssistantMessage('I could not save the fact because the old text had changed.');
+    }
+    if (!text.includes('edit-exact')) {
+      return toolEdit(existing, 'OWNER-ORIGINAL', `OWNER-ORIGINAL\n\n- ${FACT_LINE}`, 'edit-exact');
+    }
+    return fauxAssistantMessage('Added the deployment fact with an exact edit.');
+  });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  {
+    const origin = await store.gateway.conversationFor(SESSION, context);
+    await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
+
+    // 1. A refused write outside the curation scope fails the batch even though the model answers.
+    const first = await startDigest(store.gateway);
+    assert.equal(first.status, 'started');
+    const refused = await settleTask(store.gateway.harness, first.taskId);
+    assert.equal(refused.state.outcome.status, 'failed');
+    assert.match(refused.state.outcome.error.message, /tool call failed/);
+    assert.equal(refused.state.outcome.result.consumed, false);
+    assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+    assert.equal(await readFile(join(fixture.workspace, 'AGENTS.md'), 'utf8'), 'AGENT-RULES-KEEP\n');
+
+    // 2. A create-only refusal against an existing file fails the batch and changes nothing.
+    state.run = 2;
+    const second = await startDigest(store.gateway);
+    assert.equal(second.status, 'started');
+    const createOnly = await settleTask(store.gateway.harness, second.taskId);
+    assert.equal(createOnly.state.outcome.status, 'failed');
+    assert.match(createOnly.state.outcome.error.message, /tool call failed/);
+    assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+    assert.match(await readFile(join(fixture.workspace, existing), 'utf8'), /OWNER-ORIGINAL/);
+    assert.doesNotMatch(await readFile(join(fixture.workspace, existing), 'utf8'), /REPLACED-BY-WRITE/);
+
+    // 3. A stale edit (the owner's text moved) fails the batch instead of overwriting it.
+    state.run = 3;
+    const third = await startDigest(store.gateway);
+    assert.equal(third.status, 'started');
+    const stale = await settleTask(store.gateway.harness, third.taskId);
+    assert.equal(stale.state.outcome.status, 'failed');
+    assert.match(stale.state.outcome.error.message, /tool call failed/);
+    assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+    assert.match(await readFile(join(fixture.workspace, existing), 'utf8'), /OWNER-ORIGINAL/);
+
+    // 4. A clean turn with an exact edit and a non-empty report advances the frontier.
+    state.run = 4;
+    const fourth = await startDigest(store.gateway);
+    assert.equal(fourth.status, 'started');
+    const completed = await settleTask(store.gateway.harness, fourth.taskId);
+    assert.equal(completed.state.outcome.status, 'completed', JSON.stringify(completed.state.outcome));
+    assert.equal(completed.state.outcome.result.outcome, 'digested');
+    const body = await readFile(join(fixture.workspace, existing), 'utf8');
+    assert.match(body, /OWNER-ORIGINAL/);
+    assert.match(body, new RegExp(FACT));
+    assert.equal(body.match(new RegExp(FACT, 'g')).length, 1);
+    assert.equal((await cursorDoc(store.gateway.harness, origin.id)).throughEntryId, fourth.throughEntryId);
+    const target = await targetOf(store.gateway.harness, fourth.taskId);
+    const results = await toolResults(store.gateway.harness, target.id);
+    assert.deepEqual(results.map((result) => [result.name, result.isError]), [['edit', false]],
+      'the successful turn made exactly one clean edit');
+  }
+});
+
+test('a concurrent create between the decision and the write is never overwritten', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const target = 'memory/topics/race.md';
+  await mkdir(join(fixture.workspace, 'memory/topics'), { recursive: true });
+  const store = await openStore(fixture, async (request) => {
+    const text = transcriptText(request.messages);
+    if (!text.includes('race-write')) {
+      // Another writer creates the file after the model decided to write and before the call runs.
+      await writeFile(join(fixture.workspace, target), 'CONCURRENT-OWNER-CONTENT\n', 'utf8');
+      return toolWrite(target, `- ${FACT_LINE}\n`, 'race-write');
+    }
+    return fauxAssistantMessage('I could not save the fact because the file appeared concurrently.');
+  });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  {
+    const origin = await store.gateway.conversationFor(SESSION, context);
+    await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
+    const started = await startDigest(store.gateway);
+    assert.equal(started.status, 'started');
+    const task = await settleTask(store.gateway.harness, started.taskId);
+    assert.equal(task.state.outcome.status, 'failed');
+    assert.match(task.state.outcome.error.message, /tool call failed/);
+    assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+    // The exclusive create failed and the concurrent owner content is byte-for-byte intact.
+    assert.equal(await readFile(join(fixture.workspace, target), 'utf8'), 'CONCURRENT-OWNER-CONTENT\n');
+    const digestTarget = await targetOf(store.gateway.harness, started.taskId);
+    const results = await toolResults(store.gateway.harness, digestTarget.id);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].isError, true);
+    assert.match(results[0].text, /create-only in memory digestion/);
+  }
+});
+
+test('an empty final report fails the batch even after a successful write', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, (request) => {
+    const text = transcriptText(request.messages);
+    if (!text.includes('memory/topics/host.md')) {
+      return toolWrite('memory/topics/host.md', `- ${FACT_LINE}\n`, 'write-fact');
+    }
+    return fauxAssistantMessage('   ');
+  });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  {
+    const origin = await store.gateway.conversationFor(SESSION, context);
+    await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
+    const started = await startDigest(store.gateway);
+    assert.equal(started.status, 'started');
+    const task = await settleTask(store.gateway.harness, started.taskId);
+    assert.equal(task.state.outcome.status, 'failed');
+    assert.match(task.state.outcome.error.message, /no final report/);
+    assert.equal(task.state.outcome.result.consumed, false);
+    assert.equal(task.state.outcome.result.answer, null);
+    assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+    // The write remains, honestly unacknowledged, for a later replay to inspect.
+    assert.match(await readFile(join(fixture.workspace, 'memory/topics/host.md'), 'utf8'), new RegExp(FACT));
   }
 });
 
@@ -562,7 +708,7 @@ test('an expired turn deadline fails without advancing the frontier', { timeout:
   }
 });
 
-test('an existing owner prompt is never clobbered and its text reaches the run', { timeout: 30_000 }, async (t) => {
+test('a non-empty no-op report advances the cursor and never clobbers the owner prompt', { timeout: 30_000 }, async (t) => {
   const fixture = await fixtureWorkspace();
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
   const custom = '# Owner curation prompt\n\nCUSTOM-PROMPT-9931 keep only decisions.\n';
@@ -580,53 +726,12 @@ test('an existing owner prompt is never clobbered and its text reaches the run',
     const task = await settleTask(store.gateway.harness, started.taskId);
     assert.equal(task.state.outcome.status, 'completed');
     assert.equal(task.state.outcome.result.outcome, 'digested');
+    assert.match(task.state.outcome.result.answer, /No durable fact in this batch/,
+      'the completed turn kept its explicit non-empty no-op report');
     assert.equal((await cursorDoc(store.gateway.harness, origin.id)).throughEntryId, started.throughEntryId,
       'a settled turn that saved nothing still counts as processed');
     assert.equal(await readFile(join(fixture.workspace, MEMORY_DIGEST_PROMPT_FILE), 'utf8'), custom,
       'the owner prompt is byte-for-byte untouched');
-  }
-});
-
-test('curation writes stay in scope, write is create-only, and a concurrent owner edit survives', { timeout: 30_000 }, async (t) => {
-  const fixture = await fixtureWorkspace();
-  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
-  const existing = 'memory/topics/deploy.md';
-  await mkdir(join(fixture.workspace, 'memory/topics'), { recursive: true });
-  await writeFile(join(fixture.workspace, existing), '---\ndescription: Deploy notes\n---\n\nOWNER-ORIGINAL\n', 'utf8');
-  await writeFile(join(fixture.workspace, 'AGENTS.md'), 'AGENT-RULES-KEEP\n', 'utf8');
-  const steps = [
-    toolWrite(existing, 'REPLACED-BY-WRITE\n', 'write-existing'),
-    toolWrite('AGENTS.md', 'REPLACED-RULES\n', 'write-outside'),
-    toolEdit(existing, 'STALE-OLD-TEXT', 'never\n', 'edit-stale'),
-    toolEdit(join(fixture.workspace, existing), 'OWNER-ORIGINAL', `OWNER-ORIGINAL\n\n- ${FACT_LINE}`, 'edit-exact'),
-  ];
-  const store = await openStore(fixture, (request) => {
-    const step = steps.shift();
-    if (step !== undefined) return step;
-    return fauxAssistantMessage('Added the deployment fact with an exact edit.');
-  });
-  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
-  {
-    const origin = await store.gateway.conversationFor(SESSION, context);
-    await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
-    // Simulate the owner editing the file after the model read it but before its stale edit lands.
-    const started = await startDigest(store.gateway);
-    assert.equal(started.status, 'started');
-    const task = await settleTask(store.gateway.harness, started.taskId);
-    assert.equal(task.state.outcome.status, 'completed');
-
-    assert.equal(await readFile(join(fixture.workspace, 'AGENTS.md'), 'utf8'), 'AGENT-RULES-KEEP\n');
-    const body = await readFile(join(fixture.workspace, existing), 'utf8');
-    assert.match(body, /OWNER-ORIGINAL/);
-    assert.match(body, new RegExp(FACT));
-    assert.doesNotMatch(body, /REPLACED-BY-WRITE/);
-
-    const target = await targetOf(store.gateway.harness, started.taskId);
-    const results = await toolResults(store.gateway.harness, target.id);
-    assert.equal(results.filter((result) => /create-only/.test(result.text)).length, 1);
-    assert.equal(results.filter((result) => /out of scope/i.test(result.text)).length, 1);
-    assert.equal(results.filter((result) => result.isError && /Could not find|No match|not found|oldText/i.test(result.text)).length >= 1, true,
-      'the stale edit failed instead of overwriting the owner text');
   }
 });
 
@@ -676,10 +781,11 @@ test('a reopen resumes the interrupted run with its pinned model and curation sc
       const input = lastUserText(request.messages);
       assert.match(input, /\[memory digestion task\]/, 'the resumed turn keeps its bounded batch input');
       const text = transcriptText(request.messages);
-      if (!text.includes('create-only in memory digestion')) {
-        return toolWrite('memory/topics/reopen.md', `- ${FACT_LINE}\n`, 'write-after-reopen');
+      if (!text.includes('read-after-reopen')) {
+        // The resumed turn inspects the fact its interrupted attempt already wrote.
+        return fauxAssistantMessage([fauxToolCall('read', { path: 'memory/topics/reopen.md' }, { id: 'read-after-reopen' })], { stopReason: 'toolUse' });
       }
-      return fauxAssistantMessage('Resumed after reopen; the fact was already recorded.');
+      return fauxAssistantMessage('Resumed after reopen; the fact was already recorded and was not duplicated.');
     }, { allowedModels: [MODEL, ALT_MODEL] });
     reopened = reopenedStore.gateway;
     const task = await settleTask(reopened.harness, started.taskId);
@@ -691,6 +797,56 @@ test('a reopen resumes the interrupted run with its pinned model and curation sc
     const body = await readFile(join(fixture.workspace, 'memory/topics/reopen.md'), 'utf8');
     assert.equal(body.match(new RegExp(FACT, 'g')).length, 1, 'the reopened turn could not duplicate the fact');
     const results = await toolResults(reopened.harness, target.id);
-    assert.ok(results.some((result) => /create-only/.test(result.text)), 'the reopened target had tools and the create-only guard');
+    assert.deepEqual(results.map((result) => [result.name, result.isError]),
+      [['write', false], ['read', false]],
+      'the first attempt wrote once and the reopened target read it back, both clean');
+  }
+});
+
+test('a failed tool call before a reopen still fails the resumed attempt', { timeout: 40_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const entered = deferred();
+  await writeFile(join(fixture.workspace, 'AGENTS.md'), 'AGENT-RULES-KEEP\n', 'utf8');
+  const store = await openStore(fixture, async (request, options) => {
+    const text = transcriptText(request.messages);
+    if (!text.includes('write-outside-before-close')) {
+      // A refused write is committed as a failed pi.tool-result before the attempt is interrupted.
+      return toolWrite('AGENTS.md', 'REPLACED-RULES\n', 'write-outside-before-close');
+    }
+    entered.resolve();
+    await new Promise((resolve) => {
+      const signal = options?.signal;
+      if (signal?.aborted) return resolve();
+      signal?.addEventListener('abort', resolve, { once: true });
+    });
+    return fauxAssistantMessage('answer after reopen');
+  });
+  let reopened;
+  t.after(async () => {
+    await reopened?.close(context).catch(() => undefined);
+    await store.gateway.close(context).catch(() => undefined);
+  });
+  {
+    const origin = await store.gateway.conversationFor(SESSION, context);
+    await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
+    const started = await startDigest(store.gateway);
+    assert.equal(started.status, 'started');
+    await within(entered.promise, WAIT_MS, 'the first attempt never paused after its refused call');
+    const target = await targetOf(store.gateway.harness, started.taskId);
+    assert.ok(target !== undefined);
+    assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+
+    await store.gateway.close(context);
+    reopened = (await openStore(fixture, () => {
+      // The model recovers and answers non-empty, but the committed failed call still fails the batch.
+      return fauxAssistantMessage('I could not save the fact because that file is out of scope.');
+    })).gateway;
+    const task = await settleTask(reopened.harness, started.taskId);
+    assert.equal(task.state.outcome.status, 'failed', JSON.stringify(task.state.outcome));
+    assert.match(task.state.outcome.error.message, /tool call failed/);
+    assert.equal(task.state.outcome.result.consumed, false);
+    assert.equal(await cursorDoc(reopened.harness, origin.id), undefined, 'a failed call never acknowledges on reopen');
+    assert.equal(await readFile(join(fixture.workspace, 'AGENTS.md'), 'utf8'), 'AGENT-RULES-KEEP\n');
   }
 });

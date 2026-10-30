@@ -94,8 +94,13 @@ npm start -- agent --config config.json     # attach a terminal
   native task consumes one bounded closed-episode batch in a task-owned
   conversation whose only tools are the origin's captured `read`/`write`/`edit`,
   confined to `SOUL.md`, `USER.md`, `memory/**/*.md` and
-  `skills/<name>/SKILL.md`, with `write` create-only. The cursor advances only
-  after a settled, answered turn; the editable workspace policy is `DIGEST.md`
+  `skills/<name>/SKILL.md`. Digest `write` is a guarded atomic exclusive create
+  (`O_CREAT | O_EXCL`), never a precheck plus truncation; `edit` keeps exact-text
+  in-process protection only, and an uncooperative outside editor between read
+  and write is not detected. The cursor advances only after a settled turn is
+  validated from its own committed input through its own answer: any failed
+  `pi.tool-result` fails the batch even if the model answers later, and a
+  non-empty report is required. The editable workspace policy is `DIGEST.md`
   (seeded only when absent) and it can never grant authority. No command, cron
   job, tool, channel notice, shell, network or worker authority is part of it.
 - Native web tools are default-off and separate from `toolAllowlist`: `web.search`
