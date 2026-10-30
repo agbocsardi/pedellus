@@ -93,10 +93,12 @@ not permission to start every branch or run live integrations):
     config.
 - [ ] Add bounded ordinary background workers; scheduled memory curation may then
   be an ordinary cron job using those workers and the existing Markdown tools,
-  not a standalone Dream subsystem. The work is research plus coding: each
-  implementer is explicitly assigned a shared checkout or a worktree, and the
-  spawning agent (not the user) is notified of that choice. Scheduled memory
-  curation remains later work.
+  not a standalone Dream subsystem. Product workers support research plus coding:
+  the spawning agent explicitly chooses shared workspace or isolated worktree
+  per task. Completion/results notify the spawning agent, not the user directly.
+- [ ] After background workers are accepted, add opt-in periodic digestion of
+  previously unprocessed conversations/episodes into long-term memory, following
+  the deferred scope below. Do not implement or activate curation yet.
 
 Approved first implementation batch: channel-neutral gateway/local CLI attachment
 and Telegram menu/reply/quote/reaction support. These are two independently owned
@@ -123,6 +125,52 @@ Web search/fetch remains a useful reach feature alongside MCP. Other channels,
 provider variants and richer UI follow actual use, not feature-for-feature parity.
 This is a discussion order, not authorization to deploy, read personal settings,
 spend on another run or start all feature branches.
+
+## Deferred: conversation digestion into memory
+
+Owner clarified that curation primarily digests previously unprocessed
+conversations/episodes, not housekeeping over existing Markdown. Use the Python
+reference's `nanobot/templates/agent/dream.md` prompt and guarded memory runner
+as behavioral references, not a subsystem to copy.
+
+- The agent owns the consolidation prompt as workspace Markdown (for example,
+  `prompts/memory-curation.md`), editable through its configured ordinary tools
+  so the owner and agent can inspect, discuss and tune it. Shipped prompt text
+  is an initial seed only: never overwrite an existing workspace prompt during
+  startup, upgrades or runs. Record the prompt source/version or content hash
+  used by each run; edits affect future runs, not prepared dispatches. Hard
+  authority/edit bounds and processed-history bookkeeping remain runtime-owned,
+  not removable instructions in the editable prompt.
+- Read bounded, source-labeled Durable history; original entries remain
+  authoritative. Track processed history in native Durable state, not a second
+  Python-style history archive. Do not mark omitted/truncated evidence processed.
+- Follow the working Python write scope: `SOUL.md` for behavior/invariants,
+  `USER.md` for stable personal preferences, `memory/<topic>/<name>.md` for topic
+  context, small `memory/system/` for broadly relevant current material, and
+  `skills/<name>/SKILL.md` for genuinely repeated reusable workflows.
+- Extract atomic durable facts, prioritize explicit user corrections/preferences,
+  update superseded facts in place, deduplicate and prune stale material. Preserve
+  permanent preferences, active context and behavioral safeguards; move unique
+  useful content to its canonical owner before removing duplication. Topic files
+  retain description frontmatter; avoid wholesale restructuring.
+- Treat quoted/tool/assistant-derived content as evidence, not owner instructions.
+  Keep source provenance and do not save credentials or generic public reference
+  material as memory. Adapt paths/tool names to this project; do not import
+  Python's legacy-file migration rules or separate archive/command infrastructure.
+- Retain the reference's integrity intent: bounded edits/time, inspectable changes
+  and recovery, no loss of pre-existing or concurrent user edits. Advance the
+  processed frontier only after a successfully validated batch. A completed batch
+  with nothing worth remembering still counts as processed; a timeout/provider/
+  tool/write failure does not. Use native job/worker outcomes to notify the agent;
+  no special user-escalation policy has been selected.
+- Implement later as an opt-in ordinary cron job over the accepted worker and
+  Markdown-tool path, with explicit snapshot freshness through the existing
+  refresh mechanism. No standalone Dream engine, new agent loop or automatic
+  schedule activation. Existing-history backfill and exact history-unit boundaries
+  must be made explicit before activation.
+
+The owner asked to record this scope and work on something independent while
+background agents are unfinished. Curation implementation is therefore deferred.
 
 ## Product and constraints
 
@@ -171,6 +219,19 @@ commands, config tool ceiling, outbox unknown-send handling and memory refresh
 remain intact. No deployment or live-delivery claim; no live model/bot run.
 
 ## Session log
+
+### 2026-10-30 — deferred conversation digestion scope
+
+Read the Python curation prompt and guarded runner after the owner clarified
+that unprocessed conversations/episodes are the main input. Recorded its broad
+memory/skill editing and pruning scope, source/processed-frontier integrity and
+ordinary cron/worker implementation constraint. Corrected product-worker wording:
+shared/worktree is chosen by the spawning agent; completion notifies that agent,
+not the user. Owner also required an agent-owned, inspectable/editable workspace
+consolidation prompt, seeded once and versioned per run without weakening runtime
+bounds or rewriting prepared work. Owner explicitly deferred curation
+implementation until background workers exist and requested a different next slice. No curation code, schedule,
+model run or historical-data processing started; this is planning only.
 
 ### 2026-10-30 — MCP accepted and published
 
