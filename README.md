@@ -15,10 +15,11 @@ not a standing implementation queue.
 [`SETUP.md`](./SETUP.md) is the short walkthrough: build, create a synthetic
 workspace with memory and skills, enable tools in the config, then add Telegram
 as a separate step. The example uses named `fast`/`deep` model presets; the default
-comes from config, and local `/model <name>` switching lasts until restart. It does
-not claim live-model success.
+comes from config, and local `/model <name>` switching lasts until restart.
+One bounded synthetic live-model core run passed; see [acceptance](./ACCEPTANCE.md#2026-10-30--one-live-run-passed).
+This is not a real-workspace or live-channel acceptance claim.
 
-Copy `config.example.json` to a private explicit config file and edit the workspace, model, and environment-variable *names*. The config contains no credentials. The nine supported provider aliases and their `credentials` fields are listed in [provider support and migration notes](./PROVIDERS.md). Credential references and `telegram.tokenEnv` must be environment-variable names, not values or `${...}` expressions; the runtime does not read Nanobot/Pi user config or perform live credential discovery. Native catalogs/routes are not drop-in Python-provider parity, and real-provider acceptance remains open. SDK hosts may pass an explicit pi-ai `Models` instance as `openGateway(config, context, { models })` for offline/custom use; the CLI never installs a faux provider.
+Copy `config.example.json` to a private explicit config file and edit the workspace, model, and environment-variable *names*. The config contains no credentials. The nine supported provider aliases and their `credentials` fields are listed in [provider support and migration notes](./PROVIDERS.md). Credential references and `telegram.tokenEnv` must be environment-variable names, not values or `${...}` expressions; the runtime does not read Nanobot/Pi user config or perform live credential discovery. Native catalogs/routes are not drop-in Python-provider parity, and broad provider acceptance remains open. SDK hosts may pass an explicit pi-ai `Models` instance as `openGateway(config, context, { models })` for offline/custom use; the CLI never installs a faux provider.
 
 ```sh
 npm ci
@@ -40,7 +41,7 @@ see [episode summaries](./HISTORY.md#episode-summaries).
 
 One process acquires Chord's kernel-backed `processLock` using the canonical SQLite database path before opening storage. The lock is released when the owning process exits, including an uncatchable kill; a second live owner fails closed. SQLite, under `dataDir/nanobot.sqlite`, stores the Durable transcript and work state. The root conversation's `nanobot.session-map` document commits external session-key-to-conversation mappings atomically. Reopening the database reuses the same conversation without resetting its transcript; pending durable tasks are resumed after extensions are installed. Data directory is private (`0700`) and rejected when it resolves inside the workspace or any extra allowed root; it is not exposed to the shell environment.
 
-The gateway upgrades upstream SQLite's NORMAL default to **WAL `synchronous=FULL` on its actual connection**, verifying both settings before and after native schema initialization and failing closed on mismatch. Parent crash/reopen and injected setup/readback/migration-failure probes passed; this is not proof of physical power/host-loss survival. Backup/restore, disk-full and broader storage acceptance remain open. See [storage policy and evidence](./STORAGE.md).
+The gateway upgrades upstream SQLite's NORMAL default to **WAL `synchronous=FULL` on its actual connection**, verifying both settings before and after native schema initialization and failing closed on mismatch. Parent crash/reopen and injected setup/readback/migration-failure probes passed; this is not proof of physical power/host-loss survival. Stopped-store synthetic backup/restore is verified; disk-full and broader storage acceptance remain open. See [storage policy and evidence](./STORAGE.md).
 
 `toolAllowlist` is the **config-owned tool authority** for every gateway caller
 (CLI, Telegram and SDK) and defaults to `[]`. A non-empty list may name only the
@@ -134,12 +135,17 @@ the shell mount view but is not a quota or hostile-tenant boundary.
 native replay/tool-policy boundary.
 
 For earlier Telegram reliability and scripted smoke evidence, see [TELEGRAM.md](./TELEGRAM.md).
-Bounded owner-authorized real-provider proofs and OpenCode Go tool turns passed
-on host and bwrap in disposable workspaces. These do not establish full-provider,
-real-memory/skill/compaction or scheduled-delivery acceptance. Offline consolidation
+Bounded owner-authorized provider/tool probes passed in disposable workspaces.
+A synthetic OpenCode Go / DeepSeek Flash core run also passed skill loading,
+topic-memory write/read, compaction and fresh-process recall; see
+[acceptance](./ACCEPTANCE.md#2026-10-30--one-live-run-passed). This does not
+establish broad provider support, real-model reset/history-search quality,
+real-workspace usefulness or live scheduled delivery. Offline consolidation
 also checked the combined Gateway memory/skills/four-tool path on both backends
 with a faux provider. The behavior suite includes focused config-tool regression tests, but does not
 cover every newer slice; additional temporary probes are described in feature docs.
 Behavior/execution Node test phases use GNU `timeout`: 60 seconds, followed by a
-forced kill after 5 seconds if necessary, so leaked handles cannot wait forever. Backup/restore, A/B acceptance and
-owner-approved cutover remain open; no production cutover has been performed.
+forced kill after 5 seconds if necessary, so leaked handles cannot wait forever.
+Stopped-store synthetic restore passes; broader storage-fault/restore acceptance,
+A/B acceptance and owner-approved cutover remain open. No production cutover
+has been performed.

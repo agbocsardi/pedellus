@@ -1,4 +1,4 @@
-# Core acceptance (offline)
+# Core acceptance
 
 `npm run test:core-acceptance` is a disposable, offline acceptance run of the
 actual built Gateway. It proves that the shipped wiring — not a test double of
@@ -92,11 +92,11 @@ Only synthetic markers and relative workspace labels appear in the report. The
 generated workspace, SQLite store and evidence files are deleted at the end of
 the run; no output is written into the repository by default.
 
-## Real-model acceptance (2026-10-28: 600,000 cap, offline rehearsal)
+## Real-model acceptance
 
-The owner raised the conservative input cap to 600,000 token-equivalents
-(20 requests, 20,000 output, one synthetic run). The real flow is implemented
-but has not made a live provider call. `--mode=real-rehearsal` runs the exact
+The owner set the conservative input cap to 600,000 token-equivalents
+(20 requests, 20,000 output, one synthetic run). One owner-approved live run
+passed on 2026-10-30; see the result below. `--mode=real-rehearsal` runs the
 flow with the faux provider and no network; `--mode=real` additionally requires
 `--api-key-env=NAME` and first runs that rehearsal as a preflight.
 
@@ -125,11 +125,11 @@ observations and bounded per-request hashes are recorded as soon as they are
 computed, and the `finally` block still writes them when a later check fails, so
 an early exit keeps the failure evidence.
 
-The rehearsal measured **10 requests**, a conservative input reservation of
-about **318,000 tokens** across both phases, an output reservation of
-**17,920**, reported faux input usage of **103,137** and output usage of **232**.
-The measured full flow therefore fits the 600,000 cap with substantial room for
-longer live responses, and the guard still enforces each request against the
+An earlier rehearsal measured **10 requests**, about **318,000** conservative
+input-token equivalents and **17,920** output reservation (faux reported usage:
+103,137 input / 232 output). The 2026-10-30 preflight on the simplified assistant
+reserved **348,047** input and **17,920** output over 10 requests. Both fit the
+600,000 cap; live dispatch still reserves each actual request against the
 remaining ledger.
 
 Run:
@@ -140,9 +140,9 @@ node scripts/core-acceptance.mjs --mode=real-rehearsal
 node scripts/core-acceptance.mjs --mode=real --api-key-env=OPENCODE_API_KEY
 ```
 
-The second command is the one owner-authorized live run and is **not run** by
-this batch. Live mode runs the offline rehearsal first and refuses to start if
-it fails or if its measured bound exceeds the caps. Only after that gate does a
+The live command requires separate owner approval for each run; the successful
+run below does not authorize retries or a provider matrix. Live mode runs the
+offline rehearsal first and refuses to start if it fails or exceeds the caps. Only after that gate does a
 child read the named environment variable, and it passes only that variable to
 `createProviderModels`; no owner config, ambient environment, personal
 workspace or non-auth credential is read. A phase-1 failure skips phase 2 so a
@@ -172,6 +172,40 @@ Review points before the single live call:
 - The report carries `assumptions`, `caps`, per-request `budget.records`
   (bytes, bounds, hashes, usage), `observations`, and phase timings. It carries
   no transcript, fact/body marker, credential or host path.
+
+### 2026-10-30 — one live run passed
+
+Source checkout: `7fa9804` (runtime code from the reviewed lean-assistant batch).
+Native OpenCode Go / `deepseek-v4.1-flash`, thinking `low`, synthetic workspace
+and disposable SQLite store only. Typecheck/build and the offline rehearsal
+passed before live dispatch. No retry or second live experiment was run.
+
+| Observation | Result |
+| --- | --- |
+| Live checks | 39 passed, 0 failed |
+| Whole report (rehearsal + live + runner gates) | 95 passed, 0 failed |
+| Provider requests | 10 of 20 allowed; 0 refused |
+| Conservative input reservation | 348,544 of 600,000 |
+| Output reservation | 17,920 of 20,000 |
+| Provider-reported input/output tokens | 62,350 / 1,629 |
+| Budget violation | None |
+
+The live model loaded a skill, wrote/read topic memory, produced the native
+compaction summary, reopened the same conversation in a fresh process and
+returned the exact early synthetic fact. That fact was present only in the
+placed summary, not in other messages or the system prompt. The live summary
+also quoted the raw-turn sentinel; it remained confined to the summary rather
+than being replayed as the original turn.
+
+This is evidence for one skill/memory/compaction/reopen story, not broad recall
+quality. Reset-delimited episode summaries and model-facing raw-history search
+remain offline-only evidence from `tests/history-lifecycle.behavior.test.mjs`.
+No live channel, scheduled send, personal workspace, Bubblewrap or deployment
+was exercised. Budget accounting retains the assumptions below, not a billing
+or physical-durability guarantee.
+
+Sanitized full-report SHA-256:
+`33bba490d977adcc24e79e352fb2d555ce60d2fa032156bca36fa80200a53cb1`.
 
 ## Guard assumptions (explicit, not proven from source)
 
@@ -212,9 +246,9 @@ acceptance experiment, not a proof about provider accounting.
 
 ## Not covered
 
-A live model-quality result, real-model summarization fidelity, A/B fixture
-comparison, provider/fallback matrices, channels and scheduled delivery, the
-owner's real workspace, Bubblewrap, and deployment are **not run** in this
-batch. Passing the rehearsal is evidence that the real flow and guard are wired
-and fit the cap, not evidence of model behaviour or Python parity. Review the
-guard and the real flow before the single live call.
+The live result above covers only its single synthetic story. Broad model
+quality/summarization fidelity, real-model reset/history-search recall, A/B fixture
+comparison, provider/fallback matrices, live channels and scheduled delivery,
+the owner's real workspace, Bubblewrap and deployment remain unverified.
+Passing the offline rehearsal alone establishes wiring and budget fit, not model
+behaviour or Python parity. Any further live experiment needs owner approval.
