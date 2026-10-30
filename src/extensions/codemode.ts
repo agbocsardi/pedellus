@@ -7,9 +7,12 @@ import {
   createCodemodeExtension,
   type CodemodeNamespace,
 } from "@earendil-works/pi-durable/codemode";
-import { createToolSearchExtension } from "@earendil-works/pi-durable/tool-search";
+import { createToolSearchExtension, TOOL_SEARCH_TOOL_NAME } from "@earendil-works/pi-durable/tool-search";
 import {
+  ToolTask,
   defineExtension,
+  hook,
+  type ConversationId,
   type Extension,
   type ToolExecutionApi,
   type ToolRegistration,
@@ -28,11 +31,21 @@ export interface CodeModeIntegrationOptions {
   readonly namespaces?: readonly CodemodeNamespace[];
   /** Explicitly opt into Durable's non-LLM models.* capabilities. Default false. */
   readonly models?: boolean;
+  /**
+   * Host predicate for the outer `codemode`/`tool_search` authority. When supplied, a
+   * dedicated hook extension is selected with the bundle and blocks both names outside
+   * authenticated mapped chats. Nested tool calls remain gated by each composed tool's
+   * own hook and the conversation's actual callable set.
+   */
+  readonly isAuthorizedChat?: (conversationId: ConversationId) => boolean;
 }
+
+/** The native tool names a host may need when it gates or delegates Code Mode authority. */
+export { TOOL_SEARCH_TOOL_NAME, CODEMODE_TOOL_NAME };
 
 /** Install these extensions explicitly; close the Harness before closing this host. */
 export interface CodeModeIntegration {
-  readonly extensions: readonly [Extension, Extension];
+  readonly extensions: readonly Extension[];
   /** Reject new executions and abort current Code Mode executions. */
   stopAdmission(): void;
   /** Stop admission, close the native sandbox, and wait for every worker thread to exit. */
@@ -125,7 +138,25 @@ export function createCodeModeIntegration(options: CodeModeIntegrationOptions = 
     ],
   });
 
-  const extensions = [boundedCodeMode, createToolSearchExtension()] as const;
+  const extensions: Extension[] = [boundedCodeMode, createToolSearchExtension()];
+  if (options.isAuthorizedChat !== undefined) {
+    const isAuthorizedChat = options.isAuthorizedChat;
+    // Outer Code Mode authority is independent of MCP connection state. Each nested tool
+    // still runs its own ToolTask hook and resolves from the conversation's current
+    // callable set, so this gate never grants a tool the conversation lacks.
+    extensions.push(defineExtension({
+      name: "nanobot-codemode-authority",
+      hooks: [hook(ToolTask, {
+        beforeTool(call, api) {
+          if (call.name !== CODEMODE_TOOL_NAME && call.name !== TOOL_SEARCH_TOOL_NAME) return undefined;
+          if (!isAuthorizedChat(api.conversationId)) {
+            return { block: `Tool ${call.name} is not enabled for this conversation` };
+          }
+          return undefined;
+        },
+      })],
+    }));
+  }
   const stopAdmission = () => {
     if (closed) return;
     closed = true;

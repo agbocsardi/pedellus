@@ -90,6 +90,18 @@ import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
 import {
+  createMcpIntegration,
+  mcpHasEnabledServers,
+  type McpIntegration,
+  type McpServerStatus,
+} from "./mcp/index.js";
+import {
+  CODEMODE_TOOL_NAME,
+  createCodeModeIntegration,
+  TOOL_SEARCH_TOOL_NAME,
+  type CodeModeIntegration,
+} from "./extensions/codemode.js";
+import {
   WORKER_TASK_NAME,
   createWorkerFoundation,
   workerBackgroundTarget,
@@ -108,6 +120,13 @@ import {
   type CodingToolName,
   type ToolEnvironments,
 } from "./tools/index.js";
+import {
+  BraveSearchClient,
+  PublicWebFetcher,
+  WEB_TOOL_NAMES,
+  createWebToolExtension,
+  type WebRuntimeOptions,
+} from "./web/index.js";
 
 const SessionMap = defineDoc<{ sessions: Record<string, number> }>({
   kind: "nanobot.session-map", version: 1, scope: "conversation", history: "latest", fork: "initial",
@@ -196,6 +215,18 @@ export interface OpenGatewayOptions {
      */
     readonly backfill?: "none" | "pending";
   };
+  /**
+   * Native web-tool seams for tests: environment snapshot, controlled resolver and
+   * transports, and a fixed clock. No config field selects these, and an absent
+   * value uses Node DNS and HTTPS. The ordinary runtime makes no external call at
+   * startup, so these cannot silently widen shipped behavior.
+   */
+  readonly web?: WebRuntimeOptions;
+}
+
+/** MCP servers configured for this open, with their connection state at the last read. */
+export interface GatewayMcpStatus {
+  readonly servers: readonly McpServerStatus[];
 }
 
 /** Read-only query for a bounded page of one mapped chat session's raw transcript entries. */
@@ -226,6 +257,11 @@ export interface Gateway {
    * no live channel can send. Present only when `config.telegram` is configured.
    */
   readonly telegramActions?: TelegramActionRegistry;
+  /**
+   * MCP server connection state; absent when MCP is not configured and enabled. A failed server has
+   * no tools; its status carries a fixed failure code, never a transport message or configured value.
+   */
+  readonly mcp: GatewayMcpStatus | undefined;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
   /** Lists the explicit allowlist and persisted selection for an already-known session key. */
   listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
@@ -377,8 +413,21 @@ export interface Gateway {
    * Prompt content stays metadata-only and no tool authority is added or widened.
    */
   refreshContext(sessionKey: string, context: Context): Promise<GatewayContextRefresh>;
+  /**
+   * Start a new context for one mapped chat session and rebuild its host prompt snapshot from
+   * the current workspace files, so the next request of the new session sees them. Both halves are one
+   * operation: a live run is reported as `busy` before either happens, because a rebuilt snapshot
+   * installed mid-run would change the running turn's later provider request, while a reset alone would
+   * leave the new context with the old prompt. Requests already prepared are untouched.
+   */
+  resetSession(sessionKey: string, context: Context): Promise<GatewaySessionReset>;
   close(context: Context): Promise<void>;
 }
+
+/** Outcome of {@link Gateway.resetSession}; `busy` means nothing was reset and nothing was rebuilt. */
+export type GatewaySessionReset =
+  | { readonly status: "reset"; readonly skills: number; readonly promptRebuilt: boolean }
+  | { readonly status: "busy" };
 
 function bindContextSnapshot(
   value: object | undefined,
@@ -449,6 +498,19 @@ export async function openGateway(config: PortConfig, context: Context, options:
     });
   }
   const toolsEnabled = toolAllowlist.length > 0;
+  // MCP is a separate, explicit connection authority. Connecting starts external clients, so the
+  // config switch must be on and at least one server enabled; otherwise no client is created.
+  const mcpConfig = config.mcp;
+  const mcpConfigured = mcpHasEnabledServers(mcpConfig);
+  // Native Code Mode composes whatever tools the current conversation already holds. It is
+  // independently enableable with `codemode.enabled`; when that block is absent the legacy rule
+  // still ties it to configured MCP, and an explicit `false` disables it either way.
+  const codeModeConfig = config.codemode;
+  const codeModeEnabled = codeModeConfig === undefined ? mcpConfigured : codeModeConfig.enabled;
+  // Late-bound so the coding ceiling hook can delegate MCP/Code Mode names to the hook installed
+  // later. Absent integrations mean the ceiling blocks those names instead.
+  const mcpRef: { current: McpIntegration | undefined } = { current: undefined };
+  const codeModeRef: { current: CodeModeIntegration | undefined } = { current: undefined };
   // Internal agent scheduling: opt-in, and independent of the coding-tool ceiling so a reminder job
   // needs no filesystem authority.
   const cronConfig = config.cron;
@@ -733,6 +795,45 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // Config authorization names only mapped ordinary chat conversations (loaded map + scope checked).
   // The call-time hook consults this set; the policy filter reads the same rule from committed state.
   const authorizedChatConversations = new Set<ConversationId>();
+  // Native public web tools carry network authority only: they are not coding tools, are never named by
+  // `toolAllowlist`, and are offered solely in mapped ordinary chat conversations whose scope this host
+  // validated. The search key is resolved once here; an absent value fails startup instead of quietly
+  // answering with zero results.
+  let webTool: { readonly extension: Extension } | undefined;
+  const webConfig = config.web;
+  if (webConfig !== undefined && (webConfig.search !== undefined || webConfig.fetch === true)) {
+    const searchConfig = webConfig.search;
+    let search: BraveSearchClient | undefined;
+    if (searchConfig !== undefined) {
+      const env = options.web?.env ?? process.env;
+      const key = Object.hasOwn(env, searchConfig.keyEnv) ? env[searchConfig.keyEnv] : undefined;
+      if (typeof key !== "string" || key.trim() === "") {
+        throw new StartupDiagnosticError("webCredential", {
+          detail: "Missing credential: set the environment variable named by web.search.keyEnv",
+        });
+      }
+      search = new BraveSearchClient({
+        apiKey: key.trim(),
+        ...(options.web?.searchTransport === undefined
+          ? {}
+          : { transport: options.web.searchTransport }),
+      });
+    }
+    const fetcher = webConfig.fetch === true
+      ? new PublicWebFetcher({
+          ...(options.web?.resolver === undefined ? {} : { resolver: options.web.resolver }),
+          ...(options.web?.fetchTransport === undefined ? {} : { transport: options.web.fetchTransport }),
+          ...(options.web?.now === undefined ? {} : { now: options.web.now }),
+        })
+      : undefined;
+    webTool = createWebToolExtension({
+      ...(search === undefined ? {} : { search }),
+      ...(fetcher === undefined ? {} : { fetcher }),
+      isAuthorizedChat: (conversationId) => authorizedChatConversations.has(conversationId),
+    });
+  }
+  const webToolRegistrations = webTool?.extension.tools ?? [];
+  const webConversations = new Set<ConversationId>();
   const toolExtension: Extension | undefined = toolsEnabled
     ? createCodingToolExtension({
         tools: toolAllowlist as readonly CodingToolName[],
@@ -745,9 +846,20 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // History retrieval is read-only over mapped chats and has its own scope checks, so the
           // ceiling must not suppress it when coding tools are enabled.
           ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
+          // Web tools are a separate config capability with their own call-time scope hook. They are
+          // exempt from the coding ceiling only while that gated extension is actually installed.
+          ...(webTool === undefined ? [] : WEB_TOOL_NAMES),
         ],
         defaultTimeoutSeconds,
         authenticatedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
+        // Code Mode/tool-search authority comes from their own installed scope hook, independent of
+        // MCP connection state. MCP registrations remain gated by the MCP hook. Each predicate is
+        // false unless that hook is actually installed, so a stale persisted selection cannot turn
+        // this exemption into authority.
+        delegatedTools: (name: string) =>
+          (codeModeRef.current !== undefined
+            && (name === CODEMODE_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME))
+          || (mcpRef.current !== undefined && mcpRef.current.ownsTool(name)),
       })
     : undefined;
   const toolEnvironments: ToolEnvironments | undefined = toolsEnabled
@@ -830,6 +942,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // image bounding independent of tool allowlists and channel scope.
     if (visionExtension) selected.push(visionExtension);
     if (toolExtension) selected.push(toolExtension);
+    // MCP tools and Code Mode/tool-search exist only in an authenticated mapped chat conversation.
+    // Code Mode is selected independently of MCP connection state; each bundle is selected only
+    // while it is live for this open.
+    if (authorizedChatConversations.has(conversationId)) {
+      if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
+      if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
+    }
     if (options.contextSnapshotProvider && contextExtension && contextConversations.has(conversationId)) {
       selected.push(contextExtension);
     }
@@ -837,6 +956,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       selected.push(skillTool.extension);
     }
     if (historyTool && historyConversations.has(conversationId)) selected.push(historyTool.extension);
+    if (webTool && webConversations.has(conversationId)) selected.push(webTool.extension);
     if (telegramTool && telegramChatConversations.has(conversationId)) selected.push(telegramTool.extension);
     if (cronFoundation && cronTool && cronOwners.has(conversationId)) {
       selected.push(cronFoundation.extension, cronTool.extension);
@@ -1115,12 +1235,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const telegramTools = telegramToolRegistration !== undefined && telegramChatConversations.has(conversationId)
       ? [telegramToolRegistration]
       : [];
+    const webTools = webConversations.has(conversationId) ? [...webToolRegistrations] : [];
     // Worker management is a spawning-conversation capability, not filesystem or shell authority. The
     // worker's own task-owned conversation is never in this set, so it cannot start another worker.
     const workerTools = workerToolRegistration !== undefined && workerSpawners.has(conversationId)
       ? [workerToolRegistration]
       : [];
-    return [...skillTools, ...cronTools, ...historyTools, ...telegramTools, ...workerTools];
+    return [...skillTools, ...cronTools, ...historyTools, ...telegramTools, ...webTools, ...workerTools];
   };
   /**
    * The authority-derived tool filter. The host ceiling directly authorizes authenticated mapped
@@ -1133,9 +1254,27 @@ export async function openGateway(config: PortConfig, context: Context, options:
     backgroundTools?: ReadonlySet<string>,
   ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
     const contextTools = contextToolsFor(conversationId);
+    // MCP server tools and the Code Mode/tool-search tools only hold enabled authority in an
+    // authenticated mapped chat conversation. MCP tools stay deferred: enabled for nested calls and
+    // discovery, but never declared until `tool_search` loads them or a script names them.
+    const authorized = authorizedChatConversations.has(conversationId);
+    const offered = authorized && codeModeRef.current !== undefined
+      ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]
+      : [];
+    const deferred = authorized && mcpRef.current !== undefined ? [...mcpRef.current.toolNames] : [];
     const withContext = (names: readonly string[]): Pick<AgentChange, "tools" | "modelTools"> => {
-      const tools = [...toolFilterFromNames(names).tools, ...contextTools];
-      return { tools, modelTools: tools };
+      const tools = [
+        ...toolFilterFromNames(names).tools,
+        ...toolFilterFromNames(offered).tools,
+        ...toolFilterFromNames(deferred).tools,
+        ...contextTools,
+      ];
+      const modelTools = [
+        ...toolFilterFromNames(names).tools,
+        ...toolFilterFromNames(offered).tools,
+        ...contextTools,
+      ];
+      return { tools, modelTools };
     };
     if (!toolExtension) {
       // Retire instead of creating an empty document: a disabled ceiling must durably remove
@@ -1253,13 +1392,41 @@ export async function openGateway(config: PortConfig, context: Context, options:
             ),
           now,
         });
+    // MCP connects before the registry is built so every discovered tool is in the initial
+    // registry. A failed server contributes nothing and is reported through `gateway.mcp`; the
+    // whole open fails only for an internal error, and the catch below tears down whatever started.
+    if (mcpConfigured && mcpConfig !== undefined) {
+      mcpRef.current = await createMcpIntegration({
+        config: mcpConfig,
+        workspace,
+        isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
+        delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
+      });
+      for (const tool of mcpRef.current.extension.tools ?? []) toolRegistrations.set(tool.name, tool);
+    }
+    // Code Mode is an independent compositor, not an MCP wrapper. It gets MCP namespaces only from
+    // an actually connected integration; without MCP it composes the conversation's other tools.
+    if (codeModeEnabled) {
+      codeModeRef.current = createCodeModeIntegration({
+        namespaces: mcpRef.current?.namespaces ?? [],
+        isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
+      });
+      for (const extension of codeModeRef.current.extensions) {
+        for (const tool of extension.tools ?? []) toolRegistrations.set(tool.name, tool);
+      }
+    }
     const registry = createRegistry();
     if (episodeSummaries !== undefined) registry.install(episodeSummaries.extension);
     if (visionExtension) registry.install(visionExtension);
     if (toolExtension) registry.install(toolExtension);
+    if (mcpRef.current !== undefined) registry.install(mcpRef.current.extension);
+    if (codeModeRef.current !== undefined) {
+      for (const extension of codeModeRef.current.extensions) registry.install(extension);
+    }
     if (skillTool) registry.install(skillTool.extension);
     if (historyTool) registry.install(historyTool.extension);
     if (telegramTool) registry.install(telegramTool.extension);
+    if (webTool) registry.install(webTool.extension);
     if (cronFoundation) registry.install(cronFoundation.extension);
     if (cronTool) registry.install(cronTool.extension);
     if (workerFoundation) registry.install(workerFoundation.extension);
@@ -1548,12 +1715,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
     const initialMapping = historyTool === undefined && !toolsEnabled && telegramTool === undefined && !workersEnabled
+      && webTool === undefined && !mcpConfigured && !codeModeEnabled
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
     if (initialMapping !== undefined) {
       for (const { sessionKey, conversationId } of await mappedChatSessions(context)) {
         if (historyTool !== undefined) historyConversations.add(conversationId);
         authorizedChatConversations.add(conversationId);
+        if (webTool !== undefined) webConversations.add(conversationId);
         sessionKeyForConversation.set(conversationId, sessionKey);
         // A worker may be spawned only from this scope-checked set; a task-owned target, the root,
         // a fork or a channel-state conversation is never in it.
@@ -1862,6 +2031,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
       harness,
       cronOutbox,
       ...(telegramActions === undefined ? {} : { telegramActions }),
+      get mcp() {
+        return mcpRef.current === undefined ? undefined : { servers: mcpRef.current.status };
+      },
       async conversationFor(sessionKey, ctx) {
         const key = encodedSessionKey(sessionKey);
         let conversationId: ConversationId | undefined;
@@ -1895,10 +2067,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (reason === undefined) {
             historyConversations.add(conversationId!);
             authorizedChatConversations.add(conversationId!);
+            if (webTool !== undefined) webConversations.add(conversationId!);
             mappedChat = true;
           } else {
             historyConversations.delete(conversationId!);
             authorizedChatConversations.delete(conversationId!);
+            webConversations.delete(conversationId!);
           }
         }
         // The exact host-owned session key for this conversation is what a channel action host
@@ -2093,6 +2267,28 @@ export async function openGateway(config: PortConfig, context: Context, options:
         const conversation = await existingConversationFor(sessionKey, ctx);
         return { skills: await refreshContextSnapshot(sessionKey, conversation.id, ctx) };
       },
+      async resetSession(sessionKey, ctx) {
+        // `/new` may be the first message in a chat, so its own mapped conversation is resolved the
+        // same way `conversationFor` resolves it (creating only that host-supplied key). No other
+        // session selector exists here.
+        const conversation = await gateway.conversationFor(sessionKey, ctx);
+        // Without a host prompt snapshot there is nothing to rebuild: the native reset is the whole effect.
+        if (!options.contextSnapshotProvider) {
+          await conversation.reset(undefined, ctx);
+          return { status: "reset", skills: 0, promptRebuilt: false };
+        }
+        let skills: number;
+        try {
+          // Rebuild first: a live run must be refused before anything changes. The adapter serializes
+          // this chat, so no input of this conversation can start a run between the two steps.
+          skills = await refreshContextSnapshot(sessionKey, conversation.id, ctx);
+        } catch (error) {
+          if (error instanceof ConversationBusy) return { status: "busy" };
+          throw error;
+        }
+        await conversation.reset(undefined, ctx);
+        return { status: "reset", skills, promptRebuilt: true };
+      },
       async close(ctx) {
         if (closed) return;
         closed = true;
@@ -2101,15 +2297,23 @@ export async function openGateway(config: PortConfig, context: Context, options:
         episodeCatalog?.close();
         try { await harness!.close(cleanup); }
         finally {
-          try { await historyIndex?.close(); }
+          // Code Mode first: it owns sandbox workers that may be calling MCP tools. Then the MCP
+          // clients, whose native transports tear down their server process groups.
+          try { await codeModeRef.current?.close(); }
           finally {
-            try {
-              for (const environments of workerEnvironments.values()) {
-                await environments.close(cleanup).catch(() => undefined);
+            try { await mcpRef.current?.close(); }
+            finally {
+              try { await historyIndex?.close(); }
+              finally {
+                try {
+                  for (const environments of workerEnvironments.values()) {
+                    await environments.close(cleanup).catch(() => undefined);
+                  }
+                  workerEnvironments.clear();
+                  await toolEnvironments?.close(cleanup);
+                } finally { await releaseLock(); }
               }
-              workerEnvironments.clear();
-              await toolEnvironments?.close(cleanup);
-            } finally { await releaseLock(); }
+            }
           }
         }
       },
@@ -2197,6 +2401,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
       if (harness) await harness.close(cleanup);
       else await storage?.close(cleanup);
     } finally {
+      try { await codeModeRef.current?.close(); }
+      catch { /* a sandbox close failure must not mask the startup error */ }
+      try { await mcpRef.current?.close(); }
+      catch { /* a failed server connection is already closed; never mask the startup error */ }
       try { await historyIndex?.close(); }
       catch { /* a derived index close failure leaves a rebuildable file, not source data */ }
       finally {

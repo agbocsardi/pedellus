@@ -55,25 +55,59 @@ not permission to start every branch or run live integrations):
 - [x] Handle authenticated Telegram reaction changes as ordinary agent turns,
   with durable update dedupe and explicit added/removed context. Offline handler
   verified; private-chat reaction-update delivery remains unverified live.
-- [ ] Wire configured MCP connections into the actual gateway and expose their
-  registered tools through Code Mode/tool discovery. The current SDK-only Code
-  Mode bundle is not MCP connectivity and is not installed by the shipped host.
-- [ ] Implement channel-neutral attachment/voice media next: shared transcription
+- [x] Wire configured MCP connections into the actual gateway and expose their
+  registered tools through Code Mode/tool discovery. Implemented as `4d61f50`
+  (pinned `@earendil-works/pi-mcp` client plus the existing native Code Mode
+  bundle, installed by the shipped host only when `mcp` is explicitly enabled).
+  Standalone review passed with no material code defects (`4d61f50`, docs
+  corrected in `1c38146`); a fresh combined runtime/config/authority review
+  passed `555d34c` with no material findings. Accepted and integrated into main.
+- [x] Generalize native Code Mode into the agent's general compositor: scripts may
+  compose every tool the current agent is authorized to call (coding, history,
+  skill, cron, web, MCP, Telegram actions, and worker tools once accepted), not
+  only MCP tools. No new authority: each nested call still passes its normal
+  validation and call-time checks, deferred MCP stays callable but undeclared,
+  and the tool set is the current conversation's actual callable set. Code Mode
+  is not recursive, host-only owner commands are never model tools, and
+  raw/root/state/fork targets keep no composition authority. Code Mode must be
+  enableable without a dummy MCP server. Background children keep no worker tool
+  (no recursive delegation) and only compose tools already captured for them.
+  Accepted after the combined runtime/config/authority review of `1204226` and
+  published with the web integration. Cron and background-worker composition
+  remain deliberately later: the worker branch is still in review, and no implicit
+  cron/worker grant exists.
+- [x] Native Brave web search plus safe public web fetch: one configured provider,
+  fixed HTTPS endpoint, key by environment-variable name, explicit default-off
+  config, mapped-chat-only authority, public unicast DNS pinning, per-hop redirect
+  revalidation, credential/cookie-free headers, bounded time/bytes/text, no script
+  execution, and untrusted labeled results. Accepted after standalone reviews
+  (`0a6abb6`, `b9e3339`) and the combined review of `1204226`; integrated with
+  Code Mode composition. Product Brave search remains **live-unverified** (only
+  one bounded implemented fetch smoke to example.com; no live provider query or
+  account).
+- [x] Implement channel-neutral attachment/voice media ingress: shared transcription
   configuration/processing, Telegram ingress first, native image content for
   photos with configured vision handoff, and document saving without extraction.
   Choose one initial speech backend; do not translate Python's entire provider
-  registry.
-  - [ ] Photos: send native pi-ai image content through the normal gateway turn;
+  registry. Ingress chain: `062ac68` + `0752ea1` + `a30d1cf` -> `f0e9319` ->
+  `be6afc4` -> test-strengthening `0b65601` -> integration `fd6e563`, fresh final
+  combined review PASSED and fast-forward published onto main `4a2616e`.
+  Local faster-whisper provisioning and real transcription were **not executed**:
+  provision the helper explicitly before use, and no automatic cloud, network or
+  model download happens while a message is handled.
+  - [x] Photos: send native pi-ai image content through the normal gateway turn;
     a configured vision-capable preset describes images for presets explicitly
     marked as text-only. Never silently switch the main model, and never refuse
     a photo merely because the selected preset is text-only.
-  - [ ] Documents: save the original under `workspace/media/` only. This
+  - [x] Documents: save the original under `workspace/media/` only. This
     docs-only raw-file behavior overrides the earlier "established extraction"
     wording: no automatic PDF/OCR/Office extraction libraries and no hidden
     document pipeline in this slice.
-  - [ ] Voice: local faster-whisper CPU/small/int8, owned by the separate media
+  - [x] Voice: local faster-whisper CPU/small/int8, owned by the separate media
     ingress worker; no cloud-audio upload, backend install or model download in
-    this batch.
+    this batch. The helper and bounded subprocess path are implemented and
+    offline-tested; provisioning a real environment/model and producing a real
+    transcript remain unexecuted operator steps.
   - [x] Vision handoff slice: config-flagged `needsVisionHandoff` presets, one
     named describer preset, bounded raw images and descriptions, native
     `beforeRequest` transform only, focused offline checks. Independently
@@ -82,14 +116,18 @@ not permission to start every branch or run live integrations):
     config.
 - [ ] Add bounded ordinary background workers; scheduled memory curation may then
   be an ordinary cron job using those workers and the existing Markdown tools,
-  not a standalone Dream subsystem.
+  not a standalone Dream subsystem. Product workers support research plus coding:
+  the spawning agent explicitly chooses shared workspace or isolated worktree
+  per task. Completion/results notify the spawning agent, not the user directly.
   - [ ] Bounded ordinary workers on native Durable tasks: opt-in `workers` config,
     model-facing `worker` start/list/inspect/cancel, explicit shared-or-worktree
     workspace, captured tool ceiling, one internal result event to the spawning
-    agent. Implemented on branch `t3/durable-background-workers` and awaiting
-    independent review; memory curation is deferred by owner decision (recorded on
-    main in `655b034`, which also restates these worker decisions) and this branch
-    contains none of it.
+    agent. Independent review passed on `74b9355` (no material findings); merged
+    with the current web/Code Mode main for combined review. Memory curation
+    stays deferred and this branch contains none of it.
+- [ ] After background workers are accepted, add opt-in periodic digestion of
+  previously unprocessed conversations/episodes into long-term memory, following
+  the deferred scope below. Do not implement or activate curation yet.
 
 Approved first implementation batch: channel-neutral gateway/local CLI attachment
 and Telegram menu/reply/quote/reaction support. These are two independently owned
@@ -116,6 +154,51 @@ Web search/fetch remains a useful reach feature alongside MCP. Other channels,
 provider variants and richer UI follow actual use, not feature-for-feature parity.
 This is a discussion order, not authorization to deploy, read personal settings,
 spend on another run or start all feature branches.
+
+## Deferred: conversation digestion into memory
+
+Owner clarified that curation primarily digests previously unprocessed
+conversations/episodes, not housekeeping over existing Markdown. Use the Python
+reference's `nanobot/templates/agent/dream.md` prompt and guarded memory runner
+as behavioral references, not a subsystem to copy.
+
+- The agent owns the consolidation prompt as workspace Markdown (for example,
+  `prompts/memory-curation.md`), editable through its configured ordinary tools
+  so the owner and agent can inspect, discuss and tune it. Shipped prompt text
+  is an initial seed only: never overwrite an existing workspace prompt during
+  startup, upgrades or runs. Keep this simple: no added prompt hashes, version
+  registry or prompt-management machinery. Existing runtime safeguards still apply.
+- Read bounded, source-labeled Durable history; original entries remain
+  authoritative. Keep a simple digestion cursor, like the Python dream cursor,
+  recording how far history has been successfully processed. Use native Durable
+  state, not a second history archive; never advance past unprocessed evidence.
+- Follow the working Python write scope: `SOUL.md` for behavior/invariants,
+  `USER.md` for stable personal preferences, `memory/<topic>/<name>.md` for topic
+  context, small `memory/system/` for broadly relevant current material, and
+  `skills/<name>/SKILL.md` for genuinely repeated reusable workflows.
+- Extract atomic durable facts, prioritize explicit user corrections/preferences,
+  update superseded facts in place, deduplicate and prune stale material. Preserve
+  permanent preferences, active context and behavioral safeguards; move unique
+  useful content to its canonical owner before removing duplication. Topic files
+  retain description frontmatter; avoid wholesale restructuring.
+- Treat quoted/tool/assistant-derived content as evidence, not owner instructions.
+  Keep source provenance and do not save credentials or generic public reference
+  material as memory. Adapt paths/tool names to this project; do not import
+  Python's legacy-file migration rules or separate archive/command infrastructure.
+- Retain the reference's integrity intent: bounded edits/time, inspectable changes
+  and recovery, no loss of pre-existing or concurrent user edits. Advance the
+  processed frontier only after a successfully validated batch. A completed batch
+  with nothing worth remembering still counts as processed; a timeout/provider/
+  tool/write failure does not. Use native job/worker outcomes to notify the agent;
+  no special user-escalation policy has been selected.
+- Implement later as an opt-in ordinary cron job over the accepted worker and
+  Markdown-tool path, with explicit snapshot freshness through the existing
+  refresh mechanism. No standalone Dream engine, new agent loop or automatic
+  schedule activation. Existing-history backfill and exact history-unit boundaries
+  must be made explicit before activation.
+
+The owner asked to record this scope and work on something independent while
+background agents are unfinished. Curation implementation is therefore deferred.
 
 ## Product and constraints
 
@@ -193,43 +276,131 @@ remain intact. No deployment or live-delivery claim; no live model/bot run.
 
 ## Session log
 
-### 2026-10-30 — background workers implemented, under independent review
+### 2026-10-30 — Code Mode becomes the general tool compositor
 
-Implemented bounded ordinary background workers as native Durable tasks on branch
+Owner direction: Code Mode should allow composing all tools generally available
+to the agent, not just MCP tools. This supersedes the MCP-only exposure scope
+while keeping every existing authority check, deferral rule and denial intact.
+The active web-tools integration worker owns the small native generalization and
+must report functional changes for the combined review. Separately recorded:
+Telegram owner commands are `/model`, `/status`, `/new` (reset plus rebuilt
+workspace prompt) and full-process `/restart`, with no separate `/refresh`; the
+background-worker fix round is in progress; curation stays deferred with a simple
+editable prompt and digestion cursor. No live runs or new spend authorized.
+
+### 2026-10-30 — Telegram owner-command scope
+
+Owner selected Telegram owner commands as independent work. Use `/model` for
+configured presets and `/status` for bounded own-chat metadata. Do not add a
+separate Telegram `/refresh`: `/new` must reset the conversation and rebuild the
+assembled workspace Markdown/skills prompt for the new session. `/restart` must
+gracefully restart the full gateway process so new code and config load; attached
+CLI clients disconnect and Durable work recovers under existing safety rules.
+No deployment, service manager, live bot run or new tool authority is authorized.
+The original owner-command implementer received this scope update; review and
+integration are still required.
+
+### 2026-10-30 — deferred conversation digestion scope
+
+Read the Python curation prompt and guarded runner after the owner clarified
+that unprocessed conversations/episodes are the main input. Recorded its broad
+memory/skill editing and pruning scope, source/processed-frontier integrity and
+ordinary cron/worker implementation constraint. Corrected product-worker wording:
+shared/worktree is chosen by the spawning agent; completion notifies that agent,
+not the user. Owner also required an agent-owned, inspectable/editable workspace
+consolidation prompt, seeded once. The owner subsequently clarified: a simple
+editable prompt plus digestion cursor, without prompt hashes/version machinery.
+Existing runtime safety and data-integrity requirements remain. Owner explicitly
+deferred curation implementation until background workers exist and requested a
+different next slice. No curation code, schedule, model run or historical-data
+processing started; this is planning only.
+
+### 2026-10-30 — MCP accepted and published
+
+A fresh combined runtime/config/authority review passed `555d34c` with no material
+findings, verifying the reviewed vision/gateway source coexists with the MCP
+slice, 116 registered behavior checks, 2 execution checks, 83 offline core checks,
+typecheck and build. Publication only reconciled front-door metadata and docs:
+the plan status, README/AGENTS statements that Code Mode was SDK-only with no MCP
+installed, and the MCP/CODEMODE accepted status. No functional source, test or
+dependency file changed relative to the reviewed tip. Current parallel work is
+recorded as: media ingestion under its final review (`be6`), product background
+workers under active implementation, and native Brave web search plus fetch newly
+owner-approved and running. None of those were imported here, and no live MCP,
+provider, credential or production run was performed for this slice.
+
+### 2026-10-30 — MCP connections through product Code Mode (accepted, integrated)
+
+The MCP worker wired explicit `mcp` config (stdio and Streamable HTTP, env-name
+secrets, no OAuth/`mcp.json`/hot reload) to the pinned
+`@earendil-works/pi-mcp@1.4.0` client and exposed discovered tools as deferred
+native `mcp__<server>__<tool>` registrations through the existing Code
+Mode/tool-search bundle (`4d61f50`). Authority is default-deny: mapped
+authenticated chats only, call-time hook plus per-conversation tool filter,
+coding ceiling preserved for nested calls, no scheduled-run MCP authority.
+Independent review passed with no material code defects after verifying native
+hook scopes, connection withdrawal handling, startup-timeout cleanup and no
+retry; only three documentation corrections were requested, fixed in `1c38146`
+(scoped nested-call wording, the real install gate, and the `content`/
+`structuredContent`/`isError` result shape with `_meta` dropped). The same
+correction pass documents that a configured stdio server is a native host
+process not covered by `toolSandbox: "bwrap"`, labels cancellation evidence
+honestly (script deadline tested, native request timeout code-read), and notes
+that a `tool_search`-loaded tool can need rediscovery after a policy reapply.
+
+Integration candidate `44c7385` merges current main (`c6474ee`: reviewed
+gateway/local CLI plus reviewed vision handoff) into the MCP branch. Conflicts
+were only `package.json` (test registration union, 22 files) and `src/config.ts`
+(both import/field families kept). `src/runtime.ts` auto-merged and was checked
+for semantic overlap: the vision hook keeps its all-conversation selection,
+`denyNewConversation` and cron-prepare inclusion, prepared-dispatch pin and hook
+order; MCP keeps its default-deny tool filter, call-time hook delegation,
+connection lifecycle, status surface and close/catch teardown, and cron targets
+receive no MCP authority. Combined offline checks: typecheck/build, 116
+registered behavior checks (107 main plus 9 MCP), 2 execution and 83 core
+acceptance. Carried limits: no OAuth/browser sign-in or token store, no
+`mcp.json` discovery or resources/prompts tools, no hot reload or lazy
+reconnect, tools added after open need a reopen, and no CLI notice for a failed
+server (fixed codes on the SDK `gateway.mcp` surface only). Not integrated into
+main pending the combined review, which then passed `555d34c` with no material
+findings. Front-door metadata/docs were reconciled for publication and the work
+merged by fast-forward into main. No live MCP server, provider, credential or
+production data was used; the carried limits above still hold.
+
+### 2026-10-30 — bounded background workers (reviewed; merged for combined review)
+
+Implemented bounded ordinary background workers as native Durable tasks on
 `t3/durable-background-workers`: `nanobot.worker-run` task kind, `worker` tool
-(start/list/inspect/cancel), `workers` config (`enabled`, bounded
-`maxConcurrent` default 2, optional named `preset`), child conversations that keep
-the spawning conversation's captured tool ceiling and chosen model, explicit
-`shared`/`worktree` workspaces (generated branch/path under
-`<dataDir>/worker-worktrees`, clean-base and full-repo-scope checks, no shell
-interpolation), terminal-commit retirement of captured authority and one internal
-idempotent result event to the spawning agent. Fourteen offline checks in
+(start/list/inspect/cancel), `workers` config (`enabled`, bounded `maxConcurrent`
+default 2, optional named `preset`), child conversations that keep the spawning
+conversation's captured tool ceiling and chosen model, explicit `shared`/
+`worktree` workspaces (generated branch/path under `<dataDir>/worker-worktrees`,
+clean-base and full-repo-scope checks, no shell interpolation), terminal-commit
+retirement of captured authority and one internal idempotent result event to the
+spawning agent. Fourteen offline checks in
 `tests/background-workers.behavior.test.mjs` cover the agreed finish line with a
-faux provider and temporary git/non-git fixtures. No live provider, bot, network,
-credential, dependency install or deployment was used; scheduled memory curation
-was not started. Owner later recorded the deferred curation scope on main
-(`655b034`, docs only, after the media-ingress metadata): digestion of previously
-unprocessed conversations/episodes with an agent-owned, seed-once workspace
-consolidation prompt, runtime-owned bounds/frontier, no Dream engine and no
-activation. That work remains unimplemented here by instruction; its notes must
-be preserved when this plan is merged. Awaiting fresh independent review of the
-workers slice; no integration or main publication yet.
+faux provider and temporary git/non-git fixtures.
 
-Review fixes for that slice (same worktree, no new scope): `start` now dedupes on
-Durable's tool-task identity instead of the provider's tool-call ID, so two turns
-that reuse `call_0` start two workers while a replayed task stays idempotent; and
-a reopen that removed a live worker's captured model no longer leaves capture,
-tools or pending child work behind — the target is denied and its own pending
-work withdrawn before scheduling resumes, the worker commits a terminal error,
-and the model pin is never silently replaced by the configured default. A saved
-dispatch naming a removed model keeps the inherited startup refusal; that case
-is documented rather than auto-cancelled. The worker tool also stays composable
-from native Code Mode (no model-only `callers` restriction) under the same
-spawning-conversation and capture checks. The new regressions were shown to fail
-against the reviewed pre-fix behavior in ignored build output only. The owner's
-latest curation planning is simpler than the notes on main (an editable workspace
-prompt plus a simple digestion cursor, no hash/version machinery) and is deferred;
-it is not implemented here.
+Review round (`74b9355`): `start` dedupes on Durable's tool-task identity, not the
+provider's tool-call ID, so two turns that reuse `call_0` start two workers while a
+replayed task stays idempotent. A reopen that removed a live worker's captured
+model no longer leaves capture, tools or pending child work: the target is denied
+and its own pending work withdrawn before scheduling resumes, the worker commits a
+terminal error, and the pin is never silently replaced by the configured default;
+a saved dispatch naming a removed model keeps the inherited startup refusal and is
+documented rather than auto-cancelled. The worker tool carries no model-only
+`callers` restriction, so general Code Mode may compose it under the same
+spawning-conversation and capture checks, while a worker child still gets no
+`worker` tool. Fresh independent review passed with no material findings (121
+behavior, 14 new three times, 2 execution, 83 core, typecheck/build).
+
+Integration candidate merges current main `dceb23f` (Telegram owner controls,
+media ingress, vision, MCP, general Code Mode, web tools) into this branch.
+Conflicts were only `package.json` (test registration union), `src/config.ts`
+and `src/runtime.ts` (both add independent field/import/close-chain blocks) and
+this plan file; the reviewed worker source and behavior are unchanged. No live
+provider, bot, network, credential, dependency change, model download or
+deployment was used, and scheduled memory curation remains unimplemented.
 
 ### 2026-10-30 — media ingress and configured vision handoff
 
@@ -303,6 +474,37 @@ and is covered by the focused hook regression). Media adapter/transcription work
 still belongs to the original media worker's fixes, and native MCP/product Code
 Mode has not completed independent review.
 
+### 2026-10-30 — Telegram media ingress (accepted, integrated)
+
+The media worker's branch `t3/telegram-media-transcription` merged current main
+`4a2616e` (merge `cc26bfc`) after its standalone fixes passed at `be6afc4`, and
+added one cross-feature check on top of the 25 focused media checks. The final
+combined review passed `fd6e563` with no material findings, and the metadata tip
+was fast-forward published onto main. The ingress chain is `062ac68` +
+`0752ea1` + `a30d1cf` -> `f0e9319` -> `be6afc4` -> `0b65601` -> `fd6e563`. The gateway
+process owns Telegram and media; the adapter submits photos as native pi-ai image
+content plus a labeled workspace-relative locator, stores documents unread and
+transcribes voice with the local uv/faster-whisper helper. A mocked Telegram
+photo reaches a `needsVisionHandoff` text-only preset: the configured vision
+describer receives the original image, the main request carries zero raw images
+and the labeled description, and the original stays on disk. Typecheck, build,
+142 registered behavior checks, 2 execution checks and 83 offline core checks
+pass; only faux-model/temp-store/mocked-fetch checks ran, with no live bot,
+provider, network, credential, dependency install or model download. The
+package.json union keeps all main gateway/vision/MCP registrations plus
+telegram-media; `src/config.ts`, `src/cli.ts` and `SETUP.md` were the semantic
+union points, with no functional conflict beyond the package.json test line.
+Stored originals are never auto-deleted and there is no total-disk cap. Deferred,
+reported limits: control exhaustion/reopen matrix, early-submission memory edge,
+crash hard-link window, pending-only ack after eventual apply, cached failed
+transcription, and two optional child cache-dir variables. Local faster-whisper
+provisioning and real transcription were not executed: the helper must be
+provisioned explicitly before use, and no cloud, network or model download happens
+while a message is handled. The background worker agreement is unchanged: 2–3
+implementers with separate reviewers, the spawning agent (not the user) is
+notified whether the assignment uses a shared checkout or a worktree, and
+scheduled memory curation remains later work.
+
 ### 2026-10-30 — channel surfaces and Telegram interactions
 
 Owner clarified that the gateway itself is the single agent/Durable owner and
@@ -367,7 +569,7 @@ The resumed pilot preserved a queued message from the allowlisted owner sent dur
 
 Recorded the narrow result in TELEGRAM.md. After owner confirmed the working interactions, cleaned the completed transport/typing workers and reviewers (4 agents, 2 clean worktrees and their patch-equivalent integrated branches). Other older unrelated resources remain untouched. A short separately approved reminder-only check was the remaining Telegram pilot item; do not repeat the whole sequence or silently renew the consumed budget.
 
-Owner subsequently accepted this as good enough and explicitly asked to update the plan and discuss what comes next. The pilot batch is now complete by owner decision. Reminder-only live verification is deferred, not marked passed. No more testing, provider spend or implementation was started. The initial recommendation was ordinary-use setup, then reach features. Owner's subsequent annotations corrected the next priorities: gateway is channel-neutral (CLI plus Telegram, future Discord/Email), native Telegram command-menu niceties, MCP through product Code Mode, and high-priority photos/documents/voice. Memory already supports on-the-fly Markdown changes via configured read/write/edit, but not the Python-named memory tools or automatic snapshot refresh after each write. Current Code Mode is an opt-in SDK bundle only; no MCP client/config or shipped gateway installation exists. Python's voice flow is channel download -> shared transcription config/service -> provider -> labeled transcript in the normal user turn. Plan the equivalent shared ingress with one initial backend, rather than copying its provider registry. Dream was parked as a special subsystem, not rejected as a behavior: ordinary cron plus bounded background workers and memory tools should provide its essence. No implementation/live calls launched for these annotations.
+Owner subsequently accepted this as good enough and explicitly asked to update the plan and discuss what comes next. The pilot batch is now complete by owner decision. Reminder-only live verification is deferred, not marked passed. No more testing, provider spend or implementation was started. The initial recommendation was ordinary-use setup, then reach features. Owner's subsequent annotations corrected the next priorities: gateway is channel-neutral (CLI plus Telegram, future Discord/Email), native Telegram command-menu niceties, MCP through product Code Mode, and high-priority photos/documents/voice. Memory already supports on-the-fly Markdown changes via configured read/write/edit, but not the Python-named memory tools or automatic snapshot refresh after each write. Current Code Mode is an opt-in SDK bundle only; no MCP client/config or shipped gateway installation exists. (Superseded: configured MCP connections through product Code Mode were later accepted and integrated; see the MCP entries above.) Python's voice flow is channel download -> shared transcription config/service -> provider -> labeled transcript in the normal user turn. Plan the equivalent shared ingress with one initial backend, rather than copying its provider registry. Dream was parked as a special subsystem, not rejected as a behavior: ordinary cron plus bounded background workers and memory tools should provide its essence. No implementation/live calls launched for these annotations.
 
 Gateway integration: combined the independently reviewed gateway/CLI slice
 (`5712c98` + `ca662bb`) with the approved Telegram interactions (`30d34f1` +
@@ -384,5 +586,54 @@ children total. Reviewers do not count against that implementer bound, and origi
 implementers are retained through review and fix rounds rather than replaced.
 Parent orchestrates only. The vision handoff passed fresh independent review and
 is integrated with this gateway tip. Media adapter/transcription work remains
-under the original media implementer's review fixes, and native MCP plus product
-Code Mode wiring is forthcoming; neither is complete or accepted here.
+under the original media implementer's final review (`be6`), and native MCP plus
+product Code Mode wiring is accepted and integrated (see the MCP entry above).
+Product background workers are under active research and coding implementation;
+the spawning agent (not the user) is notified whether each implementer uses a
+shared checkout or a worktree, and scheduled memory curation remains later work.
+Native web search (Brave) plus fetch and the general Code Mode compositor were
+later accepted (see the publication entry below); product web search remains
+live-unverified.
+
+### 2026-10-30 — Web + Code Mode compositor candidate (not published)
+
+Combined current main `4dbc71e` (docs over `199de08`) with the web branch
+(`b9e3339`) in this retained worktree. Resolution kept both `web` and
+`media`/`mcp` config, selected MCP and Code Mode only for mapped ordinary chats,
+made Code Mode enableable without MCP (`codemode.enabled`) while preserving MCP
+auto-enablement, and kept web tools in the same mapped set. The coding ceiling
+now delegates `codemode`/`tool_search` to an independent Code Mode authority hook
+and `mcp__*` to the MCP hook; nested scripts compose the conversation's actual
+callable set (coding, history, skill, cron, web, MCP, Telegram actions) through
+native `executeTool()`/`ToolTask` hooks with no new authority. The Telegram
+action tool accepts nested Code Mode callers while keeping its host,
+observed-target, journal and task-binding denials.
+
+Checks on this candidate: typecheck/build, 151 behavior checks (142 main + 9 web,
+including the actual gateway MCP/Code Mode nested path, no-MCP composition and a
+nested Telegram action), 2 execution and 83 core acceptance. No live Brave,
+site, provider, Telegram, credential or network run. The candidate is **not**
+merged or published; a fresh combined runtime/config/authority review is required
+first. Product Brave search remains unverified live.
+
+### 2026-10-30 — Native web + Code Mode compositor accepted and published
+
+A fresh combined runtime/config/authority review of `1204226` passed with no
+material findings, covering the merged MCP/media/vision/Telegram sources, mapped
+chat authority, nested composition, the Telegram caller widening, cron/worker
+non-grants, lifecycle and dependency union. Main advanced to the Telegram
+owner-controls publication (`578dc20`); merging it preserved `/model`, `/status`,
+`/new`, `/stop` and full-process `/restart`, the reset-with-rebuild path and the
+restart host code while keeping both command parsing/menu and the web/Code Mode
+tool wiring. Package test registration is the union (161 behavior checks: 152
+main + 9 web), with
+pinned `pi-mcp`, `htmlparser2` and `ipaddr.js` and no unrelated upgrades.
+
+Small review-hygiene fixes only: corrected the stale `mcp` config comment, removed
+a duplicated JSDoc opener, and moved web-test temp cleanup so failures also clean
+up. Checks on the merged tip: typecheck/build, 161 behavior checks, 2 execution
+and 83 core acceptance. Published by fast-forward merge after confirming main was
+clean and the validated tip's ancestor. Product Brave search remains
+live-unverified (one bounded example.com implemented fetch smoke only); cron and
+background-worker composition remain deliberately later, and the worker branch is
+still in review. No new live provider, Telegram, credential or network run.

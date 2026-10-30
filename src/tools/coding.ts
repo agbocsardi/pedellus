@@ -24,6 +24,12 @@ export interface CodingToolExtensionOptions {
    * The hook exempts them; they are outside this ceiling and never widen it.
    */
   readonly contextTools?: readonly string[];
+  /**
+   * Names whose call-time authority a separate hook enforces (MCP server tools and the Code Mode
+   * tools that reach them). A block here would make that authority unreachable, so the host must
+   * return true only for names its other hook actually guards.
+   */
+  readonly delegatedTools?: (name: string) => boolean;
   /** Effective config-level shell timeout, for a meaningful message when the host default fires. */
   readonly defaultTimeoutSeconds: number;
   /**
@@ -116,6 +122,6 @@ export function createCodingToolExtension(options: CodingToolExtensionOptions): 
     name: "nanobot-coding-tools",
     tools,
     wraps,
-    hooks: [createConfigToolHook(options.ceiling, options.authenticatedChat, contextTools)],
+    hooks: [createConfigToolHook(options.ceiling, options.authenticatedChat, contextTools, options.delegatedTools)],
   });
 }

@@ -1,9 +1,17 @@
 # Durable Code Mode integration
 
 This is a reusable bundle for the TypeScript port; the factory itself is inert.
-The current gateway is unchanged: it installs no extensions and persists
-`tools: []`. This is only genuinely **per-conversation opt-in** when the host
+The gateway installs it when `codemode.enabled` is `true`, or — when that block
+is absent — when MCP is explicitly enabled (`mcp.enabled: true` with at least
+one enabled server), preserving the previous auto-enablement. An explicit
+`codemode.enabled: false` disables it even with MCP configured (MCP tools then
+stay deferred and unreachable). With neither condition it installs no
+extensions and persists `tools: []`, exactly as before. The gateway already
 establishes Durable's native default-deny settings before resolving or resuming
+conversations, and it selects the bundle only for authenticated mapped chat
+conversations. See [MCP.md](./MCP.md) for the connection config, tool naming and
+call-time authority. This is only genuinely **per-conversation opt-in** when the
+host establishes those default-deny settings before resolving or resuming
 conversations. Durable defaults to selecting every installed extension when
 `settings.extensions` is absent, and an unset conversation `tools` field enables
 every tool in its selected extensions. Installing this bundle into those
@@ -157,6 +165,53 @@ tools/model tools, e.g.
 `{ extensions: null, tools: [], modelTools: [] }`. Do this before starting the
 scheduler; the settings default by itself is not a revocation mechanism.
 
+## Shipped gateway wiring
+
+`mcpHasEnabledServers` still gates the MCP client: `mcp.enabled` must be true
+and at least one server entry must not be `enabled: false`. No block, a disabled
+block, or only disabled entries means no client and no MCP namespaces. When that
+gate passes, `openGateway()` connects the configured servers before building the
+Durable registry. If every enabled server fails, Code Mode is still available
+(for authenticated mapped chats) with `tool_search` and zero MCP namespaces.
+
+Code Mode itself is an independent compositor. `codemode.enabled: true` installs
+it without any MCP server; with no `codemode` block the previous rule applies
+(MCP configured means Code Mode on). Its enabled tool filter includes
+`codemode`, `tool_search` and the deferred `mcp__*` registrations when MCP is
+connected, while `modelTools` offers only the first two until `tool_search`
+loads a match. A dedicated authority hook extension is selected with the bundle
+and blocks `codemode`/`tool_search` outside authenticated mapped chats; it does
+not depend on MCP being connected. The coding ceiling delegates those two fixed
+names to that hook and delegates `mcp__*` to the MCP extension's own call-time
+hook, which rechecks the conversation and the server's live tool list.
+
+Nested scripts resolve against the conversation's actual `callable` filter, not
+the global registry, through native `executeTool()` and `ToolTask` hooks. That
+makes every tool the current conversation holds composable — read/write/edit/
+bash, `history`, `skill`, `cron`, `web_search`, `web_fetch`, configured MCP
+tools and Telegram actions — without adding authority. Deferred MCP tools remain
+discoverable through `searchTools()`/`ALL_TOOLS`; tools outside the ceiling (for
+example `write` when only `read` is configured) are absent. The Telegram action
+tool now accepts nested Code Mode callers while keeping its live-adapter,
+current-chat, observed-target, write-ahead journal and task-id checks; an
+unobserved target is denied by the host, not by a blanket caller rule. Code Mode
+stays non-recursive (`codemode` and `tool_search` remain model-only).
+
+The prior MCP-only wiring was accepted: standalone review passed `4d61f50` with
+documentation corrections in `1c38146`, and a fresh combined
+runtime/config/authority review passed the integration with `555d34c` with no
+material findings. The independent-composition generalisation and the Telegram
+caller widening were later reviewed with the web integration in a fresh combined
+runtime/config/authority review of `1204226` and accepted for publication. Cron
+and background-worker composition remain deliberately later work (the worker
+branch is still in review); the Telegram owner-command slice was published
+separately and does not use Code Mode for host commands.
+
+`gateway.close()` closes the Harness first, then this bundle (stopping admission
+and waiting for sandbox workers), then every MCP client. An open that fails after
+the bundle was created applies the same order. A gateway opened without MCP still
+owns a sandbox if Code Mode is explicitly enabled.
+
 ## Replay and failure semantics
 
 Durable journals Code Mode call results before delivering them to the deterministic
@@ -186,10 +241,13 @@ ownership drains, then call `close()` to wait for the actual worker exits. Closi
 only the native sandbox is deliberately not a durable tool outcome; without
 caller cancellation, native Code Mode can leave the task pending for recovery.
 
-This bundle does not install native filesystem/bash tools, approve MCP, or make
-P1 confinement pass. Keep it out of the gateway until a separate host/security
-review explicitly enables reviewed tools under their own policy. It is not
-evidence that P1, P2 as a whole, or the TypeScript port has passed acceptance.
+This bundle does not install native filesystem/bash tools or approve MCP server
+configs, and it does not make P1 confinement pass. The gateway installs it when
+Code Mode is explicitly enabled or, absent that block, when MCP is explicitly
+configured next to the `@earendil-works/pi-mcp` client; the MCP integration has
+its own call-time authority, described in [MCP.md](./MCP.md). Neither path
+establishes P1 confinement. Enabling either is not evidence that P1, P2 as a
+whole, or the TypeScript port has passed acceptance.
 
 ## Offline verification evidence
 

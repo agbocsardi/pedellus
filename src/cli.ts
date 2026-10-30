@@ -8,6 +8,7 @@ import { connectLocalGateway } from "./local/client.js";
 import { gatewaySocketPath, serveLocalGateway } from "./local/server.js";
 import { LocalGatewayError } from "./local/protocol.js";
 import { cancelPreparedContextBlock, listPreparedContextBlocks, PreparedContextRecoveryError } from "./recovery/index.js";
+import { replaceProcess, restartPlan, restartSupported, RESTART_FAILURE_DIAGNOSTIC } from "./restart.js";
 import { runTerminalConversation } from "./terminal/index.js";
 import { openGateway } from "./runtime.js";
 import { prepareDataDirectory } from "./store.js";
@@ -126,6 +127,8 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
   process.once("SIGTERM", shutdown);
   let gateway: Awaited<ReturnType<typeof openGateway>> | undefined;
   let server: Awaited<ReturnType<typeof serveLocalGateway>> | undefined;
+  /** Set only by the authenticated owner `/restart` command; acted on after graceful teardown. */
+  let restartRequested = false;
   try {
     const socketPath = await localSocketPath(config);
     gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
@@ -145,6 +148,26 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
         token,
         allowFrom: config.telegram.allowFrom,
         ...(config.telegram.pollTimeoutSeconds === undefined ? {} : { pollTimeoutSeconds: config.telegram.pollTimeoutSeconds }),
+        ...(config.media === undefined
+          ? {}
+          : {
+              media: {
+                workspace: config.workspace,
+                directory: config.media.directory,
+                ...(config.media.transcription === undefined
+                  ? {}
+                  : { transcription: config.media.transcription }),
+              },
+            }),
+        // The host owns the process: a restart stops every surface through the same graceful
+        // shutdown, and the replacement happens here after the teardown below.
+        restart: {
+          supported: restartSupported(),
+          request: async () => {
+            restartRequested = true;
+            shutdown();
+          },
+        },
       }, context);
     } else {
       await aborted(stop.signal);
@@ -154,6 +177,22 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
     process.off("SIGTERM", shutdown);
     await server?.close();
     await gateway?.close(withoutAbortSignal(context));
+  }
+  if (restartRequested) replaceGatewayProcess();
+}
+
+/**
+ * Replace this gateway process with the same Node executable, argv and environment, so the new
+ * process loads current code and re-reads the same explicit configuration. A platform that cannot
+ * replace the process image leaves a fixed diagnostic and a non-zero exit: the gateway is stopped,
+ * never quietly still running under a false success claim.
+ */
+function replaceGatewayProcess(): void {
+  try {
+    replaceProcess(restartPlan());
+  } catch {
+    process.stderr.write(`${RESTART_FAILURE_DIAGNOSTIC}\n`);
+    process.exitCode = 1;
   }
 }
 

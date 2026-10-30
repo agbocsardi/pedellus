@@ -27,6 +27,7 @@ const [
   { BACKGROUND_CONTEXT },
   { AgentDoc },
   { ConfigToolCaptureDoc },
+  { CODEMODE_TOOL_NAME },
 ] = await Promise.all([
   import(new URL('../dist/config.js', import.meta.url).href),
   import(new URL('../dist/runtime.js', import.meta.url).href),
@@ -36,6 +37,7 @@ const [
   import(`${modules}/chord/dist/context/index.js`),
   import(`${modules}/pi-durable/dist/index.js`),
   import(new URL('../dist/tools/index.js', import.meta.url).href),
+  import(new URL('../dist/extensions/codemode.js', import.meta.url).href),
 ]);
 
 const context = BACKGROUND_CONTEXT;
@@ -1026,6 +1028,60 @@ test('a narrowed config on reopen cannot restore a live worker tool the ceiling 
     assert.equal(names.includes('read'), false, `a removed tool must not survive the reopen: ${names}`);
   } finally {
     if (reopened) await reopened.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('native Code Mode composes the worker tool from a mapped chat without widening the child', { timeout: 45_000 }, async () => {
+  const fixture = await fixtureWorkspace();
+  const issued = new Set();
+  const store = await syntheticStore(fixture, async (transcript) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.')) return fauxAssistantMessage('NESTED-CHILD-DONE');
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'compose a worker' && !issued.has(input)) {
+      issued.add(input);
+      // A general Code Mode script composes the worker tool like any other agent tool.
+      return fauxAssistantMessage([
+        fauxToolCall(CODEMODE_TOOL_NAME, {
+          code: 'return await tools.worker({ action: "start", task: "nested code mode worker", workspace_mode: "shared" });',
+        }, { id: 'nested-worker-code' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  }, { toolAllowlist: ['read'], codemode: { enabled: true } });
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    const offered = ((await conversation.agent(context)).tools ?? [])
+      .map((tool) => (typeof tool === 'string' ? tool : tool.name));
+    assert.ok(offered.includes(CODEMODE_TOOL_NAME), `a mapped chat composes Code Mode: ${offered}`);
+
+    const submission = await conversation.submit({ type: 'input', content: 'compose a worker', requestId: 'compose' }, context);
+    assert.equal((await submission.wait(context)).status, 'done');
+    const entries = (await conversation.entries({ order: 'ascending' }, 200, undefined, context)).items;
+    const codeResult = entries.filter((entry) => entry.model?.[0]?.role === 'toolResult')
+      .map((entry) => entry.model[0]).find((message) => message.toolCallId === 'nested-worker-code');
+    assert.ok(codeResult, 'the Code Mode call reached a tool result');
+    assert.equal(codeResult.isError ?? false, false, JSON.stringify(codeResult.content));
+    assert.match((codeResult.content ?? []).map((part) => part.text ?? '').join(''), /Started background worker \d+/);
+
+    const records = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers;
+    assert.equal(records.length, 1, 'the nested start created exactly one worker');
+    assert.equal(records[0].prompt, 'nested code mode worker');
+    assert.match(records[0].requestId, /^tool:\d+$/, 'the nested call uses its own host tool-task identity');
+    await waitFor(async () =>
+      (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context))?.workers[0]?.conversationId != null,
+    'the nested worker target');
+    const record = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    const child = await store.gateway.harness.conversation(record.conversationId, context);
+    const childTools = ((await child.agent(context)).tools ?? [])
+      .map((tool) => (typeof tool === 'string' ? tool : tool.name));
+    assert.ok(childTools.includes('read'), `the captured ceiling still applies: ${childTools}`);
+    for (const forbidden of [WORKER_TOOL_NAME, CODEMODE_TOOL_NAME, 'cron', 'history', 'telegram']) {
+      assert.equal(childTools.includes(forbidden), false, `Code Mode composition must not widen the child: ${forbidden}`);
+    }
+  } finally {
+    await store.gateway.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
   }
 });

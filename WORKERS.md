@@ -38,11 +38,12 @@ tool-task identity, never on the provider's tool-call ID (a provider may reuse `
 independent turns, and each of those starts a real worker). Live workers are capped per conversation,
 and a refused start creates no record and no task.
 
-The tool has no model-only `callers` restriction: native Code Mode may compose it like any other tool,
-under exactly the same hosting-conversation, capture and ceiling checks, and a worker's child still
-receives no `worker` tool. The shipped host does not install Code Mode today; when the generalized
-Code Mode slice lands, its integration test should drive a nested `worker start` through a script and
-assert the same `spawnerFor`/capture denial outside a mapped spawning chat.
+The tool has no model-only `callers` restriction: native Code Mode (`codemode.enabled`) composes it
+like any other agent tool, under exactly the same hosting-conversation, capture and ceiling checks.
+A script's nested `start` is its own Durable tool task, so it carries its own host identity and the
+capture hook sees it exactly as a direct call; a worker's child conversation is never a spawner and
+receives neither Code Mode nor `worker`. A focused regression drives a real nested `worker start`
+through Code Mode and asserts the child stays unwidened.
 
 ## What a worker is
 
