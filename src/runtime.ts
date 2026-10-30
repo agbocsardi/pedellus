@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { isChordError } from "@earendil-works/chord";
 import { processLock } from "@earendil-works/chord/node";
 import type { Context, Draft } from "@earendil-works/chord";
@@ -84,10 +85,20 @@ import { modelKey, parseToolTimeoutSeconds, type ModelReference, type PortConfig
 import { createVisionHandoffExtension } from "./media/vision-hook.js";
 import { VisionHandoff, type VisionHandoffStats } from "./media/vision.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
-import { prepareDataDirectory } from "./store.js";
+import { prepareDataDirectory, inside } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
+import {
+  WORKER_TASK_NAME,
+  createWorkerFoundation,
+  workerBackgroundTarget,
+  workerChildPolicy,
+  type WorkerFoundation,
+} from "./workers/worker-task.js";
+import { createWorkerTool, WORKER_TOOL_NAME } from "./workers/tool.js";
+import { WORKER_LIMITS } from "./workers/limits.js";
+import { createWorkerWorkspace, type WorkerWorkspace } from "./workers/workspace.js";
 import {
   boundedCapturedTools,
   CODING_TOOL_NAMES,
@@ -388,8 +399,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** A live cron run's background target, recovered from its durable checkpoint. */
-interface CronBackgroundTarget {
+/** A live background target (scheduled run or worker), recovered from its durable checkpoint. */
+interface BackgroundRunTarget {
   readonly originConversationId: ConversationId;
   readonly targetConversationId: ConversationId;
 }
@@ -399,7 +410,7 @@ interface CronBackgroundTarget {
  * target is task-owned and deliberately absent from the SessionMap, so it is restored from the run
  * task itself. An origin-mode run's target is the origin, which the map already restores.
  */
-function cronBackgroundTarget(task: unknown): CronBackgroundTarget | undefined {
+function cronBackgroundTarget(task: unknown): BackgroundRunTarget | undefined {
   if (!isRecord(task) || task.kind !== CRON_RUN_TASK_NAME) return undefined;
   const { conversationId, state } = task;
   if (!Number.isSafeInteger(conversationId) || (conversationId as number) < 1) return undefined;
@@ -442,6 +453,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // needs no filesystem authority.
   const cronConfig = config.cron;
   const cronEnabled = cronConfig?.enabled === true;
+  // Bounded ordinary background workers: opt-in, native Durable tasks, and independent of the coding
+  // tool ceiling so a research worker with no filesystem authority is still possible.
+  const workersConfig = config.workers;
+  const workersEnabled = workersConfig?.enabled === true;
   // A completed background result is queued only for an origin session that belongs to a channel
   // enabled in this configuration. A disabled channel creates no record, so no later enable can
   // deliver a stale result through a channel the host had switched off.
@@ -507,6 +522,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
     throw new TypeError("agentHistory must be a boolean");
   }
   const defaultThinkingLevel = defaultPreset?.thinkingLevel ?? config.thinkingLevel ?? "off";
+  // A worker's model comes from the spawning conversation's current selection at launch, unless config
+  // names one finite preset. Either way it is a native pair inside the configured model catalog.
+  let workerPreset: { readonly model: ModelReference; readonly thinkingLevel: ModelThinkingLevel } | undefined;
+  if (workersConfig?.preset !== undefined) {
+    const selected = presetCatalog.get(workersConfig.preset);
+    if (selected === undefined) {
+      throw new StartupDiagnosticError("model", { detail: "workers.preset must name a configured model preset" });
+    }
+    workerPreset = { model: selected.choice.native, thinkingLevel: selected.thinkingLevel ?? "off" };
+  }
   // Vision handoff: one configured describer preset replaces or bounds image attachments in the
   // model-bound request. It is a native generation hook, never a second agent loop, and it leaves
   // the persisted transcript and prepared checkpoints untouched. The map records the model pinned
@@ -659,7 +684,23 @@ export async function openGateway(config: PortConfig, context: Context, options:
   } catch (cause) {
     throw new StartupDiagnosticError("workspace", { cause });
   }
-  const { workspace, extraRoots, dbPath } = preparedDataDirectory;
+  const { workspace, extraRoots, canonicalDataDir, dbPath } = preparedDataDirectory;
+  // Worker worktrees live beside the store, outside the configured workspace: the owner's checkout is
+  // never the parent of a tool root, and only the leaf task checkout is granted to that task.
+  let workerWorkspace: WorkerWorkspace | undefined;
+  if (workersEnabled) {
+    const worktreesRoot = resolve(canonicalDataDir, "worker-worktrees");
+    if (inside(worktreesRoot, dbPath) || inside(dbPath, worktreesRoot)) {
+      throw new StartupDiagnosticError("workspace", {
+        detail: "worker worktrees must not overlap the SQLite store",
+      });
+    }
+    try {
+      workerWorkspace = createWorkerWorkspace({ repositoryRoot: workspace, worktreesRoot });
+    } catch (cause) {
+      throw new StartupDiagnosticError("workspace", { cause });
+    }
+  }
   const hostPolicy: AgentChange = { cwd: workspace };
   const defaultAgentPolicy: AgentChange = {
     ...hostPolicy,
@@ -699,6 +740,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         contextTools: [
           ...(options.contextSnapshotProvider === undefined ? [] : [SKILL_TOOL_NAME]),
           ...(cronEnabled ? [CRON_TOOL_NAME] : []),
+          ...(workersEnabled ? [WORKER_TOOL_NAME] : []),
           ...(telegramTool === undefined ? [] : [TELEGRAM_TOOL_NAME]),
           // History retrieval is read-only over mapped chats and has its own scope checks, so the
           // ceiling must not suppress it when coding tools are enabled.
@@ -717,6 +759,27 @@ export async function openGateway(config: PortConfig, context: Context, options:
         ...(toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: toolTimeoutSeconds }),
       })
     : undefined;
+  // A worker in worktree mode is an ordinary conversation whose declared cwd and filesystem guard are
+  // its own checkout instead of the configured workspace. The root is per task and is never added to
+  // the configured roots, so the two workspaces cannot read through each other.
+  const workerWorkspaceRoots = new Map<ConversationId, string>();
+  const workerEnvironments = new Map<string, ToolEnvironments>();
+  const environmentFor = (conversationId: ConversationId, ctx: Context) => {
+    const root = workerWorkspaceRoots.get(conversationId);
+    if (root === undefined) return toolEnvironments!.forConversation(conversationId, ctx);
+    let environments = workerEnvironments.get(root);
+    if (environments === undefined) {
+      environments = createToolEnvironments({
+        workspaceRoot: root,
+        allowedRoots: [],
+        sandbox: config.toolSandbox ?? "host",
+        ...(config.bwrapPath === undefined ? {} : { bwrapPath: config.bwrapPath }),
+        ...(toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: toolTimeoutSeconds }),
+      });
+      workerEnvironments.set(root, environments);
+    }
+    return environments.forConversation(conversationId, ctx);
+  };
   const fallbackThinkingLevel = (choice: ResolvedModelChoice): ModelThinkingLevel =>
     choice.thinkingLevels.includes(defaultThinkingLevel) ? defaultThinkingLevel : "off";
   const choiceFromState = (state: Readonly<AgentState> | undefined): ResolvedModelChoice | undefined =>
@@ -778,6 +841,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (cronFoundation && cronTool && cronOwners.has(conversationId)) {
       selected.push(cronFoundation.extension, cronTool.extension);
     }
+    if (workerTool && workerSpawners.has(conversationId)) selected.push(workerTool.extension);
     return { extensions: selected };
   };
   const toolRegistrations = new Map<string, ToolRegistration>(
@@ -786,6 +850,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // Origin sessions only: a scheduled run's fresh background conversation is not an origin session,
   // so it cannot schedule further jobs. Owners are keyed by the mapped session key.
   const cronOwners = new Map<ConversationId, CronOwner>();
+  // Worker spawning is the same rule, and deliberately not inherited: only a validated mapped chat
+  // conversation may start a worker, so a worker's own task-owned conversation can never recurse.
+  const workerSpawners = new Set<ConversationId>();
   const harnessRef: { current?: HarnessType } = {};
   // The snapshot-install path, late-bound because cron's `prepare` can only call it once
   // Harness.open() has run. It reports whether skills were installed for that conversation.
@@ -923,6 +990,103 @@ export async function openGateway(config: PortConfig, context: Context, options:
         ...(cronConfig?.timeZone === undefined ? {} : { timeZone: cronConfig.timeZone }),
       });
   const cronToolRegistration = cronTool?.extension.tools?.[0];
+  // Bounded ordinary background workers. The foundation owns the Durable task, its child conversation
+  // and the internal result event; the runtime supplies only capture, model, workspace and retirement,
+  // exactly as it does for a scheduled run. A worker is never an origin: its target is task-owned and
+  // carries captured tools only.
+  const workerFoundation: WorkerFoundation | undefined = workersEnabled && workerWorkspace !== undefined
+    ? createWorkerFoundation({
+        now,
+        maxConcurrent: workersConfig?.maxConcurrent ?? WORKER_LIMITS.defaultConcurrent,
+        allowModel: (candidate) => choicesByNative.has(modelKey(candidate)),
+        spawnModel: async (tx, conversationId) => {
+          const state = await tx.doc(AgentDoc, conversationId);
+          const choice = choiceFromState(state) ?? defaultChoice;
+          const level = state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
+            ? state.thinkingLevel
+            : fallbackThinkingLevel(choice);
+          return { model: choice.native, thinkingLevel: level };
+        },
+        ...(workerPreset === undefined ? {} : { preset: workerPreset }),
+        workspace: workerWorkspace!,
+        prepare: async ({ tx, spawnerConversationId, targetConversationId: target, input, workspace: targetWorkspace, ctx }) => {
+          // The worker's fresh conversation starts default-deny. Its capture is the spawning
+          // conversation's current ceiling, and the call-time hook still requires that origin and the
+          // current config, so a capture is a subset of configured authority and never new authority.
+          const authorized = authorizedChatConversations.has(spawnerConversationId);
+          const capture = await tx.doc(ConfigToolCaptureDoc, target);
+          capture.originConversationId = spawnerConversationId;
+          capture.tools = authorized ? [...toolAllowlist] : [];
+          const captured = [...capture.tools];
+          // The same snapshot path a scheduled run uses: bootstrap/AGENTS, the memory manifest, the
+          // skill summary and the read-only `skill` tool, only when the host configured a provider and
+          // the spawning session is mapped.
+          const spawnerKey = sessionKeyForConversation.get(spawnerConversationId);
+          const skillsInstalled = spawnerKey !== undefined && contextInstallerRef.current !== undefined
+            ? await contextInstallerRef.current(spawnerKey, target, ctx)
+            : false;
+          const tools = [
+            ...captured.flatMap((name) => {
+              const tool = toolRegistrations.get(name);
+              return tool === undefined ? [] : [tool];
+            }),
+            ...(skillsInstalled && skillToolRegistration !== undefined ? [skillToolRegistration] : []),
+          ];
+          const extensions: Extension[] = [];
+          // The vision hook carries no tool authority; a fresh captured-tool conversation needs it
+          // explicitly or a read-tool image would bypass the flagged-preset handoff.
+          if (visionExtension !== undefined) extensions.push(visionExtension);
+          if (toolExtension !== undefined) extensions.push(toolExtension);
+          if (contextConversations.has(target) && contextExtension !== undefined) extensions.push(contextExtension);
+          if (skillsInstalled && skillTool !== undefined) extensions.push(skillTool.extension);
+          const workerChoice = choicesByNative.get(modelKey(input.model));
+          await configure(tx, target, {
+            cwd: targetWorkspace.path,
+            model: input.model,
+            // The captured level may predate a provider catalog change; the current catalog wins.
+            thinkingLevel: workerChoice !== undefined && workerChoice.thinkingLevels.includes(input.thinkingLevel)
+              ? input.thinkingLevel
+              : workerChoice === undefined ? "off" : fallbackThinkingLevel(workerChoice),
+            tools,
+            modelTools: tools,
+            extensions,
+          });
+        },
+        finalize: async ({ tx, targetConversationId: target, settlement }) => {
+          // A worker's captured authority ends in the same terminal commit that records its outcome.
+          await tx.retireDoc(ConfigToolCaptureDoc, target);
+          await configure(tx, target, { tools: [], modelTools: [] });
+          workerWorkspaceRoots.delete(target);
+          if (settlement.status !== "ok" || settlement.answerEntryId === null) {
+            return { result: null, error: settlement.error };
+          }
+          const answer = await tx.entry(AssistantEntry, settlement.answerEntryId as EntryId);
+          const message = answer?.model?.[0] as AssistantMessage | undefined;
+          const body = (message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "").trim();
+          return { result: body === "" ? null : body, error: null };
+        },
+        trackWorkspace: (conversationId, workspaceInfo) => {
+          if (workspaceInfo.mode === "worktree") workerWorkspaceRoots.set(conversationId, workspaceInfo.path);
+          else workerWorkspaceRoots.delete(conversationId);
+        },
+        commit: (change, ctx) => {
+          if (harnessRef.current === undefined) throw new Error("The runtime is not open");
+          return harnessRef.current.commit(change, ctx);
+        },
+      })
+    : undefined;
+  const workerTool = workerFoundation === undefined
+    ? undefined
+    : createWorkerTool({
+        foundation: workerFoundation,
+        spawnerFor: (conversationId) => workerSpawners.has(conversationId),
+        harness: () => {
+          if (harnessRef.current === undefined) throw new Error("The runtime is not open");
+          return harnessRef.current;
+        },
+        precheckWorktree: () => workerWorkspace!.precheck(),
+      });
+  const workerToolRegistration = workerTool?.extension.tools?.[0];
   const toolFilterFromNames = (
     names: readonly string[],
   ): { readonly tools: readonly ToolRegistration[] } => ({
@@ -951,7 +1115,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const telegramTools = telegramToolRegistration !== undefined && telegramChatConversations.has(conversationId)
       ? [telegramToolRegistration]
       : [];
-    return [...skillTools, ...cronTools, ...historyTools, ...telegramTools];
+    // Worker management is a spawning-conversation capability, not filesystem or shell authority. The
+    // worker's own task-owned conversation is never in this set, so it cannot start another worker.
+    const workerTools = workerToolRegistration !== undefined && workerSpawners.has(conversationId)
+      ? [workerToolRegistration]
+      : [];
+    return [...skillTools, ...cronTools, ...historyTools, ...telegramTools, ...workerTools];
   };
   /**
    * The authority-derived tool filter. The host ceiling directly authorizes authenticated mapped
@@ -1093,6 +1262,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (telegramTool) registry.install(telegramTool.extension);
     if (cronFoundation) registry.install(cronFoundation.extension);
     if (cronTool) registry.install(cronTool.extension);
+    if (workerFoundation) registry.install(workerFoundation.extension);
+    if (workerTool) registry.install(workerTool.extension);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
     const harnessOptions = {
       models,
@@ -1102,7 +1273,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         ? {}
         : {
             env: (target: { readonly conversationId: ConversationId }, ctx: Context) =>
-              toolEnvironments.forConversation(target.conversationId, ctx),
+              environmentFor(target.conversationId, ctx),
           }),
     };
     harness = await Harness.open(storage, harnessOptions, context);
@@ -1376,7 +1547,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // History retrieval is independent of the context snapshot opt-in: every mapped chat
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
-    const initialMapping = historyTool === undefined && !toolsEnabled && telegramTool === undefined
+    const initialMapping = historyTool === undefined && !toolsEnabled && telegramTool === undefined && !workersEnabled
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
     if (initialMapping !== undefined) {
@@ -1384,6 +1555,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (historyTool !== undefined) historyConversations.add(conversationId);
         authorizedChatConversations.add(conversationId);
         sessionKeyForConversation.set(conversationId, sessionKey);
+        // A worker may be spawned only from this scope-checked set; a task-owned target, the root,
+        // a fork or a channel-state conversation is never in it.
+        if (workersEnabled) workerSpawners.add(conversationId);
         if (telegramTool !== undefined && sessionKey.startsWith("telegram:")) {
           telegramChatConversations.add(conversationId);
         }
@@ -1412,27 +1586,37 @@ export async function openGateway(config: PortConfig, context: Context, options:
 
     // Refuse unsafe prepared replays before resume; checkpoints pin historical context cutoffs.
     const preparedContextReplays: NonNullable<ReturnType<typeof preparedContextReplay>>[] = [];
-    const backgroundRunTargets: CronBackgroundTarget[] = [];
+    const backgroundRunTargets: BackgroundRunTarget[] = [];
+    // Live worker targets keep the model, thinking level and workspace chosen at launch. A reopen must
+    // not silently replace them with the configured default, and a worktree child keeps its own root.
+    const workerChildPolicies = new Map<ConversationId, NonNullable<ReturnType<typeof workerChildPolicy>>>();
     const runTasksById = new Map<number, { readonly originConversationId: ConversationId; readonly targetConversationId: ConversationId | null }>();
     await root.commit(async (tx) => {
       let taskCursor: Cursor | undefined;
       do {
         const page = await tx.scanTasks({}, 1000, taskCursor);
         for (const task of page.items) {
-          const backgroundTarget = cronBackgroundTarget(task);
-          if (task.kind === CRON_RUN_TASK_NAME) {
+          const backgroundTarget = cronBackgroundTarget(task) ?? workerBackgroundTarget(task);
+          if (task.kind === CRON_RUN_TASK_NAME || task.kind === WORKER_TASK_NAME) {
             runTasksById.set(Number(task.id), {
               originConversationId: task.conversationId as ConversationId,
               targetConversationId: backgroundTarget?.targetConversationId ?? null,
             });
           }
           if (backgroundTarget !== undefined) {
-            // The target must still be the conversation this run task owns on behalf of its origin;
+            // The target must still be the conversation this task owns on behalf of its origin;
             // a mismatched record is not a run target and gets no bound or snapshot restore.
             const target = await tx.conversation(backgroundTarget.targetConversationId);
             if (target?.owner?.taskId === Number(task.id)
               && target.owner.conversationId === backgroundTarget.originConversationId) {
               backgroundRunTargets.push(backgroundTarget);
+              const policy = workerChildPolicy(task);
+              if (policy !== undefined && policy.targetConversationId === target.id) {
+                workerChildPolicies.set(target.id, policy);
+                if (policy.workspace.mode === "worktree") {
+                  workerWorkspaceRoots.set(target.id, policy.workspace.path);
+                }
+              }
             }
           }
           const preparedModel = preparedTaskModel(task);
@@ -1465,7 +1649,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
     }
 
-    // Every conversation owned by a cron run task is that run's target. A live run's copy is
+    // Every conversation owned by a background run task is that run's target. A live run's copy is
     // reauthorized below; a target whose run already ended keeps no prepared authority.
     const runTargetCandidates: { conversationId: ConversationId; originConversationId: ConversationId; live: boolean }[] = [];
     await root.commit(async (tx) => {
@@ -1525,9 +1709,23 @@ export async function openGateway(config: PortConfig, context: Context, options:
         for (const conversation of page.items) {
           const state = await tx.doc(AgentDoc, conversation.id);
           const toolFilter = await toolFilterFor(tx, conversation.id, backgroundToolBounds.get(conversation.id));
+          const workerPolicy = workerChildPolicies.get(conversation.id);
+          // A live worker keeps the model, thinking level and workspace chosen at launch. If that model
+          // is no longer configured, the task itself fails closed instead of being silently moved.
+          const workerChoice = workerPolicy !== undefined && choicesByNative.has(modelKey(workerPolicy.model))
+            ? choicesByNative.get(modelKey(workerPolicy.model))
+            : undefined;
           await configure(tx, conversation.id, {
-            // Named-preset mode owns the startup default; direct mode preserves its persisted choice.
-            ...policyForState(state, configuredPresetName !== undefined),
+            ...(workerPolicy !== undefined && workerChoice !== undefined
+              ? {
+                  cwd: workerPolicy.workspace.path,
+                  model: workerPolicy.model,
+                  thinkingLevel: workerChoice.thinkingLevels.includes(workerPolicy.thinkingLevel)
+                    ? workerPolicy.thinkingLevel
+                    : fallbackThinkingLevel(workerChoice),
+                }
+              // Named-preset mode owns the startup default; direct mode preserves its persisted choice.
+              : policyForState(state, configuredPresetName !== undefined)),
             ...extensionsPolicy(conversation.id),
             ...toolFilter,
           });
@@ -1662,6 +1860,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // revalidates; it is never supplied by the model. Only a scope-checked mapped Telegram chat
         // conversation is offered the Telegram action tool.
         sessionKeyForConversation.set(conversationId!, sessionKey);
+        if (workersEnabled) {
+          // Only a scope-checked mapped chat may spawn workers; the task-owned worker conversation is
+          // never mapped, so a worker can never start another worker.
+          if (mappedChat) workerSpawners.add(conversationId!);
+          else workerSpawners.delete(conversationId!);
+        }
         if (mappedChat && sessionKey.startsWith("telegram:")) {
           telegramChatConversations.add(conversationId!);
         } else {
@@ -1854,8 +2058,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
         finally {
           try { await historyIndex?.close(); }
           finally {
-            try { await toolEnvironments?.close(cleanup); }
-            finally { await releaseLock(); }
+            try {
+              for (const environments of workerEnvironments.values()) {
+                await environments.close(cleanup).catch(() => undefined);
+              }
+              workerEnvironments.clear();
+              await toolEnvironments?.close(cleanup);
+            } finally { await releaseLock(); }
           }
         }
       },
@@ -1923,6 +2132,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
       episode: (sessionKey, startEntryId, ctx) => gateway.historyEpisode(sessionKey, startEntryId, ctx),
     };
     harness.resume();
+    // A worker that finished while the process was gone already committed its outcome and retired its
+    // authority, but may not have admitted the internal result event. Re-admitting is idempotent by the
+    // conversation-scoped request ID, so a crash cannot lose a result or duplicate the parent's turn.
+    if (workerFoundation !== undefined) {
+      try {
+        await workerFoundation.recover(harness, (conversationId) => workerSpawners.has(conversationId), context);
+      } catch {
+        // The records stay unnotified; the next open retries the same admission.
+      }
+    }
     return gateway;
   } catch (error) {
     const cleanup = withoutAbortSignal(context);
@@ -1935,8 +2154,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
     } finally {
       try { await historyIndex?.close(); }
       catch { /* a derived index close failure leaves a rebuildable file, not source data */ }
-      finally { await toolEnvironments?.close(cleanup).catch(() => undefined); }
-      await releaseLock();
+      finally {
+        try {
+          for (const environments of workerEnvironments.values()) {
+            await environments.close(cleanup).catch(() => undefined);
+          }
+          await toolEnvironments?.close(cleanup).catch(() => undefined);
+        } finally { await releaseLock(); }
+      }
     }
     throw error;
   }

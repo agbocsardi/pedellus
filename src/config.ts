@@ -19,6 +19,7 @@ import {
 } from "./context/skills.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
 import { VISION_HANDOFF_DEFAULTS, VISION_HANDOFF_LIMITS } from "./media/vision.js";
+import { WORKER_LIMITS } from "./workers/limits.js";
 
 const CREDENTIAL_PROVIDERS = [
   "anthropic",
@@ -88,6 +89,21 @@ export interface CronConfig {
   readonly timeZone?: string;
 }
 
+export interface WorkersConfig {
+  /** Opt-in model-facing `worker` tool; false registers no worker task and offers no tool. */
+  readonly enabled: boolean;
+  /**
+   * Live background workers allowed per spawning conversation. Defaults to 2; the bound is small because
+   * each worker is an ordinary model run holding a conversation of its own.
+   */
+  readonly maxConcurrent?: number;
+  /**
+   * Optional named preset for worker model/thinking. Absent uses the spawning conversation's current
+   * selection at launch. It is validated against the finite `modelPresets` catalog, not an open registry.
+   */
+  readonly preset?: string;
+}
+
 export interface WorkspaceContextConfig {
   /** Explicit workspace-relative `memory/**\/*.md` files, in output order. Defaults to none. */
   readonly memoryFiles: readonly string[];
@@ -145,6 +161,11 @@ export interface PortConfig {
   toolSandbox?: "host" | "bwrap";
   /** Internal agent scheduling. Absent or disabled leaves the runtime without cron. */
   cron?: CronConfig;
+  /**
+   * Ordinary bounded background workers. Absent or disabled leaves the runtime without the `worker` tool
+   * and without the worker task kind. Workers are native Durable tasks, never a second agent loop.
+   */
+  workers?: WorkersConfig;
   /**
    * Automatic episode summaries; by default use the conversation's current model.
    * `model` is the legacy direct selector; `preset` names an entry in `modelPresets`.
@@ -410,6 +431,27 @@ function cronConfig(value: unknown): CronConfig {
   return { enabled: true, timeZone };
 }
 
+function workersConfig(value: unknown): WorkersConfig {
+  const raw = object(value, "workers");
+  for (const key of Object.keys(raw)) {
+    if (key !== "enabled" && key !== "maxConcurrent" && key !== "preset") {
+      throw new Error(`Unknown workers field: ${key}`);
+    }
+  }
+  if (typeof raw.enabled !== "boolean") throw new Error("workers.enabled must be a boolean");
+  if (!raw.enabled) return { enabled: false };
+  const workers: { enabled: boolean; maxConcurrent?: number; preset?: string } = { enabled: true };
+  if (raw.maxConcurrent !== undefined) {
+    if (typeof raw.maxConcurrent !== "number" || !Number.isSafeInteger(raw.maxConcurrent)
+      || raw.maxConcurrent < 1 || raw.maxConcurrent > WORKER_LIMITS.maxConcurrent) {
+      throw new Error(`workers.maxConcurrent must be an integer from 1 to ${WORKER_LIMITS.maxConcurrent}`);
+    }
+    workers.maxConcurrent = raw.maxConcurrent;
+  }
+  if (raw.preset !== undefined) workers.preset = modelPresetName(raw.preset, "workers.preset");
+  return Object.freeze(workers);
+}
+
 export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig {
   const raw = object(value, "config");
   const presetMode = raw.modelPreset !== undefined || raw.modelPresets !== undefined;
@@ -493,6 +535,16 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   }
   if (raw.cron !== undefined) {
     Object.assign(config, { cron: cronConfig(raw.cron) });
+  }
+  if (raw.workers !== undefined) {
+    const workers = workersConfig(raw.workers);
+    if (workers.preset !== undefined) {
+      if (modelPresets === undefined) throw new Error("workers.preset requires named modelPresets");
+      if (!Object.hasOwn(modelPresets, workers.preset)) {
+        throw new Error("workers.preset must name an entry in modelPresets");
+      }
+    }
+    Object.assign(config, { workers });
   }
   if (raw.episodeSummary !== undefined) {
     const summary = object(raw.episodeSummary, "episodeSummary");

@@ -83,6 +83,11 @@ not permission to start every branch or run live integrations):
 - [ ] Add bounded ordinary background workers; scheduled memory curation may then
   be an ordinary cron job using those workers and the existing Markdown tools,
   not a standalone Dream subsystem.
+  - [ ] Bounded ordinary workers on native Durable tasks: opt-in `workers` config,
+    model-facing `worker` start/list/inspect/cancel, explicit shared-or-worktree
+    workspace, captured tool ceiling, one internal result event to the spawning
+    agent. Implemented on branch `t3/durable-background-workers` and awaiting
+    independent review; scheduled memory curation is explicitly still out of scope.
 
 Approved first implementation batch: channel-neutral gateway/local CLI attachment
 and Telegram menu/reply/quote/reaction support. These are two independently owned
@@ -146,6 +151,34 @@ gates/timers/subscriptions.
   observed targets; no raw chat selector, inherited fork/cron authority or blind
   replay of ambiguous external sends. Preserve existing outbox/control behavior.
 
+### 2026-10-30 — bounded background workers (implementation batch)
+
+Owner decisions for this slice: research **and** coding tasks; completion must
+never message the user, Telegram or the CLI directly — it notifies the spawning
+agent, which decides what to relay. The spawning agent chooses the workspace for
+**each** task: `shared` (the actual configured workspace, concurrent writes
+interfere) or `worktree` (isolated git worktree), never a silent default. No auto
+merge, rebase, stash or commit of the owner's state; worktree artifacts stay for
+review; uncommitted work is never deleted on cancellation. Scheduled memory
+curation is out of scope for this batch. No live provider, bot, network,
+credential, dependency install, model download or deployment is used.
+
+Ownership: new `src/workers/**` (task foundation, tool, git workspace, limits),
+the `workers` config interface/parser next to `cron`, narrowly required
+`src/runtime.ts` capture/task/extension/environment/restore integration, one new
+focused suite registered in `test:behavior`, `WORKERS.md` and this plan entry.
+Telegram/media/CLI/local/terminal/vision/MCP modules, root docs and `src/index.ts`
+exports are untouched; `package.json` gained only this suite's registration.
+
+Finish line: the tool returns before the child finishes and the parent keeps its
+turn; the mode really changes where writes land and leaves the owner's tracked
+state untouched; a non-git or dirty base is refused without copying or stashing;
+cancellation retires authority and a late child finish never reports success; a
+worker cannot delegate and only its spawning conversation can inspect it; a
+narrowed config on reopen cannot restore a removed tool; completion admission is
+exactly once across a crash window; a child image read still gets the configured
+vision handoff. No live integration is claimed.
+
 New test registration and root exports are parent integration requests. No
 unrelated reformatting or edits to the other worker's region.
 
@@ -157,6 +190,23 @@ commands, config tool ceiling, outbox unknown-send handling and memory refresh
 remain intact. No deployment or live-delivery claim; no live model/bot run.
 
 ## Session log
+
+### 2026-10-30 — background workers implemented, under independent review
+
+Implemented bounded ordinary background workers as native Durable tasks on branch
+`t3/durable-background-workers`: `nanobot.worker-run` task kind, `worker` tool
+(start/list/inspect/cancel), `workers` config (`enabled`, bounded
+`maxConcurrent` default 2, optional named `preset`), child conversations that keep
+the spawning conversation's captured tool ceiling and chosen model, explicit
+`shared`/`worktree` workspaces (generated branch/path under
+`<dataDir>/worker-worktrees`, clean-base and full-repo-scope checks, no shell
+interpolation), terminal-commit retirement of captured authority and one internal
+idempotent result event to the spawning agent. Ten offline checks in
+`tests/background-workers.behavior.test.mjs` cover the agreed finish line with a
+faux provider and temporary git/non-git fixtures. No live provider, bot, network,
+credential, dependency install or deployment was used; scheduled memory curation
+was not started. Awaiting fresh independent review; no integration or main
+publication yet.
 
 ### 2026-10-30 — media ingress and configured vision handoff
 
