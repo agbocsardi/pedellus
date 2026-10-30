@@ -107,7 +107,7 @@ function photoUpdate(updateId, messageId, { fileId, uniqueId, bytes, caption, ex
   };
 }
 
-function documentUpdate(updateId, messageId, { fileId, uniqueId, bytes, fileName, mimeType, caption }, chatId = CHAT_ID) {
+function documentUpdate(updateId, messageId, { fileId, uniqueId, bytes, fileName, mimeType, caption, declaredSize }, chatId = CHAT_ID) {
   return {
     update_id: updateId,
     message: {
@@ -118,7 +118,7 @@ function documentUpdate(updateId, messageId, { fileId, uniqueId, bytes, fileName
       document: {
         file_id: fileId,
         file_unique_id: uniqueId,
-        file_size: bytes.byteLength,
+        file_size: declaredSize ?? bytes.byteLength,
         file_name: fileName,
         mime_type: mimeType,
       },
@@ -511,16 +511,29 @@ test('a too-large or rejected Telegram file becomes a truthful note and the turn
     { path: 'documents/file_9.bin', bytes: Buffer.from('x'), declaredSize: 25 * 1024 * 1024 },
   ]]);
   const transport = telegramMock([[
-    documentUpdate(540, 140, { fileId: 'big-1', uniqueId: 'unique-big-1', bytes: Buffer.from('x'), fileName: 'big.bin', mimeType: 'application/octet-stream' }),
+    // The message already announces an oversize file: no getFile call is spent on it.
+    documentUpdate(540, 140, {
+      fileId: 'big-1', uniqueId: 'unique-big-1', bytes: Buffer.from('x'), fileName: 'big.bin',
+      mimeType: 'application/octet-stream', declaredSize: 25 * 1024 * 1024,
+    }),
+    // This one announces a small message but getFile reports the real oversize.
+    documentUpdate(541, 141, {
+      fileId: 'big-2', uniqueId: 'unique-big-2', bytes: Buffer.from('x'), fileName: 'big2.bin',
+      mimeType: 'application/octet-stream',
+    }),
   ]], files);
+  files.set('big-2', { path: 'documents/file_10.bin', bytes: Buffer.from('x'), declaredSize: 25 * 1024 * 1024 });
   let harness;
   try {
     harness = start(store, transport);
-    await until(() => transport.sent.some((entry) => entry.text === 'LARGE-NOTED'), 'large-file answer');
-    assert.equal(transport.downloads.length, 0, 'an announced oversize file is never downloaded');
+    await until(() => transport.sent.filter((entry) => entry.text === 'LARGE-NOTED').length === 2, 'both large-file answers');
+    assert.equal(transport.getFileCalls.length, 1, 'only the under-advertised file reached getFile');
+    assert.equal(transport.downloads.length, 0, 'an oversize file is never downloaded');
     assert.deepEqual(await mediaFiles(store.workspace), []);
-    const text = messageText(userMessages(requests)[0]);
-    assert.match(text, /The file could not be stored \(the file exceeds the configured size limit\)\./);
+    for (const request of requests) {
+      assert.match(userMessages([request]).map(messageText).join('\n'),
+        /The file could not be stored \(the file exceeds the configured size limit\)\./);
+    }
   } finally {
     await cleanup(store, harness, transport);
   }
@@ -886,6 +899,8 @@ test('media config is validated and traversal directories are refused before sta
   const parsed = parseConfig({ ...base, media: { directory: 'media', transcription: { language: 'en', maxDurationSeconds: 90 } } }, '/tmp');
   assert.equal(parsed.media.directory, 'media');
   assert.deepEqual(parsed.media.transcription, { language: 'en', maxDurationSeconds: 90 });
+  assert.deepEqual(parseConfig({ ...base, media: { transcription: { enabled: false } } }, '/tmp').media.transcription,
+    { enabled: false });
   assert.equal(parseConfig({ ...base, media: {} }, '/tmp').media.directory, 'media');
   assert.throws(() => parseConfig({ ...base, media: { directory: '../outside' } }, '/tmp'), /media\.directory/);
   assert.throws(() => parseConfig({ ...base, media: { unknown: true } }, '/tmp'), /Unknown media field/);

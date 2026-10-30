@@ -49,9 +49,9 @@ export type TelegramMediaPlan =
 type TelegramMediaMessage = NonNullable<Update["message"]>;
 
 function safePositive(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= TELEGRAM_MEDIA_LIMITS.maxFileBytes
-    ? value
-    : undefined;
+  // Keep the announced size even when it is over the limit: the adapter then
+  // refuses it before spending a getFile call, instead of downloading to find out.
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function mimeMetadata(value: unknown): string | undefined {
