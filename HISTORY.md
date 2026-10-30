@@ -775,6 +775,13 @@ contiguous fragments. A fragment also never ends between the two halves of a UTF
 (the boundary moves back, or the batch ends before that entry), so sending a batch as UTF-8 cannot
 introduce a replacement character; `textStart`/`chars` stay in UTF-16 code units, not bytes.
 
+`readBatch(ref)` re-derives one chunk a consumer already recorded, from its durable identity
+(session key, conversation, episode bounds, chunk position, expected end and cursor) without advancing
+anything: it re-checks that the ref is a currently mapped chat session, that its end is the entry just
+before a committed `pi.reset`, and that the re-derived chunk still ends where the ref says. That makes a
+resumable consumer independent of cross-conversation scan ordering — the reason it exists — while the
+original `read()` still chooses the oldest pending batch. See `memory-digest.ts` below.
+
 `read()` reports `status: "batch"` when it has a chunk to consume. Otherwise it returns
 `status: "idle"` with `caughtUp`, `examinedChats`, `postponedChats`, `unfinishedChats` and
 `missingChats`: `caughtUp` is true only when every mapped chat was examined to its tail, so a caller
@@ -784,13 +791,97 @@ caught up or as evidence. The in-process scan-position cache is derived, dropped
 conversation's cursor moves, and lost on restart: losing it costs a repeated bounded scan, never
 evidence.
 
-This foundation deliberately leaves the next slice: prompt selection and the editable workspace
-curation prompt, the model run and validated memory writes, worker/cron activation, and status or
-user notification. See `tests/history-digestion.behavior.test.mjs` for the checked-in evidence over a
-real Durable Harness with synthetic entries: eligibility, ordering and scan fairness, closed-episode-only
-input, reset handoff exclusion, bounded chunking with contiguous frontiers, lossless long-entry
-continuation, ack/no-op/restart behavior, stale and forged batch rejection, and the resumable scan
-cache.
+This foundation leaves activation to the next slice: `src/history/memory-digest.ts` (below) is the
+bounded execution over it, and nothing here schedules, prompts, notifies or writes memory. See
+`tests/history-digestion.behavior.test.mjs` for the checked-in evidence over a real Durable Harness
+with synthetic entries: eligibility, ordering and scan fairness, closed-episode-only input, reset
+handoff exclusion, bounded chunking with contiguous frontiers, lossless long-entry continuation,
+ack/no-op/restart behavior, stale and forged batch rejection, and the resumable scan cache.
+
+## Memory digestion execution
+
+`src/history/memory-digest.ts` is the reusable, bounded conversation-to-memory run over the input and
+cursor above. It adds no second agent loop, history archive, retry framework or service: one native
+Durable task (`nanobot.memory-digest`) consumes exactly one bounded O1 batch, in its own task-owned
+conversation, and acknowledges the cursor only after a settled, answered turn.
+
+```ts
+// O3 wires invocation. `start` is the whole host entry; nothing is scheduled or exposed here.
+const started = await gateway.memoryDigest.start({
+  id: originConversation.id,                            // authenticated mapped chat, from the host
+  commit: (change, ctx) => originConversation.commit(change, ctx),
+}, context);
+// started: {status:"started", taskId, ...} | {status:"busy", taskId} | {status:"idle", idle} | {status:"refused", reason}
+```
+
+One run, in order:
+
+1. Re-derive the accepted batch from its durable identity (`source.readBatch`) and read the
+   conversation's cursor. A cursor already at or beyond the batch means an earlier attempt
+   acknowledged it and only the outcome was missing: the run finishes `consumed` with no model turn.
+   A cursor at some other position fails closed before any provider call.
+2. A batch with no evidence fragments is acknowledged immediately — a successful no-op that advances
+   the frontier without a provider call.
+3. Otherwise the origin must currently grant `read`, `write` and `edit`: the curated subset of
+   `toolAllowlist`, and only for an authenticated mapped chat origin. An empty or narrower allowlist
+   refuses the run (at `start`, and again before the model call) instead of widening authority.
+4. The run prepares one task-owned conversation in one commit: the host captures the curated tool
+   subset, pins the origin's model and thinking level, and installs a curation-scope hook. The model
+   input is the fixed trust framing, the agent-owned prompt, a read-only workspace index (memory topic
+   manifest plus workspace skill summaries) and the bounded evidence fragments.
+5. A settled, answered turn acknowledges the batch; the acknowledgement re-validates the batch against
+   the committed transcript. The terminal commit retires the captured tools and hook in the same
+   commit that records the outcome. Provider error, a withdrawn input, a cancelled task or an expired
+   turn deadline leaves the frontier unchanged, so the same batch is offered again.
+
+The model input is bounded by the O1 batch (80 entries / 24,000 evidence characters) plus limits in
+`MEMORY_DIGEST_LIMITS`: the prompt file is read up to 64 KiB and rendered to 16,000 characters,
+the derived index to 12,000, one turn has a 300-second default deadline (a host seam,
+`memoryDigest.turnTimeoutMs`, overrides it), and the outcome keeps a 2,000-character answer excerpt.
+The task record stores only the batch identity and pinned model; the evidence lives once in the
+committed transcript and once in the run's own transcript, never in a permanent task input.
+
+The agent-owned prompt is `<workspace>/DIGEST.md`, seeded with `DEFAULT_MEMORY_DIGEST_PROMPT` only when
+the file does not exist (exclusive create; an existing file is read as-is and never rewritten,
+shortened on disk or versioned). Ordinary configured tools edit it in a normal conversation. Editing it
+changes guidance only: the trust framing, scope and authority text is composed by the host, so the
+prompt cannot grant a tool, a path or an effect.
+
+Curation scope is enforced by a hook on the digest conversation, not by the prompt: `read`, `write`
+and `edit` may only touch `SOUL.md`, `USER.md`, `memory/**/*.md` (never a `MEMORY.md` or `HISTORY.md`),
+and `skills/<name>/SKILL.md`. `write` is create-only and is refused when the file exists; existing
+files change only through native `edit` with exact old text, so a concurrent owner edit makes the call
+fail instead of being overwritten. There are no hashes, versions, managed workspace copies, rollback
+or transaction: a failed run keeps whatever it already wrote, says so honestly, and the
+unacknowledged batch is replayed idempotently. No shell, network, MCP, Code Mode, history, channel,
+worker, cron or scheduling tool is installed in a digest target, and a run never writes to the origin
+chat, a channel outbox or a schedule.
+
+Reopen is restored from the task itself: a live digest target keeps its pinned model, thinking level,
+captured Markdown tools and scope hook, and its queued turn resumes before the configured default can
+replace them. A digest target deliberately gets no origin context snapshot — its model input is its
+own bounded batch — so a resumed attempt renders the same framing. A model that left the catalog fails
+closed: its pending child input is withdrawn, its capture is retired, and the task commits the terminal
+error on resume. A terminal task's target keeps no authority after a reopen.
+
+Known limits, stated rather than implied: cross-conversation ordering is still best effort, so a
+resumed task re-derives its own batch instead of relying on which batch a new `read()` would pick; the
+first acknowledgement of an episode still pays O1's bounded, non-interruptible SQLite walk; a batch
+whose frontier lies behind `DIGEST_LIMITS.scanEntriesPerRead` empty reset markers still refuses
+loudly; the scope check is a naming guard, not confinement (a symlink swapped in after the check is
+not defended, exactly like the rest of the workspace tools); a cancelled or parked digest task still
+counts as live, so `start` reports `busy` with its task ID until a host retries or aborts it rather
+than allowing a second writer; the prompt is read when an attempt first submits its turn, so an owner
+edit applies to the next accepted batch rather than to a run already in flight (a resumed attempt
+re-submits its request ID, and text already admitted stays authoritative for that attempt); and the
+current shipped runtime has no manual command, cron job or tool that calls `start`.
+Nothing here was exercised with a real provider, a live channel, credentials or a personal workspace.
+`tests/memory-digest.behavior.test.mjs` covers the offline evidence over the real Gateway and a faux
+provider: fact/no-op/cursor, idle and refusal, provider failure and replay without duplication,
+cancellation, the turn deadline, an existing prompt not being clobbered, scope and create-only
+refusals with a stale edit, and a reopen that keeps the pinned model and curation tools. O3 owns the
+manual command, ordinary cron wiring, completion/failure visibility and prompt freshness at
+invocation; the interface is `start` plus each task's durable outcome.
 
 ## Offline lifecycle evidence
 
@@ -818,9 +909,10 @@ an outer timeout (or through the behavior suite once it is registered there).
 
 ## Not implemented
 
-- Digesting conversations into memory: `src/history/digestion.ts` supplies the bounded,
-  source-labeled input and the durable cursor, but no prompt, model run, memory write, worker/cron
-  activation or notification is wired, and nothing reads the cursor in production.
+- Digesting conversations into memory on its own: `src/history/digestion.ts` and
+  `src/history/memory-digest.ts` supply the bounded input, cursor and one-task execution, but no
+  command, tool, cron job, activation or completion notice calls it. Digestion runs only when a host
+  calls `gateway.memoryDigest.start`.
 - Background indexing independent of a search; message reconciliation and the summary sweep both
   happen on demand, and summary rows refresh only on a summary search.
 - Summary ranking beyond recency: summary pages are newest-first by episode start, with no relevance

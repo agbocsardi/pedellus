@@ -111,6 +111,18 @@ import {
 import { createWorkerTool, WORKER_TOOL_NAME } from "./workers/tool.js";
 import { WORKER_LIMITS } from "./workers/limits.js";
 import { createWorkerWorkspace, type WorkerWorkspace } from "./workers/workspace.js";
+import { createDigestSource, type DigestSource } from "./history/digestion.js";
+import {
+  MEMORY_DIGEST_TASK_NAME,
+  createMemoryDigest,
+  createMemoryDigestScopeExtension,
+  memoryDigestCurationTools,
+  memoryDigestTaskPolicy,
+  memoryDigestTaskTarget,
+  type MemoryDigest,
+  type MemoryDigestStartResult,
+  type MemoryDigestWriter,
+} from "./history/memory-digest.js";
 import {
   boundedCapturedTools,
   CODING_TOOL_NAMES,
@@ -222,6 +234,14 @@ export interface OpenGatewayOptions {
    * startup, so these cannot silently widen shipped behavior.
    */
   readonly web?: WebRuntimeOptions;
+  /**
+   * Host seam for bounded memory digestion: the one-turn deadline. A digest run that exceeds it is
+   * cancelled and fails without advancing the cursor. No config field selects it; the module's
+   * default applies when absent, and starting a run stays an explicit host call.
+   */
+  readonly memoryDigest?: {
+    readonly turnTimeoutMs?: number;
+  };
 }
 
 /** MCP servers configured for this open, with their connection state at the last read. */
@@ -246,6 +266,15 @@ export interface HistoryEntryPage {
 
 export interface Gateway {
   readonly harness: HarnessType;
+  /**
+   * Bounded conversation-to-memory digestion. `start` reads one bounded closed-episode batch from the
+   * mapped chat sessions and creates one native Durable task, or reports `idle`, `busy` or `refused`
+   * without starting anything. It is inert until a host calls it: no command, tool, schedule or
+   * provider call exists here, and nothing is sent to a user or channel. A run's cursor advance is
+   * durable and only happens after a settled, answered turn; O3 wires manual invocation and ordinary
+   * cron over this interface.
+   */
+  readonly memoryDigest: GatewayMemoryDigest;
   /**
    * Channel-neutral durable outbox of completed background cron results. Host/channel code uses it
    * after its own authentication; it creates no conversation, starts no run and adds no authority.
@@ -422,6 +451,16 @@ export interface Gateway {
    */
   resetSession(sessionKey: string, context: Context): Promise<GatewaySessionReset>;
   close(context: Context): Promise<void>;
+}
+
+/**
+ * The host entry point for memory digestion. `start` is the whole interface: the caller supplies the
+ * authenticated origin conversation and decides when to run; nothing is scheduled, exposed or sent.
+ * Call it outside a Session commit: it performs its own commits (a live-task check, the batch read and
+ * the task creation) and a nested commit would wait on the line the caller already holds.
+ */
+export interface GatewayMemoryDigest {
+  start(writer: MemoryDigestWriter, context: Context): Promise<MemoryDigestStartResult>;
 }
 
 /** Outcome of {@link Gateway.resetSession}; `busy` means nothing was reset and nothing was rebuilt. */
@@ -878,6 +917,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // Live worker children compose with Code Mode over their captured tools only. They are not mapped
   // chats: MCP, web, Telegram, cron, history and the worker tool itself stay out of their set.
   const workerChildConversations = new Set<ConversationId>();
+  // Live memory-digestion targets. They are task-owned like a worker child, but deliberately get
+  // no Code Mode, no MCP/web/channel/history tool and no shell: only the curation-scope hook and the
+  // captured Markdown tools. The set is rebuilt from live digest tasks on reopen.
+  const digestTargetConversations = new Set<ConversationId>();
+  const digestScopeExtension = createMemoryDigestScopeExtension(workspace);
+  const digestSourceRef: { current: DigestSource | undefined } = { current: undefined };
   const workerEnvironments = new Map<string, ToolEnvironments>();
   const environmentFor = (conversationId: ConversationId, ctx: Context) => {
     const root = workerWorkspaceRoots.get(conversationId);
@@ -956,6 +1001,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
       // the conversation already enables (its captured coding tools). MCP stays out.
       selected.push(...codeModeRef.current.extensions);
     }
+    // A live digest target keeps its narrowing path hook across a reopen. The hook grants nothing;
+    // it only refuses paths outside the curation scope and makes write create-only.
+    if (digestTargetConversations.has(conversationId)) selected.push(digestScopeExtension);
     if (options.contextSnapshotProvider && contextExtension && contextConversations.has(conversationId)) {
       selected.push(contextExtension);
     }
@@ -1233,6 +1281,85 @@ export async function openGateway(config: PortConfig, context: Context, options:
         precheckWorktree: () => workerWorkspace!.precheck(),
       });
   const workerToolRegistration = workerTool?.extension.tools?.[0];
+  /**
+   * Bounded conversation-to-memory digestion. It is registered even when no host will start it so a
+   * task persisted by an earlier open can resume, but it is otherwise inert: `start` is the only
+   * entry and nothing schedules, notifies or creates a conversation by itself. Its target is a
+   * task-owned conversation holding only the origin's curated Markdown subset (read/write/edit) and
+   * the curation-scope hook, so it never inherits shell, network, channel, history or worker authority.
+   */
+  const memoryDigest: MemoryDigest = createMemoryDigest({
+    harness: () => {
+      if (harnessRef.current === undefined) throw new Error("The runtime is not open");
+      return harnessRef.current;
+    },
+    source: () => {
+      if (digestSourceRef.current === undefined) throw new Error("The digest source is not open");
+      return digestSourceRef.current;
+    },
+    workspaceRoot: workspace,
+    now,
+    scopeExtension: digestScopeExtension,
+    ...(options.memoryDigest?.turnTimeoutMs === undefined
+      ? {}
+      : { turnTimeoutMs: options.memoryDigest.turnTimeoutMs }),
+    model: async (tx, conversationId) => {
+      const state = await tx.doc(AgentDoc, conversationId);
+      const choice = choiceFromState(state) ?? defaultChoice;
+      const level = state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
+        ? state.thinkingLevel
+        : fallbackThinkingLevel(choice);
+      return { model: choice.native, thinkingLevel: level };
+    },
+    allowModel: (candidate) => choicesByNative.has(modelKey(candidate)),
+    curationTools: (conversationId) => authorizedChatConversations.has(conversationId)
+      ? memoryDigestCurationTools(toolAllowlist)
+      : [],
+    prepare: async ({ tx, originConversationId, targetConversationId: target, input }) => {
+      // The fresh task-owned target starts default-deny. This capture is the origin's current
+      // curated subset, and the coding-tool hook still requires that origin and the current
+      // allowlist at call time, so a capture is never wider than configured authority.
+      const capture = await tx.doc(ConfigToolCaptureDoc, target);
+      capture.originConversationId = originConversationId;
+      capture.tools = authorizedChatConversations.has(originConversationId)
+        ? memoryDigestCurationTools(toolAllowlist)
+        : [];
+      const tools = capture.tools.flatMap((name) => {
+        const tool = toolRegistrations.get(name);
+        return tool === undefined ? [] : [tool];
+      });
+      const extensions: Extension[] = [];
+      // The vision hook carries no tool or memory authority; it is selected so a digest target can
+      // never send an unbounded raw image to a flagged text-only model. The curation hook narrows.
+      if (visionExtension !== undefined) extensions.push(visionExtension);
+      if (toolExtension !== undefined) extensions.push(toolExtension);
+      extensions.push(digestScopeExtension);
+      const choice = choicesByNative.get(modelKey(input.model));
+      await configure(tx, target, {
+        cwd: workspace,
+        model: input.model,
+        // A pinned level that left the provider catalog falls back inside the pinned model only.
+        thinkingLevel: choice !== undefined && choice.thinkingLevels.includes(input.thinkingLevel as ModelThinkingLevel)
+          ? input.thinkingLevel as ModelThinkingLevel
+          : choice === undefined ? "off" : fallbackThinkingLevel(choice),
+        tools,
+        modelTools: tools,
+        extensions,
+      });
+      digestTargetConversations.add(target);
+    },
+    finalize: async ({ tx, targetConversationId: target }) => {
+      // A digest target's captured authority ends in the same terminal commit that records the
+      // outcome. The curation hook goes with it: a terminal conversation keeps nothing to write.
+      await tx.retireDoc(ConfigToolCaptureDoc, target);
+      await configure(tx, target, {
+        tools: [],
+        modelTools: [],
+        extensions: visionExtension === undefined ? [] : [visionExtension],
+      });
+      digestTargetConversations.delete(target);
+    },
+  });
   const toolFilterFromNames = (
     names: readonly string[],
   ): { readonly tools: readonly ToolRegistration[] } => ({
@@ -1461,6 +1588,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (cronTool) registry.install(cronTool.extension);
     if (workerFoundation) registry.install(workerFoundation.extension);
     if (workerTool) registry.install(workerTool.extension);
+    registry.install(memoryDigest.extension);
+    registry.install(digestScopeExtension);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
     const harnessOptions = {
       models,
@@ -1511,6 +1640,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
         return chat;
       }, ctx);
     };
+    // The digest source shares the same host-validated mapped chat sessions as the history index
+    // and episode catalog. It is created after Harness.open() because it needs the harness; the
+    // executor above resolves it at use time, so its extension is already in the initial registry.
+    digestSourceRef.current = createDigestSource({ harness: harness!, sessions: mappedChatSessions });
     // Bounded, background-only derived state: reset-delimited episode boundaries and their
     // durable summary status. It reads committed entries only and changes no reset or busy
     // ordering. A closed episode is recorded as pending; with summaries opted in, the same
@@ -1789,17 +1922,24 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // Live worker targets keep the model, thinking level and workspace chosen at launch. A reopen must
     // not silently replace them with the configured default, and a worktree child keeps its own root.
     const workerChildPolicies = new Map<ConversationId, NonNullable<ReturnType<typeof workerChildPolicy>>>();
-    // Live worker children whose captured model left the current catalog. They are denied before
+    // Live digest targets keep the model pinned at start too. They are not run targets with a host
+    // context snapshot: a digest turn's prompt is its own bounded input, identical before and after
+    // a reopen, so only its pinned model and curation hook are restored.
+    const digestTargetPolicies = new Map<ConversationId, NonNullable<ReturnType<typeof memoryDigestTaskPolicy>>>();
+    // Live children whose captured model left the current catalog. They are denied before
     // scheduling resumes, never silently moved to the configured default.
-    const workerModelRemoved = new Set<ConversationId>();
+    const pinnedModelRemoved = new Set<ConversationId>();
     const runTasksById = new Map<number, { readonly originConversationId: ConversationId; readonly targetConversationId: ConversationId | null }>();
     await root.commit(async (tx) => {
       let taskCursor: Cursor | undefined;
       do {
         const page = await tx.scanTasks({}, 1000, taskCursor);
         for (const task of page.items) {
-          const backgroundTarget = cronBackgroundTarget(task) ?? workerBackgroundTarget(task);
-          if (task.kind === CRON_RUN_TASK_NAME || task.kind === WORKER_TASK_NAME) {
+          const snapshotTarget = cronBackgroundTarget(task) ?? workerBackgroundTarget(task);
+          const digestTarget = memoryDigestTaskTarget(task);
+          const backgroundTarget = snapshotTarget ?? digestTarget;
+          if (task.kind === CRON_RUN_TASK_NAME || task.kind === WORKER_TASK_NAME
+            || task.kind === MEMORY_DIGEST_TASK_NAME) {
             runTasksById.set(Number(task.id), {
               originConversationId: task.conversationId as ConversationId,
               targetConversationId: backgroundTarget?.targetConversationId ?? null,
@@ -1811,17 +1951,27 @@ export async function openGateway(config: PortConfig, context: Context, options:
             const target = await tx.conversation(backgroundTarget.targetConversationId);
             if (target?.owner?.taskId === Number(task.id)
               && target.owner.conversationId === backgroundTarget.originConversationId) {
-              backgroundRunTargets.push(backgroundTarget);
+              // A digest target deliberately gets no origin context snapshot: its model input is
+              // its own bounded batch, so a reopened attempt renders the same framing again.
+              if (snapshotTarget !== undefined) backgroundRunTargets.push(snapshotTarget);
               const policy = workerChildPolicy(task);
               if (policy !== undefined && policy.targetConversationId === target.id) {
                 workerChildPolicies.set(target.id, policy);
                 // A live child keeps the compositor across a reopen; its enabled tools are restored
                 // from the capture, so a narrowed ceiling also narrows what a script can compose.
                 workerChildConversations.add(target.id);
-                if (!choicesByNative.has(modelKey(policy.model))) workerModelRemoved.add(target.id);
+                if (!choicesByNative.has(modelKey(policy.model))) pinnedModelRemoved.add(target.id);
                 if (policy.workspace.mode === "worktree") {
                   workerWorkspaceRoots.set(target.id, policy.workspace.path);
                 }
+              }
+              const digestPolicy = memoryDigestTaskPolicy(task);
+              if (digestPolicy !== undefined && digestPolicy.targetConversationId === target.id) {
+                digestTargetPolicies.set(target.id, digestPolicy);
+                // A live digest target keeps its curation hook and pinned model; its captured
+                // Markdown tools are restored and narrowed from the capture below.
+                digestTargetConversations.add(target.id);
+                if (!choicesByNative.has(modelKey(digestPolicy.model))) pinnedModelRemoved.add(target.id);
               }
             }
           }
@@ -1843,12 +1993,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
       } while (taskCursor !== undefined);
     }, context);
 
-    // A worker whose captured model was removed must not reach a provider with it, or with a silently
-    // substituted default. Before scheduling resumes, stop its own child conversation's pending work
-    // through native ownership: queued inputs, and live tasks that hold no saved provider dispatch.
+    // A pinned child (worker or digest target) whose captured model was removed must not reach a
+    // provider with it, or with a silently substituted default. Before scheduling resumes, stop its
+    // own conversation's pending work through native ownership: queued inputs, and live tasks that
+    // hold no saved provider dispatch.
     // A saved dispatch is deliberately left alone; the inherited prepared-model guard refuses to open
     // the gateway in that case instead of cancelling it to "repair" startup.
-    if (workerModelRemoved.size > 0) {
+    if (pinnedModelRemoved.size > 0) {
       let inspection: Awaited<ReturnType<HarnessType["inspect"]>> | undefined;
       try {
         inspection = await harness.inspect(context);
@@ -1857,18 +2008,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
       if (inspection !== undefined) {
         for (const submission of inspection.submissions) {
-          if (submission.status !== "queued" || !workerModelRemoved.has(submission.conversationId)) continue;
+          if (submission.status !== "queued" || !pinnedModelRemoved.has(submission.conversationId)) continue;
           try {
             await harness.abortSubmission(submission.id, context, submission.conversationId);
           } catch {
-            // The worker's terminal commit still retires authority; a re-run child has none.
+            // The task's terminal commit still retires authority; a re-run child has none.
           }
         }
         for (const inspectionTask of inspection.tasks) {
           const record = inspectionTask.record;
           if (record.state.status === "terminal" || record.state.status === "completing") continue;
-          if (record.kind === WORKER_TASK_NAME) continue;
-          if (!workerModelRemoved.has(record.conversationId)) continue;
+          if (record.kind === WORKER_TASK_NAME || record.kind === MEMORY_DIGEST_TASK_NAME) continue;
+          if (!pinnedModelRemoved.has(record.conversationId)) continue;
           if (preparedTaskModel(record) !== undefined) continue;
           try {
             await harness.abortTask(record.id, context);
@@ -1952,10 +2103,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const state = await tx.doc(AgentDoc, conversation.id);
           const toolFilter = await toolFilterFor(tx, conversation.id, backgroundToolBounds.get(conversation.id));
           const workerPolicy = workerChildPolicies.get(conversation.id);
+          const digestPolicy = digestTargetPolicies.get(conversation.id);
           // A live worker keeps the model, thinking level and workspace chosen at launch, even when
           // that model has since left the catalog: the pin stays honest instead of silently becoming
           // the configured default. The worker task then fails closed in its own terminal commit.
           const workerChoice = workerPolicy === undefined ? undefined : choicesByNative.get(modelKey(workerPolicy.model));
+          const digestChoice = digestPolicy === undefined ? undefined : choicesByNative.get(modelKey(digestPolicy.model));
           await configure(tx, conversation.id, {
             ...(workerPolicy !== undefined
               ? {
@@ -1965,15 +2118,24 @@ export async function openGateway(config: PortConfig, context: Context, options:
                     ? workerPolicy.thinkingLevel
                     : workerChoice !== undefined ? fallbackThinkingLevel(workerChoice) : workerPolicy.thinkingLevel,
                 }
-              // Named-preset mode owns the startup default; direct mode preserves its persisted choice.
-              : policyForState(state, configuredPresetName !== undefined)),
+              : digestPolicy !== undefined
+                ? {
+                    cwd: workspace,
+                    model: digestPolicy.model,
+                    thinkingLevel: digestChoice !== undefined && digestChoice.thinkingLevels.includes(digestPolicy.thinkingLevel)
+                      ? digestPolicy.thinkingLevel
+                      : digestChoice !== undefined ? fallbackThinkingLevel(digestChoice) : digestPolicy.thinkingLevel,
+                  }
+                // Named-preset mode owns the startup default; direct mode preserves its persisted choice.
+                : policyForState(state, configuredPresetName !== undefined)),
             ...extensionsPolicy(conversation.id),
             ...toolFilter,
           });
-          if (workerPolicy !== undefined && workerChoice === undefined) {
+          if ((workerPolicy !== undefined && workerChoice === undefined)
+            || (digestPolicy !== undefined && digestChoice === undefined)) {
             // Removed model: no fallback dispatch and no captured authority. The target's own pending
-            // work was withdrawn above; the worker task commits the terminal error on resume. Code
-            // Mode selection goes too, so no stale script can compose a retired capture.
+            // work was withdrawn above; the task commits the terminal error on resume. Code Mode
+            // selection goes too, so no stale script can compose a retired worker capture.
             await tx.retireDoc(ConfigToolCaptureDoc, conversation.id);
             await configure(tx, conversation.id, {
               tools: [],
@@ -2067,6 +2229,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     };
     const gateway: Gateway = {
       harness,
+      memoryDigest: {
+        start: (writer, ctx) => memoryDigest.start(writer, ctx),
+      },
       cronOutbox,
       ...(telegramActions === undefined ? {} : { telegramActions }),
       get mcp() {

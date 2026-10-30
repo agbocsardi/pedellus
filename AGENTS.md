@@ -90,6 +90,14 @@ npm start -- agent --config config.json     # attach a terminal
   demand through the read-only `skill` tool.
 - Markdown in the workspace is the memory source of truth. Durable owns the
   transcript, runtime state and compaction.
+- Memory digestion is inert until a host calls `gateway.memoryDigest.start`: one
+  native task consumes one bounded closed-episode batch in a task-owned
+  conversation whose only tools are the origin's captured `read`/`write`/`edit`,
+  confined to `SOUL.md`, `USER.md`, `memory/**/*.md` and
+  `skills/<name>/SKILL.md`, with `write` create-only. The cursor advances only
+  after a settled, answered turn; the editable workspace policy is `DIGEST.md`
+  (seeded only when absent) and it can never grant authority. No command, cron
+  job, tool, channel notice, shell, network or worker authority is part of it.
 - Native web tools are default-off and separate from `toolAllowlist`: `web.search`
   names the Brave credential environment variable, and `web.fetch` enables the
   public reader. Both are limited to authenticated mapped chats. Public fetch

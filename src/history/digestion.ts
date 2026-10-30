@@ -90,7 +90,9 @@
  *   changes the frontier.
  *
  * Not here: model calls, memory writes, prompt or skill selection, scheduling, tool
- * surface, and any activation. `cursor()` exposes the frontier for status and tests.
+ * surface, and any activation. `readBatch()` only re-derives a chunk a consumer already
+ * recorded, so resumable execution does not depend on cross-conversation scan ordering.
+ * `cursor()` exposes the frontier for status and tests.
  */
 import {
   AssistantEntry,
@@ -199,6 +201,28 @@ export interface DigestIdle {
 
 export type DigestReadResult = DigestBatch | DigestIdle;
 
+/**
+ * The durable identity of one bounded chunk, without its evidence text.
+ *
+ * This is what a caller records when it accepts a batch and later resumes it: the same
+ * conversation, immutable episode bounds, chunk position, expected end and the frontier
+ * the batch was read against. {@link DigestSource.readBatch} re-derives the evidence from
+ * the committed transcript, so a resumed consumer never depends on cross-conversation
+ * scan ordering and never stores a second copy of the transcript.
+ */
+export interface DigestBatchRef {
+  readonly sessionKey: string;
+  readonly conversationId: ConversationId;
+  readonly episodeStartEntryId: EntryId;
+  readonly episodeEndEntryId: EntryId;
+  readonly firstEntryId: EntryId;
+  readonly firstTextStart: number;
+  readonly throughEntryId: EntryId;
+  readonly throughChars: number;
+  readonly complete: boolean;
+  readonly cursor: DigestCursor;
+}
+
 /** Rejects a batch whose conversation frontier changed after the batch was read. */
 export class DigestCursorConflictError extends Error {
   constructor(message: string) {
@@ -224,6 +248,20 @@ export interface DigestSource {
    * to Durable; only an acknowledgement moves a cursor.
    */
   read(context: Context): Promise<DigestReadResult>;
+  /**
+   * Re-derive one chunk this source previously returned, from its recorded identity.
+   *
+   * This reads only: it writes no cursor and advances nothing. Whether the batch is still
+   * pending is the caller's check (`cursor()`). The ref must name a currently mapped chat
+   * conversation and an entry range inside one closed segment (its end is followed by a
+   * `pi.reset`), and the re-derived chunk must still end at `throughEntryId`/
+   * `throughChars`/`complete`; a forged, stale or out-of-range ref is otherwise rejected
+   * instead of returning different evidence. It does not re-prove that the start is the
+   * episode's first entry, because only `acknowledge()` may move the frontier. Cross-conversation
+   * scan ordering cannot change the answer, so a resumed consumer replays exactly the chunk
+   * it accepted.
+   */
+  readBatch(ref: DigestBatchRef, context: Context): Promise<DigestBatch>;
   /**
    * Record that a batch was successfully consumed, including a batch with no evidence.
    * The frontier update is one commit and is validated against the committed transcript;
@@ -880,7 +918,7 @@ async function validateFreshEpisodeClosedRange(
  */
 async function validateEpisodeBounds(
   conversation: Conversation,
-  batch: DigestBatch,
+  batch: Pick<DigestBatch, "episodeStartEntryId" | "episodeEndEntryId">,
   startEntry: EntryRecord,
   context: Context,
 ): Promise<void> {
@@ -982,6 +1020,52 @@ async function validateChunkAgainstTranscript(
     && batch.throughChars === lastTotal;
   if (batch.complete !== consumedEpisode) {
     throw new TypeError("Digest batch completeness does not match its last entry");
+  }
+}
+
+/**
+ * A batch ref is consumer-supplied: validate its shape before any transcript read. The
+ * claimed end is also checked against the committed transcript, so a forged ref can only
+ * read a closed segment of a mapped chat conversation, never the open tail.
+ */
+function validateBatchRef(ref: DigestBatchRef): void {
+  if (ref === null || typeof ref !== "object") throw new TypeError("Digest batch ref must be an object");
+  if (typeof ref.sessionKey !== "string" || ref.sessionKey.length === 0) {
+    throw new TypeError("Digest batch ref session key must be a non-empty string");
+  }
+  const conversationId = ref.conversationId as number;
+  if (!Number.isSafeInteger(conversationId) || conversationId < 1) {
+    throw new TypeError("Digest batch ref conversation ID must be a positive safe integer");
+  }
+  const start = positiveId(ref.episodeStartEntryId, "Digest batch ref episode start");
+  const end = positiveId(ref.episodeEndEntryId, "Digest batch ref episode end");
+  const first = positiveId(ref.firstEntryId, "Digest batch ref first entry");
+  const through = positiveId(ref.throughEntryId, "Digest batch ref through entry");
+  const firstTextStart = offset(ref.firstTextStart, "Digest batch ref first offset");
+  offset(ref.throughChars, "Digest batch ref through offset");
+  if (typeof ref.complete !== "boolean") throw new TypeError("Digest batch ref completeness must be a boolean");
+  if (!(start <= first && first <= through && through <= end)) {
+    throw new TypeError("Digest batch ref entry range is inconsistent");
+  }
+  if (ref.complete && through !== end) {
+    throw new TypeError("Digest batch ref cannot complete before its episode end");
+  }
+  const cursor = validateCursor(ref.cursor);
+  const continues = cursor.episodeStartEntryId !== null;
+  if (continues) {
+    if (start !== cursor.episodeStartEntryId || end !== cursor.episodeEndEntryId) {
+      throw new TypeError("Digest batch ref does not continue its cursor's episode");
+    }
+    if (first !== cursor.throughEntryId || firstTextStart !== cursor.throughChars) {
+      throw new TypeError("Digest batch ref does not continue at its cursor position");
+    }
+  } else {
+    if (first !== start || firstTextStart !== 0) {
+      throw new TypeError("Digest batch ref must start its episode at the episode start");
+    }
+    if (cursor.throughEntryId !== null && first <= cursor.throughEntryId) {
+      throw new TypeError("Digest batch ref starts at or before its cursor");
+    }
   }
 }
 
@@ -1131,6 +1215,50 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
         complete: chunk.complete,
         entries: chunk.entries,
         cursor: chosen.cursor,
+      };
+    },
+
+    async readBatch(ref, context) {
+      validateBatchRef(ref);
+      const conversationId = ref.conversationId;
+      const conversation = await harness.conversation(conversationId, context);
+      if (conversation === undefined) throw new TypeError("Digest batch ref conversation is not committed");
+      const sessions = await options.sessions(context);
+      validateSessions(sessions);
+      const session = sessions.find((candidate) => candidate.conversationId === conversationId);
+      if (session === undefined || session.sessionKey !== ref.sessionKey) {
+        throw new TypeError("Digest batch ref is not a currently mapped chat session");
+      }
+      const startEntry = await entryAt(conversation, ref.episodeStartEntryId, context);
+      if (startEntry === undefined) throw new TypeError("Digest batch ref episode start is not committed");
+      await validateEpisodeBounds(conversation, ref, startEntry, context);
+      const chunk = await readChunk(
+        conversation,
+        ref.firstEntryId,
+        ref.firstTextStart,
+        ref.episodeEndEntryId,
+        context,
+      );
+      if (
+        chunk.throughEntryId !== ref.throughEntryId
+        || chunk.throughChars !== ref.throughChars
+        || chunk.complete !== ref.complete
+      ) {
+        throw new TypeError("Digest batch ref no longer matches the committed transcript");
+      }
+      return {
+        status: "batch",
+        sessionKey: ref.sessionKey,
+        conversationId,
+        episodeStartEntryId: ref.episodeStartEntryId,
+        episodeEndEntryId: ref.episodeEndEntryId,
+        firstEntryId: ref.firstEntryId,
+        firstTextStart: ref.firstTextStart,
+        throughEntryId: chunk.throughEntryId,
+        throughChars: chunk.throughChars,
+        complete: chunk.complete,
+        entries: chunk.entries,
+        cursor: ref.cursor,
       };
     },
 

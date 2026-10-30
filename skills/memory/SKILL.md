@@ -11,9 +11,11 @@ workspace-relative path and description. The manifest is navigation only; topic
 bodies stay out of the prompt unless the host explicitly selects that file, so
 read a topic before relying on it.
 
-This port has no memory-tree or memory-search tool, no Dream consolidation, and
-no dedicated `history.jsonl` search. Use the granted `read`, `write`, `edit`, and
-`bash` tools on ordinary workspace files.
+This port has no memory-tree or memory-search tool and no dedicated
+`history.jsonl` search. Use the granted `read`, `write`, `edit`, and `bash`
+tools on ordinary workspace files. Consolidation across closed conversations
+exists only as a memory digestion run started by the host; it is not a command
+or tool you can invoke from a conversation.
 
 ## Layout
 
@@ -61,7 +63,8 @@ that a quick lookup answers.
 - The manifest is read-only; edit topic files, never the injected manifest.
 - Use `grep` or `rg` through `bash` only if that tool is granted. There is no
   dedicated memory-search tool in this port.
-- Treat `memory/system/`, `SOUL.md`, and `USER.md` as host-owned. They are not
-  consolidated or rewritten by this port, and there is no Dream history here.
+- Treat `memory/system/`, `SOUL.md`, and `USER.md` as host-owned in ordinary
+  conversation: do not rewrite them there. Only a host-started memory digestion
+  run maintains them, and there is no Dream command, cursor or history archive.
 
 When memory looks disorganized, suggest the `memory-defrag` skill.
