@@ -35,4 +35,10 @@ When slots open, launch independent read-only reviewers against the correspondin
 
 ### 2026-10-30
 
-Owner requested a removal-first plan and orchestration with 2–3 OpenCode Go / DeepSeek Flash high subagents. Clean baseline: `eb1f08a4cac43498f3423d86ca283b9a434e8a3f`. Previous offline checks passed 168 behavior, 9 execution and 88 core-acceptance checks; counts will change as retired features and grant-only cases are removed. Exact installed model resolved as `deepseek-v4.1-flash`. No implementation changes yet.
+Owner requested a removal-first plan and orchestration with 2–3 OpenCode Go / DeepSeek Flash high subagents. Clean baseline: `eb1f08a4cac43498f3423d86ca283b9a434e8a3f`. Previous offline checks passed 168 behavior, 9 execution and 88 core-acceptance checks; counts will change as retired features and grant-only cases are removed. Exact installed model resolved as `deepseek-v4.1-flash`. Plan committed as `0ef92ca5eedfea076f7ae51380ad8cf3fad96bc4`; all workers start from that explicit base. Launched three independent implementation worktrees:
+
+- `worker-park-migration-e2f32b45`, pane `w2E:p1`, workspace `w2E`, branch of the same name: S1 migration/archive retirement.
+- `worker-drop-managed-b38a9733`, pane `w2F:p1`, workspace `w2F`, branch of the same name: S2 managed-copy retirement.
+- `worker-config-tools-308d967a`, pane `w2G:p1`, workspace `w2G`, branch of the same name: S3 config-only tool authority and acceptance adaptation.
+
+All use OpenCode Go / DeepSeek v4.1 Flash, high thinking. Await explicit reports; shared exports/manifest stay parent-owned until integration.
