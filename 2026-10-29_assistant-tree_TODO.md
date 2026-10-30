@@ -2,6 +2,7 @@
 
 ## Checklist
 
+- [ ] Complete the owner-authorized [removal-first simplification](2026-10-30_simplification_TODO.md) before continuing trunk acceptance.
 - [x] Agree the tree: CLI + Telegram trunk; tools, delegation, then more channels.
 - [x] T1 — Make the existing assistant straightforward to configure and use (offline verified).
   - [x] Preserve config-tool and preset behavior in focused, reviewed permanent tests.
