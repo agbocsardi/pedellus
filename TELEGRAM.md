@@ -194,6 +194,13 @@ exposes no grant or approval commands and the model cannot ask for one.
   a full durable pending queue (1000 items) fails closed before offset advance.
   Long-poll timeout is sent in seconds and the grammY request deadline is bounded
   to 60 seconds. All requests reject redirects.
+- While an admitted user turn is active, the adapter sends a best-effort
+  `sendChatAction` typing action and refreshes it before Telegram's short
+  lifetime. One loop per chat is shared by queued turns and stops when the last
+  one settles, is aborted, or the adapter shuts down. Control acknowledgements,
+  unauthorized input and scheduled-outbox delivery do not type. A rejected or
+  flood-gated action is ignored without retry, so typing never delays model
+  admission, previews or the final reply, and no typing state is stored.
 - `getUpdates` has its own flood wait and bounded transport/5xx retries,
   independent of outbound calls. Outbound calls share one bot-token flood gate;
   a later concurrent deadline wins. Full finite, positive `retry_after` values

@@ -32,6 +32,8 @@ const MAX_NOTICE_CHARS = 1_500;
 const SCHEDULED_SCAN_INTERVAL_MS = 2_000;
 const MAX_SCHEDULED_ACTIVE = 4;
 const MAX_ORIGINS = 1_000;
+/** Telegram typing actions expire after about five seconds; refresh before that while a turn is active. */
+const TYPING_REFRESH_MS = 4_000;
 
 export type TelegramOptions = {
   token: string;
@@ -90,6 +92,12 @@ export type TelegramOriginBinding = {
 };
 type PendingReply = TelegramPendingDelivery;
 type SubmissionSlot = { readonly prior: Promise<void>; release(): void };
+type TypingLoop = {
+  /** Overlapping queued turns in one chat share this loop; the indicator stays until the last one settles. */
+  turns: number;
+  stopped: boolean;
+  timer: ReturnType<typeof setTimeout> | undefined;
+};
 type ChannelState = TelegramChannelState;
 
 // Stored alongside the adapter's stable channel conversation, not in a plaintext sidecar.
@@ -238,6 +246,53 @@ export async function runTelegram(
       if (chatSendTails.get(chatId) === tail) chatSendTails.delete(chatId);
     });
     return next;
+  };
+
+  /**
+   * Best-effort presence for live inbound turns only. One refresh loop per chat is shared by queued turns, so a
+   * second turn cannot duplicate it. There is no durable typing state and no retry: the shared flood gate lets a
+   * refresh yield, and any failure is ignored because the indicator is replaceable feedback.
+   */
+  const typingLoops = new Map<number, TypingLoop>();
+  const refreshTyping = async (chatId: number, loop: TypingLoop): Promise<void> => {
+    if (loop.stopped || stopping || signal?.aborted) return;
+    await apiCall(api, "sendChatAction", signal,
+      (callSignal) => api.sendChatAction(chatId, "typing", {}, toGrammySignal(callSignal)),
+      { throttle: outboundThrottle, replaceable: true }).catch(() => undefined);
+    if (loop.stopped) return;
+    loop.timer = setTimeout(() => {
+      loop.timer = undefined;
+      void refreshTyping(chatId, loop);
+    }, TYPING_REFRESH_MS);
+  };
+  const stopTypingLoop = (chatId: number, loop: TypingLoop): void => {
+    loop.stopped = true;
+    if (loop.timer !== undefined) {
+      clearTimeout(loop.timer);
+      loop.timer = undefined;
+    }
+    if (typingLoops.get(chatId) === loop) typingLoops.delete(chatId);
+  };
+  const startTyping = (chatId: number): (() => void) => {
+    if (stopping || signal?.aborted) return () => undefined;
+    let loop = typingLoops.get(chatId);
+    if (loop === undefined) {
+      const created: TypingLoop = { turns: 0, stopped: false, timer: undefined };
+      typingLoops.set(chatId, created);
+      loop = created;
+      void refreshTyping(chatId, created);
+    }
+    loop.turns += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      loop!.turns -= 1;
+      if (loop!.turns === 0) stopTypingLoop(chatId, loop!);
+    };
+  };
+  const stopAllTyping = (): void => {
+    for (const [chatId, loop] of typingLoops) stopTypingLoop(chatId, loop);
   };
 
   // A durable origin binding is written before a message's conversation is mapped or submitted, so
@@ -673,6 +728,7 @@ export async function runTelegram(
       previewDirty = true;
       schedulePreview();
     };
+    const stopTyping = startTyping(item.chatId);
     try {
       watch.start(async (view) => {
         const live = view.docs["pi.live"] as {
@@ -706,6 +762,7 @@ export async function runTelegram(
       await flushFinal(text);
       await forget(item.updateId);
     } finally {
+      stopTyping();
       await stopPreviewWatch();
     }
 
@@ -1049,6 +1106,7 @@ export async function runTelegram(
     if (!signal?.aborted) throw error;
   } finally {
     stopping = true;
+    stopAllTyping();
     if (scheduledTimer !== undefined) clearInterval(scheduledTimer);
     scope.cancel(new DOMException("Telegram adapter stopped", "AbortError"));
     await Promise.allSettled([...active, ...pendingControls, ...scheduledTasks]);

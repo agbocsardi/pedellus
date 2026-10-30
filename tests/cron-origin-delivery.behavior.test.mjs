@@ -197,6 +197,7 @@ function telegramFetchMock(identity, updates) {
         text: body.text ?? '',
       });
     }
+    if (method === 'sendChatAction') return response(true);
     if (method === 'editMessageText' || method === 'deleteMessage') return response(true);
     throw new Error(`unexpected mocked Telegram method: ${method}`);
   };
