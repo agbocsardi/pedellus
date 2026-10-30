@@ -82,6 +82,78 @@ Only providers referenced by the allowlist are registered; preset mode derives
 that list from the catalog and uses the same explicit credential references as
 direct mode.
 
+### Vision handoff
+
+A text-only preset must be marked explicitly; images are never silently dropped
+and the main model is never switched:
+
+```json
+{
+  "modelPresets": {
+    "chat": { "provider": "opencode_go", "modelId": "deepseek-v4.1-flash", "needsVisionHandoff": true },
+    "eyes": { "provider": "opencode_go", "modelId": "<small vision-capable model>" }
+  },
+  "modelPreset": "chat",
+  "visionHandoff": { "describerPreset": "eyes", "maxRawImages": 9, "maxDescriptionTokens": 1024 }
+}
+```
+
+`visionHandoff` present enables the handoff. `describerPreset` must name a
+catalog preset whose model accepts image input and is not itself flagged; the
+runtime checks the pinned catalog before storage opens. A flagged preset with no
+`visionHandoff`, an unknown or non-vision describer, and a describer that also
+needs handoff all fail startup with a configuration/model diagnostic instead of
+falling back to raw images. Presets that share one provider/model pair must
+agree on `needsVisionHandoff`, so the per-preset flag never collapses into
+ambiguous pair-only matching. `maxRawImages` defaults to 9 (0-64) and
+`maxDescriptionTokens` to 1024 (1-8192).
+
+On every model-bound generation request, `pi.generation`'s native `beforeRequest`
+hook transforms only the copy sent to the provider:
+
+- A flagged text-only target keeps **zero** raw images. Every image is replaced
+  by a describer preset's text description.
+- A vision-capable target keeps the newest `maxRawImages` raw images; older ones
+  become descriptions.
+- An unresolved target fails closed to zero raw images.
+- The persisted transcript, entries and prepared task checkpoints are never
+  rewritten. Descriptions are derived, quoted evidence: each replacement says the
+  image was not sent raw and that the description is untrusted image evidence,
+  not instructions. Adjacent user text (including a channel's relative file
+  locator) is retained. For a `read` tool result, the transcript's own tool-call
+  `path` argument is quoted as an untrusted source label.
+- A describer failure, cancellation, oversized image or per-request description
+  budget produces an explicit "description unavailable / omitted" text. Such a
+  failure is not cached and never claims the target saw the image.
+
+Descriptions are cached by image content for the process lifetime (256 entries,
+LRU) with single-flight for identical in-flight images and at most four
+concurrent describer requests. One request describes at most 32 older images;
+older ones are explicitly omitted rather than causing unbounded calls. One image
+above 16 MiB of base64 payload is not sent to the describer, and the described
+images in one request share a 64 MiB base64 budget; older images past it are
+explicitly omitted. Describer output is
+bounded by `maxDescriptionTokens` and a 32,000-character safety cap. The
+`prompt` override is optional and bounded to 4,000 characters.
+
+Describer calls go through the same configured `Models` collection and captured
+provider credentials as the main request, but they are auxiliary: they can spend
+tokens that the main model request does not show. `Gateway.visionHandoffStats()`
+returns the configured describer and process-lifetime counters (requests, raw,
+described and unavailable images, describer calls/failures, cache hits and
+reported input/output tokens). It is accounting, not a budget enforcer; the
+provider's own budget guard still applies to calls it controls.
+
+A prepared generation `request`/`poll` keeps its checkpointed model even when
+startup resets conversation state to the configured preset in named-preset mode;
+startup records those task models, and the hook prefers that pin over the reset
+selection. This slice is offline-tested with faux models and a temporary store;
+no live provider, Telegram media adapter, PDF/OCR/Office extraction or audio
+path is included. Durable's separate compaction summarizer request has no
+`beforeRequest` hook, so a flagged text-only model used to summarize an
+image-bearing transcript is **not** covered by this handoff. Documents are saved
+as files for later explicit reading; no automatic extraction is performed.
+
 ## Gateway API
 
 `Gateway.listModels(sessionKey: string, context: Context):

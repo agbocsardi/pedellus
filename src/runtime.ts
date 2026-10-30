@@ -81,6 +81,8 @@ import {
 } from "./history/scope.js";
 import { ensureStoreIdentity, type StoreIdentity } from "./history/store-identity.js";
 import { modelKey, parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
+import { createVisionHandoffExtension } from "./media/vision-hook.js";
+import { VisionHandoff, type VisionHandoffStats } from "./media/vision.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
 import { prepareDataDirectory } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
@@ -114,6 +116,13 @@ export interface GatewayModelSelectionRequest extends ModelReference {
 
 export interface GatewayModelSelection extends ModelReference {
   thinkingLevel: ModelThinkingLevel;
+}
+
+/** Configured vision handoff and its process-lifetime, bounded accounting. */
+export interface GatewayVisionHandoffState {
+  readonly enabled: boolean;
+  readonly describer?: ModelReference;
+  readonly stats: VisionHandoffStats;
 }
 
 /** One named preset from config, using the provider spelling accepted by Gateway selection. */
@@ -218,6 +227,11 @@ export interface Gateway {
    * ConversationBusy atomically and fails for unknown names or in legacy direct-model mode.
    */
   selectModelPreset(sessionKey: string, name: string, context: Context): Promise<GatewayModelSelection>;
+  /**
+   * Configured vision handoff and bounded counters for auxiliary describer calls. The counters are
+   * process lifetime, not per conversation; they expose spend that the main model request hides.
+   */
+  visionHandoffStats(): GatewayVisionHandoffState;
   /**
    * Immutable identity of this SQLite store. A derived index persists `storeId` and refuses
    * its own rows when it changes, so a rebuilt or replaced store cannot mix two histories.
@@ -493,6 +507,66 @@ export async function openGateway(config: PortConfig, context: Context, options:
     throw new TypeError("agentHistory must be a boolean");
   }
   const defaultThinkingLevel = defaultPreset?.thinkingLevel ?? config.thinkingLevel ?? "off";
+  // Vision handoff: one configured describer preset replaces or bounds image attachments in the
+  // model-bound request. It is a native generation hook, never a second agent loop, and it leaves
+  // the persisted transcript and prepared checkpoints untouched. The map records the model pinned
+  // by a live prepared dispatch so recovery cannot silently apply the reset configured preset.
+  const preparedGenerationModels = new Map<number, ModelReference>();
+  let visionHandoff: VisionHandoff | undefined;
+  let visionExtension: Extension | undefined;
+  if (config.visionHandoff !== undefined) {
+    const describerPreset = presetCatalog.get(config.visionHandoff.describerPreset);
+    if (describerPreset === undefined) {
+      throw new StartupDiagnosticError("model", {
+        detail: "visionHandoff.describerPreset must name a configured model preset",
+      });
+    }
+    if (!describerPreset.choice.model.input.includes("image")) {
+      throw new StartupDiagnosticError("model", {
+        detail: "visionHandoff.describerPreset must name a model that accepts image input",
+      });
+    }
+    const flaggedModels = new Set<string>();
+    const flagsByNativePair = new Map<string, { readonly name: string; readonly flag: boolean }>();
+    for (const [name, preset] of Object.entries(config.modelPresets ?? {})) {
+      const choice = presetCatalog.get(name);
+      if (choice === undefined) {
+        throw new StartupDiagnosticError("model", {
+          detail: `Model preset ${name} is outside the configured model catalog`,
+        });
+      }
+      const flag = preset.needsVisionHandoff === true;
+      // Requests carry the native provider/model pair, never the config alias. Compare and key
+      // flags by that native pair, so aliasing cannot silently disable a text-only flag.
+      const key = modelKey(choice.choice.native);
+      const previous = flagsByNativePair.get(key);
+      if (previous !== undefined && previous.flag !== flag) {
+        throw new StartupDiagnosticError("model", {
+          detail: `Model presets ${previous.name} and ${name} disagree on needsVisionHandoff for the same native model`,
+        });
+      }
+      flagsByNativePair.set(key, { name, flag });
+      if (!flag) continue;
+      if (name === config.visionHandoff.describerPreset) {
+        throw new StartupDiagnosticError("model", {
+          detail: "visionHandoff.describerPreset must not itself need vision handoff",
+        });
+      }
+      flaggedModels.add(key);
+    }
+    visionHandoff = new VisionHandoff({
+      describer: describerPreset.choice.native,
+      flaggedModels,
+      maxRawImages: config.visionHandoff.maxRawImages,
+      maxDescriptionTokens: config.visionHandoff.maxDescriptionTokens,
+      ...(config.visionHandoff.prompt === undefined ? {} : { prompt: config.visionHandoff.prompt }),
+    });
+    visionExtension = createVisionHandoffExtension({
+      handoff: visionHandoff,
+      defaultModel: defaultChoice.native,
+      preparedModel: (taskId) => preparedGenerationModels.get(Number(taskId)),
+    });
+  }
   // A configured summary override must be allowed. `preset` resolves through the named catalog and
   // supplies its thinking level to real summary jobs; `model` keeps the legacy direct form.
   // Otherwise each job captures the conversation's current model when it starts; old history is not
@@ -681,6 +755,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // extension) would otherwise be selected by unrelated conversations.
   const extensionsPolicy = (conversationId: ConversationId): AgentChange => {
     const selected: Extension[] = [];
+    // The vision hook carries no tool or workspace authority; selecting it everywhere keeps
+    // image bounding independent of tool allowlists and channel scope.
+    if (visionExtension) selected.push(visionExtension);
     if (toolExtension) selected.push(toolExtension);
     if (options.contextSnapshotProvider && contextExtension && contextConversations.has(conversationId)) {
       selected.push(contextExtension);
@@ -908,7 +985,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // Any capture document is retired so a fork's copied agent state can never inherit authority,
     // and extensions are explicit so a later dynamic install cannot be selected by default.
     await tx.retireDoc(ConfigToolCaptureDoc, conversation.id);
-    await configure(tx, conversation.id, { tools: [], modelTools: [], extensions: [] });
+    await configure(tx, conversation.id, {
+      tools: [],
+      modelTools: [],
+      // Denied conversations still get the non-authoritative vision hook so a raw, forked or
+      // task-created request cannot send unbounded raw images to a flagged text-only model.
+      extensions: visionExtension === undefined ? [] : [visionExtension],
+    });
   };
   const publicChoice = (choice: ResolvedModelChoice): GatewayModelChoice => ({
     ...choice.configured,
@@ -991,6 +1074,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         });
     const registry = createRegistry();
     if (episodeSummaries !== undefined) registry.install(episodeSummaries.extension);
+    if (visionExtension) registry.install(visionExtension);
     if (toolExtension) registry.install(toolExtension);
     if (skillTool) registry.install(skillTool.extension);
     if (historyTool) registry.install(historyTool.extension);
@@ -1343,6 +1427,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (preparedModel !== undefined && !choicesByNative.has(modelKey(preparedModel))) {
             throw new Error(`Cannot resume ${task.kind} task ${task.id}: prepared model ${modelKey(preparedModel)} is outside allowedModels`);
           }
+          if (preparedModel !== undefined && task.kind === "pi.generation") {
+            // The checkpoint model, not the configured preset the startup policy pass will
+            // restore, decides whether this prepared request keeps any raw images.
+            preparedGenerationModels.set(Number(task.id), preparedModel);
+          }
           const contextReplay = preparedContextReplay(task);
           if (contextReplay !== undefined) preparedContextReplays.push(contextReplay);
         }
@@ -1615,6 +1704,17 @@ export async function openGateway(config: PortConfig, context: Context, options:
           ...preset.choice.configured,
           thinkingLevel: preset.thinkingLevel ?? "off",
         }, ctx);
+      },
+      visionHandoffStats() {
+        return visionHandoff === undefined
+          ? {
+              enabled: false,
+              stats: {
+                requests: 0, rawImages: 0, describedImages: 0, unavailableImages: 0,
+                describerCalls: 0, describerFailures: 0, cacheHits: 0, inputTokens: 0, outputTokens: 0,
+              },
+            }
+          : { enabled: true, describer: visionHandoff.describer, stats: visionHandoff.stats() };
       },
       historyIdentity() {
         return Promise.resolve(storeIdentity);

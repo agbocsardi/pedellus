@@ -56,10 +56,27 @@ not permission to start every branch or run live integrations):
 - [ ] Wire configured MCP connections into the actual gateway and expose their
   registered tools through Code Mode/tool discovery. The current SDK-only Code
   Mode bundle is not MCP connectivity and is not installed by the shipped host.
-- [ ] Prioritize channel-neutral attachment/voice support: shared transcription
-  configuration/processing, Telegram ingress first, native vision for photos and
-  established extraction for supported documents. Choose one initial speech
-  backend; do not translate Python's entire provider registry.
+- [ ] Implement channel-neutral attachment/voice media next: shared transcription
+  configuration/processing, Telegram ingress first, native image content for
+  photos with configured vision handoff, and document saving without extraction.
+  Choose one initial speech backend; do not translate Python's entire provider
+  registry.
+  - [ ] Photos: send native pi-ai image content through the normal gateway turn;
+    a configured vision-capable preset describes images for presets explicitly
+    marked as text-only. Never silently switch the main model, and never refuse
+    a photo merely because the selected preset is text-only.
+  - [ ] Documents: save the original under `workspace/media/` only. This
+    docs-only raw-file behavior overrides the earlier "established extraction"
+    wording: no automatic PDF/OCR/Office extraction libraries and no hidden
+    document pipeline in this slice.
+  - [ ] Voice: local faster-whisper CPU/small/int8, owned by the separate media
+    ingress worker; no cloud-audio upload, backend install or model download in
+    this batch.
+  - [ ] Vision handoff slice (this worktree): config-flagged
+    `needsVisionHandoff` presets, one named describer preset, bounded raw images
+    and descriptions, native `beforeRequest` transform only, focused offline
+    checks. Does not own the Telegram adapter, CLI media options or transcription
+    config.
 - [ ] Add bounded ordinary background workers; scheduled memory curation may then
   be an ordinary cron job using those workers and the existing Markdown tools,
   not a standalone Dream subsystem.
@@ -74,7 +91,12 @@ refresh and document snapshot/manifest freshness rather than adding memory tools
 The owner selected local faster-whisper for the subsequent shared media ingress
 slice, Telegram first; photos/documents remain high priority. No cloud-audio
 upload, backend installation/model download or live integration is authorized by
-this implementation batch.
+this implementation batch. For documents, the owner clarified that saving the
+original file is the whole feature for now: no automatic extraction, PDF, OCR or
+Office processing. That overrides the old "established extraction" wording.
+Photos are submitted as ordinary pi-ai image content through the normal gateway
+turn (the adapter does no vision preprocessing); a configured vision-capable
+preset describes them only for presets explicitly marked text-only.
 
 Then wire product Code Mode + MCP, followed by bounded background workers and
 ordinary scheduled memory curation. Photos/documents remain in the high-priority
@@ -129,6 +151,43 @@ commands, config tool ceiling, outbox unknown-send handling and memory refresh
 remain intact. No deployment or live-delivery claim; no live model/bot run.
 
 ## Session log
+
+### 2026-10-30 — media ingress and configured vision handoff
+
+Owner decisions for the next media slice: the gateway remains the sole Durable
+agent owner; CLI/Telegram are separate conversation surfaces sharing the one
+workspace and Markdown memory. Media follows voice, photos and documents. Photos
+are accepted as normal pi-ai image content plus an adjacent labeled relative
+locator, with the authoritative original image retained in the transcript; the
+adapter does no vision preprocessing. Documents are saved under
+`workspace/media/` only — no automatic extraction, PDF, OCR or Office libraries.
+This explicitly overrides the earlier "established extraction" wording. Local
+faster-whisper CPU/small/int8 transcription belongs to the separate media worker.
+The main model/preset is never silently switched.
+
+Two disjoint media work orders share config/runtime only where stated. The media
+worker owns Telegram/channel ingress, transcription/media config near `telegram`,
+the media config parser, `src/cli.ts`/`runTelegram` options and Telegram files.
+This vision worker owns `src/media/vision*.ts`, narrow vision-only runtime
+model-selection/hook wiring, `MODELS.md` vision documentation, focused vision
+checks and this plan entry. Config is shared but disjoint: this worker owns
+`ModelPreset.needsVisionHandoff`, the `modelPresets` parser change, and
+`PortConfig.visionHandoff` plus its parser/validation near `modelPreset`; the
+media worker's top-level fields and parser stay untouched.
+
+Vision finish line: a flagged text-only preset's model-bound request carries zero
+raw images and is never silently left with them; the configured vision-capable
+describer receives the image; a capable target keeps only the newest bounded raw
+images and gets labeled descriptions for older ones; the persisted transcript,
+original evidence and prepared dispatch are unchanged; invalid, recursive or
+non-vision describer config fails closed; failures and cancellation never
+fabricate a seen image; cache, single-flight, concurrency, image/description
+counts and output are bounded; auxiliary describer calls are disclosed. Work is
+committed on branch `t3/a5ce93e2`; parent integration records the final hash.
+Only faux-model/temp-store checks were run. No live provider, bot, network,
+credentials, personal settings, dependency install, model download or deployment
+was used. The gateway/CLI `5712c98` independent review is still in progress and
+is not marked finished by this slice.
 
 ### 2026-10-30 — channel surfaces and Telegram interactions
 
