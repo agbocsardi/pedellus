@@ -744,8 +744,9 @@ re-derives the episode bounds and the claimed chunk from the committed transcrip
 - when a batch establishes *new* episode bounds, the episode is walked from its start until its first
   closing reset, and that reset must be exactly the one after the claimed end. This proves the bounds
   cannot span an earlier episode's reset. The walk uses the same paged episode scan (memory bounded
-  regardless of episode size) and honors cancellation; continuation chunks keep the `end+1` check but
-  do not walk again. Its cost is therefore one bounded-memory pass over each newly established
+  regardless of episode size) but is not interruptible mid-walk: SQLite reads ignore the context, so
+  an aborted context only prevents the acknowledgement's commit and no cursor advances.
+  Continuation chunks keep the `end+1` check but do not walk again. Its cost is therefore one bounded-memory pass over each newly established
   episode, not per fragment, and it matters only for unusually long episodes. A restart re-verifies
   bounds independently because nothing is persisted about the verification;
 - every entry in the claimed range must exist, fit the 80-entry batch bound, and be the chunk's

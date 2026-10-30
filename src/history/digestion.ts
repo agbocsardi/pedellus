@@ -834,9 +834,11 @@ async function validateFreshEpisodeStart(
 /**
  * Establish that a newly claimed episode really is the segment its start opens: walking the
  * episode from its start, the first reset that closes a non-empty segment must be the one
- * just after the claimed end. Paged reads keep memory bounded and honor cancellation; the
- * walk runs only when new episode bounds are established, not for every continuation chunk,
- * so its total cost is one bounded-memory pass over that episode. Without it, a forged
+ * just after the claimed end. Paged reads keep memory bounded, but the walk is not
+ * interruptible mid-walk (SQLite reads ignore the context); an aborted context only stops
+ * the acknowledgement's commit, so no cursor advances. The walk runs only when new episode
+ * bounds are established, not for every continuation chunk, so its total cost is one
+ * bounded-memory pass over that episode. Without it, a forged
  * partial batch could persist an end that spans an earlier reset; later chunks would then
  * contain that internal reset and be un-acknowledgeable forever, and the poisoned position
  * would keep winning cross-chat priority.
