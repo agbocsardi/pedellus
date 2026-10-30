@@ -388,8 +388,21 @@ export interface Gateway {
    * Prompt content stays metadata-only and no tool authority is added or widened.
    */
   refreshContext(sessionKey: string, context: Context): Promise<GatewayContextRefresh>;
+  /**
+   * Start a new context for one mapped chat session and rebuild its host prompt snapshot from
+   * the current workspace files, so the next request of the new session sees them. Both halves are one
+   * operation: a live run is reported as `busy` before either happens, because a rebuilt snapshot
+   * installed mid-run would change the running turn's later provider request, while a reset alone would
+   * leave the new context with the old prompt. Requests already prepared are untouched.
+   */
+  resetSession(sessionKey: string, context: Context): Promise<GatewaySessionReset>;
   close(context: Context): Promise<void>;
 }
+
+/** Outcome of {@link Gateway.resetSession}; `busy` means nothing was reset and nothing was rebuilt. */
+export type GatewaySessionReset =
+  | { readonly status: "reset"; readonly skills: number; readonly promptRebuilt: boolean }
+  | { readonly status: "busy" };
 
 function bindContextSnapshot(
   value: object | undefined,
@@ -1929,6 +1942,28 @@ export async function openGateway(config: PortConfig, context: Context, options:
         }
         const conversation = await existingConversationFor(sessionKey, ctx);
         return { skills: await refreshContextSnapshot(sessionKey, conversation.id, ctx) };
+      },
+      async resetSession(sessionKey, ctx) {
+        // `/new` may be the first message in a chat, so its own mapped conversation is resolved the
+        // same way `conversationFor` resolves it (creating only that host-supplied key). No other
+        // session selector exists here.
+        const conversation = await gateway.conversationFor(sessionKey, ctx);
+        // Without a host prompt snapshot there is nothing to rebuild: the native reset is the whole effect.
+        if (!options.contextSnapshotProvider) {
+          await conversation.reset(undefined, ctx);
+          return { status: "reset", skills: 0, promptRebuilt: false };
+        }
+        let skills: number;
+        try {
+          // Rebuild first: a live run must be refused before anything changes. The adapter serializes
+          // this chat, so no input of this conversation can start a run between the two steps.
+          skills = await refreshContextSnapshot(sessionKey, conversation.id, ctx);
+        } catch (error) {
+          if (error instanceof ConversationBusy) return { status: "busy" };
+          throw error;
+        }
+        await conversation.reset(undefined, ctx);
+        return { status: "reset", skills, promptRebuilt: true };
       },
       async close(ctx) {
         if (closed) return;

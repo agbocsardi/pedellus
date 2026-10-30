@@ -228,7 +228,15 @@ test('the native menu lists only implemented commands', { timeout: 20_000 }, asy
     harness = start(store, transport);
     await until(() => transport.commands.length === 1, 'command menu registration');
     assert.deepEqual(transport.commands[0].scope, { type: 'all_private_chats' });
-    assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command), ['new', 'abort', 'help']);
+    // This host exposes the model catalog/preset selection and no process restart, so `/restart` is
+    // not advertised here; `/status`, `/model` and the `/stop` alias of `/abort` are. Every
+    // advertised command is implemented.
+    assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command),
+      ['new', 'abort', 'stop', 'status', 'model', 'help']);
+    assert.deepEqual(transport.commands[0].commands.map((entry) => entry.description),
+      ["Reset this conversation's context", 'Stop this turn and withdraw queued messages',
+        'Alias of /abort: stop this turn here', "Show this chat's model and run status",
+        'List or select a configured model preset', 'Show the available commands']);
   } finally {
     await cleanup(store, harness);
   }
