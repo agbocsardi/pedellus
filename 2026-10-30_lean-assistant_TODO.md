@@ -38,4 +38,10 @@ Done for this batch means the retained assistant has a reproducible offline stor
 
 ### 2026-10-30
 
-Owner confirmed the simplification and asked to continue toward a lean assistant with 2–3 implementation subagents at a time. Completed batch resources cleaned up after confirming all worker commits were patch-equivalent in main; unrelated older worktrees left untouched. Archived the former root plans into `plan/`. Baseline `b4fe8f1`: 21,496 source lines; typecheck/build, 71 behavior, 2 execution, 83 offline core acceptance and 48 faux real-flow rehearsal checks passed. This plan chooses useful end-to-end outcomes instead of restarting the old parity roadmap. Next: launch L1/L2/L3 from the committed plan.
+Owner confirmed the simplification and asked to continue toward a lean assistant with 2–3 implementation subagents at a time. Completed batch resources cleaned up after confirming all worker commits were patch-equivalent in main; unrelated older worktrees left untouched. Archived the former root plans into `plan/`. Baseline `b4fe8f1`: 21,496 source lines; typecheck/build, 71 behavior, 2 execution, 83 offline core acceptance and 48 faux real-flow rehearsal checks passed. This plan chooses useful end-to-end outcomes instead of restarting the old parity roadmap. Plan committed as `e3ab5b4f7231835886dd7f6e61c2ad39eaed8537`; launched all three slices from that explicit base:
+
+- `worker-memory-story-4fe2eca5`, pane `w2J:p1`, workspace `w2J`, branch of the same name — L1 memory lifecycle.
+- `worker-cron-outcomes-a308f483`, pane `w2K:p1`, workspace `w2K`, branch of the same name — L2 scheduled outcome notices.
+- `worker-recovery-help-96b2cbb5`, pane `w2M:p1`, workspace `w2M`, branch of the same name — L3 actionable recovery and stopped-store restore.
+
+All use OpenCode Go / DeepSeek v4.1 Flash, high thinking. Runtime regions are disjoint; no shared manifest edits. Await explicit reports, then independent review before integration.
