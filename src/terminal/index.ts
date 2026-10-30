@@ -3,16 +3,8 @@ import { withAbortSignal } from "@earendil-works/chord/context";
 import type { Writable } from "node:stream";
 import { stripVTControlCharacters } from "node:util";
 import { AssistantEntry, ConversationBusy, ToolResultEntry, UserEntry } from "@earendil-works/pi-durable";
-import type {
-  Conversation,
-  ConversationView,
-  Cursor,
-  EntryId,
-  EntryRecord,
-  LiveState,
-  UsageState,
-} from "@earendil-works/pi-durable";
-import type { AssistantMessage, Message, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { Cursor, EntryId, UsageState } from "@earendil-works/pi-durable";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
 import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "../history/episodes.js";
 import {
@@ -29,9 +21,18 @@ import type {
   GatewayModelList,
   GatewayModelSelection,
   GatewayModelSelectionRequest,
-  HistoryEntryPage,
-  HistoryEntryQuery,
 } from "../runtime.js";
+import type {
+  TerminalConversation,
+  TerminalEntry,
+  TerminalEntryPage,
+  TerminalEntryQuery,
+  TerminalMessage,
+  TerminalSettlement,
+  TerminalSnapshot,
+  TerminalStatus,
+  TerminalSubmission,
+} from "./conversation.js";
 
 const MAX_PENDING_INPUTS = 64;
 const MAX_ACTIVE_COMMANDS = 16;
@@ -46,7 +47,6 @@ const DEFAULT_SEARCH_LIMIT = 10;
 const MAX_SEARCH_LIMIT = 50;
 const SEARCH_EXCERPT_CHARS = 600;
 const ENTRY_TEXT_CHARS = 2_000;
-const ENTRY_TOOL_ARGS_CHARS = 400;
 const ENTRY_VIEW_MAX_RADIUS = 5;
 const DEFAULT_EPISODE_LIST_LIMIT = 10;
 const MAX_EPISODE_LIST_LIMIT = 50;
@@ -58,8 +58,6 @@ const HISTORY_VIEW_CHARS = 48_000;
 const MAX_REMEMBERED_ANSWERS = 256;
 const MAX_REMEMBERED_LOCAL_INPUTS = 1_024;
 const MAX_EXTERNAL_RUNS = 64;
-const MAX_STATUS_QUEUE_SCAN = 2_000;
-const MAX_MESSAGE_BLOCK_SCAN = 2_048;
 const LITERAL_SLASH_PREFIX = "//";
 
 export interface TerminalModelSelectionHost {
@@ -99,11 +97,11 @@ export interface TerminalHistoryHost {
   episode(sessionKey: string, startEntryId: EntryId, context: Context): Promise<HistoryEpisode | undefined>;
   entries(
     sessionKey: string,
-    query: HistoryEntryQuery,
+    query: TerminalEntryQuery,
     limit: number,
     cursor: Cursor | undefined,
     context: Context,
-  ): Promise<HistoryEntryPage>;
+  ): Promise<TerminalEntryPage>;
 }
 
 export interface TerminalIO {
@@ -125,11 +123,7 @@ export interface TerminalIO {
   readonly history?: TerminalHistoryHost;
 }
 
-type InboxView = { items?: readonly { mode?: string }[] };
-type RunView = { taskId: number; inputs: readonly number[] };
-type NativeSubmission = Awaited<ReturnType<Conversation["submit"]>>;
-type SettledSubmission = Awaited<ReturnType<NativeSubmission["wait"]>>;
-type LocalSubmission = { id: number; submission: NativeSubmission; runTaskId?: number; finalized?: boolean };
+type LocalSubmission = { id: number; submission: TerminalSubmission; runTaskId?: number; finalized?: boolean };
 type GenerationOutput = {
   attempt: number;
   streamed: string;
@@ -150,7 +144,7 @@ type ExternalRun = {
 
 /** Observe one existing Durable conversation and present its committed model text in a local terminal. */
 export async function runTerminalConversation(
-  conversation: Conversation,
+  conversation: TerminalConversation,
   context: Context,
   io: TerminalIO,
 ): Promise<void> {
@@ -160,6 +154,12 @@ export async function runTerminalConversation(
   const observerContext = withAbortSignal(observerController.signal, operationContext);
   const signal = operationContext.abortSignal;
   const observerSignal = observerContext.abortSignal;
+  // Prime the input source before any awaited remote setup. Readline and similar
+  // async iterables only attach their line listener on the first next(), so an
+  // immediate piped line or EOF would otherwise be lost while the watch attaches.
+  // Only one item is pulled early; later lines stay in the source's own buffer
+  // until the loop consumes them.
+  const input = primedInput(io.input);
   const watch = await conversation.watch(observerContext);
   const submissions = new Map<number, LocalSubmission>();
   const runOutputs = new Map<number, RunOutput>();
@@ -253,15 +253,9 @@ export async function runTerminalConversation(
   };
 
   const latestExternalAnswer = (
-    entries: readonly EntryRecord[],
+    snapshot: TerminalSnapshot,
     taskId: number,
-  ): EntryRecord | undefined => {
-    for (let index = entries.length - 1; index >= 0; index--) {
-      const entry = entries[index]!;
-      if (AssistantEntry.is(entry) && entry.byTaskId === taskId) return entry;
-    }
-    return undefined;
-  };
+  ) => snapshot.answers.find((answer) => answer.taskId === taskId);
 
   /**
    * A run admitted by another host path (for example a scheduled origin-mode cron turn) has no local
@@ -272,10 +266,10 @@ export async function runTerminalConversation(
    * reconcile against a settlement.
    */
   const finalizeExternalRun = async (
-    view: ConversationView,
+    snapshot: TerminalSnapshot,
     external: ExternalRun,
   ): Promise<void> => {
-    const answer = latestExternalAnswer(view.entries, external.taskId);
+    const answer = latestExternalAnswer(snapshot, external.taskId);
     if (answer === undefined) {
       await rawNotice(
         "A turn admitted before or outside this terminal ended without an attributable assistant reply; use /history to inspect the conversation.",
@@ -283,10 +277,9 @@ export async function runTerminalConversation(
       );
       return;
     }
-    if (!rememberAnswer(answer.id)) return;
-    const message = answer.model?.[0];
-    const stopReason = message?.role === "assistant" ? message.stopReason : undefined;
-    const finalText = sanitizeTerminalText(assistantText(message as AssistantMessage));
+    if (!rememberAnswer(answer.entryId)) return;
+    const stopReason = answer.stopReason;
+    const finalText = sanitizeTerminalText(answer.text);
     if (stopReason === "error" || stopReason === "aborted") {
       await rawNotice(
         `A turn admitted before or outside this terminal ended ${stopReason === "error" ? "with a model error" : "after being aborted"}; use /history to inspect it.`,
@@ -321,15 +314,15 @@ export async function runTerminalConversation(
    * one is classified.
    */
   const reconcileExternalRuns = async (
-    view: ConversationView,
-    run: RunView | undefined,
+    snapshot: TerminalSnapshot,
+    run: TerminalSnapshot["run"],
   ): Promise<void> => {
     const currentInputs = run?.inputs ?? [];
     for (const [key, external] of [...externalRuns]) {
       const stillCurrent = currentInputs.includes(external.rootInput);
-      if (run === undefined || !stillCurrent) {
+      if (run === undefined || snapshot.run === undefined || !stillCurrent) {
         externalRuns.delete(key);
-        await finalizeExternalRun(view, external);
+        await finalizeExternalRun(snapshot, external);
         continue;
       }
       // A local input joined this run (or a local admission was observed late): local settlement
@@ -371,16 +364,15 @@ export async function runTerminalConversation(
     return run.generation;
   };
 
-  const streamView = async (view: ConversationView): Promise<void> => {
-    const live = view.docs["pi.live"] as unknown as LiveState | undefined;
-    const run = live?.run as RunView | undefined;
+  const streamView = async (snapshot: TerminalSnapshot): Promise<void> => {
+    const run = snapshot.run;
     if (run === undefined) {
       // Keep the final streamed line open until the submission receipt is reconciled below.
       for (const state of runOutputs.values()) if (state.generation?.active) state.generation.active = false;
-      await reconcileExternalRuns(view, undefined);
+      await reconcileExternalRuns(snapshot, undefined);
       return;
     }
-    await reconcileExternalRuns(view, run);
+    await reconcileExternalRuns(snapshot, run);
     // Delayed watch snapshots may predate the settled assistant entry reconciled below.
     if (runOutputs.get(run.taskId)?.generation?.finalized) return;
 
@@ -416,7 +408,7 @@ export async function runTerminalConversation(
     // out to own a local input after all, local settlement owns its answer and partial rendering.
     dropExternalRunFor(run.inputs);
     const state = responseState(run.taskId);
-    const generation = live?.generation;
+    const generation = run.generation;
     if (state.finalized && (generation === undefined || state.attempt === generation.attempt)) return;
     if (generation === undefined) {
       if (state.active) {
@@ -442,8 +434,8 @@ export async function runTerminalConversation(
       state.active = true;
     }
 
-    const partial = generation.message as AssistantMessage | undefined;
-    const current = sanitizePartialText(assistantText(partial));
+    const partial = generation.text;
+    const current = sanitizePartialText(partial);
     if (!current || state.desynchronized || state.truncated || current === state.streamed) return;
     if (!current.startsWith(state.streamed)) {
       // A committed partial can be revised by a provider. Never duplicate or leak a replacement over prior output.
@@ -467,8 +459,8 @@ export async function runTerminalConversation(
     }
   };
 
-  watch.start(async (view) => {
-    const callback = serializeRender(() => streamView(view));
+  watch.start(async (snapshot) => {
+    const callback = serializeRender(() => streamView(snapshot));
     watchCallbacks.add(callback);
     try {
       await callback;
@@ -482,11 +474,11 @@ export async function runTerminalConversation(
     if (![...submissions.values()].some((submission) => submission.runTaskId === taskId)) runOutputs.delete(taskId);
   };
 
-  const finishSubmission = async (submissionId: number, settled: SettledSubmission): Promise<void> => {
-    if (settled.status === "done" && settled.type === "input") {
-      const entry = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), operationContext);
-      const message = entry?.model?.[0] as AssistantMessage | undefined;
-      const finalText = sanitizeTerminalText(assistantText(message));
+  const finishSubmission = async (submissionId: number, settled: TerminalSettlement): Promise<void> => {
+    if (settled.status === "done" && settled.type === "input" && settled.answer !== undefined) {
+      const answerId = settled.answer;
+      const answer = await conversation.answer(answerId, operationContext);
+      const finalText = sanitizeTerminalText(answer.text);
       await serializeRender(async () => {
         const local = submissions.get(submissionId);
         const taskId = local?.runTaskId;
@@ -501,7 +493,7 @@ export async function runTerminalConversation(
           generation.finalized = true;
           generation.active = false;
         }
-        if (!rememberAnswer(settled.answer)) return;
+        if (!rememberAnswer(answerId)) return;
 
         if (finalText.length === 0) {
           if (generation?.streamed.length === 0) await rawNotice("The assistant returned no text response.");
@@ -543,11 +535,11 @@ export async function runTerminalConversation(
       });
     } else if (settled.status === "unanswered") {
       if (settled.reason !== "aborted") unansweredObserved = true;
-      await notice(`Turn ended: ${safeReason(settled.reason)}`, true);
+      await notice(`Turn ended: ${safeReason(settled.reason ?? "unknown")}`, true);
     }
   };
 
-  const waitForSubmission = (id: number, submission: Awaited<ReturnType<Conversation["submit"]>>): void => {
+  const waitForSubmission = (id: number, submission: TerminalSubmission): void => {
     let task!: Promise<void>;
     task = submission.wait(observerContext)
       .then((settled) => finishSubmission(id, settled))
@@ -575,10 +567,7 @@ export async function runTerminalConversation(
     reservedInputs++;
     const operation = admissionTail.then(async () => {
       if (signal?.aborted) throw signal.reason;
-      const submission = await conversation.submit(
-        { type: "input", content },
-        operationContext,
-      );
+      const submission = await conversation.submit(content, operationContext);
       submissions.set(submission.id, { id: submission.id, submission });
       rememberLocalInput(submission.id);
       waitForSubmission(submission.id, submission);
@@ -609,9 +598,8 @@ export async function runTerminalConversation(
       const page = await conversation.entries({ order: "descending" }, limit, cursor, operationContext);
       scanned += page.items.length;
       for (const entry of page.items) {
-        for (let index = (entry.model?.length ?? 0) - 1; index >= 0; index--) {
-          const message = entry.model![index]!;
-          const formatted = formatHistoryMessage(message);
+        for (let index = entry.messages.length - 1; index >= 0; index--) {
+          const formatted = formatHistoryMessage(entry.messages[index]!);
           if (formatted !== undefined) messages.push(formatted);
           if (messages.length >= count) break;
         }
@@ -856,11 +844,8 @@ export async function runTerminalConversation(
     let selectedSeen = false;
     let conversationId: number;
     try {
-      const page: HistoryEntryPage = host === undefined
-        ? await (async () => {
-          const result = await conversation.entries({ order: "ascending", minEntryId, maxEntryId }, parsed.radius * 2 + 1, undefined, operationContext);
-          return { conversationId: conversation.id, sessionKey, items: result.items };
-        })()
+      const page: TerminalEntryPage = host === undefined
+        ? await conversation.entries({ order: "ascending", minEntryId, maxEntryId }, parsed.radius * 2 + 1, undefined, operationContext)
         : await host.entries(sessionKey, { order: "ascending", minEntryId, maxEntryId }, parsed.radius * 2 + 1, undefined, operationContext);
       conversationId = page.conversationId;
       rows = [];
@@ -889,8 +874,8 @@ export async function runTerminalConversation(
   const showModel = async (args: string): Promise<void> => {
     const host = io.modelSelection;
     if (!host) {
-      const agent = await conversation.agent(operationContext);
-      const model = modelLabel(agent.model);
+      const status = await conversation.status(operationContext);
+      const model = modelLabel(status.model);
       await notice(args.trim()
         ? `Model changes are host-controlled and unavailable here. Current model: ${model}.`
         : `Current model: ${model}.`);
@@ -1014,45 +999,20 @@ export async function runTerminalConversation(
   };
 
   const showStatus = async (): Promise<void> => {
-    const agent = await conversation.agent(operationContext);
-    const viewState = await conversation.viewState(operationContext);
-    let lines: string[];
-    try {
-      const view = viewState.value;
-      const live = view.docs["pi.live"] as unknown as LiveState | undefined;
-      const inbox = view.docs["pi.inbox"] as unknown as InboxView | undefined;
-      const usage = view.docs["pi.usage"] as unknown as UsageState | undefined;
-      const queued = inbox?.items ?? [];
-      const modeCounts = { steer: 0, followUp: 0, write: 0 };
-      const scanned = Math.min(queued.length, MAX_STATUS_QUEUE_SCAN);
-      for (let index = 0; index < scanned; index++) {
-        const mode = queued[index]!.mode;
-        if (mode === "steer" || mode === "followUp" || mode === "write") modeCounts[mode]++;
-      }
-      const queueSummary = `steer=${modeCounts.steer} followUp=${modeCounts.followUp} write=${modeCounts.write}`;
-      const queueNote = queued.length > scanned ? ` (mode counts first ${scanned})` : "";
-      const run = live?.run;
-      const taskSummary = run === undefined
-        ? "idle"
-        : `busy (run task ${run.taskId}, ${run.inputs.length} input(s)${live?.generation ? `, generation attempt ${live.generation.attempt}` : ""})`;
-      const tools = live?.tools ?? [];
-      const toolsScanned = Math.min(tools.length, MAX_STATUS_QUEUE_SCAN);
-      let runningTools = 0;
-      let pendingTools = 0;
-      for (let index = 0; index < toolsScanned; index++) {
-        if (tools[index]!.status === "running") runningTools++;
-        else if (tools[index]!.status === "pending") pendingTools++;
-      }
-      const toolsNote = tools.length > toolsScanned ? ` (first ${toolsScanned})` : "";
-      const compactions = live?.compactions?.length ?? 0;
-      lines = [
-        `Model: ${modelLabel(agent.model)}`,
-        `Run: ${taskSummary}`,
-        `Native inbox: ${queued.length} queued (${queueSummary}${queueNote}); model tools running=${runningTools} pending=${pendingTools}${toolsNote}; compactions=${compactions}`,
-        ...formatUsage(usage),
-        "Provider-side charges or usage not recorded by Durable: unknown (not inferred as zero).",
-      ];
-    } finally { viewState.dispose(); }
+    const status: TerminalStatus = await conversation.status(operationContext);
+    const queueSummary = `steer=${status.inbox.steer} followUp=${status.inbox.followUp} write=${status.inbox.write}`;
+    const queueNote = status.inbox.total > status.inbox.scanned ? ` (mode counts first ${status.inbox.scanned})` : "";
+    const taskSummary = status.run === undefined
+      ? "idle"
+      : `busy (run task ${status.run.taskId}, ${status.run.inputs} input(s)${status.run.attempt === undefined ? "" : `, generation attempt ${status.run.attempt}`})`;
+    const toolsNote = status.tools.total > status.tools.scanned ? ` (first ${status.tools.scanned})` : "";
+    const lines = [
+      `Model: ${modelLabel(status.model)}`,
+      `Run: ${taskSummary}`,
+      `Native inbox: ${status.inbox.total} queued (${queueSummary}${queueNote}); model tools running=${status.tools.running} pending=${status.tools.pending}${toolsNote}; compactions=${status.compactions}`,
+      ...formatUsage(status.usage),
+      "Provider-side charges or usage not recorded by Durable: unknown (not inferred as zero).",
+    ];
     await notice(lines.join("\n"));
   };
 
@@ -1105,7 +1065,7 @@ export async function runTerminalConversation(
         return;
       case "compact": {
         if (args.trim()) { await notice("Usage: /compact", true); return; }
-        const taskId = await conversation.compact(undefined, operationContext);
+        const taskId = await conversation.compact(operationContext);
         await notice(`Native compaction task ${taskId} admitted. Summary placement follows Durable conversation boundaries.`);
         return;
       }
@@ -1116,7 +1076,7 @@ export async function runTerminalConversation(
         return;
       case "new":
         if (args.trim()) { await notice("Usage: /new", true); return; }
-        await conversation.reset(undefined, operationContext);
+        await conversation.reset(operationContext);
         await notice("Native Durable context reset admitted for this same conversation: no handoff, summary or extra model call, earlier entries stay stored and listed by /history, and tool authority is unchanged. While busy it lands at the next safe boundary; queued inputs placed with it run in the new context.");
         return;
       default:
@@ -1161,7 +1121,7 @@ export async function runTerminalConversation(
 
   try {
     io.prompt?.();
-    for await (const line of io.input) {
+    for await (const line of input) {
       if (signal?.aborted) break;
       // This bounds admitted content after the source yields a complete line, not its ingress buffer.
       if (line.length > MAX_ADMITTED_LINE_CODE_UNITS) {
@@ -1197,14 +1157,10 @@ export async function runTerminalConversation(
     while (waits.size > 0 && !signal?.aborted) {
       await Promise.race([...waits]);
       if (!inputEnded || !unansweredObserved || signal?.aborted || waits.size === 0) continue;
-      const state = await conversation.viewState(operationContext);
-      let idle = false;
-      try {
-        const live = state.value.docs["pi.live"] as unknown as LiveState | undefined;
-        idle = live?.run === undefined;
-      } finally { state.dispose(); }
+      const status = await conversation.status(operationContext);
+      const idle = status.run === undefined;
       if (idle) {
-        const queued: NativeSubmission[] = [];
+        const queued: TerminalSubmission[] = [];
         for (const local of submissions.values()) {
           if ((await local.submission.status(operationContext)).status === "queued") queued.push(local.submission);
         }
@@ -1237,32 +1193,46 @@ export async function runTerminalConversation(
   if (outputFailure !== undefined) throw outputFailure;
 }
 
-function assistantText(message: AssistantMessage | undefined, maxChars = MAX_RESPONSE_CHARS + 1): string {
-  if (message?.role !== "assistant") return "";
-  let text = "";
-  for (let index = 0; index < message.content.length && index < MAX_MESSAGE_BLOCK_SCAN; index++) {
-    if (text.length >= maxChars) break;
-    const part = message.content[index]!;
-    if (part.type === "text") text += part.text.slice(0, maxChars - text.length);
-  }
-  return text;
+/**
+ * Start one source read immediately, then yield it before iterating normally.
+ *
+ * The early read is kept awaitable for the terminal loop and marked handled so a
+ * failure before the loop starts cannot surface as an unhandled rejection. The
+ * generator's finally releases the source iterator if the loop is abandoned.
+ */
+function primedInput(source: AsyncIterable<string>): AsyncIterable<string> {
+  const iterator = source[Symbol.asyncIterator]();
+  const first = iterator.next();
+  first.catch(() => undefined);
+  return {
+    [Symbol.asyncIterator]() {
+      return (async function* () {
+        try {
+          const initial = await first;
+          if (initial.done === true) return;
+          yield initial.value;
+          while (true) {
+            const next = await iterator.next();
+            if (next.done === true) return;
+            yield next.value;
+          }
+        } finally {
+          if (iterator.return !== undefined) {
+            try {
+              await iterator.return();
+            } catch {
+              // Closing an input source is best effort; read failures propagate through next().
+            }
+          }
+        }
+      })();
+    },
+  };
 }
 
-function formatHistoryMessage(message: Message): string | undefined {
+function formatHistoryMessage(message: TerminalMessage): string | undefined {
   if (message.role !== "user" && message.role !== "assistant") return undefined;
-  const rawLimit = HISTORY_TEXT_CHARS * 4 + 33;
-  let text: string;
-  if (message.role === "assistant") text = assistantText(message as AssistantMessage, rawLimit);
-  else if (typeof message.content === "string") text = message.content.slice(0, rawLimit);
-  else {
-    text = "";
-    for (let index = 0; index < message.content.length && index < MAX_MESSAGE_BLOCK_SCAN; index++) {
-      if (text.length >= rawLimit) break;
-      const part = message.content[index]!;
-      if (part.type === "text") text += part.text.slice(0, rawLimit - text.length);
-    }
-  }
-  const cleaned = sanitizeTerminalText(text).trim();
+  const cleaned = sanitizeTerminalText(message.text).trim();
   if (!cleaned) return undefined;
   const characters = Array.from(cleaned);
   const snippet = characters.length > HISTORY_TEXT_CHARS
@@ -1531,68 +1501,40 @@ function formatHistoryCoverage(coverage: HistoryCoverage): string[] {
   return lines;
 }
 
-function formatBrowsedEntry(entry: EntryRecord, selected: boolean): string | undefined {
+function formatBrowsedEntry(entry: TerminalEntry, selected: boolean): string | undefined {
   const body = browsedEntryBody(entry);
   if (body === undefined) return undefined;
   const text = completePrefix(sanitizeTerminalText(body.text), ENTRY_TEXT_CHARS).trim();
   if (!text) return undefined;
   const flags: string[] = [];
   if (selected) flags.push("selected");
-  if (entry.edits !== undefined) flags.push("raw entry; context edits not applied");
+  if (entry.edited === true) flags.push("raw entry; context edits not applied");
   return [
     `#${entry.id} [${body.label}] kind=${safeLabel(entry.kind, 40)}${flags.length === 0 ? "" : ` (${flags.join("; ")})`}`,
     `  ${text.replace(/\n/g, "\n  ")}`,
   ].join("\n");
 }
 
-function browsedEntryBody(entry: EntryRecord): { readonly label: string; readonly text: string } | undefined {
-  const message = entry.model?.[0];
+function browsedEntryBody(entry: TerminalEntry): { readonly label: string; readonly text: string } | undefined {
+  const message = entry.messages[0];
+  if (message === undefined) return undefined;
   if (entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND) {
-    if (message?.role !== "user") return undefined;
-    const text = messageText(message.content);
-    return text.trim() ? { label: entry.kind === CRON_INPUT_ENTRY_KIND ? "user (cron)" : "user", text } : undefined;
+    if (message.role !== "user") return undefined;
+    return message.text.trim() ? { label: entry.kind === CRON_INPUT_ENTRY_KIND ? "user (cron)" : "user", text: message.text } : undefined;
   }
-  if (AssistantEntry.is(entry)) {
-    if (message?.role !== "assistant") return undefined;
-    let text = "";
-    for (let index = 0; index < message.content.length && index < MAX_MESSAGE_BLOCK_SCAN; index++) {
-      const part = message.content[index]!;
-      if (part.type === "text") text += part.text;
-      else if (part.type === "toolCall") {
-        const args = boundedJson(part.arguments, ENTRY_TOOL_ARGS_CHARS);
-        text += `\n[tool call ${safeLabel(part.name, 80)}${args === undefined ? "" : ` ${args}`}]`;
-      }
+  if (entry.kind === AssistantEntry.kind) {
+    if (message.role !== "assistant") return undefined;
+    let text = message.text;
+    for (const call of message.toolCalls ?? []) {
+      text += `\n[tool call ${safeLabel(call.name, 80)}${call.argumentsText === undefined ? "" : ` ${sanitizeTerminalText(call.argumentsText)}`}]`;
     }
     return text.trim() ? { label: "assistant", text } : undefined;
   }
-  if (ToolResultEntry.is(entry)) {
-    if (message?.role !== "toolResult") return undefined;
-    const text = messageText(message.content);
-    return { label: `tool ${safeLabel(message.toolName, 80)}`, text: text.trim() ? text : "(no text content)" };
+  if (entry.kind === ToolResultEntry.kind) {
+    if (message.role !== "toolResult") return undefined;
+    return { label: `tool ${safeLabel(message.toolName ?? "unknown", 80)}`, text: message.text.trim() ? message.text : "(no text content)" };
   }
   return undefined;
-}
-
-function messageText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  let text = "";
-  for (let index = 0; index < content.length && index < MAX_MESSAGE_BLOCK_SCAN; index++) {
-    const part: unknown = content[index];
-    if (part === null || typeof part !== "object") continue;
-    const block = part as { readonly type?: unknown; readonly text?: unknown };
-    if (block.type === "text" && typeof block.text === "string") text += block.text;
-  }
-  return text;
-}
-
-function boundedJson(value: unknown, maxChars: number): string | undefined {
-  try {
-    const json = JSON.stringify(value);
-    return json === undefined ? undefined : completePrefix(sanitizeTerminalText(json), maxChars);
-  } catch {
-    return "(unserializable)";
-  }
 }
 
 function formatHistoryTimestamp(value: number): string {

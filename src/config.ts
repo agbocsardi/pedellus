@@ -19,6 +19,7 @@ import {
 } from "./context/skills.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
 import { parseMcpConfig, type McpConfig } from "./mcp/config.js";
+import { VISION_HANDOFF_DEFAULTS, VISION_HANDOFF_LIMITS } from "./media/vision.js";
 
 const CREDENTIAL_PROVIDERS = [
   "anthropic",
@@ -48,6 +49,28 @@ export interface ModelReference {
 /** One named model choice: provider, native model ID, and an optional thinking level. */
 export interface ModelPreset extends ModelReference {
   readonly thinkingLevel?: ModelThinkingLevel;
+  /**
+   * The preset's model cannot take images. Its requests keep zero raw images:
+   * every image is replaced by a describer preset's text description. Presets
+   * that share a provider/model pair must agree, so the flag never collapses
+   * ambiguously into pair-only matching at request time.
+   */
+  readonly needsVisionHandoff?: boolean;
+}
+
+/**
+ * Configured vision handoff. Presence enables it; a preset marked
+ * `needsVisionHandoff` is a startup error without it.
+ */
+export interface VisionHandoffConfig {
+  /** Named preset whose vision-capable model describes images. */
+  readonly describerPreset: string;
+  /** Newest images kept raw for a vision-capable target. */
+  readonly maxRawImages: number;
+  /** Output token ceiling for one description. */
+  readonly maxDescriptionTokens: number;
+  /** Optional describer instruction override. */
+  readonly prompt?: string;
 }
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -104,6 +127,11 @@ export interface PortConfig {
   modelPresets?: Readonly<Record<string, ModelPreset>>;
   /** Configured default preset name; absent means legacy direct `model` selection. */
   modelPreset?: string;
+  /**
+   * Image handoff for flagged text-only presets and the raw-image bound for
+   * vision-capable ones. Absent leaves model requests untouched.
+   */
+  visionHandoff?: VisionHandoffConfig;
   /** Host-owned global ceiling; conversations may only narrow it. Empty means tools are disabled. */
   toolAllowlist?: readonly string[];
   /**
@@ -205,18 +233,92 @@ function modelPresetsConfig(value: unknown): Readonly<Record<string, ModelPreset
     const name = modelPresetName(rawName, "modelPresets name");
     const preset = object(entry, `modelPresets.${name}`);
     for (const key of Object.keys(preset)) {
-      if (key !== "provider" && key !== "modelId" && key !== "thinkingLevel") {
+      if (key !== "provider" && key !== "modelId" && key !== "thinkingLevel" && key !== "needsVisionHandoff") {
         throw new Error(`Unknown modelPresets.${name} field: ${key}`);
       }
+    }
+    if (preset.needsVisionHandoff !== undefined && typeof preset.needsVisionHandoff !== "boolean") {
+      throw new Error(`modelPresets.${name}.needsVisionHandoff must be a boolean`);
     }
     presets[name] = Object.freeze({
       ...modelReference(preset, `modelPresets.${name}`),
       ...(preset.thinkingLevel === undefined
         ? {}
         : { thinkingLevel: modelThinkingLevel(preset.thinkingLevel, `modelPresets.${name}.thinkingLevel`) }),
+      ...(preset.needsVisionHandoff === true ? { needsVisionHandoff: true } : {}),
     });
   }
+  // A request is matched to a target preset by its native provider/model pair.
+  // Same-pair presets may differ in thinking level, never in whether images fit:
+  // otherwise the flag would silently collapse into pair-only matching.
+  const flagsByPair = new Map<string, { readonly name: string; readonly flag: boolean }>();
+  for (const [name, preset] of Object.entries(presets)) {
+    const key = modelKey(preset);
+    const flag = preset.needsVisionHandoff === true;
+    const previous = flagsByPair.get(key);
+    if (previous !== undefined && previous.flag !== flag) {
+      throw new Error(
+        `modelPresets.${name}.needsVisionHandoff conflicts with modelPresets.${previous.name} ` +
+        "for the same provider/model pair",
+      );
+    }
+    flagsByPair.set(key, { name, flag });
+  }
   return Object.freeze(presets);
+}
+
+function visionHandoffConfig(
+  value: unknown,
+  modelPresets: Readonly<Record<string, ModelPreset>> | undefined,
+): VisionHandoffConfig {
+  const raw = object(value, "visionHandoff");
+  for (const key of Object.keys(raw)) {
+    if (key !== "describerPreset" && key !== "maxRawImages" && key !== "maxDescriptionTokens" && key !== "prompt") {
+      throw new Error(`Unknown visionHandoff field: ${key}`);
+    }
+  }
+  if (modelPresets === undefined) {
+    throw new Error("visionHandoff requires named modelPresets and a describerPreset");
+  }
+  const describerPreset = modelPresetName(raw.describerPreset, "visionHandoff.describerPreset");
+  const preset = Object.hasOwn(modelPresets, describerPreset) ? modelPresets[describerPreset] : undefined;
+  if (preset === undefined) {
+    throw new Error("visionHandoff.describerPreset must name an entry in modelPresets");
+  }
+  if (preset.needsVisionHandoff === true) {
+    throw new Error("visionHandoff.describerPreset must not be a preset that itself needs vision handoff");
+  }
+  let maxRawImages = VISION_HANDOFF_DEFAULTS.maxRawImages;
+  if (raw.maxRawImages !== undefined) {
+    if (typeof raw.maxRawImages !== "number" || !Number.isSafeInteger(raw.maxRawImages)
+      || raw.maxRawImages < 0 || raw.maxRawImages > VISION_HANDOFF_LIMITS.maxRawImages) {
+      throw new Error(`visionHandoff.maxRawImages must be an integer from 0 to ${VISION_HANDOFF_LIMITS.maxRawImages}`);
+    }
+    maxRawImages = raw.maxRawImages;
+  }
+  let maxDescriptionTokens = VISION_HANDOFF_DEFAULTS.maxDescriptionTokens;
+  if (raw.maxDescriptionTokens !== undefined) {
+    if (typeof raw.maxDescriptionTokens !== "number" || !Number.isSafeInteger(raw.maxDescriptionTokens)
+      || raw.maxDescriptionTokens < 1 || raw.maxDescriptionTokens > VISION_HANDOFF_LIMITS.maxDescriptionTokens) {
+      throw new Error(
+        `visionHandoff.maxDescriptionTokens must be an integer from 1 to ${VISION_HANDOFF_LIMITS.maxDescriptionTokens}`,
+      );
+    }
+    maxDescriptionTokens = raw.maxDescriptionTokens;
+  }
+  let prompt: string | undefined;
+  if (raw.prompt !== undefined) {
+    prompt = nonempty(raw.prompt, "visionHandoff.prompt");
+    if (prompt.length > VISION_HANDOFF_LIMITS.maxPromptChars) {
+      throw new Error(`visionHandoff.prompt must be at most ${VISION_HANDOFF_LIMITS.maxPromptChars} characters`);
+    }
+  }
+  return Object.freeze({
+    describerPreset,
+    maxRawImages,
+    maxDescriptionTokens,
+    ...(prompt === undefined ? {} : { prompt }),
+  });
 }
 
 function workspaceSkillsConfig(value: unknown): WorkspaceSkillsConfig {
@@ -433,6 +535,19 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
       ...(summaryModel === undefined ? {} : { model: summaryModel }),
       ...(summaryPreset === undefined ? {} : { preset: summaryPreset }),
     };
+  }
+  if (raw.visionHandoff !== undefined) {
+    Object.assign(config, { visionHandoff: visionHandoffConfig(raw.visionHandoff, modelPresets) });
+  }
+  if (modelPresets !== undefined) {
+    const flagged = Object.entries(modelPresets)
+      .filter(([, preset]) => preset.needsVisionHandoff === true)
+      .map(([name]) => name);
+    if (flagged.length > 0 && config.visionHandoff === undefined) {
+      throw new Error(
+        `modelPresets.${flagged[0]}.needsVisionHandoff requires visionHandoff with a vision-capable describerPreset`,
+      );
+    }
   }
   if (raw.thinkingLevel !== undefined) {
     config.thinkingLevel = modelThinkingLevel(raw.thinkingLevel, "thinkingLevel");

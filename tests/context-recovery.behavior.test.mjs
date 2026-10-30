@@ -228,7 +228,7 @@ async function writeConfig(temp, workspace, dataDir, providerId, modelId = "synt
 }
 
 async function runStartupCli(configFile, options = {}) {
-  const cli = spawn(process.execPath, [resolve(pkg, "dist/cli.js"), "--config", configFile], {
+  const cli = spawn(process.execPath, [resolve(pkg, "dist/cli.js"), "gateway", "--config", configFile], {
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, ...(options.env ?? {}) },
   });
