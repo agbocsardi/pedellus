@@ -1,7 +1,7 @@
 # Port plan v2 — ship-first sequencing
 
 > **Historical — superseded 2026-10-29** by the
-> [assistant tree plan](../2026-10-29_assistant-tree_TODO.md).
+> [assistant tree plan](2026-10-29_assistant-tree_TODO.md).
 > Preserve this file as implementation evidence. Its checklists, priorities,
 > authorizations and authority claims are historical, not the current work queue.
 

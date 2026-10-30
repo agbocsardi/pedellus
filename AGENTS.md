@@ -36,8 +36,8 @@ npm start -- --config config.json   # local CLI against a config file
   summaries, rebuildable message/tool/summary search, and the read-only
   model-facing `history` tool. Original transcript entries remain authoritative.
 - `src/channels/` — Telegram adapter; other channels are not ported.
-- `2026-10-29_assistant-tree_TODO.md` — current scope and work-order authority:
-  CLI + Telegram trunk, then tools, delegation and more channels.
+- `2026-10-30_lean-assistant_TODO.md` — single current work order:
+  useful memory, scheduled outcomes and understandable recovery before breadth.
 - `plan/` — historical roadmaps and implementation evidence, not a work queue.
 
 ## Invariants worth not breaking

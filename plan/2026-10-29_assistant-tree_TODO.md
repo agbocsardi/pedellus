@@ -1,5 +1,8 @@
 # Assistant tree — usable first, breadth second
 
+> Archived after simplification. The [lean assistant plan](../2026-10-30_lean-assistant_TODO.md)
+> is the active work order; this document preserves the former scope and evidence.
+
 ## Checklist
 
 - [x] Complete the owner-authorized [removal-first simplification](2026-10-30_simplification_TODO.md) before continuing trunk acceptance.
@@ -15,7 +18,7 @@
 - [ ] B3 — Add Discord, Email and WebSocket, one channel at a time.
 - [ ] Revisit leaves after the trunk and major branches are useful.
 
-This is the current scope and work-order authority. Earlier plans in `plan/`
+This is the current scope and work-order authority. Earlier plans in this directory
 are historical evidence, not additional queues. Existing safety and data-integrity
 contracts still apply; their implementation details belong in the relevant docs.
 
