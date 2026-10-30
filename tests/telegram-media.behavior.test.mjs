@@ -194,7 +194,12 @@ function telegramMock(batches, files = new Map()) {
       return response(true);
     }
     if (method === 'getUpdates') {
-      if (batchIndex < batches.length) return response(batches[batchIndex++]);
+      if (batchIndex < batches.length) {
+        const entry = batches[batchIndex++];
+        // A batch may be gated on a promise, so a test can let the next poll happen
+        // after an asynchronous control effect without sleeping.
+        return response(typeof entry === 'function' ? await entry() : entry);
+      }
       return await new Promise((_, reject) => {
         const aborted = () => reject(new DOMException('The operation was aborted', 'AbortError'));
         if (signal?.aborted) return aborted();
@@ -232,6 +237,10 @@ function telegramMock(batches, files = new Map()) {
       downloads.push({ href: url.href, relative, redirect: init.redirect, method: init.method });
       const file = [...files.values()].find((candidate) => candidate.path === relative);
       if (file === undefined) return new Response('missing', { status: 404 });
+      if (typeof file.downloadFailures === 'number' && file.downloadFailures > 0) {
+        file.downloadFailures -= 1;
+        return new Response('busy', { status: 503 });
+      }
       if (file.hang === true) {
         return await new Promise((_, reject) => {
           const aborted = () => reject(new DOMException('The operation was aborted', 'AbortError'));
@@ -725,6 +734,49 @@ test('the same Telegram file sent twice is stored once and every turn keeps the 
     assert.equal(replay.getFileCalls.length, 0);
     assert.equal(requests.length, 2);
     transport.restore();
+  } finally {
+    await cleanup(store, harness, transport);
+  }
+});
+
+test('a control that forces an earlier media message to submit keeps its image content', { timeout: 30_000 }, async () => {
+  const store = await syntheticStore('control-media', { media: { directory: 'media' } });
+  const requests = [];
+  store.faux.setResponses(Array.from({ length: 12 }, () => (request) => {
+    requests.push({ messages: request.messages });
+    return fauxAssistantMessage('CONTROL-PHOTO-OK');
+  }));
+  // The first download is a transient failure, so the photo is still pending when /new arrives.
+  const files = new Map([[
+    'photo-control',
+    { path: 'photos/file_control.jpg', bytes: PHOTO_BYTES, contentType: 'image/jpeg', downloadFailures: 1 },
+  ]]);
+  let releaseNextPoll;
+  const nextPoll = new Promise((resolve) => { releaseNextPoll = resolve; });
+  const transport = telegramMock([
+    [photoUpdate(590, 190, { fileId: 'photo-control', uniqueId: 'unique-control-photo', bytes: PHOTO_BYTES, caption: 'held photo' })],
+    [textUpdate(591, 191, '/new')],
+    async () => { await nextPoll; return []; },
+  ], files);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.some((entry) => /Context reset applied/.test(entry.text)), 'reset acknowledgement');
+    // The transient failure is retried on the next poll, after the control forced the
+    // earlier media message to be submitted first.
+    releaseNextPoll();
+    await until(() => transport.sent.some((entry) => entry.text === 'CONTROL-PHOTO-OK'), 'photo answer');
+    assert.equal(transport.getFileCalls.length >= 1, true);
+
+    const photoTurn = requests
+      .map((request) => userMessages([request]))
+      .find((messages) => messages.some((message) => messageText(message).includes('held photo')));
+    assert.ok(photoTurn, 'the pre-control photo turn reached the model');
+    const images = photoTurn.flatMap((message) => Array.isArray(message.content) ? message.content : [])
+      .filter((part) => part.type === 'image');
+    assert.equal(images.length, 1, 'the forced submission kept the native image content');
+    assert.equal(images[0].data, PHOTO_BYTES.toString('base64'));
+    assert.equal((await mediaFiles(store.workspace)).length, 1);
   } finally {
     await cleanup(store, harness, transport);
   }

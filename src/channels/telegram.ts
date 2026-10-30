@@ -1882,10 +1882,15 @@ export async function runTelegram(
         item.notice !== true && item.chatId === chatId && item.updateId < update.update_id &&
         options.allowFrom.includes(item.senderId))) {
         const earlierConversation = await gateway.conversationFor(earlier.sessionKey, adapterContext);
-        await submitInOrder(chatId, () => earlierConversation.submit(
-          { type: "input", content: earlier.text, requestId: requestIdFor(identity, earlier.updateId) },
-          adapterContext,
-        ));
+        // Prepare attachment content in the same chat order as a normal delivery: a media
+        // message forced ahead of a control must not be submitted as text only.
+        await submitInOrder(chatId, async () => {
+          const content = await prepareInputContent(earlier);
+          return earlierConversation.submit(
+            { type: "input", content, requestId: requestIdFor(identity, earlier.updateId) },
+            adapterContext,
+          );
+        });
       }
       const conversation = await gateway.conversationFor(sessionKey, adapterContext);
       if (command === "new") await conversation.reset(undefined, adapterContext);
