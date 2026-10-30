@@ -52,7 +52,7 @@ npm start -- --config config.json   # local CLI against a config file
   from the coding-tool hook; history remains read-only over mapped chats.
 - Named model presets define provider/model/thinking in config. CLI preset switches
   are temporary: reopening restores the configured preset without rewriting prepared
-  dispatches. Legacy direct-model SDK selection retains its persisted semantics.
+  dispatches. Direct-model (non-preset) selection retains its persisted semantics.
 - The cron timer never calls a model, and a run never schedules: rescheduling is
   a deterministic task commit, so a slow or failed turn cannot stop the schedule.
 - Skill prompts carry names, descriptions and locators only; bodies load on

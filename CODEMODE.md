@@ -115,7 +115,10 @@ capabilities. It is not enabled by default. Code Mode is model-only (scripts
 cannot recursively start Code Mode); native deferred discovery is still available
 to scripts through `searchTools()`.
 
-## Native default-deny and conversation grants
+## Native default-deny and host-selected tools
+
+`extensions`, `tools` and `modelTools` are Durable's native conversation
+configuration, not an expiring grant or a Nanobot authorization step.
 
 `HarnessSettings.extensions` is the native default when an agent has no stored
 extension selection (or a selection cleared with `null`); absent means every
@@ -135,10 +138,10 @@ native configuration APIs, not an authorization service.
 For an enabled conversation, explicitly select the installed bundle extensions
 and exact `ToolRegistration` values in `AgentChange.extensions` and
 `AgentChange.tools`. `modelTools` only filters tools offered directly to the
-model; it does not add an extension, enable a tool, or grant `executeTool()`
+model; it does not add an extension, enable a tool, or enable `executeTool()`
 access. Nested Code Mode calls resolve from the conversation's enabled `tools`
 filtered by `callers: ["tools"]`. The example above keeps `reviewed_echo` out
-of direct model tools while explicitly granting it to nested calls. Tool
+of direct model tools while explicitly enabling it for nested calls. Tool
 registration names alone are not authorization.
 
 These defaults do not revoke persisted selections. An existing conversation
@@ -147,9 +150,10 @@ reopen, even if the Harness now uses `settings.extensions: []`; the creation
 callback is not called for conversations already in storage. Before `harness.resume()`
 (or `submit()`, `wait()`, or another operation that can start scheduling),
 reinstall the extensions, load every persisted conversation, and reapply its
-current host-approved native `configure()` values. For a revoked/ungranted
-conversation, clear the extension override with `extensions: null` (returning to
-the secure Harness default) and explicitly deny tools/model tools, e.g.
+current host-approved native `configure()` values. For a conversation whose
+selection is no longer approved, clear the extension override with
+`extensions: null` (returning to the secure Harness default) and explicitly deny
+tools/model tools, e.g.
 `{ extensions: null, tools: [], modelTools: [] }`. Do this before starting the
 scheduler; the settings default by itself is not a revocation mechanism.
 

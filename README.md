@@ -51,8 +51,9 @@ absent disables coding tools; the opt-in read-only `skill` tool is separate.
 Scheduled isolated runs inherit a bounded subset captured from an authenticated
 origin and stay bounded by current host config, so narrowing the list and
 reopening also narrows those runs; pending calls for a removed tool fail closed.
-There is no per-chat approval, grant or expiry step — every Telegram user in
-`allowFrom` shares the configured workspace and tool authority, so allowlist only
+Every Telegram user in
+`allowFrom` shares the configured workspace and tool authority;
+there is no per-chat approval or expiry step, so allowlist only
 trusted users. The local CLI's `/tools` is a read-only diagnostic. A deployment
 may select the optional direct-workspace Bubblewrap shell with
 `toolSandbox: "bwrap"`; it is off by default, wraps shell commands only, and

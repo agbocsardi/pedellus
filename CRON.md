@@ -78,12 +78,12 @@ the run phase waits directly.
 
 `createCronFoundation({ prepare })` accepts one optional host callback. It receives the origin and
 target conversation IDs, the job, and the occurrence. It runs inside the commit that chooses the
-run's target conversation, so its writes and the target choice are atomic. It is the only place to
-configure context and tool authorization. Durable initializes a task-owned conversation from
-the origin's agent, including its selected tools and extensions; this slice does not itself copy
-grant records. The host must apply its own deny-by-default policy and recheck authorization, not
-assume the new conversation has no capabilities. The callback must be durable and idempotent
-because a crash before that commit reruns it.
+run's target conversation, so its writes and the target choice are atomic. For a background run it
+is where the gateway installs the origin's bounded workspace context and records the run's
+coding-tool capture. Durable initializes a task-owned conversation from the origin's agent,
+including its selected tools and extensions, so the host must apply its own deny-by-default policy
+instead of assuming the new conversation has no capabilities. The callback must be durable and
+idempotent because a crash before that commit reruns it.
 
 The run stores that target choice once in its checkpoint. A resume after that commit does not
 commit a new checkpoint just to look busy, so Durable's real restart counter is preserved and a
@@ -271,19 +271,22 @@ fault document is itself ignored rather than replacing job or outbox data.
 - Background runs are owned by the run task, so cancelling the job aborts that run. In `origin` mode
   an already-placed origin run is not owned by the run task; cancellation still fences both
   pointers and withdraws a still-queued input, but cannot retract an already-placed run.
-- Origin-mode runs use the origin conversation's current agent, tool selection, and grants at
+- Origin-mode runs use the origin conversation's current agent and configured tool authority at
   request preparation. Background runs provision a fresh task-owned conversation through the
-  trusted `prepare` callback, but inherit the origin's agent selection before preparation. The
-  Gateway's `prepare` copies the origin's still-valid coding-tool grants and offers exactly those
-  tools, so a **background** run cannot schedule another job or widen authority; a different host
-  must apply the same deny-by-default rule. The foundation alone does not copy grant records. The
-  copy is recorded together with the origin conversation in the same commit that creates and
-  configures the target, and stays capped by that origin's current grants; the foundation's optional
-  `finalize` callback lets the host retire the target's authority in every terminal commit of the
-  run (normal completion or error, target missing, job record missing, generation change or
-  cancellation, and ownership fencing) and in the abort handler; only a phase fault or a crash
-  before that commit defers retirement to the next reopen (see below). When the origin has no known
-  owner, `prepare` copies nothing and the run stays default-deny.
+  trusted `prepare` callback but inherit the origin's agent selection before preparation. The
+  gateway records a `nanobot.config-tool-capture` document on the target with the origin
+  conversation ID and the coding-tool names the authenticated origin currently has; it offers
+  exactly those tools, so a **background** run cannot schedule another job or widen authority. A
+  different host must apply the same deny-by-default rule. The capture is a snapshot of names, not
+  a grant: every call must also remain inside the current config `toolAllowlist` and require the
+  recorded origin to still be an authenticated mapped chat, so narrowing the config and reopening
+  narrows a pending run. The capture is written together with the origin conversation in the same
+  commit that creates and configures the target; the foundation's optional `finalize` callback lets
+  the host retire it in every terminal commit of the run (normal completion or error, target
+  missing, job record missing, generation change or cancellation, and ownership fencing) and in the
+  abort handler; only a phase fault or a crash before that commit defers retirement to the next
+  reopen (see below). When the origin has no known owner, `prepare` records no capture and the run
+  stays default-deny.
   When a context snapshot provider is configured, `prepare` also installs the origin's snapshot
   for the target conversation — bootstrap/AGENTS files, memory, the skill summary — and the
   read-only `skill` tool, so a scheduled turn renders the same workspace context as a normal turn.
@@ -295,27 +298,24 @@ fault document is itself ignored rather than replacing job or outbox data.
 - An `origin`-mode run answers in the origin conversation, so it still holds that conversation's
   `cron` tool and can schedule further jobs. Only a background run's fresh conversation is denied
   cron.
-- A background run's copied grants are bounded, not independent. The grant hook requires both the
-  copied grant and the origin's current grant for the name, and blocks once **either** expiry
-  passes: revoking or expiring at the origin takes effect on the run's next call, including after a
-  crash and reopen, and a later origin grant cannot extend the copy. A present-but-malformed origin
-  link, a missing origin grant document or an unknown origin owner fails closed. Because Durable's
-  tool hooks run only in the call phase, the Gateway also reauthorizes every live run target before
-  `resume()`: it intersects the copy with the origin's current grants and clears a copy whose durable
-  link, origin owner or origin document is missing or mismatched, so a new admission after a revoke
-  is not offered the tool. A committed `execute` intent for a native coding tool is `unsafe` and
-  settles as interrupted rather than rerunning. Every terminal commit of a run that already prepared
-  a separate target retires that target's copied grants and tools in the same commit, as does the
-  abort handler, so a completed, failed, cancelled or superseded run leaves no copy behind for a
-  later admission. A phase fault or a crash before the terminal commit still leaves the copy until
-  the next reopen, where the pre-resume pass retires it; in that interval a direct host submission
-  remains bounded by the origin hook.
-  The copy still drives tool selection during the run,
-  so it may be offered a tool the origin just revoked; the call itself is blocked. As for any granted
-  call, one that already passed the hook and recorded intent can still execute.
+- A background run's captured tools are bounded, not independent. The config hook requires each
+  requested name to be in the current config ceiling, in that run's capture, and the recorded
+  origin to still be an authenticated mapped chat; a malformed or missing capture, or an unknown
+  origin owner, fails closed. There is no expiry and no copied grant document. Because Durable's
+  tool hooks run only in the call phase, the gateway also intersects every live run target before
+  `resume()` with the current ceiling and its authenticated origin, so a new admission after the
+  config narrowed is not offered the removed tool. A committed `execute` intent for a native coding
+  tool is `unsafe` and settles as interrupted rather than rerunning. Every terminal commit of a run
+  that already prepared a separate target retires that target's captured tools in the same commit,
+  as does the abort handler, so a completed, failed, cancelled or superseded run leaves no capture
+  behind for a later admission. A phase fault or a crash before the terminal commit still leaves
+  the capture until the next reopen, where the pre-resume pass retires it; in that interval a
+  direct host submission remains bounded by the config hook. The capture still drives tool
+  selection during the run, so it may be offered a tool the config just removed; the call itself
+  is blocked. One that already passed the hook and recorded intent can still execute.
 - Disabling cron (`cron.enabled: false`) on a store that has jobs is not a cleanup operation. Job
-  documents and grants remain, and their persisted timer/run tasks have no installed task
-  definition, so they stay blocked until cron is enabled again.
+  documents and unfinished runs' tool captures remain, and their persisted timer/run tasks have no
+  installed task definition, so they stay blocked until cron is enabled again.
 - A non-terminal run task, including a parked one, blocks new work with visible skips until it is
   retried or cancelled. Cancellation may remain pending if an owned model request ignores abort.
 - In origin mode, the displayed target generation may belong to another input while the cron input
@@ -334,29 +334,8 @@ fault visibility; parked target generation visibility; owner scoping; and dedupe
 review probes covered: a queued origin input withdrawn on cancel, the already-placed limitation,
 unhealthy-timer status dominance, and overflow rejection before job creation. A later gateway probe
 drove the real `openGateway` path with a faux provider and covered the config gate, model-issued
-`add`, isolated and origin runs, copied grants, `list`/`remove`/terminal/unknown IDs, invalid
+`add`, isolated and origin runs, `list`/`remove`/terminal/unknown IDs, invalid
 schedules, restart with a pending one-shot, and a background run that is offered no `cron` tool.
-A later bounded-authority probe drove the same path with a faux provider and covered the origin link
-written beside the copied grants, a copied grant usable while the origin still grants it, a missing
-origin grant document, revocation after preparation, a shortened origin expiry beating the still
-valid copy, and a later longer origin grant that could not extend the copy past its own expiry; it
-also confirmed the terminal commit retires the target's copied grants and tools, a finished target
-denies a direct host submission, and an invalid origin link fails closed during a live run. One
-restart probe SIGKILLed a prepared run whose origin was revoked mid-request: after reopen the
-pre-resume pass had already removed the copy and tool from the target, and the resumed admission was
-denied. Another SIGKILL probe interrupted a native `bash` call **after** its execute intent committed,
-revoked the origin grant while the command was running, and reopened: the call settled as interrupted
-without rerunning, the killed command's later effect never appeared, and the target's authority was
-already pruned before resume. An origin-mode conversation with no link was unaffected.
-A later retirement probe drove the same path with a faux provider and asserted, for each terminal
-path of a run whose target was already prepared, that the target's grant document is retired and
-that it offers no tools: normal completion (plus a denied direct host submission), a job generation
-change, a missing job record and an execution-ownership change while the run was live, cancellation
-by the model-issued `remove` tool, and a SIGKILL after preparation whose resumed early return was
-fenced by a generation change written through a raw Harness commit before reopen. The same probe
-confirmed an origin-mode run leaves its own conversation's grants and tools untouched. A control
-build without the new retirements failed exactly the generation, missing-record, ownership and
-resume probes while normal completion and the abort handler still passed.
 
 Calendar probes covered `at`/`every`/`cron` parsing, the `once` alias, UTC default, invalid zones
 and offsets, invalid expressions, no-future-occurrence rejection, strict advancement after an exact

@@ -88,7 +88,7 @@ Code Mode is opt-in and uninstalled. `src/extensions/codemode.ts` provides the
 `createCodeModeIntegration` factory, fixed budgets and lifecycle/types, also
 exported by the package root. Native Code Mode/tool-search stays uninstalled in
 the gateway. SDK hosts must establish native default-deny extension/tool state
-before scheduling, grant tools explicitly, and reapply persisted selections
+before scheduling, enable tools explicitly, and reapply persisted selections
 before resume; `modelTools` is not the nested-call authorization boundary. See
 `CODEMODE.md` for reviewed host setup, budgets/replay/cancellation evidence and
 remaining limitations.
