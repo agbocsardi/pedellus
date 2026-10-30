@@ -62,22 +62,29 @@ not permission to start every branch or run live integrations):
   Standalone review passed with no material code defects (`4d61f50`, docs
   corrected in `1c38146`); a fresh combined runtime/config/authority review
   passed `555d34c` with no material findings. Accepted and integrated into main.
-- [ ] Implement channel-neutral attachment/voice media next: shared transcription
+- [x] Implement channel-neutral attachment/voice media ingress: shared transcription
   configuration/processing, Telegram ingress first, native image content for
   photos with configured vision handoff, and document saving without extraction.
   Choose one initial speech backend; do not translate Python's entire provider
-  registry.
-  - [ ] Photos: send native pi-ai image content through the normal gateway turn;
+  registry. Ingress chain: `062ac68` + `0752ea1` + `a30d1cf` -> `f0e9319` ->
+  `be6afc4` -> test-strengthening `0b65601` -> integration `fd6e563`, fresh final
+  combined review PASSED and fast-forward published onto main `4a2616e`.
+  Local faster-whisper provisioning and real transcription were **not executed**:
+  provision the helper explicitly before use, and no automatic cloud, network or
+  model download happens while a message is handled.
+  - [x] Photos: send native pi-ai image content through the normal gateway turn;
     a configured vision-capable preset describes images for presets explicitly
     marked as text-only. Never silently switch the main model, and never refuse
     a photo merely because the selected preset is text-only.
-  - [ ] Documents: save the original under `workspace/media/` only. This
+  - [x] Documents: save the original under `workspace/media/` only. This
     docs-only raw-file behavior overrides the earlier "established extraction"
     wording: no automatic PDF/OCR/Office extraction libraries and no hidden
     document pipeline in this slice.
-  - [ ] Voice: local faster-whisper CPU/small/int8, owned by the separate media
+  - [x] Voice: local faster-whisper CPU/small/int8, owned by the separate media
     ingress worker; no cloud-audio upload, backend install or model download in
-    this batch.
+    this batch. The helper and bounded subprocess path are implemented and
+    offline-tested; provisioning a real environment/model and producing a real
+    transcript remain unexecuted operator steps.
   - [x] Vision handoff slice: config-flagged `needsVisionHandoff` presets, one
     named describer preset, bounded raw images and descriptions, native
     `beforeRequest` transform only, focused offline checks. Independently
@@ -86,7 +93,10 @@ not permission to start every branch or run live integrations):
     config.
 - [ ] Add bounded ordinary background workers; scheduled memory curation may then
   be an ordinary cron job using those workers and the existing Markdown tools,
-  not a standalone Dream subsystem.
+  not a standalone Dream subsystem. The work is research plus coding: each
+  implementer is explicitly assigned a shared checkout or a worktree, and the
+  spawning agent (not the user) is notified of that choice. Scheduled memory
+  curation remains later work.
 
 Approved first implementation batch: channel-neutral gateway/local CLI attachment
 and Telegram menu/reply/quote/reaction support. These are two independently owned
@@ -286,11 +296,14 @@ and is covered by the focused hook regression). Media adapter/transcription work
 still belongs to the original media worker's fixes, and native MCP/product Code
 Mode has not completed independent review.
 
-### 2026-10-30 — Telegram media integration candidate (not published)
+### 2026-10-30 — Telegram media ingress (accepted, integrated)
 
 The media worker's branch `t3/telegram-media-transcription` merged current main
 `4a2616e` (merge `cc26bfc`) after its standalone fixes passed at `be6afc4`, and
-adds one cross-feature check on top of the 25 focused media checks. The gateway
+added one cross-feature check on top of the 25 focused media checks. The final
+combined review passed `fd6e563` with no material findings, and the metadata tip
+was fast-forward published onto main. The ingress chain is `062ac68` +
+`0752ea1` + `a30d1cf` -> `f0e9319` -> `be6afc4` -> `0b65601` -> `fd6e563`. The gateway
 process owns Telegram and media; the adapter submits photos as native pi-ai image
 content plus a labeled workspace-relative locator, stores documents unread and
 transcribes voice with the local uv/faster-whisper helper. A mocked Telegram
@@ -306,11 +319,13 @@ union points, with no functional conflict beyond the package.json test line.
 Stored originals are never auto-deleted and there is no total-disk cap. Deferred,
 reported limits: control exhaustion/reopen matrix, early-submission memory edge,
 crash hard-link window, pending-only ack after eventual apply, cached failed
-transcription, and two optional child cache-dir variables. This is a candidate
-for a fresh combined integration review, not merged into main. The background
-worker agreement is unchanged: 2–3 implementers with separate reviewers, the
-spawner chooses worktree/shared, the spawning agent is notified rather than the
-user, and scheduled memory curation remains later work.
+transcription, and two optional child cache-dir variables. Local faster-whisper
+provisioning and real transcription were not executed: the helper must be
+provisioned explicitly before use, and no cloud, network or model download happens
+while a message is handled. The background worker agreement is unchanged: 2–3
+implementers with separate reviewers, the spawning agent (not the user) is
+notified whether the assignment uses a shared checkout or a worktree, and
+scheduled memory curation remains later work.
 
 ### 2026-10-30 — channel surfaces and Telegram interactions
 
@@ -395,6 +410,9 @@ Parent orchestrates only. The vision handoff passed fresh independent review and
 is integrated with this gateway tip. Media adapter/transcription work remains
 under the original media implementer's final review (`be6`), and native MCP plus
 product Code Mode wiring is accepted and integrated (see the MCP entry above).
-Product background workers are under active implementation, and native web
-search (Brave) plus fetch are newly owner-approved and running; none of those is
-imported into this accepted MCP slice.
+Product background workers are under active research and coding implementation;
+the spawning agent (not the user) is notified whether each implementer uses a
+shared checkout or a worktree, and scheduled memory curation remains later work.
+Native web search (Brave) plus fetch are in implementation under the web worker;
+any owner-bounded live permission is handled only by that worker, and none of
+those branches is imported into this accepted MCP slice.

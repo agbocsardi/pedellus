@@ -37,6 +37,10 @@ npm start -- agent --config config.json     # attach a terminal
 - `src/mcp/` — explicit MCP server config, the pinned `@earendil-works/pi-mcp`
   client lifecycle, deferred `mcp__<server>__<tool>` registrations, namespace
   summaries and the call-time MCP authority hook.
+- `src/media/` — shared attachment storage under the workspace, the local
+  uv/faster-whisper transcriber, and the configured vision handoff; the fixed
+  CPU/`small`/`int8` speech helper is `scripts/local-transcribe.py`. Telegram
+  ingress lives in `src/channels/telegram.ts` and `src/channels/telegram-media.ts`.
 - `src/automation/` — cron timer/run tasks and the model-facing `cron` tool.
 - `src/execution/` — guarded host environment and the optional Bubblewrap shell.
 - `src/context/` — bootstrap/memory/skills snapshots, skill tool, workspace host.
@@ -77,6 +81,12 @@ npm start -- agent --config config.json     # attach a terminal
   Root, state, fork, raw/task-owned and isolated cron conversations get none.
   A configured stdio server is a native host process, not covered by
   `toolSandbox: "bwrap"`. Secrets are referenced by environment variable name.
+- Media ingress is opt-in (`media` config) and owned by the gateway. Photos are
+  native pi-ai image content plus a workspace-relative locator; configured vision
+  handoff describes them for flagged text-only presets. Documents are stored
+  unread with no extraction, and voice/audio is transcribed locally only when the
+  helper is provisioned explicitly. Stored originals grant no tool authority, are
+  never auto-deleted, and have no total-disk cap.
 - Bubblewrap is accidental-damage protection over the real workspace, not
   hostile-tenant isolation, and it is off by default.
 

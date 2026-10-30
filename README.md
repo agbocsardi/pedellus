@@ -5,7 +5,9 @@ TypeScript port requiring Node >=22.19 and the pinned Pi 1.4.0 packages. This is
 The [lean assistant plan](2026-10-30_lean-assistant_TODO.md) is the current scope
 and work-order authority: CLI + Telegram first, then tools, delegation and channels.
 Config-selected coding tools, named model presets, optional bwrap shell, opt-in
-memory/skills and compaction plumbing are integrated. Agent-callable
+memory/skills, compaction plumbing, configured vision handoff, MCP through
+product Code Mode, and opt-in Telegram media ingress are integrated.
+Agent-callable
 cron scheduling and Telegram delivery are available. WebUI, migration and cutover are
 deferred. The [older roadmap](plan/2026-10-26_full-port_TODO.md) preserves evidence,
 not a standing implementation queue.
@@ -46,6 +48,21 @@ can set `episodeSummary.model` to an allowed `{ "provider": "...", "modelId": ".
 set `episodeSummary.enabled` to `false` to disable summaries. Already-closed episodes are not
 backfilled automatically. Short cache retention is requested, but cache reuse is not guaranteed;
 see [episode summaries](./HISTORY.md#episode-summaries).
+
+## Media
+
+Attachment ingress is opt-in with a top-level `media` config, and the gateway owns
+it. Photos arrive as native pi-ai image content plus a labeled workspace-relative
+locator, so a preset marked `needsVisionHandoff` is described by the configured
+describer preset instead of receiving raw bytes. Documents are saved unread under
+the workspace media directory: no PDF, OCR or Office extraction. Voice/audio uses
+the local uv/faster-whisper helper (CPU, `small`, `int8`); provision it explicitly
+before use, because handling a message never installs the helper, downloads a
+model or calls a cloud provider. Stored originals are ordinary workspace files
+readable through the configured tools: no extra tool authority, no automatic
+deletion and no total-disk cap. See
+[setup](./SETUP.md#8-optional-attachments-and-voice) and
+[Telegram media](./TELEGRAM.md#attachments-and-local-transcription).
 
 ## Runtime/recovery
 
