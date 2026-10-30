@@ -23,6 +23,7 @@ import type {
   GatewayModelSelectionRequest,
 } from "../runtime.js";
 import type {
+  TerminalAttachmentSubmission,
   TerminalConversation,
   TerminalEntry,
   TerminalEntryPage,
@@ -104,6 +105,15 @@ export interface TerminalHistoryHost {
   ): Promise<TerminalEntryPage>;
 }
 
+/**
+ * Optional host-owned local attachment submission. The host resolves and reads the
+ * operator-named file, stores the original in the gateway's configured media
+ * directory, and composes the ordinary turn; the terminal only names the path.
+ */
+export interface TerminalAttachmentHost {
+  submit(path: string, prompt: string, context: Context): Promise<TerminalAttachmentSubmission>;
+}
+
 export interface TerminalIO {
   /** Each item is a completed line; the source owns any memory bound before yielding it. */
   readonly input: AsyncIterable<string>;
@@ -121,6 +131,8 @@ export interface TerminalIO {
   readonly contextRefresh?: TerminalContextRefreshHost;
   /** Optional host-owned history search/episode reads; standalone callers leave /search and /episodes unavailable. */
   readonly history?: TerminalHistoryHost;
+  /** Optional host-owned local attachment submission; absent leaves /attach unavailable. */
+  readonly attachments?: TerminalAttachmentHost;
 }
 
 type LocalSubmission = { id: number; submission: TerminalSubmission; runTaskId?: number; finalized?: boolean };
@@ -1016,11 +1028,52 @@ export async function runTerminalConversation(
     await notice(lines.join("\n"));
   };
 
+  /**
+   * Store one operator-named file through the host and admit its turn. The path is
+   * local operator input; the composed content and stored locator come from the host.
+   * A refusal is reported with fixed host text and never echoed as file bytes.
+   */
+  const attachFile = async (args: string): Promise<void> => {
+    const host = io.attachments;
+    if (!host) {
+      await notice("Local attachments are unavailable here: configure media in the gateway configuration and restart.", true);
+      return;
+    }
+    const parsed = parseAttachArguments(args);
+    if (parsed.kind === "usage") {
+      await notice(ATTACH_USAGE, true);
+      return;
+    }
+    if (reservedInputs >= MAX_PENDING_INPUTS) {
+      await notice(`Input limit reached (${MAX_PENDING_INPUTS} unsettled submissions). Wait for a turn or use /abort.`, true);
+      return;
+    }
+    reservedInputs++;
+    let admitted: TerminalAttachmentSubmission;
+    try {
+      admitted = await host.submit(parsed.path, parsed.prompt, operationContext);
+    } catch (error) {
+      reservedInputs = Math.max(0, reservedInputs - 1);
+      if (!signal?.aborted) {
+        await notice(`Attachment was not submitted (${fixedErrorText(error)}).`, true);
+      }
+      return;
+    }
+    const submission = admitted.submission;
+    submissions.set(submission.id, { id: submission.id, submission });
+    rememberLocalInput(submission.id);
+    waitForSubmission(submission.id, submission);
+    await notice(
+      `Stored ${safeLabel(admitted.attachment.kind, 16)} at ${safeLabel(admitted.attachment.relativePath, 200)} ` +
+      `(${admitted.attachment.bytes} bytes) and admitted its turn.`,
+    );
+  };
+
   const runCommand = async (name: string, args: string): Promise<void> => {
     switch (name) {
       case "help":
         await notice([
-          "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /refresh /compact /abort /new",
+          "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /refresh /compact /abort /new /attach <path>[ -- <prompt>]",
           SEARCH_USAGE,
           EPISODES_USAGE,
           EPISODE_USAGE,
@@ -1033,6 +1086,9 @@ export async function runTerminalConversation(
             ? "Coding tools are configured by toolAllowlist and apply to authenticated chats; /tools is read-only diagnostics and chat commands never change tool authority."
             : "Coding-tool authority is host-controlled and unavailable here.",
           io.contextRefresh?.available ? "/refresh re-reads workspace context and skills for this conversation when it is idle." : "/refresh is unavailable without configured workspace context.",
+          io.attachments
+            ? "/attach stores one local file under the configured workspace media directory and submits it with the optional prompt. Known image extensions become image content; other files stay unread originals."
+            : "/attach is unavailable without a configured media section.",
         ].join("\n"));
         return;
       case "status":
@@ -1062,6 +1118,9 @@ export async function runTerminalConversation(
         return;
       case "refresh":
         await refreshContext(args);
+        return;
+      case "attach":
+        await attachFile(args);
         return;
       case "compact": {
         if (args.trim()) { await notice("Usage: /compact", true); return; }
@@ -1246,6 +1305,14 @@ const SEARCH_USAGE =
 const EPISODES_USAGE = "Usage: /episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>] — --session defaults to cli:default.";
 const EPISODE_USAGE = "Usage: /episode [--session <sessionKey>] <startEntryId> [--limit 1-30] — --session defaults to cli:default.";
 const ENTRY_USAGE = "Usage: /entry [--session <sessionKey>] <entryId> [--radius 0-5] — --session defaults to cli:default with a history host.";
+const ATTACH_USAGE =
+  "Usage: /attach <path>[ -- <prompt>] — store one local file under the workspace media directory and submit it as an ordinary turn. " +
+  "The path may be absolute or relative to the CLI's working directory. A known image extension becomes native image content; " +
+  "every other file stays an unread stored original. Requires the media configuration.";
+
+type AttachArguments =
+  | { readonly kind: "usage" }
+  | { readonly kind: "attach"; readonly path: string; readonly prompt: string };
 
 type SearchArguments =
   | { readonly kind: "usage" }
@@ -1436,6 +1503,18 @@ function parseEntryArguments(input: string): EntryArguments {
 
 function parseSessionKey(value: string | undefined): string | undefined {
   return historySessionToken(value);
+}
+
+/** The first ` -- ` separates the path from the optional prompt; paths may contain spaces. */
+function parseAttachArguments(input: string): AttachArguments {
+  const trimmed = input.trim();
+  if (trimmed === "") return { kind: "usage" };
+  const marker = " -- ";
+  const index = trimmed.indexOf(marker);
+  const path = (index < 0 ? trimmed : trimmed.slice(0, index)).trim();
+  const prompt = index < 0 ? "" : trimmed.slice(index + marker.length).trim();
+  if (path === "" || path.startsWith("--")) return { kind: "usage" };
+  return { kind: "attach", path, prompt };
 }
 
 function parsePositiveEntryId(value: string | undefined): EntryId | undefined {
@@ -1631,6 +1710,19 @@ function safeReason(reason: string): string {
 
 function errorName(error: unknown): string {
   return error instanceof Error ? completePrefix(sanitizeTerminalText(error.name), 80) || "Error" : "unknown error";
+}
+
+/**
+ * Bounded host text for an attachment refusal. The local gateway rejects with
+ * fixed, value-free messages; anything else the host throws is sanitized and cut
+ * to a short line so a raw stack, dependency dump or long path is never printed.
+ */
+function fixedErrorText(error: unknown): string {
+  if (error instanceof Error) {
+    const text = completePrefix(sanitizeTerminalText(error.message), 200).trim();
+    if (text) return text;
+  }
+  return "unknown error";
 }
 
 function stripTerminalControls(text: string): string {

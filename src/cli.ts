@@ -1,4 +1,5 @@
 import { createInterface } from "node:readline";
+import { resolve } from "node:path";
 import { stdin, stderr, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
@@ -7,6 +8,7 @@ import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { connectLocalGateway } from "./local/client.js";
 import { gatewaySocketPath, serveLocalGateway } from "./local/server.js";
 import { LocalGatewayError } from "./local/protocol.js";
+import { createMediaStore } from "./media/attachments.js";
 import { cancelPreparedContextBlock, listPreparedContextBlocks, PreparedContextRecoveryError } from "./recovery/index.js";
 import { replaceProcess, restartPlan, restartSupported, RESTART_FAILURE_DIAGNOSTIC } from "./restart.js";
 import { runTerminalConversation } from "./terminal/index.js";
@@ -132,6 +134,16 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
   try {
     const socketPath = await localSocketPath(config);
     gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
+    // The gateway owns local attachments too: the CLI only names an operator path, and
+    // the configured workspace media directory is the same one Telegram ingress uses.
+    const attachments = config.media === undefined
+      ? undefined
+      : {
+          store: createMediaStore({
+            workspace: config.workspace,
+            ...(config.media.directory === undefined ? {} : { directory: config.media.directory }),
+          }),
+        };
     server = await serveLocalGateway({
       socketPath,
       gateway,
@@ -139,6 +151,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       tools: config.toolAllowlist ?? [],
       contextRefresh: config.workspaceContext !== undefined,
       presets: config.modelPreset !== undefined,
+      ...(attachments === undefined ? {} : { attachments }),
     });
     if (config.telegram) {
       const token = process.env[config.telegram.tokenEnv];
@@ -262,6 +275,14 @@ async function runAgent(
         entries: (sessionKey, query, limit, cursor, ctx) =>
           client!.historyEntries(sessionKey, query, limit, cursor, ctx),
       },
+      ...(client.attachments
+        ? {
+            attachments: {
+              submit: (path, prompt, attachContext) =>
+                client!.submitAttachment(resolve(path), prompt, attachContext),
+            },
+          }
+        : {}),
     });
   } finally {
     input?.close();

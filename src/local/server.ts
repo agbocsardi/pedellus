@@ -7,6 +7,13 @@ import { withCancel } from "@earendil-works/chord/context";
 import type { Conversation, Cursor, EntryId } from "@earendil-works/pi-durable";
 import type { HistoryEpisodeQuery } from "../history/episodes.js";
 import type { HistoryQuery } from "../history/index.js";
+import type { MediaStore } from "../media/attachments.js";
+import {
+  LocalAttachmentError,
+  prepareLocalAttachment,
+  type LocalAttachment,
+  type LocalAttachmentRejection,
+} from "../media/local.js";
 import type { Gateway, GatewayModelSelectionRequest } from "../runtime.js";
 import {
   inProcessTerminalConversation,
@@ -24,6 +31,7 @@ import {
   conversationToken,
   errorBody,
   optionalCursor,
+  optionalString,
   parseRequestLine,
   requireInteger,
   requireObject,
@@ -44,6 +52,8 @@ export interface LocalGatewayHostOptions {
   readonly contextRefresh: boolean;
   /** Whether named model presets are configured. */
   readonly presets: boolean;
+  /** Configured workspace media store; absent keeps local attachments unavailable. */
+  readonly attachments?: { readonly store: MediaStore };
 }
 
 export interface LocalGatewayServer {
@@ -266,6 +276,8 @@ class LocalConnection {
         return this.startWatch();
       case "submit":
         return this.submit(request.params);
+      case "submitAttachment":
+        return this.submitAttachment(request.params);
       case "submissionStatus":
         return this.submissionStatus(request.params);
       case "answer": {
@@ -382,6 +394,7 @@ class LocalConnection {
       tools: this.options.tools,
       contextRefresh: this.options.contextRefresh,
       presets: this.options.presets,
+      attachments: this.options.attachments !== undefined,
     };
   }
 
@@ -408,6 +421,46 @@ class LocalConnection {
     this.submissions.set(submission.id, submission);
     this.observe(submission);
     return { id: submission.id };
+  }
+
+  /**
+   * Store one operator-named local file through the gateway's own media store, then
+   * admit the composed turn like any other input. The path stays operator input; the
+   * model receives only the stored workspace-relative locator and bounded metadata.
+   */
+  private async submitAttachment(params: unknown): Promise<unknown> {
+    if (this.surface === undefined) throw new LocalRequestError("unavailable", "attach must be the first request");
+    const ingress = this.options.attachments;
+    if (ingress === undefined) {
+      throw new LocalRequestError("unavailable", "local attachments are not configured");
+    }
+    const record = requireObject(params);
+    onlyKeys(record, ["path", "content"]);
+    const path = requireString(record, "path", LOCAL_PROTOCOL_LIMITS.maxAttachmentPathChars);
+    const content = optionalString(record, "content", LOCAL_PROTOCOL_LIMITS.maxInputChars);
+
+    let prepared: LocalAttachment;
+    try {
+      prepared = await prepareLocalAttachment(ingress.store, {
+        path,
+        ...(content === undefined ? {} : { text: content }),
+        ...(this.scope.context.abortSignal === undefined ? {} : { signal: this.scope.context.abortSignal }),
+      });
+    } catch (error) {
+      if (this.scope.context.abortSignal?.aborted) throw error;
+      if (error instanceof LocalAttachmentError) {
+        throw new LocalRequestError(attachmentErrorCode(error.rejection), LOCAL_ATTACHMENT_ERROR_TEXT[error.rejection]);
+      }
+      throw new LocalRequestError("failed", "the attachment could not be prepared");
+    }
+
+    const submission = await this.surface.submit(prepared.content, this.scope.context);
+    this.submissions.set(submission.id, submission);
+    this.observe(submission);
+    return {
+      id: submission.id,
+      attachment: { kind: prepared.kind, relativePath: prepared.relativePath, bytes: prepared.bytes },
+    };
   }
 
   private observe(submission: TerminalSubmission): void {
@@ -539,5 +592,19 @@ function episodeQuery(value: unknown): HistoryEpisodeQuery {
       ? {}
       : { before: requireInteger(record, "before", 1, LOCAL_PROTOCOL_LIMITS.maxEntryId) as EntryId }),
   };
+}
+
+/** Fixed, value-free attachment refusals; the operator's path never enters the error text. */
+const LOCAL_ATTACHMENT_ERROR_TEXT: Record<LocalAttachmentRejection, string> = {
+  path: "attachment path must be an absolute path without control characters",
+  unreadable: "attachment file could not be read",
+  "too-large": "attachment exceeds the configured size limit",
+  empty: "attachment file is empty",
+  "unsupported-image": "attachment is named as an image but its bytes are not a supported image",
+  "store-failed": "attachment could not be stored in the workspace media directory",
+};
+
+function attachmentErrorCode(rejection: LocalAttachmentRejection): "invalid" | "failed" {
+  return rejection === "unreadable" || rejection === "store-failed" ? "failed" : "invalid";
 }
 
