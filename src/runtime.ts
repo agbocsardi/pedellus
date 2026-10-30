@@ -1,3 +1,4 @@
+import { isChordError } from "@earendil-works/chord";
 import { processLock } from "@earendil-works/chord/node";
 import type { Context, Draft } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
@@ -889,7 +890,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
       });
     }, ctx);
   }
-  const releaseLock = await processLock(`nanobot:${dbPath}`);
+  let releaseLock: Awaited<ReturnType<typeof processLock>>;
+  try {
+    releaseLock = await processLock(`nanobot:${dbPath}`);
+  } catch (cause) {
+    // A known live owner is actionable and its raw lock name contains the database path.
+    if (isChordError(cause) && cause.reason === "locked") {
+      throw new StartupDiagnosticError("storeLocked", { cause });
+    }
+    throw cause;
+  }
   let harness: HarnessType | undefined;
   let storage: Storage | undefined;
   let episodeCatalog: EpisodeCatalog | undefined;
@@ -1346,10 +1356,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
       if (!conversation) throw new Error(`Cannot safely resume ${replay.kind} task ${replay.id}: conversation is missing`);
       const view = await conversation.context(context, { at: replay.at as EntryId });
       if (hasPersistedNanobotContext(view.messages)) {
-        throw new Error(
-          `Cannot safely resume ${replay.kind} task ${replay.id} (${replay.phase}): its prepared request includes ` +
-          "persisted Nanobot context; cancel that prepared dispatch with the context recovery interface before gateway recovery",
-        );
+        throw new StartupDiagnosticError("preparedContext", {
+          detail: `Cannot safely resume ${replay.kind} task ${replay.id} (${replay.phase}): its prepared request includes ` +
+            "persisted Nanobot context; cancel that prepared dispatch with the context recovery interface before gateway recovery",
+        });
       }
     }
 

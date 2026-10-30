@@ -47,6 +47,31 @@ released on process exit; it is not a substitute for backups. Unknown external
 outcomes (for example an accepted remote message followed by a crash) remain
 unknown and must not be retried merely because the database retained its intent.
 
+## Manual stopped backup and restore
+
+There is no backup command or backup subsystem. For a simple manual copy, stop
+the owning gateway process and wait for it to exit before touching storage. Then
+copy `dataDir/nanobot.sqlite` together with the configured workspace files to an
+empty destination `dataDir` and workspace. Do not copy a database or its `-wal`/
+`-shm` files while a gateway owns them. After a clean close this checkout's smoke
+observed no sidecars; if sidecars are still present, the main database file alone
+is not a consistent backup and the copy must not be treated as one.
+
+Point the configuration at the restored paths and open normally. The restored
+store keeps its existing session mappings, transcript entries and durable
+admission dedupe, and the restored workspace supplies the current Markdown
+memory and bootstrap files. Restore does not repair, rewrite or migrate the
+database: a corrupt or incomplete copy is not made usable by this procedure.
+
+`tests/context-recovery.behavior.test.mjs` proves the bounded synthetic case:
+a gateway serves one turn, closes, its database and workspace are copied, the
+original source workspace changes afterwards, and the restored gateway reopens
+the same conversation with the same entry IDs and text, reads the restored topic
+memory instead of the changed source, and deduplicates the original request ID
+without a new model dispatch. This is a stopped-process copy test. It does not
+establish physical-host durability, a live database backup, external-effect
+exactly-once semantics or recovery from a torn/corrupt copy.
+
 ## Offline verification
 
 `npm ci --ignore-scripts`, followed by

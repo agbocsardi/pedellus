@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, copyFile, mkdtemp, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -20,6 +20,9 @@ const { getCurrentSystemPrompt } = await import(pathToFileURL(`${ai}/utils/trans
 const { BACKGROUND_CONTEXT } = await import(pathToFileURL(`${chord}/context/index.js`).href);
 const { createRegistry, defineTask, Harness } = await import(pathToFileURL(`${durable}/index.js`).href);
 const { openFullSyncNodeSqliteStorage } = await import(pathToFileURL(`${pkg}/dist/storage/sqlite.js`).href);
+const { workspaceContextGatewayOptions } = await import(
+  pathToFileURL(`${pkg}/dist/context/workspace-host.js`).href
+);
 const context = BACKGROUND_CONTEXT;
 
 const runtimeUrl = JSON.stringify(pathToFileURL(`${pkg}/dist/runtime.js`).href);
@@ -27,10 +30,10 @@ const configModuleUrl = JSON.stringify(pathToFileURL(`${pkg}/dist/config.js`).hr
 const aiUrl = JSON.stringify(pathToFileURL(`${ai}/index.js`).href);
 const chordContextUrl = JSON.stringify(pathToFileURL(`${chord}/context/index.js`).href);
 
-function gatewayConfig(workspace, dataDir, provider, defaultModelId = "synthetic", allowedModelIds = [defaultModelId]) {
+function gatewayConfig(workspace, dataDir, provider, defaultModelId = "synthetic", allowedModelIds = [defaultModelId], extra = {}) {
   const model = { provider, modelId: defaultModelId };
   const allowedModels = allowedModelIds.map((modelId) => ({ provider, modelId }));
-  return parseConfig({ workspace, dataDir, model, allowedModels }, resolve(workspace, ".."));
+  return parseConfig({ workspace, dataDir, model, allowedModels, ...extra }, resolve(workspace, ".."));
 }
 
 function offlineModels(providerId) {
@@ -145,7 +148,7 @@ async function killAndWait(child) {
   assert.deepEqual(await exited, { code: null, signal: "SIGKILL" });
 }
 
-function generationCrashScript({ workspace, dataDir, temp, providerId, sessions, secretPrefix }) {
+function generationCrashScript({ workspace, dataDir, temp, providerId, modelId = "synthetic", sessions, secretPrefix }) {
   return `
     const { openGateway } = await import(${runtimeUrl});
     const { parseConfig } = await import(${configModuleUrl});
@@ -153,14 +156,14 @@ function generationCrashScript({ workspace, dataDir, temp, providerId, sessions,
     const { BACKGROUND_CONTEXT } = await import(${chordContextUrl});
     const context = BACKGROUND_CONTEXT;
     const sessions = ${JSON.stringify(sessions)};
-    const provider = fauxProvider({ provider: ${JSON.stringify(providerId)}, models: [{ id: "synthetic" }] });
+    const provider = fauxProvider({ provider: ${JSON.stringify(providerId)}, models: [{ id: ${JSON.stringify(modelId)} }] });
     provider.setResponses(sessions.map(() => () => {
       process.stdout.write("DISPATCHED\\n");
       return new Promise(() => {});
     }));
     const models = createModels();
     models.setProvider(provider.provider);
-    const model = { provider: ${JSON.stringify(providerId)}, modelId: "synthetic" };
+    const model = { provider: ${JSON.stringify(providerId)}, modelId: ${JSON.stringify(modelId)} };
     const config = parseConfig({ workspace: ${JSON.stringify(workspace)}, dataDir: ${JSON.stringify(dataDir)}, model, allowedModels: [model] }, ${JSON.stringify(temp)});
     const gateway = await openGateway(config, context, {
       models,
@@ -212,15 +215,37 @@ function compactionCrashScript({ workspace, dataDir, temp, providerId, secretPre
   `;
 }
 
-async function writeConfig(temp, workspace, dataDir, providerId) {
+async function writeConfig(temp, workspace, dataDir, providerId, modelId = "synthetic", credentials) {
   const path = resolve(temp, "config.json");
   await writeFile(path, JSON.stringify({
     workspace,
     dataDir,
-    model: { provider: providerId, modelId: "synthetic" },
-    allowedModels: [{ provider: providerId, modelId: "synthetic" }],
+    model: { provider: providerId, modelId },
+    allowedModels: [{ provider: providerId, modelId }],
+    ...(credentials === undefined ? {} : { credentials }),
   }));
   return path;
+}
+
+async function runStartupCli(configFile, options = {}) {
+  const cli = spawn(process.execPath, [resolve(pkg, "dist/cli.js"), "--config", configFile], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, ...(options.env ?? {}) },
+  });
+  let stdout = "";
+  let stderr = "";
+  cli.stdout.setEncoding("utf8");
+  cli.stderr.setEncoding("utf8");
+  cli.stdout.on("data", (chunk) => { stdout += chunk; });
+  cli.stderr.on("data", (chunk) => { stderr += chunk; });
+  const timer = setTimeout(() => cli.kill("SIGKILL"), options.timeoutMs ?? 10_000);
+  try {
+    const exit = await new Promise((resolveExit) => cli.once("exit", (code, signal) => resolveExit({ code, signal })));
+    return { ...exit, stdout, stderr };
+  } finally {
+    clearTimeout(timer);
+    if (cli.exitCode === null && cli.signalCode === null) cli.kill("SIGKILL");
+  }
 }
 
 async function runRecoveryCli(configFile, args = []) {
@@ -343,6 +368,48 @@ test("owner recovery cancels a SIGKILLed prepared request without replay or tran
   } finally {
     if (child && child.exitCode === null) child.kill("SIGKILL");
     if (gateway) await gateway.close(context);
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("startup refusal for a blocked prepared dispatch gives the recovery action without raw values", { timeout: 30_000 }, async () => {
+  const temp = await mkdtemp(resolve(tmpdir(), "nanobot-startup-prepared-"));
+  const workspace = resolve(temp, "workspace");
+  const dataDir = resolve(temp, "state");
+  await mkdir(workspace);
+  let child;
+  try {
+    const started = startChild(generationCrashScript({
+      workspace, dataDir, temp,
+      providerId: "deepseek",
+      modelId: "deepseek-flash",
+      sessions: ["startup-session"],
+      secretPrefix: "old-startup-secret-",
+    }));
+    child = started.child;
+    await waitForMarkers(child, "DISPATCHED", 1, started.stderr);
+    await killAndWait(child);
+    child = undefined;
+
+    const configFile = await writeConfig(
+      temp, workspace, dataDir, "deepseek", "deepseek-flash", { deepseek: "NANOBOT_SYNTHETIC_KEY" },
+    );
+    const refused = await runStartupCli(configFile, {
+      env: { NANOBOT_SYNTHETIC_KEY: "synthetic-not-a-key" },
+    });
+    assert.deepEqual({ code: refused.code, signal: refused.signal }, { code: 1, signal: null }, refused.stderr);
+    assert.match(refused.stderr, /nanobot: startup refused because a prepared model dispatch pins historical Nanobot context/);
+    assert.match(refused.stderr, /nanobot recovery --config <path>/);
+    assert.match(refused.stderr, /diagnostic details suppressed/);
+    assert.ok(!refused.stderr.includes(temp), "startup refusal must not disclose the workspace or data path");
+    assert.ok(!refused.stderr.includes("old-startup-secret"), "startup refusal must not disclose pinned context");
+    assert.ok(!refused.stderr.includes("deepseek"), "startup refusal must not disclose provider values");
+    assert.ok(!refused.stderr.includes("startup-session"), "startup refusal must not disclose session values");
+
+    assert.equal((await listPreparedContextBlocks(gatewayConfig(workspace, dataDir, "deepseek", "deepseek-flash"), context)).length, 1,
+      "startup refusal must not cancel or rewrite the prepared dispatch");
+  } finally {
+    if (child && child.exitCode === null) child.kill("SIGKILL");
     await rm(temp, { recursive: true, force: true });
   }
 });
@@ -606,6 +673,18 @@ test("recovery reports a live gateway lock conflict instead of an empty result",
   let gateway;
   try {
     gateway = await openGateway(config, context, { models: held.models });
+    const startupConfig = await writeConfig(
+      temp, workspace, dataDir, "deepseek", "deepseek-flash", { deepseek: "NANOBOT_SYNTHETIC_KEY" },
+    );
+    const refused = await runStartupCli(startupConfig, {
+      env: { NANOBOT_SYNTHETIC_KEY: "synthetic-not-a-key" },
+    });
+    assert.deepEqual({ code: refused.code, signal: refused.signal }, { code: 1, signal: null }, refused.stderr);
+    assert.match(refused.stderr, /nanobot: another process already owns the configured data store/);
+    assert.match(refused.stderr, /stop the other running nanobot\/gateway process/);
+    assert.match(refused.stderr, /diagnostic details suppressed/);
+    assert.ok(!refused.stderr.includes(temp), "lock diagnostic must not disclose the data path or lock name");
+    assert.ok(!refused.stderr.includes(dataDir), "lock diagnostic must not disclose the data path or lock name");
     await assert.rejects(
       listPreparedContextBlocks(config, context),
       /another live owner holds it/,
@@ -657,6 +736,133 @@ test("recovery refuses missing data directories or databases before creating a s
     );
     await assert.rejects(stat(resolve(emptyDataDir, "nanobot.sqlite")), { code: "ENOENT" });
   } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a cleanly stopped store restores mapping, transcript, topic memory, and admission dedupe", { timeout: 30_000 }, async () => {
+  const temp = await mkdtemp(resolve(tmpdir(), "nanobot-restore-smoke-"));
+  const sourceWorkspace = resolve(temp, "source-workspace");
+  const sourceDataDir = resolve(temp, "source-state");
+  const restoredWorkspace = resolve(temp, "restored-workspace");
+  const restoredDataDir = resolve(temp, "restored-state");
+  const providerId = "restore-smoke";
+  const extra = {
+    workspaceContext: { memoryFiles: ["memory/MEMORY.md", "memory/topics/project.md"] },
+    episodeSummary: { enabled: false },
+  };
+  let sourceGateway;
+  let restoredGateway;
+  try {
+    await mkdir(resolve(sourceWorkspace, "memory/topics"), { recursive: true });
+    for (const [path, content] of Object.entries({
+      "AGENTS.md": "RESTORE-AGENTS",
+      "memory/MEMORY.md": "RESTORE-MAIN-MEMORY",
+      "memory/topics/project.md": "RESTORE-TOPIC-MEMORY",
+    })) {
+      await writeFile(resolve(sourceWorkspace, path), content);
+    }
+
+    const prompts = [];
+    const provider = fauxProvider({ provider: providerId, models: [{ id: "synthetic" }] });
+    provider.setResponses([(request) => {
+      prompts.push(getCurrentSystemPrompt(request.messages));
+      return fauxAssistantMessage("restore reply");
+    }]);
+    const models = createModels();
+    models.setProvider(provider.provider);
+    const sourceConfig = gatewayConfig(sourceWorkspace, sourceDataDir, providerId, "synthetic", ["synthetic"], extra);
+
+    let sourceConversationId;
+    let originalSubmissionId;
+    let originalEntryIds;
+    let originalTranscript;
+    try {
+      sourceGateway = await openGateway(sourceConfig, context, {
+        models,
+        agentHistory: false,
+        ...workspaceContextGatewayOptions(sourceConfig),
+      });
+      const conversation = await sourceGateway.conversationFor("restore-session", context);
+      const submission = await conversation.submit({
+        type: "input",
+        content: "restore original turn",
+        requestId: "restore-request",
+      }, context);
+      assert.equal((await submission.wait(context)).status, "done");
+      sourceConversationId = conversation.id;
+      originalSubmissionId = submission.id;
+      const entries = await conversation.entries({ order: "ascending" }, 100, undefined, context);
+      originalEntryIds = entries.items.map((entry) => entry.id);
+      originalTranscript = JSON.stringify(entries.items);
+      assert.match(originalTranscript, /restore original turn/);
+      assert.match(originalTranscript, /restore reply/);
+      assert.match(prompts[0], /RESTORE-TOPIC-MEMORY/);
+    } finally {
+      await sourceGateway?.close(context);
+      sourceGateway = undefined;
+    }
+
+    const sidecars = (await readdir(sourceDataDir)).filter((name) => name.startsWith("nanobot.sqlite-"));
+    assert.deepEqual(sidecars, [], "a cleanly closed store must not need a live WAL copy");
+    await mkdir(restoredDataDir, { recursive: true, mode: 0o700 });
+    await copyFile(resolve(sourceDataDir, "nanobot.sqlite"), resolve(restoredDataDir, "nanobot.sqlite"));
+    await cp(sourceWorkspace, restoredWorkspace, { recursive: true });
+    // The restored copy, not the original workspace, must supply later context.
+    await writeFile(resolve(sourceWorkspace, "memory/topics/project.md"), "SOURCE-MEMORY-CHANGED-AFTER-BACKUP");
+
+    const restoredConfig = gatewayConfig(
+      restoredWorkspace, restoredDataDir, providerId, "synthetic", ["synthetic"], extra,
+    );
+    try {
+      restoredGateway = await openGateway(restoredConfig, context, {
+        models,
+        agentHistory: false,
+        ...workspaceContextGatewayOptions(restoredConfig),
+      });
+      const conversation = await restoredGateway.conversationFor("restore-session", context);
+      assert.equal(conversation.id, sourceConversationId, "session mapping must survive the restore");
+      const restoredEntries = await conversation.entries({ order: "ascending" }, 100, undefined, context);
+      assert.deepEqual(restoredEntries.items.map((entry) => entry.id), originalEntryIds,
+        "the original transcript evidence must be retained");
+      assert.equal(JSON.stringify(restoredEntries.items), originalTranscript);
+
+      const callsBeforeDuplicate = provider.state.callCount;
+      const duplicate = await conversation.submit({
+        type: "input",
+        content: "must not be admitted twice",
+        requestId: "restore-request",
+      }, context);
+      assert.equal(duplicate.id, originalSubmissionId, "durable admission dedupe must survive the restore");
+      assert.equal((await duplicate.wait(context)).status, "done");
+      await restoredGateway.harness.waitForIdle(context);
+      assert.equal(provider.state.callCount, callsBeforeDuplicate, "a deduplicated request must not dispatch");
+      const afterDuplicate = await conversation.entries({ order: "ascending" }, 100, undefined, context);
+      assert.equal(afterDuplicate.items.length, restoredEntries.items.length);
+      assert.doesNotMatch(JSON.stringify(afterDuplicate.items), /must not be admitted twice/);
+
+      provider.setResponses([(request) => {
+        prompts.push(getCurrentSystemPrompt(request.messages));
+        return fauxAssistantMessage("restored reply");
+      }]);
+      const afterRestore = await conversation.submit({
+        type: "input",
+        content: "after restore",
+        requestId: "restore-after",
+      }, context);
+      assert.equal((await afterRestore.wait(context)).status, "done");
+      const restoredPrompt = prompts.at(-1);
+      assert.match(restoredPrompt, /RESTORE-AGENTS/);
+      assert.match(restoredPrompt, /RESTORE-MAIN-MEMORY/);
+      assert.match(restoredPrompt, /RESTORE-TOPIC-MEMORY/);
+      assert.doesNotMatch(restoredPrompt, /SOURCE-MEMORY-CHANGED-AFTER-BACKUP/);
+    } finally {
+      await restoredGateway?.close(context);
+      restoredGateway = undefined;
+    }
+  } finally {
+    await sourceGateway?.close(context);
+    await restoredGateway?.close(context);
     await rm(temp, { recursive: true, force: true });
   }
 });

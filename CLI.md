@@ -29,11 +29,18 @@ The CLI fails closed with exit status 1. Known configuration and startup failure
 print one fixed, value-free message: unreadable/invalid configuration, invalid
 configuration fields, unsupported provider aliases, unavailable models or
 thinking levels, missing credential alias references, a missing Telegram token
-environment variable, and workspace/data-directory preparation failures. These messages
-never include configuration values, environment values, filesystem paths,
-provider/dependency error text or the underlying exception. Unexpected failures
-keep the generic `nanobot: command failed; diagnostic details suppressed`
-message.
+environment variable, workspace/data-directory preparation failures, a data
+store already owned by another live process, and a prepared model dispatch that
+pins historical Nanobot context. These messages never include configuration
+values, environment values, filesystem paths, provider/dependency error text or
+the underlying exception. Unexpected failures keep the generic
+`nanobot: command failed; diagnostic details suppressed` message.
+
+For live-owner lock contention, the fixed message says to stop the other running
+nanobot/gateway process. For a blocked prepared dispatch, it says to run
+`nanobot recovery --config <path>` with the same configuration to inspect and
+cancel the blocked task, then start again. The CLI does not cancel the task or
+rewrite its checkpoint automatically.
 
 Recovery operation errors keep their dedicated `nanobot recovery:` text and
 remain governed by recovery's existing disclosure contract, not this startup
@@ -65,7 +72,8 @@ mode can be delivered to a Telegram origin through its outbox. See [cron](./CRON
 ## Recovery
 
 Startup fails closed when a prepared model dispatch still pins historical Nanobot
-context. The same executable exposes an owner-only recovery path that never opens
+context, with a fixed value-free message naming the recovery command below. The
+same executable exposes an owner-only recovery path that never opens
 the gateway, resumes scheduling, or requires credentials. It does require the
 existing SQLite database and the gateway process to be stopped; a live owner is
 reported as a lock conflict. Inspection may perform Durable's native

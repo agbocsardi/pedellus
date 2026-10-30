@@ -13,6 +13,11 @@ unchanged snapshot stays blocked. This module supplies the missing owner-driven
 reconciliation: inspect exactly which dispatches are blocked, then cancel selected
 ones durably.
 
+A normal gateway start that hits this guard fails with one fixed, value-free
+message naming `nanobot recovery --config <path>` as the next action. It does not
+print the task ID, pinned entry, path, provider/model or context text, and it does
+not cancel the task. The same configuration's recovery command is the next step.
+
 ## What recovery does
 
 `listPreparedContextBlocks(config, context, options?)`:
@@ -166,6 +171,15 @@ providers only:
   cancellation, with a faux `cancelDeferred` spy at zero; restoring the allowlist
   permits the native abort and exactly one best-effort `cancelDeferred`, with no
   model dispatch;
+- normal CLI startup for a blocked prepared dispatch prints the fixed recovery
+  action and no path, provider, model, session or pinned-context value, and leaves
+  the dispatch blocked; startup against a live owner prints the fixed
+  stop-the-other-owner message with the raw lock name and paths suppressed;
+- a cleanly stopped synthetic gateway is copied by main database file plus
+  workspace (no live WAL copy), then reopened at new paths: the same session
+  mapping and entry IDs/text, restored topic memory, and durable request-ID
+  dedupe all survive without a new model dispatch; the original source workspace
+  later changes and is not used by the restored gateway;
 - holding the real gateway lock makes recovery report an actionable conflict;
   closing the gateway then releases the lock;
 - a typo/missing data directory or missing database is rejected before `mkdir` or
@@ -174,5 +188,6 @@ providers only:
 Not covered here: an actual deferred `poll` crash fixture (the synthetic poll task
 exercises the same checkpoint scanner and abort path, but no real crash fixture),
 provider-side cancellation of a live remote request, recovery while a gateway is
-still running (it fails closed on the lock), and physical power-loss durability
-beyond SQLite's configured WAL/FULL behavior.
+still running (it fails closed on the lock), live database/WAL copying, corrupt or
+torn-copy restore, and physical power-loss durability beyond SQLite's configured
+WAL/FULL behavior.

@@ -26,6 +26,13 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
   workspace:
     "cannot prepare the configured workspace or data directory; check workspace, dataDir and extraAllowedDirs " +
     "(diagnostic details suppressed)",
+  storeLocked:
+    "another process already owns the configured data store; stop the other running nanobot/gateway process " +
+    "before starting another (diagnostic details suppressed)",
+  preparedContext:
+    "startup refused because a prepared model dispatch pins historical Nanobot context; run " +
+    "`nanobot recovery --config <path>` with this configuration to inspect and cancel the blocked task, " +
+    "then start again (diagnostic details suppressed)",
   unexpected: "command failed; diagnostic details suppressed",
 } as const);
 
