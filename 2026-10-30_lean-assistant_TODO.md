@@ -62,6 +62,17 @@ not permission to start every branch or run live integrations):
   Standalone review passed with no material code defects (`4d61f50`, docs
   corrected in `1c38146`); a fresh combined runtime/config/authority review
   passed `555d34c` with no material findings. Accepted and integrated into main.
+- [ ] Generalize native Code Mode into the agent's general compositor: scripts may
+  compose every tool the current agent is authorized to call (coding, history,
+  skill, cron, web, MCP, Telegram actions, and worker tools once accepted), not
+  only MCP tools. No new authority: each nested call still passes its normal
+  validation and call-time checks, deferred MCP stays callable but undeclared,
+  and the tool set is the current conversation's actual callable set. Code Mode
+  is not recursive, host-only owner commands are never model tools, and
+  raw/root/state/fork targets keep no composition authority. Code Mode must be
+  enableable without a dummy MCP server. Background children keep no worker tool
+  (no recursive delegation) and only compose tools already captured for them.
+  In implementation and review; not yet accepted.
 - [x] Implement channel-neutral attachment/voice media ingress: shared transcription
   configuration/processing, Telegram ingress first, native image content for
   photos with configured vision handoff, and document saving without extraction.
@@ -218,6 +229,18 @@ commands, config tool ceiling, outbox unknown-send handling and memory refresh
 remain intact. No deployment or live-delivery claim; no live model/bot run.
 
 ## Session log
+
+### 2026-10-30 — Code Mode becomes the general tool compositor
+
+Owner direction: Code Mode should allow composing all tools generally available
+to the agent, not just MCP tools. This supersedes the MCP-only exposure scope
+while keeping every existing authority check, deferral rule and denial intact.
+The active web-tools integration worker owns the small native generalization and
+must report functional changes for the combined review. Separately recorded:
+Telegram owner commands are `/model`, `/status`, `/new` (reset plus rebuilt
+workspace prompt) and full-process `/restart`, with no separate `/refresh`; the
+background-worker fix round is in progress; curation stays deferred with a simple
+editable prompt and digestion cursor. No live runs or new spend authorized.
 
 ### 2026-10-30 — Telegram owner-command scope
 
