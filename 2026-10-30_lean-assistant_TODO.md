@@ -20,29 +20,57 @@
 
 ## Current status and next priorities
 
-The owner accepted the pilot. This implementation/acceptance batch is complete;
-stop adding acceptance scaffolding or repeating timed pilots. Live reminder
-delivery is still unverified, but the extra check is deferred by owner decision.
-The test bot is stopped and completed agents are cleaned up.
+The owner accepted the pilot and then directed a channel-neutral assistant build.
+Today's batch is complete on main `b0b16a6`. The gateway is the single
+agent/runtime owner; CLI/TUI, Telegram and future Discord/Email are conversation
+surfaces. CLI attach/disconnect leaves the gateway and Telegram alive;
+conversations are separate by default and share workspace/Markdown memory.
+Explicit config/workspace paths remain; there is no deployment or automatic
+service install.
 
-The next usability target is a channel-neutral gateway, not a Telegram-specific
-daemon. `openGateway` already owns shared runtime/storage; the executable currently
-chooses Telegram or terminal. Improve the host so CLI and Telegram can use the
-same owner, with Discord/Email as later adapters. Do not create a database owner
-per channel, a second agent loop or a general-purpose operations framework.
-Owner confirmed the shape: the gateway is the single agent/runtime owner;
-CLI/TUI, Telegram and future Discord/Email are conversation surfaces, not runtime
-owners. CLI connects to the running gateway and may disconnect without stopping
-it. Conversations are separate by default and share workspace/Markdown memory.
-Keep explicit config/workspace paths; no deployment or automatic service install.
+Accepted on main today:
 
-Owner's annotation feedback sets these next product requirements (plan first,
-not permission to start every branch or run live integrations):
+- Single-owner gateway plus independently attachable local CLI.
+- Telegram interactions: command menu, quotes/replies, scoped native replies and
+  reactions, reaction-triggered turns, media ingress, voice helper, owner
+  controls (`/model`, `/status`, `/new`, `/stop`, `/restart`).
+- Configured vision handoff for text-only presets.
+- MCP through the shipped gateway.
+- General Code Mode composition of the current conversation's authorized tools,
+  including scoped nested Telegram actions and background-worker children (which
+  still never receive the `worker` tool).
+- Native Brave search plus safe public fetch (default off).
+- Bounded background workers with shared/worktree choice, capture-bounded tool
+  authority and completion reported to the spawning agent, not the user.
 
-- [ ] Keep on-the-fly Markdown memory updates through configured `read`/`write`/
-  `edit`; make snapshot/manifest freshness explicit using the existing refresh
-  path. Python-named `memory_read`/`memory_write`/`memory_search` are not present;
-  add a dedicated operation only when it does more than wrap existing tools.
+Final offline gate on main: typecheck/build, 177 registered behavior checks,
+2 execution checks and 83 offline core-acceptance checks. Worktrees are preserved
+for evidence; completed agents are retired.
+
+Still unverified live, and not implied by the offline suite: real faster-whisper
+provisioning/transcription, product Brave queries, live Telegram reaction updates
+and full-process restart behaviour, and broad real-provider quality. No deployment,
+personal-workspace use or paid acceptance run happened in this batch.
+
+The next product discussion should start from ordinary use and fix what breaks,
+not feature parity. Likely candidates, all unapproved work:
+
+- Explicit local voice provisioning and one bounded real transcription check.
+- One bounded live Brave product-search check.
+- An opt-in digest of previously unprocessed conversations/episodes into memory
+  (deferred scope below), once the owner reopens it.
+- Discord/Email adapters after agreeing permissions and direct-message scope.
+- Small CLI/TUI polish driven by actual use.
+- Live Telegram restart/reaction checks, only under a separately approved window.
+
+Owner's earlier annotation requirements, now largely satisfied, follow. Remaining
+unchecked items are deliberate gaps, not forgotten work.
+
+- [x] Keep on-the-fly Markdown memory updates through configured `read`/`write`/
+  `edit`; make snapshot/manifest freshness explicit through the existing refresh
+  path rather than new memory tools. The CLI keeps explicit `/refresh`; Telegram
+  `/new` rebuilds the assembled workspace prompt for the new session (and is
+  refused while that chat is running). No Python-named memory tools were added.
 - [x] Single-owner gateway host plus independently attachable local CLI, preserving
   existing terminal commands, Durable controls, tool authority and recovery.
   Independently reviewed (`5712c98`, material F1 fixed in `ca662bb`); integration
@@ -73,9 +101,9 @@ not permission to start every branch or run live integrations):
   enableable without a dummy MCP server. Background children keep no worker tool
   (no recursive delegation) and only compose tools already captured for them.
   Accepted after the combined runtime/config/authority review of `1204226` and
-  published with the web integration. Cron and background-worker composition
-  remain deliberately later: the worker branch is still in review, and no implicit
-  cron/worker grant exists.
+  published with the web integration. Worker children now receive the same
+  compositor over their captured tools only (`d27e3e7`). Cron targets still get
+  no Code Mode, and no implicit cron/worker/MCP/web/Telegram grant exists.
 - [x] Native Brave web search plus safe public web fetch: one configured provider,
   fixed HTTPS endpoint, key by environment-variable name, explicit default-off
   config, mapped-chat-only authority, public unicast DNS pinning, per-hop redirect
@@ -205,7 +233,9 @@ as behavioral references, not a subsystem to copy.
   must be made explicit before activation.
 
 The owner asked to record this scope and work on something independent while
-background agents are unfinished. Curation implementation is therefore deferred.
+background agents are unfinished. Background workers are now accepted and published, so this is no longer blocked
+by them; curation remains deferred by owner choice for a later session. No
+curation code, schedule or historical-data processing exists yet.
 
 ## Product and constraints
 
@@ -217,9 +247,9 @@ The approved local gateway/client transport is the only new host boundary. No
 additional service layer, agent loop, queue, retry framework, configuration mode,
 dashboard, backup subsystem or general-purpose acceptance harness. A short integration check is better than a test platform. Prefer deleting obsolete work and fixing observed failures over speculative restructuring. Keep data integrity and provenance; never trade them for fewer lines.
 
-The implementation batch is offline. A separately owner-approved live acceptance run may use only an explicitly named runtime credential, synthetic data and the existing budget guard; no credential-file discovery or value output. No security audit, personal data, migration, deployment or cutover. Live Telegram activity is limited to a separately owner-approved single-user synthetic pilot. The completed pilot batch does not itself enable web/MCP, product delegation or more channels. No standalone Dream engine will return: its desired memory-curation behavior is planned as an ordinary scheduled background job using the same worker/tools path. Standing intents, dedicated heartbeat and sustained goals remain excluded.
+The implementation batch was offline. A separately owner-approved live acceptance run may use only an explicitly named runtime credential, synthetic data and the existing budget guard; no credential-file discovery or value output. No security audit, personal data, migration, deployment or cutover. The completed pilot batch did not itself enable web/MCP/product delegation; those were separately implemented, independently reviewed and published later the same day, still without live acceptance. No standalone Dream engine will return: its desired memory-curation behavior is planned as an ordinary scheduled background job using the same worker/tools path. Standing intents, dedicated heartbeat and sustained goals remain excluded.
 
-## Batch ownership and finish line
+## Batch ownership and completion record
 
 Use `opencode-go / deepseek-v4.1-flash`, thinking `high`, in separate
 worktrees. This batch started with two implementation workers; the owner later
@@ -232,16 +262,12 @@ permanent regression checks; no sleep-based schedule waits or leaked
 gates/timers/subscriptions.
 
 - **worker-gateway-surfaces:** local gateway server/client, CLI launch/attachment,
-  terminal transport boundary, CLI/setup documentation and focused checks. Owns
-  `src/cli.ts`, `src/terminal/`, new local transport modules, `CLI.md`, `SETUP.md`.
-  Does not edit `src/runtime.ts` or Telegram files. No second Durable owner or
-  remote/public listener; terminal disconnect does not stop gateway work.
+  terminal transport boundary, CLI/setup documentation and focused checks.
 - **worker-telegram-interactions:** menu registration, incoming reply/quote context,
-  authenticated reaction turns, model-callable native reply/reaction actions and
-  focused checks. Owns Telegram/new interaction modules, narrowly required runtime
-  tool integration, `TELEGRAM.md`. Restrict actions to authenticated current-chat
-  observed targets; no raw chat selector, inherited fork/cron authority or blind
-  replay of ambiguous external sends. Preserve existing outbox/control behavior.
+  authenticated reaction turns, model-callable native reply/reaction actions.
+
+Both were independently reviewed and published; their worktrees remain preserved
+for evidence.
 
 ### 2026-10-30 — bounded background workers (implementation batch)
 
@@ -271,17 +297,39 @@ narrowed config on reopen cannot restore a removed tool; completion admission is
 exactly once across a crash window; a child image read still gets the configured
 vision handoff. No live integration is claimed.
 
-New test registration and root exports are parent integration requests. No
-unrelated reformatting or edits to the other worker's region.
+New test registration and root exports were parent/integration responsibilities;
+all are registered on main.
 
-Done means offline checks demonstrate one gateway serving an independently
-connecting/disconnecting CLI plus Telegram, separate conversations, implemented
-command menu, preserved quote/reply context, agent-selected reply/reaction actions
-and reaction-triggered turns with durable dedupe/recovery. Existing terminal
-commands, config tool ceiling, outbox unknown-send handling and memory refresh
-remain intact. No deployment or live-delivery claim; no live model/bot run.
+Later slices (vision handoff, media ingress, MCP, Telegram owner controls,
+web + general Code Mode, background workers) each followed the same lifecycle:
+original implementer retains its worktree, fresh independent review, findings
+returned to that implementer, then publication by that implementer. Every slice
+passed its final gate before fast-forwarding main; no separate integration agent
+or hand-edited main source was used.
 
 ## Session log
+
+### 2026-10-30 — channel-neutral batch integrated
+
+Final main `b0b16a6`, clean. Published today, each through its own retained
+implementer, independent review(s) and fast-forward: gateway/CLI (`5712c98` +
+`ca662bb`), Telegram interactions (`30d34f1` + `59c15d7`), vision handoff
+(`86cd25e` + `3043160`), media ingress (`fd6e563` → `ef6d742`), MCP (`4d61f50`
++ docs → `4a2616e`), Telegram owner controls (`d416fbc` → `578dc20`), web +
+general Code Mode (`0a6abb6` + `b9e3339` + composition → `dceb23f`), and
+background workers (`74b9355` + child Code Mode `d27e3e7` → `b0b16a6`).
+Review findings were fixed by the original implementers, not the parent; only
+docs/metadata were parent-owned. Final gate: typecheck/build, 177 behavior,
+2 execution, 83 offline core. Completed agents retired, worktrees preserved.
+
+Environment note: the new pinned dependencies were added to main's shared
+`node_modules` additively and offline (`--ignore-scripts --no-save`) from the
+accepted lock, with versions/integrity audited and no removals or upgrades;
+`package.json`/`package-lock.json` are unchanged by that sync.
+
+No live Whisper provisioning, product Brave search, live reaction/restart run,
+deployment or paid acceptance was performed. Next session starts from actual
+use; curation remains deferred by owner choice.
 
 ### 2026-10-30 — Code Mode becomes the general tool compositor
 
