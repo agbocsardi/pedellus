@@ -88,7 +88,10 @@ resolved the same way from the host environment at connect time.
 
 Connecting a server is owner authorization for the gateway to run that
 configured subprocess or contact that URL. It is not a model-chosen shell
-execution and grants nothing else.
+execution and grants nothing else. A configured stdio server runs as a native
+host process owned by the gateway; `toolSandbox: "bwrap"` applies only to the
+shell backend and does **not** wrap MCP servers. There is no additional MCP
+confinement layer, so treat a server command as host-level authority.
 
 MCP tools and their Code Mode/tool-search tools are enabled **only in
 authenticated mapped ordinary chat conversations** — the same set that may use
@@ -101,10 +104,11 @@ The ceiling is enforced twice: the tool filter enables the tools per
 conversation, and a call-time `ToolTask` hook rechecks the conversation and the
 server's live state on every call. The hook also covers `codemode` and
 `tool_search`, which the coding-tool ceiling delegates to it. A call from a
-conversation that lost authorization, a nested Code Mode call, a persisted
-selection or a prepared replay therefore fails closed. Coding tools reached from
-a script are still bounded by `toolAllowlist`: a disabled tool is neither listed
-in `ALL_TOOLS` nor callable.
+conversation that lost authorization, a nested call naming a tool the current
+scope no longer has, a persisted selection or a prepared replay therefore fails
+closed. Nested calls to tools still in the current scope succeed. Coding tools
+reached from a script are still bounded by `toolAllowlist`: a disabled tool is
+neither listed in `ALL_TOOLS` nor callable.
 
 MCP tool annotations (`readOnlyHint` etc.) are untrusted server hints and are not
 used for authorization. No MCP tool call is retried by this layer: a dropped
@@ -126,14 +130,17 @@ MCP tools are registered `deferred`:
   description;
 - a Code Mode script reaches them through `searchTools()`, `describeTool()`,
   `ALL_TOOLS` or `tools.mcp__<server>__<tool>()`;
-- `tool_search` can load a match into the next model call as a direct tool;
+- `tool_search` can load a match into the next model call as a direct tool. That
+  loaded declaration is agent state, so a later policy reapply (`listModels`,
+  model selection, reopen) drops it and the model must search again;
 - the server's own instructions are exposed only through
   `describeNamespace("mcp__<server>")`, bounded and labeled untrusted, never as a
   tool description.
 
-A Code Mode tool call resolves to the complete MCP `CallToolResult`:
-`content`, `structuredContent` and `isError`. An `isError` result resolves inside
-a script and is reported as an error result for a direct model call. Input
+A Code Mode tool call resolves to `content`, `structuredContent` and `isError`
+from the MCP `CallToolResult`; `_meta` is deliberately dropped, and a response
+without `content` is normalized to `[]`. An `isError` result resolves inside a
+script and is reported as an error result for a direct model call. Input
 schemas are forced to object schemas; a schema over 16 KiB is replaced with an
 unconstrained object so declarations stay bounded and the tool stays callable.
 
@@ -146,14 +153,24 @@ replay semantics.
 At gateway open the runtime connects every enabled server in parallel before the
 Durable registry is built, then registers the discovered tools. A server that
 fails to connect contributes no tool and no namespace and is reported as `failed`
-through the gateway's `mcp.servers` status; the gateway still opens. The status
+through the gateway's `mcp.servers` status; the gateway still opens.
+
+Whether anything is installed is decided before connecting:
+`mcpHasEnabledServers` requires `mcp.enabled: true` **and at least one server
+entry that is not `enabled: false`**. With no block, `enabled: false`, or only
+disabled entries, no client starts and no Code Mode is installed. When at least
+one server is enabled but every enabled server fails, the MCP extension has no
+tools and Code Mode is still installed with `tool_search` but **zero MCP
+namespaces** for authenticated mapped chats. The status
 carries only a fixed failure code (`start-failed`, `start-timeout`,
 `missing-environment`, `connection-closed`, `closed`),
 never a transport message, response body, stderr tail, URL or configured value.
 
-Tool calls use the native request timeout and the calling turn's abort signal.
-When a script's deadline cancels a pending call, the client sends one MCP
-cancellation; it is not retried. Closing the gateway stops Code Mode admission,
+Tool calls pass `timeoutSeconds` (default 60) as the native per-request timeout
+and the calling turn's abort signal. The committed cancellation test covers a
+Code Mode *script deadline* aborting one pending call (one MCP cancellation, no
+retry); an expired native request timeout itself is code-read, not separately
+tested. Closing the gateway stops Code Mode admission,
 closes the sandbox and its workers, then closes every MCP client. A stdio server
 is stopped per the specification — close stdin, then SIGTERM, then SIGKILL to its
 whole process group — using the native transport. `gateway.close()` waits for
@@ -171,6 +188,9 @@ Known limits of this slice:
   that server's tools fail until the gateway is reopened.
 - No config hot reload, no per-conversation MCP selection and no scheduled-run
   MCP authority.
+- Startup failures are visible only as fixed failure codes on the SDK
+  `gateway.mcp` surface. There is no CLI notice or status UI for a failed server,
+  and the codes name no cause; inspect the server command yourself.
 - The server's declared output schema is not used as a validation contract;
   results arrive as the server sent them, bounded by native output limits.
 

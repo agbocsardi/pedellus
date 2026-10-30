@@ -164,9 +164,14 @@ scheduler; the settings default by itself is not a revocation mechanism.
 
 ## Shipped gateway wiring
 
-When `mcp.enabled` is true and at least one server is enabled, `openGateway()`
-connects the configured servers before building the Durable registry and installs
-this bundle with one `CodemodeNamespace` per connected MCP server. The MCP
+`mcpHasEnabledServers` gates the whole integration: `mcp.enabled` must be true
+and at least one server entry must not be `enabled: false`. No block, a disabled
+block, or only disabled entries means no client, no Code Mode and no
+`tool_search`. When that gate passes, `openGateway()` connects the configured
+servers before building the Durable registry and installs this bundle with one
+`CodemodeNamespace` per **connected** MCP server. If every enabled server fails,
+the bundle is still installed for authenticated mapped chats with
+`tool_search` and zero MCP namespaces; no MCP tool exists to discover. The MCP
 extension, `codemode` and `tool_search` are selected only for authenticated
 mapped chat conversations; their enabled tool filter includes `codemode`,
 `tool_search` and the deferred `mcp__*` registrations, while `modelTools` offers
