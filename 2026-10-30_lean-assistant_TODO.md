@@ -33,7 +33,7 @@ Owner approved this six-slice batch after the completed channel-neutral build:
 - [ ] O3 — Manual invocation plus opt-in ordinary cron integration over O2;
   completion/failure visibility and explicit prompt freshness. Ship inactive:
   create/enable no schedule or personal runtime configuration.
-- [ ] O4 — Research local Node/TypeScript-compatible speech alternatives before
+- [x] O4 — Research local Node/TypeScript-compatible speech alternatives before
   choosing readiness work. Compare actual native/Python/audio-decoder/model
   requirements, CPU/Linux support, packaging, licensing and maintenance. Public
   documentation research is authorized, installs/downloads/provisioning are not.
@@ -350,6 +350,29 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Overnight — Python-free local voice accepted and published
+
+O4 published by original implementer via clean-main fast-forward to `3fdd7de`,
+after research correction/re-review and fresh independent implementation/union
+PASS. Research and empirical evidence:
+[backend decision](plan/2026-10-30_local-transcription-backend-decision.md).
+Explicit whisper-cli backend uses operator-provisioned FFmpeg/ffprobe, engine,
+model and VAD; legacy faster-whisper remains the default with existing config
+compatibility. One deadline covers probe/decode/transcription; input, duration,
+decoded PCM and output bounds, cancellation/reaping and private-temp cleanup
+were checked. No runtime downloads, automatic fallback or personal config changes.
+
+Candidate gate: typecheck/build, 200 behavior, 2 execution, 83 offline core;
+published main typecheck/build and 17 focused checks passed. Real local Opus
+speech, silence and over-duration checks used downloaded local artifacts only;
+no provider/API inference or paid operations. No quality parity claim, one
+speaker/host, nightly prebuilt pin and no namespace-isolated offline proof.
+Accepted fail-closed limitation: metadata-heavy short audio can hit the PCM size
+fence. File-only protocol restrictions block network protocols but permit local
+playlist file references, not filesystem isolation; setup wording clarified.
+Optional extra test matrices/cosmetics deferred after clean independent review.
+Branches/worktrees and local proof artifacts preserved.
 
 ### Overnight — CLI attachments accepted and published
 

@@ -13,7 +13,7 @@ import type { GatewayModelList, GatewayModelSelection, GatewaySessionReset } fro
 import { inProcessTerminalConversation } from "../terminal/conversation.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import { MEDIA_LIMITS, MediaRejected, createMediaStore, type MediaRejectionReason, type MediaStore, type StoredMedia } from "../media/attachments.js";
-import { createTranscriber, type Transcriber, type TranscriptionFailure } from "../media/transcription.js";
+import { createTranscriber, type Transcriber, type TranscriptionBackend, type TranscriptionFailure, type WhisperCliEngine } from "../media/transcription.js";
 import {
   TELEGRAM_FILE_ORIGIN,
   TELEGRAM_MEDIA_LIMITS,
@@ -82,6 +82,10 @@ export type TelegramMediaTranscriptionOptions = {
   readonly enabled?: boolean;
   readonly language?: string;
   readonly maxDurationSeconds?: number;
+  /** Absent keeps the existing uv/faster-whisper helper. */
+  readonly backend?: TranscriptionBackend;
+  /** Required exactly when `backend` is `whisper-cli`. */
+  readonly whisperCli?: WhisperCliEngine;
   /** Advanced: override the uv executable or the helper script path (offline checks). */
   readonly uvPath?: string;
   readonly helperPath?: string;
@@ -2606,6 +2610,22 @@ function validateOptions(options: TelegramOptions): void {
       if (transcription.timeoutMs !== undefined &&
           (!Number.isInteger(transcription.timeoutMs) || transcription.timeoutMs < 1 || transcription.timeoutMs > 900_000)) {
         throw new Error("media.transcription.timeoutMs must be an integer from 1 to 900000");
+      }
+      if (transcription.backend === "whisper-cli") {
+        const engine = transcription.whisperCli;
+        if (engine === undefined) {
+          throw new Error("media.transcription.backend \"whisper-cli\" requires media.transcription.whisperCli");
+        }
+        for (const key of ["binary", "model", "vadModel", "ffmpeg", "ffprobe"] as const) {
+          const value = engine[key];
+          if (typeof value !== "string" || !value.startsWith("/")) {
+            throw new Error(`media.transcription.whisperCli.${key} must be an absolute path`);
+          }
+        }
+      } else if (transcription.backend !== undefined && transcription.backend !== "faster-whisper") {
+        throw new Error("media.transcription.backend must be faster-whisper or whisper-cli");
+      } else if (transcription.whisperCli !== undefined) {
+        throw new Error("media.transcription.whisperCli is required exactly when backend is whisper-cli");
       }
     }
   }

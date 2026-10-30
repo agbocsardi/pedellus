@@ -280,4 +280,82 @@ Face hub offline mode forced. If the environment or model is not cached,
 transcription fails and says so truthfully: the stored audio is still on disk,
 the caption is preserved, and the turn is never told that the speech was
 understood. Use `--language` in the helper call when you want to check a
-specific language by hand.
+specific language by hand. The helper itself also refuses its own 20 MiB input
+cap, independently of the adapter's download limit.
+
+### Optional: Python-free backend (whisper.cpp)
+
+A second engine is available and is **opt-in**: without the field below, an
+existing configuration keeps the uv/faster-whisper helper exactly as it was.
+Selecting it is explicit, and the two are never mixed or switched automatically:
+
+```json
+"media": {
+  "directory": "media",
+  "transcription": {
+    "language": "en",
+    "maxDurationSeconds": 120,
+    "backend": "whisper-cli",
+    "whisperCli": {
+      "binary": "/opt/whisper-cli/whisper-cli",
+      "model": "/opt/whisper-cli/ggml-small-q5_1.bin",
+      "vadModel": "/opt/whisper-cli/ggml-silero-v6.2.0.bin",
+      "ffmpeg": "/opt/media-tools/ffmpeg",
+      "ffprobe": "/opt/media-tools/ffprobe"
+    }
+  }
+}
+```
+
+Every path is absolute and operator-provisioned; the runtime never downloads,
+builds, discovers or falls back to another engine. `backend: "faster-whisper"`
+is the explicit spelling of the default, and a `whisperCli` block without
+`backend: "whisper-cli"` is a configuration error rather than a silent switch.
+
+Pinned provisioning (one-time, the only step that may use the network):
+
+- Engine: the upstream release tarball for the host architecture, for example
+  `whisper-bin-ubuntu-x64.tar.gz` from nightly `b5454`
+  (`sha256 a72becf15d7917f990f6313867a52638b82b7f9ef237fb0c980dac56a135781c`).
+  Extract it into one directory and keep the sibling `libggml*.so` files: the
+  CLI loads its CPU backends from `$ORIGIN`. Stable `v1.9.5` publishes no
+  binaries, so a stable pin means building from source with
+  `-DGGML_NATIVE=OFF`. `LD_LIBRARY_PATH` is deliberately not inherited, so the
+  engine directory must resolve its own libraries.
+- Model: `ggml-small-q5_1.bin` from `ggerganov/whisper.cpp`
+  (`sha256 ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb`);
+  `ggml-small-q8_0.bin`
+  (`sha256 49c8fb02b65e6049d5fa6c04f81f53b867b5ec9540406812c643f177317f779f`)
+  is the larger alternative. Both are the multilingual `small` tier; neither is
+  claimed to match the CTranslate2 `int8` baseline's output.
+- VAD: `ggml-silero-v6.2.0.bin` from `ggml-org/whisper-vad`
+  (`sha256 2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987`).
+  VAD is mandatory on this route; without it, silence and music can produce
+  phantom text.
+- `ffmpeg`/`ffprobe`: any local build with the codecs your attachments use
+  (Opus for Telegram voice notes). The project does not ship or download either.
+
+Runtime behavior of this route, all in one bounded operation:
+
+- One deadline (the same 180 s default; there is no separate per-step timeout)
+  spans the duration probe, the decode and the inference, so a slow decoder
+  cannot buy extra time.
+- `maxDurationSeconds` refuses rather than truncates: the probe rejects a longer
+  file up front, and the decoded PCM is additionally size-bounded, so wrong
+  duration metadata cannot smuggle an over-long file through.
+- The 20 MiB input cap applies to every caller of this backend, not only the
+  Telegram download path.
+- Decoding blocks network protocols (`-protocol_whitelist file`), but permits
+  local file references within playlist containers; this is not filesystem
+  isolation. It writes one private temporary WAV removed on success, failure, timeout
+  and cancellation.
+- Children see a small fixed environment (locale and temporary-directory keys
+  only). Hugging Face and `uv` variables are not inherited on this route, and
+  neither is `LD_LIBRARY_PATH`.
+- Failures stay fixed and value-free: `unavailable` (engine or model missing),
+  `timeout`, `cancelled`, `too-large`, `failed`, `empty`. Transcripts are capped
+  at 64 KiB like any other untrusted input.
+
+On one measured 4-core/8-thread CPU, a 102 s Ogg/Opus file took about 32 s end to
+end through this route (probe, decode, VAD and `small` inference). That is one
+host's number, not a guarantee.

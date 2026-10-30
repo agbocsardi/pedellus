@@ -152,17 +152,23 @@ download keeps the admitted update instead of losing it, and a reopen resumes it
 - **Documents** have no extraction scope: the file simply exists on disk with no
   read, OCR, PDF/Office conversion or automatic content extraction. The turn says
   so explicitly and leaves reading it to the configured tools.
-- **Voice/audio** is stored first and then transcribed locally by the shared
-  helper (`scripts/local-transcribe.py`, faster-whisper `small` on CPU with
-  `int8`). The transcript is bounded, labeled as automatic and untrusted user
+- **Voice/audio** is stored first and then transcribed locally by the configured
+  engine. Two explicit backends exist: the default `faster-whisper` helper
+  (`scripts/local-transcribe.py` through `uv`, model `small` on CPU with `int8`)
+  and an opt-in Python-free `whisper-cli` route (`media.transcription.backend`,
+  see [setup](./SETUP.md#optional-python-free-backend-whispercpp)). Omit `backend`
+  and the adapter behaves exactly as before; a `whisperCli` block without
+  `backend: "whisper-cli"` is refused instead of switching silently. The
+  transcript is bounded, labeled as automatic and untrusted user
   content, and never implies the speech was understood correctly. The caption is
   preserved. If the backend or model is not provisioned, or transcription fails
   or times out, the turn says that truthfully and the stored audio remains
   available; nothing is claimed to have been heard. Transcription is a bounded
-  subprocess with a wall-clock timeout, an output cap, an audio-duration cap, and
-  a killed process group on abort or timeout. It runs through uv in offline mode
-  with local-model-only loading, so handling a message never installs or
-  downloads anything. There is no cloud fallback and no provider registry.
+  subprocess with a single wall-clock deadline, an output cap, an audio-duration
+  refusal, and a killed process group on abort or timeout. It runs offline with
+  local-model-only loading, so handling a message never installs or
+  downloads anything. There is no cloud fallback, no automatic engine switching
+  and no provider registry.
 - **Unsupported kinds** (video, video notes, animations, stickers) are named in a
   fixed notice and never downloaded, stored or read.
 

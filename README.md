@@ -72,9 +72,12 @@ it. Photos arrive as native pi-ai image content plus a labeled workspace-relativ
 locator, so a preset marked `needsVisionHandoff` is described by the configured
 describer preset instead of receiving raw bytes. Documents are saved unread under
 the workspace media directory: no PDF, OCR or Office extraction. Voice/audio uses
-the local uv/faster-whisper helper (CPU, `small`, `int8`); provision it explicitly
-before use, because handling a message never installs the helper, downloads a
-model or calls a cloud provider. Stored originals are ordinary workspace files
+the configured local engine: the default uv/faster-whisper helper (CPU, `small`,
+`int8`) or the opt-in Python-free `whisper-cli` route
+(`media.transcription.backend`, with engine/model/VAD/FFmpeg paths provisioned by
+the operator). Provision whichever you choose explicitly before use, because
+handling a message never installs the helper, downloads a model or calls a cloud
+provider. Stored originals are ordinary workspace files
 readable through the configured tools: no extra tool authority, no automatic
 deletion and no total-disk cap. The local CLI submits one operator-named file per
 explicit `/attach` through the same gateway store; a known image extension

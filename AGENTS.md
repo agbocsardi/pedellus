@@ -117,8 +117,14 @@ npm start -- agent --config config.json     # attach a terminal
   native pi-ai image content plus a workspace-relative locator; configured vision
   handoff describes them for flagged text-only presets. Documents are stored
   unread with no extraction, and voice/audio is transcribed locally only when the
-  helper is provisioned explicitly. Stored originals grant no tool authority, are
-  never auto-deleted, and have no total-disk cap.
+  chosen engine is provisioned explicitly. The default engine is the uv/
+  faster-whisper helper (`small`/CPU/`int8`) and stays the default: the Python-free
+  `whisper-cli` route is selected only by `media.transcription.backend` plus an
+  absolute, operator-provisioned engine/model/VAD/FFmpeg block. No runtime
+  download, engine fallback or in-process native addon; that route enforces VAD,
+  one deadline over probe+decode+inference, a refusing duration bound backed by a
+  decoded-PCM size fence, and a cleaned private temp WAV. Stored originals grant
+  no tool authority, are never auto-deleted, and have no total-disk cap.
 - Bubblewrap is accidental-damage protection over the real workspace, not
   hostile-tenant isolation, and it is off by default.
 
