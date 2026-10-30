@@ -251,6 +251,7 @@ test("native web tools are reachable only in mapped chats", { timeout: 20_000 },
       ],
     },
   });
+  try {
   let gateway;
   try {
     const { faux, models } = syntheticModels();
@@ -357,6 +358,8 @@ test("native web tools are reachable only in mapped chats", { timeout: 20_000 },
     assert.ok(!names.includes("web_search") && !names.includes("web_fetch"), `reopened tools: ${names}`);
   } finally {
     if (reopened) await reopened.close(context);
+  }
+  } finally {
     await rm(store.directory, { recursive: true, force: true });
   }
 });
@@ -655,6 +658,7 @@ test("native Code Mode reaches configured web and MCP tools through nested hooks
     ], { stopReason: "toolUse" }),
     fauxAssistantMessage("nested answer"),
   ]);
+  try {
   let gateway;
   try {
     gateway = await openGateway(
@@ -747,7 +751,9 @@ test("native Code Mode reaches configured web and MCP tools through nested hooks
     /Missing credential/,
   );
   await assert.rejects(access(latePid), /ENOENT/);
-  await rm(store.directory, { recursive: true, force: true });
+  } finally {
+    await rm(store.directory, { recursive: true, force: true });
+  }
 });
 
 test("Code Mode composes coding, history and web without an MCP server", { timeout: 60_000 }, async () => {

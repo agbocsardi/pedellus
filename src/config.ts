@@ -181,7 +181,8 @@ export interface PortConfig {
   /**
    * Explicit MCP servers and the switch that connects them. This is a separate authority from
    * `toolAllowlist`: naming a server connects it, and its tools still reach only authenticated
-   * mapped chat conversations. Absent or disabled installs no MCP client and no Code Mode.
+   * mapped chat conversations. Absent or disabled installs no MCP client; Code Mode
+   * still follows its own `codemode` switch.
    */
   mcp?: McpConfig;
   /** Native Code Mode composition; absent follows MCP auto-enablement. */
@@ -199,7 +200,6 @@ export interface PortConfig {
   extraAllowedDirs?: readonly string[];
   bwrapPath?: string;
   credentials?: Partial<Record<CredentialProvider, string>>;
-  /**
   /**
    * Native public web capabilities. Absent installs no web tool; `search` and
    * `fetch` enable independently. This is separate authority from `toolAllowlist`
