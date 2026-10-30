@@ -137,13 +137,12 @@ as behavioral references, not a subsystem to copy.
   `prompts/memory-curation.md`), editable through its configured ordinary tools
   so the owner and agent can inspect, discuss and tune it. Shipped prompt text
   is an initial seed only: never overwrite an existing workspace prompt during
-  startup, upgrades or runs. Record the prompt source/version or content hash
-  used by each run; edits affect future runs, not prepared dispatches. Hard
-  authority/edit bounds and processed-history bookkeeping remain runtime-owned,
-  not removable instructions in the editable prompt.
+  startup, upgrades or runs. Keep this simple: no added prompt hashes, version
+  registry or prompt-management machinery. Existing runtime safeguards still apply.
 - Read bounded, source-labeled Durable history; original entries remain
-  authoritative. Track processed history in native Durable state, not a second
-  Python-style history archive. Do not mark omitted/truncated evidence processed.
+  authoritative. Keep a simple digestion cursor, like the Python dream cursor,
+  recording how far history has been successfully processed. Use native Durable
+  state, not a second history archive; never advance past unprocessed evidence.
 - Follow the working Python write scope: `SOUL.md` for behavior/invariants,
   `USER.md` for stable personal preferences, `memory/<topic>/<name>.md` for topic
   context, small `memory/system/` for broadly relevant current material, and
@@ -220,6 +219,18 @@ remain intact. No deployment or live-delivery claim; no live model/bot run.
 
 ## Session log
 
+### 2026-10-30 — Telegram owner-command scope
+
+Owner selected Telegram owner commands as independent work. Use `/model` for
+configured presets and `/status` for bounded own-chat metadata. Do not add a
+separate Telegram `/refresh`: `/new` must reset the conversation and rebuild the
+assembled workspace Markdown/skills prompt for the new session. `/restart` must
+gracefully restart the full gateway process so new code and config load; attached
+CLI clients disconnect and Durable work recovers under existing safety rules.
+No deployment, service manager, live bot run or new tool authority is authorized.
+The original owner-command implementer received this scope update; review and
+integration are still required.
+
 ### 2026-10-30 — deferred conversation digestion scope
 
 Read the Python curation prompt and guarded runner after the owner clarified
@@ -228,10 +239,12 @@ memory/skill editing and pruning scope, source/processed-frontier integrity and
 ordinary cron/worker implementation constraint. Corrected product-worker wording:
 shared/worktree is chosen by the spawning agent; completion notifies that agent,
 not the user. Owner also required an agent-owned, inspectable/editable workspace
-consolidation prompt, seeded once and versioned per run without weakening runtime
-bounds or rewriting prepared work. Owner explicitly deferred curation
-implementation until background workers exist and requested a different next slice. No curation code, schedule,
-model run or historical-data processing started; this is planning only.
+consolidation prompt, seeded once. The owner subsequently clarified: a simple
+editable prompt plus digestion cursor, without prompt hashes/version machinery.
+Existing runtime safety and data-integrity requirements remain. Owner explicitly
+deferred curation implementation until background workers exist and requested a
+different next slice. No curation code, schedule, model run or historical-data
+processing started; this is planning only.
 
 ### 2026-10-30 — MCP accepted and published
 
