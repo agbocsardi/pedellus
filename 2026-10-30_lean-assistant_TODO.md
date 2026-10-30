@@ -87,7 +87,9 @@ not permission to start every branch or run live integrations):
     model-facing `worker` start/list/inspect/cancel, explicit shared-or-worktree
     workspace, captured tool ceiling, one internal result event to the spawning
     agent. Implemented on branch `t3/durable-background-workers` and awaiting
-    independent review; scheduled memory curation is explicitly still out of scope.
+    independent review; memory curation is deferred by owner decision (recorded on
+    main in `655b034`, which also restates these worker decisions) and this branch
+    contains none of it.
 
 Approved first implementation batch: channel-neutral gateway/local CLI attachment
 and Telegram menu/reply/quote/reaction support. These are two independently owned
@@ -205,8 +207,13 @@ idempotent result event to the spawning agent. Ten offline checks in
 `tests/background-workers.behavior.test.mjs` cover the agreed finish line with a
 faux provider and temporary git/non-git fixtures. No live provider, bot, network,
 credential, dependency install or deployment was used; scheduled memory curation
-was not started. Awaiting fresh independent review; no integration or main
-publication yet.
+was not started. Owner later recorded the deferred curation scope on main
+(`655b034`, docs only, after the media-ingress metadata): digestion of previously
+unprocessed conversations/episodes with an agent-owned, seed-once workspace
+consolidation prompt, runtime-owned bounds/frontier, no Dream engine and no
+activation. That work remains unimplemented here by instruction; its notes must
+be preserved when this plan is merged. Awaiting fresh independent review of the
+workers slice; no integration or main publication yet.
 
 ### 2026-10-30 — media ingress and configured vision handoff
 

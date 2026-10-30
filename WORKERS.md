@@ -131,7 +131,11 @@ never re-run.
 
 ## Limits
 
-- This slice adds no scheduled memory curation; that is a later ordinary cron job using these workers.
+- This slice adds no memory curation, consolidation prompt, processed-history bookkeeping or
+  "Dream" engine, and nothing here schedules or activates it. The owner deferred that work until
+  workers are accepted, and its shape (an agent-owned workspace consolidation prompt, per-run prompt
+  version/hash, runtime-owned bounds and a processed frontier that advances only on a validated
+  batch) is recorded in the current work order, not implemented here.
 - No automatic merge, cleanup, stash, rebase or commit of the owner's state, and no worktree deletion.
 - No live-model, Telegram or deployment run is claimed: the offline checks use a faux provider and
   temporary git fixtures.
