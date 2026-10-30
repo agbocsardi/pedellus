@@ -130,13 +130,37 @@ export interface WorkspaceContextConfig {
   readonly skills?: WorkspaceSkillsConfig;
 }
 
+/**
+ * Operator-provisioned whisper.cpp engine. Every path is explicit and absolute;
+ * nothing is discovered, built or downloaded at runtime.
+ */
+export interface WhisperCliEngineConfig {
+  /** `whisper-cli` executable. */
+  readonly binary: string;
+  /** `ggml` Whisper model file. */
+  readonly model: string;
+  /** Silero VAD `ggml` model; required, VAD is mandatory on this route. */
+  readonly vadModel: string;
+  /** `ffmpeg` executable, used only to decode the local input. */
+  readonly ffmpeg: string;
+  /** `ffprobe` executable, used for the early duration refusal. */
+  readonly ffprobe: string;
+}
+
 export interface MediaTranscriptionConfig {
-  /** Absent or true enables local faster-whisper transcription of stored audio. */
+  /** Absent or true enables local transcription of stored audio. */
   readonly enabled?: boolean;
   /** Language hint for the local helper; absent means auto-detect. */
   readonly language?: string;
   /** Audio longer than this is not transcribed; defaults to 120 seconds. */
   readonly maxDurationSeconds?: number;
+  /**
+   * Explicit engine. Absent keeps the existing uv/faster-whisper helper exactly
+   * as configured today; `whisper-cli` opts in to the Python-free route.
+   */
+  readonly backend?: "faster-whisper" | "whisper-cli";
+  /** Required with `backend: "whisper-cli"`, rejected otherwise. */
+  readonly whisperCli?: WhisperCliEngineConfig;
 }
 
 /**
@@ -505,15 +529,51 @@ function workersConfig(value: unknown): WorkersConfig {
   return Object.freeze(workers);
 }
 
+function whisperCliEngineConfig(value: unknown): WhisperCliEngineConfig {
+  const raw = object(value, "media.transcription.whisperCli");
+  const keys = ["binary", "model", "vadModel", "ffmpeg", "ffprobe"] as const;
+  for (const key of Object.keys(raw)) {
+    if (!(keys as readonly string[]).includes(key)) {
+      throw new Error(`Unknown media.transcription.whisperCli field: ${key}`);
+    }
+  }
+  const parsed: Record<string, string> = {};
+  for (const key of keys) {
+    const entry = raw[key];
+    if (typeof entry !== "string" || entry.trim() === "") {
+      throw new Error(`media.transcription.whisperCli.${key} must be a non-empty path`);
+    }
+    if (!isAbsolute(entry)) {
+      throw new Error(`media.transcription.whisperCli.${key} must be an absolute path`);
+    }
+    parsed[key] = entry;
+  }
+  return Object.freeze(parsed as unknown as WhisperCliEngineConfig);
+}
+
 function mediaTranscriptionConfig(value: unknown): MediaTranscriptionConfig {
   const raw = object(value, "media.transcription");
   for (const key of Object.keys(raw)) {
-    if (key !== "enabled" && key !== "language" && key !== "maxDurationSeconds") {
+    if (key !== "enabled" && key !== "language" && key !== "maxDurationSeconds" &&
+        key !== "backend" && key !== "whisperCli") {
       throw new Error(`Unknown media.transcription field: ${key}`);
     }
   }
   if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") {
     throw new Error("media.transcription.enabled must be a boolean");
+  }
+  let backend: "faster-whisper" | "whisper-cli" | undefined;
+  if (raw.backend !== undefined) {
+    if (raw.backend !== "faster-whisper" && raw.backend !== "whisper-cli") {
+      throw new Error("media.transcription.backend must be faster-whisper or whisper-cli");
+    }
+    backend = raw.backend;
+  }
+  const whisperCli = raw.whisperCli === undefined ? undefined : whisperCliEngineConfig(raw.whisperCli);
+  if ((backend === "whisper-cli") !== (whisperCli !== undefined)) {
+    throw new Error(
+      "media.transcription.whisperCli is required exactly when backend is whisper-cli",
+    );
   }
   let language: string | undefined;
   if (raw.language !== undefined) {
@@ -532,6 +592,8 @@ function mediaTranscriptionConfig(value: unknown): MediaTranscriptionConfig {
   }
   return Object.freeze({
     ...(raw.enabled === undefined ? {} : { enabled: raw.enabled }),
+    ...(backend === undefined ? {} : { backend }),
+    ...(whisperCli === undefined ? {} : { whisperCli }),
     ...(language === undefined ? {} : { language }),
     ...(maxDurationSeconds === undefined ? {} : { maxDurationSeconds }),
   });

@@ -151,7 +151,7 @@ hard-requires `onnxruntime-node`, i.e. a native N-API shared library
 | Python/uv needed | no | no | no | no | **yes** |
 | Native artifact | CLI + sibling `ggml` `.so`, prebuilt nightly tarball or own build | addon, install-time build or prebuild | prebuilt `.so` via npm | prebuilt ONNX Runtime (≈308 MB unpacked) | Python wheels |
 | Compiler-free host | yes, on a nightly prerelease pin; no on a stable pin | only if a matching prebuild exists | yes | yes | n/a (needs Python toolchain) |
-| New npm dependencies | 0 (FFmpeg-predecode route); ≥1 for a Node WASM Opus decoder | 3 + optional `cmake-js` (`nodejs-whisper`) / 1 (`smart-whisper`) | 3+ optional platform packages | 5 + `sharp` | 0 |
+| New npm dependencies | 0 (FFmpeg-predecode route); ≥1 for a Node WASM Opus decoder | 3 + optional `cmake-js` (`nodejs-whisper`) / 1 (`smart-whisper`) | 3+ optional platform packages | 5, including `sharp` | 0 |
 | CPU/Linux x64 | yes (runtime CPU variants in the prebuilt, AVX/NEON builds) | yes | yes | yes | yes |
 | `small` multilingual model | 181 MiB `q5_1` / 252 MiB `q8_0` / 465 MiB fp16 | same | 610 MiB archive | ≈237 MiB int8 ONNX | 461 MiB CT2 |
 | Ogg/Opus decode | **no** by default; pre-decode with FFmpeg (host binary) or build `WHISPER_COMMON_FFMPEG` (adds runtime libav*.so) | no (caller decodes) | no (caller decodes) | no (caller decodes) | **yes** (PyAV) |
@@ -166,11 +166,12 @@ These are contract differences, not cosmetics, and were confirmed in source and
 by local trial (see the empirical note linked at the end):
 
 - **Exit codes.** The Python helper's map is 1 usage / 2 failed / 3 unavailable /
-  4 too-large. `whisper-cli` uses 3 for init or model-load failure, 4 for a
-  **grammar parse error**, 10 for a processing failure and 11 for an input-read
-  failure. Code 4 in the new engine does not mean "too large", so the existing
-  map cannot be reused unchanged; a new adapter needs its own mapping, and
-  `too-large` must come from an explicit check rather than an exit code.
+  4 too-large. `whisper-cli` uses 1 for usage or response-file errors, 2 for "no
+  input files", 3 for init or model-load failure, 4 for a **grammar parse error**,
+  10 for a processing failure and 11 for an input-read failure. Code 4 in the new
+  engine does not mean "too large", so the existing map cannot be reused unchanged;
+  a new adapter needs its own mapping, and `too-large` must come from an explicit
+  check rather than an exit code.
 - **`-d` is truncation, not refusal.** It is documented as "duration of audio to
   process in milliseconds" and behaves that way: the run still succeeds with a
   shorter transcript. The promised `maxDurationSeconds` refusal has to be enforced
@@ -267,6 +268,13 @@ reproduced. Still open:
 - Decide and record, before coding: nightly-prebuilt pin (A) versus own build (A)
   versus npm platform package (C). That choice fixes installation docs, licence
   entries and the failure messages.
+
+The selection shape is now implemented in this branch, pending review: the
+config carries `media.transcription.backend` (`"faster-whisper"` or
+`"whisper-cli"`) plus an absolute `whisperCli` block, absence of `backend` keeps
+the uv/faster-whisper helper exactly as before, and an engine block without the
+matching `backend` is a configuration error rather than a silent switch. No npm
+dependency, daemon or engine fallback was added.
 
 ## Sources (accessed 2026-10-30)
 

@@ -226,3 +226,27 @@ Redistributions in binary form must reproduce the above copyright notice, this l
 
 THIS IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS,
 EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## Optional whisper.cpp transcription backend (not bundled)
+
+The opt-in `media.transcription.backend: "whisper-cli"` route runs an
+operator-provisioned engine. This repository does not ship, vendor or download
+any of the following, and the MIT text above covers only the engine:
+
+- **whisper.cpp** (`whisper-cli`), MIT — https://github.com/ggml-org/whisper.cpp.
+  The engine directory must be provisioned by the operator, including its sibling
+  `libggml*.so` backends.
+- **Whisper `ggml` model weights** (`ggml-small-q5_1.bin`, `ggml-small-q8_0.bin`)
+  from `ggerganov/whisper.cpp`, MIT (OpenAI Whisper weights) —
+  https://huggingface.co/ggerganov/whisper.cpp.
+- **Silero VAD `ggml` model** (`ggml-silero-v6.2.0.bin`) from
+  `ggml-org/whisper-vad` — https://huggingface.co/ggml-org/whisper-vad. Required
+  on this route; check that model repository's own terms before redistributing it.
+- **FFmpeg / FFprobe**: not bundled and not redistributed. The operator supplies
+  their own build, and its licence is whatever that build carries (a
+  `libopus`-enabled static build is typically GPL). Nothing here changes the
+  licence of the project or of FFmpeg.
+
+Test speech used during local validation is not part of this repository either:
+it is a public-domain US-government recording shipped with whisper.cpp's own
+samples, kept out of version control.
