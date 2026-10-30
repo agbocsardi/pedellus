@@ -25,16 +25,48 @@ stop adding acceptance scaffolding or repeating timed pilots. Live reminder
 delivery is still unverified, but the extra check is deferred by owner decision.
 The test bot is stopped and completed agents are cleaned up.
 
-Recommended next step: make the retained assistant convenient for ordinary use,
-starting with a fresh workspace rather than migration. Agree its persistent
-workspace, config and launch method; reuse the normal CLI and the platform's
-service manager if an always-on Telegram process is wanted. No new operations
-framework. Then use it for a few days and fix observed friction.
+The next usability target is a channel-neutral gateway, not a Telegram-specific
+daemon. `openGateway` already owns shared runtime/storage; the executable currently
+chooses Telegram or terminal. Improve the host so CLI and Telegram can use the
+same owner, with Discord/Email as later adapters. Do not create a database owner
+per channel, a second agent loop or a general-purpose operations framework.
+Persistent workspace/config/launch decisions still need owner agreement.
 
-After that, the first useful feature candidate is web search/fetch, followed by
-MCP only for a concrete integration need. Product delegation and more channels
-stay later. This is a discussion order, not authorization to deploy, access
-personal data, spend on another run or start all feature branches.
+Owner's annotation feedback sets these next product requirements (plan first,
+not permission to start every branch or run live integrations):
+
+- [ ] Keep on-the-fly Markdown memory updates through configured `read`/`write`/
+  `edit`; make snapshot/manifest freshness explicit using the existing refresh
+  path. Python-named `memory_read`/`memory_write`/`memory_search` are not present;
+  add a dedicated operation only when it does more than wrap existing tools.
+- [ ] Native Telegram command menu/autocomplete for commands actually implemented;
+  reuse `setMyCommands`, with no speculative command router or dead menu entries.
+- [ ] Wire configured MCP connections into the actual gateway and expose their
+  registered tools through Code Mode/tool discovery. The current SDK-only Code
+  Mode bundle is not MCP connectivity and is not installed by the shipped host.
+- [ ] Prioritize channel-neutral attachment/voice support: shared transcription
+  configuration/processing, Telegram ingress first, native vision for photos and
+  established extraction for supported documents. Choose one initial speech
+  backend; do not translate Python's entire provider registry.
+- [ ] Add bounded ordinary background workers; scheduled memory curation may then
+  be an ordinary cron job using those workers and the existing Markdown tools,
+  not a standalone Dream subsystem.
+
+First bounded implementation batch: channel-neutral host/CLI attachment and
+Telegram command-menu registration can proceed independently. In parallel, settle
+the shared media/transcription ingress and first backend before implementing
+voice support. Python defaults to local faster-whisper; a local backend or one
+explicit hosted transcription endpoint are the candidates, not a copied registry.
+No cloud-audio upload or new runtime service is authorized by this planning step.
+
+Then wire product Code Mode + MCP, followed by bounded background workers and
+ordinary scheduled memory curation. Photos/documents remain in the high-priority
+media work, not a distant polish list.
+
+Web search/fetch remains a useful reach feature alongside MCP. Other channels,
+provider variants and richer UI follow actual use, not feature-for-feature parity.
+This is a discussion order, not authorization to deploy, read personal settings,
+spend on another run or start all feature branches.
 
 ## Product and constraints
 
@@ -44,7 +76,7 @@ This follows the useful trunk of the [old assistant tree](plan/2026-10-29_assist
 
 No new service layer, agent loop, queue, retry framework, configuration mode, dashboard, backup subsystem or general-purpose acceptance harness. A short integration check is better than a test platform. Prefer deleting obsolete work and fixing observed failures over speculative restructuring. Keep data integrity and provenance; never trade them for fewer lines.
 
-The implementation batch is offline. A separately owner-approved live acceptance run may use only an explicitly named runtime credential, synthetic data and the existing budget guard; no credential-file discovery or value output. No security audit, personal data, migration, deployment or cutover. Live Telegram activity is limited to a separately owner-approved single-user synthetic pilot. Future web/MCP, product delegation and additional channels remain possible, but are not this batch's work. Dream, standing intents, heartbeat and sustained goals remain excluded.
+The implementation batch is offline. A separately owner-approved live acceptance run may use only an explicitly named runtime credential, synthetic data and the existing budget guard; no credential-file discovery or value output. No security audit, personal data, migration, deployment or cutover. Live Telegram activity is limited to a separately owner-approved single-user synthetic pilot. The completed pilot batch does not itself enable web/MCP, product delegation or more channels. No standalone Dream engine will return: its desired memory-curation behavior is planned as an ordinary scheduled background job using the same worker/tools path. Standing intents, dedicated heartbeat and sustained goals remain excluded.
 
 ## Batch ownership and finish line
 
@@ -96,4 +128,4 @@ The resumed pilot preserved a queued message from the allowlisted owner sent dur
 
 Recorded the narrow result in TELEGRAM.md. After owner confirmed the working interactions, cleaned the completed transport/typing workers and reviewers (4 agents, 2 clean worktrees and their patch-equivalent integrated branches). Other older unrelated resources remain untouched. A short separately approved reminder-only check was the remaining Telegram pilot item; do not repeat the whole sequence or silently renew the consumed budget.
 
-Owner subsequently accepted this as good enough and explicitly asked to update the plan and discuss what comes next. The pilot batch is now complete by owner decision. Reminder-only live verification is deferred, not marked passed. No more testing, provider spend or implementation was started. Recommend ordinary-use setup with a fresh workspace, then observed-friction fixes; web search/fetch is the next feature candidate rather than more internal machinery.
+Owner subsequently accepted this as good enough and explicitly asked to update the plan and discuss what comes next. The pilot batch is now complete by owner decision. Reminder-only live verification is deferred, not marked passed. No more testing, provider spend or implementation was started. The initial recommendation was ordinary-use setup, then reach features. Owner's subsequent annotations corrected the next priorities: gateway is channel-neutral (CLI plus Telegram, future Discord/Email), native Telegram command-menu niceties, MCP through product Code Mode, and high-priority photos/documents/voice. Memory already supports on-the-fly Markdown changes via configured read/write/edit, but not the Python-named memory tools or automatic snapshot refresh after each write. Current Code Mode is an opt-in SDK bundle only; no MCP client/config or shipped gateway installation exists. Python's voice flow is channel download -> shared transcription config/service -> provider -> labeled transcript in the normal user turn. Plan the equivalent shared ingress with one initial backend, rather than copying its provider registry. Dream was parked as a special subsystem, not rejected as a behavior: ordinary cron plus bounded background workers and memory tools should provide its essence. No implementation/live calls launched for these annotations.
