@@ -3,8 +3,8 @@
 `npm run test:core-acceptance` is a disposable, offline acceptance run of the
 actual built Gateway. It proves that the shipped wiring — not a test double of
 it — can carry one conversation through context discovery, an on-demand skill,
-topic-memory read/write under expiring grants, native compaction and a
-fresh-process reopen.
+topic-memory read/write through the configured coding tools, native compaction
+and a fresh-process reopen under a narrowed configuration.
 
 It is not a unit-test suite. The default and rehearsal modes are offline and
 make no provider call; `--mode=real` is the separately authorized live path.
@@ -27,16 +27,17 @@ directory, and runs two bounded child processes:
 1. **First process** — opens `openGateway` with the real workspace host
    (`workspaceContextGatewayOptions`), a faux pi-ai provider and a synthetic
    `AGENTS.md`, `memory/MEMORY.md`, topic memory directory and `skills/`
-   directory. It grants `read`/`write`/`edit` with explicit expiries, writes a
-   topic memory file through the granted `write` tool, reads it back through the
-   granted `read` tool, proves an expired grant blocks its tool call, and runs a
-   native manual `Conversation.compact()`.
+   directory. It configures `read`/`write`/`edit`, proves those tools are
+   offered, writes a topic memory file through the configured `write` tool, reads
+   it back through the configured `read` tool, proves a call to the unconfigured
+   `bash` tool is refused, and runs a native manual `Conversation.compact()`.
 2. **Second process** — reopens the same SQLite state and workspace, then checks
    that the early fact arrives in a normal model request **through the placed
    compaction summary**, that the original early turn text does not, that
    bootstrap files, the memory manifest and the skill summary are rediscovered
-   from Markdown, and that pending grants are still present. The skill body and
-   topic body load on demand through tool results.
+   from Markdown, and that reopening with `toolAllowlist: ["read"]` offers only
+   the configured read tool. The skill body and topic body load on demand through
+   tool results.
 
 The early user turn is the only source of the acceptance fact and also carries a
 distinct raw-turn sentinel. The topic memory file uses its own marker, so a topic

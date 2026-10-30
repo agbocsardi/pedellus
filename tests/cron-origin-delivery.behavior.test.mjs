@@ -57,7 +57,7 @@ async function syntheticGateway(label, options = {}) {
         ? {}
         : { telegram: { tokenEnv: 'SYNTHETIC_TELEGRAM_TOKEN', allowFrom: ['501'] } }),
     }, directory);
-    const gateway = await openGateway(config, context, { models, toolAuthorization: 'config' });
+    const gateway = await openGateway(config, context, { models });
     return { directory, config, faux, gateway };
   } catch (error) {
     // Setup failed before the test owned a gateway to close; still remove this store's directory.

@@ -4,9 +4,10 @@
  *
  * Exercises the actual `openGateway` build over a generated, disposable
  * workspace with a faux pi-ai provider: real Markdown context discovery, an
- * on-demand skill body, topic-memory read/write through expiring grants, a
- * native Durable manual compaction, and a fresh Node process that reopens the
- * same store and must recall an early fact through the summary only.
+ * on-demand skill body, topic-memory read/write through the configured coding
+ * tools, a native Durable manual compaction, and a fresh Node process that
+ * reopens the same store under a narrowed toolAllowlist and must recall an
+ * early fact through the summary only.
  *
  * No provider network request, credential, personal workspace, channel, or
  * external fixture is involved. The run is offline-only and the report states
@@ -48,7 +49,7 @@ const MEMORY_MARKER = "MEMORY_MD_MARKER_7C1D";
 const TOPIC_PATH = "memory/topics/acceptance.md";
 /** Topic-file body marker; deliberately distinct from the early-turn FACT. */
 const TOPIC_MARKER = "TOPIC_LYNX-4820";
-const TOPIC_DESCRIPTION = "Synthetic acceptance topic written through a granted tool";
+const TOPIC_DESCRIPTION = "Synthetic acceptance topic written through a configured tool";
 const COMPACTION_PREFIX = "The conversation history before this point was compacted into the following summary";
 
 const NOT_RUN = Object.freeze([
@@ -289,14 +290,14 @@ async function loadCore() {
   };
 }
 
-function gatewayConfig(core, stateDir) {
+function gatewayConfig(core, stateDir, toolAllowlist = ["read", "write", "edit"]) {
   const model = { provider: PROVIDER, modelId: MODEL_ID };
   return core.parseConfig({
     workspace: join(stateDir, "workspace"),
     dataDir: join(stateDir, "data"),
     model,
     allowedModels: [model],
-    toolAllowlist: ["read", "write", "edit"],
+    toolAllowlist,
     workspaceContext: {
       memoryFiles: ["memory/MEMORY.md"],
       memoryManifest: true,
@@ -361,7 +362,7 @@ function installer(core, probe, requestPrefix) {
           "## Progress",
           "### Done",
           "- [x] Loaded the note-keeping skill body through the skill tool.",
-          `- [x] Wrote and read ${topic ?? "the topic memory file"} through granted tools.`,
+          `- [x] Wrote and read ${topic ?? "the topic memory file"} through configured tools.`,
           "",
           "## Critical Context",
           `- Acceptance code extracted from the summarized transcript: ${extracted}`,
@@ -422,37 +423,12 @@ async function runFirstPhase(core, stateDir, evidence) {
       return (agent.tools ?? []).map((tool) => (typeof tool === "string" ? tool : tool?.name));
     };
 
-    // Default deny, then explicit grants with expiry.
+    // Configured tools are the authority: toolAllowlist names the coding tools for this mapped chat.
     let names = await toolNames();
-    require("tools.default_deny", !names.includes("read") && !names.includes("write") && !names.includes("edit"), names.join(","));
+    require("tools.configured_offered",
+      ["read", "write", "edit"].every((name) => names.includes(name)), names.join(","));
+    require("tools.unconfigured_absent", !names.includes("bash"), names.join(","));
     record("skill.tool_offered", names.includes("skill"), names.join(","));
-
-    let ceilingRejected = false;
-    try {
-      await gateway.grantTools(SESSION_KEY, [{ name: "bash", expiresAt: Date.now() + 60_000 }], context);
-    } catch (error) {
-      ceilingRejected = /outside the host tool ceiling/.test(String(error?.message ?? error));
-    }
-    record("tools.ceiling_rejected", ceilingRejected);
-
-    let pastRejected = false;
-    try {
-      await gateway.grantTools(SESSION_KEY, [{ name: "read", expiresAt: Date.now() - 1_000 }], context);
-    } catch (error) {
-      pastRejected = /future integer expiresAt/.test(String(error?.message ?? error));
-    }
-    record("tools.past_expiry_rejected", pastRejected);
-
-    const longExpiry = Date.now() + 600_000;
-    const editExpiry = Date.now() + 8_000;
-    const granted = await gateway.grantTools(SESSION_KEY, [
-      { name: "read", expiresAt: longExpiry },
-      { name: "write", expiresAt: longExpiry },
-      { name: "edit", expiresAt: editExpiry },
-    ], context);
-    require("tools.granted", granted.map((grant) => grant.name).join(",") === "read,write,edit", granted.map((grant) => grant.name).join(","));
-    names = await toolNames();
-    record("tools.offered_after_grant", ["read", "write", "edit"].every((name) => names.includes(name)), names.join(","));
 
     // Skill summary in the prompt, body only through the tool.
     await driver.send(conversation, context, "Load the note-keeping skill instructions before continuing.", [
@@ -470,7 +446,7 @@ async function runFirstPhase(core, stateDir, evidence) {
       `Early acceptance instruction: remember the acceptance code ${FACT}. This raw early turn also contains ${SENTINEL} and it must not be replayed verbatim after compaction.`,
       [core.fauxAssistantMessage("Recorded the early instruction in this conversation.")]);
 
-    // Topic memory write through the granted write tool.
+    // Topic memory write through the configured write tool.
     const topicContent = [
       "---",
       `description: ${TOPIC_DESCRIPTION}`,
@@ -478,11 +454,11 @@ async function runFirstPhase(core, stateDir, evidence) {
       "",
       "# Acceptance topic",
       "",
-      `The topic marker is ${TOPIC_MARKER}. It was written through the granted write tool.`,
+      `The topic marker is ${TOPIC_MARKER}. It was written through the configured write tool.`,
       "",
     ].join("\n");
     await driver.send(conversation, context,
-      `Use the granted write tool to store the topic memory at ${TOPIC_PATH}.`,
+      `Use the configured write tool to store the topic memory at ${TOPIC_PATH}.`,
       [
         core.fauxAssistantMessage([core.fauxToolCall("write", { path: TOPIC_PATH, content: topicContent })], { stopReason: "toolUse" }),
         core.fauxAssistantMessage("Topic memory written."),
@@ -493,9 +469,9 @@ async function runFirstPhase(core, stateDir, evidence) {
     require("memory.write_tool_result", writeResults.length === 1 && writeResults[0].text.includes(TOPIC_PATH),
       `${writeResults.length} result(s)`);
 
-    // Topic memory read through the granted read tool.
+    // Topic memory read through the configured read tool.
     await driver.send(conversation, context,
-      `Use the granted read tool to read ${TOPIC_PATH} back.`,
+      `Use the configured read tool to read ${TOPIC_PATH} back.`,
       [
         core.fauxAssistantMessage([core.fauxToolCall("read", { path: TOPIC_PATH })], { stopReason: "toolUse" }),
         core.fauxAssistantMessage("Topic memory read back."),
@@ -511,19 +487,14 @@ async function runFirstPhase(core, stateDir, evidence) {
         [core.fauxAssistantMessage(`Acknowledged synthetic filler turn ${index}.`)]);
     }
 
-    // Wait for the short edit grant to expire, then prove the call-time check.
-    const wait = editExpiry + 300 - Date.now();
-    if (wait > 0) await sleep(Math.min(wait, 15_000));
-    const active = await gateway.listToolGrants(SESSION_KEY, context);
-    const activeNames = active.map((grant) => grant.name);
-    require("tools.expired_pruned", !activeNames.includes("edit") && activeNames.includes("read") && activeNames.includes("write"), activeNames.join(","));
-    await driver.send(conversation, context, "Try the expired edit grant once.",
+    // A tool outside the configured ceiling is not callable: the model's request is refused.
+    await driver.send(conversation, context, "Try an unconfigured tool once.",
       [
-        core.fauxAssistantMessage([core.fauxToolCall("edit", { path: TOPIC_PATH, oldText: "Acceptance topic", newText: "Acceptance topic" })], { stopReason: "toolUse" }),
-        core.fauxAssistantMessage("The edit was refused; continuing without it."),
+        core.fauxAssistantMessage([core.fauxToolCall("bash", { command: "true" })], { stopReason: "toolUse" }),
+        core.fauxAssistantMessage("The unconfigured call was refused; continuing without it."),
       ]);
-    const blocked = toolResultsOf(probe.requests.at(-1).text).filter((result) => result.toolName === "edit");
-    require("tools.expired_call_blocked", blocked.length === 1 && /grant expired/.test(blocked[0].text), blocked[0]?.text);
+    const refused = toolResultsOf(probe.requests.at(-1).text).filter((result) => result.toolName === "bash");
+    require("tools.unconfigured_call_refused", refused.length === 1 && refused[0].isError === true, refused[0]?.text);
 
     // Native manual compaction, summarized from the actual request.
     driver.state.script = [];
@@ -572,7 +543,7 @@ async function runFirstPhase(core, stateDir, evidence) {
 
     const summaryEntry = { ...summary };
     evidence.requests = probe.requests.map(({ kind, chars, sha256: digest }) => ({ kind, chars, sha256: digest }));
-    evidence.toolGrantsBeforeClose = activeNames;
+    evidence.configuredToolsBeforeClose = names;
     evidence.summary = summaryEntry;
   } finally {
     if (gateway) await gateway.close(context);
@@ -587,7 +558,8 @@ async function runSecondPhase(core, stateDir, evidence) {
   const context = core.context;
   const probe = buildProbe(core);
   const driver = installer(core, probe, "p2");
-  const config = gatewayConfig(core, stateDir);
+  // A narrowed configuration on reopen: only the read tool is configured for this mapping now.
+  const config = gatewayConfig(core, stateDir, ["read"]);
   let gateway;
   try {
     gateway = await core.openGateway(config, context, {
@@ -599,8 +571,13 @@ async function runSecondPhase(core, stateDir, evidence) {
     // Fresh process, same durable conversation.
     require("reopen.stable_conversation_identity", conversation.id === previous.conversationId,
       `${conversation.id} vs ${previous.conversationId}`);
-    const resumed = (await gateway.listToolGrants(SESSION_KEY, context)).map((grant) => grant.name);
-    require("reopen.grants_persisted", resumed.includes("read") && resumed.includes("write"), resumed.join(","));
+    const agent = await conversation.agent(context);
+    const codingNames = (agent.tools ?? [])
+      .map((tool) => (typeof tool === "string" ? tool : tool?.name))
+      .filter((name) => ["read", "write", "edit", "bash"].includes(name));
+    require("reopen.tools_follow_narrowed_config",
+      codingNames.includes("read") && !codingNames.includes("write") && !codingNames.includes("edit"),
+      codingNames.join(","));
 
     // The critical fresh-process request: fact through the summary, not the raw turn.
     await driver.send(conversation, context,
@@ -622,11 +599,7 @@ async function runSecondPhase(core, stateDir, evidence) {
     require("reopen.skill_summary_present", request.prompt.includes(SKILL_NAME) && request.prompt.includes(SKILL_DESCRIPTION));
     require("reopen.skill_body_absent_before_load", !request.text.includes(SKILL_BODY));
 
-    // Revocation still holds in a fresh process.
-    const revoked = (await gateway.revokeTools(SESSION_KEY, ["write"], context)).map((grant) => grant.name);
-    require("reopen.revoke_persisted", !revoked.includes("write") && revoked.includes("read"), revoked.join(","));
-
-    // Skill body and topic memory on demand, with the reopened read grant.
+    // Skill body and topic memory on demand, through the configured read tool.
     await driver.send(conversation, context,
       "Load the note-keeping skill and read the topic memory named in context.",
       [
@@ -641,7 +614,7 @@ async function runSecondPhase(core, stateDir, evidence) {
     const readResults = results.filter((result) => result.toolName === "read" && !result.isError);
     require("reopen.skill_body_on_demand", skillResults.length === 1 && skillResults[0].text.includes(SKILL_BODY),
       sha256(skillResults[0]?.text ?? "").slice(0, 16));
-    require("reopen.memory_read_granted",
+    require("reopen.memory_read_configured",
       readResults.length === 1 && readResults[0].text.includes(TOPIC_MARKER) && !readResults[0].text.includes(FACT),
       sha256(readResults[0]?.text ?? "").slice(0, 16));
 
@@ -1230,7 +1203,7 @@ function createRealDriver(core, probe, recorder, requestPrefix, rehearsal) {
             "## Progress",
             "### Done",
             "- [x] Loaded the note-keeping skill body through the skill tool.",
-            `- [x] Wrote and read ${analysis.extractedTopic ?? "the topic memory file"} through granted tools.`,
+            `- [x] Wrote and read ${analysis.extractedTopic ?? "the topic memory file"} through configured tools.`,
             "",
             "## Critical Context",
             `- Acceptance code extracted from the summarized transcript: ${analysis.extractedFact}`,
@@ -1289,7 +1262,7 @@ function realTopicContent() {
     "",
     "# Acceptance topic",
     "",
-    `The topic marker is ${TOPIC_MARKER}. It was written through the granted write tool.`,
+    `The topic marker is ${TOPIC_MARKER}. It was written through the configured write tool.`,
     "",
   ].join("\n");
 }
@@ -1322,13 +1295,8 @@ async function runRealFirstPhase(core, stateDir, evidence, options, budget) {
     };
     const names = await toolNames();
     record("skill.tool_offered", names.includes("skill"), names.join(","));
-    const expiry = Date.now() + 600_000;
-    const granted = await gateway.grantTools(SESSION_KEY, [
-      { name: "read", expiresAt: expiry },
-      { name: "write", expiresAt: expiry },
-      { name: "edit", expiresAt: expiry },
-    ], context);
-    require("tools.granted", granted.length === 3, granted.map((grant) => grant.name).join(","));
+    require("tools.configured_offered",
+      ["read", "write", "edit"].every((name) => names.includes(name)), names.join(","));
 
     const topicContent = realTopicContent();
     let turnStart = recorder.requests.length;
@@ -1350,7 +1318,7 @@ async function runRealFirstPhase(core, stateDir, evidence, options, budget) {
 
     turnStart = recorder.requests.length;
     await driver.send(conversation, context,
-      `Use the granted write tool to store the topic memory at ${TOPIC_PATH}. Write exactly this content:\n\n${topicContent}`, [
+      `Use the configured write tool to store the topic memory at ${TOPIC_PATH}. Write exactly this content:\n\n${topicContent}`, [
         core.fauxAssistantMessage([core.fauxToolCall("write", { path: TOPIC_PATH, content: topicContent })], { stopReason: "toolUse" }),
         core.fauxAssistantMessage("Topic memory written."),
       ]);
@@ -1364,7 +1332,7 @@ async function runRealFirstPhase(core, stateDir, evidence, options, budget) {
       `${writeResults.length} result(s)`);
 
     turnStart = recorder.requests.length;
-    await driver.send(conversation, context, `Use the granted read tool to read ${TOPIC_PATH} back.`, [
+    await driver.send(conversation, context, `Use the configured read tool to read ${TOPIC_PATH} back.`, [
       core.fauxAssistantMessage([core.fauxToolCall("read", { path: TOPIC_PATH })], { stopReason: "toolUse" }),
       core.fauxAssistantMessage("Topic memory read back."),
     ]);
@@ -1482,10 +1450,11 @@ async function runRealSecondPhase(core, stateDir, evidence, options, budget) {
     const conversation = await gateway.conversationFor(SESSION_KEY, context);
     require("reopen.stable_conversation_identity", conversation.id === previous.conversationId,
       `${conversation.id} vs ${previous.conversationId}`);
-    const resumed = (await gateway.listToolGrants(SESSION_KEY, context)).map((grant) => grant.name);
-    require("reopen.grants_persisted", resumed.includes("read") && resumed.includes("write"), resumed.join(","));
-    const revoked = (await gateway.revokeTools(SESSION_KEY, ["write"], context)).map((grant) => grant.name);
-    require("reopen.revoke_persisted", !revoked.includes("write") && revoked.includes("read"), revoked.join(","));
+    const reopenedAgent = await conversation.agent(context);
+    const reopenedNames = (reopenedAgent.tools ?? [])
+      .map((tool) => (typeof tool === "string" ? tool : tool?.name));
+    require("reopen.tools_configured",
+      ["read", "write", "edit"].every((name) => reopenedNames.includes(name)), reopenedNames.join(","));
 
     const turnStart = recorder.requests.length;
     await driver.send(conversation, context,
@@ -1533,7 +1502,7 @@ async function runRealSecondPhase(core, stateDir, evidence, options, budget) {
     const readResults = results.filter((result) => result.toolName === "read" && !result.isError);
     require("reopen.skill_body_on_demand", skillResults.length === 1 && skillResults[0].text.includes(SKILL_BODY),
       sha256(skillResults[0]?.text ?? "").slice(0, 16));
-    require("reopen.memory_read_granted",
+    require("reopen.memory_read_configured",
       readResults.length === 1 && readResults[0].text.includes(TOPIC_MARKER) && !readResults[0].text.includes(FACT),
       sha256(readResults[0]?.text ?? "").slice(0, 16));
 

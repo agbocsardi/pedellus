@@ -10,14 +10,13 @@ import {
 /**
  * Captured coding-tool authority for one scheduled isolated run.
  *
- * `toolAuthorization: "config"` makes `toolAllowlist` directly authorize authenticated mapped chat
- * conversations, but a scheduled run's target is a fresh task-owned conversation and has no session
- * key. In the same commit that creates it, cron captures the ceiling that its authenticated origin
- * currently has, plus that origin's conversation ID. The capture is a snapshot of names, never a
- * grant or an expiry: the call-time hook still requires each name to be in the current host ceiling
- * and the recorded origin to still be an authenticated mapped chat. A finished or cancelled run's
- * capture is retired, and a capture whose origin is unknown or no longer chat-authorized authorizes
- * nothing.
+ * `toolAllowlist` directly authorizes authenticated mapped chat conversations, but a scheduled
+ * run's target is a fresh task-owned conversation and has no session key. In the same commit that
+ * creates it, cron captures the ceiling that its authenticated origin currently has, plus that
+ * origin's conversation ID. The capture is a snapshot of names, never an expiry: the call-time hook
+ * still requires each name to be in the current host ceiling and the recorded origin to still be an
+ * authenticated mapped chat. A finished or cancelled run's capture is retired, and a capture whose
+ * origin is unknown or no longer chat-authorized authorizes nothing.
  */
 export type ConfigToolCaptureDocument = {
   readonly originConversationId: number;
@@ -51,13 +50,12 @@ export function boundedCapturedTools(
 }
 
 /**
- * Last-line call check for config authorization. It mirrors the grant hook's position in the call
- * phase but never reads a grant document: an authenticated mapped chat conversation may use the
- * ceiling, and a scheduled run's target may use only its captured names while its recorded origin
- * is still an authenticated mapped chat. Anything else (the root, a channel-state conversation, a
- * fork, a raw or task-owned conversation without a valid capture) is denied, so agent state that
- * still names a removed tool can never call it. `contextTools` (skill, cron, history) are exempt in
- * both modes because they carry no filesystem or shell authority.
+ * Last-line call check. An authenticated mapped chat conversation may use the ceiling, and a
+ * scheduled run's target may use only its captured names while its recorded origin is still an
+ * authenticated mapped chat. Anything else (the root, a channel-state conversation, a fork, a raw
+ * or task-owned conversation without a valid capture) is denied, so agent state that still names a
+ * removed tool can never call it. `contextTools` (skill, cron, history) are exempt because they
+ * carry no filesystem or shell authority.
  */
 export function createConfigToolHook(
   ceiling: readonly string[],

@@ -201,11 +201,10 @@ surrounding transcript beyond these bounds is not implemented.
 
 ## Coding tools
 
-`toolAllowlist` in the config is the tool authority. The shipped CLI opens the
-Gateway in config-authorized mode, so a non-empty list enables exactly those
-native `read`/`write`/`edit`/`bash` tools for authenticated mapped ordinary
-chats; `[]` or absent disables them. No grant step, expiry or per-chat approval
-is involved, and `/tools` is only a read-only diagnostic:
+`toolAllowlist` in the config is the tool authority. A non-empty list enables
+exactly those native `read`/`write`/`edit`/`bash` tools for authenticated mapped
+ordinary chats; `[]` or absent disables them. No grant step, expiry or per-chat
+approval is involved, and `/tools` is only a read-only diagnostic:
 
 ```text
 /tools
@@ -213,14 +212,9 @@ is involved, and `/tools` is only a read-only diagnostic:
 
 Restart after editing `toolAllowlist`; there is no hot reload. Narrowing the list
 limits later requests and pending calls fail closed rather than being restored by
-old records.
+old records. `/grant` and `/revoke` are not offered: they report their removal
+and change nothing.
 
-Explicit SDK/host callers that keep the legacy **expiring-grant mode**
-(`toolAuthorization: "grants"`, the default for existing SDK callers) use the
-`grantTools`/`revokeTools`/`listToolGrants` API with finite expiry and
-revoke/expiry checks before replay and at call time. That is an SDK contract, not
-a CLI setup step and not part of the shipped assistant; the CLI exposes no grant
-or revoke command for it. Unknown slash commands are never sent to the model.
 See [coding tools](./TOOLS.md).
 
 ## Workspace refresh

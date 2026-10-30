@@ -1,4 +1,4 @@
-# Nested Code Mode interrupted-tool replay, revocation, and unsafe downgrade
+# Nested Code Mode interrupted-tool replay, tool removal, and unsafe downgrade
 
 Permanent, synthetic actual-Harness coverage for the durable **nested** Code
 Mode restart boundary:
@@ -10,14 +10,14 @@ child fixture `tests/fixtures/nested-codemode-replay-child.mjs`.
 The child opens a real SQLite-backed Durable `Harness` with a faux model, the
 fork's actual Code Mode integration, and four harmless synthetic tools. Every
 tool body appends one line to a private effect log and then blocks forever. The
-child creates two conversations and grants Code Mode plus one or two nested
-tools to each:
+child creates two conversations and configures Code Mode plus one or two nested
+tools in each:
 
 - **mixed**: one Code Mode script issues `nested_revoked_effect` and
   `nested_downgraded_effect` concurrently through `Promise.allSettled`.
   Both nested calls are admitted and their bodies start before the crash.
 - **granted**: the script first awaits `nested_granted_effect`, whose body starts
-  and blocks. `nested_pending_effect` is granted at first run but is issued only
+  and blocks. `nested_pending_effect` is configured at first run but is issued only
   after the first call resolves, so it is still pending when the process dies.
 
 Once the three started bodies have appended their labels, the child publishes
@@ -25,26 +25,27 @@ conversation/submission IDs and `READY`; the parent sends a real `SIGKILL`.
 
 The parent reopens the same database and, **before** calling `resume()`:
 
-1. For **mixed**, revokes the host grant for `nested_revoked_effect` while
-   keeping the grant for `nested_downgraded_effect`, but re-registers the latter
-   with `replay: "unsafe"` (its persisted nested intent says `safe`).
-2. For **granted**, keeps the explicit `nested_granted_effect` grant and revokes
-   the grant for the still-pending `nested_pending_effect`.
+1. For **mixed**, removes `nested_revoked_effect` from the host tool selection
+   while keeping `nested_downgraded_effect`, but re-registers the latter with
+   `replay: "unsafe"` (its persisted nested intent says `safe`).
+2. For **granted**, keeps `nested_granted_effect` and removes the still-pending
+   `nested_pending_effect` from the host tool selection.
 
 After resume, native Code Mode replays the safe `codemode` tool and reattaches
 nested calls by key. The observed outcomes are:
 
 - `nested_revoked_effect` was already admitted and checkpointed before the crash.
-  Its current grant is gone, so its nested task does not rerun. It settles with
+  It is no longer in the current tool selection, so its nested task does not
+  rerun. It settles with
   the native `interrupted` result: `Tool nested_revoked_effect was interrupted
   and may have partially run`.
-- `nested_downgraded_effect` keeps its grant, but stored `safe` plus current
+- `nested_downgraded_effect` stays selected, but stored `safe` plus current
   `unsafe` must not rerun. It settles with the same native `interrupted` result.
 - `nested_granted_effect` keeps both stored and current `safe`, so its body
   reruns once after restart and returns normally.
 - `nested_pending_effect` was not admitted before the crash. The replayed
-  script reaches it only after the granted call resolves; it is then a new
-  nested admission against the current grant, so it settles with the native
+  script reaches it only after the kept call resolves; it is then a new nested
+  admission against the current selection, so it settles with the native
   non-executing error `Tool nested_pending_effect is not available`.
 
 The mixed script catches both nested failures through `Promise.allSettled` and
@@ -60,7 +61,7 @@ entries and the nested `details.calls` rows:
 | granted | success | `nested_pending_effect` | `error`, not available |
 
 The effect log has exactly one line for each mixed effect before the crash. After
-resume it adds exactly one more `nested_granted_effect` line; the revoked,
+resume it adds exactly one more `nested_granted_effect` line; the removed,
 downgraded, and pending bodies never run again or for the first time. The test
 asserts label counts and the final effect-log append.
 
@@ -68,14 +69,14 @@ asserts label counts and the final effect-log append.
 
 Durable Code Mode records the script start data (including the callable tool
 list), journals delivered results, and reattaches nested calls by key `c<VM call
-id>`. Recovery does not trust the persisted grant or replay policy alone:
-`ToolTask.execute` resolves the tool against the conversation's **current**
-grant and reruns only when both the stored intent and current registration say
-`replay: "safe"`. A missing current tool fails that test and settles the native
-`interrupted` result without executing the body. A nested call that had not been
-admitted before the crash is created after recovery and goes through the normal
-call phase, where a missing grant yields `not available` without executing the
-body.
+id>`. Recovery does not trust the persisted tool selection or replay policy
+alone: `ToolTask.execute` resolves the tool against the conversation's
+**current** selection and reruns only when both the stored intent and current
+registration say `replay: "safe"`. A missing current tool fails that test and
+settles the native `interrupted` result without executing the body. A nested call
+that had not been admitted before the crash is created after recovery and goes
+through the normal call phase, where a missing tool yields `not available`
+without executing the body.
 
 A replay-safe call that keeps a safe current registration reruns. Durable does
 not promise exactly-once external effects for safe tools; the test uses a
@@ -105,9 +106,9 @@ The test is included in `test:behavior`; it can also be run directly as above.
 ## Scope and non-claims
 
 - Covered: actual process `SIGKILL`, SQLite reopen, native Code Mode replay,
-  granted nested calls that were already admitted, an interrupted nested call
-  whose host grant is revoked before resume, a still-pending nested call whose
-  grant is revoked before resume, safe replay with an explicit current grant, and
+  kept nested calls that were already admitted, an interrupted nested call that
+  is removed from the host selection before resume, a still-pending nested call
+  that is removed before resume, safe replay with a current selection, and
   stored-safe/current-unsafe replay downgrade.
 - Not covered: real coding tools, provider behavior, approval/UI flows,
   Gateway registration, external-effect exactly-once semantics, or Windows

@@ -8,7 +8,6 @@ import {
 } from "@earendil-works/pi-durable";
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import { createConfigToolHook } from "./config-authority.js";
-import { createToolGrantHook } from "./grants.js";
 
 /** Native coding tools this slice can register, in ceiling order. */
 export const CODING_TOOL_NAMES = Object.freeze(["read", "write", "edit", "bash"] as const);
@@ -18,23 +17,20 @@ export type CodingToolName = (typeof CODING_TOOL_NAMES)[number];
 export interface CodingToolExtensionOptions {
   /** Tools to register; must be a non-empty subset of `CODING_TOOL_NAMES`. */
   readonly tools: readonly CodingToolName[];
-  /** Host-owned ceiling the grant hook enforces; normally the configured allowlist. */
+  /** Host-owned ceiling the call-time hook enforces; normally the configured allowlist. */
   readonly ceiling: readonly string[];
   /**
    * Non-effectful context tools registered by another extension in the same conversations.
-   * The grant hook exempts them; they are not grantable and never widen this ceiling.
+   * The hook exempts them; they are outside this ceiling and never widen it.
    */
   readonly contextTools?: readonly string[];
   /** Effective config-level shell timeout, for a meaningful message when the host default fires. */
   readonly defaultTimeoutSeconds: number;
-  /** Grant-clock override; defaults to `Date.now`. */
-  readonly now?: () => number;
   /**
-   * Config-mode host predicate: true only for conversations the host has authenticated as ordinary
-   * mapped chats. When present, the ceiling is authority for those conversations and scheduled-run
-   * captures are checked at call time instead of expiring grants.
+   * Host predicate: true only for conversations the host has authenticated as ordinary mapped
+   * chats. Scheduled-run captures are checked at call time against their recorded origin.
    */
-  readonly authenticatedChat?: (conversationId: ConversationId) => boolean;
+  readonly authenticatedChat: (conversationId: ConversationId) => boolean;
 }
 
 /**
@@ -85,11 +81,10 @@ function withHostTimeoutDeclaration<T extends ToolRegistration>(
 }
 
 /**
- * Register the native read/write/edit/bash tools over the guarded host environment. In the default
- * grant mode no tool is offered unless the conversation has an explicit unexpired grant, and the
- * grant hook rechecks that at call time. In config mode the host passes its authenticated-chat
- * predicate and the same ceiling directly authorizes those conversations, with scheduled-run
- * captures bounded by it. Tool definitions, limits, output windows and spill behavior stay native.
+ * Register the native read/write/edit/bash tools over the guarded host environment. The configured
+ * ceiling authorizes authenticated mapped chat conversations; the host's call-time hook rechecks
+ * that, and a scheduled-run target must present a capture bounded by the current ceiling. Tool
+ * definitions, limits, output windows and spill behavior stay native.
  */
 export function createCodingToolExtension(options: CodingToolExtensionOptions): Extension {
   const selected = new Set(options.tools);
@@ -121,10 +116,6 @@ export function createCodingToolExtension(options: CodingToolExtensionOptions): 
     name: "nanobot-coding-tools",
     tools,
     wraps,
-    hooks: [
-      options.authenticatedChat === undefined
-        ? createToolGrantHook(options.ceiling, options.now ?? Date.now, contextTools)
-        : createConfigToolHook(options.ceiling, options.authenticatedChat, contextTools),
-    ],
+    hooks: [createConfigToolHook(options.ceiling, options.authenticatedChat, contextTools)],
   });
 }

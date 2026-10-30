@@ -11,17 +11,6 @@ export {
   type ConfigToolCaptureDocument,
 } from "./config-authority.js";
 export {
-  activeToolGrants,
-  createToolGrantHook,
-  normalizeToolGrants,
-  pruneToolGrants,
-  ToolGrantDoc,
-  ToolGrantOriginDoc,
-  type GatewayToolGrant,
-  type ToolGrantDocument,
-  type ToolGrantOriginDocument,
-} from "./grants.js";
-export {
   createToolEnvironments,
   type ToolEnvironmentOptions,
   type ToolEnvironments,

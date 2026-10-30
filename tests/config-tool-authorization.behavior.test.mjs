@@ -66,7 +66,7 @@ async function toolResults(conversation, id) {
   return result;
 }
 
-test('config mode runs read and history in a mapped chat while other scopes get no coding authority', { timeout: 10_000 }, async () => {
+test('config authority runs read and history in a mapped chat while other scopes get no coding authority', { timeout: 10_000 }, async () => {
   const store = await workspaceStore('mapped');
   const { faux, models } = syntheticModels();
   const marker = 'CONFIG-HISTORY-MARKER';
@@ -83,7 +83,7 @@ test('config mode runs read and history in a mapped chat while other scopes get 
   }));
   let gateway;
   try {
-    gateway = await openGateway(store.config(['read']), context, { models, toolAuthorization: 'config' });
+    gateway = await openGateway(store.config(['read']), context, { models });
     const chat = await gateway.conversationFor('telegram:7:chat:501', context);
     assert.deepEqual(toolNames(await chat.agent(context)).sort(), ['history', 'read']);
 
@@ -117,40 +117,25 @@ test('config mode runs read and history in a mapped chat while other scopes get 
   }
 });
 
-test('config reopen follows the configured ceiling, not the legacy granted state', { timeout: 10_000 }, async () => {
+test('config reopen follows the configured ceiling, not persisted agent tool state', { timeout: 10_000 }, async () => {
   const store = await workspaceStore('reopen');
   const key = 'telegram:7:chat:601';
   let gateway;
   try {
-    gateway = await openGateway(store.config(['read', 'bash']), context, { models: syntheticModels().models });
-    await gateway.conversationFor(key, context);
-    const granted = await gateway.grantTools(key, [
-      { name: 'read', expiresAt: Date.now() + 3_600_000 },
-    ], context);
-    assert.deepEqual(granted.map((grant) => grant.name), ['read']);
-    await gateway.close(context);
-    gateway = undefined;
-
-    // Config authority, not the grant document: bash was never granted, yet the configured ceiling
-    // offers it. A fallback to grants would show only read here.
-    gateway = await openGateway(store.config(['read', 'bash']), context, { models: syntheticModels().models, toolAuthorization: 'config' });
+    gateway = await openGateway(store.config(['read', 'write', 'bash']), context, { models: syntheticModels().models });
     const configured = await gateway.conversationFor(key, context);
-    assert.deepEqual(codingNames(await configured.agent(context)), ['bash', 'read']);
-    assert.deepEqual(await gateway.listToolGrants(key, context), []);
-    await assert.rejects(
-      gateway.grantTools(key, [{ name: 'bash', expiresAt: Date.now() + 60_000 }], context),
-      /authorized by configuration/,
-    );
+    assert.deepEqual(codingNames(await configured.agent(context)), ['bash', 'read', 'write']);
     await gateway.close(context);
     gateway = undefined;
 
-    gateway = await openGateway(store.config(['read']), context, { models: syntheticModels().models, toolAuthorization: 'config' });
+    // Reopening with a narrower ceiling removes the tools the new configuration does not name.
+    gateway = await openGateway(store.config(['read']), context, { models: syntheticModels().models });
     const narrowed = await gateway.conversationFor(key, context);
     assert.deepEqual(codingNames(await narrowed.agent(context)), ['read']);
     await gateway.close(context);
     gateway = undefined;
 
-    gateway = await openGateway(store.config([]), context, { models: syntheticModels().models, toolAuthorization: 'config' });
+    gateway = await openGateway(store.config([]), context, { models: syntheticModels().models });
     const emptied = await gateway.conversationFor(key, context);
     assert.deepEqual(codingNames(await emptied.agent(context)), []);
     assert.ok(toolNames(await emptied.agent(context)).includes('history'));

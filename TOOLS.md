@@ -1,13 +1,10 @@
-# Opt-in coding tools and durable grants
+# Opt-in coding tools and configured authority
 
 `openGateway` can register the native Pi 1.4.0 `read`, `write`, `edit` and `bash`
 tools over a guarded `HostExecutionEnv` on the **actual workspace**. It stays
-disabled unless the host explicitly configures a non-empty `toolAllowlist`, and
-how that list becomes authority depends on the host's authorization mode. The
-shipped CLI and Telegram path use **config authorization** (below): the
-configured names are the authority for validated chats. An SDK host that does not
-select a mode keeps the legacy **grant authorization**: explicit, expiring,
-per-conversation grants.
+disabled unless the host explicitly configures a non-empty `toolAllowlist`; that
+list is the only tool authority for validated chats and for the bounded capture
+of a scheduled isolated run.
 
 This is W1 accidental-damage protection, not confinement. The default host shell
 can still read host files, use the network, follow a hard link out of the
@@ -33,10 +30,9 @@ described below; Code Mode is not part of this slice.
 
 - An empty or absent `toolAllowlist` means no tool extension and no host
   execution environment. Existing gateway behavior is unchanged.
-- The allowlist is the host-owned **ceiling**. Every name must be one of
-  `read`, `write`, `edit` or `bash`; an unsupported name fails startup before
-  provider or storage setup. In the default grant mode the ceiling does not
-  itself grant anything; in config mode it is the authority for validated chats,
+- The allowlist is the host-owned **ceiling** and the authority. Every name must
+  be one of `read`, `write`, `edit` or `bash`; an unsupported name fails startup
+  before provider or storage setup. Validated chats receive exactly these tools,
   described below.
 - `toolTimeoutSeconds` is the config-level default for the host shell. Absent
   keeps the shared policy default (60 s); `0` disables the default timeout. A
@@ -59,8 +55,8 @@ described below; Code Mode is not part of this slice.
 - When `workspaceContext.skills` is configured, the gateway also offers one
   read-only `skill` tool that lists discovered skills and returns one skill body
   from the conversation's context snapshot. It is not one of the four coding
-  tools: it is not in this ceiling, cannot be granted or revoked, accepts no
-  filesystem path, and executes nothing. See
+  tools: it is not in this ceiling, accepts no filesystem path, and executes
+  nothing. See
   [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md).
 - Every Gateway offers one read-only `history` tool to mapped chat conversations
   by default. The local CLI/Telegram path uses that default; a host can pass
@@ -70,21 +66,18 @@ described below; Code Mode is not part of this slice.
   entry. It can also discover ready derived episode summaries (`summaries`) and read
   one summary with provenance and drilldown (`summary`), but it never generates or
   backfills a summary, and original entries remain the evidence. It is not in the
-  coding-tool ceiling, cannot be granted or revoked, and the coding-tool call
-  hook exempts it like the `skill` tool, so enabling coding tools never
-  suppresses it. It accepts no path or shell command, modifies no transcript and
+  coding-tool ceiling, and the coding-tool call hook exempts it like the `skill`
+  tool, so enabling coding tools never suppresses it. It accepts no path or shell command, modifies no transcript and
   creates no conversation. Its output is bounded, source-labeled, and quoted as
   untrusted historical data. See
   [`HISTORY.md`](./HISTORY.md#agent-facing-history-tool).
 
-## Config authorization (shipped CLI and Telegram)
+## Configured authority
 
-The shipped `nanobot` CLI and the Telegram adapter open the Gateway with
-`toolAuthorization: "config"`. In this mode `toolAllowlist` *is* the authority: a
-validated mapped ordinary chat conversation receives exactly the configured
-coding tools, and an empty or absent list disables them. There is no grant,
-expiry, approval prompt, startup re-grant or per-channel permission list to
-manage.
+`toolAllowlist` is the only tool authority. A validated mapped ordinary chat
+conversation receives exactly the configured coding tools, and an empty or
+absent list disables them. There is no grant, expiry, approval prompt, startup
+re-grant or per-channel permission list to manage.
 
 - Every sender admitted by `telegram.allowFrom` shares the configured workspace
   and coding-tool authority for its private chat. Admission is not per-tool
@@ -96,211 +89,91 @@ manage.
   ordinary (ownerless, unforked, not the root) is authorized. The root, a
   channel-state conversation, a raw conversation, a fork and any other
   task-owned conversation keep no coding tool even if its agent state names one.
-- A scheduled isolated run has no session key. At prepare, cron captures the
-  configured names its authenticated origin currently has, together with that
-  origin, in `nanobot.config-tool-capture`. The capture is a subset of config,
-  never new authority: the call-time check still requires each name in the
-  current `toolAllowlist` and the recorded origin to still be an authenticated
-  mapped chat. Reopening re-filters both the run target and its capture against
-  the current config before resume; a finished target's capture is retired at
-  its terminal commit and keeps no tool, while a denied or reconciled target can
-  keep an emptied capture that names no tool.
-- Grant documents from the SDK grant mode are never read in this mode, so an old
-  unexpired grant cannot restore a tool that was removed from the configuration.
+- Every native conversation creation goes through the Durable
+  `conversationCreated` hook, which retires any capture document and writes empty
+  `tools`/`modelTools` filters before the optional `agent` convenience. This
+  covers raw ownerless creation, forks (whose agent state is copied from the
+  parent), and task-created conversations, so they are not offered inherited
+  tools in the first place. Durable still applies a caller-supplied
+  `ConversationCreateOptions.agent` after this hook; the Gateway does not pass
+  one that re-adds tools.
+- Emptying `toolAllowlist` retires the capture document of every conversation
+  before resume and offers no coding tool. Re-enabling the ceiling offers the
+  newly configured names from configuration alone; no earlier state can
+  resurrect a tool.
+- A `beforeTool` hook rechecks authority at call time, so agent state that still
+  names a removed tool can never call it. It returns an explicit `block` if the
+  capture read fails; it does not rely on Durable treating a throwing hook as
+  denied, and it keeps storage error detail out of the model-visible reason.
 - The workspace guard, `extraAllowedDirs`, `toolSandbox` and the rest of the
-  execution policy are unchanged. Config authorization is about which coding
-  tools are enabled, not about widening filesystem or shell reach.
+  execution policy are unchanged. Tool authorization decides which coding tools
+  are enabled, not how far their filesystem or shell reach goes.
 
 CLI `/tools` is read-only diagnostics: it lists the configured tool names and
 states that configuration is the authority. `/grant` and `/revoke` are not
-advertised, and answer that they do nothing here (nothing is changed). The
+offered: they answer that they were removed and that nothing was changed. The
 Telegram adapter has no tool-authority commands at all.
 
-## Per-conversation expiring grants (SDK default)
+### Captured tools of a scheduled isolated run
 
-`toolAuthorization: "grants"` is the default when an SDK host omits the option.
-There, grants live in the latest-only conversation document `nanobot.tool-grants`
-(`{ grants: { [name]: expiresAtEpochMs } }`). A fork starts with an empty grant
-document (`fork: "initial"`), so a fork is default-deny even if its copied agent
-state still names tools.
+A scheduled run's target is a fresh, task-owned conversation with no session
+key. At prepare, cron captures the names the current ceiling gives its
+authenticated origin, together with that origin, in
+`nanobot.config-tool-capture` (`{ originConversationId, tools }`). The capture
+is a subset of config, never new authority: the call-time hook requires the name
+to be in the current ceiling, the capture to name it, and the recorded origin to
+still be an authenticated mapped chat.
 
-`Gateway` exposes:
+Before `harness.resume()` every conversation owned by a live run task is
+re-bounded: the gateway intersects the capture with the current `toolAllowlist`
+and the validated origin, writes the intersection back, and the pre-resume
+policy pass offers only that subset. An ended run, a missing or mismatched
+capture, an unknown origin and an unmapped or non-chat origin all yield an empty
+bound, so the target keeps no tool after its terminal commit. Finalize retires
+that target's capture; a denied or reconciled target can instead keep an emptied
+capture (`tools: []`), which authorizes nothing. A capture found on a
+conversation that is not a validated live run target is retired by the policy
+pass instead of being honored.
 
-```ts
-listToolGrants(sessionKey, context): Promise<readonly GatewayToolGrant[]>;
-grantTools(sessionKey, grants, context): Promise<readonly GatewayToolGrant[]>;
-revokeTools(sessionKey, names, context): Promise<readonly GatewayToolGrant[]>;
-```
+Every terminal commit of a run that already prepared a separate target retires
+that target's capture and tools in the same commit: normal completion or a
+recorded error, a missing target conversation, a missing job record, a generation
+change or cancellation, and ownership fencing, plus the run task's abort handler.
+A completed, failed, cancelled or superseded run therefore leaves no capture
+behind for a later admission. A phase fault or a crash before that terminal
+commit still leaves the capture until the next reopen, where the pre-resume pass
+retires a target whose run already ended; a direct host submission in that
+interval remains bounded by the call-time hook.
 
-`grants` is an array of `{ name, expiresAt }`:
 
-- `name` must be in the host ceiling.
-- `expiresAt` is a future integer epoch millisecond timestamp. There is no
-  permanent or implicit grant.
-- Duplicate names are rejected.
-- `revokeTools` removes names and is idempotent for names that are not granted.
+## Replay and reopen
 
-The conversation must already exist (`conversationFor`). A grant does not widen
-the ceiling, and another conversation's grants have no effect on this one:
-agent tool filters are read from that conversation's own document. A Gateway
-opened in config mode returns an empty list from `listToolGrants` and rejects
-`grantTools`/`revokeTools` with a fixed configuration error: the two modes never
-silently share authority. Config mode leaves grant documents in place, so
-explicitly reopening the same store in legacy grant mode re-honors grants that
-are still unexpired and inside the then-current ceiling; the shipped CLI never
-selects grant mode.
-
-### Local CLI controls
-
-The shipped local CLI opens the Gateway in config mode and offers only the
-read-only `/tools` diagnostic described above. It does not wire the grant host,
-so `/grant` and `/revoke` are not advertised and cannot change authority; they
-answer that tool authority is configured.
-
-An explicit SDK or standalone terminal host that wires `toolGrants` instead gets
-the legacy local grant commands for grant-mode authority. They run in the
-terminal process, are ordered with normal admissions, and are never sent to the
-model.
-
-| Command | Effect (grant-mode host only) |
-| --- | --- |
-| `/tools` | Show the host ceiling, each ceiling tool's active grant and its expiry. |
-| `/grant <tool[,tool]> <duration>` | Add explicit grants with `now + duration` expiry. |
-| `/revoke <tool[,tool]\|all>` | Remove named grants, or every active grant. |
-
-Durations require a unit: integer `s`, `m` or `h`. A missing duration, a
-malformed or zero duration, an out-of-ceiling name, or an empty ceiling is
-rejected before any commit, with a local error that names the usable ceiling or
-the config gap where applicable. There is no default duration, no "grant all"
-shortcut and no grant on conversation creation. `/revoke` is idempotent for a
-ceiling name with no active grant and reports the names it processed; use
-`/tools` to confirm state.
-
-Grants are the same durable conversation document used by the SDK API: they
-survive a Gateway reopen, are re-checked at call time, and are pruned when
-expired. The next model request after a grant may offer the tool; a request
-already in progress keeps its tool list, and revocation bounds later calls
-rather than cancelling an execution already underway.
-
-This is an explicit owner control, not a human-approval flow or model-requested
-authorization: the model cannot call these commands, and the ceiling alone still
-grants nothing in grant mode. The Telegram adapter does not expose grant
-commands; its config-authority path is described above.
-
-### Copied grants of a scheduled background run (grant mode)
-
-A cron `prepare` copies the origin conversation's still-valid coding-tool grants
-into the fresh, task-owned background conversation and records the origin in the
-latest-only `nanobot.tool-grant-origin` document (`{ originConversationId }`) in
-the same commit that creates and configures the target. The copy replaces, never
-extends, whatever the target held. It is a cap, not authority of its own: the
-grant hook requires the origin's current document to still grant the name, and
-blocks once either expiry passes. Revoking or expiring the origin grant therefore
-takes effect on the run's next call, including after a crash and reopen, and a
-later origin grant cannot widen the copy past its own expiry. A link that is
-present but malformed, an origin grant document that is missing, or an origin
-with no known owner blocks the call; a conversation without the link (an
-ordinary session, including an origin-mode run) is unaffected. When the origin
-cannot be attributed to a known owner at preparation, `prepare` copies nothing
-and the run stays default-deny.
+The pre-resume pass rebuilds every mapped chat's offered tools from the current
+`toolAllowlist`, so removing a configured tool and reopening removes it from
+persisted policy before recovery can schedule or replay it. Native recovery
+resolves a prepared call against that current policy, so a prepared call for a
+removed tool settles as `Tool <name> was interrupted and may have partially run`
+rather than rerunning. Captures of scheduled run targets are re-bounded as
+described above.
 
 Durable's tool hooks run in the call phase only, so a committed `execute` intent
 resolves without them. Two rules keep that closed:
 
 - Before `harness.resume()`, every conversation owned by a live cron run task is
-  reauthorized. The gateway intersects its copied grants with the origin's
-  current grants (min expiry), and clears them when the durable origin link is
-  missing or mismatched, the origin owner is unknown, the origin document is
-  missing, or the run already ended. The rewritten document is what the pre-resume
-  policy pass turns into the conversation's offered tools, so a new admission
-  after a revoke is not offered the tool at all.
-- The native coding tools are `replay: "unsafe"`, so recovery never reruns a
-  committed execute intent: it settles as
-  `Tool <name> was interrupted and may have partially run`. Pruning before resume
-  means an interrupted copy has no authority left either way.
+  re-bounded against the current ceiling and its validated origin. The rewritten
+  capture is what the pre-resume policy pass turns into the conversation's
+  offered tools, so a new admission after a config change or origin loss is not
+  offered the tool at all.
+- The native coding tools have no `replay: "safe"` marker, so Durable treats them
+  as unsafe: recovery never reruns an interrupted execution body. The synthetic
+  replay fixtures in [`TOOL_REPLAY.md`](./TOOL_REPLAY.md) and
+  [`NESTED_CODEMODE_REPLAY.md`](./NESTED_CODEMODE_REPLAY.md) remain the evidence
+  for safe-tool replay under host-held tool state and for unsafe downgrades.
 
-Every terminal commit of a run that already prepared a separate target retires
-that target's copied grants and tools in the same commit: normal completion or a
-recorded error, a missing target conversation, a missing job record, a generation
-change or cancellation, and ownership fencing, plus the run task's abort handler.
-A completed, failed, cancelled or superseded run therefore leaves no copy behind
-for a later admission. A phase fault or a crash before that terminal commit still
-leaves the copy until the next reopen, where the pre-resume pass retires a target
-whose run already ended; a direct host submission in that interval remains
-bounded by the origin hook. The origin link is kept, so a re-created grant
-document for that target still has to satisfy the origin check.
-
-Every native conversation creation goes through the Durable `conversationCreated`
-hook, which retires any grant document and writes empty `tools`/`modelTools`
-filters before the optional `agent` convenience. This covers raw ownerless
-creation, forks (whose agent state is copied from the parent), and task-created
-conversations, so they are not offered inherited tools in the first place. A
-fork's grant document is `fork: "initial"` as a second layer. Durable still
-applies a caller-supplied `ConversationCreateOptions.agent` after this hook; the
-Gateway does not pass one that re-adds tools.
-
-Emptying `toolAllowlist` retires the grant document of every conversation before
-resume. Re-enabling the ceiling therefore starts from default-deny again instead
-of resurrecting a previously granted tool. An absent document is not created by
-this retirement pass.
-
-### Captured tools of a scheduled isolated run (config mode)
-
-In config mode a run target captures names, not grants. `prepare` writes
-`nanobot.config-tool-capture` (`{ originConversationId, tools }`) with the names
-the current ceiling gives its authenticated origin, and links the origin in
-`nanobot.tool-grant-origin` in the same commit. The call-time hook requires the
-name to be in the current ceiling, the capture to name it, and the recorded
-origin to still be an authenticated mapped chat.
-
-Before `harness.resume()` every conversation owned by a live run task is
-re-bounded: the gateway intersects the capture with the current `toolAllowlist`
-and the validated origin, writes the intersection back, and the pre-resume
-policy pass offers only that subset. An ended run, a missing or mismatched link
-or capture, an unknown origin and an unmapped or non-chat origin all yield an
-empty bound, so the target keeps no tool after its terminal commit. Finalize
-retires that target's capture; a denied or reconciled target can instead keep an
-emptied capture (`tools: []`), which authorizes nothing because every call
-still requires the name in both the current ceiling and the capture, plus an
-authenticated origin. A capture found on a conversation that is not a validated
-live run target is retired by the policy pass instead of being honored.
-
-## Replay and reopen
-
-In config mode the pre-resume pass rebuilds every mapped chat's offered tools
-from the current `toolAllowlist`, so removing a configured tool and reopening
-removes it from persisted policy before recovery can schedule or replay it.
-Grant documents are ignored in this mode, so an old unexpired grant cannot
-restore the removed tool. Config-mode captures are re-bounded as described below.
-Before `harness.resume()`, the gateway scans every conversation, removes expired,
-malformed and out-of-ceiling grants from the document, and rewrites the
-conversation's native `tools`/`modelTools` filters to the remaining grants. A
-revoked or expired grant is therefore **removed from persisted policy before
-recovery can schedule a tool**. Native recovery resolves a prepared call against
-that current policy, so a prepared call for a removed tool settles as
-`Tool <name> was interrupted and may have partially run` rather than rerunning.
-
-A `beforeTool` hook rechecks the grant document at call time, so expiry between
-reopen and a call blocks before intent with `Tool <name> grant expired ...`.
-Revocation also reapplies the agent filter immediately, so later calls are no
-longer offered the tool. For a scheduled background run's copied grants the
-same recheck also reads the origin's current grant document, so a revocation or
-expiry at the origin blocks a call that recovery re-dispatches, and the pre-resume
-reauthorization described above removes a revoked copy from the target's policy
-before `resume()` can replay anything. The hook returns an explicit `block` if
-the grant read fails; it does not rely on Durable treating a throwing hook as
-denied, and it keeps storage error detail out of the model-visible reason.
-
-The native coding tools have no `replay: "safe"` marker, so Durable treats them
-as unsafe: recovery never reruns an interrupted execution body. The existing
-synthetic replay fixture in
-[`TOOL_REPLAY.md`](./TOOL_REPLAY.md) remains the evidence for safe-tool replay
-under explicit grants and for unsafe downgrades.
-
-One narrow window is inherent: a call that passes `beforeTool` and records
-intent can still execute after concurrent expiry or revocation. Revocation is
-not mid-execution cancellation, and Durable does not promise exactly-once
-external effects for replay-safe tools.
+One narrow window is inherent: a call that passes `beforeTool` and records intent
+can still execute after a concurrent configuration change. A configuration
+change is not mid-execution cancellation, and Durable does not promise
+exactly-once external effects for replay-safe tools.
 
 ## Optional direct-workspace Bubblewrap shell
 
@@ -376,51 +249,38 @@ built by `createHostExecutionEnv`:
   not added here. `toolAllowlist` names are not user approvals and no
   human-approval flow is implied.
 - The gateway knows only the four native coding tool names; hosts that install
-  additional extensions into the same harness must not reuse this grant hook as
-  a policy for them.
+  additional extensions into the same harness must not reuse this call hook as a
+  policy for them.
 
 ## Checks
 
-The change was validated with the existing offline suites:
+Validated with the committed offline suites:
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
 npm run typecheck
-npm run test:behavior   # 155 checks
+npm run test:behavior   # 168 checks
 npm run test:execution  # 9 checks
 ```
 
-Bounded temporary probes (not committed as tests) used a faux provider, a
+`tests/config-tool-authorization.behavior.test.mjs` covers configured authority
+for a mapped chat, refusal of a call outside the configured set, no coding
+authority for forks, raw, state-only and root conversations, a reopen under a
+narrowed `toolAllowlist`, and the call-time capture hook.
+`scripts/core-acceptance.mjs` exercises configured `read`/`write`/`edit`, refusal
+of an unconfigured `bash` call, native compaction and a fresh-process reopen
+under a narrowed `toolAllowlist` with a faux provider.
+
+Earlier bounded temporary probes (not committed as tests) used a faux provider, a
 temporary workspace/data directory and the real `openGateway`:
 
-- default-deny before a grant; grants are conversation-scoped;
-- forks and raw ownerless conversations received no tools before any explicit
-  configure call;
-- emptying the ceiling retired the persisted grant document, and re-enabling did
-  not resurrect the tool;
-- a throwing grant snapshot produced a block result rather than an exception;
 - an impossible `toolTimeoutSeconds` was rejected at config/openGateway startup,
   and the bash declaration named the configured host default;
 - `read`, `write`, `edit` and `bash` worked from real turns;
 - lexical `../` and symlink escapes were refused for file tools, and the outside
   sentinel was unchanged;
 - `rm -rf` was refused by the deny filter;
-- a host-default 1 s timeout produced `Command timed out after 1 seconds`;
-- a grant that expired mid-session was blocked by the `beforeTool` hook, then
-  pruned before the next resume;
-- a SIGKILL during a real `bash` effect with a grant revoked before reopen left
-  exactly one effect, settled the call as interrupted, and removed the tool
-  before resume;
-- every terminal path of a prepared background cron run (normal completion, a
-  job generation change, a missing job record, an execution-ownership change,
-  model-issued cancellation, and a resumed early return after a SIGKILL) left
-  the target with no grant document and no offered tools, while an origin-mode
-  run left its own conversation's authority in place;
-- the local CLI `/tools`, `/grant` and `/revoke` controls ran against a real
-  gateway with a faux provider: they rejected a missing/zero duration and an
-  out-of-ceiling name before commit, reported an empty ceiling as disabled, made
-  a granted `read` usable on the next model turn, removed it from the offered
-  tools on `/revoke all`, and showed a persisted grant after a Gateway reopen.
+- a host-default 1 s timeout produced `Command timed out after 1 seconds`.
 
 The optional bwrap shell was checked separately with bounded temporary workspaces
 and a real Bubblewrap 0.9.0 binary: config validation, fail-closed startup for a

@@ -82,15 +82,9 @@ import {
   boundedCapturedTools,
   CODING_TOOL_NAMES,
   ConfigToolCaptureDoc,
-  ToolGrantDoc,
-  ToolGrantOriginDoc,
-  activeToolGrants,
   createCodingToolExtension,
   createToolEnvironments,
-  normalizeToolGrants,
-  pruneToolGrants,
   type CodingToolName,
-  type GatewayToolGrant,
   type ToolEnvironments,
 } from "./tools/index.js";
 
@@ -159,14 +153,6 @@ export interface OpenGatewayOptions {
    */
   readonly agentHistory?: boolean;
   /**
-   * How coding-tool authority is decided. Default `"grants"` keeps the legacy SDK behavior: the
-   * configured ceiling bounds explicit, expiring, per-conversation grants. `"config"` makes the
-   * configured ceiling itself the authority for authenticated mapped chat conversations, with
-   * scheduled isolated runs limited to a captured subset of the current config. The shipped CLI and
-   * Telegram path opt into `"config"`; an explicit SDK host that omits this keeps grant semantics.
-   */
-  readonly toolAuthorization?: "config" | "grants";
-  /**
    * Optional host override for the durable episode-summary pass. Without an override, summaries
    * use the current conversation model; `episodeSummary.enabled: false` in config disables them.
    */
@@ -218,11 +204,6 @@ export interface Gateway {
    * ConversationBusy atomically and fails for unknown names or in legacy direct-model mode.
    */
   selectModelPreset(sessionKey: string, name: string, context: Context): Promise<GatewayModelSelection>;
-  /**
-   * Active, unexpired grants for a known session; empty when tools are disabled and always empty in
-   * config authorization mode, which has no expiring grants.
-   */
-  listToolGrants(sessionKey: string, context: Context): Promise<readonly GatewayToolGrant[]>;
   /**
    * Immutable identity of this SQLite store. A derived index persists `storeId` and refuses
    * its own rows when it changes, so a rebuilt or replaced store cannot mix two histories.
@@ -354,18 +335,9 @@ export interface Gateway {
   /**
    * Re-runs the configured context snapshot provider for one existing session and applies it to the
    * next turn. Rejects an unknown session, a live run, or a gateway opened without a provider.
-   * Prompt content stays metadata-only and no tool grant is added or widened.
+   * Prompt content stays metadata-only and no tool authority is added or widened.
    */
   refreshContext(sessionKey: string, context: Context): Promise<GatewayContextRefresh>;
-  /**
-   * Adds explicit expiring grants for a known session. Every name must be inside the host ceiling and
-   * every expiry must be in the future; a conversation never receives an implicit or permanent grant.
-   * Only the legacy grant authorization mode accepts this; config mode rejects it because the
-   * configured ceiling is the authority there.
-   */
-  grantTools(sessionKey: string, grants: unknown, context: Context): Promise<readonly GatewayToolGrant[]>;
-  /** Revokes grants by name. Revocation is persisted and survives reopen; unknown names are ignored. */
-  revokeTools(sessionKey: string, names: readonly string[], context: Context): Promise<readonly GatewayToolGrant[]>;
   close(context: Context): Promise<void>;
 }
 
@@ -510,14 +482,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
   if (options.agentHistory !== undefined && typeof options.agentHistory !== "boolean") {
     throw new TypeError("agentHistory must be a boolean");
   }
-  if (options.toolAuthorization !== undefined
-      && options.toolAuthorization !== "config" && options.toolAuthorization !== "grants") {
-    throw new TypeError('toolAuthorization must be "config" or "grants"');
-  }
-  const toolAuthorization = options.toolAuthorization ?? "grants";
-  const configAuthorized = toolAuthorization === "config";
-  const configGrantApiError =
-    'Coding tools are authorized by configuration (toolAuthorization: "config"); expiring grant APIs are unavailable';
   const defaultThinkingLevel = defaultPreset?.thinkingLevel ?? config.thinkingLevel ?? "off";
   // A configured summary override must be allowed. `preset` resolves through the named catalog and
   // supplies its thinking level to real summary jobs; `model` keeps the legacy direct form.
@@ -628,15 +592,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
         contextTools: [
           ...(options.contextSnapshotProvider === undefined ? [] : [SKILL_TOOL_NAME]),
           ...(cronEnabled ? [CRON_TOOL_NAME] : []),
-          // History retrieval is read-only over mapped chats and has its own scope checks, so neither
-          // authorization mode may let the ceiling suppress it when coding tools are enabled.
+          // History retrieval is read-only over mapped chats and has its own scope checks, so the
+          // ceiling must not suppress it when coding tools are enabled.
           ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
         ],
         defaultTimeoutSeconds,
-        now,
-        ...(configAuthorized
-          ? { authenticatedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId) }
-          : {}),
+        authenticatedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
       })
     : undefined;
   const toolEnvironments: ToolEnvironments | undefined = toolsEnabled
@@ -722,46 +683,24 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const cronFoundation = cronEnabled
     ? createCronFoundation({
         now,
-        // A background run is a fresh, task-owned conversation that starts default-deny. In grant
-        // mode it copies the origin conversation's still-valid grants, bounded by their expiries. In
-        // config mode it captures the ceiling its authenticated origin currently has; the call-time
-        // hook still requires that origin and the current config, so the capture is a subset, never
-        // new authority. An origin-mode run answers inside the conversation that already has the
-        // configured authority, so it needs neither.
+        // A background run is a fresh, task-owned conversation that starts default-deny. It captures
+        // the ceiling its authenticated origin currently has; the call-time hook still requires that
+        // origin and the current config, so the capture is a subset, never new authority. An
+        // origin-mode run answers inside the conversation that already has the configured authority,
+        // so it needs no capture.
         prepare: async ({ tx, originConversationId, targetConversationId, background }, ctx) => {
           if (!background) return;
           // Fail closed on a run whose origin cannot be attributed to a known owner: it gets no
-          // copied authority and no link, so every effectful call stays denied.
+          // captured authority, so every effectful call stays denied.
           const owner = cronOwners.get(originConversationId);
-          const granted: string[] = [];
+          const captured: string[] = [];
           if (owner !== undefined) {
-            if (configAuthorized) {
-              const capture = await tx.doc(ConfigToolCaptureDoc, targetConversationId);
-              const link = await tx.doc(ToolGrantOriginDoc, targetConversationId);
-              capture.originConversationId = originConversationId;
-              capture.tools = authorizedChatConversations.has(originConversationId) ? [...toolAllowlist] : [];
-              link.originConversationId = originConversationId;
-              granted.push(...capture.tools);
-            } else {
-              const origin = await tx.doc(ToolGrantDoc, originConversationId);
-              const target = await tx.doc(ToolGrantDoc, targetConversationId);
-              const link = await tx.doc(ToolGrantOriginDoc, targetConversationId);
-              // Replace, never extend, whatever the target held: the copy is exactly the origin's
-              // current grants at this instant, and the link is durable in the same commit.
-              for (const name of Object.keys(target.grants)) delete target.grants[name];
-              link.originConversationId = originConversationId;
-              const timestamp = now();
-              for (const name of toolAllowlist) {
-                const expiresAt = origin.grants[name];
-                if (typeof expiresAt === "number" && Number.isSafeInteger(expiresAt) && expiresAt > timestamp) {
-                  target.grants[name] = expiresAt;
-                  granted.push(name);
-                }
-              }
-            }
-          } else if (configAuthorized) {
+            const capture = await tx.doc(ConfigToolCaptureDoc, targetConversationId);
+            capture.originConversationId = originConversationId;
+            capture.tools = authorizedChatConversations.has(originConversationId) ? [...toolAllowlist] : [];
+            captured.push(...capture.tools);
+          } else {
             await tx.retireDoc(ConfigToolCaptureDoc, targetConversationId);
-            await tx.retireDoc(ToolGrantOriginDoc, targetConversationId);
           }
           // The run's fresh conversation is default-deny, so it also receives the origin's workspace
           // context through the same snapshot path: bootstrap/AGENTS, the memory manifest, the skill
@@ -771,7 +710,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
             ? await contextInstallerRef.current(owner.sessionKey, targetConversationId, ctx)
             : false;
           const tools = [
-            ...granted.flatMap((name) => {
+            ...captured.flatMap((name) => {
               const tool = toolRegistrations.get(name);
               return tool === undefined ? [] : [tool];
             }),
@@ -785,14 +724,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (skillsInstalled && skillTool !== undefined) extensions.push(skillTool.extension);
           await configure(tx, targetConversationId, { tools, modelTools: tools, extensions });
         },
-        // A separate run target's captured authority ends with the run: retire its grant/capture
-        // documents and stop offering its tools in the same commit that records the terminal
-        // outcome, so a finished or cancelled run cannot be used for a later admission. An
-        // origin-mode run answers in the origin conversation itself, so that conversation keeps its
-        // configured tools, cron ownership and context, and none of its documents are retired.
+        // A separate run target's captured authority ends with the run: retire its capture document
+        // and stop offering its tools in the same commit that records the terminal outcome, so a
+        // finished or cancelled run cannot be used for a later admission. An origin-mode run answers
+        // in the origin conversation itself, so that conversation keeps its configured tools, cron
+        // ownership and context, and none of its documents are retired.
         finalize: async ({ tx, job, occurrence, originConversationId, targetConversationId, background, delivery }) => {
           if (background) {
-            await tx.retireDoc(ToolGrantDoc, targetConversationId);
             await tx.retireDoc(ConfigToolCaptureDoc, targetConversationId);
             await configure(tx, targetConversationId, { tools: [], modelTools: [] });
           }
@@ -868,8 +806,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     }),
   });
   const contextToolsFor = (conversationId: ConversationId): ToolRegistration[] => {
-    // The skill loader is context delivery, not an effectful tool: it stays outside the
-    // grant document and the host ceiling, and is offered only for captured skill snapshots.
+    // The skill loader is context delivery, not an effectful tool: it stays outside the host
+    // ceiling, and is offered only for captured skill snapshots.
     // The cron tool is an owner-scoped scheduling capability, not filesystem or shell authority,
     // and is offered only in an origin session whose owner is known.
     const skillTools = skillToolRegistration !== undefined && skillConversations.has(conversationId)
@@ -885,25 +823,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
     return [...skillTools, ...cronTools, ...historyTools];
   };
   /**
-   * The background authority a scheduled run's target may still hold. Grant mode carries expiring
-   * grants; config mode carries the captured names that the current ceiling and a validated origin
-   * still support. A finished target gets an empty bound in either mode.
-   */
-  type BackgroundToolBound =
-    | { readonly mode: "grants"; readonly grants: ReadonlyMap<string, number> }
-    | { readonly mode: "config"; readonly tools: ReadonlySet<string> };
-  /**
-   * The authority-derived tool filter. In config mode the host ceiling directly authorizes
-   * authenticated mapped ordinary chats; a scheduled background run must pass its restored capture
-   * bound, or it keeps no coding tool. In the legacy grant mode a scheduled run passes
-   * `copiedGrantBound`, the authority its origin still supports: it replaces the copied document
-   * with exactly those names and expiries, so a copied grant never outlives or outgrows its origin.
-   * An empty bound is a genuine deny and retires the copy.
+   * The authority-derived tool filter. The host ceiling directly authorizes authenticated mapped
+   * ordinary chats; a scheduled background run must pass its restored capture bound, or it keeps no
+   * coding tool. An empty bound is a genuine deny and retires the capture.
    */
   const toolFilterFor = async (
     tx: Tx,
     conversationId: ConversationId,
-    background?: BackgroundToolBound,
+    backgroundTools?: ReadonlySet<string>,
   ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
     const contextTools = contextToolsFor(conversationId);
     const withContext = (names: readonly string[]): Pick<AgentChange, "tools" | "modelTools"> => {
@@ -912,45 +839,32 @@ export async function openGateway(config: PortConfig, context: Context, options:
     };
     if (!toolExtension) {
       // Retire instead of creating an empty document: a disabled ceiling must durably remove
-      // previously granted tools so re-enabling it cannot resurrect them.
-      await tx.retireDoc(ToolGrantDoc, conversationId);
+      // previously captured tools so re-enabling it cannot resurrect them.
       await tx.retireDoc(ConfigToolCaptureDoc, conversationId);
       return withContext([]);
     }
-    if (configAuthorized) {
-      // Only the host's validated mapped-chat set carries configured authority. The root, a
-      // channel-state conversation, a fork, a raw conversation and any other task-owned target
-      // are denied even when agent state still names a tool.
-      if (authorizedChatConversations.has(conversationId)) return withContext(toolAllowlist);
-      if (background?.mode === "config") {
-        const capture = await tx.doc(ConfigToolCaptureDoc, conversationId);
-        const names = toolAllowlist.filter((name) =>
-          background.tools.has(name) && capture.tools.includes(name));
-        // Persist the prune so a later call-time check cannot revive a name the origin lost.
-        capture.tools = names;
-        return withContext(names);
-      }
-      await tx.retireDoc(ConfigToolCaptureDoc, conversationId);
-      return withContext([]);
+    // Only the host's validated mapped-chat set carries configured authority. The root, a
+    // channel-state conversation, a fork, a raw conversation and any other task-owned target
+    // are denied even when agent state still names a tool.
+    if (authorizedChatConversations.has(conversationId)) return withContext(toolAllowlist);
+    if (backgroundTools !== undefined) {
+      const capture = await tx.doc(ConfigToolCaptureDoc, conversationId);
+      const names = toolAllowlist.filter((name) =>
+        backgroundTools.has(name) && capture.tools.includes(name));
+      // Persist the prune so a later call-time check cannot revive a name the origin lost.
+      capture.tools = names;
+      return withContext(names);
     }
-    const document = await tx.doc(ToolGrantDoc, conversationId);
-    const copiedGrantBound = background?.mode === "grants" ? background.grants : undefined;
-    if (copiedGrantBound !== undefined) {
-      for (const name of Object.keys(document.grants)) {
-        if (!copiedGrantBound.has(name)) delete document.grants[name];
-      }
-      for (const [name, expiresAt] of copiedGrantBound) document.grants[name] = expiresAt;
-    }
-    return withContext(pruneToolGrants(document, toolAllowlist, now()));
+    await tx.retireDoc(ConfigToolCaptureDoc, conversationId);
+    return withContext([]);
   };
   const denyNewConversation = async (
     tx: Tx,
     conversation: { readonly id: ConversationId },
   ): Promise<void> => {
     // Every native creation path, including forks and raw/task-created conversations, starts denied.
-    // Grant and capture documents are retired so a fork's copied agent state can never inherit
-    // authority, and extensions are explicit so a later dynamic install cannot be selected by default.
-    await tx.retireDoc(ToolGrantDoc, conversation.id);
+    // Any capture document is retired so a fork's copied agent state can never inherit authority,
+    // and extensions are explicit so a later dynamic install cannot be selected by default.
     await tx.retireDoc(ConfigToolCaptureDoc, conversation.id);
     await configure(tx, conversation.id, { tools: [], modelTools: [], extensions: [] });
   };
@@ -1231,9 +1145,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
 
     // Explicit same-conversation refresh: re-run the host provider and apply the new snapshot to the
     // next turn. It is opt-in, per session key, and refuses a live run. Provider or loader failure
-    // leaves the captured snapshot untouched. Refresh changes no grant: it re-renders the skills
-    // summary and replaces the on-demand skill table, while the normal policy pass only prunes grants
-    // as before. Background cron targets are not reachable here because they have no session key.
+    // leaves the captured snapshot untouched. Refresh changes no tool authority: it re-renders the
+    // skills summary and replaces the on-demand skill table, while the normal policy pass reapplies
+    // the configured tool filter. Background cron targets are not reachable here because they have no
+    // session key.
     // The refresh registers in contextSnapshotLoads so an install for the same conversation cannot
     // build a competing snapshot; any failed commit restores the prior in-memory extension/table.
     const refreshContextSnapshot = async (
@@ -1313,13 +1228,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // History retrieval is independent of the context snapshot opt-in: every mapped chat
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
-    const initialMapping = !configAuthorized && historyTool === undefined
+    const initialMapping = historyTool === undefined && !toolsEnabled
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
     if (initialMapping !== undefined) {
       for (const { conversationId } of await mappedChatSessions(context)) {
         if (historyTool !== undefined) historyConversations.add(conversationId);
-        if (configAuthorized) authorizedChatConversations.add(conversationId);
+        authorizedChatConversations.add(conversationId);
       }
     }
     if (options.contextSnapshotProvider || cronEnabled) {
@@ -1413,50 +1328,21 @@ export async function openGateway(config: PortConfig, context: Context, options:
       } while (cursor !== undefined);
     }, context);
 
-    // A copied background-run grant is only as good as its origin's current grant. Durable's tool
-    // hooks run in the call phase only, so a committed execute intent resolves without them and a
-    // resumed turn could otherwise admit a call the origin already revoked. Intersect every live
-    // run's copy with the origin's current grants before resume, and treat a missing/mismatched
-    // link, an unknown origin owner, a missing origin document or an already finished run as a deny
-    // rather than a copy.
     // A background run's captured authority is only as good as the current host config and its
     // origin. Durable's tool hooks run in the call phase only, so a committed execute intent
     // resolves without them and a resumed turn could otherwise admit a call the config or origin no
     // longer supports. Intersect every live run's capture with the current ceiling and its
-    // authenticated origin before resume; a missing/mismatched link, an unknown origin owner, an
-    // already finished run or a missing capture is a deny rather than authority.
-    const backgroundToolBounds = new Map<ConversationId, BackgroundToolBound>();
+    // authenticated origin before resume; a mismatched origin, an unknown origin owner, an already
+    // finished run or a missing capture is a deny rather than authority.
+    const backgroundToolBounds = new Map<ConversationId, ReadonlySet<string>>();
     for (const { conversationId: targetConversationId, originConversationId, live } of runTargetCandidates) {
-      if (configAuthorized) {
-        const tools = new Set<string>();
-        const link = live ? await harness.snapshot(ToolGrantOriginDoc, targetConversationId, context) : undefined;
-        const capture = live ? await harness.snapshot(ConfigToolCaptureDoc, targetConversationId, context) : undefined;
-        if (link?.originConversationId === originConversationId
-          && capture !== undefined && capture.originConversationId === originConversationId
-          && authorizedChatConversations.has(originConversationId)) {
-          for (const name of boundedCapturedTools(capture.tools, toolAllowlist, true)) tools.add(name);
-        }
-        backgroundToolBounds.set(targetConversationId, { mode: "config", tools });
-        continue;
+      const tools = new Set<string>();
+      const capture = live ? await harness.snapshot(ConfigToolCaptureDoc, targetConversationId, context) : undefined;
+      if (capture !== undefined && capture.originConversationId === originConversationId
+        && authorizedChatConversations.has(originConversationId)) {
+        for (const name of boundedCapturedTools(capture.tools, toolAllowlist, true)) tools.add(name);
       }
-      const bounded = new Map<string, number>();
-      const link = live ? await harness.snapshot(ToolGrantOriginDoc, targetConversationId, context) : undefined;
-      const origin = live && cronOwners.has(originConversationId)
-        ? await harness.snapshot(ToolGrantDoc, originConversationId, context)
-        : undefined;
-      const copy = live ? await harness.snapshot(ToolGrantDoc, targetConversationId, context) : undefined;
-      if (link?.originConversationId === originConversationId && origin !== undefined) {
-        const timestamp = now();
-        for (const name of toolAllowlist) {
-          const copied = copy?.grants[name];
-          const originExpiry = origin.grants[name];
-          if (typeof copied === "number" && Number.isSafeInteger(copied) && copied > timestamp
-            && typeof originExpiry === "number" && Number.isSafeInteger(originExpiry) && originExpiry > timestamp) {
-            bounded.set(name, Math.min(copied, originExpiry));
-          }
-        }
-      }
-      backgroundToolBounds.set(targetConversationId, { mode: "grants", grants: bounded });
+      backgroundToolBounds.set(targetConversationId, tools);
     }
 
     for (const replay of preparedContextReplays) {
@@ -1471,8 +1357,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
     }
 
-    // Apply host security, grants and context selection only after every prepared dispatch passes the replay guard.
-    // Pruning expired/revoked grants before resume is what keeps a revoked tool from replaying.
+    // Apply host security, configured tool authority and context selection only after every prepared
+    // dispatch passes the replay guard. A narrowed configuration is what keeps a removed tool from replaying.
     await root.commit(async (tx) => {
       let cursor: Cursor | undefined;
       do {
@@ -1604,7 +1490,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const reason = await root.commit((tx) => readChatScope((id) => tx.conversation(id), conversationId!, root.id), ctx);
           if (reason === undefined) {
             historyConversations.add(conversationId!);
-            if (configAuthorized) authorizedChatConversations.add(conversationId!);
+            authorizedChatConversations.add(conversationId!);
           } else {
             historyConversations.delete(conversationId!);
             authorizedChatConversations.delete(conversationId!);
@@ -1661,13 +1547,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
           ...preset.choice.configured,
           thinkingLevel: preset.thinkingLevel ?? "off",
         }, ctx);
-      },
-      async listToolGrants(sessionKey, ctx) {
-        // Config authorization has no expiring grants; the configured ceiling is the authority.
-        if (configAuthorized || !toolExtension) return [];
-        const conversation = await existingConversationFor(sessionKey, ctx);
-        const document = await harness!.snapshot(ToolGrantDoc, conversation.id, ctx);
-        return document === undefined ? [] : activeToolGrants(document, toolAllowlist, now());
       },
       historyIdentity() {
         return Promise.resolve(storeIdentity);
@@ -1782,34 +1661,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
         }
         const conversation = await existingConversationFor(sessionKey, ctx);
         return { skills: await refreshContextSnapshot(sessionKey, conversation.id, ctx) };
-      },
-      async grantTools(sessionKey, grants, ctx) {
-        if (configAuthorized) throw new Error(configGrantApiError);
-        if (!toolExtension) throw new Error("Tools are disabled: toolAllowlist is empty");
-        const normalized = normalizeToolGrants(grants, toolAllowlist, now());
-        const conversation = await existingConversationFor(sessionKey, ctx);
-        return conversation.commit(async (tx) => {
-          const document = await tx.doc(ToolGrantDoc, conversation.id);
-          for (const grant of normalized) document.grants[grant.name] = grant.expiresAt;
-          const timestamp = now();
-          await configure(tx, conversation.id, await toolFilterFor(tx, conversation.id));
-          return activeToolGrants(document, toolAllowlist, timestamp);
-        }, ctx);
-      },
-      async revokeTools(sessionKey, names, ctx) {
-        if (configAuthorized) throw new Error(configGrantApiError);
-        if (!toolExtension) throw new Error("Tools are disabled: toolAllowlist is empty");
-        if (!Array.isArray(names) || names.some((name) => typeof name !== "string" || name.length === 0)) {
-          throw new TypeError("Tool revocations must be an array of non-empty tool names");
-        }
-        const conversation = await existingConversationFor(sessionKey, ctx);
-        return conversation.commit(async (tx) => {
-          const document = await tx.doc(ToolGrantDoc, conversation.id);
-          for (const name of new Set(names)) delete document.grants[name];
-          const timestamp = now();
-          await configure(tx, conversation.id, await toolFilterFor(tx, conversation.id));
-          return activeToolGrants(document, toolAllowlist, timestamp);
-        }, ctx);
       },
       async close(ctx) {
         if (closed) return;
