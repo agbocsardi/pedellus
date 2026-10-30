@@ -42,11 +42,15 @@ bounded newline-delimited JSON protocol over that socket:
   keys such as `telegram:<id>`, the root/state/fork conversations and arbitrary
   harness IDs are not attachable.
 - Requests are validated and bounded. Request lines are capped at 256 KiB,
-  admitted prompts at 32,000 code units, entry pages at 200 rows and history
-  pages at 50 hits; unknown methods, unknown fields and out-of-range values are
-  rejected. Rejections carry a fixed code and no dependency, path or credential
-  text. Command and admission serialization stays in the terminal, not in a new
-  gateway queue.
+  admitted prompts at 32,000 code units, attachment paths at 4,096 code units,
+  entry pages at 200 rows and history pages at 50 hits; unknown methods, unknown
+  fields and out-of-range values are rejected. Rejections carry a fixed code and
+  no dependency, path or credential text. Command and admission serialization
+  stays in the terminal, not in a new gateway queue.
+- A local attachment is one request carrying the operator's path and optional
+  prompt. The gateway reads, bounds and stores the file; the CLI never opens the
+  media directory, reads the file or learns its bytes. See
+  [local attachments](#local-attachments).
 - Snapshot delivery is bounded: the CLI keeps at most 64 pending frames
   (dropping the oldest) and awaits each render in order, while the gateway
   disconnects a socket that queues more than 8 MiB. A disconnected or stalled
@@ -156,6 +160,7 @@ fail-closed and is not remotely cancelled. See
 | `/model` | List named presets and the current/default choice. `/model <name>` temporarily selects one; `/model default` returns to the configured preset. A CLI reattach keeps the temporary selection; a gateway restart also returns to the configured preset. Direct-model configs retain `/model <provider> <modelId> [thinkingLevel]` and persisted selection. Busy selection is rejected atomically; retry when idle. In-process/SDK terminal callers without a host callback remain read-only. |
 | `/tools` | Read-only diagnostic of the config-selected coding tools for this conversation. |
 | `/refresh` | Re-read the configured workspace bootstrap, memory files, manifest and skill inventory for this attached CLI conversation. Requires `workspaceContext`; rejected while the conversation is busy. The refreshed summary and skill table apply to the next model request. |
+| `/attach <path>[ -- <prompt>]` | Store one operator-named local file through the gateway under the configured workspace media directory and submit it as an ordinary turn, optionally with prompt text after the first ` -- ` (paths may contain spaces). Requires top-level `media` config; see [local attachments](#local-attachments). |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
 | `/new` | Admit native `Conversation.reset(undefined)`: the same conversation starts a new context with no handoff. No archive, summary, usage reset or extra model call is produced; earlier entries stay stored and remain visible to `/history`, and configured tools are unchanged. While busy it is placed at the next safe boundary and ends that run there instead of interrupting the current model turn; inputs queued before or after it in the same busy window run in the new context. A queued `/new` is a write, so `/abort` withdraws queued inputs but not the pending reset. |
@@ -173,6 +178,51 @@ unrelated: there is no Telegram `/refresh` command. See
 Equivalent presets can both show as selected because the marker matches the actual
 provider/model/thinking settings, not a separately stored preset identity. A legacy
 pair selection may match no preset. See [model selection](./MODELS.md).
+
+## Local attachments
+
+`/attach` is explicit, one file per command, and opt-in with the same top-level
+`media` configuration Telegram ingress uses (see
+[setup](./SETUP.md#8-optional-attachments-and-voice)). Without `media`, the
+command reports that local attachments are unavailable and ordinary input stays
+text-only. An in-process/SDK terminal host without an attachment callback gets the
+same refusal; this adds no fallback path or local media reader.
+
+The CLI only names an operator path. The gateway, which already owns storage,
+resolves the file, reads it bounded, stores the original under
+`<workspace>/<media.directory>` (default `media/`) and composes the ordinary turn.
+The CLI does not open storage, read the file, or receive its bytes, and the model
+receives only a workspace-relative locator plus bounded metadata, never the
+operator's absolute path. Paths are operator input, not model input, and no tool
+authority is added.
+
+- A path must be absolute or is resolved by the CLI process against its own
+  working directory; it is capped at 4,096 code units and rejected if it contains
+  control characters. The gateway refuses a relative path it still receives.
+- Known image extensions (`.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`) are accepted as
+  photos only when the bytes match that format. A photo becomes native pi-ai image
+  content plus its stored locator, so the existing configured vision handoff for
+  a text-only preset applies unchanged; the CLI adds no vision call or image
+  preprocessing.
+- Every other file is stored as an opaque original with its locator only. Nothing
+  is extracted, OCRed, converted or opened; PDF/Office handling and audio
+  transcription are not added to the CLI, and no speech backend is provisioned or
+  implied.
+- The shared store enforces 20 MB per file. Empty, unreadable, non-regular,
+  oversized and mislabeled-image files are refused with fixed, value-free text
+  before anything is submitted. A stored identity comes from the file's bytes, so
+  attaching the same content twice reuses one original. Stored originals are not
+  deleted automatically and there is no total-disk cap.
+
+A successful command prints the stored kind, workspace-relative locator and byte
+count, then admits one ordinary submission. It counts against the same 64
+unsettled-input bound as typed prompts, and the existing stream, settlement,
+`/abort`, `/new` and EOF behavior is unchanged.
+
+The shared store's generated filename is the only locator the model sees; reading
+it is still a configured-tool decision. The named file is an ordinary stored
+original, not a capability, and attaching it grants no path or shell authority.
+
 
 ## History search and browsing
 
@@ -343,9 +393,11 @@ queued for owner reconciliation or reopen; only explicit `/abort` withdraws
 them. SIGINT and SIGTERM cancel local waits and watches and close input; they do
 not stop the gateway or its Harness.
 
-This remains a text-only local surface, not a complete Python command port or
-interactive terminal UI. Model selection delegates to the gateway's allowlist
-and persists in native Durable `pi.agent`; the CLI adds no agent runner, queue,
-session store, or parallel model state, and it owns no storage or provider
-credential. Scheduled origin-mode answers are rendered from
-the same conversation's committed entries; the terminal adds no delivery queue.
+This remains a text-first local surface, not a complete Python command port or
+interactive terminal UI. Without `media`, ordinary input is text-only and
+`/attach` is unavailable; with it, only the explicit `/attach` command can submit
+a stored file. Model selection delegates to the gateway's allowlist and persists
+in native Durable `pi.agent`; the CLI adds no agent runner, queue, session store,
+or parallel model state, and it owns no storage or provider credential. Scheduled
+origin-mode answers are rendered from the same conversation's committed entries;
+the terminal adds no delivery queue.

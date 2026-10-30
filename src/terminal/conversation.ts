@@ -10,7 +10,10 @@ import type {
   SettledSubmissionRecord,
   UsageState,
 } from "@earendil-works/pi-durable";
-import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+
+/** Plain typed input, or the text/image parts of a stored attachment submission. */
+export type TerminalInput = string | (TextContent | ImageContent)[];
 
 /**
  * The terminal's narrow conversation boundary.
@@ -25,8 +28,8 @@ export interface TerminalConversation {
   readonly id: number;
   /** Observe committed conversation revisions until stopped or the context fails. */
   watch(context: Context): Promise<TerminalWatch>;
-  /** Durably admit one ordinary user input into this conversation. */
-  submit(content: string, context: Context): Promise<TerminalSubmission>;
+  /** Durably admit one ordinary user input (text, or attachment content built by the host). */
+  submit(content: TerminalInput, context: Context): Promise<TerminalSubmission>;
   /** Read one committed assistant entry of this conversation, by entry ID. */
   answer(entryId: number, context: Context): Promise<TerminalAnswerText>;
   /** Point-in-time status of this conversation, already bounded for presentation. */
@@ -64,6 +67,20 @@ export interface TerminalSettlement {
   readonly type: "input" | "write";
   readonly answer?: number;
   readonly reason?: string;
+}
+
+/** One stored local attachment, as the host reports it back to the terminal. */
+export interface TerminalAttachment {
+  readonly kind: "photo" | "document";
+  /** Workspace-relative stored locator; never the operator's absolute path. */
+  readonly relativePath: string;
+  readonly bytes: number;
+}
+
+/** An attachment turn already admitted by the host, with its stored-file summary. */
+export interface TerminalAttachmentSubmission {
+  readonly submission: TerminalSubmission;
+  readonly attachment: TerminalAttachment;
 }
 
 export interface TerminalAnswerText {

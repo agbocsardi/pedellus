@@ -7,9 +7,11 @@ import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "..
 import type { HistoryPage, HistoryQuery } from "../history/index.js";
 import type { GatewayModelList, GatewayModelSelection, GatewayModelSelectionRequest } from "../runtime.js";
 import type {
+  TerminalAttachmentSubmission,
   TerminalConversation,
   TerminalEntryPage,
   TerminalEntryQuery,
+  TerminalInput,
   TerminalSettlement,
   TerminalSnapshot,
   TerminalStatus,
@@ -35,6 +37,8 @@ export interface LocalGatewayClient extends TerminalConversation {
   readonly tools: readonly string[];
   readonly contextRefresh: boolean;
   readonly presets: boolean;
+  /** True when the gateway has a configured media store for local attachments. */
+  readonly attachments: boolean;
   listModels(context: Context): Promise<GatewayModelList>;
   selectModel(selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection>;
   selectModelPreset(name: string, context: Context): Promise<GatewayModelSelection>;
@@ -49,6 +53,8 @@ export interface LocalGatewayClient extends TerminalConversation {
     cursor: Cursor | undefined,
     context: Context,
   ): Promise<TerminalEntryPage>;
+  /** Store one operator-named local file in the gateway's media directory and admit its turn. */
+  submitAttachment(path: string, content: string, context: Context): Promise<TerminalAttachmentSubmission>;
   /** Close this attachment only; the gateway and already admitted turns keep running. */
   close(): Promise<void>;
 }
@@ -107,6 +113,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
   tools: readonly string[] = [];
   contextRefresh = false;
   presets = false;
+  attachments = false;
   private readonly socket: Socket;
   private nextId = 0;
   private readonly pending = new Map<number, PendingCall>();
@@ -144,6 +151,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
     this.tools = tools as string[];
     this.contextRefresh = result.contextRefresh === true;
     this.presets = result.presets === true;
+    this.attachments = result.attachments === true;
   }
 
   async watch(context: Context): Promise<TerminalWatch> {
@@ -160,7 +168,11 @@ class LocalGatewayConnection implements LocalGatewayClient {
     };
   }
 
-  async submit(content: string, context: Context): Promise<TerminalSubmission> {
+  async submit(content: TerminalInput, context: Context): Promise<TerminalSubmission> {
+    // Attachment content is composed and stored by the gateway, never sent inline by the terminal.
+    if (typeof content !== "string") {
+      throw new Error("local attachments must be submitted through the gateway attachment request");
+    }
     const result = await this.call<{ readonly id: number }>("submit", { content }, context);
     if (!Number.isSafeInteger(result.id)) throw new LocalGatewayError("unavailable", "local gateway sent an unexpected submission");
     const id = result.id;
@@ -168,6 +180,36 @@ class LocalGatewayConnection implements LocalGatewayClient {
       id,
       wait: (waitContext) => this.waitSettlement(id, waitContext),
       status: (statusContext) => this.call("submissionStatus", { id }, statusContext),
+    };
+  }
+
+  async submitAttachment(path: string, content: string, context: Context): Promise<TerminalAttachmentSubmission> {
+    if (!this.attachments) throw new Error("local attachments are not configured");
+    const result = await this.call<Record<string, unknown>>(
+      "submitAttachment",
+      content === "" ? { path } : { path, content },
+      context,
+    );
+    const id = result.id;
+    if (typeof id !== "number" || !Number.isSafeInteger(id) || id < 1) {
+      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attachment submission");
+    }
+    const attachment = asObject(result.attachment);
+    const kind = attachment?.kind;
+    const relativePath = attachment?.relativePath;
+    const bytes = attachment?.bytes;
+    if ((kind !== "photo" && kind !== "document")
+      || typeof relativePath !== "string" || relativePath.length === 0
+      || typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0) {
+      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attachment submission");
+    }
+    return {
+      attachment: { kind, relativePath, bytes },
+      submission: {
+        id,
+        wait: (waitContext) => this.waitSettlement(id, waitContext),
+        status: (statusContext) => this.call("submissionStatus", { id }, statusContext),
+      },
     };
   }
 

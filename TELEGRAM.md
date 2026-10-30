@@ -176,8 +176,9 @@ a wall-clock timeout, and concurrent attachment work across chats is capped so
 polling is never blocked. Temporary files are removed on failure or abort.
 
 This section does not add a general media service, a durable download queue, a
-retry framework, video handling, OCR/PDF extraction, cloud speech, or a channel
-command for media.
+retry framework, video handling, OCR/PDF extraction, cloud speech, or a Telegram
+command for media. The local CLI's explicit `/attach` submission is a separate
+local-surface path into the same store; it adds no Telegram command.
 
 ## Coding tools
 
