@@ -94,6 +94,12 @@ function attachment(
  * are explicitly unsupported and never implied to have been read.
  */
 export function planTelegramMedia(message: TelegramMediaMessage, botId: string, updateId: number): TelegramMediaPlan {
+  // Unsupported kinds are checked first: a Telegram animation carries a
+  // backward-compatibility `document` field, and it must never be stored as one.
+  if (message.video !== undefined) return { kind: "unsupported", label: "video" };
+  if (message.video_note !== undefined) return { kind: "unsupported", label: "video note" };
+  if (message.animation !== undefined) return { kind: "unsupported", label: "animation" };
+  if (message.sticker !== undefined) return { kind: "unsupported", label: "sticker" };
   if (message.photo !== undefined && message.photo.length > 0) {
     let largest = message.photo[0]!;
     for (const candidate of message.photo) {
@@ -140,10 +146,6 @@ export function planTelegramMedia(message: TelegramMediaMessage, botId: string, 
       }),
     };
   }
-  if (message.video !== undefined) return { kind: "unsupported", label: "video" };
-  if (message.video_note !== undefined) return { kind: "unsupported", label: "video note" };
-  if (message.animation !== undefined) return { kind: "unsupported", label: "animation" };
-  if (message.sticker !== undefined) return { kind: "unsupported", label: "sticker" };
   return { kind: "none" };
 }
 

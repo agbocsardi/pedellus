@@ -19,6 +19,8 @@ export const TRANSCRIPTION_LIMITS = {
   maxOutputBytes: 64 * 1024,
   /** Audio longer than this is refused instead of transcribed. */
   maxDurationSeconds: 120,
+  /** Bounded wait for a killed child to be reaped before the operation settles anyway. */
+  killGraceMs: 2_000,
 } as const;
 
 export type TranscriptionFailure =
@@ -67,6 +69,45 @@ export function defaultHelperPath(): string {
 const EXIT_UNAVAILABLE = 3;
 const EXIT_TOO_LARGE = 4;
 
+/**
+ * Only what uv, Python and the local caches need. Unrelated runtime credentials from
+ * this process are not inherited; explicit uv/Hugging Face cache locations are kept so
+ * a provisioned environment still resolves, and hub offline mode is forced.
+ */
+const CHILD_ENV_KEYS = [
+  "PATH",
+  "HOME",
+  "USERPROFILE",
+  "TMPDIR",
+  "TEMP",
+  "TMP",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "XDG_CACHE_HOME",
+  "XDG_CONFIG_HOME",
+  "UV_CACHE_DIR",
+  "UV_PYTHON",
+  "HF_HOME",
+  "HF_HUB_CACHE",
+  "HUGGINGFACE_HUB_CACHE",
+  "SYSTEMROOT",
+  "COMSPEC",
+  "PATHEXT",
+] as const;
+
+function childEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    HF_HUB_OFFLINE: "1",
+    HF_HUB_DISABLE_TELEMETRY: "1",
+  };
+  for (const key of CHILD_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
 export function createTranscriber(options: TranscriberOptions = {}): Transcriber {
   const enabled = options.enabled !== false;
   const uvPath = options.uvPath ?? "uv";
@@ -108,17 +149,14 @@ export function createTranscriber(options: TranscriberOptions = {}): Transcriber
           shell: false,
           detached: process.platform !== "win32",
           stdio: ["ignore", "pipe", "pipe"],
-          env: {
-            ...process.env,
-            // A voice message must never install the helper environment or download a
-            // model: a missing local model fails truthfully instead.
-            HF_HUB_OFFLINE: "1",
-            HF_HUB_DISABLE_TELEMETRY: "1",
-          },
+          env: childEnvironment(),
         });
         const stdout: Buffer[] = [];
         let stdoutBytes = 0;
+        /** The outcome is decided; the promise may still be waiting for the child to be reaped. */
         let settled = false;
+        let resolved = false;
+        let childClosed = false;
         let timedOut = false;
         let killedByAbort = false;
 
@@ -139,13 +177,33 @@ export function createTranscriber(options: TranscriberOptions = {}): Transcriber
 
         let timer: ReturnType<typeof setTimeout> | undefined;
 
-        const fail = (reason: TranscriptionFailure) => {
+        const resolveOnce = (outcome: TranscriptionOutcome) => {
+          if (resolved) return;
+          resolved = true;
+          resolveOutcome(outcome);
+        };
+
+        /**
+         * Settle only after the child is reaped, or after a bounded grace when the platform
+         * never reports close. The caller never has to clean up a process it cannot see.
+         */
+        const settle = (outcome: TranscriptionOutcome) => {
           if (settled) return;
           settled = true;
           if (timer !== undefined) clearTimeout(timer);
           request.signal?.removeEventListener("abort", onAbort);
-          resolveOutcome({ ok: false, reason });
+          if (childClosed || child.pid === undefined) {
+            resolveOnce(outcome);
+            return;
+          }
+          const grace = setTimeout(() => resolveOnce(outcome), TRANSCRIPTION_LIMITS.killGraceMs);
+          child.once("close", () => {
+            clearTimeout(grace);
+            resolveOnce(outcome);
+          });
         };
+
+        const fail = (reason: TranscriptionFailure) => settle({ ok: false, reason });
 
         const onAbort = () => {
           killedByAbort = true;
@@ -183,6 +241,8 @@ export function createTranscriber(options: TranscriberOptions = {}): Transcriber
           fail("unavailable");
         });
         child.on("close", (code: number | null) => {
+          childClosed = true;
+          // A settle() already in flight resolves through its own close listener.
           if (settled) return;
           if (timedOut) return fail("timeout");
           if (killedByAbort) return fail("cancelled");
@@ -191,10 +251,7 @@ export function createTranscriber(options: TranscriberOptions = {}): Transcriber
           if (code !== 0) return fail("failed");
           const text = Buffer.concat(stdout).toString("utf8").trim();
           if (text === "") return fail("empty");
-          settled = true;
-          clearTimeout(timer);
-          request.signal?.removeEventListener("abort", onAbort);
-          resolveOutcome({ ok: true, text: text.slice(0, maxOutputBytes) });
+          settle({ ok: true, text: text.slice(0, maxOutputBytes) });
         });
       });
     },

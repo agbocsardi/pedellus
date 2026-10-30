@@ -66,11 +66,16 @@ download keeps the admitted update instead of losing it, and a reopen resumes it
 - **Storage.** Originals are written byte-for-byte under
   `<workspace>/<media.directory>` (default `media/`) and stay readable through the
   configured coding tools. Nothing is written to `dataDir` or an arbitrary
-  external root. Filenames are generated from the attachment kind and a hash of
-  Telegram's content-stable file identity, never from the announced filename, so
-  a retry or replay maps to the same file and a re-sent file is stored once.
-  Publication is atomic with private permissions, and a symlinked, hardlinked or
-  non-regular target path is refused rather than followed or overwritten.
+  external root. A configured workspace root may itself be an operator symlink:
+  it is resolved once to its canonical path, and every level below it is still
+  checked individually. Filenames are generated from the attachment kind and a
+  hash of Telegram's content-stable file identity, never from the announced
+  filename, so a retry or replay maps to the same file and a re-sent file is
+  stored once. Publication is atomic with private permissions, and a symlinked,
+  hardlinked or non-regular target path is refused rather than followed or
+  overwritten. Stored originals are never deleted by the adapter and there is no
+  total-disk cap; keeping the workspace media directory bounded is the
+  operator's job.
 - **Photos** are submitted as native pi-ai image content (base64 + MIME) together
   with a labeled, workspace-relative locator and bounded untrusted metadata. The
   stored file is the authoritative original; the adapter performs no vision API
@@ -174,6 +179,17 @@ cannot be submitted early and withdrawn by the abort it followed. The gate is pe
 chat: polling, other chats and other chats' deliveries continue, and the command
 runs off the polling loop. The command itself is not queued behind a running
 turn, which is what makes `/abort` able to interrupt one.
+
+A transient failure while a command is flushing an earlier input (for example a
+media download that keeps failing) is not fatal and does not apply the command
+early. The command stays admitted, the chat stays gated, its acknowledgement is
+released as the explicit still-pending wording, and the same ordered flush is
+retried once per poll response. A control-forced input reuses its single model
+turn when it is later delivered, so it is answered exactly once. After a bounded
+number of failed attempts the command is reported as unconfirmed and the gate is
+released rather than leaving the chat unusable; a reopen reports any command
+still admitted the same honest way. A newer command in that chat is refused
+while an earlier one is deferred, so two commands cannot reorder.
 
 Per-chat model submissions keep admission order, and each chat's place is
 reserved when a delivery is dispatched, before any asynchronous

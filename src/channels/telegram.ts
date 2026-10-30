@@ -5,7 +5,7 @@ import { withCancel, withoutAbortSignal } from "@earendil-works/chord/context";
 import { Api, GrammyError, HttpError } from "grammy";
 import type { ApiClientOptions } from "grammy";
 import type { MessageReactionUpdated, ReactionType, ReactionTypeEmoji, Update } from "grammy/types";
-import type { Conversation, SubmissionId } from "@earendil-works/pi-durable";
+import type { Conversation, Submission, SubmissionId } from "@earendil-works/pi-durable";
 import type { AssistantMessage, ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
 import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
@@ -59,6 +59,8 @@ const FLOOD_WAIT_BUDGET_MS = 5 * 60_000;
 const CONTROL_PENDING_NOTICE_MS = 30_000;
 /** Consecutive delivery failures after which a non-Telegram-rejected failure is held instead of retried forever. */
 const MAX_DELIVERY_FAILURES = 10;
+/** Bounded poll-cadence retries for a command whose earlier ordered inputs keep failing transiently. */
+const MAX_CONTROL_ATTEMPTS = 10;
 const FLOOD_WAIT_WITHOUT_HINT_MS = 1_000;
 const COMMAND_NAME_MAX = 32;
 const BOT_MENTION_MAX = 64;
@@ -148,6 +150,13 @@ export type TelegramControlRecord = {
   /** Chat and sender, so a reopen can report an interrupted command without its acknowledgement record. */
   chatId: number;
   senderId: string;
+};
+
+/** One admitted command whose ordered flush is retried on the polling cadence. */
+type DeferredControl = {
+  readonly updateId: number;
+  readonly command: "new" | "abort";
+  readonly chatId: number;
 };
 export type TelegramChannelState = {
   offset: number;
@@ -289,6 +298,14 @@ export async function runTelegram(
   const failedThisPoll = new Set<number>();
   /** Chats whose control command is still being applied: nothing for them is submitted or delivered. */
   const controlPending = new Set<number>();
+  /** Commands whose earlier ordered inputs hit a transient failure; retried on the poll cadence. */
+  const deferredControls = new Map<number, DeferredControl>();
+  const controlFailures = new Map<number, number>();
+  /**
+   * Submissions a control flush already placed for earlier inputs, so the normal delivery
+   * path reuses that exact turn instead of submitting the same input a second time.
+   */
+  const earlySubmissions = new Map<number, Submission>();
   const controlChains = new Map<number, Promise<void>>();
   const submissionChains = new Map<number, Promise<void>>();
   const pendingControls = new Set<Promise<void>>();
@@ -1090,7 +1107,9 @@ export async function runTelegram(
           ?.flatMap((part) => part.type === "text" && part.text ? [part.text] : []).join("");
         if (text) queuePreview(text);
       });
-      const submission = await conversation.submit({ type: "input", content, requestId }, adapterContext);
+      const early = earlySubmissions.get(item.updateId);
+      earlySubmissions.delete(item.updateId);
+      const submission = early ?? await conversation.submit({ type: "input", content, requestId }, adapterContext);
       // Ordering is established; free the chat's next submission place while this turn runs.
       slot.release();
       submissionId = submission.id;
@@ -1302,6 +1321,7 @@ export async function runTelegram(
     }, cleanupContext);
   const forget = async (updateId: number) => {
     deliveryFailures.delete(updateId);
+    earlySubmissions.delete(updateId);
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
       doc.pending = doc.pending.filter((entry) => entry.updateId !== updateId);
@@ -1458,8 +1478,8 @@ export async function runTelegram(
     if (!ingress.transcriber.enabled) return { disabled: true };
     if (attachment.relativePath === undefined) return { failure: "the stored file is missing" };
     const outcome = await mediaWork.run(
-      () => ingress.transcriber.transcribe(
-        ingress.store.absolute(attachment.relativePath!),
+      async () => ingress.transcriber.transcribe(
+        await ingress.store.absolute(attachment.relativePath!),
         { ...(signal === undefined ? {} : { signal }) },
       ),
       signal,
@@ -1600,6 +1620,7 @@ export async function runTelegram(
     while (!signal?.aborted) {
       failedThisPoll.clear();
       drain();
+      resumeDeferredControls();
       requestScheduledScan();
       const updates = await apiCall(api, "getUpdates", signal, (callSignal) => api.getUpdates({
         offset: state.offset,
@@ -1831,6 +1852,15 @@ export async function runTelegram(
     }
     // Captured before the callbacks below: the remaining commands are exactly these two.
     const command: "new" | "abort" = parsed.command === "new" ? "new" : "abort";
+    // A deferred command still owns this chat's order. Refuse a newer one instead of letting
+    // it apply first; the earlier command is retried on the poll cadence.
+    if ([...deferredControls.values()].some((entry) => entry.chatId === chatId)) {
+      await admitNotice(update, message, sessionKey,
+        "An earlier /new or /abort in this chat is still pending; this command was not started and was not sent " +
+        "to the assistant. Wait for it to finish or restart the adapter.");
+      drain();
+      return;
+    }
     // Refuse, never evict: a hung provider plus repeated commands must not grow the log without bound.
     if (state.controls.filter((entry) => entry.status !== "applied").length >= MAX_UNRESOLVED_CONTROLS) {
       await admitNotice(update, message, sessionKey,
@@ -1874,36 +1904,9 @@ export async function runTelegram(
     }, adapterContext);
     // Apply it off the polling loop, serialized per chat: other chats keep polling, and this chat's later inputs and
     // deliveries wait here so the abort cannot withdraw a message admitted after the command.
+    const record: DeferredControl = { updateId: update.update_id, command, chatId };
     const prior = controlChains.get(chatId) ?? Promise.resolve();
-    const run = prior.then(async () => {
-      // Every message admitted before the command is submitted first, including one still parked behind the delivery
-      // cap, so the native reset/abort orders correctly and an abort cannot land between admission and submission.
-      for (const earlier of state.pending.filter((item) =>
-        item.notice !== true && item.chatId === chatId && item.updateId < update.update_id &&
-        options.allowFrom.includes(item.senderId))) {
-        const earlierConversation = await gateway.conversationFor(earlier.sessionKey, adapterContext);
-        // Prepare attachment content in the same chat order as a normal delivery: a media
-        // message forced ahead of a control must not be submitted as text only.
-        await submitInOrder(chatId, async () => {
-          const content = await prepareInputContent(earlier);
-          return earlierConversation.submit(
-            { type: "input", content, requestId: requestIdFor(identity, earlier.updateId) },
-            adapterContext,
-          );
-        });
-      }
-      const conversation = await gateway.conversationFor(sessionKey, adapterContext);
-      if (command === "new") await conversation.reset(undefined, adapterContext);
-      else await conversation.abort(adapterContext);
-      state = await stateConversation.commit(async (tx) => {
-        const doc = await tx.doc(TelegramState, stateConversation.id);
-        const entry = doc.controls.find((item) => item.updateId === update.update_id);
-        if (entry !== undefined) entry.status = "applied";
-        // Bound the log here too: only applied and already-reported records are pruned, never an unresolved one.
-        doc.controls = pruneControls(doc.controls, doc.pending);
-        return copyJson(doc) as unknown as ChannelState;
-      }, adapterContext);
-    });
+    const run = prior.then(() => applyControl(record));
     // The acknowledgement is published once: as the applied wording when the native call returns, or as the explicit
     // still-pending wording when it does not. A provider that ignores cancellation keeps the chat gated, so no later
     // message can be withdrawn, and it is told plainly instead of being left silent.
@@ -1915,7 +1918,18 @@ export async function runTelegram(
     }, CONTROL_PENDING_NOTICE_MS);
     const chain = run.then(() => undefined, () => undefined);
     controlChains.set(chatId, chain);
-    const task = run.then(async () => {
+    const task = run.then(async (outcome) => {
+      if (outcome !== "applied") {
+        // Deferred: say plainly that the command is still pending; the chat keeps waiting and
+        // the poll cadence retries the same ordered flush. Abandoned: the unconfirmed wording
+        // was already released by the terminal report.
+        if (ack !== "waiting") return;
+        ack = "pending";
+        if (outcome === "deferred") {
+          await releaseControlNotice(update.update_id, CONTROL_PENDING[command]).catch(() => undefined);
+        }
+        return;
+      }
       if (ack !== "waiting") return;
       ack = "applied";
       await releaseControlNotice(update.update_id);
@@ -1932,13 +1946,105 @@ export async function runTelegram(
       if (controlChains.get(chatId) === chain) {
         controlChains.delete(chatId);
         if (!stopping && !signal?.aborted) {
-          controlPending.delete(chatId);
+          // A deferred command keeps the chat gated, but notices (including its honest
+          // still-pending acknowledgement) and other chats must still be dispatched.
+          if (!deferredControls.has(update.update_id)) controlPending.delete(chatId);
           drain();
         }
       }
     });
     pendingControls.add(task);
     drain();
+  }
+
+  /**
+   * Submit every input admitted before this command, then apply the native call and record
+   * it. A transient failure while flushing earlier inputs is not fatal: the command stays
+   * admitted, the chat stays gated, and the poll cadence retries the same ordered flush.
+   * Repeated failures end in an explicit unconfirmed report rather than a silent takeover.
+   */
+  async function applyControl(record: DeferredControl): Promise<"applied" | "deferred" | "abandoned"> {
+    try {
+      for (const earlier of state.pending.filter((item) =>
+        item.notice !== true && item.chatId === record.chatId && item.updateId < record.updateId &&
+        options.allowFrom.includes(item.senderId))) {
+        const earlierConversation = await gateway.conversationFor(earlier.sessionKey, adapterContext);
+        // Prepare attachment content in the same chat order as a normal delivery: a media
+        // message forced ahead of a control must not be submitted as text only.
+        await submitInOrder(record.chatId, async () => {
+          const content = await prepareInputContent(earlier);
+          const submission = await earlierConversation.submit(
+            { type: "input", content, requestId: requestIdFor(identity, earlier.updateId) },
+            adapterContext,
+          );
+          // The normal delivery path reuses this turn, so a control-forced input is answered
+          // exactly once even when it settles before the chat's gate is released.
+          earlySubmissions.set(earlier.updateId, submission);
+          return submission;
+        });
+      }
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const attempts = (controlFailures.get(record.updateId) ?? 0) + 1;
+      if (attempts < MAX_CONTROL_ATTEMPTS) {
+        controlFailures.set(record.updateId, attempts);
+        deferredControls.set(record.updateId, record);
+        return "deferred";
+      }
+      // A permanently failing earlier input cannot be overtaken. Report the command
+      // honestly and release the gate instead of leaving the chat unusable forever.
+      controlFailures.delete(record.updateId);
+      deferredControls.delete(record.updateId);
+      await markControlUnconfirmed(record.updateId);
+      return "abandoned";
+    }
+    const sessionKey = `telegram:${identity}:chat:${record.chatId}`;
+    const conversation = await gateway.conversationFor(sessionKey, adapterContext);
+    if (record.command === "new") await conversation.reset(undefined, adapterContext);
+    else await conversation.abort(adapterContext);
+    state = await stateConversation.commit(async (tx) => {
+      const doc = await tx.doc(TelegramState, stateConversation.id);
+      const entry = doc.controls.find((item) => item.updateId === record.updateId);
+      if (entry !== undefined) entry.status = "applied";
+      // Bound the log here too: only applied and already-reported records are pruned, never an unresolved one.
+      doc.controls = pruneControls(doc.controls, doc.pending);
+      return copyJson(doc) as unknown as ChannelState;
+    }, adapterContext);
+    controlFailures.delete(record.updateId);
+    deferredControls.delete(record.updateId);
+    return "applied";
+  }
+
+  /**
+   * Retry deferred commands once per poll response. The chat stays gated meanwhile, so no
+   * input admitted after the command can overtake the earlier durable inputs. This reuses
+   * the durable control record and the existing poll cadence; there is no separate queue.
+   */
+  function resumeDeferredControls(): void {
+    if (stopping || signal?.aborted) return;
+    for (const record of [...deferredControls.values()]) {
+      if (controlChains.has(record.chatId)) continue;
+      const prior = controlChains.get(record.chatId) ?? Promise.resolve();
+      const run = prior.then(() => applyControl(record));
+      const chain = run.then(() => undefined, () => undefined);
+      controlChains.set(record.chatId, chain);
+      const task = run.then(() => undefined, (error: unknown) => {
+        // A native reset/abort or storage failure is still a real adapter failure.
+        if (signal?.aborted) return;
+        fatal ??= error;
+        scope.cancel(error instanceof Error ? error : new Error("Telegram control command failed"));
+      }).catch(() => undefined).finally(() => {
+        pendingControls.delete(task);
+        if (controlChains.get(record.chatId) === chain) {
+          controlChains.delete(record.chatId);
+          if (!stopping && !signal?.aborted) {
+            if (!deferredControls.has(record.updateId)) controlPending.delete(record.chatId);
+            drain();
+          }
+        }
+      });
+      pendingControls.add(task);
+    }
   }
 
   /** Publish the held acknowledgement, optionally as the still-pending wording. */

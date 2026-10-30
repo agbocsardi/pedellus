@@ -223,7 +223,9 @@ Telegram adapter. Add a top-level `media` key beside the existing ones:
 - `directory` is workspace-relative and defaults to `media`. Originals are stored
   there byte-for-byte, so the ordinary configured coding tools (`read`, `bash`,
   and so on) are how the agent opens them. Storing a file grants no tool
-  authority. Nothing is written to `dataDir` or outside the workspace.
+  authority. Nothing is written to `dataDir` or outside the workspace. A
+  configured workspace that is itself a symlink is accepted and resolved once to
+  its canonical path; symlinks below it are refused.
 - `transcription.enabled` (default `true`) turns local speech recognition on or
   off; `language` is an optional hint and `maxDurationSeconds` (default `120`)
   refuses longer audio. There is no cloud speech provider and no API key.
@@ -233,7 +235,9 @@ Telegram adapter. Add a top-level `media` key beside the existing ones:
   tools. Video and stickers get an explicit unsupported notice.
 - Bounds: 20 MB per file (Telegram's ordinary Bot API `getFile` limit), a 60s
   download timeout, two concurrent attachment jobs, a 180s transcription timeout
-  and a 120s audio-duration limit by default.
+  and a 120s audio-duration limit by default. Stored originals are never deleted
+  by the adapter and there is no total-disk cap, so the media directory is yours
+  to monitor and prune.
 
 Local speech needs a one-time provisioning step; the runtime never installs or
 downloads anything while handling a message. The helper is

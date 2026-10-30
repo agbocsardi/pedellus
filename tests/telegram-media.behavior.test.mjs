@@ -147,14 +147,14 @@ function voiceUpdate(updateId, messageId, { fileId, uniqueId, bytes, caption }) 
   };
 }
 
-function textUpdate(updateId, messageId, text) {
+function textUpdate(updateId, messageId, text, chatId = CHAT_ID) {
   return {
     update_id: updateId,
     message: {
       message_id: messageId,
       date: Math.floor(Date.now() / 1000),
-      chat: privateChat(),
-      from: privateUser(),
+      chat: privateChat(chatId),
+      from: privateUser(chatId),
       text,
     },
   };
@@ -196,9 +196,18 @@ function telegramMock(batches, files = new Map()) {
     if (method === 'getUpdates') {
       if (batchIndex < batches.length) {
         const entry = batches[batchIndex++];
-        // A batch may be gated on a promise, so a test can let the next poll happen
-        // after an asynchronous control effect without sleeping.
-        return response(typeof entry === 'function' ? await entry() : entry);
+        if (typeof entry === 'function') {
+          // A batch may be gated on a promise, so a test can let the next poll happen
+          // after an asynchronous control effect without sleeping. Cancellation still
+          // aborts the pending poll, so adapter shutdown never hangs.
+          const aborted = new Promise((_, reject) => {
+            const onAbort = () => reject(new DOMException('The operation was aborted', 'AbortError'));
+            if (signal?.aborted) return onAbort();
+            signal?.addEventListener('abort', onAbort, { once: true });
+          });
+          return response(await Promise.race([entry(), aborted]));
+        }
+        return response(entry);
       }
       return await new Promise((_, reject) => {
         const aborted = () => reject(new DOMException('The operation was aborted', 'AbortError'));
@@ -237,6 +246,7 @@ function telegramMock(batches, files = new Map()) {
       downloads.push({ href: url.href, relative, redirect: init.redirect, method: init.method });
       const file = [...files.values()].find((candidate) => candidate.path === relative);
       if (file === undefined) return new Response('missing', { status: 404 });
+      if (file.failDownloads === true) return new Response('busy', { status: 503 });
       if (typeof file.downloadFailures === 'number' && file.downloadFailures > 0) {
         file.downloadFailures -= 1;
         return new Response('busy', { status: 503 });
@@ -261,7 +271,7 @@ function telegramMock(batches, files = new Map()) {
   };
 }
 
-function start(store, transport, allowFrom = ['501'], media = store.config.media) {
+function start(store, transport, allowFrom = ['501'], media = store.config.media, workspace = store.workspace) {
   const scope = withCancel(context);
   const adapter = runTelegram(store.gateway, {
     token: TOKEN,
@@ -269,7 +279,7 @@ function start(store, transport, allowFrom = ['501'], media = store.config.media
     pollTimeoutSeconds: 1,
     ...(media === undefined ? {} : {
       media: {
-        workspace: store.workspace,
+        workspace,
         directory: media.directory,
         ...(media.transcription === undefined ? {} : { transcription: media.transcription }),
       },
@@ -313,19 +323,21 @@ function responses(text, count = 24) {
   return Array.from({ length: count }, () => () => fauxAssistantMessage(text));
 }
 
-/** A controlled `uv` replacement: records argv and prints a fixed transcript. */
+/** A controlled `uv` replacement: records argv, the child environment and a fixed transcript. */
 async function fakeUv(directory, { stdout = 'SYNTHETIC TRANSCRIPT', exitCode = 0 } = {}) {
   const path = join(directory, 'fake-uv');
   const recordPath = join(directory, 'fake-uv-args.bin');
+  const envPath = join(directory, 'fake-uv-env.txt');
   await writeFile(path, [
     '#!/bin/sh',
     `: > "${recordPath}"`,
     'for arg in "$@"; do printf \'%s\\000\' "$arg" >> "' + recordPath + '"; done',
+    'printf \'%s|%s\' "${NANOBOT_TEST_SECRET-unset}" "${HF_HUB_OFFLINE-unset}" > "' + envPath + '"',
     `printf '%s' '${stdout}'`,
     `exit ${exitCode}`,
     '',
   ].join('\n'), { mode: 0o755 });
-  return { path, recordPath };
+  return { path, recordPath, envPath };
 }
 
 test('a document is stored byte-for-byte on disk and the turn names the locator without extraction', { timeout: 20_000 }, async () => {
@@ -424,9 +436,55 @@ test('a photo is stored and submitted as native image content with its relative 
   }
 });
 
+test('an animation with its backward-compatibility document field stays unsupported and is never downloaded', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('animation', { media: { directory: 'media' } });
+  const requests = [];
+  store.faux.setResponses(Array.from({ length: 8 }, () => (request) => {
+    requests.push({ messages: request.messages });
+    return fauxAssistantMessage('ANIMATION-NOTED');
+  }));
+  const gif = Buffer.from('GIF89a synthetic');
+  const files = new Map([['anim-1', { path: 'animations/file_1.gif', bytes: gif, contentType: 'image/gif' }]]);
+  const transport = telegramMock([[{
+    update_id: 605,
+    message: {
+      message_id: 205,
+      date: Math.floor(Date.now() / 1000),
+      chat: privateChat(),
+      from: privateUser(),
+      caption: 'look at this',
+      animation: {
+        file_id: 'anim-1', file_unique_id: 'unique-anim-1', file_name: 'a.gif',
+        mime_type: 'image/gif', duration: 2, width: 90, height: 90, file_size: gif.byteLength,
+      },
+      // Telegram includes this backward-compatibility field for animations.
+      document: {
+        file_id: 'anim-1', file_unique_id: 'unique-anim-1', file_name: 'a.gif',
+        mime_type: 'image/gif', file_size: gif.byteLength,
+      },
+    },
+  }]], files);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.some((entry) => entry.text === 'ANIMATION-NOTED'), 'animation answer');
+    assert.equal(transport.getFileCalls.length, 0, 'an animation never reaches getFile');
+    assert.equal(transport.downloads.length, 0, 'an animation is never downloaded');
+    assert.deepEqual(await mediaFiles(store.workspace), [], 'no document was stored for an animation');
+    const text = messageText(userMessages(requests)[0]);
+    assert.match(text, /Unsupported Telegram attachment \(animation\)/);
+    assert.match(text, /Caption: look at this/);
+    assert.doesNotMatch(text, /Stored file/);
+    assert.doesNotMatch(text, /No content was extracted/);
+  } finally {
+    await cleanup(store, harness, transport);
+  }
+});
+
 test('voice is stored and one labeled local transcript reaches the normal turn through the real helper protocol', { timeout: 25_000 }, async () => {
   const store = await syntheticStore('voice', { media: { directory: 'media' } });
-  const { path: uvPath, recordPath } = await fakeUv(store.directory);
+  const { path: uvPath, recordPath, envPath } = await fakeUv(store.directory);
+  process.env.NANOBOT_TEST_SECRET = 'test-only-secret';
   const requests = [];
   store.faux.setResponses(Array.from({ length: 12 }, () => (request) => {
     requests.push({ messages: request.messages });
@@ -453,11 +511,13 @@ test('voice is stored and one labeled local transcript reaches the normal turn t
     const argv = (await readFile(recordPath)).toString('utf8').split('\u0000').filter((value) => value !== '');
     assert.deepEqual(argv.slice(0, 4), ['run', '--quiet', '--script', '--offline']);
     assert.match(argv[4], /scripts\/local-transcribe\.py$/, 'the shipped helper is the default');
-    assert.equal(argv[5], join(store.workspace, 'media', stored[0]), 'the stored audio path is one argument');
+    assert.ok(argv[5].endsWith(join('media', stored[0])), 'the stored audio path is one argument');
     assert.equal(argv[6], '--max-duration-seconds');
     assert.equal(argv[7], '120');
     assert.equal(argv.length, 8, 'the runtime passes no provisioning flag');
     assert.ok(!argv.includes('--allow-model-download'));
+    // Only the minimal child environment is inherited: unrelated runtime secrets are not.
+    assert.equal((await readFile(envPath, 'utf8')).trim(), 'unset|1');
 
     const text = messageText(userMessages(requests)[0]);
     assert.match(text, /note to self/, 'the caption is preserved');
@@ -465,6 +525,7 @@ test('voice is stored and one labeled local transcript reaches the normal turn t
     assert.match(text, /"SYNTHETIC TRANSCRIPT"/);
     assert.match(text, new RegExp(`Stored file \\(workspace-relative\\): media/${stored[0]}`));
   } finally {
+    delete process.env.NANOBOT_TEST_SECRET;
     await cleanup(store, harness, transport);
   }
 });
@@ -662,6 +723,43 @@ test('a symlinked media directory is refused and nothing is written through it',
   }
 });
 
+test('a symlinked workspace root is canonicalized for media storage and delivery', { timeout: 25_000 }, async () => {
+  const store = await syntheticStore('root-symlink', { media: { directory: 'media' } });
+  const alias = join(store.directory, 'workspace-alias');
+  await symlink(store.workspace, alias);
+  const requests = [];
+  store.faux.setResponses(Array.from({ length: 8 }, () => (request) => {
+    requests.push({ messages: request.messages });
+    return fauxAssistantMessage('ROOT-SYMLINK-OK');
+  }));
+  const files = new Map([['photo-root', { path: 'photos/file_root.jpg', bytes: PHOTO_BYTES, contentType: 'image/jpeg' }]]);
+  const transport = telegramMock([[
+    photoUpdate(606, 206, { fileId: 'photo-root', uniqueId: 'unique-root', bytes: PHOTO_BYTES, caption: 'root alias' }),
+  ]], files);
+  let harness;
+  try {
+    harness = start(store, transport, ['501'], store.config.media, alias);
+    await until(() => transport.sent.some((entry) => entry.text === 'ROOT-SYMLINK-OK'), 'root-alias answer');
+    const stored = await mediaFiles(store.workspace);
+    assert.equal(stored.length, 1, 'the original landed in the canonical workspace');
+    assert.deepEqual(await readFile(join(store.workspace, 'media', stored[0])), PHOTO_BYTES);
+    assert.equal((await lstat(alias)).isSymbolicLink(), true, 'the operator alias was left untouched');
+    const message = userMessages(requests)[0];
+    assert.ok(Array.isArray(message.content));
+    assert.equal(message.content.filter((part) => part.type === 'image').length, 1);
+    // The shared store resolves the alias to the same canonical original.
+    const direct = createMediaStore({ workspace: alias, directory: 'media' });
+    const deduped = await direct.save({
+      kind: 'photo', identity: 'telegram:photo:unique-root', mimeType: 'image/jpeg',
+      body: (async function* () { yield PHOTO_BYTES; })(),
+    });
+    assert.equal(deduped.relativePath, `media/${stored[0]}`);
+    assert.equal((await readdir(join(store.workspace, 'media'))).length, 1, 'no duplicate was written');
+  } finally {
+    await cleanup(store, harness, transport);
+  }
+});
+
 test('an aborted download keeps the admitted update and no partial file; a reopen delivers it once', { timeout: 30_000 }, async () => {
   const store = await syntheticStore('abort-reopen', { media: { directory: 'media' } });
   const requests = [];
@@ -795,6 +893,59 @@ test('a control that forces an earlier media message to submit keeps its image c
   }
 });
 
+test('a transient attachment failure during a control flush keeps polling and defers the command honestly', { timeout: 30_000 }, async () => {
+  const store = await syntheticStore('control-deferred', { media: { directory: 'media' } });
+  const requests = [];
+  store.faux.setResponses(Array.from({ length: 24 }, () => (request) => {
+    requests.push({ messages: request.messages });
+    return fauxAssistantMessage('OK-REPLY');
+  }));
+  const file = {
+    path: 'photos/file_deferred.jpg', bytes: PHOTO_BYTES, contentType: 'image/jpeg', failDownloads: true,
+  };
+  const files = new Map([['photo-deferred', file]]);
+  let releaseNextPoll;
+  const nextPoll = new Promise((resolve) => { releaseNextPoll = resolve; });
+  const transport = telegramMock([
+    [photoUpdate(700, 300, { fileId: 'photo-deferred', uniqueId: 'unique-deferred', bytes: PHOTO_BYTES, caption: 'deferred photo' })],
+    [textUpdate(701, 301, '/new')],
+    [textUpdate(702, 302, 'other chat is alive', 999)],
+    async () => { await nextPoll; return []; },
+  ], files);
+  let harness;
+  try {
+    harness = start(store, transport, ['501', '999']);
+    // Another chat keeps being served while this chat's command waits for its earlier input.
+    await until(() => transport.sent.some((entry) => entry.chatId === 999 && entry.text === 'OK-REPLY'), 'other chat answer');
+    await until(() => transport.sent.some((entry) => /Context reset is still pending/.test(entry.text)), 'honest pending ack');
+    assert.ok(!transport.sent.some((entry) => /Context reset applied/.test(entry.text)), 'no false applied claim');
+    assert.equal(transport.sent.filter((entry) => entry.chatId === CHAT_ID && entry.text === 'OK-REPLY').length, 0,
+      'the gated chat delivers no model reply while the command is deferred');
+    assert.deepEqual(await mediaFiles(store.workspace), [], 'the failed download stored nothing');
+
+    // Controlled recovery: the transient failure stops and the next poll retries the deferred flush.
+    file.failDownloads = false;
+    releaseNextPoll();
+    await until(() => transport.sent.some((entry) => entry.chatId === CHAT_ID && entry.text === 'OK-REPLY'), 'deferred photo answer');
+    const stored = await mediaFiles(store.workspace);
+    assert.equal(stored.length, 1);
+    assert.deepEqual(await readFile(join(store.workspace, 'media', stored[0])), PHOTO_BYTES);
+    const photoTurns = requests.filter((request) =>
+      userMessages([request]).some((message) =>
+        Array.isArray(message.content) &&
+        message.content.some((part) => part.type === 'image') &&
+        messageText(message).includes('deferred photo')));
+    assert.equal(photoTurns.length, 1, 'the earlier media turn is submitted exactly once');
+    const images = userMessages([photoTurns[0]]).flatMap((message) => Array.isArray(message.content) ? message.content : [])
+      .filter((part) => part.type === 'image');
+    assert.equal(images.length, 1, 'the recovered turn kept its native image content');
+    assert.equal(transport.sent.filter((entry) => entry.chatId === CHAT_ID && entry.text === 'OK-REPLY').length, 1,
+      'the earlier photo is delivered exactly once');
+  } finally {
+    await cleanup(store, harness, transport);
+  }
+});
+
 test('a reopened pending record reuses the stored file and cached transcript without re-downloading', { timeout: 25_000 }, async () => {
   const store = await syntheticStore('reopen-stored', { media: { directory: 'media' } });
   const { path: uvPath, recordPath } = await fakeUv(store.directory);
@@ -886,6 +1037,29 @@ test('the shared store keeps unknown document formats as safe generic originals'
   }
 });
 
+test('concurrent stores of one identity publish one complete original', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'nanobot-media-concurrent-'));
+  try {
+    const store = createMediaStore({ workspace: directory, directory: 'media' });
+    const bytes = Buffer.from('same identity body');
+    const request = () => ({
+      kind: 'document',
+      identity: 'telegram:document:unique-concurrent',
+      mimeType: 'text/plain',
+      body: (async function* () { yield bytes; })(),
+    });
+    const [first, second] = await Promise.all([store.save(request()), store.save(request())]);
+    assert.equal(first.relativePath, second.relativePath);
+    assert.equal(first.bytes, bytes.byteLength);
+    assert.equal(second.bytes, bytes.byteLength);
+    assert.deepEqual(await store.read(first.relativePath), bytes);
+    assert.deepEqual(await readdir(join(directory, 'media')), [first.relativePath.split('/').pop()],
+      'one complete original and no temporary file');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('media config is validated and traversal directories are refused before startup', async () => {
   assert.equal(validateMediaDirectory(undefined), 'media');
   assert.equal(validateMediaDirectory('attachments/incoming'), 'attachments/incoming');
@@ -972,9 +1146,8 @@ test('the local transcriber kills a stuck helper group and reports a timeout', {
     assert.deepEqual(outcome, { ok: false, reason: 'timeout' });
     const pid = Number(await readFile(pidFile, 'utf8'));
     assert.ok(pid > 0);
-    await until(() => {
-      try { process.kill(pid, 0); return false; } catch { return true; }
-    }, 'helper process cleanup');
+    // The API settles only after the killed child group is reaped: no caller-side wait.
+    assert.throws(() => process.kill(pid, 0), /ESRCH/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, mkdir, open, readFile, unlink, link } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, realpath, unlink, link } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /**
@@ -75,8 +75,6 @@ export interface StoredMedia {
 export interface MediaStore {
   /** Workspace-relative directory (posix separators). */
   readonly directory: string;
-  /** Absolute media root inside the workspace. */
-  readonly root: string;
   readonly maxFileBytes: number;
   /** Deterministic locator for one identity; no download needed to compute it. */
   locator(identity: string, kind: MediaKind, mimeType?: string): string;
@@ -84,8 +82,8 @@ export interface MediaStore {
   save(request: SaveMediaRequest): Promise<StoredMedia>;
   /** Read a stored original without following symlinks or escaping the media root. */
   read(relativePath: string): Promise<Buffer>;
-  /** Absolute path for a locator produced by this store. */
-  absolute(relativePath: string): string;
+  /** Absolute path for a locator produced by this store, under the canonical workspace root. */
+  absolute(relativePath: string): Promise<string>;
   /** Resolve a stored original that already exists and is a regular file. */
   existing(relativePath: string): Promise<StoredMedia | undefined>;
 }
@@ -177,21 +175,15 @@ function insideRoot(root: string, candidate: string): boolean {
 
 /**
  * Create and verify every level of the workspace-relative media directory. The
- * configured workspace root itself may be an operator symlink, but no component
- * below it may be one, so the media subtree cannot escape the workspace.
+ * canonical workspace root is already resolved (an operator alias is allowed),
+ * but no component below it may be a symlink, so the media subtree cannot escape
+ * the workspace.
  */
 async function ensureMediaRoot(
-  workspaceRoot: string,
+  canonicalWorkspaceRoot: string,
   segments: readonly string[],
 ): Promise<void> {
-  try {
-    const stat = await lstat(workspaceRoot);
-    if (!stat.isDirectory()) throw new MediaRejected("unsafe-directory");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
-  }
-  let current = workspaceRoot;
+  let current = canonicalWorkspaceRoot;
   for (const segment of segments) {
     current = join(current, segment);
     try {
@@ -206,14 +198,35 @@ async function ensureMediaRoot(
 
 export function createMediaStore(options: MediaStoreOptions): MediaStore {
   const directory = validateMediaDirectory(options.directory);
-  const workspaceRoot = resolve(options.workspace);
+  const configuredWorkspaceRoot = resolve(options.workspace);
   const segments = directory.split("/");
-  const root = resolve(workspaceRoot, ...segments);
-  if (!insideRoot(workspaceRoot, root)) throw new Error("media.directory must stay inside the workspace");
   const maxFileBytes = options.maxFileBytes ?? MEDIA_LIMITS.maxFileBytes;
 
-  const absolute = (relativePath: string): string => {
-    const target = resolve(workspaceRoot, ...relativePath.split("/"));
+  /**
+   * The configured workspace root may itself be an operator symlink: the shipped
+   * CLI forwards `config.workspace` unchanged, and the gateway accepts a
+   * canonicalized operator root. Resolve it once and operate only on the
+   * canonical path, so a later repoint of the alias cannot redirect media writes.
+   * Every descendant is still checked individually.
+   */
+  let canonicalWorkspaceRoot: Promise<string> | undefined;
+  const workspaceRoot = (): Promise<string> => {
+    canonicalWorkspaceRoot ??= (async () => {
+      try {
+        return await realpath(configuredWorkspaceRoot);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        await mkdir(configuredWorkspaceRoot, { recursive: true, mode: 0o700 });
+        return await realpath(configuredWorkspaceRoot);
+      }
+    })();
+    return canonicalWorkspaceRoot;
+  };
+  const mediaRoot = async (): Promise<string> => resolve(await workspaceRoot(), ...segments);
+
+  const absolute = async (relativePath: string): Promise<string> => {
+    const root = await mediaRoot();
+    const target = resolve(await workspaceRoot(), ...relativePath.split("/"));
     if (!insideRoot(root, target)) throw new MediaRejected("unsafe-path");
     return target;
   };
@@ -223,7 +236,7 @@ export function createMediaStore(options: MediaStoreOptions): MediaStore {
   };
 
   const inspect = async (relativePath: string): Promise<StoredMedia | undefined> => {
-    const target = absolute(relativePath);
+    const target = await absolute(relativePath);
     let stat;
     try {
       stat = await lstat(target);
@@ -248,21 +261,22 @@ export function createMediaStore(options: MediaStoreOptions): MediaStore {
   /**
    * A concurrent store of the same identity briefly leaves its complete temporary
    * hard link in place, so a multiply-linked read is retried before it is refused.
+   * The retry is bounded and only applies to that transient window; a real
+   * symlink or hardlink is still refused.
    */
   const existing = async (relativePath: string): Promise<StoredMedia | undefined> => {
     for (let attempt = 0; ; attempt++) {
       try {
         return await inspect(relativePath);
       } catch (error) {
-        if (!(error instanceof MediaRejected) || attempt >= 5) throw error;
-        await new Promise((resolve) => setImmediate(resolve));
+        if (!(error instanceof MediaRejected) || error.reason !== "unsafe-path" || attempt >= 20) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 1));
       }
     }
   };
 
   return {
     directory,
-    root,
     maxFileBytes,
     locator,
     absolute,
@@ -275,7 +289,7 @@ export function createMediaStore(options: MediaStoreOptions): MediaStore {
         throw new MediaRejected("too-large");
       }
       const relativePath = locator(request.identity, request.kind, request.mimeType);
-      const target = absolute(relativePath);
+      const target = await absolute(relativePath);
       const mimeType = request.mimeType === undefined ? undefined : normalizedMime(request.mimeType);
       const metadata = {
         ...(mimeType === undefined ? {} : { mimeType }),
@@ -283,7 +297,7 @@ export function createMediaStore(options: MediaStoreOptions): MediaStore {
         kind: request.kind,
         identity: request.identity,
       };
-      await ensureMediaRoot(workspaceRoot, segments);
+      await ensureMediaRoot(await workspaceRoot(), segments);
 
       const already = await existing(relativePath);
       if (already !== undefined) {
@@ -292,7 +306,7 @@ export function createMediaStore(options: MediaStoreOptions): MediaStore {
         return { ...already, ...metadata };
       }
 
-      const temporary = join(root, `.tmp-${process.pid}-${randomBytes(8).toString("hex")}`);
+      const temporary = join(await mediaRoot(), `.tmp-${process.pid}-${randomBytes(8).toString("hex")}`);
       const handle = await open(temporary, "wx", 0o600);
       let bytes = 0;
       try {
