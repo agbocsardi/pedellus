@@ -1,9 +1,10 @@
-// Successful origin-mode scheduled answers reach the same durable cron outbox as isolated ones.
-// The first case runs the real Gateway, a faux provider and a mocked Telegram transport: one
-// inbound message schedules an origin job, the scheduled turn answers in that same conversation,
-// and the adapter sends the committed answer exactly once without a duplicate ordinary reply.
-// The other cases are smaller guards: an origin answer on a non-Telegram session is never queued,
-// and isolated delivery keeps working.
+// Scheduled outcomes reach the same durable cron outbox whatever the run produced. The first case
+// runs the real Gateway, a faux provider and a mocked Telegram transport: one inbound message
+// schedules an origin job, the scheduled turn answers in that same conversation, and the adapter
+// sends the committed answer exactly once without a duplicate ordinary reply. Smaller guards cover
+// an origin answer on a non-Telegram session, isolated success delivery, a failed isolated run and an
+// empty origin-mode answer (fixed sanitized notice text, one record across reopen), and an aborted
+// run (silent).
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -16,8 +17,9 @@ const [
   { parseConfig },
   { openGateway },
   { CRON_JOBS_KIND, CronJobsDoc },
-  { CRON_DELIVERIES_KIND, CronDeliveriesDoc },
+  { CRON_DELIVERIES_KIND, CronDeliveriesDoc, cronOutcomeNotice },
   { runTelegram },
+  { ConfigToolCaptureDoc },
   { BACKGROUND_CONTEXT, withCancel },
   { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
   { ToolResultEntry },
@@ -27,6 +29,7 @@ const [
   import(new URL('../dist/automation/cron.js', import.meta.url).href),
   import(new URL('../dist/automation/cron-delivery.js', import.meta.url).href),
   import(new URL('../dist/channels/telegram.js', import.meta.url).href),
+  import(new URL('../dist/tools/index.js', import.meta.url).href),
   import(`${modules}/chord/dist/context/index.js`),
   import(`${modules}/pi-ai/dist/index.js`),
   import(`${modules}/pi-durable/dist/index.js`),
@@ -58,7 +61,7 @@ async function syntheticGateway(label, options = {}) {
         : { telegram: { tokenEnv: 'SYNTHETIC_TELEGRAM_TOKEN', allowFrom: ['501'] } }),
     }, directory);
     const gateway = await openGateway(config, context, { models });
-    return { directory, config, faux, gateway };
+    return { directory, config, faux, models, gateway };
   } catch (error) {
     // Setup failed before the test owned a gateway to close; still remove this store's directory.
     await rm(directory, { recursive: true, force: true }).catch(() => undefined);
@@ -403,8 +406,199 @@ test('isolated-mode delivery remains admitted for a Telegram origin', { timeout:
     assert.equal(records.length, 1);
     assert.equal(records[0].text, 'ISOLATED-RESULT');
     assert.equal(records[0].status, 'pending');
+    // The settled isolated target retires its captured authority with its terminal commit.
+    const jobs = await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context);
+    const capture = await store.gateway.harness.snapshot(
+      ConfigToolCaptureDoc, jobs.jobs[0].lastOutcome.conversationId, context,
+    );
+    assert.equal(capture, undefined, 'no captured tools survive the isolated run');
   } finally {
     watcher.stop();
+    await store.gateway.close(context);
+    await rm(store.directory, { recursive: true, force: true });
+  }
+});
+
+test('an isolated scheduled run that errors queues one sanitized failure notice', { timeout: 25_000 }, async () => {
+  const origin = 'telegram:7:chat:503';
+  const store = await syntheticGateway('error-notice', { toolAllowlist: ['read'] });
+  const chat = await store.gateway.conversationFor(origin, context);
+  const scheduledMessage = 'run the failing reminder';
+  const providerError = 'SYNTHETIC-PROVIDER-ERROR-TEXT';
+  let toolCallIssued = false;
+  store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
+    {
+      when: ({ input }) => input === scheduledMessage,
+      respond: () => fauxAssistantMessage('', { stopReason: 'error', errorMessage: providerError }),
+    },
+    {
+      when: ({ input }) => input === 'schedule the failing reminder' && !toolCallIssued,
+      respond: () => {
+        toolCallIssued = true;
+        return fauxAssistantMessage([
+          fauxToolCall('cron', {
+            action: 'add',
+            message: scheduledMessage,
+            at: new Date(Date.now() + 1_500).toISOString(),
+          }, { id: 'failing-cron-add' }),
+        ], { stopReason: 'toolUse' });
+      },
+    },
+    { when: () => true, respond: () => fauxAssistantMessage('Scheduled the failing reminder.') },
+  ])));
+  const watcher = changeWatcher(store.gateway.harness, deliveriesChanged(chat.id), 'failure notice');
+  try {
+    const submission = await chat.submit({ type: 'input', content: 'schedule the failing reminder' }, context);
+    assert.equal((await submission.wait(context)).status, 'done');
+    await watcher.promise;
+
+    const jobs = await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context);
+    assert.equal(jobs.jobs.length, 1);
+    const job = jobs.jobs[0];
+    assert.equal(job.lastOutcome.status, 'error');
+    const records = await store.gateway.cronOutbox.list(origin, context);
+    assert.equal(records.length, 1, 'one outbox record for the failed occurrence');
+    assert.equal(records[0].id, `cron:${job.id}:${job.lastOutcome.scheduledAtMs}`);
+    assert.equal(records[0].sessionKey, origin);
+    assert.equal(records[0].status, 'pending');
+    assert.equal(records[0].text, cronOutcomeNotice('failed', job.id, job.lastOutcome.scheduledAtMs));
+    assert.match(records[0].text, /list scheduled jobs/, 'the notice names the next action');
+    assert.ok(!records[0].text.includes(providerError), `no raw provider error text: ${records[0].text}`);
+    assert.ok(!records[0].text.includes(scheduledMessage), 'no job message text in the notice');
+
+    // The finished isolated target retires its captured authority in the same terminal commit.
+    const capture = await store.gateway.harness.snapshot(
+      ConfigToolCaptureDoc, job.lastOutcome.conversationId, context,
+    );
+    assert.equal(capture, undefined, 'no captured tools survive the failed isolated run');
+  } finally {
+    watcher.stop();
+    await store.gateway.close(context);
+    await rm(store.directory, { recursive: true, force: true });
+  }
+});
+
+test('an empty origin-mode answer queues one notice and stays one record after reopen', { timeout: 25_000 }, async () => {
+  const origin = 'telegram:7:chat:504';
+  const store = await syntheticGateway('empty-notice');
+  const chat = await store.gateway.conversationFor(origin, context);
+  const scheduledMessage = 'deliver the empty reminder';
+  let toolCallIssued = false;
+  store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
+    { when: ({ input }) => input === scheduledMessage, respond: () => fauxAssistantMessage('') },
+    {
+      when: ({ input }) => input === 'schedule the empty reminder' && !toolCallIssued,
+      respond: () => {
+        toolCallIssued = true;
+        return fauxAssistantMessage([
+          fauxToolCall('cron', {
+            action: 'add',
+            message: scheduledMessage,
+            isolated: false,
+            at: new Date(Date.now() + 1_500).toISOString(),
+          }, { id: 'empty-cron-add' }),
+        ], { stopReason: 'toolUse' });
+      },
+    },
+    { when: () => true, respond: () => fauxAssistantMessage('Scheduled the empty reminder.') },
+  ])));
+  const watcher = changeWatcher(store.gateway.harness, deliveriesChanged(chat.id), 'empty-result notice');
+  let reopened;
+  try {
+    const submission = await chat.submit({ type: 'input', content: 'schedule the empty reminder' }, context);
+    assert.equal((await submission.wait(context)).status, 'done');
+    await watcher.promise;
+
+    const jobs = await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context);
+    const job = jobs.jobs[0];
+    assert.equal(job.mode, 'origin');
+    assert.equal(job.lastOutcome.status, 'ok');
+    const records = await store.gateway.cronOutbox.list(origin, context);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].text, cronOutcomeNotice('empty', job.id, job.lastOutcome.scheduledAtMs));
+    assert.match(records[0].text, /without an answer/);
+    assert.match(records[0].text, /list scheduled jobs/);
+    const admitted = records[0];
+
+    // Reopening the same store must not admit the occurrence a second time.
+    await store.gateway.close(context);
+    reopened = await openGateway(store.config, context, { models: store.models });
+    await reopened.harness.waitForIdle(context).catch(() => undefined);
+    const after = await reopened.cronOutbox.list(origin, context);
+    assert.equal(after.length, 1, 'one durable record after reopen');
+    assert.equal(after[0].id, admitted.id);
+    assert.equal(after[0].text, admitted.text);
+  } finally {
+    watcher.stop();
+    if (reopened !== undefined) await reopened.close(context).catch(() => undefined);
+    else await store.gateway.close(context).catch(() => undefined);
+    await rm(store.directory, { recursive: true, force: true });
+  }
+});
+
+test('an aborted scheduled run queues nothing', { timeout: 25_000 }, async () => {
+  const origin = 'telegram:7:chat:505';
+  const store = await syntheticGateway('cancelled');
+  const chat = await store.gateway.conversationFor(origin, context);
+  const scheduledMessage = 'run the cancelled reminder';
+  let scheduleIssued = false;
+  let releaseHeld;
+  let markHeld;
+  const held = new Promise((resolve) => { markHeld = resolve; });
+  store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
+    {
+      when: ({ input }) => input === scheduledMessage,
+      respond: () => new Promise((_resolve, reject) => {
+        // The occurrence holds here until the test aborts its task, so the abort lands mid-run.
+        releaseHeld = () => reject(new Error('held response released'));
+        markHeld();
+      }),
+    },
+    {
+      when: ({ input }) => input === 'schedule the cancelled reminder' && !scheduleIssued,
+      respond: () => {
+        scheduleIssued = true;
+        return fauxAssistantMessage([
+          fauxToolCall('cron', {
+            action: 'add',
+            message: scheduledMessage,
+            at: new Date(Date.now() + 1_500).toISOString(),
+          }, { id: 'cancelled-cron-add' }),
+        ], { stopReason: 'toolUse' });
+      },
+    },
+    { when: () => true, respond: () => fauxAssistantMessage('Scheduled.') },
+  ])));
+  try {
+    const schedule = await chat.submit({ type: 'input', content: 'schedule the cancelled reminder' }, context);
+    assert.equal((await schedule.wait(context)).status, 'done');
+    const scheduled = await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context);
+    assert.equal(scheduled.jobs.length, 1);
+    assert.equal(scheduled.jobs[0].lastOutcome, null);
+
+    // Wait for the scheduled occurrence to reach the model, then abort that run mid-flight.
+    await held;
+    const jobs = await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context);
+    const runTaskId = jobs.jobs[0].executionTaskId;
+    assert.ok(Number.isSafeInteger(runTaskId), 'the occurrence has an active run task');
+    const target = (await store.gateway.harness.getTask(runTaskId, context)).state.checkpoint.targetConversationId;
+    assert.ok(Number.isSafeInteger(target), 'the run prepared a separate target');
+    const aborted = await store.gateway.harness.abortTask(runTaskId, context);
+    releaseHeld?.();
+    if (aborted === 'marked') await store.gateway.harness.waitForTask(runTaskId, context);
+
+    const run = await store.gateway.harness.getTask(runTaskId, context);
+    assert.equal(run?.state.status, 'terminal');
+    assert.equal(run.state.outcome.status, 'aborted');
+    const after = await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context);
+    assert.equal(after.jobs[0].lastOutcome, null, 'the aborted run records no settlement');
+    const deliveries = await store.gateway.harness.snapshot(CronDeliveriesDoc, chat.id, context);
+    assert.equal(deliveries, undefined, 'an aborted run queues no notice');
+    const capture = await store.gateway.harness.snapshot(ConfigToolCaptureDoc, target, context);
+    assert.equal(capture, undefined, 'the aborted target still retires its captured tools');
+    assert.equal((await store.gateway.cronOutbox.list(origin, context)).length, 0);
+  } finally {
+    releaseHeld?.();
     await store.gateway.close(context);
     await rm(store.directory, { recursive: true, force: true });
   }

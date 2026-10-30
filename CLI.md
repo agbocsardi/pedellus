@@ -66,8 +66,10 @@ does not retry or reorder queued turns; Durable's normal failed-run policy still
 governs whether a later queued turn runs after a failure. This is
 presentation of one Durable conversation, not a delivery outbox or an exactly-once
 external send. A default isolated/background cron run uses its own task-owned
-conversation and is not shown in the CLI. Successful non-empty results in either
-mode can be delivered to a Telegram origin through its outbox. See [cron](./CRON.md).
+conversation and is not shown in the CLI. Normal settlements in either mode (an
+answer, or a fixed sanitized failure/empty-answer notice) can be delivered to a
+Telegram origin through its outbox; cancelled and superseded runs are not. See
+[cron](./CRON.md).
 
 ## Recovery
 

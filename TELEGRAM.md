@@ -332,8 +332,9 @@ after a reopen.
 ## Scheduled cron delivery
 
 The adapter also consumes the durable, channel-neutral cron outbox
-(`nanobot.cron.deliveries` in the origin chat conversation). A completed successful run, isolated or
-origin, writes its final text there in the same terminal commit as its outcome; no model turn is
+(`nanobot.cron.deliveries` in the origin chat conversation). A normal settlement, isolated or
+origin, writes the text to send there in the same terminal commit as its outcome: the committed
+final answer, or fixed sanitized notice text for a failure or empty answer; no model turn is
 rerun to resend. On startup and every few seconds the adapter enumerates already-mapped chat sessions and
 accepts only candidate keys for its own bot ID (`telegram:<bot id>:chat:<chatId>`). That key is a
 locator, not authentication: before any send the adapter requires durable admission evidence for
@@ -360,9 +361,11 @@ Delivery state lives on the outbox record, not only in this process: `pending`, 
 `unknown`, `withheld`, `delivered`, `failed`, or `unauthorized`, plus `nextChunkIndex`, `messageId`,
 `sendIntent`, `unknownSince`, `withheldSince`, `settledAt`, and a sanitized `error`. An unresolved intent at open
 becomes `unknown` and is never auto-resent; an explicit rejection becomes `failed`; 429 and proven
-pre-connect outcomes stay pending for a later scan. Only a successful, non-empty answer is queued:
-empty answers, run errors, cancellations and superseded runs are silent externally and remain
-visible through cron `lastOutcome`/`list`; there is no failure notification. If the channel is
+pre-connect outcomes stay pending for a later scan. Every normal settlement is queued: a
+successful answer's committed text, or fixed notice text for a run error or an empty answer. A
+notice names only the job id and occurrence instant and asks the owner to list scheduled jobs; no
+provider error, job message or model text is copied. Cancellations, superseded, fenced and
+missing-job runs remain silent externally and are visible through cron `lastOutcome`/`list`. If the channel is
 absent from the configuration, no record is created; an existing record is never redirected to
 another chat or channel. The outbox is bounded (1000 records per origin, 200 terminal records
 retained) and never evicts pending or ambiguous records. A full outbox does not queue the new result

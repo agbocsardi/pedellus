@@ -16,6 +16,7 @@ import {
   CronDeliveryOutboxError,
   admitCronDelivery,
   copyCronDelivery,
+  cronOutcomeNotice,
   recordCronDeliveryFault,
   type CronDeliveryOutbox,
   type CronDeliveryRecord,
@@ -731,23 +732,33 @@ export async function openGateway(config: PortConfig, context: Context, options:
             await tx.retireDoc(ConfigToolCaptureDoc, targetConversationId);
             await configure(tx, targetConversationId, { tools: [], modelTools: [] });
           }
-          // Queue the successful final text in the same commit as the terminal run outcome, for a
-          // separate target and for an origin-mode answer alike. A failed, cancelled or superseded
-          // run, and an empty answer, is silence: `lastOutcome` remains the actionable failure
-          // record and nothing is sent externally. Delivery text is the committed answer entry the
-          // scheduled submission settled with, so no model turn is rerun and no nearby user answer
-          // is substituted for it. The origin session key is also the channel locator: a key outside
-          // an enabled delivery prefix is never queued.
-          if (delivery === null || delivery.status !== "ok" || delivery.answerEntryId === null) return;
+          // Queue one record for the occurrence in the same commit as the terminal run outcome, for
+          // a separate target and for an origin-mode answer alike. A cancelled, superseded, fenced or
+          // missing-job run passes `delivery: null` and stays silent, so abandoned work never sends.
+          // A settled run with an error, or with no committed answer text, queues fixed sanitized
+          // notice text naming the job and occurrence only: raw provider errors, the job's message and
+          // model text never leave the store. A successful answer is queued from the committed entry
+          // the scheduled submission settled with, so no model turn is rerun and no nearby user
+          // answer is substituted for it. The origin session key is also the channel locator: a key
+          // outside an enabled delivery prefix is never queued.
+          if (delivery === null) return;
           if (job === null || !isChatSessionKey(job.owner.sessionKey)) return;
           if (!cronDeliveryPrefixes.some((prefix) => job.owner.sessionKey.startsWith(prefix))) return;
-          const answer = await tx.entry(AssistantEntry, delivery.answerEntryId);
-          const message = answer?.model?.[0] as AssistantMessage | undefined;
-          const text = (message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "").trim();
-          if (text === "") return;
-          const bounded = text.length > CRON_DELIVERY_MAX_TEXT_CHARS
-            ? `${text.slice(0, CRON_DELIVERY_MAX_TEXT_CHARS - 16)}\n\n[truncated]`
-            : text;
+          let text: string;
+          if (delivery.status === "error") {
+            text = cronOutcomeNotice("failed", job.id, occurrence.scheduledAtMs);
+          } else {
+            const answer = delivery.answerEntryId === null
+              ? undefined
+              : await tx.entry(AssistantEntry, delivery.answerEntryId);
+            const message = answer?.model?.[0] as AssistantMessage | undefined;
+            const body = (message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "").trim();
+            text = body === ""
+              ? cronOutcomeNotice("empty", job.id, occurrence.scheduledAtMs)
+              : body.length > CRON_DELIVERY_MAX_TEXT_CHARS
+                ? `${body.slice(0, CRON_DELIVERY_MAX_TEXT_CHARS - 16)}\n\n[truncated]`
+                : body;
+          }
           // A corrupt outbox must never fault the run's terminal commit. Invalid data is left as
           // stored; a full outbox records an actionable fault rather than implying lossless delivery.
           let admission: "admitted" | "duplicate" | "full" | "invalid" = "invalid";
@@ -756,7 +767,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
             admission = admitCronDelivery(records, {
               id: `cron:${job.id}:${occurrence.scheduledAtMs}`,
               sessionKey: job.owner.sessionKey,
-              text: bounded,
+              text,
               createdAtMs: now(),
               status: "pending",
               nextChunkIndex: 0,

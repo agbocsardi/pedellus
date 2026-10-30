@@ -1,11 +1,12 @@
 /**
- * Channel-neutral durable outbox for one completed background cron run.
+ * Channel-neutral durable outbox for one settled cron run.
  *
  * The run records its terminal outcome and this delivery record in the same commit, in the
- * origin conversation. No model is called to resend: a channel adapter reads the stored final
- * text and owns the external-send state (write-ahead intent, chunk cursor and ambiguous-outcome
- * quarantine) in this record. A record is keyed by the occurrence, so a retried terminal commit
- * cannot admit the same result twice.
+ * origin conversation. No model is called to resend: a channel adapter reads the stored text (the
+ * committed answer, or a fixed sanitized notice for a failed or empty answer) and owns the
+ * external-send state (write-ahead intent, chunk cursor and ambiguous-outcome quarantine) in this
+ * record. A record is keyed by the occurrence, so a retried terminal commit cannot admit the same
+ * result twice.
  *
  * The document carries no authority. A consumer must re-authenticate the origin session key
  * against its own live allowlist before sending anything.
@@ -126,6 +127,23 @@ function deliveriesOf(doc: unknown): DeliveryDrafts | undefined {
     }
   }
   return value as DeliveryDrafts;
+}
+
+/**
+ * Fixed text for an occurrence that produced no usable answer. It names only the machine-generated
+ * job id and the occurrence instant, so a failed or empty scheduled result is visible externally
+ * without copying a provider error, the job's own message, model text or a secret. The next action
+ * is the read-only `list` the owner can ask for; no delivery retry or inspection command is added.
+ */
+export function cronOutcomeNotice(
+  kind: "failed" | "empty", jobId: string, scheduledAtMs: number,
+): string {
+  const at = Number.isSafeInteger(scheduledAtMs) && Math.abs(scheduledAtMs) <= 8.64e15
+    ? new Date(scheduledAtMs).toISOString()
+    : String(scheduledAtMs);
+  return kind === "failed"
+    ? `Scheduled job ${jobId} did not complete its occurrence at ${at}. Ask me to list scheduled jobs to inspect or retry it.`
+    : `Scheduled job ${jobId} finished its occurrence at ${at} without an answer. Ask me to list scheduled jobs to inspect it.`;
 }
 
 export type CronDeliveryAdmission = "admitted" | "duplicate" | "full" | "invalid";

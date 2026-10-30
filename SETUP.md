@@ -181,10 +181,12 @@ groups or other bots never reach the assistant.
 
 Reminders are ordinary agent scheduling through the configured `cron` tool. A
 default isolated run answers in its own background conversation; an `origin`-mode
-job answers inside the original conversation. In either mode a successful,
-non-empty result may be delivered to the originating Telegram private chat.
-Errors and empty answers are not pushed; ask the agent to `list` cron jobs and
-read the reported failure/delivery fault. See [cron](./CRON.md).
+job answers inside the original conversation. In either mode a normal settlement is
+queued for the originating Telegram private chat: the committed answer, or a fixed
+sanitized notice naming the job and occurrence when the run failed or answered with
+nothing. Cancelled, superseded and missing-job runs are not pushed; ask the agent to
+`list` cron jobs to inspect a failure and read the reported delivery fault. See
+[cron](./CRON.md).
 
 ## 7. Optional: shell, sandbox, builtin skills
 

@@ -67,8 +67,10 @@ reminders (`after_seconds`), absolute/recurring/calendar schedules and IANA zone
 execution. Setting `cron: { enabled: true }` installs the foundation and a
 model-callable `cron` tool (`add`/`list`/`remove`) in `openGateway`. The agent
 schedules work when the user asks; there is no direct cron UI or user scheduling
-command. Successful isolated runs can deliver through
-the durable Telegram outbox, including origin-mode runs. Live-channel acceptance remains open.
+command. Normal settlements of isolated and origin-mode runs (an answer, or a
+fixed sanitized notice for a failure or empty answer) deliver through the durable
+Telegram outbox; cancelled and superseded runs stay silent. Live-channel
+acceptance remains open.
 
 The package root (`src/index.ts`) is a small host entry surface: config loading and
 types, `openGateway` and its host option types, `workspaceContextGatewayOptions`,

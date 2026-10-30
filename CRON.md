@@ -3,9 +3,10 @@
 This replaces the parked recurring-task foundation. The opt-in `cron` config installs it in the
 gateway together with a model-callable `cron` tool (`add`/`list`/`remove`); there is no command
 surface. Calendar expressions and IANA time zones are schedule math; parsing user text or ISO
-datetimes stays outside. A completed successful result, isolated or origin, is also queued in a
-durable, channel-neutral outbox for an enabled channel; the run itself still writes only its Durable
-conversation and sends no external message.
+datetimes stays outside. A normal settlement, isolated or origin, is also queued in a
+durable, channel-neutral outbox for an enabled channel: the committed answer text for a success, or
+fixed sanitized notice text for a failure or empty answer; the run itself still writes only its
+Durable conversation and sends no external message.
 
 Cron is an internal agent capability: the user asks the agent, and the agent calls the scheduling
 tool. No direct user cron UI or scheduling commands are required, and none exist.
@@ -15,7 +16,8 @@ Files:
 - `src/automation/cron.ts` — job document, timer task, run task, controller API.
 - `src/automation/cron-schedule.ts` — one-shot, interval, and calendar schedule math.
 - `src/automation/cron-tool.ts` — the model-facing `cron` tool.
-- `src/automation/cron-delivery.ts` — channel-neutral durable outbox for completed successful results.
+- `src/automation/cron-delivery.ts` — channel-neutral durable outbox for settled run results and
+  fixed sanitized failure/empty-result notices.
 - This document.
 
 ## Why two tasks
@@ -187,17 +189,17 @@ and bounds its search near year 3000/9999; that is a library limit, not an added
 
 ## Channel outbox
 
-The normal terminal commit of a successful run, isolated or origin, carries its settlement and
-final assistant entry ID to the host's optional `finalize` callback. A separate task-owned target's
-captured authority is retired there; an origin-mode run answers in the origin conversation, so that
-conversation keeps its configured tools, cron ownership and context and none of its documents are
-retired. When cron is enabled and the origin session belongs to a
+The normal terminal commit of a settled run (success or error), isolated or origin, carries its
+settlement and final assistant entry ID to the host's optional `finalize` callback. A separate
+task-owned target's captured authority is retired there; an origin-mode run answers in the origin
+conversation, so that conversation keeps its configured tools, cron ownership and context and none
+of its documents are retired. When cron is enabled and the origin session belongs to a
 channel enabled in the configuration (currently `telegram:` when `telegram` is configured), the
 gateway writes one record to the origin conversation's `nanobot.cron.deliveries` document in that
-same commit. The record is keyed by `cron:<jobId>:<scheduledAtMs>` and stores the final text, so a
-retried terminal commit cannot admit the same occurrence twice. The text is read from the answer
-entry the scheduled submission settled with, so no model turn is rerun and no nearby user answer is
-substituted for it.
+same commit. The record is keyed by `cron:<jobId>:<scheduledAtMs>` and stores the text to send, so a
+retried terminal commit cannot admit the same occurrence twice. A successful result's text is read
+from the answer entry the scheduled submission settled with, so no model turn is rerun and no nearby
+user answer is substituted for it.
 
 The channel adapter owns external-send state in that record: a bounded chunk cursor, a write-ahead
 intent, and an ambiguous-outcome quarantine. Delivery authorization uses durable admission
@@ -231,12 +233,19 @@ and warning; an evicted chat's withheld result remains nonterminal and a fresh a
 it. Every valid admission refreshes that binding's recency, so active chats are not the first
 eviction candidates.
 
-Silence policy: only a successful, non-empty final answer is queued. An empty answer, run error,
-cancellation or superseded run sends nothing externally; its actionable status stays in
-`lastOutcome` and `list()`; no failure notification is sent. An origin-mode successful answer is
-queued through the same record and authorization path as an isolated one, so it reaches its
-authenticated originating chat in addition to remaining the origin conversation's answer for a
-locally attached CLI. Delivery uses the committed answer entry of that scheduled submission; when
+Outcome policy: every normal settlement is queued, successful or not. A successful answer is
+queued from the committed answer entry of that scheduled submission; when that entry is missing or
+its text is empty, the record carries a fixed empty-result notice instead. An error settlement
+queues a fixed failure notice. Both notices name only the machine-generated `cron-<uuid>` job id and
+the occurrence's ISO instant, and ask the owner to list scheduled jobs to inspect it; no provider
+error, job message, model text or secret is copied into an external channel. A cancelled, superseded,
+fenced or missing-job run passes no settlement (`delivery: null`) and sends nothing externally, so
+abandoned work never notifies; an earlier queued result for the same occurrence is unaffected. The
+same occurrence key covers notices, so a reopen or retried terminal commit cannot queue a second
+one. An origin-mode successful answer is queued through the same record and authorization path as
+an isolated one, so it reaches its authenticated originating chat in addition to remaining the
+origin conversation's answer for a locally attached CLI. Delivery uses the committed answer entry
+of that scheduled submission; when
 native admission batches several inputs into one run, they settle on the same answer entry, so that
 batched answer can describe more than the scheduled message. There is no separate delivery service,
 config key or per-chat permission. With the channel absent from the configuration, no
@@ -371,8 +380,8 @@ scheduled run still committed its terminal outcome, left the stored value untouc
 sanitized durable delivery fault visible in the job list; a malformed pending record was settled
 `failed` without an external send; a malformed record without a usable ID was surfaced in the fault
 document; and a reopened gateway repeated none of them as a faulting loop. A full all-pending outbox
-returned `full`, retained every pending record and recorded a deduped overflow fault. No permanent
-test, live bot, credential or network request was involved.
+returned `full`, retained every pending record and recorded a deduped overflow fault. Those probes
+were temporary and uncommitted, and used no live bot, credential or network request.
 
 Relative-reminder regression coverage is permanent in `tests/cron-relative.behavior.test.mjs`.
 With an injected foundation clock it checks that `after` resolves once to admission plus the delay
@@ -380,3 +389,13 @@ and that a replay after a clock advance and reopen dedupes that stored deadline 
 fired short one-shot retry still dedupes its original instant with no new job or timer; and that a
 real Gateway turn issuing `cron add` with `after_seconds` stores and acknowledges the expected
 once-at deadline. Invalid and same-key changed requests are asserted to leave the record unchanged.
+
+Permanent channel-outcome coverage is in `tests/cron-origin-delivery.behavior.test.mjs`. It drives
+the real `openGateway` (and `runTelegram` with a mocked transport) on a faux provider in fresh
+`mkdtemp` stores: an origin-mode scheduled answer is delivered once through the outbox while the
+origin keeps its configured tools and cron ownership; a non-Telegram origin creates no outbox
+document; isolated success delivery remains `pending`; an isolated run whose provider errors queues
+exactly one fixed failure notice, asserted against the raw provider error and job message text, and
+the finished target's captured config tools are gone; an empty origin-mode answer queues the fixed
+empty-result notice once, and reopening the same store still holds exactly that one record; and an
+aborted scheduled run queues no record at all.
