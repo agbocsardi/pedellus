@@ -444,6 +444,28 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
     return true;
   };
 
+  /**
+   * Stop a terminal worker's own child conversation from doing further model work. This uses the
+   * native conversation abort (withdraw queued inputs, mark that conversation's live non-background
+   * tasks, join them) and is scoped to the worker's own target, never to the spawning chat, cron or
+   * any unrelated task. A saved provider dispatch is left alone: the inherited prepared-model guard
+   * already refuses to open a gateway that would replay it with a removed model.
+   */
+  const withdrawTargetWork = async (
+    runtime: Pick<TaskRuntime<WorkerTaskInput, WorkerCheckpoint, WorkerRunResult, object>, "conversation">,
+    targetConversationId: ConversationId,
+    context: Context,
+  ): Promise<void> => {
+    try {
+      const conversation = await runtime.conversation(targetConversationId, context);
+      if (conversation === undefined) return;
+      await conversation.abort(context);
+    } catch {
+      // Best effort: the terminal commit below still retires capture and tools, so a child that
+      // somehow runs again has no authority.
+    }
+  };
+
   const finish = async (
     runtime: TaskRuntime<WorkerTaskInput, WorkerCheckpoint, WorkerRunResult, object>,
     running: { readonly id: TaskId<WorkerRunResult>; readonly conversationId: ConversationId; readonly input: WorkerTaskInput },
@@ -549,20 +571,33 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         run: async (running, runtime, context) => {
           const parsed = parseInput(running.input);
           if (parsed === undefined) {
-            await runtime.commit(() =>
-              terminalFailed(
-                { status: "failed", error: "worker task input is invalid", answerEntryId: null },
-                "worker task input is invalid",
-              ), context);
+            // A damaged record still retires whatever target it already prepared: an unreadable input
+            // is not a reason to leave captured authority or pending child work behind.
+            const damaged = running.state.checkpoint;
+            if (damaged.targetConversationId !== null) {
+              await withdrawTargetWork(runtime, damaged.targetConversationId as ConversationId, context);
+            }
+            await finish(
+              runtime, running, zeroInput(),
+              { status: "error", answerEntryId: null, error: "worker task input is invalid" },
+              damaged.targetConversationId === null ? null : damaged.targetConversationId as ConversationId,
+              damaged.workspace, context,
+            );
             return;
           }
-          // The model chosen at launch must still be configured: a narrowed config never silently
-          // runs a worker on a model the host removed.
+          // The model chosen at launch must still be configured. A narrowed config never silently
+          // substitutes the configured default: a prepared target keeps its honest pin, loses every
+          // captured tool and is terminated here, in the same commit that retires its authority.
           if (!options.allowModel(parsed.model)) {
+            const resumed = running.state.checkpoint;
+            if (resumed.targetConversationId !== null) {
+              await withdrawTargetWork(runtime, resumed.targetConversationId as ConversationId, context);
+            }
             await finish(
               runtime, running, parsed,
               { status: "error", answerEntryId: null, error: "the worker model is no longer in the configured model catalog" },
-              null, null, context,
+              resumed.targetConversationId === null ? null : resumed.targetConversationId as ConversationId,
+              resumed.workspace, context,
             );
             return;
           }

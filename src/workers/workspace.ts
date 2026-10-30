@@ -206,7 +206,14 @@ export function createWorkerWorkspace(options: WorkerWorkspaceOptions): WorkerWo
     },
 
     async verify(taskId, info) {
-      if (info.mode === "shared") return undefined;
+      if (info.mode === "shared") {
+        // A relocated configuration must not let an old task keep writing a workspace that is no
+        // longer the configured one; fail truthfully instead of silently reusing the stale path.
+        return resolve(info.path) === repositoryRoot
+          ? undefined
+          : `worker task ${taskId} was prepared for shared workspace ${info.path}, not the configured ` +
+            `workspace ${repositoryRoot}; refusing to reuse it`;
+      }
       return verifyAt(taskId, info.path, info.branch ?? workerBranchName(taskId));
     },
   };

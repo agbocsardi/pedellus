@@ -134,8 +134,10 @@ export function createWorkerTool(options: WorkerToolOptions): WorkerTool {
         minimum: 1,
       })),
     }),
-    // Safe to rerun after an interrupted execution: `start` dedupes on the stable call ID, and the
-    // other actions only read or report an already-terminal task.
+    // Safe to rerun after an interrupted execution: `start` dedupes on the stable tool-task identity,
+    // and the other actions only read or report an already-terminal task. No `callers` restriction:
+    // native Code Mode may compose this tool like any other, under the same hosting-conversation and
+    // capture checks (a worker's own child conversation is never a spawner).
     replay: "safe",
     outputLimits: { maxBytes: 64 * 1024, maxLines: 1_000, retain: "head" },
     async execute(args, api, context) {
@@ -220,9 +222,13 @@ export function createWorkerTool(options: WorkerToolOptions): WorkerTool {
       if (request.request_id !== undefined && typeof request.request_id !== "string") {
         return text("request_id must be a string when provided.", true);
       }
+      // Dedupe identity is the host's own tool-task identity, never the provider's tool-call ID: a
+      // provider may reuse `call_0` in two independent turns, and that must start two workers. A
+      // replayed execution of the same tool task keeps the same task ID, so a crash retry still
+      // dedupes. An explicit request_id stays a deliberate cross-call key.
       const requestId = typeof request.request_id === "string" && request.request_id.trim() !== ""
         ? `model:${request.request_id.trim()}`
-        : `tool:${api.callId}`;
+        : `tool:${api.taskId}`;
       let receipt: { readonly taskId: number; readonly deduplicated: boolean };
       try {
         receipt = await options.foundation.start({

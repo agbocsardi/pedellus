@@ -10,7 +10,7 @@
 // can inspect it; a narrowed config on reopen cannot restore a removed tool; and a worker child
 // reading an image still gets the configured vision handoff.
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,9 +22,11 @@ const [
   { parseConfig },
   { openGateway },
   { WORKER_RESULT_ENTRY_KIND, WORKER_TASK_NAME, WorkerRecordsDoc, workerResultRequestId },
-  { WORKER_TOOL_NAME },
+  { WORKER_TOOL_NAME, createWorkerTool },
   { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
   { BACKGROUND_CONTEXT },
+  { AgentDoc },
+  { ConfigToolCaptureDoc },
 ] = await Promise.all([
   import(new URL('../dist/config.js', import.meta.url).href),
   import(new URL('../dist/runtime.js', import.meta.url).href),
@@ -32,6 +34,8 @@ const [
   import(new URL('../dist/workers/tool.js', import.meta.url).href),
   import(`${modules}/pi-ai/dist/index.js`),
   import(`${modules}/chord/dist/context/index.js`),
+  import(`${modules}/pi-durable/dist/index.js`),
+  import(new URL('../dist/tools/index.js', import.meta.url).href),
 ]);
 
 const context = BACKGROUND_CONTEXT;
@@ -429,6 +433,56 @@ test('shared writes land in the configured workspace while worktree writes never
   }
 });
 
+test('two independent turns reusing one provider tool-call ID start two distinct workers', { timeout: 30_000 }, async () => {
+  const fixture = await fixtureWorkspace();
+  const issued = new Set();
+  const store = await syntheticStore(fixture, async (transcript) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.')) return fauxAssistantMessage('CHILD-OK');
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'spawn alpha' && !issued.has(input)) {
+      issued.add(input);
+      // A provider may reuse one call ID across independent turns; it is not host identity.
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, { action: 'start', task: 'alpha task', workspace_mode: 'shared' }, { id: 'call_0' }),
+      ], { stopReason: 'toolUse' });
+    }
+    if (input === 'spawn beta' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, { action: 'start', task: 'beta task', workspace_mode: 'shared' }, { id: 'call_0' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  });
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    for (const content of ['spawn alpha', 'spawn beta']) {
+      const submission = await conversation.submit({ type: 'input', content, requestId: content }, context);
+      assert.equal((await submission.wait(context)).status, 'done');
+    }
+    const entries = (await conversation.entries({ order: 'ascending' }, 200, undefined, context)).items;
+    const results = entries.filter((entry) => entry.model?.[0]?.role === 'toolResult')
+      .map((entry) => entry.model[0]).filter((message) => message.toolCallId === 'call_0');
+    assert.equal(results.length, 2, 'both turns reached a tool result');
+    const started = results.map((message) => (message.content ?? []).map((part) => part.text ?? '').join(''));
+    assert.equal(results[0].isError ?? false, false, started[0]);
+    assert.equal(results[1].isError ?? false, false, started[1]);
+    assert.match(started[0], /Started background worker \d+/);
+    assert.match(started[1], /Started background worker \d+/);
+    assert.doesNotMatch(started[1], /already exists/);
+
+    const records = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers;
+    assert.equal(records.length, 2, 'two workers, not one silently swallowed');
+    assert.equal(new Set(records.map((entry) => entry.taskId)).size, 2);
+    assert.deepEqual(records.map((entry) => entry.prompt).sort(), ['alpha task', 'beta task']);
+    assert.notEqual(records[0].requestId, records[1].requestId, 'each host tool task keeps its own identity');
+  } finally {
+    await store.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test('an unsafe or non-git base is refused truthfully without copying, stashing or creating a task', { timeout: 20_000 }, async () => {
   const plain = await fixtureWorkspace();
   let plainIssued = false;
@@ -568,18 +622,21 @@ test('cancellation retires the worker authority and a late child finish never re
     const task = await store.gateway.harness.getTask(childId, context);
     assert.equal(task.state.status, 'terminal');
     assert.equal(task.state.outcome.status, 'aborted');
-    const targetConversationId = task.state.outcome.result.answerEntryId === null
-      ? record.conversationId
-      : record.conversationId;
-    const child = await store.gateway.harness.conversation(targetConversationId ?? 1, context);
-    if (child !== undefined) {
-      const names = (await child.agent(context)).tools?.map((tool) => (typeof tool === 'string' ? tool : tool.name)) ?? [];
-      assert.deepEqual(names, [], `a cancelled worker keeps no tools: ${names}`);
-    }
+    const childConversationId = record.conversationId;
+    assert.ok(childConversationId, 'the prepared worker target is recorded before the result exists');
+    const child = await store.gateway.harness.conversation(childConversationId, context);
+    assert.ok(child, 'the cancelled worker target survives for inspection');
+    const names = (await child.agent(context)).tools?.map((tool) => (typeof tool === 'string' ? tool : tool.name)) ?? [];
+    assert.deepEqual(names, [], `a cancelled worker keeps no tools: ${names}`);
 
     // A late child completion cannot turn the cancelled task into a success or send another event.
     releaseChild.resolve();
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    // Deterministic: wait until the cancelled worker's own child has no live work left.
+    await waitFor(async () => {
+      const inspection = await store.gateway.harness.inspect(context);
+      return inspection.tasks.every((entry) => entry.record.conversationId !== childConversationId
+        || entry.record.state.status === 'terminal');
+    }, 'the cancelled child work to settle');
     assert.equal(results.length, 1, 'exactly one result event after a late child finish');
     assert.equal(
       (await store.gateway.harness.getTask(childId, context)).state.outcome.status,
@@ -650,6 +707,53 @@ test('a worker cannot delegate and another conversation cannot inspect it', { ti
     await store.gateway.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
   }
+});
+
+test('start dedupes on the host tool-task identity, not a reused provider call ID', { timeout: 10_000 }, async () => {
+  const seen = [];
+  const tool = createWorkerTool({
+    foundation: {
+      async start(_writer, request) {
+        seen.push(request.requestId);
+        return { taskId: seen.length, deduplicated: false };
+      },
+      async list() { return []; },
+      async inspect() { return undefined; },
+      async cancel() { return 'not_found'; },
+      async recover() { return 0; },
+      async record() { return undefined; },
+    },
+    spawnerFor: () => true,
+    harness: () => ({}),
+    precheckWorktree: async () => undefined,
+  }).extension.tools[0];
+  // Native Code Mode composes tools through nested calls; a model-only restriction would hide it
+  // from scripts even though the hosting conversation and capture checks still apply.
+  assert.ok(tool.callers === undefined || tool.callers.includes('tools'),
+    `the worker tool must stay composable in Code Mode: ${JSON.stringify(tool.callers)}`);
+  const api = (taskId, callId) => ({
+    conversationId: 9,
+    taskId,
+    callId,
+    commit: async (change) => change({}),
+  });
+  const start = (taskId, callId, task) => tool.execute(
+    { action: 'start', task, workspace_mode: 'shared' },
+    api(taskId, callId),
+    context,
+  );
+  // Two independent tool tasks may carry the same provider call ID in one chat.
+  await start(41, 'call_0', 'alpha');
+  await start(42, 'call_0', 'beta');
+  // A rerun of the same host tool task keeps the same identity, so a crash retry still dedupes.
+  await start(41, 'call_0', 'alpha');
+  // An explicit model request_id stays a deliberate cross-call key.
+  await tool.execute(
+    { action: 'start', task: 'gamma', workspace_mode: 'shared', request_id: 'shared-key' },
+    api(43, 'call_0'),
+    context,
+  );
+  assert.deepEqual(seen, ['tool:41', 'tool:42', 'tool:41', 'model:shared-key']);
 });
 
 test('list and inspect read this conversation\'s bounded worker record, and a repeated request_id does not start twice', { timeout: 25_000 }, async () => {
@@ -923,6 +1027,129 @@ test('a narrowed config on reopen cannot restore a live worker tool the ceiling 
   } finally {
     if (reopened) await reopened.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('a reopen that removed a live worker model fails closed without substitution or dispatch', { timeout: 55_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'nanobot-worker-removed-'));
+  const workspace = join(directory, 'workspace');
+  await mkdir(workspace);
+  await writeFile(join(workspace, 'note.txt'), 'REMOVED-MODEL-NOTE\n');
+  let child;
+  let childExit;
+  let gateway;
+  let stderr = '';
+  try {
+    child = spawn(process.execPath, [
+      join(packageRoot, 'tests/fixtures/worker-model-removed-child.mjs'),
+      directory,
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // Synthetic child: no inherited credentials or host configuration.
+      env: {
+        HOME: directory,
+        TMPDIR: directory,
+        PATH: process.env.PATH ?? '',
+        PI_WORKER_CANDIDATE: packageRoot,
+      },
+    });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    childExit = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+    await within(new Promise((resolve, reject) => {
+      let stdout = '';
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk;
+        if (stdout.includes('CHILD-TOOL-RUNNING')) resolve(stdout);
+      });
+      child.once('error', reject);
+      void childExit.then((exit) => reject(
+        new Error(`fixture exited before readiness (${JSON.stringify(exit)}): ${stderr}`),
+      ));
+    }), 40_000, 'fixture readiness');
+    // Kill while the child holds a live, non-prepared tool task: no saved provider dispatch exists.
+    assert.equal(child.kill('SIGKILL'), true);
+    assert.deepEqual(await within(childExit, 10_000, 'SIGKILL exit'), { code: null, signal: 'SIGKILL' });
+    child = undefined;
+    const state = JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'));
+
+    // The reopened catalog no longer contains the non-default preset the worker captured.
+    const faux = fauxProvider({ provider: 'worker-removed', models: [{ id: 'primary', name: 'Primary' }] });
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const calls = [];
+    const dispatcher = (transcript, _options, _state, model) => {
+      calls.push({ modelId: model?.id, body: transcriptText(transcript.messages) });
+      const input = lastUserText(transcript.messages);
+      if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+      return fauxAssistantMessage('ok');
+    };
+    faux.setResponses(Array.from({ length: 20 }, () => dispatcher));
+    const config = parseConfig({
+      workspace,
+      dataDir: join(directory, 'state'),
+      modelPresets: { primary: { provider: 'worker-removed', modelId: 'primary' } },
+      modelPreset: 'primary',
+      toolAllowlist: ['read', 'bash'],
+      workers: { enabled: true },
+    }, directory);
+    // The non-prepared case must open: no saved dispatch names the removed model.
+    gateway = await openGateway(config, context, { models });
+
+    await waitFor(async () => {
+      const task = await gateway.harness.getTask(state.workerTaskId, context);
+      return task?.state.status === 'terminal';
+    }, 'the worker terminal outcome');
+    const task = await gateway.harness.getTask(state.workerTaskId, context);
+    assert.equal(task.state.outcome.status, 'failed');
+    assert.match(task.state.outcome.error.message, /no longer in the configured model catalog/);
+
+    await waitFor(async () =>
+      (await gateway.harness.snapshot(WorkerRecordsDoc, state.chatConversationId, context))?.workers[0]?.notified === true,
+    'the failure admission');
+    const record = (await gateway.harness.snapshot(WorkerRecordsDoc, state.chatConversationId, context)).workers[0];
+    assert.equal(record.status, 'failed');
+    assert.equal(record.result, null);
+
+    // The pin stays honest: the captured model is not silently replaced by the configured default.
+    const agent = await gateway.harness.snapshot(AgentDoc, state.childConversationId, context);
+    assert.equal(agent.model?.provider, 'worker-removed');
+    assert.equal(agent.model?.modelId, 'research');
+    // No captured authority survives, and no child work remains.
+    assert.equal(await gateway.harness.snapshot(ConfigToolCaptureDoc, state.childConversationId, context), undefined);
+    const childConversation = await gateway.harness.conversation(state.childConversationId, context);
+    const tools = (await childConversation.agent(context)).tools ?? [];
+    assert.deepEqual(tools.map((tool) => (typeof tool === 'string' ? tool : tool.name)), []);
+    const inspection = await gateway.harness.inspect(context);
+    assert.deepEqual(
+      inspection.tasks.filter((entry) => entry.record.conversationId === state.childConversationId)
+        .map((entry) => `${entry.record.kind}:${entry.record.state.status}`),
+      [],
+      'the removed-model worker leaves no live child work',
+    );
+    // Wait deterministically for the parent's own result-event turn: the reopen must resume the
+    // spawning agent as normal model work, and only then does the negative check below have a
+    // meaningful set of dispatches to inspect.
+    await waitFor(() => calls.some((call) => call.body.includes('[internal worker result]')),
+      'the parent result-event turn');
+    // Neither the removed model nor a fallback ran the child: the only dispatch is the parent turn
+    // answering the internal result event on the configured preset. That event echoes the spawning
+    // agent's own task text by design, so the child's own prompt wrapper and tool call are the markers
+    // that must never appear again.
+    assert.equal(calls.filter((call) => call.modelId === 'research').length, 0);
+    assert.equal(calls.filter((call) => call.body.includes('Background worker task.')).length, 0,
+      'the child conversation must never dispatch after the reopen');
+    assert.equal(calls.filter((call) => call.body.includes('seq 1 200')).length, 0,
+      'the blocked child tool must not run again');
+    assert.equal(calls.length, 1, 'exactly the parent result-event turn dispatched');
+    assert.equal(calls[0].modelId, 'primary');
+  } finally {
+    // Release the bounded synthetic shell loop the killed fixture left running.
+    await writeFile(join(workspace, 'release.txt'), 'release\n').catch(() => undefined);
+    if (gateway) await gateway.close(context);
+    if (child !== undefined) child.kill('SIGKILL');
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

@@ -203,7 +203,7 @@ the spawning conversation's captured tool ceiling and chosen model, explicit
 `shared`/`worktree` workspaces (generated branch/path under
 `<dataDir>/worker-worktrees`, clean-base and full-repo-scope checks, no shell
 interpolation), terminal-commit retirement of captured authority and one internal
-idempotent result event to the spawning agent. Ten offline checks in
+idempotent result event to the spawning agent. Fourteen offline checks in
 `tests/background-workers.behavior.test.mjs` cover the agreed finish line with a
 faux provider and temporary git/non-git fixtures. No live provider, bot, network,
 credential, dependency install or deployment was used; scheduled memory curation
@@ -214,6 +214,22 @@ consolidation prompt, runtime-owned bounds/frontier, no Dream engine and no
 activation. That work remains unimplemented here by instruction; its notes must
 be preserved when this plan is merged. Awaiting fresh independent review of the
 workers slice; no integration or main publication yet.
+
+Review fixes for that slice (same worktree, no new scope): `start` now dedupes on
+Durable's tool-task identity instead of the provider's tool-call ID, so two turns
+that reuse `call_0` start two workers while a replayed task stays idempotent; and
+a reopen that removed a live worker's captured model no longer leaves capture,
+tools or pending child work behind — the target is denied and its own pending
+work withdrawn before scheduling resumes, the worker commits a terminal error,
+and the model pin is never silently replaced by the configured default. A saved
+dispatch naming a removed model keeps the inherited startup refusal; that case
+is documented rather than auto-cancelled. The worker tool also stays composable
+from native Code Mode (no model-only `callers` restriction) under the same
+spawning-conversation and capture checks. The new regressions were shown to fail
+against the reviewed pre-fix behavior in ignored build output only. The owner's
+latest curation planning is simpler than the notes on main (an editable workspace
+prompt plus a simple digestion cursor, no hash/version machinery) and is deferred;
+it is not implemented here.
 
 ### 2026-10-30 — media ingress and configured vision handoff
 

@@ -33,8 +33,16 @@ never receive it, so a worker cannot start another worker.
 
 `start` returns a task ID immediately; the parent keeps its turn. `list` shows this conversation's
 workers, `inspect` returns one worker's bounded result and provenance, `cancel` aborts one. An
-optional `request_id` makes `start` idempotent; a retried tool call is deduplicated on its stable
-call ID. Live workers are capped per conversation, and a refused start creates no record and no task.
+optional `request_id` makes `start` idempotent; a retried tool call is deduplicated on Durable's own
+tool-task identity, never on the provider's tool-call ID (a provider may reuse `call_0` across
+independent turns, and each of those starts a real worker). Live workers are capped per conversation,
+and a refused start creates no record and no task.
+
+The tool has no model-only `callers` restriction: native Code Mode may compose it like any other tool,
+under exactly the same hosting-conversation, capture and ceiling checks, and a worker's child still
+receives no `worker` tool. The shipped host does not install Code Mode today; when the generalized
+Code Mode slice lands, its integration test should drive a nested `worker start` through a script and
+assert the same `spawnerFor`/capture denial outside a mapped spawning chat.
 
 ## What a worker is
 
@@ -53,8 +61,18 @@ Research workers therefore use the tools actually configured for that conversati
 no web search or fetch reach; a research worker without such a configured tool has none.
 
 The model is the spawning conversation's actual selection (provider/model and thinking level) at
-launch, or the configured `workers.preset`. On reopen the worker keeps that model; if the model left
-the configured catalog the task fails closed instead of silently running on another one.
+launch, or the configured `workers.preset`. On reopen the worker keeps that model. If the model left
+the configured catalog, nothing is silently substituted:
+
+- before scheduling resumes, the target's capture is retired, its coding tools are stripped, its
+  queued inputs are withdrawn and its live tasks that hold no saved provider dispatch are aborted (all
+  scoped to that worker's own conversation);
+- the worker task then commits a terminal error that retires its authority in the same commit, so no
+  fallback-model turn and no late child work runs under a captured tool;
+- if a *saved* provider dispatch names the removed model, the inherited prepared-request guard refuses
+  to open the gateway at all (operator recovery or explicit cancellation), rather than silently
+  cancelling that dispatch to "repair" startup. That inherited refusal, not a silently repaired open,
+  is the documented behavior of that case.
 
 ## Workspace mode
 
@@ -133,9 +151,14 @@ never re-run.
 
 - This slice adds no memory curation, consolidation prompt, processed-history bookkeeping or
   "Dream" engine, and nothing here schedules or activates it. The owner deferred that work until
-  workers are accepted, and its shape (an agent-owned workspace consolidation prompt, per-run prompt
-  version/hash, runtime-owned bounds and a processed frontier that advances only on a validated
-  batch) is recorded in the current work order, not implemented here.
+  workers are accepted. The latest planning keeps it simple — an editable agent-owned workspace
+  prompt plus a simple digestion cursor over unprocessed conversations/episodes, with no
+  hash/version machinery — and supersedes the earlier, more elaborate notes. It is not implemented
+  or promised by this slice.
 - No automatic merge, cleanup, stash, rebase or commit of the owner's state, and no worktree deletion.
+  A `git worktree add` that fails after creating the branch or an empty directory can leave those
+  behind; they are bounded and non-destructive, so this slice documents them instead of adding a
+  cleanup framework. A persisted `shared` task whose recorded path is no longer the configured
+  workspace root fails truthfully rather than reusing the stale path.
 - No live-model, Telegram or deployment run is claimed: the offline checks use a faux provider and
   temporary git fixtures.

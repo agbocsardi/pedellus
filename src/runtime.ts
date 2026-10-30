@@ -1590,6 +1590,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // Live worker targets keep the model, thinking level and workspace chosen at launch. A reopen must
     // not silently replace them with the configured default, and a worktree child keeps its own root.
     const workerChildPolicies = new Map<ConversationId, NonNullable<ReturnType<typeof workerChildPolicy>>>();
+    // Live worker children whose captured model left the current catalog. They are denied before
+    // scheduling resumes, never silently moved to the configured default.
+    const workerModelRemoved = new Set<ConversationId>();
     const runTasksById = new Map<number, { readonly originConversationId: ConversationId; readonly targetConversationId: ConversationId | null }>();
     await root.commit(async (tx) => {
       let taskCursor: Cursor | undefined;
@@ -1613,6 +1616,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
               const policy = workerChildPolicy(task);
               if (policy !== undefined && policy.targetConversationId === target.id) {
                 workerChildPolicies.set(target.id, policy);
+                if (!choicesByNative.has(modelKey(policy.model))) workerModelRemoved.add(target.id);
                 if (policy.workspace.mode === "worktree") {
                   workerWorkspaceRoots.set(target.id, policy.workspace.path);
                 }
@@ -1636,6 +1640,42 @@ export async function openGateway(config: PortConfig, context: Context, options:
         taskCursor = page.next;
       } while (taskCursor !== undefined);
     }, context);
+
+    // A worker whose captured model was removed must not reach a provider with it, or with a silently
+    // substituted default. Before scheduling resumes, stop its own child conversation's pending work
+    // through native ownership: queued inputs, and live tasks that hold no saved provider dispatch.
+    // A saved dispatch is deliberately left alone; the inherited prepared-model guard refuses to open
+    // the gateway in that case instead of cancelling it to "repair" startup.
+    if (workerModelRemoved.size > 0) {
+      let inspection: Awaited<ReturnType<HarnessType["inspect"]>> | undefined;
+      try {
+        inspection = await harness.inspect(context);
+      } catch {
+        inspection = undefined;
+      }
+      if (inspection !== undefined) {
+        for (const submission of inspection.submissions) {
+          if (submission.status !== "queued" || !workerModelRemoved.has(submission.conversationId)) continue;
+          try {
+            await harness.abortSubmission(submission.id, context, submission.conversationId);
+          } catch {
+            // The worker's terminal commit still retires authority; a re-run child has none.
+          }
+        }
+        for (const inspectionTask of inspection.tasks) {
+          const record = inspectionTask.record;
+          if (record.state.status === "terminal" || record.state.status === "completing") continue;
+          if (record.kind === WORKER_TASK_NAME) continue;
+          if (!workerModelRemoved.has(record.conversationId)) continue;
+          if (preparedTaskModel(record) !== undefined) continue;
+          try {
+            await harness.abortTask(record.id, context);
+          } catch {
+            // Same bounded fallback: capture and tools are retired below.
+          }
+        }
+      }
+    }
 
     // A background run's target deliberately has no SessionMap entry. Restore its snapshot from the
     // run task's checkpoint before the pre-resume policy pass, so the pass keeps the context and
@@ -1710,25 +1750,30 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const state = await tx.doc(AgentDoc, conversation.id);
           const toolFilter = await toolFilterFor(tx, conversation.id, backgroundToolBounds.get(conversation.id));
           const workerPolicy = workerChildPolicies.get(conversation.id);
-          // A live worker keeps the model, thinking level and workspace chosen at launch. If that model
-          // is no longer configured, the task itself fails closed instead of being silently moved.
-          const workerChoice = workerPolicy !== undefined && choicesByNative.has(modelKey(workerPolicy.model))
-            ? choicesByNative.get(modelKey(workerPolicy.model))
-            : undefined;
+          // A live worker keeps the model, thinking level and workspace chosen at launch, even when
+          // that model has since left the catalog: the pin stays honest instead of silently becoming
+          // the configured default. The worker task then fails closed in its own terminal commit.
+          const workerChoice = workerPolicy === undefined ? undefined : choicesByNative.get(modelKey(workerPolicy.model));
           await configure(tx, conversation.id, {
-            ...(workerPolicy !== undefined && workerChoice !== undefined
+            ...(workerPolicy !== undefined
               ? {
                   cwd: workerPolicy.workspace.path,
                   model: workerPolicy.model,
-                  thinkingLevel: workerChoice.thinkingLevels.includes(workerPolicy.thinkingLevel)
+                  thinkingLevel: workerChoice !== undefined && workerChoice.thinkingLevels.includes(workerPolicy.thinkingLevel)
                     ? workerPolicy.thinkingLevel
-                    : fallbackThinkingLevel(workerChoice),
+                    : workerChoice !== undefined ? fallbackThinkingLevel(workerChoice) : workerPolicy.thinkingLevel,
                 }
               // Named-preset mode owns the startup default; direct mode preserves its persisted choice.
               : policyForState(state, configuredPresetName !== undefined)),
             ...extensionsPolicy(conversation.id),
             ...toolFilter,
           });
+          if (workerPolicy !== undefined && workerChoice === undefined) {
+            // Removed model: no fallback dispatch and no captured authority. The target's own pending
+            // work was withdrawn above; the worker task commits the terminal error on resume.
+            await tx.retireDoc(ConfigToolCaptureDoc, conversation.id);
+            await configure(tx, conversation.id, { tools: [], modelTools: [] });
+          }
         }
         cursor = page.next;
       } while (cursor !== undefined);
