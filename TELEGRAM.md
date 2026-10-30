@@ -154,13 +154,96 @@ again. No exactly-once claim is made for a native reset (Durable exposes no rese
 idempotency key). Version 1 and 2 state documents
 migrate with an empty `controls` list.
 
-State version 4 accepts both historical version-3 shapes and preserves any present
-`controls` and authenticated origin bindings. Invalid stored shapes fail closed.
+State version 5 adds bounded observed message targets and write-ahead action records.
+Version 4 state migrates with empty `targets` and `actions` lists; versions 1 and 2
+migrate with an empty `controls` list. Invalid stored shapes fail closed.
 
 Not implemented here: `/restart`, tool-authority or approval commands, history
 commands, `/stop` aliasing, and any command that would widen tool authority. Tool
 authority is configured by the owner, not requested in chat: this adapter
 exposes no grant or approval commands and the model cannot ask for one.
+
+## Replies, quotes, reactions and native actions
+
+The adapter requests `message` and `message_reaction` updates and registers
+`/new`, `/abort`, `/help` with `setMyCommands` for all private chats at startup.
+Registration is best-effort: a rejection or flood wait logs one fixed warning
+and leaves typed commands working; no unimplemented command is advertised.
+
+An ordinary user message keeps its existing input text (including literal `//`
+handling), so literal content is unchanged. A message that replies to another
+message in the same private chat is prefixed with a bounded, labeled context
+block naming the current message id and the quoted message id/author; the quoted
+text is JSON-quoted and marked as untrusted reference. Quoted text is never an
+authorization and never creates cross-chat authority. A forwarded message adds
+no authority either.
+
+The channel-state document keeps two bounded sets:
+
+- `targets`: recently observed message identities in each private chat — every
+  admitted user message (and a quoted message) plus every bot message actually
+  accepted by Telegram, with a truncated excerpt. Old targets are evicted; a
+  target that is not present fails closed.
+- `actions`: write-ahead records for model-requested external effects. Each has
+  an identity derived from the Durable tool task id (not the provider call id),
+  kind, exact chat/target, reply text or emoji,
+  status, accepted chunk cursor and returned message ids.
+
+`openGateway` creates a model-facing `telegram` tool only when `config.telegram`
+is configured, and offers it only in a scope-checked mapped Telegram private-chat
+conversation. It is a separate channel capability, not a `toolAllowlist` name,
+and the coding-tool ceiling is unchanged. Root, channel-state, fork, raw and
+task-owned cron conversations never receive it. The live adapter attaches a host
+to the Gateway; if it is not running, every call is denied. At call time the
+host re-derives the chat from the host-owned session key (the model supplies no
+chat or session selector), rechecks durable private-chat admission evidence for
+this bot, the current `telegram.allowFrom`, and target presence.
+
+Actions:
+
+- `targets` lists the newest observed ids in this chat. An ordinary incoming
+  message's own id is reachable this way; a replied-to turn also names it in its
+  context block.
+- `reply` sends a native reply (`reply_parameters.message_id`) to one observed
+  id. Text is chunked under Telegram's 4096-character limit; the first chunk is
+  threaded. The turn's ordinary answer is still delivered unthreaded afterwards,
+  so `reply` adds a separate threaded message and is worth using only when that
+  is useful.
+- `react` calls `setMessageReaction` with one emoji on one observed id.
+
+The tool is declared `replay: "unsafe"`, so Durable never reruns an interrupted
+execution. The adapter additionally writes `intent` before the call and
+`sending` before the API request; a known rejection becomes `failed`, a success
+records the returned ids, and any ambiguous outcome becomes `unknown`. On reopen
+every `intent`/`sending` action is quarantined as `unknown`. A repeat of the same
+action identity resolves to its stored record while retained and is not resent;
+a mismatched chat, target or payload is denied without disclosing the old result.
+Interrupted tool execution remains non-replayable even after record pruning.
+Unknown outcomes are never evicted; if unresolved records fill the bounded log,
+new actions are denied rather than losing reconciliation evidence. Target observation is
+best-effort bookkeeping: a failed target commit can make an id untargetable but
+never turns an accepted send into an ambiguous delivery.
+
+An authenticated reaction change becomes an ordinary model turn. The update's
+`user` (never `actor_chat`) must be a non-bot sender in the live allowlist, the
+chat must be private with matching durable admission evidence, and the reacted
+message must be an observed target in that chat; otherwise the update only
+advances the offset. The turn input labels the target and the old/new reaction
+lists, including added and removed emoji. Pending input and offset commit
+together and use the normal submission request id, so a replay cannot admit the
+same reaction twice and a crash before submission is recovered normally. The
+reply to a reaction turn is an ordinary unthreaded answer.
+
+Telegram limitations: private-chat reaction-update delivery is unverified live.
+The installed Bot API type documentation requires administrator status for
+`message_reaction` updates, which is not a private-chat role; requesting that
+update type alone does not establish that Telegram sends it to a private bot chat.
+This adapter handles authenticated updates if received; it does not promise
+private-chat reaction-triggered turns work on the live service. Bot-generated
+reaction events are ignored, so actions cannot start a second model loop.
+Bot API sends have no idempotency
+key; an ambiguous action or delivery is quarantined for reconciliation, not
+retried.
 
 ## Behavior
 
@@ -173,11 +256,12 @@ exposes no grant or approval commands and the model cannot ask for one.
   per bot ID and Telegram `update_id`. Unknown/denied updates advance the
   offset without a reply.
 - A channel-state Durable document stores the polling offset and admitted
-  requests, including original input, chat target, and sender ID. Document values
-  are copied to strict JSON inside transaction callbacks before they return; no
-  revoked transaction draft escapes. Each accepted input is committed with its
-  pending-delivery record and offset before any model submission; the delivery
-  path submits it with the update's stable request ID. Polling does not wait for
+  requests, including original input, chat target, and sender ID, plus the
+  bounded observed targets and write-ahead action records described above.
+  Document values are copied to strict JSON inside transaction callbacks before
+  they return; no revoked transaction draft escapes. Each accepted input is
+  committed with its pending-delivery record and offset before any model
+  submission; the delivery path submits it with the update's stable request ID. Polling does not wait for
   model completion. Pending deliveries are retried after restart, and
   re-submission uses the same request ID, so recovery cannot create a second
   turn. Recovered deliveries are checked against the current allowlist;
@@ -240,10 +324,12 @@ waiter; it does not abort the Durable model work. Pending delivery records remai
 durable for restart recovery. Preview updates use one in-flight operation plus a
 latest-value coalescer; a flood wait skips replaceable previews rather than
 retaining stale calls. The channel-state document checkpoints its delta chain
-after 64 deltas using Durable's `CheckpointInfo.deltasSinceBase`. Schema version 4
+after 64 deltas using Durable's `CheckpointInfo.deltasSinceBase`. Schema version 5
 combines durable sender-to-chat admission evidence (`origins`) with controls,
-the next-final-chunk cursor, write-ahead send intent, and unknown-delivery metadata.
-Version-1 and version-2 state migrate with an empty `origins` map; version 1 resets
+the next-final-chunk cursor, write-ahead send intent, unknown-delivery metadata,
+bounded observed targets and write-ahead action records. Version 4 state migrates
+with empty `targets` and `actions` lists; version-1 and version-2 state migrate
+with an empty `origins` map; version 1 resets
 the chunk cursor, and version 2 preserves it. Pending replies are kept, and no sender
 binding is inferred from a chat ID. Prior
 queued cron results remain in the outbox as nonterminal `withheld` records until that private chat
@@ -298,6 +384,14 @@ clear these fields without resolving the external outcome. A `failed` record is
 recovered by clearing `deliveryStatus` (it is a known non-send, not an ambiguous
 one), after which normal delivery can resume. A retry command/UI is outside this
 batch.
+
+The `telegram` action tool has the same external-send limitation. Its durable
+`actions` records make the intent and outcome inspectable and prevent automatic
+resend, but they cannot make a native reply or a reaction exactly-once. A
+multi-chunk native reply records the accepted message ids and chunk cursor; a
+crash mid-sequence is quarantined as unknown rather than continued blindly. An
+operator reconciles it like a pending delivery: check Telegram, then update the
+record. There is no automatic action retry or action command/UI.
 
 ## Offline control probes — 2026-10-29
 

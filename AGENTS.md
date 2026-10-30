@@ -49,8 +49,11 @@ npm start -- agent --config config.json     # attach a terminal
   every admitted Telegram user shares the configured workspace/tools. Raw, root,
   forked and state conversations remain denied. Isolated cron runs capture an
   origin subset bounded by current config and lose it on completion. The `skill`,
-  `cron` and `history` tools carry no filesystem/shell authority and are exempt
-  from the coding-tool hook; history remains read-only over mapped chats.
+  `cron`, `history` and scoped `telegram` tools carry no filesystem/shell authority
+  and are exempt from the coding-tool hook; history remains read-only over mapped
+  chats. Telegram actions additionally require a live adapter, current private-chat
+  admission and observed same-chat targets. Unknown external outcomes are retained,
+  never blindly retried or evicted.
 - Named model presets define provider/model/thinking in config. CLI preset switches
   are temporary: a CLI reattach keeps the temporary selection, while a gateway
   restart or reopen restores the configured preset without rewriting prepared

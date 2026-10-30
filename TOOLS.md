@@ -3,7 +3,7 @@
 `openGateway` can register the native Pi 1.4.0 `read`, `write`, `edit` and `bash`
 tools over a guarded `HostExecutionEnv` on the **actual workspace**. It stays
 disabled unless the host explicitly configures a non-empty `toolAllowlist`; that
-list is the only tool authority for validated chats and for the bounded capture
+list is the only coding-tool authority for validated chats and for the bounded capture
 of a scheduled isolated run.
 
 This is W1 accidental-damage protection, not confinement. The default host shell
@@ -72,9 +72,16 @@ described below; Code Mode is not part of this slice.
   untrusted historical data. See
   [`HISTORY.md`](./HISTORY.md#agent-facing-history-tool).
 
+When `telegram` is configured, mapped Telegram chat conversations also receive
+one scoped `telegram` channel-action tool (`targets`, `reply`, `react`). It is not
+a coding-tool name or filesystem/shell grant. A running adapter rechecks current
+private-chat admission and observed same-chat targets; root/state/fork/isolated
+cron conversations do not receive it. Native replies are additional messages,
+not replacements for the ordinary answer. See [Telegram interactions](./TELEGRAM.md#replies-quotes-reactions-and-native-actions).
+
 ## Configured authority
 
-`toolAllowlist` is the only tool authority. A validated mapped ordinary chat
+`toolAllowlist` is the only coding-tool authority. A validated mapped ordinary chat
 conversation receives exactly the configured coding tools, and an empty or
 absent list disables them. There is no grant, expiry, approval prompt, startup
 re-grant or per-channel permission list to manage.
