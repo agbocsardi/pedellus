@@ -108,8 +108,9 @@ agree on `needsVisionHandoff`, so the per-preset flag never collapses into
 ambiguous pair-only matching. `maxRawImages` defaults to 9 (0-64) and
 `maxDescriptionTokens` to 1024 (1-8192).
 
-On every model-bound generation request, `pi.generation`'s native `beforeRequest`
-hook transforms only the copy sent to the provider:
+On every `pi.generation` request — ordinary chat, mapped channels and scheduled
+background runs alike — `pi.generation`'s native `beforeRequest` hook transforms
+only the copy sent to the provider:
 
 - A flagged text-only target keeps **zero** raw images. Every image is replaced
   by a describer preset's text description.
@@ -122,13 +123,26 @@ hook transforms only the copy sent to the provider:
   not instructions. Adjacent user text (including a channel's relative file
   locator) is retained. For a `read` tool result, the transcript's own tool-call
   `path` argument is quoted as an untrusted source label.
-- A describer failure, cancellation, oversized image or per-request description
-  budget produces an explicit "description unavailable / omitted" text. Such a
-  failure is not cached and never claims the target saw the image.
+- A describer failure, oversized image or per-request description budget
+  produces an explicit "description unavailable / omitted" text. Such a failure
+  is not cached and never claims the target saw the image.
+- Cancellation is per request. Identical in-flight images share one
+  service-owned describer call, but one caller aborting does not reject another
+  live caller's transform or cancel the shared call while that caller still
+  waits. A real cancellation of the requesting turn still rejects and sends
+  nothing.
+- Durable treats a thrown generation hook as `extension_error` and would then
+  send the original request. The hook therefore catches non-cancellation helper
+  errors: a flagged or unresolved target is replaced with explicit unavailable
+  text and zero raw images, never the untransformed request. A capable target
+  keeps its intended raw images.
 
 Descriptions are cached by image content for the process lifetime (256 entries,
 LRU) with single-flight for identical in-flight images and at most four
-concurrent describer requests. One request describes at most 32 older images;
+concurrent describer requests. The cache key is MIME type plus image bytes; this
+is safe because one gateway instance has one fixed describer preset, prompt and
+token budget, and a configuration change creates a new cache rather than sharing
+descriptions across different describer settings. One request describes at most 32 older images;
 older ones are explicitly omitted rather than causing unbounded calls. One image
 above 16 MiB of base64 payload is not sent to the describer, and the described
 images in one request share a 64 MiB base64 budget; older images past it are
@@ -144,15 +158,25 @@ described and unavailable images, describer calls/failures, cache hits and
 reported input/output tokens). It is accounting, not a budget enforcer; the
 provider's own budget guard still applies to calls it controls.
 
-A prepared generation `request`/`poll` keeps its checkpointed model even when
-startup resets conversation state to the configured preset in named-preset mode;
-startup records those task models, and the hook prefers that pin over the reset
-selection. This slice is offline-tested with faux models and a temporary store;
-no live provider, Telegram media adapter, PDF/OCR/Office extraction or audio
-path is included. Durable's separate compaction summarizer request has no
-`beforeRequest` hook, so a flagged text-only model used to summarize an
-image-bearing transcript is **not** covered by this handoff. Documents are saved
-as files for later explicit reading; no automatic extraction is performed.
+A prepared generation `request` keeps its checkpointed model even when startup
+resets conversation state to the configured preset in named-preset mode; startup
+records that task's model and the hook prefers it for the one saved dispatch.
+The pin is consumed on use, so a later retry of the same generation task
+re-prepares from the reset `pi.agent` selection and applies that model's image
+policy. A deferred `poll` resumes the already-sent request and runs no
+`beforeRequest` hook.
+
+Durable compaction serializes only text and drops image blocks, so it does not
+send raw images to a text-only summarizer. The real limitation is loss: handoff
+descriptions are request-only, and the compacted summary prefix therefore omits
+the image evidence. After compaction a long image-heavy conversation may retain
+only the original file/locator text as its source evidence, not the visual
+description. This slice adds no compaction engine or summary rewriting.
+
+This slice is offline-tested with faux models and a temporary store; no live
+provider, Telegram media adapter, PDF/OCR/Office extraction or audio path is
+included. Documents are saved as files for later explicit reading; no automatic
+extraction is performed.
 
 ## Gateway API
 

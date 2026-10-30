@@ -105,6 +105,13 @@ interface Replacement {
   readonly text: string;
 }
 
+interface InflightDescription {
+  promise: Promise<string | undefined>;
+  readonly controller: AbortController;
+  waiters: number;
+  settled: boolean;
+}
+
 class Semaphore {
   readonly #max: number;
   #active = 0;
@@ -165,6 +172,37 @@ function abortError(signal: AbortSignal | undefined): Error {
     : new DOMException("The operation was aborted", "AbortError");
 }
 
+/** Await a service-owned promise while letting each waiter cancel independently. */
+function waitForShared(
+  promise: Promise<string | undefined>,
+  signal: AbortSignal | undefined,
+  onAbort: () => void,
+): Promise<string | undefined> {
+  if (signal === undefined) return promise;
+  if (signal.aborted) {
+    onAbort();
+    return Promise.reject(abortError(signal));
+  }
+  return new Promise<string | undefined>((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener("abort", abort);
+      onAbort();
+      reject(abortError(signal));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      },
+    );
+  });
+}
+
 /**
  * Describe images that are older than the target model's raw window, or every
  * image when the target preset is marked text-only. The persisted transcript is
@@ -177,7 +215,7 @@ export class VisionHandoff {
   readonly #maxDescriptionTokens: number;
   readonly #system: string;
   readonly #cache = new Map<string, string>();
-  readonly #inflight = new Map<string, Promise<string | undefined>>();
+  readonly #inflight = new Map<string, InflightDescription>();
   readonly #semaphore = new Semaphore(VISION_HANDOFF_LIMITS.describeConcurrency);
   readonly #stats = {
     requests: 0,
@@ -275,7 +313,24 @@ export class VisionHandoff {
       return this.#replacement(slot, imageText(description, slot.locator));
     });
     replacements.push(...await Promise.all(tasks));
+    return this.#applyReplacements(messages, replacements);
+  }
 
+  /**
+   * Fail-closed request copy for a flagged target when the transform itself could not run.
+   * No describer call and no raw image: every image becomes explicit unavailable text.
+   */
+  failClosed(messages: readonly Message[]): readonly Message[] {
+    const slots = this.#imageSlots(messages);
+    if (slots.length === 0) return messages;
+    this.#stats.unavailableImages += slots.length;
+    return this.#applyReplacements(messages, slots.map((slot) => this.#replacement(slot, UNAVAILABLE)));
+  }
+
+  #applyReplacements(
+    messages: readonly Message[],
+    replacements: readonly Replacement[],
+  ): readonly Message[] {
     const byMessage = new Map<number, Replacement[]>();
     for (const replacement of replacements) {
       const list = byMessage.get(replacement.messageIndex);
@@ -348,16 +403,59 @@ export class VisionHandoff {
       this.#stats.cacheHits += 1;
       return cached;
     }
-    const pending = this.#inflight.get(key);
-    if (pending !== undefined) {
+    let entry = this.#inflight.get(key);
+    if (entry === undefined) {
+      const controller = new AbortController();
+      const created: InflightDescription = {
+        promise: Promise.resolve(undefined),
+        controller,
+        waiters: 0,
+        settled: false,
+      };
+      created.promise = this.#call(slot.image, key, models, controller.signal).then(
+        (value) => {
+          created.settled = true;
+          this.#inflight.delete(key);
+          return value;
+        },
+        (error: unknown) => {
+          created.settled = true;
+          this.#inflight.delete(key);
+          throw error;
+        },
+      );
+      // Every waiter may cancel before observing the service promise; keep the
+      // rejection handled without caching a fabricated result.
+      void created.promise.catch(() => undefined);
+      this.#inflight.set(key, created);
+      entry = created;
+    } else {
       this.#stats.cacheHits += 1;
-      return pending;
     }
-    const started = this.#call(slot.image, key, models, signal).finally(() => {
-      this.#inflight.delete(key);
-    });
-    this.#inflight.set(key, started);
-    return started;
+
+    entry.waiters += 1;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      entry.waiters -= 1;
+      // The underlying provider call is owned by the service, not by the
+      // first caller. Abort it only when no live waiter still needs it.
+      if (entry.waiters === 0 && !entry.settled) {
+        entry.controller.abort(signal?.reason ?? new DOMException("The operation was aborted", "AbortError"));
+      }
+    };
+    try {
+      return await waitForShared(entry.promise, signal, release);
+    } catch (error) {
+      if (signal?.aborted) throw abortError(signal);
+      // A live waiter must never inherit another caller's cancellation. An
+      // unexpected service failure is an explicit unavailable description.
+      this.#stats.describerFailures += 1;
+      return undefined;
+    } finally {
+      release();
+    }
   }
 
   async #call(

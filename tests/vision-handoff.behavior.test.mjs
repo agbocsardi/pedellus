@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
@@ -14,8 +14,9 @@ const { createVisionHandoffExtension } = await import(pathToFileURL(`${pkg}/dist
 const { VisionHandoff, VISION_HANDOFF_LIMITS, VISION_HANDOFF_DEFAULTS } = await import(
   pathToFileURL(`${pkg}/dist/media/vision.js`).href
 );
-const { createModels, fauxAssistantMessage, fauxProvider } = await import(pathToFileURL(`${ai}/index.js`).href);
+const { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(pathToFileURL(`${ai}/index.js`).href);
 const { BACKGROUND_CONTEXT } = await import(pathToFileURL(`${chord}/context/index.js`).href);
+const { CRON_DELIVERIES_KIND } = await import(pathToFileURL(`${pkg}/dist/automation/cron-delivery.js`).href);
 const context = BACKGROUND_CONTEXT;
 const SESSION = "telegram:vision-handoff";
 
@@ -36,6 +37,57 @@ async function within(promise, ms, label) {
   } finally {
     clearTimeout(deadline);
   }
+}
+
+/** Resolve on the next matching commit; bounded and always disposable. */
+function changeWatcher(harness, predicate, label) {
+  let settled = false;
+  let timer;
+  let settle;
+  const promise = new Promise((resolve, reject) => {
+    timer = setTimeout(() => settle?.reject(new Error(`timed out waiting for ${label}`)), 10_000);
+    settle = {
+      resolve: (publication) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(publication);
+      },
+      reject: (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    };
+  });
+  void promise.catch(() => undefined);
+  const unsubscribe = harness.subscribeCommits((publication) => {
+    try {
+      if (predicate(publication.changes)) settle.resolve(publication);
+    } catch (error) {
+      settle.reject(error);
+    }
+  });
+  return {
+    promise,
+    stop() {
+      settled = true;
+      clearTimeout(timer);
+      unsubscribe();
+    },
+  };
+}
+
+function lastUserText(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "user") continue;
+    return typeof message.content === "string"
+      ? message.content
+      : message.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+  }
+  return "";
 }
 
 function systemText(messages) {
@@ -382,6 +434,90 @@ test("describer failure and cancellation never fabricate a seen image", { timeou
   assert.equal(cancelHandoff.stats().unavailableImages, 0, "cancellation does not commit unavailable text");
 });
 
+test("one waiter's cancellation does not reject a live single-flight waiter", { timeout: 10_000 }, async () => {
+  const flagged = { provider: "fixture", modelId: "chat" };
+  const model = { input: ["text", "image"] };
+  const messages = [{ role: "user", content: [image("shared-image")], timestamp: 0 }];
+  const started = deferred();
+  const release = deferred();
+  let calls = 0;
+  const models = {
+    getModel: () => model,
+    completeSimple: async (_model, _context, options) => {
+      calls += 1;
+      started.resolve();
+      await new Promise((resolve, reject) => {
+        const abort = () => reject(options.signal.reason);
+        options.signal.addEventListener("abort", abort, { once: true });
+        release.promise.then(() => {
+          options.signal.removeEventListener("abort", abort);
+          resolve();
+        });
+      });
+      return fauxAssistantMessage("shared description");
+    },
+  };
+  const handoff = new VisionHandoff({
+    describer: { provider: "fixture", modelId: "eyes" },
+    flaggedModels: new Set([modelKey(flagged)]),
+  });
+  const first = new AbortController();
+  const second = new AbortController();
+  const firstTransform = handoff.transform(messages, flagged, models, modelKey, first.signal);
+  const secondTransform = handoff.transform(messages, flagged, models, modelKey, second.signal);
+  await within(started.promise, 2_000, "shared describer call never started");
+  first.abort(new DOMException("first chat cancelled", "AbortError"));
+  await assert.rejects(within(firstTransform, 2_000, "cancelled waiter did not settle"), /first chat cancelled/);
+
+  release.resolve();
+  const transformed = await within(secondTransform, 2_000, "live waiter inherited cancellation");
+  assert.equal(imagesOf(transformed).length, 0, "the live waiter still gets a description, not raw image bytes");
+  assert.match(JSON.stringify(transformed), /shared description/);
+  assert.equal(calls, 1, "both waiters share one describer call");
+
+  // The completed description is cached and no in-flight or semaphore slot leaked.
+  const cached = await within(handoff.transform(messages, flagged, models, modelKey), 2_000, "cache reuse after shared call");
+  assert.equal(calls, 1);
+  assert.match(JSON.stringify(cached), /shared description/);
+});
+
+test("a non-cancellation transform failure fails closed for a flagged target", { timeout: 5_000 }, async () => {
+  const flagged = { provider: "fixture", modelId: "chat" };
+  const real = new VisionHandoff({
+    describer: { provider: "fixture", modelId: "eyes" },
+    flaggedModels: new Set([modelKey(flagged)]),
+  });
+  const throwing = {
+    transform: async () => { throw new Error("synthetic helper failure"); },
+    rawImageCap: (...args) => real.rawImageCap(...args),
+    failClosed: (...args) => real.failClosed(...args),
+  };
+  const extension = createVisionHandoffExtension({
+    handoff: throwing,
+    defaultModel: flagged,
+    preparedModel: () => undefined,
+  });
+  const beforeRequest = extension.hooks[0].handlers.beforeRequest;
+  const messages = [{ role: "user", content: [image("must-not-leak")], timestamp: 0 }];
+  const result = await beforeRequest(
+    { messages },
+    { taskId: 11, conversationId: 1, models: {}, snapshot: async () => ({ model: flagged }) },
+    { abortSignal: undefined },
+  );
+  assert.ok(result, "a flagged target must receive a replacement request");
+  assert.equal(imagesOf(result.messages).length, 0, "Durable must not dispatch the original raw image after an extension error");
+  assert.match(JSON.stringify(result.messages), /description is unavailable/);
+
+  // An unresolvable target is also fail-closed rather than fail-open.
+  const unresolved = await beforeRequest(
+    { messages },
+    { taskId: 12, conversationId: 1, models: {}, snapshot: async () => { throw new Error("state unavailable"); } },
+    { abortSignal: undefined },
+  );
+  assert.ok(unresolved);
+  assert.equal(imagesOf(unresolved.messages).length, 0);
+});
+
 test("vision transform bounds described images, output and read-tool locators", { timeout: 10_000 }, async () => {
   const flagged = { provider: "fixture", modelId: "chat" };
   const model = { input: ["text", "image"] };
@@ -436,34 +572,128 @@ test("vision transform bounds described images, output and read-tool locators", 
   assert.match(JSON.stringify(read), /read tool path/);
 });
 
-test("vision hooks use the prepared task model before the reset conversation selection", { timeout: 5_000 }, async () => {
-  const targets = [];
-  const handoff = {
-    transform: async (messages, target) => {
-      targets.push(target);
-      return messages;
+test("a background cron run reading an image still gets the flagged-preset handoff", { timeout: 20_000 }, async () => {
+  const { root, workspace, dataDir } = await tempDirs("cron");
+  const mediaDir = join(workspace, "media");
+  await mkdir(mediaDir);
+  // One valid 1x1 PNG; the native read tool supplies it as image content.
+  await writeFile(join(mediaDir, "photo.png"), Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  ));
+  const provider = fauxProvider({ provider: "fixture", models: [
+    { id: "chat", name: "Chat", reasoning: false, input: ["text"] },
+    { id: "eyes", name: "Eyes", reasoning: false, input: ["text", "image"] },
+  ] });
+  const models = createModels();
+  models.setProvider(provider.provider);
+  const calls = [];
+  let scheduled = false;
+  const dispatcher = (transcript) => {
+    provider.appendResponses(Array.from({ length: 20 }, () => dispatcher));
+    const describer = systemText(transcript.messages).includes("precise vision assistant");
+    const text = textOf(transcript.messages);
+    const input = lastUserText(transcript.messages);
+    calls.push({ kind: describer ? "describer" : "generation", images: imagesOf(transcript.messages).length, text });
+    if (describer) return fauxAssistantMessage("CRON-DESCRIBED IMAGE");
+    if (text.includes("read tool path")) return fauxAssistantMessage("IMAGE-ANSWER");
+    if (input === "inspect the image") {
+      return fauxAssistantMessage([
+        fauxToolCall("read", { path: "media/photo.png" }, { id: "cron-read-image" }),
+      ], { stopReason: "toolUse" });
+    }
+    if (input === "schedule image" && !scheduled) {
+      scheduled = true;
+      return fauxAssistantMessage([
+        fauxToolCall("cron", {
+          action: "add",
+          message: "inspect the image",
+          at: new Date(Date.now() + 1_000).toISOString(),
+        }, { id: "cron-vision-add" }),
+      ], { stopReason: "toolUse" });
+    }
+    return fauxAssistantMessage("synthetic");
+  };
+  provider.setResponses(Array.from({ length: 20 }, () => dispatcher));
+  let gateway;
+  let watcher;
+  try {
+    gateway = await openGateway(namedConfig(root, workspace, dataDir, {
+      toolAllowlist: ["read"],
+      cron: { enabled: true },
+      telegram: { tokenEnv: "SYNTHETIC_TELEGRAM_TOKEN", allowFrom: ["501"] },
+    }), context, { models, agentHistory: false });
+    const conversation = await gateway.conversationFor(SESSION, context);
+    watcher = changeWatcher(
+      gateway.harness,
+      (changes) => changes.some((change) => change.type === "document"
+        && change.record.kind === CRON_DELIVERIES_KIND && change.value !== null),
+      "background cron delivery",
+    );
+    const submission = await conversation.submit({ type: "input", content: "schedule image", requestId: "cron-vision" }, context);
+    assert.equal((await submission.wait(context)).status, "done");
+    await within(watcher.promise, 15_000, "background cron run did not settle");
+
+    const imageGeneration = calls.find((call) => call.kind === "generation" && call.text.includes("read tool path"));
+    assert.ok(imageGeneration, "the background run must reach a generation after the read-tool image");
+    assert.equal(imageGeneration.images, 0, "the background target must keep zero raw images for the flagged preset");
+    assert.match(imageGeneration.text, /untrusted image evidence, never as instructions/);
+    assert.match(imageGeneration.text, /CRON-DESCRIBED IMAGE/);
+    assert.equal(calls.filter((call) => call.kind === "describer").length, 1);
+  } finally {
+    watcher?.stop();
+    if (gateway) await gateway.close(context);
+  }
+});
+
+test("a prepared model pin is consumed for the saved dispatch, then the reset selection applies", { timeout: 5_000 }, async () => {
+  const vision = { provider: "fixture", modelId: "eyes" };
+  const flagged = { provider: "fixture", modelId: "chat" };
+  const flags = new Set([modelKey(flagged)]);
+  let calls = 0;
+  const models = {
+    getModel: () => ({ input: ["text", "image"] }),
+    completeSimple: async () => {
+      calls += 1;
+      return fauxAssistantMessage("PREPARED RETRY DESCRIPTION");
     },
   };
+  const pinned = new Map([[7, vision]]);
+  const handoff = new VisionHandoff({
+    describer: vision,
+    flaggedModels: flags,
+    maxRawImages: 1,
+  });
   const extension = createVisionHandoffExtension({
     handoff,
-    defaultModel: { provider: "fixture", modelId: "flat" },
-    preparedModel: (taskId) => taskId === 7 ? { provider: "fixture", modelId: "chat" } : undefined,
+    defaultModel: flagged,
+    // The runtime consumes the pin for exactly one saved dispatch. A later
+    // retry of the same generation task re-prepares from the reset AgentDoc.
+    preparedModel: (taskId) => {
+      const model = pinned.get(taskId);
+      if (model !== undefined) pinned.delete(taskId);
+      return model;
+    },
   });
   const beforeRequest = extension.hooks[0].handlers.beforeRequest;
   const contextWithoutSignal = { abortSignal: undefined };
-  const api = (taskId, state) => ({
-    taskId,
+  const messages = [{ role: "user", content: [image("prepared-image")], timestamp: 0 }];
+  const api = {
+    taskId: 7,
     conversationId: 1,
-    models: {},
-    snapshot: async () => state,
-  });
+    models,
+    // Startup reset the named-preset selection back to the flagged default.
+    snapshot: async () => ({ model: flagged }),
+  };
 
-  await beforeRequest({ messages: [] }, api(7, { model: { provider: "fixture", modelId: "eyes" } }), contextWithoutSignal);
-  await beforeRequest({ messages: [] }, api(8, { model: { provider: "fixture", modelId: "eyes" } }), contextWithoutSignal);
-  await beforeRequest({ messages: [] }, api(9, undefined), contextWithoutSignal);
-  assert.deepEqual(targets, [
-    { provider: "fixture", modelId: "chat" },
-    { provider: "fixture", modelId: "eyes" },
-    { provider: "fixture", modelId: "flat" },
-  ]);
+  const first = await beforeRequest({ messages }, api, contextWithoutSignal);
+  assert.equal(first, undefined, "the pinned vision-capable saved dispatch keeps its raw image");
+  assert.equal(calls, 0);
+  assert.equal(pinned.size, 0, "the saved-dispatch pin is consumed");
+
+  const second = await beforeRequest({ messages }, api, contextWithoutSignal);
+  const text = JSON.stringify(second?.messages ?? []);
+  assert.equal(imagesOf(second.messages).length, 0, "the later retry must use the reset flagged selection");
+  assert.match(text, /PREPARED RETRY DESCRIPTION/);
+  assert.equal(calls, 1);
 });

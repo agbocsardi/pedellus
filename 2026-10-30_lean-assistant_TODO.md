@@ -186,8 +186,30 @@ counts and output are bounded; auxiliary describer calls are disclosed. Work is
 committed on branch `t3/a5ce93e2`; parent integration records the final hash.
 Only faux-model/temp-store checks were run. No live provider, bot, network,
 credentials, personal settings, dependency install, model download or deployment
-was used. The gateway/CLI `5712c98` independent review is still in progress and
-is not marked finished by this slice.
+was used. Parent reported the gateway/CLI work independently reviewed and landed
+in main as `7b9b8a9`; this vision branch still bases on `d9e0a3b` because the
+runtime Telegram source is unchanged, and integration happens later, after a
+clean vision review.
+
+Independent review did **not** pass the first vision commit `86cd25e`. It found
+four material gaps: the cron background-run prepare path dropped the vision
+extension; single-flight inherited the first caller's abort signal, so one
+cancelled conversation could reject another live transform and, because Durable
+reports a thrown generation hook and then sends the original request, leak raw
+images to a flagged model; the startup prepared-model pin was never consumed, so
+a later retry of the same generation task could apply a stale image policy; and
+the docs claimed more coverage than the code and misdescribed the compaction
+limitation. The retained original implementer fixed these in the same worktree:
+the cron path selects the non-authoritative vision extension, the describer call
+is service-owned with per-waiter cancellation, non-cancellation hook failures
+fail closed for flagged/unresolved targets, the prepared pin is consumed on use,
+and the docs now state the real text-only compaction and summary-context loss.
+Focused faux regressions cover a real background cron read-tool image round, two
+concurrent transforms with one cancellation, hook fail-closed behavior, and
+prepared-pin consumption. A fresh independent reviewer must review these fixes;
+the failed reviewer is not resumed and nothing is integrated until that review
+is clean. Owner permits 2–3 parallel implementers; independent reviews are
+separate and do not consume an implementer slot.
 
 ### 2026-10-30 — channel surfaces and Telegram interactions
 

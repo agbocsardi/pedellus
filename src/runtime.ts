@@ -564,7 +564,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
     visionExtension = createVisionHandoffExtension({
       handoff: visionHandoff,
       defaultModel: defaultChoice.native,
-      preparedModel: (taskId) => preparedGenerationModels.get(Number(taskId)),
+      preparedModel: (taskId) => {
+        // Consume the pin for exactly the saved dispatch that startup found. A later retry
+        // re-prepares from the reset AgentDoc model, so a stale task-lifetime pin would apply
+        // the old image policy to a different model.
+        const key = Number(taskId);
+        const model = preparedGenerationModels.get(key);
+        if (model !== undefined) preparedGenerationModels.delete(key);
+        return model;
+      },
     });
   }
   // A configured summary override must be allowed. `preset` resolves through the named catalog and
@@ -821,6 +829,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
             ...(skillsInstalled && skillToolRegistration !== undefined ? [skillToolRegistration] : []),
           ];
           const extensions: Extension[] = [];
+          // The vision hook carries no tool authority. A scheduled background run is a fresh
+          // conversation with only captured tools, so it needs this non-authoritative extension
+          // explicitly; otherwise a read-tool image would bypass the flagged-preset handoff.
+          if (visionExtension !== undefined) extensions.push(visionExtension);
           if (toolExtension !== undefined) extensions.push(toolExtension);
           if (contextConversations.has(targetConversationId) && contextExtension !== undefined) {
             extensions.push(contextExtension);
@@ -1427,12 +1439,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (preparedModel !== undefined && !choicesByNative.has(modelKey(preparedModel))) {
             throw new Error(`Cannot resume ${task.kind} task ${task.id}: prepared model ${modelKey(preparedModel)} is outside allowedModels`);
           }
-          if (preparedModel !== undefined && task.kind === "pi.generation") {
-            // The checkpoint model, not the configured preset the startup policy pass will
-            // restore, decides whether this prepared request keeps any raw images.
+          const contextReplay = preparedContextReplay(task);
+          if (visionHandoff !== undefined && preparedModel !== undefined
+            && contextReplay?.kind === "pi.generation" && contextReplay.phase === "request") {
+            // Only a saved request still owes its model-bound dispatch. A poll resumes an
+            // already-sent request without beforeRequest, and a later retry re-prepares from
+            // the reset AgentDoc, so pinning those would apply a stale image policy.
             preparedGenerationModels.set(Number(task.id), preparedModel);
           }
-          const contextReplay = preparedContextReplay(task);
           if (contextReplay !== undefined) preparedContextReplays.push(contextReplay);
         }
         taskCursor = page.next;
