@@ -481,3 +481,23 @@ one user/assistant turn, no pending output, no enabled tools, and only faux mode
 usage. This proves the real Telegram/Durable streaming path, not production
 readiness, execution confinement, or real-provider compatibility. No credentials
 or private transcript contents were added to the repository.
+
+## Synthetic real-model pilot — 2026-10-30
+
+After fixing the grammY/native-fetch signal mismatch, a first five-minute window
+expired unused. A later owner-approved window used a disposable workspace/store,
+one allowlisted user and the real DeepSeek Flash model. Telegram accepted 11
+typing actions, five new messages (including a control acknowledgement) and one
+edit. The owner reported that the replies worked well.
+
+Paused, no-dispatch inspection of the closed store confirmed a skill load, topic
+memory write, one reset, successful history search/open calls and a cron list.
+The pilot stopped at its four-prompt guard when a fifth message arrived, before
+that last request was admitted—not at the time limit. No cron job was created,
+so reminder scheduling/delivery is **not** a live pass.
+
+The run used 11 model requests, reserved 201,609 conservative input-token
+equivalents and 16,896 output tokens, with no budget violation. It closed with
+no pending replies. No webhook change, pending-update clearing, real workspace,
+deployment or security audit was performed. A separately approved reminder-only
+follow-up remains; the current bot process is stopped.
