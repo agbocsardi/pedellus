@@ -18,7 +18,48 @@
 - [x] Owner accepts the pilot as sufficient. Defer the reminder-only follow-up; live reminder scheduling/delivery remains unverified, not a blocker for the next discussion.
 - [x] Clean up this batch's resources after owner confirms integration.
 
-## Current status and next priorities
+## Approved overnight batch — memory digestion and local usability
+
+Owner approved this six-slice batch after the completed channel-neutral build:
+
+- [ ] O1 — Closed-episode input and durable digestion cursor. Authenticated
+  mapped CLI/Telegram chats only; bounded oldest-first backfill of existing
+  reset-closed episodes. Exclude open episodes and raw/root/fork/state/task-owned,
+  worker and cron transcripts. Source-label evidence; successful validated
+  processing (including no-op) advances the frontier, failures never do.
+- [ ] O2 — Bounded memory digestion using O1: agent-editable workspace prompt,
+  ordinary Markdown/skill writes, provenance, concurrent-edit protection and
+  inspectable recovery. No hashes/version registry, second archive or agent loop.
+- [ ] O3 — Manual invocation plus opt-in ordinary cron integration over O2;
+  completion/failure visibility and explicit prompt freshness. Ship inactive:
+  create/enable no schedule or personal runtime configuration.
+- [ ] O4 — Research local Node/TypeScript-compatible speech alternatives before
+  choosing readiness work. Compare actual native/Python/audio-decoder/model
+  requirements, CPU/Linux support, packaging, licensing and maintenance. Public
+  documentation research is authorized, installs/downloads/provisioning are not.
+  Do not silently replace faster-whisper or claim empirical quality equivalence.
+- [ ] O5 — Explicit CLI local photo/document attachment submission through the
+  single gateway/shared media pipeline. Preserve media opt-in, native image plus
+  locator/vision handoff, document originals without extraction, bounded ingress
+  and existing terminal controls. No separate runtime owner or model path grant.
+- [ ] O6 — Independent combined review, bounded offline acceptance and honest
+  setup/plan handoff; reconcile registrations and integration without dropping
+  accepted behavior. No live acceptance or deployment.
+
+Execution: O1 and O5 start alongside O4 research; O2 follows accepted O1 and O3
+follows accepted O2. O6 closes the union. Use Pi provider,
+`opencode-go/deepseek-v4.1-flash`, thinking high, fresh worktrees; 2–3 active
+implementers with separate independent reviewers. Retain original implementers
+through fixes, review every candidate independently before integration, publish
+passing work using the previous clean-main fast-forward loop. Preserve branches
+and worktrees. Parent owns plan/orchestration, not functional implementation.
+
+Offline restrictions continue: no installs, model downloads, credential/settings
+access, personal workspace, live bot/provider requests or deployment. Only O4's
+public documentation research may use the web. Existing pinned dependencies and
+synthetic providers/fixtures only; report blockers instead of widening authority.
+
+## Previous batch status and next priorities
 
 The owner accepted the pilot and then directed a channel-neutral assistant build.
 Today's batch is complete on main `b0b16a6`. The gateway is the single
@@ -162,7 +203,8 @@ unchecked items are deliberate gaps, not forgotten work.
     with no approved registration.
 - [ ] After background workers are accepted, add opt-in periodic digestion of
   previously unprocessed conversations/episodes into long-term memory, following
-  the deferred scope below. Do not implement or activate curation yet.
+  the scope below. Implementation is now approved as O1–O3 above; activation
+  in the owner's runtime remains unapproved.
 
 Approved first implementation batch: channel-neutral gateway/local CLI attachment
 and Telegram menu/reply/quote/reaction support. These are two independently owned
@@ -190,7 +232,7 @@ provider variants and richer UI follow actual use, not feature-for-feature parit
 This is a discussion order, not authorization to deploy, read personal settings,
 spend on another run or start all feature branches.
 
-## Deferred: conversation digestion into memory
+## Conversation digestion scope — approved inactive implementation
 
 Owner clarified that curation primarily digests previously unprocessed
 conversations/episodes, not housekeeping over existing Markdown. Use the Python
@@ -308,6 +350,15 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Overnight batch authorization
+
+Owner approved the six slices above, closed mapped-chat episodes with bounded
+existing-history backfill, inactive opt-in curation and offline checks. Requested
+public research into avoiding Python/uv for local voice before selecting a
+replacement. Reconfirmed the same Pi/DeepSeek Flash high worktree/independent
+review/original-worker fix/integration loop. O1, O5 and O4 research launched;
+no live operations, installs or model downloads authorized.
 
 ### 2026-10-30 — channel-neutral batch integrated
 
