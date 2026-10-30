@@ -76,7 +76,7 @@ Two pieces make progressive loading real instead of config preselection:
 
    The returned body states how to resolve relative paths: a workspace skill
    resolves them against `skills/<name>/` and its bundled files can be read with
-   the ordinary granted `read` tool; a builtin skill's other files are outside
+   the configured `read` tool; a builtin skill's other files are outside
    the workspace and are not readable with workspace tools. Honoring the Agent
    Skills `disable-model-invocation: true` flag hides that skill from both the
    summary and the tool table (there is no `/skill:name` command path here, so
@@ -86,10 +86,9 @@ The tool is context delivery, not execution or privilege:
 
 - It reads only the captured snapshot; it never touches the filesystem, so the
   builtin root is not exposed as a readable path and no path argument is accepted.
-- It is not part of `toolAllowlist`, is not grantable or revocable, and is not
-  affected by grant expiry. It grants nothing and runs nothing; effectful work
-  still needs an explicit `read`/`write`/`edit`/`bash` grant. The coding tool's
-  grant hook explicitly exempts this one non-effectful tool name.
+- It is not part of `toolAllowlist` and adds no execution authority. Effectful
+  work still needs `read`/`write`/`edit`/`bash` enabled in configuration. The coding
+  tool hook exempts this non-effectful tool name.
 - It is selected only for conversations whose snapshot carried skills and only
   when `workspaceContext.skills` is configured. Disabled and
   requirement-unavailable skills can be listed but loading one is refused with a
@@ -120,11 +119,10 @@ control:
 - A provider or loader failure rejects the refresh and leaves the working
   snapshot and tool table in place. A successful refresh returns the number of
   discovered skills; `0` removes the conversation's skill table and tool.
-- It adds no authority: no tool grant is created or widened, the host ceiling,
-  workspace roots and shell environment are unchanged, and the normal policy
-  pass only prunes already-expired grants. Durable transcript and resume
-  behavior are unchanged; the refreshed snapshot is host state, not persisted
-  conversation state.
+- It adds no authority: the configured tools, workspace roots and shell
+  environment are unchanged, and the normal policy pass reapplies the configured
+  tool filter. Durable transcript and resume behavior are unchanged; the
+  refreshed snapshot is host state, not persisted conversation state.
 - A scheduled background-run conversation has no session key and is not
   refreshable; it keeps its snapshot until the next run or Gateway reopen.
 

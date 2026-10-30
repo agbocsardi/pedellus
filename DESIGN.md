@@ -125,8 +125,8 @@ Unknown users are ignored before creating sessions or sending input. See
 - Shell must not inherit bot/provider tokens or host auth sockets. Do not mount
   dataDir in the shell. Runtime rejects dataDir under the workspace or an extra
   allowed root.
-- No web/search/MCP HTTP tools are ported, so there is no model-controlled HTTP
-  surface. The guarded shell and Bubblewrap backend both retain host network
+- No web/search/MCP HTTP tools are ported, so there is no dedicated model-controlled
+  HTTP tool surface. The guarded shell and Bubblewrap backend both retain host network
   access; neither is a network boundary. Fixed Telegram API and configured model
   providers are host integrations, not arbitrary model-controlled fetchers.
   Future HTTP tools require the SSRF gate.

@@ -34,7 +34,7 @@ export type WorkspaceContextHostConfig = Pick<PortConfig, "workspace" | "workspa
  * rejected.
  *
  * Skills are discovery and prompt inclusion only: this host never runs a skill
- * as code. A selected skill body reaches the model, and the already-granted
+ * as code. A selected skill body reaches the model, and the configured
  * `read`/`bash` tools decide what can actually be done.
  */
 export function workspaceContextGatewayOptions(

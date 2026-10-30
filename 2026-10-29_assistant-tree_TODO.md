@@ -2,7 +2,7 @@
 
 ## Checklist
 
-- [ ] Complete the owner-authorized [removal-first simplification](2026-10-30_simplification_TODO.md) before continuing trunk acceptance.
+- [x] Complete the owner-authorized [removal-first simplification](2026-10-30_simplification_TODO.md) before continuing trunk acceptance.
 - [x] Agree the tree: CLI + Telegram trunk; tools, delegation, then more channels.
 - [x] T1 — Make the existing assistant straightforward to configure and use (offline verified).
   - [x] Preserve config-tool and preset behavior in focused, reviewed permanent tests.
@@ -151,6 +151,18 @@ alone does not put it back in scope.
   owner approval before execution. This planning update does not authorize them.
 
 ## Session log
+
+### 2026-10-30
+
+Completed owner-authorized removal-first simplification with four independently
+reviewed slices: migration/archival tooling parked, managed-copy execution deleted,
+config-only tool authority (no grant/revoke/expiry pipeline), and a reduced root
+API with shared model identity/types. Current memory/skills/cron/tool docs match
+the retained behavior. Clean combined offline checks pass: 71 behavior, 2 host
+execution, 83 core acceptance and 48 faux-provider real-flow rehearsal checks.
+Source reduced by about 36%; removed-product checks are gone, not skipped. No
+security audit, live channel/provider call, real migration or deployment. Trunk
+acceptance scope is unchanged; child cleanup awaits owner confirmation.
 
 ### 2026-10-29
 

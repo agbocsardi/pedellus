@@ -3,7 +3,7 @@ import type { Context, Draft } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
-import { AgentDoc, AssistantEntry, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type ModelRef, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
+import { AgentDoc, AssistantEntry, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ContextExtensionReplacement, type ConversationContextSnapshot } from "./context/index.js";
 import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./context/skill-tool.js";
 import { CRON_RUN_TASK_NAME, createCronFoundation } from "./automation/cron.js";
@@ -72,7 +72,7 @@ import {
   type HistoryChatSession,
 } from "./history/scope.js";
 import { ensureStoreIdentity, type StoreIdentity } from "./history/store-identity.js";
-import { parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
+import { modelKey, parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
 import { prepareDataDirectory } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
@@ -354,10 +354,6 @@ function bindContextSnapshot(
   }
   snapshot.conversationId = conversationId;
   return snapshot as unknown as ConversationContextSnapshot;
-}
-
-function modelKey(model: ModelReference | ModelRef): string {
-  return JSON.stringify([model.provider, model.modelId]);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

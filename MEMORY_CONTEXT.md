@@ -197,18 +197,18 @@ When it is `true`:
   file is not falsely marked `loaded`; if it remains discoverable it is shown as
   a zero-body topic;
 - the snapshot provider is re-run on every gateway open, so a topic write made
-  through the granted native tools is present after reopen;
+  through the configured native tools is present after reopen;
 - a loaded-file error rejects conversation setup instead of installing false
   content. Broken discovered topics, shortened manifests, and stopped scans are
   not errors; each has a visible manifest line.
 
-The gateway `read`/`edit`/`write` grants are unchanged and still come from the
-Durable tool-grant document, so restart keeps both the grants and the
-file-backed memory. Compaction and per-conversation snapshot capture are also
-unchanged: the snapshot is host context, not transcript state.
+The gateway's `read`/`edit`/`write` tools come from `toolAllowlist`; reopening
+reapplies the current configuration while memory remains in workspace files.
+Compaction and per-conversation snapshot capture are unchanged: the snapshot
+is host context, not transcript state.
 
-Synthetic probes exercised a fresh gateway read, a native topic write,
-close/reopen, grant persistence, manifest reload, oversized/invalid-UTF-8/
+Earlier synthetic probes exercised a fresh gateway read, a native topic write,
+close/reopen, manifest reload, oversized/invalid-UTF-8/
 unreadable discovered topics across reopen, loud loaded-file failures, empty
 configured files, protected injected names (`HISTORY.md`,
 `memory/system/MEMORY.md`), 200 topics, 80 maximum-size files, a >4,096-entry
