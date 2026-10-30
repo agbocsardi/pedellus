@@ -25,9 +25,13 @@ npm start -- agent --config config.json     # attach a terminal
 
 - `src/runtime.ts` — `openGateway`: storage, config-scoped tool policy,
   context, cron and the conversation-facing host API.
-- `src/cli.ts` — local terminal client, model selection, recovery command.
+- `src/cli.ts` — launch surface: `gateway` owns the single runtime, storage,
+  tools and channels; `agent` (or legacy bare `--config`) attaches a terminal to
+  it and never opens a second runtime; also the stopped-store recovery command.
   The agent loop itself is Durable's; this repository is the nanobot-specific
   layer around it (context, tools, execution, automation, channels, providers).
+- `src/local/` — private Unix-socket protocol, gateway server and CLI client that
+  carry the bounded terminal conversation surface; no public listener.
 - `src/index.ts` — small host entry surface (config, gateway, workspace host,
   opt-in context/Code Mode, recovery, CLI main); import subsystems directly.
 - `src/automation/` — cron timer/run tasks and the model-facing `cron` tool.

@@ -43,8 +43,10 @@ not permission to start every branch or run live integrations):
   `edit`; make snapshot/manifest freshness explicit using the existing refresh
   path. Python-named `memory_read`/`memory_write`/`memory_search` are not present;
   add a dedicated operation only when it does more than wrap existing tools.
-- [ ] Single-owner gateway host plus independently attachable local CLI, preserving
+- [x] Single-owner gateway host plus independently attachable local CLI, preserving
   existing terminal commands, Durable controls, tool authority and recovery.
+  Independently reviewed (`5712c98`, material F1 fixed in `ca662bb`); integration
+  metadata only, no further source change.
 - [x] Native Telegram command menu/autocomplete for commands actually implemented;
   reuse `setMyCommands`, with no speculative command router or dead menu entries.
 - [x] Telegram incoming replies/quotes with bounded, labeled source context;
@@ -154,8 +156,9 @@ reaction-delivery uncertainty. Focused collision/unknown-retention checks added;
 Integrated as `30d34f1` + `59c15d7`; manifest and authority docs updated by parent.
 No broad optional test matrix or settled-text compaction added: bounded records
 remain inspectable and the targeted changes cover the material findings. No live
-bot/provider run. Gateway worker completed `5712c98`; independent review is in
-progress before integration.
+bot/provider run. Gateway worker completed `5712c98`; independent review found
+one material CLI input-loss defect (F1), fixed in `ca662bb`, and the reviewed
+slice is integrated (see the integration note below).
 
 ### 2026-10-30
 
@@ -194,3 +197,20 @@ The resumed pilot preserved a queued message from the allowlisted owner sent dur
 Recorded the narrow result in TELEGRAM.md. After owner confirmed the working interactions, cleaned the completed transport/typing workers and reviewers (4 agents, 2 clean worktrees and their patch-equivalent integrated branches). Other older unrelated resources remain untouched. A short separately approved reminder-only check was the remaining Telegram pilot item; do not repeat the whole sequence or silently renew the consumed budget.
 
 Owner subsequently accepted this as good enough and explicitly asked to update the plan and discuss what comes next. The pilot batch is now complete by owner decision. Reminder-only live verification is deferred, not marked passed. No more testing, provider spend or implementation was started. The initial recommendation was ordinary-use setup, then reach features. Owner's subsequent annotations corrected the next priorities: gateway is channel-neutral (CLI plus Telegram, future Discord/Email), native Telegram command-menu niceties, MCP through product Code Mode, and high-priority photos/documents/voice. Memory already supports on-the-fly Markdown changes via configured read/write/edit, but not the Python-named memory tools or automatic snapshot refresh after each write. Current Code Mode is an opt-in SDK bundle only; no MCP client/config or shipped gateway installation exists. Python's voice flow is channel download -> shared transcription config/service -> provider -> labeled transcript in the normal user turn. Plan the equivalent shared ingress with one initial backend, rather than copying its provider registry. Dream was parked as a special subsystem, not rejected as a behavior: ordinary cron plus bounded background workers and memory tools should provide its essence. No implementation/live calls launched for these annotations.
+
+Gateway integration: combined the independently reviewed gateway/CLI slice
+(`5712c98` + `ca662bb`) with the approved Telegram interactions (`30d34f1` +
+`59c15d7` + `d9e0a3b`) on one branch. The only integration changes are metadata and
+docs: register the six new gateway/terminal checks in `test:behavior`, record the
+single-owner launch in `AGENTS.md`, and update plan status. No reviewed functional
+source was changed. Offline combined checks pass: typecheck/build, 97 registered
+behavior checks (91 existing plus 6 gateway), 2 execution and 83 offline core
+acceptance. No live provider, Telegram or deployment run; immediate-input, external
+turn rendering and disconnect behavior are proven only offline.
+
+Owner concurrency correction for following batches: run 2–3 IMPLEMENTERS, not 2–3
+children total. Reviewers do not count against that implementer bound, and original
+implementers are retained through review and fix rounds rather than replaced.
+Parent orchestrates only. Independent media/vision reviews are still ongoing, and
+native MCP plus product Code Mode wiring is forthcoming; neither is complete or
+accepted here.
