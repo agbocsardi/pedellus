@@ -410,6 +410,85 @@ test('a target observed in another chat cannot be replied to from this chat', { 
   }
 });
 
+test('reused provider call ids remain distinct and stored action results stay request-bound', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('action-identities', { allowFrom: ['501', '999'] });
+  let harness;
+  store.faux.setResponses(Array.from({ length: 12 }, () => (request) => {
+    const secondChat = JSON.stringify(request.messages).includes('second identity chat');
+    if (!request.messages.some((message) => message.role === 'toolResult')) {
+      return fauxAssistantMessage([
+        fauxToolCall('telegram', {
+          action: 'reply', messageId: secondChat ? 200 : 100,
+          text: secondChat ? 'SECOND-NATIVE' : 'FIRST-NATIVE',
+        }, { id: 'call_0' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage(secondChat ? 'SECOND-DONE' : 'FIRST-DONE');
+  }));
+  const transport = telegramMock([[
+    messageUpdate(625, 100, 'first identity chat'),
+    messageUpdate(626, 200, 'second identity chat', 999),
+  ]]);
+  try {
+    harness = start(store, transport, ['501', '999']);
+    await until(() => transport.sent.some((entry) => entry.text === 'FIRST-DONE') &&
+      transport.sent.some((entry) => entry.text === 'SECOND-DONE'), 'both identity turns');
+    assert.equal(transport.sent.filter((entry) => entry.text === 'FIRST-NATIVE').length, 1);
+    assert.equal(transport.sent.filter((entry) => entry.text === 'SECOND-NATIVE').length, 1);
+    const doc = await stateDoc(store.gateway);
+    assert.equal(doc.actions.length, 2);
+    assert.equal(new Set(doc.actions.map((entry) => entry.callId)).size, 2,
+      'provider call_0 is not the durable action identity');
+
+    const host = store.gateway.telegramActions.current();
+    const firstSession = `telegram:${BOT_ID}:chat:${CHAT_ID}`;
+    const secondSession = `telegram:${BOT_ID}:chat:999`;
+    const request = { kind: 'reply', messageId: 100, text: 'BOUND-REPLY' };
+    const applied = await host.act(firstSession, 'synthetic-collision', request, context);
+    assert.equal(applied.ok, true);
+    const repeated = await host.act(firstSession, 'synthetic-collision', request, context);
+    assert.equal(repeated.ok, true);
+    const otherChat = await host.act(secondSession, 'synthetic-collision', {
+      kind: 'reply', messageId: 200, text: 'OTHER-CHAT',
+    }, context);
+    const changedPayload = await host.act(firstSession, 'synthetic-collision', {
+      ...request, text: 'CHANGED-PAYLOAD',
+    }, context);
+    const changedKind = await host.act(firstSession, 'synthetic-collision', {
+      kind: 'react', messageId: 100, emoji: '👍',
+    }, context);
+    for (const denied of [otherChat, changedPayload, changedKind]) {
+      assert.equal(denied.ok, false);
+      assert.match(denied.text, /different request/);
+      assert.equal(denied.messageIds, undefined, 'a mismatched request cannot read the old result');
+      assert.ok(!applied.messageIds.some((id) => denied.text.includes(String(id))));
+    }
+    assert.equal(transport.sent.filter((entry) => entry.text === 'BOUND-REPLY').length, 1);
+    assert.equal(transport.reactions.length, 0);
+  } finally {
+    await cleanup(store, harness);
+  }
+});
+
+test('unknown action evidence survives pruning and a full unknown log refuses new effects', async () => {
+  const { admitAction, settleActionRecord, TELEGRAM_ACTION_LIMITS } =
+    await import(new URL('../dist/channels/telegram-interactions.js', import.meta.url).href);
+  const actions = [];
+  const record = (callId) => ({
+    callId, kind: 'reply', chatId: CHAT_ID, targetMessageId: 100,
+    text: 'unresolved evidence', status: 'intent', nextChunkIndex: 0, startedAtMs: 1,
+  });
+  for (let index = 0; index < TELEGRAM_ACTION_LIMITS.total; index++) {
+    const id = `unknown-${index}`;
+    assert.equal(admitAction(actions, record(id)), 'admitted');
+    settleActionRecord(actions, id, 'unknown');
+  }
+  assert.equal(actions.length, TELEGRAM_ACTION_LIMITS.total);
+  assert.equal(admitAction(actions, record('would-evict')), 'full');
+  assert.equal(actions.length, TELEGRAM_ACTION_LIMITS.total);
+  assert.ok(actions.some((entry) => entry.callId === 'unknown-0'), 'old unknown evidence is retained');
+});
+
 test('authenticated reaction changes become ordinary turns once and ignore other senders, groups and unobserved targets', { timeout: 25_000 }, async () => {
   const store = await syntheticStore('reactions');
   const requests = [];
@@ -524,7 +603,7 @@ test('an ambiguous action send is quarantined and never resent, including across
     assert.match(result.text, /may or may not have been applied/);
 
     const doc = await stateDoc(store.gateway);
-    assert.equal(doc.actions.find((entry) => entry.callId === 'unknown-1').status, 'unknown');
+    assert.equal(doc.actions.find((entry) => entry.text === 'UNKNOWN-REPLY').status, 'unknown');
     assert.equal(doc.actions.find((entry) => entry.callId === 'seeded-sending').status, 'unknown');
 
     // Reopen with the same update: the durable offset prevents a second turn and no action is resent.

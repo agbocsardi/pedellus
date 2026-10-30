@@ -29,7 +29,7 @@ export const TELEGRAM_TARGET_LIMITS = Object.freeze({
 export const TELEGRAM_ACTION_LIMITS = Object.freeze({
   /** Total action records retained; terminal records are evicted first. */
   total: 100,
-  /** Settled (sent/unknown/failed/denied) action records kept for inspection and dedupe. */
+  /** Known settled (sent/failed/denied) records kept; unknown outcomes are never evicted. */
   settled: 60,
   /** Maximum text one native reply action may send. */
   textChars: 8_192,
@@ -55,7 +55,7 @@ export type TelegramActionKind = "reply" | "react";
 export type TelegramActionStatus = "intent" | "sending" | "sent" | "unknown" | "failed" | "denied";
 
 export type TelegramActionRecord = {
-  /** Durable tool call id; a replay of the same call resolves to this record instead of resending. */
+  /** Durable tool-task identity; resolves to this record while retained instead of resending. */
   readonly callId: string;
   readonly kind: TelegramActionKind;
   readonly chatId: number;
@@ -80,7 +80,7 @@ export type TelegramReactionLike = {
 };
 
 const TERMINAL_ACTION: ReadonlySet<TelegramActionStatus> = new Set([
-  "sent", "unknown", "failed", "denied",
+  "sent", "failed", "denied",
 ]);
 const ACTION_STATUSES: ReadonlySet<string> = new Set([
   "intent", "sending", "sent", "unknown", "failed", "denied",

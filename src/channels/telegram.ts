@@ -459,6 +459,19 @@ export async function runTelegram(
     return { ok: false, text: "This Telegram action was interrupted before sending and will not be retried automatically." };
   };
 
+  const priorActionOutcome = (
+    record: TelegramActionRecord,
+    chatId: number,
+    request: TelegramActionRequest,
+  ): TelegramActionOutcome => {
+    if (record.chatId !== chatId || record.targetMessageId !== request.messageId ||
+        record.kind !== request.kind || (request.kind === "reply"
+          ? record.text !== request.text : record.emoji !== request.emoji)) {
+      return { ok: false, text: "This action identity belongs to a different request; no action was taken." };
+    }
+    return actionOutcome(record);
+  };
+
   /**
    * Perform one already-admitted action. A `sending` record precedes the API call; a success records
    * the returned ids, a known rejection fails closed, and any other outcome is quarantined as
@@ -564,7 +577,7 @@ export async function runTelegram(
         };
       }
       const existing = actionFor(state.actions, callId);
-      if (existing !== undefined) return actionOutcome(existing);
+      if (existing !== undefined) return priorActionOutcome(existing, chatId, request);
 
       const record: TelegramActionRecord = {
         callId,
@@ -587,7 +600,7 @@ export async function runTelegram(
         const duplicate = actionFor(state.actions, callId);
         return duplicate === undefined
           ? { ok: false, text: "This Telegram action is already recorded and will not be resent." }
-          : actionOutcome(duplicate);
+          : priorActionOutcome(duplicate, chatId, request);
       }
       // Preflight recheck after the durable intent: never send if the adapter stopped, the admission
       // evidence changed, or the target was evicted between validation and the effect.

@@ -104,7 +104,8 @@ export function createTelegramTool(options: TelegramToolOptions): { readonly ext
       "Interact with the authenticated Telegram private chat this conversation belongs to. Ordinary answers " +
       "are already delivered automatically and unthreaded; use this tool only when a native reply or a " +
       "reaction is clearly useful. action=targets lists the recent observed message ids in this chat. " +
-      "action=reply sends a native reply to one observed message id. action=react sets one emoji reaction " +
+      "action=reply sends an additional short native reply, not a replacement for the ordinary answer; " +
+      "the substantive answer must still be ordinary turn text. action=react sets one standard reaction emoji " +
       "on one observed message id. Never guess an id: only ids listed by targets, named in the current " +
       "Telegram context, or returned by an earlier action are valid. This tool cannot choose another chat " +
       "and cannot forward messages.",
@@ -136,6 +137,8 @@ export function createTelegramTool(options: TelegramToolOptions): { readonly ext
         return errorResult("The Telegram adapter is not running, so no message can be sent or reacted to.");
       }
       if (context.abortSignal?.aborted) throw new Error("Operation aborted");
+      // Provider call ids may repeat across turns or chats; Durable task ids identify executions.
+      const actionId = `tool:${api.taskId}`;
 
       const action = args.action;
       if (action === "targets") {
@@ -160,7 +163,7 @@ export function createTelegramTool(options: TelegramToolOptions): { readonly ext
           if (text.length > TELEGRAM_ACTION_LIMITS.textChars) {
             return errorResult(`Native reply text is limited to ${TELEGRAM_ACTION_LIMITS.textChars} characters.`);
           }
-          const outcome = await host.act(sessionKey, api.callId, { kind: "reply", messageId, text }, context);
+          const outcome = await host.act(sessionKey, actionId, { kind: "reply", messageId, text }, context);
           return outcome.ok
             ? {
                 output: [{ type: "text" as const, text: outcome.text }],
@@ -173,7 +176,7 @@ export function createTelegramTool(options: TelegramToolOptions): { readonly ext
         if (emoji.length === 0 || emoji.length > TELEGRAM_ACTION_LIMITS.emojiChars || /\s/.test(emoji)) {
           return errorResult("emoji must be one non-empty emoji without spaces.");
         }
-        const outcome = await host.act(sessionKey, api.callId, { kind: "react", messageId, emoji }, context);
+        const outcome = await host.act(sessionKey, actionId, { kind: "react", messageId, emoji }, context);
         return outcome.ok
           ? {
               output: [{ type: "text" as const, text: outcome.text }],

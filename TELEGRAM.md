@@ -185,7 +185,8 @@ The channel-state document keeps two bounded sets:
   accepted by Telegram, with a truncated excerpt. Old targets are evicted; a
   target that is not present fails closed.
 - `actions`: write-ahead records for model-requested external effects. Each has
-  the Durable tool call id, kind, exact chat/target, reply text or emoji,
+  an identity derived from the Durable tool task id (not the provider call id),
+  kind, exact chat/target, reply text or emoji,
   status, accepted chunk cursor and returned message ids.
 
 `openGateway` creates a model-facing `telegram` tool only when `config.telegram`
@@ -215,7 +216,11 @@ execution. The adapter additionally writes `intent` before the call and
 `sending` before the API request; a known rejection becomes `failed`, a success
 records the returned ids, and any ambiguous outcome becomes `unknown`. On reopen
 every `intent`/`sending` action is quarantined as `unknown`. A repeat of the same
-call id resolves to its stored record and is never resent. Target observation is
+action identity resolves to its stored record while retained and is not resent;
+a mismatched chat, target or payload is denied without disclosing the old result.
+Interrupted tool execution remains non-replayable even after record pruning.
+Unknown outcomes are never evicted; if unresolved records fill the bounded log,
+new actions are denied rather than losing reconciliation evidence. Target observation is
 best-effort bookkeeping: a failed target commit can make an id untargetable but
 never turns an accepted send into an ambiguous delivery.
 
@@ -229,10 +234,14 @@ together and use the normal submission request id, so a replay cannot admit the
 same reaction twice and a crash before submission is recovered normally. The
 reply to a reaction turn is an ordinary unthreaded answer.
 
-Telegram limitations: reaction updates are delivered only when the bot is
-allowed to receive them (the adapter requests `message_reaction` and ignores
-other reaction updates); bots do not receive their own messages or reactions, so
-an action cannot start a second model loop. Bot API sends have no idempotency
+Telegram limitations: private-chat reaction-update delivery is unverified live.
+The installed Bot API type documentation requires administrator status for
+`message_reaction` updates, which is not a private-chat role; requesting that
+update type alone does not establish that Telegram sends it to a private bot chat.
+This adapter handles authenticated updates if received; it does not promise
+private-chat reaction-triggered turns work on the live service. Bot-generated
+reaction events are ignored, so actions cannot start a second model loop.
+Bot API sends have no idempotency
 key; an ambiguous action or delivery is quarantined for reconciliation, not
 retried.
 
