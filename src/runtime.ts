@@ -875,6 +875,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // its own checkout instead of the configured workspace. The root is per task and is never added to
   // the configured roots, so the two workspaces cannot read through each other.
   const workerWorkspaceRoots = new Map<ConversationId, string>();
+  // Live worker children compose with Code Mode over their captured tools only. They are not mapped
+  // chats: MCP, web, Telegram, cron, history and the worker tool itself stay out of their set.
+  const workerChildConversations = new Set<ConversationId>();
   const workerEnvironments = new Map<string, ToolEnvironments>();
   const environmentFor = (conversationId: ConversationId, ctx: Context) => {
     const root = workerWorkspaceRoots.get(conversationId);
@@ -948,6 +951,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (authorizedChatConversations.has(conversationId)) {
       if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
       if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
+    } else if (workerChildConversations.has(conversationId) && codeModeRef.current !== undefined) {
+      // A worker child gets the compositor, not a wider tool set: its scripts resolve only the tools
+      // the conversation already enables (its captured coding tools). MCP stays out.
+      selected.push(...codeModeRef.current.extensions);
     }
     if (options.contextSnapshotProvider && contextExtension && contextConversations.has(conversationId)) {
       selected.push(contextExtension);
@@ -1145,11 +1152,21 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const skillsInstalled = spawnerKey !== undefined && contextInstallerRef.current !== undefined
             ? await contextInstallerRef.current(spawnerKey, target, ctx)
             : false;
+          // The compositor is offered to the child, but it grants nothing: a script resolves only the
+          // captured tools enabled below. The worker tool, MCP, web, Telegram, cron and history are
+          // deliberately absent from both lists.
+          const composeTools = codeModeRef.current === undefined
+            ? []
+            : [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME].flatMap((name) => {
+                const tool = toolRegistrations.get(name);
+                return tool === undefined ? [] : [tool];
+              });
           const tools = [
             ...captured.flatMap((name) => {
               const tool = toolRegistrations.get(name);
               return tool === undefined ? [] : [tool];
             }),
+            ...composeTools,
             ...(skillsInstalled && skillToolRegistration !== undefined ? [skillToolRegistration] : []),
           ];
           const extensions: Extension[] = [];
@@ -1159,6 +1176,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (toolExtension !== undefined) extensions.push(toolExtension);
           if (contextConversations.has(target) && contextExtension !== undefined) extensions.push(contextExtension);
           if (skillsInstalled && skillTool !== undefined) extensions.push(skillTool.extension);
+          if (codeModeRef.current !== undefined) extensions.push(...codeModeRef.current.extensions);
           const workerChoice = choicesByNative.get(modelKey(input.model));
           await configure(tx, target, {
             cwd: targetWorkspace.path,
@@ -1174,9 +1192,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
         },
         finalize: async ({ tx, targetConversationId: target, settlement }) => {
           // A worker's captured authority ends in the same terminal commit that records its outcome.
+          // Code Mode selection goes with it: a terminal or cancelled child has nothing left to
+          // compose, and the retired capture denies any stale nested call at call time.
           await tx.retireDoc(ConfigToolCaptureDoc, target);
-          await configure(tx, target, { tools: [], modelTools: [] });
+          await configure(tx, target, {
+            tools: [],
+            modelTools: [],
+            extensions: visionExtension === undefined ? [] : [visionExtension],
+          });
           workerWorkspaceRoots.delete(target);
+          workerChildConversations.delete(target);
           if (settlement.status !== "ok" || settlement.answerEntryId === null) {
             return { result: null, error: settlement.error };
           }
@@ -1186,6 +1211,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           return { result: body === "" ? null : body, error: null };
         },
         trackWorkspace: (conversationId, workspaceInfo) => {
+          workerChildConversations.add(conversationId);
           if (workspaceInfo.mode === "worktree") workerWorkspaceRoots.set(conversationId, workspaceInfo.path);
           else workerWorkspaceRoots.delete(conversationId);
         },
@@ -1258,7 +1284,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // authenticated mapped chat conversation. MCP tools stay deferred: enabled for nested calls and
     // discovery, but never declared until `tool_search` loads them or a script names them.
     const authorized = authorizedChatConversations.has(conversationId);
-    const offered = authorized && codeModeRef.current !== undefined
+    const offered = (authorized || workerChildConversations.has(conversationId))
+      && codeModeRef.current !== undefined
       ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]
       : [];
     const deferred = authorized && mcpRef.current !== undefined ? [...mcpRef.current.toolNames] : [];
@@ -1409,7 +1436,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (codeModeEnabled) {
       codeModeRef.current = createCodeModeIntegration({
         namespaces: mcpRef.current?.namespaces ?? [],
-        isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
+        // A live worker child may compose its captured tools; every nested call still passes that
+        // tool's own call-time hook, so retirement or a narrowed ceiling denies stale composition.
+        isAuthorizedChat: (conversationId: ConversationId) =>
+          authorizedChatConversations.has(conversationId) || workerChildConversations.has(conversationId),
       });
       for (const extension of codeModeRef.current.extensions) {
         for (const tool of extension.tools ?? []) toolRegistrations.set(tool.name, tool);
@@ -1785,6 +1815,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
               const policy = workerChildPolicy(task);
               if (policy !== undefined && policy.targetConversationId === target.id) {
                 workerChildPolicies.set(target.id, policy);
+                // A live child keeps the compositor across a reopen; its enabled tools are restored
+                // from the capture, so a narrowed ceiling also narrows what a script can compose.
+                workerChildConversations.add(target.id);
                 if (!choicesByNative.has(modelKey(policy.model))) workerModelRemoved.add(target.id);
                 if (policy.workspace.mode === "worktree") {
                   workerWorkspaceRoots.set(target.id, policy.workspace.path);
@@ -1939,9 +1972,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
           });
           if (workerPolicy !== undefined && workerChoice === undefined) {
             // Removed model: no fallback dispatch and no captured authority. The target's own pending
-            // work was withdrawn above; the worker task commits the terminal error on resume.
+            // work was withdrawn above; the worker task commits the terminal error on resume. Code
+            // Mode selection goes too, so no stale script can compose a retired capture.
             await tx.retireDoc(ConfigToolCaptureDoc, conversation.id);
-            await configure(tx, conversation.id, { tools: [], modelTools: [] });
+            await configure(tx, conversation.id, {
+              tools: [],
+              modelTools: [],
+              extensions: visionExtension === undefined ? [] : [visionExtension],
+            });
           }
         }
         cursor = page.next;

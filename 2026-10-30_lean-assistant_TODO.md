@@ -123,8 +123,11 @@ not permission to start every branch or run live integrations):
     model-facing `worker` start/list/inspect/cancel, explicit shared-or-worktree
     workspace, captured tool ceiling, one internal result event to the spawning
     agent. Independent review passed on `74b9355` (no material findings); merged
-    with the current web/Code Mode main for combined review. Memory curation
-    stays deferred and this branch contains none of it.
+    with the current web/Code Mode main for combined review. Owner scope
+    correction (authorized): a worker child also composes its captured tools
+    through native Code Mode/tool_search, but never gets the `worker` tool or
+    MCP/web/Telegram/cron/history grants. Memory curation stays deferred and this
+    branch contains none of it.
 - [ ] After background workers are accepted, add opt-in periodic digestion of
   previously unprocessed conversations/episodes into long-term memory, following
   the deferred scope below. Do not implement or activate curation yet.
@@ -393,6 +396,19 @@ documented rather than auto-cancelled. The worker tool carries no model-only
 spawning-conversation and capture checks, while a worker child still gets no
 `worker` tool. Fresh independent review passed with no material findings (121
 behavior, 14 new three times, 2 execution, 83 core, typecheck/build).
+
+Owner scope correction after that review, applied in the same integration
+candidate: child/background workers must also receive the native Code
+Mode/tool_search compositor, composing **only** their captured (and still
+configured) tools — never the `worker` tool, MCP, web, Telegram, cron or history —
+so a child can neither delegate nor discover a grant it does not hold. Direct
+model tools for a child stay its captured coding tools plus the bundle's own
+`codemode`/`tool_search` visibility. Capture retirement, cancellation and the
+removed-model denial now revoke the compositor selection in the same commit, and
+a narrowed reopen leaves a live child composing only what the capture still
+allows; stale nested or prepared calls fail closed through the existing hook and
+replay guards. Two focused regressions cover a real nested `read` composition
+with a denied nested spawn, and the narrowed-reopen callable/deferred state.
 
 Integration candidate merges current main `dceb23f` (Telegram owner controls,
 media ingress, vision, MCP, general Code Mode, web tools) into this branch.

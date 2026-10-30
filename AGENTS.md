@@ -45,8 +45,9 @@ npm start -- agent --config config.json     # attach a terminal
 - `src/workers/` — bounded ordinary background workers as native Durable tasks:
   the opt-in `worker` start/list/inspect/cancel tool, an explicit
   shared-or-worktree workspace per task, captured child authority and one internal
-  result event to the spawning agent. A worker is not an origin and gets no
-  worker tool, so it cannot delegate further.
+  result event to the spawning agent. A worker is not an origin and gets no worker
+  tool; its child keeps the native Code Mode compositor over its captured tools
+  only, so it cannot delegate further.
 - `src/execution/` — guarded host environment and the optional Bubblewrap shell.
 - `src/context/` — bootstrap/memory/skills snapshots, skill tool, workspace host.
 - `src/history/` — durable store identity, reset-delimited episodes, background
@@ -102,7 +103,9 @@ npm start -- agent --config config.json     # attach a terminal
   new authority, no recursion, no host-only owner commands, and no composition in
   root, state, fork, raw/task-owned or isolated cron conversations. It may compose
   the `worker` tool from a spawning mapped chat under that tool's own spawner and
-  capture checks; a worker child still receives neither Code Mode nor `worker`.
+  capture checks. A worker child also gets the compositor, but only over its
+  captured tools (never `worker`, MCP, web, Telegram, cron or history), and its
+  composition authority is retired with the capture.
 - MCP is a separate, default-off connection authority from `toolAllowlist`:
   `mcp.enabled` plus at least one enabled server connects it, and only
   authenticated mapped chats receive MCP tools; Code Mode follows its own switch

@@ -988,7 +988,7 @@ test('a narrowed config on reopen cannot restore a live worker tool the ceiling 
     return fauxAssistantMessage('ok');
   };
 
-  const first = await syntheticStore(fixture, dispatcher);
+  const first = await syntheticStore(fixture, dispatcher, { codemode: { enabled: true } });
   let reopened;
   let childConversationId;
   try {
@@ -1016,6 +1016,7 @@ test('a narrowed config on reopen cannot restore a live worker tool the ceiling 
       allowedModels: [model],
       toolAllowlist: ['write'],
       workers: { enabled: true },
+      codemode: { enabled: true },
     }, fixture.directory);
     const faux = fauxProvider({ provider: 'worker-fixture', models: [{ id: 'synthetic', name: 'Synthetic' }] });
     const models = createModels();
@@ -1024,8 +1025,17 @@ test('a narrowed config on reopen cannot restore a live worker tool the ceiling 
     reopened = await openGateway(config, context, { models });
     const child = await reopened.harness.conversation(childConversationId, context);
     assert.ok(child, 'the live worker target survives the reopen');
-    const names = (await child.agent(context)).tools?.map((tool) => (tool && typeof tool === 'object' ? tool.name : tool)) ?? [];
+    const agent = await child.agent(context);
+    const names = (agent.tools ?? []).map((tool) => (tool && typeof tool === 'object' ? tool.name : tool));
     assert.equal(names.includes('read'), false, `a removed tool must not survive the reopen: ${names}`);
+    // The compositor itself survives for a live child, but the narrowed capture leaves nothing to
+    // compose and no worker path to discover: stale Code Mode authority stays scoped to the capture.
+    assert.ok(names.includes(CODEMODE_TOOL_NAME), `a live child keeps the compositor: ${names}`);
+    const callable = (agent.callable ?? []).map((tool) => (tool && typeof tool === 'object' ? tool.name : tool));
+    assert.equal(callable.includes('read'), false, `narrowed capture cannot compose read: ${callable}`);
+    assert.ok(callable.includes('write'), `a still-configured captured tool stays composable: ${callable}`);
+    assert.equal(callable.includes(WORKER_TOOL_NAME), false, `a child cannot compose a worker: ${callable}`);
+    assert.deepEqual(agent.deferred ?? [], [], 'no deferred MCP/web tool is discoverable in a child');
   } finally {
     if (reopened) await reopened.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
@@ -1077,10 +1087,83 @@ test('native Code Mode composes the worker tool from a mapped chat without widen
     const childTools = ((await child.agent(context)).tools ?? [])
       .map((tool) => (typeof tool === 'string' ? tool : tool.name));
     assert.ok(childTools.includes('read'), `the captured ceiling still applies: ${childTools}`);
-    for (const forbidden of [WORKER_TOOL_NAME, CODEMODE_TOOL_NAME, 'cron', 'history', 'telegram']) {
+    for (const forbidden of [WORKER_TOOL_NAME, 'cron', 'history', 'telegram']) {
       assert.equal(childTools.includes(forbidden), false, `Code Mode composition must not widen the child: ${forbidden}`);
     }
+    // The child does hold the compositor itself (owner-corrected scope); the next test proves it
+    // composes only captured tools and cannot reach the worker tool.
+    assert.ok(childTools.includes(CODEMODE_TOOL_NAME), `a live child composes its capture: ${childTools}`);
   } finally {
+    await store.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('a worker child composes its captured tools through Code Mode and cannot spawn a worker', { timeout: 45_000 }, async () => {
+  const fixture = await fixtureWorkspace();
+  const issued = new Set();
+  const store = await syntheticStore(fixture, async (transcript) => {
+    const input = lastUserText(transcript.messages);
+    const transcriptBody = transcriptText(transcript.messages);
+    if (input.includes('Background worker task.')) {
+      if (transcriptBody.includes('"child-code"')) return fauxAssistantMessage('CHILD-COMPOSED');
+      return fauxAssistantMessage([
+        fauxToolCall(CODEMODE_TOOL_NAME, {
+          code: [
+            "const hits = await searchTools('worker');",
+            "const read = await tools.read({ path: 'note.txt' });",
+            "let spawn = null;",
+            "try { await tools.worker({ action: 'start', task: 'recursive', workspace_mode: 'shared' }); }",
+            "catch (error) { spawn = String((error && error.message) || error); }",
+            'return { hits: hits.map((hit) => hit.name), read, spawn };',
+          ].join('\n'),
+        }, { id: 'child-code' }),
+      ], { stopReason: 'toolUse' });
+    }
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'spawn a composing worker' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, { action: 'start', task: 'compose captured tools', workspace_mode: 'shared' }, { id: 'compose-start' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  }, { toolAllowlist: ['read'], codemode: { enabled: true } });
+  let resultWatcher;
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    resultWatcher = changeWatcher(store.gateway.harness, workerResultCommitted(conversation.id), 'composed worker result');
+    const submission = await conversation.submit({ type: 'input', content: 'spawn a composing worker', requestId: 'compose' }, context);
+    assert.equal((await submission.wait(context)).status, 'done');
+    await within(resultWatcher.promise, WAIT_MS, 'the composing worker never reported');
+
+    const records = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers;
+    assert.equal(records.length, 1, 'the child never started another worker');
+    const childConversationId = records[0].conversationId;
+    assert.ok(childConversationId, 'the child target is recorded');
+
+    // The child's own transcript carries the Code Mode composition result.
+    const child = await store.gateway.harness.conversation(childConversationId, context);
+    const childEntries = (await child.entries({ order: 'ascending' }, 200, undefined, context)).items;
+    const composed = childEntries.filter((entry) => entry.model?.[0]?.role === 'toolResult')
+      .map((entry) => entry.model[0]).find((message) => message.toolCallId === 'child-code');
+    assert.ok(composed, 'the child reached a Code Mode result');
+    assert.equal(composed.isError ?? false, false, JSON.stringify(composed.content));
+    const composedText = (composed.content ?? []).map((part) => part.text ?? '').join('');
+    assert.match(composedText, /WORKER-NOTE-CONTENT/, 'the captured read tool really ran through Code Mode');
+    assert.match(composedText, /"hits":\[\]/, 'tool_search exposes no worker (or other) grant to the child');
+    assert.match(composedText, /spawn":/, 'the script attempted a nested spawn');
+
+    // Terminal retirement revokes the compositor with the capture: nothing left to compose.
+    const terminal = (await store.gateway.harness.getTask(records[0].taskId, context)).state;
+    assert.equal(terminal.status, 'terminal');
+    const retired = await store.gateway.harness.conversation(childConversationId, context);
+    const retiredTools = ((await retired.agent(context)).tools ?? [])
+      .map((tool) => (typeof tool === 'string' ? tool : tool.name));
+    assert.deepEqual(retiredTools, [], `a finished child keeps no compositor: ${retiredTools}`);
+    assert.equal(await store.gateway.harness.snapshot(ConfigToolCaptureDoc, childConversationId, context), undefined);
+  } finally {
+    resultWatcher?.stop();
     await store.gateway.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
   }

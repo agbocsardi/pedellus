@@ -39,11 +39,24 @@ independent turns, and each of those starts a real worker). Live workers are cap
 and a refused start creates no record and no task.
 
 The tool has no model-only `callers` restriction: native Code Mode (`codemode.enabled`) composes it
-like any other agent tool, under exactly the same hosting-conversation, capture and ceiling checks.
-A script's nested `start` is its own Durable tool task, so it carries its own host identity and the
-capture hook sees it exactly as a direct call; a worker's child conversation is never a spawner and
-receives neither Code Mode nor `worker`. A focused regression drives a real nested `worker start`
-through Code Mode and asserts the child stays unwidened.
+from a spawning chat like any other agent tool, under exactly the same hosting-conversation, capture
+and ceiling checks. A script's nested `start` is its own Durable tool task, so it carries its own host
+identity and the capture hook sees it exactly as a direct call.
+
+A worker child also receives the native Code Mode/tool_search bundle, but composition grants nothing:
+a child script resolves only the tools captured (and still configured) for that child, and its direct
+model tools remain those captured coding tools plus the Code Mode/tool_search visibility the bundle
+needs. It never receives the `worker` tool, MCP, web, Telegram, cron or history, so a child cannot
+start another worker and `tool_search` finds nothing beyond its own captured set. Code Mode is not
+recursive: `codemode`/`tool_search` are model-only tools, so a script cannot start another script.
+
+Composition authority follows the capture exactly. A terminal or cancelled child loses the capture,
+its tools and the compositor selection in the same commit; a removed-model child is denied before
+scheduling resumes; and after a narrowed reopen a live child keeps the compositor while its script
+can compose only what the current ceiling and capture still allow. A stale nested or prepared call
+fails closed through the same call-time hook and native replay guards. Focused regressions drive a
+real nested `read` composition plus a denied nested spawn inside a worker child, and check that the
+narrowed reopen leaves nothing stale to compose.
 
 ## What a worker is
 
