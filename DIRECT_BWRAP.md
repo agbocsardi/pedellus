@@ -3,11 +3,10 @@
 `src/execution/direct-bwrap.ts` is the argv builder for the optional Python-like
 Bubblewrap shell mode. `HostExecutionEnv` uses it only when a Gateway instance
 configures `toolSandbox: "bwrap"`; absent or `"host"` keeps the guarded native
-shell. It does **not** replace the managed-copy adapter in
-`src/execution/index.ts`/`src/execution/sandbox.ts`, and it does not copy, import,
-stage, or publish a workspace. The owner chose accidental-damage protection, not
-hostile isolation: the command runs directly on the actual read-write workspace,
-with no sandbox-owned state.
+shell. It is the only Bubblewrap path: there is no managed copy, import, stage
+or publish-back, and no sandbox-owned workspace state. The owner chose
+accidental-damage protection, not hostile isolation: the command runs directly on
+the actual read-write workspace.
 
 Only shell commands are wrapped. The native `read`, `write` and `edit` tools keep
 using the guarded `HostExecutionEnv` filesystem methods on the same actual

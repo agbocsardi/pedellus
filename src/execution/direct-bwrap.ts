@@ -4,8 +4,7 @@ import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "no
 
 /**
  * Build a Bubblewrap argv that runs a command against the caller's actual
- * workspace, matching Python's `_bwrap` behavior instead of the managed-copy
- * sandbox in `sandbox.ts`.
+ * workspace, matching Python's `_bwrap` behavior.
  *
  * The returned value is an argv array. Paths and the cwd are never joined into
  * a shell string, so a path containing shell metacharacters cannot change the
