@@ -64,31 +64,42 @@ hard-requires `onnxruntime-node`, i.e. a native N-API shared library
   build with `WHISPER_COMMON_FFMPEG`; provision an FFmpeg binary as a second
   executable (mind `ffmpeg-static`'s GPL-3.0-or-later licence); or decode Opus in
   Node (`opus-decoder`, WASM, MIT) and hand the engine 16 kHz PCM.
-- Packaging: releases do not ship a Linux `whisper-cli` binary (v1.9.5 publishes
-  no assets; nightly builds ship a macOS xcframework and Windows archives), so
-  provisioning means `cmake -B build && cmake --build build` from source, or a
-  distro package. `-DGGML_NATIVE=OFF` is required for a redistributable binary.
+- Packaging: two routes, and they are not the same artifact. **Compiler-free:**
+  the rolling nightly prereleases ship `whisper-bin-ubuntu-x64.tar.gz` (9.9 MiB)
+  and `-arm64` (4.4 MiB) (nightly `b5454`), built on Ubuntu 22.04 images with
+  `-DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+  -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF` and `-DGGML_CPU_ALL_VARIANTS=ON` on x64,
+  i.e. the CLI plus sibling dl-loaded `ggml` backends under a `$ORIGIN` rpath and
+  the upstream `LICENSE` copied in. Those are prerelease tags, not stable ones.
+  **Stable pin:** `v1.9.5` publishes no assets, so a stable version means
+  `cmake -B build && cmake --build build` from source (or a distro package);
+  `-DGGML_NATIVE=OFF` is required for a redistributable binary. Either way the
+  provisioning unit is an external engine directory, not a package manager unit.
 - Node fit: one `spawn` of a path, exactly like today's `uv` spawn; text-only
-  stdout with `-np`/`-nt`, `-oj` for JSON, `-l auto|xx` for language, `-d` for a
-  duration bound, `--vad --vad-model` for VAD, nonzero exit on failure. No npm
-  dependency and no in-process native crash risk.
+  stdout with `-np`/`-nt`, `-oj` for JSON, `-l auto|xx` for language,
+  `--vad --vad-model` for VAD, nonzero exit on failure. No npm dependency for the
+  FFmpeg-predecode route. A Node WASM Opus route would add dependencies, so that
+  variant no longer has "npm 0".
 
 ### B. whisper.cpp as a Node native addon (`nodejs-whisper`, `smart-whisper`)
 
 - Same engine, worse packaging. `nodejs-whisper` 0.4.1 (MIT, recent) runs
   `scripts/build-native.js --optional` on install and falls back to a CLI backend;
-  its README still requires host FFmpeg for non-WAV conversion. `smart-whisper`
-  0.8.1 (MIT) always runs `node-gyp rebuild` on install and was last published
-  2024-10, i.e. unmaintained for this purpose. Both put native inference inside
-  the gateway process, which the current design deliberately avoids (upstream
-  docs warn a fatal native crash terminates Node). Callers must supply mono 16 kHz
-  Float32 PCM, so the Opus problem is unchanged.
+  its README still requires host FFmpeg for non-WAV conversion. It carries three
+  runtime dependencies (`shelljs`, `readline-sync`, `node-addon-api`) and an
+  optional `cmake-js`. `smart-whisper` 0.8.1 (MIT) has one runtime dependency
+  (`node-addon-api`) and always runs `node-gyp rebuild` on install; it was last
+  published 2024-10, i.e. unmaintained for this purpose. Both put native
+  inference inside the gateway process, which the current design deliberately
+  avoids (upstream documents that a fatal native crash terminates Node). Callers
+  must supply mono 16 kHz Float32 PCM, so the Opus problem is unchanged and the
+  caller additionally owns decoding.
 
 ### C. sherpa-onnx (`sherpa-onnx-node` 2.0.1, Apache-2.0)
 
 - Prebuilt native libraries per platform through npm optional dependencies
   (`sherpa-onnx-linux-x64`, `-linux-arm64`, `-darwin-*`, `-win-*`), no compiler on
-  the host — the best "no Python, no build" story.
+  the host — compiler-free without depending on a project's nightly channel.
 - Whisper support exists (`OfflineRecognizer` with `whisper.encoder/decoder`,
   `language`, `task`, Silero VAD), but is a secondary path in that project: the
   pretrained-model docs demonstrate `tiny.en` and `large-v3`; the
@@ -107,21 +118,25 @@ hard-requires `onnxruntime-node`, i.e. a native N-API shared library
 - **No audio decoding in Node at all**: `load_audio` throws without `AudioContext`,
   and the official Node guide tells you to bring `wavefile` and do 32-bit float,
   16 kHz, mono conversion yourself. Opus again needs an extra decoder.
-- Model: `onnx-community/whisper-small` int8 is 88 MiB encoder + 156 MiB decoder
-  (plus a 156 MiB merged decoder variant); fp16 is 336 + 308 MiB. Offline requires
-  `env.allowRemoteModels=false` with a local model directory.
+- Model: `onnx-community/whisper-small` int8 is 88 MiB encoder + 149 MiB decoder
+  ≈ 237 MiB, with a 149 MiB merged-decoder variant fetched only if the runtime
+  path needs it; fp16 is 168 + 294 MiB; the fp32 encoder alone is 336 MiB. Offline
+  requires `env.allowRemoteModels=false` with a local model directory.
 - Net effect: strictly more native and npm surface than option A, a second
-  quantization scheme to validate, and per-token decoder overhead that makes it
-  the least attractive CPU option for short messages — unverified, but it would
-  be the wrong place to start.
+  quantization scheme to validate, and per-token decoder overhead that is a
+  plausible but **unmeasured** reason to expect slower CPU turns than a native
+  encoder-decoder engine. Not the place to start.
 
 ### E. Pure JS/WASM only (transformers.js WASM/WebGPU, whisper.cpp emscripten)
 
-- Removes native artifacts, keeps the model download. `onnxruntime-web` WASM on a
-  CPU `small` model is far slower than a native engine, and the published
-  whisper.cpp npm binding (`whisper.cpp` 1.0.3) is a 2022 emscripten build. Does
-  not credibly preserve the "bounded 180 s turn" envelope for 120 s audio.
-  Rejected as a quality/latency regression, not as a dependency win.
+- Removes native artifacts of the engine, keeps the model download.
+  `onnxruntime-web` WASM on a CPU `small` model is expected to be far slower than
+  a native engine, and the published whisper.cpp npm binding (`whisper.cpp`
+  1.0.3) is a 2022 emscripten build. Whether WASM can still hold the "bounded
+  180 s turn" envelope for 120 s audio is an **unmeasured judgment**, not a
+  measurement; the ranking against A–D in this section is opinion based on
+  architecture, not benchmarked here. Rejected as a likely quality/latency
+  regression and as the wrong reason to choose a backend.
 
 ### F. Keep Python/uv (status quo)
 
@@ -134,78 +149,124 @@ hard-requires `onnxruntime-node`, i.e. a native N-API shared library
 | | A whisper.cpp CLI | B whisper.cpp addon | C sherpa-onnx | D transformers.js | F uv + faster-whisper |
 |---|---|---|---|---|---|
 | Python/uv needed | no | no | no | no | **yes** |
-| Native artifact | one binary (build from source) | addon, install-time build or prebuild | prebuilt .so via npm | prebuilt ONNX Runtime (308 MB) | Python wheels |
-| New npm dependencies | 0 | 1–2 | 3+ optional platform pkgs | 5 + `sharp` | 0 |
-| CPU/Linux x64 | yes (AVX/NEON builds) | yes | yes | yes | yes |
-| `small` multilingual model | 181–465 MiB ggml | same | 610 MiB archive | 244 MiB int8 ONNX | 461 MiB CT2 |
-| Ogg/Opus decode | **no** without FFmpeg build/binary | no (needs FFmpeg) | no (needs decode step) | no (needs decode step) | **yes** (PyAV) |
-| Offline after provisioning | yes (`-m`) | yes | yes | yes (`allowRemoteModels=false`) | yes |
-| Isolation | separate process | in-process | in-process | in-process | separate process |
+| Native artifact | CLI + sibling `ggml` `.so`, prebuilt nightly tarball or own build | addon, install-time build or prebuild | prebuilt `.so` via npm | prebuilt ONNX Runtime (≈308 MB unpacked) | Python wheels |
+| Compiler-free host | yes, on a nightly prerelease pin; no on a stable pin | only if a matching prebuild exists | yes | yes | n/a (needs Python toolchain) |
+| New npm dependencies | 0 (FFmpeg-predecode route); ≥1 for a Node WASM Opus decoder | 3 + optional `cmake-js` (`nodejs-whisper`) / 1 (`smart-whisper`) | 3+ optional platform packages | 5 + `sharp` | 0 |
+| CPU/Linux x64 | yes (runtime CPU variants in the prebuilt, AVX/NEON builds) | yes | yes | yes | yes |
+| `small` multilingual model | 181 MiB `q5_1` / 252 MiB `q8_0` / 465 MiB fp16 | same | 610 MiB archive | ≈237 MiB int8 ONNX | 461 MiB CT2 |
+| Ogg/Opus decode | **no** by default; pre-decode with FFmpeg (host binary) or build `WHISPER_COMMON_FFMPEG` (adds runtime libav*.so) | no (caller decodes) | no (caller decodes) | no (caller decodes) | **yes** (PyAV) |
+| Offline after provisioning | yes (`-m`, no network code unless built `WHISPER_CURL`) | yes | yes | yes (`allowRemoteModels=false`) | yes |
+| Process isolation | separate child process (crash contained, not absent — the engine is native either way) | in-process | in-process | in-process | separate child process |
 | Licence | MIT | MIT | Apache-2.0 | Apache-2.0 + MIT | MIT |
-| Maintenance | active (v1.9.5, 2026-10) | mixed (one stale, one recent) | active (2.0.1) | active (4.3.2) | active |
+| Maintenance | active (v1.9.5 stable, 2026-10; rolling nightlies) | mixed (one stale, one recent) | active (2.0.1) | active (4.3.2) | active |
+
+## What does not carry over from the Python helper
+
+These are contract differences, not cosmetics, and were confirmed in source and
+by local trial (see the empirical note linked at the end):
+
+- **Exit codes.** The Python helper's map is 1 usage / 2 failed / 3 unavailable /
+  4 too-large. `whisper-cli` uses 3 for init or model-load failure, 4 for a
+  **grammar parse error**, 10 for a processing failure and 11 for an input-read
+  failure. Code 4 in the new engine does not mean "too large", so the existing
+  map cannot be reused unchanged; a new adapter needs its own mapping, and
+  `too-large` must come from an explicit check rather than an exit code.
+- **`-d` is truncation, not refusal.** It is documented as "duration of audio to
+  process in milliseconds" and behaves that way: the run still succeeds with a
+  shorter transcript. The promised `maxDurationSeconds` refusal has to be enforced
+  by probing the decoded audio first (or by bounding the decode), not by the flag.
+- **Input format.** The CLI takes file paths or piped bytes that it decodes as a
+  container; it does not accept raw PCM. Supplying 16 kHz PCM without a WAV header
+  fails as an input-read error; a WAV container works.
+- **Environment.** The current allowlist exists for `uv`, `HF_HUB_OFFLINE` and the
+  Hugging Face cache variables. Those mean nothing to a C++ CLI, which needs no
+  cache or hub configuration at all; keeping them would be cargo cult. What must
+  survive is the shape, not the keys: bounded `spawn`, no shell, bounded stdout,
+  killed process group, and a small outcome vocabulary (`unavailable`, `timeout`,
+  `cancelled`, `too-large`, `failed`, `empty`).
 
 ## Recommendation
 
 **Treat whisper.cpp `whisper-cli` (option A) as the intended replacement, and make
 the Ogg/Opus decode path the go/no-go gate.** It is the only option that removes
-Python and `uv` without adding a single npm dependency, keeps inference in a
-killable child process exactly as today, ships under MIT with the same Whisper
-`small` weights, and offers a model size tier (252 MiB `q8_0`, 181 MiB `q5_1`)
-close to the current footprint.
+Python and `uv` without adding an npm dependency on the FFmpeg-predecode route,
+keeps inference in a killable child process as today, ships under MIT with the
+same Whisper `small` weights, and offers a model size tier (252 MiB `q8_0`, 181
+MiB `q5_1`) close to the current footprint.
 
-Do **not** adopt it — and do not remove the Python helper — until one Opus route
-is proven on the actual host: (a) a build with `WHISPER_COMMON_FFMPEG`, (b) a
-provisioned FFmpeg binary alongside the engine, or (c) a Node-side WASM Opus
-decoder feeding PCM. If none is acceptable, the honest answer is that Python stays
-because PyAV is what currently makes Telegram voice work.
+Route (a) — FFmpeg pre-decode — is no longer hypothetical: it was executed
+locally and produced correct transcripts from a real Ogg/Opus voice-shaped file,
+with VAD, in bounded time and memory (see the empirical note). What still blocks
+adoption is not mechanics but policy and evidence: accepting a second provisioned
+executable (FFmpeg), accepting a nightly-prebuilt or self-built engine pin, and
+measuring quality against the current `small`/`int8` baseline. If FFmpeg cannot be
+that second executable and the Node WASM Opus route is unacceptable, the honest
+answer is that Python stays, because PyAV is what currently makes Telegram voice
+work.
 
-Fallback ranking if a compiler-free host becomes a hard requirement:
-sherpa-onnx prebuilt (C) before a whisper.cpp addon (B); `@huggingface/transformers`
-(D) is a last resort, since it trades a Python dependency for a bigger native one.
-Option E should not be revived as a "pure JS" argument.
+Compiler-free ranking (revised): **A** is available compiler-free too, but only
+from a rolling nightly prerelease tarball (`b5454`), so it trades a compiler for a
+prerelease pin; **C** is compiler-free on a normal release line; **B** only if a
+matching prebuild exists; **D** is last, since it trades a Python dependency for a
+bigger native one. Option E should not be revived as a "pure JS" argument.
 
 ## Explicit non-claim
 
 `int8` CTranslate2, `ggml` `q5_1`/`q8_0` and ONNX `int8` are three different
 quantizations of the same weights. Nothing here establishes transcript equality,
 and no option is allowed to be presented as "matching the current quality"
-without measurement. In the same way, this document does not claim any of the new
-paths is faster: no CPU benchmark was run.
+without measurement. The two `ggml` tiers already disagree by a token on a
+repeated 102 s fixture, which is exactly why this stays a measurement obligation.
 
-## Unresolved empirical checks (required before any switch)
+No speed ranking in this document is a benchmark. The local proof run measured
+only whisper.cpp `q5_1`/`q8_0` against itself; faster-whisper was never
+provisioned, sherpa-onnx and ONNX Runtime were never installed, and WASM was never
+run. Statements about D and E being slower are architectural expectation.
 
-1. **Opus**: transcribe a real Ogg/Opus voice fixture with the chosen route on the
-   target Linux host, inside the existing subprocess bounds.
-2. **Quality**: same 5–10 fixture recordings (short, long, noisy, non-English,
-   silence/music-only), transcripts diffed against the current `small`/`int8`
-   baseline; check the whisper.cpp failure modes the upstream CLI README
-   documents (phantom text on music/silence, language auto-detect drift).
-3. **Quantization choice**: `q8_0` vs `q5_1` vs fp16 on the same fixtures; pick the
-   smallest tier that holds quality, and record the decision.
-4. **Latency/memory**: real-time factor and peak RSS for 120 s audio on the target
-   CPU, against the 180 s timeout; measure model load per turn unless a resident
-   engine is chosen.
-5. **Provisioning**: reproducible build/install recipe, resulting binary size,
-   `GGML_NATIVE=OFF` portability, glibc/musl, no runtime network.
-6. **Offline proof**: with networking unavailable, a message-sized transcription
-   succeeds and a missing model fails cleanly as `unavailable`.
-7. **If D is ever revisited**: ONNX int8 transcript quality and Node 22 N-API
-   compatibility, plus local-model-path behaviour with remote loading disabled.
+## Empirical status and remaining checks
 
-## Minimal readiness work that needs no install, download or network
+A bounded local proof (separate note: `2026-10-30_local-transcription-offline-proof.md`)
+answered parts of this list on one host: Opus pre-decode works, `q5_1`/`q8_0`
+transcribe correctly, VAD removes the silence hallucination, no network syscalls
+occur, 102 s of audio finished in ≈37 s, and the contract gaps above were
+reproduced. Still open:
 
-- This document: the comparison, the gate and the measurement plan.
-- When scoped, the only code shape worth keeping is the one that already exists:
+1. **Native Opus routes**: build with `WHISPER_COMMON_FFMPEG` (plus libav runtime
+   dependency) and the Node WASM Opus route, against the same fixture.
+2. **Prebuilt vs own build**: verify the nightly `whisper-bin-ubuntu-x64` tarball
+   on a clean host (glibc baseline, `$ORIGIN` rpath, dl-loaded CPU variants, no
+   compiler) and decide how a prerelease pin is recorded and upgraded.
+3. **Quality corpus**: real recordings — noisy, accented, non-English, music-only
+   — against the current `small`/`int8` transcript baseline; the existing corpus
+   here is one public-domain clip, repeated.
+4. **Quantization choice**: `q5_1` vs `q8_0` vs fp16 on that corpus; the two tiers
+   already differ on the repeated fixture, so this is a real decision.
+5. **Latency envelope**: the 120 s duration bound and the 180 s timeout under a
+   cold model load and a loaded host; measured variance on short utterances here
+   was 2x, so medians on an idle machine are required.
+6. **Resident vs per-turn engine**: per-turn CLI load costs seconds; a resident
+   helper would need a different process design.
+7. **If D is ever revisited**: ONNX int8 transcript quality, Node N-API
+   compatibility, and local-model-path behaviour with remote loading disabled.
+
+## Minimal readiness work
+
+- This document and the empirical note: the comparison, the gate, and measured
+  contract gaps. Neither changes a backend.
+- The empirical note also records the licence/provenance facts a future slice must
+  not lose: the engine and model licences are separate, and any test speech is a
+  third-party artifact that is not committed or bundled.
+- If a slice is later scoped, the code shape that survives is the existing one:
   `src/media/transcription.ts` stays a bounded `spawn` with the same outcome
-  mapping and the same env allowlist; only the command, argv and helper path
-  change, and `defaultHelperPath()` points at a provisioned engine instead of
-  `scripts/`. No new tool, config key or provider registry is implied.
-- Documentation touchpoints for that later slice: `SETUP.md` (§8 voice
-  provisioning), `TELEGRAM.md` (§attachments), `README.md` (§Media), `AGENTS.md`
-  (invariants), `THIRD_PARTY_NOTICES.md` (engine + model licence).
-- Decide and record, before coding: whether the provisioning unit is "operator
-  builds a binary" (A) or "npm platform package" (C). That single choice fixes
-  installation docs, licence entries and the failure messages.
+  vocabulary; the command, argv, helper path and exit mapping change, the
+  Hugging Face variables leave the environment allowlist, and `maxDurationSeconds`
+  is enforced by an explicit probe instead of an engine flag.
+- Documentation touchpoints for that slice: `SETUP.md` (§8 voice provisioning),
+  `TELEGRAM.md` (§attachments), `README.md` (§Media), `AGENTS.md` (invariants),
+  `THIRD_PARTY_NOTICES.md` (engine and model licences, separately).
+- Decide and record, before coding: nightly-prebuilt pin (A) versus own build (A)
+  versus npm platform package (C). That choice fixes installation docs, licence
+  entries and the failure messages.
 
 ## Sources (accessed 2026-10-30)
 
@@ -214,7 +275,10 @@ paths is faster: no CPU benchmark was run.
 - whisper.cpp CLI flags and supported formats: https://github.com/ggml-org/whisper.cpp/blob/master/examples/cli/README.md
 - whisper.cpp audio decode path (miniaudio first, FFmpeg only when compiled in): https://github.com/ggml-org/whisper.cpp/blob/master/examples/common-whisper.cpp
 - whisper.cpp CMake option `WHISPER_COMMON_FFMPEG` (Linux-only, default OFF): https://github.com/ggml-org/whisper.cpp/blob/master/CMakeLists.txt
-- whisper.cpp release v1.9.5 (2026-10-06, no Linux CLI assets): https://github.com/ggml-org/whisper.cpp/releases/tag/v1.9.5
+- whisper.cpp release v1.9.5 (2026-10-06, stable, no binary assets): https://github.com/ggml-org/whisper.cpp/releases/tag/v1.9.5
+- whisper.cpp nightly `b5454` assets, including `whisper-bin-ubuntu-x64.tar.gz` (9.9 MiB) and `-arm64` (4.4 MiB): https://github.com/ggml-org/whisper.cpp/releases/tag/b5454
+- whisper.cpp release workflow (Ubuntu 22.04 images, `$ORIGIN` rpath, `GGML_BACKEND_DL`, `GGML_CPU_ALL_VARIANTS`, `GGML_NATIVE=OFF`): https://github.com/ggml-org/whisper.cpp/blob/master/.github/workflows/release.yml
+- whisper.cpp CLI exit codes (3 init/model, 4 grammar, 10 processing, 11 input): https://github.com/ggml-org/whisper.cpp/blob/master/examples/cli/cli.cpp
 - ggml model files and sizes (`ggml-small*`): https://huggingface.co/ggerganov/whisper.cpp/tree/main
 - miniaudio built-in decoding formats (WAV, FLAC, MP3): https://github.com/mackron/miniaudio
 - nodejs-whisper README (FFmpeg for conversion, model list): https://github.com/ChetanXpro/nodejs-whisper
@@ -227,7 +291,7 @@ paths is faster: no CPU benchmark was run.
 - Transformers.js package dependencies (onnxruntime-node/web, sharp, tokenizers): https://registry.npmjs.org/@huggingface/transformers/latest
 - Transformers.js ONNX backend selection in Node: https://github.com/huggingface/transformers.js/blob/main/packages/transformers/src/backends/onnx.js
 - ONNX Runtime Node package size and install script (CPU binaries bundled): https://registry.npmjs.org/onnxruntime-node/latest , https://github.com/microsoft/onnxruntime/blob/main/js/node/script/install.js
-- `onnx-community/whisper-small` file sizes (int8/fp16/q4 encoder and decoder): https://huggingface.co/onnx-community/whisper-small
+- `onnx-community/whisper-small` file sizes (int8 88+149 MiB, fp16 168+294 MiB, fp32 encoder 336 MiB, merged decoder as a separate variant): https://huggingface.co/onnx-community/whisper-small
 - sherpa-onnx Node addon examples README (`LD_LIBRARY_PATH`, WebAssembly alternative): https://github.com/k2-fsa/sherpa-onnx/blob/master/nodejs-addon-examples/README.md
 - sherpa-onnx JS API documentation: https://k2-fsa.github.io/sherpa/onnx/javascript-api/index.html
 - sherpa-onnx Whisper model config (`language`, `task`, multilingual behaviour): https://github.com/k2-fsa/sherpa-onnx/blob/master/sherpa-onnx/csrc/offline-whisper-model-config.h
