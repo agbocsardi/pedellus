@@ -27,7 +27,7 @@ Owner approved this six-slice batch after the completed channel-neutral build:
   reset-closed episodes. Exclude open episodes and raw/root/fork/state/task-owned,
   worker and cron transcripts. Source-label evidence; successful validated
   processing (including no-op) advances the frontier, failures never do.
-- [ ] O2 — Bounded memory digestion using O1: agent-editable workspace prompt,
+- [x] O2 — Bounded memory digestion using O1: agent-editable workspace prompt,
   ordinary Markdown/skill writes, provenance, concurrent-edit protection and
   inspectable recovery. No hashes/version registry, second archive or agent loop.
 - [ ] O3 — Manual invocation plus opt-in ordinary cron integration over O2;
@@ -350,6 +350,29 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Overnight — memory digestion execution accepted; controls/scheduling starts
+
+O2 published by original implementer via clean-main fast-forward to `51de982`
+after fresh independent PASS. One native `nanobot.memory-digest` task consumes
+one O1 batch, seeds editable `DIGEST.md` only if absent, and receives narrowly
+captured read/write/edit tools. No model-facing command/tool/cron activation yet.
+Review fixes require a non-empty committed report and reject any failed tool
+result before acknowledging; partial writes remain for replay, never rolled back.
+Digest write now uses guarded atomic exclusive create; exact edits are serialized
+in-process only, not protected against an uncooperative external editor racing
+between native edit's read and write. Task failure/reopen accounting and retired
+authority were independently checked. Gate: 231 behavior, 2 execution, 83 core,
+typecheck/build; published typecheck/build and 14 focused checks passed.
+
+Accepted limits: >4,000-entry turn verification fails closed, parked tasks block
+new starts until native retry/abort, caller's pinned model may process another
+mapped chat's batch in the shared workspace, failure evidence count currently
+reports zero. A rendered trust-envelope edit sentence still overclaims external
+concurrency protection; O3 owns its narrow wording correction. No provider/API
+inference, paid operation, personal-runtime activation or schedule was performed.
+O3 starts in a fresh worktree: manual host controls, explicit ordinary-cron path,
+internal spawning-agent completion visibility, all inactive until invoked.
 
 ### Overnight — closed-episode foundation accepted; digestion starts
 
