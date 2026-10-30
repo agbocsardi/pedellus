@@ -1,4 +1,4 @@
-import { defineDoc, AssistantEntry } from "@earendil-works/pi-durable";
+import { defineDoc, AssistantEntry, ConversationBusy } from "@earendil-works/pi-durable";
 import type { Context, Draft } from "@earendil-works/chord";
 import { copyJson } from "@earendil-works/chord";
 import { withCancel, withoutAbortSignal } from "@earendil-works/chord/context";
@@ -9,6 +9,8 @@ import type { Conversation, Submission, SubmissionId } from "@earendil-works/pi-
 import type { AssistantMessage, ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
 import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
+import type { GatewayModelList, GatewayModelSelection, GatewaySessionReset } from "../runtime.js";
+import { inProcessTerminalConversation } from "../terminal/conversation.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import { MEDIA_LIMITS, MediaRejected, createMediaStore, type MediaRejectionReason, type MediaStore, type StoredMedia } from "../media/attachments.js";
 import { createTranscriber, type Transcriber, type TranscriptionFailure } from "../media/transcription.js";
@@ -98,12 +100,28 @@ export type TelegramMediaOptions = {
   readonly transcription?: TelegramMediaTranscriptionOptions;
 };
 
+/**
+ * Host-owned full-process restart for the authenticated-owner `/restart` control. The host performs
+ * the replacement only after its own graceful teardown; the adapter confirms the request, never the
+ * restart, and never retries it.
+ */
+export type TelegramRestartHost = {
+  /** Whether this host can actually replace its own process and configuration. */
+  readonly supported: boolean;
+  /** Fixed host-owned refusal used when `supported` is false; never user, model or provider input. */
+  readonly unavailable?: string;
+  /** Called at most once, only after this command's acknowledgement and offset are durable. */
+  request(): Promise<void>;
+};
+
 export type TelegramOptions = {
   token: string;
   allowFrom: readonly string[];
   pollTimeoutSeconds?: number;
   /** Absent keeps the previous attachment-disabled behavior for SDK callers. */
   media?: TelegramMediaOptions;
+  /** Absent means `/restart` is neither advertised nor applied in this host. */
+  restart?: TelegramRestartHost;
 };
 
 type TelegramMediaIngress = {
@@ -141,12 +159,13 @@ export type TelegramPendingDelivery = {
 };
 /**
  * One authenticated control command. `admitted` is committed with the acknowledgement and the polling offset before
- * the native call; `applied` after it returns; `unconfirmed` when a reopen found it interrupted.
+ * the native call; `applied` after it returns; `refused` when the native call proved that nothing changed;
+ * `unconfirmed` when a reopen found it interrupted.
  */
 export type TelegramControlRecord = {
   updateId: number;
   command: string;
-  status: "admitted" | "applied" | "unconfirmed";
+  status: "admitted" | "applied" | "refused" | "unconfirmed";
   /** Chat and sender, so a reopen can report an interrupted command without its acknowledgement record. */
   chatId: number;
   senderId: string;
@@ -155,8 +174,10 @@ export type TelegramControlRecord = {
 /** One admitted command whose ordered flush is retried on the polling cadence. */
 type DeferredControl = {
   readonly updateId: number;
-  readonly command: "new" | "abort";
+  readonly command: TelegramMutation;
   readonly chatId: number;
+  /** The `/model` preset argument, already validated against the configured catalog. Never a provider/model selector. */
+  readonly target?: string;
 };
 export type TelegramChannelState = {
   offset: number;
@@ -190,20 +211,21 @@ type ChannelState = TelegramChannelState;
 // Stored alongside the adapter's stable channel conversation, not in a plaintext sidecar.
 export const TelegramState = defineDoc<ChannelState>({
   kind: "nanobot.telegram-state",
-  version: 6,
+  version: 7,
   scope: "conversation",
   history: "latest",
   fork: "initial",
   checkpointWhen: (_value, _ops, { deltasSinceBase }) => deltasSinceBase >= 64,
   migrate: (value, fromVersion) => {
-    if (fromVersion !== 1 && fromVersion !== 2 && fromVersion !== 3 && fromVersion !== 4 && fromVersion !== 5) {
+    if (fromVersion < 1 || fromVersion > 6) {
       throw new Error(`Unsupported Telegram state version ${fromVersion}`);
     }
     if (!Array.isArray(value.pending) || value.pending.some((item) =>
       item === null || typeof item !== "object" || Array.isArray(item))) {
       throw new Error("Stored Telegram state contains invalid pending deliveries");
     }
-    const hasControls = fromVersion === 3 || fromVersion === 4 || fromVersion === 5;
+    // Controls and origin bindings arrived with version 3; earlier states migrate to empty maps.
+    const hasControls = fromVersion >= 3;
     if (hasControls && value.controls !== undefined && !Array.isArray(value.controls)) {
       throw new Error("Stored Telegram state contains invalid controls");
     }
@@ -254,6 +276,24 @@ export interface TelegramGateway {
    * `telegram` tool only in mapped Telegram chat conversations; the running adapter attaches here.
    */
   telegramActions?: TelegramActionRegistry;
+  /**
+   * Optional host model catalog: the current selection, the configured direct choices and (in
+   * named-preset mode) the finite configured presets. Absent on a narrow SDK host, which then gets no
+   * `/status` or `/model` menu entry and a truthful refusal when the command is typed. It creates no
+   * conversation of its own and changes nothing.
+   */
+  listModels?(sessionKey: string, context: Context): Promise<GatewayModelList>;
+  /**
+   * Optional host preset selection: one configured preset name, or `default` for the configured one.
+   * It rejects atomically (including `ConversationBusy`) instead of queueing behind a running turn.
+   */
+  selectModelPreset?(sessionKey: string, name: string, context: Context): Promise<GatewayModelSelection>;
+  /**
+   * Optional paired reset for `new`: start a new context AND rebuild the host prompt snapshot from the
+   * current workspace files in one operation. Absent hosts keep the plain native reset; a host that has
+   * a prompt snapshot reports `busy` instead of resetting without rebuilding it.
+   */
+  resetSession?(sessionKey: string, context: Context): Promise<GatewaySessionReset>;
 }
 
 export async function runTelegram(
@@ -265,6 +305,18 @@ export async function runTelegram(
   // Attachment-disabled SDK callers keep the previous behavior: no store, no download, no transcription.
   const mediaIngress = createMediaIngress(options.media);
   const mediaWork = new MediaWorkGate(MEDIA_LIMITS.maxConcurrentWork);
+  /**
+   * Optional host operations this adapter may call, resolved once from the host surface. A narrow SDK
+   * host keeps `/new`, `/abort` (and `/stop`), `/help` only; `/status`, `/model` and `/restart` are then
+   * neither advertised nor applied, and typing one gets a truthful refusal instead of a half-working
+   * control. `/status` reports the selected model, so it needs the host catalog; `/model` needs the
+   * catalog and preset selection.
+   */
+  const hostCommands: TelegramCommandHost = {
+    model: typeof gateway.listModels === "function" && typeof gateway.selectModelPreset === "function",
+    status: typeof gateway.listModels === "function",
+    restart: options.restart !== undefined && options.restart.supported,
+  };
   const scope = withCancel(context);
   const adapterContext = scope.context;
   const cleanupContext = withoutAbortSignal(adapterContext);
@@ -309,6 +361,10 @@ export async function runTelegram(
   const controlChains = new Map<number, Promise<void>>();
   const submissionChains = new Map<number, Promise<void>>();
   const pendingControls = new Set<Promise<void>>();
+  /** Set once this adapter asked the host to replace the process; a second `/restart` is refused. */
+  let restartHostRequested = false;
+  /** Set when that one host request was refused, so a later refusal does not claim a restart is in progress. */
+  let restartHostRequestFailed = false;
   /** Consecutive delivery failures per pending record, so a permanent failure is held instead of retried forever. */
   const deliveryFailures = new Map<number, number>();
   let fatal: unknown;
@@ -1325,9 +1381,9 @@ export async function runTelegram(
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
       doc.pending = doc.pending.filter((entry) => entry.updateId !== updateId);
-      // Its "interrupted" report is now durably delivered, so the terminal record has served its purpose.
+      // Its terminal report (interrupted or refused) is now durably delivered, so the record has served its purpose.
       doc.controls = doc.controls.filter((entry) =>
-        !(entry.updateId === updateId && entry.status === "unconfirmed"));
+        !(entry.updateId === updateId && (entry.status === "unconfirmed" || entry.status === "refused")));
       return copyJson(doc) as unknown as ChannelState;
     }, cleanupContext);
   };
@@ -1559,9 +1615,11 @@ export async function runTelegram(
       for (const entry of doc.controls) {
         if (entry.status !== "admitted") continue;
         const notice = doc.pending.find((item) => item.notice === true && item.updateId === entry.updateId);
+        // A restart is never re-requested by recovery: only its interrupted outcome is reported.
+        const interrupted = entry.command === "restart" ? UNCONFIRMED_RESTART : UNCONFIRMED_CONTROL;
         if (notice !== undefined) {
           // In flight at a crash: correct the held acknowledgement (one message) and release it.
-          if (notice.hold === true) notice.text = UNCONFIRMED_CONTROL;
+          if (notice.hold === true) notice.text = interrupted;
           delete notice.hold;
           entry.status = "unconfirmed";
           continue;
@@ -1574,7 +1632,7 @@ export async function runTelegram(
           chatId: entry.chatId,
           sessionKey: `telegram:${identity}:chat:${entry.chatId}`,
           senderId: entry.senderId,
-          text: UNCONFIRMED_CONTROL,
+          text: interrupted,
           notice: true,
         });
         entry.status = "unconfirmed";
@@ -1748,7 +1806,7 @@ export async function runTelegram(
   async function registerCommandMenu(): Promise<void> {
     try {
       await apiCall(api, "setMyCommands", signal, (callSignal) => api.setMyCommands(
-        TELEGRAM_COMMANDS,
+        telegramCommands(hostCommands),
         { scope: { type: "all_private_chats" } },
         toGrammySignal(callSignal),
       ), { throttle: outboundThrottle, replaceable: true });
@@ -1818,11 +1876,7 @@ export async function runTelegram(
     if (recorded !== undefined) {
       // The command was durably admitted before its effect, so a replay reports it instead of running it twice.
       if (recorded.status === "admitted") await markControlUnconfirmed(recorded.updateId);
-      await admitNotice(update, message, sessionKey, recorded.status === "applied"
-        ? "That command was already applied before a restart, so it was not run again."
-        : recorded.status === "unconfirmed"
-          ? "That command was already reported as interrupted; send it again if you still need it."
-          : UNCONFIRMED_CONTROL);
+      await admitNotice(update, message, sessionKey, replayControlText(recorded));
       drain();
       return;
     }
@@ -1835,43 +1889,146 @@ export async function runTelegram(
     }
     if (parsed.kind === "unsupported") {
       await admitNotice(update, message, sessionKey,
-        `Unsupported command /${parsed.command}. Available: /new, /abort, /help. ` +
+        `Unsupported command /${parsed.command}. Available: ${availableCommandList()}. ` +
         "Any other message is sent to the assistant; prefix // to send a leading slash literally.");
       drain();
       return;
     }
+    if (parsed.command === "help") {
+      if (parsed.args) {
+        await admitNotice(update, message, sessionKey, "Usage: /help (no arguments). Nothing was sent to the assistant.");
+        drain();
+        return;
+      }
+      await admitNotice(update, message, sessionKey, controlHelpText());
+      drain();
+      return;
+    }
+    if (parsed.command === "status") {
+      if (!hostCommands.status) {
+        await admitNotice(update, message, sessionKey, STATUS_UNAVAILABLE_HOST);
+        drain();
+        return;
+      }
+      if (parsed.args) {
+        await admitNotice(update, message, sessionKey, "Usage: /status (no arguments). Nothing was sent to the assistant.");
+        drain();
+        return;
+      }
+      // Read-only: one bounded notice from the native conversation projection, no effect intent, no model call.
+      await admitNotice(update, message, sessionKey, await statusNotice(sessionKey));
+      drain();
+      return;
+    }
+    if (parsed.command === "model") {
+      if (!hostCommands.model) {
+        await admitNotice(update, message, sessionKey, MODEL_UNAVAILABLE_HOST);
+        drain();
+        return;
+      }
+      const argument = parseModelArgument(parsed.args);
+      if (argument.kind === "usage") {
+        await admitNotice(update, message, sessionKey, MODEL_USAGE);
+        drain();
+        return;
+      }
+      const listing = await readModelListing(sessionKey);
+      if (argument.kind === "list") {
+        await admitNotice(update, message, sessionKey,
+          listing === undefined ? MODEL_LISTING_UNAVAILABLE : modelListingText(listing));
+        drain();
+        return;
+      }
+      // Only the finite configured catalog may be selected; this chat command never rewrites configuration and
+      // never accepts an arbitrary provider/model/thinking triple.
+      if (listing === undefined) {
+        await admitNotice(update, message, sessionKey, MODEL_LISTING_UNAVAILABLE);
+        drain();
+        return;
+      }
+      if (listing.presets === undefined) {
+        await admitNotice(update, message, sessionKey, MODEL_PRESETS_UNAVAILABLE);
+        drain();
+        return;
+      }
+      if (argument.name !== "default" && !listing.presets.some((preset) => preset.name === argument.name)) {
+        await admitNotice(update, message, sessionKey,
+          `Unknown model preset ${boundedLabel(argument.name, 80)}: nothing was changed. ` +
+          "Use /model to list the configured presets.");
+        drain();
+        return;
+      }
+      await admitControl(update, message, sessionKey, "model", argument.name);
+      return;
+    }
+    if (parsed.command === "restart") {
+      if (!hostCommands.restart) {
+        const unavailable = options.restart?.unavailable;
+        await admitNotice(update, message, sessionKey,
+          typeof unavailable === "string" && unavailable.trim() !== ""
+            ? unavailable.slice(0, MAX_NOTICE_CHARS)
+            : RESTART_UNAVAILABLE_HOST);
+        drain();
+        return;
+      }
+      if (parsed.args) {
+        await admitNotice(update, message, sessionKey, "Usage: /restart (no arguments). Nothing was sent to the assistant.");
+        drain();
+        return;
+      }
+      if (restartHostRequested) {
+        await admitNotice(update, message, sessionKey,
+          restartHostRequestFailed ? RESTART_REQUEST_FAILED : RESTART_ALREADY_REQUESTED);
+        drain();
+        return;
+      }
+      await admitControl(update, message, sessionKey, "restart");
+      return;
+    }
+    // The remaining controls are native mutations of this same chat. `/stop` is an alias of `/abort`:
+    // it normalizes to the same control kind before admission, so the durable record, gating and
+    // recovery path are shared and there is no second cancellation semantics.
     if (parsed.args) {
       await admitNotice(update, message, sessionKey, `Usage: /${parsed.command} (no arguments). Nothing was sent to the assistant.`);
       drain();
       return;
     }
-    if (parsed.command === "help") {
-      await admitNotice(update, message, sessionKey, mediaIngress === undefined ? CONTROL_HELP : CONTROL_HELP_MEDIA);
-      drain();
-      return;
-    }
-    // Captured before the callbacks below: the remaining commands are exactly these two.
-    const command: "new" | "abort" = parsed.command === "new" ? "new" : "abort";
+    const mutation: TelegramMutation = parsed.command === "stop" ? "abort" : parsed.command;
+    await admitControl(update, message, sessionKey, mutation);
+  }
+
+  /**
+   * Admit one native mutation: durable record, held acknowledgement and offset commit before the
+   * effect. The chat stays gated so its later inputs cannot overtake this command, and a refused
+   * effect is reported instead of being recorded as applied.
+   */
+  async function admitControl(
+    update: Update,
+    message: TelegramMessage,
+    sessionKey: string,
+    command: TelegramMutation,
+    target?: string,
+  ): Promise<void> {
+    const chatId = message.chat.id;
     // An earlier command still owns this chat's order while it is applying or deferred. Refuse a
     // newer one instead of letting it apply first; there is no queue for it.
     if (controlPending.has(chatId) ||
         [...deferredControls.values()].some((entry) => entry.chatId === chatId)) {
       await admitNotice(update, message, sessionKey,
-        "An earlier /new or /abort in this chat is still being applied or is still pending; this command was not " +
+        "An earlier control command in this chat is still being applied or is still pending; this command was not " +
         "started and was not sent to the assistant. Wait for it to finish or restart the adapter.");
       drain();
       return;
     }
     // Refuse, never evict: a hung provider plus repeated commands must not grow the log without bound.
-    if (state.controls.filter((entry) => entry.status !== "applied").length >= MAX_UNRESOLVED_CONTROLS) {
+    if (state.controls.filter((entry) => entry.status === "admitted" || entry.status === "unconfirmed").length >=
+        MAX_UNRESOLVED_CONTROLS) {
       await admitNotice(update, message, sessionKey,
         `Too many control commands are still unconfirmed (limit ${MAX_UNRESOLVED_CONTROLS}); this /${command} was not ` +
         "started and was not sent to the assistant. Wait for them to finish or restart the adapter.");
       drain();
       return;
     }
-    // Durable intent first: command record, acknowledgement and offset commit before the native call. The chat stays
-    // gated until the command finishes, so its acknowledgement is never delivered early.
     controlPending.add(chatId);
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
@@ -1904,14 +2061,19 @@ export async function runTelegram(
       return copyJson(doc) as unknown as ChannelState;
     }, adapterContext);
     // Apply it off the polling loop, serialized per chat: other chats keep polling, and this chat's later inputs and
-    // deliveries wait here so the abort cannot withdraw a message admitted after the command.
-    const record: DeferredControl = { updateId: update.update_id, command, chatId };
+    // deliveries wait here so the command cannot land before a message admitted earlier.
+    const record: DeferredControl = {
+      updateId: update.update_id,
+      command,
+      chatId,
+      ...(target === undefined ? {} : { target }),
+    };
     const prior = controlChains.get(chatId) ?? Promise.resolve();
     const run = prior.then(() => applyControl(record));
-    // The acknowledgement is published once: as the applied wording when the native call returns, or as the explicit
-    // still-pending wording when it does not. A provider that ignores cancellation keeps the chat gated, so no later
-    // message can be withdrawn, and it is told plainly instead of being left silent.
-    let ack: "waiting" | "pending" | "applied" = "waiting";
+    // The acknowledgement is published once: as the applied or refused wording when the native call returns, or as the
+    // explicit still-pending wording when it does not. A provider that ignores cancellation keeps the chat gated, so no
+    // later message can be withdrawn, and it is told plainly instead of being left silent.
+    let ack: "waiting" | "pending" | "applied" | "refused" = "waiting";
     const pendingTimer = setTimeout(() => {
       if (ack !== "waiting") return;
       ack = "pending";
@@ -1920,20 +2082,39 @@ export async function runTelegram(
     const chain = run.then(() => undefined, () => undefined);
     controlChains.set(chatId, chain);
     const task = run.then(async (outcome) => {
-      if (outcome !== "applied") {
+      if (outcome.kind === "refused") {
+        // A known no-effect is recorded and reported as refused, never as applied: a later replay of this update
+        // must not claim a change that did not happen.
+        ack = "refused";
+        await markControlRefused(update.update_id, outcome.text).catch(() => undefined);
+        return;
+      }
+      if (outcome.kind !== "applied") {
         // Deferred: say plainly that the command is still pending; the chat keeps waiting and
         // the poll cadence retries the same ordered flush. Abandoned: the unconfirmed wording
         // was already released by the terminal report.
         if (ack !== "waiting") return;
         ack = "pending";
-        if (outcome === "deferred") {
+        if (outcome.kind === "deferred") {
           await releaseControlNotice(update.update_id, CONTROL_PENDING[command]).catch(() => undefined);
         }
         return;
       }
-      if (ack !== "waiting") return;
+      if (ack !== "waiting") {
+        // The acknowledgement was already published with the still-pending wording; the host request
+        // below still belongs to this command, so it is not skipped.
+        if (outcome.requestRestart === true) requestRestart();
+        return;
+      }
       ack = "applied";
-      await releaseControlNotice(update.update_id);
+      try {
+        await releaseControlNotice(update.update_id, outcome.text);
+      } finally {
+        // The record, offset and acknowledgement are durable; the host owns the process replacement and is
+        // still asked when the acknowledgement commit itself failed (its notice is then reported after the
+        // restart by the recovery pass).
+        if (outcome.requestRestart === true) requestRestart();
+      }
     }, (error: unknown) => {
       // The record stays `admitted` and the acknowledgement stays held: a reopen reports it as unconfirmed.
       if (signal?.aborted) return;
@@ -1959,12 +2140,28 @@ export async function runTelegram(
   }
 
   /**
+   * Ask the host to replace this process, at most once per adapter lifetime. The acknowledgement
+   * already told the chat that only the request is confirmed; a host refusal is logged and never
+   * retried or upgraded into a success claim.
+   */
+  function requestRestart(): void {
+    if (restartHostRequested) return;
+    const host = options.restart;
+    if (host === undefined || !host.supported) return;
+    restartHostRequested = true;
+    void host.request().catch(() => {
+      restartHostRequestFailed = true;
+      console.warn("Telegram /restart request was refused by the host; the gateway keeps running.");
+    });
+  }
+
+  /**
    * Submit every input admitted before this command, then apply the native call and record
    * it. A transient failure while flushing earlier inputs is not fatal: the command stays
    * admitted, the chat stays gated, and the poll cadence retries the same ordered flush.
    * Repeated failures end in an explicit unconfirmed report rather than a silent takeover.
    */
-  async function applyControl(record: DeferredControl): Promise<"applied" | "deferred" | "abandoned"> {
+  async function applyControl(record: DeferredControl): Promise<ControlOutcome> {
     try {
       for (const earlier of state.pending.filter((item) =>
         item.notice !== true && item.chatId === record.chatId && item.updateId < record.updateId &&
@@ -1990,30 +2187,108 @@ export async function runTelegram(
       if (attempts < MAX_CONTROL_ATTEMPTS) {
         controlFailures.set(record.updateId, attempts);
         deferredControls.set(record.updateId, record);
-        return "deferred";
+        return { kind: "deferred" };
       }
       // A permanently failing earlier input cannot be overtaken. Report the command
       // honestly and release the gate instead of leaving the chat unusable forever.
       controlFailures.delete(record.updateId);
       deferredControls.delete(record.updateId);
       await markControlUnconfirmed(record.updateId);
-      return "abandoned";
+      return { kind: "abandoned" };
     }
     const sessionKey = `telegram:${identity}:chat:${record.chatId}`;
-    const conversation = await gateway.conversationFor(sessionKey, adapterContext);
-    if (record.command === "new") await conversation.reset(undefined, adapterContext);
-    else await conversation.abort(adapterContext);
+    let outcome: ControlOutcome;
+    if (record.command === "new") {
+      outcome = await applyNewSession(sessionKey);
+    } else if (record.command === "abort") {
+      const conversation = await gateway.conversationFor(sessionKey, adapterContext);
+      await conversation.abort(adapterContext);
+      outcome = { kind: "applied" };
+    } else if (record.command === "restart") {
+      // No conversation effect: the record and its acknowledgement are durable first, and the host
+      // replacement is requested by the caller only after that acknowledgement was released.
+      outcome = { kind: "applied", text: CONTROL_ACK.restart, requestRestart: true };
+    } else {
+      outcome = await applyModelPreset(record, sessionKey);
+    }
+    if (outcome.kind !== "applied") return outcome;
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
       const entry = doc.controls.find((item) => item.updateId === record.updateId);
       if (entry !== undefined) entry.status = "applied";
-      // Bound the log here too: only applied and already-reported records are pruned, never an unresolved one.
+      // Bound the log here too: only applied, refused and already-reported records are pruned.
       doc.controls = pruneControls(doc.controls, doc.pending);
       return copyJson(doc) as unknown as ChannelState;
     }, adapterContext);
     controlFailures.delete(record.updateId);
     deferredControls.delete(record.updateId);
-    return "applied";
+    return outcome;
+  }
+
+  /**
+   * `/new`: a native reset plus, when the host offers it, a rebuild of this session's assembled
+   * workspace prompt from the current on-disk files. The host refuses while a run is live, so a
+   * half-effect (reset without rebuild, or a new snapshot leaking into a running turn) is never
+   * reported as applied.
+   */
+  async function applyNewSession(sessionKey: string): Promise<ControlOutcome> {
+    const resetSession = gateway.resetSession;
+    if (resetSession === undefined) {
+      const conversation = await gateway.conversationFor(sessionKey, adapterContext);
+      await conversation.reset(undefined, adapterContext);
+      return { kind: "applied" };
+    }
+    const result: GatewaySessionReset = await resetSession.call(gateway, sessionKey, adapterContext);
+    if (result.status === "busy") return { kind: "refused", text: RESET_BUSY };
+    if (!result.promptRebuilt) return { kind: "applied" };
+    return {
+      kind: "applied",
+      text: [
+        CONTROL_ACK.new,
+        `This session's assembled workspace prompt was rebuilt from the current files: ${result.skills} ` +
+          "skill(s) are listed for on-demand loading. The new session's next request uses that snapshot; requests " +
+          "already prepared, other chats and the configuration are unchanged.",
+      ].join("\n"),
+    };
+  }
+
+  /**
+   * The only model effect a chat command may have: select one configured preset, or `default` for the
+   * configured default. The host selection rejects atomically (including a busy conversation), so a
+   * refusal is a known no-effect on this chat's selection and is never retried or reported as applied.
+   */
+  async function applyModelPreset(record: DeferredControl, sessionKey: string): Promise<ControlOutcome> {
+    const selectPreset = gateway.selectModelPreset;
+    if (selectPreset === undefined || record.target === undefined) {
+      return { kind: "refused", text: MODEL_UNAVAILABLE_HOST };
+    }
+    try {
+      const selected: GatewayModelSelection = await selectPreset.call(gateway, sessionKey, record.target, adapterContext);
+      return {
+        kind: "applied",
+        text: [
+          `Selected preset ${boundedLabel(record.target, 80)} for this chat: ` +
+            `${boundedLabel(selected.provider, 80)}/${boundedLabel(selected.modelId, 160)} ` +
+            `(thinking: ${boundedLabel(selected.thinkingLevel, 32)}).`,
+          "Only this chat's selection changed; other chats keep theirs and the configuration was not rewritten.",
+          "The selection lasts while this gateway stays open: a restart restores the configured default preset, and " +
+            "requests already prepared keep the model they were prepared with.",
+        ].join("\n"),
+      };
+    } catch (error) {
+      if (isConversationBusy(error)) {
+        return {
+          kind: "refused",
+          text: "Model preset selection rejected: this chat is busy, so nothing changed. " +
+            "Retry /model when this chat is idle. It was not queued and no other chat was affected.",
+        };
+      }
+      return {
+        kind: "refused",
+        text: "Model preset selection was refused, so this chat's selection is unchanged. " +
+          "Use /model to list the configured presets.",
+      };
+    }
   }
 
   /**
@@ -2068,11 +2343,157 @@ export async function runTelegram(
       if (entry !== undefined) entry.status = "unconfirmed";
       const notice = doc.pending.find((item) => item.notice === true && item.updateId === updateId);
       if (notice !== undefined) {
-        notice.text = UNCONFIRMED_CONTROL;
+        notice.text = entry?.command === "restart" ? UNCONFIRMED_RESTART : UNCONFIRMED_CONTROL;
         delete notice.hold;
       }
       return copyJson(doc) as unknown as ChannelState;
     }, adapterContext);
+  }
+
+  /**
+   * Record a proven no-effect outcome and publish its refusal wording instead of an applied
+   * acknowledgement. A later replay of the same update reports the refusal; the command is never retried.
+   */
+  async function markControlRefused(updateId: number, text: string): Promise<void> {
+    const bounded = text.slice(0, MAX_NOTICE_CHARS);
+    state = await stateConversation.commit(async (tx) => {
+      const doc = await tx.doc(TelegramState, stateConversation.id);
+      const entry = doc.controls.find((item) => item.updateId === updateId);
+      if (entry !== undefined) entry.status = "refused";
+      const notice = doc.pending.find((item) => item.notice === true && item.updateId === updateId);
+      if (notice !== undefined) {
+        notice.text = bounded;
+        delete notice.hold;
+      }
+      doc.controls = pruneControls(doc.controls, doc.pending);
+      return copyJson(doc) as unknown as ChannelState;
+    }, cleanupContext);
+  }
+
+  /**
+   * The host model catalog is per-session, so this chat's mapped conversation must exist first. That
+   * mapping is the adapter's own bound for the CURRENT authenticated chat: it creates no other
+   * conversation, grants no root authority, and holds no model call.
+   */
+  async function readModelListing(sessionKey: string): Promise<GatewayModelList | undefined> {
+    if (gateway.listModels === undefined) return undefined;
+    try {
+      await gateway.conversationFor(sessionKey, adapterContext);
+      return await gateway.listModels(sessionKey, adapterContext);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Bounded point-in-time metadata of this authenticated chat through the same native conversation
+   * projection the terminal uses. Read only: no model call, no watch, no transcript, prompt, tool
+   * argument or other chat, and no configuration change.
+   */
+  async function statusNotice(sessionKey: string): Promise<string> {
+    try {
+      const listing = await readModelListing(sessionKey);
+      const conversation = await gateway.conversationFor(sessionKey, adapterContext);
+      const status = await inProcessTerminalConversation(conversation).status(adapterContext);
+      const selection = listing?.selected;
+      const model = selection === undefined
+        ? (status.model === undefined ? "unknown" : `${status.model.provider}/${status.model.modelId}`)
+        : `${selection.provider}/${selection.modelId} (thinking: ${selection.thinkingLevel})`;
+      const preset = listing === undefined ? undefined : matchingPresetName(listing);
+      return [
+        "Status for this chat (no model call, no configuration change):",
+        `Model: ${boundedLabel(model, 240)}${preset === undefined ? "" : ` — preset ${boundedLabel(preset, 80)}`}`,
+        status.run === undefined
+          ? "Run: idle"
+          : `Run: running (turn ${status.run.taskId}, ${status.run.inputs} input(s)` +
+            `${status.run.attempt === undefined ? "" : `, generation attempt ${status.run.attempt}`})`,
+        `Queued native inputs: ${status.inbox.total}`,
+        "Only this chat was read; no other chat, transcript, prompt or tool argument is included.",
+      ].join("\n");
+    } catch {
+      return "Status is unavailable right now: this chat's conversation metadata could not be read. " +
+        "No model call was made and nothing changed.";
+    }
+  }
+
+  /** One bounded listing of the current selection and the finite configured choices. */
+  function modelListingText(listing: GatewayModelList): string {
+    const maxChoices = 50;
+    const selectedLine = `Current model: ${boundedLabel(listing.selected.provider, 80)}/` +
+      `${boundedLabel(listing.selected.modelId, 160)} (thinking: ${boundedLabel(listing.selected.thinkingLevel, 32)}).`;
+    const presets = listing.presets ?? [];
+    if (presets.length === 0) {
+      // Legacy direct-model configuration: the selection and its allowed choices are shown read only.
+      const rows = listing.models.slice(0, maxChoices).map((choice) => {
+        const current = choice.provider === listing.selected.provider && choice.modelId === listing.selected.modelId;
+        const levels = choice.thinkingLevels.map((level) => boundedLabel(level, 32)).join(", ");
+        return `  ${current ? "* " : "  "}${boundedLabel(choice.provider, 80)} ${boundedLabel(choice.modelId, 160)} ` +
+          `— ${boundedLabel(choice.name, 160)} [thinking: ${levels === "" ? "off" : levels}]`;
+      });
+      if (listing.models.length > maxChoices) {
+        rows.push(`  … ${listing.models.length - maxChoices} more allowed models omitted`);
+      }
+      return [
+        selectedLine,
+        "Named model presets are not configured in this deployment, so /model <name> and /model default are " +
+          "unavailable here; this chat command never rewrites the configuration.",
+        "Configured direct choices (read only; the direct selection belongs to the local CLI):",
+        ...rows,
+      ].join("\n");
+    }
+    const selectedPreset = matchingPresetName(listing);
+    const rows = presets.slice(0, maxChoices).map((preset) => {
+      const isDefault = preset.name === listing.defaultPreset;
+      return `  ${preset.name === selectedPreset ? "* " : "  "}${boundedLabel(preset.name, 80)} — ` +
+        `${boundedLabel(preset.provider, 80)} ${boundedLabel(preset.modelId, 160)} ` +
+        `[thinking: ${boundedLabel(preset.thinkingLevel ?? "off", 32)}]${isDefault ? " (default)" : ""}`;
+    });
+    if (presets.length > maxChoices) rows.push(`  … ${presets.length - maxChoices} more named presets omitted`);
+    return [
+      selectedLine,
+      ...(listing.defaultPreset === undefined ? [] : [`Configured default preset: ${boundedLabel(listing.defaultPreset, 80)}.`]),
+      "Named model presets (use /model <name>, or /model default for the configured preset):",
+      ...rows,
+      "A selection applies to this chat only and lasts while the gateway stays open; a restart restores the " +
+        "configured default and prepared requests keep their model.",
+    ].join("\n");
+  }
+
+  /** The commands this host actually supports, in menu order. */
+  function availableCommandList(): string {
+    return ["/new", "/abort", "/stop", ...(hostCommands.status ? ["/status"] : []),
+      ...(hostCommands.model ? ["/model"] : []), ...(hostCommands.restart ? ["/restart"] : []),
+      "/help"].join(", ");
+  }
+
+  /** Help lists exactly the controls this host implements; nothing is advertised that would be refused. */
+  function controlHelpText(): string {
+    const lines = [
+      "Controls for this chat (other messages go to the assistant):",
+      "/new - native context reset for this conversation: fresh model context, no summary or handoff; stored history and tool authority unchanged; queued messages are kept.",
+      "/abort - withdraw queued messages and stop the current turn here; other chats, cron jobs and background work are unaffected.",
+      "/stop - alias of /abort with exactly the same effect.",
+    ];
+    if (hostCommands.status) {
+      lines.push("/status - bounded read-only status of this chat: selected model, run state and queued input count; no model call.");
+    }
+    if (hostCommands.model) {
+      lines.push("/model - list the configured model presets and this chat's selection; /model <preset> or /model default " +
+        "selects one for this chat only. A busy chat is refused, and a restart restores the configured default.");
+    }
+    if (hostCommands.restart) {
+      lines.push("/restart - stop this gateway and replace the process with the same program and configuration, so new " +
+        "code and configuration are loaded. It affects every chat and background work; the acknowledgement confirms " +
+        "the request, not the completed restart.");
+    }
+    lines.push("/help - this list.");
+    lines.push(mediaIngress === undefined
+      ? "Limits: text only (attachments are not read); no tool-authority, history, restart or media commands. " +
+        "Other slash commands are refused; prefix // to send a leading slash literally."
+      : "Attachments: photos are attached as image content, voice/audio is transcribed locally when the backend is " +
+        "provisioned, and documents are stored unread on disk under the configured media directory. Video and stickers " +
+        "are not downloaded. Other slash commands are refused; prefix // to send a leading slash literally.");
+    return lines.join("\n");
   }
 
   async function admitNotice(
@@ -2345,12 +2766,30 @@ function quotedMessageContext(
   };
 }
 
-/** Only commands the adapter actually implements belong in the native menu. */
-const TELEGRAM_COMMANDS: readonly { readonly command: string; readonly description: string }[] = [
-  { command: "new", description: "Reset this conversation's context" },
-  { command: "abort", description: "Stop this turn and withdraw queued messages" },
-  { command: "help", description: "Show the available commands" },
-];
+/**
+ * Only commands this adapter actually implements for this host belong in the native menu. `/status`,
+ * `/model` and `/restart` are omitted for a host that exposes no such operation.
+ */
+function telegramCommands(
+  host: TelegramCommandHost,
+): readonly { readonly command: string; readonly description: string }[] {
+  return [
+    { command: "new", description: "Reset this conversation's context" },
+    { command: "abort", description: "Stop this turn and withdraw queued messages" },
+    { command: "stop", description: "Alias of /abort: stop this turn here" },
+    ...(host.status ? [{ command: "status", description: "Show this chat's model and run status" }] : []),
+    ...(host.model ? [{ command: "model", description: "List or select a configured model preset" }] : []),
+    ...(host.restart ? [{ command: "restart", description: "Restart the gateway process" }] : []),
+    { command: "help", description: "Show the available commands" },
+  ];
+}
+
+/** Which optional host operations this adapter may advertise and apply. */
+type TelegramCommandHost = {
+  readonly status: boolean;
+  readonly model: boolean;
+  readonly restart: boolean;
+};
 
 type ParsedTelegramInput =
   | { readonly kind: "input"; readonly text: string }
@@ -2358,18 +2797,35 @@ type ParsedTelegramInput =
   | { readonly kind: "unsupported"; readonly command: string }
   | { readonly kind: "foreign"; readonly command: string; readonly mention: string };
 
-type TelegramControl = "new" | "abort" | "help";
+type TelegramControl = "new" | "abort" | "stop" | "help" | "status" | "model" | "restart";
 
-const CONTROL_ACK: Record<"new" | "abort", string> = {
+/**
+ * A command with a native effect on this chat or this process; a refusal is terminal, never retried.
+ * `/stop` normalizes to `abort` here, so one control kind covers both spellings.
+ */
+type TelegramMutation = "new" | "abort" | "model" | "restart";
+
+type ControlOutcome =
+  | { readonly kind: "applied"; readonly text?: string; readonly requestRestart?: true }
+  | { readonly kind: "refused"; readonly text: string }
+  | { readonly kind: "deferred" }
+  | { readonly kind: "abandoned" };
+
+const CONTROL_ACK: Record<TelegramMutation, string> = {
   new:
     "Context reset applied for this chat (native Durable reset, no handoff text, no summary). " +
     "Stored entries and tool authority are unchanged; queued messages are kept and run in the new context.",
   abort:
     "Abort applied for this chat: it is idle now. Queued messages were withdrawn and any running turn was stopped; " +
     "other chats, cron jobs and background work are unaffected.",
+  model:
+    "Model preset selection is being applied to this chat only. Nothing was sent to the assistant.",
+  restart:
+    "Restart requested for this gateway: it is stopping so the same process can reload its code and configuration. " +
+    "This acknowledgement confirms the request only; it does not confirm that the restart completed.",
 };
 
-const CONTROL_PENDING: Record<"new" | "abort", string> = {
+const CONTROL_PENDING: Record<TelegramMutation, string> = {
   new:
     "Context reset is still pending for this chat: Durable has not admitted it yet. Stored entries, tool authority and " +
     "queued messages are unchanged, and this chat keeps waiting instead of losing the request.",
@@ -2377,30 +2833,106 @@ const CONTROL_PENDING: Record<"new" | "abort", string> = {
     "Abort is still pending for this chat: Durable has not finished stopping the current turn, so the provider may be " +
     "ignoring cancellation. Queued messages stay withdrawn and new messages are held, never answered and never " +
     "dropped, until the turn ends. Other chats, cron jobs and background work are unaffected.",
+  model:
+    "Model preset selection is still pending for this chat: messages admitted earlier are being submitted first. " +
+    "This chat keeps waiting; nothing was applied yet and nothing was sent to the assistant.",
+  restart:
+    "Restart is still pending for this gateway: messages admitted earlier in this chat are being submitted first. " +
+    "Nothing has been restarted yet and nothing was sent to the assistant.",
 };
 
 const UNCONFIRMED_CONTROL =
-  "That earlier /new or /abort was interrupted before it was confirmed, so it may not have taken effect. " +
+  "That earlier command was interrupted before it was confirmed, so it may not have taken effect. " +
   "Send it again if you still need it.";
 
-const CONTROL_HELP = [
-  "Controls for this chat (other messages go to the assistant):",
-  "/new - native context reset for this conversation: fresh model context, no summary or handoff; stored history and tool authority unchanged; queued messages are kept.",
-  "/abort - withdraw queued messages and stop the current turn here; other chats, cron jobs and background work are unaffected.",
-  "/help - this list.",
-  "Limits: text only (attachments are not read); no tool-authority, history, restart or media commands. Other slash commands are refused; prefix // to send a leading slash literally.",
-].join("\n");
+/** An interrupted restart is never repeated automatically, and resending it is the caller's decision. */
+const UNCONFIRMED_RESTART =
+  "That earlier /restart was interrupted before it was confirmed: it may or may not have restarted the gateway, " +
+  "and it is not requested again.";
 
-/** The same controls when media ingress is configured; the attachment claim must stay truthful. */
-const CONTROL_HELP_MEDIA = [
-  "Controls for this chat (other messages go to the assistant):",
-  "/new - native context reset for this conversation: fresh model context, no summary or handoff; stored history and tool authority unchanged; queued messages are kept.",
-  "/abort - withdraw queued messages and stop the current turn here; other chats, cron jobs and background work are unaffected.",
-  "/help - this list.",
-  "Attachments: photos are attached as image content, voice/audio is transcribed locally when the backend is " +
-    "provisioned, and documents are stored unread on disk under the configured media directory. Video and stickers " +
-    "are not downloaded. Other slash commands are refused; prefix // to send a leading slash literally.",
-].join("\n");
+/** Fixed, sanitized refusals: a narrow host advertises nothing it cannot do. */
+const STATUS_UNAVAILABLE_HOST =
+  "Status is unavailable in this host: it exposes no model/status metadata for this chat. Nothing was sent to the assistant.";
+const MODEL_UNAVAILABLE_HOST =
+  "Model commands are unavailable in this host: it exposes no preset catalog or preset selection. Nothing was sent to the assistant.";
+const MODEL_LISTING_UNAVAILABLE =
+  "Model choices are unavailable right now: this chat's host model catalog could not be read. Nothing changed.";
+const MODEL_PRESETS_UNAVAILABLE =
+  "Named model presets are not configured in this deployment, so /model <name> and /model default are unavailable. " +
+  "Nothing was changed; /model lists the current selection read only, and this chat command never rewrites the configuration.";
+const MODEL_USAGE =
+  "Usage: /model (list the configured presets) or /model <preset> (or /model default). Nothing was sent to the assistant.";
+const RESTART_UNAVAILABLE_HOST =
+  "Restart is unavailable in this host: it cannot replace its own process with the same program and configuration. " +
+  "Nothing was sent to the assistant.";
+const RESTART_ALREADY_REQUESTED =
+  "A restart was already requested in this gateway and is still stopping it; this /restart was not requested again.";
+const RESTART_REQUEST_FAILED =
+  "A restart was already requested in this gateway and the host refused it, so the gateway is still running. " +
+  "This /restart was not requested again; fix the host and start the gateway yourself.";
+const RESET_BUSY =
+  "Context reset rejected: this chat has a running turn, so nothing was reset and the assembled workspace prompt was " +
+  "not rebuilt. It was not queued; /abort this chat or retry /new when it is idle. Other chats are unaffected.";
+
+/** Replay wording for a command this adapter recorded before a restart; it is never run twice. */
+function replayControlText(entry: TelegramControlRecord): string {
+  if (entry.command === "restart") {
+    return entry.status === "applied"
+      ? "That /restart was already requested before this process restarted, so it is not requested again."
+      : "That /restart was interrupted before it was confirmed: it may or may not have restarted the gateway, and it " +
+        "is not requested again.";
+  }
+  if (entry.status === "applied") return "That command was already applied before a restart, so it was not run again.";
+  if (entry.status === "refused") {
+    return "That command was refused before any effect and will not be retried; send it again if it is still needed.";
+  }
+  if (entry.status === "unconfirmed") {
+    return "That command was already reported as interrupted; send it again if you still need it.";
+  }
+  return UNCONFIRMED_CONTROL;
+}
+
+type ModelArgument =
+  | { readonly kind: "list" }
+  | { readonly kind: "preset"; readonly name: string }
+  | { readonly kind: "usage" };
+
+/** Bound a `/model` argument to the shape the config itself accepts: one name, never a selector triple. */
+function parseModelArgument(args: string): ModelArgument {
+  const trimmed = args.trim();
+  if (trimmed === "") return { kind: "list" };
+  const parts = trimmed.split(/\s+/u);
+  if (parts.length !== 1) return { kind: "usage" };
+  const name = parts[0]!;
+  // Config preset names carry no whitespace or control characters; bidi/format characters would reorder the notice.
+  if (name.length > 80 || !/^[^\s\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]+$/u.test(name)) return { kind: "usage" };
+  return { kind: "preset", name };
+}
+
+/** Plain-text notice labels: no parse mode is used, and control/bidi characters never reach the chat. */
+function boundedLabel(value: unknown, max: number): string {
+  const text = typeof value === "string" ? value : "";
+  const cleaned = text.replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (cleaned === "") return "(empty)";
+  let bounded = cleaned.slice(0, max);
+  // Never cut a surrogate pair.
+  if (bounded.length > 0 && /[\uD800-\uDBFF]/u.test(bounded[bounded.length - 1]!)) bounded = bounded.slice(0, -1);
+  return bounded;
+}
+
+/** The configured preset this chat currently uses, matched by provider/model/thinking. */
+function matchingPresetName(listing: GatewayModelList): string | undefined {
+  const selected = listing.selected;
+  return listing.presets?.find((preset) => preset.provider === selected.provider &&
+    preset.modelId === selected.modelId && (preset.thinkingLevel ?? "off") === selected.thinkingLevel)?.name;
+}
+
+function isConversationBusy(error: unknown): boolean {
+  return error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy");
+}
+
 
 const TELEGRAM_COMMAND = new RegExp(
   "^/([A-Za-z0-9_]{1," + COMMAND_NAME_MAX + "})(?:@([A-Za-z0-9_]{1," + BOT_MENTION_MAX + "}))?(?=\\s|$)",
@@ -2428,7 +2960,8 @@ function parseTelegramInput(raw: string, botUsername: string | undefined): Parse
     // Never execute or forward another bot's command; the caller answers with a bounded notice.
     return { kind: "foreign", command, mention: mention.toLowerCase() };
   }
-  if (command === "new" || command === "abort" || command === "help") {
+  if (command === "new" || command === "abort" || command === "stop" || command === "help" ||
+      command === "status" || command === "model" || command === "restart") {
     return { kind: "control", command, args: raw.slice(match[0].length).trim() };
   }
   return { kind: "unsupported", command };
@@ -2447,7 +2980,7 @@ function pruneControls(
   let drop = Math.max(0, totalApplied - MAX_CONTROL_RECORDS);
   const reported = new Set(pending.filter((item) => item.notice === true).map((item) => item.updateId));
   return controls.filter((entry) => {
-    if (entry.status === "unconfirmed" && !reported.has(entry.updateId)) return false;
+    if ((entry.status === "unconfirmed" || entry.status === "refused") && !reported.has(entry.updateId)) return false;
     if (entry.status !== "applied" || drop === 0) return true;
     drop -= 1;
     return false;

@@ -69,6 +69,15 @@ npm start -- agent --config config.json     # attach a terminal
   are temporary: a CLI reattach keeps the temporary selection, while a gateway
   restart or reopen restores the configured preset without rewriting prepared
   dispatches. Direct-model (non-preset) selection retains its persisted semantics.
+- The authenticated Telegram owner's controls are `/new`, `/abort`/`/stop`,
+  `/status`, `/model` and `/restart`, advertised only where the host implements
+  them. `/model` selects one configured preset for that chat only; `/status` is
+  bounded read-only metadata with no model call; `/new` starts a new context and
+  rebuilds the assembled workspace prompt, so a host with a prompt snapshot
+  refuses it while that chat runs instead of half-applying; `/restart` is the
+  host's full-process replacement (same executable, argv and environment through
+  POSIX `process.execve`, after normal teardown), never a model tool, daemon or
+  supervisor. `/refresh` is not a command.
 - The cron timer never calls a model, and a run never schedules: rescheduling is
   a deterministic task commit, so a slow or failed turn cannot stop the schedule.
 - Skill prompts carry names, descriptions and locators only; bodies load on

@@ -18,36 +18,104 @@ only sees updates that already passed the private-chat allowlist check, so an
 unauthorized sender, a group, a bot, or an attachment can never be a control and
 never reaches it. `message.text` (not a caption) is classified:
 
-- `/new`, `/abort`, `/help` are the only controls. Matching is an exact leading
-  command token (case-insensitive; arguments are refused with a usage notice).
-- `/new@bot` and `/abort@bot` are controls only when the mention names this bot
-  from `getMe` (case-insensitive). Another bot's mention, or a mention while
-  `getMe` returned no usable username, gets a bounded notice and is neither
-  executed nor forwarded to the assistant. A malformed mention (`/new@`,
-  `/new@@x`) is an unknown command as well, answered the same way.
-- Any other leading slash command gets a bounded notice naming the three
-  controls and is **not** sent to the assistant. `/prose` is therefore not a
-  prompt; `//prose` sends `/prose` literally as assistant input.
+- The owner controls are `/new`, `/abort`, `/stop`, `/status`, `/model`,
+  `/restart` and `/help`. `/stop` is an alias of `/abort` with exactly the same
+  effect and the same durable record (it is normalized before admission, so
+  there is one control kind and one code path). Which of them this adapter
+  advertises depends on what the host really exposes (see
+  [Host capability and the native menu](#host-capability-and-the-native-menu)).
+  A typed command the host cannot perform is refused with fixed text and is
+  never sent to the assistant.
+- Matching is an exact leading command token (case-insensitive). `/new`,
+  `/abort`, `/stop`, `/status`, `/restart` and `/help` take no arguments;
+  `/model` takes one configured preset name or `default`. Anything else gets a
+  bounded usage notice.
+- `/new@bot` etc. are controls only when the mention names this bot from
+  `getMe` (case-insensitive). Another bot's mention, or a mention while `getMe`
+  returned no usable username, gets a bounded notice and is neither executed nor
+  forwarded to the assistant. A malformed mention (`/new@`, `/new@@x`) is an
+  unknown command as well, answered the same way.
+- Any other leading slash command gets a bounded notice naming the controls this
+  host implements and is **not** sent to the assistant. `/prose` is therefore not
+  a prompt; `//prose` sends `/prose` literally as assistant input.
 - Everything else, including plain text and `/new` inside a sentence, is
   ordinary assistant input.
 
-`/new` calls Durable's native `Conversation.reset(undefined, context)` on the
-same mapped conversation: fresh model context, no handoff text, no summary, no
-model call, unchanged conversation identity, tool authority and cron ownership.
-Reset placement while busy is Durable's own next-boundary ordering; the adapter
-does not reorder a reset, and queued messages are kept and run in the new
-context. Episode boundaries that the history catalog derives from committed
-resets apply unchanged.
+`/new` starts a new context for this chat **and** rebuilds its assembled
+workspace prompt. The shipped Gateway pairs both in one host operation
+(`Gateway.resetSession`): Durable's native reset stays the context boundary (no
+handoff text, no summary, same conversation identity, same tool authority and
+cron ownership), and the configured `workspaceContext` snapshot — bootstrap
+files, memory files, the memory manifest and the on-demand skill metadata — is
+re-read from disk and replaces the previous snapshot for the new session only.
+Requests already prepared, other chats and the configuration are untouched.
+
+Because both halves must apply together, `/new` is refused while this chat has a
+running turn: a rebuilt snapshot installed mid-run would change the running
+turn's later provider request, and a reset alone would leave the new context
+with the old prompt. The refusal is atomic and is not queued; `/abort` or waiting
+for the turn to settle keeps the chat usable. Messages admitted before the
+command are still submitted first, exactly as for `/abort`.
+
+A host with no prompt snapshot (or a narrow SDK gateway without `resetSession`)
+keeps the previous behaviour: `/new` is the plain native reset on the same
+mapped conversation, and its acknowledgement says nothing about a rebuild. A
+host that does have a snapshot reports `busy` instead of a half-effect.
 
 `/abort` calls `Conversation.abort(context)` without `background`, which is the
 narrowest public API: it withdraws this conversation's queued inputs, marks its
-live non-background tasks and resolves once that ordinary scope is idle. Other
+live non-background tasks and resolves once that ordinary scope is idle. `/stop`
+is the same control under a second spelling: the parser normalizes it to the
+single `abort` command before validation, the durable record, gating and
+acknowledgement, so no second cancellation semantics and no second code path
+exist. Other
 chats' conversations, background subtrees and cron run tasks (created with
 `background: true`) are untouched. Queued inputs withdrawn this way settle
 `unanswered` with reason `aborted`, so their pending deliveries are forgotten
 without the generic failure text, one per input; the same applies to a turn
 ended by a queued reset (reason `reset`). Other settlement reasons keep the
 fixed failure text.
+
+`/status` prints bounded point-in-time metadata of **this** authenticated chat
+only: the selected model and its preset, whether a turn is running (turn number
+and input count) and how many native inputs are queued. It reuses the same
+native conversation projection the terminal uses, makes no model call, creates
+no watch or timer, and includes no transcript, prompt, tool argument, thinking
+content, provider error or other-chat data. There is no chat or session
+selector.
+
+`/model` lists the current selection and the finite configured catalog: named
+presets in named-preset mode (`/model <name>`, `/model default`), or the
+read-only direct choices in legacy direct-model mode together with an explicit
+"named presets are not configured" answer. It calls the host's
+`listModels`/`selectModelPreset`; it invents no model registry and never rewrites
+the configuration. A selection applies to this chat only: other chats keep
+their own and tool authority is unchanged. Like the local CLI's preset switch it
+is temporary — it lasts while this Gateway stays open, a restart restores the
+configured default preset, and a request already prepared keeps its model. A
+busy chat is refused atomically (nothing is queued and no change lands on a
+later turn); unknown names and legacy direct configs are refused with fixed
+text.
+
+`/restart` asks the host to replace the Gateway process so current code and a
+re-read configuration are loaded. It is not a model tool, it is available only to
+an authenticated allowlisted private sender, and it affects every surface and
+background job. The host performs it only after its own graceful teardown —
+adapters and local clients closed, timers cleared, Harness, Code Mode sandbox and
+MCP clients closed, store lock released — and only where the Node runtime can
+replace the process image (`process.execve`, POSIX; absent on Windows and IBM i).
+The replacement keeps the same executable, the same argv (script, `gateway`,
+`--config <path>`) and the current process environment; nothing is re-discovered
+from disk, and no shell respawn, supervisor or service manager is involved. The
+acknowledgement confirms the **request**, not a completed restart; a failed
+replacement leaves a fixed diagnostic and a stopped process rather than a false
+success.
+
+The host owns that capability: the local CLI injects it, and an SDK host that
+does not gets no `/restart` entry and a fixed refusal when the command is typed.
+A second `/restart` is refused while the first is stopping the Gateway, a
+recovered admitted record is only reported as interrupted (never re-requested),
+and the durable offset means a replayed update cannot restart it a second time.
 
 ## Attachments and local transcription
 
@@ -120,8 +188,9 @@ admitted by `telegram.allowFrom` shares the configured workspace and tool
 authority in its private chat. Admission is not per-tool authority, and there is
 no grant, expiry, approval prompt or startup re-grant.
 
-Tool authority comes from the configuration: editing `toolAllowlist` and
-restarting is the only way to change it. `/tools`, `/grant`, `/revoke` and other
+Tool authority comes from the configuration: editing `toolAllowlist` and restarting
+the gateway (`/restart` replaces the process, re-reading the same config path) is
+the only way to change it. `/tools`, `/grant`, `/revoke` and other
 grant or approval commands do not exist in this adapter, and the model cannot
 request or change tool authority. The same scope rules as the CLI apply: only a
 validated ordinary mapped chat conversation is authorized, and scheduled
@@ -131,17 +200,27 @@ See [`TOOLS.md`](./TOOLS.md#configured-authority).
 Acknowledgements are ordinary channel-state pending records with `notice: true`.
 They go through the same bounded chunk send, flood gate, write-ahead send intent
 and unknown-outcome quarantine as model replies, and are never submitted to
-Durable or the model. `/help` and refused commands create no conversation.
+Durable or the model. `/help`, `/status`, `/model` listing and refused commands
+create no conversation; reading the catalog or status may create this chat's own
+empty mapped conversation, which is the same mapping an ordinary message creates
+and grants no other authority.
 
 ### Acknowledgement and pending semantics
 
-A `/new` or `/abort` acknowledgement is committed **held** (`hold: true`) with
-the command intent, and published once:
+A mutating control (`/new`, `/abort`, `/model`, `/restart`) acknowledgement is
+committed **held** (`hold: true`) with the command intent, and published once:
 
-- the native call returns: "Context reset applied …" or "Abort applied for this
-  chat: it is idle now. Queued messages were withdrawn and any running turn was
-  stopped …" — phrased so an idle conversation is not claimed to have had a turn
-  stopped;
+- the native call returns: "Context reset applied …" (with the rebuilt prompt
+  and skill count when the host rebuilt it), "Abort applied for this chat: it is
+  idle now. Queued messages were withdrawn and any running turn was stopped …"
+  — phrased so an idle conversation is not claimed to have had a turn stopped —
+  "Selected preset … for this chat: …", or "Restart requested for this gateway
+  … This acknowledgement confirms the request only; it does not confirm that the
+  restart completed.";
+- the native call proved that nothing changed (`/new` or `/model` on a busy chat,
+  an unknown or unavailable preset, a legacy direct config): the acknowledgement
+  is corrected to that fixed refusal; the record becomes `refused`, never
+  `applied`, so a replay cannot claim a change that did not happen;
 - or the call has not returned after 30 seconds: the explicit still-pending
   wording, e.g. "Abort is still pending for this chat … the provider may be
   ignoring cancellation. Queued messages stay withdrawn and new messages are
@@ -170,9 +249,10 @@ record in the delivery path (with the update's stable request ID), so a crash
 before submission is recovered rather than lost, and a duplicate update cannot
 create a second turn.
 
-`/new` and `/abort` are admitted the same way and additionally record
-`{ updateId, command, status, chatId, senderId }` in the `controls` log **before**
-the native call. While a chat's command is being applied, that chat is gated:
+`/new`, `/abort` (also spelled `/stop`), `/model` and `/restart` are admitted
+the same way and additionally record `{ updateId, command, status, chatId, senderId }` in the
+`controls` log **before** the native call. While a chat's command is being
+applied, that chat is gated:
 none of its pending inputs are submitted or delivered, so the acknowledgement
 cannot precede or overstate the effect, and a message admitted after the command
 cannot be submitted early and withdrawn by the abort it followed. The gate is per
@@ -206,45 +286,73 @@ order, then applies the native call. A pre-command message is therefore
 withdrawn or marked by the abort as native semantics require, never answered
 after the acknowledgement; messages admitted afterwards stay gated and run later.
 
-After the native call returns, the record becomes `applied`, the log is pruned,
-and the held acknowledgement is released. If the process dies in between, the
-next open reports the command exactly once: its held acknowledgement is
-corrected to the explicit "interrupted, may not have taken effect" wording and
-released, or, when no acknowledgement record is left, a bounded report is queued
-for the recorded chat. `unconfirmed` is terminal, so later opens do not repeat
-it; a replayed update (possible only if the offset was not committed) answers
-that it was already reported and never repeats the action. The log keeps every
-unresolved record and bounds `applied` history at 64 on admission and completion,
-so a crash cannot evict a command whose effect is unknown. A
-reported terminal (`unconfirmed`) record is pruned once its report is durably
-delivered; unresolved records are never dropped. At most 64 unresolved records
-are kept: further control commands are refused with a bounded notice (nothing is
-executed or sent to the assistant), so a hung provider plus a flood of commands
-cannot grow the log. Refusal creates no record and no held acknowledgement. So a
-command is at-most-once: it can be lost and reported as unconfirmed, but it is
-not automatically applied twice in normal recovery. If an operator rolls back the
+After the native call returns, the record becomes `applied` (for `/restart`, once
+the host accepted the request), the log is pruned, and the held acknowledgement
+is released. The host replacement for `/restart` is requested only after that
+acknowledgement and offset are durable, and never more than once. If the process
+dies in between, the next open reports the command exactly once: its held
+acknowledgement is corrected to the explicit "interrupted, may not have taken
+effect" wording and released, or, when no acknowledgement record is left, a
+bounded report is queued for the recorded chat. `unconfirmed` and `refused` are
+terminal, so later opens do not repeat them; a replayed update (possible only if
+the offset was not committed) answers with the recorded outcome and never
+repeats the action. An interrupted `/restart` is reported as interrupted and is
+**not** requested again, so recovery cannot produce a restart cycle. The log
+keeps every unresolved record and bounds `applied` history at 64 on admission and
+completion, so a crash cannot evict a command whose effect is unknown. A
+reported terminal (`unconfirmed` or `refused`) record is pruned once its report
+is durably delivered; unresolved records are never dropped. At most 64
+unresolved (`admitted`/`unconfirmed`) records are kept: further control commands
+are refused with a bounded notice (nothing is executed or sent to the
+assistant), so a hung provider plus a flood of commands cannot grow the log.
+Refusal creates no record and no held acknowledgement. So a command is
+at-most-once: it can be lost and reported as unconfirmed, but it is not
+automatically applied twice in normal recovery. If an operator rolls back the
 polling offset without restoring the pruned control record, that update can apply
 again. No exactly-once claim is made for a native reset (Durable exposes no reset
-idempotency key). Version 1 and 2 state documents
-migrate with an empty `controls` list.
+idempotency key).
 
 State version 5 adds bounded observed message targets and write-ahead action records.
 Version 4 state migrates with empty `targets` and `actions` lists; versions 1 and 2
 migrate with an empty `controls` list. Version 6 adds admitted attachment records
 and the cached local transcript; earlier versions migrate with no attachments.
+Version 7 adds the `refused` control status; versions 1–6 migrate unchanged.
 Invalid stored shapes fail closed.
 
-Not implemented here: `/restart`, tool-authority or approval commands, history
-commands, `/stop` aliasing, and any command that would widen tool authority. Tool
+Not implemented here: tool-authority or approval commands, history commands,
+`/tools`, and any command that would widen tool authority. `/stop` is only the
+`/abort` alias; there is no stronger cancellation, no background-worker
+cancellation and no cron mutation. A separate `/refresh` owner command was never
+implemented: `/new` rebuilds the prompt as part of starting the new context, and
+`/refresh` stays an unsupported command that is never advertised. Tool
 authority is configured by the owner, not requested in chat: this adapter
 exposes no grant or approval commands and the model cannot ask for one.
 
 ## Replies, quotes, reactions and native actions
 
-The adapter requests `message` and `message_reaction` updates and registers
-`/new`, `/abort`, `/help` with `setMyCommands` for all private chats at startup.
+The adapter requests `message` and `message_reaction` updates and registers the
+implemented owner controls with `setMyCommands` for all private chats at startup.
 Registration is best-effort: a rejection or flood wait logs one fixed warning
 and leaves typed commands working; no unimplemented command is advertised.
+
+### Host capability and the native menu
+
+The menu and `/help` list exactly the controls this host can perform, and a typed
+command outside that set is refused with fixed text instead of a silent failure:
+
+- `/new`, `/abort` (with the `/stop` alias) and `/help` are always implemented.
+- `/status` and `/model` need the host model catalog; `/model` also needs preset
+  selection. The shipped Gateway exposes both; a narrow SDK gateway without them
+  keeps the three base commands and gets a truthful refusal for the typed
+  commands.
+- `/restart` needs a host restart capability. The local CLI injects it with
+  `process.execve` support detected at startup; without it the command is
+  neither advertised nor performed.
+
+A test-only host that offers none of the optional host operations therefore
+advertises exactly `/new`, `/abort`, `/stop`, `/help`, while the shipped gateway
+with the CLI restart host advertises `/new`, `/abort`, `/stop`, `/status`,
+`/model`, `/restart`, `/help`.
 
 An ordinary user message keeps its existing input text (including literal `//`
 handling), so literal content is unchanged. A message that replies to another
@@ -384,7 +492,7 @@ retried.
   logged. A terminal unanswered model submission sends the fixed message
   `Your request could not be completed.
   Please try again.`, except an intentional native settlement (`aborted` after
-  `/abort`, or `reset` when a queued `/new` ended the turn), which is forgotten
+  `/abort`, or `reset` when the `/new` reset ended the turn), which is forgotten
   silently because the user asked for it; empty text answers also get a fixed
   user-visible response.
   Polling errors other than cancellation terminate `runTelegram` for the host to
