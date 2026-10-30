@@ -62,6 +62,17 @@ not permission to start every branch or run live integrations):
   Standalone review passed with no material code defects (`4d61f50`, docs
   corrected in `1c38146`); a fresh combined runtime/config/authority review
   passed `555d34c` with no material findings. Accepted and integrated into main.
+- [ ] Generalize native Code Mode into the agent's general compositor: scripts may
+  compose every tool the current agent is authorized to call (coding, history,
+  skill, cron, web, MCP, Telegram actions, and worker tools once accepted), not
+  only MCP tools. No new authority: each nested call still passes its normal
+  validation and call-time checks, deferred MCP stays callable but undeclared,
+  and the tool set is the current conversation's actual callable set. Code Mode
+  is not recursive, host-only owner commands are never model tools, and
+  raw/root/state/fork targets keep no composition authority. Code Mode must be
+  enableable without a dummy MCP server. Background children keep no worker tool
+  (no recursive delegation) and only compose tools already captured for them.
+  In implementation and review; not yet accepted.
 - [x] Implement channel-neutral attachment/voice media ingress: shared transcription
   configuration/processing, Telegram ingress first, native image content for
   photos with configured vision handoff, and document saving without extraction.
@@ -137,13 +148,12 @@ as behavioral references, not a subsystem to copy.
   `prompts/memory-curation.md`), editable through its configured ordinary tools
   so the owner and agent can inspect, discuss and tune it. Shipped prompt text
   is an initial seed only: never overwrite an existing workspace prompt during
-  startup, upgrades or runs. Record the prompt source/version or content hash
-  used by each run; edits affect future runs, not prepared dispatches. Hard
-  authority/edit bounds and processed-history bookkeeping remain runtime-owned,
-  not removable instructions in the editable prompt.
+  startup, upgrades or runs. Keep this simple: no added prompt hashes, version
+  registry or prompt-management machinery. Existing runtime safeguards still apply.
 - Read bounded, source-labeled Durable history; original entries remain
-  authoritative. Track processed history in native Durable state, not a second
-  Python-style history archive. Do not mark omitted/truncated evidence processed.
+  authoritative. Keep a simple digestion cursor, like the Python dream cursor,
+  recording how far history has been successfully processed. Use native Durable
+  state, not a second history archive; never advance past unprocessed evidence.
 - Follow the working Python write scope: `SOUL.md` for behavior/invariants,
   `USER.md` for stable personal preferences, `memory/<topic>/<name>.md` for topic
   context, small `memory/system/` for broadly relevant current material, and
@@ -220,6 +230,30 @@ remain intact. No deployment or live-delivery claim; no live model/bot run.
 
 ## Session log
 
+### 2026-10-30 — Code Mode becomes the general tool compositor
+
+Owner direction: Code Mode should allow composing all tools generally available
+to the agent, not just MCP tools. This supersedes the MCP-only exposure scope
+while keeping every existing authority check, deferral rule and denial intact.
+The active web-tools integration worker owns the small native generalization and
+must report functional changes for the combined review. Separately recorded:
+Telegram owner commands are `/model`, `/status`, `/new` (reset plus rebuilt
+workspace prompt) and full-process `/restart`, with no separate `/refresh`; the
+background-worker fix round is in progress; curation stays deferred with a simple
+editable prompt and digestion cursor. No live runs or new spend authorized.
+
+### 2026-10-30 — Telegram owner-command scope
+
+Owner selected Telegram owner commands as independent work. Use `/model` for
+configured presets and `/status` for bounded own-chat metadata. Do not add a
+separate Telegram `/refresh`: `/new` must reset the conversation and rebuild the
+assembled workspace Markdown/skills prompt for the new session. `/restart` must
+gracefully restart the full gateway process so new code and config load; attached
+CLI clients disconnect and Durable work recovers under existing safety rules.
+No deployment, service manager, live bot run or new tool authority is authorized.
+The original owner-command implementer received this scope update; review and
+integration are still required.
+
 ### 2026-10-30 — deferred conversation digestion scope
 
 Read the Python curation prompt and guarded runner after the owner clarified
@@ -228,10 +262,12 @@ memory/skill editing and pruning scope, source/processed-frontier integrity and
 ordinary cron/worker implementation constraint. Corrected product-worker wording:
 shared/worktree is chosen by the spawning agent; completion notifies that agent,
 not the user. Owner also required an agent-owned, inspectable/editable workspace
-consolidation prompt, seeded once and versioned per run without weakening runtime
-bounds or rewriting prepared work. Owner explicitly deferred curation
-implementation until background workers exist and requested a different next slice. No curation code, schedule,
-model run or historical-data processing started; this is planning only.
+consolidation prompt, seeded once. The owner subsequently clarified: a simple
+editable prompt plus digestion cursor, without prompt hashes/version machinery.
+Existing runtime safety and data-integrity requirements remain. Owner explicitly
+deferred curation implementation until background workers exist and requested a
+different next slice. No curation code, schedule, model run or historical-data
+processing started; this is planning only.
 
 ### 2026-10-30 — MCP accepted and published
 
