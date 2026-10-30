@@ -177,8 +177,7 @@ absolute path or file content.
 
 ## Safety
 
-Path safety is identical in spirit to `src/archival-source/index.ts` and is
-Linux-only. Other platforms fail closed with `WorkspaceContextPlatformError`
+Path safety here is Linux-only. Other platforms fail closed with `WorkspaceContextPlatformError`
 rather than falling back to weaker path checks.
 
 - The absolute root is walked from `/` with `O_DIRECTORY | O_NOFOLLOW`, so a
