@@ -196,6 +196,11 @@ export class PublicWebFetcher {
   }
 
   async fetch(rawUrl: string, options: { readonly signal?: AbortSignal } = {}): Promise<WebFetchResult> {
+    const cancelled = () => new WebFetchError("cancelled", "The page request was cancelled.");
+    // Entry check: an already-aborted caller must make no request at all. Adding a
+    // listener to an aborted signal never fires, so checking only after that would
+    // still resolve DNS and reach the network.
+    if (options.signal?.aborted) throw cancelled();
     let url = parseTarget(rawUrl, this.#limits);
     const originalUrl = url.toString();
     const deadline = new AbortController();
@@ -204,6 +209,13 @@ export class PublicWebFetcher {
       timedOut = true;
       deadline.abort();
     }, this.#limits.totalTimeoutMs);
+    // Recheck immediately before registration. Nothing between these two lines
+    // awaits, so the check and the listener are one event-loop step; the repeat
+    // only guards against a future async step being inserted here.
+    if (options.signal?.aborted) {
+      clearTimeout(timer);
+      throw cancelled();
+    }
     const onAbort = () => deadline.abort();
     options.signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -253,7 +265,7 @@ export class PublicWebFetcher {
     } catch (error) {
       if (error instanceof WebFetchError) throw error;
       if (timedOut) throw new WebFetchError("timed-out", "The page request timed out.");
-      if (options.signal?.aborted === true) throw new WebFetchError("cancelled", "The page request was cancelled.");
+      if (options.signal?.aborted) throw new WebFetchError("cancelled", "The page request was cancelled.");
       if (error instanceof WebAddressError) throw new WebFetchError("address", error.message);
       throw new WebFetchError("transport", "The page request failed.");
     } finally {

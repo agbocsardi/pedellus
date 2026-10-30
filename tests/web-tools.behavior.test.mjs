@@ -358,6 +358,8 @@ test("public fetch revalidates every hop and refuses non-public targets", { time
     ["http://127.0.0.1/", "address"],
     ["http://[::1]/", "address"],
     ["http://[::ffff:127.0.0.1]/", "address"],
+    ["http://[64:ff9b:1::1]/", "address"],
+    ["http://[3fff::1]/", "address"],
     ["http://169.254.169.254/latest/meta-data/", "address"],
     ["http://10.1.2.3/", "address"],
     ["http://192.168.0.1/", "address"],
@@ -575,4 +577,52 @@ test("search and fetch tools deny unauthorized scopes and sanitize failures", { 
   assert.equal(empty.results.length, 0);
   assert.equal(empty.requestedCount, 10);
   assert.match(new URL(emptyCalls[0].url).searchParams.get("count"), /^10$/);
+});
+
+test("already-aborted signals stop web requests before any transport", { timeout: 15_000 }, async () => {
+  const searchCalls = [];
+  const resolverCalls = [];
+  const fetchCalls = [];
+  const aborted = AbortSignal.abort();
+  const client = new BraveSearchClient({
+    apiKey: "SYNTHETIC-SECRET",
+    transport: searchTransport(searchCalls, jsonResponse({ web: { results: [{ title: "must not be requested", url: "https://example.com/" }] } })),
+  });
+  await assert.rejects(
+    client.search("synthetic query", { signal: aborted }),
+    (error) => error instanceof web.WebSearchError && error.code === "cancelled",
+  );
+  assert.equal(searchCalls.length, 0);
+
+  const fetcher = new PublicWebFetcher({
+    resolver: publicResolver(resolverCalls),
+    transport: fetchTransport({}, fetchCalls),
+  });
+  await assert.rejects(
+    fetcher.fetch("https://example.com/", { signal: aborted }),
+    (error) => error instanceof WebFetchError && error.code === "cancelled",
+  );
+  assert.equal(resolverCalls.length, 0);
+  assert.equal(fetchCalls.length, 0);
+
+  // The native tool entry must report cancellation, not a successful result, even
+  // before its own authorization or client call.
+  const extension = createWebToolExtension({
+    search: client,
+    fetcher,
+    isAuthorizedChat: () => true,
+  }).extension;
+  const tools = new Map(extension.tools.map((tool) => [tool.name, tool]));
+  const abortedContext = { ...context, abortSignal: aborted };
+  await assert.rejects(
+    tools.get("web_search").execute({ query: "synthetic" }, { conversationId: 1 }, abortedContext),
+    /Operation aborted/,
+  );
+  await assert.rejects(
+    tools.get("web_fetch").execute({ url: "https://example.com/" }, { conversationId: 1 }, abortedContext),
+    /Operation aborted/,
+  );
+  assert.equal(searchCalls.length, 0);
+  assert.equal(resolverCalls.length, 0);
+  assert.equal(fetchCalls.length, 0);
 });

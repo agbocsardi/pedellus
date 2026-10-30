@@ -29,7 +29,8 @@ providers, a controlled resolver and mock transports only.
   included in an error.
 - `web.fetch`: `true` enables `web_fetch`. It needs no credential.
 - `search` and `fetch` enable independently.
-- Unknown fields and non-boolean `fetch` are configuration errors.
+- Unknown fields are configuration errors, and `fetch` must be exactly `true` when
+  present (`false` is also rejected).
 - Because `toolAllowlist` remains the coding-tool authority, `web_search` and
   `web_fetch` cannot be added to it; doing so is a startup error.
 
@@ -81,6 +82,9 @@ the raw `content-type`, retrieval time, HTTP status, redirect count, explicit
 body/text truncation, and bounded absolute links extracted from the page.
 Links and page text are labelled untrusted page data: a successful fetch does
 not make them trusted, and no fetched text can become system instructions.
+Extraction truncation is reported in characters for the model-facing text;
+Durable may independently apply its own byte/line output window to the tool
+result.
 
 Security properties:
 

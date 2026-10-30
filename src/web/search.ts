@@ -175,6 +175,11 @@ export class BraveSearchClient {
   }
 
   async search(query: string, options: BraveSearchOptions = {}): Promise<WebSearchResponse> {
+    const cancelled = () => new WebSearchError("cancelled", "Brave Search API request was cancelled.");
+    // Entry check: a listener added to an already-aborted signal never fires, so
+    // this must happen before the provider request can start (and before the key
+    // is used at all).
+    if (options.signal?.aborted) throw cancelled();
     const text = query.trim();
     if (text.length === 0 || text.length > WEB_SEARCH_LIMITS.maxQueryChars) {
       throw new WebSearchError(
@@ -200,6 +205,11 @@ export class BraveSearchClient {
       timedOut = true;
       deadline.abort();
     }, WEB_SEARCH_LIMITS.totalTimeoutMs);
+    // Recheck immediately before listener registration; no await separates them.
+    if (options.signal?.aborted) {
+      clearTimeout(timer);
+      throw cancelled();
+    }
     const onAbort = () => deadline.abort();
     options.signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -241,7 +251,7 @@ export class BraveSearchClient {
     } catch (error) {
       if (error instanceof WebSearchError) throw error;
       if (timedOut) throw new WebSearchError("timeout", "Brave Search API request timed out.");
-      if (options.signal?.aborted === true) {
+      if (options.signal?.aborted) {
         throw new WebSearchError("cancelled", "Brave Search API request was cancelled.");
       }
       throw new WebSearchError("network", "Brave Search API request failed.");

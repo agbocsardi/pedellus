@@ -163,6 +163,9 @@ function searchTool(client: BraveSearchClient, options: WebToolOptions): ToolReg
     }),
     outputLimits: { maxBytes: 64 * 1024, maxLines: 1_000, retain: "head" },
     async execute(args, api, context) {
+      // Durable's tool entry has no abort gate of its own; a cancelled turn must not
+      // start (or bill) an external request before the client-level check runs.
+      if (context.abortSignal?.aborted) throw new Error("Operation aborted");
       if (!options.isAuthorizedChat(api.conversationId)) {
         return errorResult("Web search is not available in this conversation.");
       }
@@ -180,7 +183,7 @@ function searchTool(client: BraveSearchClient, options: WebToolOptions): ToolReg
           untrusted: true,
         });
       } catch (error) {
-        if (context.abortSignal?.aborted === true) throw new Error("Operation aborted");
+        if (context.abortSignal?.aborted) throw new Error("Operation aborted");
         if (error instanceof WebSearchError) return errorResult(`Web search failed: ${error.message}`);
         return errorResult("Web search failed: the provider request did not complete.");
       }
@@ -207,6 +210,7 @@ function fetchTool(fetcher: PublicWebFetcher, options: WebToolOptions): ToolRegi
     }),
     outputLimits: { maxBytes: 64 * 1024, maxLines: 2_000, retain: "head" },
     async execute(args, api, context) {
+      if (context.abortSignal?.aborted) throw new Error("Operation aborted");
       if (!options.isAuthorizedChat(api.conversationId)) {
         return errorResult("Web fetch is not available in this conversation.");
       }
@@ -217,7 +221,7 @@ function fetchTool(fetcher: PublicWebFetcher, options: WebToolOptions): ToolRegi
         const formatted = formatFetchResult(result);
         return textResult(formatted.text, formatted.details);
       } catch (error) {
-        if (context.abortSignal?.aborted === true) throw new Error("Operation aborted");
+        if (context.abortSignal?.aborted) throw new Error("Operation aborted");
         // Every WebFetchError message is host-authored and already sanitized.
         if (error instanceof WebFetchError) return errorResult(`Web fetch failed: ${error.message}`);
         return errorResult("Web fetch failed: the page request did not complete.");
