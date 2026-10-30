@@ -74,10 +74,11 @@ not permission to start every branch or run live integrations):
   - [ ] Voice: local faster-whisper CPU/small/int8, owned by the separate media
     ingress worker; no cloud-audio upload, backend install or model download in
     this batch.
-  - [ ] Vision handoff slice (this worktree): config-flagged
-    `needsVisionHandoff` presets, one named describer preset, bounded raw images
-    and descriptions, native `beforeRequest` transform only, focused offline
-    checks. Does not own the Telegram adapter, CLI media options or transcription
+  - [x] Vision handoff slice: config-flagged `needsVisionHandoff` presets, one
+    named describer preset, bounded raw images and descriptions, native
+    `beforeRequest` transform only, focused offline checks. Independently
+    reviewed (`86cd25e` + fixes `3043160`, fresh reviewer PASS) and integrated;
+    it does not own the Telegram adapter, CLI media options or transcription
     config.
 - [ ] Add bounded ordinary background workers; scheduled memory curation may then
   be an ordinary cron job using those workers and the existing Markdown tools,
@@ -123,12 +124,15 @@ The implementation batch is offline. A separately owner-approved live acceptance
 
 ## Batch ownership and finish line
 
-Use `opencode-go / deepseek-v4.1-flash`, thinking `high`, two implementation
-workers in separate worktrees. Independent review before integration; at most
-three active children including reviewers. Parent owns this plan, shared
-manifest/root exports, integration and final checks. Workers commit bounded
-results and report exact checks and limitations. Add focused permanent regression
-checks; no sleep-based schedule waits or leaked gates/timers/subscriptions.
+Use `opencode-go / deepseek-v4.1-flash`, thinking `high`, in separate
+worktrees. This batch started with two implementation workers; the owner later
+corrected concurrency to 2–3 IMPLEMENTERS, with independent reviewers separate
+and not counted against that implementer bound. Original implementers stay
+retained through review and fix rounds rather than being replaced. Parent owns
+this plan, shared manifest/root exports, integration and final checks. Workers
+commit bounded results and report exact checks and limitations. Add focused
+permanent regression checks; no sleep-based schedule waits or leaked
+gates/timers/subscriptions.
 
 - **worker-gateway-surfaces:** local gateway server/client, CLI launch/attachment,
   terminal transport boundary, CLI/setup documentation and focused checks. Owns
@@ -185,13 +189,12 @@ original evidence and prepared dispatch are unchanged; invalid, recursive or
 non-vision describer config fails closed; failures and cancellation never
 fabricate a seen image; cache, single-flight, concurrency, image/description
 counts and output are bounded; auxiliary describer calls are disclosed. Work is
-committed on branch `t3/a5ce93e2`; parent integration records the final hash.
+committed on branch `t3/a5ce93e2` and integrated through the merge recorded here.
 Only faux-model/temp-store checks were run. No live provider, bot, network,
 credentials, personal settings, dependency install, model download or deployment
-was used. Parent reported the gateway/CLI work independently reviewed and landed
-in main as `7b9b8a9`; this vision branch still bases on `d9e0a3b` because the
-runtime Telegram source is unchanged, and integration happens later, after a
-clean vision review.
+was used. The gateway/CLI work was independently reviewed and landed in main as
+`7b9b8a9`; this vision branch merged that tip only after the fresh vision review
+passed, because the runtime Telegram source was unchanged.
 
 Independent review did **not** pass the first vision commit `86cd25e`. It found
 four material gaps: the cron background-run prepare path dropped the vision
@@ -208,10 +211,24 @@ fail closed for flagged/unresolved targets, the prepared pin is consumed on use,
 and the docs now state the real text-only compaction and summary-context loss.
 Focused faux regressions cover a real background cron read-tool image round, two
 concurrent transforms with one cancellation, hook fail-closed behavior, and
-prepared-pin consumption. A fresh independent reviewer must review these fixes;
-the failed reviewer is not resumed and nothing is integrated until that review
-is clean. Owner permits 2–3 parallel implementers; independent reviews are
-separate and do not consume an implementer slot.
+prepared-pin consumption. A fresh independent reviewer then passed the fixed
+state without material findings, independently running the 10 vision checks
+three times plus 91 baseline behavior, 83 core and 26 affected checks. The
+review verified native cron preparation, per-waiter cancellation, fail-closed
+hook behavior and prepared-pin/retry semantics.
+
+The reviewed vision source (`src/media/vision.ts`, `src/media/vision-hook.ts`)
+and the vision hunks in `src/config.ts`/`src/runtime.ts` are unchanged from
+`3043160`; merging current main (`7b9b8a9`) added only gateway/local/terminal/CLI
+source and docs. Integration registers the 10 vision checks in the behavior
+suite and reconciles this plan. Preserved limitations: original images,
+locators and transcript evidence remain authoritative; descriptions are
+request-only, so a compacted summary prefix can lose visual context even though
+compaction itself serializes only text; and no full crash-retry harness proves
+the prepared retry end to end (the native request/poll/retry ordering was traced
+and is covered by the focused hook regression). Media adapter/transcription work
+still belongs to the original media worker's fixes, and native MCP/product Code
+Mode has not completed independent review.
 
 ### 2026-10-30 — channel surfaces and Telegram interactions
 
@@ -292,6 +309,7 @@ turn rendering and disconnect behavior are proven only offline.
 Owner concurrency correction for following batches: run 2–3 IMPLEMENTERS, not 2–3
 children total. Reviewers do not count against that implementer bound, and original
 implementers are retained through review and fix rounds rather than replaced.
-Parent orchestrates only. Independent media/vision reviews are still ongoing, and
-native MCP plus product Code Mode wiring is forthcoming; neither is complete or
-accepted here.
+Parent orchestrates only. The vision handoff passed fresh independent review and
+is integrated with this gateway tip. Media adapter/transcription work remains
+under the original media implementer's review fixes, and native MCP plus product
+Code Mode wiring is forthcoming; neither is complete or accepted here.
