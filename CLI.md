@@ -212,8 +212,8 @@ approval is involved, and `/tools` is only a read-only diagnostic:
 
 Restart after editing `toolAllowlist`; there is no hot reload. Narrowing the list
 limits later requests and pending calls fail closed rather than being restored by
-old records. `/grant` and `/revoke` are not offered: they report their removal
-and change nothing.
+old records. `/grant` and `/revoke` are not commands: they take the ordinary
+unknown-slash-command path and are never sent to the model.
 
 See [coding tools](./TOOLS.md).
 
