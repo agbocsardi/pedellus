@@ -492,7 +492,7 @@ test("bounded teardown of an attached client and an active synthetic run keeps a
   }
 });
 
-test("shipped user units are static user-service examples and verify with the real launch paths", { timeout: 30_000 }, async () => {
+test("shipped user units are static user-service examples and verify with the real launch paths", { timeout: 30_000 }, async (t) => {
   const primaryPath = join(repoRoot, "systemd", "nanobot.service");
   const templatePath = join(repoRoot, "systemd", "nanobot@.service");
   const primary = await readFile(primaryPath, "utf8");
@@ -527,7 +527,8 @@ test("shipped user units are static user-service examples and verify with the re
 
   const probe = spawnSync("systemd-analyze", ["--version"], { encoding: "utf8", timeout: 10_000 });
   if (probe.error && probe.error.code === "ENOENT") {
-    return; // Static check only; no systemd-analyze on this host.
+    t.diagnostic("systemd-analyze verify skipped: systemd-analyze is not installed; static unit assertions ran");
+    return;
   }
   assert.equal(probe.status, 0, probe.stderr);
 

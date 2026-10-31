@@ -14,8 +14,8 @@ the existing SIGTERM/SIGINT teardown.
 
 | File | Use |
 | --- | --- |
-| [`systemd/nanobot.service`](../systemd/nanobot.service) | The primary instance uses the default config `~/.durable-nanobot/config.json`. |
-| [`systemd/nanobot@.service`](../systemd/nanobot@.service) | One named secondary instance uses `~/.durable-nanobot/instances/i-<name>/config.json`. |
+| [`systemd/nanobot.service`](systemd/nanobot.service) | The primary instance uses the default config `~/.durable-nanobot/config.json`. |
+| [`systemd/nanobot@.service`](systemd/nanobot@.service) | One named secondary instance uses `~/.durable-nanobot/instances/i-<name>/config.json`. |
 
 Both are user units. Copy or symlink them into the user unit directory, for
 example `~/.config/systemd/user/`, after editing the launch paths.
