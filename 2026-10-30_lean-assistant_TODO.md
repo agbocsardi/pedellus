@@ -30,7 +30,7 @@ Owner approved this six-slice batch after the completed channel-neutral build:
 - [x] O2 — Bounded memory digestion using O1: agent-editable workspace prompt,
   ordinary Markdown/skill writes, provenance, concurrent-edit protection and
   inspectable recovery. No hashes/version registry, second archive or agent loop.
-- [ ] O3 — Manual invocation plus opt-in ordinary cron integration over O2;
+- [x] O3 — Manual invocation plus opt-in ordinary cron integration over O2;
   completion/failure visibility and explicit prompt freshness. Ship inactive:
   create/enable no schedule or personal runtime configuration.
 - [x] O4 — Research local Node/TypeScript-compatible speech alternatives before
@@ -350,6 +350,30 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Overnight — manual/cron integration accepted; final handoff starts
+
+O3 published by original implementer via clean-main fast-forward to `ef0af84`
+after fresh independent final PASS. CLI/Telegram owner `/digest` starts one
+bounded batch, `/digest status` is read-only; explicit ordinary cron
+`intent: "digest"` uses authenticated origin/current tool authority and no channel
+outbox. No schedule is created/enabled automatically. Completion/failure/no-op/
+abort reaches the spawning agent through one internal result event, not a direct
+channel message. Review fixes preserve all pending/unknown results at the
+100-notice cap (safe pruning/backpressure), recover authoritative terminal tasks,
+and verify the actual result-entry kind/task/origin before marking reported.
+Status no longer creates an empty doc; idle/refused text notes that flushing old
+results may resume the origin agent, despite no new digest run being started.
+
+Gate: typecheck/build, 244 behavior, 2 execution, 83 core; published main
+rebuild/typecheck and 11 focused controls passed. Accepted edges: cron crash after
+start before occurrence finish may process one extra bounded batch on replay;
+queued result admissions stay pending until verified; a submit throw with a
+missing notice may require reopen recovery. No false reported flag/eviction is
+accepted. Rendered O2 concurrency wording was corrected to the actual in-process
+edit guarantee. No provider/API, paid, personal-runtime or deployment activity.
+O6 now starts in a fresh worktree: combined existing offline acceptance, current
+doc reconciliation and a concise evidence/assumptions morning handoff only.
 
 ### Overnight — memory digestion execution accepted; controls/scheduling starts
 
