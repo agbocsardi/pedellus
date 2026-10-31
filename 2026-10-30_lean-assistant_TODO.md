@@ -55,7 +55,7 @@ facilities; do not redesign memory quality, holistic usability or agent loops.
   The home directory exists, but that default config file was not present when
   checked (existence only; no contents/settings were read).
   Prioritize this service slice ahead of remaining status work when capacity opens.
-- [ ] P6 — Independently review the combined union, run bounded existing parity/
+- [x] P6 — Independently review the combined union, run bounded existing parity/
   integration checks and reconcile docs. No new holistic usability study or
   live-provider acceptance without separate authorization.
 
@@ -440,6 +440,24 @@ original implementer retains its worktree, fresh independent review, findings
 returned to that implementer, then publication by that implementer. Every slice
 passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
+
+## Session log
+
+### 2026-10-31 — P1–P7 parity batch closed
+
+Final main `facefae1` (docs-only above functional `3bace35`). Published this
+batch, each through its original implementer after fresh independent review:
+P1 digest bounds `3a297fa`, P2 arbitrary Telegram sending `c755673`, P3 worker
+transcripts `ba6df4e`, P4 worker steering `54b2331`, P5 bounded background
+`/status` `7caa613`, P7 default config + user-systemd parallel instances
+`5213837`, P6 parity handoff `facefae1`. Handoff:
+[plan/2026-10-31_parity-handoff.md](plan/2026-10-31_parity-handoff.md).
+Final gate: typecheck/build, 286 behavior across 35 suites, 2 execution, 83
+offline acceptance; functional identity vs `3bace35` empty. No live
+provider/API/paid calls, Telegram traffic, systemd operation, installs or
+activation. Accepted limits and remaining live gaps are in the handoff.
+Parent plan repaired here: the P5 log edit had displaced the Session-log heading;
+entries are restored under it. Stop; await owner direction.
 
 P5 (compact background status) published at `7caa613` after independent PASS and
 a narrow re-review of two low findings. `/status` in CLI and Telegram now shows,
