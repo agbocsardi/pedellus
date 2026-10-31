@@ -832,8 +832,8 @@ one run. It
 neither enables nor schedules digestion — frequency stays with ordinary cron — and an absent block
 keeps the defaults. A started task captures the resolved values in its input; a replay or reopen
 re-derives its batch, deadline, tool budget and write budget from that capture, never from a widened
-current config. A legacy task record without a captured block falls back to the canonical defaults;
-an older host deadline seam was never persisted in the task. The host seam
+current config. A legacy task record without captured limits uses current defaults only to attempt
+exact re-derivation; it fails closed when they do not reproduce its original chunk. The host seam
 `memoryDigest.turnTimeoutMs` supplies a deadline only when config leaves `runTimeoutSeconds`
 absent; a configured product deadline wins. The task record stores only
 the batch identity, pinned model and those bounds; the evidence lives once in the committed
@@ -866,16 +866,19 @@ per-run ceiling over individual calls. For `write` and `edit` it also reserves c
 changed text before execution. A create charges its whole content; an edit charges both `oldText` and
 `newText`, summed across calls, so repeated edits of one file accumulate instead of being
 undercharged. A call that would exceed `maxChangedFiles` or `maxDiffChars` is blocked before it
-mutates anything. The request and token budget is read from the same committed transcript: every assistant entry is one
-actual provider request (retried attempts included, since Durable commits each one), and input spend
-is `usage.input + usage.cacheRead + usage.cacheWrite` — pi-ai reports the cache counters separately,
-so nothing is counted twice. A response that reports no usage is charged the whole remaining input
-bound rather than a fresh allowance. The host cannot tokenize or intercept an in-flight generation
-request, so the token bound is enforced on actual usage before the next tool round is admitted: a tool
-round is the only host-visible way to cause another request, and one request is reserved for the final
-answer first. Crossing a bound is a failed batch with no acknowledgement; the target is withdrawn, so
-no further round is admitted. The counters come from the run's committed transcript and in-flight
-calls, so a replay, a parallel round or a reopen cannot reset or overshoot them. A budget refusal is a failed
+mutates anything. `maxRequests` counts successful committed model responses (`stop`, `length`,
+`toolUse`), including responses requesting tools. Native failed attempts/retries are allowed outside
+that count, as approved by the owner. Status separates successful responses from all recorded
+responses. Input spend is `usage.input + usage.cacheRead + usage.cacheWrite`; pi-ai reports the cache
+counters separately, so nothing is counted twice. Missing usage fails the run closed. A failed tool
+aborts the target after its result is committed, rather than inviting another request to repair it.
+Final response/token usage is checked again before acknowledgement, including runs without tools.
+Tool/time/write limits are the primary operational bounds. Tokens are a soft actual-usage ceiling,
+not a hard pre-dispatch or financial cap. Native retries can spend beyond it; deferred polls,
+compaction and a crash before a response commits are not fully counted. Committed counters survive
+reopen, but uncommitted provider activity cannot be reconstructed. Before submit, pi-ai's text-token
+estimate checks the rendered input plus catalog output ceiling and 4,096 tokens for tool/framing
+headroom against the model context. Native pi-ai also clamps output to available model capacity. A budget refusal is a failed
 tool result, so the batch is not acknowledged; whatever earlier calls already wrote stays (there is
 still no rollback), and the same batch is offered again. These are conservative text-unit bounds,
 not a git-diff computation.
@@ -891,8 +894,7 @@ Known limits, stated rather than implied: cross-conversation ordering is still b
 resumed task re-derives its own batch instead of relying on which batch a new `read()` would pick; the
 first acknowledgement of a segment still pays a bounded, non-interruptible SQLite walk; a forged or
 mismapped fresh start more than `DIGEST_LIMITS.scanEntriesPerRead` entries beyond the frontier is
-refused loudly; input-token overshoot is bounded by the one request already in flight rather than
-prevented before dispatch; the scope check is a naming guard, not confinement (a symlink swapped in after the check is
+refused loudly; input-token usage is a soft ceiling rather than a hard pre-dispatch cap; the scope check is a naming guard, not confinement (a symlink swapped in after the check is
 not defended, exactly like the rest of the workspace tools, though `O_EXCL` itself never follows a
 final symlink); `edit` cannot detect an outside process changing the file between its read and its
 write, so the in-process serialization and exact-text match are the honest boundary; a turn longer

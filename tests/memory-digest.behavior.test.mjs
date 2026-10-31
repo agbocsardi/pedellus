@@ -842,24 +842,14 @@ test('a reopen resumes the interrupted run with its pinned model and curation sc
   }
 });
 
-test('a failed tool call before a reopen still fails the resumed attempt', { timeout: 40_000 }, async (t) => {
+test('a failed tool ends the run without another request and remains failed after reopen', { timeout: 40_000 }, async (t) => {
   const fixture = await fixtureWorkspace();
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
-  const entered = deferred();
   await writeFile(join(fixture.workspace, 'AGENTS.md'), 'AGENT-RULES-KEEP\n', 'utf8');
-  const store = await openStore(fixture, async (request, options) => {
-    const text = transcriptText(request.messages);
-    if (!text.includes('write-outside-before-close')) {
-      // A refused write is committed as a failed pi.tool-result before the attempt is interrupted.
-      return toolWrite('AGENTS.md', 'REPLACED-RULES\n', 'write-outside-before-close');
-    }
-    entered.resolve();
-    await new Promise((resolve) => {
-      const signal = options?.signal;
-      if (signal?.aborted) return resolve();
-      signal?.addEventListener('abort', resolve, { once: true });
-    });
-    return fauxAssistantMessage('answer after reopen');
+  let requests = 0;
+  const store = await openStore(fixture, () => {
+    requests += 1;
+    return toolWrite('AGENTS.md', 'REPLACED-RULES\n', 'write-outside-before-close');
   });
   let reopened;
   t.after(async () => {
@@ -871,15 +861,16 @@ test('a failed tool call before a reopen still fails the resumed attempt', { tim
     await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
     const started = await startDigest(store.gateway);
     assert.equal(started.status, 'started');
-    await within(entered.promise, WAIT_MS, 'the first attempt never paused after its refused call');
+    const first = await settleTask(store.gateway.harness, started.taskId);
+    assert.equal(first.state.outcome.status, 'failed');
+    assert.equal(requests, 1, 'the refused result must not cause another provider request');
     const target = await targetOf(store.gateway.harness, started.taskId);
     assert.ok(target !== undefined);
     assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
 
     await store.gateway.close(context);
     reopened = (await openStore(fixture, () => {
-      // The model recovers and answers non-empty, but the committed failed call still fails the batch.
-      return fauxAssistantMessage('I could not save the fact because that file is out of scope.');
+      assert.fail('a failed digest must not resume provider work on reopen');
     })).gateway;
     const task = await settleTask(reopened.harness, started.taskId);
     assert.equal(task.state.outcome.status, 'failed', JSON.stringify(task.state.outcome));

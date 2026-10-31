@@ -451,6 +451,9 @@ export function digestCursorOf(document: unknown): DigestCursor {
   const nextItemIndex = storedOffset(document.nextItemIndex, "next item");
   const nextTextStart = storedOffset(document.nextTextStart, "next offset");
   const pendingToolCalls = pendingOf(document.pendingToolCalls ?? []);
+  if (nextEntryId === null && (episodeStartEntryId !== null || (nextItemIndex ?? 0) !== 0 || (nextTextStart ?? 0) !== 0 || pendingToolCalls.length !== 0)) {
+    throw new Error("Stored digest cursor has a segment or offset without a next position");
+  }
   return {
     nextEntryId: nextEntryId as EntryId | null,
     nextItemIndex: nextItemIndex ?? 0,

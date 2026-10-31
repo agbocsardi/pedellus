@@ -385,7 +385,7 @@ test('the tool-call cap counts a refused call and fails the batch without a curs
   const store = await openStore(fixture, (request) => {
     const text = transcriptText(request.messages);
     if (!text.includes('read-first')) return toolRead('SOUL.md', 'read-first');
-    if (!text.includes('write-outside')) return toolWrite('AGENTS.md', 'REPLACED\n', 'write-outside');
+    if (!text.includes('write-first')) return toolWrite('memory/first.md', '- first fact\n', 'write-first');
     if (!text.includes('write-over-budget')) return toolWrite('memory/ok.md', '- fact\n', 'write-over-budget');
     return fauxAssistantMessage('The last write was blocked.');
   }, { digest: { maxToolCalls: 2 } });
@@ -406,7 +406,7 @@ test('the tool-call cap counts a refused call and fails the batch without a curs
   const results = await toolResults(store.gateway.harness, target.id);
   assert.deepEqual(results.map((result) => [result.name, result.isError]), [
     ['read', false],
-    ['write', true],
+    ['write', false],
     ['write', true],
   ]);
   assert.match(results[2].text, /tool-call budget/, 'the refused call still used one of the two calls');
@@ -749,7 +749,7 @@ test('a two-unit character bound accepts one emoji per chunk and still progresse
   );
 });
 
-test('the model-request budget refuses the round that would exceed it and spends nothing more', { timeout: 30_000 }, async (t) => {
+test('the successful-response budget aborts the refused round without another request', { timeout: 30_000 }, async (t) => {
   const fixture = await fixtureWorkspace();
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
   const store = await openStore(fixture, (request) => {
@@ -770,9 +770,66 @@ test('the model-request budget refuses the round that would exceed it and spends
   assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined, 'exhausting the request budget writes no cursor');
   const target = await targetOf(store.gateway.harness, started.taskId);
   const results = await toolResults(store.gateway.harness, target.id);
-  assert.deepEqual(results.map((result) => result.isError), [true, true], 'every further tool round is refused');
-  assert.match(results[0].text, /model-request budget/);
-  // The host cannot stop an in-flight generation request; it reserves before the only host-visible
-  // way to cause another one (a tool round) and withdraws the target when the turn settles failed.
-  assert.equal(store.calls.length, 3, 'the failed turn admits no request after its final answer');
+  assert.deepEqual(results.map((result) => result.isError), [true], 'the first refused round is the last one');
+  assert.match(results[0].text, /successful-response budget/);
+  assert.equal(task.state.outcome.result.successfulRequests, 1);
+  assert.equal(store.calls.filter((input) => input.startsWith('[memory digestion task]')).length, 1,
+    'a refused tool result must not invite another model request');
+});
+
+test('a final answer over the input-token ceiling cannot acknowledge the batch', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, () => fauxAssistantMessage('Nothing new worth keeping.'), {
+    digest: { maxInputTokens: 1 },
+  });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('A durable fact.'), assistant('Noted.')]);
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'failed');
+  assert.match(task.state.outcome.error.message, /input-token budget/);
+  assert.ok(task.state.outcome.result.inputTokens > 1);
+  assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+});
+
+test('an undersized model context refuses input before a digest provider request', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, () => fauxAssistantMessage('Should never run.'));
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  store.models.getModel(PROVIDER, MODEL.modelId).contextWindow = 32;
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('A durable fact.'), assistant('Noted.')]);
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'failed');
+  assert.match(task.state.outcome.error.message, /model context/);
+  assert.equal(store.calls.filter((input) => input.startsWith('[memory digestion task]')).length, 0);
+  assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+});
+
+test('native failed attempts are reported but do not consume the successful-response allowance', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  let attempts = 0;
+  const store = await openStore(fixture, () => {
+    attempts += 1;
+    return attempts === 1
+      ? fauxAssistantMessage('busy', { stopReason: 'error', errorMessage: '429 rate limit exceeded' })
+      : fauxAssistantMessage('Nothing new worth keeping.');
+  }, { digest: { maxRequests: 1 } });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('A durable fact.'), assistant('Noted.')]);
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'completed');
+  assert.equal(task.state.outcome.result.requests, 2);
+  assert.equal(task.state.outcome.result.successfulRequests, 1);
+  assert.ok(await cursorDoc(store.gateway.harness, origin.id));
 });

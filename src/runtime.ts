@@ -1281,7 +1281,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
           return harnessRef.current;
         },
         ...(cronConfig?.timeZone === undefined ? {} : { timeZone: cronConfig.timeZone }),
-        digestAvailable: (conversationId) => authorizedChatConversations.has(conversationId)
+        digestAvailable: (conversationId) => digestChoice !== undefined
+          && authorizedChatConversations.has(conversationId)
           && hasMemoryDigestTools(toolAllowlist),
       });
   const cronToolRegistration = cronTool?.extension.tools?.[0];
@@ -1424,6 +1425,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // Explicit background selection only: never the origin conversation's current model or thinking.
     model: async () => digestChoice,
     allowModel: (candidate) => choicesByNative.has(modelKey(candidate)),
+    modelContext: (candidate) => choicesByNative.get(modelKey(candidate))?.model,
     curationTools: (conversationId) => authorizedChatConversations.has(conversationId)
       ? memoryDigestCurationTools(toolAllowlist)
       : [],

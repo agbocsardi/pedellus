@@ -34,9 +34,9 @@ export interface DigestRunLimits extends DigestBatchLimits {
   /** Individual model-issued tool calls allowed in the run, failed and refused calls included. */
   readonly maxToolCalls: number;
   /**
-   * Committed provider responses allowed in the run, retried attempts included. Every attempt is a
-   * separate request and is committed as its own assistant entry, so the count comes from the
-   * durable transcript rather than a process-local counter.
+   * Successful provider responses allowed in the run, including tool-call responses. Native failed
+   * attempts/retries are reported but do not consume this owner-approved limit. The committed
+   * transcript supplies the count; this is not a cap on network requests or financial cost.
    */
   readonly maxRequests: number;
   /**

@@ -58,6 +58,8 @@ import { open, writeFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Context, Draft, JsonValue } from "@earendil-works/chord";
 import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { withoutAbortSignal } from "@earendil-works/chord/context";
+import { estimateTextTokens } from "@earendil-works/pi-ai/utils/estimate";
 import {
   AssistantEntry,
   ToolResultEntry,
@@ -67,6 +69,7 @@ import {
   hook,
   wrapTool,
   ToolTask,
+  GenerationTask,
   type Conversation,
   type ConversationHandle,
   type ConversationId,
@@ -291,6 +294,7 @@ function digestScopeHook(workspaceRoot: string, options: MemoryDigestScopeOption
   const root = resolve(workspaceRoot);
   return hook(ToolTask, {
     async beforeTool(call, api, context) {
+      const refuseBudget = (reason: string) => ({ block: reason });
       if (!(MEMORY_DIGEST_TOOL_NAMES as readonly string[]).includes(call.name)) {
         return { block: `Memory digestion holds only ${MEMORY_DIGEST_TOOL_NAMES.join(", ")}; ${call.name} is not available` };
       }
@@ -313,7 +317,7 @@ function digestScopeHook(workspaceRoot: string, options: MemoryDigestScopeOption
         ? DIGEST_RUN_LIMITS_DEFAULT
         : options.limitsFor(api.conversationId);
       if (limits === undefined) {
-        return { block: "Memory digestion cannot verify its configured run budget; the batch was not acknowledged" };
+        return refuseBudget("Memory digestion cannot verify its configured run budget; the batch was not acknowledged");
       }
       if (options.harness !== undefined) {
         let use: DigestToolUse;
@@ -326,26 +330,25 @@ function digestScopeHook(workspaceRoot: string, options: MemoryDigestScopeOption
             context,
           );
         } catch {
-          return { block: "Memory digestion could not verify its tool and spending budget; the batch was not acknowledged" };
+          return refuseBudget("Memory digestion could not verify its tool and spending budget; the batch was not acknowledged");
         }
         if (use.calls > limits.maxToolCalls) {
-          return { block: "Memory digestion reached its configured tool-call budget; the batch was not acknowledged" };
+          return refuseBudget("Memory digestion reached its configured tool-call budget; the batch was not acknowledged");
         }
-        // One request is reserved for the final answer before this round is admitted: a tool round
-        // is the only host-visible way to cause another provider request. Once the reservation no
-        // longer fits, the call is refused and the batch fails instead of spending further.
-        if (use.requests + 2 > limits.maxRequests) {
-          return { block: "Memory digestion reached its configured model-request budget; the batch was not acknowledged" };
+        // A tool round needs room for one more successful response. Native failed attempts and
+        // retries are reported separately; the owner-approved limit counts successful responses.
+        if (use.successfulRequests >= limits.maxRequests) {
+          return refuseBudget("Memory digestion reached its configured successful-response budget; the batch was not acknowledged");
         }
-        if (use.chargedInputTokens + use.reserveNextTokens > limits.maxInputTokens) {
-          return { block: "Memory digestion reached its configured input-token budget; the batch was not acknowledged" };
+        if (use.unaccountedResponses > 0 || use.chargedInputTokens + use.reserveNextTokens > limits.maxInputTokens) {
+          return refuseBudget("Memory digestion reached its configured input-token budget; the batch was not acknowledged");
         }
         if (call.name === "write" || call.name === "edit") {
           if (use.paths.size > limits.maxChangedFiles) {
-            return { block: "Memory digestion reached its configured changed-file budget; the batch was not acknowledged" };
+            return refuseBudget("Memory digestion reached its configured changed-file budget; the batch was not acknowledged");
           }
           if (use.diffChars > limits.maxDiffChars) {
-            return { block: "Memory digestion reached its configured changed-text budget; the batch was not acknowledged" };
+            return refuseBudget("Memory digestion reached its configured changed-text budget; the batch was not acknowledged");
           }
         }
       }
@@ -362,6 +365,8 @@ function digestScopeHook(workspaceRoot: string, options: MemoryDigestScopeOption
 interface DigestUsage {
   /** Committed provider responses, including retried attempts; missing usage still counts. */
   readonly requests: number;
+  /** Successful stop/length/toolUse responses; native failed attempts do not consume this limit. */
+  readonly successfulRequests: number;
   /** Input tokens including cached input (`input + cacheRead + cacheWrite`). */
   readonly inputTokens: number;
   readonly cacheReadTokens: number;
@@ -438,6 +443,7 @@ async function digestTranscriptUse(
   const results = new Map<string, boolean>();
   let recordedCalls = 0;
   let requests = 0;
+  let successfulRequests = 0;
   let inputTokens = 0;
   let cacheReadTokens = 0;
   let cacheWriteTokens = 0;
@@ -461,6 +467,9 @@ async function digestTranscriptUse(
         if (!isRecord(candidate)) continue;
         if (candidate.role === "assistant") {
           requests += 1;
+          if (candidate.stopReason === "stop" || candidate.stopReason === "length" || candidate.stopReason === "toolUse") {
+            successfulRequests += 1;
+          }
           const usage = candidate.usage;
           if (
             isRecord(usage)
@@ -501,15 +510,14 @@ async function digestTranscriptUse(
   if (cursor !== undefined) {
     throw new Error("the digest conversation is too long to verify its budget");
   }
-  const chargedInputTokens = inputTokens + unaccountedResponses * (lastRequestTokens > 0
-    ? lastRequestTokens
-    : limits.maxInputTokens);
+  const chargedInputTokens = inputTokens + unaccountedResponses * limits.maxInputTokens;
   return {
     calls,
     results,
     recordedCalls,
     usage: {
       requests,
+      successfulRequests,
       inputTokens,
       cacheReadTokens,
       cacheWriteTokens,
@@ -646,7 +654,22 @@ export function createMemoryDigestScopeExtension(
 ): Extension {
   return defineExtension({
     name: MEMORY_DIGEST_SCOPE_EXTENSION_NAME,
-    hooks: [digestScopeHook(workspaceRoot, options)],
+    hooks: [digestScopeHook(workspaceRoot, options), hook(GenerationTask, {
+      async afterTools(_assistant, _results, api, context) {
+        if (options.harness === undefined) return;
+        const harness = options.harness();
+        const limits = options.limitsFor?.(api.conversationId) ?? DIGEST_RUN_LIMITS_DEFAULT;
+        const use = await digestTranscriptUse(harness, api.conversationId, limits, context);
+        if (![...use.results.values()].some((failed) => failed)) return;
+        // A failed tool already fails the batch. Preserve its committed result, then abort rather
+        // than letting the model retry tools forever. abort() joins this generation task too, so
+        // start it without awaiting our own termination. Its abort mark precedes another request.
+        const conversation = await harness.conversation(api.conversationId, context);
+        void conversation?.abort(withoutAbortSignal(context)).catch(() => {
+          // The deadline and final turn validation still fail closed if teardown races this abort.
+        });
+      },
+    })],
     wraps: [digestWriteWrap()],
   });
 }
@@ -875,6 +898,7 @@ export interface MemoryDigestRunResult {
   readonly model?: string | null;
   /** Committed provider responses, including retried attempts; null when not measured. */
   readonly requests?: number | null;
+  readonly successfulRequests?: number | null;
   /** Actual input plus cached input tokens; null when not measured. */
   readonly inputTokens?: number | null;
   readonly cacheReadTokens?: number | null;
@@ -921,6 +945,7 @@ export interface MemoryDigestTaskSnapshot {
   readonly evidenceEntries: number | null;
   readonly model: string | null;
   readonly requests: number | null;
+  readonly successfulRequests: number | null;
   readonly inputTokens: number | null;
   readonly cacheReadTokens: number | null;
   readonly outputTokens: number | null;
@@ -984,6 +1009,11 @@ export interface MemoryDigestOptions {
   } | undefined>;
   /** Current finite model catalog; a resumed run whose model left it fails closed. */
   readonly allowModel: (model: { readonly provider: string; readonly modelId: string }) => boolean;
+  /** Catalog capacity for a preflight estimate; native pi-ai still clamps the actual output limit. */
+  readonly modelContext?: (model: { readonly provider: string; readonly modelId: string }) => {
+    readonly contextWindow: number;
+    readonly maxTokens: number;
+  } | undefined;
   /** Current curation tools for this origin, in configured allowlist order. */
   readonly curationTools: (originConversationId: ConversationId) => readonly string[];
   /** Configure the fresh target conversation: capture, tools, model, cwd, extensions. */
@@ -1187,8 +1217,8 @@ function parseInput(value: unknown): MemoryDigestTaskInput | undefined {
   if (typeof provider !== "string" || provider === "") return undefined;
   if (typeof modelId !== "string" || modelId === "") return undefined;
   if (typeof value.thinkingLevel !== "string" || value.thinkingLevel === "") return undefined;
-  // A task recorded by an earlier build has no captured bounds. The canonical defaults are the
-  // compatible fallback; an older host deadline seam was never persisted in the task record.
+  // Missing historical bounds use current defaults, but are not assumed compatible: readBatch
+  // must re-derive the exact chunk or refuse it without moving the cursor.
   const limits = value.limits === undefined ? DIGEST_RUN_LIMITS_DEFAULT : digestRunLimitsFrom(value.limits);
   if (limits === undefined) return undefined;
   return {
@@ -1362,6 +1392,7 @@ function taskSnapshot(record: Awaited<ReturnType<Harness["getTask"]>>): MemoryDi
     evidenceEntries: result === undefined ? null : result.evidenceEntries,
     model: result?.model ?? (input === undefined ? null : `${input.model.provider}/${input.model.modelId}`),
     requests: result?.requests ?? null,
+    successfulRequests: result?.successfulRequests ?? null,
     inputTokens: result?.inputTokens ?? null,
     cacheReadTokens: result?.cacheReadTokens ?? null,
     outputTokens: result?.outputTokens ?? null,
@@ -1438,7 +1469,7 @@ export function renderMemoryDigestStatus(status: MemoryDigestStatusView): string
   if (latest.model !== null) lines.push(`Background model: ${latest.model}.`);
   if (latest.requests !== null) {
     lines.push(
-      `Model requests: ${latest.requests}` +
+      `Model responses: ${latest.successfulRequests ?? "unknown"} successful / ${latest.requests} total recorded` +
       (latest.inputTokens === null
         ? "."
         : `; input ${latest.inputTokens} tokens (${latest.cacheReadTokens ?? 0} cached read), ` +
@@ -1864,6 +1895,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
               const use = await digestRunUsage(options.harness(), target, parsed.limits, context);
               Object.assign(fields, {
                 requests: use.requests,
+                successfulRequests: use.successfulRequests,
                 inputTokens: use.inputTokens,
                 cacheReadTokens: use.cacheReadTokens,
                 outputTokens: use.outputTokens,
@@ -2053,10 +2085,10 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
               );
               return;
             }
-            if (use.requests >= parsed.limits.maxRequests) {
+            if (use.successfulRequests >= parsed.limits.maxRequests) {
               await withdrawTarget(runtime, target, context);
               await failed(
-                "memory digestion reached its configured model-request budget before another request; " +
+                "memory digestion reached its configured successful-response budget before another request; " +
                 "the batch was not acknowledged",
               );
               return;
@@ -2134,10 +2166,19 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             return;
           }
 
+          const input = renderMemoryDigestInput(batch, prompt, index);
+          const capacity = options.modelContext?.(parsed.model);
+          // Use pi-ai's own text estimate, reserve the catalog output ceiling and leave room for the
+          // three tool schemas/native framing. This is a preflight estimate, not a tokenizer guarantee.
+          if (capacity !== undefined && capacity.contextWindow > 0
+            && estimateTextTokens(input) + capacity.maxTokens + 4_096 > capacity.contextWindow) {
+            await failed("the digest input and output reserve do not fit the configured model context; lower charsPerBatch");
+            return;
+          }
           try {
             const submission = await conversation.submit({
               type: "input",
-              content: renderMemoryDigestInput(batch, prompt, index),
+              content: input,
               requestId: `memory-digest:${Number(running.id)}`,
               entry: { kind: MEMORY_DIGEST_ENTRY_KIND, data: { taskId: Number(running.id) } },
             }, context);
@@ -2170,7 +2211,11 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           if (runtime.signal.aborted) return;
 
           if (settlement.status !== "ok") {
-            await failed(settlement.error ?? "the digest turn failed");
+            const transcript = await digestTranscriptUse(options.harness(), targetId, parsed.limits, context)
+              .catch(() => undefined);
+            await failed(transcript !== undefined && [...transcript.results.values()].some((error) => error)
+              ? "a digest tool call failed; the batch was not acknowledged"
+              : settlement.error ?? "the digest turn failed");
             return;
           }
 
@@ -2203,6 +2248,19 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             return;
           }
           const report = checked.answer;
+
+          // Final answers and native retries need no tool hook. Reconcile the settled transcript
+          // before acknowledgement too: an over-budget final answer must never consume evidence.
+          try {
+            const use = await digestRunUsage(options.harness(), targetId, parsed.limits, context);
+            if (use.unaccountedResponses > 0 || use.successfulRequests > parsed.limits.maxRequests || use.chargedInputTokens > parsed.limits.maxInputTokens) {
+              await failed("memory digestion exceeded its response or input-token budget; the batch was not acknowledged");
+              return;
+            }
+          } catch {
+            await failed("memory digestion could not verify its final spending budget; the batch was not acknowledged");
+            return;
+          }
 
           // Only a validated, settled turn may move the frontier. The acknowledgement re-validates
           // the batch against the committed transcript and refuses a moved cursor.

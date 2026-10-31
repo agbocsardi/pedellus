@@ -146,9 +146,9 @@ export interface DigestConfig {
   readonly charsPerBatch?: number;
   /** Individual tool calls allowed in one run, failed and refused calls included. */
   readonly maxToolCalls?: number;
-  /** Committed provider responses allowed in one run, retried attempts included. */
+  /** Successful model responses allowed in one run, including tool rounds; native retries excluded. */
   readonly maxRequests?: number;
-  /** Cumulative input tokens allowed in one run, actual usage including cached input. */
+  /** Soft cumulative reported-input ceiling including cached input, not a hard pre-dispatch cap. */
   readonly maxInputTokens?: number;
   /** Whole-run deadline in seconds, from the run's preparation to its settled turn. */
   readonly runTimeoutSeconds?: number;

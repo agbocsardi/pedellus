@@ -31,11 +31,13 @@ is the only executor; the runtime injects that one source.
   absent both a start is refused. The target gets only curated `read`/`write`/`edit`, create-only
   `write`, exact-text `edit`, and the workspace/naming scope hook.
 - **Captured budgets.** Defaults: 200,000 evidence chars, 2,000 entries, 500,000 input tokens including
-  cached input, 12 provider requests including retries, 24 tool calls, 600,000 ms, 8 changed files,
-  32,000 inserted-plus-removed chars. Counters are read from the committed target transcript, so a
-  retry, parallel round or reopen cannot reset them. Tool rounds are admitted only while one request is
-  reserved for the final answer and the actual input spend still fits; crossing a bound fails the batch
-  without acknowledging it. Missing usage is charged the whole remaining bound, never a fresh allowance.
+  cached input, 12 successful model responses (tool-call responses included), 24 tool calls,
+  600,000 ms, 8 changed files, 32,000 inserted-plus-removed chars. The owner accepts native failed
+  attempts/retries outside the successful-response count; total recorded responses and token usage
+  are still reported. Committed counters survive reopen. Tool/time/write caps are the primary
+  operational bounds; tokens are a soft actual-usage ceiling, not a hard spending promise.
+  A failed tool aborts the turn before another request; final usage is checked before acknowledgement.
+  Missing usage fails closed rather than granting a fresh allowance.
 - **Outcomes.** Success (including a no-op and an already-consumed replay) is silent. A failed or
   cancelled run admits one bounded internal issue report, deduplicated by request ID, whose bounded
   notice list is pruned only for definitively reported, successful or nonreportable records.
@@ -49,13 +51,15 @@ is the only executor; the runtime injects that one source.
 - [ ] **Inactive 8-hour cron schedule.** The shape is documented (`CRON.md`, "Inactive 8-hour schedule
       shape"); no live job is created, enabled or started. Activation is an owner action with an
       explicit model.
-- [ ] **Pre-dispatch token bound.** A host cannot tokenize provider content or intercept an in-flight
-      generation request, so input-token overshoot is bounded by the one request already in flight, not
-      prevented before dispatch. A hard pre-dispatch bound would need a provider-side tokenizer or a
-      generation hook that can refuse or terminate a request (Durable's `beforeRequest` cannot block).
+- [x] **Budget decision.** Owner accepts 24 tools / 10 minutes and 12 successful model responses,
+      allowing native failed attempts/retries. The 500k input-token ceiling is checked from reported
+      usage, not guaranteed before dispatch. Deferred polling, compaction and an uncommitted response
+      at crash are not precisely attributable by these counters. No financial or hard network cap is
+      claimed. A pi-ai text estimate checks input plus catalog output reserve/context before submit.
 - [ ] **Verification-bound refusals.** A forged or mismapped fresh start more than 4,000 entries beyond
       the frontier is refused loudly and offered again; a tool-call id over 200 characters, more than
-      256 open calls, or more than 1,024 steps in one entry fails that chat closed. These are fixed
+      256 open calls, or more than 1,024 steps in one entry fails that chat closed. A separate
+      2,048-step batch cap can split a range even when the entry/character caps fit. These are fixed
       safety caps, not adaptive handling.
 - [ ] **Preview fidelity.** A long tool result is deliberately preview-only; the omission marker and
       reference are exact, but the middle is not part of the evidence.
@@ -94,3 +98,8 @@ position and durable open-call ids, with an exact one-time mapping for old docum
 gained an explicit background model, request/token budgets read from the committed transcript, and
 usage in its outcome and status. Obsolete closed-only regressions were replaced with tests for the
 new contracts; the old scan-bound, forgery, no-op and ordering invariants were adapted and retained.
+
+Independent review found acknowledgement could succeed over budget and failed-tool refusals could
+cause additional model requests. Coordinator fixed final-usage validation and abort-after-tools,
+separated successful responses from total recorded attempts per owner clarification, corrected the
+cron model-availability gate, and added catalog context/output-reserve preflight. No activation.

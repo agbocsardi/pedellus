@@ -125,13 +125,15 @@ npm start -- agent --config config.json     # attach a terminal
   model (`digest.preset` or `digest.model`) and never inherits the foreground
   model or thinking level; absent one, a start is refused. Its captured bounds
   (200,000 evidence characters, 2,000 entries, 500,000 input tokens including
-  cached input, 12 provider requests including retries, 24 tool calls, 600,000 ms,
-  8 files and 32,000 inserted-plus-removed characters) are read from the committed
-  target transcript, so they survive a retry and a reopen, and crossing one fails
-  the batch without acknowledging it. A host cannot tokenize or intercept an
-  in-flight provider request, so the token bound is enforced on actual reported
-  usage before the next tool round is admitted; overshoot is bounded by the one
-  request already in flight. The editable workspace policy is `DIGEST.md`
+  cached input, 12 successful model responses, 24 tool calls, 600,000 ms,
+  8 files and 32,000 inserted-plus-removed characters) are checked from the committed
+  target transcript, including before acknowledgement. Successful responses include
+  tool-call responses; native failed attempts/retries are allowed and reported separately.
+  A failed tool ends the run before another model round. Tool/time/write limits are the
+  primary operational bounds. Input tokens are a soft reported-usage ceiling, not a hard
+  pre-dispatch or financial cap: native retries, deferred polls, compaction and a crash
+  before a response is committed prevent precise network-request accounting. Missing
+  usage fails closed, and an over-budget settled run never acknowledges its batch. The editable workspace policy is `DIGEST.md`
   (seeded only when absent) and it can never grant authority. Only a failed or
   cancelled run admits one bounded internal issue report to its origin
   conversation (`nanobot.memory-digest-result`, deduplicated by request ID); a
