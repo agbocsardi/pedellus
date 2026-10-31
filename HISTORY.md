@@ -946,8 +946,14 @@ and whether a new start is possible), so an owner never sees a silent loss or an
 
 Recovery does not depend on the record surviving. `recover` treats the terminal native task as
 authoritative: if its notice record is missing, it re-admits the event only when Durable does not
-already hold that request ID. That keeps an event admitted exactly once while surviving a lost
-record, and neither notification recovery nor a retry ever advances or rewinds the digest cursor.
+already hold this exact result entry. Durable deduplicates an input by request ID alone, so a
+request ID occupied by a queued or foreign input is a collision, not proof: the placed entry must
+have `nanobot.memory-digest-result` kind and this task's `data.taskId` in the origin conversation.
+A queued, missing or foreign entry never marks the run reported; a missing record is reconstructed
+as a pending record into a safe bounded slot so it stays visible to status and cannot grow the
+list. Neither notification recovery nor a retry ever advances or rewinds the digest cursor.
+`/digest status` is strictly read-only: it reads notices from a snapshot instead of creating the
+document, so a fresh status leaves no child document behind.
 
 Two bounded edges are stated rather than implied. A cron occurrence whose digest task starts and
 then crashes before its run commit is replayed on reopen and can process one additional bounded

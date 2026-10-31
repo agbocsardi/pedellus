@@ -917,15 +917,18 @@ export function renderMemoryDigestStart(result: MemoryDigestStartResult): string
   if (result.status === "idle") {
     const idle = result.idle;
     if (idle.caughtUp) {
-      return "No closed episode is pending memory digestion: every mapped chat was examined to its tail. Nothing was started and no model was called.";
+      return "No closed episode is pending memory digestion: every mapped chat was examined to its tail. " +
+        "No new digest run was started; retained internal-result delivery may resume this conversation's agent.";
     }
     return [
       "No bounded batch was ready, but the scan did not reach the tail of every mapped chat, so closed history may remain pending.",
       `Examined ${idle.examinedChats}, postponed ${idle.postponedChats}, unfinished ${idle.unfinishedChats}, missing ${idle.missingChats}.`,
-      "Nothing was started and no model was called; retry the digest to continue the bounded scan.",
+      "No new digest run was started; retained internal-result delivery may resume this conversation's agent. " +
+        "Retry the digest to continue the bounded scan.",
     ].join("\n");
   }
-  return `Memory digestion is refused: ${result.reason}. Nothing was started and no model was called.`;
+  return `Memory digestion is refused: ${result.reason}. No new digest run was started; ` +
+    "retained internal-result delivery may resume this conversation's agent.";
 }
 
 /** Fixed, value-free wording for the bounded status surface. */
@@ -1112,14 +1115,71 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
     return lines.join("\n");
   };
 
+  /** The entry one submission has actually placed, if any. A queued input has none yet. */
+  const placedEntryOf = (record: SubmissionRecord): EntryId | undefined => {
+    if (record.type !== "input") return undefined;
+    if (record.status === "placed" || record.status === "done") return record.entry;
+    return record.status === "unanswered" ? record.entry : undefined;
+  };
+
+  /**
+   * Durable dedupes an input by request ID alone, not by entry kind. Before treating a request ID
+   * as this result's admission, the placed entry must be this task's internal result in this exact
+   * origin conversation. A queued, missing or foreign entry is not proof and never marks reported.
+   */
+  const resultEntryMatches = async (
+    harness: Harness,
+    origin: ConversationId,
+    taskId: number,
+    entryId: EntryId | undefined,
+    context: Context,
+  ): Promise<boolean> => {
+    if (entryId === undefined) return false;
+    try {
+      const entry = await harness.commit((tx) => tx.entry(entryId), context);
+      return entry !== undefined
+        && entry.conversationId === origin
+        && entry.kind === MEMORY_DIGEST_RESULT_ENTRY_KIND
+        && isRecord(entry.data)
+        && entry.data.taskId === taskId;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * Keep a terminal run visible when its record is missing and Durable holds a foreign or queued
+   * submission under the same request ID. This only reconstructs into a safe slot: it never evicts
+   * an undelivered or unknown record, and it does not grow past the bounded list.
+   */
+  const ensurePendingNotice = async (
+    harness: Harness,
+    origin: ConversationId,
+    taskId: number,
+    context: Context,
+  ): Promise<void> => {
+    try {
+      await harness.commit(async (tx) => {
+        const doc = await tx.doc(MemoryDigestNoticesDoc, origin);
+        if (doc.notices.some((candidate) => candidate.taskId === taskId)) return undefined;
+        if (!(await pruneNoticeSlots(tx, doc, MEMORY_DIGEST_LIMITS.noticeRecords - 1))) return undefined;
+        doc.notices.push({ taskId, notified: false });
+        return undefined;
+      }, context);
+    } catch {
+      // Not visible this pass; the authoritative terminal task is retried on reopen.
+    }
+  };
+
   /**
    * Admit the internal result event for one terminal run. The write-ahead notice plus the
    * conversation-scoped request ID makes a crash between the terminal commit and this admission a
    * retry instead of a lost or duplicated parent turn.
    *
    * A missing notice record is not treated as "nothing to report": the terminal native task is
-   * authoritative. The event is skipped only when Durable already holds its request ID; otherwise it
-   * is admitted from the task record itself (a bounded, idempotent retry).
+   * authoritative. The event is skipped only when Durable holds this exact result entry; otherwise
+   * it is admitted from the task record itself (a bounded, idempotent retry). A request ID occupied
+   * by a queued or foreign input is a collision, not proof: the notice stays pending and visible.
    */
   const notifyThrough = async (
     harness: Harness,
@@ -1144,14 +1204,19 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
     const result = digestResultOf(task);
     if (result === undefined) return false;
     if (notice === undefined) {
+      let existing: SubmissionRecord | undefined;
       try {
-        const admitted = await harness.commit(
+        existing = await harness.commit(
           (tx) => tx.submissionByRequest(origin, resultRequestId(taskId)),
           context,
         );
-        // Already admitted before the record was pruned or before this version wrote one: no retry.
-        if (admitted !== undefined) return false;
       } catch {
+        return false;
+      }
+      // Only an already-placed matching entry proves the event was admitted.
+      if (existing !== undefined && await resultEntryMatches(
+        harness, origin, taskId, placedEntryOf(existing), context,
+      )) {
         return false;
       }
     }
@@ -1162,8 +1227,9 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
       return false;
     }
     if (conversation === undefined) return false;
+    let submission: Submission;
     try {
-      await conversation.submit({
+      submission = await conversation.submit({
         type: "input",
         content: resultText(taskId, result),
         requestId: resultRequestId(taskId),
@@ -1172,6 +1238,17 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
     } catch {
       // The origin may be settling or the Harness closing. The notice stays open, so a reopen
       // re-admits the same request ID instead of losing or duplicating the result.
+      return false;
+    }
+    let record: SubmissionRecord;
+    try {
+      record = await submission.status(context);
+    } catch {
+      return false;
+    }
+    // A queued, missing or foreign entry under this request ID is not this result's admission.
+    if (!(await resultEntryMatches(harness, origin, taskId, placedEntryOf(record), context))) {
+      if (notice === undefined) await ensurePendingNotice(harness, origin, taskId, context);
       return false;
     }
     if (notice === undefined) return true;
@@ -1723,6 +1800,9 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
         throw new TypeError("memory digestion status needs a committed origin conversation");
       }
       const harness = options.harness();
+      // A read-only status must not create the notice document. `tx.doc` would persist an empty
+      // one, so the notices come from a read-only snapshot and only task reads happen in the commit.
+      const notices = (await harness.snapshot(MemoryDigestNoticesDoc, writer.id, context))?.notices ?? [];
       return harness.commit(async (tx) => {
         const live = await txLiveTask(tx);
         const page = await tx.scanTasks({
@@ -1733,9 +1813,8 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
         const latest = page.items[0] === undefined ? undefined : taskSnapshot(page.items[0]);
         // Report retained notices by what their native records prove: only a reported or
         // faulted/orphaned record frees a slot, so the count matches the start commit's decision.
-        const notices = await tx.doc(MemoryDigestNoticesDoc, writer.id);
         let pendingNotices = 0;
-        for (const notice of notices.notices) {
+        for (const notice of notices) {
           const task = await tx.task(notice.taskId as TaskId);
           const state = memoryDigestNoticeState(notice, task);
           if (state !== "notified" && state !== "nonreportable") pendingNotices += 1;

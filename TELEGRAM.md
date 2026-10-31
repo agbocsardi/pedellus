@@ -89,7 +89,9 @@ host for one bounded closed-episode batch from the shared, already-mapped chat
 history (the batch may come from a different mapped chat, because workspace
 memory is shared) and acknowledges only the bounded admission: started, busy,
 idle or refused. It returns immediately, starts no schedule, holds no chat turn
-while the digest runs, and calls no model from the command itself. A digest batch
+while the digest runs. The command starts no new digest model turn itself, but it
+may re-admit a retained earlier internal result, which is an ordinary origin-agent
+turn. A digest batch
 is one closed episode chunk, not a loop until history is exhausted; an `idle`
 answer that did not reach every mapped chat's tail says closed history may
 remain. `/digest status` is a bounded read-only view of the live run and this

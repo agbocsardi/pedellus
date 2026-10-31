@@ -340,7 +340,7 @@ test('/digest status, idle and malformed forms are bounded owner notices with no
     assert.match(transport.sent[0].text, /No memory digestion run is recorded for this conversation/);
     assert.match(transport.sent[0].text, /read-only: no scan, no model call/);
     assert.match(transport.sent[1].text, /No closed episode is pending memory digestion/);
-    assert.match(transport.sent[1].text, /no model was called/);
+    assert.match(transport.sent[1].text, /No new digest run was started/);
     assert.match(transport.sent[2].text, /Usage: \/digest/);
     assert.equal(store.captured.length, 0, 'no digest command form reached the model');
     const tasks = await store.gateway.harness.commit(

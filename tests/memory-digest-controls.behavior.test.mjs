@@ -28,6 +28,7 @@ const [
     MEMORY_DIGEST_NOTICES_KIND,
     MEMORY_DIGEST_PROMPT_FILE,
     MEMORY_DIGEST_RESULT_ENTRY_KIND,
+    MEMORY_DIGEST_RESULT_REQUEST_PREFIX,
     MEMORY_DIGEST_TASK_NAME,
     MemoryDigestNoticesDoc,
     memoryDigestNoticeState,
@@ -257,6 +258,12 @@ test('opening or configuring the gateway starts no digest run, task or schedule'
   const status = await statusOf(store.gateway);
   assert.equal(status.liveTaskId, null);
   assert.equal(status.latest, null);
+  assert.equal(status.pendingNotices, 0);
+  assert.equal(
+    await store.gateway.harness.snapshot(MemoryDigestNoticesDoc, origin.id, context),
+    undefined,
+    'a fresh read-only status creates no notice document',
+  );
 
   // The owner prompt is seeded by a run, not by startup.
   await assert.rejects(readFile(join(fixture.workspace, MEMORY_DIGEST_PROMPT_FILE), 'utf8'));
@@ -345,7 +352,8 @@ test('an idle scan that did not reach every chat never claims that everything is
     idle: { caughtUp: true, examinedChats: 3, postponedChats: 0, unfinishedChats: 0, missingChats: 0 },
   });
   assert.match(complete, /No closed episode is pending/);
-  assert.match(complete, /no model was called/);
+  assert.match(complete, /No new digest run was started/);
+  assert.doesNotMatch(complete, /no model was called/);
 });
 
 test('one internal result event per run: success, failure and a reopen retry that deduplicates', { timeout: 40_000 }, async (t) => {
@@ -418,8 +426,7 @@ test('a full notice queue refuses a start without evicting an undelivered result
       get(target, property) {
         if (property === 'submit') {
           return async (draft, submitContext) => {
-            if (typeof draft?.requestId === 'string'
-              && draft.requestId.startsWith('nanobot.memory-digest-result:')) {
+            if (draft?.entry?.kind === MEMORY_DIGEST_RESULT_ENTRY_KIND) {
               throw new Error('synthetic admission failure');
             }
             return target.submit(draft, submitContext);
@@ -495,15 +502,17 @@ test('a full notice queue refuses a start without evicting an undelivered result
     cursorBefore,
     'notification recovery never advances or rewinds the digest cursor',
   );
-  const afterRecover = await reopened.harness.snapshot(MemoryDigestNoticesDoc, origin.id, context);
-  assert.equal(afterRecover.notices.find((notice) => notice.taskId === started.taskId)?.notified, true);
-  const recoveredStatus = await statusOf(reopened);
-  assert.equal(recoveredStatus.pendingNotices, MEMORY_DIGEST_LIMITS.noticeRecords - 1);
-  assert.equal(recoveredStatus.canStart, true);
-
-  // One retry later, the original task's event is still admitted exactly once.
+  // Whether recovery could verify the placed entry immediately or had to leave it pending for a
+  // queued admission, the next start flushes/verifies it, prunes only that record, and then has a
+  // safe slot. The original task's event is still admitted exactly once.
+  await originIdle(reopened.harness, origin.id);
   const next = await startDigest(reopened);
   assert.equal(next.status, 'started');
+  const verified = await reopened.harness.snapshot(MemoryDigestNoticesDoc, origin.id, context);
+  const verifiedNotice = verified.notices.find((notice) => notice.taskId === started.taskId);
+  // It was verified reported and then evicted to make the slot; a surviving trace must be notified.
+  assert.ok(verifiedNotice === undefined || verifiedNotice.notified === true);
+  assert.equal((await statusOf(reopened)).pendingNotices, MEMORY_DIGEST_LIMITS.noticeRecords);
   await settleTask(reopened.harness, next.taskId);
   const resultEntries = async (reader) => (await entriesOf(reader, origin.id))
     .filter((entry) => entry.kind === MEMORY_DIGEST_RESULT_ENTRY_KIND);
@@ -511,6 +520,115 @@ test('a full notice queue refuses a start without evicting an undelivered result
   const originalNotices = (await resultEntries(reopened.harness))
     .filter((entry) => entry.data?.taskId === started.taskId);
   assert.equal(originalNotices.length, 1, 'a recovered admission is never duplicated');
+});
+
+test('a foreign input under the result request ID stays pending and visible, never reported', { timeout: 60_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, answerNothing);
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('First closed episode.'), assistant('Noted.')]);
+
+  // Keep the real result admission from landing, then remove its record to model the old eviction.
+  const harness = store.gateway.harness;
+  const originalConversation = harness.conversation.bind(harness);
+  let denyNotice = true;
+  harness.conversation = async (id, ctx) => {
+    const handle = await originalConversation(id, ctx);
+    if (!denyNotice || id !== origin.id || handle === undefined) return handle;
+    return new Proxy(handle, {
+      get(target, property) {
+        if (property === 'submit') {
+          return async (draft, submitContext) => {
+            if (draft?.entry?.kind === MEMORY_DIGEST_RESULT_ENTRY_KIND) {
+              throw new Error('synthetic admission failure');
+            }
+            return target.submit(draft, submitContext);
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  };
+
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  await settleTask(store.gateway.harness, started.taskId);
+  await waitFor(async () => {
+    const doc = await store.gateway.harness.snapshot(MemoryDigestNoticesDoc, origin.id, context);
+    return doc?.notices.some((notice) => notice.taskId === started.taskId) === true;
+  }, 'the retained notice');
+  await store.gateway.harness.commit(async (tx) => {
+    const doc = await tx.doc(MemoryDigestNoticesDoc, origin.id);
+    doc.notices = doc.notices.filter((notice) => notice.taskId !== started.taskId);
+    return undefined;
+  }, context);
+
+  // A host submits an ordinary user input under the exact internal request ID. Durable dedupes by
+  // request ID only, so a later digest admission must not mistake this foreign entry for its own.
+  const requestId = `${MEMORY_DIGEST_RESULT_REQUEST_PREFIX}${started.taskId}`;
+  const originHandle = await store.gateway.harness.conversation(origin.id, context);
+  const foreign = await originHandle.submit({
+    type: 'input',
+    content: 'foreign collision input',
+    requestId,
+  }, context);
+  await foreign.wait(context);
+  await originHandle.waitForIdle(context);
+  denyNotice = false;
+
+  await store.gateway.close(context);
+  const reopened = await openGateway(store.config, context, { models: store.models });
+  t.after(async () => { await reopened.close(context).catch(() => undefined); });
+  // Recovery sees the authoritative terminal task with no record, finds the foreign entry under its
+  // request ID, and must reconstruct a bounded pending record instead of claiming it was reported.
+  const recovered = await waitForValue(async () => {
+    const doc = await reopened.harness.snapshot(MemoryDigestNoticesDoc, origin.id, context);
+    return doc?.notices.find((notice) => notice.taskId === started.taskId);
+  }, 'the reconstructed pending notice');
+  assert.equal(recovered.notified, false);
+  assert.equal(
+    (await digestNotices(reopened.harness, origin.id))
+      .filter((entry) => entry.data?.taskId === started.taskId).length,
+    0,
+    'the foreign input is never reported as this digest result',
+  );
+  const status = await statusOf(reopened);
+  assert.equal(status.pendingNotices, 1);
+  assert.equal(status.canStart, true);
+
+  // Fill the bounded list: the collided record is unknown to its request ID and is never evicted.
+  const maxTaskId = await reopened.harness.commit(async (tx) => {
+    let max = 0;
+    let cursor;
+    do {
+      const page = await tx.scanTasks({}, 1000, cursor);
+      for (const record of page.items) max = Math.max(max, Number(record.id));
+      cursor = page.next;
+    } while (cursor !== undefined);
+    return max;
+  }, context);
+  await reopened.harness.commit(async (tx) => {
+    const doc = await tx.doc(MemoryDigestNoticesDoc, origin.id);
+    for (let index = doc.notices.length; index < MEMORY_DIGEST_LIMITS.noticeRecords; index += 1) {
+      doc.notices.push({ taskId: maxTaskId + 10_000 + index, notified: false });
+    }
+    return undefined;
+  }, context);
+  await closedEpisode(reopened.harness, origin.id, [user('Second closed episode.'), assistant('Noted.')]);
+  const callsBefore = store.calls.length;
+  const refused = await startDigest(reopened);
+  assert.equal(refused.status, 'refused');
+  assert.equal(refused.reason, MEMORY_DIGEST_NOTICE_FULL_REASON);
+  assert.equal(store.calls.length, callsBefore, 'the collision retry starts no new model turn');
+  const after = await reopened.harness.snapshot(MemoryDigestNoticesDoc, origin.id, context);
+  assert.equal(after.notices.find((notice) => notice.taskId === started.taskId)?.notified, false);
+  assert.equal((await digestNotices(reopened.harness, origin.id))
+    .filter((entry) => entry.data?.taskId === started.taskId).length, 0);
+  const refusedStatus = await statusOf(reopened);
+  assert.equal(refusedStatus.pendingNotices, MEMORY_DIGEST_LIMITS.noticeRecords);
+  assert.equal(refusedStatus.canStart, false);
 });
 
 test('notice pruning only frees reported or genuinely nonreportable outcomes', () => {
