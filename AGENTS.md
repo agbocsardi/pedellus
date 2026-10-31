@@ -146,11 +146,14 @@ npm start -- agent --config config.json     # attach a terminal
   cron conversations get none. A configured stdio server is a native host
   process, not covered by `toolSandbox: "bwrap"`. Secrets are referenced by
   environment variable name.
-- Media ingress is opt-in (`media` config) and owned by the gateway. Photos are
-  native pi-ai image content plus a workspace-relative locator; configured vision
-  handoff describes them for flagged text-only presets. Documents are stored
-  unread with no extraction, and voice/audio is transcribed locally only when the
-  chosen engine is provisioned explicitly. The default engine is the uv/
+- Media ingress is opt-in (`media` config) and owned by the gateway. Telegram
+  photos are native pi-ai image content plus a workspace-relative locator, and
+  configured vision handoff describes them for flagged text-only presets;
+  Telegram documents are stored unread and Telegram voice/audio is transcribed
+  locally only when the chosen engine is provisioned explicitly. Every CLI
+  `/attach` file, photos included, is a stored opaque original named only by a
+  workspace-relative locator: no native image content, vision handoff,
+  transcription or extraction. The default engine is the uv/
   faster-whisper helper (`small`/CPU/`int8`) and stays the default: the Python-free
   `whisper-cli` route is selected only by `media.transcription.backend` plus an
   absolute, operator-provisioned engine/model/VAD/FFmpeg block. No runtime
