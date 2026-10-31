@@ -18,7 +18,7 @@ import {
   type EntryRecord,
 } from "@earendil-works/pi-durable";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
-import { WORKER_INPUT_ENTRY_KIND } from "../workers/worker-task.js";
+import { WORKER_INPUT_ENTRY_KIND, WORKER_STEER_ENTRY_KIND } from "../workers/worker-task.js";
 
 export type EntryScope = "messages" | "tools" | "all";
 
@@ -113,6 +113,7 @@ export function messageText(content: unknown): string {
 const TASK_INPUT_KINDS: Readonly<Record<string, string>> = Object.freeze({
   [CRON_INPUT_ENTRY_KIND]: "user (cron)",
   [WORKER_INPUT_ENTRY_KIND]: "user (worker task)",
+  [WORKER_STEER_ENTRY_KIND]: "assistant (worker steer)",
 });
 
 /** Only own keys count: an entry kind such as "constructor" is not a known task input. */

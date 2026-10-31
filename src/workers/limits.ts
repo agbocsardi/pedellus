@@ -18,6 +18,10 @@ export const WORKER_LIMITS = Object.freeze({
   retainedRecords: 32,
   /** Characters of the spawning agent's task prompt echoed in the internal result event. */
   maxEchoPromptChars: 400,
+  /** Characters accepted from one steering message; a longer message is refused, not truncated. */
+  maxSteerChars: 2_000,
+  /** Steering messages retained and accepted per worker task. */
+  maxSteersPerWorker: 8,
   /** Transcript entries read and shown per page when `transcript` omits `limit`. */
   transcriptDefaultLimit: 20,
   /** Hard per-call transcript entry cap; a page is one native descending entry scan. */

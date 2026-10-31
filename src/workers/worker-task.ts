@@ -16,17 +16,22 @@ import {
   defineDoc,
   defineExtension,
   defineTask,
+  InboxDoc,
+  LiveDoc,
   type ConversationHandle,
   type ConversationId,
+  type ConversationRecord,
   type Cursor,
   type EntryId,
   type EntryRecord,
   type Extension,
   type Harness,
   type Submission,
+  type SubmissionId,
   type SubmissionRecord,
   type Task,
   type TaskId,
+  type TaskRecord,
   type TaskRuntime,
   type NextTaskState,
   type TaskState,
@@ -43,8 +48,12 @@ export const WORKER_EXTENSION_NAME = "nanobot.workers";
 export const WORKER_INPUT_ENTRY_KIND = "nanobot.worker-task";
 /** Entry kind of the internal result event inside the spawning conversation. */
 export const WORKER_RESULT_ENTRY_KIND = "nanobot.worker-result";
+/** Entry kind of one steering message inside the worker's own conversation. */
+export const WORKER_STEER_ENTRY_KIND = "nanobot.worker-steer";
 /** Conversation-scoped submission request ID; makes result admission idempotent across a crash. */
 export const WORKER_RESULT_REQUEST_PREFIX = "nanobot.worker-result:";
+/** Conversation-scoped steering request ID, keyed by the worker and the host tool task. */
+export const WORKER_STEER_REQUEST_PREFIX = "nanobot.worker-steer:";
 
 export type WorkerStatus = "queued" | "running" | "completed" | "failed" | "aborted" | "orphaned" | "faulted" | "missing";
 
@@ -68,6 +77,18 @@ export type WorkerRecord = {
   baseCommit: string | null;
   /** False until the internal result event was admitted for the spawning agent. */
   notified: boolean;
+  /** Bounded steering requests accepted while this worker was live, in acceptance order. */
+  steers?: WorkerSteerRecord[];
+};
+
+/** One accepted steering request, kept so completion can withdraw an undelivered one. */
+export type WorkerSteerRecord = {
+  readonly requestId: string;
+  /** Native submission ID; the run's input list contains it once the boundary places it. */
+  readonly submissionId: number;
+  /** Host tool task that asked for the steering message; the provider call ID is not identity. */
+  readonly sourceTaskId: number;
+  readonly acceptedAtMs: number;
 };
 
 export type WorkerRecordDocument = { workers: WorkerRecord[] };
@@ -193,6 +214,8 @@ export interface WorkerView {
   readonly workspacePath: string | null;
   readonly branch: string | null;
   readonly baseCommit: string | null;
+  /** Accepted steering messages for this worker; bounded by `maxSteersPerWorker`. */
+  readonly steerCount: number;
 }
 
 export interface WorkerFoundation {
@@ -201,6 +224,18 @@ export interface WorkerFoundation {
   list(harness: Harness, conversationId: ConversationId, context: Context): Promise<readonly WorkerView[]>;
   inspect(harness: Harness, conversationId: ConversationId, taskId: number, context: Context): Promise<WorkerView | undefined>;
   cancel(harness: Harness, conversationId: ConversationId, taskId: number, context: Context): Promise<"marked" | "terminal" | "not_found">;
+  /**
+   * Admit one bounded steering message into a live worker's current native run. The worker record,
+   * task liveness and the child's live run are checked in the admission commit itself, and the
+   * native inbox item is written in that same commit: no separate check-then-submit window exists.
+   */
+  steer(
+    harness: Harness,
+    conversationId: ConversationId,
+    taskId: number,
+    request: WorkerSteerRequest,
+    context: Context,
+  ): Promise<WorkerSteerResult>;
   /**
    * One bounded page of a live or terminal worker's own committed transcript. Resolution uses this
    * conversation's worker record and the native task/child ownership; an unstarted or missing child
@@ -224,6 +259,20 @@ export interface WorkerTranscriptQuery {
   readonly before?: EntryId;
   readonly limit: number;
 }
+
+export interface WorkerSteerRequest {
+  /** Bounded direction from the spawning agent; already validated by the model-facing tool. */
+  readonly text: string;
+  /** The host tool task that issued it; stable across a replay, unlike a provider call ID. */
+  readonly sourceTaskId: number;
+}
+
+export type WorkerSteerResult =
+  | { readonly status: "accepted"; readonly deduplicated: boolean; readonly acceptedCount: number }
+  | { readonly status: "not_found" }
+  | { readonly status: "terminal"; readonly worker: WorkerStatus }
+  | { readonly status: "not_live" }
+  | { readonly status: "refused"; readonly reason: string };
 
 /** One bounded descending page of a worker child's committed entries. */
 export interface WorkerTranscript {
@@ -261,6 +310,22 @@ export function workerResultRequestId(taskId: number): string {
   return `${WORKER_RESULT_REQUEST_PREFIX}${taskId}`;
 }
 
+/** One steering request per worker and host tool task; a replay keeps the same key. */
+export function workerSteerRequestId(taskId: number, sourceTaskId: number): string {
+  return `${WORKER_STEER_REQUEST_PREFIX}${taskId}:${sourceTaskId}`;
+}
+
+/** The model-visible text placed in the worker's own conversation for one steering message. */
+export function workerSteerText(taskId: number, text: string): string {
+  return [
+    `[internal steering message for worker ${taskId}]`,
+    "This is direction from the assistant that started this worker, not the user and not a new task.",
+    "It applies to the same worker task; keep using only the tools already available to you.",
+    "",
+    bounded(text.trim(), WORKER_LIMITS.maxSteerChars),
+  ].join("\n");
+}
+
 /** Live or terminal status of one worker task. Pure; a missing task is `missing`, never a guess. */
 function statusOf(record: { readonly state: { readonly status: string; readonly outcome?: { readonly status: string } } }): WorkerStatus {
   if (record.state.status === "terminal") {
@@ -275,24 +340,19 @@ function statusOf(record: { readonly state: { readonly status: string; readonly 
 }
 
 /**
- * Resolve one worker by ID for the conversation that owns its record, then verify the native facts
- * before anything reads its child: the task must be this conversation's worker task, and the child
- * conversation must be owned by that exact task ID. A forged record, a record that points at an
- * unrelated or conversation-owned transcript, and a checkpoint/record disagreement all resolve to
- * `undefined`. This is the narrow foundation a later steering slice can reuse after re-checking the
- * returned status; it reads only and mutates nothing.
+ * Verify one worker's native facts against a record, task and child conversation. Pure; both the
+ * read-only resolver and the atomic steering admission use it, so they cannot drift apart. A
+ * forged record, an unrelated task, a mismatched checkpoint and a child owned by anything else are
+ * all `undefined`.
  */
-export async function resolveWorkerTarget(
-  reader: Pick<Harness, "snapshot" | "getTask" | "commit">,
+function workerTargetOf(
+  record: WorkerRecord | undefined,
+  task: TaskRecord<unknown, unknown, unknown> | undefined,
+  child: ConversationRecord | undefined,
   spawnerConversationId: ConversationId,
   taskId: number,
-  context: Context,
-): Promise<WorkerTarget | undefined> {
-  if (!Number.isSafeInteger(taskId) || taskId < 1) return undefined;
-  const doc = await reader.snapshot(WorkerRecordsDoc, spawnerConversationId, context);
-  const record = doc?.workers.find((candidate) => candidate.taskId === taskId);
+): WorkerTarget | undefined {
   if (record === undefined) return undefined;
-  const task = await reader.getTask(taskId as TaskId, context);
   if (task === undefined) return { record, status: "missing", targetConversationId: null };
   if (task.kind !== WORKER_TASK_NAME || task.conversationId !== spawnerConversationId) return undefined;
   const status = statusOf(task);
@@ -308,17 +368,45 @@ export async function resolveWorkerTarget(
   const target = fromCheckpoint
     ?? (record.conversationId === null ? null : record.conversationId as ConversationId);
   if (target === null) return { record, status, targetConversationId: null };
-  const owned = await reader.commit(async (tx) => {
-    const conversation = await tx.conversation(target);
-    // A task-owned conversation records its creator edge as `owner`; both halves must name this
-    // worker task and this spawning conversation, never an unrelated transcript.
-    return conversation !== undefined
-      && conversation.owner !== undefined
-      && Number(conversation.owner.taskId) === taskId
-      && conversation.owner.conversationId === spawnerConversationId;
-  }, context);
-  if (!owned) return undefined;
+  // A task-owned conversation records its creator edge as `owner`; both halves must name this
+  // worker task and this spawning conversation, never an unrelated transcript.
+  if (child === undefined || child.owner === undefined) return undefined;
+  if (Number(child.owner.taskId) !== taskId || child.owner.conversationId !== spawnerConversationId) return undefined;
   return { record, status, targetConversationId: target };
+}
+
+/**
+ * Resolve one worker by ID for the conversation that owns its record, then verify the native facts
+ * before anything reads its child: the task must be this conversation's worker task, and the child
+ * conversation must be owned by that exact task ID. A forged record, a record that points at an
+ * unrelated or conversation-owned transcript, and a checkpoint/record disagreement all resolve to
+ * `undefined`. Read-only; steering repeats the same verification inside its admission commit.
+ */
+export async function resolveWorkerTarget(
+  reader: Pick<Harness, "snapshot" | "getTask" | "commit">,
+  spawnerConversationId: ConversationId,
+  taskId: number,
+  context: Context,
+): Promise<WorkerTarget | undefined> {
+  if (!Number.isSafeInteger(taskId) || taskId < 1) return undefined;
+  const doc = await reader.snapshot(WorkerRecordsDoc, spawnerConversationId, context);
+  const record = doc?.workers.find((candidate) => candidate.taskId === taskId);
+  if (record === undefined) return undefined;
+  const task = await reader.getTask(taskId as TaskId, context);
+  if (task === undefined) return workerTargetOf(record, undefined, undefined, spawnerConversationId, taskId);
+  if (task.kind !== WORKER_TASK_NAME || task.conversationId !== spawnerConversationId) return undefined;
+  const checkpoint = isRecord(task.state) && isRecord(task.state.checkpoint)
+    ? task.state.checkpoint.targetConversationId
+    : undefined;
+  const fromCheckpoint = Number.isSafeInteger(checkpoint) && (checkpoint as number) >= 1
+    ? checkpoint as ConversationId
+    : null;
+  const target = fromCheckpoint
+    ?? (record.conversationId === null ? null : record.conversationId as ConversationId);
+  const child = target === null
+    ? undefined
+    : await reader.commit((tx) => tx.conversation(target), context);
+  return workerTargetOf(record, task, child, spawnerConversationId, taskId);
 }
 
 function parseInput(value: unknown): WorkerTaskInput | undefined {
@@ -448,6 +536,10 @@ export function workerResultText(record: WorkerRecord): string {
       : "shared configured workspace"}`,
     `Task: ${bounded(record.prompt, WORKER_LIMITS.maxEchoPromptChars)}`,
   ];
+  const steerCount = (record.steers ?? []).length;
+  if (steerCount > 0) {
+    lines.push(`Steering messages accepted while live: ${steerCount} (not user messages).`);
+  }
   if (record.result !== null && record.result !== "") {
     lines.push("", "Result (untrusted):", record.result);
   }
@@ -483,6 +575,7 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
     workspacePath: record.workspacePath,
     branch: record.branch,
     baseCommit: record.baseCommit,
+    steerCount: (record.steers ?? []).length,
   });
 
   const readTasks = async (
@@ -551,6 +644,116 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
     }
   };
 
+  /** One accepted steering request's native submission state, read with the child's live run. */
+  type SteerState = {
+    readonly status: "queued" | "placed" | "done" | "unanswered" | "missing";
+    readonly answer: EntryId | null;
+    readonly reason: string | null;
+  };
+
+  /**
+   * Withdraw every accepted steer that is still queued, in the caller's commit. A placed submission
+   * belongs to a run the worker joined; only an undelivered inbox item is removed here. Native
+   * `Conversation.abort()` also withdraws queued inputs, but that is a separate commit: this is the
+   * atomic completion boundary that makes "terminal" and "no undelivered accepted steer" true in
+   * the same durable state.
+   */
+  const withdrawQueuedSteers = async (
+    tx: Tx,
+    record: WorkerRecord,
+    targetConversationId: ConversationId,
+    reason: string,
+  ): Promise<number> => {
+    const steers = record.steers ?? [];
+    if (steers.length === 0) return 0;
+    const queued: SubmissionId[] = [];
+    for (const steer of steers) {
+      const submission = await tx.submissionByRequest(targetConversationId, steer.requestId);
+      if (submission?.status === "queued") queued.push(submission.id);
+    }
+    if (queued.length === 0) return 0;
+    const inbox = await tx.doc(InboxDoc, targetConversationId);
+    for (const id of queued) {
+      tx.settleSubmission(id, { status: "unanswered", reason });
+      const index = inbox.items.findIndex((item) => item.id === id);
+      if (index >= 0) inbox.items.splice(index, 1);
+    }
+    return queued.length;
+  };
+
+  /**
+   * Read the child's live run and every accepted steer's native submission in one commit, so a
+   * boundary cannot place one between the two reads. Read-only.
+   */
+  const readSteerStates = async (
+    spawnerConversationId: ConversationId,
+    targetConversationId: ConversationId,
+    taskId: number,
+    context: Context,
+  ): Promise<{ readonly busy: boolean; readonly states: readonly SteerState[] }> =>
+    options.commit(async (tx) => {
+      const records = await tx.doc(WorkerRecordsDoc, spawnerConversationId);
+      const steers = records.workers.find((candidate) => candidate.taskId === taskId)?.steers ?? [];
+      const live = await tx.doc(LiveDoc, targetConversationId);
+      const states: SteerState[] = [];
+      for (const steer of steers) {
+        const submission = await tx.submissionByRequest(targetConversationId, steer.requestId);
+        states.push({
+          status: submission?.status ?? "missing",
+          answer: submission !== undefined && submission.status === "done" ? submission.answer ?? null : null,
+          reason: submission !== undefined && submission.status === "unanswered" ? submission.reason : null,
+        });
+      }
+      return { busy: live.run !== undefined, states };
+    }, context);
+
+  /**
+   * Join accepted steering to the same worker task. A steer is admitted only while the child has a
+   * live run (see `steer`), but the run's final boundary may place it as the next run's first input.
+   * Waiting until the child is genuinely idle makes that successor run part of this worker: its
+   * answer becomes the outcome, its tools remain captured, and it is never an orphan turn after
+   * retirement. A failed initial turn is not joined; its queued steers are withdrawn by `finish`.
+   */
+  const settleSteering = async (
+    conversation: Pick<ConversationHandle, "waitForIdle">,
+    spawnerConversationId: ConversationId,
+    targetConversationId: ConversationId,
+    taskId: number,
+    settlement: WorkerSettlement,
+    context: Context,
+  ): Promise<WorkerSettlement> => {
+    if (settlement.status !== "ok") return settlement;
+    // One run per accepted steer at most; the extra rounds cover the initial run and a boundary
+    // that creates the successor just as this read observes the previous one ending.
+    const rounds = WORKER_LIMITS.maxSteersPerWorker + 4;
+    let observed = await readSteerStates(spawnerConversationId, targetConversationId, taskId, context);
+    for (let round = 0; round < rounds && (observed.busy || observed.states.some((state) => state.status === "placed")); round += 1) {
+      await conversation.waitForIdle(context);
+      observed = await readSteerStates(spawnerConversationId, targetConversationId, taskId, context);
+    }
+    if (observed.states.length === 0) return settlement;
+    const last = observed.states[observed.states.length - 1]!;
+    if (last.status === "done") {
+      let answer = settlement.answerEntryId;
+      for (const state of observed.states) {
+        if (state.answer !== null && (answer === null || state.answer > answer)) answer = state.answer;
+      }
+      return { status: "ok", answerEntryId: answer, error: null };
+    }
+    if (last.status === "unanswered") {
+      return {
+        status: "error",
+        answerEntryId: settlement.answerEntryId,
+        error: bounded(last.reason ?? "the worker turn ended before answering a steering message", WORKER_LIMITS.maxErrorChars),
+      };
+    }
+    return {
+      status: "error",
+      answerEntryId: settlement.answerEntryId,
+      error: "the worker stopped before delivering an accepted steering message",
+    };
+  };
+
   const finish = async (
     runtime: TaskRuntime<WorkerTaskInput, WorkerCheckpoint, WorkerRunResult, object>,
     running: { readonly id: TaskId<WorkerRunResult>; readonly conversationId: ConversationId; readonly input: WorkerTaskInput },
@@ -560,10 +763,11 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
     workspace: WorkerWorkspaceInfo | null,
     context: Context,
   ): Promise<void> => {
-    const status: WorkerRunResult["status"] = settlement.status === "ok"
+    let status: WorkerRunResult["status"] = settlement.status === "ok"
       ? "completed"
       : settlement.status === "cancelled" ? "aborted" : "failed";
-    const result: WorkerRunResult = { status, error: settlement.error, answerEntryId: settlement.answerEntryId };
+    let error = settlement.error;
+    let result: WorkerRunResult = { status, error, answerEntryId: settlement.answerEntryId };
     await runtime.commit(async (tx) => {
       let outcome: WorkerFinalizeOutcome = { result: null, error: settlement.error };
       if (targetConversationId !== null && workspace !== null) {
@@ -586,11 +790,24 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
       }
       const records = await tx.doc(WorkerRecordsDoc, running.conversationId);
       const record = records.workers.find((candidate) => candidate.taskId === Number(running.id));
+      // Completion boundary: a steering message that was admitted but never placed into the live
+      // run is withdrawn in this same terminal commit, so no later turn can start under retired
+      // tools. An answered worker normally reaches idle only after every accepted steer settled.
+      const withdrawn = record === undefined || targetConversationId === null
+        ? 0
+        : await withdrawQueuedSteers(tx, record, targetConversationId, settlement.status === "cancelled"
+          ? "the worker was cancelled before the steering message was delivered"
+          : "the worker finished before the steering message was delivered");
+      if (withdrawn > 0 && status === "completed") {
+        status = "failed";
+        error = `${withdrawn} accepted steering message${withdrawn === 1 ? " was" : "s were"} not delivered`;
+        result = { status, error, answerEntryId: settlement.answerEntryId };
+      }
       if (record !== undefined) {
         record.status = status;
         record.finishedAtMs = clock();
         record.result = outcome.result === null ? null : bounded(outcome.result, WORKER_LIMITS.maxResultChars);
-        record.error = outcome.error === null ? null : bounded(outcome.error, WORKER_LIMITS.maxErrorChars);
+        record.error = error === null ? null : bounded(error, WORKER_LIMITS.maxErrorChars);
         record.conversationId = targetConversationId ?? record.conversationId;
         record.workspacePath = workspace?.path ?? record.workspacePath;
         record.branch = workspace?.branch ?? record.branch;
@@ -600,8 +817,8 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
       return status === "completed"
         ? terminalCompleted(result)
         : status === "aborted"
-          ? terminalAborted(result, settlement.error ?? "cancelled")
-          : terminalFailed(result, settlement.error ?? "the worker turn failed");
+          ? terminalAborted(result, error ?? "cancelled")
+          : terminalFailed(result, error ?? "the worker turn failed");
     }, context);
     await notifyThrough(runtime, running, input, context);
   };
@@ -789,7 +1006,11 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
             };
           }
           if (runtime.signal.aborted) return;
-          await finish(runtime, running, parsed, settlement, target, workspace, context);
+          const joined = await settleSteering(
+            conversation, running.conversationId, target, Number(running.id), settlement, context,
+          );
+          if (runtime.signal.aborted) return;
+          await finish(runtime, running, parsed, joined, target, workspace, context);
         },
       },
 
@@ -819,6 +1040,12 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
           const records = await tx.doc(WorkerRecordsDoc, running.conversationId);
           const record = records.workers.find((candidate) => candidate.taskId === Number(running.id));
           if (record !== undefined) {
+            if (checkpoint.targetConversationId !== null) {
+              await withdrawQueuedSteers(
+                tx, record, checkpoint.targetConversationId as ConversationId,
+                "the worker was cancelled before the steering message was delivered",
+              );
+            }
             record.status = "aborted";
             record.finishedAtMs = clock();
             record.error = "cancelled before the worker finished";
@@ -943,6 +1170,7 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
           branch: null,
           baseCommit: null,
           notified: false,
+          steers: [],
         });
         return { taskId: Number(taskId), deduplicated: false };
       }, context);
@@ -971,6 +1199,93 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
       if (task.conversationId !== conversationId) return "not_found";
       if (task.state.status === "terminal") return "terminal";
       return harness.abortTask(taskId as TaskId, context);
+    },
+
+    async steer(harness, conversationId, taskId, request, context) {
+      if (typeof request?.text !== "string") {
+        throw new TypeError("a steering message must be text");
+      }
+      const text = request.text.trim();
+      if (text === "") throw new TypeError("a steering message needs non-empty text");
+      if (text.length > WORKER_LIMITS.maxSteerChars) {
+        throw new TypeError(`a steering message must be at most ${WORKER_LIMITS.maxSteerChars} characters`);
+      }
+      if (!Number.isSafeInteger(request.sourceTaskId) || request.sourceTaskId < 1) {
+        throw new TypeError("a steering message needs the host tool-task identity");
+      }
+      const requestId = workerSteerRequestId(taskId, request.sourceTaskId);
+      return harness.commit(async (tx) => {
+        // All reads happen before the first table write: the record, the native task, the child
+        // owner and the child's live run are checked in this one commit. A terminal or completing
+        // worker makes this commit refuse, so a check-then-submit window cannot admit late input.
+        const records = await tx.doc(WorkerRecordsDoc, conversationId);
+        const record = records.workers.find((candidate) => candidate.taskId === taskId);
+        if (record === undefined) return { status: "not_found" } as const;
+        const task = await tx.task(taskId as TaskId);
+        const checkpoint = task === undefined || !isRecord(task.state) || !isRecord(task.state.checkpoint)
+          ? undefined
+          : task.state.checkpoint.targetConversationId;
+        const fromCheckpoint = Number.isSafeInteger(checkpoint) && (checkpoint as number) >= 1
+          ? checkpoint as ConversationId
+          : null;
+        const target = fromCheckpoint
+          ?? (record.conversationId === null ? null : record.conversationId as ConversationId);
+        const child = target === null ? undefined : await tx.conversation(target);
+        const resolved = workerTargetOf(record, task, child, conversationId, taskId);
+        if (resolved === undefined) return { status: "not_found" } as const;
+        const steers = record.steers ?? [];
+        const replay = steers.find((steer) => steer.requestId === requestId);
+        if (replay !== undefined) {
+          return { status: "accepted", deduplicated: true, acceptedCount: steers.length } as const;
+        }
+        if (task === undefined) return { status: "terminal", worker: "missing" } as const;
+        if (task.state.status === "terminal" || task.state.status === "completing" || task.abortRequested) {
+          return { status: "terminal", worker: statusOf(task) } as const;
+        }
+        if (resolved.targetConversationId === null) return { status: "not_live" } as const;
+        const live = await tx.doc(LiveDoc, resolved.targetConversationId);
+        if (live.run === undefined) return { status: "not_live" } as const;
+        // The run must be this worker's own: its initial submission or one of its accepted steers.
+        const initial = await tx.submissionByRequest(resolved.targetConversationId, `worker:${taskId}`);
+        const ownsRun = (initial !== undefined && live.run.inputs.includes(initial.id))
+          || steers.some((steer) => live.run!.inputs.includes(steer.submissionId as SubmissionId));
+        if (!ownsRun) return { status: "not_live" } as const;
+        if (steers.length >= WORKER_LIMITS.maxSteersPerWorker) {
+          return {
+            status: "refused",
+            reason: `this worker already holds ${steers.length} accepted steering messages; the bound is ` +
+              `${WORKER_LIMITS.maxSteersPerWorker}`,
+          } as const;
+        }
+        if ((await tx.submissionByRequest(resolved.targetConversationId, requestId)) !== undefined) {
+          return { status: "refused", reason: "that steering request ID is already used by another submission" } as const;
+        }
+        const created = await tx.createSubmission({
+          conversationId: resolved.targetConversationId,
+          requestId,
+          type: "input",
+          status: "queued",
+        });
+        const acceptedAtMs = clock();
+        const inbox = await tx.doc(InboxDoc, resolved.targetConversationId);
+        inbox.items.push({
+          id: created.id,
+          mode: "steer",
+          content: workerSteerText(taskId, text),
+          entry: {
+            kind: WORKER_STEER_ENTRY_KIND,
+            data: { taskId, sourceTaskId: request.sourceTaskId, source: "spawning-assistant", acceptedAtMs },
+          },
+        });
+        steers.push({
+          requestId,
+          submissionId: created.id,
+          sourceTaskId: request.sourceTaskId,
+          acceptedAtMs,
+        });
+        record.steers = steers;
+        return { status: "accepted", deduplicated: false, acceptedCount: steers.length } as const;
+      }, context);
     },
 
     async transcript(harness, conversationId, taskId, query, context) {
