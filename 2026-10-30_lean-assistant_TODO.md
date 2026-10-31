@@ -33,7 +33,7 @@ facilities; do not redesign memory quality, holistic usability or agent loops.
   authenticated chat only, bounded workspace files and captions, no remote URL
   fetching/arbitrary recipients; retain unknown external outcomes, never blindly
   retry or evict them. No extraction, transcoding or new media backend registry.
-- [ ] P3 — Agent reads its own workers' bounded paginated transcripts via native
+- [x] P3 — Agent reads its own workers' bounded paginated transcripts via native
   Durable conversation entries, keyed by authorized worker ID, not raw SQL or
   arbitrary conversation ID. No Atuin capture/export/second transcript archive.
 - [ ] P4 — Agent steers live workers using native Durable input semantics,
@@ -429,6 +429,20 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Parity batch — worker transcripts accepted; steering starts
+
+P3 published at `ba6df4e` by original implementer after independent CLEAN PASS:
+19 worker checks, 250 combined behavior, 2 execution, 83 core, typecheck/build.
+Shared bounded entry rendering preserves history scope; task/spawner/child-owner
+edges are checked before reading live or terminal worker transcripts. No Atuin
+capture/export or raw SQL surface. Published main rebuild and 19 focused checks
+passed. Cosmetic start-hint, record-lag wording and truncation-suffix nits waived.
+P4 starts in a fresh worktree with native steering/completion-race coordination.
+
+A separate untracked `2026-10-31_legacy-migration_TODO.md` appeared in main;
+owner explicitly directed leaving it untouched while continuing in isolated
+worktrees. Do not read, commit, modify or delete that parallel work item.
 
 ### Parity batch authorized
 
