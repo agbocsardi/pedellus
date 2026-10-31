@@ -7,14 +7,23 @@ The gateway is the single agent/Durable owner. A CLI is one conversation
 surface over it, like Telegram and future channels, not a runtime:
 
 ```sh
+nanobot gateway                    # uses ~/.durable-nanobot/config.json
 nanobot gateway --config /path/to/config.json   # one owner: storage, tools, cron, Telegram
+nanobot agent                      # attaches to the same default gateway
 nanobot agent --config /path/to/config.json     # attach a terminal to that gateway
 ```
 
+Without `--config`, `gateway`, `agent` and `recovery` read exactly
+`~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
+the shell's working directory. A secondary instance passes its own explicit
+`--config`. There is no config discovery, merging, search, auto-generation or
+migration, and a missing default file fails with a fixed message. See
+[user services](./SERVICE.md) for the shipped systemd unit pattern.
+
 `nanobot --config /path/to/config.json` remains the historical terminal command.
 It now attaches exactly like `agent` and never opens an implicit gateway or a
-second runtime; start `gateway` with the same configuration first. Both commands
-take the existing explicit config path. `agent --conversation <name>` attaches a
+second runtime; start `gateway` with the same configuration first. The bare
+historical form still takes an explicit path. `agent --conversation <name>` attaches a
 separate `cli:<name>` conversation; omitted or `default` resumes the historical
 `cli:default`.
 
@@ -72,7 +81,8 @@ vice versa; stopping the gateway stops both.
 ## Startup diagnostics
 
 Gateway startup fails closed with exit status 1. Known configuration and startup
-failures print one fixed, value-free message: unreadable/invalid configuration,
+failures print one fixed, value-free message: a missing default configuration,
+unreadable/invalid configuration,
 invalid configuration fields, unsupported provider aliases, unavailable models
 or thinking levels, missing credential alias references, a missing Telegram token
 environment variable, workspace/data-directory preparation failures, a data
@@ -90,7 +100,7 @@ second runtime.
 
 For live-owner lock contention, the fixed message says to stop the other running
 nanobot/gateway process. For a blocked prepared dispatch, it says to run
-`nanobot recovery --config <path>` with the same configuration to inspect and
+`nanobot recovery [--config <path>]` with the same configuration to inspect and
 cancel the blocked task, then start again. The CLI does not cancel the task or
 rewrite its checkpoint automatically.
 
@@ -134,6 +144,7 @@ reported as a lock conflict. Inspection may perform Durable's native
 `Harness.open()` crash reconciliation but never resumes task execution:
 
 ```sh
+node dist/cli.js recovery                         # default primary configuration
 node dist/cli.js recovery --config /path/to/config.json
 node dist/cli.js recovery --config /path/to/config.json --cancel <taskId> --fingerprint <sha256>
 ```
