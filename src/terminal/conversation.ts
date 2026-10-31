@@ -71,7 +71,6 @@ export interface TerminalSettlement {
 
 /** One stored local attachment, as the host reports it back to the terminal. */
 export interface TerminalAttachment {
-  readonly kind: "photo" | "document";
   /** Workspace-relative stored locator; never the operator's absolute path. */
   readonly relativePath: string;
   readonly bytes: number;

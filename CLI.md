@@ -162,7 +162,7 @@ fail-closed and is not remotely cancelled. See
 | `/refresh` | Re-read the configured workspace bootstrap, memory files, manifest and skill inventory for this attached CLI conversation. Requires `workspaceContext`; rejected while the conversation is busy. The refreshed summary and skill table apply to the next model request. |
 | `/digest` | Start one bounded closed-episode memory-digestion run for this attached conversation and print only the fixed bounded admission: started, busy, idle or refused. The batch may come from any mapped chat because workspace memory is shared. It returns immediately; the run is a background native task, holds no terminal turn and creates no schedule. The command starts no new digest model turn itself, but it may re-admit a retained earlier internal result, which is an ordinary origin-agent turn. An `idle` answer that did not reach every mapped chat's tail says closed history may remain and a later invocation continues the bounded scan; it never loops to exhaustion. |
 | `/digest status` | Bounded read-only view of the live digestion run, this conversation's newest run, and the retained internal-result notices (pending count and whether a new start is possible): task IDs, outcome, batch position, evidence count and a bounded recorded error. It performs no transcript scan, model call or cursor change. |
-| `/attach <path>[ -- <prompt>]` | Store one operator-named local file through the gateway under the configured workspace media directory and submit it as an ordinary turn, optionally with prompt text after the first ` -- ` (paths may contain spaces). Requires top-level `media` config; see [local attachments](#local-attachments). |
+| `/attach <path>[ -- <prompt>]` | Store one operator-named local file through the gateway under the CLI attachment subdirectory of the configured workspace media root and submit it as an ordinary path-only turn, optionally with prompt text after the first ` -- ` (paths may contain spaces). Requires top-level `media` config; see [local attachments](#local-attachments). |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
 | `/new` | Admit native `Conversation.reset(undefined)`: the same conversation starts a new context with no handoff. No archive, summary, usage reset or extra model call is produced; earlier entries stay stored and remain visible to `/history`, and configured tools are unchanged. While busy it is placed at the next safe boundary and ends that run there instead of interrupting the current model turn; inputs queued before or after it in the same busy window run in the new context. A queued `/new` is a write, so `/abort` withdraws queued inputs but not the pending reset. |
@@ -201,39 +201,42 @@ text-only. An in-process/SDK terminal host without an attachment callback gets t
 same refusal; this adds no fallback path or local media reader.
 
 The CLI only names an operator path. The gateway, which already owns storage,
-resolves the file, reads it bounded, stores the original under
-`<workspace>/<media.directory>` (default `media/`) and composes the ordinary turn.
-The private owner-only local socket is the authorization boundary: the gateway
-reads the named path with its own OS user's privileges, so it can read any file
-that user can read. The CLI does not open storage, read the file, or receive its
-bytes, and the model receives only a workspace-relative locator plus bounded
-metadata, never the operator's absolute path. Paths are operator input, not model
-input, and no tool authority is added.
+resolves the file, reads it bounded, stores the original byte-for-byte under
+`<workspace>/<media.directory>/cli` (default `media/cli/`) and composes an ordinary
+text turn naming that workspace-relative locator. The CLI channel keeps its own
+subdirectory, so its generated names never collide with Telegram originals; the
+Telegram adapter's existing locators under `<workspace>/<media.directory>` and its
+native photo handling are unchanged. The private owner-only local socket is the
+authorization boundary: the gateway reads the named path with its own OS user's
+privileges, so it can read any file that user can read. The CLI does not open
+storage, read the file, or receive its bytes, and the model receives only the
+locator plus bounded metadata, never the operator's absolute path. Paths are
+operator input, not model input, and no tool authority is added.
 
+Every CLI attachment is path-only, photos included:
+
+- The original bytes are stored unchanged and the turn carries ordinary text with
+the workspace-relative locator only. No native image content is built, no vision
+handoff or describer model is called, and no transcription or document extraction
+runs. Whether and how to inspect the file is the configured tools' decision, and
+the labeled original filename and announced MIME type are untrusted metadata.
+- File names never decide validity: a `.jpg` that holds other bytes is stored as an
+opaque original rather than refused, and an unknown extension is stored as `bin`.
+Nothing is interpreted as an image, audio or document.
 - A path must be absolute or is resolved by the CLI process against its own
   working directory; it is capped at 4,096 code units and rejected if it contains
   control characters. The gateway refuses a relative path it still receives.
-- Known image extensions (`.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`) are accepted as
-  photos only when the bytes match that format. A photo becomes native pi-ai image
-  content plus its stored locator, so the existing configured vision handoff for
-  a text-only preset applies unchanged; the CLI adds no vision call or image
-  preprocessing.
-- Every other file is stored as an opaque original with its locator only. Nothing
-  is extracted, OCRed, converted or opened; PDF/Office handling and audio
-  transcription are not added to the CLI, and no speech backend is provisioned or
-  implied.
-- The shared store enforces 20 MB per file. Empty, unreadable, non-regular,
-  oversized and mislabeled-image files are refused with fixed, value-free text
-  before anything is submitted. A stored identity comes from the file's bytes, so
-  the same content with the same detected kind and extension reuses one stored
-  original; the same bytes named `.txt` and `.md` are separate document locators,
-  because the locator carries the extension. Stored originals are not deleted
-  automatically and there is no total-disk cap.
+- The shared store enforces 20 MB per file. Empty, unreadable, non-regular and
+  oversized files are refused with fixed, value-free text before anything is
+  submitted. A stored identity comes from the file's bytes, so the same content
+  with the same extension reuses one stored original; the same bytes named `.txt`
+  and `.md` are separate locators, because the locator carries the extension.
+  Stored originals are not deleted automatically and there is no total-disk cap.
 
-A successful command prints the stored kind, workspace-relative locator and byte
-count, then admits one ordinary submission. It counts against the same 64
-unsettled-input bound as typed prompts, and the existing stream, settlement,
-`/abort`, `/new` and EOF behavior is unchanged.
+A successful command prints the workspace-relative locator and byte count, then
+admits one ordinary submission. It counts against the same 64 unsettled-input
+bound as typed prompts, and the existing stream, settlement, `/abort`, `/new` and
+EOF behavior is unchanged.
 
 The shared store's generated filename is the only locator the model sees; reading
 it is still a configured-tool decision. The named file is an ordinary stored
