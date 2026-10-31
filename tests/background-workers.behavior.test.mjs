@@ -125,6 +125,15 @@ const workerResultCommitted = (conversationId) => (changes) => changes.some((cha
   && change.value.conversationId === conversationId
   && change.value.kind === WORKER_RESULT_ENTRY_KIND);
 
+const workerResultWatcher = (harness, conversationId, label) =>
+  changeWatcher(harness, workerResultCommitted(conversationId), label);
+
+function workerResultEntry(publication, conversationId) {
+  return publication.changes.find((change) => change.type === 'entry'
+    && change.value.conversationId === conversationId
+    && change.value.kind === WORKER_RESULT_ENTRY_KIND)?.value;
+}
+
 function messageText(message) {
   if (typeof message?.content === 'string') return message.content;
   return (Array.isArray(message?.content) ? message.content : [])
@@ -1757,16 +1766,10 @@ test('steering a live worker at a tool round changes its final answer', { timeou
     }
     return fauxAssistantMessage('ok');
   });
-  let stop;
-  const results = [];
+  let resultWatcher;
   try {
     const conversation = await store.gateway.conversationFor(ORIGIN, context);
-    stop = store.gateway.harness.subscribeCommits((publication) => {
-      for (const change of publication.changes) {
-        if (change.type === 'entry' && change.value.conversationId === conversation.id
-          && change.value.kind === WORKER_RESULT_ENTRY_KIND) results.push(change.value);
-      }
-    });
+    resultWatcher = workerResultWatcher(store.gateway.harness, conversation.id, 'the steered worker result');
     const first = await conversation.submit({ type: 'input', content: 'spawn steered worker', requestId: 'spawn' }, context);
     assert.equal((await first.wait(context)).status, 'done');
     await within(childStarted.promise, WAIT_MS, 'the worker never reached its first model request');
@@ -1789,15 +1792,16 @@ test('steering a live worker at a tool round changes its final answer', { timeou
     assert.equal(accepted.steers[0].sourceTaskId > 0, true);
 
     releaseChild.resolve();
-    await within((async () => {
-      while (results.length < 1) await new Promise((resolve) => setTimeout(resolve, 25));
-    })(), WAIT_MS, 'the steered worker never reported');
-    assert.equal(results.length, 1);
-    assert.equal(results[0].data.status, 'completed');
-    const body = messageText(results[0].model?.[0]);
+    const publication = await within(resultWatcher.promise, WAIT_MS, 'the steered worker never reported');
+    const resultEntry = workerResultEntry(publication, conversation.id);
+    assert.equal(resultEntry.data.status, 'completed');
+    const body = messageText(resultEntry.model?.[0]);
     assert.match(body, /CHILD-STEERED-ANSWER/);
     assert.match(body, /Steering messages accepted while live: 1/);
 
+    const resultEntries = (await conversation.entries({ order: 'ascending' }, 300, undefined, context)).items
+      .filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND);
+    assert.equal(resultEntries.length, 1, 'exactly one result event for the worker');
     const child = await store.gateway.harness.conversation(record.conversationId, context);
     const childEntries = (await child.entries({ order: 'ascending' }, 200, undefined, context)).items;
     const steerEntry = childEntries.find((entry) => entry.kind === WORKER_STEER_ENTRY_KIND);
@@ -1818,7 +1822,7 @@ test('steering a live worker at a tool round changes its final answer', { timeou
     assert.deepEqual(names, [], 'the completed worker keeps no tools');
   } finally {
     releaseChild.resolve();
-    stop?.();
+    resultWatcher?.stop();
     await store.gateway.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
   }
@@ -1871,16 +1875,10 @@ test('a steer that loses the final-answer boundary is joined into the same worke
     }
     return fauxAssistantMessage('ok');
   });
-  let stop;
-  const results = [];
+  let resultWatcher;
   try {
     const conversation = await store.gateway.conversationFor(ORIGIN, context);
-    stop = store.gateway.harness.subscribeCommits((publication) => {
-      for (const change of publication.changes) {
-        if (change.type === 'entry' && change.value.conversationId === conversation.id
-          && change.value.kind === WORKER_RESULT_ENTRY_KIND) results.push(change.value);
-      }
-    });
+    resultWatcher = workerResultWatcher(store.gateway.harness, conversation.id, 'the joined worker result');
     const first = await conversation.submit({ type: 'input', content: 'spawn racing worker', requestId: 'spawn' }, context);
     assert.equal((await first.wait(context)).status, 'done');
     await within(childStarted.promise, WAIT_MS, 'the worker never reached its final answer request');
@@ -1894,15 +1892,15 @@ test('a steer that loses the final-answer boundary is joined into the same worke
     }, context);
     assert.equal((await steerTurn.wait(context)).status, 'done');
     releaseChild.resolve();
-    await within((async () => {
-      while (results.length < 1) await new Promise((resolve) => setTimeout(resolve, 25));
-    })(), WAIT_MS, 'the joined worker never reported');
-
-    assert.equal(results.length, 1, 'exactly one outcome for the whole worker task');
-    assert.equal(results[0].data.status, 'completed');
-    const body = messageText(results[0].model?.[0]);
+    const publication = await within(resultWatcher.promise, WAIT_MS, 'the joined worker never reported');
+    const resultEntry = workerResultEntry(publication, conversation.id);
+    assert.equal(resultEntry.data.status, 'completed');
+    const body = messageText(resultEntry.model?.[0]);
     assert.match(body, /STEERED-ANSWER/);
     assert.doesNotMatch(body, /FIRST-ANSWER/);
+    const resultEntries = (await conversation.entries({ order: 'ascending' }, 300, undefined, context)).items
+      .filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND);
+    assert.equal(resultEntries.length, 1, 'exactly one outcome for the whole worker task');
 
     const child = await store.gateway.harness.conversation(record.conversationId, context);
     const childEntries = (await child.entries({ order: 'ascending' }, 200, undefined, context)).items;
@@ -1929,7 +1927,7 @@ test('a steer that loses the final-answer boundary is joined into the same worke
     assert.deepEqual(names, [], 'the completed worker keeps no tools');
   } finally {
     releaseChild.resolve();
-    stop?.();
+    resultWatcher?.stop();
     await store.gateway.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
   }
@@ -1964,16 +1962,10 @@ test('steering dedupes on the host tool-task identity and refuses terminal or fo
     }
     return fauxAssistantMessage('ok');
   });
-  let stop;
-  const results = [];
+  let resultWatcher;
   try {
     const conversation = await store.gateway.conversationFor(ORIGIN, context);
-    stop = store.gateway.harness.subscribeCommits((publication) => {
-      for (const change of publication.changes) {
-        if (change.type === 'entry' && change.value.conversationId === conversation.id
-          && change.value.kind === WORKER_RESULT_ENTRY_KIND) results.push(change.value);
-      }
-    });
+    resultWatcher = workerResultWatcher(store.gateway.harness, conversation.id, 'the dedupe worker result');
     const first = await conversation.submit({ type: 'input', content: 'spawn dedupe worker', requestId: 'spawn' }, context);
     assert.equal((await first.wait(context)).status, 'done');
     await within(childStarted.promise, WAIT_MS, 'the worker never reached its first model request');
@@ -1993,6 +1985,17 @@ test('steering dedupes on the host tool-task identity and refuses terminal or fo
     }, api(9001), context);
     assert.equal(replay.isError ?? false, false);
     assert.match(toolOutput(replay), /already accepted/);
+    // The same host tool-task identity with a different payload is refused, not silently deduped.
+    const changed = await tool.execute({
+      action: 'steer', worker_id: record.taskId, message: 'CHANGED-DIRECTION',
+    }, api(9001), context);
+    assert.equal(changed.isError, true);
+    assert.match(toolOutput(changed), /different text/);
+    const afterMismatch = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    assert.equal(afterMismatch.steers.length, 1, 'a changed payload added no steering request');
+    const inboxAfterMismatch = await store.gateway.harness.snapshot(InboxDoc, record.conversationId, context);
+    assert.equal((inboxAfterMismatch?.items ?? []).filter((item) => item.mode === 'steer').length, 1,
+      'a changed payload added no second inbox item');
     const secondSteer = await tool.execute({
       action: 'steer', worker_id: record.taskId, message: 'SECOND-DIRECTION',
     }, api(9002), context);
@@ -2014,14 +2017,19 @@ test('steering dedupes on the host tool-task identity and refuses terminal or fo
     assert.deepEqual(accepted.steers.map((steer) => steer.sourceTaskId), [9001, 9002]);
     assert.notEqual(accepted.steers[0].requestId, accepted.steers[1].requestId);
     assert.equal(accepted.steers[0].requestId, workerSteerRequestId(record.taskId, 9001));
+    for (const steer of accepted.steers) assert.match(steer.textDigest, /^[0-9a-f]{64}$/);
+    assert.notEqual(accepted.steers[0].textDigest, accepted.steers[1].textDigest);
+    const inboxAccepted = await store.gateway.harness.snapshot(InboxDoc, record.conversationId, context);
+    assert.equal((inboxAccepted?.items ?? []).filter((item) => item.mode === 'steer').length, 2);
 
     releaseChild.resolve();
-    await within((async () => {
-      while (results.length < 1) await new Promise((resolve) => setTimeout(resolve, 25));
-    })(), WAIT_MS, 'the steered worker never reported');
-    assert.equal(results.length, 1);
-    assert.equal(results[0].data.status, 'completed');
-    assert.match(messageText(results[0].model?.[0]), /CHILD-AFTER-STEERS/);
+    const publication = await within(resultWatcher.promise, WAIT_MS, 'the steered worker never reported');
+    const resultEntry = workerResultEntry(publication, conversation.id);
+    assert.equal(resultEntry.data.status, 'completed');
+    assert.match(messageText(resultEntry.model?.[0]), /CHILD-AFTER-STEERS/);
+    const resultEntries = (await conversation.entries({ order: 'ascending' }, 300, undefined, context)).items
+      .filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND);
+    assert.equal(resultEntries.length, 1);
 
     const child = await store.gateway.harness.conversation(record.conversationId, context);
     const before = (await child.entries({ order: 'ascending' }, 300, undefined, context)).items;
@@ -2046,7 +2054,7 @@ test('steering dedupes on the host tool-task identity and refuses terminal or fo
     assert.equal(finished.status, 'completed');
   } finally {
     releaseChild.resolve();
-    stop?.();
+    resultWatcher?.stop();
     await store.gateway.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
   }
@@ -2096,16 +2104,10 @@ test('cancelling a worker with an accepted steer withdraws the queued message in
     }
     return fauxAssistantMessage('ok');
   });
-  let stop;
-  const results = [];
+  let resultWatcher;
   try {
     const conversation = await store.gateway.conversationFor(ORIGIN, context);
-    stop = store.gateway.harness.subscribeCommits((publication) => {
-      for (const change of publication.changes) {
-        if (change.type === 'entry' && change.value.conversationId === conversation.id
-          && change.value.kind === WORKER_RESULT_ENTRY_KIND) results.push(change.value);
-      }
-    });
+    resultWatcher = workerResultWatcher(store.gateway.harness, conversation.id, 'the cancelled worker result');
     const first = await conversation.submit({ type: 'input', content: 'spawn cancel-steer worker', requestId: 'spawn' }, context);
     assert.equal((await first.wait(context)).status, 'done');
     await within(childStarted.promise, WAIT_MS, 'the worker never reached its first model request');
@@ -2123,11 +2125,10 @@ test('cancelling a worker with an accepted steer withdraws the queued message in
     // Cancel while the child model request still holds the run: the queued steer belongs to a live
     // worker, so cancellation must withdraw it rather than let it start a turn after retirement.
     await store.gateway.harness.abortTask(record.taskId, context);
-    await within((async () => {
-      while (results.length < 1) await new Promise((resolve) => setTimeout(resolve, 25));
-    })(), WAIT_MS, 'the cancelled worker never reported');
-    assert.equal(results[0].data.status, 'aborted');
-    const body = messageText(results[0].model?.[0]);
+    const publication = await within(resultWatcher.promise, WAIT_MS, 'the cancelled worker never reported');
+    const resultEntry = workerResultEntry(publication, conversation.id);
+    assert.equal(resultEntry.data.status, 'aborted');
+    const body = messageText(resultEntry.model?.[0]);
     assert.match(body, /was cancelled/);
     assert.doesNotMatch(body, /LATE-CANCELLED-ANSWER/);
 
@@ -2141,7 +2142,9 @@ test('cancelling a worker with an accepted steer withdraws the queued message in
       return inspection.tasks.every((entry) => entry.record.conversationId !== record.conversationId
         || entry.record.state.status === 'terminal');
     }, 'the cancelled child work to settle');
-    assert.equal(results.length, 1, 'one cancellation event, no orphan result');
+    const resultEntries = (await conversation.entries({ order: 'ascending' }, 300, undefined, context)).items
+      .filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND);
+    assert.equal(resultEntries.length, 1, 'one cancellation event, no orphan result');
     const child = await store.gateway.harness.conversation(record.conversationId, context);
     const childEntries = (await child.entries({ order: 'ascending' }, 300, undefined, context)).items;
     assert.equal(childEntries.some((entry) => entry.kind === WORKER_STEER_ENTRY_KIND), false,
@@ -2154,7 +2157,7 @@ test('cancelling a worker with an accepted steer withdraws the queued message in
     assert.equal(finished.steers.length, 1, 'the accepted request stays visible for inspection');
   } finally {
     releaseChild.resolve();
-    stop?.();
+    resultWatcher?.stop();
     await store.gateway.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
   }

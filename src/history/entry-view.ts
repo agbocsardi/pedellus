@@ -7,8 +7,8 @@
  * control/bidi sanitized, JSON-string quoted, and cut at a character bound with an explicit
  * `[truncated]` marker.
  *
- * The formatter knows the built-in user-facing input kinds (`pi.user`, cron and worker task
- * prompts); everything else that carries no displayable message/tool text is omitted by the caller.
+ * The formatter knows the built-in prompt input kinds (`pi.user`, cron, worker task and worker steer
+ * entries); everything else that carries no displayable message/tool text is omitted by the caller.
  */
 import { Buffer } from "node:buffer";
 import {
@@ -109,7 +109,7 @@ export function messageText(content: unknown): string {
   return parts.join("\n");
 }
 
-/** User-facing input kinds that are ordinary task prompts, not `pi.user`. */
+/** Prompt input kinds that are not `pi.user`; the label names the source, never the raw text. */
 const TASK_INPUT_KINDS: Readonly<Record<string, string>> = Object.freeze({
   [CRON_INPUT_ENTRY_KIND]: "user (cron)",
   [WORKER_INPUT_ENTRY_KIND]: "user (worker task)",

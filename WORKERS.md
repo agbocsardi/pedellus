@@ -115,20 +115,24 @@ Completion is a joined boundary, not a second orphan task. After the initial tur
 worker waits until its child is genuinely idle. If the final answer boundary placed an accepted
 steer as the next run's first input, that run is part of the same worker: its tools stay captured,
 its answer becomes the worker outcome, and a chain of accepted steers is joined the same way. On a
-failed or cancelled turn, and in every terminal commit, every accepted steer that is still queued is
-settled `unanswered` and removed from the inbox in that same commit, so it cannot start a later run
-under retired tools. Consequently an accepted steer is either delivered into the worker's own run
-chain or safely cancelled with a recorded reason; a terminal worker refuses new steering instead of
-restarting, and the admission commit cannot accept input after terminal/completing or after the
-child has gone idle.
+cancelled turn, and on a failed turn under the shipped default `afterFailedRun: "keep"`, every
+accepted steer that is still queued is settled `unanswered` and removed from the inbox in the same
+terminal commit, so it cannot start a run afterwards under retired tools. Consequently an accepted
+steer is either delivered into the worker's own run chain or safely cancelled with a recorded
+reason; a terminal worker refuses new steering instead of restarting, and the admission commit
+cannot accept input after terminal/completing or after the child has gone idle. The Harness
+`afterFailedRun: "continue"` override is not configured by this host and is not supported by the
+join: it could start a successor run with a queued steer before the worker's failed terminal commit.
 
 Dedupe uses the conversation-scoped request ID
-`nanobot.worker-steer:<workerTaskId>:<hostToolTaskId>`: a replay of the same host tool task returns
-the existing acceptance, while the provider's tool-call ID is not identity and two independent tool
-tasks may reuse it. The accepted count is kept in the worker record, shown by `inspect`, and stated
-in the internal result event; the worker's own transcript keeps the authoritative steer entries.
-Steering adds no config and no timeout: it never extends a job deadline (there is none) and it
-cannot revive a worker that has already finished.
+`nanobot.worker-steer:<workerTaskId>:<hostToolTaskId>`: a replay of the same host tool task with the
+same message returns the existing acceptance, while the provider's tool-call ID is not identity and
+two independent tool tasks may reuse it. The record keeps only a SHA-256 digest of the steer text
+for that comparison, never the text itself; the same identity with a different message is refused
+with a fixed value-free reason instead of silently dropping the new direction. The accepted count is
+kept in the worker record, shown by `inspect`, and stated in the internal result event; the worker's
+own transcript keeps the authoritative steer entries. Steering adds no config and no timeout: it
+never extends a job deadline (there is none) and it cannot revive a worker that has already finished.
 
 ## What a worker is
 
@@ -255,5 +259,9 @@ silently replaced, and a completed model turn is never re-run.
   lose the terminal-race ordering. It deliberately emits no submission trace link to the live run
   (telemetry only, no model or tool authority). If a future Durable admission API accepts a
   liveness condition in the caller's commit, it should replace this narrow mirror.
+- The steering join supports the shipped default `afterFailedRun: "keep"`. The Harness
+  `afterFailedRun: "continue"` override is not configurable here and is not exercised: it could place
+  an accepted steer into a successor run before a failed worker reaches its terminal commit, which
+  this worker would not join. No shipped gateway opens with that override.
 - No live-model, Telegram or deployment run is claimed: the offline checks use a faux provider and
   temporary git fixtures.

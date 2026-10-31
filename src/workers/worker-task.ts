@@ -12,6 +12,7 @@
  * turn while the worker works and resumes at a native boundary afterwards. Nothing here writes a
  * channel outbox, calls a channel, or sends user-facing text.
  */
+import { createHash } from "node:crypto";
 import {
   defineDoc,
   defineExtension,
@@ -89,6 +90,8 @@ export type WorkerSteerRecord = {
   /** Host tool task that asked for the steering message; the provider call ID is not identity. */
   readonly sourceTaskId: number;
   readonly acceptedAtMs: number;
+  /** SHA-256 of the exact model-visible steer text, for replay payload comparison only. */
+  readonly textDigest: string;
 };
 
 export type WorkerRecordDocument = { workers: WorkerRecord[] };
@@ -324,6 +327,11 @@ export function workerSteerText(taskId: number, text: string): string {
     "",
     bounded(text.trim(), WORKER_LIMITS.maxSteerChars),
   ].join("\n");
+}
+
+/** Value-free replay comparison: the record never needs to keep the steer text itself. */
+function workerSteerDigest(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
 }
 
 /** Live or terminal status of one worker task. Pure; a missing task is `missing`, never a guess. */
@@ -712,7 +720,9 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
    * live run (see `steer`), but the run's final boundary may place it as the next run's first input.
    * Waiting until the child is genuinely idle makes that successor run part of this worker: its
    * answer becomes the outcome, its tools remain captured, and it is never an orphan turn after
-   * retirement. A failed initial turn is not joined; its queued steers are withdrawn by `finish`.
+   * retirement. A failed initial turn is not joined; under the shipped `afterFailedRun: "keep"`
+   * its queued steers are withdrawn by `finish`. (The unsupported `continue` override could start a
+   * successor before that terminal commit; the shipped gateway never sets it.)
    */
   const settleSteering = async (
     conversation: Pick<ConversationHandle, "waitForIdle">,
@@ -1234,9 +1244,19 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         const resolved = workerTargetOf(record, task, child, conversationId, taskId);
         if (resolved === undefined) return { status: "not_found" } as const;
         const steers = record.steers ?? [];
+        const content = workerSteerText(taskId, text);
+        const textDigest = workerSteerDigest(content);
         const replay = steers.find((steer) => steer.requestId === requestId);
         if (replay !== undefined) {
-          return { status: "accepted", deduplicated: true, acceptedCount: steers.length } as const;
+          // A replay keeps the same host tool-task identity; it must also carry the same payload.
+          // A changed payload under one identity is refused instead of silently losing the direction.
+          if (replay.textDigest === textDigest) {
+            return { status: "accepted", deduplicated: true, acceptedCount: steers.length } as const;
+          }
+          return {
+            status: "refused",
+            reason: "that host tool task already steered this worker with different text",
+          } as const;
         }
         if (task === undefined) return { status: "terminal", worker: "missing" } as const;
         if (task.state.status === "terminal" || task.state.status === "completing" || task.abortRequested) {
@@ -1271,7 +1291,7 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         inbox.items.push({
           id: created.id,
           mode: "steer",
-          content: workerSteerText(taskId, text),
+          content,
           entry: {
             kind: WORKER_STEER_ENTRY_KIND,
             data: { taskId, sourceTaskId: request.sourceTaskId, source: "spawning-assistant", acceptedAtMs },
@@ -1282,6 +1302,7 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
           submissionId: created.id,
           sourceTaskId: request.sourceTaskId,
           acceptedAtMs,
+          textDigest,
         });
         record.steers = steers;
         return { status: "accepted", deduplicated: false, acceptedCount: steers.length } as const;
