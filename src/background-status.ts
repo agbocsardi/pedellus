@@ -30,6 +30,11 @@ export type BackgroundTaskState = "pending" | "running" | "waiting" | "sleeping"
 export interface BackgroundWorker {
   readonly taskId: number;
   readonly status: BackgroundTaskState;
+  /**
+   * Present only when `status` is `parked`: true when the block is a restart limit, the one reason a
+   * native retry can clear. Every other blocked reason is reported without promising a retry.
+   */
+  readonly retryable?: boolean;
   readonly task: string;
   readonly workspace: "shared" | "worktree";
 }
@@ -96,14 +101,16 @@ function plural(count: number, one: string, many: string): string {
   return `${count} ${count === 1 ? one : many}`;
 }
 
-function stateWord(status: BackgroundTaskState): string {
+function stateWord(status: BackgroundTaskState, retryable?: boolean): string {
   switch (status) {
     case "pending": return "queued";
     case "running": return "running";
     case "waiting": return "waiting for another task";
     case "sleeping": return "sleeping until due";
     case "completing": return "finishing";
-    case "parked": return "parked, blocked until a native retry";
+    // Only a restart-limit block is cleared by a native retry; any other blocked reason is stated
+    // as it is, without promising work that no retry can resume.
+    case "parked": return retryable === true ? "parked, blocked until a native retry" : "parked, blocked";
   }
 }
 
@@ -129,7 +136,7 @@ export function renderBackgroundStatus(status: BackgroundStatus | undefined): st
   const workersTotal = workers.live + workers.parked;
   const due = isoTime(cron.nextAtMs);
   const rows = [
-    ...workers.items.map((worker) => `  worker ${worker.taskId} (${stateWord(worker.status)}): ${worker.task} — ` +
+    ...workers.items.map((worker) => `  worker ${worker.taskId} (${stateWord(worker.status, worker.retryable)}): ${worker.task} — ` +
       (worker.workspace === "worktree" ? "isolated worktree" : "shared workspace")),
     ...(workersTotal > workers.items.length
       ? [`  … ${plural(workersTotal - workers.items.length, "unfinished worker", "unfinished workers")} not shown`]

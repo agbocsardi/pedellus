@@ -22,7 +22,7 @@ const [
   { parseConfig },
   { openGateway },
   { BACKGROUND_STATUS_LIMITS, backgroundLabel, emptyBackgroundStatus, renderBackgroundStatus },
-  { MemoryDigestNoticesDoc },
+  { MemoryDigestNoticesDoc, renderMemoryDigestStatus },
   { DigestCursorDoc },
   { CronJobsDoc, CRON_RUN_TASK_NAME },
   { WorkerRecordsDoc },
@@ -227,7 +227,8 @@ test('the fixed renderer never calls queued, sleeping or parked work running', (
     assert.deepEqual(renderBackgroundStatus(one)[1], `  worker 7 (${word}): probe — shared workspace`);
   }
 
-  // A native-blocked task is unfinished but cannot run: it is never counted as live or healthy.
+  // A native-blocked task is unfinished but cannot run: it is never counted as live or healthy, and
+  // only the restart-limit reason may promise that a native retry clears it.
   const parkedWork = {
     ...emptyBackgroundStatus(),
     workers: {
@@ -239,7 +240,20 @@ test('the fixed renderer never calls queued, sleeping or parked work running', (
   };
   const parkedLines = renderBackgroundStatus(parkedWork);
   assert.deepEqual(parkedLines[0], 'Background: 1 parked worker, digest run parked in this chat');
-  assert.deepEqual(parkedLines[1], '  worker 8 (parked, blocked until a native retry): probe — shared workspace');
+  assert.deepEqual(parkedLines[1], '  worker 8 (parked, blocked): probe — shared workspace');
+  assert.doesNotMatch(parkedLines.join('\n'), /retry/,
+    'a blocked reason a retry cannot clear never promises one');
+
+  const retryablePark = {
+    ...parkedWork,
+    workers: {
+      live: 0,
+      parked: 1,
+      items: [{ taskId: 9, status: 'parked', retryable: true, task: 'probe', workspace: 'shared' }],
+    },
+  };
+  assert.deepEqual(renderBackgroundStatus(retryablePark)[1],
+    '  worker 9 (parked, blocked until a native retry): probe — shared workspace');
 
   // Rows are capped; the count is not hidden, and no count is invented for what was not read.
   const many = {
@@ -606,6 +620,17 @@ test('the local CLI /status carries the background summary over the private sock
   const started = await store.gateway.memoryDigest.start(digestWriter(origin), context);
   assert.equal(started.status, 'started');
   await within(batchEntered.promise, WAIT_MS, 'the digest batch request');
+
+  // The local surface carries the bounded digest view only: the live run's origin conversation is
+  // host-internal, so the socket never sees another chat's conversation ID.
+  const localDigestStatus = await client.digestStatus(context);
+  assert.equal(Object.hasOwn(localDigestStatus, 'liveConversationId'), false,
+    'the live origin conversation never crosses the private socket');
+  assert.ok(Number.isSafeInteger(localDigestStatus.liveTaskId));
+  assert.match(renderMemoryDigestStatus(localDigestStatus), /Live memory digestion run: \d+/);
+  const internalDigestStatus = await store.gateway.memoryDigest.status(digestWriter(origin), context);
+  assert.equal(internalDigestStatus.liveConversationId, origin.id,
+    'the host still knows the origin for its own own-versus-shared labelling');
 
   const busyChunks = [];
   const busyOutput = new Writable({ write(chunk, _encoding, callback) { busyChunks.push(chunk.toString()); callback(); } });

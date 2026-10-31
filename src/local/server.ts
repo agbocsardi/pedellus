@@ -346,8 +346,19 @@ class LocalConnection {
       }
       case "digestStart":
         return this.options.gateway.memoryDigest.start(this.digestWriter(), this.scope.context);
-      case "digestStatus":
-        return this.options.gateway.memoryDigest.status(this.digestWriter(), this.scope.context);
+      case "digestStatus": {
+        // The live run's origin conversation is host-internal ownership metadata: it lets the host
+        // label a run as this chat's or another's. Only that bounded view crosses the socket, so no
+        // other chat's conversation ID is exposed and a later internal field is not either.
+        const status = await this.options.gateway.memoryDigest.status(this.digestWriter(), this.scope.context);
+        return {
+          liveTaskId: status.liveTaskId,
+          latest: status.latest,
+          pendingNotices: status.pendingNotices,
+          canStart: status.canStart,
+          refusal: status.refusal,
+        };
+      }
       case "historySearch": {
         const params = requireObject(request.params);
         onlyKeys(params, ["query"]);

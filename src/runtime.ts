@@ -2651,12 +2651,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
       // A native task record keeps its last state when Durable parks it, so "unfinished" is not the
       // same as "will run": only the live-work inspection reports blocked tasks. It is read lazily,
       // once, and only when something unfinished actually needs classifying.
-      let blockedTasks: Map<number, true> | undefined;
-      const blockedNow = async (): Promise<Map<number, true>> => {
+      let blockedTasks: Map<number, string> | undefined;
+      const blockedNow = async (): Promise<Map<number, string>> => {
         if (blockedTasks !== undefined) return blockedTasks;
-        const blocked = new Map<number, true>();
+        const blocked = new Map<number, string>();
         for (const task of (await harness!.inspect(ctx)).tasks) {
-          if (task.state.kind === "blocked") blocked.set(Number(task.record.id), true);
+          // The reason decides whether a native retry can ever run the task again.
+          if (task.state.kind === "blocked") blocked.set(Number(task.record.id), task.state.reason);
         }
         blockedTasks = blocked;
         return blocked;
@@ -2673,13 +2674,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (task === undefined || task.kind !== WORKER_TASK_NAME || task.conversationId !== conversationId) continue;
           const state = task.state.status;
           if (state === "terminal") continue;
-          const parked = (await blockedNow()).has(view.taskId);
-          if (parked) parkedWorkers += 1;
-          else liveWorkers += 1;
+          const blockReason = (await blockedNow()).get(view.taskId);
+          if (blockReason === undefined) liveWorkers += 1;
+          else parkedWorkers += 1;
           if (workerItems.length >= BACKGROUND_STATUS_LIMITS.rows) continue;
           workerItems.push({
             taskId: view.taskId,
-            status: parked ? "parked" : state,
+            status: blockReason === undefined ? state : "parked",
+            // Only a restart limit is cleared by a native retry; a missing or stale definition is not.
+            ...(blockReason === undefined ? {} : { retryable: blockReason === "restart_limit" }),
             task: backgroundLabel(view.prompt),
             workspace: view.workspaceMode,
           });
