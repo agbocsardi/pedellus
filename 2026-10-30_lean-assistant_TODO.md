@@ -18,17 +18,27 @@
 - [x] Owner accepts the pilot as sufficient. Defer the reminder-only follow-up; live reminder scheduling/delivery remains unverified, not a blocker for the next discussion.
 - [x] Clean up this batch's resources after owner confirms integration.
 
-## Owner follow-up — speech provisioning command
+## Owner follow-up — digest input correction
 
-- [ ] F3 — One explicit owner-run command provisions the local speech engine and
-  model for Telegram voice notes. Default faster-whisper: pinned uv/PEP 723 helper
-  and one model download. `whisper-cli`: report configured absolute paths present
-  or missing; download/build nothing. Never invoked by gateway startup, message
-  handling, config parsing or schedule; no runtime mid-message download, no second
-  runtime or config rewrite. Focused fake-uv/helper tests, no network. Voice notes
-  already transcribe automatically once provisioned.
-- [ ] Independently review, fix via the original worker, then publish on a clean
-  main fast-forward with docs/handoff updated.
+- [ ] F4 — Digest evidence is conversation messages only: user and assistant
+  text; no tool calls and no tool-result/output text. A closed episode whose
+  selected messages fit the caps is delivered and acknowledged as one whole-episode
+  pass. New defaults: 200,000 characters per pass and 2,000 entries per batch
+  (character bound governs; entry bound only stops floods of tiny messages).
+  Oversized episodes keep independent ordered chunks with separate acknowledgements;
+  no carry-over summary machinery. Lossless fragmentation, provenance, cursor
+  and acknowledgement validation stay consistent with the new selection.
+- [ ] Independently review, fix via the original worker, publish on a clean
+  fast-forward with docs/handoff reconciled.
+
+## Owner follow-up — speech provisioning (cancelled)
+
+- [x] F3 — Cancelled by owner after implementation. No provisioning command ships.
+  The agent installs missing local speech tooling itself on first use through its
+  ordinary shell/setup path, then voice notes work. Runtime still never downloads
+  during message handling; an unprovisioned voice note yields the existing
+  unavailable note and the stored original, and the agent can act on that.
+  Worktree/commit preserved unmerged as evidence; no publication.
 
 ## Approved parity batch — bounded digestion, delivery and agent-managed work
 
@@ -455,12 +465,17 @@ or hand-edited main source was used.
 
 ## Session log
 
-### Speech provisioning follow-up
+### Digest input correction
+
+Owner rejected the tiny 24k evidence pass as unrepresentative and asked that a
+run load whole episodes of messages only, not tool calls or tool outputs. Agreed:
+200k-character configurable ceiling, 2,000-entry cap, whole-episode single pass
+when it fits, independent ordered chunks otherwise. F4 started beside F3.
 
 Owner confirmed Telegram voice auto-transcription is the desired behavior; it is
-already automatic once the engine is provisioned. Chose an explicit provisioning
-command over implicit first-use download, keeping the runtime download-free while
-handling messages. F3 started in a fresh worktree under the same review loop.
+already automatic once the engine is provisioned. First chose an explicit
+provisioning command, then cancelled it: the agent should assume tooling exists
+and install what is missing itself on first use. F3 stays unmerged; F4 continues.
 
 ### 2026-10-31 — P1–P7 parity batch closed
 
