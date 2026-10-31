@@ -859,6 +859,257 @@ test("adoption finishes a frozen closed episode without replaying its frontier m
   }
 });
 
+test("adoption pairs a result whose call precedes the frontier at entry and character boundaries", { timeout: 30_000 }, async () => {
+  const dir = await temp("nanobot-complementary-adopt-pair-boundary-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+
+    const entryChat = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [entryQuestion] = await append(harness, entryChat, user("ENTRY-QUESTION-1100"));
+    const [entryCall] = await append(
+      harness,
+      entryChat,
+      toolCallAssistant("ENTRY-REPLY-2200", "call-entry", "read", { path: "entry.txt" }),
+    );
+    const [entryResult] = await append(harness, entryChat, toolResult("ENTRY-RESULT-3300", "call-entry"));
+    await append(harness, entryChat, system("ENTRY-SYSTEM-NOT-EVIDENCE-4400"));
+    const [entryAnswer] = await append(harness, entryChat, assistant("ENTRY-ANSWER-5500"));
+    await append(harness, entryChat, reset());
+    await harness.commit(async (tx) => {
+      const document = await tx.doc(DigestCursorDoc, entryChat.id);
+      document.throughEntryId = entryResult.id;
+      document.throughChars = 0;
+      document.episodeStartEntryId = entryQuestion.id;
+      document.episodeEndEntryId = entryAnswer.id;
+    }, context);
+
+    const charText = "CHAR-RESULT-6600";
+    const charChat = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [charQuestion] = await append(harness, charChat, user("CHAR-QUESTION-7700"));
+    await append(harness, charChat, toolCallAssistant("CHAR-REPLY-8800", "call-char", "read", { path: "char.txt" }));
+    const [charResult] = await append(harness, charChat, toolResult(charText, "call-char"));
+    const [charAnswer] = await append(harness, charChat, assistant("CHAR-ANSWER-9900"));
+    await append(harness, charChat, reset());
+    await harness.commit(async (tx) => {
+      const document = await tx.doc(DigestCursorDoc, charChat.id);
+      document.throughEntryId = charResult.id;
+      document.throughChars = 0;
+      document.episodeStartEntryId = charQuestion.id;
+      document.episodeEndEntryId = charAnswer.id;
+    }, context);
+
+    const entryLimits = { entriesPerBatch: 2, charsPerBatch: 10_000 };
+    const charLimits = { entriesPerBatch: 50, charsPerBatch: charText.length };
+    let entrySource = sourceFor(harness, entryChat, entryLimits);
+    let charSource = sourceFor(harness, charChat, charLimits);
+
+    const entryFirst = batched(await entrySource.read(context));
+    assert.equal(entryFirst.conversationId, entryChat.id);
+    assert.equal(entryFirst.complete, false, "the entry bound stops the chunk after the paired result");
+    assert.deepEqual(
+      entryFirst.entries.map((entry) => [entry.entryId, entry.itemKind, entry.text]),
+      [[entryResult.id, "tool-result", "ENTRY-RESULT-3300"]],
+      "the paired result survives the entry-count boundary",
+    );
+    await entrySource.acknowledge(entryFirst, context);
+
+    const charFirst = batched(await charSource.read(context));
+    assert.equal(charFirst.conversationId, charChat.id);
+    assert.equal(charFirst.complete, false, "the character bound stops the chunk after the paired result");
+    assert.deepEqual(
+      charFirst.entries.map((entry) => [entry.entryId, entry.itemKind, entry.text]),
+      [[charResult.id, "tool-result", charText]],
+      "the paired result survives the character boundary",
+    );
+    await charSource.acknowledge(charFirst, context);
+
+    await harness.close(context);
+    harness = await openStore(db);
+    entrySource = sourceFor(harness, entryChat, entryLimits);
+    charSource = sourceFor(harness, charChat, charLimits);
+
+    const entrySecond = batched(await entrySource.read(context));
+    assert.equal(entrySecond.complete, true);
+    assert.deepEqual(
+      entrySecond.entries.map((entry) => [entry.entryId, entry.text]),
+      [[entryAnswer.id, "ENTRY-ANSWER-5500"]],
+      "the reopened entry-count continuation reads the remaining answer",
+    );
+    await entrySource.acknowledge(entrySecond, context);
+
+    const charSecond = batched(await charSource.read(context));
+    assert.equal(charSecond.complete, true);
+    assert.deepEqual(
+      charSecond.entries.map((entry) => [entry.entryId, entry.text]),
+      [[charAnswer.id, "CHAR-ANSWER-9900"]],
+      "the reopened character continuation reads the remaining answer",
+    );
+    await charSource.acknowledge(charSecond, context);
+
+    // The calls are before the frontier and must not be replayed as fresh tool-call evidence.
+    assert.ok(entryCall.id < entryResult.id);
+    assert.ok(entryFirst.entries.every((entry) => entry.itemKind !== "tool-call"));
+  } finally {
+    if (harness !== undefined) await harness.close(context);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a settled legacy cursor derives calls from its reset prefix instead of orphaning the result", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-complementary-adopt-settled-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    await append(harness, conversation, reset("SETTLED-HANDOFF-1122"));
+    const [question] = await append(harness, conversation, user("SETTLED-QUESTION-2233"));
+    const [call] = await append(
+      harness,
+      conversation,
+      toolCallAssistant("SETTLED-REPLY-3344", "call-settled", "read", { path: "settled.txt" }),
+    );
+    const [result] = await append(harness, conversation, toolResult("SETTLED-RESULT-4455", "call-settled"));
+    await append(harness, conversation, reset());
+    const [laterQuestion] = await append(harness, conversation, user("SETTLED-LATER-5566"));
+    const [laterAnswer] = await append(harness, conversation, assistant("SETTLED-LATER-6677"));
+    await harness.commit(async (tx) => {
+      const document = await tx.doc(DigestCursorDoc, conversation.id);
+      document.throughEntryId = result.id;
+      document.throughChars = 0;
+      document.episodeStartEntryId = null;
+      document.episodeEndEntryId = null;
+    }, context);
+    assert.ok(question.id < call.id && call.id < result.id);
+
+    let source = sourceFor(harness, conversation);
+    const cursor = await source.cursor(conversation.id, context);
+    assert.deepEqual(cursor.pendingToolCalls, ["call-settled"],
+      "the open call is derived from the reset-delimited legacy prefix");
+    const batch = batched(await source.read(context));
+    assert.equal(batch.segmentStartEntryId, result.id);
+    assert.equal(batch.segmentEndEntryId, laterAnswer.id);
+    assert.deepEqual(
+      batch.entries.map((entry) => [entry.entryId, entry.itemKind, entry.text]),
+      [
+        [result.id, "tool-result", "SETTLED-RESULT-4455"],
+        [laterQuestion.id, "message", "SETTLED-LATER-5566"],
+        [laterAnswer.id, "message", "SETTLED-LATER-6677"],
+      ],
+      "the frontier result is paired, and a later completed turn carries it without replaying the call",
+    );
+    await source.acknowledge(batch, context);
+
+    await harness.close(context);
+    harness = await openStore(db);
+    source = sourceFor(harness, conversation);
+    const reopened = await source.cursor(conversation.id, context);
+    assert.deepEqual(reopened.pendingToolCalls, [], "the paired result closes the derived call after reopen");
+    assert.equal(reopened.nextEntryId, laterAnswer.id + 1);
+  } finally {
+    if (harness !== undefined) await harness.close(context);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("adoption keeps the legacy empty-block extraction for a partial astral offset", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-complementary-adopt-empty-block-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [owner] = await append(harness, conversation, {
+      kind: "pi.user",
+      model: [{
+        role: "user",
+        content: [
+          { type: "text", text: "AB" },
+          { type: "text", text: "" },
+          { type: "text", text: "🙂CD" },
+        ],
+        timestamp: 1_000,
+      }],
+    });
+    const [answer] = await append(harness, conversation, {
+      kind: "pi.assistant",
+      model: [fauxAssistantMessage([
+        { type: "text", text: "REPLY" },
+        { type: "text", text: "" },
+        { type: "text", text: "🙂END" },
+      ])],
+    });
+    await append(harness, conversation, reset());
+    // The legacy extraction of the owner text is "AB\n\n🙂CD"; offset 4 is the astral pair's start.
+    // A reader that dropped the empty block would treat the same offset as the low surrogate.
+    await harness.commit(async (tx) => {
+      const document = await tx.doc(DigestCursorDoc, conversation.id);
+      document.throughEntryId = owner.id;
+      document.throughChars = 4;
+      document.episodeStartEntryId = owner.id;
+      document.episodeEndEntryId = answer.id;
+    }, context);
+
+    const source = sourceFor(harness, conversation);
+    const batch = batched(await source.read(context));
+    assert.deepEqual(
+      batch.entries.map((entry) => [entry.entryId, entry.textStart, entry.text]),
+      [
+        [owner.id, 4, "🙂CD"],
+        [answer.id, 0, "REPLY\n\n🙂END"],
+      ],
+      "the empty block keeps the legacy offset space, so the astral pair is not split",
+    );
+    await source.acknowledge(batch, context);
+  } finally {
+    if (harness !== undefined) await harness.close(context);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("adoption refuses a legacy offset that splits a surrogate pair", { timeout: 15_000 }, async () => {
+  const dir = await temp("nanobot-complementary-adopt-surrogate-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [owner] = await append(harness, conversation, {
+      kind: "pi.user",
+      model: [{
+        role: "user",
+        content: [
+          { type: "text", text: "AB" },
+          { type: "text", text: "" },
+          { type: "text", text: "🙂CD" },
+        ],
+        timestamp: 1_000,
+      }],
+    });
+    const [answer] = await append(harness, conversation, assistant("SURROGATE-ANSWER-7788"));
+    await harness.commit(async (tx) => {
+      const document = await tx.doc(DigestCursorDoc, conversation.id);
+      document.throughEntryId = owner.id;
+      // "AB\n\n🙂CD" puts the low surrogate at 5; the legacy offset cannot start there.
+      document.throughChars = 5;
+      document.episodeStartEntryId = owner.id;
+      document.episodeEndEntryId = answer.id;
+    }, context);
+
+    const source = sourceFor(harness, conversation);
+    await assert.rejects(
+      source.cursor(conversation.id, context),
+      (error) => error instanceof Error && /splits a surrogate pair/.test(error.message),
+      "an impossible legacy offset is refused instead of emitting half a pair",
+    );
+  } finally {
+    if (harness !== undefined) await harness.close(context);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("an aborted or errored assistant entry is not a completed answer", { timeout: 15_000 }, async () => {
   const dir = await temp("nanobot-complementary-abort-error-");
   const db = resolve(dir, "probe.sqlite");

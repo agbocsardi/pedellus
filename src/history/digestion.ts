@@ -415,7 +415,15 @@ export interface EvidenceShape extends TextShape {
   readonly kind: string;
 }
 
-function messageText(content: unknown): string | undefined {
+/**
+ * Extract one model message's text with the closed-episode reader's exact block semantics. Empty
+ * text blocks are kept as empty parts, so their separators remain in the offset space.
+ *
+ * Shared with the complementary reader: when it adopts a legacy cursor, `throughChars` was produced
+ * against this extraction, so any other empty-block rule would move the same offset onto a different
+ * character. Unicode offsets are UTF-16 code units into the joined parts.
+ */
+export function messageText(content: unknown): string | undefined {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return undefined;
   const parts: string[] = [];
@@ -430,8 +438,11 @@ function messageText(content: unknown): string | undefined {
  * tool-result entries contribute nothing, and assistant tool calls stay out of assistant evidence:
  * only user and assistant message text is evidence. The same selection is used for reading and for
  * acknowledgement validation, so a replay or a forged batch is judged against the same rule.
+ *
+ * Exported for the complementary reader's legacy-frontier mapping check, so an adopted offset is
+ * validated against the exact extraction that produced it.
  */
-function evidenceShapeOf(entry: EntryRecord): EvidenceShape | undefined {
+export function evidenceShapeOf(entry: EntryRecord): EvidenceShape | undefined {
   const kind = entry.kind;
   const user = kind === UserEntry.kind || kind === CRON_INPUT_ENTRY_KIND;
   const assistant = kind === AssistantEntry.kind;

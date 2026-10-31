@@ -104,9 +104,12 @@ import {
   DigestCursorDoc,
   cutsSurrogatePair,
   digestCursorOf,
+  evidenceShapeOf,
   evidenceSlice,
+  messageText,
   validateSessions,
   type DigestCursor,
+  type EvidenceShape,
   type TextShape,
 } from "./digestion.js";
 import type { HistoryChatSession } from "./scope.js";
@@ -147,7 +150,11 @@ export interface ComplementaryCursor {
   readonly segmentStartEntryId: EntryId | null;
   /** End of that completed segment, otherwise null. */
   readonly segmentEndEntryId: EntryId | null;
-  /** Tool call ids still open in the segment in progress. Empty outside one. */
+  /**
+   * Tool call ids still open at this position. Usually empty outside a segment; a settled
+   * bounds-free legacy adoption can carry calls at its frontier until the first acknowledgement
+   * freezes the new segment.
+   */
   readonly pendingToolCalls: readonly string[];
 }
 
@@ -383,9 +390,6 @@ function cursorOf(document: unknown): ComplementaryCursor {
   } else if (nextItemIndex !== 0 || nextTextStart !== 0) {
     throw new Error("Stored complementary cursor has a position outside a segment");
   }
-  if (segmentStartEntryId === null && pendingToolCalls.length > 0) {
-    throw new Error("Stored complementary cursor has open calls outside a segment");
-  }
   return {
     nextEntryId: nextEntryId as EntryId | null,
     nextItemIndex,
@@ -406,6 +410,13 @@ function sameCursor(left: ComplementaryCursor, right: ComplementaryCursor): bool
     && left.pendingToolCalls.every((id, index) => right.pendingToolCalls[index] === id);
 }
 
+function sameLegacyCursor(left: DigestCursor, right: DigestCursor): boolean {
+  return left.throughEntryId === right.throughEntryId
+    && left.throughChars === right.throughChars
+    && left.episodeStartEntryId === right.episodeStartEntryId
+    && left.episodeEndEntryId === right.episodeEndEntryId;
+}
+
 /**
  * Initial position for a conversation that already has a closed-episode cursor but no
  * complementary cursor yet. The handoff resumes at that cursor's exact acknowledged entry and
@@ -415,6 +426,13 @@ function sameCursor(left: ComplementaryCursor, right: ComplementaryCursor): bool
  * so it is still read; tool evidence before the frontier is not revisited, so no range is digested
  * twice.
  *
+ * A tool result at or after the frontier may belong to a call before it. The complementary cursor
+ * therefore carries the calls still open at the frontier, derived from the immutable legacy episode
+ * prefix (for a settled bounds-free cursor, from the nearest preceding reset). Without that state
+ * the result would look unpaired and its text would be dropped permanently, because the prefix is
+ * never revisited. The prefix walk is bounded by {@link COMPLEMENTARY_LIMITS.scanEntriesPerRead};
+ * a longer prefix fails adoption closed instead of guessing.
+ *
  * When the legacy run stopped inside a closed episode, its frozen episode bounds are adopted too, so
  * the unprocessed remainder of that exchange is consumed as this source's current segment without
  * waiting for a new owner turn. The episode was already closed in the transcript, so its bounds are
@@ -423,16 +441,143 @@ function sameCursor(left: ComplementaryCursor, right: ComplementaryCursor): bool
  * This is derived on read and frozen by the first acknowledgement; it never writes or moves the
  * closed-episode cursor.
  */
-function adoptDigestCursor(legacy: DigestCursor): ComplementaryCursor {
+async function adoptDigestCursor(
+  legacy: DigestCursor,
+  conversation: Conversation,
+  context: Context,
+): Promise<ComplementaryCursor> {
   if (legacy.throughEntryId === null || legacy.throughChars === null) return EMPTY_CURSOR;
+  const nextEntryId = legacy.throughEntryId;
+  const nextTextStart = legacy.throughChars;
+  await validateAdoptedFrontier(conversation, nextEntryId, nextTextStart, context);
+  const pendingToolCalls = await pendingCallsBefore(conversation, legacy, nextEntryId, context);
   return {
-    nextEntryId: legacy.throughEntryId,
+    nextEntryId,
     nextItemIndex: 0,
-    nextTextStart: legacy.throughChars,
+    nextTextStart,
     segmentStartEntryId: legacy.episodeStartEntryId,
     segmentEndEntryId: legacy.episodeEndEntryId,
-    pendingToolCalls: Object.freeze([]) as readonly string[],
+    pendingToolCalls,
   };
+}
+
+/**
+ * Check that the legacy frontier maps onto the same extracted text this reader will slice. The
+ * offset was produced by {@link evidenceShapeOf}; an empty text block keeps its separator there, and
+ * an offset that is beyond the entry or inside a surrogate pair cannot be mapped safely. Refuse
+ * instead of skipping or splitting characters.
+ */
+async function validateAdoptedFrontier(
+  conversation: Conversation,
+  throughEntryId: EntryId,
+  throughChars: number,
+  context: Context,
+): Promise<void> {
+  const entry = await entryAt(conversation, throughEntryId, context);
+  if (entry === undefined) {
+    throw new Error(
+      `Legacy digest frontier entry ${throughEntryId} is not committed; refusing to adopt its offset`,
+    );
+  }
+  const shape = evidenceShapeOf(entry);
+  if (shape === undefined) {
+    if (throughChars !== 0) {
+      throw new Error(
+        `Legacy digest frontier entry ${throughEntryId} has no message evidence, so offset ` +
+        `${throughChars} cannot be mapped; refusing to adopt it`,
+      );
+    }
+    return;
+  }
+  if (throughChars > shape.length) {
+    throw new Error(
+      `Legacy digest frontier offset ${throughChars} is beyond entry ${throughEntryId}'s ` +
+      `${shape.length} extracted characters; refusing to adopt it`,
+    );
+  }
+  if (throughChars > 0 && throughChars < shape.length && cutsSurrogatePair(shape, throughChars - 1, 1)) {
+    throw new Error(
+      `Legacy digest frontier offset ${throughChars} splits a surrogate pair in entry ` +
+      `${throughEntryId}; refusing to adopt it`,
+    );
+  }
+}
+
+/** Start of the legacy episode prefix that ends just before the adopted frontier entry. */
+async function legacyPrefixStart(
+  conversation: Conversation,
+  legacy: DigestCursor,
+  throughEntryId: EntryId,
+  context: Context,
+): Promise<EntryId> {
+  if (legacy.episodeStartEntryId !== null) return legacy.episodeStartEntryId;
+  // A settled legacy cursor clears its episode bounds. The reset that closed that episode is still
+  // in the immutable transcript, and open calls cannot survive a reset, so none is needed from
+  // before it.
+  const page = await conversation.entries(
+    { order: "descending", maxEntryId: throughEntryId },
+    COMPLEMENTARY_LIMITS.scanEntriesPerRead,
+    undefined,
+    context,
+  );
+  const reset = page.items.find((entry) => entry.kind === ResetEntry.kind);
+  if (reset !== undefined) return reset.id;
+  if (page.next !== undefined) {
+    throw new Error(
+      `Legacy digest frontier at entry ${throughEntryId} is more than ` +
+      `${COMPLEMENTARY_LIMITS.scanEntriesPerRead} entries from a reset; refusing to adopt it ` +
+      `without its open tool calls`,
+    );
+  }
+  return 1 as EntryId;
+}
+
+/**
+ * Open tool calls at the legacy frontier, derived by replaying pairing effects over the prefix that
+ * the closed-episode reader already consumed. The frontier entry itself is excluded: its tool steps
+ * follow the acknowledged message offset and are still this reader's evidence. A prefix longer than
+ * the scan bound fails closed rather than silently orphaning a later result.
+ */
+async function pendingCallsBefore(
+  conversation: Conversation,
+  legacy: DigestCursor,
+  throughEntryId: EntryId,
+  context: Context,
+): Promise<readonly string[]> {
+  const start = await legacyPrefixStart(conversation, legacy, throughEntryId, context);
+  if (start >= throughEntryId) return Object.freeze([]) as readonly string[];
+  const pending = new Set<string>();
+  let remaining = COMPLEMENTARY_LIMITS.scanEntriesPerRead;
+  let cursor: Cursor | undefined;
+  const maxEntryId = (throughEntryId - 1) as EntryId;
+  while (remaining > 0) {
+    const page = await conversation.entries(
+      { order: "ascending", minEntryId: start, maxEntryId },
+      Math.min(COMPLEMENTARY_LIMITS.entriesPerPage, remaining),
+      cursor,
+      context,
+    );
+    if (page.items.length === 0) break;
+    for (const entry of page.items) {
+      const plan = planOf(entry, pending);
+      for (const step of plan.steps) {
+        if (step.effect === undefined) continue;
+        if (step.effect.add) pending.add(step.effect.callId);
+        else pending.delete(step.effect.callId);
+      }
+    }
+    remaining -= page.items.length;
+    cursor = page.next;
+    if (cursor === undefined) break;
+  }
+  if (remaining <= 0) {
+    throw new Error(
+      `Legacy digest frontier at entry ${throughEntryId} is more than ` +
+      `${COMPLEMENTARY_LIMITS.scanEntriesPerRead} entries after its episode start; refusing to ` +
+      `adopt it without its open tool calls`,
+    );
+  }
+  return Object.freeze([...pending].sort());
 }
 
 interface RawItem {
@@ -550,11 +695,11 @@ function planOf(entry: EntryRecord, pending: ReadonlySet<string>): EvidencePlan 
     const parts: string[] = [];
     for (const raw of (entry.model ?? []) as readonly unknown[]) {
       if (!isRecord(raw) || raw.role !== "user") continue;
-      const text = textParts(raw.content);
-      if (text === undefined) continue;
-      parts.push(text.join("\n"));
+      const text = messageText(raw.content);
+      if (text === undefined || text.trim().length === 0) continue;
+      parts.push(text);
     }
-    if (parts.length > 0 && parts.some((part) => part.trim().length > 0)) {
+    if (parts.length > 0) {
       add({ item: messageItem("user", parts) });
     }
     return { steps };
@@ -565,8 +710,8 @@ function planOf(entry: EntryRecord, pending: ReadonlySet<string>): EvidencePlan 
     const calls: { id: string | null; name: string; args: unknown; index: number }[] = [];
     for (const raw of (entry.model ?? []) as readonly unknown[]) {
       if (!isRecord(raw) || raw.role !== "assistant") continue;
-      const text = textParts(raw.content);
-      if (text !== undefined) parts.push(text.join("\n"));
+      const text = messageText(raw.content);
+      if (text !== undefined && text.trim().length > 0) parts.push(text);
       if (!Array.isArray(raw.content)) continue;
       for (const block of raw.content) {
         if (!isRecord(block) || block.type !== "toolCall" || typeof block.name !== "string") continue;
@@ -584,7 +729,7 @@ function planOf(entry: EntryRecord, pending: ReadonlySet<string>): EvidencePlan 
         });
       }
     }
-    if (parts.length > 0 && parts.some((part) => part.trim().length > 0)) {
+    if (parts.length > 0) {
       add({ item: messageItem("assistant", parts) });
     }
     for (const call of calls) {
@@ -1185,9 +1330,6 @@ function validateCursor(cursor: unknown): ComplementaryCursor {
   } else if (nextEntryId === null && (nextItemIndex !== 0 || nextTextStart !== 0)) {
     throw new TypeError("Complementary cursor has a position before the first entry");
   }
-  if (segmentStartEntryId === null && pendingToolCalls.length > 0) {
-    throw new TypeError("Complementary cursor has open calls outside a segment");
-  }
   return {
     nextEntryId: nextEntryId as EntryId | null,
     nextItemIndex,
@@ -1453,6 +1595,7 @@ export function createComplementarySource(options: ComplementarySourceOptions): 
   const cursorStateFor = async (
     conversationId: ConversationId,
     context: Context,
+    knownConversation?: Conversation,
   ): Promise<{ readonly cursor: ComplementaryCursor; readonly stored: ComplementaryCursor | undefined }> => {
     const document = await options.harness.snapshot(ComplementaryCursorDoc, conversationId, context);
     const stored = document === undefined ? undefined : cursorOf(document);
@@ -1462,7 +1605,18 @@ export function createComplementarySource(options: ComplementarySourceOptions): 
     const legacy = digestCursorOf(
       await options.harness.snapshot(DigestCursorDoc, conversationId, context),
     );
-    return { cursor: adoptDigestCursor(legacy), stored };
+    if (legacy.throughEntryId === null || legacy.throughChars === null) {
+      return { cursor: EMPTY_CURSOR, stored };
+    }
+    const conversation = knownConversation
+      ?? await options.harness.conversation(conversationId, context);
+    if (conversation === undefined) {
+      throw new Error(
+        `Legacy digest frontier for conversation ${conversationId} has no committed conversation; ` +
+        `refusing to adopt it`,
+      );
+    }
+    return { cursor: await adoptDigestCursor(legacy, conversation, context), stored };
   };
 
   const cursorFor = async (conversationId: ConversationId, context: Context): Promise<ComplementaryCursor> =>
@@ -1525,7 +1679,7 @@ export function createComplementarySource(options: ComplementarySourceOptions): 
           missingChats += 1;
           continue;
         }
-        const cursor = await cursorFor(conversationId, context);
+        const cursor = (await cursorStateFor(conversationId, context, conversation)).cursor;
         if (cursor.segmentStartEntryId !== null) {
           examinedChats += 1;
           candidates.push({ session, conversation, cursor });
@@ -1756,15 +1910,39 @@ export function createComplementarySource(options: ComplementarySourceOptions): 
           segmentEndEntryId: batch.segmentEndEntryId,
           pendingToolCalls: rederived.pendingToolCalls,
         };
+      // An absent or untouched complementary document adopts the closed-episode frontier at the
+      // first acknowledgement. Deriving it needs the legacy prefix, which the transaction cannot
+      // walk, so derive it first and repeat the legacy-cursor comparison inside the transaction: a
+      // closed-episode cursor that moved since the read is a conflict.
+      const storedBefore = cursorOf(
+        await options.harness.snapshot(ComplementaryCursorDoc, conversationId, context),
+      );
+      let legacyBefore: DigestCursor | undefined;
+      let adoptedBefore: ComplementaryCursor | undefined;
+      if (sameCursor(storedBefore, EMPTY_CURSOR)) {
+        legacyBefore = digestCursorOf(
+          await options.harness.snapshot(DigestCursorDoc, conversationId, context),
+        );
+        adoptedBefore = await adoptDigestCursor(legacyBefore, conversation, context);
+      }
       await options.harness.commit(async (tx) => {
         const document = await tx.doc(ComplementaryCursorDoc, conversationId);
         const stored = cursorOf(document);
-        // An absent or untouched complementary document adopts the closed-episode frontier at the
-        // first acknowledgement. Reading never writes, so the comparison is repeated here against
-        // the same transaction: a closed-episode cursor that moved since the read is a conflict.
-        const expected = sameCursor(stored, EMPTY_CURSOR)
-          ? adoptDigestCursor(digestCursorOf(await tx.doc(DigestCursorDoc, conversationId)))
-          : stored;
+        let expected = stored;
+        if (sameCursor(stored, EMPTY_CURSOR)) {
+          if (legacyBefore === undefined || adoptedBefore === undefined) {
+            throw new ComplementaryCursorConflictError(
+              "Complementary cursor moved after this batch was read; re-read before acknowledging",
+            );
+          }
+          const legacyNow = digestCursorOf(await tx.doc(DigestCursorDoc, conversationId));
+          if (!sameLegacyCursor(legacyNow, legacyBefore)) {
+            throw new ComplementaryCursorConflictError(
+              "Closed-episode cursor moved after this batch was read; re-read before acknowledging",
+            );
+          }
+          expected = adoptedBefore;
+        }
         if (!sameCursor(expected, batch.cursor)) {
           throw new ComplementaryCursorConflictError(
             "Complementary cursor moved after this batch was read; re-read before acknowledging",
