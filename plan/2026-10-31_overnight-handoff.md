@@ -177,18 +177,19 @@ Memory digestion (offline evidence only; **no real-model quality claim**):
   through the existing `/refresh`/`/new` path.
 - A parked or cancelled task counts as live, so start reports `busy` until
   native retry/abort. Failure evidence may report a zero count.
-- The only live-model evidence remains the single 2026-10-30 core run
-  (skill/memory/compaction/reopen). Digestion has not been run against a real
-  provider; its Markdown usefulness and summarization judgement are unproven.
+- Digestion has not been run against a real provider. Accepted live evidence
+  remains the earlier single core run (skill/memory/compaction/reopen) and the
+  bounded Telegram pilot; neither covers digestion, so its Markdown usefulness
+  and summarization judgement are unproven.
 
 Media and voice:
 
 - Stored originals are kept byte-for-byte and never auto-deleted; there is no
   total-disk cap. Documents and CLI audio are opaque files with no extraction or
   transcription.
-- The voice route's **measured** evidence is local and synthetic-input only:
-  one host, one public-domain speech clip, one speaker, no comparison against
-  faster-whisper. See
+- The voice route's **measured** evidence is local and fixture-input only: one
+  host, one public-domain speech clip (repeated for the long-audio fixture), one
+  speaker, no comparison against faster-whisper. See
   [the offline proof](./2026-10-30_local-transcription-offline-proof.md). It does
   not establish product-quality equivalence, per-language quality or a corpus
   result.
