@@ -160,13 +160,15 @@ test("digest reads closed episodes oldest first and never the open tail", { time
     assert.equal(second.complete, true);
     // The episode starts at its reset marker; the reset marker itself is not evidence.
     assert.ok(second.episodeStartEntryId > a1.id && second.episodeStartEntryId < u2.id);
-    assert.deepEqual(second.entries.map((entry) => [entry.entryId, entry.role, entry.toolName ?? null]), [
-      [u2.id, "user", null],
-      [a2.id, "assistant", null],
-      [tool.id, "tool", "read"],
+    // The whole episode is one batch: the trailing tool result is covered and consumes no evidence.
+    assert.deepEqual(second.entries.map((entry) => [entry.entryId, entry.role]), [
+      [u2.id, "user"],
+      [a2.id, "assistant"],
     ]);
-    assert.equal(second.entries[2].text, "TOOL-OUTPUT-5523");
+    assert.deepEqual(second.entries.map((entry) => entry.text), ["SECOND-QUESTION-6619", "SECOND-ANSWER-1184"]);
+    assert.equal(second.throughEntryId, tool.id, "the tool result entry is consumed, never its text");
     await source.acknowledge(second, context);
+    assert.equal((await source.cursor(conversation.id, context)).throughEntryId, tool.id);
 
     // The still-open segment is never evidence, however often it is read.
     const settled = idle(await source.read(context));
@@ -217,7 +219,7 @@ test("digest skips reset-only segments and never returns reset handoff text", { 
   }
 });
 
-test("a long closed episode is consumed in contiguous chunks with no skipped entry", { timeout: 20_000 }, async () => {
+test("an episode over the entry cap is consumed in ordered independent chunks", { timeout: 20_000 }, async () => {
   const dir = await temp("nanobot-digest-chunks-");
   const db = resolve(dir, "probe.sqlite");
   let harness;
@@ -225,10 +227,14 @@ test("a long closed episode is consumed in contiguous chunks with no skipped ent
     harness = await openStore(db);
     const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
     const [segmentReset] = await append(harness, conversation, reset());
-    const appended = [];
-    for (let index = 0; index < DIGEST_LIMITS.entriesPerBatch * 2 + 5; index += 1) {
-      appended.push(...await append(harness, conversation, user(`CHUNK-EVIDENCE-${index}`)));
-    }
+    // One commit: the point is the entry bound, not per-entry write cost.
+    const appended = await harness.commit(async (tx) => {
+      const entries = [];
+      for (let index = 0; index < DIGEST_LIMITS.entriesPerBatch + 5; index += 1) {
+        entries.push(await tx.appendEntry(conversation.id, user(`CHUNK-EVIDENCE-${index}`)));
+      }
+      return entries;
+    }, context);
     await append(harness, conversation, reset());
 
     const source = createDigestSource({
@@ -236,7 +242,7 @@ test("a long closed episode is consumed in contiguous chunks with no skipped ent
       sessions: async () => [{ sessionKey: "cli:chunks", conversationId: conversation.id }],
     });
     const { batches } = await drain(source);
-    assert.ok(batches.length >= 3, `expected several bounded chunks, got ${batches.length}`);
+    assert.ok(batches.length >= 2, `expected the entry cap to split the episode, got ${batches.length}`);
     assert.equal(batches[0].episodeStartEntryId, segmentReset.id);
     assert.equal(batches[0].firstEntryId, segmentReset.id);
     let entry = segmentReset.id - 1;
@@ -276,6 +282,288 @@ test("a long closed episode is consumed in contiguous chunks with no skipped ent
   }
 });
 
+test("an episode under both caps is read as one complete batch and acknowledged once", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-digest-whole-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [segmentReset] = await append(harness, conversation, reset());
+    // A long ordinary episode: far more entries than the old 80-entry batch, still one pass.
+    const count = 1_500;
+    const appended = await harness.commit(async (tx) => {
+      const entries = [];
+      for (let index = 0; index < count; index += 1) {
+        entries.push(await tx.appendEntry(conversation.id, user(`WHOLE-EPISODE-${index}-${"x".repeat(90)}`)));
+      }
+      return entries;
+    }, context);
+    await append(harness, conversation, reset());
+    assert.ok(count < DIGEST_LIMITS.entriesPerBatch, "the entry cap is not what splits this episode");
+    assert.ok(count * 110 < DIGEST_LIMITS.charsPerBatch, "the character bound is not reached either");
+
+    const source = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:whole", conversationId: conversation.id }],
+    });
+    const batch = batched(await source.read(context));
+    assert.equal(batch.complete, true, "the whole episode arrives in one complete batch");
+    assert.equal(batch.episodeStartEntryId, segmentReset.id);
+    assert.equal(batch.episodeEndEntryId, appended.at(-1).id);
+    assert.equal(batch.entries.length, count, "every message is in that one batch");
+    assert.deepEqual(batch.cursor, {
+      throughEntryId: null,
+      throughChars: null,
+      episodeStartEntryId: null,
+      episodeEndEntryId: null,
+    });
+    assert.ok(evidenceChars(batch) <= DIGEST_LIMITS.charsPerBatch);
+
+    // One acknowledgement consumes it: no chunk continuation state is left behind.
+    assert.deepEqual(await source.acknowledge(batch, context), {
+      throughEntryId: appended.at(-1).id,
+      throughChars: batch.entries.at(-1).text.length,
+      episodeStartEntryId: null,
+      episodeEndEntryId: null,
+    });
+    assert.equal(idle(await source.read(context)).caughtUp, true);
+
+    // Exactly at the character bound, with trailing tool output: still one complete batch,
+    // because the budget only closes a chunk at an entry that still carries evidence.
+    const capped = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const exact = "E".repeat(DIGEST_LIMITS.charsPerBatch);
+    const [exactMessage] = await append(harness, capped, user(exact));
+    const [trailingTool] = await append(harness, capped, toolResult("TRAILING-TOOL-OUTPUT-5540", "bash"));
+    await append(harness, capped, reset());
+    const cappedSource = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:whole-capped", conversationId: capped.id }],
+    });
+    const cappedBatch = batched(await cappedSource.read(context));
+    assert.equal(cappedBatch.complete, true, "an exact-bound episode is still one pass");
+    assert.deepEqual(cappedBatch.entries.map((fragment) => [fragment.entryId, fragment.text.length]), [
+      [exactMessage.id, DIGEST_LIMITS.charsPerBatch],
+    ]);
+    assert.equal(cappedBatch.throughEntryId, trailingTool.id, "the trailing tool result rides along");
+    assert.equal(cappedBatch.throughChars, 0);
+    await cappedSource.acknowledge(cappedBatch, context);
+    assert.equal(idle(await cappedSource.read(context)).caughtUp, true);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an episode over the character cap splits into ordered independent chunks with no loss", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-digest-char-cap-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [segmentReset] = await append(harness, conversation, reset());
+    const messages = ["A", "B", "C"].map((letter) => `${letter}-${letter.repeat(150_000 - 2)}`);
+    const appended = [];
+    for (const message of messages) appended.push(...await append(harness, conversation, user(message)));
+    await append(harness, conversation, reset());
+
+    const source = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:char-cap", conversationId: conversation.id }],
+    });
+    const { batches } = await drain(source);
+    assert.ok(batches.length >= 2, `expected the character cap to split the episode, got ${batches.length}`);
+    for (const [index, batch] of batches.entries()) {
+      assert.equal(batch.episodeStartEntryId, segmentReset.id);
+      assert.equal(batch.episodeEndEntryId, appended.at(-1).id);
+      assert.equal(batch.complete, index === batches.length - 1, "only the last chunk reaches the episode end");
+      assert.ok(evidenceChars(batch) <= DIGEST_LIMITS.charsPerBatch, "each chunk respects the shared bound");
+      const ids = batch.entries.map((fragment) => fragment.entryId);
+      assert.deepEqual(ids, [...ids].sort((left, right) => left - right), "fragments stay in transcript order");
+    }
+    // Independent chunks: every chunk starts where the previous one stopped, each fragment is
+    // contiguous within its entry, and the three messages rebuild exactly once, in order.
+    const rebuilt = messages.map(() => "");
+    const offsets = messages.map(() => 0);
+    for (const batch of batches) {
+      for (const fragment of batch.entries) {
+        const index = appended.findIndex((entry) => entry.id === fragment.entryId);
+        assert.equal(fragment.textStart, offsets[index], "no gap and no overlap between chunks");
+        assert.equal(fragment.chars, messages[index].length);
+        offsets[index] += fragment.text.length;
+        rebuilt[index] += fragment.text;
+      }
+    }
+    assert.deepEqual(rebuilt, messages, "every character is consumed exactly once");
+    assert.deepEqual(offsets, messages.map((message) => message.length));
+    assert.deepEqual(await source.cursor(conversation.id, context), {
+      throughEntryId: appended.at(-1).id,
+      throughChars: messages.at(-1).length,
+      episodeStartEntryId: null,
+      episodeEndEntryId: null,
+    });
+    assert.equal(idle(await source.read(context)).caughtUp, true);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("tool results and tool calls are consumed without contributing evidence", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-digest-tool-heavy-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [question] = await append(harness, conversation, user("OWNER-QUESTION-4417"));
+    // Backend traffic that would dominate the batch if tool output were evidence: 40 results of
+    // 5,000 characters each, twice the character bound together.
+    const toolTexts = [];
+    for (let index = 0; index < 40; index += 1) {
+      const text = `TOOL-OUTPUT-${index}-${"z".repeat(5_000)}`;
+      toolTexts.push(text);
+      await append(harness, conversation, toolResult(text, "bash"));
+    }
+    const [answer] = await append(harness, conversation, assistant("OWNER-ANSWER-8825"));
+    await append(harness, conversation, reset());
+
+    const source = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:tool-heavy", conversationId: conversation.id }],
+    });
+    const batch = batched(await source.read(context));
+    assert.equal(batch.complete, true, "tool output cannot push one episode over the character bound");
+    assert.deepEqual(batch.entries.map((fragment) => [fragment.entryId, fragment.role]), [
+      [question.id, "user"],
+      [answer.id, "assistant"],
+    ]);
+    assert.deepEqual(batch.entries.map((fragment) => fragment.text), ["OWNER-QUESTION-4417", "OWNER-ANSWER-8825"]);
+    assert.equal(batch.entries.some((fragment) => toolTexts.some((text) => fragment.text.includes(text))), false);
+    // Cursor progress is unchanged: the range is covered to its last entry, with no offset in a
+    // non-evidence entry, so nothing is skipped and nothing is counted twice.
+    assert.equal(batch.throughEntryId, answer.id);
+    await source.acknowledge(batch, context);
+    assert.deepEqual(await source.cursor(conversation.id, context), {
+      throughEntryId: answer.id,
+      throughChars: "OWNER-ANSWER-8825".length,
+      episodeStartEntryId: null,
+      episodeEndEntryId: null,
+    });
+
+    // An episode ending inside tool output is complete at that entry with a zero offset.
+    const second = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [secondQuestion] = await append(harness, second, user("SECOND-QUESTION-1173"));
+    const [secondTool] = await append(harness, second, toolResult("SECOND-TOOL-OUTPUT-6619", "read"));
+    await append(harness, second, reset());
+    const secondSource = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:tool-heavy-second", conversationId: second.id }],
+    });
+    const secondBatch = batched(await secondSource.read(context));
+    assert.equal(secondBatch.complete, true);
+    assert.deepEqual(secondBatch.entries.map((fragment) => fragment.text), ["SECOND-QUESTION-1173"]);
+    assert.equal(secondBatch.throughEntryId, secondTool.id);
+    assert.equal(secondBatch.throughChars, 0);
+    assert.deepEqual(await secondSource.acknowledge(secondBatch, context), {
+      throughEntryId: secondTool.id,
+      throughChars: 0,
+      episodeStartEntryId: null,
+      episodeEndEntryId: null,
+    });
+
+    // A tool-result-only episode is an acknowledgeable no-op, not skipped evidence.
+    const third = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [onlyTool] = await append(harness, third, toolResult("ONLY-TOOL-OUTPUT-2084", "bash"));
+    await append(harness, third, reset());
+    const thirdSource = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:tool-only", conversationId: third.id }],
+    });
+    const thirdBatch = batched(await thirdSource.read(context));
+    assert.deepEqual(thirdBatch.entries, []);
+    assert.equal(thirdBatch.complete, true);
+    await thirdSource.acknowledge(thirdBatch, context);
+    assert.equal((await thirdSource.cursor(third.id, context)).throughEntryId, onlyTool.id);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a tool-result acknowledgement is refused when it claims tool text or its offset", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-digest-tool-forged-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [question] = await append(harness, conversation, user("FORGED-QUESTION-7731"));
+    const toolText = "FORGED-TOOL-OUTPUT-9934";
+    const [tool] = await append(harness, conversation, toolResult(toolText, "read"));
+    const [answer] = await append(harness, conversation, assistant("FORGED-ANSWER-2265"));
+    await append(harness, conversation, reset());
+
+    const source = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:tool-forged", conversationId: conversation.id }],
+    });
+    const batch = batched(await source.read(context));
+    const empty = {
+      throughEntryId: null,
+      throughChars: null,
+      episodeStartEntryId: null,
+      episodeEndEntryId: null,
+    };
+    const userFragment = batch.entries.find((fragment) => fragment.entryId === question.id);
+    const answerFragment = batch.entries.find((fragment) => fragment.entryId === answer.id);
+    assert.ok(userFragment !== undefined && answerFragment !== undefined);
+    const forged = (patch) => ({
+      status: "batch",
+      sessionKey: "cli:tool-forged",
+      conversationId: conversation.id,
+      episodeStartEntryId: question.id,
+      episodeEndEntryId: answer.id,
+      firstEntryId: question.id,
+      firstTextStart: 0,
+      throughEntryId: answer.id,
+      throughChars: answerFragment.text.length,
+      complete: true,
+      entries: [userFragment, answerFragment],
+      cursor: empty,
+      ...patch,
+    });
+
+    // Presenting a tool result's text as evidence is refused: the selection has no tool role.
+    await assert.rejects(
+      () => source.acknowledge(forged({
+        entries: [
+          userFragment,
+          { entryId: tool.id, role: "assistant", kind: "pi.tool-result", textStart: 0, chars: toolText.length, text: toolText },
+          answerFragment,
+        ],
+      }), context),
+      /tool is invalid|already consumed entry|does not match/,
+    );
+    // Honest evidence list, but a through offset that counts the removed tool text.
+    await assert.rejects(
+      () => source.acknowledge(forged({ throughChars: toolText.length }), context),
+      /through offset/,
+    );
+    assert.deepEqual(await source.cursor(conversation.id, context), empty);
+
+    // The real chunk is still exactly what the reader offers, and it acknowledges cleanly.
+    assert.deepEqual(batched(await source.read(context)), batch);
+    await source.acknowledge(batch, context);
+    assert.equal((await source.cursor(conversation.id, context)).throughEntryId, answer.id);
+    assert.equal(idle(await source.read(context)).caughtUp, true);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("a long entry is delivered losslessly across batches and its tail cannot be acked away", { timeout: 20_000 }, async () => {
   const dir = await temp("nanobot-digest-long-entry-");
   const db = resolve(dir, "probe.sqlite");
@@ -283,7 +571,7 @@ test("a long entry is delivered losslessly across batches and its tail cannot be
   try {
     harness = await openStore(db);
     const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
-    const long = `LONG-ENTRY-${"abcdefghij".repeat(6_000)}`;
+    const long = `LONG-ENTRY-${"abcdefghij".repeat(60_000)}`;
     const [longEntry] = await append(harness, conversation, user(long));
     await append(harness, conversation, reset());
     const source = createDigestSource({
@@ -1071,8 +1359,8 @@ test("non-BMP text is fragmented on code-unit boundaries and survives UTF-8 enco
   try {
     harness = await openStore(db);
     const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
-    // Three leading units put a high surrogate exactly on the 24,000-unit budget edge.
-    const long = `abc${"😀".repeat(20_000)}`;
+    // Three leading units put a high surrogate exactly on the 200,000-unit budget edge.
+    const long = `abc${"😀".repeat(100_000)}`;
     const [longEntry] = await append(harness, conversation, user(long));
     await append(harness, conversation, reset());
     const source = createDigestSource({

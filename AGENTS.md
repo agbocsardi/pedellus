@@ -102,7 +102,12 @@ npm start -- agent --config config.json     # attach a terminal
   One `gateway.memoryDigest.start` consumes one bounded closed-episode batch in
   a task-owned conversation whose only tools are the origin's captured
   `read`/`write`/`edit`, confined to `SOUL.md`, `USER.md`, `memory/**/*.md` and
-  `skills/<name>/SKILL.md`. Digest `write` is a guarded atomic exclusive create
+  `skills/<name>/SKILL.md`. The evidence is owner and assistant message text
+  only: tool calls and tool output are never loaded, though those entries are
+  still consumed as part of the episode range. One closed episode whose message
+  evidence fits the batch bounds is one batch and one acknowledgement; a larger
+  episode is independent ordered chunks, each acknowledged on its own, with no
+  carry-over summary. Digest `write` is a guarded atomic exclusive create
   (`O_CREAT | O_EXCL`), never a precheck plus truncation; `edit` keeps exact-text
   in-process protection only, and an uncooperative outside editor between read
   and write is not detected. The cursor advances only after a settled turn is

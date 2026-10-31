@@ -104,7 +104,12 @@ npm start -- agent   --config ~/.durable-nanobot/instances/i-work/config.json
 
 - `/digest` (CLI, or the authenticated Telegram owner) starts **one** bounded
   closed-episode batch from the shared mapped-chat history and returns at once
-  with `started`, `busy`, `idle` or `refused`. `idle` with `caughtUp: false`
+  with `started`, `busy`, `idle` or `refused`. One closed episode whose message
+  evidence fits the batch bounds is that whole batch, so an ordinary episode is
+  digested in a single pass; only a larger episode arrives as ordered chunks that
+  are each acknowledged on their own, with no carry-over note. Evidence is owner
+  and assistant message text only: tool calls and tool output are never loaded.
+  `idle` with `caughtUp: false`
   means closed history may remain; nothing loops to exhaustion.
 - `/digest status` is read-only: live run, this chat's newest run, batch
   position, evidence count, recorded error, retained issue-notice count and
@@ -115,9 +120,11 @@ npm start -- agent   --config ~/.durable-nanobot/instances/i-work/config.json
   creates an ordinary origin-mode job; no startup pass creates one, and the
   occurrence queues no channel delivery.
 - One `digest` config block bounds a run, with these accepted defaults:
-  `entriesPerBatch: 80`, `charsPerBatch: 24000` (UTF-16 units, minimum 2),
+  `entriesPerBatch: 2000`, `charsPerBatch: 200000` (UTF-16 units, minimum 2),
   `maxToolCalls: 10` individual calls, `runTimeoutSeconds: 300`,
-  `maxChangedFiles: 8`, `maxDiffChars: 32000`. A started run captures what it
+  `maxChangedFiles: 8`, `maxDiffChars: 32000`. The character bound is the real
+  size limit and the entry cap only guards against floods of tiny or
+  evidence-free entries. A started run captures what it
   accepted, so a narrowed reopen never widens it. `DIGEST.md` is seeded once
   when absent and edits apply to the next accepted batch.
 - Reporting is issues-only: a failed or cancelled run admits one bounded
@@ -224,15 +231,24 @@ main checkout's `node_modules` was reused read-only (symlinked); there was no
 
 Digestion:
 
-- Budgets are conservative UTF-16 text-unit accounting, not a git diff; there is
+- Bounds are conservative UTF-16 text-unit accounting, not a git diff; there is
   no path-alias resolution, so aliases can under- or overcharge.
-- A turn longer than 4,000 committed entries cannot be verified and fails
-  closed, and cross-chat ordering is best effort under the scan bounds.
+- The evidence is message text only. Tool calls and tool output are consumed as
+  part of an episode range and move the cursor, but they are never loaded into a
+  run, so a fact that only appeared in tool output cannot be digested.
+- A whole episode is one batch only while its message evidence fits both batch
+  bounds (200,000 units, 2,000 entries by default). A larger episode is several
+  independent chunks: each is acknowledged on its own, and a failure replays one
+  chunk rather than the whole episode. There is no running summary across chunks.
+- A run's own turn verification stays bounded at 4,000 committed entries. That
+  bound covers the run's turn (one input entry, at most `maxToolCalls` tool rounds
+  and the answer), not the batch, so a larger batch does not move it.
 - The bounded gap check between the previous frontier and the next closed
   episode examines up to 4,000 entries. A conversation with more than 4,000
   consecutive empty `pi.reset` markers before that episode is refused loudly
   rather than assumed: the same evidence is offered again, the cursor stays
   unchanged, and no evidence is silently skipped.
+- Cross-chat ordering is best effort under the scan bounds.
 - Partial writes from a failed run stay on disk for an idempotent replay; there
   is no rollback. `write` is an atomic exclusive create, but `edit` keeps exact
   text plus in-process serialization only — an outside editor changing the file

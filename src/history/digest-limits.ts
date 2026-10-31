@@ -8,11 +8,18 @@
 
 /** Bounds on the one closed-episode chunk a digest run may consume. */
 export interface DigestBatchLimits {
-  /** Entries examined by one batch; a long entry continues in the next batch. */
+  /**
+   * Entries examined by one batch; a long entry or episode continues in the next batch.
+   *
+   * This is a flood guard, not the real size limit: an ordinary long episode is expected to fit
+   * one batch and is bounded by {@link charsPerBatch}. The entry cap only stops an episode made of
+   * thousands of tiny (or evidence-free) entries from being walked in one unbounded pass.
+   */
   readonly entriesPerBatch: number;
   /**
    * Extracted evidence characters in one batch, counted in UTF-16 code units. A fragment is cut at
-   * this bound, never dropped; the minimum is 2 so one surrogate pair always fits.
+   * this bound, never dropped; the minimum is 2 so one surrogate pair always fits. This is the
+   * effective limit on one pass, so a closed episode that fits both defaults is digested whole.
    */
   readonly charsPerBatch: number;
 }
@@ -30,8 +37,14 @@ export interface DigestRunLimits extends DigestBatchLimits {
 }
 
 export const DIGEST_RUN_LIMITS_DEFAULT: DigestRunLimits = Object.freeze({
-  entriesPerBatch: 80,
-  charsPerBatch: 24_000,
+  // 200,000 UTF-16 units is roughly 50k tokens of extracted message text: one ordinary closed
+  // episode (a session, a day of chat) fits it, and a digest run reads that episode in one pass
+  // rather than dribbling it out 24,000 characters at a time. 2,000 entries is deliberately far
+  // above any ordinary episode: the character bound is what actually sizes a batch, and the entry
+  // cap exists only so an episode of thousands of tiny (or evidence-free) entries cannot be walked
+  // without a bound. Both are configurable per `digest`.
+  entriesPerBatch: 2_000,
+  charsPerBatch: 200_000,
   maxToolCalls: 10,
   runTimeoutMs: 300_000,
   maxChangedFiles: 8,

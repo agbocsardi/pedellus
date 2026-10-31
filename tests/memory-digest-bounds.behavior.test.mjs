@@ -204,11 +204,30 @@ test('digest config accepts only its six positive integer bounds and starts noth
   const fixture = { directory: tmpdir(), workspace: join(tmpdir(), 'digest-config-ws'), dataDir: join(tmpdir(), 'digest-config-data') };
   const base = { workspace: fixture.workspace, dataDir: fixture.dataDir, model: MODEL, toolAllowlist: [] };
   assert.equal(parseConfig(base, fixture.directory).digest, undefined, 'absent config keeps the defaults');
+  // One ordinary closed episode fits these defaults, so it is digested in one pass: the character
+  // bound is the real limit and the entry cap only stops floods of tiny or evidence-free entries.
+  assert.equal(DIGEST_RUN_LIMITS_DEFAULT.charsPerBatch, 200_000);
+  assert.equal(DIGEST_RUN_LIMITS_DEFAULT.entriesPerBatch, 2_000);
+  assert.equal(DIGEST_RUN_LIMITS_DEFAULT.maxToolCalls, 10);
+  assert.equal(DIGEST_RUN_LIMITS_DEFAULT.runTimeoutMs, 300_000);
+  assert.equal(DIGEST_RUN_LIMITS_DEFAULT.maxChangedFiles, 8);
+  assert.equal(DIGEST_RUN_LIMITS_DEFAULT.maxDiffChars, 32_000);
   const partial = parseConfig({
     ...base,
     digest: { entriesPerBatch: 4, maxToolCalls: 3, runTimeoutSeconds: 60 },
   }, fixture.directory);
   assert.deepEqual({ ...partial.digest }, { entriesPerBatch: 4, maxToolCalls: 3, runTimeoutSeconds: 60 });
+  // Every field is overridable, wider or narrower, without touching the others.
+  const wider = parseConfig({
+    ...base,
+    digest: { entriesPerBatch: 5_000, charsPerBatch: 400_000 },
+  }, fixture.directory);
+  assert.deepEqual({ ...wider.digest }, { entriesPerBatch: 5_000, charsPerBatch: 400_000 });
+  assert.deepEqual(
+    { ...digestRunLimitsFrom({ ...DIGEST_RUN_LIMITS_DEFAULT, ...wider.digest }) },
+    { ...DIGEST_RUN_LIMITS_DEFAULT, entriesPerBatch: 5_000, charsPerBatch: 400_000 },
+    'a capture keeps the accepted override, not the defaults',
+  );
   const minimum = parseConfig({ ...base, digest: { charsPerBatch: 2 } }, fixture.directory);
   assert.equal(minimum.digest.charsPerBatch, 2, '2 UTF-16 units is the smallest usable character bound');
   assert.equal(digestRunLimitsFrom({ ...DIGEST_RUN_LIMITS_DEFAULT, charsPerBatch: 1 }), undefined);
@@ -279,7 +298,7 @@ test('configured batch bounds reach the source and are captured in the accepted 
   const replayed = await source.readBatch(ref, context, { entriesPerBatch: 1, charsPerBatch: 5 });
   assert.deepEqual(replayed.entries, configured.entries);
   await assert.rejects(
-    source.readBatch(ref, context, { entriesPerBatch: 80, charsPerBatch: 24_000 }),
+    source.readBatch(ref, context, { ...DIGEST_RUN_LIMITS_DEFAULT }),
     /no longer matches/,
   );
 

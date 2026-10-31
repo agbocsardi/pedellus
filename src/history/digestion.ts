@@ -29,8 +29,13 @@
  *   never returned as evidence. System, compaction and unknown entries are consumed as
  *   part of the episode range but contribute no evidence item.
  * - The episode range includes its reset marker, exactly as the episode catalog records
- *   it. Evidence is user text, assistant text and tool-result text; assistant tool calls
- *   are not evidence, because the corresponding result entry carries the outcome.
+ *   it. Evidence is *message* text only: a user entry's text (owner speech, or a
+ *   `nanobot.cron` trigger) and an assistant entry's text. A `pi.tool-result` entry, an
+ *   assistant tool-call part and any tool output are never evidence — digestion folds what
+ *   was said, not what a tool did, and tool output is untrusted machine text that would
+ *   dominate the batch. Such entries are still consumed as part of the episode range and
+ *   advance the cursor with no fragment, so nothing is skipped and a long episode's backend
+ *   traffic cannot inflate its evidence.
  *   `nanobot.cron` entries are kept with that exact `kind`, so a consumer can treat a
  *   scheduled trigger as provenance rather than owner speech. Worker child transcripts
  *   are task-owned conversations and are never in scope; worker result events are not
@@ -44,6 +49,13 @@
  *   discard a tail.
  * - A batch's evidence never exceeds {@link DIGEST_LIMITS.charsPerBatch}; the fragment
  *   that reaches the budget is cut, and the rest of that entry is the next batch.
+ * - One batch is one whole closed episode whenever that episode's selected evidence fits
+ *   both bounds ({@link DIGEST_LIMITS.charsPerBatch} and
+ *   {@link DIGEST_LIMITS.entriesPerBatch}), however many entries the episode holds: it is
+ *   read in one pass, delivered with `complete: true` and acknowledged once. Only an episode
+ *   over a bound splits, and then into independent ordered chunks that each carry their own
+ *   acknowledgement. There is no carry-over note, running summary or cross-chunk state: a
+ *   chunk is judged only against its capture and the committed transcript.
  *
  * The cursor is one small conversation-scoped document, not a second history archive:
  *
@@ -97,7 +109,6 @@
 import {
   AssistantEntry,
   ResetEntry,
-  ToolResultEntry,
   UserEntry,
   defineDoc,
   type Conversation,
@@ -115,13 +126,23 @@ import { CHANNEL_STATE_SESSION_SUFFIX, type HistoryChatSession } from "./scope.j
 export const DIGEST_CURSOR_KIND = "nanobot.digest-cursor";
 
 export const DIGEST_LIMITS = Object.freeze({
-  /** Entries examined by one batch; a long entry continues in the next batch. */
+  /** Entries examined by one batch; a longer episode or entry continues in the next batch. */
   entriesPerBatch: DIGEST_RUN_LIMITS_DEFAULT.entriesPerBatch,
-  /** Extracted evidence characters in one batch. A fragment is cut at this bound, never dropped. */
+  /**
+   * Extracted message characters in one batch. A fragment is cut at this bound, never dropped, so
+   * this is the effective size limit of one pass; the entry cap only stops a flood of tiny entries.
+   */
   charsPerBatch: DIGEST_RUN_LIMITS_DEFAULT.charsPerBatch,
-  /** Entries requested per Durable page while scanning for a closed episode. */
+  /** Entries requested per Durable page while scanning for a closed episode or reading a chunk. */
   entriesPerPage: 200,
-  /** Entries a single read may examine while looking for closed episodes, across conversations. */
+  /**
+   * Entries a single read may examine while *looking* for closed episodes, across conversations.
+   *
+   * This bounds discovery only, never consumption: it does not bound a chunk (that is
+   * `entriesPerBatch`/`charsPerBatch`), the gap check below a fresh episode start, or the walk that
+   * proves a new episode's closing reset. Worst case per read is this many entry records plus one
+   * chunk's entries, and a postponed chat is retried by a later read instead of being skipped.
+   */
   scanEntriesPerRead: 4_000,
   /** Mapped chat sessions accepted by one read. */
   maxMappedSessions: 256,
@@ -142,11 +163,10 @@ export interface DigestCursor {
 /** One fragment of one evidence entry. */
 export interface DigestEvidence {
   readonly entryId: EntryId;
-  readonly role: "user" | "assistant" | "tool";
+  /** Message author. Tool results and tool calls are never evidence, so no tool role exists. */
+  readonly role: "user" | "assistant";
   /** Durable entry kind, for provenance. */
   readonly kind: string;
-  /** Tool name for a tool result; absent for user and assistant text. */
-  readonly toolName?: string;
   /** Offset of `text` within the entry's extracted evidence text. */
   readonly textStart: number;
   /** Total extracted evidence length of the entry before any batch bound. */
@@ -374,9 +394,8 @@ function sameCursor(left: DigestCursor, right: DigestCursor): boolean {
  * unjoined so a fragment can be sliced without materializing a very long entry in full.
  */
 interface EvidenceShape {
-  readonly role: "user" | "assistant" | "tool";
+  readonly role: "user" | "assistant";
   readonly kind: string;
-  readonly toolName?: string;
   readonly parts: readonly string[];
   /** Length of `parts.join("\n")`. */
   readonly length: number;
@@ -393,51 +412,27 @@ function messageText(content: unknown): string | undefined {
 }
 
 /**
- * Evidence shape of one entry, or undefined when it carries none. Reset, system and
- * compaction entries contribute nothing; tool calls stay out of assistant evidence
- * because their result entry carries the outcome.
+ * Evidence shape of one entry, or undefined when it carries none. Reset, system, compaction and
+ * tool-result entries contribute nothing, and assistant tool calls stay out of assistant evidence:
+ * only user and assistant message text is evidence. The same selection is used for reading and for
+ * acknowledgement validation, so a replay or a forged batch is judged against the same rule.
  */
 function evidenceShapeOf(entry: EntryRecord): EvidenceShape | undefined {
   const kind = entry.kind;
   const user = kind === UserEntry.kind || kind === CRON_INPUT_ENTRY_KIND;
   const assistant = kind === AssistantEntry.kind;
-  const tool = kind === ToolResultEntry.kind;
-  if (!user && !assistant && !tool) return undefined;
+  if (!user && !assistant) return undefined;
   if (!Array.isArray(entry.model)) return undefined;
   const parts: string[] = [];
-  let toolName: string | undefined;
   for (const raw of entry.model) {
-    if (!isRecord(raw)) continue;
-    if (user) {
-      if (raw.role !== "user") continue;
-      const text = messageText(raw.content);
-      if (text !== undefined && text.trim().length > 0) parts.push(text);
-      continue;
-    }
-    if (assistant) {
-      if (raw.role !== "assistant") continue;
-      const text = messageText(raw.content);
-      if (text !== undefined && text.trim().length > 0) parts.push(text);
-      continue;
-    }
-    if (raw.role !== "toolResult") continue;
-    if (toolName === undefined && typeof raw.toolName === "string" && raw.toolName.length > 0) {
-      toolName = raw.toolName;
-    }
+    if (!isRecord(raw) || raw.role !== (user ? "user" : "assistant")) continue;
     const text = messageText(raw.content);
     if (text !== undefined && text.trim().length > 0) parts.push(text);
   }
   if (parts.length === 0) return undefined;
   let length = parts.length - 1;
   for (const part of parts) length += part.length;
-  const role = user ? "user" : assistant ? "assistant" : "tool";
-  return {
-    role,
-    kind,
-    ...(toolName === undefined ? {} : { toolName }),
-    parts,
-    length,
-  };
+  return { role: user ? "user" : "assistant", kind, parts, length };
 }
 
 /**
@@ -579,6 +574,13 @@ interface Chunk {
  * starting at `firstTextStart` inside the first entry. The chunk always includes at least
  * one character or entry, so progress through a long entry or a large episode is strictly
  * monotonic and no text is dropped.
+ *
+ * The character budget closes a chunk only where it has to: at an entry that still carries
+ * evidence. Entries after the budget is spent that carry none (reset markers, system or
+ * compaction entries, `pi.tool-result` entries, tool-call-only assistant entries) are consumed
+ * by the same chunk with a zero offset, so an episode whose evidence fits the bound is one
+ * batch even when it ends in backend traffic — including when the evidence fills the bound
+ * exactly. The entry cap still bounds that scan.
  */
 async function readChunk(
   conversation: Conversation,
@@ -608,9 +610,15 @@ async function readChunk(
       const from = entry.id === firstEntryId ? firstTextStart : 0;
       const shape = evidenceShapeOf(entry);
       const total = shape?.length ?? 0;
+      if (shape !== undefined && total > from && used >= limits.charsPerBatch) {
+        // The budget is spent and this entry still has evidence: it belongs to the next chunk.
+        // `used` is positive here, so this chunk always consumed something.
+        done = true;
+        break;
+      }
       let fragment: DigestEvidence | undefined;
       let nextThroughChars: number;
-      if (shape !== undefined && total > from && used < limits.charsPerBatch) {
+      if (shape !== undefined && total > from) {
         let take = Math.min(total - from, limits.charsPerBatch - used);
         if (from + take < total && cutsSurrogatePair(shape, from, take)) {
           // The budget cannot hold the whole character: end this batch before the entry.
@@ -625,7 +633,6 @@ async function readChunk(
           entryId: entry.id,
           role: shape.role,
           kind: shape.kind,
-          ...(shape.toolName === undefined ? {} : { toolName: shape.toolName }),
           textStart: from,
           chars: total,
           text: evidenceSlice(shape, from, from + take),
@@ -643,7 +650,7 @@ async function readChunk(
         entries.push(fragment);
         used += fragment.text.length;
       }
-      if (entry.id === episodeEndEntryId || used >= limits.charsPerBatch) {
+      if (entry.id === episodeEndEntryId) {
         done = true;
         break;
       }
@@ -799,14 +806,11 @@ function validateBatchShape(batch: DigestBatch): void {
       throw new TypeError("Digest evidence entry is outside or out of order in its chunk");
     }
     previous = entryId;
-    if (entry.role !== "user" && entry.role !== "assistant" && entry.role !== "tool") {
+    if (entry.role !== "user" && entry.role !== "assistant") {
       throw new TypeError("Digest evidence role is invalid");
     }
     if (typeof entry.kind !== "string" || entry.kind.length === 0) {
       throw new TypeError("Digest evidence kind must be a non-empty string");
-    }
-    if (entry.toolName !== undefined && (typeof entry.toolName !== "string" || entry.toolName.length === 0)) {
-      throw new TypeError("Digest evidence tool name must be a non-empty string");
     }
     if (typeof entry.text !== "string" || typeof entry.textStart !== "number") {
       throw new TypeError("Digest evidence text is invalid");
@@ -885,7 +889,9 @@ async function validateFreshEpisodeStart(
  * interruptible mid-walk (SQLite reads ignore the context); an aborted context only stops
  * the acknowledgement's commit, so no cursor advances. The walk runs only when new episode
  * bounds are established, not for every continuation chunk, so its total cost is one
- * bounded-memory pass over that episode. Without it, a forged
+ * bounded-memory pass over that episode: its length is the episode's own entry count, the same
+ * episode the acknowledging chunk came from. A whole-episode batch therefore walks exactly that
+ * episode, and a chunked episode walks it once, on its first chunk. Without it, a forged
  * partial batch could persist an end that spans an earlier reset; later chunks would then
  * contain that internal reset and be un-acknowledgeable forever, and the poisoned position
  * would keep winning cross-chat priority.
@@ -954,6 +960,13 @@ async function validateEpisodeBounds(
  * evidence entry in that range must be covered by exactly the claimed fragment at the
  * claimed offset, no entry before the last may lose its tail, and a complete chunk must
  * end just before its closing reset.
+ *
+ * Bound: one transcript read of the claimed range, at most `limits.entriesPerBatch + 1` entry
+ * records. With the shipped defaults that is 2,001 entries whose *evidence* is bounded by
+ * `limits.charsPerBatch` (200,000 UTF-16 units), because the chunk that produced them could not
+ * have covered more. This is not a scan and needs no separate budget: it re-reads exactly the
+ * chunk being acknowledged, which the read that produced it already paged through in full. A
+ * range that does not fit the captured batch bound is refused loudly instead of being truncated.
  */
 async function validateChunkAgainstTranscript(
   conversation: Conversation,
@@ -1004,8 +1017,7 @@ async function validateChunkAgainstTranscript(
       if (fragment === undefined) throw new TypeError("Digest batch omits evidence from its covered range");
       if (fragment.textStart !== from) throw new TypeError("Digest evidence fragment does not start at its position");
       if (fragment.chars !== total) throw new TypeError("Digest evidence length does not match the transcript entry");
-      if (fragment.kind !== shape!.kind || fragment.role !== shape!.role
-        || (fragment.toolName ?? undefined) !== shape!.toolName) {
+      if (fragment.kind !== shape!.kind || fragment.role !== shape!.role) {
         throw new TypeError("Digest evidence does not match the transcript entry");
       }
       end = fragment.textStart + fragment.text.length;

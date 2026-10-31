@@ -20,8 +20,8 @@
     "enabled": true
   },
   "digest": {
-    "entriesPerBatch": 80,
-    "charsPerBatch": 24000,
+    "entriesPerBatch": 2000,
+    "charsPerBatch": 200000,
     "maxToolCalls": 10,
     "runTimeoutSeconds": 300,
     "maxChangedFiles": 8,

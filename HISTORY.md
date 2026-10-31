@@ -699,11 +699,20 @@ await source.cursor(conversationId, context); // status/tests, read-only
 A batch is one bounded chunk of one **closed** episode from one mapped chat conversation:
 `sessionKey`, `conversationId`, immutable `episodeStartEntryId`/`episodeEndEntryId`, the chunk's
 `firstEntryId`/`firstTextStart`, its `throughEntryId`/`throughChars`, `complete`, and evidence
-fragments. Each fragment carries its own `entryId`, `role` (`user`/`assistant`/`tool`), Durable
-`kind`, optional `toolName`, `text`, `textStart` and the entry's full `chars` length. Nothing is
+fragments. Each fragment carries its own `entryId`, `role` (`user`/`assistant` — there is no tool
+role), Durable `kind`, `text`, `textStart` and the entry's full `chars` length. Nothing is
 excerpted away: a fragment cut at the batch bound continues in the next batch from exactly that
 offset, so every character of a long entry is eventually consumable. The reader stores nothing:
 Durable stays the only transcript authority and the original entry remains the citation.
+
+One batch is one **whole** closed episode whenever that episode's message evidence fits both batch
+bounds. It is then read in one pass, delivered with `complete: true` and acknowledged once, however
+many entries the episode holds (a session with thousands of small messages is normal). Only an
+episode over the character or entry bound splits, and it then splits into independent ordered chunks
+that each carry their own acknowledgement and their own evidence. There is no carry-over note,
+running summary or cross-chunk state: each chunk is judged against its capture and the committed
+transcript alone, so a chunk can be replayed, failed or acknowledged without reference to its
+neighbours.
 
 Eligibility and evidence rules:
 
@@ -718,7 +727,14 @@ Eligibility and evidence rules:
   episodes. Episode ranges and `pi.reset` inclusion match the episode catalog.
 - A reset's handoff message is synthetic context, not owner speech, and is never evidence. System,
   compaction and unknown entries are consumed as part of a range but yield no evidence item.
-  Assistant tool calls are not evidence; their `pi.tool-result` entries are.
+  Evidence is **message text only**: owner (`pi.user`, or a `nanobot.cron` trigger) and assistant
+  text. A `pi.tool-result` entry, an assistant tool call and any tool output are never evidence —
+  digestion folds what was said, not what a tool did, and machine output would otherwise dominate a
+  batch. Those entries are still consumed as part of the range and move the cursor with no fragment
+  (a `pi.tool-result` at a chunk's last position is acknowledged with a zero offset), so nothing is
+  skipped and backend traffic cannot inflate the evidence. Acknowledgement validation uses the same
+  selection, so a replay or a forged batch that presents tool text as evidence is rejected instead
+  of accepted.
 - `nanobot.cron` input entries keep that exact Durable `kind`, so a consumer can treat a scheduled
   trigger as provenance rather than owner speech. Worker child transcripts are task-owned and never
   in scope, and worker result events are not evidence.
@@ -746,10 +762,12 @@ re-derives the episode bounds and the claimed chunk from the committed transcrip
   cannot span an earlier episode's reset. The walk uses the same paged episode scan (memory bounded
   regardless of episode size) but is not interruptible mid-walk: SQLite reads ignore the context, so
   an aborted context only prevents the acknowledgement's commit and no cursor advances.
-  Continuation chunks keep the `end+1` check but do not walk again. Its cost is therefore one bounded-memory pass over each newly established
-  episode, not per fragment, and it matters only for unusually long episodes. A restart re-verifies
+  Continuation chunks keep the `end+1` check but do not walk again. Its cost is therefore one
+  bounded-memory pass over each newly established episode — never more than that episode holds, so a
+  whole-episode batch walks exactly the episode it acknowledges — not per fragment, and it matters
+  only for unusually long episodes. A restart re-verifies
   bounds independently because nothing is persisted about the verification;
-- every entry in the claimed range must exist, fit the 80-entry batch bound, and be the chunk's
+- every entry in the claimed range must exist, fit the captured entry bound, and be the chunk's
   actual last entry; every evidence entry in it must be covered by exactly one fragment whose kind,
   role, length, offset and text match the transcript; no entry before the last may lose its tail;
 - a partial chunk must continue exactly at the stored position, and a claimed range may contain no
@@ -764,13 +782,16 @@ silently skipped; the same evidence is offered again and the cursor stays unchan
 consequence is explicit: a conversation with more than 4,000 consecutive empty `pi.reset` markers
 before its next closed episode cannot be acknowledged by this slice and fails loudly. Normal chats
 have one or two resets between episodes; if real history ever produces such a run, the bound needs
-revisiting rather than silent acceptance. A scan paused on a reset marker never turns it into
+revisiting rather than silent acceptance. That bound is about *discovery and the empty gap*, not about
+batch size, so raising the batch bounds does not move it. A scan paused on a reset marker never
+turns it into
 segment content: the derived scan cache remembers the segment's last *content* entry separately, so a
 budget boundary between consecutive resets cannot invent a reset-only episode. A batch with
-no evidence (nothing worth remembering, or an episode of non-evidence entries) is still
-acknowledged and counts as processed; a failure or restart before acknowledgement replays the same
-chunk. `DIGEST_LIMITS` holds the default batch bounds (80 entries and strictly 24,000 evidence
-characters); a read is also bounded to 4,000 scanned entries and 256 mapped chats. A larger closed
+no evidence (nothing worth remembering, or an episode whose only entries are non-message ones such as
+`pi.tool-result`) is still acknowledged and counts as processed; a failure or restart before
+acknowledgement replays the same chunk. `DIGEST_LIMITS` holds the default batch bounds (2,000 entries
+and strictly 200,000 evidence characters), which is one ordinary closed episode in one pass; a read
+is also bounded to 4,000 scanned entries for discovery and 256 mapped chats. A larger closed
 episode or long entry is returned as contiguous fragments. The `digest` config block may override
 `entriesPerBatch` and `charsPerBatch`; a read accepts them explicitly, and a resumed batch is
 re-derived with the bounds captured when it was accepted instead of current configuration.
@@ -800,8 +821,11 @@ This foundation leaves activation to the next slice: `src/history/memory-digest.
 bounded execution over it, and nothing here schedules, prompts, notifies or writes memory. See
 `tests/history-digestion.behavior.test.mjs` for the checked-in evidence over a real Durable Harness
 with synthetic entries: eligibility, ordering and scan fairness, closed-episode-only input, reset
-handoff exclusion, bounded chunking with contiguous frontiers, lossless long-entry continuation,
-ack/no-op/restart behavior, stale and forged batch rejection, and the resumable scan cache.
+handoff exclusion, message-only evidence (a tool-result-heavy episode contributes no tool text and
+still advances the cursor), one whole episode in one batch when it fits the bounds, character- and
+entry-cap chunking with contiguous frontiers, lossless long-entry continuation,
+ack/no-op/restart behavior, stale and forged batch rejection including tool text presented as
+evidence, and the resumable scan cache.
 
 ## Memory digestion execution
 
@@ -836,7 +860,9 @@ One run, in order:
    manifest plus workspace skill summaries) and the bounded evidence fragments.
 5. A settled, answered turn is validated before the frontier may move. The check reads this attempt's
    own committed range — its placed digest input entry through its own answer entry — in pages,
-   bounded to 4,000 entries. The input must be this task's input (kind and `data.taskId`), no
+   bounded to 4,000 entries. That bound covers the run's own turn (one input entry, at most
+   `maxToolCalls` tool rounds and the answer), not the batch: a bigger batch is one larger input
+   entry, not more entries, so raising the batch bounds does not move it. The input must be this task's input (kind and `data.taskId`), no
    `pi.tool-result` inside the range may be an error (a refused write, a stale edit or a failed read
    fails the batch even when the model recovered and answered later), and the answer entry must be a
    non-empty assistant report. Only then is the batch acknowledged, re-validating it against the
@@ -849,8 +875,10 @@ One run, in order:
 The model input is bounded by the O1 batch plus fixed prompt limits in `MEMORY_DIGEST_LIMITS`: the
 prompt file is read up to 64 KiB and rendered to 16,000 characters, the derived index to 12,000, and
 the outcome keeps a 2,000-character answer excerpt. One `digest` config block exposes the six
-invocation bounds, with the accepted defaults `entriesPerBatch: 80`, `charsPerBatch: 24000`,
-`maxToolCalls: 10`, `runTimeoutSeconds: 300`, `maxChangedFiles: 8` and `maxDiffChars: 32000`. It
+invocation bounds, with the accepted defaults `entriesPerBatch: 2000`, `charsPerBatch: 200000`,
+`maxToolCalls: 10`, `runTimeoutSeconds: 300`, `maxChangedFiles: 8` and `maxDiffChars: 32000`. The
+character bound is the real size limit and the entry cap is a flood guard, so one ordinary closed
+episode is admitted as one batch and therefore one run. It
 neither enables nor schedules digestion — frequency stays with ordinary cron — and an absent block
 keeps the defaults. A started task captures the resolved values in its input; a replay or reopen
 re-derives its batch, deadline, tool budget and write budget from that capture, never from a widened
