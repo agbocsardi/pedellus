@@ -90,17 +90,19 @@ history (the batch may come from a different mapped chat, because workspace
 memory is shared) and acknowledges only the bounded admission: started, busy,
 idle or refused. It returns immediately, starts no schedule, holds no chat turn
 while the digest runs. The command starts no new digest model turn itself, but it
-may re-admit a retained earlier internal result, which is an ordinary origin-agent
-turn. A digest batch
+may re-admit a retained earlier internal issue report, which is an ordinary
+origin-agent turn. A digest batch
 is one closed episode chunk, not a loop until history is exhausted; an `idle`
 answer that did not reach every mapped chat's tail says closed history may
 remain. `/digest status` is a bounded read-only view of the live run and this
 chat's newest run; it performs no transcript scan, model call or cursor change.
-The digest turn's result is one internal event for this chat's agent, never a
-direct user or channel message, and the agent decides what to relay. The retained
-result notices are bounded: a start may be refused with fixed text when 100
-undelivered or unknown results have no safely prunable slot, and `/digest status`
-reports the pending count and whether a start is possible. Undelivered results are
+Only an issue reaches this chat's agent: a failed or cancelled digest run delivers
+one internal event, never a direct user or channel message, and the agent decides
+what to relay. A successful run, including a successful no-op, is silent and
+starts no agent turn; its outcome stays visible in `/digest status`. The retained
+issue reports are bounded: a start may be refused with fixed text when 100
+undelivered or unknown issues have no safely prunable slot, and `/digest status`
+reports the pending count and whether a start is possible. Undelivered issues are
 never evicted, and a reopen retries each admission once from the authoritative
 native task. Only an authenticated allowlisted private sender can use either form.
 A host without the manual entry advertises no `/digest` and refuses a typed one

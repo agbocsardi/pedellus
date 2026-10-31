@@ -354,7 +354,7 @@ test('/digest status, idle and malformed forms are bounded owner notices with no
   }
 });
 
-test('/digest starts one bounded batch for this authenticated chat and reports internally', { timeout: 30_000 }, async () => {
+test('/digest starts one bounded batch for this authenticated chat and stays silent on success', { timeout: 30_000 }, async () => {
   const store = await syntheticStore('digest-start', {
     tools: ['read', 'write', 'edit'],
     episodeSummary: { enabled: false },
@@ -383,17 +383,17 @@ test('/digest starts one bounded batch for this authenticated chat and reports i
     }, 'digest task terminal');
     assert.equal(task.state.outcome.status, 'completed');
     assert.equal(task.state.outcome.result.outcome, 'noop');
-    // The no-evidence batch called no provider; the one captured request is this conversation's
-    // ordinary answer to the bounded internal result event, not the command.
-    await until(() => store.captured.length === 1, 'one internal result turn');
+    // A successful no-op is silent: no internal result event and no origin-agent model turn. A
+    // follow-up start flushes retained notices once, so no delivery path is left unexercised.
+    const followUp = await store.gateway.memoryDigest.start({
+      id: chat.id,
+      commit: (change, ctx) => chat.commit(change, ctx),
+    }, context);
+    assert.equal(followUp.status, 'idle');
+    assert.equal(store.captured.length, 0, 'no internal result turn');
     const entries = (await chat.entries({ order: 'ascending' }, 100, undefined, context)).items;
     const notices = entries.filter((entry) => entry.kind === MEMORY_DIGEST_RESULT_ENTRY_KIND);
-    assert.equal(notices.length, 1, 'exactly one internal result event');
-    const content = notices[0].model?.[0]?.content;
-    const noticeText = typeof content === 'string'
-      ? content
-      : (content ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('');
-    assert.match(noticeText, /settled: noop/);
+    assert.equal(notices.length, 0, 'a successful run delivers no internal result event');
   } finally {
     await cleanup(store, harness);
     transport.restore();

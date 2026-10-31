@@ -5,8 +5,10 @@
  * agent loop, history archive, retry framework or service: one Durable task consumes exactly one
  * bounded O1 batch in its own task-owned conversation, with a model chosen by the host, narrow
  * Markdown curation tools and a durable cursor acknowledgement. Nothing here schedules work or
- * sends a user or channel message: a terminal run admits exactly one bounded internal result event
- * to its origin agent's own conversation, exactly like a worker result.
+ * sends a user or channel message: a failed or cancelled run admits exactly one bounded internal
+ * issue report to its origin agent's own conversation, exactly like a worker result. A successful
+ * run, including a successful no-op or an already-consumed replay, notifies nobody; its outcome
+ * stays visible through `/digest status`.
  *
  * What one run does, in order:
  * 1. Re-derive the accepted batch from its recorded identity, and check that the conversation's
@@ -95,7 +97,7 @@ export const MEMORY_DIGEST_EXTENSION_NAME = "nanobot.memory-digest";
 export const MEMORY_DIGEST_SCOPE_EXTENSION_NAME = "nanobot.memory-digest-scope";
 /** Entry kind of the bounded task input inside the digest run's own conversation. */
 export const MEMORY_DIGEST_ENTRY_KIND = "nanobot.memory-digest-task";
-/** Entry kind of the one bounded internal result event inside the origin chat conversation. */
+/** Entry kind of the one bounded internal issue report inside the origin chat conversation. */
 export const MEMORY_DIGEST_RESULT_ENTRY_KIND = "nanobot.memory-digest-result";
 /** Conversation-scoped submission request ID; makes result admission idempotent across a crash. */
 export const MEMORY_DIGEST_RESULT_REQUEST_PREFIX = "nanobot.memory-digest-result:";
@@ -113,9 +115,10 @@ interface MemoryDigestNoticesDocument {
 }
 
 /**
- * Bounded write-ahead list of terminal runs whose internal result event may not be admitted yet.
+ * Bounded write-ahead list of terminal runs whose internal issue report may not be admitted yet.
  * The request ID is the real exactly-once guard; this document only lets a reopen find unfinished
- * admissions without rescanning and resubmitting every historical digest.
+ * admissions without rescanning and resubmitting every historical digest. A successful run's record
+ * is not an obligation: it is never delivered and may be pruned to free a slot.
  */
 /** Exported so a host or regression can inspect the bounded notice list; it carries IDs only. */
 export const MemoryDigestNoticesDoc = defineDoc<MemoryDigestNoticesDocument>({
@@ -151,7 +154,7 @@ export const MEMORY_DIGEST_LIMITS = Object.freeze({
 
 /** Fixed, value-free refusal when every retained notice is still undelivered or unknown. */
 export const MEMORY_DIGEST_NOTICE_FULL_REASON =
-  "memory digestion cannot start: its bounded internal-result notices are full of undelivered results; " +
+  "memory digestion cannot start: its bounded internal issue notices are full of undelivered reports; " +
   "retry after an earlier run's result is admitted or its native task is settled";
 
 /**
@@ -590,7 +593,7 @@ export interface MemoryDigestStatus {
   readonly latest: MemoryDigestTaskSnapshot | null;
   /** Retained notices that are neither definitively reported nor provably nonreportable. */
   readonly pendingNotices: number;
-  /** True when one more notice slot is available without evicting an undelivered result. */
+  /** True when one more notice slot is available without evicting an undelivered issue. */
   readonly canStart: boolean;
   /** Fixed reason when `canStart` is false. */
   readonly refusal: string | null;
@@ -645,7 +648,7 @@ export interface MemoryDigest {
   /** Bounded status for one origin conversation: the live run and its newest run. */
   status(writer: Pick<MemoryDigestWriter, "id" | "commit">, context: Context): Promise<MemoryDigestStatus>;
   /**
-   * Admit the internal result event for terminal runs whose origin is still a mapped chat. Idempotent
+   * Admit the internal issue report for terminal runs whose origin is still a mapped chat. Idempotent
    * by request ID, so a crash between the terminal commit and the event loses and duplicates nothing.
    */
   recover(
@@ -669,13 +672,46 @@ function digestResultOf(record: unknown): MemoryDigestRunResult | undefined {
 }
 
 /**
+ * What one terminal digest run owes the origin agent.
+ *
+ * - `silent`: a successful run (`digested`, `noop` or an already-`consumed` replay) or a native
+ *   `faulted`/`orphaned` task that never produced a result. Nothing is delivered, ever.
+ * - `issue`: a failed or cancelled run. That is the only thing the origin agent is told about.
+ * - `unknown`: a live or malformed record, or a native status that disagrees with its result. It is
+ *   never delivered and never evicted.
+ */
+type DigestReportability = "silent" | "issue" | "unknown";
+
+/**
+ * Classify one authoritative terminal task record. The bounded result's own outcome is the
+ * authority; the native status must agree with it, so a malformed record stays `unknown` rather
+ * than being mistaken for a success or an issue.
+ */
+function digestReportability(task: unknown): DigestReportability {
+  if (!isRecord(task) || !isRecord(task.state) || task.state.status !== "terminal") return "unknown";
+  const outcome = task.state.outcome;
+  if (!isRecord(outcome)) return "unknown";
+  if (outcome.status === "faulted" || outcome.status === "orphaned") return "silent";
+  const result = digestResultOf(task);
+  if (result === undefined) return "unknown";
+  if (result.outcome === "digested" || result.outcome === "noop" || result.outcome === "consumed") {
+    return outcome.status === "completed" ? "silent" : "unknown";
+  }
+  if (result.outcome === "failed" || result.outcome === "aborted") {
+    return outcome.status === result.outcome ? "issue" : "unknown";
+  }
+  return "unknown";
+}
+
+/**
  * What one retained notice's native task proves, for the bounded cap only.
  *
- * - `notified`: the result event was admitted and the task is terminal (or already gone), so the
+ * - `notified`: the issue report was admitted and the task is terminal (or already gone), so the
  *   record is definitively reported and evictable.
- * - `nonreportable`: a genuinely terminal `faulted` or `orphaned` task never produced a digest
- *   result, so nothing can be reported and the record is evictable.
- * - `reportable`: a terminal task with a parseable bounded result that must be delivered.
+ * - `nonreportable`: the run is a success (`digested`, `noop` or `consumed`), or a native
+ *   `faulted`/`orphaned` task that never produced a result, so nothing will ever be reported and
+ *   the record is evictable.
+ * - `reportable`: a terminal failed or cancelled task whose issue report must be delivered.
  * - `unknown`: a missing, live, or malformed record. It is never evictable and never guessed.
  */
 export type MemoryDigestNoticeState = "notified" | "nonreportable" | "reportable" | "unknown";
@@ -684,11 +720,9 @@ export function memoryDigestNoticeState(notice: unknown, task: unknown): MemoryD
   const notified = isRecord(notice) && notice.notified === true;
   const terminal = isRecord(task) && isRecord(task.state) && task.state.status === "terminal";
   if (notified) return task === undefined || terminal ? "notified" : "unknown";
-  if (!terminal) return "unknown";
-  const outcome = (task as { readonly state: { readonly outcome?: unknown } }).state.outcome;
-  if (!isRecord(outcome)) return "unknown";
-  if (outcome.status === "faulted" || outcome.status === "orphaned") return "nonreportable";
-  return digestResultOf(task) === undefined ? "unknown" : "reportable";
+  const reportability = digestReportability(task);
+  if (reportability === "issue") return "reportable";
+  return reportability === "silent" ? "nonreportable" : "unknown";
 }
 
 function safeId(value: unknown): number | null {
@@ -938,8 +972,8 @@ export function renderMemoryDigestStatus(status: MemoryDigestStatus): string {
     ? "Live memory digestion run: none."
     : `Live memory digestion run: ${status.liveTaskId}. One run at a time across mapped chats.`);
   lines.push(status.pendingNotices === 0
-    ? "Internal result notices: none pending."
-    : `Internal result notices: ${status.pendingNotices} pending (bounded at ` +
+    ? "Internal issue notices: none pending."
+    : `Internal issue notices: ${status.pendingNotices} pending (bounded at ` +
       `${MEMORY_DIGEST_LIMITS.noticeRecords} per conversation).`);
   if (!status.canStart) {
     lines.push(`New starts are refused: ${status.refusal ?? MEMORY_DIGEST_NOTICE_FULL_REASON}`);
@@ -1085,7 +1119,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
   const resultRequestId = (taskId: number): string => `${MEMORY_DIGEST_RESULT_REQUEST_PREFIX}${taskId}`;
 
   /**
-   * The one bounded internal result event. Fixed wording plus this run's bounded saved fields; no
+   * The one bounded internal issue report. Fixed wording plus this run's bounded saved fields; no
    * file content, no raw provider error dump and no channel send. The agent in the origin
    * conversation decides what, if anything, to relay to its user.
    */
@@ -1172,14 +1206,16 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
   };
 
   /**
-   * Admit the internal result event for one terminal run. The write-ahead notice plus the
+   * Admit the internal issue report for one terminal run. The write-ahead notice plus the
    * conversation-scoped request ID makes a crash between the terminal commit and this admission a
    * retry instead of a lost or duplicated parent turn.
    *
-   * A missing notice record is not treated as "nothing to report": the terminal native task is
-   * authoritative. The event is skipped only when Durable holds this exact result entry; otherwise
-   * it is admitted from the task record itself (a bounded, idempotent retry). A request ID occupied
-   * by a queued or foreign input is a collision, not proof: the notice stays pending and visible.
+   * A successful run, including a no-op or a `consumed` replay, is silent here: it is never
+   * submitted, so opening, flushing or recovering the gateway cannot start a model turn after it.
+   * For an issue, a missing notice record is not treated as "nothing to report": the terminal native
+   * task is authoritative. The event is skipped only when Durable holds this exact result entry;
+   * otherwise it is admitted from the task record itself (a bounded, idempotent retry). A request ID
+   * occupied by a queued or foreign input is a collision, not proof: the notice stays pending.
    */
   const notifyThrough = async (
     harness: Harness,
@@ -1203,6 +1239,8 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
     }
     const result = digestResultOf(task);
     if (result === undefined) return false;
+    // Only an issue is worth an origin turn; a successful batch, including a no-op, stays silent.
+    if (digestReportability(task) !== "issue") return false;
     if (notice === undefined) {
       let existing: SubmissionRecord | undefined;
       try {
@@ -1266,9 +1304,9 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
   };
 
   /**
-   * Remove only records the native outcome proves safe to drop: already reported, or a terminal
-   * `faulted`/`orphaned` run that never produced a report. A missing, live or malformed record is
-   * never evicted to make room.
+   * Remove only records the native outcome proves safe to drop: already reported, a successful run
+   * that is never delivered, or a terminal `faulted`/`orphaned` run that never produced a report. A
+   * missing, live or malformed record is never evicted to make room.
    */
   const pruneNoticeSlots = async (
     tx: Tx,
@@ -1293,8 +1331,9 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
   };
 
   /**
-   * Bounded backpressure before a new start: try to admit every retained undelivered result once,
-   * outside the start commit. Failure leaves the record pending and the commit's own capacity check
+   * Bounded backpressure before a new start: try to admit every retained undelivered issue once,
+   * outside the start commit. A successful record reserves no origin turn, so this only frees its
+   * slot at the start commit. Failure leaves a record pending and the commit's own capacity check
    * decides whether a start is possible. Request IDs make a concurrent flush a no-op, not a second
    * origin turn.
    */
@@ -1778,8 +1817,9 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           // scope, exactly like a scheduled run. A user turn never waits for it.
           background: true,
         });
-        // Write-ahead the internal result admission in the same commit as the task itself, so a
-        // crash before the terminal commit still leaves one traceable, bounded notification record.
+        // Write-ahead the issue-admission record in the same commit as the task itself, so a crash
+        // before the terminal commit still leaves one traceable, bounded notification record. A
+        // successful run never uses it; the record is pruned instead of delivered.
         notices.notices.push({ taskId: Number(taskId), notified: false });
         return {
           status: "started",
@@ -1811,7 +1851,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           order: "descending",
         }, 1);
         const latest = page.items[0] === undefined ? undefined : taskSnapshot(page.items[0]);
-        // Report retained notices by what their native records prove: only a reported or
+        // Report retained notices by what their native records prove: a reported, successful or
         // faulted/orphaned record frees a slot, so the count matches the start commit's decision.
         let pendingNotices = 0;
         for (const notice of notices) {

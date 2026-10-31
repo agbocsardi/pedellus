@@ -44,7 +44,8 @@ remain. `2026-10-30_lean-assistant_TODO.md` stays the work-order authority.
    exist in the attached CLI and for the authenticated Telegram owner. An
    ordinary `cron add` with `intent: "digest"` is the only scheduled entry. A
    terminal run admits one `nanobot.memory-digest-result` internal event to its
-   origin agent; it queues no channel message.
+   origin agent only when it failed or was cancelled; a successful run, including
+   a no-op, is silent and queues no channel message.
 4. **Optional local voice without Python.** `media.transcription.backend:
    "whisper-cli"` selects an operator-provisioned whisper.cpp CLI with FFmpeg
    pre-decoding. Absent or `"faster-whisper"` keeps the existing uv helper and
@@ -107,7 +108,7 @@ reused read-only; no `npm ci`/prune/install and no lockfile change.
   history/memory, owner controls, cron, workers, media, MCP and web suites are
   all included. `package.json`/`package-lock.json` unchanged.
 - `npm run typecheck` and `npm run build` pass.
-- Registered behavior suite: **244 passed, 0 failed** under GNU
+- Registered behavior suite: **245 passed, 0 failed** under GNU
   `timeout --kill-after=5s 60s`.
 - Execution suite: **2 passed, 0 failed** under the same bound.
 - Offline core acceptance: **83 passed, 0 failed** (`status: pass`,
@@ -115,13 +116,15 @@ reused read-only; no `npm ci`/prune/install and no lockfile change.
 - Focused union selection (the same bound, the existing files only):
   `memory-digest-controls`, `memory-digest`, `history-digestion`,
   `local-attachments`, `transcription-backends`, `telegram-commands` —
-  **77 passed, 0 failed**. This is where the cross-feature stories live:
+  **78 passed, 0 failed**. This is where the cross-feature stories live:
   - authenticated CLI `/digest` start plus read-only status, and Telegram
     `/digest` admission/refusal for the authenticated owner;
   - closed episode → digest turn → plain Markdown write → cursor advance →
-    exactly one internal result → origin idle, with authority retired;
-  - notice cap/backpressure, reopen dedupe from the authoritative native task,
-    and a reopen that keeps the pinned model/curation scope;
+    success stays silent (no internal event, no origin turn) → origin idle, with
+    authority retired; a later failure reports exactly once;
+  - issues-only notice cap/backpressure, a legacy pending success that is never
+    delivered and frees its slot, reopen dedupe from the authoritative native
+    task, and a reopen that keeps the pinned model/curation scope;
   - explicit `cron` digest intent: one run, no task-owned conversation, empty
     channel outbox, next timer slot armed independently of the run, and
     narrowed-reopen refusal;
@@ -143,19 +146,23 @@ No new test file, fixture/harness or package was added.
   authority. Its task-owned target gets no Code Mode, worker, history, MCP, web,
   cron, channel-send or shell authority; it keeps only the curation scope and
   captured Markdown tools. A terminal run retires that authority.
-- Manual start is immediate; status is read-only. Flushing retained results
-  before a start may resume an origin agent turn.
+- Manual start is immediate; status is read-only. Flushing retained issues
+  before a start may resume an origin agent turn; a successful run never does.
 - A digest cron job is optional and never created by startup; an occurrence is
-  not a model turn and queues no outbox delivery. Result notification is
-  exactly-once per terminal result, **not** exactly one batch per occurrence:
+  not a model turn and queues no outbox delivery. Only a failed or cancelled run
+  notifies the origin agent; a successful run is silent and its outcome is visible
+  only in `/digest status`. Issue notification is exactly-once per failed or
+  cancelled result, **not** exactly one batch per occurrence:
   a crash after start can replay into one extra bounded batch. Its next timer
   slot is committed separately, so a slow or failed run cannot stop the
   schedule.
-- Retained result notices are a delivery obligation, capped at 100 per origin:
-  undelivered/unknown results are never evicted; when no safe slot remains a
-  start refuses with fixed text. Recovery re-admits from the authoritative
-  terminal task and verifies the placed entry is this task's
-  `nanobot.memory-digest-result`, because Durable dedupes by request ID alone.
+- Retained issue notices are a delivery obligation, capped at 100 per origin:
+  undelivered/unknown issues are never evicted; when no safe slot remains a
+  start refuses with fixed text. A successful run's pending record is not an
+  obligation: it is never delivered and may free its slot. Recovery re-admits
+  from the authoritative terminal task and verifies the placed entry is this
+  task's `nanobot.memory-digest-result`, because Durable dedupes by request ID
+  alone.
 
 ## Accepted limitations and assumptions
 

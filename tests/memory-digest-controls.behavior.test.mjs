@@ -2,8 +2,9 @@
 //
 // These checks use the real Gateway, a faux provider and a disposable synthetic workspace. They
 // cover: no activation on open or in configuration; the local CLI `/digest` host command through
-// the private socket; bounded status; exactly one internal result event on success, failure, no-op
-// and cancellation, including a reopen retry that the request ID deduplicates; prompt freshness
+// the private socket; bounded status; successful runs (including a no-op) staying silent while a
+// failure or cancellation reports exactly one internal issue event, including a reopen retry that
+// the request ID deduplicates and a legacy pending success that is never delivered; prompt freshness
 // (a new batch reads the edited DIGEST.md, an in-flight attempt keeps its admitted text); idle
 // pending versus complete wording; an ordinary cron job with explicit digest intent that calls the
 // same native entry once, leaves scheduling to the timer, captures the mapped origin and current
@@ -147,7 +148,7 @@ function configFor(fixture, overrides = {}) {
 }
 
 /**
- * Real Gateway over a faux dispatcher. Digest batch requests and the internal result turns are
+ * Real Gateway over a faux dispatcher. Digest batch requests and the internal issue-report turns are
  * distinguished, so a script only ever sees the batch it is meant to answer.
  */
 async function openStore(fixture, script, overrides = {}, openOptions = {}) {
@@ -230,7 +231,7 @@ async function settleTask(harness, taskId) {
   return harness.getTask(taskId, context);
 }
 
-/** Wait until the origin's own turn (including the internal result turn) has settled. */
+/** Wait until the origin's own turn (including an internal issue-report turn) has settled. */
 async function originIdle(harness, conversationId) {
   const conversation = await harness.conversation(conversationId, context);
   assert.ok(conversation !== undefined);
@@ -331,9 +332,12 @@ test('the local CLI /digest starts one batch and reports bounded status', { time
     return candidate !== undefined && candidate.state.status === 'terminal' ? candidate : undefined;
   }, 'the CLI-started digest task');
   assert.equal(task.state.outcome.result.outcome, 'digested');
-  assert.equal((await digestNotices(store.gateway.harness, origin.id)).length, 1);
+  // A successful run is silent: it delivers no internal result event and so no origin-agent turn.
+  assert.equal((await digestNotices(store.gateway.harness, origin.id)).length, 0);
   const status = await statusOf(store.gateway);
   assert.equal(status.latest.taskId, Number(task.id));
+  assert.equal(status.latest.outcome, 'digested', 'status still shows the successful outcome');
+  assert.equal(status.pendingNotices, 0);
 
   // With nothing pending, a second /digest reports a complete scan and starts nothing.
   assert.equal((await startDigest(store.gateway)).status, 'idle');
@@ -356,7 +360,7 @@ test('an idle scan that did not reach every chat never claims that everything is
   assert.doesNotMatch(complete, /no model was called/);
 });
 
-test('one internal result event per run: success, failure and a reopen retry that deduplicates', { timeout: 40_000 }, async (t) => {
+test('a successful run stays silent while a failure reports once and a reopen deduplicates', { timeout: 40_000 }, async (t) => {
   const fixture = await fixtureWorkspace();
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
   const state = { fail: false };
@@ -370,11 +374,13 @@ test('one internal result event per run: success, failure and a reopen retry tha
   assert.equal(first.status, 'started');
   const firstTask = await settleTask(store.gateway.harness, first.taskId);
   assert.equal(firstTask.state.outcome.status, 'completed');
-  await waitFor(async () => (await digestNotices(store.gateway.harness, origin.id)).length === 1, 'one success notice');
-  const successNotice = (await digestNotices(store.gateway.harness, origin.id))[0];
-  assert.match(messageText(successNotice.model?.[0]), /settled: digested/);
-  assert.match(messageText(successNotice.model?.[0]), /frontier advanced/);
   await originIdle(store.gateway.harness, origin.id);
+  assert.equal((await digestNotices(store.gateway.harness, origin.id)).length, 0,
+    'a successful run delivers no internal result event');
+  const successRecords = await store.gateway.harness.snapshot(MemoryDigestNoticesDoc, origin.id, context);
+  assert.deepEqual(successRecords?.notices, [{ taskId: first.taskId, notified: false }],
+    'the write-ahead record survives, unreported and safe to prune');
+  assert.equal(store.calls.length, 1, 'the successful batch was the only model request');
 
   // A fresh closed episode is owed; the first batch's frontier is already advanced.
   await closedEpisode(store.gateway.harness, origin.id, [user('Second small talk.'), assistant('Sure.')]);
@@ -384,38 +390,51 @@ test('one internal result event per run: success, failure and a reopen retry tha
   const secondTask = await settleTask(store.gateway.harness, second.taskId);
   assert.equal(secondTask.state.outcome.status, 'failed');
   assert.equal(secondTask.state.outcome.result.consumed, false);
-  await waitFor(async () => (await digestNotices(store.gateway.harness, origin.id)).length === 2, 'one failure notice');
-  const failureNotice = (await digestNotices(store.gateway.harness, origin.id))[1];
+  await waitFor(async () => (await digestNotices(store.gateway.harness, origin.id)).length === 1, 'one failure report');
+  const failureNotice = (await digestNotices(store.gateway.harness, origin.id))[0];
   assert.match(messageText(failureNotice.model?.[0]), /settled: failed/);
   assert.match(messageText(failureNotice.model?.[0]), /frontier is unchanged/);
+  assert.equal(failureNotice.data?.taskId, second.taskId, 'the failure is the reported run');
+  await originIdle(store.gateway.harness, origin.id);
 
-  // Simulate a crash between the terminal commit and the notice admission, then reopen. The same
-  // request ID must re-admit instead of duplicating the origin agent's turn.
+  // Simulate a crash between the terminal commit and the notice admission, then reopen. The legacy
+  // pending success must never be delivered; the failure re-admits under the same request ID
+  // instead of duplicating the origin agent's turn.
   await store.gateway.harness.commit(async (tx) => {
     const doc = await tx.doc(MemoryDigestNoticesDoc, origin.id);
     for (const notice of doc.notices) notice.notified = false;
     return undefined;
   }, context);
+  const callsBefore = store.calls.length;
   await store.gateway.close(context);
   const reopened = await openGateway(store.config, context, { models: store.models });
   t.after(async () => { await reopened.close(context).catch(() => undefined); });
-  await waitFor(async () => {
-    const current = await reopened.harness.snapshot(MemoryDigestNoticesDoc, origin.id, context);
-    return current?.notices.every((notice) => notice.notified === true) === true;
-  }, 'the reopen notice pass');
-  assert.equal((await digestNotices(reopened.harness, origin.id)).length, 2,
-    'the reopen retried both admissions and the request IDs deduplicated them');
+  await originIdle(reopened.harness, origin.id);
+  const notices = await reopened.harness.snapshot(MemoryDigestNoticesDoc, origin.id, context);
+  assert.equal(notices.notices.find((notice) => notice.taskId === first.taskId)?.notified, false,
+    'the legacy pending success is neither delivered nor marked reported');
+  assert.equal(notices.notices.find((notice) => notice.taskId === second.taskId)?.notified, true,
+    'the failure is the only reported outcome');
+  assert.equal((await digestNotices(reopened.harness, origin.id)).length, 1,
+    'the reopen retried the issue admission and the request ID deduplicated it');
+  assert.equal(store.calls.length, callsBefore, 'the reopen started no new origin-agent turn');
+  const status = await statusOf(reopened);
+  assert.equal(status.pendingNotices, 0, 'neither a success nor a reported issue holds a pending slot');
 });
 
-test('a full notice queue refuses a start without evicting an undelivered result, then reopen retries once', { timeout: 60_000 }, async (t) => {
+test('a full notice queue refuses a start without evicting an undelivered issue, then reopen retries once', { timeout: 60_000 }, async (t) => {
   const fixture = await fixtureWorkspace();
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
-  const store = await openStore(fixture, answerNothing);
+  // A failed run is an issue, so its report is a real delivery obligation.
+  const store = await openStore(fixture, () => fauxAssistantMessage('provider unavailable', {
+    stopReason: 'error',
+    errorMessage: 'provider unavailable',
+  }));
   const origin = await store.gateway.conversationFor(SESSION, context);
   await closedEpisode(store.gateway.harness, origin.id, [user('First closed episode.'), assistant('Noted.')]);
 
   // Controllable admission failure: the digest target and ordinary conversation lookup still work,
-  // but submitting this origin's internal result throws until the patch is removed.
+  // but submitting this origin's internal issue report throws until the patch is removed.
   const harness = store.gateway.harness;
   const originalConversation = harness.conversation.bind(harness);
   let denyNotice = true;
@@ -441,7 +460,7 @@ test('a full notice queue refuses a start without evicting an undelivered result
   const started = await startDigest(store.gateway);
   assert.equal(started.status, 'started');
   const task = await settleTask(store.gateway.harness, started.taskId);
-  assert.equal(task.state.outcome.status, 'completed');
+  assert.equal(task.state.outcome.status, 'failed');
   const noticeDoc = async (reader) => reader.snapshot(MemoryDigestNoticesDoc, origin.id, context);
   await waitFor(async () => {
     const current = await noticeDoc(store.gateway.harness);
@@ -516,7 +535,7 @@ test('a full notice queue refuses a start without evicting an undelivered result
   await settleTask(reopened.harness, next.taskId);
   const resultEntries = async (reader) => (await entriesOf(reader, origin.id))
     .filter((entry) => entry.kind === MEMORY_DIGEST_RESULT_ENTRY_KIND);
-  await waitFor(async () => (await resultEntries(reopened.harness)).length === 2, 'the second internal result');
+  await waitFor(async () => (await resultEntries(reopened.harness)).length === 2, 'the second internal issue report');
   const originalNotices = (await resultEntries(reopened.harness))
     .filter((entry) => entry.data?.taskId === started.taskId);
   assert.equal(originalNotices.length, 1, 'a recovered admission is never duplicated');
@@ -525,11 +544,13 @@ test('a full notice queue refuses a start without evicting an undelivered result
 test('a foreign input under the result request ID stays pending and visible, never reported', { timeout: 60_000 }, async (t) => {
   const fixture = await fixtureWorkspace();
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
-  const store = await openStore(fixture, answerNothing);
+  // Keep the real issue admission from landing, then remove its record to model the old eviction.
+  const store = await openStore(fixture, () => fauxAssistantMessage('provider unavailable', {
+    stopReason: 'error',
+    errorMessage: 'provider unavailable',
+  }));
   const origin = await store.gateway.conversationFor(SESSION, context);
   await closedEpisode(store.gateway.harness, origin.id, [user('First closed episode.'), assistant('Noted.')]);
-
-  // Keep the real result admission from landing, then remove its record to model the old eviction.
   const harness = store.gateway.harness;
   const originalConversation = harness.conversation.bind(harness);
   let denyNotice = true;
@@ -631,25 +652,112 @@ test('a foreign input under the result request ID stays pending and visible, nev
   assert.equal(refusedStatus.canStart, false);
 });
 
-test('notice pruning only frees reported or genuinely nonreportable outcomes', () => {
+test('notice pruning only frees reported, successful or genuinely nonreportable outcomes', () => {
   const live = { state: { status: 'running' } };
   const faulted = { state: { status: 'terminal', outcome: { status: 'faulted', error: { message: 'x' } } } };
   const orphaned = { state: { status: 'terminal', outcome: { status: 'orphaned', reason: 'x' } } };
   const abortedWithResult = {
     state: { status: 'terminal', outcome: { status: 'aborted', reason: 'x', result: { outcome: 'aborted' } } },
   };
+  const failedWithResult = {
+    state: {
+      status: 'terminal',
+      outcome: { status: 'failed', error: { message: 'x' }, result: { outcome: 'failed' } },
+    },
+  };
+  const digested = { state: { status: 'terminal', outcome: { status: 'completed', result: { outcome: 'digested' } } } };
+  const noop = { state: { status: 'terminal', outcome: { status: 'completed', result: { outcome: 'noop' } } } };
+  const consumed = { state: { status: 'terminal', outcome: { status: 'completed', result: { outcome: 'consumed' } } } };
   const completedWithoutResult = { state: { status: 'terminal', outcome: { status: 'completed' } } };
+  const successUnderFailure = {
+    state: { status: 'terminal', outcome: { status: 'failed', error: { message: 'x' }, result: { outcome: 'noop' } } },
+  };
+  const issueUnderCompletion = {
+    state: { status: 'terminal', outcome: { status: 'completed', result: { outcome: 'failed' } } },
+  };
   assert.equal(memoryDigestNoticeState({ notified: false }, undefined), 'unknown');
   assert.equal(memoryDigestNoticeState({ notified: false }, live), 'unknown');
   assert.equal(memoryDigestNoticeState({ notified: false }, {}), 'unknown');
   assert.equal(memoryDigestNoticeState({ notified: false }, completedWithoutResult), 'unknown');
   assert.equal(memoryDigestNoticeState({ notified: false }, faulted), 'nonreportable');
   assert.equal(memoryDigestNoticeState({ notified: false }, orphaned), 'nonreportable');
+  assert.equal(memoryDigestNoticeState({ notified: false }, digested), 'nonreportable');
+  assert.equal(memoryDigestNoticeState({ notified: false }, noop), 'nonreportable');
+  assert.equal(memoryDigestNoticeState({ notified: false }, consumed), 'nonreportable');
+  assert.equal(memoryDigestNoticeState({ notified: false }, successUnderFailure), 'unknown');
+  assert.equal(memoryDigestNoticeState({ notified: false }, issueUnderCompletion), 'unknown');
+  assert.equal(memoryDigestNoticeState({ notified: false }, failedWithResult), 'reportable');
   assert.equal(memoryDigestNoticeState({ notified: false }, abortedWithResult), 'reportable');
   assert.equal(memoryDigestNoticeState({ notified: true }, undefined), 'notified');
   assert.equal(memoryDigestNoticeState({ notified: true }, abortedWithResult), 'notified');
   assert.equal(memoryDigestNoticeState({ notified: true }, live), 'unknown');
   assert.equal(MEMORY_DIGEST_NOTICES_KIND, 'nanobot.memory-digest-notices');
+});
+
+test('a reopen keeps a successful run silent and reclaims its retained slot without evicting unknown records', { timeout: 40_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, answerNothing);
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('Small talk.'), assistant('Sure.')]);
+  const success = await startDigest(store.gateway);
+  assert.equal(success.status, 'started');
+  await settleTask(store.gateway.harness, success.taskId);
+  await originIdle(store.gateway.harness, origin.id);
+  const callsAfterSuccess = store.calls.length;
+  assert.equal(callsAfterSuccess, 1, 'the successful batch was the only model request');
+
+  // A prior version left this success record pending, as if its result still owed a delivery. It is
+  // not an obligation: a reopen must not deliver it, and a start may free its slot.
+  const noticeDoc = async (reader) => reader.snapshot(MemoryDigestNoticesDoc, origin.id, context);
+  assert.deepEqual((await noticeDoc(store.gateway.harness)).notices, [{ taskId: success.taskId, notified: false }]);
+
+  // Fill the bounded list with records whose native task is unknown: never evictable.
+  const maxTaskId = await store.gateway.harness.commit(async (tx) => {
+    let max = 0;
+    let cursor;
+    do {
+      const page = await tx.scanTasks({}, 1000, cursor);
+      for (const record of page.items) max = Math.max(max, Number(record.id));
+      cursor = page.next;
+    } while (cursor !== undefined);
+    return max;
+  }, context);
+  await store.gateway.harness.commit(async (tx) => {
+    const doc = await tx.doc(MemoryDigestNoticesDoc, origin.id);
+    for (let index = doc.notices.length; index < MEMORY_DIGEST_LIMITS.noticeRecords; index += 1) {
+      doc.notices.push({ taskId: maxTaskId + 10_000 + index, notified: false });
+    }
+    return undefined;
+  }, context);
+  assert.equal((await noticeDoc(store.gateway.harness)).notices.length, MEMORY_DIGEST_LIMITS.noticeRecords);
+  const before = await statusOf(store.gateway);
+  assert.equal(before.pendingNotices, MEMORY_DIGEST_LIMITS.noticeRecords - 1,
+    'the successful record is not a pending delivery obligation');
+  assert.equal(before.canStart, true);
+
+  await store.gateway.close(context);
+  const reopened = await openGateway(store.config, context, { models: store.models });
+  t.after(async () => { await reopened.close(context).catch(() => undefined); });
+  await originIdle(reopened.harness, origin.id);
+  assert.equal(store.calls.length, callsAfterSuccess, 'opening and recovery delivered no successful run');
+  assert.equal((await digestNotices(reopened.harness, origin.id)).length, 0);
+  assert.equal((await noticeDoc(reopened.harness)).notices.find((notice) => notice.taskId === success.taskId)?.notified,
+    false, 'the success record stays unreported');
+
+  // A start reclaims exactly that slot. The unknown records stay retained, so nothing is silently
+  // dropped to make room.
+  await closedEpisode(reopened.harness, origin.id, [user('A second closed episode.'), assistant('Noted.')]);
+  const next = await startDigest(reopened);
+  assert.equal(next.status, 'started');
+  const reclaimed = (await noticeDoc(reopened.harness)).notices;
+  assert.equal(reclaimed.some((notice) => notice.taskId === success.taskId), false,
+    'the successful record freed its slot');
+  assert.equal(reclaimed.filter((notice) => notice.taskId > maxTaskId && notice.taskId !== next.taskId).length,
+    MEMORY_DIGEST_LIMITS.noticeRecords - 1, 'no unknown record was evicted');
+  assert.equal(reclaimed.find((notice) => notice.taskId === next.taskId)?.notified, false,
+    'the new run has its own write-ahead record');
+  await settleTask(reopened.harness, next.taskId);
 });
 
 test('a new batch reloads the edited DIGEST.md while an in-flight attempt keeps its admitted text', { timeout: 40_000 }, async (t) => {
@@ -814,7 +922,11 @@ test('an explicit cron digest job calls the same entry once and leaves schedulin
   }, context);
   assert.deepEqual(owned, [], 'the digest cron run creates no task-owned conversation');
 
-  await waitFor(async () => (await digestNotices(store.gateway.harness, origin.id)).length === 1, 'internal result');
+  // A successful run is silent: the cron occurrence still queues no channel delivery and the origin
+  // agent gets no internal result event.
+  await originIdle(store.gateway.harness, origin.id);
+  assert.equal((await digestNotices(store.gateway.harness, origin.id)).length, 0,
+    'a successful cron digest delivers no internal result event');
   assert.deepEqual(await store.gateway.cronOutbox.list(originSession, context), [],
     'digest completion is not a user/channel delivery');
 });

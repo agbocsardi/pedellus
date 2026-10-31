@@ -86,9 +86,11 @@ differs is only the run phase:
   the host calls the same native `start` a manual `/digest` uses. `start`
   re-checks that the origin is still a mapped chat and re-reads the current
   curation allowlist, so a narrowed configuration refuses instead of widening.
-- It queues no delivery in the channel outbox. The digest task's own bounded
-  internal result event reports to the origin agent; existing scheduled-message
-  delivery and its dedupe/unknown-send behavior are unchanged.
+- It queues no delivery in the channel outbox. Only a failed or cancelled digest
+  run's bounded internal issue report reaches the origin agent; a successful run,
+  including a successful no-op, is silent and starts no origin-agent turn. Its
+  outcome stays visible in `/digest status`. Existing scheduled-message delivery
+  and its dedupe/unknown-send behavior are unchanged.
 - `lastOutcome` records the bounded host settlement (`ok` when a run started, one
   was already live or nothing was pending; `error` with fixed text for a refusal,
   a full undelivered-notice queue or a missing host entry), so `cron list` shows

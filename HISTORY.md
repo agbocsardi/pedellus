@@ -924,29 +924,35 @@ curation tools (including a failed call before the reopen that still fails the r
   the schedule. Cancelling the job stops its occurrence and later ones; an already-started digest
   task is a separate native task and is cancelled through the native task controls.
 
-Completion is visible through one bounded internal Durable event per terminal run, not a user or
-channel message. Its entry kind is `nanobot.memory-digest-result`, it is admitted to the origin
-conversation at the conversation-scoped request ID `nanobot.memory-digest-result:<taskId>`, and it
-reports only the outcome, the bounded batch shape, the evidence count and a bounded report excerpt.
-The origin agent decides what, if anything, to relay. A small write-ahead notice document records
-which terminal runs were admitted so a reopen retries a lost admission; the request ID makes that
-retry a no-op instead of a duplicate turn. A successful `digested`, a provider-free `noop`, a
-`consumed` replay and a failed or aborted run each notify once. Digest cron jobs queue nothing in
-the channel delivery outbox, so existing scheduled-job notices and dedupe are unchanged.
+Completion is issues-only: a failed or cancelled run admits one bounded internal Durable event,
+never a user or channel message. Its entry kind is `nanobot.memory-digest-result`, it is admitted to
+the origin conversation at the conversation-scoped request ID
+`nanobot.memory-digest-result:<taskId>`, and it reports only the outcome, the bounded batch shape,
+the evidence count and a bounded report excerpt. The origin agent decides what, if anything, to
+relay. A successful run — `digested`, a provider-free `noop`, or an already-`consumed` replay — is
+silent: it admits no event, so opening, starting, flushing or recovering the gateway cannot start an
+origin-agent turn after it, and `/digest status` is where its outcome stays visible. A small
+write-ahead notice document records which terminal runs were admitted so a reopen retries a lost
+admission; the request ID makes that retry a no-op instead of a duplicate turn. Digest cron jobs
+queue nothing in the channel delivery outbox, so existing scheduled-job notices and dedupe are
+unchanged.
 
 The notice list is bounded at 100 records per origin and treated as a delivery obligation, not a
-cache. It is pruned only when a record is definitively reported, or when the native outcome proves
-there is nothing to report (a genuinely terminal `faulted` or `orphaned` task). A missing, live or
-malformed record is unknown and is never evicted; an undelivered reportable result is never evicted.
-Before a start consumes a batch, retained undelivered results are flushed once, outside the start
+cache. It is pruned only when a record is definitively reported, when the native outcome is a
+successful run that will never be delivered, or when the native outcome proves there is nothing to
+report (a genuinely terminal `faulted` or `orphaned` task). A pending successful record left behind
+by an older version is never delivered and may free its slot. A missing, live or malformed record
+is unknown and is never evicted; an undelivered issue is never evicted.
+Before a start consumes a batch, retained undelivered issues are flushed once, outside the start
 commit. The start commit then prunes only safe records and reserves its own slot atomically with the
 task; if no safe slot remains it returns `refused` with fixed text, starts no task, consumes no
 batch and makes no provider request. The same count is visible in `/digest status` (pending notices
 and whether a new start is possible), so an owner never sees a silent loss or an unexplained refusal.
 
 Recovery does not depend on the record surviving. `recover` treats the terminal native task as
-authoritative: if its notice record is missing, it re-admits the event only when Durable does not
-already hold this exact result entry. Durable deduplicates an input by request ID alone, so a
+authoritative: a successful run is never admitted, and for an issue whose record is missing, the
+event is re-admitted only when Durable does not already hold this exact result entry. Durable
+deduplicates an input by request ID alone, so a
 request ID occupied by a queued or foreign input is a collision, not proof: the placed entry must
 have `nanobot.memory-digest-result` kind and this task's `data.taskId` in the origin conversation.
 A queued, missing or foreign entry never marks the run reported; a missing record is reconstructed
@@ -959,7 +965,7 @@ Two bounded edges are stated rather than implied. A cron occurrence whose digest
 then crashes before its run commit is replayed on reopen and can process one additional bounded
 batch before the occurrence finishes; a digest cron occurrence is therefore not claimed to consume
 exactly one batch in that crash window, while manual `start` still consumes at most one accepted
-batch per call. If an origin mapping is removed at settle time, the internal result route has no tools
+batch per call. If an origin mapping is removed at settle time, the internal issue route has no tools
 or authority, exactly as the accepted worker result behaves.
 
 Status is bounded and read-only: `memoryDigest.status(writer, context)` returns the live task ID
@@ -974,8 +980,10 @@ the text it admitted (a resumed attempt re-submits the same request ID, so its p
 authoritative). Editing `DIGEST.md` or any memory file never rewrites an assembled workspace prompt
 mid-turn; the existing refresh/`/new` path is still what updates an ordinary conversation's
 snapshot on its next request. `tests/memory-digest-controls.behavior.test.mjs` covers the manual CLI
-path, Telegram command exposure, no activation on open, exactly-once success/failure/no-op/abort
-notices with reopen dedupe, idle-pending wording, prompt freshness including an in-flight pin, the
+path, Telegram command exposure, no activation on open, issues-only reporting where a success or
+no-op stays silent (no event, no origin turn) while failure and cancellation report once with reopen
+dedupe, a legacy pending success that is suppressed and whose slot is reclaimed, idle-pending
+wording, prompt freshness including an in-flight pin, the
 cron digest occurrence and its independent reschedule, narrowed-reopen refusal, and cancellation
 leaving cursor and authority unchanged. All checks are offline with a faux provider and a
 synthetic workspace; no live provider, channel, credential or personal workspace was used.

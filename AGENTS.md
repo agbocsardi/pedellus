@@ -105,17 +105,21 @@ npm start -- agent --config config.json     # attach a terminal
   validated from its own committed input through its own answer: any failed
   `pi.tool-result` fails the batch even if the model answers later, and a
   non-empty report is required. The editable workspace policy is `DIGEST.md`
-  (seeded only when absent) and it can never grant authority. A terminal run
-  admits exactly one bounded internal result event to its origin conversation
-  (`nanobot.memory-digest-result`, deduplicated by request ID); the agent decides
-  what to relay, and a digest cron occurrence queues no channel delivery. The
-  bounded notice list is pruned only for definitively reported or genuinely
-  nonreportable (`faulted`/`orphaned`) native outcomes; an undelivered or unknown
-  result is never evicted, and a start refuses with fixed text when no safe slot
-  remains. Recovery re-admits from the authoritative terminal task when the
-  record is missing, without advancing the cursor, and only when the placed entry
-  is this task's internal result (Durable dedupes by request ID alone); a queued
-  or foreign entry under that ID stays pending and visible. No digest run gets shell,
+  (seeded only when absent) and it can never grant authority. Only a failed or
+  cancelled run admits one bounded internal issue report to its origin
+  conversation (`nanobot.memory-digest-result`, deduplicated by request ID); a
+  successful run, including a successful no-op or an already-consumed replay, is
+  silent and starts no origin-agent turn, and `/digest status` still shows its
+  outcome. The agent decides what to relay, and a digest cron occurrence queues no
+  channel delivery. The bounded notice list is pruned only for definitively
+  reported, successful, or genuinely nonreportable (`faulted`/`orphaned`) native
+  outcomes; a pending successful record left by an older version is never
+  delivered and may free its slot, while an undelivered or unknown issue is never
+  evicted. A start refuses with fixed text when no safe slot remains. Recovery
+  re-admits from the authoritative terminal task when the record is missing,
+  without advancing the cursor, and only when the placed entry is this task's
+  internal issue report (Durable dedupes by request ID alone); a queued or foreign
+  entry under that ID stays pending and visible. No digest run gets shell,
   network, worker, channel-send, history, MCP or scheduling authority, and a
   digest cron occurrence runs from the validated mapped origin with the current
   allowlist, never from a task-owned target.
