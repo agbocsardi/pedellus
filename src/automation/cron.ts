@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { copyJson, type Context, type Draft, type JsonValue } from "@earendil-works/chord";
-import { LiveDoc, defineDoc, defineExtension, defineTask } from "@earendil-works/pi-durable";
+import { LiveDoc, ResetEntry, defineDoc, defineExtension, defineTask } from "@earendil-works/pi-durable";
 import type {
   ConversationHandle,
   ConversationId,
@@ -31,6 +31,7 @@ import {
 } from "./cron-delivery.js";
 import {
   CRON_ONE_OFF_QUEUE_LIMIT,
+  CronConversationDoc,
   ensureAutomationConversation,
   readOneOffQueue,
   type CronOneOffQueueEntry,
@@ -52,6 +53,12 @@ const RUN_TASK_VERSION = 2;
  */
 const ONE_OFF_QUEUE_FULL =
   `one-off run queue is full (${CRON_ONE_OFF_QUEUE_LIMIT} admitted runs); this occurrence was not run`;
+/**
+ * Fixed failure text for an occurrence whose shared one-off queue cannot be read. The document is
+ * never guessed at or rewritten: the occurrence is refused with visible text instead of faulting its
+ * run task and blocking the job behind a parked task.
+ */
+const ONE_OFF_QUEUE_MALFORMED = "one-off run queue is malformed; this occurrence was not run";
 /**
  * How long a cancelled run waits for its automation conversation to go idle. It is a bound, not a
  * guarantee: a provider request that ignores the abort signal can keep running, and the next run
@@ -362,7 +369,8 @@ export interface CronFoundationOptions {
   readonly digest?: CronDigest;
   /**
    * Optional native reset boundary for one background run. Called only for an occurrence whose own
-   * input is not placed yet, never in origin mode and never for a digest occurrence.
+   * input is not placed yet and whose conversation does not already end at a reset entry, never in
+   * origin mode and never for a digest occurrence.
    */
   readonly reset?: CronReset;
   /** The Harness clock (`HarnessOptions.now`); default `Date.now`. */
@@ -777,6 +785,30 @@ async function leaveOneOffQueue(
   }
 }
 
+type CronRunRuntime = TaskRuntime<CronOccurrenceInput, CronRunCheckpoint, CronRunResult, object>;
+
+/**
+ * Read one recorded automation conversation and its own class marker before the claim commit. It is
+ * a plain snapshot read, so an unadoptable pointer never even gets a document written onto it;
+ * `ensureAutomationConversation` then decides adoption from this exact pair.
+ */
+async function recordedAutomationConversation(
+  runtime: Pick<CronRunRuntime, "snapshot">,
+  context: Context,
+  recordedId: number | null | undefined,
+): Promise<{ readonly id: number; readonly marker: unknown } | null> {
+  if (recordedId === null || recordedId === undefined
+    || !Number.isSafeInteger(recordedId) || recordedId < 1) return null;
+  try {
+    return {
+      id: recordedId,
+      marker: await runtime.snapshot(CronConversationDoc, recordedId as ConversationId, context),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Build the deterministic timer plus execution controller. Gateway and delivery stay outside. */
 export function createCronFoundation(options: CronFoundationOptions): CronFoundation {
   const prepare = options.prepare;
@@ -852,13 +884,30 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           let waitFor: TaskId | null = null;
           let prepareError: string | null = null;
           let target: ConversationId | null = null;
+          // Read the recorded conversation pointers and their own class markers before the claim
+          // commit. A snapshot read creates nothing, so a damaged or hand-edited pointer cannot even
+          // have a marker written onto the chat it names; a pointer that changed before the commit
+          // is simply not adopted and costs one new conversation.
+          const before = await runtime.snapshot(CronJobsDoc, running.conversationId, context);
+          const beforeJob = before?.jobs.find((candidate) => candidate.id === input.jobId);
+          const jobPointer = await recordedAutomationConversation(
+            runtime, context, beforeJob?.conversationId,
+          );
+          const oneOffPointer = await recordedAutomationConversation(
+            runtime, context, before?.oneOffConversationId,
+          );
 
           await runtime.commit(async (tx) => {
             const doc = await tx.doc(CronJobsDoc, running.conversationId);
             const fence = runFence(
               doc.jobs.find((candidate) => candidate.id === input.jobId), input, running.id,
             );
-            if (fence.rejected !== undefined) return fence.rejected;
+            if (fence.rejected !== undefined) {
+              // A fenced run leaves the catch-all queue too: a one-off cancelled while the gateway
+              // was down is claimed again on reopen and terminates here.
+              await leaveOneOffQueue(doc, running.id);
+              return fence.rejected;
+            }
             const stored = doc.jobs.find((candidate) => candidate.id === input.jobId)!;
             const job = fence.job!;
             const background = job.mode === "background" && intentOf(job) !== "digest";
@@ -872,44 +921,57 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
                 originConversationId: running.conversationId,
                 conversationClass: "recurring",
                 jobId: job.id,
-                recordedId: job.conversationId ?? null,
+                recorded: jobPointer?.id === stored.conversationId ? jobPointer : null,
               });
               stored.conversationId = target;
             } else {
               // One-off jobs share one catch-all conversation per origin and queue on it.
-              target = await ensureAutomationConversation(tx, {
-                originConversationId: running.conversationId,
-                conversationClass: "one-off",
-                jobId: null,
-                recordedId: doc.oneOffConversationId ?? null,
-              });
-              doc.oneOffConversationId = target;
-              const queue = readOneOffQueue(doc.oneOffQueue);
-              // An entry whose run task already ended can never execute, so it must not hold the
-              // queue in front of a live occurrence after a crash or a lost pointer.
-              const live: CronOneOffQueueEntry[] = [];
-              for (const entry of queue) {
-                const record = await tx.task(entry.taskId as TaskId);
-                if (record !== undefined && record.state.status !== "terminal") live.push(entry);
+              let queue: CronOneOffQueueEntry[] | null;
+              try {
+                queue = readOneOffQueue(doc.oneOffQueue);
+              } catch {
+                queue = null;
               }
-              if (!live.some((entry) => entry.taskId === running.id)) {
-                if (live.length >= CRON_ONE_OFF_QUEUE_LIMIT) refused = ONE_OFF_QUEUE_FULL;
-                else {
-                  live.push({
-                    jobId: job.id,
-                    scheduledAtMs: input.scheduledAtMs,
-                    taskId: running.id,
-                  });
+              if (queue === null) {
+                // A malformed queue is never guessed at or rewritten: the occurrence is refused with
+                // visible text instead of faulting its run task and blocking the job behind it.
+                refused = ONE_OFF_QUEUE_MALFORMED;
+              } else {
+                // An entry whose run task already ended can never execute, so it must not hold the
+                // queue in front of a live occurrence after a crash or a lost pointer.
+                const live: CronOneOffQueueEntry[] = [];
+                for (const entry of queue) {
+                  const record = await tx.task(entry.taskId as TaskId);
+                  if (record !== undefined && record.state.status !== "terminal") live.push(entry);
                 }
-              }
-              doc.oneOffQueue = live;
-              const head = live[0];
-              if (refused === null && head !== undefined && head.taskId !== running.id) {
-                waitFor = head.taskId as TaskId;
+                if (!live.some((entry) => entry.taskId === running.id)) {
+                  if (live.length >= CRON_ONE_OFF_QUEUE_LIMIT) refused = ONE_OFF_QUEUE_FULL;
+                  else {
+                    live.push({
+                      jobId: job.id,
+                      scheduledAtMs: input.scheduledAtMs,
+                      taskId: running.id,
+                    });
+                  }
+                }
+                doc.oneOffQueue = live;
+                // A refused occurrence leaves the conversation untouched: nothing is created or
+                // classified for it, so a full queue never leaves a new catch-all behind.
+                if (refused === null) {
+                  target = await ensureAutomationConversation(tx, {
+                    originConversationId: running.conversationId,
+                    conversationClass: "one-off",
+                    jobId: null,
+                    recorded: oneOffPointer?.id === doc.oneOffConversationId ? oneOffPointer : null,
+                  });
+                  doc.oneOffConversationId = target;
+                  const head = live[0];
+                  if (head !== undefined && head.taskId !== running.id) waitFor = head.taskId as TaskId;
+                }
               }
             }
             if (refused !== null) {
-              // The queue bound is hit: this occurrence is refused with fixed text the job record
+              // A full or unreadable queue: this occurrence is refused with fixed text the job record
               // keeps for `list`, the conversation is not touched, and no channel notice is invented.
               stored.lastOutcome = {
                 scheduledAtMs: input.scheduledAtMs,
@@ -944,8 +1006,9 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
                 }, context);
               }
             } catch (error) {
-              // The preparation commit rolls back, including a conversation and queue entry it
-              // created; there is nothing prepared to retire.
+              // Returning nothing leaves the task's state unchanged, but the staged document writes
+              // still commit: this run's conversation, its marker, the job's or the origin's pointer
+              // and the queue entry all stay, and nothing was prepared that could be retired.
               prepareError = `preparation failed: ${errorText(error)}`;
               return undefined;
             }
@@ -1040,16 +1103,22 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           try {
             const requestId = occurrenceKey(input.jobId, input.scheduledAtMs);
             let settled: unknown;
+            let boundaryPlaced = false;
             await runtime.commit(async (tx) => {
               settled = await tx.submissionByRequest(targetConversationId, requestId);
+              if (settled !== undefined) return undefined;
+              // The boundary is itself a durable entry: a retry after a crash between `reset(...)` and
+              // `submit(...)` finds it as the newest entry and places no second one. A boundary that
+              // is already the end of the conversation means the run's context is already empty.
+              const newest = await tx.scanEntries({ conversationId: targetConversationId }, 1);
+              boundaryPlaced = newest.items[0]?.kind === ResetEntry.kind;
               return undefined;
             }, context);
             // Each run is a new episode: a native reset boundary keeps every earlier entry stored
             // and searchable while this run's model context starts empty. It is the same native
             // reset `/new` places, admitted before this run's own input, so an ordered inbox keeps
-            // the boundary ahead of the input even if another run is still finishing. A replay after
-            // a crash finds its own submission and adds no second boundary.
-            if (settled === undefined && targetConversationId !== running.conversationId
+            // the boundary ahead of the input even if another run is still finishing.
+            if (settled === undefined && !boundaryPlaced && targetConversationId !== running.conversationId
               && reset !== undefined) {
               await reset(targetConversationId, context);
             }

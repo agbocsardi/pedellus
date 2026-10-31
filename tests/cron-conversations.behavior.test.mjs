@@ -4,9 +4,9 @@
 // boundary so earlier episodes stay stored but out of the model context, and each run prepares and
 // retires its own authority. Origin mode keeps running in the chat itself.
 //
-// The first two cases drive the foundation directly with a faux provider and real task waits; the
-// third drives the real Gateway and asserts the automation class, authority retirement, the mapped
-// chat rule and episode cataloguing.
+// The foundation cases drive the foundation directly with a faux provider and real task waits; the
+// gateway cases drive the real Gateway and assert the automation class, authority retirement, the
+// mapped chat rule, per-run workspace context and episode cataloguing.
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -32,7 +32,13 @@ const {
 } = await load(`${durable}/index.js`);
 const { BACKGROUND_CONTEXT } = await load(`${chord}/context/index.js`);
 const { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } = await load(`${ai}/index.js`);
+const { getCurrentSystemPrompt } = await load(`${ai}/utils/transcript.js`);
 const context = BACKGROUND_CONTEXT;
+
+const MODEL = { id: "synthetic", name: "Synthetic" };
+const ONE_OFF_QUEUE_FULL_TEXT =
+  "one-off run queue is full (16 admitted runs); this occurrence was not run";
+const ONE_OFF_QUEUE_MALFORMED_TEXT = "one-off run queue is malformed; this occurrence was not run";
 
 const WAIT_MS = 10_000;
 
@@ -153,6 +159,89 @@ const transcriptKinds = (page) => page.items
   .map((entry) => entry.kind)
   .filter((kind) => kind === "pi.reset" || kind === "pi.assistant" || kind === CRON_INPUT_ENTRY_KIND);
 
+/**
+ * One isolated store: a faux provider, the host seams above, the cron foundation and an ownerless
+ * origin conversation. `script` is the provider's response list; every request's user texts are
+ * recorded in `requests` before the responder runs. Always `close()` in a `finally`.
+ */
+async function openScenario(prefix, script) {
+  const dir = await temp(`nanobot-cron-conversations-${prefix}-`);
+  const providerId = `cron-conversations-${prefix}`;
+  const provider = fauxProvider({ provider: providerId, models: [MODEL] });
+  const requests = [];
+  provider.setResponses(script.map((respond) => (transcript) => {
+    requests.push(userTexts(transcript.messages));
+    return respond(transcript);
+  }));
+  const models = createModels();
+  models.setProvider(provider.provider);
+  const harnessRef = { current: undefined };
+  const seams = hostSeams(harnessRef);
+  const foundation = createCronFoundation({
+    now: () => Date.now(),
+    prepare: seams.prepare,
+    finalize: seams.finalize,
+    reset: seams.reset,
+  });
+  const harness = await openHarness(resolve(dir, "probe.sqlite"), foundation.extension, models);
+  harnessRef.current = harness;
+  harness.resume();
+  // Create the root conversation up front, as the gateway does, so the root's own ID is a real
+  // conversation rather than a reserved number this store has never stored.
+  await harness.root(context, {});
+  const origin = await harness.createConversation({
+    ownership: { kind: "ownerless" },
+    agent: { model: { provider: providerId, modelId: "synthetic" }, tools: [], modelTools: [] },
+  }, context);
+  const writer = conversationWriter(harness, origin);
+  return {
+    dir, harness, origin, foundation, seams, requests,
+    schedule: (job) => foundation.schedule(owner, writer, job, context),
+    oneOff: (message, key, options = {}) => foundation.schedule(owner, writer, {
+      message,
+      name: message,
+      mode: "background",
+      schedule: { kind: "after", afterMs: 200 },
+      idempotencyKey: key,
+      ...options,
+    }, context),
+    async close() {
+      harnessRef.current = undefined;
+      await harness.close(context).catch(() => {});
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/** Settle one one-off job's admitted run and return the stored job record. */
+async function settledOneOff(scenario, jobId) {
+  const admitted = (await readJobs(scenario.harness, scenario.origin.id)).find((job) => job.id === jobId);
+  await scenario.harness.waitForTask(admitted.executionTaskId, context);
+  return (await readJobs(scenario.harness, scenario.origin.id)).find((job) => job.id === jobId);
+}
+
+/**
+ * Wait for one commit of the origin's job document whose one-off queue satisfies `predicate`, and
+ * return that committed document. It is armed before the event, so nothing is missed by polling.
+ */
+async function waitForQueue(harness, conversationId, predicate, label) {
+  const watcher = changeWatcher(harness, (changes) => changes.some((change) => {
+    if (change.type !== "document" || change.record.kind !== CRON_JOBS_KIND
+      || change.conversationId !== conversationId || change.value === null) return false;
+    return Array.isArray(change.value.oneOffQueue) && predicate(change.value.oneOffQueue);
+  }), label);
+  try {
+    const publication = await watcher.promise;
+    return publication.changes.find((change) =>
+      change.type === "document" && change.record.kind === CRON_JOBS_KIND)?.value;
+  } finally {
+    watcher.stop();
+  }
+}
+
+const countConversations = async (scenario) =>
+  (await scenario.harness.commit((tx) => tx.scanConversations({}, 100), context)).items.length;
+
 test("a recurring job keeps one conversation and starts a new episode for each run", { timeout: 20_000 }, async () => {
   const dir = await temp("nanobot-cron-conversations-recurring-");
   const db = resolve(dir, "probe.sqlite");
@@ -233,7 +322,6 @@ test("a recurring job keeps one conversation and starts a new episode for each r
     // The reset boundary is real: the second request's context holds only its own episode.
     assert.equal(requests.length >= 2, true);
     assert.deepEqual(requests[1], ["stretch every interval"]);
-    assert.equal(requests[0].includes("episode 1 answered"), false);
 
     await harness.abortTask(afterSecond.timerTaskId, context);
     await harness.waitForTask(afterSecond.timerTaskId, context);
@@ -249,10 +337,11 @@ test("one-off runs share the catch-all conversation and queue durably", { timeou
   const db = resolve(dir, "probe.sqlite");
   const harnessRef = { current: undefined };
   let harness;
+  // Released in the finally so a failed assertion cannot turn into a 20 s timeout.
+  let releaseFirst = () => {};
   try {
     const providerId = "cron-conversations-one-off-faux";
-    const provider = fauxProvider({ provider: providerId, models: [{ id: "synthetic", name: "Synthetic" }] });
-    let releaseFirst;
+    const provider = fauxProvider({ provider: providerId, models: [MODEL] });
     const gate = new Promise((resolveGate) => { releaseFirst = resolveGate; });
     let started;
     const firstStarted = new Promise((resolveStarted) => { started = resolveStarted; });
@@ -360,9 +449,324 @@ test("one-off runs share the catch-all conversation and queue durably", { timeou
       "pi.reset", CRON_INPUT_ENTRY_KIND, "pi.assistant",
     ], "two executed occurrences, two episodes, one conversation");
   } finally {
+    releaseFirst();
     harnessRef.current = undefined;
     if (harness !== undefined) await harness.close(context).catch(() => {});
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a queued one-off wakes when its head finishes and runs in its own episode", { timeout: 20_000 }, async () => {
+  let release = () => {};
+  const gate = new Promise((resolveGate) => { release = resolveGate; });
+  let firstStarted = () => {};
+  const started = new Promise((resolveStarted) => { firstStarted = resolveStarted; });
+  const scenario = await openScenario("queued-wake", [
+    async () => {
+      firstStarted();
+      await gate;
+      return fauxAssistantMessage("head answered");
+    },
+    () => fauxAssistantMessage("queued answered"),
+  ]);
+  try {
+    const head = await scenario.oneOff("head one-off", "queued-wake-1");
+    await scenario.harness.waitForTask(head.timerTaskId, context);
+    const [headJob] = await readJobs(scenario.harness, scenario.origin.id);
+    await started;
+
+    const queued = await scenario.oneOff("queued one-off", "queued-wake-2");
+    const queuedDoc = await waitForQueue(scenario.harness, scenario.origin.id, (queue) => queue.length === 2,
+      "the queued one-off to be admitted");
+    await scenario.harness.waitForTask(queued.timerTaskId, context);
+    const queuedJob = queuedDoc.jobs.find((job) => job.id === queued.jobId);
+    assert.equal((await scenario.harness.getTask(queuedJob.executionTaskId, context)).state.status, "waiting");
+
+    release();
+    await scenario.harness.waitForTask(headJob.executionTaskId, context);
+    // The queued run wakes on the head's terminal commit and executes in the same conversation.
+    await scenario.harness.waitForTask(queuedJob.executionTaskId, context);
+    const doc = await readDoc(scenario.harness, scenario.origin.id);
+    assert.deepEqual(doc.oneOffQueue, [], "both admitted runs left the queue");
+    const automationId = doc.oneOffConversationId;
+    assert.equal(typeof automationId, "number", "both runs used the catch-all conversation");
+    for (const job of doc.jobs) {
+      assert.equal(job.lastOutcome.status, "ok");
+      assert.equal(job.lastOutcome.conversationId, automationId);
+    }
+    assert.deepEqual(scenario.requests.map((texts) => texts[0]), ["head one-off", "queued one-off"],
+      "the occurrence order is the queue's durable order");
+    const conversation = await scenario.harness.conversation(automationId, context);
+    const page = await conversation.entries({ order: "ascending" }, 100, undefined, context);
+    assert.deepEqual(transcriptKinds(page), [
+      "pi.reset", CRON_INPUT_ENTRY_KIND, "pi.assistant",
+      "pi.reset", CRON_INPUT_ENTRY_KIND, "pi.assistant",
+    ], "each executed occurrence is its own episode");
+  } finally {
+    release();
+    await scenario.close();
+  }
+});
+
+test("cancelling a head one-off lets the queued occurrence proceed", { timeout: 20_000 }, async () => {
+  let release = () => {};
+  const gate = new Promise((resolveGate) => { release = resolveGate; });
+  let firstStarted = () => {};
+  const started = new Promise((resolveStarted) => { firstStarted = resolveStarted; });
+  const scenario = await openScenario("cancelled-head", [
+    async () => {
+      firstStarted();
+      await gate;
+      return fauxAssistantMessage("head answered");
+    },
+    () => fauxAssistantMessage("queued answered"),
+  ]);
+  try {
+    const head = await scenario.oneOff("head one-off", "cancelled-head-1");
+    await scenario.harness.waitForTask(head.timerTaskId, context);
+    const [headJob] = await readJobs(scenario.harness, scenario.origin.id);
+    await started;
+
+    const next = await scenario.oneOff("queued one-off", "cancelled-head-2");
+    const nextDoc = await waitForQueue(scenario.harness, scenario.origin.id, (queue) => queue.length === 2,
+      "the next one-off to be queued");
+    await scenario.harness.waitForTask(next.timerTaskId, context);
+    const nextJob = nextDoc.jobs.find((job) => job.id === next.jobId);
+    assert.equal((await scenario.harness.getTask(nextJob.executionTaskId, context)).state.status, "waiting");
+
+    // Cancel the head while the next occurrence waits behind it. Releasing the blocked response lets
+    // the bounded conversation abort land instead of waiting out its full 5 s bound.
+    const cancelling = scenario.foundation.cancel(
+      scenario.harness, scenario.origin.id, head.jobId, owner, context,
+    );
+    release();
+    assert.equal((await cancelling).status, "cancelled");
+    await scenario.harness.waitForTask(nextJob.executionTaskId, context);
+
+    const doc = await readDoc(scenario.harness, scenario.origin.id);
+    assert.deepEqual(doc.oneOffQueue, [], "the cancelled head left the queue and the next run finished");
+    assert.notEqual(doc.jobs.find((job) => job.id === head.jobId).cancelledAtMs, null);
+    assert.equal(doc.jobs.find((job) => job.id === next.jobId).lastOutcome.status, "ok");
+    const page = await (await scenario.harness.conversation(doc.oneOffConversationId, context))
+      .entries({ order: "ascending" }, 100, undefined, context);
+    assert.equal(page.items.some((entry) => entry.kind === CRON_INPUT_ENTRY_KIND), true,
+      "the shared conversation and its entries stay");
+  } finally {
+    release();
+    await scenario.close();
+  }
+});
+
+test("a full one-off queue refuses the occurrence visibly and touches no conversation", { timeout: 20_000 }, async () => {
+  const scenario = await openScenario("queue-full", [() => fauxAssistantMessage("unused answer")]);
+  try {
+    const conversationsBefore = await countConversations(scenario);
+    // Sixteen live entries is the bound. A one-shot timer far in the future is a live task, so it
+    // stands in for sixteen admitted runs and nothing here executes.
+    const holder = await scenario.schedule({
+      message: "hold the queue",
+      name: "hold",
+      schedule: { kind: "at", at: Date.now() + 3_600_000 },
+      idempotencyKey: "queue-full-hold",
+    });
+    assert.notEqual(holder.timerTaskId, null);
+    await scenario.harness.commit(async (tx) => {
+      const doc = await tx.doc(CronJobsDoc, scenario.origin.id);
+      doc.oneOffQueue = Array.from({ length: 16 }, (_, index) => ({
+        jobId: `held-${index}`,
+        scheduledAtMs: Date.now(),
+        taskId: holder.timerTaskId,
+      }));
+    }, context);
+
+    const refused = await scenario.oneOff("refused one-off", "queue-full-run");
+    await scenario.harness.waitForTask(refused.timerTaskId, context);
+    const stored = await settledOneOff(scenario, refused.jobId);
+    assert.equal(stored.lastOutcome.status, "error");
+    assert.equal(stored.lastOutcome.error, ONE_OFF_QUEUE_FULL_TEXT);
+    const doc = await readDoc(scenario.harness, scenario.origin.id);
+    assert.equal(doc.oneOffConversationId, undefined, "a refused occurrence creates no conversation");
+    assert.equal(doc.oneOffQueue.length, 16, "a refused occurrence adds no queue entry");
+    assert.equal(await countConversations(scenario), conversationsBefore, "no conversation was created");
+    assert.deepEqual(scenario.seams.resets, [], "a refused occurrence places no boundary");
+    await scenario.foundation.cancel(scenario.harness, scenario.origin.id, holder.jobId, owner, context);
+  } finally {
+    await scenario.close();
+  }
+});
+
+test("a malformed one-off queue refuses the occurrence instead of faulting its run", { timeout: 20_000 }, async () => {
+  const scenario = await openScenario("queue-malformed", [() => fauxAssistantMessage("unused answer")]);
+  try {
+    await scenario.harness.commit(async (tx) => {
+      const doc = await tx.doc(CronJobsDoc, scenario.origin.id);
+      doc.oneOffQueue = "not-an-array";
+    }, context);
+    const refused = await scenario.oneOff("malformed queue one-off", "queue-malformed-run");
+    await scenario.harness.waitForTask(refused.timerTaskId, context);
+    const admitted = (await readJobs(scenario.harness, scenario.origin.id))
+      .find((job) => job.id === refused.jobId);
+    const outcome = await scenario.harness.waitForTask(admitted.executionTaskId, context);
+    assert.equal(outcome.state.outcome.status, "completed", "the occurrence is refused, not faulted");
+    const stored = (await readJobs(scenario.harness, scenario.origin.id))
+      .find((job) => job.id === refused.jobId);
+    assert.equal(stored.lastOutcome.status, "error");
+    assert.equal(stored.lastOutcome.error, ONE_OFF_QUEUE_MALFORMED_TEXT);
+    const doc = await readDoc(scenario.harness, scenario.origin.id);
+    assert.equal(doc.oneOffQueue, "not-an-array", "a malformed queue is never guessed at or rewritten");
+    assert.equal(doc.oneOffConversationId, undefined);
+  } finally {
+    await scenario.close();
+  }
+});
+
+test("a recorded conversation is adopted only when its own marker names this job", { timeout: 20_000 }, async () => {
+  const scenario = await openScenario("adoption", Array.from({ length: 4 }, () => () => fauxAssistantMessage("adopted answered")));
+  try {
+    // A chat-like ownerless conversation: unforked and not the origin, so only its own class marker
+    // can keep it out of the automation class.
+    const bystander = await scenario.harness.createConversation({
+      ownership: { kind: "ownerless" },
+      agent: { tools: [{ name: "read" }], modelTools: [{ name: "read" }] },
+    }, context);
+    const bystanderAgent = await scenario.harness.snapshot(AgentDoc, bystander.id, context);
+    const damaged = await scenario.oneOff("damaged pointer", "adoption-damaged", { schedule: { kind: "after", afterMs: 400 } });
+    await scenario.harness.commit(async (tx) => {
+      const doc = await tx.doc(CronJobsDoc, scenario.origin.id);
+      doc.oneOffConversationId = bystander.id;
+    }, context);
+    await scenario.harness.waitForTask(damaged.timerTaskId, context);
+    const stored = await settledOneOff(scenario, damaged.jobId);
+    assert.equal(stored.lastOutcome.status, "ok");
+    const created = (await readDoc(scenario.harness, scenario.origin.id)).oneOffConversationId;
+    assert.equal(typeof created, "number");
+    assert.notEqual(created, bystander.id, "an unmarked conversation is never adopted");
+    assert.equal(stored.lastOutcome.conversationId, created);
+    assert.equal(await scenario.harness.snapshot(CronConversationDoc, bystander.id, context), undefined,
+      "the conversation the damaged pointer named keeps no automation marker");
+    assert.deepEqual((await scenario.harness.snapshot(AgentDoc, bystander.id, context)).tools, bystanderAgent.tools,
+      "its agent authority is untouched");
+    assert.equal((await scenario.harness.commit((tx) => tx.scanEntries({ conversationId: bystander.id }, 10), context)).items.length, 0,
+      "the conversation the damaged pointer named received nothing");
+
+    // The root is ownerless and unforked too, so it needs the same guard.
+    const rooted = await scenario.oneOff("root pointer", "adoption-root", { schedule: { kind: "after", afterMs: 400 } });
+    await scenario.harness.commit(async (tx) => {
+      const doc = await tx.doc(CronJobsDoc, scenario.origin.id);
+      doc.oneOffConversationId = ROOT_CONVERSATION_ID;
+    }, context);
+    await scenario.harness.waitForTask(rooted.timerTaskId, context);
+    const rootStored = await settledOneOff(scenario, rooted.jobId);
+    assert.equal(rootStored.lastOutcome.status, "ok");
+    const replacement = (await readDoc(scenario.harness, scenario.origin.id)).oneOffConversationId;
+    assert.equal(typeof replacement, "number");
+    assert.notEqual(replacement, ROOT_CONVERSATION_ID, "the root is never adopted");
+    assert.equal(await scenario.harness.snapshot(CronConversationDoc, ROOT_CONVERSATION_ID, context), undefined);
+    assert.equal((await scenario.harness.commit((tx) => tx.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 10), context)).items.length, 0,
+      "the root received no marker, boundary or input");
+  } finally {
+    await scenario.close();
+  }
+});
+
+test("a boundary already at the end of the conversation is not placed twice", { timeout: 20_000 }, async () => {
+  const scenario = await openScenario("boundary", [() => fauxAssistantMessage("boundary answered")]);
+  try {
+    // The catch-all conversation, its class marker and a boundary already as the newest entry: this
+    // is exactly the durable state a retry after a crash between `reset(...)` and `submit(...)` sees.
+    const automation = await scenario.harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    await scenario.harness.commit(async (tx) => {
+      const marker = await tx.doc(CronConversationDoc, automation.id);
+      marker.conversationClass = "one-off";
+      marker.originConversationId = scenario.origin.id;
+      marker.jobId = null;
+      const doc = await tx.doc(CronJobsDoc, scenario.origin.id);
+      doc.oneOffConversationId = automation.id;
+    }, context);
+    await (await scenario.harness.conversation(automation.id, context)).reset(undefined, context);
+
+    const run = await scenario.oneOff("boundary one-off", "boundary-run");
+    await scenario.harness.waitForTask(run.timerTaskId, context);
+    const stored = await settledOneOff(scenario, run.jobId);
+    assert.equal(stored.lastOutcome.status, "ok");
+    assert.equal(stored.lastOutcome.conversationId, automation.id, "the marked conversation was adopted");
+    assert.deepEqual(scenario.seams.resets, [], "the run placed no second boundary");
+    const page = await (await scenario.harness.conversation(automation.id, context))
+      .entries({ order: "ascending" }, 100, undefined, context);
+    assert.deepEqual(transcriptKinds(page), ["pi.reset", CRON_INPUT_ENTRY_KIND, "pi.assistant"]);
+    assert.deepEqual(scenario.requests[0], ["boundary one-off"],
+      "the already-placed boundary starts the episode with an empty context");
+  } finally {
+    await scenario.close();
+  }
+});
+
+test("origin mode runs in the chat with no new conversation and no cron boundary", { timeout: 20_000 }, async () => {
+  const scenario = await openScenario("origin-mode", [() => fauxAssistantMessage("origin answered")]);
+  try {
+    const conversationsBefore = await countConversations(scenario);
+    const receipt = await scenario.oneOff("origin one-off", "origin-mode-run", { mode: "origin" });
+    await scenario.harness.waitForTask(receipt.timerTaskId, context);
+    const stored = await settledOneOff(scenario, receipt.jobId);
+    assert.equal(stored.lastOutcome.status, "ok");
+    assert.equal(stored.lastOutcome.conversationId, scenario.origin.id, "the occurrence ran in the chat itself");
+    assert.equal(stored.conversationId, undefined, "origin mode records no conversation for its job");
+    const doc = await readDoc(scenario.harness, scenario.origin.id);
+    assert.equal(doc.oneOffConversationId, undefined, "origin mode creates no catch-all conversation");
+    assert.equal(await countConversations(scenario), conversationsBefore, "no conversation was created");
+    assert.deepEqual(scenario.seams.resets, [], "origin mode places no cron boundary");
+    const page = await (await scenario.harness.conversation(scenario.origin.id, context))
+      .entries({ order: "ascending" }, 100, undefined, context);
+    assert.deepEqual(transcriptKinds(page), [CRON_INPUT_ENTRY_KIND, "pi.assistant"],
+      "the chat itself holds the occurrence and its answer");
+  } finally {
+    await scenario.close();
+  }
+});
+
+test("a fenced one-off claim removes its queued entry", { timeout: 20_000 }, async () => {
+  let release = () => {};
+  const gate = new Promise((resolveGate) => { release = resolveGate; });
+  let firstStarted = () => {};
+  const started = new Promise((resolveStarted) => { firstStarted = resolveStarted; });
+  const scenario = await openScenario("fenced-claim", [
+    async () => {
+      firstStarted();
+      await gate;
+      return fauxAssistantMessage("head answered");
+    },
+    () => fauxAssistantMessage("unused answer"),
+  ]);
+  try {
+    const head = await scenario.oneOff("head one-off", "fenced-claim-1");
+    await scenario.harness.waitForTask(head.timerTaskId, context);
+    const [headJob] = await readJobs(scenario.harness, scenario.origin.id);
+    await started;
+
+    const next = await scenario.oneOff("fenced one-off", "fenced-claim-2");
+    const nextDoc = await waitForQueue(scenario.harness, scenario.origin.id, (queue) => queue.length === 2,
+      "the fenced one-off to be queued");
+    await scenario.harness.waitForTask(next.timerTaskId, context);
+    const nextJob = nextDoc.jobs.find((job) => job.id === next.jobId);
+    // A cancellation recorded while the gateway was down: the generation moved on but the queued run
+    // task was never aborted, so it re-claims on reopen and is fenced out there.
+    await scenario.harness.commit(async (tx) => {
+      const doc = await tx.doc(CronJobsDoc, scenario.origin.id);
+      doc.jobs.find((job) => job.id === next.jobId).generation += 1;
+    }, context);
+
+    release();
+    await scenario.harness.waitForTask(headJob.executionTaskId, context);
+    const outcome = await scenario.harness.waitForTask(nextJob.executionTaskId, context);
+    assert.equal(outcome.state.outcome.status, "aborted");
+    assert.equal(outcome.state.outcome.result.outcome, "superseded");
+    const doc = await readDoc(scenario.harness, scenario.origin.id);
+    assert.deepEqual(doc.oneOffQueue, [], "a fenced claim leaves no stale queue entry");
+    assert.equal(doc.jobs.find((job) => job.id === next.jobId).lastOutcome, null,
+      "a fenced run records no outcome");
+  } finally {
+    release();
+    await scenario.close();
   }
 });
 
@@ -462,6 +866,18 @@ test("a scheduled run's conversation is automation, not chat, and keeps no autho
           () => gateway.listHistoryEpisodes(forgedKey, {}, context),
           /automation conversation/,
         );
+        // Channel ingress refuses the same mapping before it can become a cron owner or receive
+        // chat policy, so a forged or stale map entry can never schedule from an automation
+        // conversation or take a live run's captured tools away through the policy pass.
+        await assert.rejects(
+          () => gateway.conversationFor(forgedKey, context),
+          /automation conversation/,
+          "a forged mapping is refused on the channel ingress path too",
+        );
+        // The forged mapping refuses, but the real chat keeps its own conversation and authority.
+        const stillChat = await gateway.conversationFor(sessionKey, context);
+        assert.equal(stillChat.id, chat.id);
+        assert.equal((await stillChat.agent(context)).tools.some((tool) => tool.name === "read"), true);
 
         // It does participate in episode cataloguing: a reset scheduled that pass.
         const catalogPublication = await catalogWatcher.promise;
@@ -475,6 +891,124 @@ test("a scheduled run's conversation is automation, not chat, and keeps no autho
         catalogWatcher.stop();
       }
     } finally {
+      await gateway.close(context);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a recurring run rebuilds the origin's workspace context for each episode", { timeout: 25_000 }, async () => {
+  const directory = await temp("nanobot-cron-conversations-workspace-");
+  try {
+    const workspace = resolve(directory, "workspace");
+    await mkdir(workspace);
+    const providerId = "cron-conversations-workspace-faux";
+    const model = { provider: providerId, modelId: "synthetic" };
+    const { openGateway } = await load(`${pkg}/dist/runtime.js`);
+    const { parseConfig } = await load(`${pkg}/dist/config.js`);
+    const config = parseConfig({
+      workspace,
+      dataDir: resolve(directory, "state"),
+      model,
+      allowedModels: [model],
+      toolAllowlist: ["read"],
+      cron: { enabled: true, timeZone: "UTC" },
+    }, directory);
+    const provider = fauxProvider({ provider: providerId, models: [MODEL] });
+    const prompts = [];
+    let toolCallIssued = false;
+    provider.setResponses(Array.from({ length: 12 }, () => (transcript) => {
+      prompts.push({
+        system: getCurrentSystemPrompt(transcript.messages),
+        texts: userTexts(transcript.messages),
+      });
+      const input = userTexts(transcript.messages)[0];
+      if (input === "schedule a recurring context check" && !toolCallIssued) {
+        toolCallIssued = true;
+        return fauxAssistantMessage([
+          fauxToolCall("cron", {
+            action: "add",
+            message: "scheduled context episode",
+            every_seconds: 1,
+          }, { id: "cron-workspace-add" }),
+        ], { stopReason: "toolUse" });
+      }
+      return fauxAssistantMessage("SYNTHETIC-ANSWER");
+    }));
+    const models = createModels();
+    models.setProvider(provider.provider);
+    // Every call returns a new token, so a snapshot reused from an earlier run is visible in the
+    // rendered context instead of being indistinguishable from a fresh one.
+    const loads = new Map();
+    const gateway = await openGateway(config, context, {
+      models,
+      contextSnapshotProvider: (_sessionKey, conversationId) => {
+        const n = (loads.get(conversationId) ?? 0) + 1;
+        loads.set(conversationId, n);
+        return { identity: { source: "synthetic:cron-context", content: `cron-context-${n}` } };
+      },
+    });
+    const aborts = [];
+    try {
+      const sessionKey = "cron-conversations:workspace";
+      const chat = await gateway.conversationFor(sessionKey, context);
+      const firstSettled = changeWatcher(gateway.harness, (changes) => changes.some((change) => {
+        if (change.type !== "document" || change.record.kind !== CRON_JOBS_KIND
+          || change.conversationId !== chat.id || change.value === null) return false;
+        return Array.isArray(change.value.jobs)
+          && change.value.jobs.some((job) => job.lastOutcome !== null && job.lastOutcome !== undefined);
+      }), "the first recurring run to settle");
+      let firstJob;
+      let firstOutcome;
+      try {
+        const submission = await chat.submit(
+          { type: "input", content: "schedule a recurring context check", requestId: "cron-workspace-request" },
+          context,
+        );
+        assert.equal((await submission.wait(context)).status, "done");
+        const publication = await firstSettled.promise;
+        const doc = publication.changes.find((change) =>
+          change.type === "document" && change.record.kind === CRON_JOBS_KIND)?.value;
+        firstJob = doc.jobs[0];
+        firstOutcome = firstJob.lastOutcome;
+        assert.equal(firstOutcome.status, "ok");
+        const automationId = firstJob.lastOutcome.conversationId;
+        assert.equal(typeof automationId, "number");
+        assert.equal(firstJob.conversationId, automationId);
+
+        // The next occurrence is already armed; arm its watcher before the settled one above is read
+        // so no commit can be missed.
+        const secondSettled = changeWatcher(gateway.harness, (changes) => changes.some((change) => {
+          if (change.type !== "document" || change.record.kind !== CRON_JOBS_KIND
+            || change.conversationId !== chat.id || change.value === null) return false;
+          return Array.isArray(change.value.jobs) && change.value.jobs.some((job) =>
+            job.lastOutcome !== null && job.lastOutcome !== undefined
+            && job.lastOutcome.scheduledAtMs !== firstOutcome.scheduledAtMs);
+        }), "the second recurring run to settle");
+        try {
+          await secondSettled.promise;
+        } finally {
+          secondSettled.stop();
+        }
+        assert.equal(loads.get(automationId), 2, "the shared conversation's snapshot was prepared twice");
+        const episodes = prompts.filter((prompt) => prompt.texts.includes("scheduled context episode"));
+        assert.equal(episodes.length, 2, "two episodes produced two model requests");
+        assert.match(episodes[0].system, /cron-context-1/);
+        assert.doesNotMatch(episodes[0].system, /cron-context-2/);
+        assert.match(episodes[1].system, /cron-context-2/,
+          "the second episode renders the workspace context rebuilt for it");
+        assert.doesNotMatch(episodes[1].system, /cron-context-1/,
+          "the rebuilt snapshot replaces the earlier one instead of stacking");
+      } finally {
+        firstSettled.stop();
+      }
+      const [job] = await readJobs(gateway.harness, chat.id);
+      if (job?.timerTaskId !== null && job?.timerTaskId !== undefined) aborts.push(job.timerTaskId);
+    } finally {
+      for (const timerTaskId of aborts) {
+        await gateway.harness.abortTask(timerTaskId, context).catch(() => undefined);
+      }
       await gateway.close(context);
     }
   } finally {

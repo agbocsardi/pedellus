@@ -1244,7 +1244,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const workerSpawners = new Set<ConversationId>();
   const harnessRef: { current?: HarnessType } = {};
   // The snapshot-install path, late-bound because cron's `prepare` can only call it once
-  // Harness.open() has run. It reports whether skills were installed for that conversation.
+  // Harness.open() has run. It reports whether skills were installed for that conversation, and it
+  // rebuilds a background target's snapshot instead of reusing the one an earlier run installed.
   const contextInstallerRef: {
     current?: (sessionKey: string, conversationId: ConversationId, ctx: Context) => Promise<boolean>;
   } = {};
@@ -1294,13 +1295,26 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (conversation === undefined) return;
           await conversation.reset(undefined, ctx);
         },
-        // A background run is an automation conversation that starts default-deny. It captures the
-        // ceiling its authenticated origin currently has; the call-time hook still requires that
-        // origin and the current config, so the capture is a subset, never new authority. An
-        // origin-mode run answers inside the conversation that already has the configured authority,
-        // so it needs no capture.
+        // A background run is an automation conversation whose authority is prepared per run. It
+        // captures the ceiling its authenticated origin currently has; the call-time hook still
+        // requires that origin and the current config, so the capture is a subset, never new
+        // authority. An origin-mode run answers inside the conversation that already has the
+        // configured authority, so it needs no capture.
         prepare: async ({ tx, originConversationId, targetConversationId, background }, ctx) => {
           if (!background) return;
+          // Classify the conversation first, from the durable marker the foundation wrote in the same
+          // commit: a forged or stale mapping can never be mistaken for chat via this host, and a
+          // failure later in this preparation cannot leave the conversation chat-like in memory.
+          const classified = automationConversationOf(
+            await tx.doc(CronConversationDoc, targetConversationId),
+          );
+          if (classified !== undefined) {
+            automationConversations.set(targetConversationId, {
+              originConversationId,
+              conversationClass: classified.conversationClass,
+              jobId: classified.jobId,
+            });
+          }
           // Fail closed on a run whose origin cannot be attributed to a known owner: it gets no
           // captured authority, so every effectful call stays denied.
           const owner = cronOwners.get(originConversationId);
@@ -1315,10 +1329,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
           } else {
             await tx.retireDoc(ConfigToolCaptureDoc, targetConversationId);
           }
-          // The run's fresh conversation is default-deny, so it also receives the origin's workspace
-          // context through the same snapshot path: bootstrap/AGENTS, the memory manifest, the skill
-          // summary and the read-only `skill` tool. An origin with no known owner skips this and keeps
-          // the run default-deny. The cron tool and foundation are never offered here.
+          // The automation conversation is default-deny between runs, so it also receives the
+          // origin's workspace context through the same snapshot path: bootstrap/AGENTS, the memory
+          // manifest, the skill summary and the read-only `skill` tool. That snapshot is rebuilt in
+          // this same preparation, so a later episode renders the workspace as it is now. An origin
+          // with no known owner skips this and keeps the run default-deny. The cron tool and
+          // foundation are never offered here.
           const skillsInstalled = owner !== undefined && contextInstallerRef.current !== undefined
             ? await contextInstallerRef.current(owner.sessionKey, targetConversationId, ctx)
             : false;
@@ -1351,17 +1367,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
             ...(originAgent.model === undefined ? {} : { model: { ...originAgent.model } }),
             ...(originAgent.thinkingLevel === undefined ? {} : { thinkingLevel: originAgent.thinkingLevel }),
           });
-          // Classify the conversation for this open from the durable marker the foundation wrote in
-          // the same commit: a forged or stale mapping can never be mistaken for chat via this host.
-          const marker = await tx.doc(CronConversationDoc, targetConversationId);
-          const classified = automationConversationOf(marker);
-          if (classified !== undefined) {
-            automationConversations.set(targetConversationId, {
-              originConversationId,
-              conversationClass: classified.conversationClass,
-              jobId: classified.jobId,
-            });
-          }
         },
         // A separate run target's captured authority ends with the run: retire its capture document
         // and stop offering its tools in the same commit that records the terminal outcome, so a
@@ -2074,6 +2079,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
     };
     const contextSnapshotLoads = new Map<ConversationId, Promise<unknown>>();
+    /**
+     * Install one conversation's workspace snapshot. A mapped chat is installed once per process; a
+     * background target is rebuilt on every call, because each scheduled run is a new episode that
+     * must render the workspace as it is now rather than as the first run of this process found it.
+     * Both paths reuse the one `nanobot-context` extension name, so a rebuild replaces this
+     * conversation's sections instead of adding a second extension.
+     */
     const installContextSnapshot = async (
       sessionKey: string,
       conversationId: ConversationId,
@@ -2086,8 +2098,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
         await loading;
         return skillConversations.has(conversationId);
       }
-      if (contextConversations.has(conversationId)) return skillConversations.has(conversationId);
-      if (backgroundTarget && !backgroundTargets.includes(conversationId)) {
+      const installed = contextConversations.has(conversationId);
+      if (installed && !backgroundTarget) return skillConversations.has(conversationId);
+      if (backgroundTarget && !installed && !backgroundTargets.includes(conversationId)) {
         backgroundTargets.push(conversationId);
       }
       const pending = Promise.resolve()
@@ -2097,8 +2110,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
             throw new TypeError("Context snapshot provider must return an object or undefined");
           }
           const snapshot = bindContextSnapshot(supplied, conversationId);
-          if (backgroundTarget) await makeSnapshotRoom(ctx);
-          const extension = contextExtensionBuilder.add(snapshot);
+          if (backgroundTarget && !installed) await makeSnapshotRoom(ctx);
+          const replacement = installed
+            ? contextExtensionBuilder.replace(snapshot)
+            : { extension: contextExtensionBuilder.add(snapshot) };
           contextConversations.add(conversationId);
           let skillsPresent = false;
           if (skillTool !== undefined) {
@@ -2109,8 +2124,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
               skillConversations.delete(conversationId);
             }
           }
-          contextExtension = extension;
-          registry.install(extension);
+          contextExtension = replacement.extension;
+          registry.install(replacement.extension);
           return skillsPresent;
         })
         .finally(() => {
@@ -2664,21 +2679,21 @@ export async function openGateway(config: PortConfig, context: Context, options:
           conversationId = created.id;
         }, ctx);
         if (!Number.isSafeInteger(conversationId)) throw new Error("Stored conversation mapping has an invalid ID");
+        // The stored map is host data, not authority: it can be forged, imported or left behind by an
+        // older layout. A mapped session key may therefore name only an ordinary chat conversation;
+        // anything else is refused here, before it can become a cron owner or receive chat policy.
+        const scopeReason = await root.commit(
+          (tx) => readChatScope((id) => scopeRecordFor(tx, id), conversationId!, root.id), ctx,
+        );
+        if (scopeReason !== undefined) throw new Error(chatScopeMessage(scopeReason));
         // A mapped session key is the cron owner; unmapped conversations (such as a scheduled run's
         // own background conversation) have no owner and therefore never receive the cron tool.
         let mappedChat = false;
         if (isChatSessionKey(sessionKey)) {
-          const reason = await root.commit((tx) => readChatScope((id) => scopeRecordFor(tx, id), conversationId!, root.id), ctx);
-          if (reason === undefined) {
-            historyConversations.add(conversationId!);
-            authorizedChatConversations.add(conversationId!);
-            if (webTool !== undefined) webConversations.add(conversationId!);
-            mappedChat = true;
-          } else {
-            historyConversations.delete(conversationId!);
-            authorizedChatConversations.delete(conversationId!);
-            webConversations.delete(conversationId!);
-          }
+          historyConversations.add(conversationId!);
+          authorizedChatConversations.add(conversationId!);
+          if (webTool !== undefined) webConversations.add(conversationId!);
+          mappedChat = true;
         }
         // The exact host-owned session key for this conversation is what a channel action host
         // revalidates; it is never supplied by the model. Only a scope-checked mapped Telegram chat

@@ -81,38 +81,52 @@ export interface AutomationConversationRequest {
   readonly originConversationId: ConversationId;
   readonly conversationClass: CronConversationClass;
   readonly jobId: string | null;
-  /** The ID the owning document currently records, or `null` when no conversation exists yet. */
-  readonly recordedId: number | null;
+  /**
+   * The ID the owning document currently records together with that conversation's own marker, both
+   * read before this commit by a snapshot read (which creates nothing), or `null` when the document
+   * records none.
+   */
+  readonly recorded: { readonly id: number; readonly marker: unknown } | null;
 }
 
 /**
  * Resolve this run's automation conversation inside the committing transaction: reuse the recorded
- * one while it still exists, otherwise create a new ownerless conversation and record it. The
- * marker is (re)written either way, so a conversation the owning document points at is always
- * classified as this job's automation conversation and nothing else's.
+ * one while its own marker still names this origin and this job/class, otherwise create a new
+ * ownerless conversation and record it. The marker is (re)written either way, so a conversation the
+ * owning document points at is always classified as this job's automation conversation and nothing
+ * else's.
+ *
+ * Adoption needs both halves: the conversation itself must still be ownerless and unforked, and its
+ * `nanobot.cron.conversation` marker must name this origin, class and job. A damaged or hand-edited
+ * pointer to a chat, the root, a fork, a task-owned conversation or another job's conversation
+ * therefore costs one new conversation instead of pulling that conversation into this class.
  */
 export async function ensureAutomationConversation(
   tx: Tx,
   request: AutomationConversationRequest,
 ): Promise<ConversationId> {
-  // A recorded ID is reused only when it still names an ownerless, unforked conversation that is not
-  // the origin chat. A damaged or stale pointer therefore costs one new conversation instead of
-  // adopting a chat, a worker's task-owned conversation or a fork into the automation class.
-  const candidate = request.recordedId === null
-    || !Number.isSafeInteger(request.recordedId)
-    || request.recordedId === request.originConversationId
+  const candidate = request.recorded === null
+    || !Number.isSafeInteger(request.recorded.id)
+    || request.recorded.id === request.originConversationId
     ? undefined
-    : await tx.conversation(request.recordedId as ConversationId);
-  const recorded = candidate !== undefined && candidate.owner === undefined && candidate.parent === undefined
+    : await tx.conversation(request.recorded.id as ConversationId);
+  const marker = automationConversationOf(request.recorded?.marker);
+  const recorded = candidate !== undefined
+    && marker !== undefined
+    && marker.originConversationId === request.originConversationId
+    && marker.conversationClass === request.conversationClass
+    && marker.jobId === request.jobId
+    && candidate.owner === undefined
+    && candidate.parent === undefined
     ? candidate
     : undefined;
   const conversationId = recorded === undefined
     ? (await tx.createConversation({ ownership: { kind: "ownerless" } })).id
     : recorded.id;
-  const marker = await tx.doc(CronConversationDoc, conversationId);
-  marker.conversationClass = request.conversationClass;
-  marker.originConversationId = request.originConversationId;
-  marker.jobId = request.jobId;
+  const markerDoc = await tx.doc(CronConversationDoc, conversationId);
+  markerDoc.conversationClass = request.conversationClass;
+  markerDoc.originConversationId = request.originConversationId;
+  markerDoc.jobId = request.jobId;
   return conversationId;
 }
 

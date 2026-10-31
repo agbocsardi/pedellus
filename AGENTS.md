@@ -92,12 +92,16 @@ edits need restart only; unit edits additionally need daemon-reload.
   own opt-ins; Telegram, cron and recursive worker grants are forbidden.
   Only validated mapped chats receive foreground authority, and
   every admitted Telegram user shares the configured workspace/tools. Raw, root,
-  forked and state conversations remain denied. A scheduled run's automation
+  forked and state conversations remain denied; a mapped session key naming
+  anything but an ordinary chat is refused at ingress, before it can become a
+  cron owner or receive chat policy. A scheduled run's automation
   conversation is a distinct class: ownerless, recorded by its origin's cron
-  documents and by its own class marker, and never a chat, an origin, a digest
+  documents and by its own class marker, adopted only while that marker names
+  the same origin and job, and never a chat, an origin, a digest
   source, a worker, an MCP/Code Mode/compositor scope or a scheduling scope.
   Isolated cron runs capture an origin subset bounded by current config, prepare it
-  per run, and lose it on completion; persistent history confers no permission.
+  per run (including its workspace context), and lose it on completion; persistent
+  history confers no permission.
   The `skill`,
   `cron`, `history`, `worker` and scoped `telegram` tools carry no filesystem/shell
   authority and are exempt from the coding-tool hook; history remains read-only

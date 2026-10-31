@@ -421,7 +421,10 @@ cron documents, and `runtime.ts` passes it into the shared rule as `automation: 
 forged mapping naming one is rejected explicitly rather than by the accident of it being unmapped.
 The same class keeps every other capability set closed: an automation conversation is never in the
 authenticated mapped-chat set, the worker spawner set, the web/Telegram/MCP/Code Mode scope, the
-classifier scope or the cron-owner set, and its prepared tools are retired when each run ends.
+classifier scope or the cron-owner set, and its prepared tools are retired when each run ends. The
+channel ingress path reads the same record first and refuses the mapping with the same fixed message
+before anything else runs, so a mapped automation conversation cannot become a cron owner, gain an
+unevictable snapshot slot or have a live run's capture retired by the chat policy pass.
 
 The rule itself and the read pattern live in one place: `chatScopeExclusion` (classify one record),
 `readChatScope` (read one), `partitionChatScope` (split a mapped set) and `chatScopeMessage` (the fixed

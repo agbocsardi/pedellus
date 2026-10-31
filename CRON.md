@@ -57,7 +57,8 @@ one execution. Scheduled work follows that split.
   cancellation aborts that work without deleting the conversation or its history.
 - **Authority and workspace context are prepared per run and retired when it ends.** Persistent
   history never carries persistent permission: a job whose captured tools were narrowed by
-  configuration has none on its next run.
+  configuration has none on its next run, and a run whose conversation an earlier run already used
+  renders the workspace as it is now, not as that earlier run found it.
 - **`origin` mode is unchanged**: the occurrence runs directly in the origin chat conversation, in
   one conversation with no catch-all, no new conversation and no cron-placed reset boundary. The
   owner's own `/new` is that conversation's reset.
@@ -67,7 +68,10 @@ outlive every run task, they carry a `nanobot.cron.conversation` marker naming t
 and job, and the origin's own job document records the same ID. They never become chat sessions,
 never appear in the session map, never receive foreground chat, channel, worker, MCP, Code Mode,
 classifier, scheduling or digest authority, and never appear to the read-only `history` tool as a
-readable chat source. The shared history scope rule classifies them explicitly (`automation`) rather
+readable chat source. A mapped session key naming anything that is not an ordinary chat
+conversation is refused when the channel resolves it, before it can become a cron owner or receive
+chat policy, so a forged or stale map entry cannot reach either path. The shared history scope rule
+classifies them explicitly (`automation`) rather
 than relying on them being absent from the session map.
 
 ## Timer handoff
@@ -106,12 +110,14 @@ record) or `"digest"`. It is set only by an explicit `cron add` with
 
 `conversationId` is the recurring job's own automation conversation. It is optional and absent
 until that job's first run records it, so a job document written by the earlier per-occurrence
-model keeps working. A recorded ID whose conversation is gone, or whose class marker no longer
-names this job and origin, is not an error: the next run creates a fresh automation conversation and
-rewrites the field. A recorded ID that names the origin chat, a mapped session, the root, a
-task-owned conversation or a fork is never adopted, so a damaged pointer costs one new conversation
-instead of pulling a chat into the automation class. Nothing is migrated, version-bumped or dropped, and the same rule covers the
-two document-level fields below (also optional):
+model keeps working. Reuse is never inferred from the pointer alone: the recorded conversation is
+adopted only when its own `nanobot.cron.conversation` marker names this origin, this class and this
+job. A recorded ID whose conversation is gone, unmarked, or marked for something else, or that
+names the origin chat, a mapped session, the root, a task-owned conversation or a fork, is not an
+error: the next run creates a fresh automation conversation and rewrites the field. A damaged
+pointer therefore costs one new conversation instead of pulling a chat into the automation class,
+and it never rewrites a marker on the conversation it named. Nothing is migrated, version-bumped or
+dropped, and the same rule covers the two document-level fields below (also optional):
 
 ```ts
 { jobs: [...], oneOffConversationId?, oneOffQueue? }
@@ -125,12 +131,19 @@ two document-level fields below (also optional):
 ```
 
 `taskId` is the queued run task, which is also its waiter. An entry leaves the queue in the same
-commit as its run's terminal outcome or cancellation, and the claim phase drops entries whose task
-record is already terminal before it decides who is next, so a crash cannot leave a dead entry at
-the head. The bound is a count of admitted runs, not of time or of jobs ever created. When it is
-reached, the new occurrence is refused: `lastOutcome` records `status: "error"` with the fixed text
+commit as its run's terminal outcome or cancellation, and in the claim commit that fences an
+admitted run out (a job cancelled while the gateway was down, for example), so a stale claim cannot
+leave its entry behind. The claim phase also drops entries whose task record is already terminal
+before it decides who is next, so a crash cannot leave a dead entry at the head. The bound is a
+count of admitted runs, not of time or of jobs ever created. The capacity check runs before any
+catch-all conversation is created or recorded. When the bound is reached, the new occurrence is
+refused: `lastOutcome` records `status: "error"` with the fixed text
 `one-off run queue is full (16 admitted runs); this occurrence was not run`, the conversation is not
 touched, and no channel notice is invented. `cron list` shows that text as the job's last run.
+An unreadable queue is refused the same way, with the fixed text
+`one-off run queue is malformed; this occurrence was not run`: the stored value is neither guessed at
+nor rewritten, and the run task settles instead of faulting and blocking the job behind it. The
+refusal repeats for each occurrence until an operator repairs the document.
 
 Each automation conversation also carries its own class marker, one small document:
 
@@ -212,23 +225,33 @@ memory. A one-off run's timer is already terminal, so nothing about the queue is
 background run's conversation, then submits one native input with the stable request ID
 `cron:<jobId>:<scheduledAtMs>`. Both are ordered admissions on that conversation, so the boundary is
 always ahead of the input even when the conversation was still finishing. A retry after a crash
-first looks for its own submission: an occurrence that is already placed is waited on instead of
-being submitted twice and does not add a second boundary. Durable's `submissionByRequest` behavior
-makes the submit itself idempotent. There is no waiting task on a submission ID; the execute phase
-waits directly.
+first looks for its own submission and then at the conversation's newest entry: an occurrence that
+is already placed is waited on instead of being submitted twice, and a conversation whose newest
+entry is already a reset has its boundary in place, so neither path adds a second `pi.reset` (and no
+empty closed episode). That check reads the boundary itself, which is durable, rather than separate
+state that could disagree with it. Durable's `submissionByRequest` behavior makes the submit itself
+idempotent. There is no waiting task on a submission ID; the execute phase waits directly.
 
 `createCronFoundation({ prepare, finalize, reset })` exposes the host seams. `prepare` receives the
 transaction, the origin and target conversation IDs, the job, and the occurrence. It runs inside the
 claim commit, so its writes, the conversation choice and the queue entry are atomic, and it runs
 once per run — including a run whose conversation is the same one the previous run used. For a
-background run it is where the gateway installs the origin's bounded workspace context and records
-the run's coding-tool capture. An automation conversation is ownerless, so Durable copies no agent
-state into it: the host also prepares the model, thinking level and workspace the run executes with.
-A reopen therefore re-authorizes a live run's capture against the current ceiling and origin before
-resuming; anything else is denied. `reset` is the host's native reset entry, called only for a
-background run that has no placed submission yet. `finalize` runs in the terminal commit and retires
-the target's captured authority. Every callback must be durable and idempotent because a crash
-before its commit reruns it.
+background run it is where the gateway rebuilds the origin's bounded workspace context and records
+the run's coding-tool capture; a later episode therefore renders the current bootstrap files,
+memory, skills and skill table instead of the ones the first run of this process read. An
+automation conversation is ownerless, so Durable copies no agent state into it: the host also
+prepares the model, thinking level and workspace the run executes with. A reopen therefore
+re-authorizes a live run's capture against the current ceiling and origin before resuming;
+anything else is denied. `reset` is the host's native reset entry, called only for a background run
+that has no placed submission and whose conversation does not already end at a reset entry.
+`finalize` runs in the terminal commit and retires the target's captured authority. Every callback
+must be durable and idempotent because a crash before its commit reruns it.
+
+Returning nothing from the claim callback leaves the run task's state unchanged but still commits
+the staged document writes. A `prepare` that throws after those writes therefore keeps the
+conversation, its marker, the job's or the origin's recorded ID and the queue entry (the run then
+settles as an error with nothing prepared to retire); only a crash before the commit itself loses
+them.
 
 The run stores its target choice and phase in its checkpoint. A resume after the claim does not
 commit a new checkpoint just to look busy, so Durable's real restart counter is preserved and a run
@@ -257,12 +280,14 @@ already placed stays in the origin transcript and may still complete: that is th
 recording.
 
 A cancelled run also leaves the catch-all queue in its own terminal commit, so a queued occurrence
-that will never execute cannot hold the queue in front of a later one. When the cancelled run owned
-a background conversation, the abort handler first stops that conversation's live work through
-Durable's own conversation abort — before the terminal commit, so a later abort can never withdraw
-the next run's own queued input. That abort is bounded (5 s) and best effort: a provider request
-that ignores the signal keeps running and the next run queues behind it. The conversation and every
-entry in it stay, so cancelling a run never deletes history.
+that will never execute cannot hold the queue in front of a later one. A run whose job was cancelled
+while the gateway was down re-claims on reopen, is fenced out there, and removes its own queue entry
+in that same claim commit. When the cancelled run owned a background conversation, the abort handler
+first stops that conversation's live work through Durable's own conversation abort — before the
+terminal commit, so a later abort can never withdraw the next run's own queued input. That abort is
+bounded (5 s) and best effort: a provider request that ignores the signal keeps running and the next
+run queues behind it. The conversation and every entry in it stay, so cancelling a run never deletes
+history.
 
 `list()` and `inspect()` are owner-scoped and derive status from the actual timer and run task
 records plus live inspection. An admitted one-off run waiting for its turn reports `queued`, not
@@ -454,15 +479,19 @@ fault document is itself ignored rather than replacing job or outbox data.
   reopen (see below). Because preparation happens per run, a later run's authority is whatever the
   configuration allows then, never what an earlier run held. When the origin has no known owner,
   `prepare` records no capture and the run stays default-deny.
-  When a context snapshot provider is configured, `prepare` also installs the origin's snapshot
+  When a context snapshot provider is configured, `prepare` also rebuilds the origin's snapshot
   for the target conversation — bootstrap/AGENTS files, memory, the skill summary — and the
-  read-only `skill` tool, so a scheduled turn renders the same workspace context as a normal turn.
-- An automation conversation deliberately has no SessionMap entry, so it cannot become a cron
-  owner. After a reopen the Gateway finds a live run's target from the run task's checkpoint plus
-  the class the origin's cron documents record, and restores that target's snapshot before applying
-  conversation policy. At the 256-snapshot cap it evicts the oldest idle background target rather
-  than failing the run; a mapped session's snapshot, the cron tool and the cron foundation are never
-  added to an automation conversation.
+  read-only `skill` tool, so a scheduled turn renders the workspace context a normal turn would see
+  at that moment: a later episode of the same conversation sees the current files, not the ones its
+  first run read.
+- An automation conversation deliberately has no SessionMap entry, so nothing maps to it and it
+  cannot become a cron owner. The channel ingress path applies the same chat-scope rule and refuses
+  a session key mapped to one instead of continuing with chat policy. After a reopen the Gateway
+  finds a live run's target from the run task's checkpoint plus the class the origin's cron documents
+  record, and restores that target's snapshot before applying conversation policy. At the
+  256-snapshot cap it evicts the oldest idle background target rather than failing the run; a mapped
+  session's snapshot, the cron tool and the cron foundation are never added to an automation
+  conversation.
 - An `origin`-mode run answers in the origin conversation, so it still holds that conversation's
   `cron` tool and can schedule further jobs. An automation conversation is never given cron.
 - A scheduled run's history participates in the episode catalog, because the reset boundary that
@@ -573,13 +602,26 @@ transcript is exactly reset/input/answer twice; the second run's provider reques
 own episode, so the boundary is real and not a trim. It checks that a run's captured authority is
 gone between runs while the conversation persists. For one-off jobs it gates the first run's model
 request, schedules a second, and asserts the second is `waiting` in the durable queue and `queued` in
-the job view, that the admission order is the document's order, that cancelling the queued job
-removes exactly its entry and terminals its task, that the next one-off reuses the same catch-all
-conversation with its own reset, and that finished runs leave an empty queue. A gateway case schedules
-one occurrence through the real `cron` tool, then asserts the recorded automation conversation, its
-`one-off` class marker, retired capture and empty tool list, that a forged session mapping to it is
-rejected as an `automation` conversation by both `historyEntries` and `listHistoryEpisodes`, and that
-the reset scheduled an episode-catalog pass for it.
+the job view, that the admission order is the document's order, that the queued run wakes when the
+head finishes and executes in that order in its own episode, that cancelling the queued job removes
+exactly its entry and terminals its task, that cancelling the head lets the next queued run proceed,
+that the next one-off reuses the same catch-all conversation with its own reset, and that finished
+runs leave an empty queue. A fenced re-claim (a job whose generation moved on while the
+gateway was down) removes its own queue entry. A full queue refuses the occurrence with its fixed
+`lastOutcome` text without creating a catch-all conversation or adding a queue entry, and a
+malformed queue refuses it with its own fixed text instead of faulting the run. A recorded pointer
+is adopted only when the conversation's own marker names that job: a chat-like conversation and the
+root are both left untouched (no marker, no boundary, no input) and a fresh conversation is recorded
+in their place. A boundary already at the end of a conversation is not placed a second time, and
+`origin` mode creates no conversation, records no conversation ID and places no cron boundary. A
+gateway case schedules one occurrence through the real `cron` tool, then asserts the recorded
+automation conversation, its `one-off` class marker, retired capture and empty tool list, that a
+forged session mapping to it is rejected as an `automation` conversation by `historyEntries`,
+`listHistoryEpisodes` and the channel ingress path (which also leaves the real chat working), and that
+the reset scheduled an episode-catalog pass for it. A second gateway case schedules a recurring job
+through the `cron` tool with a context snapshot provider whose content changes on every call, and
+asserts that each episode's request renders the snapshot rebuilt for it instead of the one the
+earlier episode installed.
 
 Stored-document compatibility was verified in that same suite: a job document written by the earlier
 per-occurrence model (no `conversationId`, no `oneOffConversationId`, no `oneOffQueue`) is exercised

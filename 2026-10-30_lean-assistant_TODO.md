@@ -1228,3 +1228,30 @@ checks (3 new in `tests/cron-conversations.behavior.test.mjs`) and 83 core accep
 gaps: a restart while a one-off run is queued is reasoned from durable state, not exercised by a
 test; a provider request that ignores abort keeps running in the automation conversation after its
 run is cancelled (the next run queues behind it).
+
+### Session — cron conversation model review fixes
+
+An independent review of the conversation-model change verified nine findings against the code and
+probes; all are fixed at their root rather than reworded away. Channel ingress (`conversationFor`)
+now applies the shared chat-scope rule and refuses a mapped session key naming anything but an
+ordinary chat, so an automation conversation can no longer become a cron owner, gain an unevictable
+snapshot slot or have a live run's capture retired by the chat policy pass. A recorded automation
+conversation is adopted only when its own `nanobot.cron.conversation` marker names the same origin,
+class and job, read by a snapshot before the claim commit so an unadoptable pointer cannot even have
+a marker written onto it (the root and an unrelated ownerless chat are both covered). A background
+run rebuilds its workspace snapshot on every run instead of freezing the first run's bootstrap,
+memory, skills and skill table for the process. The claim phase also removes a fenced run's queue
+entry, decides capacity before creating the catch-all conversation, and refuses an unreadable queue
+with fixed visible text instead of faulting the run; the prepare-failure comment now states that
+the staged document writes commit, and classification happens before preparation so a failed
+prepare cannot leave the conversation chat-like in memory. The reset boundary is detected from the
+conversation's own newest entry, so a crash between reset and submit cannot place a second one.
+
+Docs updated where a claim changed (CRON.md, HISTORY.md, AGENTS.md). Coverage grew to 12 cases in
+`tests/cron-conversations.behavior.test.mjs`, including a queued one-off that wakes and runs in
+order, a cancelled head that lets the queue proceed, queue-full and malformed-queue refusals, the
+adoption guard, the single boundary on retry, `origin` mode with no conversation and no reset, a
+fenced claim that leaves no queue entry, ingress refusal of a forged mapping, and per-episode
+workspace context in the real gateway. Verified offline: typecheck/build, 318 behavior checks and 83
+core acceptance; the three signature tests (boundary, per-run context, fenced claim) were confirmed
+to fail against the pre-fix behaviour. Execution checks were not run for this fix.
