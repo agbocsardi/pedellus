@@ -109,15 +109,16 @@ import {
 } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
+import { DIGEST_RUN_LIMITS_DEFAULT, isDigestBound, isDigestCharsBound, type DigestBatchLimits } from "./digest-limits.js";
 import { CHANNEL_STATE_SESSION_SUFFIX, type HistoryChatSession } from "./scope.js";
 
 export const DIGEST_CURSOR_KIND = "nanobot.digest-cursor";
 
 export const DIGEST_LIMITS = Object.freeze({
   /** Entries examined by one batch; a long entry continues in the next batch. */
-  entriesPerBatch: 80,
+  entriesPerBatch: DIGEST_RUN_LIMITS_DEFAULT.entriesPerBatch,
   /** Extracted evidence characters in one batch. A fragment is cut at this bound, never dropped. */
-  charsPerBatch: 24_000,
+  charsPerBatch: DIGEST_RUN_LIMITS_DEFAULT.charsPerBatch,
   /** Entries requested per Durable page while scanning for a closed episode. */
   entriesPerPage: 200,
   /** Entries a single read may examine while looking for closed episodes, across conversations. */
@@ -238,6 +239,11 @@ export interface DigestSourceOptions {
    * shared chat-scope provider (the same one the history index and episode catalog use).
    */
   readonly sessions: (context: Context) => Promise<readonly HistoryChatSession[]>;
+  /**
+   * Accepted bounds for new batches. Absent keeps {@link DIGEST_LIMITS}. A resumed consumer passes
+   * the bounds captured with its batch instead of re-reading them from current configuration.
+   */
+  readonly limits?: DigestBatchLimits;
 }
 
 export interface DigestSource {
@@ -245,9 +251,10 @@ export interface DigestSource {
   cursor(conversationId: ConversationId, context: Context): Promise<DigestCursor>;
   /**
    * The oldest unprocessed closed-episode chunk across the mapped chats. Writes nothing
-   * to Durable; only an acknowledgement moves a cursor.
+   * to Durable; only an acknowledgement moves a cursor. `limits` overrides the source's
+   * configured batch bounds for this read only.
    */
-  read(context: Context): Promise<DigestReadResult>;
+  read(context: Context, limits?: DigestBatchLimits): Promise<DigestReadResult>;
   /**
    * Re-derive one chunk this source previously returned, from its recorded identity.
    *
@@ -258,16 +265,17 @@ export interface DigestSource {
    * `throughChars`/`complete`; a forged, stale or out-of-range ref is otherwise rejected
    * instead of returning different evidence. It does not re-prove that the start is the
    * episode's first entry, because only `acknowledge()` may move the frontier. Cross-conversation
-   * scan ordering cannot change the answer, so a resumed consumer replays exactly the chunk
-   * it accepted.
+   * scan ordering cannot change the answer, so a resumed consumer replays exactly the chunk it accepted.
+   * `limits` must be the bounds captured with the batch; a different bound set re-derives a
+   * different chunk and is rejected instead of silently accepting a wider one.
    */
-  readBatch(ref: DigestBatchRef, context: Context): Promise<DigestBatch>;
+  readBatch(ref: DigestBatchRef, context: Context, limits?: DigestBatchLimits): Promise<DigestBatch>;
   /**
    * Record that a batch was successfully consumed, including a batch with no evidence.
    * The frontier update is one commit and is validated against the committed transcript;
-   * a rejection leaves the frontier unchanged.
+   * a rejection leaves the frontier unchanged. `limits` must be the batch's captured bounds.
    */
-  acknowledge(batch: DigestBatch, context: Context): Promise<DigestCursor>;
+  acknowledge(batch: DigestBatch, context: Context, limits?: DigestBatchLimits): Promise<DigestCursor>;
 }
 
 type DigestCursorDocument = {
@@ -577,6 +585,7 @@ async function readChunk(
   firstEntryId: EntryId,
   firstTextStart: number,
   episodeEndEntryId: EntryId,
+  limits: DigestBatchLimits,
   context: Context,
 ): Promise<Chunk> {
   const entries: DigestEvidence[] = [];
@@ -587,10 +596,10 @@ async function readChunk(
   let read = 0;
   let cursor: Cursor | undefined;
   let done = false;
-  while (!done && read < DIGEST_LIMITS.entriesPerBatch) {
+  while (!done && read < limits.entriesPerBatch) {
     const page = await conversation.entries(
       { order: "ascending", minEntryId: firstEntryId, maxEntryId: episodeEndEntryId },
-      Math.min(DIGEST_LIMITS.entriesPerPage, DIGEST_LIMITS.entriesPerBatch - read),
+      Math.min(DIGEST_LIMITS.entriesPerPage, limits.entriesPerBatch - read),
       cursor,
       context,
     );
@@ -601,8 +610,8 @@ async function readChunk(
       const total = shape?.length ?? 0;
       let fragment: DigestEvidence | undefined;
       let nextThroughChars: number;
-      if (shape !== undefined && total > from && used < DIGEST_LIMITS.charsPerBatch) {
-        let take = Math.min(total - from, DIGEST_LIMITS.charsPerBatch - used);
+      if (shape !== undefined && total > from && used < limits.charsPerBatch) {
+        let take = Math.min(total - from, limits.charsPerBatch - used);
         if (from + take < total && cutsSurrogatePair(shape, from, take)) {
           // The budget cannot hold the whole character: end this batch before the entry.
           // A first entry always has the full budget, so `take <= 1` implies earlier entries.
@@ -634,7 +643,7 @@ async function readChunk(
         entries.push(fragment);
         used += fragment.text.length;
       }
-      if (entry.id === episodeEndEntryId || used >= DIGEST_LIMITS.charsPerBatch) {
+      if (entry.id === episodeEndEntryId || used >= limits.charsPerBatch) {
         done = true;
         break;
       }
@@ -949,11 +958,12 @@ async function validateEpisodeBounds(
 async function validateChunkAgainstTranscript(
   conversation: Conversation,
   batch: DigestBatch,
+  limits: DigestBatchLimits,
   context: Context,
 ): Promise<void> {
   const page = await conversation.entries(
     { order: "ascending", minEntryId: batch.firstEntryId, maxEntryId: batch.throughEntryId },
-    DIGEST_LIMITS.entriesPerBatch + 1,
+    limits.entriesPerBatch + 1,
     undefined,
     context,
   );
@@ -962,8 +972,8 @@ async function validateChunkAgainstTranscript(
   if (last === undefined || last.id !== batch.throughEntryId) {
     throw new TypeError("Digest batch does not cover its claimed entry range");
   }
-  if (items.length > DIGEST_LIMITS.entriesPerBatch) {
-    throw new TypeError(`Digest batch covers more than ${DIGEST_LIMITS.entriesPerBatch} entries`);
+  if (items.length > limits.entriesPerBatch) {
+    throw new TypeError(`Digest batch covers more than ${limits.entriesPerBatch} entries`);
   }
   if (items[0]!.id !== batch.firstEntryId) {
     throw new TypeError("Digest batch does not start at a committed entry");
@@ -1069,8 +1079,16 @@ function validateBatchRef(ref: DigestBatchRef): void {
   }
 }
 
+function requireBatchLimits(limits: DigestBatchLimits): DigestBatchLimits {
+  if (!isDigestBound(limits.entriesPerBatch) || !isDigestCharsBound(limits.charsPerBatch)) {
+    throw new TypeError("digest batch bounds must be positive safe integers, with charsPerBatch at least 2");
+  }
+  return limits;
+}
+
 export function createDigestSource(options: DigestSourceOptions): DigestSource {
   const { harness } = options;
+  const configured = requireBatchLimits(options.limits ?? DIGEST_LIMITS);
   // Derived scan positions only: losing them costs a repeated bounded scan, never evidence.
   const scanCache = new Map<ConversationId, ScanCacheEntry>();
   // Scan budget rotates its starting conversation, so a chat with continuous activity cannot
@@ -1086,7 +1104,8 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
       return cursorFor(conversationId, context);
     },
 
-    async read(context) {
+    async read(context, limits) {
+      const batchLimits = requireBatchLimits(limits ?? configured);
       const sessions = await options.sessions(context);
       validateSessions(sessions);
       const mapped = new Set<ConversationId>(sessions.map((session) => session.conversationId));
@@ -1200,6 +1219,7 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
         firstEntryId,
         firstTextStart,
         episode.episodeEndEntryId,
+        batchLimits,
         context,
       );
       return {
@@ -1218,8 +1238,9 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
       };
     },
 
-    async readBatch(ref, context) {
+    async readBatch(ref, context, limits) {
       validateBatchRef(ref);
+      const batchLimits = requireBatchLimits(limits ?? configured);
       const conversationId = ref.conversationId;
       const conversation = await harness.conversation(conversationId, context);
       if (conversation === undefined) throw new TypeError("Digest batch ref conversation is not committed");
@@ -1237,6 +1258,7 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
         ref.firstEntryId,
         ref.firstTextStart,
         ref.episodeEndEntryId,
+        batchLimits,
         context,
       );
       if (
@@ -1262,8 +1284,9 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
       };
     },
 
-    async acknowledge(batch, context) {
+    async acknowledge(batch, context, limits) {
       validateBatchShape(batch);
+      const batchLimits = requireBatchLimits(limits ?? configured);
       const conversationId = batch.conversationId;
       const conversation = await harness.conversation(conversationId, context);
       if (conversation === undefined) throw new TypeError("Digest batch conversation is not a committed conversation");
@@ -1276,7 +1299,7 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
         // New bounds are proven complete here; continuation chunks reuse them.
         await validateFreshEpisodeClosedRange(conversation, batch, startEntry, context);
       }
-      await validateChunkAgainstTranscript(conversation, batch, context);
+      await validateChunkAgainstTranscript(conversation, batch, batchLimits, context);
       const next: DigestCursor = {
         throughEntryId: batch.throughEntryId,
         throughChars: batch.throughChars,

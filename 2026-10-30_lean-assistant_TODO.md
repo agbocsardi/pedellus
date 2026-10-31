@@ -23,17 +23,17 @@
 Python is the accepted behavioral/product reference. Port onto native Durable
 facilities; do not redesign memory quality, holistic usability or agent loops.
 
-- [ ] P1 — Configurable digest bounds: entries/batch (80), characters/batch
+- [x] P1 — Configurable digest bounds: entries/batch (80), characters/batch
   (24,000), tool calls (10 individual calls, not Python iterations), whole-run
   timeout (300 seconds), changed files (8) and changed-text volume (32,000).
   Preserve one bounded closed-episode chunk per invocation, partial writes and
   cursor failure guards. Next ordinary invocation may retry a native parked task
   once; no retry loop or user recovery UI. No automatic schedule activation.
-- [ ] P2 — Telegram outbound local documents/photos/audio/video/voice, current
+- [x] P2 — Telegram outbound local documents/photos/audio/video/voice, current
   authenticated chat only, bounded workspace files and captions, no remote URL
   fetching/arbitrary recipients; retain unknown external outcomes, never blindly
   retry or evict them. No extraction, transcoding or new media backend registry.
-- [ ] P3 — Agent reads its own workers' bounded paginated transcripts via native
+- [x] P3 — Agent reads its own workers' bounded paginated transcripts via native
   Durable conversation entries, keyed by authorized worker ID, not raw SQL or
   arbitrary conversation ID. No Atuin capture/export/second transcript archive.
 - [ ] P4 — Agent steers live workers using native Durable input semantics,
@@ -42,6 +42,19 @@ facilities; do not redesign memory quality, holistic usability or agent loops.
 - [ ] P5 — Concise, read-only background summary inside existing `/status`:
   what is running (workers/digest/cron), if anything. No dashboard, management
   commands, model call or transcript dump; agent remains the manager.
+- [ ] P7 — User-systemd service readiness and parallel instances: one template
+  service per instance, per-instance config/environment, independent
+  dataDir/SQLite/socket and workspace. Verify graceful stop/restart/journal and
+  same-store duplicate-owner refusal offline. No install/enable/start, lingering,
+  dedicated system account or live deployment. Distinct Telegram pollers require
+  distinct bot tokens; shared provider keys share quota, not a security boundary.
+  Default primary config: `~/.durable-nanobot/config.json`; `--config` overrides
+  it for a secondary instance. Resolve home at runtime, never depend on CWD;
+  preserve explicit-config semantics for gateway/agent/recovery. No discovery,
+  merging configs, auto-generation, migration or reading actual personal config.
+  The home directory exists, but that default config file was not present when
+  checked (existence only; no contents/settings were read).
+  Prioritize this service slice ahead of remaining status work when capacity opens.
 - [ ] P6 — Independently review the combined union, run bounded existing parity/
   integration checks and reconcile docs. No new holistic usability study or
   live-provider acceptance without separate authorization.
@@ -429,6 +442,54 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Parity batch — P1 digest budgets and P2 Telegram sends published
+
+P1 published at `3a297fa`: configurable per-invocation digest bounds (entries,
+characters, individual tool calls, run timeout, changed files and changed text),
+captured across replay/reopen; repaired native-edit argument shapes are charged
+using the same normalizer; one ordinary-invocation native parked-task retry; no
+retry loop or recovery UI. Independent review found and the original worker
+fixed repaired-edit budget bypass and a one-unit Unicode wedge. Gate: 262
+behavior / 32 files, 2 execution, 83 core; published main rebuild plus 12 bounds
+and 14 digest checks. Accepted limits: UTF-16 conservative diff accounting, no
+path-alias resolution, 4,000-entry verification bound, no nested digest tools.
+
+P2 published at `c755673` after two independent passes and a final union PASS:
+agent sends any workspace file through the current authenticated private chat;
+omitted kind sends unchanged bytes as a document, while photo/audio/video/voice
+are optional presentation hints. Authority is media opt-in plus `read` for the
+model tool, current mapping/allowlist, workspace-only paths and 20 MiB; durable
+task identity, write-ahead records, unknown retention and cancellation preserved.
+Gate: 270 behavior / 33 files, 2 execution, 83 core, 8 focused; published main
+rebuild plus 8 outbound and 12 bounds checks. Accepted limits: live Telegram
+format/delivery unverified, no transcoding/autodetect, documented parent-directory
+resolve/open race and UTF-16 display-name stem. Owner parallel migration plan
+remained untracked, unread and untouched.
+
+### Service readiness and parallel instances approved
+
+Owner identified service operation as important and approved a user-systemd
+service template, plus independent parallel instances rather than multi-tenancy.
+Use the existing foreground gateway and its SIGTERM/SIGINT teardown; separate
+configs/data directories/workspaces supply separate SQLite stores and sockets.
+No automatic service installation/activation or system settings changes.
+P7 added to the batch; implement when an active worker slot opens, then include
+it in P6 combined review. No new daemon or supervisor layer.
+
+### Parity batch — worker transcripts accepted; steering starts
+
+P3 published at `ba6df4e` by original implementer after independent CLEAN PASS:
+19 worker checks, 250 combined behavior, 2 execution, 83 core, typecheck/build.
+Shared bounded entry rendering preserves history scope; task/spawner/child-owner
+edges are checked before reading live or terminal worker transcripts. No Atuin
+capture/export or raw SQL surface. Published main rebuild and 19 focused checks
+passed. Cosmetic start-hint, record-lag wording and truncation-suffix nits waived.
+P4 starts in a fresh worktree with native steering/completion-race coordination.
+
+A separate untracked `2026-10-31_legacy-migration_TODO.md` appeared in main;
+owner explicitly directed leaving it untouched while continuing in isolated
+worktrees. Do not read, commit, modify or delete that parallel work item.
 
 ### Parity batch authorized
 

@@ -769,9 +769,14 @@ segment content: the derived scan cache remembers the segment's last *content* e
 budget boundary between consecutive resets cannot invent a reset-only episode. A batch with
 no evidence (nothing worth remembering, or an episode of non-evidence entries) is still
 acknowledged and counts as processed; a failure or restart before acknowledgement replays the same
-chunk. `DIGEST_LIMITS` bounds a batch (80 entries and strictly 24,000 evidence characters) and a read
-(4,000 scanned entries, 256 mapped chats); a larger closed episode or long entry is returned as
-contiguous fragments. A fragment also never ends between the two halves of a UTF-16 surrogate pair
+chunk. `DIGEST_LIMITS` holds the default batch bounds (80 entries and strictly 24,000 evidence
+characters); a read is also bounded to 4,000 scanned entries and 256 mapped chats. A larger closed
+episode or long entry is returned as contiguous fragments. The `digest` config block may override
+`entriesPerBatch` and `charsPerBatch`; a read accepts them explicitly, and a resumed batch is
+re-derived with the bounds captured when it was accepted instead of current configuration.
+`charsPerBatch` counts UTF-16 code units and has a minimum of 2, so one surrogate pair always fits;
+a smaller value is rejected at config, capture and direct-source entry points instead of wedging the
+first chunk. A fragment also never ends between the two halves of a UTF-16 surrogate pair
 (the boundary moves back, or the batch ends before that entry), so sending a batch as UTF-8 cannot
 introduce a replacement character; `textStart`/`chars` stay in UTF-16 code units, not bytes.
 
@@ -841,12 +846,20 @@ One run, in order:
    frontier unchanged, so the same batch is offered again. Because the check reads the committed
    transcript, the same accounting applies to a resumed attempt after a reopen.
 
-The model input is bounded by the O1 batch (80 entries / 24,000 evidence characters) plus limits in
-`MEMORY_DIGEST_LIMITS`: the prompt file is read up to 64 KiB and rendered to 16,000 characters,
-the derived index to 12,000, one turn has a 300-second default deadline (a host seam,
-`memoryDigest.turnTimeoutMs`, overrides it), and the outcome keeps a 2,000-character answer excerpt.
-The task record stores only the batch identity and pinned model; the evidence lives once in the
-committed transcript and once in the run's own transcript, never in a permanent task input.
+The model input is bounded by the O1 batch plus fixed prompt limits in `MEMORY_DIGEST_LIMITS`: the
+prompt file is read up to 64 KiB and rendered to 16,000 characters, the derived index to 12,000, and
+the outcome keeps a 2,000-character answer excerpt. One `digest` config block exposes the six
+invocation bounds, with the accepted defaults `entriesPerBatch: 80`, `charsPerBatch: 24000`,
+`maxToolCalls: 10`, `runTimeoutSeconds: 300`, `maxChangedFiles: 8` and `maxDiffChars: 32000`. It
+neither enables nor schedules digestion — frequency stays with ordinary cron — and an absent block
+keeps the defaults. A started task captures the resolved values in its input; a replay or reopen
+re-derives its batch, deadline, tool budget and write budget from that capture, never from a widened
+current config. A legacy task record without a captured block falls back to the canonical defaults;
+an older host deadline seam was never persisted in the task. The host seam
+`memoryDigest.turnTimeoutMs` supplies a deadline only when config leaves `runTimeoutSeconds`
+absent; a configured product deadline wins. The task record stores only
+the batch identity, pinned model and those bounds; the evidence lives once in the committed
+transcript and once in the run's own transcript, never in a permanent task input.
 
 The agent-owned prompt is `<workspace>/DIGEST.md`, seeded with `DEFAULT_MEMORY_DIGEST_PROMPT` only when
 the file does not exist (exclusive create; an existing file is read as-is and never rewritten,
@@ -869,7 +882,17 @@ edit only text it just saw. There are no hashes, versions, managed workspace cop
 transaction: a failed run keeps whatever it already wrote, says so honestly, and the unacknowledged
 batch is replayed idempotently. No shell, network, MCP, Code Mode, history, channel, worker, cron or
 scheduling tool is installed in a digest target, and a run never writes to the origin chat, a channel
-outbox or a schedule.
+outbox or a schedule. The same curation hook enforces the run's budgets at the native call: every
+assistant tool-call part counts, including a call that is refused or fails, so `maxToolCalls` is a
+per-run ceiling over individual calls. For `write` and `edit` it also reserves changed files and
+changed text before execution. A create charges its whole content; an edit charges both `oldText` and
+`newText`, summed across calls, so repeated edits of one file accumulate instead of being
+undercharged. A call that would exceed `maxChangedFiles` or `maxDiffChars` is blocked before it
+mutates anything. The counters come from the run's committed transcript and in-flight calls, so a
+replay, a parallel round or a reopen cannot reset or overshoot them. A budget refusal is a failed
+tool result, so the batch is not acknowledged; whatever earlier calls already wrote stays (there is
+still no rollback), and the same batch is offered again. These are conservative text-unit bounds,
+not a git-diff computation.
 
 Reopen is restored from the task itself: a live digest target keeps its pinned model, thinking level,
 captured Markdown tools and scope hook, and its queued turn resumes before the configured default can
@@ -886,11 +909,14 @@ loudly; the scope check is a naming guard, not confinement (a symlink swapped in
 not defended, exactly like the rest of the workspace tools, though `O_EXCL` itself never follows a
 final symlink); `edit` cannot detect an outside process changing the file between its read and its
 write, so the in-process serialization and exact-text match are the honest boundary; a turn longer
-than 4,000 committed entries cannot be verified and fails closed; a cancelled or parked digest task still
-counts as live, so `start` reports `busy` with its task ID until a host retries or aborts it rather
-than allowing a second writer; the prompt is read when an attempt first submits its turn, so an owner
-edit applies to the next accepted batch rather than to a run already in flight (a resumed attempt
-re-submits its request ID, and text already admitted stays authoritative for that attempt).
+than 4,000 committed entries cannot be verified and fails closed; a cancelled or parked digest task
+still counts as live, so `start` reports `busy` with its task ID rather than allowing a second writer.
+Before that busy result, an ordinary start calls Durable's `retryTask` once for the live digest task,
+outside any commit; it is a no-op unless the task was parked at the restart limit and never starts a
+new task or loops. There is no digest user recovery command. The prompt is read when an attempt first
+submits its turn, so an owner edit applies to the next accepted batch rather than to a run already in
+flight (a resumed attempt re-submits its request ID, and text already admitted stays authoritative for
+that attempt).
 Nothing here was exercised with a real provider, a live channel, credentials or a personal workspace.
 `tests/memory-digest.behavior.test.mjs` covers the offline evidence over the real Gateway and a faux
 provider: fact/no-op/cursor, idle and refusal, provider failure and a replay that reads the retained
@@ -898,6 +924,10 @@ fact instead of duplicating it, refused/create-only/stale calls failing the batc
 report failing the batch, a concurrent create that is never overwritten, cancellation, the turn
 deadline, an existing prompt not being clobbered, and a reopen that keeps the pinned model and
 curation tools (including a failed call before the reopen that still fails the resumed attempt).
+`tests/memory-digest-bounds.behavior.test.mjs` covers the configured bounds and their capture in the
+task input, the call-time tool budget (a refused call included), changed-file and changed-text
+refusals before mutation, a repeated same-file edit, parallel calls, budget persistence across a
+reopen, the config-over-seam deadline precedence, and the single native parked-task retry.
 
 ## Manual and scheduled invocation
 
