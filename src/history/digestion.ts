@@ -581,6 +581,11 @@ interface Chunk {
  * by the same chunk with a zero offset, so an episode whose evidence fits the bound is one
  * batch even when it ends in backend traffic — including when the evidence fills the bound
  * exactly. The entry cap still bounds that scan.
+ *
+ * The one exception is an entry the budget cuts short: a partially consumed entry must be the
+ * chunk's last entry (a fragment may never lose its tail before the last entry, or
+ * acknowledgement would refuse the chunk forever), so a cut ends the chunk immediately, however
+ * many evidence-free entries follow it. Those entries then ride with the next chunk.
  */
 async function readChunk(
   conversation: Conversation,
@@ -651,6 +656,15 @@ async function readChunk(
         used += fragment.text.length;
       }
       if (entry.id === episodeEndEntryId) {
+        done = true;
+        break;
+      }
+      if (nextThroughChars < total) {
+        // This entry still has a tail (the character budget cut it, or a surrogate pair moved the
+        // boundary): the chunk must end here so the tail continues next batch. Consuming further
+        // entries would put a partially consumed entry before the chunk's last entry, which
+        // acknowledgement validation refuses as a lost tail — and the reader would then re-offer
+        // the same chunk forever.
         done = true;
         break;
       }
@@ -961,12 +975,15 @@ async function validateEpisodeBounds(
  * claimed offset, no entry before the last may lose its tail, and a complete chunk must
  * end just before its closing reset.
  *
- * Bound: one transcript read of the claimed range, at most `limits.entriesPerBatch + 1` entry
- * records. With the shipped defaults that is 2,001 entries whose *evidence* is bounded by
- * `limits.charsPerBatch` (200,000 UTF-16 units), because the chunk that produced them could not
- * have covered more. This is not a scan and needs no separate budget: it re-reads exactly the
- * chunk being acknowledged, which the read that produced it already paged through in full. A
- * range that does not fit the captured batch bound is refused loudly instead of being truncated.
+ * Bound: one transcript read of the claimed range, bounded by *entry count* at
+ * `limits.entriesPerBatch + 1` records (2,001 with the shipped defaults), never by bytes. The
+ * character bound does not cover every record: a chunk may end in evidence-free entries (reset
+ * markers, system or compaction entries, `pi.tool-result` entries, tool-call-only assistant
+ * entries) whose bytes contribute no evidence characters, and one individual entry may itself be
+ * larger than `limits.charsPerBatch`. So the honest statement is: this re-reads exactly the chunk
+ * being acknowledged (no scan, no second pass over the episode), with work proportional to that
+ * chunk's entry count, and per-entry size is not bounded by the character bound. A range that does
+ * not fit the captured entry bound is refused loudly instead of being truncated.
  */
 async function validateChunkAgainstTranscript(
   conversation: Conversation,

@@ -410,6 +410,84 @@ test("an episode over the character cap splits into ordered independent chunks w
   }
 });
 
+test("a chunk cut mid-entry ends before following tool output and resumes without stalling", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-digest-cut-entry-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    // The dangerous shape: a long assistant reply overflows the character budget and the very next
+    // entry is its evidence-free tool result. Consuming that tool result after a cut would put a
+    // partially consumed entry before the chunk's last entry, so acknowledgement would refuse the
+    // chunk and the deterministic reader would offer it again forever.
+    const long = `CUT-MID-ENTRY-${"m".repeat(250)}`;
+    const [longEntry] = await append(harness, conversation, assistant(long));
+    const [tool] = await append(harness, conversation, toolResult("CUT-TOOL-OUTPUT-3318", "bash"));
+    const [afterUser] = await append(harness, conversation, user("AFTER-CUT-1"));
+    const [afterAssistant] = await append(harness, conversation, assistant("FINAL-2"));
+    await append(harness, conversation, reset());
+
+    const limits = { entriesPerBatch: 100, charsPerBatch: 100 };
+    const source = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:cut-entry", conversationId: conversation.id }],
+      limits,
+    });
+
+    const first = batched(await source.read(context));
+    assert.equal(first.complete, false);
+    assert.equal(first.throughEntryId, longEntry.id, "the cut entry ends the chunk, before its tool result");
+    assert.equal(first.throughChars, 100);
+    assert.deepEqual(first.entries.map((fragment) => [fragment.entryId, fragment.chars]), [[longEntry.id, long.length]]);
+    await source.acknowledge(first, context);
+
+    // The chunk that used to livelock: it still ends on the cut entry, so it is acknowledgeable.
+    const second = batched(await source.read(context));
+    assert.equal(second.episodeStartEntryId, first.episodeStartEntryId);
+    assert.equal(second.firstEntryId, longEntry.id);
+    assert.equal(second.firstTextStart, 100);
+    assert.equal(second.throughEntryId, longEntry.id);
+    assert.equal(second.throughChars, 200);
+    assert.equal(second.complete, false);
+    await source.acknowledge(second, context);
+
+    const third = batched(await source.read(context));
+    assert.equal(third.firstEntryId, longEntry.id);
+    assert.equal(third.firstTextStart, 200);
+    assert.equal(third.complete, true, "the tail of the cut entry, its tool result and the rest fit one chunk");
+    assert.equal(third.throughEntryId, afterAssistant.id);
+    assert.deepEqual(third.entries.filter((fragment) => fragment.role === "user").map((fragment) => fragment.text), [
+      "AFTER-CUT-1",
+    ]);
+    assert.equal(third.entries.some((fragment) => fragment.text.includes("CUT-TOOL-OUTPUT")), false);
+    await source.acknowledge(third, context);
+
+    // The long reply rebuilds exactly once, in order, and the cursor settles on the last entry.
+    const batches = [first, second, third];
+    const pieces = fragmentsOf(batches, longEntry.id);
+    let offset = 0;
+    let rebuilt = "";
+    for (const [textStart, text] of pieces) {
+      assert.equal(textStart, offset, "fragments are contiguous across chunks");
+      offset += text.length;
+      rebuilt += text;
+    }
+    assert.equal(rebuilt, long, "the whole cut entry is consumed exactly once");
+    assert.deepEqual(await source.cursor(conversation.id, context), {
+      throughEntryId: afterAssistant.id,
+      throughChars: "FINAL-2".length,
+      episodeStartEntryId: null,
+      episodeEndEntryId: null,
+    });
+    assert.equal(idle(await source.read(context)).caughtUp, true);
+    assert.ok(afterUser.id > tool.id && tool.id > longEntry.id);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("tool results and tool calls are consumed without contributing evidence", { timeout: 20_000 }, async () => {
   const dir = await temp("nanobot-digest-tool-heavy-");
   const db = resolve(dir, "probe.sqlite");
@@ -557,6 +635,73 @@ test("a tool-result acknowledgement is refused when it claims tool text or its o
     assert.deepEqual(batched(await source.read(context)), batch);
     await source.acknowledge(batch, context);
     assert.equal((await source.cursor(conversation.id, context)).throughEntryId, answer.id);
+    assert.equal(idle(await source.read(context)).caughtUp, true);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a recorded batch from the old selection fails closed instead of acknowledging", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-digest-old-format-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    // The old build split at exactly 24,000 evidence characters, so this message filled one chunk
+    // and the trailing tool result started the next one.
+    const message = "O".repeat(24_000);
+    const [messageEntry] = await append(harness, conversation, user(message));
+    const toolText = "OLD-FORMAT-TOOL-OUTPUT-7702";
+    const [tool] = await append(harness, conversation, toolResult(toolText, "read"));
+    await append(harness, conversation, reset());
+
+    const source = createDigestSource({
+      harness,
+      sessions: async () => [{ sessionKey: "cli:old-format", conversationId: conversation.id }],
+    });
+    const oldLimits = { entriesPerBatch: 80, charsPerBatch: 24_000 };
+    // Under today's selection the message no longer fills the old character bound, so the recorded
+    // old chunk (cut at the message, not complete) cannot be re-derived and is refused.
+    const current = batched(await source.read(context, oldLimits));
+    assert.equal(current.complete, true, "message and trailing tool result are one pass now");
+    assert.equal(current.throughEntryId, tool.id);
+    const oldRef = {
+      sessionKey: current.sessionKey,
+      conversationId: current.conversationId,
+      episodeStartEntryId: current.episodeStartEntryId,
+      episodeEndEntryId: current.episodeEndEntryId,
+      firstEntryId: current.firstEntryId,
+      firstTextStart: 0,
+      throughEntryId: messageEntry.id,
+      throughChars: 24_000,
+      complete: false,
+      cursor: current.cursor,
+    };
+    await assert.rejects(
+      () => source.readBatch(oldRef, context, oldLimits),
+      /no longer matches/,
+      "an old recorded chunk is refused rather than silently re-derived as a different chunk",
+    );
+
+    // A recorded old-format evidence object (tool role, tool name) is not acknowledged wrongly.
+    await assert.rejects(
+      () => source.acknowledge({
+        ...current,
+        entries: [
+          current.entries[0],
+          { entryId: tool.id, role: "tool", kind: "pi.tool-result", toolName: "read", textStart: 0, chars: toolText.length, text: toolText },
+        ],
+      }, context),
+      /role is invalid/,
+    );
+    assert.deepEqual(await source.cursor(conversation.id, context), oldRef.cursor, "nothing advanced");
+
+    // The honest current chunk still acknowledges cleanly.
+    assert.deepEqual(batched(await source.read(context)), current);
+    await source.acknowledge(current, context);
+    assert.equal((await source.cursor(conversation.id, context)).throughEntryId, tool.id);
     assert.equal(idle(await source.read(context)).caughtUp, true);
   } finally {
     if (harness !== undefined) await harness.close(context).catch(() => {});

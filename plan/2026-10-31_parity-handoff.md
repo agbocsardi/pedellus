@@ -243,6 +243,13 @@ Digestion:
 - A run's own turn verification stays bounded at 4,000 committed entries. That
   bound covers the run's turn (one input entry, at most `maxToolCalls` tool rounds
   and the answer), not the batch, so a larger batch does not move it.
+- The acknowledgement re-read of a chunk is bounded by entry count
+  (`entriesPerBatch + 1` records), not by bytes. Evidence-free entries, and one
+  entry larger than `charsPerBatch`, are not covered by the character bound, so
+  that re-read's peak size is that many entry records rather than a byte ceiling.
+- An entry the character budget cuts short always ends its chunk, so a long reply
+  followed by its tool result costs one chunk per cut instead of one chunk per
+  episode. The tail and the following entries ride with the next chunk.
 - The bounded gap check between the previous frontier and the next closed
   episode examines up to 4,000 entries. A conversation with more than 4,000
   consecutive empty `pi.reset` markers before that episode is refused loudly

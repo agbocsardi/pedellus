@@ -773,6 +773,16 @@ re-derives the episode bounds and the claimed chunk from the committed transcrip
 - a partial chunk must continue exactly at the stored position, and a claimed range may contain no
   reset after its first entry.
 
+The reader guarantees the tail rule above rather than leaving it to the acknowledgement: an entry the
+character budget cuts short always ends its chunk, even when evidence-free entries (a
+`pi.tool-result`, system or tool-call-only assistant entry) follow it. Consuming one of those after a
+cut would put a partially read entry before the chunk's last entry, which acknowledgement refuses —
+and because the reader is deterministic it would then re-offer the same refused chunk forever. A cut
+entry's tail and any entries after it ride with the next chunk. The re-read that validates a chunk is
+bounded by **entry count** (`entriesPerBatch + 1` records), not by bytes: evidence-free entries and
+an individual entry larger than `charsPerBatch` contribute no character-bound accounting, so peak
+read size is that many entry records.
+
 A malformed or forged batch is therefore rejected instead of corrupting the cursor, so no
 acknowledgement can advance the frontier past evidence the transcript does not support. The gap
 check above is bounded: the reset markers between the previous frontier (or the beginning of the
