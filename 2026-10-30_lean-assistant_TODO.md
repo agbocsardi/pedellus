@@ -42,6 +42,13 @@ facilities; do not redesign memory quality, holistic usability or agent loops.
 - [ ] P5 — Concise, read-only background summary inside existing `/status`:
   what is running (workers/digest/cron), if anything. No dashboard, management
   commands, model call or transcript dump; agent remains the manager.
+- [ ] P7 — User-systemd service readiness and parallel instances: one template
+  service per instance, explicit per-instance config/environment, independent
+  dataDir/SQLite/socket and workspace. Verify graceful stop/restart/journal and
+  same-store duplicate-owner refusal offline. No install/enable/start, lingering,
+  dedicated system account or live deployment. Distinct Telegram pollers require
+  distinct bot tokens; shared provider keys share quota, not a security boundary.
+  Prioritize this service slice ahead of remaining status work when capacity opens.
 - [ ] P6 — Independently review the combined union, run bounded existing parity/
   integration checks and reconcile docs. No new holistic usability study or
   live-provider acceptance without separate authorization.
@@ -429,6 +436,16 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Service readiness and parallel instances approved
+
+Owner identified service operation as important and approved a user-systemd
+service template, plus independent parallel instances rather than multi-tenancy.
+Use the existing foreground gateway and its SIGTERM/SIGINT teardown; separate
+configs/data directories/workspaces supply separate SQLite stores and sockets.
+No automatic service installation/activation or system settings changes.
+P7 added to the batch; implement when an active worker slot opens, then include
+it in P6 combined review. No new daemon or supervisor layer.
 
 ### Parity batch — worker transcripts accepted; steering starts
 
