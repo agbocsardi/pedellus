@@ -123,6 +123,49 @@ capabilities. It is not enabled by default. Code Mode is model-only (scripts
 cannot recursively start Code Mode); native deferred discovery is still available
 to scripts through `searchTools()`.
 
+## Classifiers and image generation
+
+When the shipped gateway installs Code Mode it passes `models: true` and keeps
+the native classifier path. Scripts can list the configured provider catalog with
+`models.getModelsOfType(type, provider?)` / `getAvailableOfType()` /
+`getModelOfType()` and answer typed questions with `models.classify(model, {
+state, questions, images? })`. A classifier model is not a chat selection and
+never appears in `/model`.
+
+A provider is in the catalog only when configuration references it through
+`allowedModels`/`modelPresets`, `credentials`, or a custom `providers` entry. A
+classifier-only provider can therefore be enabled by adding its credential
+reference without adding any chat model. Catalog helpers are read-only; they
+expose no chat completion, fallback, discovery or budget bypass.
+
+`models.classify()` runs as the native reserved nested tool
+`pi.codemode.models.classify`. It is a real Durable tool task, so the native
+ToolTask hooks, cancellation, replay policy and usage accounting apply, and its
+usage is counted in the Code Mode result. The QuickJS deadline and output budget
+from `CODEMODE_BUDGETS` still bound the whole script. Classifier image blocks are
+accepted only when the model declares `"image"` input; this is image understanding,
+not generation.
+
+Image generation is deliberately absent. The integration removes the native
+`pi.codemode.models.generateImages` registration, removes its `models.generateImages`
+documentation from the Code Mode description, and a call-time hook refuses the
+reserved generation name if it ever appears. `image()` remains only an output
+helper for existing image blocks, not a generation API. The catalog may still
+list image-model metadata; it cannot be run.
+
+The native classifier tool is enabled in a conversation's `tools` list but kept
+out of `modelTools`, so the model cannot call it directly and scripts reach it
+only through the `models` global. It is added only when Code Mode itself is
+offered. For a worker child, that means the pruned durable worker capture must
+still contain `codemode` and the current worker grants must still include it. A
+worker capture never names classifier rights separately: disabling Code Mode (or
+narrowing it out of the worker grant) prunes both permanently, and a later
+re-enable cannot resurrect the removed classifier right. Root, channel-state,
+fork, raw/other task-owned, isolated cron, memory-digest and retired-worker
+scopes never receive Code Mode, so they cannot reach `models.*`. The local CLI
+attachment is an authenticated mapped `cli:<name>` chat and follows the same
+mapped-chat rule.
+
 ## Native default-deny and host-selected tools
 
 `extensions`, `tools` and `modelTools` are Durable's native conversation
@@ -177,13 +220,15 @@ Durable registry. If every enabled server fails, Code Mode is still available
 Code Mode itself is an independent compositor. `codemode.enabled: true` installs
 it without any MCP server; with no `codemode` block the previous rule applies
 (MCP configured means Code Mode on). Its enabled tool filter includes
-`codemode`, `tool_search` and the deferred `mcp__*` registrations when MCP is
-connected, while `modelTools` offers only the first two until `tool_search`
-loads a match. A dedicated authority hook extension is selected with the bundle
-and blocks `codemode`/`tool_search` outside authenticated mapped chats and live captured
-workers; it does not depend on MCP being connected. The worker's additional hook checks
-its durable per-tool capture and authorized origin on every call. The coding ceiling delegates those two fixed
-names to that hook and delegates `mcp__*` to the MCP extension's own call-time
+`codemode`, `tool_search`, the native classifier nested tool and the deferred
+`mcp__*` registrations when MCP is
+connected, while `modelTools` offers only `codemode` and `tool_search` until
+`tool_search` loads a match. A dedicated authority hook extension is selected with the bundle
+and blocks `codemode`/`tool_search` and the classifier nested tool outside authenticated
+mapped chats and live captured workers; it also refuses the reserved generation
+name unconditionally. It does not depend on MCP being connected. The worker's additional hook checks
+its durable per-tool capture and authorized origin on every call. The coding ceiling delegates those
+three fixed names to that hook and delegates `mcp__*` to the MCP extension's own call-time
 hook, which rechecks the conversation and the server's live tool list.
 
 Nested scripts resolve against the conversation's actual `callable` filter, not
@@ -303,6 +348,31 @@ The probes have bounded `timeout` limits (60 seconds for local integration,
 and a 128 MiB QuickJS heap limit. They do not establish provider behavior,
 filesystem confinement, non-interruptible-worker upper bounds, safe-tool effect
 idempotency, or live service readiness.
+
+### Classifier and provider/auth probe
+
+`/tmp/nanobot-native-provider-probe.mjs` (90-second outer timeout) used only
+temporary directories, synthetic credentials and a synthetic classifier. It
+verified: the private file-backed credential store round-trips and deletes a
+synthetic credential; `createProvider()` registers an explicit Umans-style
+Anthropic-compatible catalog and resolves its referenced environment variable;
+the legacy `opencode_go` spelling maps to native `opencode-go`; a custom provider
+cannot redefine a native provider; a mapped chat receives `codemode` but not the
+classifier as a direct model tool; the classifier nested tool is callable while
+`generateImages` is absent from tools and the Code Mode description; a native
+`models.classify` call returns through the nested task and the synthetic
+classifier was called once; `models.generateImages` fails without a model call;
+and the login model registry exposes native provider OAuth/API-key methods and
+more than thirty providers rather than a nine-provider whitelist. No real login,
+network request or real credential was used.
+
+`/tmp/nanobot-worker-classifier-probe.mjs` (90-second timeout) verified that a
+captured ordinary worker carries `codemode` and
+`pi.codemode.models.classify` and can run one synthetic classifier through its
+child Code Mode. `/tmp/nanobot-worker-classifier-narrowing-probe.mjs`
+(120-second timeout) kept a worker live across reopen and verified that disabling
+Code Mode pruned both the compositor and the classifier from its durable capture,
+and that re-enabling Code Mode did not restore either right.
 
 ### Parent integration verification
 

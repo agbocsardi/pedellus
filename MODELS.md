@@ -1,7 +1,7 @@
 # Model presets and selection
 
 Named presets are the config-first model surface; direct model/allowlist configs
-remain supported. Both use the pinned Pi AI 1.4.0 catalog and Durable's native
+remain supported. Both use the pinned Pi AI 1.4.0 registry and Durable's native
 `pi.agent` state. There is no second selection store, automatic model discovery,
 catalog refresh or fallback chain.
 
@@ -21,12 +21,26 @@ additional choices. For named configs, use [presets](#named-presets) instead:
 }
 ```
 
-Each provider spelling is one of the aliases in [PROVIDERS.md](./PROVIDERS.md).
-The default must appear in `allowedModels`; entries must be unique and each
-provider/model pair must exist in its pinned native catalog. If `allowedModels`
-is omitted, the legacy `model` becomes a singleton allowlist, preserving
-single-model config files. Empty lists, duplicate entries, and a default outside
-the allowlist fail config parsing.
+Each provider spelling is a native Pi AI provider ID, a documented legacy alias
+from [PROVIDERS.md](./PROVIDERS.md), or a key in the config's custom `providers`
+block. The default must appear in `allowedModels`; entries must be unique and each
+provider/model pair must exist in the registered native/custom catalog. If
+`allowedModels` is omitted, the legacy `model` becomes a singleton allowlist,
+preserving single-model config files. Empty lists, duplicate entries, and a
+default outside the allowlist fail config parsing.
+
+Chat selection authority stays with `allowedModels`/`modelPresets`. Registering a
+provider for authentication, custom-endpoint use or classifier access does not
+make any of its chat models selectable. At startup, each provider named by the
+chat allowlist must have usable native auth; this check reads a stored credential
+or resolves its configured/native API-key environment without refreshing OAuth or
+making a network request. See [credentials and login](./PROVIDERS.md#credentials).
+
+Classifier models are not part of this allowlist and never appear in `/model`.
+They are available only through native Code Mode `models.*` for an authenticated
+mapped chat or a captured ordinary worker; see
+[classifiers](./CODEMODE.md#classifiers-and-image-generation). Image generation
+is not installed.
 
 `thinkingLevel` is optional and applies as the default only where the model
 supports it. The runtime checks it against Pi AI's `getSupportedThinkingLevels`
@@ -78,9 +92,10 @@ Without a configured summary override, summaries keep using the conversation's
 current model, and `enabled: false` still disables them. Direct
 `episodeSummary.model` continues to work in direct configs.
 
-Only providers referenced by the allowlist are registered; preset mode derives
-that list from the catalog and uses the same explicit credential references as
-direct mode.
+Only providers referenced by the allowlist (or the preset catalog derived from
+it), `credentials`, or a custom `providers` entry are registered; preset mode
+derives its provider list from the catalog and uses the same explicit credential
+references as direct mode.
 
 ### Vision handoff
 
@@ -286,5 +301,6 @@ acquisition. Transcript and requestId identity remain intact.
   `packages/durable/src/harness/{generation,compaction,tool}.ts` (checkpointed
   model dispatch and tool resolution).
 - Pinned Pi AI 1.4.0: `packages/ai/src/models.ts`
-  (`getSupportedThinkingLevels`), provider `ApiKeyAuth.resolve`, and installed
-  `docs/models.md`, `docs/models-configuration.md`, and `docs/providers.md`.
+  (`getSupportedThinkingLevels`, `checkAuth`, native provider registry), provider
+  `ApiKeyAuth.resolve`, and installed `docs/models.md`,
+  `docs/models-configuration.md`, and `docs/providers.md`.

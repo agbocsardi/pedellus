@@ -87,7 +87,14 @@ import { VisionHandoff, type VisionHandoffStats } from "./media/vision.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
 import { prepareDataDirectory, inside } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
-import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
+import {
+  assertConfiguredModelAuth,
+  createProviderModels,
+  nativeModelReference,
+  resolveModelChoices,
+  type ResolvedModelChoice,
+} from "./providers.js";
+import { authStorePath, FileCredentialStore } from "./auth/store.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
 import {
   BACKGROUND_STATUS_LIMITS,
@@ -106,6 +113,7 @@ import {
   type McpServerStatus,
 } from "./mcp/index.js";
 import {
+  CLASSIFIER_MODEL_TOOL_NAME,
   CODEMODE_TOOL_NAME,
   createCodeModeIntegration,
   TOOL_SEARCH_TOOL_NAME,
@@ -602,9 +610,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const allowedModels = config.allowedModels ?? [config.model];
   const prepared = options.models
     ? { models: options.models, model: nativeModelReference(config.model) }
-    : createProviderModels(config);
+    : createProviderModels(config, process.env, new FileCredentialStore(authStorePath(config.dataDir)));
   const { models, model } = prepared;
   const choices = resolveModelChoices(models, allowedModels);
+  if (options.models === undefined) {
+    // Fail before storage opens when a configured chat provider has no usable
+    // native credential. Stored OAuth is checked for presence, not refreshed.
+    await assertConfiguredModelAuth(models, choices, context.abortSignal);
+  }
   const choicesByConfigured = new Map(choices.map((choice) => [modelKey(choice.configured), choice]));
   const choicesByNative = new Map(choices.map((choice) => [modelKey(choice.native), choice]));
   // Named presets are a config-level catalog over the same finite model choices. Validate every
@@ -966,7 +979,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // this exemption into authority.
         delegatedTools: (name: string) =>
           (codeModeRef.current !== undefined
-            && (name === CODEMODE_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME))
+            && (name === CODEMODE_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME
+              || name === CLASSIFIER_MODEL_TOOL_NAME))
           || (mcpRef.current !== undefined && mcpRef.current.ownsTool(name)),
       })
     : undefined;
@@ -989,14 +1003,20 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const workerToolNames = (): string[] => {
     if (config.workers?.enabled !== true) return [];
     const configured = config.workers?.toolAllowlist;
+    // Classifier authority is part of the Code Mode grant, never a separately named
+    // worker tool. Removing Code Mode from worker config removes it permanently.
+    const codeModeGranted = codeModeRef.current !== undefined
+      && (configured === undefined || configured.includes(CODEMODE_TOOL_NAME));
     return [
       ...workerCodingTools,
       ...(skillToolRegistration === undefined ? [] : [SKILL_TOOL_NAME]),
       ...webToolRegistrations.map((tool) => tool.name),
       ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
-      ...(codeModeRef.current === undefined ? [] : [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]),
+      ...(codeModeGranted
+        ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, CLASSIFIER_MODEL_TOOL_NAME]
+        : []),
       ...(mcpRef.current?.toolNames ?? []),
-    ].filter((name) => configured === undefined || configured.includes(name)
+    ].filter((name) => name === CLASSIFIER_MODEL_TOOL_NAME || configured === undefined || configured.includes(name)
       || (configured.includes("mcp") && mcpRef.current?.ownsTool(name)));
   };
   const workerCapabilityExtension = defineExtension({
@@ -1569,13 +1589,19 @@ export async function openGateway(config: PortConfig, context: Context, options:
       !worker || captured!.has(tool.name));
     // MCP stays deferred in both mapped chats and captured workers.
     const authorized = authorizedChatConversations.has(conversationId);
-    const offered = codeModeRef.current === undefined ? []
-      : [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME].filter((name) => authorized || captured?.has(name));
+    const codeModeOfferedBase = codeModeRef.current !== undefined
+      && (authorized || captured?.has(CODEMODE_TOOL_NAME));
+    let offered = codeModeOfferedBase ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME] : [];
+    // Classifier calls are native nested ToolTasks of Code Mode. They stay out of
+    // `modelTools`, so the model cannot call them directly, and no other scope
+    // receives them without the Code Mode grant.
+    let classifierTools = codeModeOfferedBase ? [CLASSIFIER_MODEL_TOOL_NAME] : [];
     const deferred = [...(mcpRef.current?.toolNames ?? [])].filter((name) => authorized || captured?.has(name));
     const withContext = (names: readonly string[]): Pick<AgentChange, "tools" | "modelTools"> => {
       const tools = [
         ...toolFilterFromNames(names).tools,
         ...toolFilterFromNames(offered).tools,
+        ...toolFilterFromNames(classifierTools).tools,
         ...toolFilterFromNames(deferred).tools,
         ...contextTools,
       ];
@@ -1590,6 +1616,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const capture = await tx.doc(ConfigToolCaptureDoc, conversationId);
       capture.tools = workerToolNames().filter((name) =>
         captured!.has(name) && capture.tools.includes(name));
+      // Use the pruned durable capture, not the launch input, so removing Code Mode
+      // from worker config or a reopen cannot resurrect classifiers from a stale grant.
+      const capturedCodeMode = codeModeRef.current !== undefined
+        && workerToolNames().includes(CODEMODE_TOOL_NAME)
+        && capture.tools.includes(CODEMODE_TOOL_NAME);
+      offered = capturedCodeMode ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME] : [];
+      classifierTools = capturedCodeMode ? [CLASSIFIER_MODEL_TOOL_NAME] : [];
       return withContext(capture.tools.filter((name) => workerCodingTools.includes(name)));
     }
     if (!toolExtension) {
@@ -1726,6 +1759,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (codeModeEnabled) {
       codeModeRef.current = createCodeModeIntegration({
         namespaces: mcpRef.current?.namespaces ?? [],
+        // Native `models.*`: classifier models plus read-only catalog helpers. Image
+        // generation is not registered by this integration.
+        models: true,
         // A live worker child may compose its captured tools; every nested call still passes that
         // tool's own call-time hook, so retirement or a narrowed ceiling denies stale composition.
         isAuthorizedChat: (conversationId: ConversationId) =>

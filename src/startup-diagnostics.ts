@@ -6,7 +6,7 @@
  * filesystem paths, provider/dependency error text or the underlying exception.
  */
 export const STARTUP_DIAGNOSTICS = Object.freeze({
-  usage: "Usage: durable-nanobot gateway|agent|recovery [--config <path>] (without --config: ~/.durable-nanobot/config.json)",
+  usage: "Usage: durable-nanobot gateway|agent|login|logout|recovery [--config <path>] (without --config: ~/.durable-nanobot/config.json)",
   configHome:
     "cannot resolve the default configuration home; set HOME or pass --config <path> (diagnostic details suppressed)",
   defaultConfigFile:
@@ -18,11 +18,11 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
   configInvalid:
     "invalid configuration; check required fields and documented value formats (diagnostic details suppressed)",
   provider:
-    "invalid provider configuration; check allowedModels and the supported provider aliases in PROVIDERS.md " +
+    "invalid provider configuration; check allowedModels, providers and the native provider IDs in PROVIDERS.md " +
     "(diagnostic details suppressed)",
   credential:
-    "provider credential is missing or misconfigured; set the environment variable named by credentials.<alias> " +
-    "(diagnostic details suppressed)",
+    "provider credential is missing or misconfigured; run durable-nanobot login, set the environment variable " +
+    "named by credentials.<provider>, or set the provider's native API-key environment (diagnostic details suppressed)",
   model:
     "configured model or thinking level is unavailable; compare model/allowedModels with the pinned provider catalog " +
     "(diagnostic details suppressed)",

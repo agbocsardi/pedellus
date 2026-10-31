@@ -187,11 +187,20 @@ the process environment. The config stores **variable names**, not values:
 
 The existing provider, Telegram and web paths resolve those names from the gateway
 process environment; MCP has the same explicit environment-name convention.
-There is no blanket `${VAR}` substitution in JSON and no automatic environment-file
+`credentials` is an alias for a provider's environment variable, not a closed
+provider list: native providers use their documented variables when no reference
+is configured, and a provider credential stored by `durable-nanobot login` is used
+first. There is no blanket `${VAR}` substitution in JSON and no automatic environment-file
 loader in the CLI. A manually launched gateway must inherit its environment by
 another explicit launch mechanism; an attaching agent uses the running gateway
 and does not need provider credentials locally. The gateway's shell tools keep
 their separate filtered environment and do not inherit all gateway credentials.
+
+`durable-nanobot login` and `logout` are explicit terminal commands. They read the
+same config only to locate the configured `dataDir`, write Durable's own private
+credential store there, and never open the gateway or contact a model. The gateway
+never logs in automatically and never reads Pi's credential store. A stored OAuth
+credential is refreshed natively when a request needs it, under the store lock.
 
 Use a service-manager restart after changing the environment file; the owner
 `/restart` preserves the existing process environment and cannot reload it.

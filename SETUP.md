@@ -89,13 +89,25 @@ The shipped [`config.example.json`](./config.example.json) is the starting point
 | `cron` | Installs the model-facing `cron` tool; `timeZone: "UTC"` interprets calendar expressions without an explicit zone. |
 | `episodeSummary` | Closed episodes use the conversation's current model, or a named override such as `"preset": "fast"`. This costs provider calls; set `enabled: false` to turn it off. |
 | `digest` | Requires an explicit background `preset` or `model`; never inherits the chat model. Defaults per invocation: `entriesPerBatch` 2000, `charsPerBatch` 200,000 UTF-16 units (both minimum 2), `maxToolCalls` 24, `maxRequests` 12 successful responses (native failed retries allowed), `maxInputTokens` 500,000 reported input including cache (soft ceiling), `runTimeoutSeconds` 600, `maxChangedFiles` 8 and `maxDiffChars` 32,000 inserted plus removed units. One fitting completed-turn range is one batch; a larger range splits into ordered chunks, potentially within a turn. Evidence includes owner/assistant prose and paired untrusted tool calls/results; long results have 2,500-character head/tail previews with original references. See [bounds and fixed safety caps](HISTORY.md). Values are captured per run; this block enables no schedule. |
-| `credentials` | Environment-variable *names* only. No secret value belongs in this file. |
+| `credentials` | Provider spelling → environment-variable *name*. No secret value belongs in this file. Native provider environment names also work without an entry. |
 
-Export the key named by `credentials.openai` (or whichever alias you allow):
+Export the key named by `credentials.openai` (or whichever provider you allow):
 
 ```sh
 export OPENAI_API_KEY=...
 ```
+
+Or store a provider credential explicitly, without putting it in config:
+
+```sh
+durable-nanobot login            # choose a native provider and auth method
+durable-nanobot login openai --auth oauth
+```
+
+`login` writes Durable's private credential store under the configured `dataDir`;
+it never reads or changes Pi's store and never runs at gateway startup. Custom
+compatible endpoints use an explicit `providers` block; see
+[providers and auth](./PROVIDERS.md#custom-compatible-providers).
 
 Configured tools apply to validated mapped ordinary chats — not to arbitrary
 internal or forked conversations — and still run over the guarded workspace

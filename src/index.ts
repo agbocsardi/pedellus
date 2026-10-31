@@ -1,7 +1,11 @@
 export {
   loadConfig,
   parseConfig,
+  CUSTOM_PROVIDER_APIS,
   type CredentialProvider,
+  type CustomModelConfig,
+  type CustomProviderApi,
+  type CustomProviderConfig,
   type ModelReference,
   type PortConfig,
   type WorkspaceSkillsConfig,
@@ -24,9 +28,11 @@ export {
 } from "./context/index.js";
 export { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 export {
+  CLASSIFIER_MODEL_TOOL_NAME,
   CODEMODE_BUDGETS,
   CODEMODE_TOOL_NAME,
   createCodeModeIntegration,
+  IMAGE_GENERATION_MODEL_TOOL_NAME,
   TOOL_SEARCH_TOOL_NAME,
   type CodeModeIntegration,
   type CodeModeIntegrationOptions,

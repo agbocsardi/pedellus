@@ -26,19 +26,51 @@ import { parseWebConfig, type WebConfig } from "./web/config.js";
 import { WORKER_LIMITS, WORKER_TOOL_GRANTS } from "./workers/limits.js";
 import { DIGEST_CHARS_PER_BATCH_MIN, DIGEST_ENTRIES_PER_BATCH_MIN } from "./history/digest-limits.js";
 
-const CREDENTIAL_PROVIDERS = [
-  "anthropic",
-  "deepseek",
-  "minimax_anthropic",
-  "moonshot",
-  "openai",
-  "openrouter",
-  "opencode_zen",
-  "opencode_go",
-  "xiaomi_mimo",
-] as const;
+/**
+ * Provider spelling used by credentials, model references and `providers` keys.
+ * It is not a closed list: any native Pi AI provider ID, legacy alias or
+ * configured custom provider is valid. Kept as a named alias for SDK
+ * compatibility with the earlier whitelist type.
+ */
+export type CredentialProvider = string;
 
-export type CredentialProvider = typeof CREDENTIAL_PROVIDERS[number];
+/** Native Pi AI chat APIs a configured custom provider may use. */
+export const CUSTOM_PROVIDER_APIS = Object.freeze([
+  "anthropic-messages",
+  "openai-completions",
+  "openai-responses",
+  "google-generative-ai",
+] as const);
+
+export type CustomProviderApi = typeof CUSTOM_PROVIDER_APIS[number];
+
+/** Operator-supplied metadata for one model on a custom OpenAI/Anthropic-compatible endpoint. */
+export interface CustomModelConfig {
+  readonly id: string;
+  readonly name: string;
+  readonly reasoning: boolean;
+  readonly input: readonly ("text" | "image")[];
+  readonly contextWindow: number;
+  readonly maxTokens: number;
+  /** Display/accounting metadata supplied by the operator; it is not provider billing evidence. */
+  readonly cost: {
+    readonly input: number;
+    readonly output: number;
+    readonly cacheRead: number;
+    readonly cacheWrite: number;
+  };
+}
+
+/**
+ * One custom compatible endpoint, registered through native `createProvider()`.
+ * It uses a native Pi AI API implementation; no bespoke request client is added.
+ */
+export interface CustomProviderConfig {
+  readonly name: string;
+  readonly baseUrl: string;
+  readonly api: CustomProviderApi;
+  readonly models: readonly CustomModelConfig[];
+}
 
 /**
  * Largest default shell timeout the native host environment can represent:
@@ -289,7 +321,13 @@ export interface PortConfig {
   thinkingLevel?: ModelThinkingLevel;
   extraAllowedDirs?: readonly string[];
   bwrapPath?: string;
-  credentials?: Partial<Record<CredentialProvider, string>>;
+  credentials?: Readonly<Record<CredentialProvider, string>>;
+  /**
+   * Explicit custom compatible providers. Each key is the provider spelling used by
+   * `model`, `allowedModels`, `modelPresets` and `credentials`. Native provider IDs
+   * and the documented legacy aliases cannot be redefined here.
+   */
+  providers?: Readonly<Record<string, CustomProviderConfig>>;
   /**
    * Native public web capabilities. Absent installs no web tool; `search` and
    * `fetch` enable independently. This is separate authority from `toolAllowlist`
@@ -349,6 +387,121 @@ function modelThinkingLevel(value: unknown, name: string): ModelThinkingLevel {
     throw new Error(`${name} must be one of ${THINKING_LEVELS.join(", ")}`);
   }
   return value as ModelThinkingLevel;
+}
+
+/**
+ * Provider spelling accepted by config and native Pi AI. This is a syntax bound,
+ * not a provider whitelist; existence is checked against native/custom providers
+ * during startup.
+ */
+function providerKey(value: unknown, name: string): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) {
+    throw new Error(`${name} must be a provider ID using letters, digits, dot, underscore or hyphen`);
+  }
+  return value;
+}
+
+function positiveInteger(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function nonnegativeNumber(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative finite number`);
+  }
+  return value;
+}
+
+function customModelConfig(value: unknown, name: string): CustomModelConfig {
+  const raw = object(value, name);
+  for (const key of Object.keys(raw)) {
+    if (!["id", "name", "reasoning", "input", "contextWindow", "maxTokens", "cost"].includes(key)) {
+      throw new Error(`Unknown ${name} field: ${key}`);
+    }
+  }
+  const id = nonempty(raw.id, `${name}.id`);
+  const displayName = raw.name === undefined ? id : nonempty(raw.name, `${name}.name`);
+  let reasoning = false;
+  if (raw.reasoning !== undefined) {
+    if (typeof raw.reasoning !== "boolean") throw new Error(`${name}.reasoning must be a boolean`);
+    reasoning = raw.reasoning;
+  }
+  let input: ("text" | "image")[] = ["text"];
+  if (raw.input !== undefined) {
+    if (!Array.isArray(raw.input) || raw.input.length === 0
+      || raw.input.some((entry) => entry !== "text" && entry !== "image")) {
+      throw new Error(`${name}.input must be a non-empty list of "text" and/or "image"`);
+    }
+    const values = raw.input as ("text" | "image")[];
+    if (new Set(values).size !== values.length) throw new Error(`${name}.input must not contain duplicates`);
+    if (!values.includes("text")) throw new Error(`${name}.input must include "text"`);
+    input = [...values];
+  }
+  const costRaw = object(raw.cost, `${name}.cost`);
+  for (const key of Object.keys(costRaw)) {
+    if (!["input", "output", "cacheRead", "cacheWrite"].includes(key)) {
+      throw new Error(`Unknown ${name}.cost field: ${key}`);
+    }
+  }
+  return {
+    id,
+    name: displayName,
+    reasoning,
+    input,
+    contextWindow: positiveInteger(raw.contextWindow, `${name}.contextWindow`),
+    maxTokens: positiveInteger(raw.maxTokens, `${name}.maxTokens`),
+    cost: {
+      input: nonnegativeNumber(costRaw.input, `${name}.cost.input`),
+      output: nonnegativeNumber(costRaw.output, `${name}.cost.output`),
+      cacheRead: nonnegativeNumber(costRaw.cacheRead, `${name}.cost.cacheRead`),
+      cacheWrite: nonnegativeNumber(costRaw.cacheWrite, `${name}.cost.cacheWrite`),
+    },
+  };
+}
+
+function customProvidersConfig(value: unknown): Readonly<Record<string, CustomProviderConfig>> {
+  const raw = object(value, "providers");
+  if (Object.keys(raw).length === 0) throw new Error("providers must contain at least one custom provider");
+  const providers: Record<string, CustomProviderConfig> = Object.create(null) as Record<string, CustomProviderConfig>;
+  for (const [rawKey, entry] of Object.entries(raw)) {
+    const key = providerKey(rawKey, "providers key");
+    const provider = object(entry, `providers.${key}`);
+    for (const field of Object.keys(provider)) {
+      if (!["name", "baseUrl", "api", "models"].includes(field)) {
+        throw new Error(`Unknown providers.${key} field: ${field}`);
+      }
+    }
+    if (typeof provider.api !== "string" || !(CUSTOM_PROVIDER_APIS as readonly string[]).includes(provider.api)) {
+      throw new Error(`providers.${key}.api must be one of ${CUSTOM_PROVIDER_APIS.join(", ")}`);
+    }
+    const baseUrl = nonempty(provider.baseUrl, `providers.${key}.baseUrl`);
+    let url: URL;
+    try { url = new URL(baseUrl); }
+    catch { throw new Error(`providers.${key}.baseUrl must be an absolute http(s) URL`); }
+    if ((url.protocol !== "http:" && url.protocol !== "https:")
+      || url.username !== "" || url.password !== "" || url.hash !== "") {
+      throw new Error(`providers.${key}.baseUrl must be an absolute http(s) URL without credentials or a fragment`);
+    }
+    if (!Array.isArray(provider.models) || provider.models.length === 0) {
+      throw new Error(`providers.${key}.models must be a non-empty array`);
+    }
+    const models = provider.models.map((model, index) =>
+      customModelConfig(model, `providers.${key}.models[${index}]`));
+    const ids = models.map((model) => model.id);
+    if (new Set(ids).size !== ids.length) {
+      throw new Error(`providers.${key}.models must not contain duplicate model IDs`);
+    }
+    providers[key] = Object.freeze({
+      name: provider.name === undefined ? key : nonempty(provider.name, `providers.${key}.name`),
+      baseUrl,
+      api: provider.api as CustomProviderApi,
+      models: Object.freeze(models),
+    });
+  }
+  return Object.freeze(providers);
 }
 
 function modelPresetName(value: unknown, name: string): string {
@@ -910,11 +1063,14 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   if (raw.credentials !== undefined) {
     const credentials = object(raw.credentials, "credentials");
     const normalized: Record<string, string> = Object.create(null) as Record<string, string>;
-    for (const [key, name] of Object.entries(credentials)) {
-      if (!(CREDENTIAL_PROVIDERS as readonly string[]).includes(key)) throw new Error("Unknown credentials provider");
+    for (const [rawKey, name] of Object.entries(credentials)) {
+      const key = providerKey(rawKey, "credentials key");
       normalized[key] = envName(name, `credentials.${key}`);
     }
-    Object.assign(config, { credentials: normalized });
+    Object.assign(config, { credentials: Object.freeze(normalized) });
+  }
+  if (raw.providers !== undefined) {
+    Object.assign(config, { providers: customProvidersConfig(raw.providers) });
   }
   if (raw.telegram !== undefined) {
     const t = object(raw.telegram, "telegram");

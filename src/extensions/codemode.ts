@@ -26,6 +26,24 @@ export const CODEMODE_BUDGETS = Object.freeze({
   maxWorkers: 2,
 });
 
+/**
+ * Pinned native internal tool names from `@earendil-works/pi-durable@1.4.0`.
+ * They are never offered to the model or listed as script tools.
+ */
+export const CLASSIFIER_MODEL_TOOL_NAME = "pi.codemode.models.classify";
+export const IMAGE_GENERATION_MODEL_TOOL_NAME = "pi.codemode.models.generateImages";
+
+const IMAGE_GENERATION_UNAVAILABLE = "Image generation is not available from this deployment.";
+
+/** The native `models.*` description with its image-generation helper removed. */
+function classifierOnlyDescription(description: string): string {
+  const lines = description
+    .split("\n")
+    .filter((line) => !line.includes("generateImages"))
+    .map((line) => line.replace("classify/generateImages", "classify"));
+  return `${lines.join("\n")}\n${IMAGE_GENERATION_UNAVAILABLE}`;
+}
+
 export interface CodeModeIntegrationOptions {
   /** Group deferred tools in the native code-mode declaration and search. */
   readonly namespaces?: readonly CodemodeNamespace[];
@@ -105,9 +123,13 @@ export function createCodeModeIntegration(options: CodeModeIntegrationOptions = 
   });
   const nativeTool = native.tools?.find((tool) => tool.name === CODEMODE_TOOL_NAME);
   if (!nativeTool) throw new Error("Durable Code Mode extension did not register its codemode tool");
+  // Classifiers are exposed through the native `models.*` globals and their
+  // native nested ToolTask. Image generation is deliberately not registered.
+  const nativeTools = (native.tools ?? []).filter((tool) => tool.name !== IMAGE_GENERATION_MODEL_TOOL_NAME);
 
   const boundedCodeMode = defineExtension({
     ...native,
+    tools: nativeTools,
     wraps: [
       ...(native.wraps ?? []),
       wrapTool(nativeTool as ToolRegistration, (tool) => {
@@ -115,6 +137,7 @@ export function createCodeModeIntegration(options: CodeModeIntegrationOptions = 
         const execute = registration.execute;
         return {
           ...tool,
+          description: classifierOnlyDescription(registration.description),
           async execute(args: { code: string }, api: ToolExecutionApi, context: Context) {
             if (closed) throw new Error("Code Mode integration is closed");
             // Invalid source/options retain the native tool's error path.
@@ -148,6 +171,15 @@ export function createCodeModeIntegration(options: CodeModeIntegrationOptions = 
       name: "nanobot-codemode-authority",
       hooks: [hook(ToolTask, {
         beforeTool(call, api) {
+          if (call.name === IMAGE_GENERATION_MODEL_TOOL_NAME) {
+            return { block: IMAGE_GENERATION_UNAVAILABLE };
+          }
+          if (call.name === CLASSIFIER_MODEL_TOOL_NAME) {
+            if (!isAuthorizedChat(api.conversationId)) {
+              return { block: `Tool ${call.name} is not enabled for this conversation` };
+            }
+            return undefined;
+          }
           if (call.name !== CODEMODE_TOOL_NAME && call.name !== TOOL_SEARCH_TOOL_NAME) return undefined;
           if (!isAuthorizedChat(api.conversationId)) {
             return { block: `Tool ${call.name} is not enabled for this conversation` };

@@ -19,12 +19,37 @@ durable-nanobot agent                      # attaches to the same default gatewa
 durable-nanobot agent --config /path/to/config.json     # attach a terminal to that gateway
 ```
 
-Without `--config`, `gateway`, `agent` and `recovery` read exactly
+Without `--config`, `gateway`, `agent`, `login`, `logout` and `recovery` read exactly
 `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
 the shell's working directory. A secondary instance passes its own explicit
 `--config`. There is no config discovery, merging, search, auto-generation or
 migration, and a missing default file fails with a fixed message. See
 [user services](./SERVICE.md) for the shipped systemd unit pattern.
+
+## Provider authentication
+
+Authentication is explicit and terminal-only; the gateway never logs in at
+startup, and no model or Telegram chat can start a login flow:
+
+```sh
+durable-nanobot login
+durable-nanobot login openai
+durable-nanobot login openai --auth oauth
+durable-nanobot logout
+durable-nanobot logout openai
+```
+
+`login` presents the native provider list and each provider's native API-key or
+OAuth method, then prints browser URLs, device codes, progress and typed prompts.
+`--auth` accepts `api_key` or `oauth`; `provider` is a native provider ID (a
+legacy alias is resolved for convenience). `logout` removes one stored provider
+credential. Both accept `--config <path>` like the gateway, operate on the
+configured `dataDir`, and open no store or gateway. Durable's private credential
+store is independent of Pi's; see [providers and auth](./PROVIDERS.md#login-and-logout).
+
+A gateway request resolves stored OAuth and refreshes it natively. `/restart`
+keeps the current process environment, so a changed systemd environment file needs
+a service restart.
 
 `durable-nanobot --config /path/to/config.json` remains the historical terminal command.
 It now attaches exactly like `agent` and never opens an implicit gateway or a
@@ -89,8 +114,8 @@ vice versa; stopping the gateway stops both.
 Gateway startup fails closed with exit status 1. Known configuration and startup
 failures print one fixed, value-free message: a missing default configuration,
 unreadable/invalid configuration,
-invalid configuration fields, unsupported provider aliases, unavailable models
-or thinking levels, missing credential alias references, a missing Telegram token
+invalid configuration fields, unknown providers or custom-provider entries, unavailable models
+or thinking levels, missing provider credentials, a missing Telegram token
 environment variable, workspace/data-directory preparation failures, a data
 store already owned by another live process, and a prepared model dispatch that
 pins historical Nanobot context. These messages never include configuration

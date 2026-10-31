@@ -2,7 +2,9 @@
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import { stdin, stderr, stdout } from "node:process";
+import type { AuthType } from "@earendil-works/pi-ai";
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
+import { runLogin, runLogout } from "./auth/cli.js";
 import { loadConfig, defaultConfigPath } from "./config.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { connectLocalGateway } from "./local/client.js";
@@ -19,9 +21,11 @@ import { StartupDiagnosticError, startupDiagnostic } from "./startup-diagnostics
 
 const USAGE =
   "Usage: durable-nanobot gateway [--config <path>] | durable-nanobot agent [--config <path>] [--conversation <name>] | " +
+  "durable-nanobot login [--config <path>] [provider] [--auth api_key|oauth] | " +
+  "durable-nanobot logout [--config <path>] [provider] | " +
   "durable-nanobot --config <path> (agent, compatibility) | " +
   "durable-nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]\n" +
-  "Without --config, gateway, agent and recovery use ~/.durable-nanobot/config.json.";
+  "Without --config, gateway, agent, login, logout and recovery use ~/.durable-nanobot/config.json.";
 
 const RECOVERY_USAGE = "Usage: durable-nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]";
 
@@ -39,6 +43,15 @@ type ConfigSource =
 type RecoveryInvocation =
   | { readonly kind: "list"; readonly config: ConfigSource }
   | { readonly kind: "cancel"; readonly config: ConfigSource; readonly taskId: number; readonly fingerprint: string };
+
+type AuthInvocation =
+  | {
+      readonly kind: "login";
+      readonly config: ConfigSource;
+      readonly provider?: string;
+      readonly auth?: AuthType;
+    }
+  | { readonly kind: "logout"; readonly config: ConfigSource; readonly provider?: string };
 
 type LaunchInvocation =
   | { readonly kind: "gateway"; readonly config: ConfigSource }
@@ -121,6 +134,43 @@ function recoveryInvocation(args: readonly string[]): RecoveryInvocation | undef
   return { kind: "cancel", config, taskId, fingerprint };
 }
 
+const PROVIDER_ARGUMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+function authInvocation(args: readonly string[]): AuthInvocation | undefined {
+  const kind = args[0];
+  if (kind !== "login" && kind !== "logout") return undefined;
+  let config: ConfigSource = { kind: "default" };
+  let configSeen = false;
+  let provider: string | undefined;
+  let auth: AuthType | undefined;
+  const rest = args.slice(1);
+  for (let index = 0; index < rest.length;) {
+    const argument = rest[index];
+    if (argument === "--config" && !configSeen && rest[index + 1]) {
+      config = { kind: "path", path: rest[index + 1]! };
+      configSeen = true;
+      index += 2;
+    } else if (kind === "login" && argument === "--auth" && auth === undefined && rest[index + 1]) {
+      if (rest[index + 1] !== "api_key" && rest[index + 1] !== "oauth") throw new UsageError();
+      auth = rest[index + 1] as AuthType;
+      index += 2;
+    } else if (provider === undefined && argument !== undefined && PROVIDER_ARGUMENT.test(argument)) {
+      provider = argument;
+      index += 1;
+    } else {
+      throw new UsageError();
+    }
+  }
+  return kind === "login"
+    ? {
+        kind,
+        config,
+        ...(provider === undefined ? {} : { provider }),
+        ...(auth === undefined ? {} : { auth }),
+      }
+    : { kind, config, ...(provider === undefined ? {} : { provider }) };
+}
+
 /**
  * Load the selected configuration. A missing default file gets its own fixed
  * diagnostic; an explicit path keeps the existing unreadable/invalid text and
@@ -148,12 +198,41 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     await runRecovery(recovery, await readConfig(recovery.config));
     return;
   }
+  const auth = authInvocation(args);
+  if (auth !== undefined) {
+    await runAuthCommand(auth, await readConfig(auth.config));
+    return;
+  }
   const invocation = launchInvocation(args);
   const config = await readConfig(invocation.config);
   if (invocation.kind === "gateway") {
     await runGateway(config);
   } else {
     await runAgent(config, invocation.conversation);
+  }
+}
+
+/** Explicit terminal authentication. It never opens the gateway or starts a model turn. */
+async function runAuthCommand(
+  invocation: AuthInvocation,
+  config: Awaited<ReturnType<typeof loadConfig>>,
+): Promise<void> {
+  const stop = new AbortController();
+  const shutdown = () => stop.abort(new Error("login cancelled"));
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+  try {
+    if (invocation.kind === "login") {
+      await runLogin(config, {
+        ...(invocation.provider === undefined ? {} : { provider: invocation.provider }),
+        ...(invocation.auth === undefined ? {} : { auth: invocation.auth }),
+      }, { input: stdin, output: stdout, signal: stop.signal });
+    } else {
+      await runLogout(config, invocation.provider, { input: stdin, output: stdout, signal: stop.signal });
+    }
+  } finally {
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
   }
 }
 

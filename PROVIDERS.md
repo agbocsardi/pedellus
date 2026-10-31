@@ -1,104 +1,210 @@
-# Provider/config parity slice
+# Providers, auth, models and classifiers
 
-This is a bounded P3/P8 slice, not provider-parity acceptance. It uses the pinned
-Pi AI `1.4.0` provider factories and their model catalogs. Only provider aliases
-referenced by the explicit `allowedModels` list, or by the deduped catalog
-derived from named `modelPresets`, are registered (legacy configs implicitly
-allow only `model`); every allowed model must exist in its pinned catalog. No
-model discovery, custom/dynamic endpoint configuration, catalog refresh, fallback
-chains, or legacy presets are added. Named `modelPresets` are only names for the
-same finite allowed choices; see [MODELS.md](./MODELS.md). No live provider,
-paid request, or real credential was used to validate it. See
-[MODELS.md](./MODELS.md) for allowlist, persisted selection, thinking levels, and
-revocation behavior.
+This slice exposes the pinned Pi AI `1.4.0` provider registry and its native auth,
+model and API facilities. There is no application-side provider whitelist: a
+configured provider spelling is a native Pi AI provider ID, one documented legacy
+alias, or an explicit custom provider entry. The model allowlist remains the
+authority for chat selection; registering a provider does not select or dispatch
+its models.
 
-## Credentials and selection
+No live provider, paid request, browser login, Telegram call or real credential
+was used to validate this slice. It is offline-tested with synthetic credentials,
+temporary stores, faux models and synthetic classifiers.
 
-Configuration contains environment-variable **names**, never API keys:
+## Provider identity
+
+The gateway registers only providers referenced by `allowedModels`, named
+`modelPresets` (which derive `allowedModels`), `credentials`, or `providers`.
+Native provider factories and catalogs come directly from
+`@earendil-works/pi-ai@1.4.0`; there is no second hand-maintained provider list,
+catalog refresh, model discovery, fallback chain or automatic substitution.
+
+Existing configuration keeps working through these explicit legacy spellings.
+They are compatibility aliases, not a provider whitelist:
+
+| Existing spelling | Native provider ID |
+|---|---|
+| `minimax_anthropic` | `minimax` |
+| `moonshot` | `moonshotai` |
+| `opencode_zen` | `opencode` |
+| `opencode_go` | `opencode-go` |
+| `xiaomi_mimo` | `xiaomi` |
+
+Every other spelling must be a native provider ID from the pinned Pi AI registry
+or a key in the config's `providers` block. Unknown spellings fail startup. The
+default seed remains unchanged: `opencode_go` / `deepseek-v4.1-flash` at thinking
+level `high`, with `credentials.opencode_go` naming its environment variable.
+
+A custom provider key cannot redefine a native provider ID or a legacy alias.
+
+## Credentials
+
+`credentials` maps a configured provider spelling to an environment-variable
+**name**. Configuration never contains a secret value:
 
 ```json
 {
-  "model": { "provider": "anthropic", "modelId": "claude-sonnet-4-5" },
-  "credentials": { "anthropic": "ANTHROPIC_API_KEY" }
+  "model": { "provider": "openai", "modelId": "gpt-6-sol" },
+  "credentials": { "openai": "OPENAI_API_KEY" }
 }
 ```
 
-Credential references (and `telegram.tokenEnv`) must match
-`[A-Za-z_][A-Za-z0-9_]*`. Every alias used by `allowedModels`, or by the catalog
-derived from named `modelPresets`, must have an explicit
-credential reference whose environment variable is set and nonblank before the
-gateway opens. Other aliases in `credentials` need not be configured unless
-allowlisted. Credentials are not inferred from provider defaults.
+The referenced variable must match `[A-Za-z_][A-Za-z0-9_]*` and is resolved from
+the gateway process environment, for example one supplied by a systemd
+environment file. There is no blanket `${VAR}` expansion in JSON and no CLI
+dotenv loader.
 
-Each registered native provider receives only the key captured for its own
-configured alias through Pi's provider-scoped API-key resolver. This keeps
-`opencode_zen` and `opencode_go` isolated even though both native adapters name
-the same `OPENCODE_API_KEY` environment variable. Other process environment
-values are unavailable to provider auth; Pi credential-file discovery is
-disabled, and native API-key login and OAuth methods are removed. Adapter errors
-do not include credential values. OpenAI/Anthropic/OpenRouter subscription
-OAuth, Codex OAuth, ambient credentials, and Pi `auth.json` are not part of this
-slice.
+An explicit reference overrides the provider's default API-key variable for that
+provider only. If no reference is configured, the provider's native environment
+variables and ambient credential facilities remain available. A stored credential
+from `login` owns its provider and is used before environment resolution. OAuth
+refresh is native and happens under the credential-store lock.
 
-## Supported native aliases
+Every provider referenced by the chat allowlist needs usable auth before the
+gateway opens storage. `opencode_zen` and `opencode_go` are distinct native
+providers and can hold separate credentials even when both ultimately use the
+same environment-variable name in native code. If several configured spellings
+map to one native provider, one explicit credentials reference applies to that
+provider; two different references are ambiguous and fail startup.
 
-| Nanobot config alias | Pi provider ID | Pi API family | Endpoint in pinned Pi catalog | Credential reference |
-|---|---|---|---|---|
-| `anthropic` | `anthropic` | `anthropic-messages` | `https://api.anthropic.com` | `credentials.anthropic` → `ANTHROPIC_API_KEY` |
-| `openai` | `openai` | `openai-responses` | `https://api.openai.com/v1` | `credentials.openai` → `OPENAI_API_KEY` |
-| `openrouter` | `openrouter` | `openai-completions` or `anthropic-messages`, per model | `https://openrouter.ai/api/v1` | `credentials.openrouter` → `OPENROUTER_API_KEY` |
-| `deepseek` | `deepseek` | `openai-completions` | `https://api.deepseek.com` | `credentials.deepseek` → `DEEPSEEK_API_KEY` |
-| `moonshot` | `moonshotai` | `openai-completions` | `https://api.moonshot.ai/v1` | `credentials.moonshot` → `MOONSHOT_API_KEY` |
-| `minimax_anthropic` | `minimax` | `anthropic-messages` | `https://api.minimax.io/anthropic` | `credentials.minimax_anthropic` → `MINIMAX_API_KEY` |
-| `xiaomi_mimo` | `xiaomi` | `openai-completions` | `https://api.xiaomimimo.com/v1` | `credentials.xiaomi_mimo` → `XIAOMI_API_KEY` |
-| `opencode_zen` | `opencode` | Anthropic Messages, Google Generative AI, OpenAI Completions, or OpenAI Responses, per model | `https://opencode.ai/inference` (Anthropic); `/inference/v1` (others) | `credentials.opencode_zen` → `OPENCODE_API_KEY` |
-| `opencode_go` | `opencode-go` | Anthropic Messages, Google Generative AI, OpenAI Completions, or OpenAI Responses, per model | `https://opencode.ai/inference/go` (Anthropic); `/inference/go/v1` (others) | `credentials.opencode_go` → `OPENCODE_API_KEY` |
+## Login and logout
 
-The OpenCode endpoint/API selection and model compatibility metadata come from
-each model in Pi's pinned catalog, rather than a Nanobot-side protocol guess.
+Authentication is an explicit terminal operation, never startup, model-triggered
+or Telegram-triggered:
 
-### Migration differences
+```sh
+durable-nanobot login                  # list and choose a native provider and method
+durable-nanobot login openai           # one provider; prompts for its available method
+durable-nanobot login openai --auth oauth
+durable-nanobot logout                 # choose a stored credential
+durable-nanobot logout openai
+```
 
-- Python defaults use OpenCode `/zen/v1` and `/zen/go/v1`; this port uses Pi's
-  model-specific `/inference...` routes and API families listed above, as the
-  original spike already did. There is no endpoint override in this slice.
-  Catalog/offline checks do not establish equivalent service access, pricing or
-  live compatibility; real-provider verification remains an acceptance gate.
-- Python's Xiaomi credential variable is `XIAOMIMIMO_API_KEY`, while Pi expects
-  `XIAOMI_API_KEY`. The example keeps `credentials.xiaomi_mimo` pointing to the
-  legacy `XIAOMIMIMO_API_KEY`; the adapter maps that selected value to Pi's expected
-  name. Either variable name works when explicitly referenced in configuration;
-  neither is discovered implicitly.
+Both commands take the same optional `--config <path>` as the gateway and use the
+configured `dataDir`. `login` opens no gateway, starts no model turn and makes no
+model request. It presents the native provider list and the methods each provider
+offers: stored API key, or provider-owned OAuth (for example Sign in with ChatGPT,
+Anthropic subscription login, GitHub Copilot, or OpenRouter PKCE). Browser URLs,
+device codes, progress and manual-code prompts come from the provider's
+UI-neutral `AuthInteraction`; the terminal prints them and returns typed answers.
+API-key entry is hidden in an interactive terminal.
+
+`logout` removes one provider's stored credential from Durable's store only.
+
+Durable keeps an independent private credential store under the configured
+`dataDir`. It never reads, shares or modifies Pi's own credential store. The store
+uses the native type-tagged credential shape, private file permissions, atomic
+replacement and a sibling lock so login and gateway OAuth refresh do not
+double-rotate a token. Do not copy Pi credentials into it; run `login` instead.
+Keep the data directory private, as for every other runtime secret.
+
+The gateway uses stored OAuth without a login flow: a request resolves and
+refreshes the provider credential natively. `/restart` keeps the current process
+environment; a systemd environment-file change needs a service restart.
+
+## Custom compatible providers
+
+Use `providers` for an OpenAI-, Anthropic- or Google-compatible endpoint that is
+not a pinned native provider. Models are metadata supplied by the operator and
+requests run through a native Pi AI API implementation, not a bespoke client:
+
+```json
+{
+  "model": { "provider": "umans", "modelId": "umans-deepseek-v4.1-flash" },
+  "allowedModels": [
+    { "provider": "umans", "modelId": "umans-deepseek-v4.1-flash" }
+  ],
+  "credentials": { "umans": "UMANS_API_KEY" },
+  "providers": {
+    "umans": {
+      "name": "Umans",
+      "baseUrl": "https://api.code.umans.ai",
+      "api": "anthropic-messages",
+      "models": [
+        {
+          "id": "umans-deepseek-v4.1-flash",
+          "name": "Umans DeepSeek V4.1 Flash",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 128000,
+          "maxTokens": 8192,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    }
+  }
+}
+```
+
+`providers.<key>` accepts exactly `name`, `baseUrl`, `api` and `models`. `api` is
+one of `anthropic-messages`, `openai-completions`, `openai-responses` or
+`google-generative-ai`. Each model requires `id`, `contextWindow`, `maxTokens`
+and a complete `cost` object; `name` defaults to the ID, `reasoning` to false and
+`input` to `["text"]`. Cost values are display/accounting metadata supplied by
+the operator, not provider billing evidence. There are no provider headers,
+model overrides, dynamic discovery, command interpolation or image/classifier
+entries in this block.
+
+Omit `credentials.<key>` for a keyless local compatible endpoint. A custom
+provider still needs model metadata and an absolute `http(s)` base URL without
+embedded credentials or a fragment. `durable-nanobot login <key>` can store a key
+for such a provider; a stored key wins and the endpoint is keyless otherwise.
+
+## Classifiers and image generation
+
+Classifier models are exposed through the native Code Mode `models.*` surface
+when [Code Mode](./CODEMODE.md) is enabled for an authenticated mapped chat or a
+captured ordinary worker. They are not chat selections, do not appear in
+`/model`, and cannot be run directly by the model. A classifier-only provider can
+be registered by naming it in `credentials` even when no chat model from that
+provider is in `allowedModels`:
+
+```json
+{
+  "credentials": {
+    "opencode_go": "OPENCODE_GO_API_KEY",
+    "typesafe": "TYPESAFE_API_KEY"
+  }
+}
+```
+
+Scripts list candidates with `models.getModelsOfType("classifier")` or
+`models.getAvailableOfType("classifier")` and call the native
+`models.classify(model, { state, questions, images? })`. Calls are native nested
+Durable tasks: their cancellation, usage accounting, replay policy and the Code
+Mode time/output budgets apply. Image input is accepted only when the classifier
+model declares `"image"` input.
+
+Image **generation** is not installed. There is no `models.generateImages`
+helper, no image-generation tool and no generation API registration. The `image()`
+script output helper remains only for showing existing image blocks. Existing
+image understanding, `read` image results and the vision handoff are unchanged.
 
 ## Explicit gaps
 
-| Retained Python provider | Status in this slice | Why it is not aliased |
-|---|---|---|
-| `custom` and dynamic provider names | Unsupported | No user-defined URL, API-family, headers, or model catalog configuration. |
-| `openai_codex` | Unsupported | OAuth-only flow is outside the environment-reference credential contract. |
-| `zhipu` | Unsupported | No matching first-party Pi adapter/catalog; it is not interchangeable with Z.AI. |
-| `zai` | Unsupported | Nanobot's default is `https://api.z.ai/api/paas/v4`; Pi's pinned Z.AI catalog targets the distinct Coding Plan endpoint `https://api.z.ai/api/coding/paas/v4`. This config has no endpoint override. |
-| `dashscope` | Unsupported | Nanobot's DashScope endpoint differs from Pi's Qwen token-plan endpoints and auth contract. |
-| `minimax` | Unsupported | Nanobot uses OpenAI Chat Completions and a `reasoning_split` quirk; Pi's native MiniMax adapter is Anthropic Messages at `/anthropic`. Only the separate `minimax_anthropic` alias is included. |
-| `umans` | Unsupported | No first-party Pi 1.4.0 provider/catalog; a generic OpenAI-compatible endpoint would need explicit endpoint/model metadata and provider-specific behavior. |
-
-The native Moonshot catalog is used as-is. Nanobot's temperature override for
-`kimi-k2.5` and `kimi-k2.6` is not ported; `kimi-k2.5` is absent from the pinned
-Pi catalog. Other older or dynamic model IDs can likewise be unknown. This is
-not a claim of full model, thinking, vision, tool, pricing, fallback, or error
-behavior parity. In particular, successful catalog lookup is not evidence of
-provider service compatibility.
+- No dynamic provider/model discovery, catalog refresh, fallback chain or
+  automatic model substitution.
+- No endpoint override for a native provider, only whole custom providers.
+- No custom-provider classifier or image entries, provider headers, compatibility
+  overrides, command-backed credentials or `${VAR}` interpolation.
+- No image generation.
+- No provider matrix acceptance. Catalog lookup is not evidence that a remote
+  service accepts requests, tool calls, streaming or image input.
+- Python's `zhipu`, `zai`, `dashscope` and plain `minimax` endpoint differences
+  are not aliased. Use a native provider whose catalog matches the service, or an
+  explicit compatible provider entry.
+- The native Moonshot catalog is used as-is; Python model-specific temperature
+  overrides are not ported.
 
 ## Source basis
 
-- Nanobot reference: `nanobot/providers/registry.py`,
-  `nanobot/providers/factory.py`, `nanobot/providers/openai_compat_provider.py`,
-  and `nanobot/config/schema.py`.
-- Pinned Pi source: tag `v1.4.0` (`4a080252f06caf63a525d7873c5d94d3c23887e0`),
-  `packages/ai/src/providers/{anthropic,deepseek,minimax,moonshotai,openai,openrouter,opencode,opencode-go,xiaomi}.ts`
-  and their provider model catalogs. These provider factories supply the API
-  implementations, native model metadata, endpoints, and auth variable names.
-- Installed Pi 1.4.0 docs: `docs/providers.md`, `docs/models.md`,
-  `docs/models-configuration.md`, and `docs/custom-provider.md`. These distinguish
-  compatible API endpoints from custom-provider/OAuth extensions and describe
-  endpoint/API-family compatibility settings.
+- Pinned Pi AI `1.4.0`: `createModels`, `createProvider`, `CredentialStore`,
+  `Models.login`/`logout`/`getAuth`/`checkAuth`, provider factories and native API
+  implementations. Installed `docs/models.md`, `custom-provider.md`,
+  `models-configuration.md` and the Pi AI README describe the native contracts.
+- Pinned Durable `1.4.0`: Code Mode `models.*` catalog globals, the reserved
+  `pi.codemode.models.classify` nested tool and the `pi.codemode.models.generateImages`
+  registration deliberately omitted here.
+- Nanobot reference: `nanobot/providers/registry.py`, `factory.py`,
+  `openai_compat_provider.py` and `nanobot/config/schema.py`. Provider aliases are
+  migration compatibility only, not a replacement catalog.
