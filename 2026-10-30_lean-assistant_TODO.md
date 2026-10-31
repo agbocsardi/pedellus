@@ -17,6 +17,9 @@
 - [x] Complete the approved five-minute synthetic Telegram pilot and record the actual outcome; no personal workspace or broader rollout.
 - [x] Owner accepts the pilot as sufficient. Defer the reminder-only follow-up; live reminder scheduling/delivery remains unverified, not a blocker for the next discussion.
 - [x] Clean up this batch's resources after owner confirms integration.
+- [x] Adopt the cron conversation model: one persistent automation conversation per recurring
+  job and one catch-all per origin for one-offs, a reset-delimited episode per run, a durable
+  bounded one-off queue, and per-run prepared/retired authority.
 
 ## Owner follow-up — digest input correction
 
@@ -1201,3 +1204,27 @@ clean and the validated tip's ancestor. Product Brave search remains
 live-unverified (one bounded example.com implemented fetch smoke only); cron and
 background-worker composition remain deliberately later, and the worker branch is
 still in review. No new live provider, Telegram, credential or network run.
+
+### Session — cron conversation model
+
+Conversation and execution are now separate for scheduled work. A recurring job keeps one
+ownerless automation conversation for its lifetime and each run adds a reset-delimited episode; all
+one-off jobs of an origin share one catch-all conversation and queue on it in a document-backed FIFO
+(bounded at 16 admitted runs, refusing the occurrence with fixed text in the job record when full).
+Runs sharing a conversation execute serially: recurring jobs keep the timer's skip-on-overlap rule
+and queued one-offs wait on the native task ahead of them, so nothing is decided in memory. The run
+task still owns one execution, in two phases (`claim`, `execute`), and every run prepares its own
+model, workspace context and captured tools and retires them in its terminal commit, so persistent
+history never carries permission. `origin` mode is unchanged.
+
+Decisions: no document version bump — the new job/queue fields are optional and created lazily, so a
+job document written by the per-occurrence model keeps working and a stale conversation ID is
+recreated instead of adopted. The new class is named `automation` in the shared scope rule and
+"automation conversation" everywhere else, carried by a `nanobot.cron.conversation` marker plus the
+origin's cron documents rather than inferred from being unmapped. Episode cataloguing includes these
+conversations; the message/tool search index and the summary policy stay mapped-chat only, so no
+model call is spent on a summary nothing can read. Verified offline: typecheck/build, 309 behavior
+checks (3 new in `tests/cron-conversations.behavior.test.mjs`) and 83 core acceptance. Deliberate
+gaps: a restart while a one-off run is queued is reasoned from durable state, not exercised by a
+test; a provider request that ignores abort keeps running in the automation conversation after its
+run is cancelled (the next run queues behind it).

@@ -404,20 +404,53 @@ required for a current view.
 
 A session key is a host string and can be forged, imported or left behind by an older
 layout, so the key alone never decides scope: `chatScopeExclusion` in `src/history/scope.ts`
-classifies the conversation record (`missing`, `root`, `task-owned`, `forked`) and every derived
-history consumer uses it. Search, entry reads and episode reads fail loudly with "Stored session
-mapping points to a task-owned conversation" / "… forked conversation". The episode catalog and the
+classifies the conversation record (`missing`, `root`, `automation`, `task-owned`, `forked`) and
+every derived history consumer uses it. Search, entry reads and episode reads fail loudly with
+"Stored session mapping points to a task-owned conversation" / "… forked conversation" /
+"… a scheduled run's automation conversation". The episode catalog and the
 summary scheduler instead skip such a mapping, so one forged entry cannot stop cataloguing or
 summarizing the conversations that really are chat history, and the summary worker re-checks scope in
 its first commit: a job whose conversation is out of scope fails with `conversation-out-of-scope` and
-creates no summary record, so a task-owned background run's transcript or an inherited fork can never
+creates no summary record, so a task-owned or automation transcript or an inherited fork can never
 be summarized into chat history or reach a provider through this pass.
+
+The `automation` reason exists because a scheduled run's conversation is ownerless by design: it
+outlives the run task that created it, so `owner`/`parent` cannot distinguish it from a chat. The
+host states the class instead, from the durable `nanobot.cron.conversation` marker plus the origin's
+cron documents, and `runtime.ts` passes it into the shared rule as `automation: true` — so a stale or
+forged mapping naming one is rejected explicitly rather than by the accident of it being unmapped.
+The same class keeps every other capability set closed: an automation conversation is never in the
+authenticated mapped-chat set, the worker spawner set, the web/Telegram/MCP/Code Mode scope, the
+classifier scope or the cron-owner set, and its prepared tools are retired when each run ends.
+
 The rule itself and the read pattern live in one place: `chatScopeExclusion` (classify one record),
 `readChatScope` (read one), `partitionChatScope` (split a mapped set) and `chatScopeMessage` (the fixed
 rejection text) in `src/history/scope.ts`. `assertMappedChatConversations`, the catalog's
 `mappedChatSessions` and the summary worker's `scope` hook all call those, so the three consumers cannot
 drift apart. `assertMappedChatConversations` in `runtime.ts` is the same check main's shared validator
 uses; the coordinator's version supersedes this one at merge time.
+
+## Automation conversations in indexing
+
+Episode indexing covers automation conversations; the message/tool search index and the summary
+policy do not. A scheduled run's conversation is catalogued like a chat one: the reset boundary that
+starts each run closes the previous episode, and closed episodes are recorded with their counts and
+recovery boundaries. Its entries are ordinary Durable entries, including the `nanobot.cron` input
+kind that the summary source already treats as user text.
+
+Episode *summaries* are not generated for them. Summaries are a model-spend opt-in whose only reader
+is the mapped-chat-scoped `history` tool, and nothing can read an automation conversation through it,
+so initializing the summary policy there would spend on text no surface would show. The
+catalog therefore records the conversation's opt-in watermark and defers its closed episodes, which
+stay `pending`; a future surface that reads them would start from that recorded point rather than
+resummarizing history.
+
+The search index is bound to mapped chat sessions: its rows, its cursor identity and the read-only
+`history` tool all resolve a source through the session map and the chat scope rule, and a
+conversation that is not a chat session has no label to report and no readable source. Automation
+conversations are therefore excluded from that index rather than indexed under a synthetic key that
+the tool could not open. Reading a scheduled run's own transcript is an operator/store-level action,
+not a `history` tool action.
 
 ## Authorization boundary
 
@@ -426,8 +459,8 @@ supplies mapped sessions after its own channel authentication and is the trust
 boundary for the single-tenant policy. `Gateway.historyEntries` accepts a session
 key but resolves it only through the existing session map: it never creates a
 conversation, accepts no conversation ID, and rejects state-only channel sessions.
-Entry and episode reads share the search validator that also rejects task-owned and
-forked conversations mapped under a chat session key. `historyEntries` returns
+Entry and episode reads share the search validator that also rejects task-owned,
+automation and forked conversations mapped under a chat session key. `historyEntries` returns
 bounded raw entries, so the caller must filter system, reset, compaction and
 thinking content before display. This is a trusted host surface, not an
 untrusted-channel API. Search results include `sessionKey`, `conversationId`,

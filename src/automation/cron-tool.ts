@@ -5,10 +5,11 @@
  * There is no user scheduler, slash command, or UI. Every operation is owner-scoped to the calling
  * conversation's job document, and the tool never widens authority:
  *
- * - a job gets the origin conversation's enabled tools when its run is prepared, so scheduling
- *   cannot grant a tool the conversation does not already hold;
- * - a `background` run gets a fresh task-owned conversation with that authority copied and nothing
- *   else, so a scheduled turn cannot reach another conversation's state;
+ * - a job gets the origin conversation's enabled tools when each of its runs is prepared, so
+ *   scheduling cannot grant a tool the conversation does not already hold;
+ * - a `background` run executes in that job's own automation conversation — one per recurring job,
+ *   one shared catch-all conversation per origin for one-off jobs — which holds only the authority
+ *   captured for that run and nothing from another conversation's state;
  * - `origin` runs answer in the conversation that scheduled them.
  *
  * The tool itself is not grant-gated and is not part of the host coding-tool ceiling: it can only
@@ -45,7 +46,7 @@ export interface CronToolOptions {
   readonly foundation: CronFoundation;
   /**
    * Host-resolved owner of a conversation. `undefined` means the conversation is not an origin
-   * session (for example a scheduled run's own background conversation), so cron is unavailable.
+   * session (for example a scheduled run's automation conversation), so cron is unavailable.
    */
   readonly ownerFor: (conversationId: ConversationId, context: Context) => CronOwner | undefined;
   /**
@@ -204,8 +205,11 @@ export function createCronTool(options: CronToolOptions): CronTool {
       "do something later, repeatedly, or on a calendar schedule (reminders, daily checks, periodic " +
       "reports). Actions: `add` creates a job whose message you will receive as a new turn when due; " +
       "`list` shows this conversation's jobs, their status and next run; `remove` cancels one job. " +
-      "A job runs in an isolated background conversation by default, or in this conversation when " +
-      "`isolated` is false. Scheduled runs inherit this conversation's enabled tools; they never " +
+      "A job runs in its own background conversation by default: each recurring job keeps one " +
+      "conversation across its runs, one-off jobs share a per-conversation background conversation " +
+      "and queue there, and every run starts a fresh episode that does not carry the previous run's " +
+      "context. `isolated: false` instead runs the job in this conversation once it is idle. " +
+      "Scheduled runs inherit this conversation's enabled tools; they never " +
       "gain more. `intent: \"digest\"` schedules one bounded memory-digestion run instead of a model " +
       "turn; it needs read/write/edit authority in this conversation and reports through an internal " +
       "result, not a chat message.",
@@ -256,8 +260,8 @@ export function createCronTool(options: CronToolOptions): CronTool {
       })),
       isolated: Type.Optional(Type.Boolean({
         description:
-          "add: true (default) runs the job in a fresh background conversation; false runs it in this " +
-          "conversation once it is idle.",
+          "add: true (default) runs the job in its background automation conversation, which " +
+          "accumulates one episode per run; false runs it in this conversation once it is idle.",
       })),
       job_id: Type.Optional(Type.String({
         description: "remove: the job ID from `list`.",

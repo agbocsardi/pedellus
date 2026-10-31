@@ -63,7 +63,8 @@ edits need restart only; unit edits additionally need daemon-reload.
   `credentials.<provider>` environment reference, Durable's own file
   `CredentialStore` under the canonical `dataDir`, and the terminal-only
   `login`/`logout` commands. No provider whitelist, no Pi credential store.
-- `src/automation/` — cron timer/run tasks and the model-facing `cron` tool.
+- `src/automation/` — cron timer/run tasks, persistent automation conversations and
+  the model-facing `cron` tool.
 - `src/workers/` — bounded ordinary background workers as native Durable tasks:
   the opt-in `worker` start/list/inspect/cancel tool, an explicit
   shared-or-worktree workspace per task, captured child authority and one internal
@@ -91,8 +92,13 @@ edits need restart only; unit edits additionally need daemon-reload.
   own opt-ins; Telegram, cron and recursive worker grants are forbidden.
   Only validated mapped chats receive foreground authority, and
   every admitted Telegram user shares the configured workspace/tools. Raw, root,
-  forked and state conversations remain denied. Isolated cron runs capture an
-  origin subset bounded by current config and lose it on completion. The `skill`,
+  forked and state conversations remain denied. A scheduled run's automation
+  conversation is a distinct class: ownerless, recorded by its origin's cron
+  documents and by its own class marker, and never a chat, an origin, a digest
+  source, a worker, an MCP/Code Mode/compositor scope or a scheduling scope.
+  Isolated cron runs capture an origin subset bounded by current config, prepare it
+  per run, and lose it on completion; persistent history confers no permission.
+  The `skill`,
   `cron`, `history`, `worker` and scoped `telegram` tools carry no filesystem/shell
   authority and are exempt from the coding-tool hook; history remains read-only
   over mapped chats. Telegram actions additionally require a live adapter, current private-chat
@@ -136,6 +142,14 @@ edits need restart only; unit edits additionally need daemon-reload.
   `/refresh` is CLI-only; browsing, compaction and local attachments also remain CLI extras.
 - The cron timer never calls a model, and a run never schedules: rescheduling is
   a deterministic task commit, so a slow or failed turn cannot stop the schedule.
+  A conversation is ongoing activity and an episode is one execution: a recurring
+  job keeps one automation conversation with a reset-delimited episode per run,
+  one-off jobs share one catch-all conversation per origin and queue durably on it
+  (bounded, refusing visibly when full), and `origin` mode still runs in the chat
+  with no new conversation and no cron-placed reset. Runs sharing a conversation
+  never interleave; the execution task stays separate from the conversation, so
+  cancelling a run retires its authority and stops its work without deleting
+  history.
 - Skill prompts carry names, descriptions and locators only; bodies load on
   demand through the read-only `skill` tool.
 - Markdown in the workspace is the memory source of truth. Durable owns the
@@ -212,19 +226,19 @@ edits need restart only; unit edits additionally need daemon-reload.
   auto-enablement when that block is absent. Scripts compose only the current
   conversation's callable set through native `executeTool`/`ToolTask` hooks: no
   new authority, no recursion, no host-only owner commands, and no composition in
-  root, state, fork, raw/other task-owned or isolated cron conversations. It may compose
+  root, state, fork, raw/other task-owned or scheduled-run automation conversations. It may compose
   the `worker` tool from a spawning mapped chat under that tool's own spawner and
   capture checks. A worker child also gets the compositor, but only over its
   captured coding, web, MCP and read-only mapped-chat history tools (never `worker`,
   Telegram or cron). A worker-specific call-time hook checks the durable capture and
   authorized origin and, for the classifier nested tool, the captured model identity;
   reopen permanently prunes removed names and identities, and terminal authority
-  is retired with the capture. Digest and isolated cron targets remain unchanged.
+  is retired with the capture. Digest and scheduled-run automation targets remain unchanged.
 - MCP is a separate, default-off connection authority from `toolAllowlist`:
   `mcp.enabled` plus at least one enabled server connects it, and only
   authenticated mapped chats and ordinary workers with captured grants receive MCP tools;
   Code Mode follows its own switch and the same scope rule. Root, state, fork, raw/other
-  task-owned, digest and isolated cron conversations get none. A worker's worktree does
+  task-owned, digest and scheduled-run automation conversations get none. A worker's worktree does
   not confine MCP: the server keeps its gateway-owned host cwd and authority. A configured stdio server is a native host
   process, not covered by `toolSandbox: "bwrap"`. Secrets are referenced by
   environment variable name.

@@ -152,7 +152,7 @@ no `codemode` block it is installed when MCP is configured, as before. Scripts
 compose every tool the current authenticated mapped-chat conversation is already
 authorized to call, through native `executeTool` validation and `ToolTask` hooks.
 Code Mode adds no authority, is not recursive, and grants nothing to root, state,
-fork, raw/other task-owned or isolated cron conversations. Ordinary workers may compose
+fork, raw/other task-owned or scheduled-run automation conversations. Ordinary workers may compose
 their captured coding, web, MCP and history tools, but never Telegram, cron or workers.
 `workers.toolAllowlist` sets independent worker grants (including worker-only shell/file tools);
 omitted inherits configured chat capabilities, and `[]` grants none. Integrations still require
@@ -164,7 +164,7 @@ at least one enabled stdio or Streamable HTTP server makes the shipped gateway
 connect them and install the native Durable QuickJS Code Mode/tool-search bundle.
 Discovered tools are deferred `mcp__<server>__<tool>` registrations reachable from
 Code Mode scripts and `tool_search` in authenticated mapped chats and ordinary workers
-with exact per-tool captures. Root, state, forked, digest and isolated cron/other task
+with exact per-tool captures. Root, state, forked, digest and scheduled-run automation/other task
 conversations get no MCP tool and no Code Mode. `toolAllowlist` still names only the coding tools
 (`read`/`write`/`edit`/`bash`), independently of MCP.
 

@@ -174,7 +174,7 @@ that same task outcome as described above. The child inherits:
 - the configured vision handoff, so a flagged text-only worker model never receives raw images;
 - configured public web search/fetch, configured MCP, Code Mode/tool_search and read-only history
   over the same validated mapped chats the parent can retrieve;
-- no `worker`, `cron` or Telegram tool. Digest and isolated cron targets do not inherit these grants.
+- no `worker`, `cron` or Telegram tool. Digest and scheduled-run automation targets do not inherit these grants.
 
 Research capabilities are stored by exact tool name in the existing durable capture. A worker-specific
 call-time hook checks the live child and its authorized origin; reopen intersects and persists the

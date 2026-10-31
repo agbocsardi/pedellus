@@ -8,7 +8,12 @@ import type { Models } from "@earendil-works/pi-ai/models";
 import { AgentDoc, AssistantEntry, ResetEntry, ToolTask, configure, ConversationBusy, createRegistry, defineDoc, defineExtension, hook, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type Storage, type TaskId, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ContextExtensionReplacement, type ConversationContextSnapshot } from "./context/index.js";
 import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./context/skill-tool.js";
-import { CRON_RUN_TASK_NAME, createCronFoundation } from "./automation/cron.js";
+import { CRON_RUN_TASK_NAME, CronJobsDoc, createCronFoundation } from "./automation/cron.js";
+import {
+  automationConversationOf,
+  CronConversationDoc,
+  type CronConversationClass,
+} from "./automation/cron-conversations.js";
 import { createCronTool, CRON_TOOL_NAME } from "./automation/cron-tool.js";
 import {
   CRON_DELIVERY_MAX_TEXT_CHARS,
@@ -1212,9 +1217,28 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ...(skillToolRegistration === undefined ? [] : [skillToolRegistration])]
       .map((tool) => [tool.name, tool]),
   );
-  // Origin sessions only: a scheduled run's fresh background conversation is not an origin session,
-  // so it cannot schedule further jobs. Owners are keyed by the mapped session key.
+  // Origin sessions only: a scheduled run's automation conversation is not an origin session, so it
+  // cannot schedule further jobs. Owners are keyed by the mapped session key.
   const cronOwners = new Map<ConversationId, CronOwner>();
+  // Scheduled runs' automation conversations, by the durable class this host recorded for them. They
+  // are ownerless so they outlive every run task, which means the class has to be carried explicitly:
+  // it keeps them out of chat scope, it denies them every capability set below, and it is how a
+  // reopened gateway finds a live run's target. Rebuilt from committed cron documents at open and
+  // extended by `prepare`, so a conversation created by this process is classified too.
+  const automationConversations = new Map<ConversationId, {
+    readonly originConversationId: ConversationId;
+    readonly conversationClass: CronConversationClass;
+    readonly jobId: string | null;
+  }>();
+  /** This host's scope record for one conversation: its class, never inferred from absence. */
+  const scopeRecordFor = async (tx: Tx, conversationId: ConversationId) => {
+    const record = await tx.conversation(conversationId);
+    if (record === undefined) return undefined;
+    return automationConversations.has(conversationId) ? { ...record, automation: true } : record;
+  };
+  /** Automation conversations in episode-catalog shape; never chat, so no session key is implied. */
+  const automationSessions = (): HistoryChatSession[] => [...automationConversations.keys()]
+    .map((conversationId) => ({ sessionKey: `cron-automation:${conversationId}`, conversationId }));
   // Worker spawning is the same rule, and deliberately not inherited: only a validated mapped chat
   // conversation may start a worker, so a worker's own task-owned conversation can never recurse.
   const workerSpawners = new Set<ConversationId>();
@@ -1259,8 +1283,19 @@ export async function openGateway(config: PortConfig, context: Context, options:
             return { status: "error", error: error instanceof Error ? error.message : String(error) };
           }
         },
-        // A background run is a fresh, task-owned conversation that starts default-deny. It captures
-        // the ceiling its authenticated origin currently has; the call-time hook still requires that
+        // Each run starts a new episode in its automation conversation: the foundation asks for the
+        // same native reset `/new` places, so earlier entries stay stored and searchable while this
+        // run's model context starts empty. It is admitted before the run's own input, and no stored
+        // entry is ever trimmed or rewritten.
+        reset: async (targetConversationId, ctx) => {
+          const harness = harnessRef.current;
+          if (harness === undefined) return;
+          const conversation = await harness.conversation(targetConversationId, ctx);
+          if (conversation === undefined) return;
+          await conversation.reset(undefined, ctx);
+        },
+        // A background run is an automation conversation that starts default-deny. It captures the
+        // ceiling its authenticated origin currently has; the call-time hook still requires that
         // origin and the current config, so the capture is a subset, never new authority. An
         // origin-mode run answers inside the conversation that already has the configured authority,
         // so it needs no capture.
@@ -1295,7 +1330,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
             ...(skillsInstalled && skillToolRegistration !== undefined ? [skillToolRegistration] : []),
           ];
           const extensions: Extension[] = [];
-          // The vision hook carries no tool authority. A scheduled background run is a fresh
+          // The vision hook carries no tool authority. A scheduled background run is an automation
           // conversation with only captured tools, so it needs this non-authoritative extension
           // explicitly; otherwise a read-tool image would bypass the flagged-preset handoff.
           if (visionExtension !== undefined) extensions.push(visionExtension);
@@ -1304,13 +1339,37 @@ export async function openGateway(config: PortConfig, context: Context, options:
             extensions.push(contextExtension);
           }
           if (skillsInstalled && skillTool !== undefined) extensions.push(skillTool.extension);
-          await configure(tx, targetConversationId, { tools, modelTools: tools, extensions });
+          // An automation conversation is ownerless, so Durable copies no agent state into it: the
+          // workspace, model and thinking level this run uses are prepared here, per run, instead of
+          // being inherited once at creation. History keeps no authority either way.
+          const originAgent = await tx.doc(AgentDoc, originConversationId);
+          await configure(tx, targetConversationId, {
+            tools,
+            modelTools: tools,
+            extensions,
+            cwd: workspace,
+            ...(originAgent.model === undefined ? {} : { model: { ...originAgent.model } }),
+            ...(originAgent.thinkingLevel === undefined ? {} : { thinkingLevel: originAgent.thinkingLevel }),
+          });
+          // Classify the conversation for this open from the durable marker the foundation wrote in
+          // the same commit: a forged or stale mapping can never be mistaken for chat via this host.
+          const marker = await tx.doc(CronConversationDoc, targetConversationId);
+          const classified = automationConversationOf(marker);
+          if (classified !== undefined) {
+            automationConversations.set(targetConversationId, {
+              originConversationId,
+              conversationClass: classified.conversationClass,
+              jobId: classified.jobId,
+            });
+          }
         },
         // A separate run target's captured authority ends with the run: retire its capture document
         // and stop offering its tools in the same commit that records the terminal outcome, so a
-        // finished or cancelled run cannot be used for a later admission. An origin-mode run answers
-        // in the origin conversation itself, so that conversation keeps its configured tools, cron
-        // ownership and context, and none of its documents are retired.
+        // finished or cancelled run cannot be used for a later admission. The automation
+        // conversation itself stays: its history is the job's ongoing activity, and the next run
+        // prepares its own authority again. An origin-mode run answers in the origin conversation
+        // itself, so that conversation keeps its configured tools, cron ownership and context, and
+        // none of its documents are retired.
         finalize: async ({ tx, job, occurrence, originConversationId, targetConversationId, background, delivery }) => {
           if (background) {
             await tx.retireDoc(ConfigToolCaptureDoc, targetConversationId);
@@ -1791,9 +1850,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
           } : {}),
           allowModel: (provider: string, modelId: string) => choicesByNative.has(modelKey({ provider, modelId })),
           includeOpenAtActivation: options.episodeSummary === undefined,
-          // Backstop: a job whose conversation is not chat scope never reaches a provider call.
+          // Backstop: a job whose conversation is not chat scope never reaches a provider call. An
+          // automation conversation and a summary task's own target are equally out of scope.
           scope: (tx: Tx, conversationId: ConversationId): Promise<ChatScopeExclusion | undefined> =>
-            readChatScope((id) => tx.conversation(id), conversationId, root.id),
+            readChatScope((id) => scopeRecordFor(tx, id), conversationId, root.id),
           // Resolved lazily: the catalog is created after this object so its extension can be
           // installed in the initial registry.
           listEpisodes: (conversationId, query, ctx) =>
@@ -1876,39 +1936,46 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // its rows to this value instead of to a file path, which a replaced store can reuse.
     const storeIdentity = await ensureStoreIdentity(harness!, context, { now });
 
-    // History scope: mapped chat sessions only. A channel's own state conversation, an unmapped
-    // conversation (a scheduled run's task-owned target) and the root are not chat history, and the
-    // host has already authenticated the session key before naming it. A mapped chat session is also
-    // ownerless and unforked: search, every entry/episode read and the background episode/summary work
-    // share that check, so a forged or stale map entry cannot expose or summarize a task-owned
-    // transcript, an inherited fork or the root.
+    // History scope: mapped chat sessions only. A channel's own state conversation, a scheduled run's
+    // automation conversation and the root are not chat history, and the host has already
+    // authenticated the session key before naming it. A mapped chat session is also unforked: search,
+    // every entry/episode read and the background episode/summary work share that check, so a forged
+    // or stale map entry cannot expose or summarize an automation, task-owned or inherited
+    // transcript, a fork, or the root.
     const assertMappedChatConversations = async (
       conversationIds: readonly ConversationId[],
       ctx: Context,
     ): Promise<void> => {
       await root.commit(async (tx) => {
         for (const conversationId of conversationIds) {
-          const reason = await readChatScope((id) => tx.conversation(id), conversationId, root.id);
+          const reason = await readChatScope((id) => scopeRecordFor(tx, id), conversationId, root.id);
           if (reason !== undefined) throw new Error(chatScopeMessage(reason));
         }
       }, ctx);
     };
-    // Background scope is decided by the conversation record, never by the session key alone. An
-    // out-of-scope mapping is skipped instead of failing the whole pass, so one forged entry cannot
-    // stop cataloguing or summarizing the conversations that really are chat history. The per-session
-    // history surface still rejects such a mapping loudly.
+    // Background scope is decided by the conversation record and this host's automation
+    // classification, never by the session key alone. An out-of-scope mapping is skipped instead of
+    // failing the whole pass, so one forged entry cannot stop cataloguing or summarizing the
+    // conversations that really are chat history. The per-session history surface still rejects such
+    // a mapping loudly.
     const mappedChatSessions = async (ctx: Context): Promise<readonly HistoryChatSession[]> => {
       const mapping = await harness!.snapshot(SessionMap, root.id, ctx);
       if (mapping === undefined) return [];
       const candidates = readChatSessions(mapping.sessions, root.id);
       return root.commit(async (tx) => {
-        const { chat } = await partitionChatScope((id) => tx.conversation(id), candidates, root.id);
+        const { chat } = await partitionChatScope((id) => scopeRecordFor(tx, id), candidates, root.id);
         return chat;
       }, ctx);
     };
-    // The digest source shares the same host-validated mapped chat sessions as the history index
-    // and episode catalog. It is created after Harness.open() because it needs the harness; the
-    // executor above resolves it at use time, so its extension is already in the initial registry.
+    // Episode cataloguing covers chat and automation conversations alike: a scheduled run's episodes
+    // are exactly the executions a recurring job accumulates, and a one-off job's are its occurrence
+    // in the shared catch-all conversation. Summary queueing is conversation-scoped, so it needs no
+    // session key; the read-only history tool still resolves sources through the mapped-chat rule and
+    // therefore never presents these conversations as chats.
+    const episodeSessions = async (ctx: Context): Promise<readonly HistoryChatSession[]> =>
+      [...(await mappedChatSessions(ctx)), ...automationSessions()];
+    // The digest source shares the host-validated mapped chat sessions of the history index. It never
+    // includes automation conversations: a scheduled run is not a digest origin.
     digestSourceRef.current = createDigestSource({
       harness: harness!,
       sessions: mappedChatSessions,
@@ -1920,7 +1987,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // commit queues its summary job, and without them nothing schedules or calls a provider.
     episodeCatalog = createEpisodeCatalog({
       harness: harness!,
-      sessions: mappedChatSessions,
+      sessions: episodeSessions,
       context,
       ...(episodeSummaries === undefined ? {} : { summaryJobs: { enqueue: episodeSummaries.enqueue } }),
     });
@@ -2189,6 +2256,52 @@ export async function openGateway(config: PortConfig, context: Context, options:
         mappedSessionKeys.set(conversationId, sessionKey);
       }
     }
+    // Restore the class of every automation conversation the committed cron documents record, before
+    // resume can schedule a run into one. Only a conversation that still carries this host's marker
+    // for that origin counts; a missing, foreign or damaged marker leaves the recorded ID
+    // unclassified, and the job's next run records a fresh conversation in its place. This is a
+    // read: it creates no document and starts nothing.
+    if (cronEnabled) {
+      for (const originConversationId of cronOwners.keys()) {
+        let doc: { readonly jobs: readonly { readonly id: string; readonly conversationId?: number | null }[]; readonly oneOffConversationId?: number | null } | undefined;
+        try {
+          doc = await harness.snapshot(CronJobsDoc, originConversationId, context);
+        } catch {
+          continue;
+        }
+        if (doc === undefined) continue;
+        const recorded: { conversationId: number; jobId: string | null }[] = [];
+        for (const job of doc.jobs) {
+          if (Number.isSafeInteger(job.conversationId) && (job.conversationId as number) > 0) {
+            recorded.push({ conversationId: job.conversationId as number, jobId: job.id });
+          }
+        }
+        if (Number.isSafeInteger(doc.oneOffConversationId) && (doc.oneOffConversationId as number) > 0) {
+          recorded.push({ conversationId: doc.oneOffConversationId as number, jobId: null });
+        }
+        for (const candidate of recorded) {
+          const conversationId = candidate.conversationId as ConversationId;
+          // A mapped session or the root is never an automation conversation, whatever a damaged
+          // document records; classifying one would take a chat out of chat scope.
+          if (cronOwners.has(conversationId) || conversationId === root.id) continue;
+          let marker: unknown;
+          try {
+            marker = await harness.snapshot(CronConversationDoc, conversationId, context);
+          } catch {
+            marker = undefined;
+          }
+          const classified = automationConversationOf(marker);
+          if (classified === undefined
+            || classified.originConversationId !== originConversationId
+            || classified.jobId !== candidate.jobId) continue;
+          automationConversations.set(conversationId, {
+            originConversationId,
+            conversationClass: classified.conversationClass,
+            jobId: classified.jobId,
+          });
+        }
+      }
+    }
 
     // Refuse unsafe prepared replays before resume; checkpoints pin historical context cutoffs.
     const preparedContextReplays: NonNullable<ReturnType<typeof preparedContextReplay>>[] = [];
@@ -2220,11 +2333,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
             });
           }
           if (backgroundTarget !== undefined) {
-            // The target must still be the conversation this task owns on behalf of its origin;
-            // a mismatched record is not a run target and gets no bound or snapshot restore.
+            // A scheduled run's target is an automation conversation that this origin's committed cron
+            // documents record; a worker or digest target is still the conversation its task owns. A
+            // mismatched record is not a run target and gets no bound or snapshot restore.
             const target = await tx.conversation(backgroundTarget.targetConversationId);
-            if (target?.owner?.taskId === Number(task.id)
-              && target.owner.conversationId === backgroundTarget.originConversationId) {
+            const ownsTarget = target?.owner?.taskId === Number(task.id)
+              && target.owner.conversationId === backgroundTarget.originConversationId;
+            const automationTarget = target !== undefined
+              && automationConversations.get(target.id)?.originConversationId
+                === backgroundTarget.originConversationId;
+            if (ownsTarget || automationTarget) {
               // A digest target deliberately gets no origin context snapshot: its model input is
               // its own bounded batch, so a reopened attempt renders the same framing again.
               if (snapshotTarget !== undefined) backgroundRunTargets.push(snapshotTarget);
@@ -2317,26 +2435,28 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
     }
 
-    // Every conversation owned by a background run task is that run's target. A live run's copy is
-    // reauthorized below; a target whose run already ended keeps no prepared authority.
-    const runTargetCandidates: { conversationId: ConversationId; originConversationId: ConversationId; live: boolean }[] = [];
+    // Every conversation a live run task currently targets is that run's target. A scheduled run's
+    // automation conversation is ownerless, so it is found through the class this open restored;
+    // a worker or digest target is found through the task that still owns it. A target whose run
+    // already ended keeps no prepared authority and is left out.
+    const runTargetCandidates: { conversationId: ConversationId; originConversationId: ConversationId }[] = [];
     await root.commit(async (tx) => {
-      let cursor: Cursor | undefined;
-      do {
-        const page = await tx.scanConversations({}, 1000, cursor);
-        for (const conversation of page.items) {
-          const owner = conversation.owner;
-          if (owner?.taskId === undefined) continue;
-          const task = runTasksById.get(Number(owner.taskId));
-          if (task === undefined || task.originConversationId !== owner.conversationId) continue;
-          runTargetCandidates.push({
-            conversationId: conversation.id,
-            originConversationId: task.originConversationId,
-            live: task.targetConversationId === conversation.id,
-          });
+      for (const [taskId, task] of runTasksById) {
+        const targetConversationId = task.targetConversationId;
+        if (targetConversationId === null) continue;
+        const conversation = await tx.conversation(targetConversationId);
+        if (conversation === undefined) continue;
+        const automation = automationConversations.get(conversation.id);
+        const owned = conversation.owner?.taskId === taskId
+          && conversation.owner.conversationId === task.originConversationId;
+        if (automation === undefined || automation.originConversationId !== task.originConversationId) {
+          if (!owned) continue;
         }
-        cursor = page.next;
-      } while (cursor !== undefined);
+        runTargetCandidates.push({
+          conversationId: conversation.id,
+          originConversationId: task.originConversationId,
+        });
+      }
     }, context);
 
     // A background run's captured authority is only as good as the current host config and its
@@ -2346,9 +2466,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // authenticated origin before resume; a mismatched origin, an unknown origin owner, an already
     // finished run or a missing capture is a deny rather than authority.
     const backgroundToolBounds = new Map<ConversationId, ReadonlySet<string>>();
-    for (const { conversationId: targetConversationId, originConversationId, live } of runTargetCandidates) {
+    for (const { conversationId: targetConversationId, originConversationId } of runTargetCandidates) {
       const tools = new Set<string>();
-      const capture = live ? await harness.snapshot(ConfigToolCaptureDoc, targetConversationId, context) : undefined;
+      const capture = await harness.snapshot(ConfigToolCaptureDoc, targetConversationId, context);
       if (capture !== undefined && capture.originConversationId === originConversationId
         && authorizedChatConversations.has(originConversationId)) {
         const ceiling = workerChildPolicies.has(targetConversationId)
@@ -2548,7 +2668,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // own background conversation) have no owner and therefore never receive the cron tool.
         let mappedChat = false;
         if (isChatSessionKey(sessionKey)) {
-          const reason = await root.commit((tx) => readChatScope((id) => tx.conversation(id), conversationId!, root.id), ctx);
+          const reason = await root.commit((tx) => readChatScope((id) => scopeRecordFor(tx, id), conversationId!, root.id), ctx);
           if (reason === undefined) {
             historyConversations.add(conversationId!);
             authorizedChatConversations.add(conversationId!);
@@ -2938,6 +3058,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
         }
         return false;
       };
+      // Summary policy stays chat-only: an automation conversation's episodes are catalogued, but a
+      // summary of one has no reader (the history tool is mapped-chat scoped), so it is not
+      // initialized here and the catalog's enqueue defers instead of spending on it.
       for (const session of await mappedChatSessions(context)) {
         try {
           await episodeSummaries.initialize(harness, session.conversationId, context);
