@@ -85,12 +85,13 @@ import { modelKey, parseToolTimeoutSeconds, type ModelReference, type PortConfig
 import { createVisionHandoffExtension } from "./media/vision-hook.js";
 import { VisionHandoff, type VisionHandoffStats } from "./media/vision.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
-import { prepareDataDirectory, inside } from "./store.js";
+import { canonicalFuturePath, prepareDataDirectory, inside } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import {
   assertConfiguredModelAuth,
   createProviderModels,
   nativeModelReference,
+  resolveClassifierModel,
   resolveModelChoices,
   type ResolvedModelChoice,
 } from "./providers.js";
@@ -608,11 +609,29 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // Fail at startup, not at the first tool call, when the default cannot be represented by the host shell.
   const toolTimeoutSeconds = parseToolTimeoutSeconds(config.toolTimeoutSeconds);
   const allowedModels = config.allowedModels ?? [config.model];
-  const prepared = options.models
-    ? { models: options.models, model: nativeModelReference(config.model) }
-    : createProviderModels(config, process.env, new FileCredentialStore(authStorePath(config.dataDir)));
+  // The gateway and the terminal login/logout command must resolve one private store
+  // file. Resolve the future canonical data directory without creating it: a failed
+  // startup keeps its existing side-effect-free behavior, and startup below re-checks
+  // that the validated, chmodded canonical directory is exactly this one.
+  let credentialStoreDir: string | undefined;
+  let prepared: { models: Models; model: ModelReference; classifier: ModelReference | undefined };
+  if (options.models !== undefined) {
+    prepared = { models: options.models, model: nativeModelReference(config.model), classifier: undefined };
+  } else {
+    try {
+      credentialStoreDir = await canonicalFuturePath(config.dataDir);
+    } catch (cause) {
+      throw new StartupDiagnosticError("workspace", { cause });
+    }
+    prepared = createProviderModels(config, process.env, new FileCredentialStore(authStorePath(credentialStoreDir)));
+  }
   const { models, model } = prepared;
   const choices = resolveModelChoices(models, allowedModels);
+  // The one configured classifier model, resolved against the very catalog Code Mode uses.
+  const classifierGrant = options.models === undefined
+    ? prepared.classifier
+    : resolveClassifierModel(models, config.classifierModel);
+  const classifierGrantKey = classifierGrant === undefined ? undefined : modelKey(classifierGrant);
   if (options.models === undefined) {
     // Fail before storage opens when a configured chat provider has no usable
     // native credential. Stored OAuth is checked for presence, not refreshed.
@@ -861,6 +880,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
     throw new StartupDiagnosticError("workspace", { cause });
   }
   const { workspace, extraRoots, canonicalDataDir, dbPath } = preparedDataDirectory;
+  if (credentialStoreDir !== undefined && credentialStoreDir !== canonicalDataDir) {
+    // The configured dataDir changed between credential resolution and validation (for
+    // example a symlink appeared). Refuse instead of reading a different store file.
+    throw new StartupDiagnosticError("credential", {
+      detail: "The configured dataDir changed while startup prepared the credential store",
+    });
+  }
   // Worker worktrees live beside the store, outside the configured workspace: the owner's checkout is
   // never the parent of a tool root, and only the leaf task checkout is granted to that task.
   let workerWorkspace: WorkerWorkspace | undefined;
@@ -1007,14 +1033,17 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // worker tool. Removing Code Mode from worker config removes it permanently.
     const codeModeGranted = codeModeRef.current !== undefined
       && (configured === undefined || configured.includes(CODEMODE_TOOL_NAME));
+    // The classifier nested tool exists only with an explicit configured model grant.
+    const classifierGranted = codeModeGranted && classifierGrantKey !== undefined;
     return [
       ...workerCodingTools,
       ...(skillToolRegistration === undefined ? [] : [SKILL_TOOL_NAME]),
       ...webToolRegistrations.map((tool) => tool.name),
       ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
       ...(codeModeGranted
-        ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, CLASSIFIER_MODEL_TOOL_NAME]
+        ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]
         : []),
+      ...(classifierGranted ? [CLASSIFIER_MODEL_TOOL_NAME] : []),
       ...(mcpRef.current?.toolNames ?? []),
     ].filter((name) => name === CLASSIFIER_MODEL_TOOL_NAME || configured === undefined || configured.includes(name)
       || (configured.includes("mcp") && mcpRef.current?.ownsTool(name)));
@@ -1033,6 +1062,17 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (capture === undefined || !authorizedChatConversations.has(capture.originConversationId as ConversationId)
           || !capture.tools.includes(call.name)) {
           return { block: `Tool ${call.name} is outside this worker's captured authority` };
+        }
+        if (call.name === CLASSIFIER_MODEL_TOOL_NAME) {
+          // The durable capture, not the current config, decides which classifier model this
+          // worker may still call. A pruned or retired identity never returns.
+          const model = call.arguments.model;
+          const provider = typeof model === "object" && model !== null ? (model as Record<string, unknown>).provider : undefined;
+          const id = typeof model === "object" && model !== null ? (model as Record<string, unknown>).id : undefined;
+          if (typeof provider !== "string" || typeof id !== "string"
+            || capture.classifierModel !== modelKey({ provider, modelId: id })) {
+            return { block: "Classifier model is outside this worker's captured authority" };
+          }
         }
         return undefined;
       },
@@ -1234,6 +1274,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
             const capture = await tx.doc(ConfigToolCaptureDoc, targetConversationId);
             capture.originConversationId = originConversationId;
             capture.tools = authorizedChatConversations.has(originConversationId) ? [...toolAllowlist] : [];
+            // A scheduled run never holds Code Mode or classifier authority.
+            capture.classifierModel = null;
             captured.push(...capture.tools);
           } else {
             await tx.retireDoc(ConfigToolCaptureDoc, targetConversationId);
@@ -1377,6 +1419,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const capture = await tx.doc(ConfigToolCaptureDoc, target);
           capture.originConversationId = spawnerConversationId;
           capture.tools = authorized ? workerToolNames() : [];
+          // Classifier model authority is captured with the tool name, so a config
+          // change narrows it durably instead of re-admitting a stale model later.
+          capture.classifierModel = capture.tools.includes(CLASSIFIER_MODEL_TOOL_NAME)
+            ? classifierGrantKey ?? null
+            : null;
           // The same snapshot path a scheduled run uses: bootstrap/AGENTS, the memory manifest, the
           // skill summary and the read-only `skill` tool, only when the host configured a provider and
           // the spawning session is mapped.
@@ -1412,7 +1459,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
               ? input.thinkingLevel
               : workerChoice === undefined ? "off" : fallbackThinkingLevel(workerChoice),
             tools,
-            modelTools: tools.filter((tool) => !mcpRef.current?.ownsTool(tool.name)),
+            // The classifier nested tool is script-reachable only, never a direct model tool.
+            modelTools: tools.filter((tool) =>
+              !mcpRef.current?.ownsTool(tool.name) && tool.name !== CLASSIFIER_MODEL_TOOL_NAME),
             extensions,
           });
         },
@@ -1495,6 +1544,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
       capture.tools = authorizedChatConversations.has(originConversationId)
         ? memoryDigestCurationTools(toolAllowlist)
         : [];
+      // A digest run never holds Code Mode or classifier authority.
+      capture.classifierModel = null;
       const tools = capture.tools.flatMap((name) => {
         const tool = toolRegistrations.get(name);
         return tool === undefined ? [] : [tool];
@@ -1594,8 +1645,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
     let offered = codeModeOfferedBase ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME] : [];
     // Classifier calls are native nested ToolTasks of Code Mode. They stay out of
     // `modelTools`, so the model cannot call them directly, and no other scope
-    // receives them without the Code Mode grant.
-    let classifierTools = codeModeOfferedBase ? [CLASSIFIER_MODEL_TOOL_NAME] : [];
+    // receives them without the Code Mode grant and an explicit configured model.
+    const classifierOffered = (): string[] => classifierGrantKey === undefined
+      ? []
+      : [CLASSIFIER_MODEL_TOOL_NAME];
+    let classifierTools = codeModeOfferedBase ? classifierOffered() : [];
     const deferred = [...(mcpRef.current?.toolNames ?? [])].filter((name) => authorized || captured?.has(name));
     const withContext = (names: readonly string[]): Pick<AgentChange, "tools" | "modelTools"> => {
       const tools = [
@@ -1621,8 +1675,19 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const capturedCodeMode = codeModeRef.current !== undefined
         && workerToolNames().includes(CODEMODE_TOOL_NAME)
         && capture.tools.includes(CODEMODE_TOOL_NAME);
+      // Classifier authority is captured by model identity, not only by tool name: a
+      // removed or changed configuration is pruned in this same commit, so a later
+      // re-enable cannot resurrect it for an existing worker.
+      capture.classifierModel = capturedCodeMode
+        && capture.tools.includes(CLASSIFIER_MODEL_TOOL_NAME)
+        && classifierGrantKey !== undefined
+        && capture.classifierModel === classifierGrantKey
+        ? classifierGrantKey
+        : null;
       offered = capturedCodeMode ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME] : [];
-      classifierTools = capturedCodeMode ? [CLASSIFIER_MODEL_TOOL_NAME] : [];
+      classifierTools = capturedCodeMode && capture.classifierModel !== null
+        ? [CLASSIFIER_MODEL_TOOL_NAME]
+        : [];
       return withContext(capture.tools.filter((name) => workerCodingTools.includes(name)));
     }
     if (!toolExtension) {
@@ -1759,9 +1824,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (codeModeEnabled) {
       codeModeRef.current = createCodeModeIntegration({
         namespaces: mcpRef.current?.namespaces ?? [],
-        // Native `models.*`: classifier models plus read-only catalog helpers. Image
-        // generation is not registered by this integration.
+        // Native `models.*`: only the one configured classifier model plus read-only
+        // catalog helpers. Image generation is not registered by this integration.
         models: true,
+        ...(classifierGrant === undefined ? {} : { classifierModel: classifierGrant }),
         // A live worker child may compose its captured tools; every nested call still passes that
         // tool's own call-time hook, so retirement or a narrowed ceiling denies stale composition.
         isAuthorizedChat: (conversationId: ConversationId) =>

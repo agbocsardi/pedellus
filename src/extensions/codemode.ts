@@ -1,4 +1,5 @@
 import type { Context } from "@earendil-works/chord";
+import type { Models } from "@earendil-works/pi-ai";
 import { withAbortSignal } from "@earendil-works/chord/context";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { parseCodemodeSource, CODEMODE_OPTIONS_PREFIX } from "@earendil-works/pi-codemode/source";
@@ -15,9 +16,11 @@ import {
   type ConversationId,
   type Extension,
   type ToolExecutionApi,
+  type ToolHookCall,
   type ToolRegistration,
   wrapTool,
 } from "@earendil-works/pi-durable";
+import { modelKey, type ModelReference } from "../config.js";
 
 export const CODEMODE_BUDGETS = Object.freeze({
   memoryLimitBytes: 128 * 1024 * 1024,
@@ -34,6 +37,9 @@ export const CLASSIFIER_MODEL_TOOL_NAME = "pi.codemode.models.classify";
 export const IMAGE_GENERATION_MODEL_TOOL_NAME = "pi.codemode.models.generateImages";
 
 const IMAGE_GENERATION_UNAVAILABLE = "Image generation is not available from this deployment.";
+const CLASSIFIER_AUTHORITY_NOTE =
+  "Only the one classifier model configured by classifierModel is callable, and only from an authorized " +
+  "mapped chat or a worker whose durable capture still holds that model.";
 
 /** The native `models.*` description with its image-generation helper removed. */
 function classifierOnlyDescription(description: string): string {
@@ -41,7 +47,70 @@ function classifierOnlyDescription(description: string): string {
     .split("\n")
     .filter((line) => !line.includes("generateImages"))
     .map((line) => line.replace("classify/generateImages", "classify"));
-  return `${lines.join("\n")}\n${IMAGE_GENERATION_UNAVAILABLE}`;
+  return `${lines.join("\n")}\n${CLASSIFIER_AUTHORITY_NOTE}\n${IMAGE_GENERATION_UNAVAILABLE}`;
+}
+
+function argumentRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+/**
+ * Whether a native nested call names the one configured classifier model. A script can
+ * forge any object; only an exact `{ provider, id }` pair passes, and the native resolver
+ * then re-reads the catalog entry itself, so baseUrl/headers or other injected fields
+ * never reach a request.
+ */
+function classifierAllowed(call: ToolHookCall, configured: string | undefined): boolean {
+  const model = argumentRecord(argumentRecord(call.arguments)?.model);
+  const provider = model?.provider;
+  const id = model?.id;
+  return configured !== undefined && typeof provider === "string" && typeof id === "string"
+    && modelKey({ provider, modelId: id }) === configured;
+}
+
+/**
+ * A read-only catalog view for one Code Mode execution: chat metadata unchanged, only
+ * the one configured classifier, and no image models. Catalog discovery therefore cannot
+ * list, select or describe model authority the configuration did not grant.
+ */
+function restrictedCatalog(models: Models, configured: string | undefined): Models {
+  const granted = (model: unknown): boolean => {
+    const entry = argumentRecord(model);
+    return configured !== undefined && entry !== undefined
+      && typeof entry.provider === "string" && typeof entry.id === "string"
+      && modelKey({ provider: entry.provider, modelId: entry.id }) === configured;
+  };
+  const allow = <T>(type: unknown, values: readonly T[]): T[] =>
+    type === "chat" ? [...values] : type === "classifier" ? values.filter(granted) : [];
+  const against = <T>(method: string, ...args: unknown[]): T => {
+    const fn = (models as unknown as Record<string, unknown>)[method];
+    if (typeof fn !== "function") throw new Error(`Code Mode catalog method ${method} is unavailable`);
+    return (fn as (...rest: unknown[]) => T).apply(models, args);
+  };
+  return new Proxy(models, {
+    get(target, property) {
+      switch (property) {
+        case "getModelsOfType":
+          return (type: unknown, provider?: string) =>
+            allow(type, against<readonly unknown[]>("getModelsOfType", type, provider));
+        case "getAvailableOfType":
+          return async (type: unknown, provider?: string, options?: unknown) =>
+            allow(type, await against<Promise<readonly unknown[]>>("getAvailableOfType", type, provider, options));
+        case "getModelOfType":
+          return (type: unknown, provider: string, id: string) => {
+            const model = against<unknown>("getModelOfType", type, provider, id);
+            if (type === "chat") return model;
+            return type === "classifier" && granted(model) ? model : undefined;
+          };
+        default: {
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      }
+    },
+  });
 }
 
 export interface CodeModeIntegrationOptions {
@@ -49,6 +118,12 @@ export interface CodeModeIntegrationOptions {
   readonly namespaces?: readonly CodemodeNamespace[];
   /** Explicitly opt into Durable's non-LLM models.* capabilities. Default false. */
   readonly models?: boolean;
+  /**
+   * The one configured classifier model, already resolved against the same `Models`
+   * catalog. Absent denies every classifier: no registered provider implies one, and
+   * the native classifier nested tool is not registered at all.
+   */
+  readonly classifierModel?: ModelReference;
   /**
    * Host predicate for the outer `codemode`/`tool_search` authority. When supplied, a
    * dedicated hook extension is selected with the bundle and blocks both names outside
@@ -116,6 +191,8 @@ export function createCodeModeIntegration(options: CodeModeIntegrationOptions = 
     },
   });
 
+  const classifierKey = options.classifierModel === undefined ? undefined : modelKey(options.classifierModel);
+
   const native = createCodemodeExtension({
     sandbox,
     models: options.models === true,
@@ -124,8 +201,11 @@ export function createCodeModeIntegration(options: CodeModeIntegrationOptions = 
   const nativeTool = native.tools?.find((tool) => tool.name === CODEMODE_TOOL_NAME);
   if (!nativeTool) throw new Error("Durable Code Mode extension did not register its codemode tool");
   // Classifiers are exposed through the native `models.*` globals and their
-  // native nested ToolTask. Image generation is deliberately not registered.
-  const nativeTools = (native.tools ?? []).filter((tool) => tool.name !== IMAGE_GENERATION_MODEL_TOOL_NAME);
+  // native nested ToolTask. Image generation is deliberately not registered, and
+  // the classifier tool itself exists only with an explicit model grant.
+  const nativeTools = (native.tools ?? []).filter((tool) =>
+    tool.name !== IMAGE_GENERATION_MODEL_TOOL_NAME
+    && (tool.name !== CLASSIFIER_MODEL_TOOL_NAME || classifierKey !== undefined));
 
   const boundedCodeMode = defineExtension({
     ...native,
@@ -148,7 +228,9 @@ export function createCodeModeIntegration(options: CodeModeIntegrationOptions = 
               // createCodemodeTool parses the same source and returns its normal error result.
             }
             const scopedContext = withAbortSignal(shutdown.signal, context);
-            const running = Promise.resolve(execute({ ...args, code }, api, scopedContext));
+            // Bound discovery to configured authority for the whole script execution.
+            const scopedApi = { ...api, models: restrictedCatalog(api.models, classifierKey) };
+            const running = Promise.resolve(execute({ ...args, code }, scopedApi, scopedContext));
             activeExecutions.add(running);
             try {
               return await running;
@@ -177,6 +259,12 @@ export function createCodeModeIntegration(options: CodeModeIntegrationOptions = 
           if (call.name === CLASSIFIER_MODEL_TOOL_NAME) {
             if (!isAuthorizedChat(api.conversationId)) {
               return { block: `Tool ${call.name} is not enabled for this conversation` };
+            }
+            if (classifierKey === undefined) {
+              return { block: "No classifier model is configured for this deployment" };
+            }
+            if (!classifierAllowed(call, classifierKey)) {
+              return { block: "Classifier model is not the configured classifier model" };
             }
             return undefined;
           }

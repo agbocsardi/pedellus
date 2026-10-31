@@ -187,18 +187,21 @@ the process environment. The config stores **variable names**, not values:
 
 The existing provider, Telegram and web paths resolve those names from the gateway
 process environment; MCP has the same explicit environment-name convention.
-`credentials` is an alias for a provider's environment variable, not a closed
-provider list: native providers use their documented variables when no reference
-is configured, and a provider credential stored by `durable-nanobot login` is used
-first. There is no blanket `${VAR}` substitution in JSON and no automatic environment-file
+`credentials` names one environment variable for a provider spelling; it is not a
+closed provider list. An explicit reference pins that variable and fails closed
+when it is unset or blank, without falling back to native ambient variables; with
+no reference, native providers use their documented variables. A provider
+credential stored by `durable-nanobot login` is used first. There is no blanket `${VAR}` substitution in JSON and no automatic environment-file
 loader in the CLI. A manually launched gateway must inherit its environment by
 another explicit launch mechanism; an attaching agent uses the running gateway
 and does not need provider credentials locally. The gateway's shell tools keep
 their separate filtered environment and do not inherit all gateway credentials.
 
-`durable-nanobot login` and `logout` are explicit terminal commands. They read the
-same config only to locate the configured `dataDir`, write Durable's own private
-credential store there, and never open the gateway or contact a model. The gateway
+`durable-nanobot login` and `logout` are explicit terminal commands. They load and
+validate the same configuration as the gateway (workspace and `dataDir` boundary
+included), prepare the canonical private `dataDir`, write Durable's own credential
+store there, and never open the gateway, the Durable store or contact a model. A
+failed authentication command prints one fixed diagnostic and no credential value. The gateway
 never logs in automatically and never reads Pi's credential store. A stored OAuth
 credential is refreshed natively when a request needs it, under the store lock.
 

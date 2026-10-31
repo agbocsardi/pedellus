@@ -230,6 +230,12 @@ async function runAuthCommand(
     } else {
       await runLogout(config, invocation.provider, { input: stdin, output: stdout, signal: stop.signal });
     }
+  } catch (error) {
+    // Known selection/configuration failures keep their fixed specific text. Anything else
+    // is suppressed behind one safe authentication diagnostic: provider and store errors may
+    // embed credentials, URLs or paths.
+    if (error instanceof StartupDiagnosticError || error instanceof UsageError) throw error;
+    throw new StartupDiagnosticError(stop.signal.aborted ? "authCanceled" : "authFailed", { cause: error });
   } finally {
     process.off("SIGINT", shutdown);
     process.off("SIGTERM", shutdown);
@@ -307,8 +313,10 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       ...(attachments === undefined ? {} : { attachments }),
     });
     if (config.telegram) {
-      const token = process.env[config.telegram.tokenEnv];
-      if (!token) throw new StartupDiagnosticError("telegramToken");
+      const token = Object.hasOwn(process.env, config.telegram.tokenEnv)
+        ? process.env[config.telegram.tokenEnv]
+        : undefined;
+      if (typeof token !== "string" || token.trim() === "") throw new StartupDiagnosticError("telegramToken");
       const { runTelegram } = await import("./channels/telegram.js");
       await runTelegram(gateway, {
         token,

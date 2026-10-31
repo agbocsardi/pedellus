@@ -43,9 +43,15 @@ durable-nanobot logout openai
 OAuth method, then prints browser URLs, device codes, progress and typed prompts.
 `--auth` accepts `api_key` or `oauth`; `provider` is a native provider ID (a
 legacy alias is resolved for convenience). `logout` removes one stored provider
-credential. Both accept `--config <path>` like the gateway, operate on the
-configured `dataDir`, and open no store or gateway. Durable's private credential
-store is independent of Pi's; see [providers and auth](./PROVIDERS.md#login-and-logout).
+credential. Both accept `--config <path>` like the gateway and validate the full
+configuration the same way, including `workspace` and the `dataDir` boundary.
+They prepare (create if absent, `0700`) the canonical configured `dataDir` and
+write only Durable's private credential files there; they open no gateway, no
+Durable store and no model turn. Failures print one fixed diagnostic naming the
+cause (unknown provider, unsupported method, missing stored credential, cancelled,
+or failed) without echoing credentials, provider errors or paths. Durable's private
+credential store is independent of Pi's; see
+[providers and auth](./PROVIDERS.md#login-and-logout).
 
 A gateway request resolves stored OAuth and refreshes it natively. `/restart`
 keeps the current process environment, so a changed systemd environment file needs

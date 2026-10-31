@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, mkdir, open, readFile, rename, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type {
   ApiKeyCredential,
@@ -116,11 +117,12 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
       reject(signal.reason);
       return;
     }
+    // Never unref: a login/logout waiting for the cross-process lock must keep the
+    // process alive until the wait settles or its deadline aborts it.
     const timer = setTimeout(() => {
       signal?.removeEventListener("abort", onAbort);
       resolve();
     }, ms);
-    timer.unref();
     const onAbort = () => {
       clearTimeout(timer);
       reject(signal?.reason);
@@ -146,20 +148,35 @@ export class FileCredentialStore implements CredentialStore {
   async #readAll(options?: AuthOperationOptions): Promise<Record<string, Credential>> {
     options?.signal?.throwIfAborted();
     let text: string;
+    let handle: FileHandle | undefined;
     try {
-      text = await readFile(this.#path, "utf8");
+      // O_NOFOLLOW keeps the read on the resolved regular file, so a symlink swapped
+      // in after canonical data-directory validation is refused rather than followed.
+      handle = await open(this.#path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      if (!(await handle.stat()).isFile()) {
+        throw new Error("Credential store path must be a regular file, not a symlink or special file");
+      }
+      text = await handle.readFile("utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return Object.create(null) as Record<string, Credential>;
       throw error;
+    } finally {
+      await handle?.close();
     }
     options?.signal?.throwIfAborted();
     return parseFile(text);
   }
 
-  async #writeAll(entries: Record<string, Credential>, signal?: AbortSignal): Promise<void> {
-    signal?.throwIfAborted();
+  /** The private store lives only in a private directory; prepare it before any write. */
+  async #ensureDirectory(): Promise<void> {
     const directory = dirname(this.#path);
     await mkdir(directory, { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o700);
+  }
+
+  async #writeAll(entries: Record<string, Credential>, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    await this.#ensureDirectory();
     const temporary = `${this.#path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
     const body: StoreFile = { version: STORE_VERSION, credentials: entries };
     try {
@@ -200,7 +217,7 @@ export class FileCredentialStore implements CredentialStore {
   }
 
   async #withLock<T>(signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
-    await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
+    await this.#ensureDirectory();
     const lock = await this.#acquire(signal);
     try {
       return await operation();

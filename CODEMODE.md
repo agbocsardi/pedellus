@@ -126,45 +126,67 @@ to scripts through `searchTools()`.
 ## Classifiers and image generation
 
 When the shipped gateway installs Code Mode it passes `models: true` and keeps
-the native classifier path. Scripts can list the configured provider catalog with
+the native classifier path. Scripts can list the provider catalog with
 `models.getModelsOfType(type, provider?)` / `getAvailableOfType()` /
 `getModelOfType()` and answer typed questions with `models.classify(model, {
 state, questions, images? })`. A classifier model is not a chat selection and
 never appears in `/model`.
 
-A provider is in the catalog only when configuration references it through
-`allowedModels`/`modelPresets`, `credentials`, or a custom `providers` entry. A
-classifier-only provider can therefore be enabled by adding its credential
-reference without adding any chat model. Catalog helpers are read-only; they
-expose no chat completion, fallback, discovery or budget bypass.
+Classifier authority is one optional configured model, never a provider
+capability:
+
+```json
+{ "classifierModel": { "provider": "typesafe", "modelId": "jev-latest" } }
+```
+
+Absent `classifierModel`, classifiers are unavailable: the native nested tool is
+not registered, catalog discovery lists no classifier, and a script call fails
+without a model request. Naming a provider in `allowedModels`, `credentials` or
+`providers` never makes its classifier models reachable, and the configured pair
+must be a classifier-type model in the registered native/custom catalog. There is
+one such model, no list, no fallback and no substitution: a call naming any other
+identity is refused. A forged object that copies the configured `{ provider, id }`
+pair cannot inject anything, because the native resolver replaces it with the
+catalog entry and drops extra fields such as `baseUrl` or `headers`. The catalog
+view a script sees exposes chat metadata unchanged,
+the one configured classifier, and no image models, so discovery cannot enumerate
+authority that configuration did not grant. A classifier-only provider is
+registered by naming its model in `classifierModel` (its credential comes from
+`credentials` or `login`), with no chat model needed.
 
 `models.classify()` runs as the native reserved nested tool
 `pi.codemode.models.classify`. It is a real Durable tool task, so the native
-ToolTask hooks, cancellation, replay policy and usage accounting apply, and its
-usage is counted in the Code Mode result. The QuickJS deadline and output budget
-from `CODEMODE_BUDGETS` still bound the whole script. Classifier image blocks are
-accepted only when the model declares `"image"` input; this is image understanding,
-not generation.
+ToolTask hooks, cancellation, replay policy and usage accounting apply. Its usage
+lands in the conversation's `pi.usage` under that nested tool's own bucket, not in
+the `codemode` tool result's usage; the QuickJS deadline and output budget from
+`CODEMODE_BUDGETS` bound the whole script. Classifier image blocks are accepted
+only when the model declares `"image"` input; this is image understanding, not
+generation.
 
-Image generation is deliberately absent. The integration removes the native
-`pi.codemode.models.generateImages` registration, removes its `models.generateImages`
-documentation from the Code Mode description, and a call-time hook refuses the
-reserved generation name if it ever appears. `image()` remains only an output
-helper for existing image blocks, not a generation API. The catalog may still
-list image-model metadata; it cannot be run.
+Image generation stays unavailable, with one native constraint reported honestly:
+`models: true` is a single native switch whose script globals are a frozen internal
+map, so the `models.generateImages` global name still exists in a script even
+though this integration removes and never registers its internal tool. Calling it
+resolves to no registered tool and fails without a provider or image-model call,
+its documentation is removed from the Code Mode description, and the scoped
+catalog hides image models entirely (`getModelsOfType("image")` is empty and
+`getModelOfType("image", ...)` is undefined). `image()` remains only an output
+helper for existing image blocks, not a generation API. Removing the global name
+itself would require replacing the native `models.*` surface; that is not done
+because the replacement cannot keep the native nested-task semantics as reliably.
 
 The native classifier tool is enabled in a conversation's `tools` list but kept
-out of `modelTools`, so the model cannot call it directly and scripts reach it
-only through the `models` global. It is added only when Code Mode itself is
-offered. For a worker child, that means the pruned durable worker capture must
-still contain `codemode` and the current worker grants must still include it. A
-worker capture never names classifier rights separately: disabling Code Mode (or
-narrowing it out of the worker grant) prunes both permanently, and a later
-re-enable cannot resurrect the removed classifier right. Root, channel-state,
-fork, raw/other task-owned, isolated cron, memory-digest and retired-worker
-scopes never receive Code Mode, so they cannot reach `models.*`. The local CLI
-attachment is an authenticated mapped `cli:<name>` chat and follows the same
-mapped-chat rule.
+out of both mapped-chat and worker `modelTools`, so no model can call it directly
+and scripts reach it only through the `models` global. It is added only when Code
+Mode is offered and `classifierModel` is configured. For a worker child, the
+pruned durable capture must still contain `codemode`, the current worker grants
+must still include it, and the capture records the classifier model identity:
+removing or changing `classifierModel` prunes that identity in the same commit, so
+restoring the same configuration later cannot resurrect it for an existing worker.
+Root, channel-state, fork, raw/other task-owned, isolated cron, memory-digest and
+retired-worker scopes never receive Code Mode, so they cannot reach `models.*`.
+The local CLI attachment is an authenticated mapped `cli:<name>` chat and follows
+the same mapped-chat rule.
 
 ## Native default-deny and host-selected tools
 
@@ -227,7 +249,8 @@ connected, while `modelTools` offers only `codemode` and `tool_search` until
 and blocks `codemode`/`tool_search` and the classifier nested tool outside authenticated
 mapped chats and live captured workers; it also refuses the reserved generation
 name unconditionally. It does not depend on MCP being connected. The worker's additional hook checks
-its durable per-tool capture and authorized origin on every call. The coding ceiling delegates those
+its durable per-tool capture, the captured classifier model identity and its authorized origin on
+every call. The coding ceiling delegates those
 three fixed names to that hook and delegates `mcp__*` to the MCP extension's own call-time
 hook, which rechecks the conversation and the server's live tool list.
 
@@ -351,28 +374,44 @@ idempotency, or live service readiness.
 
 ### Classifier and provider/auth probe
 
-`/tmp/nanobot-native-provider-probe.mjs` (90-second outer timeout) used only
-temporary directories, synthetic credentials and a synthetic classifier. It
-verified: the private file-backed credential store round-trips and deletes a
-synthetic credential; `createProvider()` registers an explicit Umans-style
-Anthropic-compatible catalog and resolves its referenced environment variable;
-the legacy `opencode_go` spelling maps to native `opencode-go`; a custom provider
-cannot redefine a native provider; a mapped chat receives `codemode` but not the
-classifier as a direct model tool; the classifier nested tool is callable while
-`generateImages` is absent from tools and the Code Mode description; a native
-`models.classify` call returns through the nested task and the synthetic
-classifier was called once; `models.generateImages` fails without a model call;
-and the login model registry exposes native provider OAuth/API-key methods and
-more than thirty providers rather than a nine-provider whitelist. No real login,
-network request or real credential was used.
+Post-review probes use only temporary directories, faux providers, synthetic
+credentials and no provider network access. `/tmp/nanobot-auth-authority-probe.mjs`
+(90-second timeout) verified: prototype member names are not legacy aliases;
+an explicit `credentials.<provider>` reference fails closed when its variable is
+unset or blank even though the provider's native ambient variable is set, and the
+named value wins when both exist; a stored login credential keeps precedence; only
+own environment properties are read; two spellings for one native provider cannot
+take different references; prototype-named keys are a clear diagnostic or a real
+own property; a custom provider resolves pinned-env, keyless and stored-key auth
+only; the single `classifierModel` grant resolves exactly and a chat model is
+rejected; and the login registry exposes native OAuth/API-key methods with the
+same pinned-env rule.
 
-`/tmp/nanobot-worker-classifier-probe.mjs` (90-second timeout) verified that a
-captured ordinary worker carries `codemode` and
-`pi.codemode.models.classify` and can run one synthetic classifier through its
-child Code Mode. `/tmp/nanobot-worker-classifier-narrowing-probe.mjs`
-(120-second timeout) kept a worker live across reopen and verified that disabling
-Code Mode pruned both the compositor and the classifier from its durable capture,
-and that re-enabling Code Mode did not restore either right.
+`/tmp/nanobot-classifier-authority-probe.mjs` (120-second timeout) verified through
+the real gateway: the configured classifier is a nested tool only, never a direct
+model tool; it answers through the native nested task; another classifier model of
+the same registered provider is refused without a call; a forged model object
+carrying `baseUrl`/`headers` reaches only the catalog entry; a forged ungranted
+identity is refused; catalog discovery lists only the configured classifier and no
+image models; `models.generateImages` fails without an image-model call; root and
+raw conversations hold neither Code Mode nor classifier authority; and removing
+`classifierModel` denies the same mapped chat at call time.
+
+`/tmp/nanobot-worker-classifier-grants-probe.mjs` (120-second timeout) kept a
+worker live across reopen: its durable capture records the classifier model
+identity; changing the configured model prunes that identity while the worker
+keeps its `codemode` grant; and re-adding the original model does not restore the
+pruned right.
+
+`/tmp/nanobot-store-lock-probe.mjs` (60-second timeout) plus
+`/tmp/nanobot-lock-wait-child.mjs` verified: private `0600`/`0700` store
+permissions, a waiting process stays alive until a held cross-process lock is
+released, a stale lock is reclaimed, an abort signal ends the wait promptly, and a
+symlinked store file is refused. `/tmp/nanobot-auth-cli-probe.mjs` (90-second
+timeout) exercised the built CLI: unknown provider, unsupported method, empty
+store, missing stored credential, corrupt store, and full configuration validation
+each print one fixed safe diagnostic without echoing values, and `logout` removes
+only the named stored credential.
 
 ### Parent integration verification
 

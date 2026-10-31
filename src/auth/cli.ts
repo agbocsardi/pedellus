@@ -12,6 +12,7 @@ import type {
 import { createModels } from "@earendil-works/pi-ai";
 import type { PortConfig } from "../config.js";
 import { createAuthModels, nativeProviderId } from "../providers.js";
+import { StartupDiagnosticError } from "../startup-diagnostics.js";
 import { prepareDataDirectory } from "../store.js";
 import { authStorePath, FileCredentialStore, installationDeviceId } from "./store.js";
 
@@ -174,7 +175,7 @@ function interactiveChoices(models: Models): LoginChoice[] {
 }
 
 async function chooseLogin(choices: readonly LoginChoice[], interaction: AuthInteraction): Promise<LoginChoice> {
-  if (choices.length === 0) throw new Error("No provider supports interactive login");
+  if (choices.length === 0) throw new StartupDiagnosticError("authProvider");
   if (choices.length === 1) return choices[0]!;
   const answer = await interaction.prompt({
     type: "select",
@@ -186,7 +187,7 @@ async function chooseLogin(choices: readonly LoginChoice[], interaction: AuthInt
     })),
   });
   const choice = choices[Number(answer)];
-  if (choice === undefined) throw new Error("No authentication method selected");
+  if (choice === undefined) throw new StartupDiagnosticError("authMethod");
   return choice;
 }
 
@@ -204,11 +205,19 @@ export async function runLogin(
     if (selection.provider !== undefined) {
       const nativeId = nativeProviderId(selection.provider);
       choices = choices.filter((choice) => choice.provider.id === nativeId);
-      if (choices.length === 0) throw new Error(`Provider ${nativeId} is unknown or has no interactive login`);
+      if (choices.length === 0) {
+        throw new StartupDiagnosticError("authProvider", {
+          detail: `Provider ${nativeId} is unknown or has no interactive login`,
+        });
+      }
     }
     if (selection.auth !== undefined) {
       choices = choices.filter((choice) => choice.type === selection.auth);
-      if (choices.length === 0) throw new Error(`No selected provider supports ${selection.auth} login`);
+      if (choices.length === 0) {
+        throw new StartupDiagnosticError("authMethod", {
+          detail: `No selected provider supports ${selection.auth} login`,
+        });
+      }
     }
     const choice = await chooseLogin(choices, interaction);
     const deviceId = choice.type === "oauth" ? await installationDeviceId(prepared.canonicalDataDir) : undefined;
@@ -255,7 +264,7 @@ export async function runLogout(
       const choice = stored
         .slice()
         .sort((left, right) => left.providerId.localeCompare(right.providerId))[Number(answer)];
-      if (choice === undefined) throw new Error("No stored credential selected");
+      if (choice === undefined) throw new StartupDiagnosticError("authFailed");
       providerId = choice.providerId;
     } finally {
       close();
@@ -263,7 +272,9 @@ export async function runLogout(
   } else {
     providerId = nativeProviderId(provider);
     if (!stored.some((entry) => entry.providerId === providerId)) {
-      throw new Error(`No stored credential for provider ${providerId}`);
+      throw new StartupDiagnosticError("authNoCredential", {
+        detail: `No stored credential for provider ${providerId}`,
+      });
     }
   }
   await models.logout(providerId, terminal.signal === undefined ? {} : { signal: terminal.signal });

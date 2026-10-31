@@ -53,6 +53,11 @@ link. Code edits need build + restart; unit edits additionally need daemon-reloa
   uv/faster-whisper transcriber, and the configured vision handoff; the fixed
   CPU/`small`/`int8` speech helper is `scripts/local-transcribe.py`. Telegram
   ingress lives in `src/channels/telegram.ts` and `src/channels/telegram-media.ts`.
+- `src/providers.ts`, `src/auth/` — native Pi AI provider registration (native IDs,
+  documented legacy aliases, explicit `providers` entries), the pinned
+  `credentials.<provider>` environment reference, Durable's own file
+  `CredentialStore` under the canonical `dataDir`, and the terminal-only
+  `login`/`logout` commands. No provider whitelist, no Pi credential store.
 - `src/automation/` — cron timer/run tasks and the model-facing `cron` tool.
 - `src/workers/` — bounded ordinary background workers as native Durable tasks:
   the opt-in `worker` start/list/inspect/cancel tool, an explicit
@@ -88,6 +93,26 @@ link. Code edits need build + restart; unit edits additionally need daemon-reloa
   over mapped chats. Telegram actions additionally require a live adapter, current private-chat
   admission and observed same-chat targets. Unknown external outcomes are retained,
   never blindly retried or evicted.
+- Provider spellings are native Pi AI IDs, the documented legacy aliases or
+  custom `providers` keys; there is no application provider whitelist. A
+  `credentials.<provider>` reference pins that one environment variable: when it
+  is unset or blank, resolution fails closed and never falls back to the
+  provider's ambient variables. A stored login credential wins over the
+  reference, and two configured spellings for one native provider may not name
+  different references. The credential store is Durable's private file under the
+  canonical `dataDir` (never Pi's), and `login`/`logout` are explicit terminal
+  commands that never run at startup or from a chat turn.
+- Classifiers are default-deny: at most one `classifierModel` pair, which must be a
+  classifier-type model in the registered catalog, is reachable only through
+  native Code Mode `models.*` from an authenticated mapped chat or a live ordinary
+  worker. The model identity is exact and checked at call time (a forged catalog
+  object cannot substitute it), catalog discovery lists only that model and no
+  image models, and work, cron, digest, root, fork, raw, retired-worker and other
+  task-owned scopes get no classifier. A worker capture stores the identity, so a
+  removed or changed configuration prunes it permanently and a later re-enable
+  cannot resurrect it. Image generation is not registered; the native
+  `models.generateImages` script global name cannot be filtered from Durable's
+  frozen `models.*` map, so it fails as an unregistered tool without a model call.
 - Named model presets define provider/model/thinking in config. CLI preset switches
   are temporary: a CLI reattach keeps the temporary selection, while a gateway
   restart or reopen restores the configured preset without rewriting prepared
@@ -187,7 +212,8 @@ link. Code edits need build + restart; unit edits additionally need daemon-reloa
   capture checks. A worker child also gets the compositor, but only over its
   captured coding, web, MCP and read-only mapped-chat history tools (never `worker`,
   Telegram or cron). A worker-specific call-time hook checks the durable capture and
-  authorized origin; reopen permanently prunes removed names, and terminal authority
+  authorized origin and, for the classifier nested tool, the captured model identity;
+  reopen permanently prunes removed names and identities, and terminal authority
   is retired with the capture. Digest and isolated cron targets remain unchanged.
 - MCP is a separate, default-off connection authority from `toolAllowlist`:
   `mcp.enabled` plus at least one enabled server connects it, and only

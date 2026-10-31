@@ -34,11 +34,15 @@ provider for authentication, custom-endpoint use or classifier access does not
 make any of its chat models selectable. At startup, each provider named by the
 chat allowlist must have usable native auth; this check reads a stored credential
 or resolves its configured/native API-key environment without refreshing OAuth or
-making a network request. See [credentials and login](./PROVIDERS.md#credentials).
+making a network request. An explicit `credentials.<provider>` reference pins its
+one environment variable and fails closed when that variable is unset or blank; it
+never falls back to the provider's ambient variables. See
+[credentials and login](./PROVIDERS.md#credentials).
 
-Classifier models are not part of this allowlist and never appear in `/model`.
-They are available only through native Code Mode `models.*` for an authenticated
-mapped chat or a captured ordinary worker; see
+Classifiers are outside this allowlist and never appear in `/model`. Exactly one
+optional `classifierModel` `{ provider, modelId }` pair is reachable, only through
+native Code Mode `models.*` in an authenticated mapped chat or a captured ordinary
+worker; absent, classifiers are unavailable. See
 [classifiers](./CODEMODE.md#classifiers-and-image-generation). Image generation
 is not installed.
 
@@ -273,11 +277,13 @@ using the normalized current `pi.agent` choice.
 
 This guard follows Durable 1.4.0's public task records and dispatch paths:
 `generation.ts` resolves the checkpoint model before streaming or polling, while
-`compaction.ts` resolves it before summarization. `tool.ts` resolves every tool
-from the current agent's `tools`/`callable` lists; those are cleared before
-resume, and this gateway registers no tools or model-using hooks. Thus there is
-no image/classifier tool task that can dispatch through this gateway. The model
-catalog supplied by an SDK host is not mutated. Offline SIGKILL/reopen sentinels
+`compaction.ts` resolves it before summarization. The scan covers those model
+dispatches only. A Code Mode classifier call is a nested tool task, not a chat
+dispatch: the native classifier registration has no `replay: "safe"` opt-in, so an
+interrupted nested call is never rerun after restart, and a fresh call passes the
+current call-time classifier authority again. `tool.ts` resolves every tool from
+the current agent's `tools`/`callable` lists, which startup clears before resume.
+The model catalog supplied by an SDK host is not mutated. Offline SIGKILL/reopen sentinels
 left prepared alpha generation and compaction requests, then reopened with only
 same-provider beta allowed; both startups failed before a second provider call.
 Each sentinel recorded the original faux-provider dispatch. If that original call

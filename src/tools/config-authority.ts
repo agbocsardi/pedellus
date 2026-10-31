@@ -9,7 +9,8 @@ import {
 
 /**
  * Captured tool authority for one task-owned target. Cron/digest capture only their coding subset;
- * ordinary workers can additionally capture separately configured research and coding grants.
+ * ordinary workers can additionally capture separately configured research and coding grants, plus
+ * the one configured classifier model identity when Code Mode is part of their grant.
  *
  * `toolAllowlist` directly authorizes authenticated mapped chat conversations, but a scheduled
  * run's target is a fresh task-owned conversation and has no session key. In the same commit that
@@ -23,6 +24,12 @@ export type ConfigToolCaptureDocument = {
   readonly originConversationId: number;
   /** Captured tool names; mutable because Durable document values are JSON arrays. */
   readonly tools: string[];
+  /**
+   * Captured classifier model identity (`JSON.stringify([provider, modelId])`), pruned with
+   * `tools`. `null` denies classifiers for that run; a capture written before this field
+   * existed also denies rather than re-admitting a stale configuration.
+   */
+  readonly classifierModel: string | null;
 };
 
 export const ConfigToolCaptureDoc = defineDoc<ConfigToolCaptureDocument>({
@@ -31,7 +38,7 @@ export const ConfigToolCaptureDoc = defineDoc<ConfigToolCaptureDocument>({
   scope: "conversation",
   history: "latest",
   fork: "initial",
-  initial: () => ({ originConversationId: 0, tools: [] }),
+  initial: () => ({ originConversationId: 0, tools: [], classifierModel: null }),
   checkpointWhen: () => true,
 });
 

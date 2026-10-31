@@ -26,6 +26,18 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
   model:
     "configured model or thinking level is unavailable; compare model/allowedModels with the pinned provider catalog " +
     "(diagnostic details suppressed)",
+  authProvider:
+    "unknown provider or no interactive login method; run `durable-nanobot login` without a provider to list " +
+    "native providers and their methods (diagnostic details suppressed)",
+  authMethod:
+    "the selected provider does not offer that authentication method; omit --auth to choose from the methods it " +
+    "actually offers (diagnostic details suppressed)",
+  authNoCredential:
+    "no stored credential for that provider; run `durable-nanobot login <provider>` first (diagnostic details suppressed)",
+  authCanceled: "login or logout was cancelled; nothing further was attempted (diagnostic details suppressed)",
+  authFailed:
+    "login or logout failed; check the provider selection, network access for an OAuth flow, and the private " +
+    "credential store under dataDir (diagnostic details suppressed)",
   telegramToken:
     "missing Telegram bot token; set the environment variable named by telegram.tokenEnv (diagnostic details suppressed)",
   webCredential:

@@ -27,9 +27,9 @@ import { WORKER_LIMITS, WORKER_TOOL_GRANTS } from "./workers/limits.js";
 import { DIGEST_CHARS_PER_BATCH_MIN, DIGEST_ENTRIES_PER_BATCH_MIN } from "./history/digest-limits.js";
 
 /**
- * Provider spelling used by credentials, model references and `providers` keys.
- * It is not a closed list: any native Pi AI provider ID, legacy alias or
- * configured custom provider is valid. Kept as a named alias for SDK
+ * Provider spelling used by credentials, model references, classifier grants and
+ * `providers` keys. It is not a closed list: any native Pi AI provider ID, legacy
+ * alias or configured custom provider is valid. Kept as a named alias for SDK
  * compatibility with the earlier whitelist type.
  */
 export type CredentialProvider = string;
@@ -268,6 +268,13 @@ export interface PortConfig {
    */
   allowedModels?: readonly ModelReference[];
   /**
+   * The one classifier model native Code Mode `models.classify` may use. Absent means
+   * classifiers are unavailable: registering a provider, or naming one of its chat models,
+   * never makes a classifier reachable. The pair must be a classifier-type model in the
+   * registered native/custom catalog; there is no substitution or fallback.
+   */
+  classifierModel?: ModelReference;
+  /**
    * Named model catalog. Present only in named-preset mode, together with `modelPreset`.
    * The catalog is the source of both the default and the allowed provider/model pairs.
    */
@@ -372,7 +379,7 @@ export function parseToolTimeoutSeconds(value: unknown): number | undefined {
 function modelReference(value: unknown, name: string): ModelReference {
   const model = object(value, name);
   return {
-    provider: nonempty(model.provider, `${name}.provider`),
+    provider: providerKey(model.provider, `${name}.provider`),
     modelId: nonempty(model.modelId, `${name}.modelId`),
   };
 }
@@ -944,11 +951,17 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
       if (!keys.includes(modelKey(model))) throw new Error("model must be included in allowedModels");
     }
   }
+  // One classifier model is a separate authority from chat selection. Absent means no
+  // classifier is reachable, however many providers are registered.
+  const classifierModel = raw.classifierModel === undefined
+    ? undefined
+    : modelReference(raw.classifierModel, "classifierModel");
   const config: PortConfig = {
     workspace: resolve(baseDir, nonempty(raw.workspace, "workspace")),
     dataDir: resolve(baseDir, nonempty(raw.dataDir, "dataDir")),
     model,
     allowedModels,
+    ...(classifierModel === undefined ? {} : { classifierModel }),
     ...(modelPresets === undefined ? {} : { modelPresets }),
     ...(modelPreset === undefined ? {} : { modelPreset }),
   };

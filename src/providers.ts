@@ -4,7 +4,6 @@ import { join } from "node:path";
 import {
   createModels,
   createProvider,
-  envApiKeyAuth,
   getSupportedThinkingLevels,
   type AuthContext,
   type CredentialStore,
@@ -52,7 +51,8 @@ const CUSTOM_PROVIDER_API: Readonly<Record<CustomProviderApi, () => ProviderStre
 
 /** Native provider ID for a configured spelling. Unknown spellings stay unchanged for validation. */
 export function nativeProviderId(configured: string): string {
-  return LEGACY_PROVIDER_ALIASES[configured] ?? configured;
+  // Own-property only: a spelling such as `constructor` or `__proto__` is never an alias.
+  return Object.hasOwn(LEGACY_PROVIDER_ALIASES, configured) ? LEGACY_PROVIDER_ALIASES[configured]! : configured;
 }
 
 export interface ResolvedModelChoice {
@@ -69,6 +69,25 @@ export function nativeModelReference(model: ModelReference): ModelReference {
     provider: nativeProviderId(model.provider),
     modelId: model.modelId,
   };
+}
+
+/**
+ * Resolve the one configured classifier model. A classifier is never implied by a
+ * registered provider or by a chat `allowedModels` entry: the pair must name a
+ * classifier-type model in the registered native/custom catalog.
+ */
+export function resolveClassifierModel(
+  models: Models,
+  configured: ModelReference | undefined,
+): ModelReference | undefined {
+  if (configured === undefined) return undefined;
+  const native = nativeModelReference(configured);
+  if (models.getModelOfType("classifier", native.provider, native.modelId) === undefined) {
+    throw new StartupDiagnosticError("model", {
+      detail: `Unknown classifier model ${native.provider}/${native.modelId} in the configured Models catalog`,
+    });
+  }
+  return native;
 }
 
 /** Resolve only the explicit allowlist, without auth lookup, catalog refresh, or network access. */
@@ -100,7 +119,13 @@ function existsPath(path: string): Promise<boolean> {
 
 function authContext(env: NodeJS.ProcessEnv): AuthContext {
   return {
-    env: async (name) => env[name],
+    // Own-property and string-only: an inherited prototype member such as `constructor`
+    // is never a credential value. Withheld rather than stringified.
+    env: async (name) => {
+      if (!Object.hasOwn(env, name)) return undefined;
+      const value = env[name];
+      return typeof value === "string" ? value : undefined;
+    },
     // Native Vertex ADC discovery uses this; it does not read Pi's credential store.
     fileExists: existsPath,
   };
@@ -136,6 +161,29 @@ function requireEnvName(name: string | undefined, spelling: string): string | un
 }
 
 /**
+ * Read one explicitly configured environment reference. An unset or blank variable
+ * fails closed instead of falling back to the provider's native ambient variables,
+ * so `credentials.<spelling>` always pins the source it names. Errors name the
+ * configuration key and variable only, never a value.
+ */
+async function configuredEnvValue(
+  ctx: AuthContext,
+  envName: string,
+  spelling: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const value = await ctx.env(envName);
+  signal.throwIfAborted();
+  if (value === undefined || value.trim() === "") {
+    throw new Error(
+      `credentials.${spelling} requires environment variable ${envName} to be set and non-empty; ` +
+      "native ambient credential discovery is disabled while that reference is configured",
+    );
+  }
+  return value;
+}
+
+/**
  * Preserve the native provider and its OAuth method, but let an explicit
  * `credentials.<spelling>` environment reference stand in for the provider's
  * default API-key variable. A stored credential still owns the provider.
@@ -160,12 +208,10 @@ function withConfiguredCredential(
         ...nativeApiKey,
         resolve: async (input) => {
           input.signal.throwIfAborted();
+          // Stored API-key and OAuth credentials keep precedence over a configured reference.
           if (input.credential?.key) return nativeApiKey.resolve(input);
-          const value = await input.ctx.env(envName);
-          input.signal.throwIfAborted();
-          if (value?.trim()) return { auth: { apiKey: value }, source: `credentials.${spelling}` };
-          // Native provider env/ambient resolution remains the fallback.
-          return nativeApiKey.resolve(input);
+          const value = await configuredEnvValue(input.ctx, envName, spelling, input.signal);
+          return { auth: { apiKey: value }, source: `credentials.${spelling}` };
         },
       },
     },
@@ -178,35 +224,32 @@ function customProvider(
   envName: string | undefined,
 ): Provider {
   const displayName = `${config.name} API key`;
-  let auth: ProviderAuth;
-  if (envName === undefined) {
-    // No configured environment reference: a stored login key wins, otherwise the
-    // endpoint is treated as keyless. The login method remains available.
-    auth = {
-      apiKey: {
-        name: displayName,
-        login: async (interaction) => {
-          interaction.signal.throwIfAborted();
-          const key = await interaction.prompt({ type: "secret", message: `Enter ${displayName}` });
-          interaction.signal.throwIfAborted();
-          return { type: "api_key", key };
-        },
-        resolve: async ({ credential, signal }) => {
-          signal.throwIfAborted();
-          if (credential?.key) {
-            return {
-              auth: { apiKey: credential.key },
-              ...(credential.env === undefined ? {} : { env: credential.env }),
-              source: "stored credential",
-            };
-          }
-          return { auth: {}, source: "keyless" };
-        },
-      },
-    };
-  } else {
-    auth = { apiKey: envApiKeyAuth(displayName, [envName]) };
-  }
+  // Stored login keys win. With an explicit `credentials.<key>` reference the named
+  // environment variable is the only other source and fails closed when unset; with no
+  // reference the endpoint is keyless.
+  const apiKey: NonNullable<ProviderAuth["apiKey"]> = {
+    name: displayName,
+    login: async (interaction) => {
+      interaction.signal.throwIfAborted();
+      const secret = await interaction.prompt({ type: "secret", message: `Enter ${displayName}` });
+      interaction.signal.throwIfAborted();
+      return { type: "api_key", key: secret };
+    },
+    resolve: async ({ ctx, credential, signal }) => {
+      signal.throwIfAborted();
+      if (credential?.key) {
+        return {
+          auth: { apiKey: credential.key },
+          ...(credential.env === undefined ? {} : { env: credential.env }),
+          source: "stored credential",
+        };
+      }
+      if (envName === undefined) return { auth: {}, source: "keyless" };
+      const value = await configuredEnvValue(ctx, envName, key, signal);
+      return { auth: { apiKey: value }, source: `credentials.${key}` };
+    },
+  };
+  const auth: ProviderAuth = { apiKey };
   const api = config.api as Api;
   const models: Model<Api>[] = config.models.map((model) => ({
     type: "chat",
@@ -244,9 +287,11 @@ export function createProviderModels(
   config: PortConfig,
   env: NodeJS.ProcessEnv = process.env,
   credentials?: CredentialStore,
-): { models: Models; model: ModelReference } {
+): { models: Models; model: ModelReference; classifier: ModelReference | undefined } {
   const builtins = nativeProviders();
   const custom = config.providers ?? {};
+  const customProviderConfig = (spelling: string): CustomProviderConfig | undefined =>
+    Object.hasOwn(custom, spelling) ? custom[spelling] : undefined;
   for (const key of Object.keys(custom)) {
     if (builtins.has(key) || Object.hasOwn(LEGACY_PROVIDER_ALIASES, key)) {
       throw new StartupDiagnosticError("provider", {
@@ -257,6 +302,7 @@ export function createProviderModels(
 
   const spellings = new Set<string>();
   for (const configured of config.allowedModels ?? [config.model]) spellings.add(configured.provider);
+  if (config.classifierModel !== undefined) spellings.add(config.classifierModel.provider);
   for (const key of Object.keys(config.credentials ?? {})) spellings.add(key);
   for (const key of Object.keys(custom)) spellings.add(key);
 
@@ -269,7 +315,7 @@ export function createProviderModels(
       if (envName !== undefined) previous.envNames.add(envName);
       continue;
     }
-    if (!custom[spelling] && !builtins.has(nativeId)) {
+    if (customProviderConfig(spelling) === undefined && !builtins.has(nativeId)) {
       throw new StartupDiagnosticError("provider", {
         detail: `Unknown provider ${spelling}; use a native Pi AI provider ID, a documented legacy alias, or a providers entry`,
       });
@@ -291,7 +337,7 @@ export function createProviderModels(
       });
     }
     const envName = [...envNames][0];
-    const definition = custom[spelling];
+    const definition = customProviderConfig(spelling);
     const provider = definition === undefined
       ? withConfiguredCredential(builtins.get(nativeId)!, spelling, envName)
       : customProvider(spelling, definition, envName);
@@ -306,7 +352,8 @@ export function createProviderModels(
   if (!defaultChoice) {
     throw new StartupDiagnosticError("model", { detail: "Default model must be included in allowedModels" });
   }
-  return { models, model: defaultChoice.native };
+  const classifier = resolveClassifierModel(models, config.classifierModel);
+  return { models, model: defaultChoice.native, classifier };
 }
 
 /**

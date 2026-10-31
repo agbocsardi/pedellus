@@ -54,11 +54,15 @@ the gateway process environment, for example one supplied by a systemd
 environment file. There is no blanket `${VAR}` expansion in JSON and no CLI
 dotenv loader.
 
-An explicit reference overrides the provider's default API-key variable for that
-provider only. If no reference is configured, the provider's native environment
-variables and ambient credential facilities remain available. A stored credential
-from `login` owns its provider and is used before environment resolution. OAuth
-refresh is native and happens under the credential-store lock.
+An explicit reference pins the source it names: while `credentials.<spelling>` is
+configured, that one variable is the provider's only environment source. If it is
+unset or blank, auth resolution fails closed with a configuration error and does
+not fall back to the provider's native ambient variables. Only when no reference
+is configured do the provider's native environment variables and ambient
+credential facilities remain available. A stored credential from `login` owns its
+provider and is used before environment resolution, with or without a reference;
+OAuth refresh is native and happens under the credential-store lock. A custom
+provider without a reference is keyless unless a stored login key exists.
 
 Every provider referenced by the chat allowlist needs usable auth before the
 gateway opens storage. `opencode_zen` and `opencode_go` are distinct native
@@ -80,9 +84,12 @@ durable-nanobot logout                 # choose a stored credential
 durable-nanobot logout openai
 ```
 
-Both commands take the same optional `--config <path>` as the gateway and use the
-configured `dataDir`. `login` opens no gateway, starts no model turn and makes no
-model request. It presents the native provider list and the methods each provider
+Both commands take the same optional `--config <path>` as the gateway, validate
+the full configuration the same way, and prepare (create if absent, `0700`) the
+configured canonical `dataDir`; they open no gateway, no Durable store and no model
+turn. Errors print one fixed diagnostic for a known cause (unknown provider,
+unsupported method, missing stored credential, cancelled, or failed) and never a
+credential value, provider error text or path. It presents the native provider list and the methods each provider
 offers: stored API key, or provider-owned OAuth (for example Sign in with ChatGPT,
 Anthropic subscription login, GitHub Copilot, or OpenRouter PKCE). Browser URLs,
 device codes, progress and manual-code prompts come from the provider's
@@ -152,33 +159,39 @@ for such a provider; a stored key wins and the endpoint is keyless otherwise.
 
 ## Classifiers and image generation
 
-Classifier models are exposed through the native Code Mode `models.*` surface
-when [Code Mode](./CODEMODE.md) is enabled for an authenticated mapped chat or a
-captured ordinary worker. They are not chat selections, do not appear in
-`/model`, and cannot be run directly by the model. A classifier-only provider can
-be registered by naming it in `credentials` even when no chat model from that
-provider is in `allowedModels`:
+At most one classifier model is reachable, only through native Code Mode
+`models.*` and only when configuration grants it:
 
 ```json
 {
-  "credentials": {
-    "opencode_go": "OPENCODE_GO_API_KEY",
-    "typesafe": "TYPESAFE_API_KEY"
-  }
+  "classifierModel": { "provider": "typesafe", "modelId": "jev-latest" },
+  "credentials": { "typesafe": "TYPESAFE_API_KEY" }
 }
 ```
 
-Scripts list candidates with `models.getModelsOfType("classifier")` or
-`models.getAvailableOfType("classifier")` and call the native
-`models.classify(model, { state, questions, images? })`. Calls are native nested
-Durable tasks: their cancellation, usage accounting, replay policy and the Code
-Mode time/output budgets apply. Image input is accepted only when the classifier
-model declares `"image"` input.
+`classifierModel` is one exact `{ provider, modelId }` pair that must name a
+classifier-type model in the registered native/custom catalog. Absent, classifiers
+are unavailable even while Code Mode is enabled: the native classifier nested tool
+is not registered, discovery lists none, and a script call fails without a model
+request. A registered provider's other classifier models are never implied. There
+is no list, fallback, substitution or chat-model grant. A classifier-only provider
+is registered by naming its model here (plus `credentials` or `login`), with no
+`allowedModels` entry.
 
-Image **generation** is not installed. There is no `models.generateImages`
-helper, no image-generation tool and no generation API registration. The `image()`
-script output helper remains only for showing existing image blocks. Existing
-image understanding, `read` image results and the vision handoff are unchanged.
+Scripts can list what they may use with `models.getModelsOfType("classifier")` or
+`models.getAvailableOfType("classifier")` — only the configured model appears —
+and call the native `models.classify(model, { state, questions, images? })`.
+Calls are native nested Durable tasks: their cancellation, replay policy and usage
+accounting apply, and the usage lands in the conversation's `pi.usage` under the
+nested tool's bucket rather than in the `codemode` result. Image input is accepted
+only when the classifier model declares `"image"` input.
+
+Image **generation** is not installed. The generator registration and its Code
+Mode documentation are removed and image models are hidden from the scoped
+catalog. One native constraint remains: `models: true` installs the native
+`models.*` globals from a frozen internal map, so the `models.generateImages`
+global name still exists in a script; a call resolves to no registered tool and
+fails without any provider or image-model request.
 
 ## Explicit gaps
 

@@ -104,10 +104,15 @@ durable-nanobot login            # choose a native provider and auth method
 durable-nanobot login openai --auth oauth
 ```
 
-`login` writes Durable's private credential store under the configured `dataDir`;
-it never reads or changes Pi's store and never runs at gateway startup. Custom
-compatible endpoints use an explicit `providers` block; see
-[providers and auth](./PROVIDERS.md#custom-compatible-providers).
+`login` validates the same configuration as the gateway, writes Durable's private
+credential store under the configured canonical `dataDir`, never reads or changes
+Pi's store, and never runs at gateway startup. A configured
+`credentials.<provider>` reference pins that one environment variable: when it is
+unset or blank, startup or the request fails instead of using the provider's
+ambient variables. Custom compatible endpoints use an explicit `providers` block;
+see [providers and auth](./PROVIDERS.md#custom-compatible-providers). Code Mode
+classifiers need one explicit `classifierModel` pair; see
+[classifiers](./PROVIDERS.md#classifiers-and-image-generation).
 
 Configured tools apply to validated mapped ordinary chats — not to arbitrary
 internal or forked conversations — and still run over the guarded workspace
