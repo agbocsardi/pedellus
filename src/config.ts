@@ -24,7 +24,7 @@ import { parseMcpConfig, type McpConfig } from "./mcp/config.js";
 import { VISION_HANDOFF_DEFAULTS, VISION_HANDOFF_LIMITS } from "./media/vision.js";
 import { parseWebConfig, type WebConfig } from "./web/config.js";
 import { WORKER_LIMITS } from "./workers/limits.js";
-import { DIGEST_CHARS_PER_BATCH_MIN } from "./history/digest-limits.js";
+import { DIGEST_CHARS_PER_BATCH_MIN, DIGEST_ENTRIES_PER_BATCH_MIN } from "./history/digest-limits.js";
 
 const CREDENTIAL_PROVIDERS = [
   "anthropic",
@@ -125,7 +125,11 @@ export interface CodeModeConfig {
  * A started run captures the accepted values, so a reopen never widens them from current config.
  */
 export interface DigestConfig {
-  /** Entries examined by one closed-episode chunk. */
+  /**
+   * Message entries examined by one closed-episode chunk. The minimum is 2: a one-entry chunk cannot
+   * always advance past an episode's opening reset marker, so it would refuse its own
+   * acknowledgement and wedge the cursor.
+   */
   readonly entriesPerBatch?: number;
   /**
    * Extracted evidence characters in one closed-episode chunk, in UTF-16 code units.
@@ -658,6 +662,9 @@ function digestConfig(value: unknown): DigestConfig {
     }
     if (field === "charsPerBatch" && bound < DIGEST_CHARS_PER_BATCH_MIN) {
       throw new Error(`digest.${field} must be an integer of at least ${DIGEST_CHARS_PER_BATCH_MIN}`);
+    }
+    if (field === "entriesPerBatch" && bound < DIGEST_ENTRIES_PER_BATCH_MIN) {
+      throw new Error(`digest.${field} must be an integer of at least ${DIGEST_ENTRIES_PER_BATCH_MIN}`);
     }
     // Converted to milliseconds in the runtime; keep the product inside the safe integer range.
     if (field === "runTimeoutSeconds" && bound > Math.floor(Number.MAX_SAFE_INTEGER / 1000)) {

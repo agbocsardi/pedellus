@@ -120,7 +120,8 @@ npm start -- agent   --config ~/.durable-nanobot/instances/i-work/config.json
   creates an ordinary origin-mode job; no startup pass creates one, and the
   occurrence queues no channel delivery.
 - One `digest` config block bounds a run, with these accepted defaults:
-  `entriesPerBatch: 2000`, `charsPerBatch: 200000` (UTF-16 units, minimum 2),
+  `entriesPerBatch: 2000` (minimum 2 entries), `charsPerBatch: 200000` (UTF-16
+  units, minimum 2),
   `maxToolCalls: 10` individual calls, `runTimeoutSeconds: 300`,
   `maxChangedFiles: 8`, `maxDiffChars: 32000`. The character bound is the real
   size limit and the entry cap only guards against floods of tiny or
@@ -250,6 +251,10 @@ Digestion:
 - An entry the character budget cuts short always ends its chunk, so a long reply
   followed by its tool result costs one chunk per cut instead of one chunk per
   episode. The tail and the following entries ride with the next chunk.
+- Both batch minimums are 2 (characters and message entries). A one-entry chunk
+  cannot advance past an episode's opening reset marker, so it would refuse its
+  own acknowledgement and re-offer itself forever; config, a captured task,
+  `validateDigestRunLimits` and every direct source override reject it.
 - The bounded gap check between the previous frontier and the next closed
   episode examines up to 4,000 entries. A conversation with more than 4,000
   consecutive empty `pi.reset` markers before that episode is refused loudly

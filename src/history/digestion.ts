@@ -120,7 +120,14 @@ import {
 } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
-import { DIGEST_RUN_LIMITS_DEFAULT, isDigestBound, isDigestCharsBound, type DigestBatchLimits } from "./digest-limits.js";
+import {
+  DIGEST_CHARS_PER_BATCH_MIN,
+  DIGEST_ENTRIES_PER_BATCH_MIN,
+  DIGEST_RUN_LIMITS_DEFAULT,
+  isDigestCharsBound,
+  isDigestEntriesBound,
+  type DigestBatchLimits,
+} from "./digest-limits.js";
 import { CHANNEL_STATE_SESSION_SUFFIX, type HistoryChatSession } from "./scope.js";
 
 export const DIGEST_CURSOR_KIND = "nanobot.digest-cursor";
@@ -1108,9 +1115,19 @@ function validateBatchRef(ref: DigestBatchRef): void {
   }
 }
 
+/**
+ * Reject batch bounds that could not progress, at every direct entry point: construction, each
+ * `read`, `readBatch` and `acknowledge` override. Two entries per chunk is the minimum because a
+ * one-entry chunk stuck on a non-evidence entry (an episode's opening reset marker, typically) would
+ * be refused as non-advancing and re-offered forever; two characters is the minimum that can hold a
+ * surrogate pair.
+ */
 function requireBatchLimits(limits: DigestBatchLimits): DigestBatchLimits {
-  if (!isDigestBound(limits.entriesPerBatch) || !isDigestCharsBound(limits.charsPerBatch)) {
-    throw new TypeError("digest batch bounds must be positive safe integers, with charsPerBatch at least 2");
+  if (!isDigestEntriesBound(limits.entriesPerBatch) || !isDigestCharsBound(limits.charsPerBatch)) {
+    throw new TypeError(
+      `digest batch bounds must be positive safe integers, with entriesPerBatch at least ` +
+      `${DIGEST_ENTRIES_PER_BATCH_MIN} and charsPerBatch at least ${DIGEST_CHARS_PER_BATCH_MIN}`,
+    );
   }
   return limits;
 }

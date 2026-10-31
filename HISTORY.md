@@ -806,8 +806,13 @@ episode or long entry is returned as contiguous fragments. The `digest` config b
 `entriesPerBatch` and `charsPerBatch`; a read accepts them explicitly, and a resumed batch is
 re-derived with the bounds captured when it was accepted instead of current configuration.
 `charsPerBatch` counts UTF-16 code units and has a minimum of 2, so one surrogate pair always fits;
-a smaller value is rejected at config, capture and direct-source entry points instead of wedging the
-first chunk. A fragment also never ends between the two halves of a UTF-16 surrogate pair
+`entriesPerBatch` has the same minimum of 2, because a one-entry chunk cannot always advance: an
+episode range opens on its `pi.reset` marker, which carries no message text, so a one-entry chunk
+would hand back that same zero-offset entry, have its acknowledgement refused as non-advancing and
+be re-offered forever. A smaller value for either bound is rejected at config, capture
+(`digestRunLimitsFrom`), the in-process `validateDigestRunLimits` check and every direct
+`createDigestSource`/`read`/`readBatch`/`acknowledge` override instead of wedging the cursor. A
+fragment also never ends between the two halves of a UTF-16 surrogate pair
 (the boundary moves back, or the batch ends before that entry), so sending a batch as UTF-8 cannot
 introduce a replacement character; `textStart`/`chars` stay in UTF-16 code units, not bytes.
 

@@ -20,7 +20,7 @@ const [
     MEMORY_DIGEST_RESULT_ENTRY_KIND,
   },
   { createDigestSource, DigestCursorDoc },
-  { DIGEST_RUN_LIMITS_DEFAULT, digestRunLimitsFrom },
+  { DIGEST_RUN_LIMITS_DEFAULT, digestRunLimitsFrom, validateDigestRunLimits },
   { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
   { BACKGROUND_CONTEXT },
 ] = await Promise.all([
@@ -232,10 +232,25 @@ test('digest config accepts only its six positive integer bounds and starts noth
   assert.equal(minimum.digest.charsPerBatch, 2, '2 UTF-16 units is the smallest usable character bound');
   assert.equal(digestRunLimitsFrom({ ...DIGEST_RUN_LIMITS_DEFAULT, charsPerBatch: 1 }), undefined);
   assert.equal(digestRunLimitsFrom({ ...DIGEST_RUN_LIMITS_DEFAULT, charsPerBatch: 2 }).charsPerBatch, 2);
+  // Two entries is the smallest batch that can always advance past a non-evidence entry such as an
+  // episode's opening reset marker; one would refuse its own acknowledgement and wedge the cursor.
+  assert.throws(
+    () => parseConfig({ ...base, digest: { entriesPerBatch: 1 } }, fixture.directory),
+    /digest.entriesPerBatch must be an integer of at least 2/,
+  );
+  assert.equal(parseConfig({ ...base, digest: { entriesPerBatch: 2 } }, fixture.directory).digest.entriesPerBatch, 2);
+  assert.equal(digestRunLimitsFrom({ ...DIGEST_RUN_LIMITS_DEFAULT, entriesPerBatch: 1 }), undefined);
+  assert.equal(digestRunLimitsFrom({ ...DIGEST_RUN_LIMITS_DEFAULT, entriesPerBatch: 2 }).entriesPerBatch, 2);
+  assert.throws(
+    () => validateDigestRunLimits({ ...DIGEST_RUN_LIMITS_DEFAULT, entriesPerBatch: 1 }),
+    /entriesPerBatch must be an integer of at least 2/,
+  );
+  assert.doesNotThrow(() => validateDigestRunLimits({ ...DIGEST_RUN_LIMITS_DEFAULT, entriesPerBatch: 2 }));
   for (const bad of [
     { enabled: true },
     { intervalSeconds: 60 },
     { entriesPerBatch: 0 },
+    { entriesPerBatch: 1 },
     { charsPerBatch: 1 },
     { charsPerBatch: -1 },
     { maxToolCalls: 1.5 },
@@ -277,7 +292,7 @@ test('configured batch bounds reach the source and are captured in the accepted 
   const source = createDigestSource({
     harness: store.gateway.harness,
     sessions: async () => [{ sessionKey: SESSION, conversationId: origin.id }],
-    limits: { entriesPerBatch: 1, charsPerBatch: 5 },
+    limits: { entriesPerBatch: 2, charsPerBatch: 5 },
   });
   const configured = await source.read(context);
   assert.equal(configured.status, 'batch');
@@ -295,7 +310,7 @@ test('configured batch bounds reach the source and are captured in the accepted 
     complete: configured.complete,
     cursor: configured.cursor,
   };
-  const replayed = await source.readBatch(ref, context, { entriesPerBatch: 1, charsPerBatch: 5 });
+  const replayed = await source.readBatch(ref, context, { entriesPerBatch: 2, charsPerBatch: 5 });
   assert.deepEqual(replayed.entries, configured.entries);
   await assert.rejects(
     source.readBatch(ref, context, { ...DIGEST_RUN_LIMITS_DEFAULT }),

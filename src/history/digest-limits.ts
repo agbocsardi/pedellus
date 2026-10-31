@@ -14,6 +14,11 @@ export interface DigestBatchLimits {
    * This is a flood guard, not the real size limit: an ordinary long episode is expected to fit
    * one batch and is bounded by {@link charsPerBatch}. The entry cap only stops an episode made of
    * thousands of tiny (or evidence-free) entries from being walked in one unbounded pass.
+   *
+   * The minimum is 2: a one-entry chunk cannot always advance, because an episode that opens on a
+   * `pi.reset` marker (or any other entry carrying no message text) would hand back the same
+   * zero-offset entry, refuse its own acknowledgement as a non-advancing chunk and re-offer it
+   * forever. Two entries always let a chunk clear one non-evidence entry and progress.
    */
   readonly entriesPerBatch: number;
   /**
@@ -54,6 +59,17 @@ export const DIGEST_RUN_LIMITS_DEFAULT: DigestRunLimits = Object.freeze({
 /** The smallest evidence bound that can hold one UTF-16 surrogate pair. */
 export const DIGEST_CHARS_PER_BATCH_MIN = 2;
 
+/**
+ * The smallest entry bound that always makes progress: one non-evidence entry must be clearable.
+ *
+ * At 1, an episode opening on a `pi.reset` marker (or a system entry, or a chunk position inside an
+ * already-consumed entry) would return a chunk of that single zero-offset entry, which
+ * acknowledgement rightly refuses as non-advancing; the deterministic reader would then re-offer it
+ * forever. Config, a captured task, the in-process bound check and every direct source override all
+ * require at least this value.
+ */
+export const DIGEST_ENTRIES_PER_BATCH_MIN = 2;
+
 /** True for a positive safe integer, the only shape a digest bound may have. */
 export function isDigestBound(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
@@ -64,9 +80,15 @@ export function isDigestCharsBound(value: unknown): value is number {
   return isDigestBound(value) && value >= DIGEST_CHARS_PER_BATCH_MIN;
 }
 
+/** An entry bound must also always advance; a bound of 1 would wedge a non-evidence entry. */
+export function isDigestEntriesBound(value: unknown): value is number {
+  return isDigestBound(value) && value >= DIGEST_ENTRIES_PER_BATCH_MIN;
+}
+
 /**
  * Parse a captured bound object from a durable task input. Every field is required and must be a
- * positive safe integer; a malformed record is rejected instead of silently falling back.
+ * positive safe integer, with the batch minimums applied; a malformed record is rejected instead of
+ * silently falling back.
  */
 export function digestRunLimitsFrom(value: unknown): DigestRunLimits | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -82,7 +104,7 @@ export function digestRunLimitsFrom(value: unknown): DigestRunLimits | undefined
   const parsed: Partial<Record<(typeof fields)[number], number>> = {};
   for (const field of fields) {
     const bound = record[field];
-    if (!(field === "charsPerBatch" ? isDigestCharsBound(bound) : isDigestBound(bound))) return undefined;
+    if (!isDigestBoundOf(field, bound)) return undefined;
     parsed[field] = bound as number;
   }
   return {
@@ -95,15 +117,27 @@ export function digestRunLimitsFrom(value: unknown): DigestRunLimits | undefined
   };
 }
 
+/** True for the bound of one named digest field, including the batch minimums. */
+function isDigestBoundOf(name: string, value: unknown): value is number {
+  if (name === "charsPerBatch") return isDigestCharsBound(value);
+  if (name === "entriesPerBatch") return isDigestEntriesBound(value);
+  return isDigestBound(value);
+}
+
 /** Reject an invalid in-process bound set before any task, provider call or cursor move. */
 export function validateDigestRunLimits(limits: DigestRunLimits): void {
   for (const [name, value] of Object.entries(limits)) {
-    if (name === "charsPerBatch" ? !isDigestCharsBound(value) : !isDigestBound(value)) {
+    if (isDigestBoundOf(name, value)) continue;
+    if (name === "charsPerBatch") {
       throw new TypeError(
-        name === "charsPerBatch"
-          ? `memory digest charsPerBatch must be an integer of at least ${DIGEST_CHARS_PER_BATCH_MIN}`
-          : `memory digest ${name} must be a positive safe integer`,
+        `memory digest charsPerBatch must be an integer of at least ${DIGEST_CHARS_PER_BATCH_MIN}`,
       );
     }
+    if (name === "entriesPerBatch") {
+      throw new TypeError(
+        `memory digest entriesPerBatch must be an integer of at least ${DIGEST_ENTRIES_PER_BATCH_MIN}`,
+      );
+    }
+    throw new TypeError(`memory digest ${name} must be a positive safe integer`);
   }
 }

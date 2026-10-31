@@ -709,6 +709,83 @@ test("a recorded batch from the old selection fails closed instead of acknowledg
   }
 });
 
+test("a two-entry batch minimum is enforced and always advances past a reset marker", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-digest-entry-minimum-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    // The wedge shape for a one-entry batch: the episode range opens on its reset marker, which
+    // carries no evidence, so a one-entry chunk could only hand back that same zero-offset entry.
+    const [openingReset] = await append(harness, conversation, reset());
+    const [first] = await append(harness, conversation, user("ENTRY-MIN-FIRST-5512"));
+    const [second] = await append(harness, conversation, assistant("ENTRY-MIN-SECOND-8841"));
+    const [third] = await append(harness, conversation, user("ENTRY-MIN-THIRD-2296"));
+    await append(harness, conversation, reset());
+
+    const limits = { entriesPerBatch: 2, charsPerBatch: 1_000 };
+    const sessions = async () => [{ sessionKey: "cli:entry-minimum", conversationId: conversation.id }];
+    // One entry per chunk would refuse its own acknowledgement and re-offer it forever, so every
+    // direct entry point rejects it: construction, a read override, a re-derive and an acknowledge.
+    assert.throws(() => createDigestSource({ harness, sessions, limits: { entriesPerBatch: 1, charsPerBatch: 5 } }),
+      /entriesPerBatch at least 2 and charsPerBatch at least 2/);
+    const source = createDigestSource({ harness, sessions, limits });
+    await assert.rejects(() => source.read(context, { entriesPerBatch: 1, charsPerBatch: 5 }),
+      /entriesPerBatch at least 2 and charsPerBatch at least 2/);
+    await assert.rejects(
+      () => source.acknowledge({
+        status: "batch",
+        sessionKey: "cli:entry-minimum",
+        conversationId: conversation.id,
+        episodeStartEntryId: openingReset.id,
+        episodeEndEntryId: third.id,
+        firstEntryId: openingReset.id,
+        firstTextStart: 0,
+        throughEntryId: first.id,
+        throughChars: "ENTRY-MIN-FIRST-5512".length,
+        complete: false,
+        entries: [],
+        cursor: { throughEntryId: null, throughChars: null, episodeStartEntryId: null, episodeEndEntryId: null },
+      }, context, { entriesPerBatch: 1, charsPerBatch: 5 }),
+      /entriesPerBatch at least 2 and charsPerBatch at least 2/,
+    );
+    assert.equal((await source.cursor(conversation.id, context)).throughEntryId, null);
+
+    // Two entries progress: the opening reset is cleared with the first message in chunk one, and
+    // every later chunk advances by one message (each chunk re-reads the previous chunk's last entry
+    // to position itself, so a two-entry cap yields one new message per chunk and never stalls).
+    const batches = [];
+    for (let index = 0; index < 5; index += 1) {
+      const result = await source.read(context);
+      if (result.status === "idle") {
+        assert.equal(result.caughtUp, true);
+        break;
+      }
+      batches.push(batched(result));
+      await source.acknowledge(batches.at(-1), context);
+    }
+    assert.deepEqual(batches.map((batch) => [batch.throughEntryId, batch.entries.map((fragment) => fragment.text)]), [
+      [first.id, ["ENTRY-MIN-FIRST-5512"]],
+      [second.id, ["ENTRY-MIN-SECOND-8841"]],
+      [third.id, ["ENTRY-MIN-THIRD-2296"]],
+    ], "every chunk advances the frontier and nothing repeats");
+    assert.equal(batches[0].episodeStartEntryId, openingReset.id);
+    assert.equal(batches[0].complete, false, "the empty opening reset is cleared in the same chunk");
+    assert.deepEqual(batches.slice(1).map((batch) => batch.complete), [false, true]);
+    assert.deepEqual(await source.cursor(conversation.id, context), {
+      throughEntryId: third.id,
+      throughChars: "ENTRY-MIN-THIRD-2296".length,
+      episodeStartEntryId: null,
+      episodeEndEntryId: null,
+    });
+    assert.ok(openingReset.id < first.id && second.id < third.id);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("a long entry is delivered losslessly across batches and its tail cannot be acked away", { timeout: 20_000 }, async () => {
   const dir = await temp("nanobot-digest-long-entry-");
   const db = resolve(dir, "probe.sqlite");
