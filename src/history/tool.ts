@@ -21,12 +21,8 @@
  * explicitly selects the `tools` or `all` scope.
  */
 import type { Context } from "@earendil-works/chord";
-import { Buffer } from "node:buffer";
 import { Type } from "@earendil-works/pi-ai";
 import {
-  AssistantEntry,
-  ToolResultEntry,
-  UserEntry,
   defineExtension,
   defineTool,
   type ConversationId,
@@ -35,7 +31,19 @@ import {
   type EntryRecord,
   type Extension,
 } from "@earendil-works/pi-durable";
-import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
+import {
+  browsedEntry as browseEntry,
+  entryRow,
+  isToolOmittedEntry,
+  label as sharedLabel,
+  quoted,
+  renderBoundedInfo as renderBoundedInfoShared,
+  sanitizeHistoryText,
+  type BoundedRender,
+  type BoundedRenderLimits,
+  type BrowsedEntry,
+  type EntryScope,
+} from "./entry-view.js";
 import {
   HISTORY_INDEX_LIMITS,
   HISTORY_SUMMARY_LIMITS,
@@ -144,97 +152,15 @@ const errorResult = (value: string) => ({
   isError: true,
 });
 
-function isHighSurrogate(code: number): boolean {
-  return code >= 0xd800 && code <= 0xdbff;
-}
-
-function isLowSurrogate(code: number): boolean {
-  return code >= 0xdc00 && code <= 0xdfff;
-}
-
-/** Strip controls that can hide or spoof text; keep newline/tab for quoting. */
-function sanitizeHistoryText(value: string): string {
-  let cleaned = value.replace(
-    /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u206f\ufeff]/g,
-    "",
-  );
-  let result = "";
-  for (let index = 0; index < cleaned.length; index++) {
-    const code = cleaned.charCodeAt(index);
-    if (isHighSurrogate(code)) {
-      if (isLowSurrogate(cleaned.charCodeAt(index + 1))) result += cleaned[index]! + cleaned[++index]!;
-      else result += "\ufffd";
-    } else if (isLowSurrogate(code)) result += "\ufffd";
-    else result += cleaned[index]!;
-  }
-  return result;
-}
-
-function clampCodeUnits(value: string, max: number): string {
-  if (value.length <= max) return value;
-  let end = Math.max(0, max);
-  if (end > 0 && isHighSurrogate(value.charCodeAt(end - 1))) end--;
-  return value.slice(0, end);
-}
-
-/** Clamp to a UTF-8 byte budget without splitting a surrogate pair. */
-function clampUtf8(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-  let output = "";
-  let used = 0;
-  for (const character of value) {
-    const bytes = Buffer.byteLength(character, "utf8");
-    if (used + bytes > maxBytes) break;
-    output += character;
-    used += bytes;
-  }
-  return output;
-}
-
-/** A bounded, quoted field. JSON escaping keeps newlines and quotes inside the value. */
-function quoted(value: string, max: number): string {
-  const clean = sanitizeHistoryText(value);
-  const bounded = clampCodeUnits(clean, max);
-  const encoded = JSON.stringify(bounded)
-    .replace(/\u2028/g, "\\u2028")
-    .replace(/\u2029/g, "\\u2029");
-  return `${encoded}${bounded.length < clean.length ? " [truncated]" : ""}`;
-}
-
-/** One-line label text: controls removed and all whitespace collapsed, never quoted. */
-function plainLabel(value: string): string {
-  return sanitizeHistoryText(value).replace(/\s+/gu, " ").trim();
-}
+const HISTORY_RENDER_BOUND: BoundedRenderLimits = Object.freeze({
+  outputBytes: HISTORY_TOOL_LIMITS.outputBytes,
+  reserveBytes: HISTORY_TOOL_LIMITS.omissionReserveBytes,
+  countReserveBytes: HISTORY_TOOL_LIMITS.rowCountReserveBytes,
+  headerMarker: "\n[History header truncated by the byte bound.]",
+});
 
 function label(value: string, max: number = HISTORY_TOOL_LIMITS.labelChars): string {
-  return quoted(plainLabel(value), max);
-}
-
-function boundedJson(value: unknown, max: number): string {
-  try {
-    const json = JSON.stringify(value);
-    return json === undefined ? "undefined" : quoted(json, max);
-  } catch {
-    return "\"(unserializable)\"";
-  }
-}
-
-function messageText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  const parts: string[] = [];
-  for (const block of content) {
-    if (block === null || typeof block !== "object") continue;
-    const part = block as { readonly type?: unknown; readonly text?: unknown };
-    if (part.type === "text" && typeof part.text === "string") parts.push(part.text);
-  }
-  return parts.join("\n");
-}
-
-interface BoundedRender {
-  readonly text: string;
-  readonly shownRows: number;
-  readonly omittedRows: number;
+  return sharedLabel(value, max);
 }
 
 function renderBounded(header: readonly string[], footer: readonly string[], rows: readonly string[]): string {
@@ -247,47 +173,16 @@ function renderBoundedInfo(
   rows: readonly string[],
   counts?: (shown: number, omitted: number) => string,
 ): BoundedRender {
-  const max = HISTORY_TOOL_LIMITS.outputBytes;
-  const reserve = HISTORY_TOOL_LIMITS.omissionReserveBytes;
-  const countReserve = counts === undefined ? 0 : HISTORY_TOOL_LIMITS.rowCountReserveBytes;
-  // The footer carries coverage, the continuation cursor and mandatory notices. It is
-  // never dropped or truncated: fit the header and rows around its exact UTF-8 size.
-  // A caller-supplied count line is reserved separately so it can describe the rows that
-  // survived byte culling instead of claiming every selected row was displayed.
-  const footerText = footer.join("\n");
-  const footerBytes = Buffer.byteLength(footerText, "utf8");
-  if (footerBytes + countReserve > max) {
-    return { text: footerText, shownRows: 0, omittedRows: rows.length };
-  }
-  const headerBudget = Math.max(0, max - footerBytes - countReserve - reserve - 2);
-  const headerMarker = "\n[History header truncated by the byte bound.]";
-  const headerMarkerBytes = Buffer.byteLength(headerMarker, "utf8");
-  let headerText = header.join("\n");
-  if (Buffer.byteLength(headerText, "utf8") > headerBudget) {
-    headerText = headerBudget <= headerMarkerBytes
-      ? ""
-      : `${clampUtf8(headerText, headerBudget - headerMarkerBytes)}${headerMarker}`;
-  }
-  let used = Buffer.byteLength(headerText, "utf8") + 1 + footerBytes + countReserve;
-  const visible: string[] = [];
-  for (const row of rows) {
-    const rowBytes = Buffer.byteLength(row, "utf8") + (visible.length === 0 ? 2 : 1);
-    if (used + rowBytes > max - reserve) break;
-    visible.push(row);
-    used += rowBytes;
-  }
-  const lines = headerText.length === 0 ? [footerText] : [headerText, footerText];
-  const omitted = rows.length - visible.length;
-  if (counts !== undefined) {
-    const countText = clampUtf8(counts(visible.length, omitted), Math.max(0, countReserve - 2));
-    if (countText.length > 0) lines.push(countText);
-  }
-  if (visible.length > 0) lines.push("", ...visible);
-  if (omitted > 0) {
-    lines.push(`[${omitted} additional record(s) omitted by the tool output bound; lower the limit or narrow the scope.]`);
-  }
-  const text = lines.join("\n");
-  return { text, shownRows: visible.length, omittedRows: omitted };
+  return renderBoundedInfoShared(header, footer, rows, HISTORY_RENDER_BOUND, counts);
+}
+
+/** History's own display bounds on the shared entry formatter. */
+function browsedEntry(entry: EntryRecord, scope: EntryScope): BrowsedEntry | undefined {
+  return browseEntry(entry, scope, HISTORY_TOOL_LIMITS.toolArgumentChars);
+}
+
+function openRow(entry: BrowsedEntry, selected: boolean): string {
+  return entryRow(entry, { selected, entryChars: HISTORY_TOOL_LIMITS.entryChars });
 }
 
 function coverageLines(coverage: HistoryPage["coverage"]): string[] {
@@ -414,85 +309,7 @@ function parseCursor(raw: unknown): ReturnType<typeof decodeHistoryCursor> | und
   }
 }
 
-function isToolOmittedEntry(entry: EntryRecord, scope: HistoryScope): boolean {
-  if (scope !== "messages") return false;
-  if (ToolResultEntry.is(entry)) return true;
-  if (!AssistantEntry.is(entry) || !Array.isArray(entry.model)) return false;
-  return entry.model.some((message) =>
-    message !== null && typeof message === "object" && Array.isArray((message as { readonly content?: unknown }).content) &&
-    ((message as { readonly content: readonly unknown[] }).content).some((block) =>
-      block !== null && typeof block === "object" && (block as { readonly type?: unknown }).type === "toolCall"));
-}
 
-interface BrowsedEntry {
-  readonly id: EntryId;
-  readonly label: string;
-  readonly text: string;
-  readonly edits: boolean;
-}
-
-/** Extract only displayable message/tool text; system, reset, compaction and images are omitted. */
-function browsedEntry(entry: EntryRecord, scope: HistoryScope): BrowsedEntry | undefined {
-  let labelText: string | undefined;
-  const parts: string[] = [];
-  const messages = Array.isArray(entry.model) ? entry.model : [];
-  if ((entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND) && scope !== "tools") {
-    for (const raw of messages) {
-      if (raw === null || typeof raw !== "object" || (raw as { readonly role?: unknown }).role !== "user") continue;
-      const text = messageText((raw as { readonly content?: unknown }).content);
-      if (text.trim().length > 0) parts.push(text);
-    }
-    labelText = entry.kind === CRON_INPUT_ENTRY_KIND ? "user (cron)" : "user";
-  } else if (AssistantEntry.is(entry)) {
-    for (const raw of messages) {
-      if (raw === null || typeof raw !== "object" || (raw as { readonly role?: unknown }).role !== "assistant") continue;
-      const content = (raw as { readonly content?: unknown }).content;
-      if (!Array.isArray(content)) continue;
-      for (const block of content) {
-        if (block === null || typeof block !== "object") continue;
-        const part = block as { readonly type?: unknown; readonly text?: unknown; readonly name?: unknown; readonly arguments?: unknown };
-        if (part.type === "text" && typeof part.text === "string" && (scope === "messages" || scope === "all")) {
-          parts.push(part.text);
-        } else if (part.type === "toolCall" && typeof part.name === "string" && (scope === "tools" || scope === "all")) {
-          parts.push(`[tool call ${sanitizeHistoryText(part.name)} ${boundedJson(part.arguments, HISTORY_TOOL_LIMITS.toolArgumentChars)}]`);
-        }
-      }
-    }
-    labelText = "assistant";
-  } else if (ToolResultEntry.is(entry) && (scope === "tools" || scope === "all")) {
-    for (const raw of messages) {
-      if (raw === null || typeof raw !== "object" || (raw as { readonly role?: unknown }).role !== "toolResult") continue;
-      const content = (raw as { readonly content?: unknown }).content;
-      const text = messageText(content);
-      if (text.trim().length > 0) parts.push(text);
-    }
-    const first = messages.find((raw) =>
-      raw !== null && typeof raw === "object" && (raw as { readonly role?: unknown }).role === "toolResult");
-    const toolName = first !== null && typeof first === "object" && typeof (first as { readonly toolName?: unknown }).toolName === "string"
-      ? (first as { readonly toolName: string }).toolName
-      : "tool";
-    labelText = `tool ${clampCodeUnits(plainLabel(toolName), 80)}`;
-  }
-  if (labelText === undefined) return undefined;
-  const text = parts.join("\n").trim();
-  if (text.length === 0) return undefined;
-  return {
-    id: entry.id,
-    label: labelText,
-    text,
-    edits: entry.edits !== undefined,
-  };
-}
-
-function openRow(entry: BrowsedEntry, selected: boolean): string {
-  const flags: string[] = [];
-  if (selected) flags.push("selected");
-  if (entry.edits) flags.push("raw stored entry; context edits not applied");
-  return [
-    `#${entry.id} [${clampCodeUnits(plainLabel(entry.label), 100)}]${flags.length === 0 ? "" : ` (${flags.join("; ")})`}`,
-    `  text=${quoted(entry.text, HISTORY_TOOL_LIMITS.entryChars)}`,
-  ].join("\n");
-}
 
 async function runSearch(host: HistoryToolHost, args: HistoryToolArguments, context: Context): Promise<string> {
   const scope = parseScope(args.scope);

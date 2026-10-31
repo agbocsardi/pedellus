@@ -21,7 +21,14 @@ const modules = join(packageRoot, 'node_modules/@earendil-works');
 const [
   { parseConfig },
   { openGateway },
-  { WORKER_RESULT_ENTRY_KIND, WORKER_TASK_NAME, WorkerRecordsDoc, workerResultRequestId },
+  {
+    WORKER_INPUT_ENTRY_KIND,
+    WORKER_RESULT_ENTRY_KIND,
+    WORKER_TASK_NAME,
+    WorkerRecordsDoc,
+    resolveWorkerTarget,
+    workerResultRequestId,
+  },
   { WORKER_TOOL_NAME, createWorkerTool },
   { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
   { BACKGROUND_CONTEXT },
@@ -1371,4 +1378,331 @@ test('a worker child reading an image still gets the flagged-preset vision hando
     if (gateway) await gateway.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
   }
+});
+
+async function toolResultFor(conversation, callId) {
+  const entries = (await conversation.entries({ order: 'ascending' }, 400, undefined, context)).items;
+  const message = entries
+    .filter((entry) => entry.model?.[0]?.role === 'toolResult')
+    .map((entry) => entry.model[0])
+    .find((candidate) => candidate.toolCallId === callId);
+  assert.ok(message, `the ${callId} call must reach a tool result`);
+  return {
+    message,
+    text: (message.content ?? []).map((part) => part.text ?? '').join(''),
+  };
+}
+
+const rowIds = (text) => [...text.matchAll(/^#(\d+) \[/gm)].map((match) => Number(match[1]));
+
+test('transcript reads a live then finished worker, renders its task prompt and tool records, pages older entries and writes nothing', { timeout: 45_000 }, async () => {
+  const fixture = await fixtureWorkspace();
+  const childStarted = deferred();
+  const releaseChild = deferred();
+  const childDispatches = [];
+  let childTurns = 0;
+  const issued = new Set();
+  const store = await syntheticStore(fixture, async (transcript) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.')) {
+      childDispatches.push(input);
+      childTurns += 1;
+      if (childTurns === 1) {
+        childStarted.resolve();
+        await releaseChild.promise;
+        return fauxAssistantMessage([
+          fauxToolCall('write', { path: 'transcript-note.txt', content: 'TOOL-RESULT-MARKER\n' }, { id: 'child-write' }),
+        ], { stopReason: 'toolUse' });
+      }
+      return fauxAssistantMessage(`LONG-ANSWER-MARKER ${'x'.repeat(2_000)}`);
+    }
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'spawn transcript worker' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'start',
+          task: 'WORKER-TASK-MARKER write the transcript note then report',
+          workspace_mode: 'shared',
+        }, { id: 'transcript-start' }),
+      ], { stopReason: 'toolUse' });
+    }
+    if (input.startsWith('read transcript') && !issued.has(input)) {
+      issued.add(input);
+      const worker = /worker (\d+)/.exec(input);
+      const before = /before (\d+)/.exec(input);
+      const limit = /limit (\d+)/.exec(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'transcript',
+          worker_id: Number(worker[1]),
+          ...(before === null ? {} : { before: Number(before[1]) }),
+          ...(limit === null ? {} : { limit: Number(limit[1]) }),
+        }, { id: input.replace(/\s+/gu, '-') }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  });
+  let conversation;
+  try {
+    conversation = await store.gateway.conversationFor(ORIGIN, context);
+    const spawn = await conversation.submit({ type: 'input', content: 'spawn transcript worker', requestId: 'spawn-transcript' }, context);
+    assert.equal((await spawn.wait(context)).status, 'done');
+    await within(childStarted.promise, WAIT_MS, 'the worker child never started');
+    await waitFor(async () =>
+      (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context))?.workers[0]?.conversationId != null,
+    'the worker target conversation');
+    const live = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    assert.ok(['queued', 'running'].includes(live.status));
+    const liveCall = `read-transcript-worker-${live.taskId}-limit-20`;
+    const liveRead = await conversation.submit({
+      type: 'input',
+      content: `read transcript worker ${live.taskId} limit 20`,
+      requestId: 'read-live',
+    }, context);
+    assert.equal((await liveRead.wait(context)).status, 'done');
+    const liveText = (await toolResultFor(conversation, liveCall)).text;
+    assert.match(liveText, /Status: (queued|running)/);
+    assert.match(liveText, /user \(worker task\)/);
+    assert.match(liveText, new RegExp(`kind=${WORKER_INPUT_ENTRY_KIND}`));
+    assert.match(liveText, /WORKER-TASK-MARKER/);
+    assert.match(liveText, /untrusted data/);
+    assert.match(liveText, /Read-only: this call ran no model/);
+    assert.equal(rowIds(liveText).length, 1, 'the live page shows exactly the committed worker task input entry');
+
+    releaseChild.resolve();
+    await waitFor(async () => {
+      const record = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+      return record.status === 'completed' && record.notified === true;
+    }, 'the worker to finish and notify');
+    const finished = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    const child = await store.gateway.harness.conversation(finished.conversationId, context);
+    const childEntriesBefore = (await child.entries({ order: 'ascending' }, 100, undefined, context)).items;
+    const dispatchesBefore = childDispatches.length;
+
+    const pageOneCall = `read-transcript-worker-${finished.taskId}-limit-2`;
+    const pageOne = await conversation.submit({
+      type: 'input',
+      content: `read transcript worker ${finished.taskId} limit 2`,
+      requestId: 'read-page-one',
+    }, context);
+    assert.equal((await pageOne.wait(context)).status, 'done');
+    const pageOneText = (await toolResultFor(conversation, pageOneCall)).text;
+    const firstIds = rowIds(pageOneText);
+    assert.equal(firstIds.length, 2);
+    assert.deepEqual(firstIds, [...firstIds].sort((a, b) => a - b), 'a page is shown oldest to newest');
+    assert.match(pageOneText, /\[assistant\] kind=pi\.assistant/);
+    assert.match(pageOneText, /LONG-ANSWER-MARKER/);
+    assert.match(pageOneText, /\[truncated\]/);
+    assert.equal(pageOneText.includes('x'.repeat(1_300)), false, 'one long answer is bounded per entry');
+    assert.ok(Buffer.byteLength(pageOneText, 'utf8') < 64 * 1024, 'the rendered page stays under the tool limit');
+    assert.match(pageOneText, /\[tool write\] kind=pi\.tool-result/);
+    const before = /before=(\d+)/.exec(pageOneText);
+    assert.ok(before, `the page must offer the strictly older cursor: ${pageOneText.slice(-400)}`);
+
+    const pageTwoCall = `read-transcript-worker-${finished.taskId}-before-${before[1]}-limit-3`;
+    const pageTwo = await conversation.submit({
+      type: 'input',
+      content: `read transcript worker ${finished.taskId} before ${before[1]} limit 3`,
+      requestId: 'read-page-two',
+    }, context);
+    assert.equal((await pageTwo.wait(context)).status, 'done');
+    const pageTwoText = (await toolResultFor(conversation, pageTwoCall)).text;
+    const secondIds = rowIds(pageTwoText);
+    assert.deepEqual(secondIds, [...secondIds].sort((a, b) => a - b));
+    assert.ok(secondIds.length >= 2, `the older page shows the prompt and the tool call: ${pageTwoText}`);
+    assert.equal(firstIds.some((id) => secondIds.includes(id)), false, 'pages never overlap');
+    assert.ok(Math.max(...secondIds) < Math.min(...firstIds), 'the older page is strictly below the first');
+    assert.match(pageTwoText, /user \(worker task\)/);
+    assert.match(pageTwoText, /kind=nanobot\.worker-task/);
+    assert.match(pageTwoText, /\[tool call write /);
+
+    // Read-only: no child model dispatch, no child entry, no record or notification change.
+    assert.equal(childDispatches.length, dispatchesBefore, 'transcript runs no worker model turn');
+    const childEntriesAfter = (await child.entries({ order: 'ascending' }, 100, undefined, context)).items;
+    assert.deepEqual(childEntriesAfter.map((entry) => entry.id), childEntriesBefore.map((entry) => entry.id));
+    const afterRead = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    assert.deepEqual(afterRead, finished, 'transcript writes no worker record, status or cursor');
+    const parentEntries = (await conversation.entries({ order: 'ascending' }, 400, undefined, context)).items;
+    assert.equal(parentEntries.filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND).length, 1);
+  } finally {
+    releaseChild.resolve();
+    if (store.gateway !== undefined) await store.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('transcript resolution refuses forged child ownership, other chats, root and raw conversations', { timeout: 40_000 }, async () => {
+  const fixture = await fixtureWorkspace();
+  const issued = new Set();
+  const store = await syntheticStore(fixture, async (transcript) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.')) return fauxAssistantMessage('BOUNDED-CHILD-DONE');
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'spawn one worker' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, { action: 'start', task: 'bounded child task', workspace_mode: 'shared' }, { id: 'spawn-one' }),
+      ], { stopReason: 'toolUse' });
+    }
+    if (input.startsWith('read transcript') && !issued.has(input)) {
+      issued.add(input);
+      const worker = /worker (\d+)/.exec(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'transcript',
+          worker_id: Number(worker[1]),
+          limit: 2,
+        }, { id: input.replace(/\s+/gu, '-') }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  });
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    const submission = await conversation.submit({ type: 'input', content: 'spawn one worker', requestId: 'spawn-one' }, context);
+    assert.equal((await submission.wait(context)).status, 'done');
+    await waitFor(async () => {
+      const record = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context))?.workers[0];
+      return record?.status === 'completed' && record.notified === true;
+    }, 'the worker to finish');
+    const record = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+
+    const resolved = await resolveWorkerTarget(store.gateway.harness, conversation.id, record.taskId, context);
+    assert.ok(resolved, 'the owning conversation resolves its own worker');
+    assert.equal(resolved.targetConversationId, record.conversationId);
+    assert.equal(resolved.status, 'completed');
+
+    const other = await store.gateway.conversationFor(ELSEWHERE, context);
+    const root = await store.gateway.harness.root(context);
+    const raw = await store.gateway.harness.createConversation({ ownership: { kind: 'ownerless' } }, context);
+    for (const [id, label] of [
+      [other.id, 'another mapped chat'],
+      [root.id, 'the root conversation'],
+      [raw.id, 'a raw conversation'],
+      [record.conversationId, 'the worker child itself'],
+      [Number.MAX_SAFE_INTEGER, 'an unknown task ID'],
+    ]) {
+      assert.equal(
+        await resolveWorkerTarget(store.gateway.harness, id, record.taskId, context),
+        undefined,
+        `${label} must not resolve this worker`,
+      );
+    }
+
+    // A record forged into another chat does not resolve: the native task belongs here, not there.
+    await store.gateway.harness.commit(async (tx) => {
+      const doc = await tx.doc(WorkerRecordsDoc, other.id);
+      doc.workers.push({ ...record, requestId: 'forged-cross-spawner' });
+    }, context);
+    assert.equal(await resolveWorkerTarget(store.gateway.harness, other.id, record.taskId, context), undefined);
+
+    // A worker record whose child conversation is not owned by that task is refused.
+    await store.gateway.harness.commit(async (tx) => {
+      const doc = await tx.doc(WorkerRecordsDoc, conversation.id);
+      const stored = doc.workers.find((candidate) => candidate.taskId === record.taskId);
+      stored.conversationId = raw.id;
+    }, context);
+    assert.equal(await resolveWorkerTarget(store.gateway.harness, conversation.id, record.taskId, context), undefined);
+
+    // A record that survives but whose native task kind is not a worker task is refused.
+    const tasks = await store.gateway.harness.commit(async (tx) =>
+      (await tx.scanTasks({ conversationId: conversation.id }, 200)).items, context);
+    const foreign = tasks.find((task) => task.kind !== WORKER_TASK_NAME);
+    assert.ok(foreign, 'the parent holds at least one tool task');
+    await store.gateway.harness.commit(async (tx) => {
+      const doc = await tx.doc(WorkerRecordsDoc, conversation.id);
+      const stored = doc.workers.find((candidate) => candidate.taskId === record.taskId);
+      stored.conversationId = record.conversationId;
+      stored.taskId = Number(foreign.id);
+    }, context);
+    assert.equal(await resolveWorkerTarget(store.gateway.harness, conversation.id, Number(foreign.id), context), undefined);
+
+    // The tool path maps an unresolved worker to an ordinary not-found answer, not a leak.
+    const missing = await conversation.submit({ type: 'input', content: 'read transcript worker 999999 limit 2', requestId: 'read-missing' }, context);
+    assert.equal((await missing.wait(context)).status, 'done');
+    const missingText = (await toolResultFor(conversation, 'read-transcript-worker-999999-limit-2')).text;
+    assert.match(missingText, /No worker 999999 in this conversation/);
+  } finally {
+    await store.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('the transcript action handles an unstarted worker and rejects bad bounds without touching a task', { timeout: 10_000 }, async () => {
+  const calls = [];
+  const view = {
+    taskId: 7,
+    status: 'queued',
+    prompt: 'unstarted bounded task',
+    workspaceMode: 'shared',
+    createdAtMs: 0,
+    finishedAtMs: null,
+    result: null,
+    error: null,
+    conversationId: null,
+    workspacePath: null,
+    branch: null,
+    baseCommit: null,
+  };
+  let answer;
+  const foundation = {
+    async start() { throw new Error('start must not be called'); },
+    async list() { return []; },
+    async inspect() { return undefined; },
+    async cancel() { return 'not_found'; },
+    async recover() { return 0; },
+    async record() { return undefined; },
+    async transcript(_harness, _conversationId, _taskId, query) {
+      calls.push(query);
+      return answer;
+    },
+  };
+  const tool = createWorkerTool({
+    foundation,
+    spawnerFor: () => true,
+    harness: () => ({}),
+    precheckWorktree: async () => undefined,
+  }).extension.tools[0];
+  const api = { conversationId: 9, taskId: 71, callId: 'call', commit: async (change) => change({}) };
+  const output = (result) => (result.output ?? []).map((part) => part.text ?? '').join('');
+
+  answer = { worker: view, targetConversationId: null, items: [], nextBefore: null };
+  const unstarted = await tool.execute({ action: 'transcript', worker_id: 7 }, api, context);
+  assert.equal(unstarted.isError, undefined);
+  assert.match(output(unstarted), /has not started a transcript/);
+  assert.match(output(unstarted), /No transcript entries yet/);
+  assert.deepEqual(calls.at(-1), { limit: 20 }, 'the default page is bounded at 20 entries');
+
+  answer = {
+    worker: { ...view, status: 'completed', conversationId: 12 },
+    targetConversationId: 12,
+    items: [],
+    nextBefore: null,
+  };
+  calls.length = 0;
+  const empty = await tool.execute({ action: 'transcript', worker_id: 7, before: 4, limit: 3 }, api, context);
+  assert.equal(empty.isError, undefined);
+  assert.match(output(empty), /No committed entries older than that boundary/);
+  assert.deepEqual(calls.at(-1), { before: 4, limit: 3 });
+
+  answer = undefined;
+  const missing = await tool.execute({ action: 'transcript', worker_id: 77 }, api, context);
+  assert.equal(missing.isError, true);
+  assert.match(output(missing), /No worker 77 in this conversation/);
+
+  for (const [args, pattern] of [
+    [{ action: 'transcript' }, /requires worker_id/],
+    [{ action: 'transcript', worker_id: 7, limit: 0 }, /limit must be an integer from 1 to 20/],
+    [{ action: 'transcript', worker_id: 7, limit: 21 }, /limit must be an integer from 1 to 20/],
+    [{ action: 'transcript', worker_id: 7, before: 0 }, /before must be a positive entry ID/],
+  ]) {
+    const rejected = await tool.execute(args, api, context);
+    assert.equal(rejected.isError, true, `${JSON.stringify(args)} must be rejected`);
+    assert.match(output(rejected), pattern);
+  }
+
+  // Existing actions keep their shape: a fake foundation is enough; no task is created or mutated.
+  assert.equal((await tool.execute({ action: 'list' }, api, context)).isError, undefined);
+  assert.equal((await tool.execute({ action: 'inspect', worker_id: 7 }, api, context)).isError, true);
 });
