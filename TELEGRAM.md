@@ -207,7 +207,9 @@ polling is never blocked. Temporary files are removed on failure or abort.
 
 This section does not add a general media service, a durable download queue, a
 retry framework, video handling, OCR/PDF extraction, cloud speech, or a Telegram
-command for media. The local CLI's explicit `/attach` submission is a separate
+command for media. The reverse direction is the scoped `telegram` tool's `send`
+action described above: one existing workspace file, never a download or a
+subscription. The local CLI's explicit `/attach` submission is a separate
 local-surface path into the same workspace media store, kept in its own
 `media/cli/` subdirectory; it is path-only, so Telegram's storage location, native
 photo handling and transcription are unchanged.
@@ -410,8 +412,9 @@ The channel-state document keeps two bounded sets:
   target that is not present fails closed.
 - `actions`: write-ahead records for model-requested external effects. Each has
   an identity derived from the Durable tool task id (not the provider call id),
-  kind, exact chat/target, reply text or emoji,
-  status, accepted chunk cursor and returned message ids.
+  kind, exact chat and (for a reply/reaction) target, reply text, emoji, or the
+  workspace-relative file path with its bounded caption, plus status, accepted
+  chunk cursor and returned message ids.
 
 `openGateway` creates a model-facing `telegram` tool only when `config.telegram`
 is configured, and offers it only in a scope-checked mapped Telegram private-chat
@@ -434,6 +437,32 @@ Actions:
   so `reply` adds a separate threaded message and is worth using only when that
   is useful.
 - `react` calls `setMessageReaction` with one emoji on one observed id.
+- `send` uploads one existing workspace file with a native Bot API method:
+  `sendDocument`, `sendPhoto`, `sendAudio`, `sendVideo` or `sendVoice`. `kind`
+  selects the method, an optional bounded caption is passed through, and an
+  optional observed `messageId` makes it a native reply. The path is
+  workspace-relative; the adapter resolves it under the canonical configured
+  workspace and refuses an absolute path, a `..` segment, a symlink escape, a
+  non-regular file, a file larger than 20 MiB or an empty file. Bytes are pinned
+  into memory before the call, so a later write or growth cannot change what is
+  uploaded; a file that shrinks or grows while it is read is refused rather than
+  sent as a partial snapshot. The caption is plain text (no `parse_mode`), so it
+  cannot inject markup. The extension must match the requested kind (documents
+  accept any
+  file; voice needs `.ogg`/`.oga`/`.opus`; video, audio and photo have short
+  allowlists); nothing is converted, so a mismatch is refused before upload
+  instead of being sent as another kind. Telegram remains the format validator
+  for content that passes the extension check, and its rejection is a known
+  non-send. There is no remote URL, Telegram file id, credential, arbitrary
+  recipient, extraction or transcription path.
+
+The `send` action is offered only when two operator decisions hold: the top-level
+`media` configuration is present (which also supplies the channel workspace) and
+`toolAllowlist` contains `read`. The same conversation already has the
+configured read tool, so the upload adds no filesystem read grant; without
+either, the action is absent from the tool schema and the adapter refuses a file
+request. Path resolution is workspace-only and does not use
+`extraAllowedDirs`.
 
 The tool is declared `replay: "unsafe"`, so Durable never reruns an interrupted
 execution. The adapter additionally writes `intent` before the call and
@@ -467,7 +496,11 @@ private-chat reaction-triggered turns work on the live service. Bot-generated
 reaction events are ignored, so actions cannot start a second model loop.
 Bot API sends have no idempotency
 key; an ambiguous action or delivery is quarantined for reconciliation, not
-retried.
+retried. Outbound file uploads were validated offline against a mocked Bot API
+only; live delivery, format acceptance and the service's current upload limits
+are not verified here. Path resolution and open are separate host calls: a local
+process racing the workspace between them is not fully excluded on this host
+(Node has no `openat`), though the final component is opened with `O_NOFOLLOW`.
 
 ## Behavior
 

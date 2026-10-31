@@ -8,7 +8,12 @@
  * bounded observed targets in that chat.
  *
  * Ordinary assistant answers stay unthreaded. `reply` sends one native reply to an observed
- * message; `react` sets one emoji reaction. `targets` lists the ids the model may use.
+ * message; `react` sets one emoji reaction. `send` uploads one existing workspace file as a native
+ * document, photo, audio, video or voice message. The file path is workspace-relative and the
+ * host resolves it: there is no remote URL, Telegram file id, credential or arbitrary recipient.
+ * `send` is offered only when the host enables outbound files (configured `media` plus the `read`
+ * coding tool), so the tool adds no filesystem read grant of its own. `targets` lists the ids the
+ * model may use.
  *
  * The tool is not replay-safe: an interrupted execution is never rerun by Durable. The adapter's
  * write-ahead action record additionally refuses to resend an action whose outcome is unknown.
@@ -23,15 +28,31 @@ import {
 } from "@earendil-works/pi-durable";
 import {
   TELEGRAM_ACTION_LIMITS,
+  TELEGRAM_FILE_KINDS,
   formatObservedTargets,
+  validTelegramFilePath,
+  type TelegramFileKind,
   type TelegramObservedTarget,
 } from "./telegram-interactions.js";
 
 export const TELEGRAM_TOOL_NAME = "telegram";
 
-export type TelegramActionRequest =
-  | { readonly kind: "reply"; readonly messageId: number; readonly text: string }
-  | { readonly kind: "react"; readonly messageId: number; readonly emoji: string };
+export type TelegramReplyRequest = { readonly kind: "reply"; readonly messageId: number; readonly text: string };
+export type TelegramReactRequest = { readonly kind: "react"; readonly messageId: number; readonly emoji: string };
+export type TelegramSendRequest = {
+  readonly kind: TelegramFileKind;
+  /** Workspace-relative path of one existing regular file. */
+  readonly path: string;
+  readonly caption?: string;
+  /** Optional observed message to reply to; absent sends an ordinary unthreaded message. */
+  readonly messageId?: number;
+};
+export type TelegramActionRequest = TelegramReplyRequest | TelegramReactRequest | TelegramSendRequest;
+
+/** True only for a native media send; reply and react are the observed-target actions. */
+export function isTelegramSendRequest(request: TelegramActionRequest): request is TelegramSendRequest {
+  return request.kind !== "reply" && request.kind !== "react";
+}
 
 export type TelegramActionOutcome = {
   readonly ok: boolean;
@@ -83,6 +104,12 @@ export interface TelegramToolOptions {
   readonly registry: TelegramActionRegistry;
   /** Host-owned mapping from a mapped conversation to its exact session key. */
   readonly sessionKeyFor: (conversationId: ConversationId) => string | undefined;
+  /**
+   * Host-owned outbound-file authority. True only when the host configured the workspace media
+   * opt-in and the same conversation already holds the configured `read` coding tool, so a file
+   * send adds no read grant the agent did not already have.
+   */
+  readonly fileSend?: boolean;
 }
 
 function textResult(text: string): { output: { type: "text"; text: string }[] } {
@@ -94,6 +121,7 @@ function errorResult(text: string): { output: { type: "text"; text: string }[]; 
 }
 
 export function createTelegramTool(options: TelegramToolOptions): { readonly extension: Extension } {
+  const fileSend = options.fileSend === true;
   const tool = defineTool({
     name: TELEGRAM_TOOL_NAME,
     // An interrupted external send is ambiguous; Durable must not rerun this tool on recovery.
@@ -104,28 +132,45 @@ export function createTelegramTool(options: TelegramToolOptions): { readonly ext
     callers: ["model", "tools"],
     description:
       "Interact with the authenticated Telegram private chat this conversation belongs to. Ordinary answers " +
-      "are already delivered automatically and unthreaded; use this tool only when a native reply or a " +
-      "reaction is clearly useful. action=targets lists the recent observed message ids in this chat. " +
-      "action=reply sends an additional short native reply, not a replacement for the ordinary answer; " +
-      "the substantive answer must still be ordinary turn text. action=react sets one standard reaction emoji " +
-      "on one observed message id. Never guess an id: only ids listed by targets, named in the current " +
-      "Telegram context, or returned by an earlier action are valid. This tool cannot choose another chat " +
-      "and cannot forward messages.",
+      "are already delivered automatically and unthreaded; use this tool only when a native reply, a " +
+      "reaction or a file delivery is clearly useful. action=targets lists the recent observed message ids " +
+      "in this chat. action=reply sends an additional short native reply, not a replacement for the " +
+      "ordinary answer; the substantive answer must still be ordinary turn text. action=react sets one " +
+      "standard reaction emoji on one observed message id. " +
+      (fileSend
+        ? "action=send uploads one existing file from the configured workspace as a native document, " +
+          "photo, audio, video or voice message, with an optional bounded caption and optional observed " +
+          "reply target; the file must already exist under the workspace and its kind must match the " +
+          "file, because no conversion or extraction is performed. "
+        : "Outbound files are not enabled in this host. ") +
+      "Never guess an id: only ids listed by targets, named in the current Telegram context, or returned " +
+      "by an earlier action are valid. This tool cannot choose another chat, cannot fetch a remote URL, " +
+      "cannot reuse a Telegram file id and cannot forward messages.",
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("targets"),
         Type.Literal("reply"),
         Type.Literal("react"),
-      ], { description: "targets: list observed ids; reply: native reply; react: emoji reaction." }),
+        ...(fileSend ? [Type.Literal("send")] : []),
+      ], { description: "targets: list observed ids; reply: native reply; react: emoji reaction; send: upload one workspace file." }),
       messageId: Type.Optional(Type.Integer({
         minimum: 1,
-        description: "Observed message id in this exact chat. Required for reply and react.",
+        description: "Observed message id in this exact chat. Required for reply and react; optional reply target for send.",
       })),
       text: Type.Optional(Type.String({
         description: "Native reply text. Required for action=reply.",
       })),
       emoji: Type.Optional(Type.String({
         description: "One emoji to set as the reaction. Required for action=react.",
+      })),
+      kind: Type.Optional(Type.Union([
+        ...TELEGRAM_FILE_KINDS.map((kind) => Type.Literal(kind)),
+      ], { description: "File kind for action=send: document, photo, audio, video or voice." })),
+      path: Type.Optional(Type.String({
+        description: "Workspace-relative path of an existing regular file. Required for action=send.",
+      })),
+      caption: Type.Optional(Type.String({
+        description: `Optional bounded caption for action=send (at most ${TELEGRAM_ACTION_LIMITS.captionChars} characters).`,
       })),
     }),
     outputLimits: { maxBytes: 16 * 1024, maxLines: 200, retain: "head" },
@@ -142,13 +187,48 @@ export function createTelegramTool(options: TelegramToolOptions): { readonly ext
       // Provider call ids may repeat across turns or chats; Durable task ids identify executions.
       const actionId = `tool:${api.taskId}`;
 
-      const action = args.action;
+      const action: string = args.action;
       if (action === "targets") {
         const targets = host.targets(sessionKey);
         if (targets === undefined) {
           return errorResult("This Telegram chat is not currently authorized for actions.");
         }
         return textResult(formatObservedTargets(targets));
+      }
+
+      if (action === "send") {
+        // Defence in depth: the schema omits this action when the host has no outbound-file
+        // authority, so a decline here means the caller bypassed the declared surface.
+        if (!fileSend) return errorResult("Outbound files are not enabled in this host.");
+        const kind = args.kind;
+        if (kind === undefined || !TELEGRAM_FILE_KINDS.includes(kind)) {
+          return errorResult("kind must be document, photo, audio, video or voice for action=send.");
+        }
+        const path = args.path;
+        if (!validTelegramFilePath(path)) {
+          return errorResult("path must be a workspace-relative path inside the configured workspace, " +
+            "for example notes/report.pdf; absolute paths, `..` segments and Windows separators are refused.");
+        }
+        const caption = typeof args.caption === "string" ? args.caption.trim() : undefined;
+        if (caption !== undefined && caption.length > TELEGRAM_ACTION_LIMITS.captionChars) {
+          return errorResult(`A caption is limited to ${TELEGRAM_ACTION_LIMITS.captionChars} characters.`);
+        }
+        if (args.messageId !== undefined &&
+            (typeof args.messageId !== "number" || !Number.isSafeInteger(args.messageId) || args.messageId < 1)) {
+          return errorResult("messageId, when given for action=send, must be a positive observed message id.");
+        }
+        const outcome = await host.act(sessionKey, actionId, {
+          kind,
+          path,
+          ...(caption === undefined || caption === "" ? {} : { caption }),
+          ...(args.messageId === undefined ? {} : { messageId: args.messageId }),
+        }, context);
+        return outcome.ok
+          ? {
+              output: [{ type: "text" as const, text: outcome.text }],
+              details: { action, kind, messageIds: [...(outcome.messageIds ?? [])] },
+            }
+          : errorResult(outcome.text);
       }
 
       const messageId = args.messageId;

@@ -267,6 +267,13 @@ existing ones:
   transcription timeout and a 120s audio-duration limit by default. Stored
   originals are never deleted by the adapter and there is no total-disk cap, so
   the media directory is yours to monitor and prune.
+- Outbound files are the scoped `telegram` tool's `send` action, not a general
+  upload service: one existing workspace file (document/photo/audio/video/voice)
+  with an optional bounded caption, sent to the current authenticated private
+  chat only. It exists only when `media` is configured and `toolAllowlist`
+  contains `read`; the path is workspace-relative, symlink escapes and
+  non-regular files are refused, the 20 MB ceiling applies, and there is no
+  remote-URL fetch, arbitrary recipient, extraction or transcoding.
 
 Local speech needs a one-time provisioning step; the runtime never installs or
 downloads anything while handling a message. The helper is
