@@ -20,7 +20,7 @@ const [
     MEMORY_DIGEST_RESULT_ENTRY_KIND,
   },
   { createDigestSource, DigestCursorDoc },
-  { DIGEST_RUN_LIMITS_DEFAULT },
+  { DIGEST_RUN_LIMITS_DEFAULT, digestRunLimitsFrom },
   { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
   { BACKGROUND_CONTEXT },
 ] = await Promise.all([
@@ -209,10 +209,15 @@ test('digest config accepts only its six positive integer bounds and starts noth
     digest: { entriesPerBatch: 4, maxToolCalls: 3, runTimeoutSeconds: 60 },
   }, fixture.directory);
   assert.deepEqual({ ...partial.digest }, { entriesPerBatch: 4, maxToolCalls: 3, runTimeoutSeconds: 60 });
+  const minimum = parseConfig({ ...base, digest: { charsPerBatch: 2 } }, fixture.directory);
+  assert.equal(minimum.digest.charsPerBatch, 2, '2 UTF-16 units is the smallest usable character bound');
+  assert.equal(digestRunLimitsFrom({ ...DIGEST_RUN_LIMITS_DEFAULT, charsPerBatch: 1 }), undefined);
+  assert.equal(digestRunLimitsFrom({ ...DIGEST_RUN_LIMITS_DEFAULT, charsPerBatch: 2 }).charsPerBatch, 2);
   for (const bad of [
     { enabled: true },
     { intervalSeconds: 60 },
     { entriesPerBatch: 0 },
+    { charsPerBatch: 1 },
     { charsPerBatch: -1 },
     { maxToolCalls: 1.5 },
     { maxChangedFiles: '8' },
@@ -576,4 +581,122 @@ test('an ordinary start retries a live digest task once through the native call 
   assert.deepEqual(await digest.start(writer, context), { status: 'busy', taskId: 42 });
   assert.deepEqual(retries, [42, 42], 'one retry per ordinary invocation, never a loop');
   assert.equal(sourceReads, 0, 'a live task is never joined by a second writer');
+});
+
+test('legacy edit shapes are charged from the same native repair, so two files cannot pass a one-file cap', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const a = join(fixture.workspace, 'memory/legacy-a.md');
+  const b = join(fixture.workspace, 'memory/legacy-b.md');
+  await mkdir(join(fixture.workspace, 'memory'), { recursive: true });
+  await writeFile(a, 'ALPHA\n', 'utf8');
+  await writeFile(b, 'BETA\n', 'utf8');
+  const store = await openStore(fixture, (request) => {
+    const text = transcriptText(request.messages);
+    // Both calls use the native top-level oldText/newText repair, not an edits array.
+    if (!text.includes('edit-legacy-a')) {
+      return fauxAssistantMessage([fauxToolCall('edit', {
+        path: 'memory/legacy-a.md',
+        oldText: 'ALPHA',
+        newText: 'ALPHA-2',
+      }, { id: 'edit-legacy-a' })], { stopReason: 'toolUse' });
+    }
+    if (!text.includes('edit-legacy-b')) {
+      return fauxAssistantMessage([fauxToolCall('edit', {
+        path: 'memory/legacy-b.md',
+        oldText: 'BETA',
+        newText: 'BETA-2',
+      }, { id: 'edit-legacy-b' })], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('The second file was refused by the changed-file budget.');
+  }, { digest: { maxChangedFiles: 1 } });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('Two legacy edits exceed one file.'), assistant('Noted.')]);
+
+  const started = await startDigest(store.gateway);
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'failed');
+  assert.match(task.state.outcome.error.message, /tool call failed/);
+  assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+  assert.match(await readFile(a, 'utf8'), /ALPHA-2/);
+  assert.equal(await readFile(b, 'utf8'), 'BETA\n', 'the second legacy edit never mutated its file');
+  const target = await targetOf(store.gateway.harness, started.taskId);
+  const results = await toolResults(store.gateway.harness, target.id);
+  assert.deepEqual(results.map((result) => [result.name, result.isError]), [['edit', false], ['edit', true]]);
+  assert.match(results[1].text, /changed-file budget/);
+});
+
+test('a JSON-string edits array is repaired and charged before mutation', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const target = join(fixture.workspace, 'memory/json-edit.md');
+  await mkdir(join(fixture.workspace, 'memory'), { recursive: true });
+  const original = '0123456789';
+  await writeFile(target, original, 'utf8');
+  const store = await openStore(fixture, (request) => {
+    const text = transcriptText(request.messages);
+    if (!text.includes('edit-json')) {
+      // The model sends the native repair's JSON-string `edits` shape.
+      return fauxAssistantMessage([fauxToolCall('edit', {
+        path: 'memory/json-edit.md',
+        edits: JSON.stringify([{ oldText: original, newText: `${original}!` }]),
+      }, { id: 'edit-json' })], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('The JSON edit was refused by the changed-text budget.');
+  }, { digest: { maxDiffChars: 15 } });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('A JSON edit exceeds the text bound.'), assistant('Noted.')]);
+
+  const started = await startDigest(store.gateway);
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'failed');
+  assert.match(task.state.outcome.error.message, /tool call failed/);
+  assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+  assert.equal(await readFile(target, 'utf8'), original, 'the repaired edit never mutated the file');
+  const digestTarget = await targetOf(store.gateway.harness, started.taskId);
+  const results = await toolResults(store.gateway.harness, digestTarget.id);
+  assert.equal(results.length, 1);
+  assert.equal(results[0].isError, true);
+  // This wording proves the 10+11 unit charge was understood; an unrecognized shape fails closed
+  // with the separate verification message instead.
+  assert.match(results[0].text, /changed-text budget/);
+});
+
+test('a two-unit character bound accepts one emoji per chunk and still progresses', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, () => fauxAssistantMessage('No durable fact in this batch.'), {
+    digest: { charsPerBatch: 2 },
+  });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  const emoji = '\u{1F600}\u{1F600}';
+  await closedEpisode(store.gateway.harness, origin.id, [user(emoji)]);
+
+  const source = createDigestSource({
+    harness: store.gateway.harness,
+    sessions: async () => [{ sessionKey: SESSION, conversationId: origin.id }],
+    limits: { entriesPerBatch: 80, charsPerBatch: 2 },
+  });
+  const first = await source.read(context);
+  assert.equal(first.status, 'batch');
+  assert.equal(first.entries[0].text, '\u{1F600}');
+  assert.equal(first.complete, false);
+  await source.acknowledge(first, context, { entriesPerBatch: 80, charsPerBatch: 2 });
+  const second = await source.read(context);
+  assert.equal(second.status, 'batch');
+  assert.equal(second.entries[0].text, '\u{1F600}');
+  assert.equal(second.entries[0].textStart, 2);
+  await source.acknowledge(second, context, { entriesPerBatch: 80, charsPerBatch: 2 });
+  assert.equal((await source.read(context)).status, 'idle', 'both emoji were consumed without loss');
+  assert.throws(
+    () => createDigestSource({
+      harness: store.gateway.harness,
+      sessions: async () => [],
+      limits: { entriesPerBatch: 80, charsPerBatch: 1 },
+    }),
+    /charsPerBatch at least 2/,
+  );
 });

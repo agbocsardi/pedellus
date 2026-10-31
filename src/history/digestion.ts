@@ -109,7 +109,7 @@ import {
 } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
-import { DIGEST_RUN_LIMITS_DEFAULT, isDigestBound, type DigestBatchLimits } from "./digest-limits.js";
+import { DIGEST_RUN_LIMITS_DEFAULT, isDigestBound, isDigestCharsBound, type DigestBatchLimits } from "./digest-limits.js";
 import { CHANNEL_STATE_SESSION_SUFFIX, type HistoryChatSession } from "./scope.js";
 
 export const DIGEST_CURSOR_KIND = "nanobot.digest-cursor";
@@ -1080,8 +1080,8 @@ function validateBatchRef(ref: DigestBatchRef): void {
 }
 
 function requireBatchLimits(limits: DigestBatchLimits): DigestBatchLimits {
-  if (!isDigestBound(limits.entriesPerBatch) || !isDigestBound(limits.charsPerBatch)) {
-    throw new TypeError("digest batch bounds must be positive safe integers");
+  if (!isDigestBound(limits.entriesPerBatch) || !isDigestCharsBound(limits.charsPerBatch)) {
+    throw new TypeError("digest batch bounds must be positive safe integers, with charsPerBatch at least 2");
   }
   return limits;
 }

@@ -773,7 +773,10 @@ chunk. `DIGEST_LIMITS` holds the default batch bounds (80 entries and strictly 2
 characters); a read is also bounded to 4,000 scanned entries and 256 mapped chats. A larger closed
 episode or long entry is returned as contiguous fragments. The `digest` config block may override
 `entriesPerBatch` and `charsPerBatch`; a read accepts them explicitly, and a resumed batch is
-re-derived with the bounds captured when it was accepted instead of current configuration. A fragment also never ends between the two halves of a UTF-16 surrogate pair
+re-derived with the bounds captured when it was accepted instead of current configuration.
+`charsPerBatch` counts UTF-16 code units and has a minimum of 2, so one surrogate pair always fits;
+a smaller value is rejected at config, capture and direct-source entry points instead of wedging the
+first chunk. A fragment also never ends between the two halves of a UTF-16 surrogate pair
 (the boundary moves back, or the batch ends before that entry), so sending a batch as UTF-8 cannot
 introduce a replacement character; `textStart`/`chars` stay in UTF-16 code units, not bytes.
 
@@ -851,8 +854,10 @@ invocation bounds, with the accepted defaults `entriesPerBatch: 80`, `charsPerBa
 neither enables nor schedules digestion — frequency stays with ordinary cron — and an absent block
 keeps the defaults. A started task captures the resolved values in its input; a replay or reopen
 re-derives its batch, deadline, tool budget and write budget from that capture, never from a widened
-current config. The host seam `memoryDigest.turnTimeoutMs` supplies a deadline only when config
-leaves `runTimeoutSeconds` absent; a configured product deadline wins. The task record stores only
+current config. A legacy task record without a captured block falls back to the canonical defaults;
+an older host deadline seam was never persisted in the task. The host seam
+`memoryDigest.turnTimeoutMs` supplies a deadline only when config leaves `runTimeoutSeconds`
+absent; a configured product deadline wins. The task record stores only
 the batch identity, pinned model and those bounds; the evidence lives once in the committed
 transcript and once in the run's own transcript, never in a permanent task input.
 

@@ -79,7 +79,7 @@ import {
   type ToolRegistration,
   type Tx,
 } from "@earendil-works/pi-durable";
-import { createWriteTool } from "@earendil-works/pi-durable/tools";
+import { createEditTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import { supportsExclusiveFileCreate } from "../execution/host.js";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
 import { loadMemoryContext } from "../context/memory.js";
@@ -357,6 +357,19 @@ function mutationUseOf(name: string, args: unknown): { readonly path: string; re
 }
 
 /**
+ * The native edit repair, reused rather than re-implemented. The committed assistant entry keeps the
+ * model's raw arguments, while the tool executes repaired ones; accounting must see the same shapes
+ * (JSON-string or single-object `edits`, or a top-level `oldText`/`newText` pair). The current call's
+ * hook arguments are already repaired, and applying this pure repair again is a no-op for them.
+ */
+const NATIVE_EDIT_PREPARE = (createEditTool() as ToolRegistration).prepareArguments;
+
+function preparedMutationArguments(name: string, args: unknown): unknown {
+  if (name !== "edit" || NATIVE_EDIT_PREPARE === undefined) return args;
+  return NATIVE_EDIT_PREPARE(args);
+}
+
+/**
  * Read this digest target's committed calls and results and derive the bounded usage of its one run.
  * Any assistant tool-call part counts, including a call that failed or was refused; only a call with
  * a successful result, or one still in flight, reserves changed files and changed text. A parallel
@@ -413,21 +426,26 @@ async function digestToolUse(
   const recorded = calls.has(current.id);
   const paths = new Set<string>();
   let diffChars = 0;
+  /** A mutation whose args cannot be normalized fail closes instead of charging nothing. */
+  const account = (name: string, args: unknown): { readonly path: string; readonly chars: number } | undefined => {
+    if (name !== "write" && name !== "edit") return undefined;
+    const use = mutationUseOf(name, preparedMutationArguments(name, args));
+    if (use === undefined) throw new Error("a digest mutation has unrecognizable arguments");
+    return use;
+  };
   for (const [id, call] of calls) {
+    // The current call is accounted below with the arguments its hook actually received.
+    if (id === current.id) continue;
     if (call.name !== "write" && call.name !== "edit") continue;
-    const use = mutationUseOf(call.name, call.arguments);
-    if (use === undefined) continue;
-    const failed = results.get(id);
-    if (failed === true) continue;
+    if (results.get(id) === true) continue;
+    const use = account(call.name, call.arguments)!;
     paths.add(use.path);
     diffChars += use.chars;
   }
-  if (!recorded) {
-    const use = mutationUseOf(current.name, current.arguments);
-    if (use !== undefined) {
-      paths.add(use.path);
-      diffChars += use.chars;
-    }
+  const currentUse = account(current.name, current.arguments);
+  if (currentUse !== undefined) {
+    paths.add(currentUse.path);
+    diffChars += currentUse.chars;
   }
   return { calls: recordedCalls + (recorded ? 0 : 1), paths, diffChars };
 }
@@ -784,7 +802,9 @@ export interface MemoryDigestOptions {
   readonly finalize: (details: MemoryDigestFinalizeDetails) => Promise<void>;
   /**
    * Bounds for new runs, resolved by the host from config. Absent keeps the shared defaults. A
-   * started run captures these values, so a later replay or reopen cannot widen them.
+   * started run captures these values, so a later replay or reopen cannot widen them. The default
+   * scope extension enforces these factory limits; a host that reopens captured tasks passes its own
+   * `scopeExtension` with a per-target lookup (the gateway does).
    */
   readonly limits?: DigestRunLimits;
   /** The curation-scope extension instance the host also installs in its registry. */
@@ -928,8 +948,8 @@ function parseInput(value: unknown): MemoryDigestTaskInput | undefined {
   if (typeof provider !== "string" || provider === "") return undefined;
   if (typeof modelId !== "string" || modelId === "") return undefined;
   if (typeof value.thinkingLevel !== "string" || value.thinkingLevel === "") return undefined;
-  // A task recorded by an earlier build has no captured bounds; the shared defaults are the
-  // compatible fallback and are what that build accepted.
+  // A task recorded by an earlier build has no captured bounds. The canonical defaults are the
+  // compatible fallback; an older host deadline seam was never persisted in the task record.
   const limits = value.limits === undefined ? DIGEST_RUN_LIMITS_DEFAULT : digestRunLimitsFrom(value.limits);
   if (limits === undefined) return undefined;
   return {

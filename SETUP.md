@@ -70,7 +70,7 @@ The shipped [`config.example.json`](./config.example.json) is the starting point
 | `toolAllowlist` | Config authority: these coding tools are enabled for authenticated mapped chats. `[]` or absent disables them. |
 | `cron` | Installs the model-facing `cron` tool; `timeZone: "UTC"` interprets calendar expressions without an explicit zone. |
 | `episodeSummary` | Closed episodes use the conversation's current model, or a named override such as `"preset": "fast"`. This costs provider calls; set `enabled: false` to turn it off. |
-| `digest` | Optional bounds for one explicitly started memory-digestion run: `entriesPerBatch`, `charsPerBatch`, `maxToolCalls`, `runTimeoutSeconds`, `maxChangedFiles`, `maxDiffChars`. Absent keeps the accepted defaults; it neither enables nor schedules digestion. A configured `runTimeoutSeconds` wins over a host deadline seam. |
+| `digest` | Optional bounds for one explicitly started memory-digestion run: `entriesPerBatch`, `charsPerBatch`, `maxToolCalls`, `runTimeoutSeconds`, `maxChangedFiles`, `maxDiffChars`. `charsPerBatch` is UTF-16 units with a minimum of 2; absent keeps the accepted defaults. The block neither enables nor schedules digestion. A configured `runTimeoutSeconds` wins over a host deadline seam. |
 | `credentials` | Environment-variable *names* only. No secret value belongs in this file. |
 
 Export the key named by `credentials.openai` (or whichever alias you allow):

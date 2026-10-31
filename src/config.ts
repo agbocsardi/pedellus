@@ -23,6 +23,7 @@ import { parseMcpConfig, type McpConfig } from "./mcp/config.js";
 import { VISION_HANDOFF_DEFAULTS, VISION_HANDOFF_LIMITS } from "./media/vision.js";
 import { parseWebConfig, type WebConfig } from "./web/config.js";
 import { WORKER_LIMITS } from "./workers/limits.js";
+import { DIGEST_CHARS_PER_BATCH_MIN } from "./history/digest-limits.js";
 
 const CREDENTIAL_PROVIDERS = [
   "anthropic",
@@ -125,7 +126,10 @@ export interface CodeModeConfig {
 export interface DigestConfig {
   /** Entries examined by one closed-episode chunk. */
   readonly entriesPerBatch?: number;
-  /** Extracted evidence characters in one closed-episode chunk. */
+  /**
+   * Extracted evidence characters in one closed-episode chunk, in UTF-16 code units.
+   * The minimum is 2 so one surrogate pair always fits.
+   */
   readonly charsPerBatch?: number;
   /** Individual tool calls allowed in one run, failed and refused calls included. */
   readonly maxToolCalls?: number;
@@ -650,6 +654,9 @@ function digestConfig(value: unknown): DigestConfig {
     if (bound === undefined) continue;
     if (typeof bound !== "number" || !Number.isSafeInteger(bound) || bound < 1) {
       throw new Error(`digest.${field} must be a positive integer`);
+    }
+    if (field === "charsPerBatch" && bound < DIGEST_CHARS_PER_BATCH_MIN) {
+      throw new Error(`digest.${field} must be an integer of at least ${DIGEST_CHARS_PER_BATCH_MIN}`);
     }
     // Converted to milliseconds in the runtime; keep the product inside the safe integer range.
     if (field === "runTimeoutSeconds" && bound > Math.floor(Number.MAX_SAFE_INTEGER / 1000)) {

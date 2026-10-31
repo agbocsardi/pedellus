@@ -10,7 +10,10 @@
 export interface DigestBatchLimits {
   /** Entries examined by one batch; a long entry continues in the next batch. */
   readonly entriesPerBatch: number;
-  /** Extracted evidence characters in one batch. A fragment is cut at this bound, never dropped. */
+  /**
+   * Extracted evidence characters in one batch, counted in UTF-16 code units. A fragment is cut at
+   * this bound, never dropped; the minimum is 2 so one surrogate pair always fits.
+   */
   readonly charsPerBatch: number;
 }
 
@@ -35,9 +38,17 @@ export const DIGEST_RUN_LIMITS_DEFAULT: DigestRunLimits = Object.freeze({
   maxDiffChars: 32_000,
 });
 
+/** The smallest evidence bound that can hold one UTF-16 surrogate pair. */
+export const DIGEST_CHARS_PER_BATCH_MIN = 2;
+
 /** True for a positive safe integer, the only shape a digest bound may have. */
 export function isDigestBound(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+/** A character bound must also fit one surrogate pair; a bound of 1 would wedge the first chunk. */
+export function isDigestCharsBound(value: unknown): value is number {
+  return isDigestBound(value) && value >= DIGEST_CHARS_PER_BATCH_MIN;
 }
 
 /**
@@ -57,8 +68,9 @@ export function digestRunLimitsFrom(value: unknown): DigestRunLimits | undefined
   ] as const;
   const parsed: Partial<Record<(typeof fields)[number], number>> = {};
   for (const field of fields) {
-    if (!isDigestBound(record[field])) return undefined;
-    parsed[field] = record[field] as number;
+    const bound = record[field];
+    if (!(field === "charsPerBatch" ? isDigestCharsBound(bound) : isDigestBound(bound))) return undefined;
+    parsed[field] = bound as number;
   }
   return {
     entriesPerBatch: parsed.entriesPerBatch!,
@@ -73,6 +85,12 @@ export function digestRunLimitsFrom(value: unknown): DigestRunLimits | undefined
 /** Reject an invalid in-process bound set before any task, provider call or cursor move. */
 export function validateDigestRunLimits(limits: DigestRunLimits): void {
   for (const [name, value] of Object.entries(limits)) {
-    if (!isDigestBound(value)) throw new TypeError(`memory digest ${name} must be a positive safe integer`);
+    if (name === "charsPerBatch" ? !isDigestCharsBound(value) : !isDigestBound(value)) {
+      throw new TypeError(
+        name === "charsPerBatch"
+          ? `memory digest charsPerBatch must be an integer of at least ${DIGEST_CHARS_PER_BATCH_MIN}`
+          : `memory digest ${name} must be a positive safe integer`,
+      );
+    }
   }
 }
