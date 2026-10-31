@@ -770,6 +770,13 @@ export interface MemoryDigestStatus {
   readonly refusal: string | null;
 }
 
+/**
+ * The bounded digest status as it crosses a host surface: the live run's origin conversation is
+ * host-internal ownership metadata, so a surface that only reports its own chat's view never holds
+ * it. A host that needs the origin (to label a run as this chat's or another's) keeps the full type.
+ */
+export type MemoryDigestStatusView = Omit<MemoryDigestStatus, "liveConversationId">;
+
 export interface MemoryDigestPrepareDetails {
   readonly tx: Tx;
   readonly taskId: number;
@@ -1147,7 +1154,7 @@ export function renderMemoryDigestStart(result: MemoryDigestStartResult): string
 }
 
 /** Fixed, value-free wording for the bounded status surface. */
-export function renderMemoryDigestStatus(status: MemoryDigestStatus): string {
+export function renderMemoryDigestStatus(status: MemoryDigestStatusView): string {
   const lines: string[] = [];
   lines.push(status.liveTaskId === null
     ? "Live memory digestion run: none."

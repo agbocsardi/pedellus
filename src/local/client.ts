@@ -5,7 +5,7 @@ import type { Context } from "@earendil-works/chord";
 import type { Cursor } from "@earendil-works/pi-durable";
 import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "../history/episodes.js";
 import type { HistoryPage, HistoryQuery } from "../history/index.js";
-import type { MemoryDigestStartResult, MemoryDigestStatus } from "../history/memory-digest.js";
+import type { MemoryDigestStartResult, MemoryDigestStatusView } from "../history/memory-digest.js";
 import type { GatewayModelList, GatewayModelSelection, GatewayModelSelectionRequest } from "../runtime.js";
 import type {
   TerminalAttachmentSubmission,
@@ -49,7 +49,7 @@ export interface LocalGatewayClient extends TerminalConversation {
   /** Start one bounded digestion batch for this attachment's conversation. */
   digestStart(context: Context): Promise<MemoryDigestStartResult>;
   /** Bounded read-only digest status: no scan, no model call, no cursor change. */
-  digestStatus(context: Context): Promise<MemoryDigestStatus>;
+  digestStatus(context: Context): Promise<MemoryDigestStatusView>;
   historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage>;
   listEpisodes(sessionKey: string, query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage>;
   episode(sessionKey: string, startEntryId: number, context: Context): Promise<HistoryEpisode | undefined>;
@@ -271,7 +271,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
     return this.call("digestStart", {}, context);
   }
 
-  async digestStatus(context: Context): Promise<MemoryDigestStatus> {
+  async digestStatus(context: Context): Promise<MemoryDigestStatusView> {
     return this.call("digestStatus", {}, context);
   }
 

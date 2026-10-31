@@ -12,7 +12,7 @@ import {
   renderMemoryDigestStart,
   renderMemoryDigestStatus,
   type MemoryDigestStartResult,
-  type MemoryDigestStatus,
+  type MemoryDigestStatusView,
 } from "../history/memory-digest.js";
 import {
   HISTORY_INDEX_LIMITS,
@@ -99,7 +99,8 @@ export interface TerminalContextRefreshHost {
  */
 export interface TerminalDigestHost {
   start(): Promise<MemoryDigestStartResult>;
-  status(): Promise<MemoryDigestStatus>;
+  /** One host-projected status view: this attachment never receives another chat's origin. */
+  status(): Promise<MemoryDigestStatusView>;
 }
 
 /**

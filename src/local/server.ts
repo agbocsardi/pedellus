@@ -8,7 +8,7 @@ import type { Conversation, Cursor, EntryId, Tx } from "@earendil-works/pi-durab
 import type { HistoryEpisodeQuery } from "../history/episodes.js";
 import type { BackgroundStatus } from "../background-status.js";
 import type { HistoryQuery } from "../history/index.js";
-import type { MemoryDigestWriter } from "../history/memory-digest.js";
+import type { MemoryDigestStatusView, MemoryDigestWriter } from "../history/memory-digest.js";
 import type { MediaStore } from "../media/attachments.js";
 import {
   LocalAttachmentError,
@@ -351,13 +351,16 @@ class LocalConnection {
         // label a run as this chat's or another's. Only that bounded view crosses the socket, so no
         // other chat's conversation ID is exposed and a later internal field is not either.
         const status = await this.options.gateway.memoryDigest.status(this.digestWriter(), this.scope.context);
-        return {
+        // Annotated with the projected shape, so a new internal status field must be admitted here
+        // deliberately instead of reaching the socket by accident.
+        const projected: MemoryDigestStatusView = {
           liveTaskId: status.liveTaskId,
           latest: status.latest,
           pendingNotices: status.pendingNotices,
           canStart: status.canStart,
           refusal: status.refusal,
         };
+        return projected;
       }
       case "historySearch": {
         const params = requireObject(request.params);
