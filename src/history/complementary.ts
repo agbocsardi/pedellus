@@ -1,9 +1,11 @@
 /**
  * Complementary background-memory evidence and its completed-turn cursor.
  *
- * This is the additive twin of the closed-episode reader in `./digestion.ts`, not a replacement
- * for it: the two sources keep separate durable cursors, so enabling one never moves the other's
- * frontier. It reads only, calls no model, writes no memory and schedules nothing. `read()` returns
+ * This is the planned single evidence source for `memory-digest`. When the consumer integration
+ * lands, it replaces the closed-episode reader in `./digestion.ts` for that command instead of
+ * running beside it; until then the closed-episode reader remains the only active consumer. The two
+ * sources keep separate durable cursors, so this source never moves the active frontier. It reads
+ * only, calls no model, writes no memory and schedules nothing. `read()` returns
  * one bounded chunk of one completed segment from one host-authenticated mapped chat conversation.
  * `acknowledge()` moves that conversation's cursor after the consumer has settled the chunk. A read
  * that is never acknowledged advances nothing, so a failure or restart replays the same evidence.
@@ -20,7 +22,8 @@
  * - A tool result is paired only with a call id that is still open in the same segment. Pairing state
  *   is durable in the cursor, so a result in a later chunk is paired even after a reopen. An orphan
  *   result is consumed with no fragment instead of being presented as if the owner or assistant
- *   said it.
+ *   said it. A call id longer than the fixed bound fails the segment closed; dropping it would
+ *   silently lose the result that cites the same id.
  *
  * Eligibility and high-water:
  * - A segment starts at the cursor's next entry and ends only at a completed exchange boundary:
@@ -60,12 +63,14 @@
  *   this conversation is normal; an entry in it is refused rather than silently skipped.
  * - A conversation with an existing closed-episode cursor but no complementary cursor derives its
  *   first complementary position from that cursor on read, and freezes it on the first
- *   acknowledgement. A partially consumed closed episode is replayed from its immutable start, so
- *   no unconsumed entry or message tail of that episode is skipped; fully consumed closed episodes
- *   stay the existing digest's work. The closed-episode document is never written or moved.
- * - A pathologically large single entry (more evidence items, or more open calls, than the fixed
- *   internal safety caps) fails with a fixed error instead of silently dropping evidence. This is a
- *   bound, not a retry loop.
+ *   acknowledgement. The handoff resumes at that cursor's exact acknowledged entry and message
+ *   offset, so a range another reader already digested is never processed twice; tool steps after
+ *   that offset in the same entry were never digested and are still read, and a frozen legacy
+ *   episode's bounds are continued so its remainder needs no new owner turn. The closed-episode
+ *   document is never written or moved.
+ * - A pathologically shaped entry (more evidence items, more open calls, or a longer tool call id
+ *   than the fixed internal safety caps) fails with a fixed error instead of silently dropping
+ *   evidence. This is a bound, not a retry loop.
  *
  * Not here: model calls, prompt rendering, memory writes, scheduling, activation, and any outcome or
  * notification path. A chunk with no evidence is still an acknowledgeable no-op, so a consumer can
@@ -124,7 +129,7 @@ export const COMPLEMENTARY_LIMITS = Object.freeze({
   maxStepsPerEntry: 1_024,
   /** Calls that may still be open in one segment before the segment fails closed. */
   maxPendingToolCalls: 256,
-  /** Longest accepted tool call id; longer ids are still cited by a stable index reference. */
+  /** Longest accepted tool call id; a longer id fails the segment instead of orphaning its result. */
   maxToolCallIdChars: 200,
   /** Smallest remaining budget that may render a preview instead of ending the chunk first. */
   minPreviewBudget: 8,
@@ -403,24 +408,29 @@ function sameCursor(left: ComplementaryCursor, right: ComplementaryCursor): bool
 
 /**
  * Initial position for a conversation that already has a closed-episode cursor but no
- * complementary cursor yet. A partially consumed closed episode is replayed from its immutable
- * start, so no unconsumed entry, message tail or tool step of that episode is skipped. Otherwise
- * the source starts after the last acknowledged closed-episode entry. Already completed closed
- * episodes stay the existing digest's work and are not replayed here.
+ * complementary cursor yet. The handoff resumes at that cursor's exact acknowledged entry and
+ * message offset: the closed-episode reader consumed message text only, which is this source's
+ * first evidence step for a user/assistant entry, so already digested text is not processed again.
+ * Any tool step of that entry follows the acknowledged message offset and was never digested here,
+ * so it is still read; tool evidence before the frontier is not revisited, so no range is digested
+ * twice.
+ *
+ * When the legacy run stopped inside a closed episode, its frozen episode bounds are adopted too, so
+ * the unprocessed remainder of that exchange is consumed as this source's current segment without
+ * waiting for a new owner turn. The episode was already closed in the transcript, so its bounds are
+ * a legitimate segment for this reader as well.
  *
  * This is derived on read and frozen by the first acknowledgement; it never writes or moves the
  * closed-episode cursor.
  */
 function adoptDigestCursor(legacy: DigestCursor): ComplementaryCursor {
-  const start = legacy.episodeStartEntryId
-    ?? (legacy.throughEntryId === null ? null : (legacy.throughEntryId + 1) as EntryId);
-  if (start === null) return EMPTY_CURSOR;
+  if (legacy.throughEntryId === null || legacy.throughChars === null) return EMPTY_CURSOR;
   return {
-    nextEntryId: start,
+    nextEntryId: legacy.throughEntryId,
     nextItemIndex: 0,
-    nextTextStart: 0,
-    segmentStartEntryId: null,
-    segmentEndEntryId: null,
+    nextTextStart: legacy.throughChars,
+    segmentStartEntryId: legacy.episodeStartEntryId,
+    segmentEndEntryId: legacy.episodeEndEntryId,
     pendingToolCalls: Object.freeze([]) as readonly string[],
   };
 }
@@ -476,10 +486,20 @@ function canonicalArguments(args: unknown): string {
   }
 }
 
-function validCallId(value: unknown): string | null {
-  return typeof value === "string" && value.length > 0 && value.length <= COMPLEMENTARY_LIMITS.maxToolCallIdChars
-    ? value
-    : null;
+/**
+ * Pairing id of one tool call. An absent or non-string id cannot be paired and stays unpaired. An id
+ * longer than {@link COMPLEMENTARY_LIMITS.maxToolCallIdChars} fails closed: truncating or dropping
+ * it would silently orphan the result that carries the same id, so the segment is refused instead.
+ */
+function callIdOf(value: unknown, entryId: EntryId): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  if (value.length > COMPLEMENTARY_LIMITS.maxToolCallIdChars) {
+    throw new Error(
+      `Complementary digest entry ${entryId} has a tool call id longer than ` +
+      `${COMPLEMENTARY_LIMITS.maxToolCallIdChars} characters`,
+    );
+  }
+  return value;
 }
 
 /**
@@ -557,7 +577,7 @@ function planOf(entry: EntryRecord, pending: ReadonlySet<string>): EvidencePlan 
           );
         }
         calls.push({
-          id: validCallId(block.id),
+          id: callIdOf(block.id, entry.id),
           name: block.name,
           args: block.arguments,
           index: calls.length,
@@ -594,9 +614,9 @@ function planOf(entry: EntryRecord, pending: ReadonlySet<string>): EvidencePlan 
     for (const raw of (entry.model ?? []) as readonly unknown[]) {
       if (!isRecord(raw) || raw.role !== "toolResult") continue;
       // Every result message is one step, paired or not, so a re-plan from a later resume
-      // position keeps the same step indices. An unpaired or invalid result is a silent no-op,
-      // never evidence.
-      const id = validCallId(raw.toolCallId);
+      // position keeps the same step indices. An unpaired result, or one with no usable call id,
+      // is a silent no-op, never evidence.
+      const id = callIdOf(raw.toolCallId, entry.id);
       if (id === null || !open.has(id)) {
         add({});
         continue;
@@ -642,7 +662,7 @@ function assistantCalls(entry: EntryRecord): { readonly calls: readonly string[]
     if (Array.isArray(raw.content)) {
       for (const block of raw.content) {
         if (isRecord(block) && block.type === "toolCall") {
-          const id = validCallId(block.id);
+          const id = callIdOf(block.id, entry.id);
           if (id !== null) {
             if (calls.length >= COMPLEMENTARY_LIMITS.maxStepsPerEntry) {
               throw new Error(
@@ -672,7 +692,7 @@ function resultCalls(entry: EntryRecord): readonly string[] {
   const ids: string[] = [];
   for (const raw of (entry.model ?? []) as readonly unknown[]) {
     if (isRecord(raw) && raw.role === "toolResult") {
-      const id = validCallId(raw.toolCallId);
+      const id = callIdOf(raw.toolCallId, entry.id);
       if (id !== null) {
         if (ids.length >= COMPLEMENTARY_LIMITS.maxStepsPerEntry) {
           throw new Error(
@@ -1164,8 +1184,6 @@ function validateCursor(cursor: unknown): ComplementaryCursor {
     }
   } else if (nextEntryId === null && (nextItemIndex !== 0 || nextTextStart !== 0)) {
     throw new TypeError("Complementary cursor has a position before the first entry");
-  } else if (segmentStartEntryId === null && (nextItemIndex !== 0 || nextTextStart !== 0)) {
-    throw new TypeError("Complementary cursor has a position outside a segment");
   }
   if (segmentStartEntryId === null && pendingToolCalls.length > 0) {
     throw new TypeError("Complementary cursor has open calls outside a segment");
@@ -1221,8 +1239,10 @@ function validateBatchRef(ref: ComplementaryBatchRef): void {
     }
   } else {
     if (first !== start) throw new TypeError("Complementary batch ref must start its segment at its start");
-    if (firstItem !== 0 || firstTextStart !== 0) {
-      throw new TypeError("Complementary batch ref must start a fresh segment at item 0 and offset 0");
+    // A fresh segment starts at the cursor's position. Only a migrated closed-episode frontier
+    // holds a non-zero position here; a settled frontier is item 0 offset 0.
+    if (firstItem !== cursor.nextItemIndex || firstTextStart !== cursor.nextTextStart) {
+      throw new TypeError("Complementary batch ref must start a fresh segment at its cursor position");
     }
     if (cursor.nextEntryId !== null && cursor.nextEntryId > first) {
       throw new TypeError("Complementary batch ref starts before its cursor frontier");
@@ -1588,8 +1608,13 @@ export function createComplementarySource(options: ComplementarySourceOptions): 
       const firstEntryId = (chosen.segment !== undefined
         ? segment.segmentStartEntryId
         : chosen.cursor.nextEntryId!) as EntryId;
-      const firstItemIndex = chosen.segment !== undefined ? 0 : chosen.cursor.nextItemIndex;
-      const firstTextStart = chosen.segment !== undefined ? 0 : chosen.cursor.nextTextStart;
+      // The cursor position is this chunk's start when the chunk begins at the cursor frontier: a
+      // fresh segment starts there, and a migrated closed-episode frontier resumes inside that entry
+      // at the already-digested message offset instead of re-emitting text another reader processed.
+      const atFrontier = chosen.segment === undefined
+        || segment.segmentStartEntryId === chosen.cursor.nextEntryId;
+      const firstItemIndex = atFrontier ? chosen.cursor.nextItemIndex : 0;
+      const firstTextStart = atFrontier ? chosen.cursor.nextTextStart : 0;
       const chunk = await readChunk(
         chosen.conversation,
         firstEntryId,
