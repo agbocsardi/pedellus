@@ -33,11 +33,11 @@ never receive it, so a worker cannot start another worker.
 
 `start` returns a task ID immediately; the parent keeps its turn. `list` shows this conversation's
 workers, `inspect` returns one worker's bounded result and provenance, `transcript` reads that
-worker's own committed conversation in bounded pages, and `cancel` aborts one. An optional
-`request_id` makes `start` idempotent; a retried tool call is deduplicated on Durable's own
-tool-task identity, never on the provider's tool-call ID (a provider may reuse `call_0` across
-independent turns, and each of those starts a real worker). Live workers are capped per conversation,
-and a refused start creates no record and no task.
+worker's own committed conversation in bounded pages, `steer` sends one bounded direction to a live
+worker, and `cancel` aborts one. An optional `request_id` makes `start` idempotent; a retried tool
+call is deduplicated on Durable's own tool-task identity, never on the provider's tool-call ID (a
+provider may reuse `call_0` across independent turns, and each of those starts a real worker). Live
+workers are capped per conversation, and a refused start creates no record and no task.
 
 The tool has no model-only `callers` restriction: native Code Mode (`codemode.enabled`) composes it
 from a spawning chat like any other agent tool, under exactly the same hosting-conversation, capture
@@ -85,11 +85,61 @@ instructions. Image-only and binary entries are omitted with a count; no base64 
 Pages are strictly ordered and non-overlapping: the newest page needs no cursor, and each page
 reports the `before` entry ID for the strictly older page, or says that no older entries remain.
 
+## Steering a live worker
+
+`steer` takes only a `worker_id` from this conversation's own records and one bounded `message` (at
+most 2,000 characters; 8 accepted messages per worker). It accepts no conversation ID, task ID,
+command or new task: a steer is direction for an existing worker from the spawning assistant, never
+a user message and never a second worker. Terminal, completing, cancelled, foreign, root, forked,
+raw and task-owned conversations are refused; a worker that is still preparing or has no live model
+run is refused with a clear "not live" result rather than started implicitly.
+
+The message is committed as an entry of kind `nanobot.worker-steer`, labeled `assistant (worker
+steer)` in the shared transcript formatter, with the worker ID, the host tool-task ID and its source
+in the entry data. Its model text says explicitly that it is internal direction from the spawning
+assistant, not the user and not a new task. The worker still has only its captured tools; a steer
+adds no tool, history, channel, scheduling or delegation authority, and the child cannot steer
+anything.
+
+Admission is one native commit, not a check followed by `Conversation.submit()`: that API commits
+separately, so a terminal worker could win the race between the check and the submit. The steer
+commit re-verifies the worker record, the `nanobot.worker-run` task and its spawner, the task-owned
+child, and the child's live `pi.live.run` (which must own this worker's initial submission or an
+already accepted steer); in that same commit it creates the native submission record and appends the
+native `pi.inbox` steer item. This is the smallest platform facility with the required ordering:
+no second queue, no custom boundary and no agent loop. Native boundaries place the item at the next
+tool round, exactly as ordinary steering does; a steer never preempts a tool already claimed by the
+run.
+
+Completion is a joined boundary, not a second orphan task. After the initial turn answers, the
+worker waits until its child is genuinely idle. If the final answer boundary placed an accepted
+steer as the next run's first input, that run is part of the same worker: its tools stay captured,
+its answer becomes the worker outcome, and a chain of accepted steers is joined the same way. On a
+cancelled turn, and on a failed turn under the shipped default `afterFailedRun: "keep"`, every
+accepted steer that is still queued is settled `unanswered` and removed from the inbox in the same
+terminal commit, so it cannot start a run afterwards under retired tools. Consequently an accepted
+steer is either delivered into the worker's own run chain or safely cancelled with a recorded
+reason; a terminal worker refuses new steering instead of restarting, and the admission commit
+cannot accept input after terminal/completing or after the child has gone idle. The Harness
+`afterFailedRun: "continue"` override is not configured by this host and is not supported by the
+join: it could start a successor run with a queued steer before the worker's failed terminal commit.
+
+Dedupe uses the conversation-scoped request ID
+`nanobot.worker-steer:<workerTaskId>:<hostToolTaskId>`: a replay of the same host tool task with the
+same message returns the existing acceptance, while the provider's tool-call ID is not identity and
+two independent tool tasks may reuse it. The record keeps only a SHA-256 digest of the steer text
+for that comparison, never the text itself; the same identity with a different message is refused
+with a fixed value-free reason instead of silently dropping the new direction. The accepted count is
+kept in the worker record, shown by `inspect`, and stated in the internal result event; the worker's
+own transcript keeps the authoritative steer entries. Steering adds no config and no timeout: it
+never extends a job deadline (there is none) and it cannot revive a worker that has already finished.
+
 ## What a worker is
 
 The worker task's first phase creates a task-owned conversation, configures it with a captured subset
 of the spawning conversation's currently configured tools plus the model chosen at launch, submits
-one bounded task prompt and waits for that turn's committed answer. The child inherits:
+one bounded task prompt and waits for that turn's committed answer. Accepted steering is joined into
+that same task outcome as described above. The child inherits:
 
 - the config ceiling captured at launch, re-intersected with the current config and the origin's
   current authorization on every reopen; a removed tool never returns;
@@ -159,9 +209,10 @@ Completion, failure and cancellation each produce exactly one internal result ev
 conversation. It is a normal admitted input, queued behind whatever the parent is doing, so the parent
 resumes at a native busy boundary rather than being steered into an unfinished tool call. The event is
 formatted deterministically (no summarizer model call), labeled as internal, and states that the
-worker output is untrusted data rather than user instructions. Its admission uses the conversation-
-scoped request ID `nanobot.worker-result:<taskId>`, and a reopen re-attempts any admission a crash
-interrupted: a retry cannot duplicate the parent turn.
+worker output is untrusted data rather than user instructions. When steering was accepted, it reports
+how many messages were part of the live worker and whether any had to be cancelled at completion.
+Its admission uses the conversation-scoped request ID `nanobot.worker-result:<taskId>`, and a reopen
+re-attempts any admission a crash interrupted: a retry cannot duplicate the parent turn.
 
 Nothing here writes a channel outbox or sends user-facing text. The worker never messages the user.
 The spawning agent decides what, if anything, to relay.
@@ -184,9 +235,9 @@ when nothing is evictable, `start` refuses instead of dropping history.
 A worker is `background`, so it is outside the spawning conversation's idle wait, abort cascade and
 ownership scope: an ordinary chat abort does not cancel it, and `waitForIdle` does not wait for it.
 `cancel` marks the task, its abort phase commits a terminal aborted outcome, retires the target's
-authority and admits the cancellation event; a late child completion cannot turn it into a success.
-Missing or changed worktrees are reported, never silently replaced, and a completed model turn is
-never re-run.
+authority, withdraws accepted steering that was still queued, and admits the cancellation event; a
+late child completion cannot turn it into a success. Missing or changed worktrees are reported, never
+silently replaced, and a completed model turn is never re-run.
 
 ## Limits
 
@@ -203,5 +254,14 @@ never re-run.
 - `transcript` is a read-only view of one paginated window, not a live stream, an export or a complete
   archive. Very old pages remain reachable by paging, but the view is bounded at each call and may
   lag entries that are not committed yet.
+- Steering admission mirrors Durable's own busy/`whenBusy: "steer"` branch over the public
+  submission and `pi.inbox` primitives, because `Conversation.submit()` would commit separately and
+  lose the terminal-race ordering. It deliberately emits no submission trace link to the live run
+  (telemetry only, no model or tool authority). If a future Durable admission API accepts a
+  liveness condition in the caller's commit, it should replace this narrow mirror.
+- The steering join supports the shipped default `afterFailedRun: "keep"`. The Harness
+  `afterFailedRun: "continue"` override is not configurable here and is not exercised: it could place
+  an accepted steer into a successor run before a failed worker reaches its terminal commit, which
+  this worker would not join. No shipped gateway opens with that override.
 - No live-model, Telegram or deployment run is claimed: the offline checks use a faux provider and
   temporary git fixtures.

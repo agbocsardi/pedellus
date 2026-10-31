@@ -2,8 +2,8 @@
  * The model-facing `worker` tool.
  *
  * The tool is a context capability, not a coding tool: it takes no path, runs no shell and holds no
- * filesystem authority. It starts, lists, inspects, reads the bounded transcript of and cancels this
- * conversation's own durable worker tasks. Scope is the host's mapped-chat policy, enforced by the
+ * filesystem authority. It starts, lists, inspects, reads the bounded transcript of, steers and cancels
+ * this conversation's own durable worker tasks. Scope is the host's mapped-chat policy, enforced by the
  * runtime: only an authenticated, scope-checked spawning conversation is offered it, never a raw,
  * forked, channel-state or task-owned conversation, so a worker can never start another worker.
  *
@@ -55,7 +55,7 @@ export interface WorkerTool {
   readonly extension: Extension;
 }
 
-const ACTIONS = ["start", "list", "inspect", "transcript", "cancel"] as const;
+const ACTIONS = ["start", "list", "inspect", "transcript", "steer", "cancel"] as const;
 
 const TRANSCRIPT_SCOPE: EntryScope = "all";
 
@@ -74,6 +74,7 @@ interface WorkerToolArguments {
   readonly worker_id?: number;
   readonly before?: number;
   readonly limit?: number;
+  readonly message?: string;
 }
 
 const text = (value: string, isError = false) => ({
@@ -186,6 +187,9 @@ function describe(view: WorkerView, detailed: boolean): string {
         `worker_id ${view.taskId})`,
       );
     }
+    if (view.steerCount > 0) {
+      lines.push(`  steering messages accepted while live: ${view.steerCount}`);
+    }
   } else if (view.error !== null) {
     lines.push(`  reason: ${oneLine(view.error, 200)}`);
   }
@@ -202,14 +206,16 @@ export function createWorkerTool(options: WorkerToolOptions): WorkerTool {
       "sent to the user directly; you decide what, if anything, to relay. Actions: `start` launches one " +
       "worker and returns immediately; `list` shows this conversation's workers; `inspect` shows one " +
       "worker's bounded result; `transcript` reads one worker's own committed conversation in bounded, " +
-      "paginated pages; `cancel` aborts one worker. A worker inherits this conversation's " +
-      "currently enabled tools (never more) and has no way to start further workers or use channels.",
+      "paginated pages; `steer` sends one bounded direction to a live worker at its next tool-round " +
+      "boundary; `cancel` aborts one worker. A worker inherits this conversation's currently enabled " +
+      "tools (never more) and has no way to start further workers or use channels.",
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("start"),
         Type.Literal("list"),
         Type.Literal("inspect"),
         Type.Literal("transcript"),
+        Type.Literal("steer"),
         Type.Literal("cancel"),
       ], { description: "Which operation to perform." }),
       task: Type.Optional(Type.String({
@@ -234,7 +240,7 @@ export function createWorkerTool(options: WorkerToolOptions): WorkerTool {
           "worker instead of launching a second one.",
       })),
       worker_id: Type.Optional(Type.Integer({
-        description: "inspect/transcript/cancel: the worker ID from `start` or `list`.",
+        description: "inspect/transcript/steer/cancel: the worker ID from `start` or `list`.",
         minimum: 1,
       })),
       before: Type.Optional(Type.Integer({
@@ -250,11 +256,18 @@ export function createWorkerTool(options: WorkerToolOptions): WorkerTool {
         minimum: 1,
         maximum: WORKER_LIMITS.transcriptMaxLimit,
       })),
+      message: Type.Optional(Type.String({
+        description:
+          "steer: bounded direction for a live worker, delivered at its next tool-round boundary. " +
+          "This is direction from this assistant, not a user message, and it never starts a new worker " +
+          `or task. At most ${WORKER_LIMITS.maxSteerChars} characters.`,
+      })),
     }),
     // Safe to rerun after an interrupted execution: `start` dedupes on the stable tool-task identity,
-    // and the other actions only read or report an already-terminal task. No `callers` restriction:
-    // native Code Mode may compose this tool like any other, under the same hosting-conversation and
-    // capture checks (a worker's own child conversation is never a spawner).
+    // `steer` dedupes on the same identity (never the provider call ID), and the other actions only
+    // read or report an already-terminal task. No `callers` restriction: native Code Mode may compose
+    // this tool like any other, under the same hosting-conversation and capture checks (a worker's own
+    // child conversation is never a spawner).
     replay: "safe",
     outputLimits: { maxBytes: 64 * 1024, maxLines: 1_000, retain: "head" },
     async execute(args, api, context) {
@@ -284,10 +297,55 @@ export function createWorkerTool(options: WorkerToolOptions): WorkerTool {
         return text(views.map((view) => describe(view, false)).join("\n\n"));
       }
 
-      if (request.action === "inspect" || request.action === "transcript" || request.action === "cancel") {
+      if (request.action === "inspect" || request.action === "transcript" || request.action === "steer" || request.action === "cancel") {
         const workerId = request.worker_id;
         if (!Number.isSafeInteger(workerId) || (workerId as number) < 1) {
           return text(`${request.action} requires worker_id; use action \`list\` to see the IDs.`, true);
+        }
+        if (request.action === "steer") {
+          const message = typeof request.message === "string" ? request.message.trim() : "";
+          if (message === "") return text("steer requires a non-empty message for the worker.", true);
+          if (message.length > WORKER_LIMITS.maxSteerChars) {
+            return text(
+              `steer refuses a message longer than ${WORKER_LIMITS.maxSteerChars} characters; ` +
+              "send one shorter, bounded direction.",
+              true,
+            );
+          }
+          let result: Awaited<ReturnType<WorkerFoundation["steer"]>>;
+          try {
+            result = await options.foundation.steer(harness, api.conversationId, workerId as number, {
+              text: message,
+              sourceTaskId: Number(api.taskId),
+            }, context);
+          } catch (error) {
+            return text(`Could not steer worker ${workerId}: ${reasonText(error)}`, true);
+          }
+          if (result.status === "not_found") return text(`No worker ${workerId} in this conversation.`, true);
+          if (result.status === "terminal") {
+            return text(
+              `Worker ${workerId} has already finished or is being finalized (${result.worker}); steering is ` +
+              "only accepted while it is live. Use `inspect` or `transcript` to read its outcome.",
+              true,
+            );
+          }
+          if (result.status === "not_live") {
+            return text(
+              `Worker ${workerId} is not in a live model turn right now, so the steering message was not ` +
+              "accepted. Retry while it is running, or use `inspect` if it has finished.",
+              true,
+            );
+          }
+          if (result.status === "refused") {
+            return text(`Worker ${workerId} refused the steering message: ${result.reason}.`, true);
+          }
+          return text(
+            result.deduplicated
+              ? `That steering message was already accepted for worker ${workerId}; nothing was added again.`
+              : `Steering message accepted for worker ${workerId} ` +
+                `(${result.acceptedCount} accepted while it was live). It will reach the worker at its next ` +
+                "tool-round boundary; this call started no new worker or task.",
+          );
         }
         if (request.action === "transcript") {
           const limit = request.limit ?? WORKER_LIMITS.transcriptDefaultLimit;

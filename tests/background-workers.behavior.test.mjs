@@ -24,15 +24,17 @@ const [
   {
     WORKER_INPUT_ENTRY_KIND,
     WORKER_RESULT_ENTRY_KIND,
+    WORKER_STEER_ENTRY_KIND,
     WORKER_TASK_NAME,
     WorkerRecordsDoc,
     resolveWorkerTarget,
     workerResultRequestId,
+    workerSteerRequestId,
   },
   { WORKER_TOOL_NAME, createWorkerTool },
   { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
   { BACKGROUND_CONTEXT },
-  { AgentDoc },
+  { AgentDoc, InboxDoc },
   { ConfigToolCaptureDoc },
   { CODEMODE_TOOL_NAME },
 ] = await Promise.all([
@@ -123,6 +125,15 @@ const workerResultCommitted = (conversationId) => (changes) => changes.some((cha
   && change.value.conversationId === conversationId
   && change.value.kind === WORKER_RESULT_ENTRY_KIND);
 
+const workerResultWatcher = (harness, conversationId, label) =>
+  changeWatcher(harness, workerResultCommitted(conversationId), label);
+
+function workerResultEntry(publication, conversationId) {
+  return publication.changes.find((change) => change.type === 'entry'
+    && change.value.conversationId === conversationId
+    && change.value.kind === WORKER_RESULT_ENTRY_KIND)?.value;
+}
+
 function messageText(message) {
   if (typeof message?.content === 'string') return message.content;
   return (Array.isArray(message?.content) ? message.content : [])
@@ -143,6 +154,10 @@ function lastUserText(messages) {
 
 function transcriptText(messages) {
   return JSON.stringify(messages);
+}
+
+function toolOutput(result) {
+  return (result.output ?? []).map((part) => (typeof part.text === 'string' ? part.text : '')).join('');
 }
 
 async function run(command, args, cwd) {
@@ -1705,4 +1720,445 @@ test('the transcript action handles an unstarted worker and rejects bad bounds w
   // Existing actions keep their shape: a fake foundation is enough; no task is created or mutated.
   assert.equal((await tool.execute({ action: 'list' }, api, context)).isError, undefined);
   assert.equal((await tool.execute({ action: 'inspect', worker_id: 7 }, api, context)).isError, true);
+});
+
+test('steering a live worker at a tool round changes its final answer', { timeout: 30_000 }, async () => {
+  const fixture = await fixtureWorkspace();
+  const childStarted = deferred();
+  const releaseChild = deferred();
+  let gated = false;
+  const issued = new Set();
+  const store = await syntheticStore(fixture, async (transcript) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.') || input.includes('[internal steering message for worker ')) {
+      if (!gated) {
+        gated = true;
+        childStarted.resolve();
+        await releaseChild.promise;
+      }
+      if (!transcriptText(transcript.messages).includes('STEER-MARKER')) {
+        return fauxAssistantMessage([
+          fauxToolCall('read', { path: 'note.txt' }, { id: 'child-read' }),
+        ], { stopReason: 'toolUse' });
+      }
+      return fauxAssistantMessage('CHILD-STEERED-ANSWER');
+    }
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'spawn steered worker' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'start',
+          task: 'STEER-TASK read note.txt and report the steered direction',
+          workspace_mode: 'shared',
+        }, { id: 'steer-start' }),
+      ], { stopReason: 'toolUse' });
+    }
+    if (input.startsWith('steer worker ') && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'steer',
+          worker_id: Number(input.split(' ')[2]),
+          message: 'STEER-MARKER: report the steered direction instead.',
+        }, { id: 'parent-steer-call' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  });
+  let resultWatcher;
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    resultWatcher = workerResultWatcher(store.gateway.harness, conversation.id, 'the steered worker result');
+    const first = await conversation.submit({ type: 'input', content: 'spawn steered worker', requestId: 'spawn' }, context);
+    assert.equal((await first.wait(context)).status, 'done');
+    await within(childStarted.promise, WAIT_MS, 'the worker never reached its first model request');
+    const record = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+
+    // The child model request is still in flight: the steer is admitted into that live run and is
+    // placed at the tool round boundary that follows it, before the next generation.
+    const steerTurn = await conversation.submit({
+      type: 'input', content: `steer worker ${record.taskId}`, requestId: 'steer',
+    }, context);
+    assert.equal((await steerTurn.wait(context)).status, 'done');
+    const parentEntries = (await conversation.entries({ order: 'ascending' }, 200, undefined, context)).items;
+    const steerResult = parentEntries.filter((entry) => entry.model?.[0]?.role === 'toolResult')
+      .map((entry) => entry.model[0]).find((message) => message.toolCallId === 'parent-steer-call');
+    assert.ok(steerResult, 'the steer action must reach a tool result');
+    assert.equal(steerResult.isError ?? false, false);
+    assert.match(messageText(steerResult), /Steering message accepted for worker \d+/);
+    const accepted = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    assert.equal(accepted.steers.length, 1, 'the admission is recorded before the run continues');
+    assert.equal(accepted.steers[0].sourceTaskId > 0, true);
+
+    releaseChild.resolve();
+    const publication = await within(resultWatcher.promise, WAIT_MS, 'the steered worker never reported');
+    const resultEntry = workerResultEntry(publication, conversation.id);
+    assert.equal(resultEntry.data.status, 'completed');
+    const body = messageText(resultEntry.model?.[0]);
+    assert.match(body, /CHILD-STEERED-ANSWER/);
+    assert.match(body, /Steering messages accepted while live: 1/);
+
+    const resultEntries = (await conversation.entries({ order: 'ascending' }, 300, undefined, context)).items
+      .filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND);
+    assert.equal(resultEntries.length, 1, 'exactly one result event for the worker');
+    const child = await store.gateway.harness.conversation(record.conversationId, context);
+    const childEntries = (await child.entries({ order: 'ascending' }, 200, undefined, context)).items;
+    const steerEntry = childEntries.find((entry) => entry.kind === WORKER_STEER_ENTRY_KIND);
+    assert.ok(steerEntry, 'the steer is a native committed entry in the worker transcript');
+    assert.equal(steerEntry.data.source, 'spawning-assistant');
+    assert.match(messageText(steerEntry.model?.[0]), /STEER-MARKER/);
+    const readResult = childEntries.find((entry) => entry.model?.[0]?.role === 'toolResult'
+      && entry.model[0].toolName === 'read');
+    assert.ok(readResult, 'the worker kept its captured read tool');
+    assert.match(JSON.stringify(readResult.model), /WORKER-NOTE-CONTENT/);
+
+    const finished = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    assert.equal(finished.status, 'completed');
+    assert.equal(finished.result, 'CHILD-STEERED-ANSWER');
+    assert.equal(finished.steers.length, 1);
+    const names = ((await child.agent(context)).tools ?? [])
+      .map((tool) => (typeof tool === 'string' ? tool : tool.name));
+    assert.deepEqual(names, [], 'the completed worker keeps no tools');
+  } finally {
+    releaseChild.resolve();
+    resultWatcher?.stop();
+    await store.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('a steer that loses the final-answer boundary is joined into the same worker outcome', { timeout: 30_000 }, async () => {
+  const fixture = await fixtureWorkspace();
+  const childStarted = deferred();
+  const releaseChild = deferred();
+  let firstAnswer = false;
+  let steeredRead = false;
+  const issued = new Set();
+  const store = await syntheticStore(fixture, async (transcript) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.') || input.includes('[internal steering message for worker ')) {
+      if (!firstAnswer) {
+        firstAnswer = true;
+        childStarted.resolve();
+        await releaseChild.promise;
+        return fauxAssistantMessage('FIRST-ANSWER');
+      }
+      if (!steeredRead) {
+        steeredRead = true;
+        return fauxAssistantMessage([
+          fauxToolCall('read', { path: 'note.txt' }, { id: 'steered-read' }),
+        ], { stopReason: 'toolUse' });
+      }
+      return fauxAssistantMessage('STEERED-ANSWER');
+    }
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'spawn racing worker' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'start',
+          task: 'RACE-TASK answer first, then follow any steering message',
+          workspace_mode: 'shared',
+        }, { id: 'race-start' }),
+      ], { stopReason: 'toolUse' });
+    }
+    if (input.startsWith('steer worker ') && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'steer',
+          worker_id: Number(input.split(' ')[2]),
+          message: 'STEER-MARKER: answer STEERED-ANSWER instead.',
+        }, { id: 'race-steer-call' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  });
+  let resultWatcher;
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    resultWatcher = workerResultWatcher(store.gateway.harness, conversation.id, 'the joined worker result');
+    const first = await conversation.submit({ type: 'input', content: 'spawn racing worker', requestId: 'spawn' }, context);
+    assert.equal((await first.wait(context)).status, 'done');
+    await within(childStarted.promise, WAIT_MS, 'the worker never reached its final answer request');
+    const record = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+
+    // The steer is admitted during the final generation. That generation's final boundary places it
+    // as the next run's first input; the worker must join that run instead of finishing and leaving
+    // an orphan turn under retired tools.
+    const steerTurn = await conversation.submit({
+      type: 'input', content: `steer worker ${record.taskId}`, requestId: 'steer',
+    }, context);
+    assert.equal((await steerTurn.wait(context)).status, 'done');
+    releaseChild.resolve();
+    const publication = await within(resultWatcher.promise, WAIT_MS, 'the joined worker never reported');
+    const resultEntry = workerResultEntry(publication, conversation.id);
+    assert.equal(resultEntry.data.status, 'completed');
+    const body = messageText(resultEntry.model?.[0]);
+    assert.match(body, /STEERED-ANSWER/);
+    assert.doesNotMatch(body, /FIRST-ANSWER/);
+    const resultEntries = (await conversation.entries({ order: 'ascending' }, 300, undefined, context)).items
+      .filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND);
+    assert.equal(resultEntries.length, 1, 'exactly one outcome for the whole worker task');
+
+    const child = await store.gateway.harness.conversation(record.conversationId, context);
+    const childEntries = (await child.entries({ order: 'ascending' }, 200, undefined, context)).items;
+    const steerEntry = childEntries.find((entry) => entry.kind === WORKER_STEER_ENTRY_KIND);
+    const readResult = childEntries.find((entry) => entry.model?.[0]?.role === 'toolResult'
+      && entry.model[0].toolName === 'read');
+    assert.ok(steerEntry && readResult);
+    assert.ok(readResult.id > steerEntry.id, 'the joined successor run still had its captured tool');
+    assert.match(JSON.stringify(readResult.model), /WORKER-NOTE-CONTENT/);
+    const assistantTexts = childEntries.filter((entry) => entry.model?.[0]?.role === 'assistant')
+      .map((entry) => messageText(entry.model[0]));
+    assert.ok(assistantTexts.includes('FIRST-ANSWER'));
+    assert.ok(assistantTexts.includes('STEERED-ANSWER'));
+
+    const finished = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    assert.equal(finished.status, 'completed');
+    assert.equal(finished.result, 'STEERED-ANSWER');
+    assert.equal(finished.steers.length, 1);
+    const inspection = await store.gateway.harness.inspect(context);
+    assert.equal(inspection.tasks.every((entry) => entry.record.conversationId !== record.conversationId
+      || entry.record.state.status === 'terminal'), true, 'no orphan child work remains');
+    const names = ((await child.agent(context)).tools ?? [])
+      .map((tool) => (typeof tool === 'string' ? tool : tool.name));
+    assert.deepEqual(names, [], 'the completed worker keeps no tools');
+  } finally {
+    releaseChild.resolve();
+    resultWatcher?.stop();
+    await store.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('steering dedupes on the host tool-task identity and refuses terminal or foreign workers', { timeout: 30_000 }, async () => {
+  const fixture = await fixtureWorkspace();
+  const childStarted = deferred();
+  const releaseChild = deferred();
+  let gated = false;
+  const issued = new Set();
+  const store = await syntheticStore(fixture, async (transcript) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.') || input.includes('[internal steering message for worker ')) {
+      if (!gated) {
+        gated = true;
+        childStarted.resolve();
+        await releaseChild.promise;
+      }
+      return fauxAssistantMessage('CHILD-AFTER-STEERS');
+    }
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'spawn dedupe worker' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'start',
+          task: 'DEDUPE-TASK accept two distinct steering directions',
+          workspace_mode: 'shared',
+        }, { id: 'dedupe-start' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  });
+  let resultWatcher;
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    resultWatcher = workerResultWatcher(store.gateway.harness, conversation.id, 'the dedupe worker result');
+    const first = await conversation.submit({ type: 'input', content: 'spawn dedupe worker', requestId: 'spawn' }, context);
+    assert.equal((await first.wait(context)).status, 'done');
+    await within(childStarted.promise, WAIT_MS, 'the worker never reached its first model request');
+    const record = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    const tool = ((await conversation.agent(context)).tools ?? [])
+      .find((candidate) => (typeof candidate === 'string' ? candidate : candidate.name) === WORKER_TOOL_NAME);
+    assert.ok(tool, 'the mapped chat is offered the worker tool');
+    // Provider call IDs are not identity: both requests use the same call ID but different host task IDs.
+    const api = (taskId) => ({ conversationId: conversation.id, taskId, callId: 'same-provider-call' });
+    const firstSteer = await tool.execute({
+      action: 'steer', worker_id: record.taskId, message: 'FIRST-DIRECTION',
+    }, api(9001), context);
+    assert.equal(firstSteer.isError ?? false, false);
+    assert.match(toolOutput(firstSteer), /Steering message accepted/);
+    const replay = await tool.execute({
+      action: 'steer', worker_id: record.taskId, message: 'FIRST-DIRECTION',
+    }, api(9001), context);
+    assert.equal(replay.isError ?? false, false);
+    assert.match(toolOutput(replay), /already accepted/);
+    // The same host tool-task identity with a different payload is refused, not silently deduped.
+    const changed = await tool.execute({
+      action: 'steer', worker_id: record.taskId, message: 'CHANGED-DIRECTION',
+    }, api(9001), context);
+    assert.equal(changed.isError, true);
+    assert.match(toolOutput(changed), /different text/);
+    const afterMismatch = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    assert.equal(afterMismatch.steers.length, 1, 'a changed payload added no steering request');
+    const inboxAfterMismatch = await store.gateway.harness.snapshot(InboxDoc, record.conversationId, context);
+    assert.equal((inboxAfterMismatch?.items ?? []).filter((item) => item.mode === 'steer').length, 1,
+      'a changed payload added no second inbox item');
+    const secondSteer = await tool.execute({
+      action: 'steer', worker_id: record.taskId, message: 'SECOND-DIRECTION',
+    }, api(9002), context);
+    assert.equal(secondSteer.isError ?? false, false);
+    assert.match(toolOutput(secondSteer), /Steering message accepted/);
+
+    const empty = await tool.execute({
+      action: 'steer', worker_id: record.taskId, message: '   ',
+    }, api(9005), context);
+    assert.equal(empty.isError, true);
+    assert.match(toolOutput(empty), /requires a non-empty message/);
+    const tooLong = await tool.execute({
+      action: 'steer', worker_id: record.taskId, message: 'x'.repeat(2_001),
+    }, api(9006), context);
+    assert.equal(tooLong.isError, true);
+    assert.match(toolOutput(tooLong), /longer than 2000 characters/);
+    const accepted = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    assert.equal(accepted.steers.length, 2, 'the replay added no third request');
+    assert.deepEqual(accepted.steers.map((steer) => steer.sourceTaskId), [9001, 9002]);
+    assert.notEqual(accepted.steers[0].requestId, accepted.steers[1].requestId);
+    assert.equal(accepted.steers[0].requestId, workerSteerRequestId(record.taskId, 9001));
+    for (const steer of accepted.steers) assert.match(steer.textDigest, /^[0-9a-f]{64}$/);
+    assert.notEqual(accepted.steers[0].textDigest, accepted.steers[1].textDigest);
+    const inboxAccepted = await store.gateway.harness.snapshot(InboxDoc, record.conversationId, context);
+    assert.equal((inboxAccepted?.items ?? []).filter((item) => item.mode === 'steer').length, 2);
+
+    releaseChild.resolve();
+    const publication = await within(resultWatcher.promise, WAIT_MS, 'the steered worker never reported');
+    const resultEntry = workerResultEntry(publication, conversation.id);
+    assert.equal(resultEntry.data.status, 'completed');
+    assert.match(messageText(resultEntry.model?.[0]), /CHILD-AFTER-STEERS/);
+    const resultEntries = (await conversation.entries({ order: 'ascending' }, 300, undefined, context)).items
+      .filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND);
+    assert.equal(resultEntries.length, 1);
+
+    const child = await store.gateway.harness.conversation(record.conversationId, context);
+    const before = (await child.entries({ order: 'ascending' }, 300, undefined, context)).items;
+    const late = await tool.execute({
+      action: 'steer', worker_id: record.taskId, message: 'TOO-LATE',
+    }, api(9003), context);
+    assert.equal(late.isError, true);
+    assert.match(toolOutput(late), /already finished/);
+    const other = await store.gateway.conversationFor(ELSEWHERE, context);
+    const otherTool = ((await other.agent(context)).tools ?? [])
+      .find((candidate) => (typeof candidate === 'string' ? candidate : candidate.name) === WORKER_TOOL_NAME);
+    const foreign = await otherTool.execute({
+      action: 'steer', worker_id: record.taskId, message: 'FOREIGN',
+    }, { conversationId: other.id, taskId: 9004, callId: 'same-provider-call' }, context);
+    assert.equal(foreign.isError, true);
+    assert.match(toolOutput(foreign), /No worker \d+ in this conversation/);
+
+    const after = (await child.entries({ order: 'ascending' }, 300, undefined, context)).items;
+    assert.equal(after.length, before.length, 'terminal and foreign steering wrote nothing');
+    const finished = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    assert.equal(finished.steers.length, 2);
+    assert.equal(finished.status, 'completed');
+  } finally {
+    releaseChild.resolve();
+    resultWatcher?.stop();
+    await store.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('cancelling a worker with an accepted steer withdraws the queued message instead of orphaning a turn', { timeout: 30_000 }, async () => {
+  const fixture = await fixtureWorkspace();
+  const childStarted = deferred();
+  const releaseChild = deferred();
+  let gated = false;
+  const issued = new Set();
+  const store = await syntheticStore(fixture, async (transcript, options) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.') || input.includes('[internal steering message for worker ')) {
+      if (!gated) {
+        gated = true;
+        childStarted.resolve();
+        await new Promise((resolve) => {
+          const signal = options?.signal;
+          if (signal?.aborted) return resolve();
+          signal?.addEventListener('abort', () => resolve(), { once: true });
+          releaseChild.promise.then(() => resolve());
+        });
+      }
+      return fauxAssistantMessage('LATE-CANCELLED-ANSWER');
+    }
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'spawn cancel-steer worker' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'start',
+          task: 'CANCEL-STEER-TASK wait while a steer is accepted',
+          workspace_mode: 'shared',
+        }, { id: 'cancel-steer-start' }),
+      ], { stopReason: 'toolUse' });
+    }
+    if (input.startsWith('steer worker ') && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'steer',
+          worker_id: Number(input.split(' ')[2]),
+          message: 'STEER-BEFORE-CANCEL',
+        }, { id: 'cancel-steer-call' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  });
+  let resultWatcher;
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    resultWatcher = workerResultWatcher(store.gateway.harness, conversation.id, 'the cancelled worker result');
+    const first = await conversation.submit({ type: 'input', content: 'spawn cancel-steer worker', requestId: 'spawn' }, context);
+    assert.equal((await first.wait(context)).status, 'done');
+    await within(childStarted.promise, WAIT_MS, 'the worker never reached its first model request');
+    const record = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+
+    const steerTurn = await conversation.submit({
+      type: 'input', content: `steer worker ${record.taskId}`, requestId: 'steer',
+    }, context);
+    assert.equal((await steerTurn.wait(context)).status, 'done');
+    assert.equal(
+      (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0].steers.length,
+      1,
+    );
+
+    // Cancel while the child model request still holds the run: the queued steer belongs to a live
+    // worker, so cancellation must withdraw it rather than let it start a turn after retirement.
+    await store.gateway.harness.abortTask(record.taskId, context);
+    const publication = await within(resultWatcher.promise, WAIT_MS, 'the cancelled worker never reported');
+    const resultEntry = workerResultEntry(publication, conversation.id);
+    assert.equal(resultEntry.data.status, 'aborted');
+    const body = messageText(resultEntry.model?.[0]);
+    assert.match(body, /was cancelled/);
+    assert.doesNotMatch(body, /LATE-CANCELLED-ANSWER/);
+
+    const inbox = await store.gateway.harness.snapshot(InboxDoc, record.conversationId, context);
+    assert.equal((inbox?.items ?? []).some((item) => item.mode === 'steer'), false,
+      'the accepted steer was withdrawn from the inbox');
+
+    releaseChild.resolve();
+    await waitFor(async () => {
+      const inspection = await store.gateway.harness.inspect(context);
+      return inspection.tasks.every((entry) => entry.record.conversationId !== record.conversationId
+        || entry.record.state.status === 'terminal');
+    }, 'the cancelled child work to settle');
+    const resultEntries = (await conversation.entries({ order: 'ascending' }, 300, undefined, context)).items
+      .filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND);
+    assert.equal(resultEntries.length, 1, 'one cancellation event, no orphan result');
+    const child = await store.gateway.harness.conversation(record.conversationId, context);
+    const childEntries = (await child.entries({ order: 'ascending' }, 300, undefined, context)).items;
+    assert.equal(childEntries.some((entry) => entry.kind === WORKER_STEER_ENTRY_KIND), false,
+      'the withdrawn steer was never placed into the child transcript');
+    const names = ((await child.agent(context)).tools ?? [])
+      .map((tool) => (typeof tool === 'string' ? tool : tool.name));
+    assert.deepEqual(names, [], 'the cancelled worker keeps no tools');
+    const finished = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    assert.equal(finished.status, 'aborted');
+    assert.equal(finished.steers.length, 1, 'the accepted request stays visible for inspection');
+  } finally {
+    releaseChild.resolve();
+    resultWatcher?.stop();
+    await store.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
 });

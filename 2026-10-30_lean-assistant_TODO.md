@@ -36,13 +36,13 @@ facilities; do not redesign memory quality, holistic usability or agent loops.
 - [x] P3 — Agent reads its own workers' bounded paginated transcripts via native
   Durable conversation entries, keyed by authorized worker ID, not raw SQL or
   arbitrary conversation ID. No Atuin capture/export/second transcript archive.
-- [ ] P4 — Agent steers live workers using native Durable input semantics,
+- [x] P4 — Agent steers live workers using native Durable input semantics,
   coordinating admission with completion/authority retirement. Cancellation
   already exists; preserve it. No user worker-management surface or recursion.
 - [ ] P5 — Concise, read-only background summary inside existing `/status`:
   what is running (workers/digest/cron), if anything. No dashboard, management
   commands, model call or transcript dump; agent remains the manager.
-- [ ] P7 — User-systemd service readiness and parallel instances: one template
+- [x] P7 — User-systemd service readiness and parallel instances: one template
   service per instance, per-instance config/environment, independent
   dataDir/SQLite/socket and workspace. Verify graceful stop/restart/journal and
   same-store duplicate-owner refusal offline. No install/enable/start, lingering,
@@ -442,6 +442,44 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Parity batch — P3 transcripts, P7 service readiness and P4 steering accepted
+
+P3 (worker transcripts) published at `ba6df4e`: existing `worker` tool gained a
+bounded, ownership-verified `transcript` action over native Durable entries;
+history's bounded entry renderer was shared rather than copied. No Atuin
+capture/export or SQL surface. Independent PASS: 19 worker checks, 250 behavior,
+2 execution, 83 core.
+
+P7 published at `52138372` by its original implementer after two independent
+reviews (first found the branch predated P1/P2 and dropped a registered suite):
+default config `~/.durable-nanobot/config.json` resolved from the runtime home,
+explicit `--config` preserved for secondary instances, user-systemd templates
+for a primary and `nanobot@` secondaries, per-instance config/dataDir/workspace/
+socket separation. Instance paths use a literal `i-%i` directory so a dot-like
+name cannot traverse. Static `systemd-analyze verify` only; nothing installed,
+enabled, started, lingered or reloaded. Final gate: 276 behavior across 34 files,
+2 execution, 83 core; published main build plus 6 focused service checks.
+One docs link defect and a silent-skip were fixed before publication. Accepted
+limits: same-UID instances are not a security boundary, distinct pollers need
+distinct bot tokens, live systemd operation untested, canceled/parked worker and
+restart-limit block classification covered by renderer tests only.
+
+P4 (worker steering) published at `54b2331` after two independent reviews. The
+`worker` tool gained bounded `steer` (2,000 UTF-16 units, 8 accepted per worker)
+using one native commit that verifies task/spawner/child ownership and a live run
+owning this worker's initial or accepted steer submission, so admission cannot
+race finalize into an orphan turn; queued steers are withdrawn on cancel and the
+worker joins successor runs. Re-review fixed silently deduping a changed payload:
+the record stores a SHA-256 of the exact steer text, replays dedupe, and a changed
+payload refuses without a second inbox item. Independent probes confirmed 10
+concurrent admissions → exactly 8 accepted, full successor chain joined, latest
+answer reported, no dangling child task. Gate: 280 behavior across 34 files,
+2 execution, 83 core; published main build plus 23 focused worker checks.
+Accepted limits: admission is a narrow native submission/inbox mirror without a
+submission trace link (telemetry only); `afterFailedRun:"continue"` is unsupported
+and not configurable by the shipped harness; no worker deadline exists. Untracked
+owner migration plan stayed untouched.
 
 ### Parity batch — P1 digest budgets and P2 Telegram sends published
 

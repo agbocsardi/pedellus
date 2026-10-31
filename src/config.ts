@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { CONTEXT_LIMITS } from "./context/index.js";
 import {
   MemoryContextBoundsError,
@@ -865,6 +866,24 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
     Object.assign(config, { web: parseWebConfig(raw.web) });
   }
   return config;
+}
+
+/**
+ * The primary configuration used when a launch has no `--config` override. It is
+ * resolved from the runtime user home, never the process working directory, so a
+ * service start is independent of where systemd happens to place it. This locates
+ * exactly one file; it never searches, merges or creates configuration.
+ */
+export function defaultConfigPath(): string {
+  return join(userHome(), ".durable-nanobot", "config.json");
+}
+
+function userHome(): string {
+  let home: string;
+  try { home = homedir(); }
+  catch (cause) { throw new StartupDiagnosticError("configHome", { cause }); }
+  if (home.length === 0 || !isAbsolute(home)) throw new StartupDiagnosticError("configHome");
+  return home;
 }
 
 export async function loadConfig(path: string): Promise<PortConfig> {
