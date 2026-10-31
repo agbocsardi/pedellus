@@ -20,6 +20,21 @@
 
 ## Approved overnight batch — memory digestion and local usability
 
+All six slices are accepted and published. Final reviewed product/docs tip:
+`46a00c8` (functional tree identical to `ef0af84`). Morning handoff:
+[2026-10-31_overnight-handoff.md](plan/2026-10-31_overnight-handoff.md).
+
+Final independent gate: typecheck/build, 244 behavior checks across 31 files,
+2 execution, 83 offline acceptance, and 77 focused union checks. No live
+provider/API inference, paid operations, personal workspace, deployment or
+schedule activation. Local speech artifacts were downloaded and tested under
+owner authorization; that is not real-model memory-quality acceptance.
+
+Batch complete: stop implementation. Completed agents retired; branches,
+worktrees and voice proof artifacts preserved. Earlier sections/log entries
+record historical decisions; this completed-batch summary supersedes stale
+future/deferred wording below.
+
 Owner approved this six-slice batch after the completed channel-neutral build:
 
 - [x] O1 — Closed-episode input and durable digestion cursor. Authenticated
@@ -36,13 +51,16 @@ Owner approved this six-slice batch after the completed channel-neutral build:
 - [x] O4 — Research local Node/TypeScript-compatible speech alternatives before
   choosing readiness work. Compare actual native/Python/audio-decoder/model
   requirements, CPU/Linux support, packaging, licensing and maintenance. Public
-  documentation research is authorized, installs/downloads/provisioning are not.
+  documentation research was authorized initially; the owner subsequently
+  authorized local voice dependencies/model downloads and synthetic local tests.
+  Delivered an explicitly selected whisper-cli/FFmpeg route, keeping the legacy
+  Python default and configuration compatible.
   Do not silently replace faster-whisper or claim empirical quality equivalence.
 - [x] O5 — Explicit CLI local photo/document attachment submission through the
   single gateway/shared media pipeline. Preserve media opt-in, native image plus
   locator/vision handoff, document originals without extraction, bounded ingress
   and existing terminal controls. No separate runtime owner or model path grant.
-- [ ] O6 — Independent combined review, bounded offline acceptance and honest
+- [x] O6 — Independent combined review, bounded offline acceptance and honest
   setup/plan handoff; reconcile registrations and integration without dropping
   accepted behavior. No live acceptance or deployment.
 
@@ -54,10 +72,11 @@ through fixes, review every candidate independently before integration, publish
 passing work using the previous clean-main fast-forward loop. Preserve branches
 and worktrees. Parent owns plan/orchestration, not functional implementation.
 
-Offline restrictions continue: no installs, model downloads, credential/settings
-access, personal workspace, live bot/provider requests or deployment. Only O4's
-public documentation research may use the web. Existing pinned dependencies and
-synthetic providers/fixtures only; report blockers instead of widening authority.
+No credential/settings access, personal workspace, live provider/API inference,
+paid operations or deployment was authorized. Public voice documentation research
+and local voice dependencies/model downloads were explicitly allowed; other
+checks used existing pinned dependencies and synthetic providers/fixtures.
+No personal runtime configuration or schedule was activated.
 
 ## Previous batch status and next priorities
 
@@ -201,10 +220,9 @@ unchecked items are deliberate gaps, not forgotten work.
     Carried cosmetic limitation (docs only, no source change): config parsing
     accepts non-coding `toolAllowlist` names, while gateway startup rejects names
     with no approved registration.
-- [ ] After background workers are accepted, add opt-in periodic digestion of
-  previously unprocessed conversations/episodes into long-term memory, following
-  the scope below. Implementation is now approved as O1–O3 above; activation
-  in the owner's runtime remains unapproved.
+- [x] Add opt-in periodic digestion of previously unprocessed closed mapped-chat
+  episodes into long-term memory. Implemented and independently accepted as
+  O1–O3 above; activation in the owner's runtime remains unapproved.
 
 Approved first implementation batch: channel-neutral gateway/local CLI attachment
 and Telegram menu/reply/quote/reaction support. These are two independently owned
@@ -274,10 +292,11 @@ as behavioral references, not a subsystem to copy.
   schedule activation. Existing-history backfill and exact history-unit boundaries
   must be made explicit before activation.
 
-The owner asked to record this scope and work on something independent while
-background agents are unfinished. Background workers are now accepted and published, so this is no longer blocked
-by them; curation remains deferred by owner choice for a later session. No
-curation code, schedule or historical-data processing exists yet.
+This scope was initially deferred, then approved and implemented as O1–O3.
+`DIGEST.md`, bounded native tasks, `/digest` and explicit cron `intent: "digest"`
+are shipped. Backfill includes closed mapped-chat episodes only. Nothing creates
+or enables a schedule automatically; personal-runtime activation and real-model
+quality acceptance remain unperformed.
 
 ## Product and constraints
 
@@ -350,6 +369,19 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### 2026-10-31 — overnight batch closed
+
+O6 published by its original implementer via clean-main fast-forward to
+`46a00c8`, after independent CLEAN PASS on `fef0407` and two wording-only nits
+corrected. No source/test/script/dependency difference from functional tip
+`ef0af84`. Final independently repeated gate: 244 behavior, 2 execution,
+83 offline core, 77 focused cross-feature checks, typecheck/build; final docs
+publication also passed main typecheck/build. All six checklist items complete.
+Handoff records commands, opt-in setup, exact tips, best assumptions and accepted
+limitations. No live API/provider or paid calls, deployment, personal-workspace
+use, automatic schedule or runtime activation. Completed agents retired;
+branches/worktrees and voice proof artifacts retained. Stop; await owner review.
 
 ### Overnight — manual/cron integration accepted; final handoff starts
 
