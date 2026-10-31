@@ -15,9 +15,9 @@ is the only executor; the runtime injects that one source.
   in-progress turn is never offered; a read offers only evidence already committed when it began, and
   an accepted batch's bounds never move.
 - **One range per read.** The reader scans once and takes the furthest completed turn inside its
-  4,000-entry discovery bound, so a batch covers every completed turn that fits its entry and
-  character bounds (three short turns are one batch, not three). An oversized range splits into
-  ordered chunks with immutable bounds; a reset, the tail or the scan bound ends the range at its
+  4,000-entry discovery bound. A range that fits entry, character and fixed step bounds is one batch
+  (three short turns are one batch, not three). A larger range splits into ordered chunks, and a
+  turn may straddle chunks. Bounds stay immutable; a reset, the tail or the scan bound ends the range at its
   last completed turn, and an unfinished trailing turn is never cut into a batch.
 - **Evidence.** Owner/assistant prose is lossless and streamed in ordered fragments (UTF-16 offsets,
   surrogate-safe). Assistant tool calls and paired results are included and labeled `untrusted-tool`.
@@ -52,6 +52,9 @@ is the only executor; the runtime injects that one source.
 
 ## Remaining checklist
 
+- [x] **Independent code review and offline gate.** Final code `e34816f` accepted after fresh review;
+      build/typecheck, 306 behavior, 2 execution and 83 offline acceptance passed. Coordinator fixed
+      the review's remaining documentation-only granularity/default/evidence wording findings.
 - [ ] **Live-model acceptance and quality.** Every check here is offline with synthetic providers and
       data. Real provider behavior, curation quality on real transcripts and deployment remain unproven.
 - [ ] **Inactive 8-hour cron schedule.** The shape is documented (`CRON.md`, "Inactive 8-hour schedule
@@ -125,3 +128,13 @@ and never skips or replays. Canonical tests now cover three fitting turns in one
 open tail, a later-appended turn processed once, over-budget multi-turn chunks, the tool-round cutoff
 and a >4,000-entry scan. Minor message fixes: the cron tool's digest refusal names the configured
 background model, and a missing-usage refusal no longer claims the token budget was reached.
+
+### 2026-10-31 — reviewed handoff
+
+Fresh final review accepted the code at `e34816f` and independently repeated the offline gate:
+306 behavior, 2 execution, 83 core acceptance, build/typecheck. Remaining review findings were stale
+documentation only; coordinator corrected range/chunk wording, defaults and tool-evidence descriptions.
+Native retries outside 12 successful responses and the soft token ceiling are owner-approved;
+activation and real-provider/real-workspace acceptance remain unapproved. Late results from an
+abandoned turn whose call belonged to an earlier range are treated as unpaired and excluded.
+No live schedule, deployment, restart, install, main merge or push occurred.

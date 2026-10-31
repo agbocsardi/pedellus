@@ -106,10 +106,10 @@ npm start -- agent --config config.json     # attach a terminal
   and reset chats: a reset that follows an owner turn, the next owner/scheduled
   input, or a terminal assistant entry whose calls are all paired closes a
   segment, and an in-progress turn is never offered. One read scans once and
-  takes the furthest completed turn within its scan bound, so every completed
-  turn that fits the batch bounds is one batch and one acknowledgement; only a
-  range over those bounds splits into independent ordered chunks, each
-  acknowledged on its own, with no carry-over summary. An open trailing turn is
+  takes the furthest completed turn within its scan bound. A completed-turn range
+  that fits the entry, character and fixed step bounds is one batch and one
+  acknowledgement; a larger range splits into independent ordered chunks, and a
+  turn may straddle chunks. Each chunk is acknowledged on its own, with no carry-over summary. An open trailing turn is
   never cut into a range. The evidence is owner and
   assistant message text plus paired assistant tool calls and results labeled as
   untrusted machine output; a long result is a bounded head-tail preview with an

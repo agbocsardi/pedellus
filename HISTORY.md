@@ -830,8 +830,8 @@ the outcome keeps a 2,000-character answer excerpt. One `digest` config block na
 invocation bounds, with the accepted defaults `entriesPerBatch: 2000`, `charsPerBatch: 200000`,
 `maxToolCalls: 24`, `maxRequests: 12`, `maxInputTokens: 500000`, `runTimeoutSeconds: 600`,
 `maxChangedFiles: 8` and `maxDiffChars: 32000`. The character bound is the real size limit and the
-entry cap is a flood guard, so every completed turn that fits is admitted in one batch and therefore
-one run. It
+entry cap is a flood guard. A completed-turn range that fits these and the fixed step bound is
+one batch/run; a larger range splits, and a turn inside it can straddle chunks. It
 neither enables nor schedules digestion — frequency stays with ordinary cron — and an absent block
 keeps the defaults. A started task captures the resolved values in its input; a replay or reopen
 re-derives its batch, deadline, tool budget and write budget from that capture, never from a widened
