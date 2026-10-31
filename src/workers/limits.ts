@@ -18,6 +18,22 @@ export const WORKER_LIMITS = Object.freeze({
   retainedRecords: 32,
   /** Characters of the spawning agent's task prompt echoed in the internal result event. */
   maxEchoPromptChars: 400,
+  /** Transcript entries read and shown per page when `transcript` omits `limit`. */
+  transcriptDefaultLimit: 20,
+  /** Hard per-call transcript entry cap; a page is one native descending entry scan. */
+  transcriptMaxLimit: 20,
+  /** Characters retained from one transcript tool-call argument list before quoting. */
+  transcriptToolArgumentChars: 800,
+  /** Characters retained from one transcript entry body before quoting. */
+  transcriptEntryChars: 1_200,
+  /** Overall rendered transcript byte budget, below the tool's 64 KiB output limiter. */
+  transcriptOutputBytes: 48 * 1024,
+  /** Bytes reserved in the transcript render for the omission note. */
+  transcriptOmissionReserveBytes: 256,
+  /** Bytes reserved for the transcript's displayed/omitted row count line. */
+  transcriptRowCountReserveBytes: 512,
+  /** Characters of the worker task echoed in the transcript header. */
+  transcriptTaskChars: 400,
   /** Host command timeout for one git worktree operation. */
   gitTimeoutMs: 30_000,
   /** Bytes of git stderr kept in a failure message. */
