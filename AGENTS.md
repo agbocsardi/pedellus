@@ -28,6 +28,10 @@ npm start -- agent --config config.json     # attach a terminal
 - `src/cli.ts` — launch surface: `gateway` owns the single runtime, storage,
   tools and channels; `agent` (or legacy bare `--config`) attaches a terminal to
   it and never opens a second runtime; also the stopped-store recovery command.
+  Without `--config`, gateway/agent/recovery read the fixed runtime-home default
+  `~/.durable-nanobot/config.json`; an explicit `--config` is the secondary-instance
+  override. `systemd/` holds the foreground user-unit examples documented in
+  `SERVICE.md`; checks neither install nor start them.
   The agent loop itself is Durable's; this repository is the nanobot-specific
   layer around it (context, tools, execution, automation, channels, providers).
 - `src/local/` — private Unix-socket protocol, gateway server and CLI client that

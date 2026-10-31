@@ -99,6 +99,13 @@ Then attach a terminal in another:
 node dist/cli.js agent --config demo/config.json
 ```
 
+This walkthrough uses an explicit demo config. Without `--config`, `gateway`,
+`agent` and `recovery` read the fixed primary file
+`~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
+the working directory; there is no discovery, merge or auto-generation. A
+secondary instance passes its own `--config`. See [user services](./SERVICE.md)
+for the shipped foreground systemd user units.
+
 The agent resumes the `cli:default` conversation and prints a prompt. The
 historical `node dist/cli.js --config demo/config.json` is the same attach; it
 fails with a fixed message when no gateway is running and never opens a second

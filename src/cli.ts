@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { stdin, stderr, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
-import { loadConfig } from "./config.js";
+import { loadConfig, defaultConfigPath } from "./config.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { connectLocalGateway } from "./local/client.js";
 import { gatewaySocketPath, serveLocalGateway } from "./local/server.js";
@@ -18,76 +18,138 @@ import { prepareDataDirectory } from "./store.js";
 import { StartupDiagnosticError, startupDiagnostic } from "./startup-diagnostics.js";
 
 const USAGE =
-  "Usage: nanobot gateway --config <path> | nanobot agent --config <path> [--conversation <name>] | " +
-  "nanobot --config <path> (agent, compatibility) | nanobot recovery --config <path> [--cancel <taskId> --fingerprint <sha256>]";
+  "Usage: nanobot gateway [--config <path>] | nanobot agent [--config <path>] [--conversation <name>] | " +
+  "nanobot --config <path> (agent, compatibility) | " +
+  "nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]\n" +
+  "Without --config, gateway, agent and recovery use ~/.durable-nanobot/config.json.";
+
+const RECOVERY_USAGE = "Usage: nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]";
 
 const CONVERSATION_NAME = /^[a-z0-9](?:[a-z0-9_-]{0,30})[a-z0-9]$|^[a-z0-9]$/;
 
+/**
+ * Where a launch reads its configuration. `default` resolves the owner's fixed
+ * primary file at call time; `path` preserves the explicit `--config` argument
+ * and its existing relative-path base exactly.
+ */
+type ConfigSource =
+  | { readonly kind: "default" }
+  | { readonly kind: "path"; readonly path: string };
+
 type RecoveryInvocation =
-  | { readonly kind: "list"; readonly configPath: string }
-  | { readonly kind: "cancel"; readonly configPath: string; readonly taskId: number; readonly fingerprint: string };
+  | { readonly kind: "list"; readonly config: ConfigSource }
+  | { readonly kind: "cancel"; readonly config: ConfigSource; readonly taskId: number; readonly fingerprint: string };
 
 type LaunchInvocation =
-  | { readonly kind: "gateway"; readonly configPath: string }
-  | { readonly kind: "agent"; readonly configPath: string; readonly conversation?: string };
+  | { readonly kind: "gateway"; readonly config: ConfigSource }
+  | { readonly kind: "agent"; readonly config: ConfigSource; readonly conversation?: string };
 
 /** A usage mistake; the CLI prints the fixed usage line, never the supplied arguments. */
 class UsageError extends Error {
   override name = "UsageError";
 }
 
-function configArgument(args: readonly string[], start: number): string {
+function configPath(args: readonly string[], start: number): ConfigSource {
   if (args.length !== start + 2 || args[start] !== "--config" || !args[start + 1]) throw new UsageError();
-  return args[start + 1]!;
+  return { kind: "path", path: args[start + 1]! };
 }
 
 /**
  * `nanobot --config <path>` remains the historical terminal launch. It now attaches
  * to the running gateway instead of opening a second runtime; no gateway is started
- * implicitly.
+ * implicitly. A subcommand without `--config` uses the fixed primary default; the
+ * bare historical form still requires an explicit path.
  */
 function launchInvocation(args: readonly string[]): LaunchInvocation {
-  if (args[0] === "gateway") return { kind: "gateway", configPath: configArgument(args, 1) };
-  if (args[0] === "agent") {
-    if (args[1] !== "--config" || !args[2]) throw new UsageError();
-    if (args.length === 3) return { kind: "agent", configPath: args[2] };
-    if (args.length === 5 && args[3] === "--conversation" && args[4] && CONVERSATION_NAME.test(args[4])) {
-      return { kind: "agent", configPath: args[2], conversation: args[4] };
-    }
-    throw new UsageError();
+  if (args[0] === "gateway") {
+    return { kind: "gateway", config: args.length === 1 ? { kind: "default" } : configPath(args, 1) };
   }
-  return { kind: "agent", configPath: configArgument(args, 0) };
+  if (args[0] === "agent") return agentInvocation(args.slice(1));
+  return { kind: "agent", config: configPath(args, 0) };
+}
+
+function agentInvocation(args: readonly string[]): LaunchInvocation {
+  let config: ConfigSource = { kind: "default" };
+  let configSeen = false;
+  let conversation: string | undefined;
+  for (let index = 0; index < args.length;) {
+    const argument = args[index];
+    if (argument === "--config" && !configSeen && args[index + 1]) {
+      config = { kind: "path", path: args[index + 1]! };
+      configSeen = true;
+      index += 2;
+    } else if (argument === "--conversation" && conversation === undefined && args[index + 1] &&
+        CONVERSATION_NAME.test(args[index + 1]!)) {
+      conversation = args[index + 1];
+      index += 2;
+    } else {
+      throw new UsageError();
+    }
+  }
+  return { kind: "agent", config, ...(conversation === undefined ? {} : { conversation }) };
 }
 
 function recoveryInvocation(args: readonly string[]): RecoveryInvocation | undefined {
   if (args[0] !== "recovery") return undefined;
+  let config: ConfigSource = { kind: "default" };
+  let configSeen = false;
+  let cancel: string | undefined;
+  let fingerprint: string | undefined;
   const rest = args.slice(1);
-  if (rest.length === 2 && rest[0] === "--config" && rest[1]) {
-    return { kind: "list", configPath: rest[1] };
-  }
-  if (rest.length === 6 && rest[0] === "--config" && rest[1] &&
-      rest[2] === "--cancel" && rest[3] && rest[4] === "--fingerprint" && rest[5]) {
-    const taskId = Number(rest[3]);
-    if (!/^[1-9][0-9]*$/.test(rest[3]) || !Number.isSafeInteger(taskId) || !/^[0-9a-f]{64}$/.test(rest[5])) {
-      throw new PreparedContextRecoveryError(
-        "Usage: nanobot recovery --config <path> [--cancel <taskId> --fingerprint <sha256>]",
-      );
+  for (let index = 0; index < rest.length;) {
+    const argument = rest[index];
+    if (argument === "--config" && !configSeen && rest[index + 1]) {
+      config = { kind: "path", path: rest[index + 1]! };
+      configSeen = true;
+      index += 2;
+    } else if (argument === "--cancel" && cancel === undefined && rest[index + 1]) {
+      cancel = rest[index + 1];
+      index += 2;
+    } else if (argument === "--fingerprint" && fingerprint === undefined && rest[index + 1]) {
+      fingerprint = rest[index + 1];
+      index += 2;
+    } else {
+      throw new PreparedContextRecoveryError(RECOVERY_USAGE);
     }
-    return { kind: "cancel", configPath: rest[1], taskId, fingerprint: rest[5] };
   }
-  throw new PreparedContextRecoveryError(
-    "Usage: nanobot recovery --config <path> [--cancel <taskId> --fingerprint <sha256>]",
-  );
+  if (cancel === undefined && fingerprint === undefined) return { kind: "list", config };
+  if (cancel === undefined || fingerprint === undefined) throw new PreparedContextRecoveryError(RECOVERY_USAGE);
+  const taskId = Number(cancel);
+  if (!/^[1-9][0-9]*$/.test(cancel) || !Number.isSafeInteger(taskId) || !/^[0-9a-f]{64}$/.test(fingerprint)) {
+    throw new PreparedContextRecoveryError(RECOVERY_USAGE);
+  }
+  return { kind: "cancel", config, taskId, fingerprint };
+}
+
+/**
+ * Load the selected configuration. A missing default file gets its own fixed
+ * diagnostic; an explicit path keeps the existing unreadable/invalid text and
+ * relative-path semantics. No discovery, merge or file creation happens here.
+ */
+async function readConfig(source: ConfigSource): Promise<Awaited<ReturnType<typeof loadConfig>>> {
+  if (source.kind === "path") return loadConfig(source.path);
+  try {
+    return await loadConfig(defaultConfigPath());
+  } catch (cause) {
+    if (cause instanceof StartupDiagnosticError && cause.code === "configFile" && missingFile(cause.cause)) {
+      throw new StartupDiagnosticError("defaultConfigFile", { cause });
+    }
+    throw cause;
+  }
+}
+
+function missingFile(cause: unknown): boolean {
+  return typeof cause === "object" && cause !== null && (cause as NodeJS.ErrnoException).code === "ENOENT";
 }
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
   const recovery = recoveryInvocation(args);
   if (recovery !== undefined) {
-    await runRecovery(recovery, await loadConfig(recovery.configPath));
+    await runRecovery(recovery, await readConfig(recovery.config));
     return;
   }
   const invocation = launchInvocation(args);
-  const config = await loadConfig(invocation.configPath);
+  const config = await readConfig(invocation.config);
   if (invocation.kind === "gateway") {
     await runGateway(config);
   } else {
@@ -329,7 +391,8 @@ function aborted(signal: AbortSignal): Promise<void> {
 function localGatewayDiagnostic(error: LocalGatewayError): string {
   return error.reason === "unavailable"
     ? "nanobot: no running gateway answers on this configuration's local endpoint; start " +
-      "`nanobot gateway --config <path>` with the same configuration first (diagnostic details suppressed)"
+      "`nanobot gateway --config <path>` with the same configuration first; omit `--config` for the default " +
+      "primary configuration (diagnostic details suppressed)"
     : "nanobot: the configured local gateway endpoint is unavailable or owned by another process; " +
       "stop the other gateway before starting another (diagnostic details suppressed)";
 }

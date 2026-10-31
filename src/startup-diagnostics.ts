@@ -6,7 +6,12 @@
  * filesystem paths, provider/dependency error text or the underlying exception.
  */
 export const STARTUP_DIAGNOSTICS = Object.freeze({
-  usage: "Usage: nanobot --config <path>",
+  usage: "Usage: nanobot gateway|agent|recovery [--config <path>] (without --config: ~/.durable-nanobot/config.json)",
+  configHome:
+    "cannot resolve the default configuration home; set HOME or pass --config <path> (diagnostic details suppressed)",
+  defaultConfigFile:
+    "no default configuration found; create ~/.durable-nanobot/config.json or pass --config <path> " +
+    "(diagnostic details suppressed)",
   configFile:
     "cannot read or parse the configuration file; check that it exists, is readable, and contains valid JSON " +
     "(diagnostic details suppressed)",
@@ -34,6 +39,7 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
   preparedContext:
     "startup refused because a prepared model dispatch pins historical Nanobot context; run " +
     "`nanobot recovery --config <path>` with this configuration to inspect and cancel the blocked task, " +
+    "or omit `--config` for the default primary configuration, " +
     "then start again (diagnostic details suppressed)",
   unexpected: "command failed; diagnostic details suppressed",
 } as const);

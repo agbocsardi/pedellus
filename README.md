@@ -33,6 +33,12 @@ node dist/cli.js gateway --config /path/to/config.json
 node dist/cli.js agent --config /path/to/config.json
 ```
 
+Without `--config`, `gateway`, `agent` and `recovery` use the fixed primary file
+`~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
+the working directory. A secondary instance passes its own explicit `--config`.
+[User services](./SERVICE.md) documents the shipped foreground systemd user
+units; this repository does not install or start them.
+
 The gateway is the single owner: it opens storage, config tools, cron and, when
 configured, the restricted Telegram adapter (explicit decimal user allowlist
 only). One or more `agent` CLIs attach to it as conversation surfaces; the
