@@ -5,7 +5,7 @@ import type { Context, Draft } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
-import { AgentDoc, AssistantEntry, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type Storage, type TaskId, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
+import { AgentDoc, AssistantEntry, ResetEntry, ToolTask, configure, ConversationBusy, createRegistry, defineDoc, defineExtension, hook, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type Storage, type TaskId, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ContextExtensionReplacement, type ConversationContextSnapshot } from "./context/index.js";
 import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./context/skill-tool.js";
 import { CRON_RUN_TASK_NAME, createCronFoundation } from "./automation/cron.js";
@@ -567,7 +567,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
         "(no approved registered tools)",
     });
   }
-  const toolsEnabled = toolAllowlist.length > 0;
+  const workerCodingTools = config.workers?.enabled === true
+    ? (config.workers.toolAllowlist ?? toolAllowlist).filter((name) =>
+        (CODING_TOOL_NAMES as readonly string[]).includes(name)) : [];
+  const registeredCodingTools = [...new Set([...toolAllowlist, ...workerCodingTools])];
+  const toolsEnabled = registeredCodingTools.length > 0;
   // MCP is a separate, explicit connection authority. Connecting starts external clients, so the
   // config switch must be on and at least one server enabled; otherwise no client is created.
   const mcpConfig = config.mcp;
@@ -930,15 +934,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
     webTool = createWebToolExtension({
       ...(search === undefined ? {} : { search }),
       ...(fetcher === undefined ? {} : { fetcher }),
-      isAuthorizedChat: (conversationId) => authorizedChatConversations.has(conversationId),
+      isAuthorizedChat: (conversationId) => authorizedChatConversations.has(conversationId)
+        || workerChildConversations.has(conversationId),
     });
   }
   const webToolRegistrations = webTool?.extension.tools ?? [];
   const webConversations = new Set<ConversationId>();
   const toolExtension: Extension | undefined = toolsEnabled
     ? createCodingToolExtension({
-        tools: toolAllowlist as readonly CodingToolName[],
+        tools: registeredCodingTools as readonly CodingToolName[],
         ceiling: toolAllowlist,
+        capturedCeiling: (conversationId) => workerChildConversations.has(conversationId)
+          ? workerCodingTools : toolAllowlist,
         contextTools: [
           ...(options.contextSnapshotProvider === undefined ? [] : [SKILL_TOOL_NAME]),
           ...(cronEnabled ? [CRON_TOOL_NAME] : []),
@@ -976,9 +983,41 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // its own checkout instead of the configured workspace. The root is per task and is never added to
   // the configured roots, so the two workspaces cannot read through each other.
   const workerWorkspaceRoots = new Map<ConversationId, string>();
-  // Live worker children compose with Code Mode over their captured tools only. They are not mapped
-  // chats: MCP, web, Telegram, cron, history and the worker tool itself stay out of their set.
+  // Workers are not mapped chats. Separate scope plus a durable per-tool capture grants research
+  // capabilities without Telegram, scheduling or recursive delegation.
   const workerChildConversations = new Set<ConversationId>();
+  const workerToolNames = (): string[] => {
+    if (config.workers?.enabled !== true) return [];
+    const configured = config.workers?.toolAllowlist;
+    return [
+      ...workerCodingTools,
+      ...(skillToolRegistration === undefined ? [] : [SKILL_TOOL_NAME]),
+      ...webToolRegistrations.map((tool) => tool.name),
+      ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
+      ...(codeModeRef.current === undefined ? [] : [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]),
+      ...(mcpRef.current?.toolNames ?? []),
+    ].filter((name) => configured === undefined || configured.includes(name)
+      || (configured.includes("mcp") && mcpRef.current?.ownsTool(name)));
+  };
+  const workerCapabilityExtension = defineExtension({
+    name: "nanobot-worker-capabilities",
+    hooks: [hook(ToolTask, {
+      async beforeTool(call, api, ctx) {
+        if (!workerToolNames().includes(call.name)) {
+          return { block: `Tool ${call.name} is outside the configured worker grants` };
+        }
+        if (!workerChildConversations.has(api.conversationId)) {
+          return { block: "Worker capability is no longer active" };
+        }
+        const capture = await api.snapshot(ConfigToolCaptureDoc, api.conversationId, ctx);
+        if (capture === undefined || !authorizedChatConversations.has(capture.originConversationId as ConversationId)
+          || !capture.tools.includes(call.name)) {
+          return { block: `Tool ${call.name} is outside this worker's captured authority` };
+        }
+        return undefined;
+      },
+    })],
+  });
   // Live memory-digestion targets. They are task-owned like a worker child, but deliberately get
   // no Code Mode, no MCP/web/channel/history tool and no shell: only the curation-scope hook and the
   // captured Markdown tools. The set is rebuilt from live digest tasks on reopen.
@@ -1082,10 +1121,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (authorizedChatConversations.has(conversationId)) {
       if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
       if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
-    } else if (workerChildConversations.has(conversationId) && codeModeRef.current !== undefined) {
-      // A worker child gets the compositor, not a wider tool set: its scripts resolve only the tools
-      // the conversation already enables (its captured coding tools). MCP stays out.
-      selected.push(...codeModeRef.current.extensions);
+    } else if (workerChildConversations.has(conversationId)) {
+      selected.push(workerCapabilityExtension);
+      if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
+      if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
+      if (historyTool !== undefined) selected.push(historyTool.extension);
+      if (webTool !== undefined) selected.push(webTool.extension);
     }
     // A live digest target keeps its narrowing path hook across a reopen. The hook grants nothing;
     // it only refuses paths outside the curation scope and makes write create-only.
@@ -1106,7 +1147,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     return { extensions: selected };
   };
   const toolRegistrations = new Map<string, ToolRegistration>(
-    (toolExtension?.tools ?? []).map((tool) => [tool.name, tool]),
+    [...(toolExtension?.tools ?? []), ...webToolRegistrations,
+      ...(historyToolRegistration === undefined ? [] : [historyToolRegistration]),
+      ...(skillToolRegistration === undefined ? [] : [skillToolRegistration])]
+      .map((tool) => [tool.name, tool]),
   );
   // Origin sessions only: a scheduled run's fresh background conversation is not an origin session,
   // so it cannot schedule further jobs. Owners are keyed by the mapped session key.
@@ -1306,14 +1350,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
         ...(workerPreset === undefined ? {} : { preset: workerPreset }),
         workspace: workerWorkspace!,
         prepare: async ({ tx, spawnerConversationId, targetConversationId: target, input, workspace: targetWorkspace, ctx }) => {
-          // The worker's fresh conversation starts default-deny. Its capture is the spawning
-          // conversation's current ceiling, and the call-time hook still requires that origin and the
-          // current config, so a capture is a subset of configured authority and never new authority.
+          // The worker starts default-deny. Its capture comes from the independent worker config
+          // (or inherited defaults), and call-time hooks still require an authorized spawning chat.
+          // A worker-only coding grant never widens the foreground or other task targets.
           const authorized = authorizedChatConversations.has(spawnerConversationId);
           const capture = await tx.doc(ConfigToolCaptureDoc, target);
           capture.originConversationId = spawnerConversationId;
-          capture.tools = authorized ? [...toolAllowlist] : [];
-          const captured = [...capture.tools];
+          capture.tools = authorized ? workerToolNames() : [];
           // The same snapshot path a scheduled run uses: bootstrap/AGENTS, the memory manifest, the
           // skill summary and the read-only `skill` tool, only when the host configured a provider and
           // the spawning session is mapped.
@@ -1321,23 +1364,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const skillsInstalled = spawnerKey !== undefined && contextInstallerRef.current !== undefined
             ? await contextInstallerRef.current(spawnerKey, target, ctx)
             : false;
-          // The compositor is offered to the child, but it grants nothing: a script resolves only the
-          // captured tools enabled below. The worker tool, MCP, web, Telegram, cron and history are
-          // deliberately absent from both lists.
-          const composeTools = codeModeRef.current === undefined
-            ? []
-            : [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME].flatMap((name) => {
-                const tool = toolRegistrations.get(name);
-                return tool === undefined ? [] : [tool];
-              });
-          const tools = [
-            ...captured.flatMap((name) => {
-              const tool = toolRegistrations.get(name);
-              return tool === undefined ? [] : [tool];
-            }),
-            ...composeTools,
-            ...(skillsInstalled && skillToolRegistration !== undefined ? [skillToolRegistration] : []),
-          ];
+          // Explicit worker grants are independent of the foreground coding ceiling. Snapshot
+          // delivery cannot add a skill tool the worker configuration withheld.
+          if (!skillsInstalled) capture.tools = capture.tools.filter((name) => name !== SKILL_TOOL_NAME);
+          const tools = capture.tools.flatMap((name) => {
+            const tool = toolRegistrations.get(name);
+            return tool === undefined ? [] : [tool];
+          });
           const extensions: Extension[] = [];
           // The vision hook carries no tool authority; a fresh captured-tool conversation needs it
           // explicitly or a read-tool image would bypass the flagged-preset handoff.
@@ -1346,6 +1379,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (contextConversations.has(target) && contextExtension !== undefined) extensions.push(contextExtension);
           if (skillsInstalled && skillTool !== undefined) extensions.push(skillTool.extension);
           if (codeModeRef.current !== undefined) extensions.push(...codeModeRef.current.extensions);
+          if (mcpRef.current !== undefined) extensions.push(mcpRef.current.extension);
+          if (webTool !== undefined) extensions.push(webTool.extension);
+          if (historyTool !== undefined) extensions.push(historyTool.extension);
+          extensions.push(workerCapabilityExtension);
           const workerChoice = choicesByNative.get(modelKey(input.model));
           await configure(tx, target, {
             cwd: targetWorkspace.path,
@@ -1355,7 +1392,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
               ? input.thinkingLevel
               : workerChoice === undefined ? "off" : fallbackThinkingLevel(workerChoice),
             tools,
-            modelTools: tools,
+            modelTools: tools.filter((tool) => !mcpRef.current?.ownsTool(tool.name)),
             extensions,
           });
         },
@@ -1497,8 +1534,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const cronTools = cronToolRegistration !== undefined && cronOwners.has(conversationId)
       ? [cronToolRegistration]
       : [];
-    // History retrieval is enabled by default, read-only, and limited to mapped chat conversations.
-    const historyTools = historyToolRegistration !== undefined && historyConversations.has(conversationId)
+    // History is read-only over mapped chats; ordinary workers may capture the retrieval tool too.
+    const historyTools = historyToolRegistration !== undefined
+      && (historyConversations.has(conversationId) || workerChildConversations.has(conversationId))
       ? [historyToolRegistration]
       : [];
     // Telegram interaction is a scoped channel capability for one mapped private chat, not a coding
@@ -1506,7 +1544,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const telegramTools = telegramToolRegistration !== undefined && telegramChatConversations.has(conversationId)
       ? [telegramToolRegistration]
       : [];
-    const webTools = webConversations.has(conversationId) ? [...webToolRegistrations] : [];
+    const webTools = webConversations.has(conversationId) || workerChildConversations.has(conversationId)
+      ? [...webToolRegistrations] : [];
     // Worker management is a spawning-conversation capability, not filesystem or shell authority. The
     // worker's own task-owned conversation is never in this set, so it cannot start another worker.
     const workerTools = workerToolRegistration !== undefined && workerSpawners.has(conversationId)
@@ -1524,16 +1563,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
     conversationId: ConversationId,
     backgroundTools?: ReadonlySet<string>,
   ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
-    const contextTools = contextToolsFor(conversationId);
-    // MCP server tools and the Code Mode/tool-search tools only hold enabled authority in an
-    // authenticated mapped chat conversation. MCP tools stay deferred: enabled for nested calls and
-    // discovery, but never declared until `tool_search` loads them or a script names them.
+    const worker = workerChildConversations.has(conversationId);
+    const captured = worker ? backgroundTools ?? new Set<string>() : undefined;
+    const contextTools = contextToolsFor(conversationId).filter((tool) =>
+      !worker || captured!.has(tool.name));
+    // MCP stays deferred in both mapped chats and captured workers.
     const authorized = authorizedChatConversations.has(conversationId);
-    const offered = (authorized || workerChildConversations.has(conversationId))
-      && codeModeRef.current !== undefined
-      ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]
-      : [];
-    const deferred = authorized && mcpRef.current !== undefined ? [...mcpRef.current.toolNames] : [];
+    const offered = codeModeRef.current === undefined ? []
+      : [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME].filter((name) => authorized || captured?.has(name));
+    const deferred = [...(mcpRef.current?.toolNames ?? [])].filter((name) => authorized || captured?.has(name));
     const withContext = (names: readonly string[]): Pick<AgentChange, "tools" | "modelTools"> => {
       const tools = [
         ...toolFilterFromNames(names).tools,
@@ -1548,6 +1586,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ];
       return { tools, modelTools };
     };
+    if (worker) {
+      const capture = await tx.doc(ConfigToolCaptureDoc, conversationId);
+      capture.tools = workerToolNames().filter((name) =>
+        captured!.has(name) && capture.tools.includes(name));
+      return withContext(capture.tools.filter((name) => workerCodingTools.includes(name)));
+    }
     if (!toolExtension) {
       // Retire instead of creating an empty document: a disabled ceiling must durably remove
       // previously captured tools so re-enabling it cannot resurrect them.
@@ -1671,7 +1715,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
       mcpRef.current = await createMcpIntegration({
         config: mcpConfig,
         workspace,
-        isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
+        isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId)
+          || workerChildConversations.has(conversationId),
         delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
       });
       for (const tool of mcpRef.current.extension.tools ?? []) toolRegistrations.set(tool.name, tool);
@@ -1706,6 +1751,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (cronTool) registry.install(cronTool.extension);
     if (workerFoundation) registry.install(workerFoundation.extension);
     if (workerTool) registry.install(workerTool.extension);
+    registry.install(workerCapabilityExtension);
     registry.install(memoryDigest.extension);
     registry.install(digestScopeExtension);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
@@ -1926,6 +1972,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       sessionKey: string,
       conversationId: ConversationId,
       ctx: Context,
+      reset = false,
     ): Promise<number> => {
       // Serialize with an in-flight install or a previous refresh for this conversation.
       for (;;) {
@@ -1966,6 +2013,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
             registry.install(replacement.extension);
             const toolFilter = await toolFilterFor(tx, conversationId);
             await configure(tx, conversationId, { ...extensionsPolicy(conversationId), ...toolFilter });
+            // Idle-only reset and prompt replacement share one commit, including across multiple
+            // CLI attachments. No submission can begin between the two effects.
+            if (reset) await tx.appendEntry(conversationId, { kind: ResetEntry.kind, head: "self" });
             return count;
           }, ctx);
         } catch (error) {
@@ -2199,7 +2249,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const capture = live ? await harness.snapshot(ConfigToolCaptureDoc, targetConversationId, context) : undefined;
       if (capture !== undefined && capture.originConversationId === originConversationId
         && authorizedChatConversations.has(originConversationId)) {
-        for (const name of boundedCapturedTools(capture.tools, toolAllowlist, true)) tools.add(name);
+        const ceiling = workerChildPolicies.has(targetConversationId)
+          ? workerToolNames() : toolAllowlist;
+        for (const name of boundedCapturedTools(capture.tools, ceiling, true)) tools.add(name);
       }
       backgroundToolBounds.set(targetConversationId, tools);
     }
@@ -2611,14 +2663,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
         }
         let skills: number;
         try {
-          // Rebuild first: a live run must be refused before anything changes. The adapter serializes
-          // this chat, so no input of this conversation can start a run between the two steps.
-          skills = await refreshContextSnapshot(sessionKey, conversation.id, ctx);
+          // Rebuild and reset atomically: a live run refuses before either effect is published.
+          skills = await refreshContextSnapshot(sessionKey, conversation.id, ctx, true);
         } catch (error) {
           if (error instanceof ConversationBusy) return { status: "busy" };
           throw error;
         }
-        await conversation.reset(undefined, ctx);
         return { status: "reset", skills, promptRebuilt: true };
       },
       async close(ctx) {

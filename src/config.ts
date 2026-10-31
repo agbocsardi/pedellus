@@ -23,7 +23,7 @@ import { StartupDiagnosticError } from "./startup-diagnostics.js";
 import { parseMcpConfig, type McpConfig } from "./mcp/config.js";
 import { VISION_HANDOFF_DEFAULTS, VISION_HANDOFF_LIMITS } from "./media/vision.js";
 import { parseWebConfig, type WebConfig } from "./web/config.js";
-import { WORKER_LIMITS } from "./workers/limits.js";
+import { WORKER_LIMITS, WORKER_TOOL_GRANTS } from "./workers/limits.js";
 import { DIGEST_CHARS_PER_BATCH_MIN, DIGEST_ENTRIES_PER_BATCH_MIN } from "./history/digest-limits.js";
 
 const CREDENTIAL_PROVIDERS = [
@@ -107,6 +107,8 @@ export interface WorkersConfig {
    * selection at launch. It is validated against the finite `modelPresets` catalog, not an open registry.
    */
   readonly preset?: string;
+  /** Independent worker grants; absent inherits configured chat tools, empty grants no tools. */
+  readonly toolAllowlist?: readonly string[];
 }
 
 export interface CodeModeConfig {
@@ -554,13 +556,13 @@ function cronConfig(value: unknown): CronConfig {
 function workersConfig(value: unknown): WorkersConfig {
   const raw = object(value, "workers");
   for (const key of Object.keys(raw)) {
-    if (key !== "enabled" && key !== "maxConcurrent" && key !== "preset") {
+    if (key !== "enabled" && key !== "maxConcurrent" && key !== "preset" && key !== "toolAllowlist") {
       throw new Error(`Unknown workers field: ${key}`);
     }
   }
   if (typeof raw.enabled !== "boolean") throw new Error("workers.enabled must be a boolean");
   if (!raw.enabled) return { enabled: false };
-  const workers: { enabled: boolean; maxConcurrent?: number; preset?: string } = { enabled: true };
+  const workers: { enabled: boolean; maxConcurrent?: number; preset?: string; toolAllowlist?: readonly string[] } = { enabled: true };
   if (raw.maxConcurrent !== undefined) {
     if (typeof raw.maxConcurrent !== "number" || !Number.isSafeInteger(raw.maxConcurrent)
       || raw.maxConcurrent < 1 || raw.maxConcurrent > WORKER_LIMITS.maxConcurrent) {
@@ -569,6 +571,20 @@ function workersConfig(value: unknown): WorkersConfig {
     workers.maxConcurrent = raw.maxConcurrent;
   }
   if (raw.preset !== undefined) workers.preset = modelPresetName(raw.preset, "workers.preset");
+  if (raw.toolAllowlist !== undefined) {
+    if (!Array.isArray(raw.toolAllowlist)) throw new Error("workers.toolAllowlist must be an array");
+    const names = raw.toolAllowlist.map((name) => {
+      if (typeof name !== "string" || !((WORKER_TOOL_GRANTS as readonly string[]).includes(name)
+        || (name.length <= 64 && /^mcp__[A-Za-z0-9_]+__[A-Za-z0-9_]+$/.test(name)))) {
+        throw new Error("workers.toolAllowlist must name supported worker tools; Telegram, cron and worker are forbidden");
+      }
+      return name;
+    });
+    if (new Set(names.map((name) => name.toLocaleLowerCase("en-US"))).size !== names.length) {
+      throw new Error("workers.toolAllowlist must not contain duplicate or case-ambiguous names");
+    }
+    workers.toolAllowlist = Object.freeze(names);
+  }
   return Object.freeze(workers);
 }
 

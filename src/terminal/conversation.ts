@@ -46,7 +46,7 @@ export interface TerminalConversation {
   compact(context: Context): Promise<number>;
   /** Native Durable abort: withdraw queued inputs and stop foreground work. */
   abort(context: Context): Promise<void>;
-  /** Native Durable reset: a new context in this same conversation. */
+  /** New context in this conversation; a gateway host also rebuilds configured workspace context. */
   reset(context: Context): Promise<void>;
 }
 

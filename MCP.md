@@ -99,15 +99,16 @@ host process owned by the gateway; `toolSandbox: "bwrap"` applies only to the
 shell backend and does **not** wrap MCP servers. There is no additional MCP
 confinement layer, so treat a server command as host-level authority.
 
-MCP tools are enabled **only in authenticated mapped ordinary chat
-conversations** — the same set that may use `toolAllowlist`. That set does not
-require a nonempty `toolAllowlist`: MCP tools work with `toolAllowlist: []`,
-which simply leaves no coding tools available to scripts. Code Mode itself can
-also be enabled independently of MCP (`codemode.enabled`), but the same
-mapped-chat restriction applies to it. The root conversation, state-only channel
-conversations, forks, raw or task-owned conversations and isolated scheduled
-cron runs receive no MCP tool, no `codemode` and no `tool_search`. A scheduled
-run has no bounded MCP capture; that capability is deliberately not implemented.
+MCP tools are enabled in authenticated mapped ordinary chats and in ordinary workers
+with an exact per-tool capture from an authorized spawning chat. Neither requires a
+nonempty coding `toolAllowlist`. Workers may discover and compose captured MCP tools,
+but never receive Telegram, cron or recursive worker delegation. A worker-specific
+call-time hook checks its durable capture; reopening prunes it against current config,
+and completion/cancellation retires it. See [worker authority](WORKERS.md).
+Code Mode can also be enabled independently (`codemode.enabled`). Root, state,
+forked, raw and other task-owned conversations, digest runs and isolated cron targets
+remain denied. MCP connections and their configured cwd remain gateway-owned, not
+isolated inside a worker's shell sandbox or worktree.
 
 The ceiling is enforced twice: the tool filter enables the tools per
 conversation, and a call-time `ToolTask` hook rechecks the conversation and the

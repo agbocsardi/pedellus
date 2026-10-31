@@ -709,9 +709,10 @@ test('a worker cannot delegate and another conversation cannot inspect it', { ti
     const child = await store.gateway.harness.conversation(record.conversationId, context);
     const childTools = ((await child.agent(context)).tools ?? [])
       .map((tool) => (typeof tool === 'string' ? tool : tool.name));
-    // The child inherits configured coding tools only: no worker tool, no cron, no history, no channel.
+    // Research history is captured too, but scheduling, channel actions and delegation stay denied.
     assert.ok(childTools.includes('read'), `the captured ceiling still applies: ${childTools}`);
-    for (const forbidden of [WORKER_TOOL_NAME, 'cron', 'history', 'telegram']) {
+    assert.ok(childTools.includes('history'), `the child can retrieve mapped-chat evidence: ${childTools}`);
+    for (const forbidden of [WORKER_TOOL_NAME, 'cron', 'telegram']) {
       assert.equal(childTools.includes(forbidden), false, `a worker child must not have ${forbidden}`);
     }
 
@@ -1057,7 +1058,7 @@ test('a narrowed config on reopen cannot restore a live worker tool the ceiling 
     assert.equal(callable.includes('read'), false, `narrowed capture cannot compose read: ${callable}`);
     assert.ok(callable.includes('write'), `a still-configured captured tool stays composable: ${callable}`);
     assert.equal(callable.includes(WORKER_TOOL_NAME), false, `a child cannot compose a worker: ${callable}`);
-    assert.deepEqual(agent.deferred ?? [], [], 'no deferred MCP/web tool is discoverable in a child');
+    assert.deepEqual(agent.deferred ?? [], [], 'no unconfigured deferred MCP tool is discoverable in a child');
   } finally {
     if (reopened) await reopened.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
@@ -1109,7 +1110,8 @@ test('native Code Mode composes the worker tool from a mapped chat without widen
     const childTools = ((await child.agent(context)).tools ?? [])
       .map((tool) => (typeof tool === 'string' ? tool : tool.name));
     assert.ok(childTools.includes('read'), `the captured ceiling still applies: ${childTools}`);
-    for (const forbidden of [WORKER_TOOL_NAME, 'cron', 'history', 'telegram']) {
+    assert.ok(childTools.includes('history'), `the child retains captured research tools: ${childTools}`);
+    for (const forbidden of [WORKER_TOOL_NAME, 'cron', 'telegram']) {
       assert.equal(childTools.includes(forbidden), false, `Code Mode composition must not widen the child: ${forbidden}`);
     }
     // The child does hold the compositor itself (owner-corrected scope); the next test proves it

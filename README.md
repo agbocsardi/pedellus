@@ -144,16 +144,20 @@ no `codemode` block it is installed when MCP is configured, as before. Scripts
 compose every tool the current authenticated mapped-chat conversation is already
 authorized to call, through native `executeTool` validation and `ToolTask` hooks.
 Code Mode adds no authority, is not recursive, and grants nothing to root, state,
-fork, raw/task-owned or isolated cron conversations. See
+fork, raw/other task-owned or isolated cron conversations. Ordinary workers may compose
+their captured coding, web, MCP and history tools, but never Telegram, cron or workers.
+`workers.toolAllowlist` sets independent worker grants (including worker-only shell/file tools);
+omitted inherits configured chat capabilities, and `[]` grants none. Integrations still require
+their own opt-ins. See [worker grants](./WORKERS.md#separate-worker-grants) and
 [Code Mode contract](./CODEMODE.md).
 
 MCP is **off by default**. Configuring `mcp: { enabled: true, servers: {...} }` with
 at least one enabled stdio or Streamable HTTP server makes the shipped gateway
 connect them and install the native Durable QuickJS Code Mode/tool-search bundle.
 Discovered tools are deferred `mcp__<server>__<tool>` registrations reachable from
-Code Mode scripts and `tool_search`, and only in authenticated mapped chat
-conversations; root, state, forked and isolated cron/task conversations get no MCP
-tool and no Code Mode. `toolAllowlist` still names only the coding tools
+Code Mode scripts and `tool_search` in authenticated mapped chats and ordinary workers
+with exact per-tool captures. Root, state, forked, digest and isolated cron/other task
+conversations get no MCP tool and no Code Mode. `toolAllowlist` still names only the coding tools
 (`read`/`write`/`edit`/`bash`), independently of MCP.
 
 MCP is a separate explicit connection authority. A configured stdio server runs as
@@ -174,7 +178,8 @@ private, loopback, link-local, reserved and mapped addresses, pins the validated
 DNS answer, revalidates every redirect, sends no credentials or cookies, bounds
 time/bytes/text, parses HTML without executing scripts, and reports original/final
 URLs, MIME, retrieval time and explicit truncation. Neither tool grants filesystem
-or shell authority, and both are offered only in authenticated mapped chats. There
+or shell authority, and both are offered in authenticated mapped chats and ordinary
+workers with captured grants. There
 is no login, cookie jar, browser automation, crawling, PDF/Office extraction or
 retrieval cache. Product Brave search remains **live-unverified**; the implemented
 fetch has one bounded `example.com` smoke. See [WEB.md](./WEB.md).

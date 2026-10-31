@@ -153,6 +153,8 @@ export interface TerminalIO {
   readonly history?: TerminalHistoryHost;
   /** Optional host-owned local attachment submission; absent leaves /attach unavailable. */
   readonly attachments?: TerminalAttachmentHost;
+  /** Host-owned whole-gateway restart, never a model tool or a terminal-only reconnect. */
+  readonly restart?: () => Promise<void>;
 }
 
 type LocalSubmission = { id: number; submission: TerminalSubmission; runTaskId?: number; finalized?: boolean };
@@ -1094,14 +1096,16 @@ export async function runTerminalConversation(
   const runCommand = async (name: string, args: string): Promise<void> => {
     switch (name) {
       case "help":
+        if (args.trim()) { await notice("Usage: /help", true); return; }
         await notice([
-          "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /refresh /digest [status] /compact /abort /new /attach <path>[ -- <prompt>]",
+          "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /refresh /digest [status] /compact /abort /stop /new /attach <path>[ -- <prompt>]" + (io.restart ? " /restart" : ""),
           SEARCH_USAGE,
           EPISODES_USAGE,
           EPISODE_USAGE,
           ENTRY_USAGE,
           "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
-          "/abort uses native Durable semantics: it cancels foreground work and withdraws queued inputs.",
+          "/abort and /stop cancel foreground work and withdraw queued inputs; background work is unchanged.",
+          ...(io.restart ? ["/restart replaces the whole gateway process, re-reads its configuration and disconnects every attached channel."] : []),
           io.history ? "/search --next continues the last successful query; cursors stay in this process and are never printed. History sessions default to cli:default; use --session with a key reported by /search." : "History search and episode browsing are host-controlled and unavailable here. /entry <entryId> [--radius N] still opens a bounded window in this terminal's default conversation; --session requires a history host.",
           io.modelSelection ? "/model lists host model choices; named-preset configs select with /model <name> (or /model default), direct configs with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
           io.toolPolicy
@@ -1171,22 +1175,39 @@ export async function runTerminalConversation(
         await notice(`Native compaction task ${taskId} admitted. Summary placement follows Durable conversation boundaries.`);
         return;
       }
+      case "stop":
       case "abort":
-        if (args.trim()) { await notice("Usage: /abort", true); return; }
+        if (args.trim()) { await notice(`Usage: /${name}`, true); return; }
         await conversation.abort(operationContext);
         await notice("Native Durable conversation abort completed; queued inputs were withdrawn. This does not implement Python sustained-goal abort.");
         return;
       case "new":
         if (args.trim()) { await notice("Usage: /new", true); return; }
-        await conversation.reset(operationContext);
-        await notice("Native Durable context reset admitted for this same conversation: no handoff, summary or extra model call, earlier entries stay stored and listed by /history, and tool authority is unchanged. While busy it lands at the next safe boundary; queued inputs placed with it run in the new context.");
+        try {
+          await conversation.reset(operationContext);
+        } catch (error) {
+          if (error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy")) {
+            await notice("New context rejected: this conversation is busy. Use /abort or wait, then retry.", true);
+            return;
+          }
+          throw error;
+        }
+        await notice("Native Durable context reset admitted for this same conversation: no handoff, summary or extra model call, earlier entries stay stored and listed by /history, and tool authority is unchanged." +
+          (io.contextRefresh?.available ? " Workspace context and skills were rebuilt atomically; a busy conversation is refused." : " While busy it lands at the next safe boundary; queued inputs placed with it run in the new context."));
+        return;
+      case "restart":
+        if (args.trim()) { await notice("Usage: /restart", true); return; }
+        if (!io.restart) {
+          await notice("Gateway process restart is unavailable on this host.", true);
+          return;
+        }
+        await io.restart();
+        await notice("Gateway restart requested; all attached channels will disconnect.");
+        io.closeInput?.();
+        operationController.abort(new Error("gateway restart requested"));
         return;
       default:
-        if (name === "stop") {
-          await notice("/stop is unsupported: it is not aliased to native /abort, which withdraws queued inputs.", true);
-        } else if (name === "restart") {
-          await notice("/restart is unsupported: process restart belongs to the deployment owner.", true);
-        } else if (name === "steer" || name === "after") {
+        if (name === "steer" || name === "after") {
           await notice(`/${name} was removed from this CLI; the line was not sent to the model.`, true);
         } else if (["goal", "interrupt", "btw", "skill", "policy", "receipt", "tasks", "task", "dream", "dream-log", "dream-restore", "remember", "pairing"].includes(name)) {
           await notice(`/${name} is not implemented in this CLI; it was not sent to the model.`, true);
@@ -1203,7 +1224,9 @@ export async function runTerminalConversation(
     }
     activeCommands++;
     let task!: Promise<void>;
-    task = admissionTail.then(() => runCommand(name, args))
+    task = admissionTail.then(() => {
+      if (!signal?.aborted) return runCommand(name, args);
+    })
       .catch(async (error: unknown) => {
         if (!signal?.aborted) await notice(`/${completePrefix(name, 80)} failed (${errorName(error)}).`, true);
       })

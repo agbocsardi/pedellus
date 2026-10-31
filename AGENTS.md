@@ -65,8 +65,13 @@ npm start -- agent --config config.json     # attach a terminal
 ## Invariants worth not breaking
 
 - Shipped CLI/Telegram coding tools come directly from config `toolAllowlist`;
-  empty disables them. The same config is the only tool authority for SDK
-  gateway callers. Only validated mapped chats receive this authority, and
+  empty disables them. Config remains the only authority for SDK gateway callers.
+  `workers.toolAllowlist` is an independent ordinary-worker ceiling: omitted inherits
+  configured chat tools; `[]` grants no tools; explicit worker-only coding names never
+  widen foreground, cron or digest authority. `mcp` expands to connected tools at launch,
+  or exact MCP registration names can be selected. Integrations still require their
+  own opt-ins; Telegram, cron and recursive worker grants are forbidden.
+  Only validated mapped chats receive foreground authority, and
   every admitted Telegram user shares the configured workspace/tools. Raw, root,
   forked and state conversations remain denied. Isolated cron runs capture an
   origin subset bounded by current config and lose it on completion. The `skill`,
@@ -79,7 +84,7 @@ npm start -- agent --config config.json     # attach a terminal
   are temporary: a CLI reattach keeps the temporary selection, while a gateway
   restart or reopen restores the configured preset without rewriting prepared
   dispatches. Direct-model (non-preset) selection retains its persisted semantics.
-- The authenticated Telegram owner's controls are `/new`, `/abort`/`/stop`,
+- Shared CLI and authenticated Telegram owner controls are `/new`, `/abort`/`/stop`,
   `/status`, `/model`, `/digest` and `/digest status`, plus `/restart`,
   advertised only where the host implements them. `/model` selects one
   configured preset for that chat only; `/status` is bounded read-only metadata
@@ -88,7 +93,9 @@ npm start -- agent --config config.json     # attach a terminal
   refuses it while that chat runs instead of half-applying; `/restart` is the
   host's full-process replacement (same executable, argv and environment through
   POSIX `process.execve`, after normal teardown), never a model tool, daemon or
-  supervisor. `/refresh` is not a command.
+  supervisor. The CLI flushes its acknowledgement before restart tears down connections.
+  Prompt rebuild and the idle reset marker share one commit across all channel attachments.
+  `/refresh` is CLI-only; browsing, compaction and local attachments also remain CLI extras.
 - The cron timer never calls a model, and a run never schedules: rescheduling is
   a deterministic task commit, so a slow or failed turn cannot stop the schedule.
 - Skill prompts carry names, descriptions and locators only; bodies load on
@@ -157,7 +164,8 @@ npm start -- agent --config config.json     # attach a terminal
   allowlist, never from a task-owned target.
 - Native web tools are default-off and separate from `toolAllowlist`: `web.search`
   names the Brave credential environment variable, and `web.fetch` enables the
-  public reader. Both are limited to authenticated mapped chats. Public fetch
+  public reader. Both are limited to authenticated mapped chats and live ordinary workers
+  with exact per-tool captures. Public fetch
   refuses userinfo and private/loopback/link-local/reserved targets, pins the
   validated DNS answer, revalidates redirects, sends no credentials or cookies,
   bounds time/bytes/text, and never executes page scripts. Product Brave search
@@ -166,16 +174,19 @@ npm start -- agent --config config.json     # attach a terminal
   auto-enablement when that block is absent. Scripts compose only the current
   conversation's callable set through native `executeTool`/`ToolTask` hooks: no
   new authority, no recursion, no host-only owner commands, and no composition in
-  root, state, fork, raw/task-owned or isolated cron conversations. It may compose
+  root, state, fork, raw/other task-owned or isolated cron conversations. It may compose
   the `worker` tool from a spawning mapped chat under that tool's own spawner and
   capture checks. A worker child also gets the compositor, but only over its
-  captured tools (never `worker`, MCP, web, Telegram, cron or history), and its
-  composition authority is retired with the capture.
+  captured coding, web, MCP and read-only mapped-chat history tools (never `worker`,
+  Telegram or cron). A worker-specific call-time hook checks the durable capture and
+  authorized origin; reopen permanently prunes removed names, and terminal authority
+  is retired with the capture. Digest and isolated cron targets remain unchanged.
 - MCP is a separate, default-off connection authority from `toolAllowlist`:
   `mcp.enabled` plus at least one enabled server connects it, and only
-  authenticated mapped chats receive MCP tools; Code Mode follows its own switch
-  and the same mapped-chat rule. Root, state, fork, raw/task-owned and isolated
-  cron conversations get none. A configured stdio server is a native host
+  authenticated mapped chats and ordinary workers with captured grants receive MCP tools;
+  Code Mode follows its own switch and the same scope rule. Root, state, fork, raw/other
+  task-owned, digest and isolated cron conversations get none. A worker's worktree does
+  not confine MCP: the server keeps its gateway-owned host cwd and authority. A configured stdio server is a native host
   process, not covered by `toolSandbox: "bwrap"`. Secrets are referenced by
   environment variable name.
 - Media ingress is opt-in (`media` config) and owned by the gateway. Telegram

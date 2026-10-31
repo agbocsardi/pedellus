@@ -860,8 +860,13 @@ keeps the native exact-text semantics and its in-process serialization: it prote
 made through this assistant's tools in this process, but an outside editor changing the file between
 the read and the write is not detected — there is no lock framework, and the prompt tells the model to
 edit only text it just saw. There are no hashes, versions, managed workspace copies, rollback or
-transaction: a failed run keeps whatever it already wrote, says so honestly, and the unacknowledged
-batch is replayed idempotently. No shell, network, MCP, Code Mode, history, channel, worker, cron or
+transaction: a failed run keeps whatever it already wrote, says so honestly, and does not acknowledge
+its batch or advance the cursor. A later invocation can process the same evidence again. The curation
+prompt tells the model to read existing files and check whether a fact is already recorded before
+adding it; create-only writes and exact-text edits remain enforced, but semantic correctness and
+duplicate-free replay are not guaranteed. This partial-write/retry behavior is intentional; rollback
+and staged publication are [not planned](plan/2026-10-31_digest-rollback-design.md).
+No shell, network, MCP, Code Mode, history, channel, worker, cron or
 scheduling tool is installed in a digest target, and a run never writes to the origin chat, a channel
 outbox or a schedule. The same curation hook enforces the run's budgets at the native call: every
 assistant tool-call part counts, including a call that is refused or fails, so `maxToolCalls` is a

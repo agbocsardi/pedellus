@@ -175,8 +175,9 @@ fail-closed and is not remotely cancelled. See
 | `/digest status` | Bounded read-only view of the live digestion run, this conversation's newest run, and the retained internal issue reports (pending count and whether a new start is possible): task IDs, outcome, batch position, evidence count and a bounded recorded error. It performs no transcript scan, model call or cursor change. |
 | `/attach <path>[ -- <prompt>]` | Store one operator-named local file through the gateway under the CLI attachment subdirectory of the configured workspace media root and submit it as an ordinary path-only turn, optionally with prompt text after the first ` -- ` (paths may contain spaces). Requires top-level `media` config; see [local attachments](#local-attachments). |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
-| `/abort` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
-| `/new` | Admit native `Conversation.reset(undefined)`: the same conversation starts a new context with no handoff. No archive, summary, usage reset or extra model call is produced; earlier entries stay stored and remain visible to `/history`, and configured tools are unchanged. While busy it is placed at the next safe boundary and ends that run there instead of interrupting the current model turn; inputs queued before or after it in the same busy window run in the new context. A queued `/new` is a write, so `/abort` withdraws queued inputs but not the pending reset. |
+| `/abort`, `/stop` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
+| `/new` | Start a fresh context in the same conversation and rebuild configured workspace instructions, memory and skills, exactly as Telegram does. With workspace context configured, a busy conversation is refused; prompt replacement and the reset marker commit atomically. No handoff, archive, summary, usage reset or extra model call; original entries and tool authority remain. Without configured workspace context, native reset semantics apply, including safe-boundary placement while busy. |
+| `/restart` | Ask the owner host to replace the whole gateway process after graceful teardown, using the same executable, argv and environment. Advertised only when supported. Configuration and workspace context reload; every attached CLI and Telegram surface disconnects. The local acknowledgement is flushed before shutdown. |
 
 Memory digestion reports only issues. A failed or cancelled run is one internal
 event for this conversation's agent (the same pattern as a worker result), not a
@@ -191,14 +192,11 @@ issues and none can be safely pruned; `/digest status` reports that pending coun
 and the refusal. Undelivered issues are never evicted to make room, and reopening
 the gateway retries each admission once from the authoritative native task.
 
-The Telegram adapter exposes its own owner controls; they are not CLI commands.
-`/new` there also rebuilds the assembled workspace prompt from the current files,
-so a host with a prompt snapshot refuses it while that chat runs. `/abort` has a
-`/stop` alias, `/status` and `/model` are bounded per-chat views, and `/restart`
-is a host full-process replacement (the same Node executable, argv and current
-environment through POSIX `process.execve`, after normal graceful teardown), not
-a Harness close/reopen, daemon or supervisor. The CLI `/refresh` above is
-unrelated: there is no Telegram `/refresh` command. See
+Shared owner controls have the same effects in CLI and Telegram: `/new`, `/abort`/`/stop`,
+`/status`, `/model`, `/digest`, `/digest status`, `/help` and supported `/restart`.
+Presentation remains channel-specific; CLI retains browsing, compaction, attachment and `/refresh`
+controls. `/restart` is whole-process replacement, not a Harness reopen or terminal reconnect.
+There is no Telegram `/refresh`; `/new` rebuilds that chat's prompt. See
 [Telegram controls](./TELEGRAM.md#controls).
 
 Equivalent presets can both show as selected because the marker matches the actual
@@ -400,10 +398,9 @@ conversation usable without starting another conversation. Scheduled background
 runs have no session key and are not refreshed; they pick up the snapshot on
 their next run or Gateway reopen.
 
-`/stop` is deliberately not an alias for `/abort`: native abort withdraws queued
-inputs, while Python stop preserves queued work. `/restart`, `/goal`,
-`/interrupt`, `/btw`, task/policy/receipt/skill, memory/Dream and pairing
-commands are not implemented here. `/steer` and `/after` were removed; normal
+`/stop` aliases `/abort` in CLI and Telegram: both withdraw queued foreground inputs.
+`/restart` is available only through a supporting gateway host. `/goal`, `/interrupt`, `/btw`,
+task/policy/receipt/skill, memory/Dream and pairing commands are not implemented here. `/steer` and `/after` were removed; normal
 input is admitted by the native conversation in input order. Unsupported slash
 commands are reported locally and are never silently sent as model prompts.
 Prefix a prompt with `//` to send one literal leading slash (for example,

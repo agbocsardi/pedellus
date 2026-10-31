@@ -42,6 +42,9 @@ export interface LocalGatewayClient extends TerminalConversation {
   readonly attachments: boolean;
   /** True when this host exposes the manual memory-digestion entry and status. */
   readonly digest: boolean;
+  /** True only when the owner host supports whole-gateway process replacement. */
+  readonly restartSupported: boolean;
+  restart(context: Context): Promise<void>;
   listModels(context: Context): Promise<GatewayModelList>;
   selectModel(selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection>;
   selectModelPreset(name: string, context: Context): Promise<GatewayModelSelection>;
@@ -122,6 +125,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
   presets = false;
   attachments = false;
   digest = false;
+  restartSupported = false;
   private readonly socket: Socket;
   private nextId = 0;
   private readonly pending = new Map<number, PendingCall>();
@@ -161,6 +165,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
     this.presets = result.presets === true;
     this.attachments = result.attachments === true;
     this.digest = result.digest === true;
+    this.restartSupported = result.restart === true;
   }
 
   async watch(context: Context): Promise<TerminalWatch> {
@@ -248,7 +253,13 @@ class LocalGatewayConnection implements LocalGatewayClient {
   }
 
   async reset(context: Context): Promise<void> {
-    await this.call("reset", {}, context);
+    const result = await this.call<{ readonly status: string }>("reset", {}, context);
+    if (result.status === "busy") throw new RemoteConversationBusy("conversation is busy");
+  }
+
+  async restart(context: Context): Promise<void> {
+    if (!this.restartSupported) throw new Error("gateway restart is unavailable");
+    await this.call("restart", {}, context);
   }
 
   async listModels(context: Context): Promise<GatewayModelList> {

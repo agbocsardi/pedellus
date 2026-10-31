@@ -19,6 +19,10 @@
   "episodeSummary": {
     "enabled": true
   },
+  "workers": {
+    "enabled": false,
+    "toolAllowlist": ["read", "write", "edit", "bash", "skill", "history", "web_search", "web_fetch", "codemode", "tool_search", "mcp"]
+  },
   "digest": {
     "preset": "fast",
     "entriesPerBatch": 2000,

@@ -68,6 +68,7 @@ The shipped [`config.example.json`](./config.example.json) is the starting point
 | `workspaceContext.memoryManifest` | Lists the other `memory/**/*.md` topics recursively for on-demand `read`; their bodies stay out of the prompt. |
 | `workspaceContext.skills` | Its presence opts into workspace skill discovery; `disabledSkills` can hide names. |
 | `toolAllowlist` | Config authority: these coding tools are enabled for authenticated mapped chats. `[]` or absent disables them. |
+| `workers` | Default off. `toolAllowlist` grants ordinary subagents tools independently of the foreground coding list; omitted inherits configured chat tools, `[]` gives no tools. Supports native coding/research/skill names, `mcp` for connected MCP tools, or exact MCP registration names. It never grants Telegram, cron or further delegation. Integrations must still be enabled separately; see [worker configuration](WORKERS.md#separate-worker-grants). |
 | `cron` | Installs the model-facing `cron` tool; `timeZone: "UTC"` interprets calendar expressions without an explicit zone. |
 | `episodeSummary` | Closed episodes use the conversation's current model, or a named override such as `"preset": "fast"`. This costs provider calls; set `enabled: false` to turn it off. |
 | `digest` | Requires an explicit background `preset` or `model`; never inherits the chat model. Defaults per invocation: `entriesPerBatch` 2000, `charsPerBatch` 200,000 UTF-16 units (both minimum 2), `maxToolCalls` 24, `maxRequests` 12 successful responses (native failed retries allowed), `maxInputTokens` 500,000 reported input including cache (soft ceiling), `runTimeoutSeconds` 600, `maxChangedFiles` 8 and `maxDiffChars` 32,000 inserted plus removed units. One fitting completed-turn range is one batch; a larger range splits into ordered chunks, potentially within a turn. Evidence includes owner/assistant prose and paired untrusted tool calls/results; long results have 2,500-character head/tail previews with original references. See [bounds and fixed safety caps](HISTORY.md). Values are captured per run; this block enables no schedule. |
@@ -138,11 +139,12 @@ created or when the gateway reopens. Editing `AGENTS.md`, `MEMORY.md`, or a
 ```
 
 `/refresh` re-reads bootstrap files, selected memory, the manifest and skills
-together in the same conversation. The CLI's `/new` is different: it starts a
-fresh model context with no handoff and does **not** re-read files. (The
-Telegram owner's `/new` does both: it resets that chat and rebuilds its assembled
-workspace prompt, as described in
-[6. Telegram continuation](#6-telegram-continuation).) A gateway restart applies
+together in the same conversation. `/new` in both CLI and Telegram starts a fresh
+model context and rebuilds that chat's workspace prompt, memory and skills. With
+workspace context configured, a busy chat refuses the command without applying
+either half; use `/abort` (or `/stop`) or wait, then retry. Supported `/restart`
+replaces the whole gateway process and disconnects every channel; it is not a CLI
+reattach. A gateway restart applies
 config edits and re-reads the files, because startup reloads the config selection
 for every persisted session mapping.
 

@@ -15,12 +15,38 @@ Opt-in:
 | `enabled` | Installs the model-facing `worker` tool and registers the `nanobot.worker-run` task kind. Default off. |
 | `maxConcurrent` | Live workers per spawning conversation. Default 2, allowed 1–4. |
 | `preset` | Optional named `modelPresets` entry for worker model/thinking. Absent uses the spawning conversation's current selection at launch. |
+| `toolAllowlist` | Independent worker tool grants. Omitted inherits the configured chat capabilities; `[]` grants no tools. An explicit list replaces inheritance and can grant worker-only coding tools. |
 
 `worker` is a context capability like `skill`, `cron`, `history` and `telegram`: it takes no path,
 runs no shell and carries no filesystem authority, so it is outside the coding-tool ceiling. It is
 offered only in an authenticated, scope-checked mapped chat conversation. The root, a channel-state
 conversation, a fork, a raw conversation and any task-owned conversation (including a worker's own)
 never receive it, so a worker cannot start another worker.
+
+## Separate worker grants
+
+```json
+{
+  "toolAllowlist": ["read"],
+  "workers": {
+    "enabled": true,
+    "toolAllowlist": ["read", "write", "edit", "bash", "skill", "history", "web_search", "web_fetch", "codemode", "tool_search", "mcp"]
+  }
+}
+```
+
+This allows workers to write and run shell commands while the foreground remains read-only.
+Native names are exact: `read`, `write`, `edit`, `bash`, `skill`, `history`, `web_search`,
+`web_fetch`, `codemode` and `tool_search`. `mcp` expands to every currently connected MCP
+registration; an exact `mcp__<server>__<tool>` registration name grants just that tool.
+Expansion is captured as exact names at launch, not as a wildcard future grant.
+Unknown names, duplicates and the forbidden `telegram`, `cron` and `worker` names are rejected.
+
+A grant does not enable an integration: web, MCP and Code Mode still require their normal
+configuration; skills require the workspace snapshot host. Unavailable tools are not captured.
+A worker-only coding registration is never a foreground grant, including through stale state
+or Code Mode. Cron and digestion retain their separate existing policies. Disabling workers
+or removing a grant prunes live captures on reopen; re-enabling cannot add it back to an old task.
 
 ## The tool
 
@@ -45,10 +71,10 @@ and ceiling checks. A script's nested `start` is its own Durable tool task, so i
 identity and the capture hook sees it exactly as a direct call.
 
 A worker child also receives the native Code Mode/tool_search bundle, but composition grants nothing:
-a child script resolves only the tools captured (and still configured) for that child, and its direct
-model tools remain those captured coding tools plus the Code Mode/tool_search visibility the bundle
-needs. It never receives the `worker` tool, MCP, web, Telegram, cron or history, so a child cannot
-start another worker and `tool_search` finds nothing beyond its own captured set. Code Mode is not
+a child script resolves only the tools captured (and still configured) for that child: coding tools,
+configured public web, configured MCP tools, read-only mapped-chat history and Code Mode/tool_search.
+MCP registrations stay deferred until discovery; the other captured tools are declared normally.
+It never receives `worker`, Telegram or cron, so it cannot delegate, schedule or message the user. Code Mode is not
 recursive: `codemode`/`tool_search` are model-only tools, so a script cannot start another script.
 
 Composition authority follows the capture exactly. A terminal or cancelled child loses the capture,
@@ -136,8 +162,8 @@ never extends a job deadline (there is none) and it cannot revive a worker that 
 
 ## What a worker is
 
-The worker task's first phase creates a task-owned conversation, configures it with a captured subset
-of the spawning conversation's currently configured tools plus the model chosen at launch, submits
+The worker task's first phase creates a task-owned conversation, configures it with its configured
+worker grants (independent when explicit) plus the model chosen at launch, submits
 one bounded task prompt and waits for that turn's committed answer. Accepted steering is joined into
 that same task outcome as described above. The child inherits:
 
@@ -146,10 +172,15 @@ that same task outcome as described above. The child inherits:
 - the current workspace snapshot path (bootstrap/AGENTS, memory manifest, skill summary, on-demand
   `skill` tool) only when the host configured a snapshot provider and the spawner is mapped;
 - the configured vision handoff, so a flagged text-only worker model never receives raw images;
-- no `worker`, `cron`, `history` or channel tool, and no mapped-conversation history.
+- configured public web search/fetch, configured MCP, Code Mode/tool_search and read-only history
+  over the same validated mapped chats the parent can retrieve;
+- no `worker`, `cron` or Telegram tool. Digest and isolated cron targets do not inherit these grants.
 
-Research workers therefore use the tools actually configured for that conversation. This slice adds
-no web search or fetch reach; a research worker without such a configured tool has none.
+Research capabilities are stored by exact tool name in the existing durable capture. A worker-specific
+call-time hook checks the live child and its authorized origin; reopen intersects and persists the
+capture against current config. Disabled and later re-enabled tools cannot return to an old capture.
+MCP connections remain gateway-owned: a stdio server uses its configured host cwd, not the child's
+worktree or shell sandbox, and may have write authority. A worker worktree does not isolate MCP.
 
 The model is the spawning conversation's actual selection (provider/model and thinking level) at
 launch, or the configured `workers.preset`. On reopen the worker keeps that model. If the model left
@@ -194,9 +225,10 @@ cancellation or failure deletes nothing, and the spawning agent decides what to 
 ## Authority
 
 The child conversation starts default-deny. In the same commit that prepares it, the host records the
-spawning conversation as its capture origin and copies the configured tool names; the existing
-call-time hook still requires that origin to be a currently authorized mapped chat and every name to
-be inside the current config ceiling. A capture is a subset of configured authority, never a grant.
+spawning conversation as its capture origin and records the expanded worker grants. Call-time hooks
+require a currently authorized mapped origin and the worker-specific ceiling, not the foreground
+coding ceiling. Foreground calls still use only the foreground ceiling; cron and digest captures do
+not gain worker-only grants. The capture can narrow its configured authority, never enlarge it.
 
 The terminal commit records the outcome, retires the capture document and strips the target's tools.
 Before scheduling resumes after a reopen, every live worker target's capture is intersected with the

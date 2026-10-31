@@ -38,14 +38,13 @@ providers, a controlled resolver and mock transports only.
 
 ## Authority
 
-Both tools exist only in a conversation the host has validated as a mapped
-ordinary chat (the same rule as history retrieval: ownerless, unforked, not the
-root, not a channel-state key). The tool extension is selected only for those
-conversations, and its own `ToolTask` hook rechecks the conversation at call
-time. The root, forks, raw/task-created conversations, channel-state
-conversations and isolated cron run targets are denied even when persisted
-agent state still names a tool. Cron captures contain only coding-tool names,
-so a background run never inherits web authority.
+Both tools are available in validated mapped ordinary chats and in ordinary workers
+whose authorized origin captured those exact configured tool names. Their scope hook
+runs on every call; a worker additionally checks its durable capture. Reopen prunes
+removed tools permanently from that capture, and terminal workers lose all authority.
+Root, forks, raw/task-created conversations, channel state, digest runs and isolated
+cron targets remain denied even if persisted agent state names a tool. Cron captures
+contain only coding tools; they do not inherit worker research capabilities.
 
 On reopen with `web` removed, the extension is not installed and the policy
 pass rewrites each conversation's tool list, so a previously prepared or nested

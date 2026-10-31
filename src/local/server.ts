@@ -56,6 +56,11 @@ export interface LocalGatewayHostOptions {
   readonly presets: boolean;
   /** Configured CLI-scoped workspace media store; absent keeps local attachments unavailable. */
   readonly attachments?: { readonly store: MediaStore };
+  /** Host-owned process replacement; acknowledge the request before tearing down connections. */
+  readonly restart?: {
+    readonly supported: boolean;
+    request(acknowledge: () => Promise<void>): Promise<void>;
+  };
 }
 
 export interface LocalGatewayServer {
@@ -262,7 +267,7 @@ class LocalConnection {
     }
     try {
       const result = await this.dispatch(request);
-      if (!this.finished) this.send({ id: request.id, result });
+      if (!this.finished && request.method !== "restart") this.send({ id: request.id, result });
     } catch (error) {
       if (!this.finished) this.send({ id: request.id, error: errorBody(error) });
     }
@@ -316,8 +321,20 @@ class LocalConnection {
         await this.surface.abort(this.scope.context);
         return {};
       case "reset":
-        await this.surface.reset(this.scope.context);
+        return this.options.gateway.resetSession(this.sessionKey, this.scope.context);
+      case "restart": {
+        onlyKeys(requireObject(request.params ?? {}), []);
+        if (!this.options.restart?.supported) {
+          throw new LocalRequestError("unavailable", "gateway process restart is unavailable on this host");
+        }
+        await this.options.restart.request(() => new Promise<void>((resolveSent, rejectSent) => {
+          this.socket.write(`${JSON.stringify({ id: request.id, result: {} })}\n`, (error) => {
+            if (error) rejectSent(error);
+            else resolveSent();
+          });
+        }));
         return {};
+      }
       case "listModels":
         return this.options.gateway.listModels(this.sessionKey, this.scope.context);
       case "selectModel": {
@@ -427,6 +444,7 @@ class LocalConnection {
       presets: this.options.presets,
       attachments: this.options.attachments !== undefined,
       digest: true,
+      restart: this.options.restart?.supported === true,
     };
   }
 

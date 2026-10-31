@@ -8,8 +8,8 @@ one enabled server), preserving the previous auto-enablement. An explicit
 stay deferred and unreachable). With neither condition it installs no
 extensions and persists `tools: []`, exactly as before. The gateway already
 establishes Durable's native default-deny settings before resolving or resuming
-conversations, and it selects the bundle only for authenticated mapped chat
-conversations. See [MCP.md](./MCP.md) for the connection config, tool naming and
+conversations, and it selects the bundle for authenticated mapped chats and ordinary
+workers with a captured compositor grant. See [MCP.md](./MCP.md) for the connection config, tool naming and
 call-time authority. This is only genuinely **per-conversation opt-in** when the
 host establishes those default-deny settings before resolving or resuming
 conversations. Durable defaults to selecting every installed extension when
@@ -180,8 +180,9 @@ it without any MCP server; with no `codemode` block the previous rule applies
 `codemode`, `tool_search` and the deferred `mcp__*` registrations when MCP is
 connected, while `modelTools` offers only the first two until `tool_search`
 loads a match. A dedicated authority hook extension is selected with the bundle
-and blocks `codemode`/`tool_search` outside authenticated mapped chats; it does
-not depend on MCP being connected. The coding ceiling delegates those two fixed
+and blocks `codemode`/`tool_search` outside authenticated mapped chats and live captured
+workers; it does not depend on MCP being connected. The worker's additional hook checks
+its durable per-tool capture and authorized origin on every call. The coding ceiling delegates those two fixed
 names to that hook and delegates `mcp__*` to the MCP extension's own call-time
 hook, which rechecks the conversation and the server's live tool list.
 

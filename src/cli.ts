@@ -194,6 +194,12 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
   let server: Awaited<ReturnType<typeof serveLocalGateway>> | undefined;
   /** Set only by the authenticated owner `/restart` command; acted on after graceful teardown. */
   let restartRequested = false;
+  const requestRestart = async (acknowledge?: () => Promise<void>): Promise<void> => {
+    if (restartRequested) throw new Error("gateway restart is already in progress");
+    restartRequested = true;
+    try { await acknowledge?.(); }
+    finally { shutdown(); }
+  };
   try {
     const socketPath = await localSocketPath(config);
     gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
@@ -218,6 +224,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       tools: config.toolAllowlist ?? [],
       contextRefresh: config.workspaceContext !== undefined,
       presets: config.modelPreset !== undefined,
+      restart: { supported: restartSupported(), request: requestRestart },
       ...(attachments === undefined ? {} : { attachments }),
     });
     if (config.telegram) {
@@ -243,10 +250,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
         // shutdown, and the replacement happens here after the teardown below.
         restart: {
           supported: restartSupported(),
-          request: async () => {
-            restartRequested = true;
-            shutdown();
-          },
+          request: () => requestRestart(),
         },
       }, context);
     } else {
@@ -329,6 +333,7 @@ async function runAgent(
           ? { selectPreset: (name: string) => client!.selectModelPreset(name, context) }
           : {}),
       },
+      ...(client.restartSupported ? { restart: () => client!.restart(context) } : {}),
       toolPolicy: { tools: client.tools },
       contextRefresh: {
         available: client.contextRefresh,

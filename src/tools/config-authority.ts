@@ -8,7 +8,8 @@ import {
 } from "@earendil-works/pi-durable";
 
 /**
- * Captured coding-tool authority for one scheduled isolated run.
+ * Captured tool authority for one task-owned target. Cron/digest capture only their coding subset;
+ * ordinary workers can additionally capture separately configured research and coding grants.
  *
  * `toolAllowlist` directly authorizes authenticated mapped chat conversations, but a scheduled
  * run's target is a fresh task-owned conversation and has no session key. In the same commit that
@@ -58,13 +59,15 @@ export function boundedCapturedTools(
  * carry no filesystem or shell authority. `delegatedTools` names a separate authority whose own
  * call-time hook is selected in the same conversations (MCP server tools and the Code Mode/tool
  * search tools that reach them); they are exempt here but never unguarded: the delegating
- * predicate must be false unless that hook is installed.
+ * predicate must be false unless that hook is installed. `capturedCeiling` permits an independent
+ * coding ceiling for ordinary workers only; their additional hook checks every captured tool.
  */
 export function createConfigToolHook(
   ceiling: readonly string[],
   isAuthenticatedChat: (conversationId: ConversationId) => boolean,
   contextTools: readonly string[] = [],
   delegatedTools?: (name: string) => boolean,
+  capturedCeiling?: (conversationId: ConversationId) => readonly string[],
 ): HookRegistration {
   const allowed = new Set(ceiling);
   const ungated = new Set(contextTools);
@@ -72,10 +75,12 @@ export function createConfigToolHook(
     async beforeTool(call: ToolHookCall, api, context) {
       if (ungated.has(call.name)) return undefined;
       if (delegatedTools?.(call.name) === true) return undefined;
-      if (!allowed.has(call.name)) {
-        return { block: `Tool ${call.name} is outside the host tool ceiling` };
-      }
-      if (isAuthenticatedChat(api.conversationId)) return undefined;
+      const chat = isAuthenticatedChat(api.conversationId);
+      const enabled = chat || capturedCeiling === undefined
+        ? allowed.has(call.name)
+        : capturedCeiling(api.conversationId).includes(call.name);
+      if (!enabled) return { block: `Tool ${call.name} is outside the host tool ceiling` };
+      if (chat) return undefined;
       try {
         const capture = await api.snapshot(ConfigToolCaptureDoc, api.conversationId, context);
         if (capture === undefined) {

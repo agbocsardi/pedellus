@@ -125,7 +125,7 @@ process's standard output and error, plus systemd's own unit messages.
 - `Restart=on-failure` restarts after a crash or non-zero exit, with
   `RestartSec=5s` and `StartLimitIntervalSec=300`/`StartLimitBurst=5` limiting a
   crash loop. A clean stop is not restarted.
-- The authenticated owner `/restart` control uses POSIX `process.execve` to
+- The authenticated Telegram owner or attached CLI `/restart` control uses POSIX `process.execve` to
   replace the process image with the same executable, argv and environment. It
   keeps the same PID and service process, so systemd does not see a second
   gateway; the old process completes its normal teardown first.

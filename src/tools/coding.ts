@@ -19,6 +19,8 @@ export interface CodingToolExtensionOptions {
   readonly tools: readonly CodingToolName[];
   /** Host-owned ceiling the call-time hook enforces; normally the configured allowlist. */
   readonly ceiling: readonly string[];
+  /** Optional separate coding ceiling for captured task targets; mapped chats still use `ceiling`. */
+  readonly capturedCeiling?: (conversationId: ConversationId) => readonly string[];
   /**
    * Non-effectful context tools registered by another extension in the same conversations.
    * The hook exempts them; they are outside this ceiling and never widen it.
@@ -122,6 +124,6 @@ export function createCodingToolExtension(options: CodingToolExtensionOptions): 
     name: "nanobot-coding-tools",
     tools,
     wraps,
-    hooks: [createConfigToolHook(options.ceiling, options.authenticatedChat, contextTools, options.delegatedTools)],
+    hooks: [createConfigToolHook(options.ceiling, options.authenticatedChat, contextTools, options.delegatedTools, options.capturedCeiling)],
   });
 }

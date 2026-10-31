@@ -44,6 +44,12 @@ export const WORKER_LIMITS = Object.freeze({
   maxGitErrorChars: 400,
 });
 
+/** Worker-specific grants. `mcp` expands to connected tools; exact MCP registration names also work. */
+export const WORKER_TOOL_GRANTS = Object.freeze([
+  "read", "write", "edit", "bash", "skill", "history",
+  "web_search", "web_fetch", "codemode", "tool_search", "mcp",
+] as const);
+
 /** Workspace chosen by the spawning agent for one worker task. Never defaulted silently. */
 export const WORKER_WORKSPACE_MODES = ["shared", "worktree"] as const;
 
