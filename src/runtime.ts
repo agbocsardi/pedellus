@@ -275,8 +275,8 @@ export interface Gateway {
    * provider call exists here, and nothing is sent to a user or channel. A run's cursor advance is
    * durable and only happens after a settled, answered turn. The owner command (`/digest`, also
    * offered to the authenticated Telegram owner) and an explicit ordinary cron job with
-   * `intent: "digest"` are the only callers; a terminal run admits one bounded internal result
-   * event to the origin agent's own conversation.
+   * `intent: "digest"` are the only callers; a failed or cancelled terminal run admits one bounded
+   * internal issue report to the origin agent's own conversation, and a successful run is silent.
    */
   readonly memoryDigest: GatewayMemoryDigest;
   /**
@@ -2635,9 +2635,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // The records stay unnotified; the next open retries the same admission.
       }
     }
-    // The same admission guarantee for a terminal digest run: its internal result event may have
-    // been lost between the terminal commit and the submit. Only currently mapped chat origins are
-    // notified, and the request ID keeps a retry from duplicating the origin agent's turn.
+    // The same admission guarantee for a terminal failed or cancelled digest run: its internal issue
+    // report may have been lost between the terminal commit and the submit. Only currently mapped
+    // chat origins are notified, and the request ID keeps a retry from duplicating the origin
+    // agent's turn. A successful run is never admitted at all.
     try {
       await memoryDigest.recover(
         harness,

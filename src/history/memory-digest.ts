@@ -148,7 +148,7 @@ export const MEMORY_DIGEST_LIMITS = Object.freeze({
   maxErrorChars: 400,
   /** Bounded answer excerpt kept in the task outcome; the run transcript keeps the full text. */
   maxAnswerChars: 2_000,
-  /** Retained internal-result notice records per origin; an undelivered one is never evicted. */
+  /** Retained internal issue-report notice records per origin; an undelivered issue is never evicted. */
   noticeRecords: 100,
 });
 
@@ -942,7 +942,7 @@ export function renderMemoryDigestStart(result: MemoryDigestStartResult): string
       `Batch source: conversation ${result.conversationId}, through entry ${result.throughEntryId} ` +
         `(${result.complete ? "closed episode complete" : "episode continues in a later batch"}), ` +
         `${result.evidenceEntries} evidence entries.`,
-      "It runs in the background against the shared workspace; this chat is not held open and no answer is sent to a user or channel. The result is an internal notice to this conversation's agent.",
+      "It runs in the background against the shared workspace; this chat is not held open and no answer is sent to a user or channel. A failed or cancelled run reports one internal issue to this conversation's agent; a successful run is silent.",
     ].join("\n");
   }
   if (result.status === "busy") {
@@ -952,17 +952,17 @@ export function renderMemoryDigestStart(result: MemoryDigestStartResult): string
     const idle = result.idle;
     if (idle.caughtUp) {
       return "No closed episode is pending memory digestion: every mapped chat was examined to its tail. " +
-        "No new digest run was started; retained internal-result delivery may resume this conversation's agent.";
+        "No new digest run was started; retained issue delivery may resume this conversation's agent.";
     }
     return [
       "No bounded batch was ready, but the scan did not reach the tail of every mapped chat, so closed history may remain pending.",
       `Examined ${idle.examinedChats}, postponed ${idle.postponedChats}, unfinished ${idle.unfinishedChats}, missing ${idle.missingChats}.`,
-      "No new digest run was started; retained internal-result delivery may resume this conversation's agent. " +
+      "No new digest run was started; retained issue delivery may resume this conversation's agent. " +
         "Retry the digest to continue the bounded scan.",
     ].join("\n");
   }
   return `Memory digestion is refused: ${result.reason}. No new digest run was started; ` +
-    "retained internal-result delivery may resume this conversation's agent.";
+    "retained issue delivery may resume this conversation's agent.";
 }
 
 /** Fixed, value-free wording for the bounded status surface. */
@@ -1143,7 +1143,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
     if (result.error !== null) lines.push(`Recorded error: ${bounded(result.error, MEMORY_DIGEST_LIMITS.maxErrorChars)}`);
     if (result.answer !== null) lines.push("", "Report (untrusted):", result.answer);
     lines.push(
-      "This is an internal result for this conversation's agent, not a user or channel message. " +
+      "This is an internal issue report for this conversation's agent, not a user or channel message. " +
       "Nothing was sent outside this conversation; relay only what is useful.",
     );
     return lines.join("\n");

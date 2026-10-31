@@ -2563,8 +2563,8 @@ export async function runTelegram(
     }
     if (hostCommands.digest) {
       lines.push("/digest - start one bounded closed-episode memory-digestion run from the shared workspace; the run is " +
-        "background and its result is an internal notice to this chat's agent, never a direct user or channel message. " +
-        "/digest status is a bounded read-only view; both cost no model call by themselves.");
+        "background, and only a failure or cancellation reports an internal issue to this chat's agent, never a direct " +
+        "user or channel message. /digest status is a bounded read-only view; both cost no model call by themselves.");
     }
     lines.push("/help - this list.");
     lines.push(mediaIngress === undefined
@@ -2922,7 +2922,7 @@ const CONTROL_ACK: Record<TelegramMutation, string> = {
     "Restart requested for this gateway: it is stopping so the same process can reload its code and configuration. " +
     "This acknowledgement confirms the request only; it does not confirm that the restart completed.",
   digest:
-    "Memory digestion request applied for this chat; the bounded run and its internal result, if any, follow separately.",
+    "Memory digestion request applied for this chat; the bounded run follows separately and reports only a failure or cancellation to this chat's agent.",
 };
 
 const CONTROL_PENDING: Record<TelegramMutation, string> = {

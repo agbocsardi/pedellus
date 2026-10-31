@@ -293,7 +293,8 @@ export interface CronFoundationOptions {
   /**
    * Optional host entry for a `digest`-intent occurrence. The foundation passes the authenticated
    * origin conversation, never a task-owned target, and records no user/channel delivery for it;
-   * the digest run's own internal result event reports completion to that origin's agent.
+   * only a failed or cancelled digest run reports an internal issue to that origin's agent, and a
+   * successful run is silent.
    */
   readonly digest?: CronDigest;
   /** The Harness clock (`HarnessOptions.now`); default `Date.now`. */
@@ -1034,8 +1035,9 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       };
       // The run's authority ends with the run, in this same terminal commit. A separate target is
       // retired; the origin-mode target is the origin conversation itself and keeps its policy.
-      // A digest occurrence queues no user/channel delivery: its own internal result event reports
-      // to the origin agent, while the job record keeps this bounded status for `cron list`.
+      // A digest occurrence queues no user/channel delivery: only a failed or cancelled digest run's
+      // internal issue report reaches the origin agent, a successful run is silent, and the job
+      // record keeps this bounded status for `cron list`.
       await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, intentOf(job) === "digest" ? null : {
         status: settlement.status,
         error: settlement.error,

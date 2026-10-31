@@ -7,8 +7,10 @@ remain. `2026-10-30_lean-assistant_TODO.md` stays the work-order authority.
 
 ## Source identity
 
-- Base: main `ef0af84`, confirmed an ancestor of this branch. Main's only later
-  commit (`a391f1c`) is a TODO/docs acceptance note; this branch does not change
+### Historical — the O6 close before the owner followup
+
+- Base: main `ef0af84`, confirmed an ancestor of that branch. Main's only later
+  commit (`a391f1c`) is a TODO/docs acceptance note; that branch did not change
   the TODO.
 - Published functional tips, all ancestors of this branch:
   - O1 closed-episode input and durable cursor — `9b38b13`.
@@ -25,6 +27,19 @@ remain. `2026-10-30_lean-assistant_TODO.md` stays the work-order authority.
   (`a391f1c`) so publication can fast-forward; the TODO is byte-identical to
   main and was not edited here. Nothing is published to main; an independent
   fresh O6 review is still required.
+
+### Current — the quiet-digestion followup
+
+- The owner corrected the overnight assumption after the O6 close: a successful
+  digestion run, including a successful no-op, must not notify or resume the
+  origin agent; only a failed or cancelled run reports, and the outcome stays
+  visible in `/digest status`. That functional change is commit `9c47bb7` on
+  branch `t3/silent-successful-digests`, merged with main `8398608` (the
+  TODO-only owner-followup scope) and kept byte-identical to main's TODO.
+- The historical identity above — base `ef0af84` with product source unchanged —
+  describes only the pre-followup O6 tip. The current branch tip is not
+  `ef0af84`, so its source identity and gates are recorded under "Current
+  followup acceptance run" below.
 
 ## What now exists
 
@@ -75,7 +90,7 @@ npm start -- agent --config config.json       # attach a separate CLI chat
   (any mapped chat, not only the caller) and returns immediately with `started`,
   `busy`, `idle` or `refused`. `/digest status` is read-only. The batch is
   curated with the caller conversation's pinned model, so it can process another
-  mapped chat's episode. A start may re-admit an earlier retained result, which
+  mapped chat's episode. A start may re-admit an earlier retained issue, which
   is an ordinary origin-agent turn.
 - To try scheduled digestion, ask the agent to add an **explicit**
   `cron` job with `intent: "digest"`. Nothing in config parsing or gateway start
@@ -95,7 +110,7 @@ npm start -- agent --config config.json       # attach a separate CLI chat
   CLI `/attach` both work. Without it, both stay off and ordinary input is
   text-only. CLI audio is stored, not transcribed.
 
-## O6 acceptance actually run
+## O6 acceptance actually run (historical, before the owner followup)
 
 All checks are offline, use synthetic providers/fixtures and the existing pinned
 dependency tree. No live provider/API call, paid operation, network fetch,
@@ -108,7 +123,7 @@ reused read-only; no `npm ci`/prune/install and no lockfile change.
   history/memory, owner controls, cron, workers, media, MCP and web suites are
   all included. `package.json`/`package-lock.json` unchanged.
 - `npm run typecheck` and `npm run build` pass.
-- Registered behavior suite: **245 passed, 0 failed** under GNU
+- Registered behavior suite: **244 passed, 0 failed** under GNU
   `timeout --kill-after=5s 60s`.
 - Execution suite: **2 passed, 0 failed** under the same bound.
 - Offline core acceptance: **83 passed, 0 failed** (`status: pass`,
@@ -116,15 +131,13 @@ reused read-only; no `npm ci`/prune/install and no lockfile change.
 - Focused union selection (the same bound, the existing files only):
   `memory-digest-controls`, `memory-digest`, `history-digestion`,
   `local-attachments`, `transcription-backends`, `telegram-commands` —
-  **78 passed, 0 failed**. This is where the cross-feature stories live:
+  **77 passed, 0 failed**. This is where the cross-feature stories live:
   - authenticated CLI `/digest` start plus read-only status, and Telegram
     `/digest` admission/refusal for the authenticated owner;
   - closed episode → digest turn → plain Markdown write → cursor advance →
-    success stays silent (no internal event, no origin turn) → origin idle, with
-    authority retired; a later failure reports exactly once;
-  - issues-only notice cap/backpressure, a legacy pending success that is never
-    delivered and frees its slot, reopen dedupe from the authoritative native
-    task, and a reopen that keeps the pinned model/curation scope;
+    origin idle, with authority retired; at that time every terminal run
+    (success, no-op, failure or abort) reported once, which the owner followup
+    below changes;
   - explicit `cron` digest intent: one run, no task-owned conversation, empty
     channel outbox, next timer slot armed independently of the run, and
     narrowed-reopen refusal;
@@ -135,6 +148,30 @@ reused read-only; no `npm ci`/prune/install and no lockfile change.
     selected explicitly and refuses ambiguous/partial configuration.
 
 No new test file, fixture/harness or package was added.
+
+## Current followup acceptance run
+
+Re-run on the current branch tip after the quiet-digestion wording/comment pass
+and the main merge, with the same offline bounds and no new dependency, network,
+provider or runtime change:
+
+- `npm run typecheck` and `npm run build` pass.
+- Focused digest selection: `memory-digest` and `memory-digest-controls` —
+  **26 passed, 0 failed** under GNU `timeout --kill-after=5s 60s`.
+- Registered behavior suite: **245 passed, 0 failed** across 31 files under the
+  same bound.
+- Execution suite: **2 passed, 0 failed**; offline core acceptance:
+  **83 passed, 0 failed** (`status: pass`, `mode: offline-synthetic`,
+  `network: false`).
+- Focused union selection (the same six files, same bound): **78 passed,
+  0 failed**.
+- Current digest stories: closed episode → digest turn → plain Markdown write →
+  cursor advance → a successful run (including a no-op) stays silent with no
+  internal event and no origin turn → origin idle with authority retired, while
+  a later failure reports exactly once; issues-only notice cap/backpressure
+  retains undelivered or unknown issues, never delivers a legacy pending
+  success, and reclaims its slot on the next start; reopen recovery dedupes by
+  the authoritative native task and keeps the pinned model/curation scope.
 
 ## Union facts that must stay true together
 
