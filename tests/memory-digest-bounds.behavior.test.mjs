@@ -327,7 +327,9 @@ test('configured batch bounds reach the source and are captured in the accepted 
   // A new start uses the configured batch and records every accepted bound in the task input.
   const started = await startDigest(store.gateway);
   assert.equal(started.status, 'started');
-  assert.equal(started.evidenceEntries, 1, 'the first completed turn fits the configured bounds');
+  // The range holds the turns closed before the still-unanswered last owner message; the configured
+  // 2-entry/40-character bounds cut it at the character limit (one 30-character turn plus 10).
+  assert.equal(started.evidenceEntries, 2, 'the first range is split by the configured bounds');
   const task = await taskOf(store.gateway.harness, started.taskId);
   assert.deepEqual({ ...task.input.limits }, {
     entriesPerBatch: 2,

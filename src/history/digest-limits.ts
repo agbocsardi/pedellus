@@ -6,16 +6,17 @@
  * schedules, enables or activates digestion.
  */
 
-/** Bounds on the one closed-episode chunk a digest run may consume. */
+/** Bounds on the one completed-turn chunk a digest run may consume. */
 export interface DigestBatchLimits {
   /**
-   * Entries examined by one batch; a long entry or episode continues in the next batch.
+   * Entries examined by one batch; a longer range or entry continues in the next batch.
    *
-   * This is a flood guard, not the real size limit: an ordinary long episode is expected to fit
-   * one batch and is bounded by {@link charsPerBatch}. The entry cap only stops an episode made of
-   * thousands of tiny (or evidence-free) entries from being walked in one unbounded pass.
+   * This is a flood guard, not the real size limit: an ordinary long range of completed turns is
+   * expected to fit one batch and is bounded by {@link charsPerBatch}. The entry cap only stops a
+   * range made of thousands of tiny (or evidence-free) entries from being walked in one unbounded
+   * pass.
    *
-   * The minimum is 2: a one-entry chunk cannot always advance, because an episode that opens on a
+   * The minimum is 2: a one-entry chunk cannot always advance, because a range that opens on a
    * `pi.reset` marker (or any other entry carrying no message text) would hand back the same
    * zero-offset entry, refuse its own acknowledgement as a non-advancing chunk and re-offer it
    * forever. Two entries always let a chunk clear one non-evidence entry and progress.
@@ -24,7 +25,7 @@ export interface DigestBatchLimits {
   /**
    * Extracted evidence characters in one batch, counted in UTF-16 code units. A fragment is cut at
    * this bound, never dropped; the minimum is 2 so one surrogate pair always fits. This is the
-   * effective limit on one pass, so a closed episode that fits both defaults is digested whole.
+   * effective limit on one pass, so a completed-turn range that fits both defaults is digested whole.
    */
   readonly charsPerBatch: number;
 }

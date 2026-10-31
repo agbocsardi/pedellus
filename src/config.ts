@@ -134,13 +134,13 @@ export interface DigestConfig {
   /** Explicit named preset for a background digestion run; its thinking level applies as configured. */
   readonly preset?: string;
   /**
-   * Message and tool entries examined by one completed-exchange chunk. The minimum is 2: a one-entry chunk cannot
+   * Message and tool entries examined by one completed-turn chunk. The minimum is 2: a one-entry chunk cannot
    * always advance past an episode's opening reset marker, so it would refuse its own
    * acknowledgement and wedge the cursor.
    */
   readonly entriesPerBatch?: number;
   /**
-   * Extracted evidence characters in one completed-exchange chunk, in UTF-16 code units.
+   * Extracted evidence characters in one completed-turn chunk, in UTF-16 code units.
    * The minimum is 2 so one surrogate pair always fits.
    */
   readonly charsPerBatch?: number;

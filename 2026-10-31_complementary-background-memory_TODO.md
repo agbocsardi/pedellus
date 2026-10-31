@@ -14,6 +14,11 @@ is the only executor; the runtime injects that one source.
   the next owner/scheduled input, or a terminal assistant entry whose calls are all paired. An
   in-progress turn is never offered; a read offers only evidence already committed when it began, and
   an accepted batch's bounds never move.
+- **One range per read.** The reader scans once and takes the furthest completed turn inside its
+  4,000-entry discovery bound, so a batch covers every completed turn that fits its entry and
+  character bounds (three short turns are one batch, not three). An oversized range splits into
+  ordered chunks with immutable bounds; a reset, the tail or the scan bound ends the range at its
+  last completed turn, and an unfinished trailing turn is never cut into a batch.
 - **Evidence.** Owner/assistant prose is lossless and streamed in ordered fragments (UTF-16 offsets,
   surrogate-safe). Assistant tool calls and paired results are included and labeled `untrusted-tool`.
   A long result is one head-tail preview (≤ 2,500 chars) with an omission marker and the original entry
@@ -24,8 +29,9 @@ is the only executor; the runtime injects that one source.
   Acknowledgement re-proves a fresh segment's end and re-derives the claimed evidence before one
   compare-and-commit. A document written by the earlier closed-episode reader is mapped at its exact
   acknowledged entry/offset and upgraded in place; no second reader, cursor or migration project.
-- **One batch per invocation.** A no-evidence batch is acknowledged without a provider call. There is
-  no drain loop, retry loop or re-digest of expanding history.
+- **One batch per invocation.** A batch can cover several completed turns; a no-evidence batch is
+  acknowledged without a provider call. There is no drain loop, retry loop or re-digest of expanding
+  history.
 - **Explicit background model.** `digest.preset` or `digest.model` (existing catalog and preset
   validation) is pinned at start; the foreground model and thinking level are never inherited, and
   absent both a start is refused. The target gets only curated `read`/`write`/`edit`, create-only
@@ -77,11 +83,14 @@ npm run test:execution
 npm run --silent test:core-acceptance
 ```
 
-`tests/history-digestion.behavior.test.mjs` covers completed-turn eligibility, open tool rounds,
-untrusted labels and previews, excluded entries, Unicode-safe lossless fragmentation, durable pairing
+`tests/history-digestion.behavior.test.mjs` covers completed-turn eligibility, multi-turn batching
+and open-tail exclusion, an over-budget multi-turn range's ordered chunks, the tool-round cutoff,
+open tool rounds, untrusted labels and previews, excluded entries, Unicode-safe lossless
+fragmentation, durable pairing
 across chunks and reopens, replay/forged/stale/tail-less acknowledgement rejection, interleaved chat
 IDs with fresh-start gap proof, the legacy cursor mapping (entry, character, empty-block, surrogate
-and pairing cases), the two-entry minimum, the verification bound and the no-evidence batch. The
+and pairing cases), the two-entry minimum, the bounded long scan, the verification bound and the
+no-evidence batch. The
 `memory-digest*` suites cover the executor, captured bounds, request/tool/write budgets, status,
 notices, cancellation and cron intent.
 
@@ -103,3 +112,16 @@ Independent review found acknowledgement could succeed over budget and failed-to
 cause additional model requests. Coordinator fixed final-usage validation and abort-after-tools,
 separated successful responses from total recorded attempts per owner clarification, corrected the
 cron model-availability gate, and added catalog context/output-reserve preflight. No activation.
+
+### 2026-10-31 — batching fix
+
+Review found the reader stopped the scan at the first completed boundary, so consecutive short turns
+became one provider run each and global throughput was a few turns per day. The scan now walks once,
+tracks the last safe completed boundary, and admits one bounded range covering every new completed
+turn it reaches; `readChunk` still applies the entry/character/step bounds and splits only a range
+that does not fit. The tail, a reset after an owner turn and the 4,000-entry scan bound end the
+range at that boundary, so an unfinished trailing turn stays queued; a resumed scan is still bounded
+and never skips or replays. Canonical tests now cover three fitting turns in one batch, an excluded
+open tail, a later-appended turn processed once, over-budget multi-turn chunks, the tool-round cutoff
+and a >4,000-entry scan. Minor message fixes: the cron tool's digest refusal names the configured
+background model, and a missing-usage refusal no longer claims the token budget was reached.

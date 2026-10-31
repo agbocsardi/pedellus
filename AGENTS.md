@@ -105,14 +105,17 @@ npm start -- agent --config config.json     # attach a terminal
   `skills/<name>/SKILL.md`. Eligibility is a completed-turn high-water over open
   and reset chats: a reset that follows an owner turn, the next owner/scheduled
   input, or a terminal assistant entry whose calls are all paired closes a
-  segment, and an in-progress turn is never offered. The evidence is owner and
+  segment, and an in-progress turn is never offered. One read scans once and
+  takes the furthest completed turn within its scan bound, so every completed
+  turn that fits the batch bounds is one batch and one acknowledgement; only a
+  range over those bounds splits into independent ordered chunks, each
+  acknowledged on its own, with no carry-over summary. An open trailing turn is
+  never cut into a range. The evidence is owner and
   assistant message text plus paired assistant tool calls and results labeled as
   untrusted machine output; a long result is a bounded head-tail preview with an
   omission marker and the original entry reference, never a claim that the
-  omitted middle was read. One completed segment whose evidence fits the batch
-  bounds is one batch and one acknowledgement; a larger segment is independent
-  ordered chunks, each acknowledged on its own, with no carry-over summary. The
-  one durable cursor carries the next step position and the open tool-call ids, so
+  omitted middle was read. The one durable cursor carries the next step position
+  and the open tool-call ids, so
   pairing survives a chunk, a reopen and a restart; a cursor written by the earlier
   closed-episode reader is mapped at its exact acknowledged offset and upgraded in
   place, never replayed and never migrated into a second reader. Digest `write` is a guarded atomic exclusive create

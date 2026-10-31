@@ -281,7 +281,7 @@ export interface HistoryEntryPage {
 export interface Gateway {
   readonly harness: HarnessType;
   /**
-   * Bounded conversation-to-memory digestion. `start` reads one bounded completed-exchange batch from the
+   * Bounded conversation-to-memory digestion. `start` reads one bounded completed-turn batch from the
    * mapped chat sessions and creates one native Durable task, or reports `idle`, `busy` or `refused`
    * without starting anything. It is inert until a host calls it: no command, tool, schedule or
    * provider call exists here, and nothing is sent to a user or channel. A run's cursor advance is

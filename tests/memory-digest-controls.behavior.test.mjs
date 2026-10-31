@@ -324,7 +324,7 @@ test('the local CLI /digest starts one batch and reports bounded status', { time
     },
   }), WAIT_MS, 'the CLI /digest commands');
   const text = chunks.join('');
-  assert.match(text, /started for one bounded completed-exchange batch/);
+  assert.match(text, /started for one bounded completed-turn batch/);
   assert.match(text, /shared workspace/);
   assert.match(text, /Newest run: \d+ \((digested|running)\)/);
   assert.match(text, /Status is read-only/);
@@ -353,12 +353,12 @@ test('an idle scan that did not reach every chat never claims that everything is
   });
   assert.match(pending, /did not reach the tail of every mapped chat/);
   assert.match(pending, /completed history may remain pending/);
-  assert.doesNotMatch(pending, /No completed exchange is pending/);
+  assert.doesNotMatch(pending, /No completed turn is pending/);
   const complete = renderMemoryDigestStart({
     status: 'idle',
     idle: { caughtUp: true, examinedChats: 3, postponedChats: 0, unfinishedChats: 0, missingChats: 0 },
   });
-  assert.match(complete, /No completed exchange is pending/);
+  assert.match(complete, /No completed turn is pending/);
   assert.match(complete, /No new digest run was started/);
   assert.doesNotMatch(complete, /no model was called/);
 });

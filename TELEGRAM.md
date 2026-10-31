@@ -92,16 +92,16 @@ never names another chat's ID, and the agent remains the manager of that work.
 There is no chat or session selector.
 
 `/digest` is the manual memory-digestion entry. With no argument it asks the
-host for one bounded closed-episode batch from the shared, already-mapped chat
-history (the batch may come from a different mapped chat, because workspace
-memory is shared) and acknowledges only the bounded admission: started, busy,
-idle or refused. It returns immediately, starts no schedule, holds no chat turn
-while the digest runs. The command starts no new digest model turn itself, but it
+host for one bounded batch of already-completed turns from the shared,
+already-mapped chat history (the batch may come from a different mapped chat,
+because workspace memory is shared) and acknowledges only the bounded admission:
+started, busy, idle or refused. It returns immediately, starts no schedule, holds
+no chat turn while the digest runs. The command starts no new digest model turn itself, but it
 may re-admit a retained earlier internal issue report, which is an ordinary
 origin-agent turn. A digest batch
-is one closed episode chunk, not a loop until history is exhausted; an `idle`
-answer that did not reach every mapped chat's tail says closed history may
-remain. `/digest status` is a bounded read-only view of the live run and this
+is one bounded completed-turn range, not a loop until history is exhausted; an
+`idle` answer that did not reach every mapped chat's tail says closed history
+may remain. `/digest status` is a bounded read-only view of the live run and this
 chat's newest run; it performs no transcript scan, model call or cursor change.
 Only an issue reaches this chat's agent: a failed or cancelled digest run delivers
 one internal event, never a direct user or channel message, and the agent decides

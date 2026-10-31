@@ -189,7 +189,7 @@ function hasLoneSurrogate(text) {
   return false;
 }
 
-test("digest advances only through completed turns in an open chat", { timeout: 15_000 }, async () => {
+test("three fitting completed turns are one batch and an open tail waits for its answer", { timeout: 15_000 }, async () => {
   const dir = await temp("nanobot-digest-open-");
   const db = resolve(dir, "probe.sqlite");
   let harness;
@@ -200,23 +200,31 @@ test("digest advances only through completed turns in an open chat", { timeout: 
     const [a1] = await append(harness, conversation, assistant("FIRST-ANSWER-1182"));
     const [q2] = await append(harness, conversation, user("SECOND-QUESTION-7734"));
     const [a2] = await append(harness, conversation, assistant("SECOND-ANSWER-2298"));
+    const [q3] = await append(harness, conversation, user("THIRD-QUESTION-4410"));
+    const [a3] = await append(harness, conversation, assistant("THIRD-ANSWER-8865"));
     const [open] = await append(harness, conversation, user("STILL-OPEN-6610"));
 
     const source = sourceFor(harness, conversation);
     const first = batched(await source.read(context));
+    // The range covers every completed turn the scan reached, not just the first boundary.
     assert.equal(first.episodeStartEntryId, q1.id);
-    assert.equal(first.episodeEndEntryId, a1.id);
+    assert.equal(first.episodeEndEntryId, a3.id);
     assert.equal(first.complete, true);
     assert.deepEqual(first.entries.map((entry) => [entry.entryId, entry.trustLabel, entry.text]), [
       [q1.id, "owner message", "FIRST-QUESTION-5501"],
       [a1.id, "assistant reply", "FIRST-ANSWER-1182"],
+      [q2.id, "owner message", "SECOND-QUESTION-7734"],
+      [a2.id, "assistant reply", "SECOND-ANSWER-2298"],
+      [q3.id, "owner message", "THIRD-QUESTION-4410"],
+      [a3.id, "assistant reply", "THIRD-ANSWER-8865"],
     ]);
+    assert.ok(!first.entries.some((entry) => entry.entryId === open.id), "the open tail is not evidence");
 
     // Reading again before acknowledgement is stable and moves nothing.
     assert.deepEqual(await source.read(context), first);
     await source.acknowledge(first, context);
     assert.deepEqual(await source.cursor(conversation.id, context), {
-      nextEntryId: q2.id,
+      nextEntryId: open.id,
       nextItemIndex: 0,
       nextTextStart: 0,
       episodeStartEntryId: null,
@@ -224,24 +232,116 @@ test("digest advances only through completed turns in an open chat", { timeout: 
       pendingToolCalls: [],
     });
 
-    const second = batched(await source.read(context));
-    assert.equal(second.episodeStartEntryId, q2.id);
-    assert.equal(second.episodeEndEntryId, a2.id);
-    assert.deepEqual(second.entries.map((entry) => entry.text), ["SECOND-QUESTION-7734", "SECOND-ANSWER-2298"]);
-    await source.acknowledge(second, context);
-
     // The last owner message has no answer yet: it is not evidence and the high-water stays put.
     const waiting = idle(await source.read(context));
     assert.equal(waiting.caughtUp, true);
     assert.equal((await source.cursor(conversation.id, context)).nextEntryId, open.id);
     assert.deepEqual(await source.read(context), waiting);
 
+    // A turn appended after that read is a later range: processed once, and nothing already
+    // acknowledged is replayed.
     const [answer] = await append(harness, conversation, assistant("OPEN-ANSWER-8843"));
-    const third = batched(await source.read(context));
-    assert.equal(third.episodeStartEntryId, open.id);
-    assert.equal(third.episodeEndEntryId, answer.id);
-    assert.deepEqual(third.entries.map((entry) => entry.text), ["STILL-OPEN-6610", "OPEN-ANSWER-8843"]);
-    await source.acknowledge(third, context);
+    const second = batched(await source.read(context));
+    assert.equal(second.episodeStartEntryId, open.id);
+    assert.equal(second.episodeEndEntryId, answer.id);
+    assert.deepEqual(second.entries.map((entry) => entry.text), ["STILL-OPEN-6610", "OPEN-ANSWER-8843"]);
+    assert.ok(!second.entries.some((entry) => entry.entryId <= a3.id), "earlier turns are never replayed");
+    await source.acknowledge(second, context);
+    assert.equal(idle(await source.read(context)).caughtUp, true);
+  } finally {
+    if (harness !== undefined) await harness.close(context);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an over-budget multi-turn range is delivered as ordered chunks, one per read", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-digest-multiturn-chunks-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const texts = [
+      "CHUNK-Q1-00000000001",
+      "CHUNK-A1-00000000002",
+      "CHUNK-Q2-00000000003",
+      "CHUNK-A2-00000000004",
+      "CHUNK-Q3-00000000005",
+      "CHUNK-A3-00000000006",
+    ];
+    const entries = [];
+    for (let index = 0; index < texts.length; index += 1) {
+      const [entry] = index % 2 === 0
+        ? await append(harness, conversation, user(texts[index]))
+        : await append(harness, conversation, assistant(texts[index]));
+      entries.push(entry);
+    }
+
+    // Six turns of 20 characters each against 30 characters per chunk: the range cannot fit one
+    // chunk, but its accepted bounds never move, and each read serves exactly one ordered chunk.
+    const source = sourceFor(harness, conversation, { entriesPerBatch: 6, charsPerBatch: 30 });
+    const batches = [];
+    for (let index = 0; index < 10; index += 1) {
+      const result = await source.read(context);
+      if (result.status === "idle") break;
+      batches.push(batched(result));
+      await source.acknowledge(batches.at(-1), context);
+    }
+    assert.equal(batches.length, 4, "one ordered chunk per read for the over-budget range");
+    assert.deepEqual(batches.map((batch) => batch.complete), [false, false, false, true]);
+    for (const batch of batches) {
+      assert.equal(batch.episodeStartEntryId, entries[0].id, "the range start is immutable across chunks");
+      assert.equal(batch.episodeEndEntryId, entries[5].id, "the range end is immutable across chunks");
+    }
+    for (let index = 0; index < texts.length; index += 1) {
+      assert.equal(itemText(batches, entries[index].id, 0), texts[index], `turn ${index + 1} is delivered whole once`);
+    }
+    const fragments = batches.flatMap((batch) => batch.entries);
+    assert.equal(new Set(fragments.map((entry) => `${entry.entryId}:${entry.itemIndex}`)).size, texts.length);
+    assert.equal(idle(await source.read(context)).caughtUp, true);
+  } finally {
+    if (harness !== undefined) await harness.close(context);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an open tool round after completed turns is not cut into the range", { timeout: 15_000 }, async () => {
+  const dir = await temp("nanobot-digest-tool-cutoff-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [firstQuestion] = await append(harness, conversation, user("DONE-QUESTION-1180"));
+    const [firstAnswer] = await append(harness, conversation, assistant("DONE-ANSWER-2244"));
+    const [secondQuestion] = await append(harness, conversation, user("ROUND-QUESTION-3355"));
+    const [call] = await append(harness, conversation, toolCallAssistant("ROUND-READING-4466", "call-cutoff", "read", {
+      path: "b.txt",
+    }));
+
+    const source = sourceFor(harness, conversation);
+    const first = batched(await source.read(context));
+    assert.equal(first.episodeStartEntryId, firstQuestion.id);
+    assert.equal(first.episodeEndEntryId, firstAnswer.id, "the range ends at the last completed answer");
+    assert.deepEqual(first.entries.map((entry) => entry.text), ["DONE-QUESTION-1180", "DONE-ANSWER-2244"]);
+    assert.ok(!first.entries.some((entry) => entry.entryId === call.id), "no partial tool round is offered");
+    await source.acknowledge(first, context);
+    assert.equal(idle(await source.read(context)).caughtUp, true, "the open round stays queued");
+
+    const [result] = await append(harness, conversation, toolResult("ROUND-CONTENTS-5577", "call-cutoff"));
+    const [answer] = await append(harness, conversation, assistant("ROUND-ANSWER-6688"));
+    const second = batched(await source.read(context));
+    assert.equal(second.episodeStartEntryId, secondQuestion.id);
+    assert.equal(second.episodeEndEntryId, answer.id);
+    assert.deepEqual(second.entries.map((entry) => [entry.entryId, entry.itemKind, entry.text]), [
+      [secondQuestion.id, "message", "ROUND-QUESTION-3355"],
+      [call.id, "message", "ROUND-READING-4466"],
+      [call.id, "tool-call", JSON.stringify({ path: "b.txt" })],
+      [result.id, "tool-result", "ROUND-CONTENTS-5577"],
+      [answer.id, "message", "ROUND-ANSWER-6688"],
+    ]);
+    await source.acknowledge(second, context);
+    assert.equal(idle(await source.read(context)).caughtUp, true);
   } finally {
     if (harness !== undefined) await harness.close(context);
     await rm(dir, { recursive: true, force: true });
@@ -1322,6 +1422,82 @@ test("a bounded scan reports postponed and unfinished chats instead of claiming 
   }
 });
 
+test("a bounded long scan ends at the last completed turn and never skips or replays", { timeout: 30_000 }, async () => {
+  const dir = await temp("nanobot-digest-long-scan-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const turnCount = 1_999;
+    let firstEntryId = 0;
+    let lastCompletedEntryId = 0;
+    await harness.commit(async (tx) => {
+      for (let index = 0; index < turnCount; index += 1) {
+        const question = await tx.appendEntry(conversation.id, user(`S${index}-Q-0000000000`));
+        const answer = await tx.appendEntry(conversation.id, assistant(`S${index}-A-0000000000`));
+        firstEntryId ||= question.id;
+        lastCompletedEntryId = answer.id;
+      }
+    }, context);
+    // An in-progress turn straddles the scan bound: its owner input and open tool call are examined
+    // but fall after the last completed turn, so they must not enter the accepted range.
+    const [openQuestion] = await append(harness, conversation, user("OPEN-TAIL-QUESTION-7712"));
+    const [openCall] = await append(harness, conversation, toolCallAssistant(
+      "OPEN-TAIL-READING-8823",
+      "call-long-scan",
+      "read",
+      { path: "c.txt" },
+    ));
+
+    const source = sourceFor(harness, conversation, { entriesPerBatch: 4_000, charsPerBatch: 100_000 });
+    const first = batched(await source.read(context));
+    assert.equal(first.episodeStartEntryId, firstEntryId);
+    assert.equal(first.episodeEndEntryId, lastCompletedEntryId, "the range ends before the open live turn");
+    assert.ok(!first.entries.some((entry) => entry.entryId >= openQuestion.id));
+
+    // The 3,998-entry range still exceeds the native step cap, so it continues in the same immutable
+    // bounds: one chunk per read, and no entry is ever offered twice.
+    const batches = [first];
+    await source.acknowledge(first, context);
+    while (!batches.at(-1).complete) {
+      const next = batched(await source.read(context));
+      assert.equal(next.episodeStartEntryId, firstEntryId);
+      assert.equal(next.episodeEndEntryId, lastCompletedEntryId);
+      batches.push(next);
+      await source.acknowledge(next, context);
+    }
+    const consumed = batches.flatMap((batch) => batch.entries);
+    assert.equal(consumed.length, turnCount * 2, "every completed turn is evidence exactly once");
+    assert.equal(
+      new Set(consumed.map((entry) => `${entry.entryId}:${entry.itemIndex}`)).size,
+      consumed.length,
+      "the bounded scan neither skips nor replays an entry",
+    );
+    assert.equal((await source.cursor(conversation.id, context)).nextEntryId, openQuestion.id);
+
+    // The unfinishable-by-the-bound turn is still queued, and completing it is a later range.
+    assert.equal(idle(await source.read(context)).caughtUp, true);
+    const [result] = await append(harness, conversation, toolResult("OPEN-TAIL-CONTENTS-9934", "call-long-scan"));
+    const [answer] = await append(harness, conversation, assistant("OPEN-TAIL-ANSWER-1045"));
+    const tail = batched(await source.read(context));
+    assert.equal(tail.episodeStartEntryId, openQuestion.id);
+    assert.equal(tail.episodeEndEntryId, answer.id);
+    assert.deepEqual(tail.entries.map((entry) => [entry.entryId, entry.itemKind]), [
+      [openQuestion.id, "message"],
+      [openCall.id, "message"],
+      [openCall.id, "tool-call"],
+      [result.id, "tool-result"],
+      [answer.id, "message"],
+    ]);
+    await source.acknowledge(tail, context);
+    assert.equal(idle(await source.read(context)).caughtUp, true);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("reset-only segments and handoff text are consumed without evidence", { timeout: 15_000 }, async () => {
   const dir = await temp("nanobot-digest-handoff-");
   const db = resolve(dir, "probe.sqlite");
@@ -1388,10 +1564,17 @@ test("a chunk cut mid-item ends before following entries and resumes without sta
     const last = batches.at(-1);
     assert.equal(last.complete, true);
     assert.equal(last.throughEntryId, afterAssistant.id);
-    assert.deepEqual(last.entries.map((entry) => [entry.entryId, entry.text]), [
-      [afterUser.id, "AFTER-CUT-1"],
-      [afterAssistant.id, "FINAL-2"],
-    ]);
+    assert.deepEqual(
+      last.entries.filter((entry) => entry.entryId !== longEntry.id).map((entry) => [entry.entryId, entry.text]),
+      [
+        [afterUser.id, "AFTER-CUT-1"],
+        [afterAssistant.id, "FINAL-2"],
+      ],
+    );
+    const tailFragment = last.entries.find((entry) => entry.entryId === longEntry.id);
+    if (tailFragment !== undefined) {
+      assert.equal(tailFragment.textStart + tailFragment.text.length, tailFragment.chars, "its tail is whole");
+    }
     // A partially consumed item always ends its chunk, and the following unpaired result is consumed
     // without evidence: a chunk cut inside the reply never runs past it into the result body.
     for (const batch of batches) {

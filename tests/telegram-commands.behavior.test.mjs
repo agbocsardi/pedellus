@@ -343,7 +343,7 @@ test('/digest status, idle and malformed forms are bounded owner notices with no
     assert.equal(transport.sent.length, 3, 'an unauthenticated chat gets no digest control');
     assert.match(transport.sent[0].text, /No memory digestion run is recorded for this conversation/);
     assert.match(transport.sent[0].text, /read-only: no scan, no model call/);
-    assert.match(transport.sent[1].text, /No completed exchange is pending memory digestion/);
+    assert.match(transport.sent[1].text, /No completed turn is pending memory digestion/);
     assert.match(transport.sent[1].text, /No new digest run was started/);
     assert.match(transport.sent[2].text, /Usage: \/digest/);
     assert.equal(store.captured.length, 0, 'no digest command form reached the model');
@@ -376,7 +376,7 @@ test('/digest starts one bounded batch for this authenticated chat and stays sil
   try {
     harness = start(store, transport);
     await until(() => transport.sent.length >= 1, 'the bounded start acknowledgement');
-    assert.match(transport.sent[0].text, /started for one bounded completed-exchange batch/);
+    assert.match(transport.sent[0].text, /started for one bounded completed-turn batch/);
     assert.match(transport.sent[0].text, /0 evidence entries/);
     assert.match(transport.sent[0].text, /shared workspace/);
     let task;

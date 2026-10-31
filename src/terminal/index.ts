@@ -1109,7 +1109,7 @@ export async function runTerminalConversation(
             : "Coding-tool authority is host-controlled and unavailable here.",
           io.contextRefresh?.available ? "/refresh re-reads workspace context and skills for this conversation when it is idle." : "/refresh is unavailable without configured workspace context.",
           io.digest
-            ? "/digest starts one bounded completed-exchange memory-digestion run for this conversation and reports only the bounded admission; /digest status is a read-only bounded view. The run works in the background against the shared workspace and reports to this conversation's agent, not to a user or channel."
+            ? "/digest starts one bounded completed-turn memory-digestion run for this conversation and reports only the bounded admission; /digest status is a read-only bounded view. The run works in the background against the shared workspace and reports to this conversation's agent, not to a user or channel."
             : "/digest is unavailable in this host.",
           io.attachments
             ? "/attach stores one local file under the workspace CLI attachment directory and submits it with the optional prompt. The original is stored unchanged and the agent decides with the configured tools whether to inspect it; no image content, vision call or transcription is added."

@@ -707,10 +707,13 @@ leading system/reset block is consumed without its own model-free batch. One rea
 evidence that was already a completed exchange when the read began; entries appended later belong to
 a later segment, and an accepted batch's bounds never move.
 
-One completed segment whose evidence fits both batch bounds is one batch, delivered with
-`complete: true` and acknowledged once. Only a larger segment splits, into independent ordered chunks
-that each carry their own acknowledgement. There is no carry-over note, running summary or
-cross-chunk state.
+One scan tracks the furthest completed turn and admits one range covering every completed turn it
+reaches inside its 4,000-entry discovery bound, so three short turns are one batch, not three. A
+range whose evidence fits both batch bounds is one batch, delivered with `complete: true` and
+acknowledged once. Only a larger range splits, into independent ordered chunks that each carry their
+own acknowledgement. The tail, a reset after an owner turn, or the scan bound ends the range at its
+last completed turn, so an unfinished trailing turn is never cut into it and stays queued. There is
+no carry-over note, running summary or cross-chunk state.
 
 Evidence shape and trust labels:
 
@@ -827,7 +830,7 @@ the outcome keeps a 2,000-character answer excerpt. One `digest` config block na
 invocation bounds, with the accepted defaults `entriesPerBatch: 2000`, `charsPerBatch: 200000`,
 `maxToolCalls: 24`, `maxRequests: 12`, `maxInputTokens: 500000`, `runTimeoutSeconds: 600`,
 `maxChangedFiles: 8` and `maxDiffChars: 32000`. The character bound is the real size limit and the
-entry cap is a flood guard, so one ordinary completed exchange is admitted as one batch and therefore
+entry cap is a flood guard, so every completed turn that fits is admitted in one batch and therefore
 one run. It
 neither enables nor schedules digestion — frequency stays with ordinary cron — and an absent block
 keeps the defaults. A started task captures the resolved values in its input; a replay or reopen

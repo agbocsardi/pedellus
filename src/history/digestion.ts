@@ -2,18 +2,23 @@
  * Bounded, source-labeled evidence for memory digestion, plus its one durable cursor.
  *
  * This module reads only; it calls no model, writes no memory, creates no task and schedules
- * nothing. `read()` returns one bounded chunk of one *completed turn* from one mapped chat
- * conversation, whether that chat is still open or already reset. `acknowledge()` moves that
- * conversation's cursor after the caller has successfully consumed the chunk. A read that is never
- * acknowledged advances nothing, so a failure or restart replays the same evidence.
+ * nothing. `read()` returns one bounded chunk of one mapped chat conversation, covering every new
+ * completed turn the cursor can reach inside one scan bound rather than stopping at the first turn,
+ * whether that chat is still open or already reset. `acknowledge()` moves that conversation's cursor
+ * after the caller has successfully consumed the chunk. A read that is never acknowledged advances
+ * nothing, so a failure or restart replays the same evidence.
  *
  * Eligibility is a completed-turn high-water, not a closed episode:
  * - A segment ends just before a reset that follows an owner or scheduled turn, just before the
  *   next owner/scheduled input, or at a terminal assistant entry whose tool calls are all paired.
  *   An assistant entry that stopped with an explicit error or abort is not a completed answer and
  *   cannot close a segment by itself.
+ * - The scan tracks the furthest such boundary in one pass, so a range spans as many new completed
+ *   turns as the cursor's frontier reaches within the scan bound. Three short turns are therefore
+ *   one batch, not three, and `readChunk` alone decides whether the range fits or splits.
  * - An in-progress tail (an owner message still awaiting an answer, an assistant tool round, or a
- *   tool result still awaiting its next assistant entry) is never offered and never starts a batch.
+ *   tool result still awaiting its next assistant entry) is never offered and never starts a batch;
+ *   a range ends at the last completed turn before it and leaves the open tail queued.
  * - A reset before the first owner input stays inside the segment prefix, so a leading
  *   system/reset block does not need a model-free batch of its own.
  * - One read offers only evidence that was already a completed exchange when the read began; a
@@ -45,8 +50,8 @@
  *   reference to the original entry. A short result is included whole. The preview is not a
  *   fragment of a longer item: it is consumed whole, and a consumer must never claim the omitted
  *   middle was read. Durable remains the transcript authority; no second archive is written.
- * - A batch's evidence never exceeds {@link DIGEST_LIMITS.charsPerBatch}. One completed segment is
- *   one batch whenever its evidence fits both bounds; only a larger segment splits, into independent
+ * - A batch's evidence never exceeds {@link DIGEST_LIMITS.charsPerBatch}. One completed range is
+ *   one batch whenever its evidence fits both bounds; only a larger range splits, into independent
  *   ordered chunks that each carry their own acknowledgement. A chunk never moves the completed
  *   boundary, and there is no carry-over note, running summary or cross-chunk state.
  * - One evidence step is a message, a tool call, a tool result or a silent pairing step. Steps are
@@ -129,9 +134,10 @@ export const DIGEST_LIMITS = Object.freeze({
   /** Entries requested per Durable page. */
   entriesPerPage: 200,
   /**
-   * Entries one read may examine while *looking* for a completed boundary, across conversations.
-   * This bounds discovery only: it does not bound a chunk, a gap check or a segment-end walk. A
-   * postponed chat is retried by a later read instead of being skipped.
+   * Entries one read may examine while *looking* for the furthest completed boundary, across
+   * conversations. This bounds discovery only: it does not bound a chunk, a gap check or a
+   * segment-end walk. A range may span several completed turns inside this bound; a postponed chat
+   * is retried by a later read instead of being skipped.
    */
   scanEntriesPerRead: 4_000,
   /** Mapped chat sessions accepted by one read. */
@@ -1105,7 +1111,8 @@ interface ScanState {
   readonly sawInput: boolean;
   readonly hasContent: boolean;
   readonly pending: ReadonlySet<string>;
-  readonly terminalEntryId: EntryId | null;
+  /** Latest entry that already closed a completed turn inside this range, or null. */
+  readonly safeEndEntryId: EntryId | null;
   readonly lastEntryId: EntryId;
 }
 
@@ -1120,10 +1127,16 @@ type ScanResult =
   | { readonly status: "empty"; readonly examined: number };
 
 /**
- * Walk ascending from the cursor frontier until a completed exchange boundary is found, the tail is
- * reached, or the scan budget is spent. A reset closes the preceding non-empty segment; a new
- * owner/scheduled input closes the preceding turn; a terminal assistant entry with no open calls
- * closes the tail. An in-progress tail is returned as open, never as evidence.
+ * Walk ascending from the cursor frontier, tracking the latest completed turn, and report the widest
+ * completed range one scan may accept. The range can cover several turns, so a read hands a whole
+ * run of short completed turns to one batch instead of stopping at the first boundary; `readChunk`
+ * then applies the evidence and entry bounds and splits only a range that does not fit.
+ *
+ * A new owner/scheduled input closes the preceding turn and the walk continues; a terminal assistant
+ * entry with no open calls closes the range so far. The tail, a reset that follows an owner turn, or
+ * the scan budget ends the walk at the last completed turn, so an unfinished trailing turn (an
+ * unanswered owner message, an open tool round) stays queued for a later read rather than entering a
+ * cutoff. With no completed turn yet, an in-progress tail is reported open, never as evidence.
  */
 async function scanForCompletedSegment(
   conversation: Conversation,
@@ -1136,23 +1149,28 @@ async function scanForCompletedSegment(
   let sawInput = resumed?.sawInput ?? false;
   let hasContent = resumed?.hasContent ?? false;
   let pending = new Set(resumed?.pending ?? []);
-  let terminalEntryId = resumed?.terminalEntryId ?? null;
+  let safeEndEntryId = resumed?.safeEndEntryId ?? null;
   let lastEntryId = resumed?.lastEntryId ?? ((fromEntryId - 1) as EntryId);
   let examined = 0;
   let cursor: Cursor | undefined;
   let nextId = fromEntryId;
+  const stateOf = (): ScanState => ({
+    startEntryId: startEntryId!,
+    sawInput,
+    hasContent,
+    pending,
+    safeEndEntryId,
+    lastEntryId,
+  });
+  const completeAt = (endEntryId: EntryId): ScanResult => {
+    if (startEntryId === null) throw new Error("Digest scan lost its segment start");
+    return { status: "complete", startEntryId, endEntryId, examined };
+  };
   const settle = (): ScanResult => {
     if (!hasContent) return { status: "empty", examined };
-    if (sawInput && terminalEntryId !== null && pending.size === 0 && startEntryId !== null) {
-      return { status: "complete", startEntryId, endEntryId: terminalEntryId, examined };
-    }
+    if (sawInput && safeEndEntryId !== null) return completeAt(safeEndEntryId);
     if (startEntryId === null) return { status: "empty", examined };
-    return {
-      status: "open",
-      examined,
-      reachedTail: true,
-      state: { startEntryId, sawInput, hasContent, pending, terminalEntryId, lastEntryId },
-    };
+    return { status: "open", examined, reachedTail: true, state: stateOf() };
   };
   while (examined < budget) {
     const page = await conversation.entries(
@@ -1167,26 +1185,25 @@ async function scanForCompletedSegment(
       startEntryId ??= entry.id;
       if (entry.kind === ResetEntry.kind) {
         if (sawInput && hasContent) {
-          if (startEntryId === null) throw new Error("Digest scan lost its segment start");
-          return { status: "complete", startEntryId, endEntryId: lastEntryId, examined };
+          // The reset closes this range at its last completed turn. When no later turn completed, the
+          // reset itself closes the opening turn, so the entry before the reset is the range end.
+          return completeAt(safeEndEntryId ?? lastEntryId);
         }
         // A reset before the first owner/scheduled input closes no exchange: keep it inside the
         // segment prefix so a leading system/reset block does not need a model-free batch of its own.
         pending = new Set();
-        terminalEntryId = null;
+        safeEndEntryId = null;
         lastEntryId = entry.id;
         nextId = (entry.id + 1) as EntryId;
         continue;
       }
       if (entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND) {
-        if (sawInput && hasContent) {
-          if (startEntryId === null) throw new Error("Digest scan lost its segment start");
-          return { status: "complete", startEntryId, endEntryId: lastEntryId, examined };
-        }
+        // A new input closes the preceding turn; the walk keeps going so one range can hold several
+        // completed turns instead of stopping at each one.
+        if (sawInput && hasContent) safeEndEntryId = lastEntryId;
         sawInput = true;
         hasContent = true;
         pending.clear();
-        terminalEntryId = null;
         lastEntryId = entry.id;
         nextId = (entry.id + 1) as EntryId;
         continue;
@@ -1202,10 +1219,11 @@ async function scanForCompletedSegment(
           }
           pending.add(callId);
         }
-        terminalEntryId = parsed.terminal && pending.size === 0 ? entry.id : null;
+        // A terminal answer with every call paired closes the range so far; a later input or tool
+        // result leaves that boundary valid, so it is kept as the monotonic range end.
+        if (parsed.terminal && pending.size === 0) safeEndEntryId = entry.id;
       } else if (entry.kind === ToolResultEntry.kind) {
         for (const callId of resultCalls(entry)) pending.delete(callId);
-        terminalEntryId = null;
       }
       lastEntryId = entry.id;
       nextId = (entry.id + 1) as EntryId;
@@ -1213,20 +1231,11 @@ async function scanForCompletedSegment(
     cursor = page.next;
     if (cursor === undefined) return settle();
   }
+  // The scan budget is spent before the tail: the last completed turn is still a safe range end, and
+  // the next read continues from it. Entries examined after it are walked again, never skipped.
+  if (sawInput && safeEndEntryId !== null) return completeAt(safeEndEntryId);
   if (startEntryId === null) return { status: "empty", examined };
-  return {
-    status: "open",
-    examined,
-    reachedTail: false,
-    state: {
-      startEntryId,
-      sawInput,
-      hasContent,
-      pending,
-      terminalEntryId,
-      lastEntryId,
-    },
-  };
+  return { status: "open", examined, reachedTail: false, state: stateOf() };
 }
 
 interface SegmentBounds {

@@ -345,7 +345,8 @@ export function createCronTool(options: CronToolOptions): CronTool {
       if (intent === "digest" && !(options.digestAvailable?.(api.conversationId) ?? false)) {
         return text(
           "Memory digestion cannot be scheduled from this conversation: it needs an authenticated " +
-          "mapped chat with read, write and edit in toolAllowlist. Nothing was scheduled.",
+          "mapped chat with read, write and edit in toolAllowlist and the configured background " +
+          "model from digest.preset or digest.model. Nothing was scheduled.",
           true,
         );
       }
