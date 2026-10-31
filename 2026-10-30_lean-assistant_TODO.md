@@ -18,6 +18,45 @@
 - [x] Owner accepts the pilot as sufficient. Defer the reminder-only follow-up; live reminder scheduling/delivery remains unverified, not a blocker for the next discussion.
 - [x] Clean up this batch's resources after owner confirms integration.
 
+## Approved parity batch — bounded digestion, delivery and agent-managed work
+
+Python is the accepted behavioral/product reference. Port onto native Durable
+facilities; do not redesign memory quality, holistic usability or agent loops.
+
+- [ ] P1 — Configurable digest bounds: entries/batch (80), characters/batch
+  (24,000), tool calls (10 individual calls, not Python iterations), whole-run
+  timeout (300 seconds), changed files (8) and changed-text volume (32,000).
+  Preserve one bounded closed-episode chunk per invocation, partial writes and
+  cursor failure guards. Next ordinary invocation may retry a native parked task
+  once; no retry loop or user recovery UI. No automatic schedule activation.
+- [ ] P2 — Telegram outbound local documents/photos/audio/video/voice, current
+  authenticated chat only, bounded workspace files and captions, no remote URL
+  fetching/arbitrary recipients; retain unknown external outcomes, never blindly
+  retry or evict them. No extraction, transcoding or new media backend registry.
+- [ ] P3 — Agent reads its own workers' bounded paginated transcripts via native
+  Durable conversation entries, keyed by authorized worker ID, not raw SQL or
+  arbitrary conversation ID. No Atuin capture/export/second transcript archive.
+- [ ] P4 — Agent steers live workers using native Durable input semantics,
+  coordinating admission with completion/authority retirement. Cancellation
+  already exists; preserve it. No user worker-management surface or recursion.
+- [ ] P5 — Concise, read-only background summary inside existing `/status`:
+  what is running (workers/digest/cron), if anything. No dashboard, management
+  commands, model call or transcript dump; agent remains the manager.
+- [ ] P6 — Independently review the combined union, run bounded existing parity/
+  integration checks and reconcile docs. No new holistic usability study or
+  live-provider acceptance without separate authorization.
+
+Execution: start P1/P2/P3 independently (2–3 implementers); P4 follows accepted
+P3, P5 uses accepted foundation interfaces, P6 closes the union. Pi provider,
+`opencode-go/deepseek-v4.1-flash`, thinking high, fresh worktrees. Original workers
+retain fixes; fresh independent reviewer per candidate/re-check, then clean-main
+fast-forward publication by original worker. Parent owns this plan/orchestration.
+Existing pinned dependencies, synthetic providers/transports/clocks, no live API/
+provider/paid calls, installs/downloads, credential/settings/personal workspace
+access, runtime activation or deployment. Record best assumptions; ask only for
+material scope expansion. Preserve branches/worktrees. No freshness project,
+recovery UI, document extraction or speculative framework.
+
 ## Owner follow-up — quiet digestion and CLI path attachments
 
 - [x] F1 — Successful digest runs, including successful no-ops, do not notify
@@ -390,6 +429,14 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Parity batch authorized
+
+Owner approved P1–P6 above with the same worktree/DeepSeek Flash high/original-
+worker fix/independent-review loop. Python behavior is the reference, not a
+request to redesign memory or prove holistic assistant usability. Initial slices
+are digest limits/retry, Telegram local-media sending and worker transcript
+access; later steering/status and union acceptance remain within this batch.
 
 ### Owner follow-up — both corrections accepted and published
 
