@@ -46,6 +46,8 @@ export interface CronOwner {
   readonly sessionKey: string;
 }
 export type CronMode = "background" | "origin";
+/** One occurrence's explicit intent. Absent on historical job records means `message`. */
+export type CronIntent = "message" | "digest";
 
 export interface CronOutcome {
   readonly [key: string]: JsonValue;
@@ -83,6 +85,12 @@ export interface CronJob {
   readonly name: string;
   readonly message: string;
   readonly mode: CronMode;
+  /**
+   * What one occurrence does. `message` (also the historical default when absent) submits the job
+   * message as a turn. `digest` calls the host's memory-digestion entry for this origin instead; it
+   * never submits the message and never runs in a task-owned background conversation.
+   */
+  readonly intent?: CronIntent;
   readonly schedule: CronSchedule;
   readonly idempotencyKey: string;
   readonly createdAtMs: number;
@@ -146,6 +154,8 @@ export interface CronScheduleInput {
   readonly name?: string;
   /** Default `background`: each run gets a fresh, task-owned conversation. */
   readonly mode?: CronMode;
+  /** Default `message`; `digest` invokes the host's bounded memory-digestion entry. */
+  readonly intent?: CronIntent;
 }
 export interface CronActor {
   readonly owner: CronOwner;
@@ -280,9 +290,34 @@ export interface CronFoundationOptions {
    * durable delivery here.
    */
   readonly finalize?: CronFinalize;
+  /**
+   * Optional host entry for a `digest`-intent occurrence. The foundation passes the authenticated
+   * origin conversation, never a task-owned target, and records no user/channel delivery for it;
+   * the digest run's own internal result event reports completion to that origin's agent.
+   */
+  readonly digest?: CronDigest;
   /** The Harness clock (`HarnessOptions.now`); default `Date.now`. */
   readonly now?: () => number;
 }
+
+/** One `digest` occurrence, handed to the host without any model or channel work here. */
+export interface CronDigestInvocation {
+  readonly job: CronJob;
+  readonly occurrence: CronOccurrenceInput;
+  readonly originConversationId: ConversationId;
+}
+/**
+ * Host settlement of one digest occurrence. `ok` means the host accepted (started, already caught
+ * up, or one run already live); `error` carries bounded, value-free text shown in `cron list`.
+ */
+export interface CronDigestSettlement {
+  readonly status: "ok" | "error";
+  readonly error: string | null;
+}
+export type CronDigest = (
+  invocation: CronDigestInvocation,
+  context: Context,
+) => CronDigestSettlement | Promise<CronDigestSettlement>;
 export interface CronFoundation {
   /** Install before opening or resuming the Harness; registers the timer and run tasks. */
   readonly extension: Extension;
@@ -328,14 +363,21 @@ interface NormalizedRequest {
   readonly message: string;
   readonly name: string;
   readonly mode: CronMode;
+  readonly intent: CronIntent;
   readonly schedule: CronScheduleRequest;
   readonly idempotencyKey: string;
 }
 
+const intentOf = (job: CronJob): CronIntent => job.intent === "digest" ? "digest" : "message";
+
 function normalizeRequest(actor: CronActor, request: CronScheduleInput): NormalizedRequest {
   const owner = ownerOf(actor);
   if (!isRecord(request)) throw new TypeError("schedule request must be an object");
-  if (typeof request.message !== "string" || request.message.trim() === "") {
+  const intent = request.intent === undefined ? "message" : request.intent;
+  if (intent !== "message" && intent !== "digest") {
+    throw new TypeError("intent must be 'message' or 'digest'");
+  }
+  if (typeof request.message !== "string" || (intent === "message" && request.message.trim() === "")) {
     throw new TypeError("message must be a non-empty string");
   }
   if (typeof request.idempotencyKey !== "string" || request.idempotencyKey === "") {
@@ -344,8 +386,13 @@ function normalizeRequest(actor: CronActor, request: CronScheduleInput): Normali
   if (request.name !== undefined && typeof request.name !== "string") {
     throw new TypeError("name must be a string when provided");
   }
-  const mode = request.mode === undefined ? "background" : request.mode;
-  if (mode !== "background" && mode !== "origin") throw new TypeError("mode must be 'background' or 'origin'");
+  const requestedMode = request.mode === undefined ? "background" : request.mode;
+  if (requestedMode !== "background" && requestedMode !== "origin") {
+    throw new TypeError("mode must be 'background' or 'origin'");
+  }
+  // A digest occurrence runs from the authenticated origin itself: it has no model turn and must
+  // never create or borrow a task-owned background conversation's authority.
+  const mode: CronMode = intent === "digest" ? "origin" : requestedMode;
   let schedule: CronScheduleRequest;
   try {
     schedule = parseCronScheduleRequest(request.schedule);
@@ -354,9 +401,10 @@ function normalizeRequest(actor: CronActor, request: CronScheduleInput): Normali
   }
   return {
     owner,
-    message: request.message,
-    name: request.name?.trim() || request.message.slice(0, 30),
+    message: request.message.trim() === "" ? "Memory digestion run" : request.message,
+    name: request.name?.trim() || (intent === "digest" ? "Memory digestion" : request.message.slice(0, 30)),
     mode,
+    intent,
     schedule,
     idempotencyKey: request.idempotencyKey,
   };
@@ -386,6 +434,7 @@ function sameNormalizedRequest(job: CronJob, request: NormalizedRequest): boolea
   return job.message === request.message
     && job.name === request.name
     && job.mode === request.mode
+    && intentOf(job) === request.intent
     && sameScheduleRequest(job, request.schedule);
 }
 function parseOccurrenceInput(value: unknown): CronOccurrenceInput | undefined {
@@ -599,6 +648,7 @@ async function viewsOf(
 export function createCronFoundation(options: CronFoundationOptions): CronFoundation {
   const prepare = options.prepare;
   const finalize = options.finalize;
+  const digest = options.digest;
   const clock = options.now ?? (() => Date.now());
 
   /**
@@ -692,7 +742,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
                 const rejected = inspectJob(doc.jobs.find((candidate) => candidate.id === input.jobId));
                 if (rejected !== undefined) return rejected;
                 const found = doc.jobs.find((candidate) => candidate.id === input.jobId)!;
-                targetConversationId = found.mode === "background"
+                targetConversationId = found.mode === "background" && found.intent !== "digest"
                   ? (await tx.scanConversations({ ownerTaskId: running.id }, 1)).items[0]?.id
                     ?? (await tx.createConversation({ ownership: { kind: "task", taskId: running.id } })).id
                   : running.conversationId;
@@ -756,6 +806,25 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           }
 
           let settlement: WaitSettlement;
+          if (job.intent === "digest") {
+            // A digest occurrence is a host entry, not a model turn: it asks for the same bounded
+            // native execution a manual command uses, with this authenticated origin's current
+            // authority. The message is never submitted and no target conversation is involved.
+            try {
+              settlement = digest === undefined
+                ? { status: "error", error: "memory digestion is not available in this host", answerEntryId: null }
+                : { ...(await digest({ job, occurrence: input, originConversationId: running.conversationId }, context)), answerEntryId: null };
+            } catch (error) {
+              if (runtime.signal.aborted) return;
+              settlement = { status: "error", error: errorText(error), answerEntryId: null };
+            }
+            if (runtime.signal.aborted) return;
+            await finishRun(
+              runtime, running.conversationId, running.id, input, settlement,
+              targetConversationId, context,
+            );
+            return;
+          }
           try {
             const requestId = occurrenceKey(input.jobId, input.scheduledAtMs);
             const submission = await conversation.submit({
@@ -965,7 +1034,9 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       };
       // The run's authority ends with the run, in this same terminal commit. A separate target is
       // retired; the origin-mode target is the origin conversation itself and keeps its policy.
-      await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, {
+      // A digest occurrence queues no user/channel delivery: its own internal result event reports
+      // to the origin agent, while the job record keeps this bounded status for `cron list`.
+      await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, intentOf(job) === "digest" ? null : {
         status: settlement.status,
         error: settlement.error,
         answerEntryId: settlement.answerEntryId,
@@ -1038,6 +1109,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           name: value.name,
           message: value.message,
           mode: value.mode,
+          intent: value.intent,
           schedule,
           idempotencyKey: value.idempotencyKey,
           createdAtMs: now,
@@ -1092,7 +1164,9 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           ? undefined : parseOccurrenceInput(executionRecord.input);
         const target = runTargetOf(executionRecord)
           ?? (job.mode === "origin" ? conversationId : null);
-        if (executionInput !== undefined && target !== null) {
+        // A digest run submits no occurrence message, so there is no queued submission to withdraw;
+        // cancelling the job only stops this occurrence and every later one.
+        if (executionInput !== undefined && target !== null && intentOf(job) !== "digest") {
           withdrawal = {
             conversationId: target,
             requestId: occurrenceKey(job.id, executionInput.scheduledAtMs),

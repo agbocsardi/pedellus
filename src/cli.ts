@@ -267,6 +267,14 @@ async function runAgent(
         available: client.contextRefresh,
         refresh: () => client!.refreshContext(context),
       },
+      ...(client.digest
+        ? {
+            digest: {
+              start: () => client!.digestStart(context),
+              status: () => client!.digestStatus(context),
+            },
+          }
+        : {}),
       history: {
         defaultSession: client.sessionKey,
         search: (query, ctx) => client!.historySearch(query, ctx),

@@ -14,8 +14,10 @@ read a topic before relying on it.
 This port has no memory-tree or memory-search tool and no dedicated
 `history.jsonl` search. Use the granted `read`, `write`, `edit`, and `bash`
 tools on ordinary workspace files. Consolidation across closed conversations
-exists only as a memory digestion run started by the host; it is not a command
-or tool you can invoke from a conversation.
+exists only as a memory digestion run that the authenticated owner starts with
+`/digest` (or schedules as an ordinary cron job with `intent: "digest"`); it is
+not a tool you can invoke from a conversation, and its result arrives later as
+an internal event for you to act on.
 
 ## Layout
 
@@ -64,7 +66,8 @@ that a quick lookup answers.
 - Use `grep` or `rg` through `bash` only if that tool is granted. There is no
   dedicated memory-search tool in this port.
 - Treat `memory/system/`, `SOUL.md`, and `USER.md` as host-owned in ordinary
-  conversation: do not rewrite them there. Only a host-started memory digestion
-  run maintains them, and there is no Dream command, cursor or history archive.
+  conversation: do not rewrite them there. Only an owner-invoked memory
+  digestion run maintains them, and there is no Dream command, cursor or
+  history archive.
 
 When memory looks disorganized, suggest the `memory-defrag` skill.

@@ -890,17 +890,67 @@ than 4,000 committed entries cannot be verified and fails closed; a cancelled or
 counts as live, so `start` reports `busy` with its task ID until a host retries or aborts it rather
 than allowing a second writer; the prompt is read when an attempt first submits its turn, so an owner
 edit applies to the next accepted batch rather than to a run already in flight (a resumed attempt
-re-submits its request ID, and text already admitted stays authoritative for that attempt); and the
-current shipped runtime has no manual command, cron job or tool that calls `start`.
+re-submits its request ID, and text already admitted stays authoritative for that attempt).
 Nothing here was exercised with a real provider, a live channel, credentials or a personal workspace.
 `tests/memory-digest.behavior.test.mjs` covers the offline evidence over the real Gateway and a faux
 provider: fact/no-op/cursor, idle and refusal, provider failure and a replay that reads the retained
 fact instead of duplicating it, refused/create-only/stale calls failing the batch, an empty final
 report failing the batch, a concurrent create that is never overwritten, cancellation, the turn
 deadline, an existing prompt not being clobbered, and a reopen that keeps the pinned model and
-curation tools (including a failed call before the reopen that still fails the resumed attempt). O3
-owns the manual command, ordinary cron wiring, completion/failure visibility and prompt freshness at
-invocation; the interface is `start` plus each task's durable outcome.
+curation tools (including a failed call before the reopen that still fails the resumed attempt).
+
+## Manual and scheduled invocation
+
+`start` is the whole execution entry. Two host paths call it, and nothing else does:
+
+- **Manual owner command.** The local CLI has `/digest` (start one bounded batch) and `/digest
+  status` (bounded read-only status). The Telegram adapter offers the same two forms to an
+  authenticated owner, advertised in its command menu only when the host exposes the entry. Both
+  use the existing host command surfaces and fixed, value-free acknowledgements; neither adds a
+  model tool. A start returns as soon as one native task is committed (or reports `busy`, `idle` or
+  `refused`), so the user's turn is never held while the digest runs. `idle` distinguishes a
+  genuinely complete scan from one that stopped early: a `caughtUp: false` answer says closed
+  history may remain and a later manual or scheduled invocation continues the bounded scan. One
+  invocation consumes one bounded batch; nothing loops until the history is exhausted.
+- **Explicit ordinary cron intent.** The existing `cron` tool's `add` action accepts
+  `intent: "digest"`. It creates one ordinary job record in the origin chat conversation with that
+  discriminant, and the existing timer/run task path invokes the same `start` through a host
+  callback. There is no new timer, queue, agent loop or automatic job: the job is created only by
+  that explicit add, a digest occurrence never submits the job message, and it is normalized to
+  `mode: origin` so no task-owned target conversation is created or can gain authority. The run
+  calls `start` with the authenticated origin conversation, and `start` re-checks that origin and
+  the current curation allowlist, so a narrowed reopen refuses instead of widening. The timer still
+  arms the next occurrence in its own deterministic commit; a slow or failed digest cannot stop
+  the schedule. Cancelling the job stops its occurrence and later ones; an already-started digest
+  task is a separate native task and is cancelled through the native task controls.
+
+Completion is visible through one bounded internal Durable event per terminal run, not a user or
+channel message. Its entry kind is `nanobot.memory-digest-result`, it is admitted to the origin
+conversation at the conversation-scoped request ID `nanobot.memory-digest-result:<taskId>`, and it
+reports only the outcome, the bounded batch shape, the evidence count and a bounded report excerpt.
+The origin agent decides what, if anything, to relay. A small write-ahead notice document records
+which terminal runs were admitted so a reopen retries a lost admission; the request ID makes that
+retry a no-op instead of a duplicate turn. A successful `digested`, a provider-free `noop`, a
+`consumed` replay and a failed or aborted run each notify once. Digest cron jobs queue nothing in
+the channel delivery outbox, so existing scheduled-job notices and dedupe are unchanged.
+
+Status is bounded and read-only: `memoryDigest.status(writer, context)` returns the live task ID
+(one run at a time) and this origin's newest task with its outcome, batch position and recorded
+error. It performs no transcript scan, provider call or cursor change. `/digest status` renders it.
+Recovery stays native: a cancelled or parked digest task keeps its ID until the host retries or
+aborts it, and `start` reports `busy` meanwhile instead of allowing a second writer.
+
+Prompt freshness is per accepted batch. A new run reads `DIGEST.md` from disk when it first submits
+its turn, so an owner edit applies to the next accepted batch. An attempt already in flight keeps
+the text it admitted (a resumed attempt re-submits the same request ID, so its placed input stays
+authoritative). Editing `DIGEST.md` or any memory file never rewrites an assembled workspace prompt
+mid-turn; the existing refresh/`/new` path is still what updates an ordinary conversation's
+snapshot on its next request. `tests/memory-digest-controls.behavior.test.mjs` covers the manual CLI
+path, Telegram command exposure, no activation on open, exactly-once success/failure/no-op/abort
+notices with reopen dedupe, idle-pending wording, prompt freshness including an in-flight pin, the
+cron digest occurrence and its independent reschedule, narrowed-reopen refusal, and cancellation
+leaving cursor and authority unchanged. All checks are offline with a faux provider and a
+synthetic workspace; no live provider, channel, credential or personal workspace was used.
 
 ## Offline lifecycle evidence
 
@@ -928,10 +978,10 @@ an outer timeout (or through the behavior suite once it is registered there).
 
 ## Not implemented
 
-- Digesting conversations into memory on its own: `src/history/digestion.ts` and
-  `src/history/memory-digest.ts` supply the bounded input, cursor and one-task execution, but no
-  command, tool, cron job, activation or completion notice calls it. Digestion runs only when a host
-  calls `gateway.memoryDigest.start`.
+- Digesting conversations into memory on its own: no timer, startup pass or configuration parse
+  starts a digest. The manual owner command (`/digest`, `/digest status`) and an explicit ordinary
+  cron job with `intent: "digest"` are the only callers of `gateway.memoryDigest.start`; nothing
+  runs until one of those is invoked.
 - Background indexing independent of a search; message reconciliation and the summary sweep both
   happen on demand, and summary rows refresh only on a summary search.
 - Summary ranking beyond recency: summary pages are newest-first by episode start, with no relevance

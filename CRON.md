@@ -60,14 +60,47 @@ One record in the origin conversation's `nanobot.cron.jobs` document, fixed size
 ```ts
 { id, owner, name, message, mode, schedule, idempotencyKey, createdAtMs,
   generation, timerTaskId, executionTaskId, cancelledAtMs,
-  lastOutcome, lastSkip, lastFault }
+  lastOutcome, lastSkip, lastFault, intent? }
 ```
+
+`intent` is `"message"` (also the meaning of an absent field on a historical
+record) or `"digest"`. It is set only by an explicit `cron add` with
+`intent: "digest"`.
 
 `timerTaskId` is the only timer allowed to arm the next slot. `executionTaskId` is the newest run
 task and drives overlap checks. `lastOutcome` is the newest run result; `lastSkip` is the newest
 busy skip; `lastFault` retains the newest execution fault after a timer replaces its pointer.
 There is no stored `nextAtMs`, no occurrence array, and no job lifecycle state machine. Full
 history stays in timer/run task records and conversation entries, under Durable's normal retention.
+
+## Digest intent
+
+A `digest` job is an ordinary job record and uses the same timer/run tasks. What
+differs is only the run phase:
+
+- The occurrence is normalized to `mode: origin` when it is created, so the run
+  uses the origin chat conversation as its target and creates no task-owned
+  conversation, capture or snapshot.
+- It never submits the job message. Instead it calls the host's memory-digestion
+  entry with `running.conversationId` (the authenticated origin conversation);
+  the host calls the same native `start` a manual `/digest` uses. `start`
+  re-checks that the origin is still a mapped chat and re-reads the current
+  curation allowlist, so a narrowed configuration refuses instead of widening.
+- It queues no delivery in the channel outbox. The digest task's own bounded
+  internal result event reports to the origin agent; existing scheduled-message
+  delivery and its dedupe/unknown-send behavior are unchanged.
+- `lastOutcome` records the bounded host settlement (`ok` when a run started, one
+  was already live or nothing was pending; `error` with fixed text for a refusal
+  or missing host entry), so `cron list` shows the outcome without a channel
+  message.
+- The timer still arms the next occurrence in its own commit. The digest run is
+  a separate background native task and does not affect that reschedule.
+  Cancelling the job fences its occurrence and later ones; an already-started
+  digest task is cancelled with the native task controls, not by the job.
+
+An `intent: "digest"` add is refused unless the calling conversation is an
+authenticated mapped chat with `read`, `write` and `edit` currently configured.
+No configuration parse and no startup pass creates a digest job.
 
 ## Native run and recovery
 

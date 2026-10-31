@@ -48,6 +48,12 @@ export interface CronToolOptions {
    * session (for example a scheduled run's own background conversation), so cron is unavailable.
    */
   readonly ownerFor: (conversationId: ConversationId, context: Context) => CronOwner | undefined;
+  /**
+   * Optional host check for a `digest`-intent job: the calling conversation must currently be an
+   * authenticated mapped chat with the curation tools. Scheduling is refused otherwise instead of
+   * recording a job that can only fail. Absent means `digest` is unavailable.
+   */
+  readonly digestAvailable?: (conversationId: ConversationId) => boolean;
   /** The open Harness; the extension is registered before `Harness.open()`, so this is late-bound. */
   readonly harness: () => Harness;
   /** IANA zone for calendar expressions that omit `tz`. */
@@ -63,6 +69,7 @@ const SCHEDULE_FIELDS = ["at", "after_seconds", "every_seconds", "cron_expr"] as
 
 interface CronToolArguments {
   readonly action: (typeof ACTIONS)[number];
+  readonly intent?: "message" | "digest";
   readonly message?: string;
   readonly name?: string;
   readonly at?: string;
@@ -158,6 +165,7 @@ function describe(view: CronJobView): string {
     `${view.job.id}  ${view.job.name}`,
     `  schedule: ${scheduleText(view)}`,
     `  mode: ${view.job.mode}`,
+    ...(view.job.intent === "digest" ? ["  intent: digest (one bounded memory-digestion run per occurrence)"] : []),
     `  status: ${view.status}`,
     `  next: ${iso(view.nextAtMs)}`,
   ];
@@ -198,15 +206,25 @@ export function createCronTool(options: CronToolOptions): CronTool {
       "`list` shows this conversation's jobs, their status and next run; `remove` cancels one job. " +
       "A job runs in an isolated background conversation by default, or in this conversation when " +
       "`isolated` is false. Scheduled runs inherit this conversation's enabled tools; they never " +
-      "gain more.",
+      "gain more. `intent: \"digest\"` schedules one bounded memory-digestion run instead of a model " +
+      "turn; it needs read/write/edit authority in this conversation and reports through an internal " +
+      "result, not a chat message.",
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("add"),
         Type.Literal("list"),
         Type.Literal("remove"),
       ], { description: "Which operation to perform." }),
+      intent: Type.Optional(Type.Union([
+        Type.Literal("message"),
+        Type.Literal("digest"),
+      ], {
+        description:
+          "add: `message` (default) sends `message` as a turn when due. `digest` instead runs one " +
+          "bounded memory-digestion batch for this chat; message and isolated are then ignored.",
+      })),
       message: Type.Optional(Type.String({
-        description: "add: the instruction the agent receives when the job fires. Required for add.",
+        description: "add: the instruction the agent receives when the job fires. Required unless intent is digest.",
       })),
       name: Type.Optional(Type.String({
         description: "add: short human-readable label; defaults to the first characters of the message.",
@@ -320,8 +338,21 @@ export function createCronTool(options: CronToolOptions): CronTool {
       if (request.action !== "add") {
         return text(`Unknown action; use one of ${ACTIONS.join(", ")}.`, true);
       }
+      if (request.intent !== undefined && request.intent !== "message" && request.intent !== "digest") {
+        return text("intent must be \"message\" or \"digest\".", true);
+      }
+      const intent = request.intent ?? "message";
+      if (intent === "digest" && !(options.digestAvailable?.(api.conversationId) ?? false)) {
+        return text(
+          "Memory digestion cannot be scheduled from this conversation: it needs an authenticated " +
+          "mapped chat with read, write and edit in toolAllowlist. Nothing was scheduled.",
+          true,
+        );
+      }
       const message = typeof request.message === "string" ? request.message.trim() : "";
-      if (message === "") return text("add requires a non-empty message to run when the job fires.", true);
+      if (intent === "message" && message === "") {
+        return text("add requires a non-empty message to run when the job fires.", true);
+      }
       if (request.name !== undefined && typeof request.name !== "string") {
         return text("name must be a string when provided.", true);
       }
@@ -329,10 +360,11 @@ export function createCronTool(options: CronToolOptions): CronTool {
       try {
         // A call ID is stable across a retried call, so a replay cannot create a second job.
         receipt = await options.foundation.schedule(actor, writer, {
-          message,
+          message: intent === "digest" ? "Memory digestion run" : message,
           ...(request.name === undefined ? {} : { name: request.name }),
           schedule: scheduleOf(request, zone),
-          mode: request.isolated === false ? "origin" : "background",
+          mode: intent === "digest" || request.isolated === false ? "origin" : "background",
+          intent,
           idempotencyKey: `tool:${api.callId}`,
         }, context);
       } catch (error) {

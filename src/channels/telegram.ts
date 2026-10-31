@@ -9,7 +9,16 @@ import type { Conversation, Submission, SubmissionId } from "@earendil-works/pi-
 import type { AssistantMessage, ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
 import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
-import type { GatewayModelList, GatewayModelSelection, GatewaySessionReset } from "../runtime.js";
+import {
+  renderMemoryDigestStart,
+  renderMemoryDigestStatus,
+} from "../history/memory-digest.js";
+import type {
+  GatewayMemoryDigest,
+  GatewayModelList,
+  GatewayModelSelection,
+  GatewaySessionReset,
+} from "../runtime.js";
 import { inProcessTerminalConversation } from "../terminal/conversation.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import { MEDIA_LIMITS, MediaRejected, createMediaStore, type MediaRejectionReason, type MediaStore, type StoredMedia } from "../media/attachments.js";
@@ -298,6 +307,12 @@ export interface TelegramGateway {
    * a prompt snapshot reports `busy` instead of resetting without rebuilding it.
    */
   resetSession?(sessionKey: string, context: Context): Promise<GatewaySessionReset>;
+  /**
+   * Optional host manual memory-digestion entry. Present means the authenticated owner may start one
+   * bounded batch with `/digest` and read bounded status with `/digest status`; absent means neither
+   * is advertised. It starts no schedule and calls no model from the command itself.
+   */
+  memoryDigest?: GatewayMemoryDigest;
 }
 
 export async function runTelegram(
@@ -311,15 +326,17 @@ export async function runTelegram(
   const mediaWork = new MediaWorkGate(MEDIA_LIMITS.maxConcurrentWork);
   /**
    * Optional host operations this adapter may call, resolved once from the host surface. A narrow SDK
-   * host keeps `/new`, `/abort` (and `/stop`), `/help` only; `/status`, `/model` and `/restart` are then
-   * neither advertised nor applied, and typing one gets a truthful refusal instead of a half-working
-   * control. `/status` reports the selected model, so it needs the host catalog; `/model` needs the
-   * catalog and preset selection.
+   * host keeps `/new`, `/abort` (and `/stop`), `/help` only; `/status`, `/model`, `/digest` and
+   * `/restart` are then neither advertised nor applied, and typing one gets a truthful refusal
+   * instead of a half-working control. `/status` reports the selected model, so it needs the host
+   * catalog; `/model` needs the catalog and preset selection; `/digest` needs the manual digestion
+   * entry.
    */
   const hostCommands: TelegramCommandHost = {
     model: typeof gateway.listModels === "function" && typeof gateway.selectModelPreset === "function",
     status: typeof gateway.listModels === "function",
     restart: options.restart !== undefined && options.restart.supported,
+    digest: typeof gateway.memoryDigest?.start === "function" && typeof gateway.memoryDigest?.status === "function",
   };
   const scope = withCancel(context);
   const adapterContext = scope.context;
@@ -1989,6 +2006,29 @@ export async function runTelegram(
       await admitControl(update, message, sessionKey, "restart");
       return;
     }
+    if (parsed.command === "digest") {
+      if (!hostCommands.digest) {
+        await admitNotice(update, message, sessionKey, DIGEST_UNAVAILABLE_HOST);
+        drain();
+        return;
+      }
+      const argument = parsed.args.trim().toLowerCase();
+      if (argument === "status") {
+        // Read-only bounded status: no scan, no model call and no cursor change.
+        await admitNotice(update, message, sessionKey, await digestStatusNotice(sessionKey));
+        drain();
+        return;
+      }
+      if (argument !== "") {
+        await admitNotice(update, message, sessionKey, DIGEST_USAGE);
+        drain();
+        return;
+      }
+      // Starting one bounded batch is an effect, so it uses the same durable control record and
+      // ordered acknowledgement as the other owner commands.
+      await admitControl(update, message, sessionKey, "digest");
+      return;
+    }
     // The remaining controls are native mutations of this same chat. `/stop` is an alias of `/abort`:
     // it normalizes to the same control kind before admission, so the durable record, gating and
     // recovery path are shared and there is no second cancellation semantics.
@@ -2160,6 +2200,35 @@ export async function runTelegram(
   }
 
   /**
+   * `/digest`: start one bounded digestion batch for this chat's own conversation. The host returns
+   * as soon as one native task is admitted; the digest turn runs in the background and reports to
+   * this conversation's agent internally. Nothing waits for it and nothing is sent to a user.
+   */
+  async function applyDigest(sessionKey: string): Promise<ControlOutcome> {
+    const host = gateway.memoryDigest;
+    if (host === undefined) return { kind: "refused", text: DIGEST_UNAVAILABLE_HOST };
+    const conversation = await gateway.conversationFor(sessionKey, adapterContext);
+    const result = await host.start({
+      id: conversation.id,
+      commit: (change, context) => conversation.commit(change, context),
+    }, adapterContext);
+    return result.status === "refused"
+      ? { kind: "refused", text: renderMemoryDigestStart(result) }
+      : { kind: "applied", text: renderMemoryDigestStart(result) };
+  }
+
+  /** Bounded read-only `/digest status`; it creates no task and reads no chat transcript. */
+  async function digestStatusNotice(sessionKey: string): Promise<string> {
+    const host = gateway.memoryDigest;
+    if (host === undefined) return DIGEST_UNAVAILABLE_HOST;
+    const conversation = await gateway.conversationFor(sessionKey, adapterContext);
+    return renderMemoryDigestStatus(await host.status({
+      id: conversation.id,
+      commit: (change, context) => conversation.commit(change, context),
+    }, adapterContext));
+  }
+
+  /**
    * Submit every input admitted before this command, then apply the native call and record
    * it. A transient failure while flushing earlier inputs is not fatal: the command stays
    * admitted, the chat stays gated, and the poll cadence retries the same ordered flush.
@@ -2208,6 +2277,8 @@ export async function runTelegram(
       const conversation = await gateway.conversationFor(sessionKey, adapterContext);
       await conversation.abort(adapterContext);
       outcome = { kind: "applied" };
+    } else if (record.command === "digest") {
+      outcome = await applyDigest(sessionKey);
     } else if (record.command === "restart") {
       // No conversation effect: the record and its acknowledgement are durable first, and the host
       // replacement is requested by the caller only after that acknowledgement was released.
@@ -2467,7 +2538,7 @@ export async function runTelegram(
   function availableCommandList(): string {
     return ["/new", "/abort", "/stop", ...(hostCommands.status ? ["/status"] : []),
       ...(hostCommands.model ? ["/model"] : []), ...(hostCommands.restart ? ["/restart"] : []),
-      "/help"].join(", ");
+      ...(hostCommands.digest ? ["/digest"] : []), "/help"].join(", ");
   }
 
   /** Help lists exactly the controls this host implements; nothing is advertised that would be refused. */
@@ -2489,6 +2560,11 @@ export async function runTelegram(
       lines.push("/restart - stop this gateway and replace the process with the same program and configuration, so new " +
         "code and configuration are loaded. It affects every chat and background work; the acknowledgement confirms " +
         "the request, not the completed restart.");
+    }
+    if (hostCommands.digest) {
+      lines.push("/digest - start one bounded closed-episode memory-digestion run from the shared workspace; the run is " +
+        "background and its result is an internal notice to this chat's agent, never a direct user or channel message. " +
+        "/digest status is a bounded read-only view; both cost no model call by themselves.");
     }
     lines.push("/help - this list.");
     lines.push(mediaIngress === undefined
@@ -2788,7 +2864,7 @@ function quotedMessageContext(
 
 /**
  * Only commands this adapter actually implements for this host belong in the native menu. `/status`,
- * `/model` and `/restart` are omitted for a host that exposes no such operation.
+ * `/model`, `/digest` and `/restart` are omitted for a host that exposes no such operation.
  */
 function telegramCommands(
   host: TelegramCommandHost,
@@ -2800,6 +2876,7 @@ function telegramCommands(
     ...(host.status ? [{ command: "status", description: "Show this chat's model and run status" }] : []),
     ...(host.model ? [{ command: "model", description: "List or select a configured model preset" }] : []),
     ...(host.restart ? [{ command: "restart", description: "Restart the gateway process" }] : []),
+    ...(host.digest ? [{ command: "digest", description: "Run one bounded memory-digestion batch" }] : []),
     { command: "help", description: "Show the available commands" },
   ];
 }
@@ -2809,6 +2886,7 @@ type TelegramCommandHost = {
   readonly status: boolean;
   readonly model: boolean;
   readonly restart: boolean;
+  readonly digest: boolean;
 };
 
 type ParsedTelegramInput =
@@ -2817,13 +2895,13 @@ type ParsedTelegramInput =
   | { readonly kind: "unsupported"; readonly command: string }
   | { readonly kind: "foreign"; readonly command: string; readonly mention: string };
 
-type TelegramControl = "new" | "abort" | "stop" | "help" | "status" | "model" | "restart";
+type TelegramControl = "new" | "abort" | "stop" | "help" | "status" | "model" | "restart" | "digest";
 
 /**
  * A command with a native effect on this chat or this process; a refusal is terminal, never retried.
  * `/stop` normalizes to `abort` here, so one control kind covers both spellings.
  */
-type TelegramMutation = "new" | "abort" | "model" | "restart";
+type TelegramMutation = "new" | "abort" | "model" | "restart" | "digest";
 
 type ControlOutcome =
   | { readonly kind: "applied"; readonly text?: string; readonly requestRestart?: true }
@@ -2843,6 +2921,8 @@ const CONTROL_ACK: Record<TelegramMutation, string> = {
   restart:
     "Restart requested for this gateway: it is stopping so the same process can reload its code and configuration. " +
     "This acknowledgement confirms the request only; it does not confirm that the restart completed.",
+  digest:
+    "Memory digestion request applied for this chat; the bounded run and its internal result, if any, follow separately.",
 };
 
 const CONTROL_PENDING: Record<TelegramMutation, string> = {
@@ -2859,6 +2939,9 @@ const CONTROL_PENDING: Record<TelegramMutation, string> = {
   restart:
     "Restart is still pending for this gateway: messages admitted earlier in this chat are being submitted first. " +
     "Nothing has been restarted yet and nothing was sent to the assistant.",
+  digest:
+    "Memory digestion is still pending for this chat: messages admitted earlier are being submitted first. " +
+    "Nothing has been started yet and nothing was sent to the assistant.",
 };
 
 const UNCONFIRMED_CONTROL =
@@ -2893,6 +2976,11 @@ const RESTART_REQUEST_FAILED =
 const RESET_BUSY =
   "Context reset rejected: this chat has a running turn, so nothing was reset and the assembled workspace prompt was " +
   "not rebuilt. It was not queued; /abort this chat or retry /new when it is idle. Other chats are unaffected.";
+const DIGEST_UNAVAILABLE_HOST =
+  "Memory digestion is unavailable in this host: it exposes no manual digestion entry. Nothing was started and " +
+  "nothing was sent to the assistant.";
+const DIGEST_USAGE =
+  "Usage: /digest (start one bounded batch) or /digest status (bounded read-only status). Nothing was sent to the assistant.";
 
 /** Replay wording for a command this adapter recorded before a restart; it is never run twice. */
 function replayControlText(entry: TelegramControlRecord): string {
@@ -2981,7 +3069,7 @@ function parseTelegramInput(raw: string, botUsername: string | undefined): Parse
     return { kind: "foreign", command, mention: mention.toLowerCase() };
   }
   if (command === "new" || command === "abort" || command === "stop" || command === "help" ||
-      command === "status" || command === "model" || command === "restart") {
+      command === "status" || command === "model" || command === "restart" || command === "digest") {
     return { kind: "control", command, args: raw.slice(match[0].length).trim() };
   }
   return { kind: "unsupported", command };

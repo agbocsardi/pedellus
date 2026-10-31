@@ -160,10 +160,18 @@ fail-closed and is not remotely cancelled. See
 | `/model` | List named presets and the current/default choice. `/model <name>` temporarily selects one; `/model default` returns to the configured preset. A CLI reattach keeps the temporary selection; a gateway restart also returns to the configured preset. Direct-model configs retain `/model <provider> <modelId> [thinkingLevel]` and persisted selection. Busy selection is rejected atomically; retry when idle. In-process/SDK terminal callers without a host callback remain read-only. |
 | `/tools` | Read-only diagnostic of the config-selected coding tools for this conversation. |
 | `/refresh` | Re-read the configured workspace bootstrap, memory files, manifest and skill inventory for this attached CLI conversation. Requires `workspaceContext`; rejected while the conversation is busy. The refreshed summary and skill table apply to the next model request. |
+| `/digest` | Start one bounded closed-episode memory-digestion run for this attached conversation and print only the fixed bounded admission: started, busy, idle or refused. The batch may come from any mapped chat because workspace memory is shared. It returns immediately; the run is a background native task, holds no terminal turn, creates no schedule and calls no model from the command. An `idle` answer that did not reach every mapped chat's tail says closed history may remain and a later invocation continues the bounded scan; it never loops to exhaustion. |
+| `/digest status` | Bounded read-only view of the live digestion run and this conversation's newest run: task IDs, outcome, batch position, evidence count and a bounded recorded error. It performs no transcript scan, model call or cursor change. |
 | `/attach <path>[ -- <prompt>]` | Store one operator-named local file through the gateway under the configured workspace media directory and submit it as an ordinary turn, optionally with prompt text after the first ` -- ` (paths may contain spaces). Requires top-level `media` config; see [local attachments](#local-attachments). |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
 | `/new` | Admit native `Conversation.reset(undefined)`: the same conversation starts a new context with no handoff. No archive, summary, usage reset or extra model call is produced; earlier entries stay stored and remain visible to `/history`, and configured tools are unchanged. While busy it is placed at the next safe boundary and ends that run there instead of interrupting the current model turn; inputs queued before or after it in the same busy window run in the new context. A queued `/new` is a write, so `/abort` withdraws queued inputs but not the pending reset. |
+
+Memory digestion's result is one internal event for this conversation's agent (the
+same pattern as a worker result), not a local terminal answer the command
+produces; the agent decides what to relay. `/digest` and `/digest status` require
+the configured `read`, `write` and `edit` tools for this authenticated chat;
+without them the admission is a fixed refusal and nothing runs.
 
 The Telegram adapter exposes its own owner controls; they are not CLI commands.
 `/new` there also rebuilds the assembled workspace prompt from the current files,

@@ -90,10 +90,13 @@ npm start -- agent --config config.json     # attach a terminal
   demand through the read-only `skill` tool.
 - Markdown in the workspace is the memory source of truth. Durable owns the
   transcript, runtime state and compaction.
-- Memory digestion is inert until a host calls `gateway.memoryDigest.start`: one
-  native task consumes one bounded closed-episode batch in a task-owned
-  conversation whose only tools are the origin's captured `read`/`write`/`edit`,
-  confined to `SOUL.md`, `USER.md`, `memory/**/*.md` and
+- Memory digestion starts only on an explicit owner command or an explicit
+  ordinary cron intent (`intent: "digest"`); opening the gateway and parsing
+  configuration start nothing. `/digest` and `/digest status` are host commands
+  in the local CLI and for the authenticated Telegram owner, not model tools.
+  One `gateway.memoryDigest.start` consumes one bounded closed-episode batch in
+  a task-owned conversation whose only tools are the origin's captured
+  `read`/`write`/`edit`, confined to `SOUL.md`, `USER.md`, `memory/**/*.md` and
   `skills/<name>/SKILL.md`. Digest `write` is a guarded atomic exclusive create
   (`O_CREAT | O_EXCL`), never a precheck plus truncation; `edit` keeps exact-text
   in-process protection only, and an uncooperative outside editor between read
@@ -101,8 +104,13 @@ npm start -- agent --config config.json     # attach a terminal
   validated from its own committed input through its own answer: any failed
   `pi.tool-result` fails the batch even if the model answers later, and a
   non-empty report is required. The editable workspace policy is `DIGEST.md`
-  (seeded only when absent) and it can never grant authority. No command, cron
-  job, tool, channel notice, shell, network or worker authority is part of it.
+  (seeded only when absent) and it can never grant authority. A terminal run
+  admits exactly one bounded internal result event to its origin conversation
+  (`nanobot.memory-digest-result`, deduplicated by request ID); the agent decides
+  what to relay, and a digest cron occurrence queues no channel delivery. No
+  digest run gets shell, network, worker, channel-send, history, MCP or
+  scheduling authority, and a digest cron occurrence runs from the validated
+  mapped origin with the current allowlist, never from a task-owned target.
 - Native web tools are default-off and separate from `toolAllowlist`: `web.search`
   names the Brave credential environment variable, and `web.fetch` enables the
   public reader. Both are limited to authenticated mapped chats. Public fetch

@@ -232,11 +232,12 @@ test('the native menu lists only implemented commands', { timeout: 20_000 }, asy
     // not advertised here; `/status`, `/model` and the `/stop` alias of `/abort` are. Every
     // advertised command is implemented.
     assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command),
-      ['new', 'abort', 'stop', 'status', 'model', 'help']);
+      ['new', 'abort', 'stop', 'status', 'model', 'digest', 'help']);
     assert.deepEqual(transport.commands[0].commands.map((entry) => entry.description),
       ["Reset this conversation's context", 'Stop this turn and withdraw queued messages',
         'Alias of /abort: stop this turn here', "Show this chat's model and run status",
-        'List or select a configured model preset', 'Show the available commands']);
+        'List or select a configured model preset', 'Run one bounded memory-digestion batch',
+        'Show the available commands']);
   } finally {
     await cleanup(store, harness);
   }

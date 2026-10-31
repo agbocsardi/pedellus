@@ -8,6 +8,12 @@ import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
 import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "../history/episodes.js";
 import {
+  renderMemoryDigestStart,
+  renderMemoryDigestStatus,
+  type MemoryDigestStartResult,
+  type MemoryDigestStatus,
+} from "../history/memory-digest.js";
+import {
   HISTORY_INDEX_LIMITS,
   type HistoryCoverage,
   type HistoryCursor,
@@ -86,6 +92,16 @@ export interface TerminalContextRefreshHost {
 }
 
 /**
+ * Optional host-owned manual memory-digestion entry. Starting returns once one bounded task is
+ * admitted (or reports idle/busy/refused); status is a bounded read-only read. Neither waits for
+ * the digest model turn, and neither is a model tool or an automatic schedule.
+ */
+export interface TerminalDigestHost {
+  start(): Promise<MemoryDigestStartResult>;
+  status(): Promise<MemoryDigestStatus>;
+}
+
+/**
  * Optional host-owned history read surface. The host supplies authenticated session scope; the
  * terminal never chooses a conversation or session key for search. Search results and episodes
  * are read-only derived views, never transcript writes or tool authority.
@@ -129,6 +145,8 @@ export interface TerminalIO {
   readonly toolPolicy?: TerminalToolPolicyHost;
   /** Optional host-owned workspace-context refresh; standalone callers leave /refresh unavailable. */
   readonly contextRefresh?: TerminalContextRefreshHost;
+  /** Optional host-owned memory-digestion entry; absent leaves /digest unavailable. */
+  readonly digest?: TerminalDigestHost;
   /** Optional host-owned history search/episode reads; standalone callers leave /search and /episodes unavailable. */
   readonly history?: TerminalHistoryHost;
   /** Optional host-owned local attachment submission; absent leaves /attach unavailable. */
@@ -1073,7 +1091,7 @@ export async function runTerminalConversation(
     switch (name) {
       case "help":
         await notice([
-          "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /refresh /compact /abort /new /attach <path>[ -- <prompt>]",
+          "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /refresh /digest [status] /compact /abort /new /attach <path>[ -- <prompt>]",
           SEARCH_USAGE,
           EPISODES_USAGE,
           EPISODE_USAGE,
@@ -1086,6 +1104,9 @@ export async function runTerminalConversation(
             ? "Coding tools are configured by toolAllowlist and apply to authenticated chats; /tools is read-only diagnostics and chat commands never change tool authority."
             : "Coding-tool authority is host-controlled and unavailable here.",
           io.contextRefresh?.available ? "/refresh re-reads workspace context and skills for this conversation when it is idle." : "/refresh is unavailable without configured workspace context.",
+          io.digest
+            ? "/digest starts one bounded closed-episode memory-digestion run for this conversation and reports only the bounded admission; /digest status is a read-only bounded view. The run works in the background against the shared workspace and reports to this conversation's agent, not to a user or channel."
+            : "/digest is unavailable in this host.",
           io.attachments
             ? "/attach stores one local file under the configured workspace media directory and submits it with the optional prompt. Known image extensions become image content; other files stay unread originals."
             : "/attach is unavailable without a configured media section.",
@@ -1119,6 +1140,24 @@ export async function runTerminalConversation(
       case "refresh":
         await refreshContext(args);
         return;
+      case "digest": {
+        const host = io.digest;
+        if (!host) {
+          await notice("Memory digestion is unavailable in this host. Nothing was started.", true);
+          return;
+        }
+        const argument = args.trim().toLowerCase();
+        if (argument === "") {
+          await notice(renderMemoryDigestStart(await host.start()));
+          return;
+        }
+        if (argument === "status") {
+          await notice(renderMemoryDigestStatus(await host.status()));
+          return;
+        }
+        await notice("Usage: /digest (start one bounded batch) or /digest status (bounded read-only status).", true);
+        return;
+      }
       case "attach":
         await attachFile(args);
         return;

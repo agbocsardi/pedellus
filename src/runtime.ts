@@ -116,11 +116,13 @@ import {
   MEMORY_DIGEST_TASK_NAME,
   createMemoryDigest,
   createMemoryDigestScopeExtension,
+  hasMemoryDigestTools,
   memoryDigestCurationTools,
   memoryDigestTaskPolicy,
   memoryDigestTaskTarget,
   type MemoryDigest,
   type MemoryDigestStartResult,
+  type MemoryDigestStatus,
   type MemoryDigestWriter,
 } from "./history/memory-digest.js";
 import {
@@ -271,8 +273,10 @@ export interface Gateway {
    * mapped chat sessions and creates one native Durable task, or reports `idle`, `busy` or `refused`
    * without starting anything. It is inert until a host calls it: no command, tool, schedule or
    * provider call exists here, and nothing is sent to a user or channel. A run's cursor advance is
-   * durable and only happens after a settled, answered turn; O3 wires manual invocation and ordinary
-   * cron over this interface.
+   * durable and only happens after a settled, answered turn. The owner command (`/digest`, also
+   * offered to the authenticated Telegram owner) and an explicit ordinary cron job with
+   * `intent: "digest"` are the only callers; a terminal run admits one bounded internal result
+   * event to the origin agent's own conversation.
    */
   readonly memoryDigest: GatewayMemoryDigest;
   /**
@@ -461,6 +465,8 @@ export interface Gateway {
  */
 export interface GatewayMemoryDigest {
   start(writer: MemoryDigestWriter, context: Context): Promise<MemoryDigestStartResult>;
+  /** Bounded read-only status: the live run and this conversation's newest run. No scan, no model. */
+  status(writer: MemoryDigestWriter, context: Context): Promise<MemoryDigestStatus>;
 }
 
 /** Outcome of {@link Gateway.resetSession}; `busy` means nothing was reset and nothing was rebuilt. */
@@ -1037,6 +1043,38 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const cronFoundation = cronEnabled
     ? createCronFoundation({
         now,
+        // A `digest` occurrence is the same bounded native entry a manual command uses. It is
+        // invoked with the authenticated origin conversation (the job's own document conversation),
+        // never a task-owned target; `start` re-checks that origin and the current curation
+        // allowlist, so a narrowed config refuses instead of widening. The digest task reports its
+        // own completion internally, so no cron outbox delivery is queued for this intent.
+        digest: async ({ originConversationId }, ctx) => {
+          const harness = harnessRef.current;
+          if (harness === undefined) return { status: "error", error: "the runtime is not open" };
+          const conversation = await harness.conversation(originConversationId, ctx);
+          if (conversation === undefined) {
+            return { status: "error", error: "the digest origin conversation is missing" };
+          }
+          try {
+            const result = await memoryDigest.start({
+              id: conversation.id,
+              commit: (change, inner) => conversation.commit(change, inner),
+            }, ctx);
+            if (result.status === "started") return { status: "ok", error: null };
+            if (result.status === "busy") {
+              return { status: "ok", error: `run ${result.taskId} is still active; nothing new was started` };
+            }
+            if (result.status === "idle") {
+              return {
+                status: "ok",
+                error: result.idle.caughtUp ? null : "no bounded batch was ready; closed history remains for a later run",
+              };
+            }
+            return { status: "error", error: result.reason };
+          } catch (error) {
+            return { status: "error", error: error instanceof Error ? error.message : String(error) };
+          }
+        },
         // A background run is a fresh, task-owned conversation that starts default-deny. It captures
         // the ceiling its authenticated origin currently has; the call-time hook still requires that
         // origin and the current config, so the capture is a subset, never new authority. An
@@ -1163,6 +1201,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
           return harnessRef.current;
         },
         ...(cronConfig?.timeZone === undefined ? {} : { timeZone: cronConfig.timeZone }),
+        digestAvailable: (conversationId) => authorizedChatConversations.has(conversationId)
+          && hasMemoryDigestTools(toolAllowlist),
       });
   const cronToolRegistration = cronTool?.extension.tools?.[0];
   // Bounded ordinary background workers. The foundation owns the Durable task, its child conversation
@@ -2231,6 +2271,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       harness,
       memoryDigest: {
         start: (writer, ctx) => memoryDigest.start(writer, ctx),
+        status: (writer, ctx) => memoryDigest.status(writer, ctx),
       },
       cronOutbox,
       ...(telegramActions === undefined ? {} : { telegramActions }),
@@ -2593,6 +2634,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
       } catch {
         // The records stay unnotified; the next open retries the same admission.
       }
+    }
+    // The same admission guarantee for a terminal digest run: its internal result event may have
+    // been lost between the terminal commit and the submit. Only currently mapped chat origins are
+    // notified, and the request ID keeps a retry from duplicating the origin agent's turn.
+    try {
+      await memoryDigest.recover(
+        harness,
+        (conversationId) => authorizedChatConversations.has(conversationId),
+        context,
+      );
+    } catch {
+      // Notices stay open; the next open retries.
     }
     return gateway;
   } catch (error) {

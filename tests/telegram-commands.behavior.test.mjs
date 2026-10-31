@@ -21,6 +21,7 @@ const [
   { BACKGROUND_CONTEXT, withCancel },
   { createModels, fauxAssistantMessage, fauxProvider },
   { getCurrentSystemPrompt },
+  { MEMORY_DIGEST_RESULT_ENTRY_KIND, MEMORY_DIGEST_TASK_NAME },
 ] = await Promise.all([
   import(new URL('../dist/config.js', import.meta.url).href),
   import(new URL('../dist/runtime.js', import.meta.url).href),
@@ -29,6 +30,7 @@ const [
   import(`${modules}/chord/dist/context/index.js`),
   import(`${modules}/pi-ai/dist/index.js`),
   import(`${modules}/pi-ai/dist/utils/transcript.js`),
+  import(new URL('../dist/history/memory-digest.js', import.meta.url).href),
 ]);
 
 const context = BACKGROUND_CONTEXT;
@@ -146,6 +148,7 @@ async function syntheticStore(label, options = {}) {
     toolAllowlist: options.tools ?? [],
     telegram: { tokenEnv: 'TG_SYNTHETIC_TOKEN', allowFrom: options.allowFrom ?? ['501'] },
     ...(options.workspaceContext === undefined ? {} : { workspaceContext: options.workspaceContext }),
+    ...(options.episodeSummary === undefined ? {} : { episodeSummary: options.episodeSummary }),
   }, directory);
   const gateway = await openGateway(config, context, { models, ...workspaceContextGatewayOptions(config) });
   return { directory, workspace, gateway, config, captured, gate };
@@ -280,7 +283,7 @@ test('a native host advertises exactly the implemented owner commands, with the 
     await until(() => transport.commands.length === 1, 'command menu registration');
     assert.deepEqual(transport.commands[0].scope, { type: 'all_private_chats' });
     assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command),
-      ['new', 'abort', 'stop', 'status', 'model', 'restart', 'help']);
+      ['new', 'abort', 'stop', 'status', 'model', 'restart', 'digest', 'help']);
     // The retired `/refresh` is not an owner command: no menu entry and a truthful refusal.
     assert.ok(!transport.commands[0].commands.some((entry) => entry.command === 'refresh'));
     assert.equal(store.captured.length, 0, 'registering commands costs no model request');
@@ -313,6 +316,84 @@ test('a narrow SDK host keeps the base commands and truthfully refuses typed hos
     const help = texts.find((text) => text.startsWith('Controls for this chat'));
     assert.doesNotMatch(help, /\/status|\/model|\/restart|\/refresh/);
     assert.equal(store.captured.length, 0, 'no command reached the model');
+  } finally {
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('/digest status, idle and malformed forms are bounded owner notices with no model call', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('digest-idle', { tools: ['read', 'write', 'edit'] });
+  const transport = telegramMock([[
+    textUpdate(510, 510, '/digest status'),
+    textUpdate(511, 511, '/digest'),
+    textUpdate(512, 512, '/digest now'),
+    // Not an allowlisted sender: the chat is not admitted, so this starts nothing and replies nothing.
+    textUpdate(513, 513, '/digest', 999),
+  ]]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.length === 3, 'three bounded digest notices');
+    await flush();
+    assert.equal(transport.sent.length, 3, 'an unauthenticated chat gets no digest control');
+    assert.match(transport.sent[0].text, /No memory digestion run is recorded for this conversation/);
+    assert.match(transport.sent[0].text, /read-only: no scan, no model call/);
+    assert.match(transport.sent[1].text, /No closed episode is pending memory digestion/);
+    assert.match(transport.sent[1].text, /no model was called/);
+    assert.match(transport.sent[2].text, /Usage: \/digest/);
+    assert.equal(store.captured.length, 0, 'no digest command form reached the model');
+    const tasks = await store.gateway.harness.commit(
+      async (tx) => (await tx.scanTasks({ kind: MEMORY_DIGEST_TASK_NAME }, 10)).items,
+      context,
+    );
+    assert.equal(tasks.length, 0, 'neither status nor an idle start creates a digest task');
+  } finally {
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('/digest starts one bounded batch for this authenticated chat and reports internally', { timeout: 30_000 }, async () => {
+  const store = await syntheticStore('digest-start', {
+    tools: ['read', 'write', 'edit'],
+    episodeSummary: { enabled: false },
+  });
+  const chat = await store.gateway.conversationFor(`telegram:${BOT_ID}:chat:${CHAT_ID}`, context);
+  await store.gateway.harness.commit(async (tx) => {
+    await tx.appendEntry(chat.id, { kind: 'pi.system', model: [{ role: 'system', content: 'boot', timestamp: 1_000 }] });
+  }, context);
+  await chat.reset(undefined, context);
+  const transport = telegramMock([[textUpdate(520, 520, '/digest')]]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.length >= 1, 'the bounded start acknowledgement');
+    assert.match(transport.sent[0].text, /started for one bounded closed-episode batch/);
+    assert.match(transport.sent[0].text, /0 evidence entries/);
+    assert.match(transport.sent[0].text, /shared workspace/);
+    let task;
+    await untilAsync(async () => {
+      const page = await store.gateway.harness.commit(
+        async (tx) => (await tx.scanTasks({ kind: MEMORY_DIGEST_TASK_NAME }, 10)).items,
+        context,
+      );
+      task = page[0];
+      return task !== undefined && task.state.status === 'terminal';
+    }, 'digest task terminal');
+    assert.equal(task.state.outcome.status, 'completed');
+    assert.equal(task.state.outcome.result.outcome, 'noop');
+    // The no-evidence batch called no provider; the one captured request is this conversation's
+    // ordinary answer to the bounded internal result event, not the command.
+    await until(() => store.captured.length === 1, 'one internal result turn');
+    const entries = (await chat.entries({ order: 'ascending' }, 100, undefined, context)).items;
+    const notices = entries.filter((entry) => entry.kind === MEMORY_DIGEST_RESULT_ENTRY_KIND);
+    assert.equal(notices.length, 1, 'exactly one internal result event');
+    const content = notices[0].model?.[0]?.content;
+    const noticeText = typeof content === 'string'
+      ? content
+      : (content ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('');
+    assert.match(noticeText, /settled: noop/);
   } finally {
     await cleanup(store, harness);
     transport.restore();
@@ -359,7 +440,7 @@ test('/model lists and selects one configured preset for this chat only', { time
     // `/refresh` was retired in favour of `/new`; it is refused and never a control. This host has no
     // restart capability, so `/restart` is not offered either.
     assert.match(texts[6], /Unsupported command \/refresh/);
-    assert.match(texts[6], /Available: \/new, \/abort, \/stop, \/status, \/model, \/help/);
+    assert.match(texts[6], /Available: \/new, \/abort, \/stop, \/status, \/model, \/digest, \/help/);
     assert.doesNotMatch(texts[6], /restart/);
 
     assert.deepEqual((await store.gateway.listModels(`telegram:${BOT_ID}:chat:${CHAT_ID}`, context)).selected,

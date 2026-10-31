@@ -4,9 +4,10 @@ import { resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { Context } from "@earendil-works/chord";
 import { withCancel } from "@earendil-works/chord/context";
-import type { Conversation, Cursor, EntryId } from "@earendil-works/pi-durable";
+import type { Conversation, Cursor, EntryId, Tx } from "@earendil-works/pi-durable";
 import type { HistoryEpisodeQuery } from "../history/episodes.js";
 import type { HistoryQuery } from "../history/index.js";
+import type { MemoryDigestWriter } from "../history/memory-digest.js";
 import type { MediaStore } from "../media/attachments.js";
 import {
   LocalAttachmentError,
@@ -331,6 +332,10 @@ class LocalConnection {
         }
         return this.options.gateway.refreshContext(this.sessionKey, this.scope.context);
       }
+      case "digestStart":
+        return this.options.gateway.memoryDigest.start(this.digestWriter(), this.scope.context);
+      case "digestStatus":
+        return this.options.gateway.memoryDigest.status(this.digestWriter(), this.scope.context);
       case "historySearch": {
         const params = requireObject(request.params);
         onlyKeys(params, ["query"]);
@@ -395,6 +400,16 @@ class LocalConnection {
       contextRefresh: this.options.contextRefresh,
       presets: this.options.presets,
       attachments: this.options.attachments !== undefined,
+      digest: true,
+    };
+  }
+
+  /** The attached conversation is the digest origin; no other conversation is addressable here. */
+  private digestWriter(): MemoryDigestWriter {
+    const conversation = this.gatewayConversation!;
+    return {
+      id: conversation.id,
+      commit: (change, context) => conversation.commit(change, context),
     };
   }
 

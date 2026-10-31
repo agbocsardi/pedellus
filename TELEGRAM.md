@@ -19,17 +19,17 @@ unauthorized sender, a group, a bot, or an attachment can never be a control and
 never reaches it. `message.text` (not a caption) is classified:
 
 - The owner controls are `/new`, `/abort`, `/stop`, `/status`, `/model`,
-  `/restart` and `/help`. `/stop` is an alias of `/abort` with exactly the same
-  effect and the same durable record (it is normalized before admission, so
-  there is one control kind and one code path). Which of them this adapter
-  advertises depends on what the host really exposes (see
+  `/digest`, `/restart` and `/help`. `/stop` is an alias of `/abort` with
+  exactly the same effect and the same durable record (it is normalized before
+  admission, so there is one control kind and one code path). Which of them this
+  adapter advertises depends on what the host really exposes (see
   [Host capability and the native menu](#host-capability-and-the-native-menu)).
   A typed command the host cannot perform is refused with fixed text and is
   never sent to the assistant.
 - Matching is an exact leading command token (case-insensitive). `/new`,
-  `/abort`, `/stop`, `/status`, `/restart` and `/help` take no arguments;
-  `/model` takes one configured preset name or `default`. Anything else gets a
-  bounded usage notice.
+  `/abort`, `/stop`, `/status`, `/restart`, `/digest` and `/help` take no
+  arguments; `/model` takes one configured preset name or `default`; `/digest`
+  also accepts the literal `status`. Anything else gets a bounded usage notice.
 - `/new@bot` etc. are controls only when the mention names this bot from
   `getMe` (case-insensitive). Another bot's mention, or a mention while `getMe`
   returned no usable username, gets a bounded notice and is neither executed nor
@@ -83,6 +83,21 @@ native conversation projection the terminal uses, makes no model call, creates
 no watch or timer, and includes no transcript, prompt, tool argument, thinking
 content, provider error or other-chat data. There is no chat or session
 selector.
+
+`/digest` is the manual memory-digestion entry. With no argument it asks the
+host for one bounded closed-episode batch from the shared, already-mapped chat
+history (the batch may come from a different mapped chat, because workspace
+memory is shared) and acknowledges only the bounded admission: started, busy,
+idle or refused. It returns immediately, starts no schedule, holds no chat turn
+while the digest runs, and calls no model from the command itself. A digest batch
+is one closed episode chunk, not a loop until history is exhausted; an `idle`
+answer that did not reach every mapped chat's tail says closed history may
+remain. `/digest status` is a bounded read-only view of the live run and this
+chat's newest run; it performs no transcript scan, model call or cursor change.
+The digest turn's result is one internal event for this chat's agent, never a
+direct user or channel message, and the agent decides what to relay. Only an
+authenticated allowlisted private sender can use either form. A host without the
+manual entry advertises no `/digest` and refuses a typed one with fixed text.
 
 `/model` lists the current selection and the finite configured catalog: named
 presets in named-preset mode (`/model <name>`, `/model default`), or the
@@ -214,16 +229,18 @@ and grants no other authority.
 
 ### Acknowledgement and pending semantics
 
-A mutating control (`/new`, `/abort`, `/model`, `/restart`) acknowledgement is
-committed **held** (`hold: true`) with the command intent, and published once:
+A mutating control (`/new`, `/abort`, `/model`, `/digest`, `/restart`)
+acknowledgement is committed **held** (`hold: true`) with the command intent, and
+published once:
 
 - the native call returns: "Context reset applied …" (with the rebuilt prompt
   and skill count when the host rebuilt it), "Abort applied for this chat: it is
   idle now. Queued messages were withdrawn and any running turn was stopped …"
   — phrased so an idle conversation is not claimed to have had a turn stopped —
-  "Selected preset … for this chat: …", or "Restart requested for this gateway
-  … This acknowledgement confirms the request only; it does not confirm that the
-  restart completed.";
+  "Selected preset … for this chat: …", the bounded `/digest` admission
+  (started/busy/idle/refused, never evidence text), or "Restart requested for
+  this gateway … This acknowledgement confirms the request only; it does not
+  confirm that the restart completed.";
 - the native call proved that nothing changed (`/new` or `/model` on a busy chat,
   an unknown or unavailable preset, a legacy direct config): the acknowledgement
   is corrected to that fixed refusal; the record becomes `refused`, never
@@ -256,8 +273,8 @@ record in the delivery path (with the update's stable request ID), so a crash
 before submission is recovered rather than lost, and a duplicate update cannot
 create a second turn.
 
-`/new`, `/abort` (also spelled `/stop`), `/model` and `/restart` are admitted
-the same way and additionally record `{ updateId, command, status, chatId, senderId }` in the
+`/new`, `/abort` (also spelled `/stop`), `/model`, `/digest` and `/restart` are
+admitted the same way and additionally record `{ updateId, command, status, chatId, senderId }` in the
 `controls` log **before** the native call. While a chat's command is being
 applied, that chat is gated:
 none of its pending inputs are submitted or delivered, so the acknowledgement
@@ -355,11 +372,16 @@ command outside that set is refused with fixed text instead of a silent failure:
 - `/restart` needs a host restart capability. The local CLI injects it with
   `process.execve` support detected at startup; without it the command is
   neither advertised nor performed.
+- `/digest` and `/digest status` need the host manual digestion entry
+  (`memoryDigest.start`/`status`). Without it neither form is advertised and a
+  typed one is refused with fixed text. The shipped Gateway always exposes it;
+  the run itself still refuses when this chat has no `read`/`write`/`edit`
+  authority.
 
 A test-only host that offers none of the optional host operations therefore
 advertises exactly `/new`, `/abort`, `/stop`, `/help`, while the shipped gateway
 with the CLI restart host advertises `/new`, `/abort`, `/stop`, `/status`,
-`/model`, `/restart`, `/help`.
+`/model`, `/restart`, `/digest`, `/help`.
 
 An ordinary user message keeps its existing input text (including literal `//`
 handling), so literal content is unchanged. A message that replies to another

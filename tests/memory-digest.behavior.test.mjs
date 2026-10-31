@@ -23,6 +23,7 @@ const [
   {
     MEMORY_DIGEST_ENTRY_KIND,
     MEMORY_DIGEST_PROMPT_FILE,
+    MEMORY_DIGEST_RESULT_ENTRY_KIND,
     MEMORY_DIGEST_TASK_NAME,
     memoryDigestScopeProblem,
   },
@@ -153,7 +154,14 @@ async function openStore(fixture, script, overrides = {}, openOptions = {}) {
   const calls = [];
   const dispatcher = (request, options, _state, model) => {
     faux.appendResponses([dispatcher]);
-    calls.push(lastUserText(request.messages));
+    const input = lastUserText(request.messages);
+    calls.push(input);
+    // A terminal digest admits one internal result input to the origin conversation, which is an
+    // ordinary model turn for that agent. Answer it here so a test script only ever sees the digest
+    // batch itself; the committed notice entry is asserted separately.
+    if (input.startsWith('[internal memory digest result]')) {
+      return fauxAssistantMessage('Digest result noted.');
+    }
     return script(request, options, model);
   };
   faux.setResponses([dispatcher]);
@@ -369,10 +377,16 @@ test('one closed episode becomes a topic-memory fact and only a settled turn adv
     assert.equal(cursor.episodeStartEntryId, null);
     assert.equal(cursor.episodeEndEntryId, null);
 
-    // Nothing was sent to the origin chat and no channel delivery was queued.
+    // No user/channel message and no cron delivery were produced. The origin gained exactly one
+    // bounded internal result event for this conversation's agent, admitted once.
     const originHandle = await store.gateway.harness.conversation(origin.id, context);
-    const originEntries = (await originHandle.entries({ order: 'ascending' }, 100, undefined, context)).items;
-    assert.equal(originEntries[originEntries.length - 1].kind, 'pi.reset', 'the origin transcript gained nothing');
+    const originNotices = async () => (await originHandle.entries({ order: 'ascending' }, 100, undefined, context))
+      .items.filter((entry) => entry.kind === MEMORY_DIGEST_RESULT_ENTRY_KIND);
+    await waitFor(async () => (await originNotices()).length === 1, 'one internal digest result notice');
+    const notice = (await originNotices())[0];
+    assert.match(messageText(notice.model?.[0]), /Run \d+ settled: digested/);
+    assert.match(messageText(notice.model?.[0]), /frontier advanced/);
+    assert.match(messageText(notice.model?.[0]), /internal result for this conversation's agent/);
     assert.deepEqual(await store.gateway.cronOutbox.list(SESSION, context), []);
 
     // Authority is retired in the terminal commit.
@@ -384,7 +398,9 @@ test('one closed episode becomes a topic-memory fact and only a settled turn adv
     const idle = await startDigest(store.gateway);
     assert.equal(idle.status, 'idle');
     assert.equal(idle.idle.caughtUp, true);
-    assert.equal(store.calls.length, 2, 'the tool round and its answer were the only model requests');
+    await waitFor(async () => store.calls.length === 3, 'the internal result turn');
+    assert.equal(store.calls.length, 3,
+      'the digest tool round, its answer and the one internal result turn were the only model requests');
   }
 });
 
@@ -406,7 +422,10 @@ test('a chunk with no evidence advances the cursor without a provider call', { t
     assert.equal(task.state.outcome.status, 'completed');
     assert.equal(task.state.outcome.result.outcome, 'noop');
     assert.equal(task.state.outcome.result.consumed, true);
-    assert.equal(store.calls.length, 0, 'a no-op batch never reaches a provider');
+    // The no-op batch itself never reaches a provider. Only the one bounded internal result event is
+    // an ordinary model turn for the origin agent.
+    await waitFor(async () => store.calls.length === 1, 'the internal no-op result turn');
+    assert.match(store.calls[0], /Run \d+ settled: noop/);
     const cursor = await cursorDoc(store.gateway.harness, origin.id);
     assert.equal(cursor.throughEntryId, started.throughEntryId);
   }
