@@ -19,6 +19,14 @@
   "episodeSummary": {
     "enabled": true
   },
+  "digest": {
+    "entriesPerBatch": 80,
+    "charsPerBatch": 24000,
+    "maxToolCalls": 10,
+    "runTimeoutSeconds": 300,
+    "maxChangedFiles": 8,
+    "maxDiffChars": 32000
+  },
   "credentials": {
     "anthropic": "ANTHROPIC_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",

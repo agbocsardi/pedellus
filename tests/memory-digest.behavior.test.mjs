@@ -718,7 +718,7 @@ test('an expired turn deadline fails without advancing the frontier', { timeout:
       signal?.addEventListener('abort', resolve, { once: true });
     });
     return fauxAssistantMessage('too late');
-  }, {}, { memoryDigest: { turnTimeoutMs: 120 } });
+  }, {}, { memoryDigest: { turnTimeoutMs: 1_500 } });
   t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
   {
     const origin = await store.gateway.conversationFor(SESSION, context);
