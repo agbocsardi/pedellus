@@ -138,8 +138,11 @@ created or when the gateway reopens. Editing `AGENTS.md`, `MEMORY.md`, or a
 ```
 
 `/refresh` re-reads bootstrap files, selected memory, the manifest and skills
-together in the same conversation. `/new` is different: it starts a fresh model
-context with no handoff and does **not** re-read files. A gateway restart applies
+together in the same conversation. The CLI's `/new` is different: it starts a
+fresh model context with no handoff and does **not** re-read files. (The
+Telegram owner's `/new` does both: it resets that chat and rebuilds its assembled
+workspace prompt, as described in
+[6. Telegram continuation](#6-telegram-continuation).) A gateway restart applies
 config edits and re-reads the files, because startup reloads the config selection
 for every persisted session mapping.
 

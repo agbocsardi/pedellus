@@ -22,8 +22,10 @@ what was actually measured, and which limits and live gaps remain.
   identical to `3bace35`; the whole delta is `SETUP.md`, `TELEGRAM.md` and this
   file. The commit that adds this file is the P6 doc tip
   (`git log -1 -- plan/2026-10-31_parity-handoff.md`).
-- Nothing is published to main until a fresh independent review of this combined
-  union passes. The parent owns publication and the TODO.
+- The P1/P2/P3/P4/P5/P7 functional tips are already ancestors of main
+  `3bace35`; only this docs close is still unpublished. A fresh independent
+  review of this combined union passed clean, so publication is a fast-forward of
+  this docs-only tip. The parent owns publication and the TODO.
 
 ## Active by default vs opt-in
 
@@ -225,7 +227,12 @@ Digestion:
 - Budgets are conservative UTF-16 text-unit accounting, not a git diff; there is
   no path-alias resolution, so aliases can under- or overcharge.
 - A turn longer than 4,000 committed entries cannot be verified and fails
-  closed; cross-chat ordering is best effort under the scan bounds.
+  closed, and cross-chat ordering is best effort under the scan bounds.
+- The bounded gap check between the previous frontier and the next closed
+  episode examines up to 4,000 entries. A conversation with more than 4,000
+  consecutive empty `pi.reset` markers before that episode is refused loudly
+  rather than assumed: the same evidence is offered again, the cursor stays
+  unchanged, and no evidence is silently skipped.
 - Partial writes from a failed run stay on disk for an idempotent replay; there
   is no rollback. `write` is an atomic exclusive create, but `edit` keeps exact
   text plus in-process serialization only — an outside editor changing the file
@@ -297,6 +304,10 @@ Service:
   that `/new` does not re-read files is replaced with the shipped behaviour
   (reset plus assembled-prompt rebuild; a gateway restart is what re-reads
   configuration).
+- `SETUP.md` refresh/reset section: the surface is now explicit — the CLI's
+  `/new` resets without re-reading files, while the Telegram owner's `/new` also
+  rebuilds that chat's assembled workspace prompt — so the two SETUP passages
+  cannot be read as contradicting each other.
 - `SETUP.md` config table: the `digest` row now states the accepted default
   bounds and that `maxToolCalls` counts individual calls, matching
   `config.example.json` and the shipped defaults.
