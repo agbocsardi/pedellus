@@ -42,7 +42,7 @@ facilities; do not redesign memory quality, holistic usability or agent loops.
 - [ ] P5 — Concise, read-only background summary inside existing `/status`:
   what is running (workers/digest/cron), if anything. No dashboard, management
   commands, model call or transcript dump; agent remains the manager.
-- [ ] P7 — User-systemd service readiness and parallel instances: one template
+- [x] P7 — User-systemd service readiness and parallel instances: one template
   service per instance, per-instance config/environment, independent
   dataDir/SQLite/socket and workspace. Verify graceful stop/restart/journal and
   same-store duplicate-owner refusal offline. No install/enable/start, lingering,
@@ -442,6 +442,32 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Parity batch — P3 transcripts, P7 service readiness and P4 steering accepted
+
+P3 (worker transcripts) published at `ba6df4e`: existing `worker` tool gained a
+bounded, ownership-verified `transcript` action over native Durable entries;
+history's bounded entry renderer was shared rather than copied. No Atuin
+capture/export or SQL surface. Independent PASS: 19 worker checks, 250 behavior,
+2 execution, 83 core.
+
+P7 published at `52138372` by its original implementer after two independent
+reviews (first found the branch predated P1/P2 and dropped a registered suite):
+default config `~/.durable-nanobot/config.json` resolved from the runtime home,
+explicit `--config` preserved for secondary instances, user-systemd templates
+for a primary and `nanobot@` secondaries, per-instance config/dataDir/workspace/
+socket separation. Instance paths use a literal `i-%i` directory so a dot-like
+name cannot traverse. Static `systemd-analyze verify` only; nothing installed,
+enabled, started, lingered or reloaded. Final gate: 276 behavior across 34 files,
+2 execution, 83 core; published main build plus 6 focused service checks.
+One docs link defect and a silent-skip were fixed before publication. Accepted
+limits: same-UID instances are not a security boundary, distinct pollers need
+distinct bot tokens, live systemd operation untested, canceled/parked worker and
+restart-limit block classification covered by renderer tests only.
+
+P4 (worker steering) cleared independent re-review at `6880486` (274 behavior,
+2 execution, 83 core; 10 concurrent admissions → 8 accepted/2 refused; digest
+refusal for changed payloads). Publication pending its current-main union.
 
 ### Parity batch — P1 digest budgets and P2 Telegram sends published
 
