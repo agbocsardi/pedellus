@@ -70,6 +70,7 @@ The shipped [`config.example.json`](./config.example.json) is the starting point
 | `toolAllowlist` | Config authority: these coding tools are enabled for authenticated mapped chats. `[]` or absent disables them. |
 | `cron` | Installs the model-facing `cron` tool; `timeZone: "UTC"` interprets calendar expressions without an explicit zone. |
 | `episodeSummary` | Closed episodes use the conversation's current model, or a named override such as `"preset": "fast"`. This costs provider calls; set `enabled: false` to turn it off. |
+| `digest` | Optional bounds for one explicitly started memory-digestion run: `entriesPerBatch`, `charsPerBatch`, `maxToolCalls`, `runTimeoutSeconds`, `maxChangedFiles`, `maxDiffChars`. `charsPerBatch` is UTF-16 units with a minimum of 2; absent keeps the accepted defaults. The block neither enables nor schedules digestion. A configured `runTimeoutSeconds` wins over a host deadline seam. |
 | `credentials` | Environment-variable *names* only. No secret value belongs in this file. |
 
 Export the key named by `credentials.openai` (or whichever alias you allow):
@@ -274,6 +275,14 @@ existing ones:
   transcription timeout and a 120s audio-duration limit by default. Stored
   originals are never deleted by the adapter and there is no total-disk cap, so
   the media directory is yours to monitor and prune.
+- Outbound files are the scoped `telegram` tool's `send` action, not a general
+  upload service: one existing workspace file, unchanged (a document by default,
+  or an optional native photo/audio/video/voice presentation), with an optional
+  bounded caption, sent to the current authenticated private chat only. It
+  exists only when `media` is configured and `toolAllowlist` contains `read`;
+  the path is workspace-relative, symlink escapes and non-regular files are
+  refused, the 20 MB ceiling applies, and there is no remote-URL fetch,
+  arbitrary recipient, extraction, transcoding or automatic kind detection.
 
 Local speech needs a one-time provisioning step; the runtime never installs or
 downloads anything while handling a message. The helper is

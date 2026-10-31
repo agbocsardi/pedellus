@@ -112,6 +112,7 @@ import { createWorkerTool, WORKER_TOOL_NAME } from "./workers/tool.js";
 import { WORKER_LIMITS } from "./workers/limits.js";
 import { createWorkerWorkspace, type WorkerWorkspace } from "./workers/workspace.js";
 import { createDigestSource, type DigestSource } from "./history/digestion.js";
+import { DIGEST_RUN_LIMITS_DEFAULT, type DigestRunLimits } from "./history/digest-limits.js";
 import {
   MEMORY_DIGEST_TASK_NAME,
   createMemoryDigest,
@@ -237,9 +238,10 @@ export interface OpenGatewayOptions {
    */
   readonly web?: WebRuntimeOptions;
   /**
-   * Host seam for bounded memory digestion: the one-turn deadline. A digest run that exceeds it is
-   * cancelled and fails without advancing the cursor. No config field selects it; the module's
-   * default applies when absent, and starting a run stays an explicit host call.
+   * Host seam for bounded memory digestion: the one-turn deadline used only when `digest` config
+   * leaves `runTimeoutSeconds` absent. A configured product deadline always wins over this seam; a
+   * digest run that exceeds its deadline is cancelled and fails without advancing the cursor. No
+   * config field selects this seam, and starting a run stays an explicit host call.
    */
   readonly memoryDigest?: {
     readonly turnTimeoutMs?: number;
@@ -835,6 +837,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     : createTelegramTool({
         registry: telegramActions,
         sessionKeyFor: (conversationId) => sessionKeyForConversation.get(conversationId),
+        // Outbound workspace files need two explicit operator decisions: the `media` opt-in (which
+        // also supplies the channel's workspace) and the configured `read` coding tool, so the agent
+        // can already open what it sends. Neither is implied by configuring Telegram alone.
+        fileSend: config.media !== undefined && toolAllowlist.includes("read"),
       });
   const telegramToolRegistration = telegramTool?.extension.tools?.[0];
   // Config authorization names only mapped ordinary chat conversations (loaded map + scope checked).
@@ -927,7 +933,29 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // no Code Mode, no MCP/web/channel/history tool and no shell: only the curation-scope hook and the
   // captured Markdown tools. The set is rebuilt from live digest tasks on reopen.
   const digestTargetConversations = new Set<ConversationId>();
-  const digestScopeExtension = createMemoryDigestScopeExtension(workspace);
+  // Accepted bounds of each live target, restored from its task input on reopen. The scope hook reads
+  // them at call time, so config changes in a later open cannot widen an already-started run.
+  const digestTargetLimits = new Map<ConversationId, DigestRunLimits>();
+  const digestLimits: DigestRunLimits = Object.freeze({
+    ...DIGEST_RUN_LIMITS_DEFAULT,
+    ...(config.digest?.entriesPerBatch === undefined ? {} : { entriesPerBatch: config.digest.entriesPerBatch }),
+    ...(config.digest?.charsPerBatch === undefined ? {} : { charsPerBatch: config.digest.charsPerBatch }),
+    ...(config.digest?.maxToolCalls === undefined ? {} : { maxToolCalls: config.digest.maxToolCalls }),
+    ...(config.digest?.maxChangedFiles === undefined ? {} : { maxChangedFiles: config.digest.maxChangedFiles }),
+    ...(config.digest?.maxDiffChars === undefined ? {} : { maxDiffChars: config.digest.maxDiffChars }),
+    // A product-configured run deadline wins over the host test seam; the seam only fills the gap
+    // when config leaves `runTimeoutSeconds` absent.
+    runTimeoutMs: config.digest?.runTimeoutSeconds !== undefined
+      ? config.digest.runTimeoutSeconds * 1000
+      : options.memoryDigest?.turnTimeoutMs ?? DIGEST_RUN_LIMITS_DEFAULT.runTimeoutMs,
+  });
+  const digestScopeExtension = createMemoryDigestScopeExtension(workspace, {
+    harness: () => {
+      if (harnessRef.current === undefined) throw new Error("The runtime is not open");
+      return harnessRef.current;
+    },
+    limitsFor: (conversationId) => digestTargetLimits.get(conversationId),
+  });
   const digestSourceRef: { current: DigestSource | undefined } = { current: undefined };
   const workerEnvironments = new Map<string, ToolEnvironments>();
   const environmentFor = (conversationId: ConversationId, ctx: Context) => {
@@ -1340,9 +1368,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     workspaceRoot: workspace,
     now,
     scopeExtension: digestScopeExtension,
-    ...(options.memoryDigest?.turnTimeoutMs === undefined
-      ? {}
-      : { turnTimeoutMs: options.memoryDigest.turnTimeoutMs }),
+    limits: digestLimits,
     model: async (tx, conversationId) => {
       const state = await tx.doc(AgentDoc, conversationId);
       const choice = choiceFromState(state) ?? defaultChoice;
@@ -1387,6 +1413,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         extensions,
       });
       digestTargetConversations.add(target);
+      digestTargetLimits.set(target, { ...input.limits });
     },
     finalize: async ({ tx, targetConversationId: target }) => {
       // A digest target's captured authority ends in the same terminal commit that records the
@@ -1398,6 +1425,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         extensions: visionExtension === undefined ? [] : [visionExtension],
       });
       digestTargetConversations.delete(target);
+      digestTargetLimits.delete(target);
     },
   });
   const toolFilterFromNames = (
@@ -1683,7 +1711,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // The digest source shares the same host-validated mapped chat sessions as the history index
     // and episode catalog. It is created after Harness.open() because it needs the harness; the
     // executor above resolves it at use time, so its extension is already in the initial registry.
-    digestSourceRef.current = createDigestSource({ harness: harness!, sessions: mappedChatSessions });
+    digestSourceRef.current = createDigestSource({
+      harness: harness!,
+      sessions: mappedChatSessions,
+      limits: { entriesPerBatch: digestLimits.entriesPerBatch, charsPerBatch: digestLimits.charsPerBatch },
+    });
     // Bounded, background-only derived state: reset-delimited episode boundaries and their
     // durable summary status. It reads committed entries only and changes no reset or busy
     // ordering. A closed episode is recorded as pending; with summaries opted in, the same
@@ -2011,6 +2043,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
                 // A live digest target keeps its curation hook and pinned model; its captured
                 // Markdown tools are restored and narrowed from the capture below.
                 digestTargetConversations.add(target.id);
+                digestTargetLimits.set(target.id, { ...digestPolicy.limits });
                 if (!choicesByNative.has(modelKey(digestPolicy.model))) pinnedModelRemoved.add(target.id);
               }
             }
