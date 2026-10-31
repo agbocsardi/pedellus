@@ -860,6 +860,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     : createTelegramTool({
         registry: telegramActions,
         sessionKeyFor: (conversationId) => sessionKeyForConversation.get(conversationId),
+        // Outbound workspace files need two explicit operator decisions: the `media` opt-in (which
+        // also supplies the channel's workspace) and the configured `read` coding tool, so the agent
+        // can already open what it sends. Neither is implied by configuring Telegram alone.
+        fileSend: config.media !== undefined && toolAllowlist.includes("read"),
       });
   const telegramToolRegistration = telegramTool?.extension.tools?.[0];
   // Config authorization names only mapped ordinary chat conversations (loaded map + scope checked).

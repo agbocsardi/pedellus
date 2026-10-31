@@ -8,6 +8,9 @@
  * control-character sanitized and JSON-quoted so it stays visibly untrusted reference context,
  * never an instruction or an authorization.
  *
+ * A native media send records its workspace-relative path and bounded caption instead of a target
+ * text; its reply target is optional. Action records never carry an absolute host path.
+ *
  * Actions also carry a write-ahead external-effect record. The adapter records the intent before
  * the Telegram call and the outcome after it; an interrupted intent or a `sending` record is
  * quarantined as `unknown` on reopen and is never resent automatically.
@@ -37,7 +40,43 @@ export const TELEGRAM_ACTION_LIMITS = Object.freeze({
   emojiChars: 32,
   /** Tool call id bound. */
   callIdChars: 200,
+  /** Workspace-relative path bound on one outbound file action. */
+  filePathChars: 1_024,
+  /** Telegram caption bound on one outbound file action. */
+  captionChars: 1_024,
 });
+
+/** Native Telegram media send kinds; each maps to one Bot API send method. */
+export const TELEGRAM_FILE_KINDS = Object.freeze([
+  "document", "photo", "audio", "video", "voice",
+] as const);
+
+export type TelegramFileKind = (typeof TELEGRAM_FILE_KINDS)[number];
+
+const FILE_KINDS: ReadonlySet<string> = new Set(TELEGRAM_FILE_KINDS);
+
+/** True when a stored or requested action kind is one of the native media sends. */
+export function isTelegramFileKind(value: unknown): value is TelegramFileKind {
+  return typeof value === "string" && FILE_KINDS.has(value);
+}
+
+/**
+ * One workspace-relative file path an outbound send may name.
+ *
+ * This is a syntax check only: no filesystem is touched here. The live adapter
+ * still resolves the path under the configured workspace, refuses symlink
+ * escapes and pins the bytes before the external call.
+ */
+export function validTelegramFilePath(value: unknown): value is string {
+  if (typeof value !== "string" || value === "" || value.length > TELEGRAM_ACTION_LIMITS.filePathChars) {
+    return false;
+  }
+  if (value !== value.trim()) return false;
+  if (value.startsWith("/") || value.includes("\\")) return false;
+  if (/[\u0000-\u001f\u007f]/.test(value)) return false;
+  const segments = value.split("/");
+  return segments.every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}
 
 export type TelegramTargetDirection = "incoming" | "outgoing";
 
@@ -51,7 +90,7 @@ export type TelegramObservedTarget = {
   readonly observedAtMs: number;
 };
 
-export type TelegramActionKind = "reply" | "react";
+export type TelegramActionKind = "reply" | "react" | TelegramFileKind;
 export type TelegramActionStatus = "intent" | "sending" | "sent" | "unknown" | "failed" | "denied";
 
 export type TelegramActionRecord = {
@@ -59,10 +98,15 @@ export type TelegramActionRecord = {
   readonly callId: string;
   readonly kind: TelegramActionKind;
   readonly chatId: number;
+  /** Observed reply target, or 0 for an outbound file that is not a reply. */
   readonly targetMessageId: number;
   /** Native reply text, or the reaction emoji. */
   readonly text?: string;
   readonly emoji?: string;
+  /** Workspace-relative file path for a media send. Never an absolute host path. */
+  readonly path?: string;
+  /** Bounded caption for a media send. */
+  readonly caption?: string;
   readonly status: TelegramActionStatus;
   /** Accepted reply chunk cursor; only meaningful for a native reply. */
   readonly nextChunkIndex: number;
@@ -127,9 +171,14 @@ export function validActionRecord(value: unknown): value is TelegramActionRecord
   if (!isRecord(value)) return false;
   if (typeof value.callId !== "string" || value.callId === "" ||
       value.callId.length > TELEGRAM_ACTION_LIMITS.callIdChars) return false;
-  if (value.kind !== "reply" && value.kind !== "react") return false;
-  if (!isPositiveInteger(value.chatId) || !isPositiveInteger(value.targetMessageId)) return false;
+  if (value.kind !== "reply" && value.kind !== "react" && !isTelegramFileKind(value.kind)) return false;
+  if (!isPositiveInteger(value.chatId)) return false;
+  if (typeof value.targetMessageId !== "number" || !Number.isSafeInteger(value.targetMessageId) ||
+      value.targetMessageId < 0) return false;
   if (typeof value.status !== "string" || !ACTION_STATUSES.has(value.status)) return false;
+  if (value.path !== undefined && !validTelegramFilePath(value.path)) return false;
+  if (value.caption !== undefined && (typeof value.caption !== "string" ||
+      value.caption.length > TELEGRAM_ACTION_LIMITS.captionChars)) return false;
   if (!Number.isSafeInteger(value.nextChunkIndex) || (value.nextChunkIndex as number) < 0) return false;
   if (value.text !== undefined && (typeof value.text !== "string" ||
       value.text.length > TELEGRAM_ACTION_LIMITS.textChars)) return false;

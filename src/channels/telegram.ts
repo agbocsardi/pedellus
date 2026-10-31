@@ -2,7 +2,8 @@ import { defineDoc, AssistantEntry, ConversationBusy } from "@earendil-works/pi-
 import type { Context, Draft } from "@earendil-works/chord";
 import { copyJson } from "@earendil-works/chord";
 import { withCancel, withoutAbortSignal } from "@earendil-works/chord/context";
-import { Api, GrammyError, HttpError } from "grammy";
+import { Api, GrammyError, HttpError, InputFile } from "grammy";
+import type { Message } from "grammy/types";
 import type { ApiClientOptions } from "grammy";
 import type { MessageReactionUpdated, ReactionType, ReactionTypeEmoji, Update } from "grammy/types";
 import type { Conversation, Submission, SubmissionId } from "@earendil-works/pi-durable";
@@ -49,16 +50,25 @@ import {
   settleActionRecord,
   targetsForChat,
   unresolvedActions,
+  validTelegramFilePath,
   type TelegramActionRecord,
   type TelegramObservedTarget,
   type TelegramQuotedContext,
 } from "./telegram-interactions.js";
+import {
+  TELEGRAM_SEND_METHODS,
+  TelegramOutboundRejected,
+  outboundRejectionText,
+  readTelegramOutboundFile,
+} from "./telegram-outbound-media.js";
 import type {
   TelegramActionHost,
   TelegramActionOutcome,
   TelegramActionRegistry,
   TelegramActionRequest,
+  TelegramSendRequest,
 } from "./telegram-tool.js";
+import { isTelegramSendRequest } from "./telegram-tool.js";
 
 const API = "https://api.telegram.org";
 const TELEGRAM_LIMIT = 4096;
@@ -350,6 +360,9 @@ export async function runTelegram(
   const cleanupContext = withoutAbortSignal(adapterContext);
   const signal = adapterContext.abortSignal;
   if (signal?.aborted) return;
+  // Outbound uploads resolve against the configured workspace only; the media opt-in is the
+  // operator switch. Absent means every file send is refused before any external call.
+  const outboundWorkspace = options.media?.workspace;
   const outboundThrottle = new TelegramFloodGate();
   const pollThrottle = new TelegramFloodGate();
   const api = new Api(options.token, {
@@ -628,12 +641,110 @@ export async function runTelegram(
     chatId: number,
     request: TelegramActionRequest,
   ): TelegramActionOutcome => {
-    if (record.chatId !== chatId || record.targetMessageId !== request.messageId ||
-        record.kind !== request.kind || (request.kind === "reply"
-          ? record.text !== request.text : record.emoji !== request.emoji)) {
+    const targetMessageId = isTelegramSendRequest(request)
+      ? request.messageId ?? 0
+      : request.messageId;
+    const samePayload = isTelegramSendRequest(request)
+      ? record.path === request.path && (record.caption ?? "") === (request.caption ?? "")
+      : request.kind === "reply"
+        ? record.text === request.text
+        : record.emoji === request.emoji;
+    if (record.chatId !== chatId || record.targetMessageId !== targetMessageId ||
+        record.kind !== request.kind || !samePayload) {
       return { ok: false, text: "This action identity belongs to a different request; no action was taken." };
     }
     return actionOutcome(record);
+  };
+
+  /**
+   * One native media upload. The workspace file is read into bounded memory before the API call so
+   * the bytes cannot change mid-upload, and every refusal happens before any external request. The
+   * `sending` record was already written by `act`, so an abort or transport ambiguity here stays
+   * `unknown` and is never resent.
+   */
+  const performFileSend = async (
+    chatId: number,
+    callId: string,
+    request: TelegramSendRequest,
+  ): Promise<TelegramActionOutcome> => {
+    const kind = request.kind;
+    const caption = request.caption === undefined || request.caption === "" ? undefined : request.caption;
+    const targetMessageId = request.messageId ?? 0;
+    if (outboundWorkspace === undefined) {
+      await settleAction(callId, "failed", "outbound files are not configured");
+      return { ok: false, text: "Outbound files are not enabled in this host." };
+    }
+    let file;
+    try {
+      file = await readTelegramOutboundFile({
+        workspace: outboundWorkspace,
+        path: request.path,
+        kind,
+      });
+    } catch (error) {
+      const reason = error instanceof TelegramOutboundRejected ? error.reason : "unreadable";
+      // Nothing left the host, so this is a known non-send rather than an ambiguous outcome.
+      await settleAction(callId, "failed", `outbound file refused: ${reason}`);
+      return { ok: false, text: `The file was not sent: ${outboundRejectionText(kind, reason)}.` };
+    }
+    const method = TELEGRAM_SEND_METHODS[kind];
+    try {
+      const sent = await apiCall<Message>(api, method, signal, (callSignal) => withChatSendOrder<Message>(chatId, () => {
+        const outbound = new InputFile(file!.bytes, file!.filename);
+        const other = {
+          ...(caption === undefined ? {} : { caption }),
+          ...(targetMessageId > 0
+            ? { reply_parameters: { message_id: targetMessageId, allow_sending_without_reply: false } }
+            : {}),
+        };
+        const callSignalOrUndefined = toGrammySignal(callSignal);
+        switch (kind) {
+          case "document": return api.sendDocument(chatId, outbound, other, callSignalOrUndefined);
+          case "photo": return api.sendPhoto(chatId, outbound, other, callSignalOrUndefined);
+          case "audio": return api.sendAudio(chatId, outbound, other, callSignalOrUndefined);
+          case "video":
+            return api.sendVideo(chatId, outbound, { ...other, supports_streaming: true }, callSignalOrUndefined);
+          case "voice": return api.sendVoice(chatId, outbound, other, callSignalOrUndefined);
+        }
+      }), { throttle: outboundThrottle });
+      if (sent === undefined) throw new Error(`Telegram ${method} returned no result`);
+      const messageIds = [sent.message_id];
+      await mutateState((doc) => {
+        const entry = doc.actions.find((candidate) => candidate.callId === callId);
+        if (entry === undefined) return;
+        entry.resultMessageIds = [...(entry.resultMessageIds ?? []), sent.message_id];
+      });
+      await rememberOutgoingTarget(
+        chatId,
+        sent.message_id,
+        caption ?? `[${kind}: ${file.filename}]`,
+      );
+      await settleAction(callId, "sent");
+      return {
+        ok: true,
+        text: `Sent one ${kind} (${file.filename})` +
+          `${targetMessageId > 0 ? ` as a native reply to message ${targetMessageId}` : ""} ` +
+          `(message id ${sent.message_id}).`,
+        messageIds,
+      };
+    } catch (error) {
+      const knownNotSent = error instanceof TelegramApiError &&
+        (error.outcome === "not-sent" ||
+          (error.outcome === "rejected" && error.status > 0 && error.status < 500));
+      if (knownNotSent) {
+        await settleAction(callId, "failed", "Telegram rejected the upload");
+        return {
+          ok: false,
+          text: "Telegram rejected the file; it was not accepted and will not be retried automatically.",
+        };
+      }
+      await settleAction(callId, "unknown");
+      console.warn(`Telegram ${kind} upload outcome unknown; it will not be retried automatically.`);
+      return {
+        ok: false,
+        text: "The file may or may not have been delivered; it will not be retried automatically.",
+      };
+    }
   };
 
   /**
@@ -646,6 +757,7 @@ export async function runTelegram(
     callId: string,
     request: TelegramActionRequest,
   ): Promise<TelegramActionOutcome> => {
+    if (isTelegramSendRequest(request)) return performFileSend(chatId, callId, request);
     try {
       if (request.kind === "react") {
         const reaction: ReactionType[] = [{
@@ -730,15 +842,49 @@ export async function runTelegram(
       if (chatId === undefined) {
         return { ok: false, text: "This chat is not currently authorized for Telegram actions." };
       }
-      if (!Number.isSafeInteger(request.messageId) || request.messageId < 1) {
-        return { ok: false, text: "messageId must be a positive observed message id from this chat." };
-      }
-      if (findTarget(state.targets, chatId, request.messageId) === undefined) {
-        return {
-          ok: false,
-          text: `Message id ${request.messageId} is not an observed message in this chat, so it cannot be ` +
-            "targeted. Use action=targets to see the ids this chat may target.",
-        };
+      let targetMessageId: number;
+      if (isTelegramSendRequest(request)) {
+        // A host caller may bypass the model schema; an unknown kind is refused before admission.
+        if (!Object.hasOwn(TELEGRAM_SEND_METHODS, request.kind)) {
+          return { ok: false, text: "Unknown Telegram file kind; no file was sent." };
+        }
+        // Outbound files need the configured workspace media opt-in. The tool is also withheld
+        // unless the same conversation holds the configured `read` tool, so this adds no read grant.
+        if (options.media === undefined) {
+          return { ok: false, text: "Outbound files are not enabled in this host." };
+        }
+        if (!validTelegramFilePath(request.path)) {
+          return { ok: false, text: "The file path must be workspace-relative and inside the configured workspace." };
+        }
+        if (request.caption !== undefined &&
+            (typeof request.caption !== "string" || request.caption.length > TELEGRAM_ACTION_LIMITS.captionChars)) {
+          return { ok: false, text: `A caption is limited to ${TELEGRAM_ACTION_LIMITS.captionChars} characters.` };
+        }
+        if (request.messageId !== undefined &&
+            (!Number.isSafeInteger(request.messageId) || request.messageId < 1)) {
+          return { ok: false, text: "messageId, when given for a file send, must be a positive observed message id." };
+        }
+        targetMessageId = request.messageId ?? 0;
+        // A file send without a reply target is ordinary; a named target must be observed here.
+        if (targetMessageId > 0 && findTarget(state.targets, chatId, targetMessageId) === undefined) {
+          return {
+            ok: false,
+            text: `Message id ${targetMessageId} is not an observed message in this chat, so it cannot be ` +
+              "targeted. Use action=targets to see the ids this chat may target.",
+          };
+        }
+      } else {
+        if (!Number.isSafeInteger(request.messageId) || request.messageId < 1) {
+          return { ok: false, text: "messageId must be a positive observed message id from this chat." };
+        }
+        if (findTarget(state.targets, chatId, request.messageId) === undefined) {
+          return {
+            ok: false,
+            text: `Message id ${request.messageId} is not an observed message in this chat, so it cannot be ` +
+              "targeted. Use action=targets to see the ids this chat may target.",
+          };
+        }
+        targetMessageId = request.messageId;
       }
       const existing = actionFor(state.actions, callId);
       if (existing !== undefined) return priorActionOutcome(existing, chatId, request);
@@ -747,8 +893,15 @@ export async function runTelegram(
         callId,
         kind: request.kind,
         chatId,
-        targetMessageId: request.messageId,
-        ...(request.kind === "reply" ? { text: request.text } : { emoji: request.emoji }),
+        targetMessageId,
+        ...(isTelegramSendRequest(request)
+          ? {
+              path: request.path,
+              ...(request.caption === undefined ? {} : { caption: request.caption }),
+            }
+          : request.kind === "reply"
+            ? { text: request.text }
+            : { emoji: request.emoji }),
         status: "intent",
         nextChunkIndex: 0,
         startedAtMs: Date.now(),
@@ -773,7 +926,7 @@ export async function runTelegram(
         return { ok: false, text: "The adapter stopped before sending; no action was taken." };
       }
       if (authorizedActionChat(sessionKey) === undefined ||
-          findTarget(state.targets, chatId, request.messageId) === undefined) {
+          (targetMessageId > 0 && findTarget(state.targets, chatId, targetMessageId) === undefined)) {
         await settleAction(callId, "denied", "scope or target recheck failed");
         return { ok: false, text: "The chat or target is no longer authorized; no action was taken." };
       }
@@ -3163,6 +3316,16 @@ export function telegramFetch(
   return globalThis.fetch(input, { ...init, signal: controller.signal, redirect: "error" });
 }
 
+/** Bot API methods whose request may already have been accepted when 5xx/transport fails. */
+const AMBIGUOUS_SEND_METHODS: ReadonlySet<string> = new Set([
+  "sendMessage",
+  ...Object.values(TELEGRAM_SEND_METHODS),
+]);
+
+function isAmbiguousSendMethod(method: string): boolean {
+  return AMBIGUOUS_SEND_METHODS.has(method);
+}
+
 async function apiCall<T>(
   api: Api,
   method: string,
@@ -3206,10 +3369,10 @@ async function apiCall<T>(
           continue;
         }
         throw new TelegramApiError(method, error.error_code,
-          method === "sendMessage" && error.error_code >= 500 ? "unknown" : "rejected");
+          isAmbiguousSendMethod(method) && error.error_code >= 500 ? "unknown" : "rejected");
       }
       if (error instanceof HttpError) {
-        if (method === "sendMessage") {
+        if (isAmbiguousSendMethod(method)) {
           if (isProvenPreConnectFailure(error.error)) {
             if (attempt < MAX_API_ATTEMPTS - 1 && !signal?.aborted) {
               await delay(backoff(attempt), signal);
@@ -3226,7 +3389,7 @@ async function apiCall<T>(
         }
       }
       if (signal?.aborted) throw signal.reason;
-      if (method === "sendMessage") throw new TelegramApiError(method, 0, "unknown");
+      if (isAmbiguousSendMethod(method)) throw new TelegramApiError(method, 0, "unknown");
       throw new Error(`Telegram ${method} transport failed`);
     }
   }

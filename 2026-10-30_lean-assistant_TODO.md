@@ -23,13 +23,13 @@
 Python is the accepted behavioral/product reference. Port onto native Durable
 facilities; do not redesign memory quality, holistic usability or agent loops.
 
-- [ ] P1 — Configurable digest bounds: entries/batch (80), characters/batch
+- [x] P1 — Configurable digest bounds: entries/batch (80), characters/batch
   (24,000), tool calls (10 individual calls, not Python iterations), whole-run
   timeout (300 seconds), changed files (8) and changed-text volume (32,000).
   Preserve one bounded closed-episode chunk per invocation, partial writes and
   cursor failure guards. Next ordinary invocation may retry a native parked task
   once; no retry loop or user recovery UI. No automatic schedule activation.
-- [ ] P2 — Telegram outbound local documents/photos/audio/video/voice, current
+- [x] P2 — Telegram outbound local documents/photos/audio/video/voice, current
   authenticated chat only, bounded workspace files and captions, no remote URL
   fetching/arbitrary recipients; retain unknown external outcomes, never blindly
   retry or evict them. No extraction, transcoding or new media backend registry.
@@ -442,6 +442,30 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Parity batch — P1 digest budgets and P2 Telegram sends published
+
+P1 published at `3a297fa`: configurable per-invocation digest bounds (entries,
+characters, individual tool calls, run timeout, changed files and changed text),
+captured across replay/reopen; repaired native-edit argument shapes are charged
+using the same normalizer; one ordinary-invocation native parked-task retry; no
+retry loop or recovery UI. Independent review found and the original worker
+fixed repaired-edit budget bypass and a one-unit Unicode wedge. Gate: 262
+behavior / 32 files, 2 execution, 83 core; published main rebuild plus 12 bounds
+and 14 digest checks. Accepted limits: UTF-16 conservative diff accounting, no
+path-alias resolution, 4,000-entry verification bound, no nested digest tools.
+
+P2 published at `c755673` after two independent passes and a final union PASS:
+agent sends any workspace file through the current authenticated private chat;
+omitted kind sends unchanged bytes as a document, while photo/audio/video/voice
+are optional presentation hints. Authority is media opt-in plus `read` for the
+model tool, current mapping/allowlist, workspace-only paths and 20 MiB; durable
+task identity, write-ahead records, unknown retention and cancellation preserved.
+Gate: 270 behavior / 33 files, 2 execution, 83 core, 8 focused; published main
+rebuild plus 8 outbound and 12 bounds checks. Accepted limits: live Telegram
+format/delivery unverified, no transcoding/autodetect, documented parent-directory
+resolve/open race and UTF-16 display-name stem. Owner parallel migration plan
+remained untracked, unread and untouched.
 
 ### Service readiness and parallel instances approved
 
