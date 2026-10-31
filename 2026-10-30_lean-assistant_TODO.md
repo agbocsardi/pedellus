@@ -36,7 +36,7 @@ facilities; do not redesign memory quality, holistic usability or agent loops.
 - [x] P3 — Agent reads its own workers' bounded paginated transcripts via native
   Durable conversation entries, keyed by authorized worker ID, not raw SQL or
   arbitrary conversation ID. No Atuin capture/export/second transcript archive.
-- [ ] P4 — Agent steers live workers using native Durable input semantics,
+- [x] P4 — Agent steers live workers using native Durable input semantics,
   coordinating admission with completion/authority retirement. Cancellation
   already exists; preserve it. No user worker-management surface or recursion.
 - [ ] P5 — Concise, read-only background summary inside existing `/status`:
@@ -465,9 +465,21 @@ limits: same-UID instances are not a security boundary, distinct pollers need
 distinct bot tokens, live systemd operation untested, canceled/parked worker and
 restart-limit block classification covered by renderer tests only.
 
-P4 (worker steering) cleared independent re-review at `6880486` (274 behavior,
-2 execution, 83 core; 10 concurrent admissions → 8 accepted/2 refused; digest
-refusal for changed payloads). Publication pending its current-main union.
+P4 (worker steering) published at `54b2331` after two independent reviews. The
+`worker` tool gained bounded `steer` (2,000 UTF-16 units, 8 accepted per worker)
+using one native commit that verifies task/spawner/child ownership and a live run
+owning this worker's initial or accepted steer submission, so admission cannot
+race finalize into an orphan turn; queued steers are withdrawn on cancel and the
+worker joins successor runs. Re-review fixed silently deduping a changed payload:
+the record stores a SHA-256 of the exact steer text, replays dedupe, and a changed
+payload refuses without a second inbox item. Independent probes confirmed 10
+concurrent admissions → exactly 8 accepted, full successor chain joined, latest
+answer reported, no dangling child task. Gate: 280 behavior across 34 files,
+2 execution, 83 core; published main build plus 23 focused worker checks.
+Accepted limits: admission is a narrow native submission/inbox mirror without a
+submission trace link (telemetry only); `afterFailedRun:"continue"` is unsupported
+and not configurable by the shipped harness; no worker deadline exists. Untracked
+owner migration plan stayed untouched.
 
 ### Parity batch — P1 digest budgets and P2 Telegram sends published
 
