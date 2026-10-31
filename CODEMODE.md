@@ -203,9 +203,10 @@ runtime/config/authority review passed the integration with `555d34c` with no
 material findings. The independent-composition generalisation and the Telegram
 caller widening were later reviewed with the web integration in a fresh combined
 runtime/config/authority review of `1204226` and accepted for publication. Cron
-and background-worker composition remain deliberately later work (the worker
-branch is still in review); the Telegram owner-command slice was published
-separately and does not use Code Mode for host commands.
+and background-worker composition follow the same callable-set rule (`cron`, and
+for a spawning mapped chat the `worker` tool, while a worker child never receives
+`worker` itself); the Telegram owner-command slice was published separately and
+does not use Code Mode for host commands.
 
 `gateway.close()` closes the Harness first, then this bundle (stopping admission
 and waiting for sandbox workers), then every MCP client. An open that fails after

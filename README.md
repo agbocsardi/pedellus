@@ -5,9 +5,10 @@ TypeScript port requiring Node >=22.19 and the pinned Pi 1.4.0 packages. This is
 The [lean assistant plan](2026-10-30_lean-assistant_TODO.md) is the current scope
 and work-order authority: CLI + Telegram first, then tools, delegation and channels.
 Config-selected coding tools, named model presets, optional bwrap shell, opt-in
-memory/skills, compaction plumbing, configured vision handoff, MCP, native Code
-Mode composition, native Brave web search plus safe public fetch, and opt-in
-Telegram media ingress are integrated.
+memory/skills, compaction plumbing, owner-invoked closed-episode memory
+digestion, configured vision handoff, MCP, native Code Mode composition, native
+Brave web search plus safe public fetch, and opt-in media ingress (Telegram and
+local CLI attachments) are integrated.
 Agent-callable
 cron scheduling and Telegram delivery are available. WebUI, migration and cutover are
 deferred. The [older roadmap](plan/2026-10-26_full-port_TODO.md) preserves evidence,
@@ -43,7 +44,7 @@ fixed, value-free diagnostics; unexpected failures stay suppressed. See
 [interactive CLI](./CLI.md#startup-diagnostics).
 
 The authenticated owner also drives that gateway from a private Telegram chat:
-`/new`, `/abort` (also spelled `/stop`), `/status`, `/model` and `/restart`.
+`/new`, `/abort` (also spelled `/stop`), `/status`, `/model`, `/digest` and `/restart`.
 Each host advertises only what it implements and refuses a typed command it cannot
 perform. `/model` selects one configured preset for that chat only. `/status` is
 bounded read-only metadata with no model call. `/new` starts a new context **and**

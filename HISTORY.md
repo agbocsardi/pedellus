@@ -681,10 +681,10 @@ session key, and the summary text is model output over untrusted source.
 
 ## Digestion input and cursor
 
-`src/history/digestion.ts` is the bounded, source-labeled input for the deferred
-conversation-digestion (memory curation) slice, plus its durable cursor. It is not wired into
-`openGateway` and is not activated: it calls no model, writes no memory, creates no task, schedules
-nothing, and adds no tool surface.
+`src/history/digestion.ts` is the bounded, source-labeled input for conversation digestion (memory
+curation), plus its durable cursor. `openGateway` wires it through `src/history/memory-digest.ts`
+below, but a run still starts only on an explicit manual command or cron intent: this module calls
+no model, writes no memory, creates no task, schedules nothing, and adds no tool surface.
 
 ```ts
 createDigestSource({

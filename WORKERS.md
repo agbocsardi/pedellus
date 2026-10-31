@@ -163,12 +163,11 @@ never re-run.
 
 ## Limits
 
-- This slice adds no memory curation, consolidation prompt, processed-history bookkeeping or
-  "Dream" engine, and nothing here schedules or activates it. The owner deferred that work until
-  workers are accepted. The latest planning keeps it simple — an editable agent-owned workspace
-  prompt plus a simple digestion cursor over unprocessed conversations/episodes, with no
-  hash/version machinery — and supersedes the earlier, more elaborate notes. It is not implemented
-  or promised by this slice.
+- This worker slice adds no memory curation, consolidation prompt, processed-history bookkeeping or
+  "Dream" engine, and nothing here schedules or activates it. That work was implemented later as a
+  separate bounded slice (see [memory digestion](./HISTORY.md#memory-digestion-execution)): only an
+  explicit `/digest` or an ordinary cron job with `intent: "digest"` starts a run, and workers
+  neither trigger nor schedule it.
 - No automatic merge, cleanup, stash, rebase or commit of the owner's state, and no worktree deletion.
   A `git worktree add` that fails after creating the branch or an empty directory can leave those
   behind; they are bounded and non-destructive, so this slice documents them instead of adding a
