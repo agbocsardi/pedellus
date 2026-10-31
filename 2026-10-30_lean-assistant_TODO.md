@@ -39,7 +39,7 @@ facilities; do not redesign memory quality, holistic usability or agent loops.
 - [x] P4 — Agent steers live workers using native Durable input semantics,
   coordinating admission with completion/authority retirement. Cancellation
   already exists; preserve it. No user worker-management surface or recursion.
-- [ ] P5 — Concise, read-only background summary inside existing `/status`:
+- [x] P5 — Concise, read-only background summary inside existing `/status`:
   what is running (workers/digest/cron), if anything. No dashboard, management
   commands, model call or transcript dump; agent remains the manager.
 - [x] P7 — User-systemd service readiness and parallel instances: one template
@@ -441,7 +441,20 @@ returned to that implementer, then publication by that implementer. Every slice
 passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
-## Session log
+P5 (compact background status) published at `7caa613` after independent PASS and
+a narrow re-review of two low findings. `/status` in CLI and Telegram now shows,
+on demand, the current chat's running/queued/sleeping/parked workers, own cron
+runs and armed jobs, and the workspace digest run labelled own vs shared, with
+row/name/character caps and honest truncation. It is read-only: no document,
+task, cursor, notice, tool authority or model call; non-mapped conversations get
+an empty snapshot. Fixes: parked wording only promises a native retry for a
+restart-limit block, and the local `/digest status` payload is an explicit
+allowlist that excludes another chat's internal conversation ID. Gate: 286
+behavior across 35 files, 2 execution, 83 core; published main build plus 6
+focused checks. Accepted limits: parked worker/digest classification is
+renderer-covered only, up to two live-task index scans per status, snapshot not
+atomic across parts. One earlier offline `npm ci` in a fresh worktree was a
+recorded process deviation; no tracked or lockfile change.
 
 ### Parity batch — P3 transcripts, P7 service readiness and P4 steering accepted
 
