@@ -194,7 +194,9 @@ example. Add `telegram` as a top-level key beside the existing ones in
 ```
 
 - `tokenEnv` is an environment-variable name; export the token, never paste it
-  into the file.
+  into JSON. A systemd launch inherits it from the unit's private environment file;
+  see [environment handling](SERVICE.md#environment-file). Use a distinct test bot
+  while the Python bot remains active; do not run two pollers with the same token.
 - `allowFrom` is a non-empty list of decimal Telegram user IDs, written as JSON
   strings (for example `"123456789"`, not unquoted numbers), allowed to talk to
   the bot; only private chats reach the assistant.

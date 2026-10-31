@@ -19,7 +19,7 @@ ExecStart=/usr/bin/node /opt/durable-nanobot/dist/cli.js gateway --config %h/.du
 WorkingDirectory=%h/.durable-nanobot/instances/i-%i
 # Optional per-instance environment, e.g. one provider key per line. Keep the
 # file private and outside this repository; it is ignored when absent.
-EnvironmentFile=-%h/.durable-nanobot/instances/i-%i.env
+EnvironmentFile=-%h/.durable-nanobot/instances/i-%i/secrets.env
 Restart=on-failure
 RestartSec=5s
 KillSignal=SIGTERM

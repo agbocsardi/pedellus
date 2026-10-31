@@ -517,7 +517,7 @@ test("shipped user units are static user-service examples and verify with the re
   }
   assert.match(primary, /--config %h\/\.durable-nanobot\/config\.json/);
   assert.match(template, /--config %h\/\.durable-nanobot\/instances\/i-%i\/config\.json/);
-  assert.match(template, /EnvironmentFile=-%h\/\.durable-nanobot\/instances\/i-%i\.env/);
+  assert.match(template, /EnvironmentFile=-%h\/\.durable-nanobot\/instances\/i-%i\/secrets\.env/);
   // The instance specifier is used only inside the one fixed instances
   // directory (plus the unit description), never as a standalone arbitrary path.
   for (const line of template.split("\n")) {

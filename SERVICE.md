@@ -134,7 +134,6 @@ The template maps the instance name into one fixed directory pattern:
 
 ```text
 ~/.durable-nanobot/instances/i-<instance>/config.json
-~/.durable-nanobot/instances/i-<instance>.env      # optional, ignored when absent
 ```
 
 `<instance>` is a systemd unit instance name, not a filesystem path. The literal
@@ -168,14 +167,38 @@ provider key shares its quota; it is not a security boundary.
 
 ## Environment file
 
-`EnvironmentFile=-%h/...` is optional: the leading `-` makes a missing file
-harmless. Use it for per-instance environment such as the variable names the
-config's `credentials` and `telegram.tokenEnv` refer to. Put each value on its
-own line, keep the file private (for example mode `0600`) and outside this
-repository, and never commit secret values. The shipped units contain no
-credentials. The gateway prints fixed startup diagnostics and does not echo
-configuration values, environment values or paths; journal output is the
-process's standard output and error, plus systemd's own unit messages.
+Each template names its private environment file beside its instance config.
+`EnvironmentFile=-%h/...` is optional to systemd: the leading `-` ignores a
+missing file, but the gateway still refuses missing configured credentials.
+Keep the runtime directory private (`0700`) and the environment file private
+(`0600`), outside this repository. Use systemd environment-file syntax, not
+shell commands; never commit secret values.
+
+systemd reads that file when it launches the gateway and supplies its values in
+the process environment. The config stores **variable names**, not values:
+
+```json
+{
+  "credentials": { "opencode_go": "OPENCODE_GO_API_KEY" },
+  "telegram": { "tokenEnv": "DURABLE_TELEGRAM_TOKEN", "allowFrom": ["123456789"] },
+  "web": { "search": { "keyEnv": "BRAVE_SEARCH_API_KEY" }, "fetch": true }
+}
+```
+
+The existing provider, Telegram and web paths resolve those names from the gateway
+process environment; MCP has the same explicit environment-name convention.
+There is no blanket `${VAR}` substitution in JSON and no automatic environment-file
+loader in the CLI. A manually launched gateway must inherit its environment by
+another explicit launch mechanism; an attaching agent uses the running gateway
+and does not need provider credentials locally. The gateway's shell tools keep
+their separate filtered environment and do not inherit all gateway credentials.
+
+Use a service-manager restart after changing the environment file; the owner
+`/restart` preserves the existing process environment and cannot reload it.
+Use a distinct Telegram token while Python's bot is still running; two pollers
+must not share a token. The shipped units contain no credential values. Startup
+diagnostics suppress configuration/environment values and underlying errors;
+journal output also contains systemd's own unit messages.
 
 ## Stop, restart and journal
 
