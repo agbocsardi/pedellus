@@ -76,9 +76,10 @@ npm start -- agent --config config.json     # attach a terminal
   restart or reopen restores the configured preset without rewriting prepared
   dispatches. Direct-model (non-preset) selection retains its persisted semantics.
 - The authenticated Telegram owner's controls are `/new`, `/abort`/`/stop`,
-  `/status`, `/model` and `/restart`, advertised only where the host implements
-  them. `/model` selects one configured preset for that chat only; `/status` is
-  bounded read-only metadata with no model call; `/new` starts a new context and
+  `/status`, `/model`, `/digest` and `/digest status`, plus `/restart`,
+  advertised only where the host implements them. `/model` selects one
+  configured preset for that chat only; `/status` is bounded read-only metadata
+  with no model call; `/new` starts a new context and
   rebuilds the assembled workspace prompt, so a host with a prompt snapshot
   refuses it while that chat runs instead of half-applying; `/restart` is the
   host's full-process replacement (same executable, argv and environment through

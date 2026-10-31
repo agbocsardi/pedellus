@@ -31,8 +31,9 @@ remain. `2026-10-30_lean-assistant_TODO.md` stays the work-order authority.
 1. **Lossless digestion input.** Closed episodes of authenticated mapped chats
    are read oldest-first in bounded chunks, with a durable cursor. Open
    episodes, root/fork/state/raw/task-owned transcripts, worker transcripts and
-   cron run targets are excluded. Fragments split on UTF-16 code-unit
-   boundaries, so a batch sent as UTF-8 never gains a replacement character.
+   cron run targets are excluded. Fragment offsets are UTF-16 code-unit offsets
+   that never end between the two halves of a surrogate pair, so the actual
+   UTF-8 wire form stays valid instead of gaining a replacement character.
 2. **Bounded digestion execution.** One native `nanobot.memory-digest` task
    consumes exactly one input batch in its own task-owned conversation. It can
    write only `SOUL.md`, `USER.md`, `memory/**/*.md` and
