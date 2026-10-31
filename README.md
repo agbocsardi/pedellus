@@ -33,6 +33,13 @@ node dist/cli.js gateway --config /path/to/config.json
 node dist/cli.js agent --config /path/to/config.json
 ```
 
+The optional checkout-linked command is **`durable-nanobot`**, not Python's
+`nanobot`: after building, run `npm link --offline` manually to expose it.
+For development, `npm run build -- --watch` rebuilds on edits; restart the gateway
+after a successful build. The `durable-nanobot.service` / `durable-nanobot@.service`
+templates run the checkout directly and need no command link. See
+[checkout and service updates](./SERVICE.md#checkout-command-and-build-workflow).
+
 Without `--config`, `gateway`, `agent` and `recovery` use the fixed primary file
 `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
 the working directory. A secondary instance passes its own explicit `--config`.

@@ -14,8 +14,8 @@ the existing SIGTERM/SIGINT teardown.
 
 | File | Use |
 | --- | --- |
-| [`systemd/nanobot.service`](systemd/nanobot.service) | The primary instance uses the default config `~/.durable-nanobot/config.json`. |
-| [`systemd/nanobot@.service`](systemd/nanobot@.service) | One named secondary instance uses `~/.durable-nanobot/instances/i-<name>/config.json`. |
+| [`systemd/durable-nanobot.service`](systemd/durable-nanobot.service) | The primary instance uses the default config `~/.durable-nanobot/config.json`. |
+| [`systemd/durable-nanobot@.service`](systemd/durable-nanobot@.service) | One named secondary instance uses `~/.durable-nanobot/instances/i-<name>/config.json`. |
 
 Both are user units. Copy or symlink them into the user unit directory, for
 example `~/.config/systemd/user/`, after editing the launch paths.
@@ -24,14 +24,61 @@ Each unit has two placeholders that must become absolute paths on the installed
 machine:
 
 - `/usr/bin/node` — the Node >= 22.19 executable. Use the absolute path from
-  `command -v node`; do not rely on a shell `PATH` or a global `nanobot` command.
-- `/opt/durable-nanobot` — this checkout. The package is private and installs no
-  `nanobot` executable, so the unit runs `<checkout>/dist/cli.js` through Node
-  after `npm ci` and `npm run build`.
+  `command -v node`; do not rely on a shell `PATH` or either global CLI command.
+- `/opt/durable-nanobot` — this checkout. The unit runs `<checkout>/dist/cli.js`
+  through Node after `npm ci` and `npm run build`, independently of `npm link`.
+
+The TypeScript command and units are named `durable-nanobot`; Python keeps
+`nanobot`. These templates neither replace nor stop an installed Python unit.
+The existing runtime home and storage/protocol identities are unchanged.
 
 Because the unit file cannot expand shell variables in `ExecStart`, those two
 paths are edited directly in the copy. Everything else uses systemd specifiers:
 `%h` is the user's home and `%i` is the unit instance name.
+
+## Checkout command and build workflow
+
+The package exposes only `durable-nanobot` as its executable. From the checkout,
+after installing the pinned dependencies, these are optional operator steps:
+
+```sh
+npm run build
+npm link --offline
+durable-nanobot agent
+```
+
+`npm link` links that command to this checkout; it does not copy the code, run a
+gateway, install a service or claim Python's `nanobot` command. You can instead
+use `node dist/cli.js agent` or `npm start -- agent` without linking anything.
+The agent attaches to an already-running gateway with the same configuration.
+
+For source edits, rebuild and restart the gateway so it loads the new JavaScript:
+
+```sh
+npm run build
+systemctl --user restart durable-nanobot.service
+```
+
+To compile continuously, run `npm run build -- --watch` in another terminal.
+Wait for a successful build before restarting. Building is not hot reload;
+`systemd` neither compiles TypeScript nor watches the checkout. Code-only edits
+need no `daemon-reload` and no repeated `npm link`. A supported owner `/restart`
+can replace the process after a build too, but keeps the current process environment.
+
+Editing a unit or drop-in requires `systemctl --user daemon-reload` before
+restart. Editing only an environment file needs a service restart to reload it;
+`/restart` does not reload systemd's environment file. Relocating the checkout
+requires updating the unit's absolute launch path and relinking the CLI if used.
+Do not run a second `gateway` manually while the service owns the same store.
+None of these linking or service-manager commands is run by the offline checks.
+
+Reinstalling dependencies (`npm ci`), rebuilding or relinking the command does not
+remove Durable state. The authoritative SQLite store remains under the configured
+`dataDir`, not `node_modules` or the command link. Keep `dataDir`, workspace and
+private config outside a checkout you may delete or replace. Continue using the
+same `dataDir` after reinstalling: selecting a different directory opens a different
+store, not the old history. The database and its storage identities are not renamed
+by the `durable-nanobot` command/unit rename.
 
 ## Primary instance
 
@@ -42,9 +89,27 @@ directory:
 ~/.durable-nanobot/config.json
 ```
 
-`nanobot gateway` without `--config` reads exactly that file. `nanobot agent`
-without `--config` and `nanobot recovery` without `--config` use it too, and the
-historical `nanobot --config <path>` still attaches an agent with the explicit
+Keep the primary instance's persistent layout outside the checkout:
+
+```text
+~/.durable-nanobot/
+  config.json
+  data/                # Durable SQLite store, derived indexes and private socket
+  workspace/           # Markdown memory, skills and attachments
+```
+
+Place the example configuration at that primary config path with
+`"workspace": "./workspace"` and `"dataDir": "./data"`. Relative paths resolve
+from the config file, so the primary store is `~/.durable-nanobot/data/nanobot.sqlite`,
+independent of the checkout or working directory. This layout is explicit config,
+not an implicit data-directory fallback. JSON paths do not expand `~`; use these
+relative paths or an absolute path. Secondary configs should similarly use their
+own `./data` and `./workspace` under their instance directory. Preserve an existing
+store's configured location until a deliberate stopped-store migration is approved.
+
+`durable-nanobot gateway` without `--config` reads exactly that file. `durable-nanobot agent`
+without `--config` and `durable-nanobot recovery` without `--config` use it too, and the
+historical `durable-nanobot --config <path>` still attaches an agent with the explicit
 path. There is no discovery, merge, search, auto-generation, migration or
 implicit runtime activation: create the file and its workspace/data directories
 yourself. A missing default file fails with a fixed message that names no
@@ -58,7 +123,7 @@ After editing the copy:
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user enable --now nanobot.service
+systemctl --user enable --now durable-nanobot.service
 ```
 
 Those commands are the operator's; they are not part of any offline check here.
@@ -84,8 +149,8 @@ config only on that instance's command line (the unit already does):
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user start 'nanobot@work.service'
-journalctl --user -u 'nanobot@work.service'
+systemctl --user start 'durable-nanobot@work.service'
+journalctl --user -u 'durable-nanobot@work.service'
 ```
 
 Use a separate `dataDir` and `workspace` in every instance config. The store
@@ -129,7 +194,7 @@ process's standard output and error, plus systemd's own unit messages.
   replace the process image with the same executable, argv and environment. It
   keeps the same PID and service process, so systemd does not see a second
   gateway; the old process completes its normal teardown first.
-- `journalctl --user -u nanobot.service` (or the instance unit) shows output.
+- `journalctl --user -u durable-nanobot.service` (or the instance unit) shows output.
   Startup failures use the fixed, value-free diagnostics described in
   [interactive CLI](./CLI.md#startup-diagnostics).
 

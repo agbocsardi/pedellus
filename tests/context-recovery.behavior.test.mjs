@@ -398,8 +398,8 @@ test("startup refusal for a blocked prepared dispatch gives the recovery action 
       env: { NANOBOT_SYNTHETIC_KEY: "synthetic-not-a-key" },
     });
     assert.deepEqual({ code: refused.code, signal: refused.signal }, { code: 1, signal: null }, refused.stderr);
-    assert.match(refused.stderr, /nanobot: startup refused because a prepared model dispatch pins historical Nanobot context/);
-    assert.match(refused.stderr, /nanobot recovery --config <path>/);
+    assert.match(refused.stderr, /durable-nanobot: startup refused because a prepared model dispatch pins historical Nanobot context/);
+    assert.match(refused.stderr, /durable-nanobot recovery --config <path>/);
     assert.match(refused.stderr, /diagnostic details suppressed/);
     assert.ok(!refused.stderr.includes(temp), "startup refusal must not disclose the workspace or data path");
     assert.ok(!refused.stderr.includes("old-startup-secret"), "startup refusal must not disclose pinned context");
@@ -680,8 +680,8 @@ test("recovery reports a live gateway lock conflict instead of an empty result",
       env: { NANOBOT_SYNTHETIC_KEY: "synthetic-not-a-key" },
     });
     assert.deepEqual({ code: refused.code, signal: refused.signal }, { code: 1, signal: null }, refused.stderr);
-    assert.match(refused.stderr, /nanobot: another process already owns the configured data store/);
-    assert.match(refused.stderr, /stop the other running nanobot\/gateway process/);
+    assert.match(refused.stderr, /durable-nanobot: another process already owns the configured data store/);
+    assert.match(refused.stderr, /stop the other running durable-nanobot gateway process/);
     assert.match(refused.stderr, /diagnostic details suppressed/);
     assert.ok(!refused.stderr.includes(temp), "lock diagnostic must not disclose the data path or lock name");
     assert.ok(!refused.stderr.includes(dataDir), "lock diagnostic must not disclose the data path or lock name");

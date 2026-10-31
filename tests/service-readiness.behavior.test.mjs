@@ -225,9 +225,9 @@ test("a missing default config and explicit config keep separate fixed diagnosti
     const bare = startCli(home, [], elsewhere);
     const bareExit = await waitForExit(bare);
     assert.equal(bareExit.code, 1);
-    assert.match(bare.stderr, /Usage: nanobot gateway \[--config <path>\]/);
-    assert.match(bare.stderr, /nanobot agent \[--config <path>\] \[--conversation <name>\]/);
-    assert.match(bare.stderr, /nanobot recovery \[--config <path>\] \[--cancel/);
+    assert.match(bare.stderr, /Usage: durable-nanobot gateway \[--config <path>\]/);
+    assert.match(bare.stderr, /durable-nanobot agent \[--config <path>\] \[--conversation <name>\]/);
+    assert.match(bare.stderr, /durable-nanobot recovery \[--config <path>\] \[--cancel/);
     assert.match(bare.stderr, /~\/\.durable-nanobot\/config\.json/);
 
     const instance = await writeDefaultInstance(home, "gpt-6-luna");
@@ -493,8 +493,8 @@ test("bounded teardown of an attached client and an active synthetic run keeps a
 });
 
 test("shipped user units are static user-service examples and verify with the real launch paths", { timeout: 30_000 }, async (t) => {
-  const primaryPath = join(repoRoot, "systemd", "nanobot.service");
-  const templatePath = join(repoRoot, "systemd", "nanobot@.service");
+  const primaryPath = join(repoRoot, "systemd", "durable-nanobot.service");
+  const templatePath = join(repoRoot, "systemd", "durable-nanobot@.service");
   const primary = await readFile(primaryPath, "utf8");
   const template = await readFile(templatePath, "utf8");
   for (const text of [primary, template]) {
@@ -513,7 +513,7 @@ test("shipped user units are static user-service examples and verify with the re
     assert.match(text, /^EnvironmentFile=-%h\//m);
     assert.match(text, /dist\/cli\.js gateway --config /);
     assert.match(text, /^WantedBy=default.target$/m);
-    assert.doesNotMatch(text, /npm start|nanobot\.service\b.*ExecStart|OPENAI|ANTHROPIC|DEEPSEEK_API_KEY|API_KEY=/);
+    assert.doesNotMatch(text, /npm start|durable-nanobot\.service\b.*ExecStart|OPENAI|ANTHROPIC|DEEPSEEK_API_KEY|API_KEY=/);
   }
   assert.match(primary, /--config %h\/\.durable-nanobot\/config\.json/);
   assert.match(template, /--config %h\/\.durable-nanobot\/instances\/i-%i\/config\.json/);
@@ -538,13 +538,13 @@ test("shipped user units are static user-service examples and verify with the re
     const substitute = (text) => text
       .replaceAll("/usr/bin/node", process.execPath)
       .replaceAll("/opt/durable-nanobot", repoRoot);
-    await writeFile(join(directory, "units", "nanobot.service"), substitute(primary));
-    await writeFile(join(directory, "units", "nanobot@demo.service"), substitute(template));
+    await writeFile(join(directory, "units", "durable-nanobot.service"), substitute(primary));
+    await writeFile(join(directory, "units", "durable-nanobot@demo.service"), substitute(template));
     const verified = spawnSync("systemd-analyze", [
       "verify",
       "--man=no",
-      join(directory, "units", "nanobot.service"),
-      join(directory, "units", "nanobot@demo.service"),
+      join(directory, "units", "durable-nanobot.service"),
+      join(directory, "units", "durable-nanobot@demo.service"),
     ], { encoding: "utf8", timeout: 20_000 });
     assert.equal(verified.status, 0, verified.stderr || verified.stdout);
   } finally {

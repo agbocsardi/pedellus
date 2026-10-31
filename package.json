@@ -4,6 +4,7 @@
   "private": true,
   "description": "Initial TypeScript nanobot port on Pi Durable; not production-ready",
   "type": "module",
+  "bin": { "durable-nanobot": "dist/cli.js" },
   "engines": { "node": ">=22.19.0" },
   "scripts": {
     "build": "tsc -p tsconfig.json",

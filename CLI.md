@@ -3,14 +3,20 @@
 For a first-time walkthrough of workspace, memory, skills and config-enabled
 tools, start with [setup](./SETUP.md).
 
+The package exposes `durable-nanobot`, leaving Python's `nanobot` untouched.
+Build first, then optionally run `npm link --offline` manually from the checkout
+to expose the command. Without linking, `node dist/cli.js` or `npm start --` uses
+the same entry point. Rebuild after TypeScript edits and restart the gateway;
+[service/update details](./SERVICE.md#checkout-command-and-build-workflow).
+
 The gateway is the single agent/Durable owner. A CLI is one conversation
 surface over it, like Telegram and future channels, not a runtime:
 
 ```sh
-nanobot gateway                    # uses ~/.durable-nanobot/config.json
-nanobot gateway --config /path/to/config.json   # one owner: storage, tools, cron, Telegram
-nanobot agent                      # attaches to the same default gateway
-nanobot agent --config /path/to/config.json     # attach a terminal to that gateway
+durable-nanobot gateway                    # uses ~/.durable-nanobot/config.json
+durable-nanobot gateway --config /path/to/config.json   # one owner: storage, tools, cron, Telegram
+durable-nanobot agent                      # attaches to the same default gateway
+durable-nanobot agent --config /path/to/config.json     # attach a terminal to that gateway
 ```
 
 Without `--config`, `gateway`, `agent` and `recovery` read exactly
@@ -20,7 +26,7 @@ the shell's working directory. A secondary instance passes its own explicit
 migration, and a missing default file fails with a fixed message. See
 [user services](./SERVICE.md) for the shipped systemd unit pattern.
 
-`nanobot --config /path/to/config.json` remains the historical terminal command.
+`durable-nanobot --config /path/to/config.json` remains the historical terminal command.
 It now attaches exactly like `agent` and never opens an implicit gateway or a
 second runtime; start `gateway` with the same configuration first. The bare
 historical form still takes an explicit path. `agent --conversation <name>` attaches a
@@ -90,21 +96,21 @@ store already owned by another live process, and a prepared model dispatch that
 pins historical Nanobot context. These messages never include configuration
 values, environment values, filesystem paths, provider/dependency error text or
 the underlying exception. Unexpected failures keep the generic
-`nanobot: command failed; diagnostic details suppressed` message.
+`durable-nanobot: command failed; diagnostic details suppressed` message.
 
 An `agent` (or legacy default) launch additionally fails closed when no gateway
 answers on the configured endpoint, or when the endpoint's socket path cannot be
-used. Its fixed message says to start `nanobot gateway --config <path>` with the
+used. Its fixed message says to start `durable-nanobot gateway --config <path>` with the
 same configuration. The CLI does not fall back to opening a store or starting a
 second runtime.
 
 For live-owner lock contention, the fixed message says to stop the other running
-nanobot/gateway process. For a blocked prepared dispatch, it says to run
-`nanobot recovery [--config <path>]` with the same configuration to inspect and
+durable-nanobot gateway process. For a blocked prepared dispatch, it says to run
+`durable-nanobot recovery [--config <path>]` with the same configuration to inspect and
 cancel the blocked task, then start again. The CLI does not cancel the task or
 rewrite its checkpoint automatically.
 
-Recovery operation errors keep their dedicated `nanobot recovery:` text and
+Recovery operation errors keep their dedicated `durable-nanobot recovery:` text and
 remain governed by recovery's existing disclosure contract, not this startup
 policy. This section does not broaden or change that behavior. Configuration
 loading for a recovery invocation still uses the fixed startup messages above.

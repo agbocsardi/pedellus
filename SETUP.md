@@ -18,13 +18,30 @@ npm ci
 npm run build
 ```
 
+Optionally run `npm link --offline` manually from this checkout after building
+to expose **`durable-nanobot`**. Python's `nanobot` command is not replaced.
+Without linking, the `node dist/cli.js` examples below work directly. A build
+watcher (`npm run build -- --watch`) can recompile edits, but the gateway still
+needs a restart after a successful build. The renamed systemd units launch this
+checkout directly; linking is not required for service operation. See
+[service/update workflow](SERVICE.md#checkout-command-and-build-workflow).
+
 ## 2. Create a workspace
 
 Config paths resolve relative to the **config file's directory**, not the shell's
 working directory. Keep `dataDir` outside `workspace`: the gateway rejects a data
 directory that resolves inside the workspace or an extra allowed root.
 
-From the checkout, make a disposable sample that matches the shipped example:
+For the persistent primary instance, keep the config at
+`~/.durable-nanobot/config.json` and use `"dataDir": "./data"` and
+`"workspace": "./workspace"` as in the shipped example. This places Durable state
+under `~/.durable-nanobot/data/`, separate from the workspace and the checkout.
+JSON does not expand `~`; those relative paths resolve from the config file.
+See [primary service layout](SERVICE.md#primary-instance). Do not change an existing
+store's path without deliberately migrating its stopped state.
+
+The walkthrough below instead uses a **disposable demo** inside the checkout:
+its `./data` resolves under `demo/`, not the persistent primary directory.
 
 ```sh
 mkdir -p demo/workspace/memory demo/workspace/skills

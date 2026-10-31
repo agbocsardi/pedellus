@@ -1,7 +1,7 @@
+#!/usr/bin/env node
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import { stdin, stderr, stdout } from "node:process";
-import { pathToFileURL } from "node:url";
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { loadConfig, defaultConfigPath } from "./config.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
@@ -18,12 +18,12 @@ import { prepareDataDirectory } from "./store.js";
 import { StartupDiagnosticError, startupDiagnostic } from "./startup-diagnostics.js";
 
 const USAGE =
-  "Usage: nanobot gateway [--config <path>] | nanobot agent [--config <path>] [--conversation <name>] | " +
-  "nanobot --config <path> (agent, compatibility) | " +
-  "nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]\n" +
+  "Usage: durable-nanobot gateway [--config <path>] | durable-nanobot agent [--config <path>] [--conversation <name>] | " +
+  "durable-nanobot --config <path> (agent, compatibility) | " +
+  "durable-nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]\n" +
   "Without --config, gateway, agent and recovery use ~/.durable-nanobot/config.json.";
 
-const RECOVERY_USAGE = "Usage: nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]";
+const RECOVERY_USAGE = "Usage: durable-nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]";
 
 const CONVERSATION_NAME = /^[a-z0-9](?:[a-z0-9_-]{0,30})[a-z0-9]$|^[a-z0-9]$/;
 
@@ -55,7 +55,7 @@ function configPath(args: readonly string[], start: number): ConfigSource {
 }
 
 /**
- * `nanobot --config <path>` remains the historical terminal launch. It now attaches
+ * `durable-nanobot --config <path>` remains the historical terminal launch. It now attaches
  * to the running gateway instead of opening a second runtime; no gateway is started
  * implicitly. A subcommand without `--config` uses the fixed primary default; the
  * bare historical form still requires an explicit path.
@@ -395,17 +395,18 @@ function aborted(signal: AbortSignal): Promise<void> {
 
 function localGatewayDiagnostic(error: LocalGatewayError): string {
   return error.reason === "unavailable"
-    ? "nanobot: no running gateway answers on this configuration's local endpoint; start " +
-      "`nanobot gateway --config <path>` with the same configuration first; omit `--config` for the default " +
+    ? "durable-nanobot: no running gateway answers on this configuration's local endpoint; start " +
+      "`durable-nanobot gateway --config <path>` with the same configuration first; omit `--config` for the default " +
       "primary configuration (diagnostic details suppressed)"
-    : "nanobot: the configured local gateway endpoint is unavailable or owned by another process; " +
+    : "durable-nanobot: the configured local gateway endpoint is unavailable or owned by another process; " +
       "stop the other gateway before starting another (diagnostic details suppressed)";
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Native entry-point detection also handles npm's symlinked executable (Node >= 22.19).
+if (import.meta.main) {
   main().catch((error) => {
     if (error instanceof PreparedContextRecoveryError) {
-      console.error(`nanobot recovery: ${error.message}`);
+      console.error(`durable-nanobot recovery: ${error.message}`);
     } else if (error instanceof UsageError) {
       console.error(USAGE);
     } else if (error instanceof LocalGatewayError) {

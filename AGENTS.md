@@ -21,6 +21,14 @@ npm start -- gateway --config config.json   # single local owner
 npm start -- agent --config config.json     # attach a terminal
 ```
 
+The optional package executable is `durable-nanobot`; never install an alias
+named `nanobot` over the Python command. `npm link --offline` is an explicit
+operator step after building, not part of checks. `npm run build -- --watch`
+recompiles edits but does not reload a running gateway. The user-unit templates
+are `systemd/durable-nanobot.service` and `systemd/durable-nanobot@.service`;
+they run the built checkout through an absolute Node path and do not need a CLI
+link. Code edits need build + restart; unit edits additionally need daemon-reload.
+
 ## Layout
 
 - `src/runtime.ts` — `openGateway`: storage, config-scoped tool policy,

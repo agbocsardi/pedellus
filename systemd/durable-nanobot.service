@@ -1,14 +1,14 @@
 [Unit]
-Description=Nanobot gateway (primary configuration)
+Description=Durable Nanobot gateway (primary configuration)
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
 Type=exec
 # Replace /usr/bin/node with the absolute Node >= 22.19 executable and
-# /opt/durable-nanobot with this checkout's absolute path. This package is
-# private and installs no `nanobot` executable, so the unit runs dist/cli.js
-# through Node directly. Do not replace this with a bare `nanobot` command.
+# /opt/durable-nanobot with this checkout's absolute path. Run dist/cli.js
+# through Node directly, independently of the optional linked CLI command.
+# Never point this unit at Python's `nanobot` command.
 ExecStart=/usr/bin/node /opt/durable-nanobot/dist/cli.js gateway --config %h/.durable-nanobot/config.json
 WorkingDirectory=%h/.durable-nanobot
 # Optional per-instance environment, e.g. one provider key per line. Keep the

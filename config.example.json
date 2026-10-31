@@ -1,6 +1,6 @@
 {
   "workspace": "./workspace",
-  "dataDir": "./.nanobot-data",
+  "dataDir": "./data",
   "modelPresets": {
     "fast": { "provider": "openai", "modelId": "gpt-6-luna", "thinkingLevel": "off" },
     "deep": { "provider": "openai", "modelId": "gpt-6-sol", "thinkingLevel": "high" }

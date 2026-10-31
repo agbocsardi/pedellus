@@ -6,7 +6,7 @@
  * filesystem paths, provider/dependency error text or the underlying exception.
  */
 export const STARTUP_DIAGNOSTICS = Object.freeze({
-  usage: "Usage: nanobot gateway|agent|recovery [--config <path>] (without --config: ~/.durable-nanobot/config.json)",
+  usage: "Usage: durable-nanobot gateway|agent|recovery [--config <path>] (without --config: ~/.durable-nanobot/config.json)",
   configHome:
     "cannot resolve the default configuration home; set HOME or pass --config <path> (diagnostic details suppressed)",
   defaultConfigFile:
@@ -34,11 +34,11 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
     "cannot prepare the configured workspace or data directory; check workspace, dataDir and extraAllowedDirs " +
     "(diagnostic details suppressed)",
   storeLocked:
-    "another process already owns the configured data store; stop the other running nanobot/gateway process " +
+    "another process already owns the configured data store; stop the other running durable-nanobot gateway process " +
     "before starting another (diagnostic details suppressed)",
   preparedContext:
     "startup refused because a prepared model dispatch pins historical Nanobot context; run " +
-    "`nanobot recovery --config <path>` with this configuration to inspect and cancel the blocked task, " +
+    "`durable-nanobot recovery --config <path>` with this configuration to inspect and cancel the blocked task, " +
     "or omit `--config` for the default primary configuration, " +
     "then start again (diagnostic details suppressed)",
   unexpected: "command failed; diagnostic details suppressed",
@@ -82,6 +82,6 @@ export function startupDiagnostic(error: unknown): string {
   const code = error instanceof StartupDiagnosticError
     ? knownStartupDiagnosticCode(error.code)
     : "unexpected";
-  // Usage text already names the executable; avoid a `nanobot: Usage: nanobot` prefix.
-  return code === "usage" ? STARTUP_DIAGNOSTICS.usage : `nanobot: ${STARTUP_DIAGNOSTICS[code]}`;
+  // Usage text already names the executable; avoid a `durable-nanobot: Usage: durable-nanobot` prefix.
+  return code === "usage" ? STARTUP_DIAGNOSTICS.usage : `durable-nanobot: ${STARTUP_DIAGNOSTICS[code]}`;
 }

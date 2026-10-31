@@ -20,7 +20,7 @@ export type RestartPlan = {
 
 /** Fixed diagnostic for a restart that could not replace the process; carries no path, argv or env. */
 export const RESTART_FAILURE_DIAGNOSTIC =
-  "nanobot: process restart failed; this gateway has stopped and must be started again " +
+  "durable-nanobot: process restart failed; this gateway has stopped and must be started again " +
   "(diagnostic details suppressed)";
 
 /** Whether this platform and Node runtime can replace the current process image. */
