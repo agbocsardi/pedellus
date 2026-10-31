@@ -155,6 +155,23 @@ function telegramMock(batches) {
         text,
       });
     }
+    if (method === 'sendRichMessage') {
+      const rich = body.rich_message ?? {};
+      const text = rich.markdown ?? '';
+      const replyTo = body.reply_parameters?.message_id;
+      sendAttempts.push({ chatId: body.chat_id, text, replyTo, rich: true });
+      if (text === 'UNKNOWN-REPLY') {
+        return json({ ok: false, error_code: 500, description: 'Internal Server Error' }, 500);
+      }
+      const messageId = nextMessageId++;
+      sent.push({ chatId: body.chat_id, text, messageId, replyTo, rich: true });
+      return response({
+        message_id: messageId,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: body.chat_id, type: 'private' },
+        rich_message: rich,
+      });
+    }
     if (method === 'setMessageReaction') {
       reactions.push({ chatId: body.chat_id, messageId: body.message_id, reaction: body.reaction });
       return response(true);

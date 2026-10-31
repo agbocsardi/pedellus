@@ -441,10 +441,11 @@ Actions:
   message's own id is reachable this way; a replied-to turn also names it in its
   context block.
 - `reply` sends a native reply (`reply_parameters.message_id`) to one observed
-  id. Text is chunked under Telegram's 4096-character limit; the first chunk is
-  threaded. The turn's ordinary answer is still delivered unthreaded afterwards,
-  so `reply` adds a separate threaded message and is worth using only when that
-  is useful.
+  id. Text is chunked under the rich-message limit and delivered as rich
+  markdown, falling back to plain text (see "Rich message formatting"); the first
+  chunk is threaded. The turn's ordinary answer is still delivered unthreaded
+  afterwards, so `reply` adds a separate threaded message and is worth using only
+  when that is useful.
 - `react` calls `setMessageReaction` with one emoji on one observed id.
 - `send` uploads one existing workspace file unchanged: any file, whatever its
   extension or content, can be sent as a document, which is the default when
@@ -537,11 +538,12 @@ process racing the workspace between them is not fully excluded on this host
   revoked senders' pending outputs are discarded (a known preview is best-effort
   deleted).
 - The adapter watches committed snapshots for the active input and coalesces
-  partial text updates into `editMessageText` calls. It filters to text blocks
-  only (never reasoning/thinking), explicitly flushes the final assistant entry
-  after `submission.wait()`, splits output under Telegram's 4096-character
-  limit, and bounds concurrent deliveries to eight. The remote message ID and
-  last preview are stored with the Durable pending-delivery record.
+  partial text updates into rich `editMessageText` calls. It filters to text
+  blocks only (never reasoning/thinking), explicitly flushes the final assistant
+  entry after `submission.wait()`, splits output under the rich-message limit and
+  bounds concurrent deliveries to eight. The remote message ID and last preview
+  are stored with the Durable pending-delivery record. Previews stay inside one
+  plain-sized message because they are replaced repeatedly while a turn runs.
 - The poller continues admitting updates while up to eight deliveries wait on
   model or Telegram work. The eight-job limit applies only to started deliveries;
   a full durable pending queue (1000 items) fails closed before offset advance.
@@ -582,6 +584,38 @@ process racing the workspace between them is not fully excluded on this host
   user-visible response.
   Polling errors other than cancellation terminate `runTelegram` for the host to
   handle.
+
+## Rich message formatting
+
+Bot API 10.1 rich messages carry the answer as markdown instead of one more chunk of plain text,
+so headings, lists, tables, code and links render as the agent wrote them and most turns are a single
+message.
+
+- Ordinary replies, scheduled cron deliveries, live previews and their final edits all use
+  `sendRichMessage` with `rich_message.markdown`, or `editMessageText` with `rich_message` for
+  in-place edits. No `parse_mode`, no markdown→HTML conversion, no second formatting authority.
+- Rich chunking uses Telegram's 32,768-character budget, cuts on a line then a word boundary, never
+  splits a surrogate pair, and never leaves a fenced code block open: a cut inside ``` closes the
+  fence and reopens the same fence line in the next chunk.
+- Host-generated notices (status, help, digest status, control acknowledgements) are escaped so
+  paths, ids, `<placeholder>`s and `*` selection markers render exactly as written; an underscore
+  between two alphanumerics is left bare, and an escaped character renders as the bare character.
+- Two rejections are proven non-sends and fall back to plain text: a server without the method
+  (404/`method not found`/`invalid parameter`) latches rich off for the rest of the process, and a
+  refused body (`can't parse`, `unsupported start tag`, `message is too long`, `rich_message`)
+  resends that chunk as plain text split under the 4096-character limit. Every other rejection and
+  every ambiguous outcome keeps the existing semantics: held, never blindly resent. The plain
+  fallback is all-or-nothing per chunk — if a later part fails, the record is held as an ambiguous
+  outcome rather than resent.
+- `sendRichMessage` is in the ambiguous-send method set, so a 5xx or transport failure is `unknown`
+  like any other send.
+- Attachment captions stay plain text with no `parse_mode`, and media is sent through the upload
+  actions, not as rich media blocks.
+
+Live acceptance is outstanding: offline checks cover the request shapes, chunking, latching and
+fallbacks against a mocked Bot API, not the live service accepting rich bodies or a client rendering
+them. A model-written markdown image or video reference is resolved by Telegram's servers, not this
+adapter.
 
 ## Adapter lifecycle and Telegram edit recovery
 
@@ -724,7 +758,7 @@ evidence is bounded (1000 origins per bot): every valid admission refreshes `adm
 eviction is surfaced through a deduped sanitized fault and warning rather than silently hiding the
 lost binding.
 
-Scheduled sends share the bot flood gate, 4096-character chunking, chunk cursor, write-ahead
+Scheduled sends share the bot flood gate, rich-message chunking, chunk cursor, write-ahead
 `sendIntent`, and bounded retries with inbound replies. Network writes for one chat are serialized
 in request order, and only one scheduled record per chat is active at a time. That prevents
 overlapping network calls and scheduled-record reordering, but it is not a whole-message lock: the

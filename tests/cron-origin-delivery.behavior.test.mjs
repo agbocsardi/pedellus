@@ -197,6 +197,18 @@ function telegramFetchMock(identity, updates) {
         text: body.text ?? '',
       });
     }
+    if (method === 'sendRichMessage') {
+      const messageId = nextMessageId++;
+      const rich = body.rich_message ?? {};
+      sent.push({ chatId: body.chat_id, text: rich.markdown ?? '', messageId, rich });
+      notify();
+      return response({
+        message_id: messageId,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: body.chat_id, type: 'private' },
+        rich_message: rich,
+      });
+    }
     if (method === 'sendChatAction') return response(true);
     if (method === 'editMessageText' || method === 'deleteMessage') return response(true);
     throw new Error(`unexpected mocked Telegram method: ${method}`);

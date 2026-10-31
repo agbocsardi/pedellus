@@ -72,6 +72,12 @@ manager, and a platform without `execve` refuses it. These controls add no tool
 authority and coexist with media ingress and MCP. See
 [Telegram controls](./TELEGRAM.md#controls).
 
+Answers, scheduled deliveries and host notices are delivered as rich messages: the answer travels as
+markdown (Bot API 10.1), so headings, lists, tables and code render as written and most turns are one
+message instead of several plain chunks. A server without the method, or a body Telegram refuses to
+parse, falls back to plain text; attachment captions stay plain. See
+[rich message formatting](./TELEGRAM.md#rich-message-formatting).
+
 Closed episodes are summarized in the background by default using the conversation's current
 model when the job starts. This makes provider calls and can incur costs. To use a different
 model, set `episodeSummary.preset` to a configured preset name. Legacy direct configs

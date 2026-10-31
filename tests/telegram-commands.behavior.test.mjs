@@ -229,6 +229,18 @@ function telegramMock(batches) {
         text: body.text ?? '',
       });
     }
+    if (method === 'sendRichMessage') {
+      const messageId = nextMessageId++;
+      const rich = body.rich_message ?? {};
+      // The shipped adapter sends markdown; this mock records it as the text the chat sees.
+      sent.push({ chatId: body.chat_id, text: rich.markdown ?? '', messageId, rich });
+      return response({
+        message_id: messageId,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: body.chat_id, type: 'private' },
+        rich_message: rich,
+      });
+    }
     if (method === 'editMessageText' || method === 'deleteMessage') return response(true);
     throw new Error(`unexpected mocked Telegram method: ${method}`);
   };
@@ -275,6 +287,14 @@ function userTexts(messages) {
     .map((message) => (typeof message.content === 'string'
       ? message.content
       : message.content.filter((part) => part.type === 'text').map((part) => part.text).join('')));
+}
+
+/**
+ * Host notices travel as rich markdown, where literal characters are backslash-escaped and the chat
+ * renders the bare character; this is the text the reader sees.
+ */
+function rendered(text) {
+  return text.replace(/\\([\\`*_[\]<>~$])/g, '$1');
 }
 
 test('a native host advertises exactly the implemented owner commands, with the /stop alias', { timeout: 20_000 }, async () => {
@@ -427,7 +447,7 @@ test('/model lists and selects one configured preset for this chat only', { time
     await until(() => transport.sent.length === 7, 'model command replies');
     const texts = transport.sent.map((entry) => entry.text);
 
-    const listing = texts[0];
+    const listing = rendered(texts[0]);
     assert.match(listing, /Current model: fixture\/alpha \(thinking: off\)/);
     assert.match(listing, /\* fast — fixture alpha \[thinking: off\]/);
     assert.match(listing, /\n +deep — fixture beta \[thinking: high\]/);
@@ -437,8 +457,8 @@ test('/model lists and selects one configured preset for this chat only', { time
     assert.match(texts[1], /Only this chat's selection changed/);
     assert.match(texts[1], /a restart restores the configured default preset/);
 
-    assert.match(texts[2], /Current model: fixture\/beta \(thinking: high\)/);
-    assert.match(texts[2], /\* deep — fixture beta \[thinking: high\]/);
+    assert.match(rendered(texts[2]), /Current model: fixture\/beta \(thinking: high\)/);
+    assert.match(rendered(texts[2]), /\* deep — fixture beta \[thinking: high\]/);
 
     assert.match(texts[3], /Unknown model preset nope: nothing was changed/);
     assert.match(texts[4], /Usage: \/model \(list the configured presets\)/);
