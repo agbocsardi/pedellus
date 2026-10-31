@@ -91,6 +91,7 @@ import type {
   DigestIdle,
   DigestSource,
 } from "./digestion.js";
+import { DIGEST_RUN_LIMITS_DEFAULT, digestRunLimitsFrom, validateDigestRunLimits, type DigestRunLimits } from "./digest-limits.js";
 
 export const MEMORY_DIGEST_TASK_NAME = "nanobot.memory-digest";
 export const MEMORY_DIGEST_EXTENSION_NAME = "nanobot.memory-digest";
@@ -142,8 +143,6 @@ export const MEMORY_DIGEST_LIMITS = Object.freeze({
   promptChars: 16_000,
   /** Derived memory/skill navigation characters rendered into the model input. */
   indexChars: 12_000,
-  /** One model turn's deadline; a run that exceeds it fails without advancing the cursor. */
-  turnTimeoutMs: 300_000,
   /** Bounded failure text kept in the task outcome. */
   maxErrorChars: 400,
   /** Bounded answer excerpt kept in the task outcome; the run transcript keeps the full text. */
@@ -274,10 +273,10 @@ export function memoryDigestScopeProblem(path: string): string | undefined {
   return "only SOUL.md, USER.md, memory/**/*.md and skills/<name>/SKILL.md are curated";
 }
 
-function digestScopeHook(workspaceRoot: string): HookRegistration {
+function digestScopeHook(workspaceRoot: string, options: MemoryDigestScopeOptions): HookRegistration {
   const root = resolve(workspaceRoot);
   return hook(ToolTask, {
-    async beforeTool(call) {
+    async beforeTool(call, api, context) {
       if (!(MEMORY_DIGEST_TOOL_NAMES as readonly string[]).includes(call.name)) {
         return { block: `Memory digestion holds only ${MEMORY_DIGEST_TOOL_NAMES.join(", ")}; ${call.name} is not available` };
       }
@@ -292,9 +291,145 @@ function digestScopeHook(workspaceRoot: string): HookRegistration {
       }
       const problem = memoryDigestScopeProblem(inside.split(sep).join("/"));
       if (problem !== undefined) return { block: `Memory digestion is out of scope: ${problem}` };
+
+      // Budgets are checked at the native call, after scope and before execution, so a failed or
+      // refused call still counts and a mutation that would exceed a bound never runs. The counters
+      // come from this run's committed transcript, so a replay or reopen cannot reset them.
+      const limits = options.limitsFor === undefined
+        ? DIGEST_RUN_LIMITS_DEFAULT
+        : options.limitsFor(api.conversationId);
+      if (limits === undefined) {
+        return { block: "Memory digestion cannot verify its configured run budget; the batch was not acknowledged" };
+      }
+      if (options.harness !== undefined) {
+        let use: DigestToolUse;
+        try {
+          use = await digestToolUse(
+            options.harness(),
+            api.conversationId,
+            { id: call.id, name: call.name, arguments: call.arguments },
+            context,
+          );
+        } catch {
+          return { block: "Memory digestion could not verify its tool-call and change budget; the batch was not acknowledged" };
+        }
+        if (use.calls > limits.maxToolCalls) {
+          return { block: "Memory digestion reached its configured tool-call budget; the batch was not acknowledged" };
+        }
+        if (call.name === "write" || call.name === "edit") {
+          if (use.paths.size > limits.maxChangedFiles) {
+            return { block: "Memory digestion reached its configured changed-file budget; the batch was not acknowledged" };
+          }
+          if (use.diffChars > limits.maxDiffChars) {
+            return { block: "Memory digestion reached its configured changed-text budget; the batch was not acknowledged" };
+          }
+        }
+      }
       return undefined;
     },
   });
+}
+
+/** What this run's committed transcript already used, plus the call currently being admitted. */
+interface DigestToolUse {
+  readonly calls: number;
+  readonly paths: ReadonlySet<string>;
+  readonly diffChars: number;
+}
+
+/**
+ * Conservative inserted-plus-removed text for one mutation call: a create charges its whole content,
+ * an edit charges both sides of every pair. Repeated edits of one file therefore accumulate instead
+ * of being undercharged, while a call that fails or is refused never reaches this accounting.
+ */
+function mutationUseOf(name: string, args: unknown): { readonly path: string; readonly chars: number } | undefined {
+  if (!isRecord(args) || typeof args.path !== "string") return undefined;
+  if (name === "write") {
+    return typeof args.content === "string" ? { path: args.path, chars: args.content.length } : undefined;
+  }
+  if (name !== "edit" || !Array.isArray(args.edits)) return undefined;
+  let chars = 0;
+  for (const edit of args.edits) {
+    if (!isRecord(edit) || typeof edit.oldText !== "string" || typeof edit.newText !== "string") return undefined;
+    chars += edit.oldText.length + edit.newText.length;
+  }
+  return { path: args.path, chars };
+}
+
+/**
+ * Read this digest target's committed calls and results and derive the bounded usage of its one run.
+ * Any assistant tool-call part counts, including a call that failed or was refused; only a call with
+ * a successful result, or one still in flight, reserves changed files and changed text. A parallel
+ * round is fully committed before its first call reaches this hook, so every call in it sees the same
+ * reservation and no round can overshoot.
+ */
+async function digestToolUse(
+  harness: Harness,
+  conversationId: ConversationId,
+  current: { readonly id: string; readonly name: string; readonly arguments: unknown },
+  context: Context,
+): Promise<DigestToolUse> {
+  const conversation = await harness.conversation(conversationId, context);
+  if (conversation === undefined) throw new Error("the digest conversation is not committed");
+  const calls = new Map<string, { readonly name: string; readonly arguments: unknown }>();
+  const results = new Map<string, boolean>();
+  let recordedCalls = 0;
+  let examined = 0;
+  let cursor: Cursor | undefined;
+  while (examined < TURN_SCAN_LIMITS.maxEntries) {
+    const page = await conversation.entries(
+      { order: "ascending" },
+      Math.min(TURN_SCAN_LIMITS.entriesPerPage, TURN_SCAN_LIMITS.maxEntries - examined),
+      cursor,
+      context,
+    );
+    if (page.items.length === 0) break;
+    for (const entry of page.items) {
+      examined += 1;
+      for (const message of entry.model ?? []) {
+        const candidate: unknown = message;
+        if (!isRecord(candidate)) continue;
+        if (candidate.role === "assistant" && Array.isArray(candidate.content)) {
+          for (const part of candidate.content) {
+            if (
+              isRecord(part) && part.type === "toolCall"
+              && typeof part.id === "string" && typeof part.name === "string"
+            ) {
+              calls.set(part.id, { name: part.name, arguments: part.arguments });
+              recordedCalls += 1;
+            }
+          }
+        } else if (candidate.role === "toolResult" && typeof candidate.toolCallId === "string") {
+          results.set(candidate.toolCallId, candidate.isError === true);
+        }
+      }
+    }
+    cursor = page.next;
+    if (cursor === undefined) break;
+  }
+  if (cursor !== undefined) {
+    throw new Error("the digest conversation is too long to verify its tool and change budget");
+  }
+  const recorded = calls.has(current.id);
+  const paths = new Set<string>();
+  let diffChars = 0;
+  for (const [id, call] of calls) {
+    if (call.name !== "write" && call.name !== "edit") continue;
+    const use = mutationUseOf(call.name, call.arguments);
+    if (use === undefined) continue;
+    const failed = results.get(id);
+    if (failed === true) continue;
+    paths.add(use.path);
+    diffChars += use.chars;
+  }
+  if (!recorded) {
+    const use = mutationUseOf(current.name, current.arguments);
+    if (use !== undefined) {
+      paths.add(use.path);
+      diffChars += use.chars;
+    }
+  }
+  return { calls: recordedCalls + (recorded ? 0 : 1), paths, diffChars };
 }
 
 /**
@@ -339,11 +474,22 @@ function digestWriteWrap(): ReturnType<typeof wrapTool<ToolRegistration>> {
   }) as ToolRegistration);
 }
 
+/** Host lookups the scope hook needs: the target transcript and this run's accepted bounds. */
+export interface MemoryDigestScopeOptions {
+  /** Live harness, resolved at call time because the extension is built before the Harness opens. */
+  readonly harness?: () => Harness;
+  /** Accepted bounds of the run that owns this conversation; absent uses the shared defaults. */
+  readonly limitsFor?: (conversationId: ConversationId) => DigestRunLimits | undefined;
+}
+
 /** The curation-scope hook and create-only writer a digest target conversation needs. */
-export function createMemoryDigestScopeExtension(workspaceRoot: string): Extension {
+export function createMemoryDigestScopeExtension(
+  workspaceRoot: string,
+  options: MemoryDigestScopeOptions = {},
+): Extension {
   return defineExtension({
     name: MEMORY_DIGEST_SCOPE_EXTENSION_NAME,
-    hooks: [digestScopeHook(workspaceRoot)],
+    hooks: [digestScopeHook(workspaceRoot, options)],
     wraps: [digestWriteWrap()],
   });
 }
@@ -523,6 +669,8 @@ export interface MemoryDigestTaskInput {
   readonly cursor: MemoryDigestCursorJson;
   readonly model: { readonly [key: string]: JsonValue; readonly provider: string; readonly modelId: string };
   readonly thinkingLevel: string;
+  /** Bounds accepted when this run started; a replay or reopen reuses these, never current config. */
+  readonly limits: { readonly [key: string]: JsonValue } & DigestRunLimits;
 }
 
 export type MemoryDigestCheckpoint = {
@@ -634,8 +782,11 @@ export interface MemoryDigestOptions {
   readonly prepare: (details: MemoryDigestPrepareDetails) => Promise<void>;
   /** Retire the target's captured authority in the run's terminal commit. */
   readonly finalize: (details: MemoryDigestFinalizeDetails) => Promise<void>;
-  /** Host override of the single-turn deadline. */
-  readonly turnTimeoutMs?: number;
+  /**
+   * Bounds for new runs, resolved by the host from config. Absent keeps the shared defaults. A
+   * started run captures these values, so a later replay or reopen cannot widen them.
+   */
+  readonly limits?: DigestRunLimits;
   /** The curation-scope extension instance the host also installs in its registry. */
   readonly scopeExtension?: Extension;
 }
@@ -777,6 +928,10 @@ function parseInput(value: unknown): MemoryDigestTaskInput | undefined {
   if (typeof provider !== "string" || provider === "") return undefined;
   if (typeof modelId !== "string" || modelId === "") return undefined;
   if (typeof value.thinkingLevel !== "string" || value.thinkingLevel === "") return undefined;
+  // A task recorded by an earlier build has no captured bounds; the shared defaults are the
+  // compatible fallback and are what that build accepted.
+  const limits = value.limits === undefined ? DIGEST_RUN_LIMITS_DEFAULT : digestRunLimitsFrom(value.limits);
+  if (limits === undefined) return undefined;
   return {
     sessionKey,
     conversationId,
@@ -790,6 +945,7 @@ function parseInput(value: unknown): MemoryDigestTaskInput | undefined {
     cursor,
     model: { provider, modelId },
     thinkingLevel: value.thinkingLevel,
+    limits: { ...limits },
   };
 }
 
@@ -1087,11 +1243,12 @@ function hasFailedToolResult(entry: EntryRecord): boolean {
 }
 
 export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
-  const scopeExtension = options.scopeExtension ?? createMemoryDigestScopeExtension(options.workspaceRoot);
-  const turnTimeoutMs = options.turnTimeoutMs ?? MEMORY_DIGEST_LIMITS.turnTimeoutMs;
-  if (!Number.isSafeInteger(turnTimeoutMs) || turnTimeoutMs < 1) {
-    throw new TypeError("memory digest turnTimeoutMs must be a positive integer");
-  }
+  const limits = options.limits ?? DIGEST_RUN_LIMITS_DEFAULT;
+  validateDigestRunLimits(limits);
+  const scopeExtension = options.scopeExtension ?? createMemoryDigestScopeExtension(options.workspaceRoot, {
+    harness: options.harness,
+    limitsFor: () => limits,
+  });
   const clock = options.now;
 
   const liveTask = async (
@@ -1493,7 +1650,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
 
           let batch: DigestBatch;
           try {
-            batch = await source.readBatch(refOf(parsed), context);
+            batch = await source.readBatch(refOf(parsed), context, parsed.limits);
           } catch (error) {
             // The recorded batch no longer re-derives from the transcript: fail without acking.
             await failed(`the accepted digest batch could not be read: ${error instanceof Error ? error.message : String(error)}`);
@@ -1503,7 +1660,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           if (batch.entries.length === 0) {
             // Nothing to curate: a successful no-op is still processed work, so it advances.
             try {
-              await source.acknowledge(batch, context);
+              await source.acknowledge(batch, context, parsed.limits);
             } catch (error) {
               await failed(`the digest batch could not be acknowledged: ${error instanceof Error ? error.message : String(error)}`);
               return;
@@ -1551,7 +1708,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
                 const created = existing?.id
                   ?? (await tx.createConversation({ ownership: { kind: "task", taskId: running.id } })).id;
                 prepared = created;
-                deadline = clock() + turnTimeoutMs;
+                deadline = clock() + parsed.limits.runTimeoutMs;
                 await options.prepare({
                   tx,
                   taskId: Number(running.id),
@@ -1678,7 +1835,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           // Only a validated, settled turn may move the frontier. The acknowledgement re-validates
           // the batch against the committed transcript and refuses a moved cursor.
           try {
-            await source.acknowledge(batch, context);
+            await source.acknowledge(batch, context, parsed.limits);
           } catch (error) {
             const after = await source.cursor(parsed.conversationId as ConversationId, context).catch(() => undefined);
             if (after === undefined || !consumedThrough(after, parsed)) {
@@ -1776,10 +1933,20 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
         };
       }
       const running = await harnessLiveTask(context);
-      if (running !== undefined) return { status: "busy", taskId: running };
+      if (running !== undefined) {
+        // A live digest task may be parked at Durable's restart limit. This ordinary start retries
+        // that same task once through the native call (a no-op when it is not parked), outside any
+        // commit, then still reports busy: there is no second writer, retry loop or recovery command.
+        try {
+          await options.harness().retryTask(running as TaskId, context);
+        } catch {
+          // An unknown or already-settled task is handled by the busy result and the next start.
+        }
+        return { status: "busy", taskId: running };
+      }
       // Bounded backpressure before consuming a batch: try once to admit every retained result.
       await flushPending(options.harness(), writer.id, context);
-      const result = await options.source().read(context);
+      const result = await options.source().read(context, limits);
       if (result.status === "idle") return { status: "idle", idle: result };
       const batch = result;
       return writer.commit(async (tx) => {
@@ -1810,6 +1977,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           },
           model: { ...choice.model },
           thinkingLevel: choice.thinkingLevel,
+          limits: { ...limits },
         };
         const taskId = await tx.createTask(runTask, input, {
           ownership: { kind: "conversation" },
@@ -1921,6 +2089,8 @@ export function memoryDigestTaskPolicy(task: unknown): {
   readonly targetConversationId: ConversationId;
   readonly model: { readonly provider: string; readonly modelId: string };
   readonly thinkingLevel: ModelThinkingLevel;
+  /** Bounds captured at start, never the current config's. */
+  readonly limits: DigestRunLimits;
 } | undefined {
   const target = memoryDigestTaskTarget(task);
   if (target === undefined || !isRecord(task)) return undefined;
@@ -1931,6 +2101,7 @@ export function memoryDigestTaskPolicy(task: unknown): {
     targetConversationId: target.targetConversationId,
     model: { provider: input.model.provider, modelId: input.model.modelId },
     thinkingLevel: input.thinkingLevel as ModelThinkingLevel,
+    limits: { ...input.limits },
   };
 }
 

@@ -117,6 +117,26 @@ export interface CodeModeConfig {
   readonly enabled: boolean;
 }
 
+/**
+ * Bounds for one explicitly started memory-digestion run. Absent fields keep the shared defaults;
+ * the block itself neither enables nor schedules anything, and frequency stays with ordinary cron.
+ * A started run captures the accepted values, so a reopen never widens them from current config.
+ */
+export interface DigestConfig {
+  /** Entries examined by one closed-episode chunk. */
+  readonly entriesPerBatch?: number;
+  /** Extracted evidence characters in one closed-episode chunk. */
+  readonly charsPerBatch?: number;
+  /** Individual tool calls allowed in one run, failed and refused calls included. */
+  readonly maxToolCalls?: number;
+  /** Whole-run deadline in seconds, from the run's preparation to its settled turn. */
+  readonly runTimeoutSeconds?: number;
+  /** Distinct workspace files one run may successfully change. */
+  readonly maxChangedFiles?: number;
+  /** Inserted plus removed text units one run may successfully write. */
+  readonly maxDiffChars?: number;
+}
+
 export interface WorkspaceContextConfig {
   /** Explicit workspace-relative `memory/**\/*.md` files, in output order. Defaults to none. */
   readonly memoryFiles: readonly string[];
@@ -232,6 +252,8 @@ export interface PortConfig {
   mcp?: McpConfig;
   /** Native Code Mode composition; absent follows MCP auto-enablement. */
   codemode?: CodeModeConfig;
+  /** Explicit memory-digestion bounds; absent keeps the defaults and starts nothing by itself. */
+  digest?: DigestConfig;
   /**
    * Automatic episode summaries; by default use the conversation's current model.
    * `model` is the legacy direct selector; `preset` names an entry in `modelPresets`.
@@ -608,6 +630,36 @@ function codeModeConfig(value: unknown): CodeModeConfig {
   return Object.freeze({ enabled: raw.enabled });
 }
 
+const DIGEST_CONFIG_FIELDS = [
+  "entriesPerBatch",
+  "charsPerBatch",
+  "maxToolCalls",
+  "runTimeoutSeconds",
+  "maxChangedFiles",
+  "maxDiffChars",
+] as const;
+
+function digestConfig(value: unknown): DigestConfig {
+  const raw = object(value, "digest");
+  for (const key of Object.keys(raw)) {
+    if (!(DIGEST_CONFIG_FIELDS as readonly string[]).includes(key)) throw new Error(`Unknown digest field: ${key}`);
+  }
+  const parsed: { -readonly [K in keyof DigestConfig]: number } = {} as { -readonly [K in keyof DigestConfig]: number };
+  for (const field of DIGEST_CONFIG_FIELDS) {
+    const bound = raw[field];
+    if (bound === undefined) continue;
+    if (typeof bound !== "number" || !Number.isSafeInteger(bound) || bound < 1) {
+      throw new Error(`digest.${field} must be a positive integer`);
+    }
+    // Converted to milliseconds in the runtime; keep the product inside the safe integer range.
+    if (field === "runTimeoutSeconds" && bound > Math.floor(Number.MAX_SAFE_INTEGER / 1000)) {
+      throw new Error(`digest.${field} is too large`);
+    }
+    parsed[field] = bound;
+  }
+  return Object.freeze(parsed);
+}
+
 function mediaConfig(value: unknown): MediaConfig {
   const raw = object(value, "media");
   for (const key of Object.keys(raw)) {
@@ -720,6 +772,9 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   }
   if (raw.codemode !== undefined) {
     Object.assign(config, { codemode: codeModeConfig(raw.codemode) });
+  }
+  if (raw.digest !== undefined) {
+    Object.assign(config, { digest: digestConfig(raw.digest) });
   }
   if (raw.media !== undefined) {
     Object.assign(config, { media: mediaConfig(raw.media) });
