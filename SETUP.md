@@ -238,25 +238,30 @@ existing ones:
 }
 ```
 
-- `directory` is workspace-relative and defaults to `media`. Originals are stored
-  there byte-for-byte, so the ordinary configured coding tools (`read`, `bash`,
-  and so on) are how the agent opens them. Storing a file grants no tool
-  authority. Nothing is written to `dataDir` or outside the workspace. A
-  configured workspace that is itself a symlink is accepted and resolved once to
-  its canonical path; symlinks below it are refused.
+- `directory` is workspace-relative and defaults to `media`. Telegram originals are
+  stored there byte-for-byte, while the CLI keeps its own originals in the `cli/`
+  subdirectory, so the ordinary configured coding tools (`read`, `bash`, and so on)
+  are how the agent opens them. Storing a file grants no tool authority. Nothing is
+  written to `dataDir` or outside the workspace. A configured workspace that is
+  itself a symlink is accepted and resolved once to its canonical path; symlinks
+  below it are refused.
 - `transcription.enabled` (default `true`) turns local speech recognition on or
   off; `language` is an optional hint and `maxDurationSeconds` (default `120`)
   refuses longer audio. There is no cloud speech provider and no API key.
-- Photos arrive as native image content plus a workspace-relative locator.
-  Documents are stored unread: no text extraction, OCR, PDF/Office conversion or
-  dependency is involved, so reading one is the agent's job with the configured
-  tools. Video and stickers get an explicit unsupported notice.
+- Telegram photos arrive as native image content plus a workspace-relative
+  locator. Telegram documents are stored unread: no text extraction, OCR,
+  PDF/Office conversion or dependency is involved, so reading one is the agent's
+  job with the configured tools. Video and stickers get an explicit unsupported
+  notice.
 - The local CLI submits one operator-named file per `/attach` command through the
-  running gateway. A known image extension with matching bytes becomes image
-  content (the configured vision handoff applies as usual); every other file,
-  including audio, is stored as an opaque original with a locator only. The CLI
-  adds no document extraction or audio transcription, and the model never
-  receives the operator's absolute path. See [the CLI](./CLI.md#local-attachments).
+  running gateway. Every CLI attachment, photos included, is stored path-only
+  under `<workspace>/<media.directory>/cli` (default `media/cli/`); the turn names
+  that workspace-relative locator and nothing else. The CLI builds no native image
+  content, never triggers the configured vision handoff, and adds no document
+  extraction or audio transcription; the configured tools decide whether to read
+  the original. The model never receives the operator's absolute path. Telegram's
+  own originals stay at `<workspace>/<media.directory>` with its native photo and
+  transcription handling unchanged. See [the CLI](./CLI.md#local-attachments).
 - Bounds: 20 MB per file (also Telegram's ordinary Bot API `getFile` limit), a
   60s Telegram download timeout, two concurrent attachment jobs, a 180s
   transcription timeout and a 120s audio-duration limit by default. Stored

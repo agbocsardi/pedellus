@@ -60,7 +60,7 @@ export interface LocalGatewayClient extends TerminalConversation {
     cursor: Cursor | undefined,
     context: Context,
   ): Promise<TerminalEntryPage>;
-  /** Store one operator-named local file in the gateway's media directory and admit its turn. */
+  /** Store one operator-named local file in the gateway's CLI attachment directory and admit its path-only turn. */
   submitAttachment(path: string, content: string, context: Context): Promise<TerminalAttachmentSubmission>;
   /** Close this attachment only; the gateway and already admitted turns keep running. */
   close(): Promise<void>;
@@ -204,16 +204,14 @@ class LocalGatewayConnection implements LocalGatewayClient {
       throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attachment submission");
     }
     const attachment = asObject(result.attachment);
-    const kind = attachment?.kind;
     const relativePath = attachment?.relativePath;
     const bytes = attachment?.bytes;
-    if ((kind !== "photo" && kind !== "document")
-      || typeof relativePath !== "string" || relativePath.length === 0
+    if (typeof relativePath !== "string" || relativePath.length === 0
       || typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0) {
       throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attachment submission");
     }
     return {
-      attachment: { kind, relativePath, bytes },
+      attachment: { relativePath, bytes },
       submission: {
         id,
         wait: (waitContext) => this.waitSettlement(id, waitContext),

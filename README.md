@@ -81,9 +81,11 @@ handling a message never installs the helper, downloads a model or calls a cloud
 provider. Stored originals are ordinary workspace files
 readable through the configured tools: no extra tool authority, no automatic
 deletion and no total-disk cap. The local CLI submits one operator-named file per
-explicit `/attach` through the same gateway store; a known image extension
-follows the same vision-handoff path, and every other file (including audio) is
-stored as an unread original with no extraction or transcription. See
+explicit `/attach` through the same gateway store, under its own `media/cli/`
+subdirectory. Every CLI attachment is path-only, photos included: the original is
+stored unchanged and the turn names its workspace-relative locator, so no native
+image content, vision handoff, transcription or extraction is added and the
+configured tools decide whether to read it. See
 [setup](./SETUP.md#8-optional-attachments-and-voice),
 [Telegram media](./TELEGRAM.md#attachments-and-local-transcription) and
 [local CLI attachments](./CLI.md#local-attachments).

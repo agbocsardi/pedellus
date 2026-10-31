@@ -53,7 +53,7 @@ export interface LocalGatewayHostOptions {
   readonly contextRefresh: boolean;
   /** Whether named model presets are configured. */
   readonly presets: boolean;
-  /** Configured workspace media store; absent keeps local attachments unavailable. */
+  /** Configured CLI-scoped workspace media store; absent keeps local attachments unavailable. */
   readonly attachments?: { readonly store: MediaStore };
 }
 
@@ -440,8 +440,9 @@ class LocalConnection {
 
   /**
    * Store one operator-named local file through the gateway's own media store, then
-   * admit the composed turn like any other input. The path stays operator input; the
-   * model receives only the stored workspace-relative locator and bounded metadata.
+   * admit the path-only turn like any other input. The path stays operator input; the
+   * model receives only the stored workspace-relative locator and bounded metadata,
+   * never image content or an automatic vision/transcription call.
    */
   private async submitAttachment(params: unknown): Promise<unknown> {
     if (this.surface === undefined) throw new LocalRequestError("unavailable", "attach must be the first request");
@@ -474,7 +475,7 @@ class LocalConnection {
     this.observe(submission);
     return {
       id: submission.id,
-      attachment: { kind: prepared.kind, relativePath: prepared.relativePath, bytes: prepared.bytes },
+      attachment: { relativePath: prepared.relativePath, bytes: prepared.bytes },
     };
   }
 
@@ -615,7 +616,6 @@ const LOCAL_ATTACHMENT_ERROR_TEXT: Record<LocalAttachmentRejection, string> = {
   unreadable: "attachment file could not be read",
   "too-large": "attachment exceeds the configured size limit",
   empty: "attachment file is empty",
-  "unsupported-image": "attachment is named as an image but its bytes are not a supported image",
   "store-failed": "attachment could not be stored in the workspace media directory",
 };
 

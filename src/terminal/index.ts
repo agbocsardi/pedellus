@@ -123,8 +123,8 @@ export interface TerminalHistoryHost {
 
 /**
  * Optional host-owned local attachment submission. The host resolves and reads the
- * operator-named file, stores the original in the gateway's configured media
- * directory, and composes the ordinary turn; the terminal only names the path.
+ * operator-named file, stores the original in the gateway's CLI attachment
+ * directory, and composes ordinary path-only text; the terminal only names the path.
  */
 export interface TerminalAttachmentHost {
   submit(path: string, prompt: string, context: Context): Promise<TerminalAttachmentSubmission>;
@@ -1047,9 +1047,9 @@ export async function runTerminalConversation(
   };
 
   /**
-   * Store one operator-named file through the host and admit its turn. The path is
-   * local operator input; the composed content and stored locator come from the host.
-   * A refusal is reported with fixed host text and never echoed as file bytes.
+   * Store one operator-named file through the host and admit its path-only turn. The
+   * path is local operator input; the stored locator and composed text come from the
+   * host. A refusal is reported with fixed host text and never echoed as file bytes.
    */
   const attachFile = async (args: string): Promise<void> => {
     const host = io.attachments;
@@ -1082,7 +1082,7 @@ export async function runTerminalConversation(
     rememberLocalInput(submission.id);
     waitForSubmission(submission.id, submission);
     await notice(
-      `Stored ${safeLabel(admitted.attachment.kind, 16)} at ${safeLabel(admitted.attachment.relativePath, 200)} ` +
+      `Stored attachment at ${safeLabel(admitted.attachment.relativePath, 200)} ` +
       `(${admitted.attachment.bytes} bytes) and admitted its turn.`,
     );
   };
@@ -1108,7 +1108,7 @@ export async function runTerminalConversation(
             ? "/digest starts one bounded closed-episode memory-digestion run for this conversation and reports only the bounded admission; /digest status is a read-only bounded view. The run works in the background against the shared workspace and reports to this conversation's agent, not to a user or channel."
             : "/digest is unavailable in this host.",
           io.attachments
-            ? "/attach stores one local file under the configured workspace media directory and submits it with the optional prompt. Known image extensions become image content; other files stay unread originals."
+            ? "/attach stores one local file under the workspace CLI attachment directory and submits it with the optional prompt. The original is stored unchanged and the agent decides with the configured tools whether to inspect it; no image content, vision call or transcription is added."
             : "/attach is unavailable without a configured media section.",
         ].join("\n"));
         return;
@@ -1345,9 +1345,9 @@ const EPISODES_USAGE = "Usage: /episodes [--session <sessionKey>] [--limit 1-50]
 const EPISODE_USAGE = "Usage: /episode [--session <sessionKey>] <startEntryId> [--limit 1-30] — --session defaults to cli:default.";
 const ENTRY_USAGE = "Usage: /entry [--session <sessionKey>] <entryId> [--radius 0-5] — --session defaults to cli:default with a history host.";
 const ATTACH_USAGE =
-  "Usage: /attach <path>[ -- <prompt>] — store one local file under the workspace media directory and submit it as an ordinary turn. " +
-  "The path may be absolute or relative to the CLI's working directory. A known image extension becomes native image content; " +
-  "every other file stays an unread stored original. Requires the media configuration.";
+  "Usage: /attach <path>[ -- <prompt>] — store one local file under the workspace CLI attachment directory and submit it as an ordinary path-only turn. " +
+  "The path may be absolute or relative to the CLI's working directory. The original bytes are stored unchanged; the agent decides whether to read them with the configured tools. " +
+  "No native image content, vision handoff, transcription or extraction is added. Requires the media configuration.";
 
 type AttachArguments =
   | { readonly kind: "usage" }

@@ -47,6 +47,13 @@ export interface MediaStoreOptions {
   readonly workspace: string;
   /** Workspace-relative directory for originals; default `media`. */
   readonly directory?: string;
+  /**
+   * One trusted internal child segment (for example `cli`) appended after the
+   * operator `directory` has passed the normal validation. Channel-scoped storage
+   * uses this so an already-valid 125-128 character operator directory is not
+   * re-checked against that operator length cap as one longer path.
+   */
+  readonly childDirectory?: string;
   readonly maxFileBytes?: number;
 }
 
@@ -104,6 +111,25 @@ export function validateMediaDirectory(value: unknown): string {
   }
   if (directory.length > 128) throw new Error("media.directory is too long");
   return segments.join("/");
+}
+
+/**
+ * Validate one internal child segment. It is code-owned, not operator input, so it
+ * never carries a separator, `.`/`..`, control characters, surrounding whitespace
+ * or the dot-prefixed namespace used by this store's temporary files.
+ */
+function validateChildDirectory(value: unknown): string {
+  if (typeof value !== "string" || value === "" || value !== value.trim()) {
+    throw new Error("media store childDirectory must be one non-empty path segment");
+  }
+  if (value.length > 64) throw new Error("media store childDirectory is too long");
+  if (value === "." || value === ".." || value.startsWith(".")) {
+    throw new Error("media store childDirectory must not be . or .. or dot-prefixed");
+  }
+  if (value.includes("/") || value.includes("\\") || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error("media store childDirectory must be one path segment without control characters");
+  }
+  return value;
 }
 
 /** Bounded printable metadata; never used to build a filesystem path. */
@@ -197,7 +223,15 @@ async function ensureMediaRoot(
 }
 
 export function createMediaStore(options: MediaStoreOptions): MediaStore {
-  const directory = validateMediaDirectory(options.directory);
+  // The operator base keeps its own 128-character contract; a code-owned child is
+  // appended only after that validation, so the composed directory is not forced
+  // back through the operator cap. Every later symlink/inside-root guard applies to
+  // the composed segments exactly as before.
+  const baseDirectory = validateMediaDirectory(options.directory);
+  const childDirectory = options.childDirectory === undefined
+    ? undefined
+    : validateChildDirectory(options.childDirectory);
+  const directory = childDirectory === undefined ? baseDirectory : `${baseDirectory}/${childDirectory}`;
   const configuredWorkspaceRoot = resolve(options.workspace);
   const segments = directory.split("/");
   const maxFileBytes = options.maxFileBytes ?? MEDIA_LIMITS.maxFileBytes;
