@@ -196,6 +196,9 @@ test("a missing default config and explicit config keep separate fixed diagnosti
   const home = await mkdtemp(join(tmpdir(), "nanobot-missing-home-"));
   const elsewhere = await mkdtemp(join(tmpdir(), "nanobot-missing-cwd-"));
   try {
+    // A decoy `config.json` in the working directory must be ignored: the
+    // default is resolved from HOME, not CWD.
+    await writeFile(join(elsewhere, "config.json"), JSON.stringify({ DECOY: "CWD-DECOY-CONFIG" }));
     const missing = startCli(home, ["gateway"], elsewhere);
     const missingExit = await waitForExit(missing);
     assert.equal(missingExit.code, 1);
@@ -204,6 +207,9 @@ test("a missing default config and explicit config keep separate fixed diagnosti
     assert.match(missing.stderr, /diagnostic details suppressed/);
     assert.doesNotMatch(missing.stderr + missing.stdout, new RegExp(home.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.doesNotMatch(missing.stderr + missing.stdout, new RegExp(SYNTHETIC_ENV));
+    assert.equal(await pathExists(join(home, ".durable-nanobot")), false, "missing default must not create the default home");
+    assert.equal(await pathExists(join(elsewhere, "decoy-state")), false, "the CWD decoy config was used");
+    assert.equal(await pathExists(join(elsewhere, "config.json")), true, "the decoy config disappeared");
 
     // An explicit path keeps the existing unreadable-config diagnostic; it is
     // not reported as a missing default.
@@ -510,13 +516,13 @@ test("shipped user units are static user-service examples and verify with the re
     assert.doesNotMatch(text, /npm start|nanobot\.service\b.*ExecStart|OPENAI|ANTHROPIC|DEEPSEEK_API_KEY|API_KEY=/);
   }
   assert.match(primary, /--config %h\/\.durable-nanobot\/config\.json/);
-  assert.match(template, /--config %h\/\.durable-nanobot\/instances\/%i\/config\.json/);
-  assert.match(template, /EnvironmentFile=-%h\/\.durable-nanobot\/instances\/%i\.env/);
+  assert.match(template, /--config %h\/\.durable-nanobot\/instances\/i-%i\/config\.json/);
+  assert.match(template, /EnvironmentFile=-%h\/\.durable-nanobot\/instances\/i-%i\.env/);
   // The instance specifier is used only inside the one fixed instances
   // directory (plus the unit description), never as a standalone arbitrary path.
   for (const line of template.split("\n")) {
     if (!/%i/.test(line) || line.startsWith("Description=")) continue;
-    assert.match(line, /instances\/%i/);
+    assert.match(line, /instances\/i-%i/);
   }
 
   const probe = spawnSync("systemd-analyze", ["--version"], { encoding: "utf8", timeout: 10_000 });

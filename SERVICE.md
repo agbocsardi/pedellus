@@ -15,7 +15,7 @@ the existing SIGTERM/SIGINT teardown.
 | File | Use |
 | --- | --- |
 | [`systemd/nanobot.service`](../systemd/nanobot.service) | The primary instance uses the default config `~/.durable-nanobot/config.json`. |
-| [`systemd/nanobot@.service`](../systemd/nanobot@.service) | One named secondary instance uses `~/.durable-nanobot/instances/<name>/config.json`. |
+| [`systemd/nanobot@.service`](../systemd/nanobot@.service) | One named secondary instance uses `~/.durable-nanobot/instances/i-<name>/config.json`. |
 
 Both are user units. Copy or symlink them into the user unit directory, for
 example `~/.config/systemd/user/`, after editing the launch paths.
@@ -68,15 +68,19 @@ Those commands are the operator's; they are not part of any offline check here.
 The template maps the instance name into one fixed directory pattern:
 
 ```text
-~/.durable-nanobot/instances/<instance>/config.json
-~/.durable-nanobot/instances/<instance>.env      # optional, ignored when absent
+~/.durable-nanobot/instances/i-<instance>/config.json
+~/.durable-nanobot/instances/i-<instance>.env      # optional, ignored when absent
 ```
 
-`<instance>` is a systemd unit instance name, not a filesystem path. A systemd
-unit name cannot contain `/`, so the argument cannot select an arbitrary path
-outside `~/.durable-nanobot/instances/`. Create the directory and `config.json`
-yourself, then use the explicit config only on that instance's command line (the
-unit already does):
+`<instance>` is a systemd unit instance name, not a filesystem path. The literal
+`i-` prefix keeps every selected directory a real child of the fixed
+`instances/` directory, so even a dot-like name such as `..` selects `i-..`, not
+a parent path. systemd also validates and normalizes unit names before starting
+a template instance: a name that is not a valid instance name, including any
+name containing `/`, is refused. The units assume a systemd release with
+`Type=exec` (systemd 230 or newer); use `Type=simple` on an older release if
+needed. Create the directory and `config.json` yourself, then use the explicit
+config only on that instance's command line (the unit already does):
 
 ```sh
 systemctl --user daemon-reload

@@ -11,13 +11,15 @@ Type=exec
 # through Node directly. Do not replace this with a bare `nanobot` command.
 #
 # The instance name is a systemd unit instance identifier, not a filesystem
-# path. It selects one fixed configuration directory under the owner's home;
-# a systemd instance name cannot contain `/`, so it cannot escape this pattern.
-ExecStart=/usr/bin/node /opt/durable-nanobot/dist/cli.js gateway --config %h/.durable-nanobot/instances/%i/config.json
-WorkingDirectory=%h/.durable-nanobot/instances/%i
+# path. It selects one fixed configuration directory under the owner's home.
+# The literal `i-` prefix keeps even a dot-like instance name inside a real
+# directory instead of allowing it to name `..`; systemd also refuses names that
+# are not valid normalized unit instance names, including any name with `/`.
+ExecStart=/usr/bin/node /opt/durable-nanobot/dist/cli.js gateway --config %h/.durable-nanobot/instances/i-%i/config.json
+WorkingDirectory=%h/.durable-nanobot/instances/i-%i
 # Optional per-instance environment, e.g. one provider key per line. Keep the
 # file private and outside this repository; it is ignored when absent.
-EnvironmentFile=-%h/.durable-nanobot/instances/%i.env
+EnvironmentFile=-%h/.durable-nanobot/instances/i-%i.env
 Restart=on-failure
 RestartSec=5s
 KillSignal=SIGTERM
