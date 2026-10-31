@@ -368,7 +368,11 @@ function storedOffset(value: unknown, field: string): number | null {
   return value;
 }
 
-function cursorOf(document: unknown): DigestCursor {
+/**
+ * Parse one stored closed-episode cursor. Exported for the complementary reader's one-time
+ * adoption, so both readers agree on the legacy document's shape instead of duplicating it.
+ */
+export function digestCursorOf(document: unknown): DigestCursor {
   if (document === undefined) return EMPTY_CURSOR;
   if (!isRecord(document)) throw new Error("Stored digest cursor is malformed");
   const throughEntryId = storedId(document.throughEntryId, "through entry");
@@ -1150,7 +1154,7 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
   let rotation = 0;
 
   const cursorFor = async (conversationId: ConversationId, context: Context): Promise<DigestCursor> =>
-    cursorOf(await harness.snapshot(DigestCursorDoc, conversationId, context));
+    digestCursorOf(await harness.snapshot(DigestCursorDoc, conversationId, context));
 
   return {
     cursor(conversationId, context) {
@@ -1362,7 +1366,7 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
       };
       await harness.commit(async (tx) => {
         const document = await tx.doc(DigestCursorDoc, conversationId);
-        const stored = cursorOf(document);
+        const stored = digestCursorOf(document);
         if (!sameCursor(stored, batch.cursor)) {
           throw new DigestCursorConflictError(
             "Digest cursor moved after this batch was read; re-read before acknowledging",

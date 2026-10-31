@@ -17,6 +17,7 @@ const {
   ComplementaryCursorConflictError,
   COMPLEMENTARY_PREVIEW_CHARS,
 } = await load(`${pkg}/dist/history/complementary.js`);
+const { DigestCursorDoc } = await load(`${pkg}/dist/history/digestion.js`);
 const { createModels, fauxAssistantMessage, fauxThinking, fauxToolCall } = await load(`${ai}/index.js`);
 const { BACKGROUND_CONTEXT } = await load(`${chord}/context/index.js`);
 const context = BACKGROUND_CONTEXT;
@@ -104,6 +105,17 @@ function sourceFor(harness, conversation, limits) {
     harness,
     ...(limits === undefined ? {} : { limits }),
     sessions: async () => [{ sessionKey: "cli:complementary", conversationId: conversation.id }],
+  });
+}
+
+function sourcesFor(harness, chats, limits) {
+  return createComplementarySource({
+    harness,
+    ...(limits === undefined ? {} : { limits }),
+    sessions: async () => chats.map(({ key, conversation }) => ({
+      sessionKey: key,
+      conversationId: conversation.id,
+    })),
   });
 }
 
@@ -563,6 +575,260 @@ test("the complementary source accepts only validated mapped chat sessions", { t
       emptyKey.read(context),
       (error) => error instanceof TypeError && /non-empty/.test(error.message),
     );
+  } finally {
+    if (harness !== undefined) await harness.close(context);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a fresh segment starts at its own start when two chats interleave entry IDs", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-complementary-interleaved-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const a = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const b = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    await append(harness, a, user("A-FIRST-QUESTION-6610"));
+    await append(harness, b, user("B-FIRST-QUESTION-7721"));
+    const [a2] = await append(harness, a, assistant("A-FIRST-ANSWER-3382"));
+    await append(harness, b, assistant("B-FIRST-ANSWER-4493"));
+
+    const source = sourcesFor(harness, [
+      { key: "cli:a", conversation: a },
+      { key: "cli:b", conversation: b },
+    ]);
+    const first = batched(await source.read(context));
+    assert.equal(first.sessionKey, "cli:a");
+    assert.deepEqual(first.entries.map((entry) => entry.text), ["A-FIRST-QUESTION-6610", "A-FIRST-ANSWER-3382"]);
+
+    // With no cursor yet, a claimed start beyond an unconsumed entry is still refused.
+    const skippedPrefix = {
+      ...first,
+      segmentStartEntryId: a2.id,
+      firstEntryId: a2.id,
+      entries: first.entries.filter((entry) => entry.entryId >= a2.id),
+    };
+    await assert.rejects(
+      source.acknowledge(skippedPrefix, context),
+      (error) => error instanceof TypeError && /skip an earlier entry/.test(error.message),
+    );
+    await source.acknowledge(first, context);
+    const second = batched(await source.read(context));
+    assert.equal(second.sessionKey, "cli:b");
+    await source.acknowledge(second, context);
+
+    const [a3] = await append(harness, a, user("A-SECOND-QUESTION-8844"));
+    await append(harness, a, assistant("A-SECOND-ANSWER-9955"));
+    const frontier = await source.cursor(a.id, context);
+    assert.ok(frontier.nextEntryId !== null && frontier.nextEntryId < a3.id, "the chat frontier is below its next entry ID");
+
+    const third = batched(await source.read(context));
+    assert.equal(third.sessionKey, "cli:a");
+    assert.equal(third.segmentStartEntryId, a3.id);
+    assert.equal(third.firstEntryId, a3.id, "a fresh chunk starts at its own segment start");
+    assert.equal(third.firstItemIndex, 0);
+    assert.equal(third.firstTextStart, 0);
+    assert.deepEqual(third.entries.map((entry) => entry.text), ["A-SECOND-QUESTION-8844", "A-SECOND-ANSWER-9955"]);
+    await source.acknowledge(third, context);
+
+    const [a5] = await append(harness, a, user("UNACKNOWLEDGED-QUESTION-1166"));
+    const [a6] = await append(harness, a, assistant("UNACKNOWLEDGED-ANSWER-2277"));
+    const valid = batched(await source.read(context));
+    assert.equal(valid.segmentStartEntryId, a5.id);
+
+    // A forged fresh start beyond an unconsumed entry must not be able to skip it.
+    const forged = {
+      ...valid,
+      segmentStartEntryId: a6.id,
+      firstEntryId: a6.id,
+      entries: valid.entries.filter((entry) => entry.entryId >= a6.id),
+    };
+    await assert.rejects(
+      source.acknowledge(forged, context),
+      (error) => error instanceof TypeError && /skip an earlier entry/.test(error.message),
+    );
+    assert.deepEqual(await source.cursor(a.id, context), valid.cursor, "a rejected skip moves nothing");
+
+    await source.acknowledge(valid, context);
+    assert.deepEqual(valid.entries.map((entry) => entry.text), ["UNACKNOWLEDGED-QUESTION-1166", "UNACKNOWLEDGED-ANSWER-2277"]);
+  } finally {
+    if (harness !== undefined) await harness.close(context);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an astral tool-result preview keeps whole surrogate pairs at odd budgets", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-complementary-astral-preview-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const emoji = "😀🚀";
+    const longResult = `${emoji.repeat(1_500)}-TAIL-${emoji.repeat(20)}`;
+    for (const charsPerBatch of [99, 100, 101, 102, 103, 105, 107]) {
+      const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+      await append(harness, conversation, user("PREVIEW-OWNER-3311"));
+      await append(harness, conversation, toolCallAssistant("PREVIEW-READING-4422", "call-astral", "read", { path: "e.txt" }));
+      const [result] = await append(harness, conversation, toolResult(longResult, "call-astral"));
+      await append(harness, conversation, assistant("PREVIEW-DONE-5533"));
+
+      const source = sourceFor(harness, conversation, { entriesPerBatch: 2, charsPerBatch });
+      const { batches } = await drain(source, 400);
+      const previews = batches
+        .flatMap((batch) => batch.entries)
+        .filter((entry) => entry.entryId === result.id && entry.itemKind === "tool-result");
+      assert.equal(previews.length, 1, `one preview for budget ${charsPerBatch}`);
+      const evidence = previews[0];
+      assert.ok(evidence.preview !== null, `preview at budget ${charsPerBatch}`);
+      assert.ok(evidence.text.length <= charsPerBatch, `preview fits budget ${charsPerBatch}`);
+      assert.equal(hasLoneSurrogate(evidence.text), false, `no split pair at budget ${charsPerBatch}`);
+      assert.equal(Buffer.from(evidence.text, "utf8").toString("utf8"), evidence.text);
+
+      const preview = evidence.preview;
+      assert.equal(preview.headChars, evidence.text.slice(0, preview.headChars).length);
+      assert.equal(preview.omittedStart, preview.headChars);
+      assert.equal(preview.tailChars, evidence.text.length - preview.headChars - preview.marker.length);
+      assert.equal(preview.omittedEnd, evidence.chars - preview.tailChars);
+      assert.equal(preview.headChars + preview.tailChars + preview.omittedChars, evidence.chars);
+    }
+  } finally {
+    if (harness !== undefined) await harness.close(context);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the complementary cursor adopts an existing digest frontier without moving it", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-complementary-adopt-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    await append(harness, conversation, user("OLD-DIGEST-QUESTION-6611"));
+    const [oldAnswer] = await append(harness, conversation, assistant("OLD-DIGEST-ANSWER-7722"));
+    const [newQuestion] = await append(harness, conversation, user("NEW-TURN-QUESTION-8833"));
+    const [newAnswer] = await append(harness, conversation, assistant("NEW-TURN-ANSWER-9944"));
+    await harness.commit(async (tx) => {
+      const document = await tx.doc(DigestCursorDoc, conversation.id);
+      document.throughEntryId = oldAnswer.id;
+      document.throughChars = "OLD-DIGEST-ANSWER-7722".length;
+      document.episodeStartEntryId = null;
+      document.episodeEndEntryId = null;
+    }, context);
+    const legacyBefore = await harness.snapshot(DigestCursorDoc, conversation.id, context);
+    assert.ok(legacyBefore !== undefined);
+
+    let source = sourceFor(harness, conversation);
+    assert.deepEqual(await source.cursor(conversation.id, context), {
+      nextEntryId: oldAnswer.id + 1,
+      nextItemIndex: 0,
+      nextTextStart: 0,
+      segmentStartEntryId: null,
+      segmentEndEntryId: null,
+      pendingToolCalls: [],
+    });
+    const batch = batched(await source.read(context));
+    assert.equal(batch.segmentStartEntryId, newQuestion.id);
+    assert.equal(batch.firstEntryId, newQuestion.id);
+    assert.deepEqual(batch.entries.map((entry) => entry.text), ["NEW-TURN-QUESTION-8833", "NEW-TURN-ANSWER-9944"]);
+    assert.deepEqual(await source.read(context), batch, "adoption is stable before acknowledgement");
+    await source.acknowledge(batch, context);
+    assert.deepEqual(await harness.snapshot(DigestCursorDoc, conversation.id, context), legacyBefore,
+      "the closed-episode cursor is untouched");
+
+    // A later closed-episode move must not pull the complementary frontier forward.
+    const [laterQuestion] = await append(harness, conversation, user("LATER-TURN-QUESTION-1155"));
+    await append(harness, conversation, assistant("LATER-TURN-ANSWER-2266"));
+    await harness.commit(async (tx) => {
+      const document = await tx.doc(DigestCursorDoc, conversation.id);
+      document.throughEntryId = laterQuestion.id + 1;
+      document.throughChars = 1;
+    }, context);
+    const frozen = await source.cursor(conversation.id, context);
+    assert.equal(frozen.nextEntryId, newAnswer.id + 1, "the complementary cursor is independent after adoption");
+
+    await harness.close(context);
+    harness = await openStore(db);
+    source = sourceFor(harness, conversation);
+    assert.deepEqual(await source.cursor(conversation.id, context), frozen, "the adopted cursor survives a reopen");
+    const reopened = batched(await source.read(context));
+    assert.equal(reopened.segmentStartEntryId, laterQuestion.id);
+    assert.deepEqual(reopened.entries.map((entry) => entry.text), ["LATER-TURN-QUESTION-1155", "LATER-TURN-ANSWER-2266"]);
+    await source.acknowledge(reopened, context);
+  } finally {
+    if (harness !== undefined) await harness.close(context);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("adopting a partially consumed closed episode replays it from its start", { timeout: 15_000 }, async () => {
+  const dir = await temp("nanobot-complementary-adopt-partial-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [question] = await append(harness, conversation, user("PARTIAL-QUESTION-7733"));
+    const [answer] = await append(harness, conversation, assistant("PARTIAL-ANSWER-8844"));
+    await append(harness, conversation, reset("PARTIAL-HANDOFF-NOT-EVIDENCE-9955"));
+    await harness.commit(async (tx) => {
+      const document = await tx.doc(DigestCursorDoc, conversation.id);
+      document.throughEntryId = question.id;
+      document.throughChars = 4;
+      document.episodeStartEntryId = question.id;
+      document.episodeEndEntryId = answer.id;
+    }, context);
+
+    const source = sourceFor(harness, conversation);
+    const cursor = await source.cursor(conversation.id, context);
+    assert.equal(cursor.nextEntryId, question.id, "a partial episode restarts at its immutable start");
+    const batch = batched(await source.read(context));
+    assert.equal(batch.segmentStartEntryId, question.id);
+    assert.equal(batch.segmentEndEntryId, answer.id);
+    assert.deepEqual(batch.entries.map((entry) => entry.text), ["PARTIAL-QUESTION-7733", "PARTIAL-ANSWER-8844"]);
+    await source.acknowledge(batch, context);
+  } finally {
+    if (harness !== undefined) await harness.close(context);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an aborted or errored assistant entry is not a completed answer", { timeout: 15_000 }, async () => {
+  const dir = await temp("nanobot-complementary-abort-error-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const errored = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    await append(harness, errored, user("ERROR-QUESTION-1166"));
+    await append(harness, errored, assistant("ERROR-PARTIAL-2277", { stopReason: "error" }));
+    const aborted = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    await append(harness, aborted, user("ABORT-QUESTION-3388"));
+    await append(harness, aborted, assistant("ABORT-PARTIAL-4499", { stopReason: "aborted" }));
+
+    const source = sourcesFor(harness, [
+      { key: "cli:error", conversation: errored },
+      { key: "cli:abort", conversation: aborted },
+    ]);
+    const waiting = idle(await source.read(context));
+    assert.equal(waiting.caughtUp, true);
+    assert.equal(waiting.openChats, 2, "neither failed entry closes its turn");
+    assert.deepEqual(await source.cursor(errored.id, context), {
+      nextEntryId: null,
+      nextItemIndex: 0,
+      nextTextStart: 0,
+      segmentStartEntryId: null,
+      segmentEndEntryId: null,
+      pendingToolCalls: [],
+    });
+
+    const [answer] = await append(harness, errored, assistant("ERROR-RECOVERED-5500"));
+    const batch = batched(await source.read(context));
+    assert.equal(batch.conversationId, errored.id);
+    assert.equal(batch.segmentEndEntryId, answer.id, "a real answer closes the turn");
+    assert.ok(batch.entries.some((entry) => entry.text === "ERROR-RECOVERED-5500"));
+    await source.acknowledge(batch, context);
   } finally {
     if (harness !== undefined) await harness.close(context);
     await rm(dir, { recursive: true, force: true });

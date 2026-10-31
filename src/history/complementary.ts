@@ -25,7 +25,9 @@
  * Eligibility and high-water:
  * - A segment starts at the cursor's next entry and ends only at a completed exchange boundary:
  *   just before a reset that follows an owner/cron turn, just before the next owner/cron input, or
- *   at a terminal assistant entry whose tool calls are all paired. A reset before the first owner
+ *   at a terminal assistant entry whose tool calls are all paired. An assistant entry that stopped
+ *   with an explicit error or abort is not a completed answer and cannot close a segment by itself.
+ *   A reset before the first owner
  *   input is part of the consumed prefix, so a leading system/reset block does not need a separate
  *   model-free batch. An in-progress tail (an owner message still awaiting an answer, an assistant
  *   tool round, or a tool result still awaiting the next assistant entry) is never offered. One read
@@ -53,6 +55,14 @@
  *   a long still-open segment resumes from a derived in-process scan cache instead of rescanning
  *   from its beginning. Acknowledgement re-derives exactly the claimed chunk from the committed
  *   transcript; a forged, stale or out-of-range batch is rejected instead of moving the cursor.
+ * - A fresh segment that starts after the cursor frontier must have no same-conversation entry in
+ *   the skipped gap. Entry IDs are global and interleave other chats, so a zero-entry gap within
+ *   this conversation is normal; an entry in it is refused rather than silently skipped.
+ * - A conversation with an existing closed-episode cursor but no complementary cursor derives its
+ *   first complementary position from that cursor on read, and freezes it on the first
+ *   acknowledgement. A partially consumed closed episode is replayed from its immutable start, so
+ *   no unconsumed entry or message tail of that episode is skipped; fully consumed closed episodes
+ *   stay the existing digest's work. The closed-episode document is never written or moved.
  * - A pathologically large single entry (more evidence items, or more open calls, than the fixed
  *   internal safety caps) fails with a fixed error instead of silently dropping evidence. This is a
  *   bound, not a retry loop.
@@ -86,9 +96,12 @@ import {
 } from "./digest-limits.js";
 import {
   DIGEST_LIMITS,
+  DigestCursorDoc,
   cutsSurrogatePair,
+  digestCursorOf,
   evidenceSlice,
   validateSessions,
+  type DigestCursor,
   type TextShape,
 } from "./digestion.js";
 import type { HistoryChatSession } from "./scope.js";
@@ -362,6 +375,8 @@ function cursorOf(document: unknown): ComplementaryCursor {
     if (nextItemIndex !== 0 || nextTextStart !== 0) {
       throw new Error("Stored complementary cursor has a position before the first entry");
     }
+  } else if (nextItemIndex !== 0 || nextTextStart !== 0) {
+    throw new Error("Stored complementary cursor has a position outside a segment");
   }
   if (segmentStartEntryId === null && pendingToolCalls.length > 0) {
     throw new Error("Stored complementary cursor has open calls outside a segment");
@@ -384,6 +399,30 @@ function sameCursor(left: ComplementaryCursor, right: ComplementaryCursor): bool
     && left.segmentEndEntryId === right.segmentEndEntryId
     && left.pendingToolCalls.length === right.pendingToolCalls.length
     && left.pendingToolCalls.every((id, index) => right.pendingToolCalls[index] === id);
+}
+
+/**
+ * Initial position for a conversation that already has a closed-episode cursor but no
+ * complementary cursor yet. A partially consumed closed episode is replayed from its immutable
+ * start, so no unconsumed entry, message tail or tool step of that episode is skipped. Otherwise
+ * the source starts after the last acknowledged closed-episode entry. Already completed closed
+ * episodes stay the existing digest's work and are not replayed here.
+ *
+ * This is derived on read and frozen by the first acknowledgement; it never writes or moves the
+ * closed-episode cursor.
+ */
+function adoptDigestCursor(legacy: DigestCursor): ComplementaryCursor {
+  const start = legacy.episodeStartEntryId
+    ?? (legacy.throughEntryId === null ? null : (legacy.throughEntryId + 1) as EntryId);
+  if (start === null) return EMPTY_CURSOR;
+  return {
+    nextEntryId: start,
+    nextItemIndex: 0,
+    nextTextStart: 0,
+    segmentStartEntryId: null,
+    segmentEndEntryId: null,
+    pendingToolCalls: Object.freeze([]) as readonly string[],
+  };
 }
 
 interface RawItem {
@@ -617,9 +656,12 @@ function assistantCalls(entry: EntryRecord): { readonly calls: readonly string[]
       }
     }
     const stop = raw.stopReason;
-    // A legacy entry without a stop reason is still terminal when it asked for no tool round.
+    // A legacy entry without a stop reason is still terminal when it asked for no tool round. An
+    // explicit error or abort is not a completed answer, so it cannot close a segment by itself;
+    // a later owner input can still close the preceding range.
     const terminalStop = typeof stop !== "string"
-      || (stop !== "pending" && stop !== "toolUse" && stop !== "deferred");
+      || (stop !== "pending" && stop !== "toolUse" && stop !== "deferred"
+        && stop !== "aborted" && stop !== "error");
     terminal = calls.length === 0 && terminalStop;
   }
   return { calls: Object.freeze(calls), terminal: sawAssistant && terminal };
@@ -652,36 +694,46 @@ function clipPreview(parts: readonly string[], total: number, limit: number, ref
   const shape = joinedParts(parts);
   const target = Math.max(1, Math.min(COMPLEMENTARY_PREVIEW_CHARS, limit));
   const markerOf = (omitted: number): string => `\n… [${omitted} characters omitted; original at ${ref}] …\n`;
+  // Both cuts are surrogate-safe: a head ending on a high surrogate or a tail starting on a low
+  // surrogate is moved inward by one unit, so the preview never contains half a pair.
+  const headTextOf = (count: number): string => {
+    let end = Math.max(0, Math.min(count, total));
+    if (end > 0 && end < total && cutsSurrogatePair(shape, 0, end)) end -= 1;
+    return evidenceSlice(shape, 0, end);
+  };
+  const tailTextOf = (count: number): string => {
+    let start = Math.max(0, total - Math.max(0, Math.min(count, total)));
+    if (start > 0 && start < total && cutsSurrogatePair(shape, start - 1, 1)) start += 1;
+    return evidenceSlice(shape, start, total);
+  };
   let head = Math.max(0, Math.floor((target - 80) / 2));
   let tail = Math.max(0, target - 80 - head);
-  let headText = evidenceSlice(shape, 0, head);
-  let tailText = evidenceSlice(shape, total - tail, total);
-  let omitted = total - headText.length - tailText.length;
+  let headText = headTextOf(head);
+  let tailText = tailTextOf(tail);
+  let omitted = Math.max(0, total - headText.length - tailText.length);
   let marker = markerOf(omitted);
   let size = headText.length + marker.length + tailText.length;
   // Reserve room for the marker, then give any leftover back to the head and tail. A pathological
   // bound smaller than the marker keeps a tiny visible marker rather than an empty preview.
   while (size > target && (headText.length > 0 || tailText.length > 0)) {
+    const excess = size - target;
     if (tailText.length >= headText.length && tailText.length > 0) {
-      tail = Math.max(0, tail - (size - target));
-      tailText = evidenceSlice(shape, total - tail, total);
-    } else if (head > 0) {
-      head = Math.max(0, head - (size - target));
-      headText = evidenceSlice(shape, 0, head);
+      tail = Math.max(0, tailText.length - excess);
+      tailText = tailTextOf(tail);
     } else {
-      break;
+      head = Math.max(0, headText.length - excess);
+      headText = headTextOf(head);
     }
-    omitted = total - headText.length - tailText.length;
+    omitted = Math.max(0, total - headText.length - tailText.length);
     marker = markerOf(omitted);
     size = headText.length + marker.length + tailText.length;
   }
   if (size > target) {
     // The bound cannot hold the reference marker; keep the head bounded and say so compactly.
     const compact = "…";
-    head = Math.max(0, Math.min(head, target - compact.length));
-    headText = evidenceSlice(shape, 0, head);
+    headText = headTextOf(Math.max(0, target - compact.length));
     tailText = "";
-    omitted = total - headText.length;
+    omitted = Math.max(0, total - headText.length);
     marker = compact;
     size = headText.length + marker.length;
   }
@@ -1112,6 +1164,8 @@ function validateCursor(cursor: unknown): ComplementaryCursor {
     }
   } else if (nextEntryId === null && (nextItemIndex !== 0 || nextTextStart !== 0)) {
     throw new TypeError("Complementary cursor has a position before the first entry");
+  } else if (segmentStartEntryId === null && (nextItemIndex !== 0 || nextTextStart !== 0)) {
+    throw new TypeError("Complementary cursor has a position outside a segment");
   }
   if (segmentStartEntryId === null && pendingToolCalls.length > 0) {
     throw new TypeError("Complementary cursor has open calls outside a segment");
@@ -1167,9 +1221,11 @@ function validateBatchRef(ref: ComplementaryBatchRef): void {
     }
   } else {
     if (first !== start) throw new TypeError("Complementary batch ref must start its segment at its start");
-    const cursorFirst = cursor.nextEntryId ?? start;
-    if (first !== cursorFirst || firstItem !== cursor.nextItemIndex || firstTextStart !== cursor.nextTextStart) {
-      throw new TypeError("Complementary batch ref does not continue at its cursor position");
+    if (firstItem !== 0 || firstTextStart !== 0) {
+      throw new TypeError("Complementary batch ref must start a fresh segment at item 0 and offset 0");
+    }
+    if (cursor.nextEntryId !== null && cursor.nextEntryId > first) {
+      throw new TypeError("Complementary batch ref starts before its cursor frontier");
     }
   }
   void throughChars;
@@ -1330,6 +1386,35 @@ async function validateCompletedSegment(
   }
 }
 
+/**
+ * Prove that a fresh segment's start did not hop over an unconsumed entry in the same conversation.
+ * Entry IDs are global and may interleave other conversations, so the cursor frontier can be below
+ * the segment start; only the skipped range within this conversation must be empty. The gap is
+ * bounded by one read's scan budget and a longer one is refused rather than assumed, so a forged
+ * start cannot skip an earlier exchange whose evidence would then be lost forever.
+ */
+async function validateFreshSegmentGap(
+  conversation: Conversation,
+  batch: ComplementaryBatch,
+  context: Context,
+): Promise<void> {
+  const gapFrom = batch.cursor.nextEntryId ?? (1 as EntryId);
+  const gapTo = batch.firstEntryId - 1;
+  if (gapTo < gapFrom) return;
+  const gap = await conversation.entries(
+    { order: "ascending", minEntryId: gapFrom, maxEntryId: gapTo as EntryId },
+    COMPLEMENTARY_LIMITS.scanEntriesPerRead + 1,
+    undefined,
+    context,
+  );
+  if (gap.items.length > COMPLEMENTARY_LIMITS.scanEntriesPerRead || gap.next !== undefined) {
+    throw new TypeError("Complementary segment start is too far from its cursor to verify");
+  }
+  if (gap.items.length > 0) {
+    throw new TypeError("Complementary segment start would skip an earlier entry with content");
+  }
+}
+
 function requireBatchLimits(limits: DigestBatchLimits): DigestBatchLimits {
   if (!isDigestEntriesBound(limits.entriesPerBatch) || !isDigestCharsBound(limits.charsPerBatch)) {
     throw new TypeError(
@@ -1345,13 +1430,30 @@ export function createComplementarySource(options: ComplementarySourceOptions): 
   const scanCache = new Map<ConversationId, ScanCacheEntry>();
   let rotation = 0;
 
+  const cursorStateFor = async (
+    conversationId: ConversationId,
+    context: Context,
+  ): Promise<{ readonly cursor: ComplementaryCursor; readonly stored: ComplementaryCursor | undefined }> => {
+    const document = await options.harness.snapshot(ComplementaryCursorDoc, conversationId, context);
+    const stored = document === undefined ? undefined : cursorOf(document);
+    if (stored !== undefined && !sameCursor(stored, EMPTY_CURSOR)) return { cursor: stored, stored };
+    // No complementary cursor yet (or only an untouched initial one): derive the starting frontier
+    // from an existing closed-episode cursor instead of replaying work that digest already did.
+    const legacy = digestCursorOf(
+      await options.harness.snapshot(DigestCursorDoc, conversationId, context),
+    );
+    return { cursor: adoptDigestCursor(legacy), stored };
+  };
+
   const cursorFor = async (conversationId: ConversationId, context: Context): Promise<ComplementaryCursor> =>
-    cursorOf(await options.harness.snapshot(ComplementaryCursorDoc, conversationId, context));
+    (await cursorStateFor(conversationId, context)).cursor;
 
   const batchOf = (
     session: HistoryChatSession,
     segment: SegmentBounds,
     firstEntryId: EntryId,
+    firstItemIndex: number,
+    firstTextStart: number,
     chunk: Chunk,
     cursor: ComplementaryCursor,
   ): ComplementaryBatch => ({
@@ -1361,8 +1463,8 @@ export function createComplementarySource(options: ComplementarySourceOptions): 
     segmentStartEntryId: segment.segmentStartEntryId,
     segmentEndEntryId: segment.segmentEndEntryId,
     firstEntryId,
-    firstItemIndex: cursor.nextItemIndex,
-    firstTextStart: cursor.nextTextStart,
+    firstItemIndex,
+    firstTextStart,
     throughEntryId: chunk.throughEntryId,
     throughItemIndex: chunk.throughItemIndex,
     throughChars: chunk.throughChars,
@@ -1483,18 +1585,30 @@ export function createComplementarySource(options: ComplementarySourceOptions): 
         segmentStartEntryId: chosen.cursor.segmentStartEntryId!,
         segmentEndEntryId: chosen.cursor.segmentEndEntryId!,
       };
-      const firstEntryId = (chosen.cursor.nextEntryId ?? segment.segmentStartEntryId) as EntryId;
+      const firstEntryId = (chosen.segment !== undefined
+        ? segment.segmentStartEntryId
+        : chosen.cursor.nextEntryId!) as EntryId;
+      const firstItemIndex = chosen.segment !== undefined ? 0 : chosen.cursor.nextItemIndex;
+      const firstTextStart = chosen.segment !== undefined ? 0 : chosen.cursor.nextTextStart;
       const chunk = await readChunk(
         chosen.conversation,
         firstEntryId,
-        chosen.cursor.nextItemIndex,
-        chosen.cursor.nextTextStart,
+        firstItemIndex,
+        firstTextStart,
         segment.segmentEndEntryId,
         chosen.cursor.pendingToolCalls,
         batchLimits,
         context,
       );
-      return batchOf(chosen.session, segment, firstEntryId, chunk, chosen.cursor);
+      return batchOf(
+        chosen.session,
+        segment,
+        firstEntryId,
+        firstItemIndex,
+        firstTextStart,
+        chunk,
+        chosen.cursor,
+      );
     },
 
     async readBatch(ref, context, limits) {
@@ -1563,6 +1677,7 @@ export function createComplementarySource(options: ComplementarySourceOptions): 
         throw new TypeError("Complementary batch is not a currently mapped chat session");
       }
       if (batch.cursor.segmentStartEntryId === null) {
+        await validateFreshSegmentGap(conversation, batch, context);
         await validateCompletedSegment(
           conversation,
           batch.segmentStartEntryId,
@@ -1619,7 +1734,13 @@ export function createComplementarySource(options: ComplementarySourceOptions): 
       await options.harness.commit(async (tx) => {
         const document = await tx.doc(ComplementaryCursorDoc, conversationId);
         const stored = cursorOf(document);
-        if (!sameCursor(stored, batch.cursor)) {
+        // An absent or untouched complementary document adopts the closed-episode frontier at the
+        // first acknowledgement. Reading never writes, so the comparison is repeated here against
+        // the same transaction: a closed-episode cursor that moved since the read is a conflict.
+        const expected = sameCursor(stored, EMPTY_CURSOR)
+          ? adoptDigestCursor(digestCursorOf(await tx.doc(DigestCursorDoc, conversationId)))
+          : stored;
+        if (!sameCursor(expected, batch.cursor)) {
           throw new ComplementaryCursorConflictError(
             "Complementary cursor moved after this batch was read; re-read before acknowledging",
           );

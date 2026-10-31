@@ -51,7 +51,9 @@ message or schedules work.
 - [x] **C1 — Evidence and eligibility/cursor source.**
   `src/history/complementary.ts` provides a separate durable cursor, completed-turn discovery for
   open chats, message/tool-call/tool-result evidence, pairing, previews, lossless fragmentation,
-  scoped-session validation and replay-safe acknowledgement.
+  scoped-session validation and replay-safe acknowledgement. On first use it adopts an existing
+  closed-episode cursor instead of replaying already digested work, and a fresh segment starts at
+  its own segment start even when global entry IDs interleave chats.
 - [ ] **C2 — Execution path.** One explicit run consumes one accepted chunk in a task-owned
   conversation with an explicit provider/model/thinking selection, renders the trust labels and
   preview markers verbatim, acknowledges no-evidence chunks without a provider call, and never runs
@@ -88,7 +90,10 @@ Implemented in this slice:
 - `tests/complementary-digest.behavior.test.mjs` — focused checks for open-chat high-water, open tool
   rounds, untrusted tool labels and previews, excluded entries, Unicode-safe lossless fragmentation,
   durable pairing across chunks and a fresh reader, replay/forged acknowledgement, the no-evidence
-  zero-model batch, and mapped-session validation.
+  zero-model batch, and mapped-session validation. Review regressions add: two-chat interleaved IDs
+  (fresh start, acknowledgement and a refused skipped gap), astral preview cuts at odd budgets,
+  adoption of a complete and a partially consumed closed-episode cursor (coexistence, independence
+  and reopen), and an aborted/errored entry that cannot close a turn.
 
 Run:
 
@@ -108,6 +113,26 @@ node --test tests/complementary-digest.behavior.test.mjs
   original entry, but it is not a lossless rendering of the result body.
 - The preview marker is compacted when a configured character bound is smaller than the full marker;
   normal bounds render the full marker and reference.
+- Adoption never replays fully consumed closed episodes: complementary-only evidence in them (tool
+  calls and results) is not revisited, because that range remains the closed-episode digest's work.
+  A partially consumed closed episode is replayed from its immutable start. Adoption is derived on
+  read and frozen by the first acknowledgement; if the closed-episode cursor advances between that
+  read and acknowledgement, the acknowledgement conflicts and the re-read adopts the newer frontier.
+- A caller must capture the batch bounds with an accepted chunk, exactly as the closed-episode
+  execution path does. `ComplementaryBatch`/`ComplementaryBatchRef` do not carry the bound set, and
+  `acknowledge` re-derives with the caller-supplied limits; C2/C6 must persist them.
+- Batch and acknowledgement require the conversation to be currently mapped with the same session
+  key. Unmapping a chat mid-batch makes acknowledgement refuse rather than move a cursor; remapping
+  resumes at the persisted frontier. Adoption for a conversation that has never been mapped waits
+  until it is mapped.
+- The in-process scan cache holds only derived scan state, is dropped when that conversation's
+  cursor moves or it is unmapped, and is lost on restart. It has no timer or TTL; its size is bounded
+  by the mapped set.
+- Reads are sequential across mapped chats. One pathological entry (over the per-entry step cap, or
+  over 256 open calls) fails the whole read rather than isolating that chat, and the first
+  acknowledgement of a new segment walks that segment to prove its end. C2 should place a run in a
+  task-owned conversation with a deadline and treat such a refusal as a run failure, not retry it
+  automatically.
 - The live provider, real-model quality, deployment and production-data behavior remain unproven.
 
 ## Log
@@ -119,5 +144,13 @@ digestion, its cursor and its execution path were left untouched. Decisions reco
 cursor (so enabling complementary memory cannot move the closed-episode frontier), resets before the
 first owner input stay in the segment prefix, short tool results are whole while long ones are
 head-tail previews, and pairing state is durable so a later chunk or fresh reader does not lose it.
-Next: C2 execution path with an explicit model and the no-evidence no-provider rule, then C3 durable
-budgets, then C4 the inactive 8-hour schedule.
+
+Review fixes: a fresh chunk now starts at its own segment start (the previous reader used the chat's
+global next entry ID, so interleaved chat IDs could make its acknowledgement unverifiable) and the
+skipped gap must be proven empty within that conversation. Both head and tail preview cuts are
+surrogate-safe. The separate cursor adopts an existing `DigestCursorDoc` on first use without writing
+or moving it; a partial old episode replays from its start. An assistant entry stopped by an explicit
+error or abort no longer counts as a completed answer.
+
+Next: C2 execution path with an explicit model, captured batch bounds and the no-evidence
+no-provider rule, then C3 durable budgets, then C4 the inactive 8-hour schedule.
