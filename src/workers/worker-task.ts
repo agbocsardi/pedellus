@@ -19,6 +19,8 @@ import {
   type ConversationHandle,
   type ConversationId,
   type Cursor,
+  type EntryId,
+  type EntryRecord,
   type Extension,
   type Harness,
   type Submission,
@@ -199,10 +201,45 @@ export interface WorkerFoundation {
   list(harness: Harness, conversationId: ConversationId, context: Context): Promise<readonly WorkerView[]>;
   inspect(harness: Harness, conversationId: ConversationId, taskId: number, context: Context): Promise<WorkerView | undefined>;
   cancel(harness: Harness, conversationId: ConversationId, taskId: number, context: Context): Promise<"marked" | "terminal" | "not_found">;
+  /**
+   * One bounded page of a live or terminal worker's own committed transcript. Resolution uses this
+   * conversation's worker record and the native task/child ownership; an unstarted or missing child
+   * yields an empty page rather than an error. Read-only: no model run, no cursor or record write.
+   */
+  transcript(
+    harness: Harness,
+    conversationId: ConversationId,
+    taskId: number,
+    query: WorkerTranscriptQuery,
+    context: Context,
+  ): Promise<WorkerTranscript | undefined>;
   /** Admit any internal result event a crash or close left outstanding. Idempotent. */
   recover(harness: Harness, isSpawner: (conversationId: ConversationId) => boolean, context: Context): Promise<number>;
   /** Read one record; the tool and recovery share it. */
   record(harness: Pick<Harness, "snapshot">, conversationId: ConversationId, taskId: number, context: Context): Promise<WorkerRecord | undefined>;
+}
+
+export interface WorkerTranscriptQuery {
+  /** Page strictly older than this entry ID; absent reads the newest entries. */
+  readonly before?: EntryId;
+  readonly limit: number;
+}
+
+/** One bounded descending page of a worker child's committed entries. */
+export interface WorkerTranscript {
+  readonly worker: WorkerView;
+  /** The verified task-owned child conversation, or null before one exists. */
+  readonly targetConversationId: ConversationId | null;
+  readonly items: readonly EntryRecord[];
+  /** Next `before` for the strictly older page, or null when the child holds no older entries. */
+  readonly nextBefore: EntryId | null;
+}
+
+/** One of this conversation's own workers, resolved against its native task and task-owned child. */
+export interface WorkerTarget {
+  readonly record: WorkerRecord;
+  readonly status: WorkerStatus;
+  readonly targetConversationId: ConversationId | null;
 }
 
 /** Commit writer for one spawning conversation, so start is atomic with task creation. */
@@ -222,6 +259,66 @@ function bounded(value: string, max: number): string {
 
 export function workerResultRequestId(taskId: number): string {
   return `${WORKER_RESULT_REQUEST_PREFIX}${taskId}`;
+}
+
+/** Live or terminal status of one worker task. Pure; a missing task is `missing`, never a guess. */
+function statusOf(record: { readonly state: { readonly status: string; readonly outcome?: { readonly status: string } } }): WorkerStatus {
+  if (record.state.status === "terminal") {
+    const outcome = record.state.outcome?.status;
+    if (outcome === "completed" || outcome === "failed" || outcome === "aborted" || outcome === "orphaned" || outcome === "faulted") {
+      return outcome;
+    }
+    return "failed";
+  }
+  if (record.state.status === "pending") return "queued";
+  return "running";
+}
+
+/**
+ * Resolve one worker by ID for the conversation that owns its record, then verify the native facts
+ * before anything reads its child: the task must be this conversation's worker task, and the child
+ * conversation must be owned by that exact task ID. A forged record, a record that points at an
+ * unrelated or conversation-owned transcript, and a checkpoint/record disagreement all resolve to
+ * `undefined`. This is the narrow foundation a later steering slice can reuse after re-checking the
+ * returned status; it reads only and mutates nothing.
+ */
+export async function resolveWorkerTarget(
+  reader: Pick<Harness, "snapshot" | "getTask" | "commit">,
+  spawnerConversationId: ConversationId,
+  taskId: number,
+  context: Context,
+): Promise<WorkerTarget | undefined> {
+  if (!Number.isSafeInteger(taskId) || taskId < 1) return undefined;
+  const doc = await reader.snapshot(WorkerRecordsDoc, spawnerConversationId, context);
+  const record = doc?.workers.find((candidate) => candidate.taskId === taskId);
+  if (record === undefined) return undefined;
+  const task = await reader.getTask(taskId as TaskId, context);
+  if (task === undefined) return { record, status: "missing", targetConversationId: null };
+  if (task.kind !== WORKER_TASK_NAME || task.conversationId !== spawnerConversationId) return undefined;
+  const status = statusOf(task);
+  const checkpoint = isRecord(task.state) && isRecord(task.state.checkpoint)
+    ? task.state.checkpoint.targetConversationId
+    : undefined;
+  const fromCheckpoint = Number.isSafeInteger(checkpoint) && (checkpoint as number) >= 1
+    ? checkpoint as ConversationId
+    : null;
+  if (record.conversationId !== null && fromCheckpoint !== null && record.conversationId !== fromCheckpoint) {
+    return undefined;
+  }
+  const target = fromCheckpoint
+    ?? (record.conversationId === null ? null : record.conversationId as ConversationId);
+  if (target === null) return { record, status, targetConversationId: null };
+  const owned = await reader.commit(async (tx) => {
+    const conversation = await tx.conversation(target);
+    // A task-owned conversation records its creator edge as `owner`; both halves must name this
+    // worker task and this spawning conversation, never an unrelated transcript.
+    return conversation !== undefined
+      && conversation.owner !== undefined
+      && Number(conversation.owner.taskId) === taskId
+      && conversation.owner.conversationId === spawnerConversationId;
+  }, context);
+  if (!owned) return undefined;
+  return { record, status, targetConversationId: target };
 }
 
 function parseInput(value: unknown): WorkerTaskInput | undefined {
@@ -371,18 +468,6 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
       return { model: options.preset.model, thinkingLevel: options.preset.thinkingLevel };
     }
     return options.spawnModel(tx, conversationId);
-  };
-
-  const statusOf = (record: { readonly state: { readonly status: string; readonly outcome?: { readonly status: string } } }): WorkerStatus => {
-    if (record.state.status === "terminal") {
-      const outcome = record.state.outcome?.status;
-      if (outcome === "completed" || outcome === "failed" || outcome === "aborted" || outcome === "orphaned" || outcome === "faulted") {
-        return outcome;
-      }
-      return "failed";
-    }
-    if (record.state.status === "pending") return "queued";
-    return "running";
   };
 
   const viewOf = (record: WorkerRecord, status: WorkerStatus): WorkerView => ({
@@ -886,6 +971,40 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
       if (task.conversationId !== conversationId) return "not_found";
       if (task.state.status === "terminal") return "terminal";
       return harness.abortTask(taskId as TaskId, context);
+    },
+
+    async transcript(harness, conversationId, taskId, query, context) {
+      if (query === null || typeof query !== "object") {
+        throw new TypeError("transcript query must be an object");
+      }
+      const limit = query.limit;
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > WORKER_LIMITS.transcriptMaxLimit) {
+        throw new TypeError(`transcript limit must be an integer from 1 to ${WORKER_LIMITS.transcriptMaxLimit}`);
+      }
+      const before = query.before;
+      if (before !== undefined && (!Number.isSafeInteger(before) || before < 1)) {
+        throw new TypeError("transcript before must be a positive entry ID");
+      }
+      const target = await resolveWorkerTarget(harness, conversationId, taskId, context);
+      if (target === undefined) return undefined;
+      const worker = viewOf(target.record, target.status);
+      if (target.targetConversationId === null || before === 1) {
+        return { worker, targetConversationId: target.targetConversationId, items: [], nextBefore: null };
+      }
+      const conversation = await harness.conversation(target.targetConversationId, context);
+      if (conversation === undefined) {
+        return { worker, targetConversationId: target.targetConversationId, items: [], nextBefore: null };
+      }
+      // One native committed-entry page, newest first, strictly below `before`: pages never overlap.
+      const page = await conversation.entries({
+        order: "descending",
+        ...(before === undefined ? {} : { maxEntryId: (before - 1) as EntryId }),
+      }, limit, undefined, context);
+      const oldest = page.items[page.items.length - 1]?.id;
+      const nextBefore = page.next !== undefined && oldest !== undefined && oldest > 1
+        ? oldest as EntryId
+        : null;
+      return { worker, targetConversationId: target.targetConversationId, items: page.items, nextBefore };
     },
 
     async recover(harness, isSpawner, context) {

@@ -32,8 +32,9 @@ never receive it, so a worker cannot start another worker.
   generated branch `nanobot/worker-<taskId>`. Nothing is merged, rebased, stashed or removed.
 
 `start` returns a task ID immediately; the parent keeps its turn. `list` shows this conversation's
-workers, `inspect` returns one worker's bounded result and provenance, `cancel` aborts one. An
-optional `request_id` makes `start` idempotent; a retried tool call is deduplicated on Durable's own
+workers, `inspect` returns one worker's bounded result and provenance, `transcript` reads that
+worker's own committed conversation in bounded pages, and `cancel` aborts one. An optional
+`request_id` makes `start` idempotent; a retried tool call is deduplicated on Durable's own
 tool-task identity, never on the provider's tool-call ID (a provider may reuse `call_0` across
 independent turns, and each of those starts a real worker). Live workers are capped per conversation,
 and a refused start creates no record and no task.
@@ -57,6 +58,32 @@ can compose only what the current ceiling and capture still allow. A stale neste
 fails closed through the same call-time hook and native replay guards. Focused regressions drive a
 real nested `read` composition plus a denied nested spawn inside a worker child, and check that the
 narrowed reopen leaves nothing stale to compose.
+
+## Reading a worker's transcript
+
+`transcript` takes only a `worker_id` from this conversation's own records, plus optional `before`
+and `limit`. It resolves the record through the existing record/spawner gate, then verifies the
+native facts before reading any entry: the task must be this conversation's `nanobot.worker-run`
+task, and the child conversation must be owned by that exact task ID (the task checkpoint and the
+record must also agree while a checkpoint exists). A forged record, a child conversation owned by
+anything else, another chat, the root, a fork, a raw conversation and a worker child itself all
+resolve to "no such worker here". There is no arbitrary conversation-ID or task-ID parameter, and
+this action adds no new conversation, history or scheduling authority.
+
+Entries are read from the worker's own committed Durable conversation with the native entry page
+API; nothing is captured, exported, copied into a second archive or read from Atuin. The action
+works while the worker is live and after it is terminal, and it runs no model, changes no status,
+record or cursor, and sends no notification. `inspect` remains the bounded result view; its
+provenance line points at this action instead of the old, unsupported "inspect the transcript
+there" hint.
+
+One page is at most 20 entries (default 20) and 1,200 characters per entry, with a 48 KiB rendered
+budget below the tool's 64 KiB output limiter. Text is control-sanitized and JSON-quoted, and a cut
+body ends with `[truncated]`. The worker's task prompt renders as a user/task input entry, and
+assistant text, tool calls and tool results are labeled with their entry kind as untrusted data, not
+instructions. Image-only and binary entries are omitted with a count; no base64 payload is dumped.
+Pages are strictly ordered and non-overlapping: the newest page needs no cursor, and each page
+reports the `before` entry ID for the strictly older page, or says that no older entries remain.
 
 ## What a worker is
 
@@ -173,5 +200,8 @@ never re-run.
   behind; they are bounded and non-destructive, so this slice documents them instead of adding a
   cleanup framework. A persisted `shared` task whose recorded path is no longer the configured
   workspace root fails truthfully rather than reusing the stale path.
+- `transcript` is a read-only view of one paginated window, not a live stream, an export or a complete
+  archive. Very old pages remain reachable by paging, but the view is bounded at each call and may
+  lag entries that are not committed yet.
 - No live-model, Telegram or deployment run is claimed: the offline checks use a faux provider and
   temporary git fixtures.
