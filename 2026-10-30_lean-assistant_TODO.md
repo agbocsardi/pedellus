@@ -20,17 +20,17 @@
 
 ## Owner follow-up — quiet digestion and CLI path attachments
 
-- [ ] F1 — Successful digest runs, including successful no-ops, do not notify
+- [x] F1 — Successful digest runs, including successful no-ops, do not notify
   or resume the origin agent. Preserve successful task/status/cursor records;
   only issues (failed/aborted runs) notify. Suppress legacy pending success
   notices during start/flush/reopen; retain unknown/issue results conservatively.
-- [ ] F2 — CLI attachments are path-only for every type, including images.
+- [x] F2 — CLI attachments are path-only for every type, including images.
   Save originals in a CLI-specific workspace attachment directory and supply a
   workspace-relative locator; no native images or automatic vision/transcription.
   Inspect Pi coding-agent attachment handling and reuse compatible interaction
   patterns without transplanting its TUI or claiming unsupported paste behavior.
   Telegram's existing native image/voice behavior and stored locators remain intact.
-- [ ] Independently review each original worker's changes, fix findings through
+- [x] Independently review each original worker's changes, fix findings through
   that worker, integrate passing candidates, and reconcile the final union/docs.
 
 Two fresh worktree implementers launched from `8aadbfa` using the same Pi /
@@ -390,6 +390,37 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Owner follow-up — both corrections accepted and published
+
+Path-only CLI attachments published at `49407ff` after independent fix/union
+PASS; all originals, including images, now use `<media.directory>/cli` and plain
+workspace-relative locators. No native images, vision or transcription on CLI;
+Telegram unchanged. Review caught/fixed valid 125–128-character media-directory
+startup regression by validating the operator base before the trusted child.
+No clipboard/drag interaction parity with Pi is claimed.
+
+Quiet-success digestion published at `cf5407a` after independent standalone and
+combined PASS. Successful digested/no-op/consumed tasks stay visible in status
+but never notify or resume the origin agent, including legacy pending records
+on reopen/flush; failed/aborted issues still notify once. Unknown issues remain
+retained; success records safely release notice capacity. Final AGENTS wording
+now distinguishes Telegram media from path-only CLI attachments.
+
+Combined reviewed gate: typecheck/build, 247 behavior across 31 files,
+2 execution, 83 offline acceptance, 80 focused union; published main build,
+typecheck, 26 digest and 8 CLI checks passed. Pre-existing transcription tests'
+global temporary-directory snapshot race was observed in earlier worker runs,
+reported honestly; final independent union passed first-run. No live API/provider,
+network, installs, settings or runtime activation. Branches/worktrees preserved.
+
+Next batch remains discussion only: owner rejected digest recovery UI, memory
+freshness and document extraction. Proposed six are digest limits/next-invocation
+retry, Telegram local-media sending, worker transcript reading, worker steering,
+compact background `/status`, and combined acceptance/docs. Read-only research
+confirmed native Durable entries (not Atuin capture) are the worker transcript
+source; cancel already exists. Python limits count history records, not sessions.
+Exact next-batch defaults and final work orders await owner approval.
 
 ### Owner follow-up — assumptions corrected
 
