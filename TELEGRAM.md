@@ -215,7 +215,9 @@ polling is never blocked. Temporary files are removed on failure or abort.
 This section does not add a general media service, a durable download queue, a
 retry framework, video handling, OCR/PDF extraction, cloud speech, or a Telegram
 command for media. The reverse direction is the scoped `telegram` tool's `send`
-action described above: one existing workspace file, never a download or a
+action described under
+[native actions](#replies-quotes-reactions-and-native-actions): one existing
+workspace file, never a download or a
 subscription. The local CLI's explicit `/attach` submission is a separate
 local-surface path into the same workspace media store, kept in its own
 `media/cli/` subdirectory; it is path-only, so Telegram's storage location, native

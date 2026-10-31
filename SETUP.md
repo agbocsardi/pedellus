@@ -70,7 +70,7 @@ The shipped [`config.example.json`](./config.example.json) is the starting point
 | `toolAllowlist` | Config authority: these coding tools are enabled for authenticated mapped chats. `[]` or absent disables them. |
 | `cron` | Installs the model-facing `cron` tool; `timeZone: "UTC"` interprets calendar expressions without an explicit zone. |
 | `episodeSummary` | Closed episodes use the conversation's current model, or a named override such as `"preset": "fast"`. This costs provider calls; set `enabled: false` to turn it off. |
-| `digest` | Optional bounds for one explicitly started memory-digestion run: `entriesPerBatch`, `charsPerBatch`, `maxToolCalls`, `runTimeoutSeconds`, `maxChangedFiles`, `maxDiffChars`. `charsPerBatch` is UTF-16 units with a minimum of 2; absent keeps the accepted defaults. The block neither enables nor schedules digestion. A configured `runTimeoutSeconds` wins over a host deadline seam. |
+| `digest` | Optional bounds for one explicitly started memory-digestion run, shown here with the accepted defaults: `entriesPerBatch` 80, `charsPerBatch` 24,000 UTF-16 units (minimum 2, so one surrogate pair always fits), `maxToolCalls` 10 individual calls (failed and refused calls included), `runTimeoutSeconds` 300, `maxChangedFiles` 8 and `maxDiffChars` 32,000 inserted plus removed text units. An absent field keeps its default; the block neither enables nor schedules digestion, and a started run captures the values it accepted. A configured `runTimeoutSeconds` wins over a host deadline seam. |
 | `credentials` | Environment-variable *names* only. No secret value belongs in this file. |
 
 Export the key named by `credentials.openai` (or whichever alias you allow):
@@ -198,12 +198,14 @@ minutes). The gateway fixes the deadline from its own clock once, so the model
 needs no clock tool and retries never push it back. For an exact instant, use an
 ISO timestamp with `Z` or a UTC offset; naive local timestamps remain rejected.
 
-`/new`, `/abort` and `/help` are the channel controls. Context refresh in
-Telegram is a gateway restart; there is no Telegram refresh command, and `/new`
-does not re-read files. Without a `media` section the adapter is text-only: an
-attachment gets a fixed unsupported-attachment notice (caption text is still
-passed as input). With `media`, photos, voice/audio and documents are stored under
-the workspace and the turn is told exactly what arrived—see
+`/help` lists only the controls this host implements: `/new`, `/abort` (also
+spelled `/stop`), `/status`, `/model`, `/digest` and `/restart`. There is no
+Telegram `/refresh` command: `/new` starts a new context **and** rebuilds this
+chat's assembled workspace prompt from the current files, while a gateway
+restart is what re-reads configuration. Without a `media` section the adapter is
+text-only: an attachment gets a fixed unsupported-attachment notice (caption
+text is still passed as input). With `media`, photos, voice/audio and documents
+are stored under the workspace and the turn is told exactly what arrived—see
 [8. Optional: attachments and voice](#8-optional-attachments-and-voice). Groups or
 other bots never reach the assistant.
 
