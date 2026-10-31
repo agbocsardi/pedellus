@@ -43,11 +43,17 @@ facilities; do not redesign memory quality, holistic usability or agent loops.
   what is running (workers/digest/cron), if anything. No dashboard, management
   commands, model call or transcript dump; agent remains the manager.
 - [ ] P7 — User-systemd service readiness and parallel instances: one template
-  service per instance, explicit per-instance config/environment, independent
+  service per instance, per-instance config/environment, independent
   dataDir/SQLite/socket and workspace. Verify graceful stop/restart/journal and
   same-store duplicate-owner refusal offline. No install/enable/start, lingering,
   dedicated system account or live deployment. Distinct Telegram pollers require
   distinct bot tokens; shared provider keys share quota, not a security boundary.
+  Default primary config: `~/.durable-nanobot/config.json`; `--config` overrides
+  it for a secondary instance. Resolve home at runtime, never depend on CWD;
+  preserve explicit-config semantics for gateway/agent/recovery. No discovery,
+  merging configs, auto-generation, migration or reading actual personal config.
+  The home directory exists, but that default config file was not present when
+  checked (existence only; no contents/settings were read).
   Prioritize this service slice ahead of remaining status work when capacity opens.
 - [ ] P6 — Independently review the combined union, run bounded existing parity/
   integration checks and reconcile docs. No new holistic usability study or
