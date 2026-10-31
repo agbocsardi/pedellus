@@ -400,12 +400,15 @@ function sameCursor(left: DigestCursor, right: DigestCursor): boolean {
  * Extracted evidence text of one entry, as text parts joined by a newline. Parts are kept
  * unjoined so a fragment can be sliced without materializing a very long entry in full.
  */
-interface EvidenceShape {
-  readonly role: "user" | "assistant";
-  readonly kind: string;
+export interface TextShape {
   readonly parts: readonly string[];
   /** Length of `parts.join("\n")`. */
   readonly length: number;
+}
+
+export interface EvidenceShape extends TextShape {
+  readonly role: "user" | "assistant";
+  readonly kind: string;
 }
 
 function messageText(content: unknown): string | undefined {
@@ -447,7 +450,8 @@ function evidenceShapeOf(entry: EntryRecord): EvidenceShape | undefined {
  * batch boundary is moved instead, so encoding the fragment as UTF-8 cannot produce a
  * replacement character. Offsets stay in UTF-16 code units, never bytes.
  */
-function cutsSurrogatePair(shape: EvidenceShape, from: number, take: number): boolean {
+/** Shared with the complementary reader, so both readers cut evidence at the same safe boundary. */
+export function cutsSurrogatePair(shape: TextShape, from: number, take: number): boolean {
   if (take <= 0) return false;
   const tail = evidenceSlice(shape, from + take - 1, from + take).charCodeAt(0);
   if (!(tail >= 0xd800 && tail <= 0xdbff)) return false;
@@ -455,7 +459,8 @@ function cutsSurrogatePair(shape: EvidenceShape, from: number, take: number): bo
   return next >= 0xdc00 && next <= 0xdfff;
 }
 
-function evidenceSlice(shape: EvidenceShape, from: number, to: number): string {
+/** Shared with the complementary reader; offsets are UTF-16 code units into `parts.join("\n")`. */
+export function evidenceSlice(shape: TextShape, from: number, to: number): string {
   let output = "";
   let offset = 0;
   for (let index = 0; index < shape.parts.length; index += 1) {
@@ -714,8 +719,11 @@ function nextPositionOf(candidate: Candidate): { readonly entryId: number; reado
     : { entryId: candidate.episode.episodeStartEntryId, chars: 0 };
 }
 
-/** Validate the host's mapped chat sessions; they name authorization, not content. */
-function validateSessions(sessions: readonly HistoryChatSession[]): void {
+/**
+ * Validate the host's mapped chat sessions; they name authorization, not content. Shared by the
+ * complementary reader so both readers accept exactly the same host-authenticated chat set.
+ */
+export function validateSessions(sessions: readonly HistoryChatSession[]): void {
   const seen = new Set<number>();
   for (const session of sessions) {
     if (typeof session.sessionKey !== "string" || session.sessionKey.length === 0) {
