@@ -28,15 +28,18 @@ remain. `2026-10-30_lean-assistant_TODO.md` stays the work-order authority.
   main and was not edited here. Nothing is published to main; an independent
   fresh O6 review is still required.
 
-### Current — the quiet-digestion followup
+### Current — the quiet-digestion and path-only-attachment followup
 
-- The owner corrected the overnight assumption after the O6 close: a successful
-  digestion run, including a successful no-op, must not notify or resume the
-  origin agent; only a failed or cancelled run reports, and the outcome stays
-  visible in `/digest status`. That functional change is commit `9c47bb7` on
-  branch `t3/silent-successful-digests`, merged with main `8398608` (the
-  TODO-only owner-followup scope) and kept byte-identical to main's TODO.
-- The historical identity above — base `ef0af84` with product source unchanged —
+- The owner corrected two overnight assumptions after the O6 close. First, a
+  successful digestion run, including a successful no-op, must not notify or
+  resume the origin agent; only a failed or cancelled run reports, and the
+  outcome stays visible in `/digest status`. That functional change is commit
+  `9c47bb7` on branch `t3/silent-successful-digests`. Second, CLI attachments are
+  path-only for every type; the accepted CLI change was merged here from main
+  `49407ff` with its source, tests and docs taken unchanged.
+- This candidate merges main `49407ff` without rebasing or amending, so it is a
+  descendant of that accepted main and its TODO is byte-identical to main's. The
+  historical identity above — base `ef0af84` with product source unchanged —
   describes only the pre-followup O6 tip. The current branch tip is not
   `ef0af84`, so its source identity and gates are recorded under "Current
   followup acceptance run" below.
@@ -65,11 +68,13 @@ remain. `2026-10-30_lean-assistant_TODO.md` stays the work-order authority.
    "whisper-cli"` selects an operator-provisioned whisper.cpp CLI with FFmpeg
    pre-decoding. Absent or `"faster-whisper"` keeps the existing uv helper and
    its configuration exactly as before.
-5. **Local CLI attachments.** `/attach <path>[ -- <prompt>]` submits one
-   operator-named file through the private socket and the gateway-owned media
-   store. A real image becomes native image content plus a locator (the
-   configured vision handoff applies); everything else, including audio, is
-   stored as an unread opaque original.
+5. **Path-only local CLI attachments.** `/attach <path>[ -- <prompt>]` submits
+   one operator-named file through the private socket and the gateway-owned
+   media store. Every type, photos included, is stored byte-for-byte under the
+   CLI child of the media directory and named to the model only by a
+   workspace-relative locator; no native image content, vision handoff,
+   transcription or extraction runs. Telegram's native photo and voice behavior
+   is unchanged.
 
 ## How to use it tomorrow without switching anything on
 
@@ -108,7 +113,8 @@ npm start -- agent --config config.json       # attach a separate CLI chat
   part of that route.
 - **Attachments:** with a top-level `media` block, Telegram media ingress and
   CLI `/attach` both work. Without it, both stay off and ordinary input is
-  text-only. CLI audio is stored, not transcribed.
+  text-only. Every CLI attachment is an opaque stored original: inspect it with
+  a configured `read` tool, never an implicit vision or transcription call.
 
 ## O6 acceptance actually run (historical, before the owner followup)
 
@@ -151,20 +157,23 @@ No new test file, fixture/harness or package was added.
 
 ## Current followup acceptance run
 
-Re-run on the current branch tip after the quiet-digestion wording/comment pass
-and the main merge, with the same offline bounds and no new dependency, network,
-provider or runtime change:
+Re-run on this candidate after merging main `49407ff` (accepted CLI path-only
+attachments) and the quiet-digestion wording/comment pass, with the same offline
+bounds and no new dependency, network, provider or runtime change:
 
 - `npm run typecheck` and `npm run build` pass.
 - Focused digest selection: `memory-digest` and `memory-digest-controls` —
   **26 passed, 0 failed** under GNU `timeout --kill-after=5s 60s`.
-- Registered behavior suite: **245 passed, 0 failed** across 31 files under the
-  same bound.
+- Registered behavior suite: **247 passed, 0 failed** across 31 files under the
+  same bound (main's 246 plus the quiet-digestion regression).
 - Execution suite: **2 passed, 0 failed**; offline core acceptance:
   **83 passed, 0 failed** (`status: pass`, `mode: offline-synthetic`,
   `network: false`).
-- Focused union selection (the same six files, same bound): **78 passed,
+- Focused union selection (the same six files, same bound): **80 passed,
   0 failed**.
+- `git diff 49407ff..candidate` leaves the CLI attachment source and its
+  `local-attachments` regression unchanged; the delta is the quiet-digestion
+  classification, its wording/docs and the digest regressions.
 - Current digest stories: closed episode → digest turn → plain Markdown write →
   cursor advance → a successful run (including a no-op) stays silent with no
   internal event and no origin turn → origin idle with authority retired, while
@@ -230,8 +239,8 @@ Memory digestion (offline evidence only; **no real-model quality claim**):
 Media and voice:
 
 - Stored originals are kept byte-for-byte and never auto-deleted; there is no
-  total-disk cap. Documents and CLI audio are opaque files with no extraction or
-  transcription.
+  total-disk cap. Telegram documents and every CLI attachment are opaque files
+  with no extraction or transcription.
 - The voice route's **measured** evidence is local and fixture-input only: one
   host, one public-domain speech clip (repeated for the long-audio fixture), one
   speaker, no comparison against faster-whisper. See
@@ -249,8 +258,9 @@ Media and voice:
   The one private temporary WAV is removed on every path. No namespace-isolated
   offline run was possible on that host.
 - The legacy uv/faster-whisper default was never provisioned or run here, so it
-  remains designed-and-unverified. CLI `/attach` dedupe treats bytes with the
-  same detected kind but different extensions as separate document locators.
+  remains designed-and-unverified. CLI `/attach` dedupe reuses one stored
+  original for the same bytes and extension, and treats the same bytes with
+  different extensions as separate locators.
 
 Other carried limits: no live Telegram/Brave/provider acceptance in this batch;
 Bubblewrap was not exercised. This close added no new live evidence: the earlier
