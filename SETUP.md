@@ -1,6 +1,6 @@
 # Set up the assistant
 
-A short, CLI-first walkthrough on a synthetic workspace: build, configure memory,
+A short, CLI-first walkthrough on a synthetic workspace: install dependencies, configure memory,
 skills and tool authority in the config, then add Telegram as a separate step.
 The config owns persistent settings and policy; the CLI and Telegram are utility
 surfaces over it. Changing the config takes effect on restart — there is no hot
@@ -9,21 +9,21 @@ reload, and no command is a prerequisite for enabling a capability.
 This does not claim live-model success; what you can verify offline is in
 [Current status and checks](./README.md#current-status-and-checks).
 
-## 1. Build
+## 1. Install dependencies
 
 Node >= 22.19 and the pinned dependencies:
 
 ```sh
 npm ci
-npm run build
 ```
 
-Optionally run `npm link --offline` manually from this checkout after building
-to expose **`durable-nanobot`**. Python's `nanobot` command is not replaced.
-Without linking, the `node dist/cli.js` examples below work directly. A build
-watcher (`npm run build -- --watch`) can recompile edits, but the gateway still
-needs a restart after a successful build. The renamed systemd units launch this
-checkout directly; linking is not required for service operation. See
+Optionally run `npm link --offline` from this checkout to expose
+**`durable-nanobot`**. Python's `nanobot` command is not replaced. Without linking,
+the `node bin/durable-nanobot.mjs` examples below load TypeScript source directly
+through pinned `tsx`. A process restart picks up source edits without a build or
+watcher; `npm run typecheck` remains a separate recommended check. The systemd
+units use that same launcher, without requiring a command link. Compiled output
+is still available via `npm run build` for tests/distribution. See
 [service/update workflow](SERVICE.md#checkout-command-and-build-workflow).
 
 ## 2. Create a workspace
@@ -126,13 +126,13 @@ The gateway owns storage, tools, cron and Telegram; the CLI attaches to it as a
 conversation surface. Start the gateway in one terminal:
 
 ```sh
-node dist/cli.js gateway --config demo/config.json
+node bin/durable-nanobot.mjs gateway --config demo/config.json
 ```
 
 Then attach a terminal in another:
 
 ```sh
-node dist/cli.js agent --config demo/config.json
+node bin/durable-nanobot.mjs agent --config demo/config.json
 ```
 
 This walkthrough uses an explicit demo config. Without `--config`, `gateway`,
@@ -143,7 +143,7 @@ secondary instance passes its own `--config`. See [user services](./SERVICE.md)
 for the shipped foreground systemd user units.
 
 The agent resumes the `cli:default` conversation and prints a prompt. The
-historical `node dist/cli.js --config demo/config.json` is the same attach; it
+historical `node bin/durable-nanobot.mjs --config demo/config.json` is the same attach; it
 fails with a fixed message when no gateway is running and never opens a second
 runtime. `agent --conversation <name>` uses a separate `cli:<name>`
 conversation in the same gateway; conversations are separate by default and

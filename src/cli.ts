@@ -489,9 +489,9 @@ function localGatewayDiagnostic(error: LocalGatewayError): string {
       "stop the other gateway before starting another (diagnostic details suppressed)";
 }
 
-// Native entry-point detection also handles npm's symlinked executable (Node >= 22.19).
-if (import.meta.main) {
-  main().catch((error) => {
+/** Shared executable runner for the source launcher and optional compiled entry point. */
+export function runCli(): Promise<void> {
+  return main().catch((error) => {
     if (error instanceof PreparedContextRecoveryError) {
       console.error(`durable-nanobot recovery: ${error.message}`);
     } else if (error instanceof UsageError) {
@@ -506,3 +506,5 @@ if (import.meta.main) {
     process.exitCode = 1;
   });
 }
+
+if (import.meta.main) await runCli();

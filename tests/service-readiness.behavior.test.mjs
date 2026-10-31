@@ -10,7 +10,7 @@ import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earend
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
-const cli = join(repoRoot, "dist", "cli.js");
+const cli = join(repoRoot, "bin", "durable-nanobot.mjs");
 const {
   parseConfig,
 } = await import(new URL("../dist/config.js", import.meta.url).href);
@@ -511,7 +511,7 @@ test("shipped user units are static user-service examples and verify with the re
     assert.match(text, /^StandardOutput=journal$/m);
     assert.match(text, /^StandardError=journal$/m);
     assert.match(text, /^EnvironmentFile=-%h\//m);
-    assert.match(text, /dist\/cli\.js gateway --config /);
+    assert.match(text, /bin\/durable-nanobot\.mjs gateway --config /);
     assert.match(text, /^WantedBy=default.target$/m);
     assert.doesNotMatch(text, /npm start|durable-nanobot\.service\b.*ExecStart|OPENAI|ANTHROPIC|DEEPSEEK_API_KEY|API_KEY=/);
   }

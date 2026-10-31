@@ -7,7 +7,7 @@ commands below are operator steps; none were run by this project's checks.
 
 The gateway itself remains an ordinary foreground process. These units do not
 add a daemon, supervisor, background shell, restart loop or npm-start wrapper:
-systemd runs one `node dist/cli.js gateway` process per instance and stops it with
+systemd runs one `node bin/durable-nanobot.mjs gateway` process per instance and stops it with
 the existing SIGTERM/SIGINT teardown.
 
 ## Units
@@ -25,8 +25,9 @@ machine:
 
 - `/usr/bin/node` — the Node >= 22.19 executable. Use the absolute path from
   `command -v node`; do not rely on a shell `PATH` or either global CLI command.
-- `/opt/durable-nanobot` — this checkout. The unit runs `<checkout>/dist/cli.js`
-  through Node after `npm ci` and `npm run build`, independently of `npm link`.
+- `/opt/durable-nanobot` — this checkout. The unit runs
+  `<checkout>/bin/durable-nanobot.mjs` through Node after `npm ci`, independently
+  of `npm link`. The launcher loads source TypeScript through pinned `tsx`.
 
 The TypeScript command and units are named `durable-nanobot`; Python keeps
 `nanobot`. These templates neither replace nor stop an installed Python unit.
@@ -42,28 +43,36 @@ The package exposes only `durable-nanobot` as its executable. From the checkout,
 after installing the pinned dependencies, these are optional operator steps:
 
 ```sh
-npm run build
 npm link --offline
 durable-nanobot agent
 ```
 
-`npm link` links that command to this checkout; it does not copy the code, run a
-gateway, install a service or claim Python's `nanobot` command. You can instead
-use `node dist/cli.js agent` or `npm start -- agent` without linking anything.
-The agent attaches to an already-running gateway with the same configuration.
+The linked command, `npm start -- ...` and the service all use the same small
+JavaScript source launcher. It loads `src/cli.ts` in-process with pinned `tsx`,
+including TypeScript parameter properties and the source tree's `.js` import
+specifiers. Its compiler setting avoids a persistent helper child across native
+execve restart. Loading it is independent of the process working directory.
 
-For source edits, rebuild and restart the gateway so it loads the new JavaScript:
+`npm link` does not copy the code, run a gateway, install a service or claim
+Python's `nanobot` command. Without linking, use
+`node bin/durable-nanobot.mjs agent` or `npm start -- agent`. The agent attaches
+to an already-running gateway with the same configuration.
+
+For source edits, restart the gateway: **no build is needed**. Checking types
+first is recommended because runtime transpilation does not typecheck:
 
 ```sh
-npm run build
+npm run typecheck
 systemctl --user restart durable-nanobot.service
 ```
 
-To compile continuously, run `npm run build -- --watch` in another terminal.
-Wait for a successful build before restarting. Building is not hot reload;
-`systemd` neither compiles TypeScript nor watches the checkout. Code-only edits
-need no `daemon-reload` and no repeated `npm link`. A supported owner `/restart`
-can replace the process after a build too, but keeps the current process environment.
+A supported owner `/restart` also reloads source through the same launcher and
+keeps the current process environment. This is restart-to-reload, not hot reload;
+there is no filesystem watcher or build-on-start step. Code-only edits need no
+`daemon-reload`, `npm link` or `tsc` output. Dependency changes require updating
+the pinned installation before restarting. `npm run build` still creates the
+optional compiled `dist/cli.js` entry point for distribution and existing tests;
+that alternative does require rebuilding before a code change can take effect.
 
 Editing a unit or drop-in requires `systemctl --user daemon-reload` before
 restart. Editing only an environment file needs a service restart to reload it;
@@ -244,12 +253,22 @@ installation scope.
 
 ## What is verified
 
-The unit files are static examples. `systemd-analyze verify` accepts them and an
-edited copy that points at the actual Node executable, checkout, and instance
-config path. That is a static file check only: no service was installed, enabled
-or started, no user manager was reloaded, and no lingering login lifetime was
-tested in this environment. The graceful gateway SIGTERM shutdown, store-lock
-release and reopen, duplicate-owner refusal and two independent instances are
-covered by bounded offline process checks with synthetic configuration; see the
-repository's behavior tests. Live provider, Telegram polling and real systemd
-operation remain unverified.
+Offline checks use static `systemd-analyze verify` plus temporary synthetic
+source-mode processes: graceful SIGTERM, store-lock release/reopen, duplicate-owner
+refusal and separate instances. They do not install or activate services or send
+provider requests. A disposable probe also changes TypeScript without building,
+then verifies native execve restart loads the change with the same PID and no
+persistent compiler child.
+
+### Owner-authorized test deployment — 2026-10-31
+
+The linked source command and primary user service were explicitly installed,
+enabled and started for the separate test bot, with private state outside the
+checkout. Its identity was verified distinct from Python's bot; the Python command,
+unit and running process were left unchanged. Read-only CLI status succeeded, and
+live owner restart reopened the endpoint with the same PID and no systemd crash
+restart. The owner then confirmed sending a Telegram message and receiving a reply.
+
+This establishes the basic source-launch/service/Telegram/model path, not migrated
+personal memory, worker/MCP/media behavior, classifier quality or live OAuth. Existing
+lingering was observed enabled; logout/reboot survival was not separately tested.

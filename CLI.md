@@ -4,9 +4,11 @@ For a first-time walkthrough of workspace, memory, skills and config-enabled
 tools, start with [setup](./SETUP.md).
 
 The package exposes `durable-nanobot`, leaving Python's `nanobot` untouched.
-Build first, then optionally run `npm link --offline` manually from the checkout
-to expose the command. Without linking, `node dist/cli.js` or `npm start --` uses
-the same entry point. Rebuild after TypeScript edits and restart the gateway;
+After installing pinned dependencies, optionally run `npm link --offline` from
+the checkout to expose the command. Without linking, `node bin/durable-nanobot.mjs`
+or `npm start --` uses the same source entry point. Restart after TypeScript edits;
+no build is required, while `npm run typecheck` remains a useful separate check.
+The optional compiled `node dist/cli.js` alternative still needs a build;
 [service/update details](./SERVICE.md#checkout-command-and-build-workflow).
 
 The gateway is the single agent/Durable owner. A CLI is one conversation
@@ -181,9 +183,9 @@ reported as a lock conflict. Inspection may perform Durable's native
 `Harness.open()` crash reconciliation but never resumes task execution:
 
 ```sh
-node dist/cli.js recovery                         # default primary configuration
-node dist/cli.js recovery --config /path/to/config.json
-node dist/cli.js recovery --config /path/to/config.json --cancel <taskId> --fingerprint <sha256>
+node bin/durable-nanobot.mjs recovery                         # default primary configuration
+node bin/durable-nanobot.mjs recovery --config /path/to/config.json
+node bin/durable-nanobot.mjs recovery --config /path/to/config.json --cancel <taskId> --fingerprint <sha256>
 ```
 
 Inspection prints JSON with task ID, kind, phase, pinned entry, and fingerprint.

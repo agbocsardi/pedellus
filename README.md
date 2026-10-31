@@ -16,7 +16,7 @@ not a standing implementation queue.
 
 ## Run
 
-[`SETUP.md`](./SETUP.md) is the short walkthrough: build, create a synthetic
+[`SETUP.md`](./SETUP.md) is the short walkthrough: install dependencies, create a synthetic
 workspace with memory and skills, enable tools in the config, then add Telegram
 as a separate step. The example uses named `fast`/`deep` model presets; the default
 comes from config. A local `/model <name>` switch is temporary: reattaching a CLI
@@ -28,16 +28,17 @@ Copy `config.example.json` to a private explicit config file and edit the worksp
 
 ```sh
 npm ci
-npm run build
-node dist/cli.js gateway --config /path/to/config.json
-node dist/cli.js agent --config /path/to/config.json
+node bin/durable-nanobot.mjs gateway --config /path/to/config.json
+node bin/durable-nanobot.mjs agent --config /path/to/config.json
 ```
 
 The optional checkout-linked command is **`durable-nanobot`**, not Python's
-`nanobot`: after building, run `npm link --offline` manually to expose it.
-For development, `npm run build -- --watch` rebuilds on edits; restart the gateway
-after a successful build. The `durable-nanobot.service` / `durable-nanobot@.service`
-templates run the checkout directly and need no command link. See
+`nanobot`: after installing dependencies, run `npm link --offline` to expose it.
+The command and service use pinned `tsx` to load source in-process. Restart after
+TypeScript edits: no full build, watcher or hot reload is required. Run
+`npm run typecheck` separately for type errors. The `durable-nanobot.service` /
+`durable-nanobot@.service` templates use that same launcher without needing a
+command link. `npm run build` remains available for compiled output/tests. See
 [checkout and service updates](./SERVICE.md#checkout-command-and-build-workflow).
 
 Without `--config`, `gateway`, `agent`, `login`, `logout` and `recovery` use the fixed primary file
@@ -49,7 +50,7 @@ units; this repository does not install or start them.
 The gateway is the single owner: it opens storage, config tools, cron and, when
 configured, the restricted Telegram adapter (explicit decimal user allowlist
 only). One or more `agent` CLIs attach to it as conversation surfaces; the
-historical bare `node dist/cli.js --config ...` is the same attach and never opens
+historical bare `node bin/durable-nanobot.mjs --config ...` is the same attach and never opens
 a second runtime. A CLI disconnect leaves the gateway, Telegram polling, admitted
 turns and queued work running; a gateway restart stops all of them. Do not use
 live bot polling for offline checks. Known startup/configuration failures print

@@ -5,8 +5,9 @@ TypeScript port of Nanobot on the Pi 1.4.0 stack (`@earendil-works/pi-ai`,
 `~/projects/pi-nanobot` is reference material only — never merge or rebase onto
 it, and port individual changes by hand.
 
-Status is experimental. Nothing here is deployed, and no acceptance run has used
-production data or a live user workspace.
+Status is experimental. The owner's separate test-bot user service is deployed
+from source; production memory/workspace migration and broader live acceptance
+remain pending. Never stop or replace Python's production bot as part of checks.
 
 ## Commands
 
@@ -23,11 +24,15 @@ npm start -- agent --config config.json     # attach a terminal
 
 The optional package executable is `durable-nanobot`; never install an alias
 named `nanobot` over the Python command. `npm link --offline` is an explicit
-operator step after building, not part of checks. `npm run build -- --watch`
-recompiles edits but does not reload a running gateway. The user-unit templates
-are `systemd/durable-nanobot.service` and `systemd/durable-nanobot@.service`;
-they run the built checkout through an absolute Node path and do not need a CLI
-link. Code edits need build + restart; unit edits additionally need daemon-reload.
+operator step after dependency installation, not part of checks. Package bin,
+`npm start` and user-unit templates use `bin/durable-nanobot.mjs`, which imports
+source with pinned `tsx` in the same process; restart reloads edits without tsc
+or a watcher. The launcher disables esbuild's persistent sync compiler worker so
+native execve restart does not leave an unreapable compiler child. Keep the
+source/compiled error boundary shared through `src/cli.ts:runCli`.
+`npm run typecheck` remains separate; `npm run build` still supports compiled
+output/tests. Units use an absolute Node path and do not need a CLI link. Code
+edits need restart only; unit edits additionally need daemon-reload.
 
 ## Layout
 
