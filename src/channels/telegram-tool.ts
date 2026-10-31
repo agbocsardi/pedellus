@@ -138,10 +138,11 @@ export function createTelegramTool(options: TelegramToolOptions): { readonly ext
       "ordinary answer; the substantive answer must still be ordinary turn text. action=react sets one " +
       "standard reaction emoji on one observed message id. " +
       (fileSend
-        ? "action=send uploads one existing file from the configured workspace as a native document, " +
-          "photo, audio, video or voice message, with an optional bounded caption and optional observed " +
-          "reply target; the file must already exist under the workspace and its kind must match the " +
-          "file, because no conversion or extraction is performed. "
+        ? "action=send uploads one existing file from the configured workspace into this chat. Any " +
+          "workspace file can be sent unchanged as a document; kind optionally selects a native photo, " +
+          "audio, video or voice presentation when that is useful, and that kind must match the file " +
+          "because no conversion or extraction is performed. action=send accepts an optional bounded " +
+          "caption and optional observed reply target. "
         : "Outbound files are not enabled in this host. ") +
       "Never guess an id: only ids listed by targets, named in the current Telegram context, or returned " +
       "by an earlier action are valid. This tool cannot choose another chat, cannot fetch a remote URL, " +
@@ -165,7 +166,7 @@ export function createTelegramTool(options: TelegramToolOptions): { readonly ext
       })),
       kind: Type.Optional(Type.Union([
         ...TELEGRAM_FILE_KINDS.map((kind) => Type.Literal(kind)),
-      ], { description: "File kind for action=send: document, photo, audio, video or voice." })),
+      ], { description: "Optional native presentation for action=send: document (default), photo, audio, video or voice. Omit to send any file unchanged as a document." })),
       path: Type.Optional(Type.String({
         description: "Workspace-relative path of an existing regular file. Required for action=send.",
       })),
@@ -200,10 +201,12 @@ export function createTelegramTool(options: TelegramToolOptions): { readonly ext
         // Defence in depth: the schema omits this action when the host has no outbound-file
         // authority, so a decline here means the caller bypassed the declared surface.
         if (!fileSend) return errorResult("Outbound files are not enabled in this host.");
-        const kind = args.kind;
-        if (kind === undefined || !TELEGRAM_FILE_KINDS.includes(kind)) {
+        const requestedKind = args.kind;
+        if (requestedKind !== undefined && !TELEGRAM_FILE_KINDS.includes(requestedKind)) {
           return errorResult("kind must be document, photo, audio, video or voice for action=send.");
         }
+        // Any workspace file is always sendable unchanged; the native presentation is optional.
+        const kind = requestedKind ?? "document";
         const path = args.path;
         if (!validTelegramFilePath(path)) {
           return errorResult("path must be a workspace-relative path inside the configured workspace, " +

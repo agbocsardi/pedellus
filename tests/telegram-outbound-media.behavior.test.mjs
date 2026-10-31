@@ -200,7 +200,7 @@ function telegramMock(batches) {
         return json({ ok: false, error_code: 500, description: 'Internal Server Error' }, 500);
       }
       const messageId = nextMessageId++;
-      uploads.push({ ...attempt, text: file.bytes.toString('utf8'), messageId });
+      uploads.push({ ...attempt, text: file.bytes.toString('utf8'), bytes: file.bytes, messageId });
       return response({
         message_id: messageId,
         date: Math.floor(Date.now() / 1000),
@@ -490,6 +490,60 @@ test('a long valid basename keeps its photo extension and pinned bytes', { timeo
     const record = (await stateDoc(store.gateway)).actions.find((entry) => entry.kind === 'photo');
     assert.equal(record?.status, 'sent');
     assert.equal(record?.path, path, 'the record keeps the workspace-relative path, not the host path');
+
+    // A symlink target can give a document an extension containing a control character. The
+    // display name is sanitized, never passed through raw from the resolved path.
+    await writeFile(join(store.workspace, 'files/report.\u0007pdf'), 'CTRL-BYTES');
+    await symlink('report.\u0007pdf', join(store.workspace, 'files/ctrl.alias'));
+    const ctrl = await store.gateway.telegramActions.current().act(
+      `telegram:${BOT_ID}:chat:${CHAT_ID}`,
+      'ctrl-suffix',
+      { kind: 'document', path: 'files/ctrl.alias' },
+      context,
+    );
+    assert.equal(ctrl.ok, true, ctrl.text);
+    const ctrlUpload = transport.uploads.find((entry) => entry.method === 'sendDocument');
+    assert.ok(ctrlUpload, 'the resolved control-character document reached the mock');
+    assert.equal(ctrlUpload.text, 'CTRL-BYTES');
+    assert.doesNotMatch(ctrlUpload.filename, /[\u0000-\u001f\u007f]/, 'the display name is sanitized');
+    assert.ok(ctrlUpload.filename.length <= 120);
+  } finally {
+    await cleanup(store, harness);
+  }
+});
+
+test('omitting kind sends any workspace file unchanged as a document', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('default-document');
+  const binary = Buffer.from([0x00, 0xff, 0x10, 0x0a, 0x7f, 0x80, 0x0b, 0x2e]);
+  await writeFile(join(store.workspace, 'files/payload.weird'), binary);
+  let issued = false;
+  store.faux.setResponses(Array.from({ length: 6 }, () => (request) => {
+    if (!issued) {
+      issued = true;
+      return fauxAssistantMessage([
+        fauxToolCall('telegram', { action: 'send', path: 'files/payload.weird', caption: 'Anything' },
+          { id: 'default-document' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('DEFAULT-DOC-DONE');
+  }));
+  const transport = telegramMock([[messageUpdate(707, 100, 'send anything')]]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.some((entry) => entry.text === 'DEFAULT-DOC-DONE'), 'default document turn');
+    assert.equal(transport.uploads.length, 1, 'an omitted kind is a document send');
+    const upload = transport.uploads[0];
+    assert.equal(upload.method, 'sendDocument');
+    assert.equal(upload.caption, 'Anything');
+    assert.equal(Buffer.compare(upload.bytes, binary), 0, 'the arbitrary binary bytes are sent unchanged');
+    assert.equal(upload.filename, 'payload.weird');
+    const chat = await store.gateway.conversationFor(`telegram:${BOT_ID}:chat:${CHAT_ID}`, context);
+    const result = await toolResults(chat, 'default-document');
+    assert.equal(result.isError, false, result.text);
+    const record = (await stateDoc(store.gateway)).actions.find((entry) => entry.path === 'files/payload.weird');
+    assert.equal(record?.kind, 'document');
+    assert.equal(record?.status, 'sent');
   } finally {
     await cleanup(store, harness);
   }
@@ -529,7 +583,7 @@ test('path, symlink, kind, size and non-regular refusals happen before any uploa
       { callId: 'refuse-symlink', request: { kind: 'document', path: 'files/escape.txt' }, match: /workspace/ },
       { callId: 'refuse-fifo', request: { kind: 'document', path: 'files/pipe' }, match: /not a regular file/ },
       { callId: 'refuse-huge', request: { kind: 'document', path: 'files/huge.bin' }, match: /larger than/ },
-      { callId: 'refuse-format', request: { kind: 'voice', path: 'files/report.pdf' }, match: /no conversion/ },
+      { callId: 'refuse-format', request: { kind: 'voice', path: 'files/report.pdf' }, match: /resend as kind=document/ },
       { callId: 'refuse-missing', request: { kind: 'document', path: 'files/missing.pdf' }, match: /no such file/ },
       { callId: 'refuse-kind', request: { kind: 'sticker', path: 'files/report.pdf' }, match: /Unknown Telegram file kind/ },
     ];

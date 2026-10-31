@@ -99,6 +99,11 @@ function extensionOf(filename: string): string {
  * and this helper keeps that suffix inside the 120-character display-name bound
  * whenever it fits, so a long valid name is not refused as a wrong format and
  * the service still sees the same kind hint.
+ *
+ * The suffix comes from the resolved name, which a symlink target can shape. The
+ * composed name therefore goes through the same sanitizer as every stored
+ * original name, so a control character in a document extension cannot reach
+ * the API field.
  */
 function outboundFilename(originalName: string, extension: string): string {
   const sanitized = sanitizeOriginalName(originalName);
@@ -112,7 +117,7 @@ function outboundFilename(originalName: string, extension: string): string {
     : originalName;
   const stem = (sanitizeOriginalName(stemSource) ?? "file").replace(/[. ]+$/, "") || "file";
   const room = MEDIA_LIMITS.maxOriginalNameChars - suffix.length;
-  return `${stem.slice(0, room)}${suffix}`;
+  return sanitizeOriginalName(`${stem.slice(0, room)}${suffix}`) ?? "file";
 }
 
 /**
@@ -210,6 +215,7 @@ export function outboundRejectionText(kind: TelegramFileKind, reason: TelegramOu
     case "unreadable":
       return "the file could not be read as one stable snapshot";
     case "unsupported-format":
-      return `a ${kind} send needs a supported file extension; no conversion is performed`;
+      return `a ${kind} send needs a matching file extension; resend as kind=document to send these ` +
+        "bytes unchanged (no conversion is performed)";
   }
 }

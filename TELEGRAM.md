@@ -437,32 +437,35 @@ Actions:
   so `reply` adds a separate threaded message and is worth using only when that
   is useful.
 - `react` calls `setMessageReaction` with one emoji on one observed id.
-- `send` uploads one existing workspace file with a native Bot API method:
-  `sendDocument`, `sendPhoto`, `sendAudio`, `sendVideo` or `sendVoice`. `kind`
-  selects the method, an optional bounded caption is passed through, and an
-  optional observed `messageId` makes it a native reply. The path is
-  workspace-relative; the adapter resolves it under the canonical configured
-  workspace and refuses an absolute path, a `..` segment, a symlink escape, a
-  non-regular file, a file larger than 20 MiB or an empty file. Bytes are pinned
-  into memory before the call, so a later write or growth cannot change what is
-  uploaded; a file that shrinks or grows while it is read is refused rather than
-  sent as a partial snapshot. The caption is plain text (no `parse_mode`), so it
-  cannot inject markup. The extension must match the requested kind (documents
-  accept any
-  file; voice needs `.ogg`/`.oga`/`.opus`; video, audio and photo have short
-  allowlists); nothing is converted, so a mismatch is refused before upload
-  instead of being sent as another kind. Telegram remains the format validator
-  for content that passes the extension check, and its rejection is a known
-  non-send. There is no remote URL, Telegram file id, credential, arbitrary
-  recipient, extraction or transcription path.
+- `send` uploads one existing workspace file unchanged: any file, whatever its
+  extension or content, can be sent as a document, which is the default when
+  `kind` is omitted. `kind` optionally selects a native `photo`, `audio`, `video`
+  or `voice` presentation when that is useful. An optional bounded caption is
+  passed through, and an optional observed `messageId` makes it a native reply.
+  The path is workspace-relative; the adapter resolves it under the canonical
+  configured workspace and refuses an absolute path, a `..` segment, a symlink
+  escape, a non-regular file, a file larger than 20 MiB or an empty file. Bytes
+  are pinned into memory before the call, so a later write or growth cannot
+  change what is uploaded; a file that shrinks or grows while it is read is
+  refused rather than sent as a partial snapshot. The caption is plain text (no
+  `parse_mode`), so it cannot inject markup. Explicit native kinds keep a short
+  extension allowlist as a capability hint (voice needs `.ogg`/`.oga`/`.opus`;
+  video, audio and photo have short allowlists); nothing is converted, so a
+  mismatch is refused before upload with a fixed suggestion to resend as
+  `kind=document` for the same bytes. Document sends perform no content check.
+  Telegram remains the format validator, and its rejection is a known non-send.
+  There is no remote URL, Telegram file id, credential, arbitrary recipient,
+  extraction, transcoding or automatic kind detection.
 
 The `send` action is offered only when two operator decisions hold: the top-level
 `media` configuration is present (which also supplies the channel workspace) and
 `toolAllowlist` contains `read`. The same conversation already has the
-configured read tool, so the upload adds no filesystem read grant; without
-either, the action is absent from the tool schema and the adapter refuses a file
-request. Path resolution is workspace-only and does not use
-`extraAllowedDirs`.
+configured read tool, so the upload adds no filesystem read grant. Without both,
+`send` is absent from the model tool's schema and its execute path refuses a
+bypassing call. The adapter behind that tool checks only the configured `media`
+workspace at call time: the `read` conjunction is the model tool's authority
+rule, so it never widens what a direct host caller may request. Path resolution
+is workspace-only and does not use `extraAllowedDirs`.
 
 The tool is declared `replay: "unsafe"`, so Durable never reruns an interrupted
 execution. The adapter additionally writes `intent` before the call and

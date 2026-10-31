@@ -79,9 +79,10 @@ a coding-tool name or filesystem/shell grant. A running adapter rechecks current
 private-chat admission and observed same-chat targets; root/state/fork/isolated
 cron conversations do not receive it. Native replies are additional messages,
 not replacements for the ordinary answer. The optional `send` action uploads one
-existing workspace file (document/photo/audio/video/voice) with a bounded
-caption; it is offered only when the top-level `media` configuration is present
-and `toolAllowlist` contains `read`, so it adds no read grant. See
+existing workspace file unchanged — as a document by default, or as a native
+photo/audio/video/voice presentation when chosen — with a bounded caption; it is
+offered only when the top-level `media` configuration is present and
+`toolAllowlist` contains `read`, so it adds no read grant. See
 [Telegram interactions](./TELEGRAM.md#replies-quotes-reactions-and-native-actions).
 
 ## Configured authority
