@@ -21,8 +21,10 @@ remain. `2026-10-30_lean-assistant_TODO.md` stays the work-order authority.
 - O6 is a docs-only close: reconfigured product docs plus this note on branch
   `t3/final-acceptance-handoff`. Functional source in `src/`, the registered
   tests, `package.json` and `package-lock.json` are unchanged from `ef0af84`.
-  Nothing here is published to main; an independent fresh O6 review is still
-  required.
+  The delivered tip merges current main's TODO-only acceptance note
+  (`a391f1c`) so publication can fast-forward; the TODO is byte-identical to
+  main and was not edited here. Nothing is published to main; an independent
+  fresh O6 review is still required.
 
 ## What now exists
 
