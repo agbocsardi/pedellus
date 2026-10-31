@@ -33,6 +33,18 @@ export interface DigestBatchLimits {
 export interface DigestRunLimits extends DigestBatchLimits {
   /** Individual model-issued tool calls allowed in the run, failed and refused calls included. */
   readonly maxToolCalls: number;
+  /**
+   * Committed provider responses allowed in the run, retried attempts included. Every attempt is a
+   * separate request and is committed as its own assistant entry, so the count comes from the
+   * durable transcript rather than a process-local counter.
+   */
+  readonly maxRequests: number;
+  /**
+   * Cumulative input tokens allowed in the run, counted from actual reported usage: `input` plus the
+   * `cacheRead` and `cacheWrite` counters (pi-ai reports those separately, so this is not doubled).
+   * A response that reports no usage is charged the whole bound instead of a fresh allowance.
+   */
+  readonly maxInputTokens: number;
   /** Whole-run deadline from preparation; an expired run fails without acknowledging its batch. */
   readonly runTimeoutMs: number;
   /** Distinct workspace files the run may successfully change. */
@@ -50,8 +62,10 @@ export const DIGEST_RUN_LIMITS_DEFAULT: DigestRunLimits = Object.freeze({
   // without a bound. Both are configurable per `digest`.
   entriesPerBatch: 2_000,
   charsPerBatch: 200_000,
-  maxToolCalls: 10,
-  runTimeoutMs: 300_000,
+  maxToolCalls: 24,
+  maxRequests: 12,
+  maxInputTokens: 500_000,
+  runTimeoutMs: 600_000,
   maxChangedFiles: 8,
   maxDiffChars: 32_000,
 });
@@ -97,6 +111,8 @@ export function digestRunLimitsFrom(value: unknown): DigestRunLimits | undefined
     "entriesPerBatch",
     "charsPerBatch",
     "maxToolCalls",
+    "maxRequests",
+    "maxInputTokens",
     "runTimeoutMs",
     "maxChangedFiles",
     "maxDiffChars",
@@ -111,6 +127,8 @@ export function digestRunLimitsFrom(value: unknown): DigestRunLimits | undefined
     entriesPerBatch: parsed.entriesPerBatch!,
     charsPerBatch: parsed.charsPerBatch!,
     maxToolCalls: parsed.maxToolCalls!,
+    maxRequests: parsed.maxRequests!,
+    maxInputTokens: parsed.maxInputTokens!,
     runTimeoutMs: parsed.runTimeoutMs!,
     maxChangedFiles: parsed.maxChangedFiles!,
     maxDiffChars: parsed.maxDiffChars!,

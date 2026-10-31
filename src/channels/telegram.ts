@@ -2733,7 +2733,7 @@ export async function runTelegram(
         "the request, not the completed restart.");
     }
     if (hostCommands.digest) {
-      lines.push("/digest - start one bounded closed-episode memory-digestion run from the shared workspace; the run is " +
+      lines.push("/digest - start one bounded completed-exchange memory-digestion run from the shared workspace; the run is " +
         "background, and only a failure or cancellation reports an internal issue to this chat's agent, never a direct " +
         "user or channel message. /digest status is a bounded read-only view; both cost no model call by themselves.");
     }

@@ -681,10 +681,11 @@ session key, and the summary text is model output over untrusted source.
 
 ## Digestion input and cursor
 
-`src/history/digestion.ts` is the bounded, source-labeled input for conversation digestion (memory
-curation), plus its durable cursor. `openGateway` wires it through `src/history/memory-digest.ts`
-below, but a run still starts only on an explicit manual command or cron intent: this module calls
-no model, writes no memory, creates no task, schedules nothing, and adds no tool surface.
+`src/history/digestion.ts` is the one bounded, source-labeled evidence reader for conversation
+digestion (memory curation) and its one durable cursor. `openGateway` injects it into
+`src/history/memory-digest.ts` below; a run still starts only on an explicit manual command or cron
+intent. The module calls no model, writes no memory, creates no task, schedules nothing and adds no
+tool surface. There is no second reader or second cursor.
 
 ```ts
 createDigestSource({
@@ -696,151 +697,83 @@ await source.acknowledge(batch, context);     // only after the caller consumed 
 await source.cursor(conversationId, context); // status/tests, read-only
 ```
 
-A batch is one bounded chunk of one **closed** episode from one mapped chat conversation:
-`sessionKey`, `conversationId`, immutable `episodeStartEntryId`/`episodeEndEntryId`, the chunk's
-`firstEntryId`/`firstTextStart`, its `throughEntryId`/`throughChars`, `complete`, and evidence
-fragments. Each fragment carries its own `entryId`, `role` (`user`/`assistant` — there is no tool
-role), Durable `kind`, `text`, `textStart` and the entry's full `chars` length. Nothing is
-excerpted away: a fragment cut at the batch bound continues in the next batch from exactly that
-offset, so every character of a long entry is eventually consumable. The reader stores nothing:
-Durable stays the only transcript authority and the original entry remains the citation.
+Eligibility is a **completed-turn high-water**, not a closed episode. A segment ends just before a
+`pi.reset` that follows an owner (`pi.user`/`nanobot.cron`) turn, just before the next owner or
+scheduled input, or at a terminal assistant entry whose tool calls are all paired. An in-progress
+tail — an owner message still awaiting an answer, an assistant tool round, or a tool result awaiting
+its next assistant entry — is never offered. An assistant entry stopped by an explicit error or abort
+cannot close a turn. A reset before the first owner input stays inside the next segment's prefix, so a
+leading system/reset block is consumed without its own model-free batch. One read offers only
+evidence that was already a completed exchange when the read began; entries appended later belong to
+a later segment, and an accepted batch's bounds never move.
 
-One batch is one **whole** closed episode whenever that episode's message evidence fits both batch
-bounds. It is then read in one pass, delivered with `complete: true` and acknowledged once, however
-many entries the episode holds (a session with thousands of small messages is normal). Only an
-episode over the character or entry bound splits, and it then splits into independent ordered chunks
-that each carry their own acknowledgement and their own evidence. There is no carry-over note,
-running summary or cross-chunk state: each chunk is judged against its capture and the committed
-transcript alone, so a chunk can be replayed, failed or acknowledged without reference to its
-neighbours.
+One completed segment whose evidence fits both batch bounds is one batch, delivered with
+`complete: true` and acknowledged once. Only a larger segment splits, into independent ordered chunks
+that each carry their own acknowledgement. There is no carry-over note, running summary or
+cross-chunk state.
 
-Eligibility and evidence rules:
+Evidence shape and trust labels:
 
-- Eligible conversations are exactly the mapped chat sessions the host supplies after
-  authentication and `chatScopeExclusion`/`partitionChatScope`. The host is the authorization
-  boundary; this module does not re-derive root/fork/task ownership and only refuses a shape error
-  such as a `:channel-state` key or a repeated conversation ID. Channel-state keys, the root, forks,
-  task-owned (cron/worker) conversations and raw/unmapped transcripts never qualify when the host
-  passes the shared provider.
-- Only closed episodes are evidence. An episode closes at the `pi.reset` entry committed after it;
-  the current open segment is never returned, however often it is read. Reset-only segments are not
-  episodes. Episode ranges and `pi.reset` inclusion match the episode catalog.
-- A reset's handoff message is synthetic context, not owner speech, and is never evidence. System,
-  compaction and unknown entries are consumed as part of a range but yield no evidence item.
-  Evidence is **message text only**: owner (`pi.user`, or a `nanobot.cron` trigger) and assistant
-  text. A `pi.tool-result` entry, an assistant tool call and any tool output are never evidence —
-  digestion folds what was said, not what a tool did, and machine output would otherwise dominate a
-  batch. Those entries are still consumed as part of the range and move the cursor with no fragment
-  (a `pi.tool-result` at a chunk's last position is acknowledged with a zero offset), so nothing is
-  skipped and backend traffic cannot inflate the evidence. Acknowledgement validation uses the same
-  selection, so a replay or a forged batch that presents tool text as evidence is rejected instead
-  of accepted.
-- `nanobot.cron` input entries keep that exact Durable `kind`, so a consumer can treat a scheduled
-  trigger as provenance rather than owner speech. Worker child transcripts are task-owned and never
-  in scope, and worker result events are not evidence.
-- Ordering is oldest first by Durable entry ID within a conversation, so timestamps never create a
-  tie to break. Across conversations the oldest discovered next position is served first; a bounded
-  scan budget can postpone discovery in a conversation, which delays evidence but never skips it.
-  The scan budget rotates its starting conversation so one busy chat cannot starve the others.
+- Owner messages and scheduled triggers are `owner`; assistant message text is `assistant`; assistant
+  tool calls and their paired results are always `untrusted-tool`. Reset handoffs, system and
+  compaction entries, assistant thinking and unpaired tool results are consumed inside the range but
+  contribute no evidence. A tool result pairs only with a call id still open in the same segment; the
+  open-call set is durable in the cursor, so a result in a later chunk or after a reopen still pairs.
+  A call id longer than 200 characters fails the segment closed instead of silently orphaning its
+  result.
+- Message prose and tool-call arguments are lossless fragments of the original entry (UTF-16 offsets,
+  surrogate-safe); a cut continues in the next chunk from exactly that offset. A tool result is
+  machine output: a short one is included whole, and a long one is one head-tail preview of at most
+  2,500 characters with an explicit omission marker and a stable original-entry reference. The preview
+  is not a fragment, and the omitted middle is never claimed to have been read. Durable remains the
+  only transcript authority; no second archive or evidence copy is stored.
+- A batch with no evidence is still acknowledged and counts as processed; the consumer advances it
+  without a provider call.
 
-Cursor semantics: one small `nanobot.digest-cursor` conversation document holds
-`throughEntryId`/`throughChars` (highest acknowledged entry and UTF-16 code units consumed within it)
-and, only while a large closed episode is being consumed in chunks,
-`episodeStartEntryId`/`episodeEndEntryId`. `acknowledge()` is the only writer. It is a trusted
-in-process API and does not re-check the mapped chat set (the host owns authorization); it compares
-the stored cursor with the batch's frontier (`DigestCursorConflictError` when it moved), then
-re-derives the episode bounds and the claimed chunk from the committed transcript before one commit:
+Ordering, fairness and bounds: batches are served oldest first by Durable entry ID across the mapped
+chats; the discovery scan is bounded to 4,000 examined entries per read and rotates its starting
+conversation, so one busy chat cannot starve the others, and a postponed chat is offered later
+instead of skipped. The scan position cache is derived, dropped when the cursor moves or the chat is
+unmapped, and lost on restart; losing it costs a repeated bounded scan, never evidence. A pathological
+entry (more than 1,024 steps, more than 256 open calls, or an over-long call id) fails the read closed.
+`DIGEST_LIMITS` holds 2,000 entries and 200,000 evidence characters per batch with minimums of 2 and
+2; the character bound is the real size limit and the entry cap is a flood guard. The `digest` config
+block may override the batch bounds, and a resumed batch is re-derived with the bounds captured when
+it was accepted.
 
-- a fresh chunk starts at its claimed episode start, which must be a `pi.reset` or the conversation's
-  first entry, and the entries between the previous frontier (or the beginning of the conversation)
-  and that start must carry no content (otherwise an earlier closed episode would be skipped);
-- the claimed end is validated on every acknowledgement, not only a complete one: it must be a
-  committed non-reset entry whose successor is the `pi.reset` that actually closes the episode, and a
-  reset-started episode must contain something besides its marker;
-- when a batch establishes *new* episode bounds, the episode is walked from its start until its first
-  closing reset, and that reset must be exactly the one after the claimed end. This proves the bounds
-  cannot span an earlier episode's reset. The walk uses the same paged episode scan (memory bounded
-  regardless of episode size) but is not interruptible mid-walk: SQLite reads ignore the context, so
-  an aborted context only prevents the acknowledgement's commit and no cursor advances.
-  Continuation chunks keep the `end+1` check but do not walk again. Its cost is therefore one
-  bounded-memory pass over each newly established episode — never more than that episode holds, so a
-  whole-episode batch walks exactly the episode it acknowledges — not per fragment, and it matters
-  only for unusually long episodes. A restart re-verifies
-  bounds independently because nothing is persisted about the verification;
-- every entry in the claimed range must exist, fit the captured entry bound, and be the chunk's
-  actual last entry; every evidence entry in it must be covered by exactly one fragment whose kind,
-  role, length, offset and text match the transcript; no entry before the last may lose its tail;
-- a partial chunk must continue exactly at the stored position, and a claimed range may contain no
-  reset after its first entry.
+The cursor is one small `nanobot.digest-cursor` conversation document: `nextEntryId`,
+`nextItemIndex`, `nextTextStart` (position after the last acknowledged step), the immutable
+`episodeStartEntryId`/`episodeEndEntryId` while a segment is being chunked, and `pendingToolCalls`.
+`acknowledge()` is the only writer and requires the conversation to still be mapped with the same
+session key. It compares the stored position with the batch's frontier (`DigestCursorConflictError`),
+re-proves a fresh segment's end as a completed boundary by walking that segment, and re-derives the
+claimed chunk from the committed transcript evidence by evidence before one commit. A fresh segment
+must start at the cursor's next position, and any entry in the same conversation skipped before it is
+refused (entry IDs are global and interleave chats, so a zero-entry gap within the conversation is
+normal). A forged, stale or non-advancing batch is rejected instead of corrupting the cursor; a gap
+longer than the verification bound is refused loudly and offered again, never skipped.
 
-The reader guarantees the tail rule above rather than leaving it to the acknowledgement: an entry the
-character budget cuts short always ends its chunk, even when evidence-free entries (a
-`pi.tool-result`, system or tool-call-only assistant entry) follow it. Consuming one of those after a
-cut would put a partially read entry before the chunk's last entry, which acknowledgement refuses —
-and because the reader is deterministic it would then re-offer the same refused chunk forever. A cut
-entry's tail and any entries after it ride with the next chunk. The re-read that validates a chunk is
-bounded by **entry count** (`entriesPerBatch + 1` records), not by bytes: evidence-free entries and
-an individual entry larger than `charsPerBatch` contribute no character-bound accounting, so peak
-read size is that many entry records.
+Compatibility with the earlier closed-episode reader is one read-time mapping, not a migration: a
+stored document without `nextEntryId` becomes the position of its acknowledged entry and message
+offset, and its frozen episode bounds are continued, so already digested text is not processed again
+and the remainder still settles. The offset is validated against the same prose extraction that
+produced it; an offset beyond that entry's message text or one that would split a surrogate pair fails
+closed. Open calls at that frontier are derived once from the immutable segment prefix, so a result
+after it still pairs with a call before it, while the prefix itself is never revisited as evidence. The
+first acknowledgement writes the new fields and clears the old ones. There is no second cursor, dual
+ingestion or cursor migration project; an old *batch record* (no step position) is refused rather than
+re-derived as different evidence.
 
-A malformed or forged batch is therefore rejected instead of corrupting the cursor, so no
-acknowledgement can advance the frontier past evidence the transcript does not support. The gap
-check above is bounded: the reset markers between the previous frontier (or the beginning of the
-conversation) and a fresh episode start are examined up to `scanEntriesPerRead` (4,000) entries. A
-gap that exceeds that bound is refused with an error rather than assumed, so evidence is never
-silently skipped; the same evidence is offered again and the cursor stays unchanged. The practical
-consequence is explicit: a conversation with more than 4,000 consecutive empty `pi.reset` markers
-before its next closed episode cannot be acknowledged by this slice and fails loudly. Normal chats
-have one or two resets between episodes; if real history ever produces such a run, the bound needs
-revisiting rather than silent acceptance. That bound is about *discovery and the empty gap*, not about
-batch size, so raising the batch bounds does not move it. A scan paused on a reset marker never
-turns it into
-segment content: the derived scan cache remembers the segment's last *content* entry separately, so a
-budget boundary between consecutive resets cannot invent a reset-only episode. A batch with
-no evidence (nothing worth remembering, or an episode whose only entries are non-message ones such as
-`pi.tool-result`) is still acknowledged and counts as processed; a failure or restart before
-acknowledgement replays the same chunk. `DIGEST_LIMITS` holds the default batch bounds (2,000 entries
-and strictly 200,000 evidence characters), which is one ordinary closed episode in one pass; a read
-is also bounded to 4,000 scanned entries for discovery and 256 mapped chats. A larger closed
-episode or long entry is returned as contiguous fragments. The `digest` config block may override
-`entriesPerBatch` and `charsPerBatch`; a read accepts them explicitly, and a resumed batch is
-re-derived with the bounds captured when it was accepted instead of current configuration.
-`charsPerBatch` counts UTF-16 code units and has a minimum of 2, so one surrogate pair always fits;
-`entriesPerBatch` has the same minimum of 2, because a one-entry chunk cannot always advance: an
-episode range opens on its `pi.reset` marker, which carries no message text, so a one-entry chunk
-would hand back that same zero-offset entry, have its acknowledgement refused as non-advancing and
-be re-offered forever. A smaller value for either bound is rejected at config, capture
-(`digestRunLimitsFrom`), the in-process `validateDigestRunLimits` check and every direct
-`createDigestSource`/`read`/`readBatch`/`acknowledge` override instead of wedging the cursor. A
-fragment also never ends between the two halves of a UTF-16 surrogate pair
-(the boundary moves back, or the batch ends before that entry), so sending a batch as UTF-8 cannot
-introduce a replacement character; `textStart`/`chars` stay in UTF-16 code units, not bytes.
-
-`readBatch(ref)` re-derives one chunk a consumer already recorded, from its durable identity
-(session key, conversation, episode bounds, chunk position, expected end and cursor) without advancing
-anything: it re-checks that the ref is a currently mapped chat session, that its end is the entry just
-before a committed `pi.reset`, and that the re-derived chunk still ends where the ref says. That makes a
-resumable consumer independent of cross-conversation scan ordering — the reason it exists — while the
-original `read()` still chooses the oldest pending batch. See `memory-digest.ts` below.
-
-`read()` reports `status: "batch"` when it has a chunk to consume. Otherwise it returns
-`status: "idle"` with `caughtUp`, `examinedChats`, `postponedChats`, `unfinishedChats` and
-`missingChats`: `caughtUp` is true only when every mapped chat was examined to its tail, so a caller
-can tell a genuinely empty pass from one that stopped at the scan bound or skipped a mapped
-conversation whose store is missing. A missing mapped conversation is reported, never treated as
-caught up or as evidence. The in-process scan-position cache is derived, dropped whenever that
-conversation's cursor moves, and lost on restart: losing it costs a repeated bounded scan, never
-evidence.
-
-This foundation leaves activation to the next slice: `src/history/memory-digest.ts` (below) is the
-bounded execution over it, and nothing here schedules, prompts, notifies or writes memory. See
-`tests/history-digestion.behavior.test.mjs` for the checked-in evidence over a real Durable Harness
-with synthetic entries: eligibility, ordering and scan fairness, closed-episode-only input, reset
-handoff exclusion, message-only evidence (a tool-result-heavy episode contributes no tool text and
-still advances the cursor), one whole episode in one batch when it fits the bounds, character- and
-entry-cap chunking with contiguous frontiers, lossless long-entry continuation,
-ack/no-op/restart behavior, stale and forged batch rejection including tool text presented as
-evidence, and the resumable scan cache.
+`readBatch(ref)` re-derives one chunk a consumer already recorded from its durable identity without
+advancing anything, which makes a resumable consumer independent of cross-conversation scan ordering;
+`read()` still chooses the oldest pending batch. `read()` reports `status: "idle"` with `caughtUp`,
+`examinedChats`, `postponedChats`, `unfinishedChats` and `missingChats`; `caughtUp` is true only when
+every mapped chat was examined to its tail. See `tests/history-digestion.behavior.test.mjs` for the
+checked-in evidence over a real Durable Harness: completed-turn eligibility, open tool rounds,
+untrusted tool labels and previews, reset/system/compaction/thinking exclusion, lossless Unicode
+fragmentation, durable pairing across chunks and reopens, forged/stale/tail-less batch rejection,
+two-chat interleaved IDs and fresh-start gap proof, the legacy cursor mapping at entry and character
+boundaries, the two-entry minimum, the verification bound, and the no-evidence batch.
 
 ## Memory digestion execution
 
@@ -870,7 +803,8 @@ One run, in order:
    `toolAllowlist`, and only for an authenticated mapped chat origin. An empty or narrower allowlist
    refuses the run (at `start`, and again before the model call) instead of widening authority.
 4. The run prepares one task-owned conversation in one commit: the host captures the curated tool
-   subset, pins the origin's model and thinking level, and installs a curation-scope hook. The model
+   subset, pins the explicitly configured background model (`digest.preset` or `digest.model`, never
+   the foreground conversation's selection), and installs a curation-scope hook. The model
    input is the fixed trust framing, the agent-owned prompt, a read-only workspace index (memory topic
    manifest plus workspace skill summaries) and the bounded evidence fragments.
 5. A settled, answered turn is validated before the frontier may move. The check reads this attempt's
@@ -889,11 +823,12 @@ One run, in order:
 
 The model input is bounded by the O1 batch plus fixed prompt limits in `MEMORY_DIGEST_LIMITS`: the
 prompt file is read up to 64 KiB and rendered to 16,000 characters, the derived index to 12,000, and
-the outcome keeps a 2,000-character answer excerpt. One `digest` config block exposes the six
+the outcome keeps a 2,000-character answer excerpt. One `digest` config block names the explicit background model and exposes the
 invocation bounds, with the accepted defaults `entriesPerBatch: 2000`, `charsPerBatch: 200000`,
-`maxToolCalls: 10`, `runTimeoutSeconds: 300`, `maxChangedFiles: 8` and `maxDiffChars: 32000`. The
-character bound is the real size limit and the entry cap is a flood guard, so one ordinary closed
-episode is admitted as one batch and therefore one run. It
+`maxToolCalls: 24`, `maxRequests: 12`, `maxInputTokens: 500000`, `runTimeoutSeconds: 600`,
+`maxChangedFiles: 8` and `maxDiffChars: 32000`. The character bound is the real size limit and the
+entry cap is a flood guard, so one ordinary completed exchange is admitted as one batch and therefore
+one run. It
 neither enables nor schedules digestion — frequency stays with ordinary cron — and an absent block
 keeps the defaults. A started task captures the resolved values in its input; a replay or reopen
 re-derives its batch, deadline, tool budget and write budget from that capture, never from a widened
@@ -931,8 +866,16 @@ per-run ceiling over individual calls. For `write` and `edit` it also reserves c
 changed text before execution. A create charges its whole content; an edit charges both `oldText` and
 `newText`, summed across calls, so repeated edits of one file accumulate instead of being
 undercharged. A call that would exceed `maxChangedFiles` or `maxDiffChars` is blocked before it
-mutates anything. The counters come from the run's committed transcript and in-flight calls, so a
-replay, a parallel round or a reopen cannot reset or overshoot them. A budget refusal is a failed
+mutates anything. The request and token budget is read from the same committed transcript: every assistant entry is one
+actual provider request (retried attempts included, since Durable commits each one), and input spend
+is `usage.input + usage.cacheRead + usage.cacheWrite` — pi-ai reports the cache counters separately,
+so nothing is counted twice. A response that reports no usage is charged the whole remaining input
+bound rather than a fresh allowance. The host cannot tokenize or intercept an in-flight generation
+request, so the token bound is enforced on actual usage before the next tool round is admitted: a tool
+round is the only host-visible way to cause another request, and one request is reserved for the final
+answer first. Crossing a bound is a failed batch with no acknowledgement; the target is withdrawn, so
+no further round is admitted. The counters come from the run's committed transcript and in-flight
+calls, so a replay, a parallel round or a reopen cannot reset or overshoot them. A budget refusal is a failed
 tool result, so the batch is not acknowledged; whatever earlier calls already wrote stays (there is
 still no rollback), and the same batch is offered again. These are conservative text-unit bounds,
 not a git-diff computation.
@@ -946,9 +889,10 @@ error on resume. A terminal task's target keeps no authority after a reopen.
 
 Known limits, stated rather than implied: cross-conversation ordering is still best effort, so a
 resumed task re-derives its own batch instead of relying on which batch a new `read()` would pick; the
-first acknowledgement of an episode still pays O1's bounded, non-interruptible SQLite walk; a batch
-whose frontier lies behind `DIGEST_LIMITS.scanEntriesPerRead` empty reset markers still refuses
-loudly; the scope check is a naming guard, not confinement (a symlink swapped in after the check is
+first acknowledgement of a segment still pays a bounded, non-interruptible SQLite walk; a forged or
+mismapped fresh start more than `DIGEST_LIMITS.scanEntriesPerRead` entries beyond the frontier is
+refused loudly; input-token overshoot is bounded by the one request already in flight rather than
+prevented before dispatch; the scope check is a naming guard, not confinement (a symlink swapped in after the check is
 not defended, exactly like the rest of the workspace tools, though `O_EXCL` itself never follows a
 final symlink); `edit` cannot detect an outside process changing the file between its read and its
 write, so the in-process serialization and exact-text match are the honest boundary; a turn longer

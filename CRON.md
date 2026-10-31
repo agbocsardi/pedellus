@@ -104,8 +104,21 @@ differs is only the run phase:
   digest task is cancelled with the native task controls, not by the job.
 
 An `intent: "digest"` add is refused unless the calling conversation is an
-authenticated mapped chat with `read`, `write` and `edit` currently configured.
+authenticated mapped chat with `read`, `write` and `edit` currently configured
+and `digest.preset` or `digest.model` names an explicit background model.
 No configuration parse and no startup pass creates a digest job.
+
+### Inactive 8-hour schedule shape
+
+The ready-made background cadence is one ordinary job every eight hours, added
+explicitly by the owner (for example through the `cron` tool with
+`{ schedule: { kind: "interval", every: "8h" }, intent: "digest" }`). Nothing in
+this repository creates or enables it: an install ships no such job, and parsing
+configuration or opening the gateway never arms one. Each occurrence starts at
+most one bounded run through the same `start` a manual `/digest` uses, and the
+run's own outcome is visible in `/digest status` rather than in a channel
+message. A digest job delays and never accelerates the cadence of ordinary
+scheduled messages.
 
 ## Native run and recovery
 

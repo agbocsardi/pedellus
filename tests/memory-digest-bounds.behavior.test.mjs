@@ -107,14 +107,17 @@ async function fixtureWorkspace() {
 }
 
 function digestConfig(fixture, overrides = {}) {
+  const { digest, ...rest } = overrides;
   return parseConfig({
     workspace: fixture.workspace,
     dataDir: fixture.dataDir,
     model: MODEL,
     allowedModels: [MODEL],
     toolAllowlist: ['read', 'write', 'edit'],
+    // An explicit background model is required; the foreground conversation's is never inherited.
+    digest: { model: MODEL, ...(digest ?? {}) },
     episodeSummary: { enabled: false },
-    ...overrides,
+    ...rest,
   }, fixture.directory);
 }
 
@@ -208,8 +211,10 @@ test('digest config accepts only its six positive integer bounds and starts noth
   // bound is the real limit and the entry cap only stops floods of tiny or evidence-free entries.
   assert.equal(DIGEST_RUN_LIMITS_DEFAULT.charsPerBatch, 200_000);
   assert.equal(DIGEST_RUN_LIMITS_DEFAULT.entriesPerBatch, 2_000);
-  assert.equal(DIGEST_RUN_LIMITS_DEFAULT.maxToolCalls, 10);
-  assert.equal(DIGEST_RUN_LIMITS_DEFAULT.runTimeoutMs, 300_000);
+  assert.equal(DIGEST_RUN_LIMITS_DEFAULT.maxToolCalls, 24);
+  assert.equal(DIGEST_RUN_LIMITS_DEFAULT.maxRequests, 12);
+  assert.equal(DIGEST_RUN_LIMITS_DEFAULT.maxInputTokens, 500_000);
+  assert.equal(DIGEST_RUN_LIMITS_DEFAULT.runTimeoutMs, 600_000);
   assert.equal(DIGEST_RUN_LIMITS_DEFAULT.maxChangedFiles, 8);
   assert.equal(DIGEST_RUN_LIMITS_DEFAULT.maxDiffChars, 32_000);
   const partial = parseConfig({
@@ -304,8 +309,10 @@ test('configured batch bounds reach the source and are captured in the accepted 
     episodeStartEntryId: configured.episodeStartEntryId,
     episodeEndEntryId: configured.episodeEndEntryId,
     firstEntryId: configured.firstEntryId,
+    firstItemIndex: configured.firstItemIndex,
     firstTextStart: configured.firstTextStart,
     throughEntryId: configured.throughEntryId,
+    throughItemIndex: configured.throughItemIndex,
     throughChars: configured.throughChars,
     complete: configured.complete,
     cursor: configured.cursor,
@@ -320,12 +327,14 @@ test('configured batch bounds reach the source and are captured in the accepted 
   // A new start uses the configured batch and records every accepted bound in the task input.
   const started = await startDigest(store.gateway);
   assert.equal(started.status, 'started');
-  assert.equal(started.evidenceEntries, 2, 'two entries fit the configured entry and character bounds');
+  assert.equal(started.evidenceEntries, 1, 'the first completed turn fits the configured bounds');
   const task = await taskOf(store.gateway.harness, started.taskId);
   assert.deepEqual({ ...task.input.limits }, {
     entriesPerBatch: 2,
     charsPerBatch: 40,
     maxToolCalls: 4,
+    maxRequests: 12,
+    maxInputTokens: 500_000,
     runTimeoutMs: 120_000,
     maxChangedFiles: 1,
     maxDiffChars: 1_000,
@@ -353,7 +362,7 @@ test('exact tool-call and changed-file bounds admit one clean run and stay silen
   assert.equal(task.state.outcome.status, 'completed', JSON.stringify(task.state.outcome));
   assert.equal(task.state.outcome.result.outcome, 'digested');
   assert.match(await readFile(join(fixture.workspace, 'memory/one.md'), 'utf8'), /ADDED-FACT-19/);
-  assert.equal((await cursorDoc(store.gateway.harness, origin.id)).throughEntryId, started.throughEntryId);
+  assert.ok((await cursorDoc(store.gateway.harness, origin.id)).nextEntryId > started.throughEntryId);
   // A successful run notifies nobody: only the two digest requests reached the provider.
   const originHandle = await store.gateway.harness.conversation(origin.id, context);
   const notices = (await originHandle.entries({ order: 'ascending' }, 100, undefined, context)).items
@@ -361,6 +370,11 @@ test('exact tool-call and changed-file bounds admit one clean run and stay silen
   assert.deepEqual(notices, []);
   await originHandle.waitForIdle(context);
   assert.equal(store.calls.length, 3, 'two tool rounds and the answer are the only requests');
+  assert.equal(task.state.outcome.result.model, `${PROVIDER}/${MODEL.modelId}`,
+    'the outcome names the explicit background model');
+  assert.equal(task.state.outcome.result.requests, 3, 'every committed response is counted as a request');
+  assert.ok(task.state.outcome.result.inputTokens > 0, 'actual input tokens are recorded');
+  assert.ok(task.state.outcome.result.changedFiles >= 1, 'reserved writes are recorded');
 });
 
 test('the tool-call cap counts a refused call and fails the batch without a cursor move', { timeout: 30_000 }, async (t) => {
@@ -733,4 +747,32 @@ test('a two-unit character bound accepts one emoji per chunk and still progresse
     }),
     /charsPerBatch at least 2/,
   );
+});
+
+test('the model-request budget refuses the round that would exceed it and spends nothing more', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, (request) => {
+    const text = transcriptText(request.messages);
+    if (!text.includes('read-budget')) return toolRead('SOUL.md', 'read-budget');
+    if (!text.includes('write-budget')) return toolWrite('memory/budget.md', '- fact\n', 'write-budget');
+    return fauxAssistantMessage('This round should never be admitted.');
+  }, { digest: { maxRequests: 1 } });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('A durable fact.'), assistant('Noted.')]);
+
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'failed');
+  assert.match(task.state.outcome.error.message, /tool call failed/);
+  assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined, 'exhausting the request budget writes no cursor');
+  const target = await targetOf(store.gateway.harness, started.taskId);
+  const results = await toolResults(store.gateway.harness, target.id);
+  assert.deepEqual(results.map((result) => result.isError), [true, true], 'every further tool round is refused');
+  assert.match(results[0].text, /model-request budget/);
+  // The host cannot stop an in-flight generation request; it reserves before the only host-visible
+  // way to cause another one (a tool round) and withdraws the target when the turn settles failed.
+  assert.equal(store.calls.length, 3, 'the failed turn admits no request after its final answer');
 });

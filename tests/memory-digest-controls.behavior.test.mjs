@@ -136,14 +136,17 @@ async function fixtureWorkspace() {
 }
 
 function configFor(fixture, overrides = {}) {
+  const { digest, ...rest } = overrides;
   return parseConfig({
     workspace: fixture.workspace,
     dataDir: fixture.dataDir,
     model: MODEL,
     allowedModels: [MODEL],
     toolAllowlist: ['read', 'write', 'edit'],
+    // An explicit background model is required; the foreground conversation's is never inherited.
+    digest: { model: MODEL, ...(digest ?? {}) },
     episodeSummary: { enabled: false },
-    ...overrides,
+    ...rest,
   }, fixture.directory);
 }
 
@@ -321,7 +324,7 @@ test('the local CLI /digest starts one batch and reports bounded status', { time
     },
   }), WAIT_MS, 'the CLI /digest commands');
   const text = chunks.join('');
-  assert.match(text, /started for one bounded closed-episode batch/);
+  assert.match(text, /started for one bounded completed-exchange batch/);
   assert.match(text, /shared workspace/);
   assert.match(text, /Newest run: \d+ \((digested|running)\)/);
   assert.match(text, /Status is read-only/);
@@ -349,13 +352,13 @@ test('an idle scan that did not reach every chat never claims that everything is
     idle: { caughtUp: false, examinedChats: 2, postponedChats: 1, unfinishedChats: 1, missingChats: 1 },
   });
   assert.match(pending, /did not reach the tail of every mapped chat/);
-  assert.match(pending, /closed history may remain pending/);
-  assert.doesNotMatch(pending, /No closed episode is pending/);
+  assert.match(pending, /completed history may remain pending/);
+  assert.doesNotMatch(pending, /No completed exchange is pending/);
   const complete = renderMemoryDigestStart({
     status: 'idle',
     idle: { caughtUp: true, examinedChats: 3, postponedChats: 0, unfinishedChats: 0, missingChats: 0 },
   });
-  assert.match(complete, /No closed episode is pending/);
+  assert.match(complete, /No completed exchange is pending/);
   assert.match(complete, /No new digest run was started/);
   assert.doesNotMatch(complete, /no model was called/);
 });

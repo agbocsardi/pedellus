@@ -29,7 +29,7 @@ const [
   },
   { DigestCursorDoc, createDigestSource },
   { ConfigToolCaptureDoc },
-  { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
+  { createModels, fauxAssistantMessage, fauxProvider, fauxThinking, fauxToolCall },
   { BACKGROUND_CONTEXT },
   { AgentDoc },
 ] = await Promise.all([
@@ -93,6 +93,14 @@ function assistant(text) {
   return { kind: 'pi.assistant', model: [fauxAssistantMessage(text)] };
 }
 
+/** A completed turn with no text evidence: an image-only owner entry and a thinking-only answer. */
+function evidenceFreeTurn() {
+  return {
+    user: { kind: 'pi.user', model: [{ role: 'user', content: [{ type: 'image', data: 'AAAA', mimeType: 'image/png' }], timestamp: 1_000 }] },
+    assistant: { kind: 'pi.assistant', model: [fauxAssistantMessage([fauxThinking('THINKING-ONLY-5510')])] },
+  };
+}
+
 function system(text = '') {
   return { kind: 'pi.system', model: [{ role: 'system', content: text, timestamp: 1_000 }] };
 }
@@ -125,15 +133,18 @@ async function fixtureWorkspace() {
 }
 
 function digestConfig(fixture, overrides = {}) {
+  const { digest, ...rest } = overrides;
   return parseConfig({
     workspace: fixture.workspace,
     dataDir: fixture.dataDir,
     model: MODEL,
     allowedModels: [MODEL],
     toolAllowlist: ['read', 'write', 'edit'],
+    // An explicit background model is required; the foreground conversation's is never inherited.
+    digest: { model: MODEL, ...(digest ?? {}) },
     // Episode summaries share the model catalog; keep these checks to the digest's own requests.
     episodeSummary: { enabled: false },
-    ...overrides,
+    ...rest,
   }, fixture.directory);
 }
 
@@ -287,8 +298,10 @@ test('a recorded batch ref re-derives only its own closed chunk and advances not
     episodeStartEntryId: batch.episodeStartEntryId,
     episodeEndEntryId: batch.episodeEndEntryId,
     firstEntryId: batch.firstEntryId,
+    firstItemIndex: batch.firstItemIndex,
     firstTextStart: batch.firstTextStart,
     throughEntryId: batch.throughEntryId,
+    throughItemIndex: batch.throughItemIndex,
     throughChars: batch.throughChars,
     complete: batch.complete,
     cursor: batch.cursor,
@@ -301,7 +314,7 @@ test('a recorded batch ref re-derives only its own closed chunk and advances not
     /inconsistent|no longer matches/,
   );
   await assert.rejects(source.readBatch({ ...ref, sessionKey: 'cli:other' }, context), /mapped chat/);
-  await assert.rejects(source.readBatch({ ...ref, firstTextStart: 1 }, context), /no longer matches|start its episode/);
+  await assert.rejects(source.readBatch({ ...ref, firstTextStart: 1 }, context), /no longer matches|fresh segment/);
   assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined, 'reading a ref moves no cursor');
   assert.equal(store.calls.length, 0);
 });
@@ -365,7 +378,7 @@ test('one closed episode becomes a topic-memory fact and only a settled turn adv
     assert.ok(target !== undefined, 'the run owns one target conversation');
     const inputs = await digestInputs(store.gateway.harness, target.id);
     assert.equal(inputs.length, 1, 'one bounded model input');
-    assert.match(messageText(inputs[0].model?.[0]), /entry \d+ \| owner message \| durable kind pi\.user/);
+    assert.match(messageText(inputs[0].model?.[0]), /entry \d+ \| step 0 \| owner message \| durable kind pi\.user/);
 
     // The fact is in plain workspace Markdown, and the seeded prompt is an ordinary file.
     assert.match(await readFile(join(fixture.workspace, 'memory/infra/host.md'), 'utf8'), new RegExp(FACT));
@@ -373,9 +386,10 @@ test('one closed episode becomes a topic-memory fact and only a settled turn adv
 
     // The frontier advanced to the committed batch end and the chunk state was cleared.
     const cursor = await cursorDoc(store.gateway.harness, origin.id);
-    assert.equal(cursor.throughEntryId, started.throughEntryId);
+    assert.ok(cursor.nextEntryId > started.throughEntryId, 'the frontier advanced past the batch end');
     assert.equal(cursor.episodeStartEntryId, null);
     assert.equal(cursor.episodeEndEntryId, null);
+    assert.equal(cursor.throughEntryId, null, 'the legacy fields are cleared once upgraded');
 
     // No user/channel message and no cron delivery were produced, and a successful run notifies
     // nobody: no internal result event, so no extra origin-agent model turn.
@@ -417,7 +431,8 @@ test('a chunk with no evidence advances the cursor without a provider call', { t
   t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
   {
     const origin = await store.gateway.conversationFor(SESSION, context);
-    await closedEpisode(store.gateway.harness, origin.id, [system('boot')]);
+    const silent = evidenceFreeTurn();
+    await closedEpisode(store.gateway.harness, origin.id, [silent.user, silent.assistant]);
     const started = await startDigest(store.gateway);
     assert.equal(started.status, 'started');
     assert.equal(started.evidenceEntries, 0);
@@ -434,7 +449,7 @@ test('a chunk with no evidence advances the cursor without a provider call', { t
     await originHandle.waitForIdle(context);
     assert.equal(store.calls.length, 0, 'a successful no-op run makes no model request');
     const cursor = await cursorDoc(store.gateway.harness, origin.id);
-    assert.equal(cursor.throughEntryId, started.throughEntryId);
+    assert.ok(cursor.nextEntryId > started.throughEntryId, 'the no-op batch advanced the cursor');
   }
 });
 
@@ -522,7 +537,7 @@ test('a partial write survives a failed turn, and the replay reads and compares 
     assert.match(completed.state.outcome.result.answer, /already recorded/);
     const body = await readFile(join(fixture.workspace, 'memory/topics/host.md'), 'utf8');
     assert.equal(body.match(new RegExp(FACT, 'g')).length, 1, 'the replay did not duplicate the fact');
-    assert.equal((await cursorDoc(store.gateway.harness, origin.id)).throughEntryId, second.throughEntryId);
+    assert.ok((await cursorDoc(store.gateway.harness, origin.id)).nextEntryId > second.throughEntryId);
     const target = await targetOf(store.gateway.harness, second.taskId);
     const results = await toolResults(store.gateway.harness, target.id);
     assert.deepEqual(results.map((result) => [result.name, result.isError]), [['read', false]],
@@ -604,7 +619,7 @@ test('a refused, create-only or stale call fails the batch, and only a clean tur
     assert.match(body, /OWNER-ORIGINAL/);
     assert.match(body, new RegExp(FACT));
     assert.equal(body.match(new RegExp(FACT, 'g')).length, 1);
-    assert.equal((await cursorDoc(store.gateway.harness, origin.id)).throughEntryId, fourth.throughEntryId);
+    assert.ok((await cursorDoc(store.gateway.harness, origin.id)).nextEntryId > fourth.throughEntryId);
     const target = await targetOf(store.gateway.harness, fourth.taskId);
     const results = await toolResults(store.gateway.harness, target.id);
     assert.deepEqual(results.map((result) => [result.name, result.isError]), [['edit', false]],
@@ -754,7 +769,7 @@ test('a non-empty no-op report advances the cursor and never clobbers the owner 
     assert.equal(task.state.outcome.result.outcome, 'digested');
     assert.match(task.state.outcome.result.answer, /No durable fact in this batch/,
       'the completed turn kept its explicit non-empty no-op report');
-    assert.equal((await cursorDoc(store.gateway.harness, origin.id)).throughEntryId, started.throughEntryId,
+    assert.ok((await cursorDoc(store.gateway.harness, origin.id)).nextEntryId > started.throughEntryId,
       'a settled turn that saved nothing still counts as processed');
     assert.equal(await readFile(join(fixture.workspace, MEMORY_DIGEST_PROMPT_FILE), 'utf8'), custom,
       'the owner prompt is byte-for-byte untouched');
@@ -766,7 +781,7 @@ test('a reopen resumes the interrupted run with its pinned model and curation sc
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
   const entered = deferred();
   const store = await openStore(fixture, async (request, options, model) => {
-    assert.equal(model.id, ALT_MODEL.modelId, 'the digest run uses the origin model selected at start');
+    assert.equal(model.id, ALT_MODEL.modelId, 'the digest run uses the configured background model');
     const text = transcriptText(request.messages);
     if (!text.includes('memory/topics/reopen.md')) {
       return toolWrite('memory/topics/reopen.md', `- ${FACT_LINE}\n`, 'write-before-close');
@@ -778,7 +793,7 @@ test('a reopen resumes the interrupted run with its pinned model and curation sc
       signal?.addEventListener('abort', resolve, { once: true });
     });
     return fauxAssistantMessage('answer after reopen');
-  }, { allowedModels: [MODEL, ALT_MODEL] });
+  }, { allowedModels: [MODEL, ALT_MODEL], digest: { model: ALT_MODEL } });
   let reopened;
   t.after(async () => {
     await reopened?.close(context).catch(() => undefined);
@@ -786,9 +801,7 @@ test('a reopen resumes the interrupted run with its pinned model and curation sc
   });
   {
     const origin = await store.gateway.conversationFor(SESSION, context);
-    // A temporary per-chat model switch must be pinned into the run and survive the reopen,
-    // instead of silently reverting to the configured default in the middle of the batch.
-    await store.gateway.selectModel(SESSION, ALT_MODEL, context);
+    // The explicitly configured background model is pinned into the run and survives the reopen.
     await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
     const started = await startDigest(store.gateway);
     assert.equal(started.status, 'started');
@@ -812,14 +825,14 @@ test('a reopen resumes the interrupted run with its pinned model and curation sc
         return fauxAssistantMessage([fauxToolCall('read', { path: 'memory/topics/reopen.md' }, { id: 'read-after-reopen' })], { stopReason: 'toolUse' });
       }
       return fauxAssistantMessage('Resumed after reopen; the fact was already recorded and was not duplicated.');
-    }, { allowedModels: [MODEL, ALT_MODEL] });
+    }, { allowedModels: [MODEL, ALT_MODEL], digest: { model: ALT_MODEL } });
     reopened = reopenedStore.gateway;
     const task = await settleTask(reopened.harness, started.taskId);
     assert.equal(task.state.outcome.status, 'completed', JSON.stringify(task.state.outcome));
     assert.equal(task.state.outcome.result.outcome, 'digested');
     assert.equal(task.state.outcome.result.consumed, true);
     const after = await cursorDoc(reopened.harness, origin.id);
-    assert.equal(after.throughEntryId, started.throughEntryId);
+    assert.ok(after.nextEntryId > started.throughEntryId);
     const body = await readFile(join(fixture.workspace, 'memory/topics/reopen.md'), 'utf8');
     assert.equal(body.match(new RegExp(FACT, 'g')).length, 1, 'the reopened turn could not duplicate the fact');
     const results = await toolResults(reopened.harness, target.id);

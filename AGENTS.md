@@ -99,21 +99,39 @@ npm start -- agent --config config.json     # attach a terminal
   ordinary cron intent (`intent: "digest"`); opening the gateway and parsing
   configuration start nothing. `/digest` and `/digest status` are host commands
   in the local CLI and for the authenticated Telegram owner, not model tools.
-  One `gateway.memoryDigest.start` consumes one bounded closed-episode batch in
+  One `gateway.memoryDigest.start` consumes one bounded completed-turn batch in
   a task-owned conversation whose only tools are the origin's captured
   `read`/`write`/`edit`, confined to `SOUL.md`, `USER.md`, `memory/**/*.md` and
-  `skills/<name>/SKILL.md`. The evidence is owner and assistant message text
-  only: tool calls and tool output are never loaded, though those entries are
-  still consumed as part of the episode range. One closed episode whose message
-  evidence fits the batch bounds is one batch and one acknowledgement; a larger
-  episode is independent ordered chunks, each acknowledged on its own, with no
-  carry-over summary. Digest `write` is a guarded atomic exclusive create
+  `skills/<name>/SKILL.md`. Eligibility is a completed-turn high-water over open
+  and reset chats: a reset that follows an owner turn, the next owner/scheduled
+  input, or a terminal assistant entry whose calls are all paired closes a
+  segment, and an in-progress turn is never offered. The evidence is owner and
+  assistant message text plus paired assistant tool calls and results labeled as
+  untrusted machine output; a long result is a bounded head-tail preview with an
+  omission marker and the original entry reference, never a claim that the
+  omitted middle was read. One completed segment whose evidence fits the batch
+  bounds is one batch and one acknowledgement; a larger segment is independent
+  ordered chunks, each acknowledged on its own, with no carry-over summary. The
+  one durable cursor carries the next step position and the open tool-call ids, so
+  pairing survives a chunk, a reopen and a restart; a cursor written by the earlier
+  closed-episode reader is mapped at its exact acknowledged offset and upgraded in
+  place, never replayed and never migrated into a second reader. Digest `write` is a guarded atomic exclusive create
   (`O_CREAT | O_EXCL`), never a precheck plus truncation; `edit` keeps exact-text
   in-process protection only, and an uncooperative outside editor between read
   and write is not detected. The cursor advances only after a settled turn is
   validated from its own committed input through its own answer: any failed
   `pi.tool-result` fails the batch even if the model answers later, and a
-  non-empty report is required. The editable workspace policy is `DIGEST.md`
+  non-empty report is required. A run uses an explicitly configured background
+  model (`digest.preset` or `digest.model`) and never inherits the foreground
+  model or thinking level; absent one, a start is refused. Its captured bounds
+  (200,000 evidence characters, 2,000 entries, 500,000 input tokens including
+  cached input, 12 provider requests including retries, 24 tool calls, 600,000 ms,
+  8 files and 32,000 inserted-plus-removed characters) are read from the committed
+  target transcript, so they survive a retry and a reopen, and crossing one fails
+  the batch without acknowledging it. A host cannot tokenize or intercept an
+  in-flight provider request, so the token bound is enforced on actual reported
+  usage before the next tool round is admitted; overshoot is bounded by the one
+  request already in flight. The editable workspace policy is `DIGEST.md`
   (seeded only when absent) and it can never grant authority. Only a failed or
   cancelled run admits one bounded internal issue report to its origin
   conversation (`nanobot.memory-digest-result`, deduplicated by request ID); a

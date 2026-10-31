@@ -128,6 +128,8 @@ async function syntheticGateway(label, script, overrides = {}) {
     model: MODEL,
     allowedModels: [MODEL],
     toolAllowlist: ['read', 'write', 'edit'],
+    // Digestion never inherits the foreground model; name one explicitly.
+    digest: { model: MODEL },
     episodeSummary: { enabled: false },
     ...overrides,
   }, fixture.directory);

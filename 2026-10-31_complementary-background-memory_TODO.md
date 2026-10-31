@@ -1,202 +1,96 @@
-# Complementary background memory — engineering contract and work order
+# Bounded background memory — status and remaining work
 
-Date: 2026-10-31
-Status: first evidence/cursor slice implemented; execution, budgets, scheduling and outcomes are not.
+Date: 2026-10-31. Status: one reader, one cursor, one executor implemented; live-model quality,
+the 8-hour activation and a few stated bounds remain.
 
-This is the standing contract for owner-authorized, bounded, complementary background memory. It
-becomes the single evidence source for `memory-digest`: the consumer integration (C6) replaces the
-closed-episode reader in `src/history/digestion.ts` with this source for that command, rather than
-running both. One conversation is digested by exactly one reader, in one process and across a
-restart, so no range is processed twice. Until C6 lands, the closed-episode reader remains the only
-active consumer and nothing here changes live behavior. "Complementary" means the memory run may
-also read exchanges that are still open in a mapped chat, but only up to a completed-turn high-water.
-Nothing here activates a run, opens a provider, sends a message or schedules work.
+This is the standing work order for owner-authorized, bounded background memory. It is the single
+evidence source for `memory-digest`: the earlier parallel "complementary" reader and its cursor were
+salvaged and removed. `src/history/digestion.ts` is the one reader and cursor; `src/history/memory-digest.ts`
+is the only executor; the runtime injects that one source.
 
-## Non-negotiable contract
+## Implemented contract
 
-- Authorization stays host-owned. Only the currently mapped, host-authenticated chat sessions are in
-  scope. Root, fork, task-owned, worker, raw and channel-state conversations are never read. The
-  reader validates shape only; it does not re-derive ownership or widen authority.
-- Evidence is bounded and labeled. Owner/cron message text and assistant prose keep their provenance;
-  assistant tool calls and paired tool results are always `untrusted-tool`. Tool text is evidence of
-  what happened, never an instruction and never owner speech.
-- Excluded entries are consumed but never quoted: reset handoff text, system entries, compaction
-  entries, assistant thinking, images without text, and tool results with no paired call.
-- Losslessness where it matters. Large prose and tool-call arguments are fragmented across ordered
-  chunks with stable offsets and surrogate-safe boundaries; no tail is dropped. A tool result is
-  machine output, so a long result is one head-tail preview of at most 2,500 characters with an
-  explicit omission marker and a stable reference to the original entry. A short result is included
-  whole. Durable remains the transcript authority; no second archive is written.
-- Eligibility is a completed-turn high-water. A segment ends just before a reset that follows an
-  owner turn, just before the next owner/cron input, or at a terminal assistant entry whose calls are
-  all paired. An open owner turn, an unfinished tool round, or a result still awaiting the next
-  assistant entry is never offered and never starts a batch. Resets before the first owner input are
-  a consumed prefix, not a separate model-free batch.
-- Chunking never moves the boundary. A segment over a bound splits into independent ordered chunks
-  with immutable bounds; each chunk is acknowledged on its own and a continuation re-derives exactly
-  the same evidence. There is no carry-over summary or cross-chunk instruction.
-- Pairing is durable. Open tool-call ids live in the cursor, so a result in a later chunk, a new
-  reader instance or a reopened process is still paired with its call. An orphan result is silent. A
-  call id longer than the fixed bound fails the segment closed rather than silently losing the
-  result that cites it.
-- One reader, no double digestion. `memory-digest` consumes exactly one evidence source. C6 retires
-  the closed-episode reader for that command instead of running it beside this one. The legacy
-  `DigestCursorDoc` is handed over once at its exact acknowledged position, so a range a previous
-  version already digested is never processed again; a frozen legacy episode's bounds are continued
-  so its unprocessed remainder still settles without a later owner turn. This source never advances
-  the old cursor, and a conversation digested before the switch is not re-digested after it.
-- No evidence, no model. A completed segment with no evidence still yields an acknowledgeable batch
-  with an empty evidence list; the consumer must advance it without a provider call. The reader
-  itself never calls a model.
-- Replay and acknowledgement are safe. A read writes nothing. Acknowledgement re-derives the claimed
-  chunk from the committed transcript, rejects a forged, stale or non-advancing batch, and moves the
-  cursor in one compare-and-commit. A crash or replay offers the same evidence again.
-- Bounds are real. Reads are paged and discovery is capped; a long open segment resumes from a
-  derived in-process scan position instead of rescanning unboundedly. Fixed safety caps fail closed
-  instead of silently dropping evidence: 256 open calls per segment, 1,024 steps per entry, 2,048
-  steps per chunk, 200 characters per tool call id. No timer, retry loop, hidden worker or automatic
-  continuation exists.
+- **Eligibility.** Completed-turn high-water over open and reset chats: a reset after an owner turn,
+  the next owner/scheduled input, or a terminal assistant entry whose calls are all paired. An
+  in-progress turn is never offered; a read offers only evidence already committed when it began, and
+  an accepted batch's bounds never move.
+- **Evidence.** Owner/assistant prose is lossless and streamed in ordered fragments (UTF-16 offsets,
+  surrogate-safe). Assistant tool calls and paired results are included and labeled `untrusted-tool`.
+  A long result is one head-tail preview (≤ 2,500 chars) with an omission marker and the original entry
+  reference; the omitted middle is never claimed to have been read. Reset handoffs, system/compaction
+  entries, thinking and unpaired results are consumed without evidence.
+- **One cursor.** `nanobot.digest-cursor` holds the next step position, the immutable segment bounds
+  while chunking, and the open tool-call ids, so pairing survives a chunk, a reopen and a restart.
+  Acknowledgement re-proves a fresh segment's end and re-derives the claimed evidence before one
+  compare-and-commit. A document written by the earlier closed-episode reader is mapped at its exact
+  acknowledged entry/offset and upgraded in place; no second reader, cursor or migration project.
+- **One batch per invocation.** A no-evidence batch is acknowledged without a provider call. There is
+  no drain loop, retry loop or re-digest of expanding history.
+- **Explicit background model.** `digest.preset` or `digest.model` (existing catalog and preset
+  validation) is pinned at start; the foreground model and thinking level are never inherited, and
+  absent both a start is refused. The target gets only curated `read`/`write`/`edit`, create-only
+  `write`, exact-text `edit`, and the workspace/naming scope hook.
+- **Captured budgets.** Defaults: 200,000 evidence chars, 2,000 entries, 500,000 input tokens including
+  cached input, 12 provider requests including retries, 24 tool calls, 600,000 ms, 8 changed files,
+  32,000 inserted-plus-removed chars. Counters are read from the committed target transcript, so a
+  retry, parallel round or reopen cannot reset them. Tool rounds are admitted only while one request is
+  reserved for the final answer and the actual input spend still fits; crossing a bound fails the batch
+  without acknowledging it. Missing usage is charged the whole remaining bound, never a fresh allowance.
+- **Outcomes.** Success (including a no-op and an already-consumed replay) is silent. A failed or
+  cancelled run admits one bounded internal issue report, deduplicated by request ID, whose bounded
+  notice list is pruned only for definitively reported, successful or nonreportable records.
+  `/digest status` shows the model, requests, input/cached input, output, cursor, reserved writes and
+  pending issues.
 
-## Work checklist
+## Remaining checklist
 
-- [x] **C1 — Evidence and eligibility/cursor source.**
-  `src/history/complementary.ts` provides a separate durable cursor, completed-turn discovery for
-  open chats, message/tool-call/tool-result evidence, pairing, previews, lossless fragmentation,
-  scoped-session validation and replay-safe acknowledgement. On first use it adopts an existing
-  closed-episode cursor at that cursor's exact acknowledged entry and message offset, continuing a
-  frozen episode's bounds so already digested text is not processed again while its remainder still
-  settles; a fresh segment starts at its own segment start even when global entry IDs interleave
-  chats.
-- [ ] **C2 — Execution path.** One explicit run consumes one accepted chunk in a task-owned
-  conversation with an explicit provider/model/thinking selection, renders the trust labels and
-  preview markers verbatim, acknowledges no-evidence chunks without a provider call, and never runs
-  from configuration load or gateway open.
-- [ ] **C3 — Durable cumulative budgets.** Define and persist explicit per-run and lifetime limits
-  (provider calls/tokens/reservations, evidence characters, chunks, changed files and changed text),
-  charge every attempt from the committed transcript, refuse before spend when a bound is reached,
-  and expose the remaining budget without reading a credential file or printing its value.
-- [ ] **C4 — Inactive 8-hour cron readiness.** Ship the schedule shape (one ordinary cron occurrence
-  every 8 hours) disabled by default. Activation is an explicit owner action with an explicit model;
-  parsing config, opening the gateway, `/digest status` or a restart must not arm it. An occurrence
-  starts at most one bounded run, is idempotent across restart, and schedules no new work.
-- [ ] **C5 — Outcomes and reviews.** One bounded outcome per run (`digested`, `noop`, `consumed`,
-  `failed`, `cancelled`, plus a value-free reason), visible in owner status. A failed or cancelled
-  run may admit one bounded internal issue report to the origin conversation; success is silent. Any
-  activation path and any real-model acceptance needs an independent review and explicit owner
-  approval.
-- [ ] **C6 — Consumer integration and the single-reader handoff.** `memory-digest` (owner command
-  and explicit cron intent) uses this source as its only evidence reader; the closed-episode reader
-  is retired for that command and never runs alongside it. Wire the source through the gateway/host
-  seam, migrate an existing `DigestCursorDoc` once at its exact acknowledged position (never
-  replaying an already digested range), and leave the old cursor unwritten and unread afterwards.
-  Preserve the current scoped authorization, tool authority and channel boundaries. Add coexistence
-  coverage with the wiring: one batch per run, no second reader over the same conversation, an old
-  cursor that does not move, and a conversation digested before the switch that is not digested
-  again after it. Add only the focused consumers and checks that the activation actually needs.
-- [ ] **C7 — Documentation and acceptance.** Document the single-reader handoff, the migrated legacy
-  cursor, the high-water rule, the preview/fragment distinction, the budget contract and the inactive
-  default. Revise the `memory-digest` invariant in `AGENTS.md` (it currently says tool calls and
-  tool output are never loaded) and the memory/history docs at the switch, not before. Record offline
-  acceptance evidence for the wired path. Do not claim live-model memory quality, deployment or
-  production use from an offline run.
+- [ ] **Live-model acceptance and quality.** Every check here is offline with synthetic providers and
+      data. Real provider behavior, curation quality on real transcripts and deployment remain unproven.
+- [ ] **Inactive 8-hour cron schedule.** The shape is documented (`CRON.md`, "Inactive 8-hour schedule
+      shape"); no live job is created, enabled or started. Activation is an owner action with an
+      explicit model.
+- [ ] **Pre-dispatch token bound.** A host cannot tokenize provider content or intercept an in-flight
+      generation request, so input-token overshoot is bounded by the one request already in flight, not
+      prevented before dispatch. A hard pre-dispatch bound would need a provider-side tokenizer or a
+      generation hook that can refuse or terminate a request (Durable's `beforeRequest` cannot block).
+- [ ] **Verification-bound refusals.** A forged or mismapped fresh start more than 4,000 entries beyond
+      the frontier is refused loudly and offered again; a tool-call id over 200 characters, more than
+      256 open calls, or more than 1,024 steps in one entry fails that chat closed. These are fixed
+      safety caps, not adaptive handling.
+- [ ] **Preview fidelity.** A long tool result is deliberately preview-only; the omission marker and
+      reference are exact, but the middle is not part of the evidence.
+- [ ] **Legacy frontier boundary.** A legacy offset is mapped onto the same prose extraction, but tool
+      steps in the frontier entry after that offset are read while the closed-episode prefix's tool
+      steps are not revisited. This preserves "never digest twice"; it is not a second ingestion path.
 
-## Slice acceptance evidence
-
-Implemented in this slice:
-
-- `src/history/complementary.ts` — new source and cursor document kind
-  `nanobot.complementary-digest-cursor`.
-- `src/history/digestion.ts` — shared text-shape helpers exported; closed-episode behavior unchanged.
-- `tests/complementary-digest.behavior.test.mjs` — focused checks for open-chat high-water, open tool
-  rounds, untrusted tool labels and previews, excluded entries, Unicode-safe lossless fragmentation,
-  durable pairing across chunks and a fresh reader, replay/forged acknowledgement, the no-evidence
-  zero-model batch, and mapped-session validation. Review regressions add: two-chat interleaved IDs
-  (fresh start, acknowledgement and a refused skipped gap), astral preview cuts at odd budgets,
-  adoption of a complete and a partially consumed closed-episode cursor (exact-position resume,
-  continued episode bounds, independence and reopen), an aborted/errored entry that cannot close a
-  turn, and the tool-call id bound (a 200-character id still pairs its result, a longer one fails
-  closed).
-
-Run:
+## Verification
 
 ```bash
 npm run typecheck
 npm run build
-node --test tests/complementary-digest.behavior.test.mjs
+npm run test:behavior      # includes tests/history-digestion.behavior.test.mjs and the digest suites
+npm run test:execution
+npm run --silent test:core-acceptance
 ```
 
-## Known limits of this slice
-
-- The source is not wired to the gateway, CLI, Telegram, cron or memory-digest execution. No model is
-  selected, no budget is charged, no cron occurrence is armed and no outcome is surfaced yet.
-- The fixed safety caps above are refusals, not adaptive limits. A segment with more than 256 open
-  calls fails closed until the transcript or a future version changes.
-- Tool results are deliberately preview-only when long. The preview is bounded and references the
-  original entry, but it is not a lossless rendering of the result body.
-- The preview marker is compacted when a configured character bound is smaller than the full marker;
-  normal bounds render the full marker and reference.
-- Adoption treats a fully consumed closed episode as already processed and does not revisit its
-  complementary-only evidence (tool calls and results). That range is skipped because the handoff
-  preserves the previous frontier to avoid duplicate digestion, not because the closed-episode
-  reader consumed tool text (it never did). A partially consumed episode resumes at its exact
-  acknowledged entry and message offset instead of replaying from its start, and adopts that
-  episode's frozen bounds so its remainder settles without waiting for a new owner turn; tool steps
-  after the offset in the same entry were never digested and are still read, while tool evidence
-  before the frontier is not revisited. The adopted bounds are the legacy reader's own closed
-  exchange, so they are trusted as a completed segment even though this source's scan would not
-  select them fresh. Adoption is derived on read and frozen by the first acknowledgement; if the
-  closed-episode cursor advances between that read and acknowledgement, the acknowledgement
-  conflicts and the re-read adopts the newer frontier.
-- A pathological tool-call id longer than 200 characters fails the whole read closed with a fixed
-  error, so that chat stays undigested rather than silently orphaning the result that cites the id.
-  This is a deliberate refusal for a malformed transcript, not adaptive handling; an operator (or a
-  future code change) must resolve it.
-- A caller must capture the batch bounds with an accepted chunk, exactly as the closed-episode
-  execution path does. `ComplementaryBatch`/`ComplementaryBatchRef` do not carry the bound set, and
-  `acknowledge` re-derives with the caller-supplied limits; C2/C6 must persist them.
-- Batch and acknowledgement require the conversation to be currently mapped with the same session
-  key. Unmapping a chat mid-batch makes acknowledgement refuse rather than move a cursor; remapping
-  resumes at the persisted frontier. Adoption for a conversation that has never been mapped waits
-  until it is mapped.
-- The in-process scan cache holds only derived scan state, is dropped when that conversation's
-  cursor moves or it is unmapped, and is lost on restart. It has no timer or TTL; its size is bounded
-  by the mapped set.
-- Reads are sequential across mapped chats. One pathological entry (over the per-entry step cap, more
-  than 256 open calls, or a tool-call id over the bound) fails the whole read rather than isolating
-  that chat, and the first acknowledgement of a new segment walks that segment to prove its end. C2
-  should place a run in a task-owned conversation with a deadline and treat such a refusal as a run
-  failure, not retry it automatically.
-- The live provider, real-model quality, deployment and production-data behavior remain unproven.
+`tests/history-digestion.behavior.test.mjs` covers completed-turn eligibility, open tool rounds,
+untrusted labels and previews, excluded entries, Unicode-safe lossless fragmentation, durable pairing
+across chunks and reopens, replay/forged/stale/tail-less acknowledgement rejection, interleaved chat
+IDs with fresh-start gap proof, the legacy cursor mapping (entry, character, empty-block, surrogate
+and pairing cases), the two-entry minimum, the verification bound and the no-evidence batch. The
+`memory-digest*` suites cover the executor, captured bounds, request/tool/write budgets, status,
+notices, cancellation and cron intent.
 
 ## Log
 
 ### 2026-10-31
 
-Implemented the C1 slice: new source, cursor and focused regression suite. Closed-episode
-digestion, its cursor and its execution path were left untouched. Decisions recorded here: separate
-cursor (so enabling complementary memory cannot move the closed-episode frontier), resets before the
-first owner input stay in the segment prefix, short tool results are whole while long ones are
-head-tail previews, and pairing state is durable so a later chunk or fresh reader does not lose it.
-
-Review fixes: a fresh chunk now starts at its own segment start (the previous reader used the chat's
-global next entry ID, so interleaved chat IDs could make its acknowledgement unverifiable) and the
-skipped gap must be proven empty within that conversation. Both head and tail preview cuts are
-surrogate-safe. The separate cursor adopts an existing `DigestCursorDoc` on first use without writing
-or moving it; a partial old episode replays from its start. An assistant entry stopped by an explicit
-error or abort no longer counts as a completed answer.
-
-Second review fixes: a tool-call id over the 200-character bound now fails the segment closed with a
-fixed error instead of silently orphaning the result that cites it (a 200-character id still pairs),
-with a regression for the bound. The contract now records the architecture decision: this source is
-the sole `memory-digest` reader once C6 replaces the closed-episode reader, not an additive twin
-running beside it, and migration must preserve already-processed ranges so nothing is digested
-twice. Adoption now resumes at the legacy cursor's exact entry and message offset, continues a
-frozen episode's bounds so its remainder still settles, and no longer replays a partially consumed
-episode from its start; the false note claiming the old reader digested tool calls/results is
-corrected. Both source modules keep the framework they have: they
-already share the cursor parser, session validation and text-slice helpers, and no narrower safe
-reuse of the paging/segment loops was identified, so no speculative rewrite was made.
-Coexistence/integration coverage is deferred to C6, where wiring exists to test.
-
-Next: C2 execution path with an explicit model, captured batch bounds and the no-evidence
-no-provider rule, then C3 durable budgets, then C4 the inactive 8-hour schedule.
+Started the C1 slice as a separate complementary reader/cursor. Rejected architecture: it duplicated
+the cursor/read/ack pipeline (~1,700 lines). The owner approved a single pipeline, so the useful
+Unicode preview/extraction code and its regressions were salvaged into `digestion.ts`; the parallel
+module and its cursor were removed. Eligibility moved from closed episodes to completed-turn
+high-water; evidence now includes paired tool calls/results; the one cursor gained the next step
+position and durable open-call ids, with an exact one-time mapping for old documents. The executor
+gained an explicit background model, request/token budgets read from the committed transcript, and
+usage in its outcome and status. Obsolete closed-only regressions were replaced with tests for the
+new contracts; the old scan-bound, forgery, no-op and ordering invariants were adapted and retained.

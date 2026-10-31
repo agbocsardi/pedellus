@@ -126,18 +126,30 @@ export interface CodeModeConfig {
  */
 export interface DigestConfig {
   /**
-   * Message entries examined by one closed-episode chunk. The minimum is 2: a one-entry chunk cannot
+   * Explicit curation model for a background digestion run. It never inherits the foreground
+   * conversation's model or thinking level; absent both this and `preset`, starting a run is
+   * refused. Mutually exclusive with `preset`.
+   */
+  readonly model?: ModelReference;
+  /** Explicit named preset for a background digestion run; its thinking level applies as configured. */
+  readonly preset?: string;
+  /**
+   * Message and tool entries examined by one completed-exchange chunk. The minimum is 2: a one-entry chunk cannot
    * always advance past an episode's opening reset marker, so it would refuse its own
    * acknowledgement and wedge the cursor.
    */
   readonly entriesPerBatch?: number;
   /**
-   * Extracted evidence characters in one closed-episode chunk, in UTF-16 code units.
+   * Extracted evidence characters in one completed-exchange chunk, in UTF-16 code units.
    * The minimum is 2 so one surrogate pair always fits.
    */
   readonly charsPerBatch?: number;
   /** Individual tool calls allowed in one run, failed and refused calls included. */
   readonly maxToolCalls?: number;
+  /** Committed provider responses allowed in one run, retried attempts included. */
+  readonly maxRequests?: number;
+  /** Cumulative input tokens allowed in one run, actual usage including cached input. */
+  readonly maxInputTokens?: number;
   /** Whole-run deadline in seconds, from the run's preparation to its settled turn. */
   readonly runTimeoutSeconds?: number;
   /** Distinct workspace files one run may successfully change. */
@@ -643,17 +655,27 @@ const DIGEST_CONFIG_FIELDS = [
   "entriesPerBatch",
   "charsPerBatch",
   "maxToolCalls",
+  "maxRequests",
+  "maxInputTokens",
   "runTimeoutSeconds",
   "maxChangedFiles",
   "maxDiffChars",
 ] as const;
 
-function digestConfig(value: unknown): DigestConfig {
+type DigestNumericField = (typeof DIGEST_CONFIG_FIELDS)[number];
+
+function digestConfig(
+  value: unknown,
+  allowedModels: readonly ModelReference[],
+  modelPresets: Readonly<Record<string, ModelPreset>> | undefined,
+): DigestConfig {
   const raw = object(value, "digest");
   for (const key of Object.keys(raw)) {
-    if (!(DIGEST_CONFIG_FIELDS as readonly string[]).includes(key)) throw new Error(`Unknown digest field: ${key}`);
+    if (key !== "model" && key !== "preset" && !(DIGEST_CONFIG_FIELDS as readonly string[]).includes(key)) {
+      throw new Error(`Unknown digest field: ${key}`);
+    }
   }
-  const parsed: { -readonly [K in keyof DigestConfig]: number } = {} as { -readonly [K in keyof DigestConfig]: number };
+  const parsed: Partial<Record<DigestNumericField, number>> = {};
   for (const field of DIGEST_CONFIG_FIELDS) {
     const bound = raw[field];
     if (bound === undefined) continue;
@@ -672,7 +694,26 @@ function digestConfig(value: unknown): DigestConfig {
     }
     parsed[field] = bound;
   }
-  return Object.freeze(parsed);
+  if (raw.model !== undefined && raw.preset !== undefined) {
+    throw new Error("digest.model and digest.preset are mutually exclusive");
+  }
+  const model = raw.model === undefined ? undefined : modelReference(raw.model, "digest.model");
+  if (model !== undefined && !allowedModels.some((choice) => modelKey(choice) === modelKey(model))) {
+    throw new Error("digest.model must be included in allowedModels");
+  }
+  let preset: string | undefined;
+  if (raw.preset !== undefined) {
+    if (modelPresets === undefined) throw new Error("digest.preset requires named modelPresets");
+    preset = modelPresetName(raw.preset, "digest.preset");
+    if (!Object.hasOwn(modelPresets, preset)) {
+      throw new Error("digest.preset must name an entry in modelPresets");
+    }
+  }
+  return Object.freeze({
+    ...parsed,
+    ...(model === undefined ? {} : { model }),
+    ...(preset === undefined ? {} : { preset }),
+  });
 }
 
 function mediaConfig(value: unknown): MediaConfig {
@@ -789,7 +830,7 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
     Object.assign(config, { codemode: codeModeConfig(raw.codemode) });
   }
   if (raw.digest !== undefined) {
-    Object.assign(config, { digest: digestConfig(raw.digest) });
+    Object.assign(config, { digest: digestConfig(raw.digest, allowedModels, modelPresets) });
   }
   if (raw.media !== undefined) {
     Object.assign(config, { media: mediaConfig(raw.media) });

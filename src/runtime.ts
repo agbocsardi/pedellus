@@ -281,7 +281,7 @@ export interface HistoryEntryPage {
 export interface Gateway {
   readonly harness: HarnessType;
   /**
-   * Bounded conversation-to-memory digestion. `start` reads one bounded closed-episode batch from the
+   * Bounded conversation-to-memory digestion. `start` reads one bounded completed-exchange batch from the
    * mapped chat sessions and creates one native Durable task, or reports `idle`, `busy` or `refused`
    * without starting anything. It is inert until a host calls it: no command, tool, schedule or
    * provider call exists here, and nothing is sent to a user or channel. A run's cursor advance is
@@ -654,6 +654,33 @@ export async function openGateway(config: PortConfig, context: Context, options:
     throw new TypeError("agentHistory must be a boolean");
   }
   const defaultThinkingLevel = defaultPreset?.thinkingLevel ?? config.thinkingLevel ?? "off";
+  /**
+   * Explicit background model for memory digestion. It is resolved from `digest.preset` or
+   * `digest.model` only: the origin conversation's current model and thinking level are never
+   * inherited, and absent both, a start is refused. A preset keeps its configured thinking level;
+   * a direct model runs at the lowest level it supports (never the foreground default).
+   */
+  let digestChoice: { readonly model: { readonly provider: string; readonly modelId: string }; readonly thinkingLevel: ModelThinkingLevel } | undefined;
+  if (config.digest?.preset !== undefined) {
+    const preset = presetCatalog.get(config.digest.preset);
+    if (preset === undefined) {
+      throw new StartupDiagnosticError("configInvalid", { detail: "digest.preset must name a configured model preset" });
+    }
+    const level = preset.thinkingLevel ?? "off";
+    digestChoice = {
+      model: { provider: preset.choice.native.provider, modelId: preset.choice.native.modelId },
+      thinkingLevel: preset.choice.thinkingLevels.includes(level) ? level : preset.choice.thinkingLevels[0]!,
+    };
+  } else if (config.digest?.model !== undefined) {
+    const choice = choicesByConfigured.get(modelKey(config.digest.model));
+    if (choice === undefined) {
+      throw new StartupDiagnosticError("configInvalid", { detail: "digest.model must be included in allowedModels" });
+    }
+    digestChoice = {
+      model: { provider: choice.native.provider, modelId: choice.native.modelId },
+      thinkingLevel: choice.thinkingLevels.includes("off") ? "off" : choice.thinkingLevels[0]!,
+    };
+  }
   // A worker's model comes from the spawning conversation's current selection at launch, unless config
   // names one finite preset. Either way it is a native pair inside the configured model catalog.
   let workerPreset: { readonly model: ModelReference; readonly thinkingLevel: ModelThinkingLevel } | undefined;
@@ -964,6 +991,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ...(config.digest?.entriesPerBatch === undefined ? {} : { entriesPerBatch: config.digest.entriesPerBatch }),
     ...(config.digest?.charsPerBatch === undefined ? {} : { charsPerBatch: config.digest.charsPerBatch }),
     ...(config.digest?.maxToolCalls === undefined ? {} : { maxToolCalls: config.digest.maxToolCalls }),
+    ...(config.digest?.maxRequests === undefined ? {} : { maxRequests: config.digest.maxRequests }),
+    ...(config.digest?.maxInputTokens === undefined ? {} : { maxInputTokens: config.digest.maxInputTokens }),
     ...(config.digest?.maxChangedFiles === undefined ? {} : { maxChangedFiles: config.digest.maxChangedFiles }),
     ...(config.digest?.maxDiffChars === undefined ? {} : { maxDiffChars: config.digest.maxDiffChars }),
     // A product-configured run deadline wins over the host test seam; the seam only fills the gap
@@ -1118,7 +1147,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
             if (result.status === "idle") {
               return {
                 status: "ok",
-                error: result.idle.caughtUp ? null : "no bounded batch was ready; closed history remains for a later run",
+                error: result.idle.caughtUp ? null : "no bounded batch was ready; completed history remains for a later run",
               };
             }
             return { status: "error", error: result.reason };
@@ -1392,14 +1421,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     now,
     scopeExtension: digestScopeExtension,
     limits: digestLimits,
-    model: async (tx, conversationId) => {
-      const state = await tx.doc(AgentDoc, conversationId);
-      const choice = choiceFromState(state) ?? defaultChoice;
-      const level = state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
-        ? state.thinkingLevel
-        : fallbackThinkingLevel(choice);
-      return { model: choice.native, thinkingLevel: level };
-    },
+    // Explicit background selection only: never the origin conversation's current model or thinking.
+    model: async () => digestChoice,
     allowModel: (candidate) => choicesByNative.has(modelKey(candidate)),
     curationTools: (conversationId) => authorizedChatConversations.has(conversationId)
       ? memoryDigestCurationTools(toolAllowlist)
@@ -1430,7 +1453,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // A pinned level that left the provider catalog falls back inside the pinned model only.
         thinkingLevel: choice !== undefined && choice.thinkingLevels.includes(input.thinkingLevel as ModelThinkingLevel)
           ? input.thinkingLevel as ModelThinkingLevel
-          : choice === undefined ? "off" : fallbackThinkingLevel(choice),
+          : choice === undefined ? "off" : choice.thinkingLevels.includes("off")
+            ? "off"
+            : choice.thinkingLevels[0]!,
         tools,
         modelTools: tools,
         extensions,
@@ -2218,9 +2243,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
                 ? {
                     cwd: workspace,
                     model: digestPolicy.model,
+                    // Deterministic lowest supported level if the pinned one left the catalog: the
+                    // foreground thinking level is never inherited by a background digest run.
                     thinkingLevel: digestChoice !== undefined && digestChoice.thinkingLevels.includes(digestPolicy.thinkingLevel)
                       ? digestPolicy.thinkingLevel
-                      : digestChoice !== undefined ? fallbackThinkingLevel(digestChoice) : digestPolicy.thinkingLevel,
+                      : digestChoice !== undefined
+                        ? digestChoice.thinkingLevels.includes("off") ? "off" : digestChoice.thinkingLevels[0]!
+                        : digestPolicy.thinkingLevel,
                   }
                 // Named-preset mode owns the startup default; direct mode preserves its persisted choice.
                 : policyForState(state, configuredPresetName !== undefined)),

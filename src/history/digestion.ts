@@ -1,114 +1,100 @@
 /**
- * Bounded, lossless, source-labeled input for later conversation digestion, plus its cursor.
+ * Bounded, source-labeled evidence for memory digestion, plus its one durable cursor.
  *
- * This module reads only; it calls no model, writes no memory, creates no task and
- * schedules nothing. `read()` returns one bounded chunk of one *closed* episode from
- * one mapped chat conversation. `acknowledge()` moves that conversation's cursor after
- * the caller has successfully consumed the chunk. A read that is never acknowledged
- * advances nothing, so a failure or restart replays the same evidence.
+ * This module reads only; it calls no model, writes no memory, creates no task and schedules
+ * nothing. `read()` returns one bounded chunk of one *completed turn* from one mapped chat
+ * conversation, whether that chat is still open or already reset. `acknowledge()` moves that
+ * conversation's cursor after the caller has successfully consumed the chunk. A read that is never
+ * acknowledged advances nothing, so a failure or restart replays the same evidence.
  *
- * Trust contract (no parallel scope framework):
- * - The host is the authorization boundary. It must pass the same mapped chat sessions
- *   its own provider already authenticated and classified through `readChatSessions`
- *   and `partitionChatScope`; this module does not re-derive root/fork/task ownership.
- *   It only rejects shape errors a host callback should never produce: an empty or
- *   channel-state session key, an invalid conversation ID, a repeated conversation ID,
- *   or more than {@link DIGEST_LIMITS.maxMappedSessions} mappings. A session provider
- *   that has not applied the shared chat-scope rule is a host bug, not something this
- *   module tries to repair.
- * - Every batch names its session key, conversation and episode entry IDs. Each evidence
- *   fragment names the entry it came from and its UTF-16 code-unit range in that entry's
- *   extracted text, so a consumer can cite the original transcript and finish a long entry
- *   across batches. A fragment never ends between the halves of a surrogate pair, so UTF-8
- *   encoding cannot introduce a replacement character. Durable remains the only transcript
- *   authority: nothing here copies the transcript into a second archive.
- * - Only closed episodes are evidence. An episode closes when a `pi.reset` entry is
- *   committed after it; the current, still-open segment is never returned. Empty
- *   segments (a reset with no following entry) are skipped and are not evidence.
- * - A reset entry's handoff message is synthetic context, not owner speech, so it is
- *   never returned as evidence. System, compaction and unknown entries are consumed as
- *   part of the episode range but contribute no evidence item.
- * - The episode range includes its reset marker, exactly as the episode catalog records
- *   it. Evidence is *message* text only: a user entry's text (owner speech, or a
- *   `nanobot.cron` trigger) and an assistant entry's text. A `pi.tool-result` entry, an
- *   assistant tool-call part and any tool output are never evidence — digestion folds what
- *   was said, not what a tool did, and tool output is untrusted machine text that would
- *   dominate the batch. Such entries are still consumed as part of the episode range and
- *   advance the cursor with no fragment, so nothing is skipped and a long episode's backend
- *   traffic cannot inflate its evidence.
- *   `nanobot.cron` entries are kept with that exact `kind`, so a consumer can treat a
- *   scheduled trigger as provenance rather than owner speech. Worker child transcripts
- *   are task-owned conversations and are never in scope; worker result events are not
- *   evidence either, and nothing here reads them.
+ * Eligibility is a completed-turn high-water, not a closed episode:
+ * - A segment ends just before a reset that follows an owner or scheduled turn, just before the
+ *   next owner/scheduled input, or at a terminal assistant entry whose tool calls are all paired.
+ *   An assistant entry that stopped with an explicit error or abort is not a completed answer and
+ *   cannot close a segment by itself.
+ * - An in-progress tail (an owner message still awaiting an answer, an assistant tool round, or a
+ *   tool result still awaiting its next assistant entry) is never offered and never starts a batch.
+ * - A reset before the first owner input stays inside the segment prefix, so a leading
+ *   system/reset block does not need a model-free batch of its own.
+ * - One read offers only evidence that was already a completed exchange when the read began; a
+ *   later appended entry is a later segment. The bounds of an accepted batch are immutable.
  *
- * Evidence is lossless, not excerpted:
- * - One evidence item is a fragment `[textStart, textStart + text.length)` of its entry's
- *   extracted text, with the entry's full `chars` length. A fragment is bounded by the
- *   remaining batch budget, so a long entry continues in the next batch from exactly
- *   where this one stopped. Nothing is dropped and no `truncated` flag can be used to
- *   discard a tail.
- * - A batch's evidence never exceeds {@link DIGEST_LIMITS.charsPerBatch}; the fragment
- *   that reaches the budget is cut, and the rest of that entry is the next batch.
- * - One batch is one whole closed episode whenever that episode's selected evidence fits
- *   both bounds ({@link DIGEST_LIMITS.charsPerBatch} and
- *   {@link DIGEST_LIMITS.entriesPerBatch}), however many entries the episode holds: it is
- *   read in one pass, delivered with `complete: true` and acknowledged once. Only an episode
- *   over a bound splits, and then into independent ordered chunks that each carry their own
- *   acknowledgement. There is no carry-over note, running summary or cross-chunk state: a
- *   chunk is judged only against its capture and the committed transcript.
+ * Trust contract (the host remains the authorization boundary):
+ * - The host passes the same currently mapped chat sessions its provider already authenticated and
+ *   classified through `readChatSessions` and `partitionChatScope`; this module does not re-derive
+ *   root/fork/task/worker ownership. It only rejects shape errors a host callback should never
+ *   produce: an empty or channel-state session key, an invalid conversation ID, a repeated
+ *   conversation ID, or more than {@link DIGEST_LIMITS.maxMappedSessions} mappings.
+ * - Owner messages and scheduled triggers are `owner` evidence; assistant message text is
+ *   `assistant` evidence. Assistant tool calls and their paired tool results are always
+ *   `untrusted-tool`: they are machine text, never instructions and never attributed to the owner.
+ * - Reset handoff messages, system entries, compaction entries, assistant thinking parts and tool
+ *   results with no paired call are consumed as part of the range but contribute no evidence.
+ * - A tool result is paired only with a call id that is still open in the same segment. Pairing
+ *   state is durable in the cursor, so a result in a later chunk is paired even after a reopen. An
+ *   orphan result is consumed with no fragment instead of being presented as if the owner or
+ *   assistant said it. A call id longer than the fixed bound fails the segment closed; dropping it
+ *   would silently lose the result that cites the same id.
+ *
+ * Evidence shape and bounds:
+ * - Message prose and tool-call arguments are lossless fragments of the original entry (UTF-16
+ *   offsets, surrogate-safe). A long item continues in the next chunk from exactly where the last
+ *   chunk stopped; nothing is dropped and no tail is discarded.
+ * - A tool result is machine output, so a long result is one head-tail preview of at most
+ *   {@link DIGEST_PREVIEW_CHARS} characters with an explicit omission marker and a stable
+ *   reference to the original entry. A short result is included whole. The preview is not a
+ *   fragment of a longer item: it is consumed whole, and a consumer must never claim the omitted
+ *   middle was read. Durable remains the transcript authority; no second archive is written.
+ * - A batch's evidence never exceeds {@link DIGEST_LIMITS.charsPerBatch}. One completed segment is
+ *   one batch whenever its evidence fits both bounds; only a larger segment splits, into independent
+ *   ordered chunks that each carry their own acknowledgement. A chunk never moves the completed
+ *   boundary, and there is no carry-over note, running summary or cross-chunk state.
+ * - One evidence step is a message, a tool call, a tool result or a silent pairing step. Steps are
+ *   addressed by `(entryId, itemIndex)` and their extracted text by a UTF-16 offset, so a consumer
+ *   can cite the original transcript and finish a long item across batches.
  *
  * The cursor is one small conversation-scoped document, not a second history archive:
+ * - `nextEntryId`/`nextItemIndex`/`nextTextStart` are the position after the last acknowledged step
+ *   (`nextEntryId` null before the conversation's first batch).
+ * - `episodeStartEntryId`/`episodeEndEntryId` are set only while a completed segment is being
+ *   consumed in bounded chunks, naming its immutable bounds so the next batch continues it.
+ * - `pendingToolCalls` holds the call ids still open at that position, so pairing survives a chunk
+ *   boundary, a new source instance and a reopened process.
+ * - `acknowledge()` is the only writer. It is a trusted in-process API: it requires the conversation
+ *   to still be mapped with the same session key, and compares the stored cursor position with the
+ *   cursor the batch was read against. A fresh segment must start at the cursor's next position
+ *   with no skipped entry in the same conversation (entry IDs are global and interleave chats, so a
+ *   zero-entry gap within the conversation is normal), and its end is re-proven as a completed
+ *   boundary by walking that segment. The claimed chunk is re-derived from the committed transcript
+ *   and compared evidence by evidence, so a malformed or forged batch is rejected instead of
+ *   corrupting the cursor, and no acknowledgement can advance past evidence the transcript does not
+ *   support.
+ * - A batch with no evidence (a completed turn of tool-free non-evidence, for example) is still
+ *   acknowledged, which counts as processed; the consumer must advance it without a model call.
  *
- * - `throughEntryId`/`throughChars` are the last entry and the number of extracted-text
- *   characters of that entry whose evidence has been acknowledged. Entries below it are
- *   consumed or non-evidence (an empty segment, or a reset marker whose handoff is not
- *   evidence).
- * - `episodeStartEntryId`/`episodeEndEntryId` are set only while a closed episode is
- *   being consumed in bounded chunks. They name the immutable episode bounds so the next
- *   batch continues the same episode instead of inventing a new boundary.
- * - `acknowledge()` is the only writer. It is a trusted in-process API: it does not re-check
- *   the mapped chat set (the host owns that) and instead compares the stored cursor with the
- *   cursor the batch was read against and re-derives the episode bounds and claimed chunk
- *   from the committed transcript before advancing. A fresh chunk must start at its claimed
- *   episode start, the entries between the previous frontier (or the transcript beginning)
- *   and that start may hold no content, the claimed end must be a committed non-reset entry
- *   whose successor is the `pi.reset` that closes the episode, every entry in the claimed
- *   range must be covered (with the exact text at the claimed offsets), and a continued
- *   chunk must resume at the stored position. New episode bounds are additionally proven by
- *   walking that episode to its first closing reset (paged, bounded memory, once per new
- *   episode), so a claimed end cannot span an earlier reset. A malformed or forged batch is
- *   rejected instead of corrupting the cursor, so no acknowledgement can advance the
- *   frontier past evidence the transcript does not support.
- * - A batch with no evidence (a "nothing worth remembering" episode, or an episode of
- *   non-evidence entries) is still acknowledged, which counts as processed.
+ * Compatibility with the earlier closed-episode cursor (one document, one reader, no migration
+ * project):
+ * - A document written by the closed-episode reader is read as the position that reader recorded:
+ *   its acknowledged entry and message offset become this reader's next position inside that same
+ *   entry, so an already digested range is never processed again and a frozen episode's bounds are
+ *   continued so its remainder settles without a later owner turn. No second cursor is written and
+ *   nothing is replayed. The offset is validated against the same prose extraction that produced it;
+ *   an offset beyond that entry's message text, or one that would split a surrogate pair, fails
+ *   closed instead of being guessed.
+ * - Open tool calls at that frontier are derived once from the immutable segment prefix, so a result
+ *   after the frontier still pairs with a call before it. The prefix is never revisited as evidence;
+ *   tool steps in the frontier entry after the acknowledged offset are still read.
+ * - The old fields are cleared on the first acknowledgement; a new cursor never writes them.
  *
- * Ordering and bounds:
- * - Within one conversation, episodes are consumed oldest first by entry ID. Across
- *   conversations the oldest discovered next position is served first, but a bounded read
- *   budget can postpone discovery in a conversation that has not been scanned recently;
- *   that only delays evidence, never skips it, and each conversation's cursor stays
- *   monotonic. The scan budget rotates its starting conversation, so one busy chat cannot
- *   postpone the others indefinitely.
- * - Entry IDs are immutable and unique across one store, so there is no timestamp tie to
- *   break and a restart resumes exactly at the acknowledged frontier.
- * - A read that finds no pending chunk reports how much of the mapped set it examined:
- *   `caughtUp` is true only when every mapped chat was examined to its tail. A specific
- *   chat can be postponed by the scan budget, and a mapped conversation whose record is
- *   missing is counted separately instead of being reported as caught up.
- * - The scan that looks for the next closed episode is bounded per read and resumes from an
- *   in-process position cache, so a long still-open conversation is not rescanned from its
- *   start on every pass. The cache is derived, is dropped whenever that conversation's
- *   cursor moves, and is lost on restart; losing it costs a repeated bounded scan and never
- *   changes the frontier.
- *
- * Not here: model calls, memory writes, prompt or skill selection, scheduling, tool
- * surface, and any activation. `readBatch()` only re-derives a chunk a consumer already
- * recorded, so resumable execution does not depend on cross-conversation scan ordering.
- * `cursor()` exposes the frontier for status and tests.
+ * Not here: model calls, memory writes, prompt or skill selection, scheduling, tool surface, and any
+ * activation. `readBatch()` only re-derives a chunk a consumer already recorded, so resumable
+ * execution does not depend on cross-conversation scan ordering. `cursor()` exposes the frontier for
+ * status and tests.
  */
 import {
   AssistantEntry,
   ResetEntry,
+  ToolResultEntry,
   UserEntry,
   defineDoc,
   type Conversation,
@@ -132,120 +118,152 @@ import { CHANNEL_STATE_SESSION_SUFFIX, type HistoryChatSession } from "./scope.j
 
 export const DIGEST_CURSOR_KIND = "nanobot.digest-cursor";
 
+/** Maximum characters in one head-tail tool-result preview, including its omission marker. */
+export const DIGEST_PREVIEW_CHARS = 2_500;
+
 export const DIGEST_LIMITS = Object.freeze({
-  /** Entries examined by one batch; a longer episode or entry continues in the next batch. */
+  /** Evidence entries examined by one batch; a longer segment continues in the next batch. */
   entriesPerBatch: DIGEST_RUN_LIMITS_DEFAULT.entriesPerBatch,
-  /**
-   * Extracted message characters in one batch. A fragment is cut at this bound, never dropped, so
-   * this is the effective size limit of one pass; the entry cap only stops a flood of tiny entries.
-   */
+  /** Extracted evidence characters in one batch, cut but never dropped. */
   charsPerBatch: DIGEST_RUN_LIMITS_DEFAULT.charsPerBatch,
-  /** Entries requested per Durable page while scanning for a closed episode or reading a chunk. */
+  /** Entries requested per Durable page. */
   entriesPerPage: 200,
   /**
-   * Entries a single read may examine while *looking* for closed episodes, across conversations.
-   *
-   * This bounds discovery only, never consumption: it does not bound a chunk (that is
-   * `entriesPerBatch`/`charsPerBatch`), the gap check below a fresh episode start, or the walk that
-   * proves a new episode's closing reset. Worst case per read is this many entry records plus one
-   * chunk's entries, and a postponed chat is retried by a later read instead of being skipped.
+   * Entries one read may examine while *looking* for a completed boundary, across conversations.
+   * This bounds discovery only: it does not bound a chunk, a gap check or a segment-end walk. A
+   * postponed chat is retried by a later read instead of being skipped.
    */
   scanEntriesPerRead: 4_000,
   /** Mapped chat sessions accepted by one read. */
   maxMappedSessions: 256,
+  /** Evidence steps in one chunk. */
+  maxStepsPerBatch: 2_048,
+  /** Evidence steps in one entry before the entry fails closed rather than growing without bound. */
+  maxStepsPerEntry: 1_024,
+  /** Calls that may stay open in one segment before the segment fails closed. */
+  maxPendingToolCalls: 256,
+  /** Longest accepted tool call id; a longer id fails the segment instead of orphaning its result. */
+  maxToolCallIdChars: 200,
+  /** Smallest remaining budget that may render a preview instead of ending the chunk first. */
+  minPreviewBudget: 8,
 });
 
-/** Durable consumption frontier of one conversation. */
+/**
+ * Resume position plus the immutable bounds and pairing state of the completed segment in progress.
+ * `nextEntryId` null means nothing was acknowledged yet.
+ */
 export interface DigestCursor {
-  /** Highest acknowledged entry; null before the conversation's first batch. */
-  readonly throughEntryId: EntryId | null;
-  /** Extracted-text characters of that entry already acknowledged; null before the first batch. */
-  readonly throughChars: number | null;
-  /** Start of the closed episode being consumed in chunks, otherwise null. */
+  readonly nextEntryId: EntryId | null;
+  /** Next evidence step in that entry; 0 when the entry has not been entered yet. */
+  readonly nextItemIndex: number;
+  /** Offset inside that step's extracted text; 0 for a whole step. */
+  readonly nextTextStart: number;
+  /** Start of the completed segment being consumed in chunks, otherwise null. */
   readonly episodeStartEntryId: EntryId | null;
-  /** End of that closed episode, otherwise null. */
+  /** End of that completed segment, otherwise null. */
   readonly episodeEndEntryId: EntryId | null;
+  /** Tool call ids still open at this position. */
+  readonly pendingToolCalls: readonly string[];
 }
 
-/** One fragment of one evidence entry. */
+export type DigestTrust = "owner" | "assistant" | "untrusted-tool";
+export type DigestItemKind = "message" | "tool-call" | "tool-result";
+
+/** The omitted middle of a head-tail preview; `text` still holds the visible head and tail. */
+export interface DigestPreview {
+  readonly headChars: number;
+  readonly tailChars: number;
+  readonly omittedStart: number;
+  readonly omittedEnd: number;
+  readonly omittedChars: number;
+  readonly marker: string;
+}
+
+/** One bounded evidence fragment or preview. */
 export interface DigestEvidence {
   readonly entryId: EntryId;
-  /** Message author. Tool results and tool calls are never evidence, so no tool role exists. */
-  readonly role: "user" | "assistant";
+  /** Step index within the entry's evidence plan; stable for this extraction version. */
+  readonly itemIndex: number;
+  readonly role: "user" | "assistant" | "tool";
+  readonly trust: DigestTrust;
+  /** Fixed human label; a renderer may use it verbatim. */
+  readonly trustLabel: string;
+  readonly itemKind: DigestItemKind;
   /** Durable entry kind, for provenance. */
   readonly kind: string;
-  /** Offset of `text` within the entry's extracted evidence text. */
+  /** Stable reference to the original item inside Durable. */
+  readonly ref: string;
+  /** Tool call id for a tool call and its paired result. */
+  readonly toolCallId: string | null;
+  readonly toolName: string | null;
+  /** Offset of `text` within the item's extracted text. A preview always starts at 0. */
   readonly textStart: number;
-  /** Total extracted evidence length of the entry before any batch bound. */
+  /** Total extracted item length before any bound. */
   readonly chars: number;
-  /** Fragment text; `chars` and `textStart` place it in the full entry. */
+  /** Fragment text, or a bounded preview of the whole item. */
   readonly text: string;
+  /** Present only when `text` is a head-tail preview with an omitted middle. */
+  readonly preview: DigestPreview | null;
 }
 
-/** One bounded chunk of one closed episode. */
+/** One bounded chunk of one completed segment. */
 export interface DigestBatch {
   readonly status: "batch";
   /** Mapped chat session that owns the conversation; the source label for the batch. */
   readonly sessionKey: string;
   readonly conversationId: ConversationId;
-  /** Immutable bounds of the closed episode these entries belong to. */
+  /** Immutable bounds of the completed segment these entries belong to. */
   readonly episodeStartEntryId: EntryId;
   readonly episodeEndEntryId: EntryId;
-  /** Lower bound of this chunk; the episode start for a new episode, else the previous position. */
+  /** Lower bound of this chunk; the segment start for a new segment, else the cursor position. */
   readonly firstEntryId: EntryId;
-  /** Offset in `firstEntryId`'s extracted text where this chunk starts. */
+  readonly firstItemIndex: number;
+  /** Offset in `firstEntryId`'s item where this chunk starts. */
   readonly firstTextStart: number;
-  /** Last entry in this chunk; acknowledging moves the cursor here. */
+  /** Last entry and step this chunk consumed; `throughItemIndex` -1 means an entry boundary. */
   readonly throughEntryId: EntryId;
-  /** Extracted-text characters of `throughEntryId` consumed through this chunk. */
+  readonly throughItemIndex: number;
   readonly throughChars: number;
-  /** True when this chunk reaches the episode end and consumed that entry completely. */
+  /** True when this chunk reaches the segment end and consumed it completely. */
   readonly complete: boolean;
+  /** Position after this chunk; acknowledging writes exactly this into the cursor. */
+  readonly nextEntryId: EntryId;
+  readonly nextItemIndex: number;
+  readonly nextTextStart: number;
   readonly entries: readonly DigestEvidence[];
-  /** Frontier this batch was read against; acknowledging rejects if it has moved. */
+  /** Frontier this batch was read against; acknowledging rejects if its position has moved. */
   readonly cursor: DigestCursor;
 }
 
 /**
  * Nothing to consume in this read, with unambiguous scan coverage.
  *
- * `caughtUp` is true only when every mapped chat was examined to its tail and the read
- * found no pending closed episode. Otherwise a later read may find more evidence or
- * complete the scan; this is not a claim that the store has no pending work.
+ * `caughtUp` is false while a chat was postponed by the scan budget, an unfinished scan stopped
+ * mid-conversation, or a mapped conversation record is missing. A still-open exchange is not
+ * pending work: it simply has no completed boundary yet.
  */
 export interface DigestIdle {
   readonly status: "idle";
-  /** True only when no chat was postponed, unfinished or missing. */
   readonly caughtUp: boolean;
-  /** Mapped chats examined, or skipped from a complete in-process scan position. */
   readonly examinedChats: number;
-  /** Mapped chats after the scan budget ran out; a later read examines them. */
   readonly postponedChats: number;
-  /** Mapped chats whose scan stopped at the entry budget mid-conversation. */
   readonly unfinishedChats: number;
-  /** Mapped chats whose conversation record was missing; never treated as evidence. */
   readonly missingChats: number;
 }
 
 export type DigestReadResult = DigestBatch | DigestIdle;
 
-/**
- * The durable identity of one bounded chunk, without its evidence text.
- *
- * This is what a caller records when it accepts a batch and later resumes it: the same
- * conversation, immutable episode bounds, chunk position, expected end and the frontier
- * the batch was read against. {@link DigestSource.readBatch} re-derives the evidence from
- * the committed transcript, so a resumed consumer never depends on cross-conversation
- * scan ordering and never stores a second copy of the transcript.
- */
+/** The durable identity of one bounded chunk, without its evidence text. */
 export interface DigestBatchRef {
   readonly sessionKey: string;
   readonly conversationId: ConversationId;
   readonly episodeStartEntryId: EntryId;
   readonly episodeEndEntryId: EntryId;
   readonly firstEntryId: EntryId;
+  readonly firstItemIndex: number;
   readonly firstTextStart: number;
   readonly throughEntryId: EntryId;
+  readonly throughItemIndex: number;
   readonly throughChars: number;
   readonly complete: boolean;
   readonly cursor: DigestCursor;
@@ -262,8 +280,8 @@ export class DigestCursorConflictError extends Error {
 export interface DigestSourceOptions {
   readonly harness: Harness;
   /**
-   * Currently mapped chat sessions, already authenticated and classified by the host's
-   * shared chat-scope provider (the same one the history index and episode catalog use).
+   * Currently mapped chat sessions, already authenticated and classified by the host's shared
+   * chat-scope provider (the same one the history index and episode catalog use).
    */
   readonly sessions: (context: Context) => Promise<readonly HistoryChatSession[]>;
   /**
@@ -276,40 +294,32 @@ export interface DigestSourceOptions {
 export interface DigestSource {
   /** Current frontier of one conversation; reads only. */
   cursor(conversationId: ConversationId, context: Context): Promise<DigestCursor>;
-  /**
-   * The oldest unprocessed closed-episode chunk across the mapped chats. Writes nothing
-   * to Durable; only an acknowledgement moves a cursor. `limits` overrides the source's
-   * configured batch bounds for this read only.
-   */
+  /** The oldest unprocessed completed chunk across the mapped chats. Writes nothing. */
   read(context: Context, limits?: DigestBatchLimits): Promise<DigestReadResult>;
   /**
-   * Re-derive one chunk this source previously returned, from its recorded identity.
-   *
-   * This reads only: it writes no cursor and advances nothing. Whether the batch is still
-   * pending is the caller's check (`cursor()`). The ref must name a currently mapped chat
-   * conversation and an entry range inside one closed segment (its end is followed by a
-   * `pi.reset`), and the re-derived chunk must still end at `throughEntryId`/
-   * `throughChars`/`complete`; a forged, stale or out-of-range ref is otherwise rejected
-   * instead of returning different evidence. It does not re-prove that the start is the
-   * episode's first entry, because only `acknowledge()` may move the frontier. Cross-conversation
-   * scan ordering cannot change the answer, so a resumed consumer replays exactly the chunk it accepted.
-   * `limits` must be the bounds captured with the batch; a different bound set re-derives a
-   * different chunk and is rejected instead of silently accepting a wider one.
+   * Re-derive one chunk this source previously returned, from its recorded identity. Reads only.
+   * The ref must name a currently mapped chat conversation and a range inside one completed
+   * segment; the re-derived chunk must still match every recorded position and fragment.
    */
   readBatch(ref: DigestBatchRef, context: Context, limits?: DigestBatchLimits): Promise<DigestBatch>;
   /**
-   * Record that a batch was successfully consumed, including a batch with no evidence.
-   * The frontier update is one commit and is validated against the committed transcript;
-   * a rejection leaves the frontier unchanged. `limits` must be the batch's captured bounds.
+   * Record that a batch was successfully consumed, including a batch with no evidence. The frontier
+   * update is one commit, validated against the committed transcript; a rejection leaves it
+   * unchanged. `limits` must be the batch's captured bounds.
    */
   acknowledge(batch: DigestBatch, context: Context, limits?: DigestBatchLimits): Promise<DigestCursor>;
 }
 
 type DigestCursorDocument = {
-  throughEntryId: number | null;
-  throughChars: number | null;
+  nextEntryId: number | null;
+  nextItemIndex: number;
+  nextTextStart: number;
   episodeStartEntryId: number | null;
   episodeEndEntryId: number | null;
+  pendingToolCalls: string[];
+  // Written only by the earlier closed-episode reader; cleared on the first acknowledgement.
+  throughEntryId: number | null;
+  throughChars: number | null;
 };
 
 export const DigestCursorDoc = defineDoc<DigestCursorDocument>({
@@ -319,19 +329,25 @@ export const DigestCursorDoc = defineDoc<DigestCursorDocument>({
   history: "latest",
   fork: "initial",
   initial: () => ({
-    throughEntryId: null,
-    throughChars: null,
+    nextEntryId: null,
+    nextItemIndex: 0,
+    nextTextStart: 0,
     episodeStartEntryId: null,
     episodeEndEntryId: null,
+    pendingToolCalls: [],
+    throughEntryId: null,
+    throughChars: null,
   }),
   checkpointWhen: () => true,
 });
 
 const EMPTY_CURSOR: DigestCursor = Object.freeze({
-  throughEntryId: null,
-  throughChars: null,
+  nextEntryId: null,
+  nextItemIndex: 0,
+  nextTextStart: 0,
   episodeStartEntryId: null,
   episodeEndEntryId: null,
+  pendingToolCalls: Object.freeze([]) as readonly string[],
 });
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -345,19 +361,19 @@ function positiveId(value: unknown, field: string): EntryId {
   return value as EntryId;
 }
 
-function offset(value: unknown, field: string): number {
+function nonNegative(value: unknown, field: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new TypeError(`${field} must be a non-negative integer offset`);
+    throw new TypeError(`${field} must be a non-negative integer`);
   }
   return value;
 }
 
-function storedId(value: unknown, field: string): EntryId | null {
+function storedId(value: unknown, field: string): number | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
     throw new Error(`Stored digest cursor has an invalid ${field}`);
   }
-  return value as EntryId;
+  return value;
 }
 
 function storedOffset(value: unknown, field: string): number | null {
@@ -368,42 +384,118 @@ function storedOffset(value: unknown, field: string): number | null {
   return value;
 }
 
+function pendingOf(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) throw new Error("Stored digest cursor has invalid open tool calls");
+  const pending = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string" || item.length === 0) {
+      throw new Error("Stored digest cursor has an invalid open tool call id");
+    }
+    pending.add(item);
+  }
+  return Object.freeze([...pending].sort());
+}
+
 /**
- * Parse one stored closed-episode cursor. Exported for the complementary reader's one-time
- * adoption, so both readers agree on the legacy document's shape instead of duplicating it.
+ * True when a stored document still uses the earlier closed-episode shape (no `nextEntryId`). Such
+ * a document is mapped to this reader's position once, on read; nothing is re-digested.
+ */
+export function isLegacyDigestCursor(document: unknown): boolean {
+  return isRecord(document) && !("nextEntryId" in document);
+}
+
+/**
+ * Parse one stored cursor.
+ *
+ * A document written by the closed-episode reader is mapped exactly: its acknowledged entry and
+ * message offset become the next position inside that same entry, and its frozen episode bounds are
+ * continued. Tool calls still open at that position are derived by the source, because they need the
+ * transcript.
  */
 export function digestCursorOf(document: unknown): DigestCursor {
   if (document === undefined) return EMPTY_CURSOR;
   if (!isRecord(document)) throw new Error("Stored digest cursor is malformed");
-  const throughEntryId = storedId(document.throughEntryId, "through entry");
-  const throughChars = storedOffset(document.throughChars, "through offset");
   const episodeStartEntryId = storedId(document.episodeStartEntryId, "episode start");
   const episodeEndEntryId = storedId(document.episodeEndEntryId, "episode end");
-  if ((throughEntryId === null) !== (throughChars === null)) {
-    throw new Error("Stored digest cursor has half a through position");
-  }
   if ((episodeStartEntryId === null) !== (episodeEndEntryId === null)) {
-    throw new Error("Stored digest cursor has half an episode boundary");
+    throw new Error("Stored digest cursor has half a segment boundary");
   }
-  if (episodeStartEntryId !== null && episodeEndEntryId !== null) {
-    if (throughEntryId === null || episodeStartEntryId > throughEntryId || throughEntryId > episodeEndEntryId) {
-      throw new Error("Stored digest cursor has an inconsistent episode position");
+  if (isLegacyDigestCursor(document)) {
+    const throughEntryId = storedId(document.throughEntryId, "through entry");
+    const throughChars = storedOffset(document.throughChars, "through offset");
+    if ((throughEntryId === null) !== (throughChars === null)) {
+      throw new Error("Stored digest cursor has half a through position");
     }
+    if (episodeStartEntryId !== null && episodeEndEntryId !== null) {
+      if (throughEntryId === null || episodeStartEntryId > throughEntryId || throughEntryId > episodeEndEntryId) {
+        throw new Error("Stored digest cursor has an inconsistent episode position");
+      }
+    }
+    if (throughEntryId === null || throughChars === null) {
+      return {
+        ...EMPTY_CURSOR,
+        episodeStartEntryId: episodeStartEntryId as EntryId | null,
+        episodeEndEntryId: episodeEndEntryId as EntryId | null,
+      };
+    }
+    return {
+      nextEntryId: throughEntryId as EntryId,
+      nextItemIndex: 0,
+      nextTextStart: throughChars,
+      episodeStartEntryId: episodeStartEntryId as EntryId | null,
+      episodeEndEntryId: episodeEndEntryId as EntryId | null,
+      pendingToolCalls: Object.freeze([]) as readonly string[],
+    };
   }
-  return { throughEntryId, throughChars, episodeStartEntryId, episodeEndEntryId };
+  const nextEntryId = storedId(document.nextEntryId, "next entry");
+  const nextItemIndex = storedOffset(document.nextItemIndex, "next item");
+  const nextTextStart = storedOffset(document.nextTextStart, "next offset");
+  const pendingToolCalls = pendingOf(document.pendingToolCalls ?? []);
+  return {
+    nextEntryId: nextEntryId as EntryId | null,
+    nextItemIndex: nextItemIndex ?? 0,
+    nextTextStart: nextTextStart ?? 0,
+    episodeStartEntryId: episodeStartEntryId as EntryId | null,
+    episodeEndEntryId: episodeEndEntryId as EntryId | null,
+    pendingToolCalls,
+  };
 }
 
+/** Full equality, including pairing state. */
 function sameCursor(left: DigestCursor, right: DigestCursor): boolean {
-  return left.throughEntryId === right.throughEntryId
-    && left.throughChars === right.throughChars
+  return sameCursorPosition(left, right)
+    && left.pendingToolCalls.length === right.pendingToolCalls.length
+    && left.pendingToolCalls.every((id, index) => right.pendingToolCalls[index] === id);
+}
+
+/**
+ * Position equality only. Open calls are written in the same commit as the position, so a matching
+ * position already proves the frontier did not move; comparing them too would reject a legacy
+ * frontier whose open calls are derived rather than stored.
+ */
+function sameCursorPosition(left: DigestCursor, right: DigestCursor): boolean {
+  return left.nextEntryId === right.nextEntryId
+    && left.nextItemIndex === right.nextItemIndex
+    && left.nextTextStart === right.nextTextStart
     && left.episodeStartEntryId === right.episodeStartEntryId
     && left.episodeEndEntryId === right.episodeEndEntryId;
 }
 
 /**
- * Extracted evidence text of one entry, as text parts joined by a newline. Parts are kept
- * unjoined so a fragment can be sliced without materializing a very long entry in full.
+ * Extracted message text, keeping empty text blocks so their separators stay in the offset space.
+ * This is the exact extraction the earlier closed-episode cursor was produced against; any other
+ * empty-block rule would move a stored offset onto a different character.
  */
+export function messageText(content: unknown): string | undefined {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const parts: string[] = [];
+  for (const block of content) {
+    if (isRecord(block) && block.type === "text" && typeof block.text === "string") parts.push(block.text);
+  }
+  return parts.length === 0 ? undefined : parts.join("\n");
+}
+
 export interface TextShape {
   readonly parts: readonly string[];
   /** Length of `parts.join("\n")`. */
@@ -416,31 +508,9 @@ export interface EvidenceShape extends TextShape {
 }
 
 /**
- * Extract one model message's text with the closed-episode reader's exact block semantics. Empty
- * text blocks are kept as empty parts, so their separators remain in the offset space.
- *
- * Shared with the complementary reader: when it adopts a legacy cursor, `throughChars` was produced
- * against this extraction, so any other empty-block rule would move the same offset onto a different
- * character. Unicode offsets are UTF-16 code units into the joined parts.
- */
-export function messageText(content: unknown): string | undefined {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return undefined;
-  const parts: string[] = [];
-  for (const block of content) {
-    if (isRecord(block) && block.type === "text" && typeof block.text === "string") parts.push(block.text);
-  }
-  return parts.length === 0 ? undefined : parts.join("\n");
-}
-
-/**
- * Evidence shape of one entry, or undefined when it carries none. Reset, system, compaction and
- * tool-result entries contribute nothing, and assistant tool calls stay out of assistant evidence:
- * only user and assistant message text is evidence. The same selection is used for reading and for
- * acknowledgement validation, so a replay or a forged batch is judged against the same rule.
- *
- * Exported for the complementary reader's legacy-frontier mapping check, so an adopted offset is
- * validated against the exact extraction that produced it.
+ * Message-only evidence shape of one entry, or undefined when it carries none. Used to validate a
+ * legacy frontier offset against the exact extraction that produced it; reading uses
+ * {@link planOf}, whose message item is this same text.
  */
 export function evidenceShapeOf(entry: EntryRecord): EvidenceShape | undefined {
   const kind = entry.kind;
@@ -461,11 +531,10 @@ export function evidenceShapeOf(entry: EntryRecord): EvidenceShape | undefined {
 }
 
 /**
- * True when a fragment ending at `from + take` would split a UTF-16 surrogate pair. The
- * batch boundary is moved instead, so encoding the fragment as UTF-8 cannot produce a
- * replacement character. Offsets stay in UTF-16 code units, never bytes.
+ * True when a fragment ending at `from + take` would split a UTF-16 surrogate pair. The boundary is
+ * moved instead, so encoding the fragment as UTF-8 cannot produce a replacement character. Offsets
+ * stay in UTF-16 code units, never bytes.
  */
-/** Shared with the complementary reader, so both readers cut evidence at the same safe boundary. */
 export function cutsSurrogatePair(shape: TextShape, from: number, take: number): boolean {
   if (take <= 0) return false;
   const tail = evidenceSlice(shape, from + take - 1, from + take).charCodeAt(0);
@@ -474,7 +543,7 @@ export function cutsSurrogatePair(shape: TextShape, from: number, take: number):
   return next >= 0xdc00 && next <= 0xdfff;
 }
 
-/** Shared with the complementary reader; offsets are UTF-16 code units into `parts.join("\n")`. */
+/** Slice `parts.join("\n")` without materializing the join. Offsets are UTF-16 code units. */
 export function evidenceSlice(shape: TextShape, from: number, to: number): string {
   let output = "";
   let offset = 0;
@@ -493,205 +562,511 @@ export function evidenceSlice(shape: TextShape, from: number, to: number): strin
   return output;
 }
 
-interface ClosedEpisodeBounds {
-  readonly episodeStartEntryId: EntryId;
-  readonly episodeEndEntryId: EntryId;
+interface RawItem {
+  readonly ref: string;
+  readonly role: "user" | "assistant" | "tool";
+  readonly trust: DigestTrust;
+  readonly trustLabel: string;
+  readonly itemKind: DigestItemKind;
+  readonly kind: string;
+  readonly toolCallId: string | null;
+  readonly toolName: string | null;
+  readonly parts: readonly string[];
+  readonly length: number;
+  readonly preview: boolean;
 }
 
-type ScanResult =
-  | ({ readonly status: "closed"; readonly examined: number } & ClosedEpisodeBounds)
-  | {
-    readonly status: "open";
-    readonly examined: number;
-    /** True when the scan reached the conversation tail instead of stopping at its budget. */
-    readonly reachedTail: boolean;
-    /** Last entry examined, or null when the scan examined none. */
-    readonly scannedThroughEntryId: EntryId | null;
-    /** Start of the segment the scan is inside, or null when none was reached. */
-    readonly segmentStartEntryId: EntryId | null;
-    /** Last entry of that segment that is not its own reset marker, or null when it is empty so far. */
-    readonly segmentLastContentEntryId: EntryId | null;
-  };
+interface PlanStep {
+  /** Absent for a silent pairing step, such as a paired tool result with no text. */
+  readonly item?: RawItem;
+  readonly effect?: { readonly callId: string; readonly add: boolean };
+}
+
+interface EvidencePlan {
+  readonly steps: readonly PlanStep[];
+}
+
+function joinedParts(parts: readonly string[]): TextShape {
+  let length = parts.length === 0 ? 0 : parts.length - 1;
+  for (const part of parts) length += part.length;
+  return { parts, length };
+}
+
+function canonicalArguments(args: unknown): string {
+  try {
+    const text = JSON.stringify(args);
+    return typeof text === "string" ? text : "null";
+  } catch {
+    return "[unserializable arguments]";
+  }
+}
 
 /**
- * Walk entries ascending from `fromEntryId`, tracking the current reset-delimited segment,
- * until a reset closes a non-empty segment or the scan reaches the tail or its entry
- * budget. A segment is non-empty when it holds any entry besides its own reset marker,
- * matching the episode catalog. The closing reset is not consumed by this scan, so a
- * discovered episode keeps an immutable end just before it.
+ * Pairing id of one tool call. An absent or non-string id cannot be paired and stays unpaired. An id
+ * longer than {@link DIGEST_LIMITS.maxToolCallIdChars} fails closed: truncating or dropping it would
+ * silently orphan the result that carries the same id, so the segment is refused instead.
  */
-async function scanForClosedEpisode(
-  conversation: Conversation,
-  fromEntryId: EntryId,
-  segmentStartEntryId: EntryId | null,
-  segmentLastContentEntryId: EntryId | null,
-  budget: number,
-  context: Context,
-): Promise<ScanResult> {
-  let segmentStart = segmentStartEntryId;
-  let scannedThrough: EntryId | null = fromEntryId > 1 ? (fromEntryId - 1) as EntryId : null;
-  // Resume from the last content entry, never from the last examined entry: a scan that
-  // paused on a reset marker must not turn that marker into segment content.
-  let lastSegmentEntryId: EntryId | null = segmentLastContentEntryId;
-  let examined = 0;
-  let cursor: Cursor | undefined;
-  while (examined < budget) {
-    const page = await conversation.entries(
-      { order: "ascending", minEntryId: fromEntryId },
-      Math.min(DIGEST_LIMITS.entriesPerPage, budget - examined),
-      cursor,
-      context,
+function callIdOf(value: unknown, entryId: EntryId): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  if (value.length > DIGEST_LIMITS.maxToolCallIdChars) {
+    throw new Error(
+      `Digest entry ${entryId} has a tool call id longer than ` +
+      `${DIGEST_LIMITS.maxToolCallIdChars} characters`,
     );
-    if (page.items.length === 0) {
-      return openResult(examined, true, scannedThrough, segmentStart, lastSegmentEntryId);
-    }
-    for (const entry of page.items) {
-      examined += 1;
-      scannedThrough = entry.id;
-      if (entry.kind === ResetEntry.kind) {
-        if (segmentStart !== null && lastSegmentEntryId !== null) {
-          return {
-            status: "closed",
-            examined,
-            episodeStartEntryId: segmentStart,
-            episodeEndEntryId: lastSegmentEntryId,
-          };
-        }
-        segmentStart = entry.id;
-        lastSegmentEntryId = null;
-      } else {
-        segmentStart ??= entry.id;
-        lastSegmentEntryId = entry.id;
-      }
-    }
-    cursor = page.next;
-    if (cursor === undefined) {
-      return openResult(examined, true, scannedThrough, segmentStart, lastSegmentEntryId);
-    }
   }
-  return openResult(examined, false, scannedThrough, segmentStart, lastSegmentEntryId);
+  return value;
 }
 
-function openResult(
-  examined: number,
-  reachedTail: boolean,
-  scannedThroughEntryId: EntryId | null,
-  segmentStartEntryId: EntryId | null,
-  segmentLastContentEntryId: EntryId | null,
-): ScanResult {
+/**
+ * Evidence plan of one entry. Tool results are paired against the durable open-call set; a silent
+ * step consumes a paired result that has no text without emitting a fragment.
+ */
+function planOf(entry: EntryRecord, pending: ReadonlySet<string>): EvidencePlan {
+  const kind = entry.kind;
+  const steps: PlanStep[] = [];
+  const open = new Set(pending);
+  const add = (step: PlanStep): void => {
+    if (steps.length >= DIGEST_LIMITS.maxStepsPerEntry) {
+      throw new Error(
+        `Digest entry ${entry.id} has more than ${DIGEST_LIMITS.maxStepsPerEntry} evidence steps`,
+      );
+    }
+    steps.push(step);
+    if (step.effect !== undefined) {
+      if (step.effect.add) {
+        if (!open.has(step.effect.callId) && open.size >= DIGEST_LIMITS.maxPendingToolCalls) {
+          throw new Error(
+            `Digest segment has more than ${DIGEST_LIMITS.maxPendingToolCalls} open tool calls`,
+          );
+        }
+        open.add(step.effect.callId);
+      } else {
+        open.delete(step.effect.callId);
+      }
+    }
+  };
+  const messageItem = (role: "user" | "assistant", parts: readonly string[]): RawItem => ({
+    ref: `entry:${entry.id}/${role === "user" ? "message" : "reply"}`,
+    role,
+    trust: role === "user" ? "owner" : "assistant",
+    trustLabel: role === "user"
+      ? (kind === CRON_INPUT_ENTRY_KIND ? "scheduled trigger (untrusted data)" : "owner message")
+      : "assistant reply",
+    itemKind: "message",
+    kind,
+    toolCallId: null,
+    toolName: null,
+    parts,
+    length: joinedParts(parts).length,
+    preview: false,
+  });
+
+  if (kind === UserEntry.kind || kind === CRON_INPUT_ENTRY_KIND) {
+    const parts: string[] = [];
+    for (const raw of (entry.model ?? []) as readonly unknown[]) {
+      if (!isRecord(raw) || raw.role !== "user") continue;
+      const text = messageText(raw.content);
+      if (text === undefined || text.trim().length === 0) continue;
+      parts.push(text);
+    }
+    if (parts.length > 0) add({ item: messageItem("user", parts) });
+    return { steps };
+  }
+
+  if (kind === AssistantEntry.kind) {
+    const parts: string[] = [];
+    const calls: { id: string | null; name: string; args: unknown; index: number }[] = [];
+    for (const raw of (entry.model ?? []) as readonly unknown[]) {
+      if (!isRecord(raw) || raw.role !== "assistant") continue;
+      const text = messageText(raw.content);
+      if (text !== undefined && text.trim().length > 0) parts.push(text);
+      if (!Array.isArray(raw.content)) continue;
+      for (const block of raw.content) {
+        if (!isRecord(block) || block.type !== "toolCall" || typeof block.name !== "string") continue;
+        if (calls.length >= DIGEST_LIMITS.maxStepsPerEntry) {
+          throw new Error(
+            `Digest entry ${entry.id} has more than ${DIGEST_LIMITS.maxStepsPerEntry} tool calls`,
+          );
+        }
+        calls.push({
+          id: callIdOf(block.id, entry.id),
+          name: block.name,
+          args: block.arguments,
+          index: calls.length,
+        });
+      }
+    }
+    if (parts.length > 0) add({ item: messageItem("assistant", parts) });
+    for (const call of calls) {
+      const args = [canonicalArguments(call.args)];
+      const key = call.id ?? `index-${call.index}`;
+      add({
+        item: {
+          ref: `entry:${entry.id}/tool-call/${key}`,
+          role: "tool",
+          trust: "untrusted-tool",
+          trustLabel: "untrusted tool call arguments",
+          itemKind: "tool-call",
+          kind,
+          toolCallId: call.id,
+          toolName: call.name,
+          parts: args,
+          length: args[0]!.length,
+          preview: false,
+        },
+        ...(call.id === null ? {} : { effect: { callId: call.id, add: true } }),
+      });
+    }
+    return { steps };
+  }
+
+  if (kind === ToolResultEntry.kind) {
+    for (const raw of (entry.model ?? []) as readonly unknown[]) {
+      if (!isRecord(raw) || raw.role !== "toolResult") continue;
+      // Every result message is one step, paired or not, so a re-plan from a later resume
+      // position keeps the same step indices. An unpaired result, or one with no usable call id,
+      // is a silent no-op, never evidence.
+      const id = callIdOf(raw.toolCallId, entry.id);
+      if (id === null || !open.has(id)) {
+        add({});
+        continue;
+      }
+      const text = messageText(raw.content);
+      const joined = text === undefined ? undefined : text;
+      if (joined === undefined || joined.trim().length === 0) {
+        add({ effect: { callId: id, add: false } });
+        continue;
+      }
+      add({
+        item: {
+          ref: `entry:${entry.id}/tool-result/${id}`,
+          role: "tool",
+          trust: "untrusted-tool",
+          trustLabel: "untrusted tool result",
+          itemKind: "tool-result",
+          kind,
+          toolCallId: id,
+          toolName: typeof raw.toolName === "string" ? raw.toolName : null,
+          parts: [joined],
+          length: joined.length,
+          preview: true,
+        },
+        effect: { callId: id, add: false },
+      });
+    }
+    return { steps };
+  }
+
+  // Reset, system, compaction and unknown entries are consumed with no evidence.
+  return { steps };
+}
+
+/** True when the assistant entry ends without an outstanding tool round. */
+function assistantCalls(entry: EntryRecord): { readonly calls: readonly string[]; readonly terminal: boolean } {
+  const calls: string[] = [];
+  let sawAssistant = false;
+  let terminal = false;
+  for (const raw of (entry.model ?? []) as readonly unknown[]) {
+    if (!isRecord(raw) || raw.role !== "assistant") continue;
+    sawAssistant = true;
+    if (Array.isArray(raw.content)) {
+      for (const block of raw.content) {
+        if (isRecord(block) && block.type === "toolCall") {
+          const id = callIdOf(block.id, entry.id);
+          if (id !== null) {
+            if (calls.length >= DIGEST_LIMITS.maxStepsPerEntry) {
+              throw new Error(
+                `Digest entry ${entry.id} has more than ${DIGEST_LIMITS.maxStepsPerEntry} tool calls`,
+              );
+            }
+            calls.push(id);
+          }
+        }
+      }
+    }
+    const stop = raw.stopReason;
+    // A legacy entry without a stop reason is still terminal when it asked for no tool round. An
+    // explicit error or abort is not a completed answer, so it cannot close a segment by itself;
+    // a later owner input can still close the preceding range.
+    const terminalStop = typeof stop !== "string"
+      || (stop !== "pending" && stop !== "toolUse" && stop !== "deferred"
+        && stop !== "aborted" && stop !== "error");
+    terminal = calls.length === 0 && terminalStop;
+  }
+  return { calls: Object.freeze(calls), terminal: sawAssistant && terminal };
+}
+
+/** Tool call ids completed by one tool-result entry, paired or not. */
+function resultCalls(entry: EntryRecord): readonly string[] {
+  const ids: string[] = [];
+  for (const raw of (entry.model ?? []) as readonly unknown[]) {
+    if (isRecord(raw) && raw.role === "toolResult") {
+      const id = callIdOf(raw.toolCallId, entry.id);
+      if (id !== null) {
+        if (ids.length >= DIGEST_LIMITS.maxStepsPerEntry) {
+          throw new Error(
+            `Digest entry ${entry.id} has more than ${DIGEST_LIMITS.maxStepsPerEntry} tool results`,
+          );
+        }
+        ids.push(id);
+      }
+    }
+  }
+  return ids;
+}
+
+/**
+ * One head-tail preview of a long machine result. Both cuts are surrogate-safe: a head ending on a
+ * high surrogate or a tail starting on a low surrogate is moved inward by one unit, so the preview
+ * never contains half a pair. The marker names the omitted length and the original reference, so a
+ * consumer can neither mistake the preview for the whole result nor claim it read the middle.
+ */
+function clipPreview(parts: readonly string[], total: number, limit: number, ref: string): {
+  readonly text: string;
+  readonly preview: DigestPreview;
+} {
+  const shape = joinedParts(parts);
+  const target = Math.max(1, Math.min(DIGEST_PREVIEW_CHARS, limit));
+  const markerOf = (omitted: number): string => `\n… [${omitted} characters omitted; original at ${ref}] …\n`;
+  const headTextOf = (count: number): string => {
+    let end = Math.max(0, Math.min(count, total));
+    if (end > 0 && end < total && cutsSurrogatePair(shape, 0, end)) end -= 1;
+    return evidenceSlice(shape, 0, end);
+  };
+  const tailTextOf = (count: number): string => {
+    let start = Math.max(0, total - Math.max(0, Math.min(count, total)));
+    if (start > 0 && start < total && cutsSurrogatePair(shape, start - 1, 1)) start += 1;
+    return evidenceSlice(shape, start, total);
+  };
+  let head = Math.max(0, Math.floor((target - 80) / 2));
+  let tail = Math.max(0, target - 80 - head);
+  let headText = headTextOf(head);
+  let tailText = tailTextOf(tail);
+  let omitted = Math.max(0, total - headText.length - tailText.length);
+  let marker = markerOf(omitted);
+  let size = headText.length + marker.length + tailText.length;
+  // Reserve room for the marker, then give any leftover back to the head and tail. A pathological
+  // bound smaller than the marker keeps a tiny visible marker rather than an empty preview.
+  while (size > target && (headText.length > 0 || tailText.length > 0)) {
+    const excess = size - target;
+    if (tailText.length >= headText.length && tailText.length > 0) {
+      tail = Math.max(0, tailText.length - excess);
+      tailText = tailTextOf(tail);
+    } else {
+      head = Math.max(0, headText.length - excess);
+      headText = headTextOf(head);
+    }
+    omitted = Math.max(0, total - headText.length - tailText.length);
+    marker = markerOf(omitted);
+    size = headText.length + marker.length + tailText.length;
+  }
+  if (size > target) {
+    // The bound cannot hold the reference marker; keep the head bounded and say so compactly.
+    const compact = "…";
+    headText = headTextOf(Math.max(0, target - compact.length));
+    tailText = "";
+    omitted = Math.max(0, total - headText.length);
+    marker = compact;
+  }
   return {
-    status: "open",
-    examined,
-    reachedTail,
-    scannedThroughEntryId,
-    segmentStartEntryId,
-    segmentLastContentEntryId,
+    text: `${headText}${marker}${tailText}`,
+    preview: {
+      headChars: headText.length,
+      tailChars: tailText.length,
+      omittedStart: headText.length,
+      omittedEnd: total - tailText.length,
+      omittedChars: omitted,
+      marker,
+    },
+  };
+}
+
+function evidenceOfItem(
+  item: RawItem,
+  entryId: EntryId,
+  itemIndex: number,
+  textStart: number,
+  text: string,
+): DigestEvidence {
+  return {
+    entryId,
+    itemIndex,
+    role: item.role,
+    trust: item.trust,
+    trustLabel: item.trustLabel,
+    itemKind: item.itemKind,
+    kind: item.kind,
+    ref: item.ref,
+    toolCallId: item.toolCallId,
+    toolName: item.toolName,
+    textStart,
+    chars: item.length,
+    text,
+    preview: null,
   };
 }
 
 interface Chunk {
+  readonly entries: readonly DigestEvidence[];
   readonly throughEntryId: EntryId;
+  readonly throughItemIndex: number;
   readonly throughChars: number;
   readonly complete: boolean;
-  readonly entries: readonly DigestEvidence[];
+  readonly nextEntryId: EntryId;
+  readonly nextItemIndex: number;
+  readonly nextTextStart: number;
+  readonly pendingToolCalls: readonly string[];
 }
 
 /**
- * Read one bounded chunk of the inclusive episode range `[firstEntryId..episodeEndEntryId]`
- * starting at `firstTextStart` inside the first entry. The chunk always includes at least
- * one character or entry, so progress through a long entry or a large episode is strictly
- * monotonic and no text is dropped.
- *
- * The character budget closes a chunk only where it has to: at an entry that still carries
- * evidence. Entries after the budget is spent that carry none (reset markers, system or
- * compaction entries, `pi.tool-result` entries, tool-call-only assistant entries) are consumed
- * by the same chunk with a zero offset, so an episode whose evidence fits the bound is one
- * batch even when it ends in backend traffic — including when the evidence fills the bound
- * exactly. The entry cap still bounds that scan.
- *
- * The one exception is an entry the budget cuts short: a partially consumed entry must be the
- * chunk's last entry (a fragment may never lose its tail before the last entry, or
- * acknowledgement would refuse the chunk forever), so a cut ends the chunk immediately, however
- * many evidence-free entries follow it. Those entries then ride with the next chunk.
+ * Read one bounded chunk from an exact resume position. The chunk always consumes at least one
+ * entry or evidence step, and a partially consumed item is always its last item.
  */
 async function readChunk(
   conversation: Conversation,
   firstEntryId: EntryId,
+  firstItemIndex: number,
   firstTextStart: number,
-  episodeEndEntryId: EntryId,
+  segmentEndEntryId: EntryId,
+  pendingStart: readonly string[],
   limits: DigestBatchLimits,
   context: Context,
 ): Promise<Chunk> {
   const entries: DigestEvidence[] = [];
+  const pending = new Set(pendingStart);
   let used = 0;
-  let through: EntryId | null = null;
-  let throughChars = 0;
-  let lastTotal = 0;
-  let read = 0;
+  let entryCount = 0;
+  let stepCount = 0;
   let cursor: Cursor | undefined;
+  let entryId = firstEntryId;
+  let itemIndex = firstItemIndex;
+  let textStart = firstTextStart;
+  let lastEntryId: EntryId | null = null;
+  let lastItemIndex = -1;
+  let lastChars = 0;
   let done = false;
-  while (!done && read < limits.entriesPerBatch) {
+
+  while (!done && entryId <= segmentEndEntryId && entryCount < limits.entriesPerBatch) {
     const page = await conversation.entries(
-      { order: "ascending", minEntryId: firstEntryId, maxEntryId: episodeEndEntryId },
-      Math.min(DIGEST_LIMITS.entriesPerPage, limits.entriesPerBatch - read),
+      { order: "ascending", minEntryId: entryId, maxEntryId: segmentEndEntryId },
+      Math.min(DIGEST_LIMITS.entriesPerPage, limits.entriesPerBatch - entryCount),
       cursor,
       context,
     );
     if (page.items.length === 0) break;
     for (const entry of page.items) {
-      const from = entry.id === firstEntryId ? firstTextStart : 0;
-      const shape = evidenceShapeOf(entry);
-      const total = shape?.length ?? 0;
-      if (shape !== undefined && total > from && used >= limits.charsPerBatch) {
-        // The budget is spent and this entry still has evidence: it belongs to the next chunk.
-        // `used` is positive here, so this chunk always consumed something.
-        done = true;
-        break;
+      entryCount += 1;
+      const plan = planOf(entry, pending);
+      let start = 0;
+      let startOffset = 0;
+      if (entry.id === entryId) {
+        start = Math.min(itemIndex, plan.steps.length);
+        startOffset = textStart;
       }
-      let fragment: DigestEvidence | undefined;
-      let nextThroughChars: number;
-      if (shape !== undefined && total > from) {
-        let take = Math.min(total - from, limits.charsPerBatch - used);
-        if (from + take < total && cutsSurrogatePair(shape, from, take)) {
-          // The budget cannot hold the whole character: end this batch before the entry.
-          // A first entry always has the full budget, so `take <= 1` implies earlier entries.
-          if (take <= 1) {
-            done = true;
-            break;
-          }
-          take -= 1;
+      if (start >= plan.steps.length) {
+        // The entry was already consumed (or carries no steps): move to the next entry.
+        lastEntryId = entry.id;
+        lastItemIndex = -1;
+        lastChars = 0;
+        itemIndex = 0;
+        textStart = 0;
+        entryId = (entry.id + 1) as EntryId;
+        continue;
+      }
+      for (let index = start; index < plan.steps.length; index += 1) {
+        if (stepCount >= DIGEST_LIMITS.maxStepsPerBatch) {
+          done = true;
+          break;
         }
-        fragment = {
-          entryId: entry.id,
-          role: shape.role,
-          kind: shape.kind,
-          textStart: from,
-          chars: total,
-          text: evidenceSlice(shape, from, from + take),
-        };
-        nextThroughChars = from + take;
+        const step = plan.steps[index]!;
+        const item = step.item;
+        const from = index === start ? startOffset : 0;
+        if (item === undefined) {
+          stepCount += 1;
+          if (step.effect !== undefined) {
+            if (step.effect.add) pending.add(step.effect.callId);
+            else pending.delete(step.effect.callId);
+          }
+          lastEntryId = entry.id;
+          lastItemIndex = index;
+          lastChars = 0;
+          itemIndex = index + 1;
+          textStart = 0;
+          continue;
+        }
+        if (from >= item.length) {
+          // This step was already consumed; its effect is already durable in the cursor.
+          itemIndex = index + 1;
+          textStart = 0;
+          continue;
+        }
+        if (used >= limits.charsPerBatch) {
+          done = true;
+          break;
+        }
+        const remaining = limits.charsPerBatch - used;
+        let emitted: DigestEvidence;
+        let consumedThrough: number;
+        let whole: boolean;
+        if (item.preview) {
+          const shape = joinedParts(item.parts);
+          if (item.length <= DIGEST_PREVIEW_CHARS && item.length <= remaining) {
+            emitted = evidenceOfItem(item, entry.id, index, 0, evidenceSlice(shape, 0, item.length));
+          } else {
+            if (used > 0 && remaining < DIGEST_LIMITS.minPreviewBudget) {
+              done = true;
+              break;
+            }
+            const preview = clipPreview(item.parts, shape.length, remaining, item.ref);
+            emitted = {
+              ...evidenceOfItem(item, entry.id, index, 0, preview.text),
+              preview: preview.preview,
+            };
+          }
+          consumedThrough = item.length;
+          whole = true;
+        } else {
+          const shape = joinedParts(item.parts);
+          let take = Math.min(item.length - from, remaining);
+          if (from + take < item.length && cutsSurrogatePair(shape, from, take)) {
+            if (take <= 1) {
+              done = true;
+              break;
+            }
+            take -= 1;
+          }
+          emitted = evidenceOfItem(item, entry.id, index, from, evidenceSlice(shape, from, from + take));
+          consumedThrough = from + take;
+          whole = consumedThrough === item.length;
+        }
+        entries.push(emitted);
+        used += emitted.text.length;
+        stepCount += 1;
+        lastEntryId = entry.id;
+        lastItemIndex = index;
+        lastChars = consumedThrough;
+        if (step.effect !== undefined) {
+          if (step.effect.add) pending.add(step.effect.callId);
+          else pending.delete(step.effect.callId);
+        }
+        if (!whole) {
+          itemIndex = index;
+          textStart = consumedThrough;
+          done = true;
+          break;
+        }
+        itemIndex = index + 1;
+        textStart = 0;
+      }
+      if (done) break;
+      if (itemIndex >= plan.steps.length) {
+        itemIndex = 0;
+        textStart = 0;
+        entryId = (entry.id + 1) as EntryId;
       } else {
-        nextThroughChars = total === 0 ? 0 : Math.min(total, from);
+        entryId = entry.id;
       }
-      // Commit this entry only once its fragment (or its no-evidence decision) is settled.
-      read += 1;
-      through = entry.id;
-      throughChars = nextThroughChars;
-      lastTotal = total;
-      if (fragment !== undefined) {
-        entries.push(fragment);
-        used += fragment.text.length;
-      }
-      if (entry.id === episodeEndEntryId) {
-        done = true;
-        break;
-      }
-      if (nextThroughChars < total) {
-        // This entry still has a tail (the character budget cut it, or a surrogate pair moved the
-        // boundary): the chunk must end here so the tail continues next batch. Consuming further
-        // entries would put a partially consumed entry before the chunk's last entry, which
-        // acknowledgement validation refuses as a lost tail — and the reader would then re-offer
-        // the same chunk forever.
+      if (entry.id === segmentEndEntryId && entryId > segmentEndEntryId) {
         done = true;
         break;
       }
@@ -700,43 +1075,186 @@ async function readChunk(
     cursor = page.next;
     if (cursor === undefined) break;
   }
-  if (through === null) {
-    throw new Error("Digest episode has no entries at the requested position");
+
+  if (lastEntryId === null) {
+    throw new Error("Digest segment has no entries at the requested position");
+  }
+  if (entryId > segmentEndEntryId) {
+    entryId = (segmentEndEntryId + 1) as EntryId;
+    itemIndex = 0;
+    textStart = 0;
   }
   return {
-    throughEntryId: through,
-    throughChars,
-    complete: through === episodeEndEntryId && throughChars === lastTotal,
     entries,
+    throughEntryId: lastEntryId,
+    throughItemIndex: lastItemIndex,
+    throughChars: lastChars,
+    complete: entryId > segmentEndEntryId,
+    nextEntryId: entryId,
+    nextItemIndex: itemIndex,
+    nextTextStart: textStart,
+    pendingToolCalls: Object.freeze([...pending].sort()),
   };
 }
 
-interface ScanCacheEntry {
-  /** Frontier the scan was taken against; a moved frontier discards the entry. */
-  readonly throughEntryId: EntryId | null;
-  readonly throughChars: number | null;
-  readonly scannedThroughEntryId: EntryId | null;
-  readonly segmentStartEntryId: EntryId | null;
-  readonly segmentLastContentEntryId: EntryId | null;
+interface ScanState {
+  readonly startEntryId: EntryId;
+  readonly sawInput: boolean;
+  readonly hasContent: boolean;
+  readonly pending: ReadonlySet<string>;
+  readonly terminalEntryId: EntryId | null;
+  readonly lastEntryId: EntryId;
+}
+
+type ScanResult =
+  | {
+    readonly status: "complete";
+    readonly startEntryId: EntryId;
+    readonly endEntryId: EntryId;
+    readonly examined: number;
+  }
+  | { readonly status: "open"; readonly examined: number; readonly reachedTail: boolean; readonly state: ScanState | null }
+  | { readonly status: "empty"; readonly examined: number };
+
+/**
+ * Walk ascending from the cursor frontier until a completed exchange boundary is found, the tail is
+ * reached, or the scan budget is spent. A reset closes the preceding non-empty segment; a new
+ * owner/scheduled input closes the preceding turn; a terminal assistant entry with no open calls
+ * closes the tail. An in-progress tail is returned as open, never as evidence.
+ */
+async function scanForCompletedSegment(
+  conversation: Conversation,
+  fromEntryId: EntryId,
+  resumed: ScanState | null,
+  budget: number,
+  context: Context,
+): Promise<ScanResult> {
+  let startEntryId: EntryId | null = resumed?.startEntryId ?? null;
+  let sawInput = resumed?.sawInput ?? false;
+  let hasContent = resumed?.hasContent ?? false;
+  let pending = new Set(resumed?.pending ?? []);
+  let terminalEntryId = resumed?.terminalEntryId ?? null;
+  let lastEntryId = resumed?.lastEntryId ?? ((fromEntryId - 1) as EntryId);
+  let examined = 0;
+  let cursor: Cursor | undefined;
+  let nextId = fromEntryId;
+  const settle = (): ScanResult => {
+    if (!hasContent) return { status: "empty", examined };
+    if (sawInput && terminalEntryId !== null && pending.size === 0 && startEntryId !== null) {
+      return { status: "complete", startEntryId, endEntryId: terminalEntryId, examined };
+    }
+    if (startEntryId === null) return { status: "empty", examined };
+    return {
+      status: "open",
+      examined,
+      reachedTail: true,
+      state: { startEntryId, sawInput, hasContent, pending, terminalEntryId, lastEntryId },
+    };
+  };
+  while (examined < budget) {
+    const page = await conversation.entries(
+      { order: "ascending", minEntryId: nextId },
+      Math.min(DIGEST_LIMITS.entriesPerPage, budget - examined),
+      cursor,
+      context,
+    );
+    if (page.items.length === 0) return settle();
+    for (const entry of page.items) {
+      examined += 1;
+      startEntryId ??= entry.id;
+      if (entry.kind === ResetEntry.kind) {
+        if (sawInput && hasContent) {
+          if (startEntryId === null) throw new Error("Digest scan lost its segment start");
+          return { status: "complete", startEntryId, endEntryId: lastEntryId, examined };
+        }
+        // A reset before the first owner/scheduled input closes no exchange: keep it inside the
+        // segment prefix so a leading system/reset block does not need a model-free batch of its own.
+        pending = new Set();
+        terminalEntryId = null;
+        lastEntryId = entry.id;
+        nextId = (entry.id + 1) as EntryId;
+        continue;
+      }
+      if (entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND) {
+        if (sawInput && hasContent) {
+          if (startEntryId === null) throw new Error("Digest scan lost its segment start");
+          return { status: "complete", startEntryId, endEntryId: lastEntryId, examined };
+        }
+        sawInput = true;
+        hasContent = true;
+        pending.clear();
+        terminalEntryId = null;
+        lastEntryId = entry.id;
+        nextId = (entry.id + 1) as EntryId;
+        continue;
+      }
+      hasContent = true;
+      if (entry.kind === AssistantEntry.kind) {
+        const parsed = assistantCalls(entry);
+        for (const callId of parsed.calls) {
+          if (!pending.has(callId) && pending.size >= DIGEST_LIMITS.maxPendingToolCalls) {
+            throw new Error(
+              `Digest segment has more than ${DIGEST_LIMITS.maxPendingToolCalls} open tool calls`,
+            );
+          }
+          pending.add(callId);
+        }
+        terminalEntryId = parsed.terminal && pending.size === 0 ? entry.id : null;
+      } else if (entry.kind === ToolResultEntry.kind) {
+        for (const callId of resultCalls(entry)) pending.delete(callId);
+        terminalEntryId = null;
+      }
+      lastEntryId = entry.id;
+      nextId = (entry.id + 1) as EntryId;
+    }
+    cursor = page.next;
+    if (cursor === undefined) return settle();
+  }
+  if (startEntryId === null) return { status: "empty", examined };
+  return {
+    status: "open",
+    examined,
+    reachedTail: false,
+    state: {
+      startEntryId,
+      sawInput,
+      hasContent,
+      pending,
+      terminalEntryId,
+      lastEntryId,
+    },
+  };
+}
+
+interface SegmentBounds {
+  readonly segmentStartEntryId: EntryId;
+  readonly segmentEndEntryId: EntryId;
+}
+
+interface ScanCacheEntry extends ScanState {
+  readonly cursor: DigestCursor;
 }
 
 interface Candidate {
   readonly session: HistoryChatSession;
   readonly conversation: Conversation;
   readonly cursor: DigestCursor;
-  /** Set when the scan discovered a closed episode; absent for a resumed chunk. */
-  readonly episode?: ClosedEpisodeBounds;
+  readonly segment?: SegmentBounds;
 }
 
-function nextPositionOf(candidate: Candidate): { readonly entryId: number; readonly chars: number } {
-  return candidate.episode === undefined
-    ? { entryId: candidate.cursor.throughEntryId!, chars: candidate.cursor.throughChars! }
-    : { entryId: candidate.episode.episodeStartEntryId, chars: 0 };
+function nextPositionOf(candidate: Candidate): { readonly entryId: number; readonly item: number; readonly chars: number } {
+  if (candidate.segment !== undefined) {
+    return { entryId: candidate.segment.segmentStartEntryId, item: 0, chars: 0 };
+  }
+  return {
+    entryId: candidate.cursor.nextEntryId ?? 1,
+    item: candidate.cursor.nextItemIndex,
+    chars: candidate.cursor.nextTextStart,
+  };
 }
 
 /**
- * Validate the host's mapped chat sessions; they name authorization, not content. Shared by the
- * complementary reader so both readers accept exactly the same host-authenticated chat set.
+ * Validate the host's mapped chat sessions; they name authorization, not content.
  */
 export function validateSessions(sessions: readonly HistoryChatSession[]): void {
   const seen = new Set<number>();
@@ -766,105 +1284,159 @@ export function validateSessions(sessions: readonly HistoryChatSession[]): void 
 
 function validateCursor(cursor: unknown): DigestCursor {
   if (!isRecord(cursor)) throw new TypeError("Digest cursor must be an object");
-  const throughEntryId = cursor.throughEntryId === null
+  const nextEntryId = cursor.nextEntryId === null
     ? null
-    : positiveId(cursor.throughEntryId, "Digest cursor through entry");
-  const throughChars = cursor.throughChars === null
-    ? null
-    : offset(cursor.throughChars, "Digest cursor through offset");
+    : positiveId(cursor.nextEntryId, "Digest cursor next entry");
+  const nextItemIndex = nonNegative(cursor.nextItemIndex, "Digest cursor next item");
+  const nextTextStart = nonNegative(cursor.nextTextStart, "Digest cursor next offset");
   const episodeStartEntryId = cursor.episodeStartEntryId === null
     ? null
-    : positiveId(cursor.episodeStartEntryId, "Digest cursor episode start");
+    : positiveId(cursor.episodeStartEntryId, "Digest cursor segment start");
   const episodeEndEntryId = cursor.episodeEndEntryId === null
     ? null
-    : positiveId(cursor.episodeEndEntryId, "Digest cursor episode end");
-  if ((throughEntryId === null) !== (throughChars === null)) {
-    throw new TypeError("Digest cursor must name both through fields or neither");
-  }
+    : positiveId(cursor.episodeEndEntryId, "Digest cursor segment end");
+  const pendingToolCalls = pendingOf(cursor.pendingToolCalls ?? []);
   if ((episodeStartEntryId === null) !== (episodeEndEntryId === null)) {
-    throw new TypeError("Digest cursor must name both episode bounds or neither");
+    throw new TypeError("Digest cursor must name both segment bounds or neither");
   }
   if (episodeStartEntryId !== null && episodeEndEntryId !== null) {
-    if (throughEntryId === null || episodeStartEntryId > throughEntryId || throughEntryId > episodeEndEntryId) {
-      throw new TypeError("Digest cursor episode position is inconsistent");
+    if (episodeStartEntryId > episodeEndEntryId) {
+      throw new TypeError("Digest cursor segment bounds are inverted");
     }
+    if (nextEntryId === null || nextEntryId > episodeEndEntryId) {
+      throw new TypeError("Digest cursor position is outside its segment");
+    }
+  } else if (nextEntryId === null && (nextItemIndex !== 0 || nextTextStart !== 0)) {
+    throw new TypeError("Digest cursor has a position before the first entry");
   }
-  return { throughEntryId, throughChars, episodeStartEntryId, episodeEndEntryId };
+  return {
+    nextEntryId,
+    nextItemIndex,
+    nextTextStart,
+    episodeStartEntryId,
+    episodeEndEntryId,
+    pendingToolCalls,
+  };
 }
 
-/**
- * A batch is consumer-supplied: validate its shape and that it advances the cursor before
- * any transcript check or write. Transcript agreement is checked separately.
- */
+function validateBatchRef(ref: DigestBatchRef): void {
+  if (ref === null || typeof ref !== "object") throw new TypeError("Digest batch ref must be an object");
+  if (typeof ref.sessionKey !== "string" || ref.sessionKey.length === 0) {
+    throw new TypeError("Digest batch ref session key must be a non-empty string");
+  }
+  const conversationId = ref.conversationId as number;
+  if (!Number.isSafeInteger(conversationId) || conversationId < 1) {
+    throw new TypeError("Digest batch ref conversation ID must be a positive safe integer");
+  }
+  const start = positiveId(ref.episodeStartEntryId, "Digest batch ref segment start");
+  const end = positiveId(ref.episodeEndEntryId, "Digest batch ref segment end");
+  const first = positiveId(ref.firstEntryId, "Digest batch ref first entry");
+  const through = positiveId(ref.throughEntryId, "Digest batch ref through entry");
+  const firstItem = nonNegative(ref.firstItemIndex, "Digest batch ref first item");
+  const throughItem = ref.throughItemIndex;
+  if (typeof throughItem !== "number" || !Number.isSafeInteger(throughItem) || throughItem < -1) {
+    throw new TypeError("Digest batch ref through item must be an integer of at least -1");
+  }
+  const firstTextStart = nonNegative(ref.firstTextStart, "Digest batch ref first offset");
+  nonNegative(ref.throughChars, "Digest batch ref through offset");
+  if (!(start <= first && first <= through && through <= end)) {
+    throw new TypeError("Digest batch ref entry range is inconsistent");
+  }
+  if (first === through && throughItem !== -1 && throughItem < firstItem) {
+    throw new TypeError("Digest batch ref item range is inconsistent");
+  }
+  if (typeof ref.complete !== "boolean") throw new TypeError("Digest batch ref completeness must be a boolean");
+  if (ref.complete && through !== end) {
+    throw new TypeError("Digest batch ref cannot complete before its segment end");
+  }
+  const cursor = validateCursor(ref.cursor);
+  if (cursor.episodeStartEntryId !== null) {
+    if (start !== cursor.episodeStartEntryId || end !== cursor.episodeEndEntryId) {
+      throw new TypeError("Digest batch ref does not continue its cursor's segment");
+    }
+    if (first !== cursor.nextEntryId || firstItem !== cursor.nextItemIndex
+      || firstTextStart !== cursor.nextTextStart) {
+      throw new TypeError("Digest batch ref does not continue at its cursor position");
+    }
+  } else {
+    if (first !== start) throw new TypeError("Digest batch ref must start its segment at its start");
+    // A fresh segment starts at the cursor's position. Only a frontier mapped from the earlier
+    // closed-episode cursor holds a non-zero item or offset here; a settled frontier is 0/0.
+    if (firstItem !== cursor.nextItemIndex || firstTextStart !== cursor.nextTextStart) {
+      throw new TypeError("Digest batch ref must start a fresh segment at its cursor position");
+    }
+    if (cursor.nextEntryId !== null && cursor.nextEntryId > first) {
+      throw new TypeError("Digest batch ref starts before its cursor frontier");
+    }
+  }
+}
+
 function validateBatchShape(batch: DigestBatch): void {
   if (batch === null || typeof batch !== "object") throw new TypeError("Digest batch must be an object");
   if (batch.status !== "batch") throw new TypeError("Digest batch status is invalid");
-  if (typeof batch.sessionKey !== "string" || batch.sessionKey.length === 0) {
-    throw new TypeError("Digest batch session key must be a non-empty string");
+  validateBatchRef(batch as unknown as DigestBatchRef);
+  const first = batch.firstEntryId;
+  const through = batch.throughEntryId;
+  if (through < first) throw new TypeError("Digest batch ends before it starts");
+  if (batch.complete && through !== batch.episodeEndEntryId) {
+    throw new TypeError("Digest batch cannot complete before its segment end");
   }
-  const conversationId = batch.conversationId as number;
-  if (!Number.isSafeInteger(conversationId) || conversationId < 1) {
-    throw new TypeError("Digest batch conversation ID must be a positive safe integer");
-  }
-  const start = positiveId(batch.episodeStartEntryId, "Digest batch episode start");
-  const end = positiveId(batch.episodeEndEntryId, "Digest batch episode end");
-  const first = positiveId(batch.firstEntryId, "Digest batch first entry");
-  const through = positiveId(batch.throughEntryId, "Digest batch through entry");
-  const firstTextStart = offset(batch.firstTextStart, "Digest batch first offset");
-  const throughChars = offset(batch.throughChars, "Digest batch through offset");
-  if (!(start <= first && first <= through && through <= end)) {
-    throw new TypeError("Digest batch entry range is inconsistent");
-  }
-  if (batch.complete && through !== end) {
-    throw new TypeError("Digest batch cannot complete before its episode end");
-  }
-  const cursor = validateCursor(batch.cursor);
-  if (cursor.throughEntryId === null) {
-    if (first !== start) throw new TypeError("Digest batch must start its episode at the episode start");
-    if (firstTextStart !== 0) throw new TypeError("Digest batch must start a new episode at offset 0");
-  } else if (cursor.episodeStartEntryId === null) {
-    if (first <= cursor.throughEntryId) {
-      throw new TypeError("Digest batch starts at or before its cursor");
-    }
-    if (first !== start) throw new TypeError("Digest batch must start its episode at the episode start");
-    if (firstTextStart !== 0) throw new TypeError("Digest batch must start a new episode at offset 0");
-  } else {
-    if (start !== cursor.episodeStartEntryId || end !== cursor.episodeEndEntryId) {
-      throw new TypeError("Digest batch does not continue its cursor's episode");
-    }
-    if (first !== cursor.throughEntryId || firstTextStart !== cursor.throughChars) {
-      throw new TypeError("Digest batch does not continue at its cursor position");
-    }
-  }
-  const advanced = cursor.throughEntryId === null
-    ? through > 0
-    : through > cursor.throughEntryId
-      || (through === cursor.throughEntryId && throughChars > (cursor.throughChars ?? 0));
-  if (!advanced) throw new TypeError("Digest acknowledgement does not advance the cursor");
   if (!Array.isArray(batch.entries)) throw new TypeError("Digest batch entries must be an array");
-  let previous = 0;
+  let previousEntry = 0;
+  let previousItem = -1;
   for (const entry of batch.entries as readonly unknown[]) {
-    if (!isRecord(entry)) throw new TypeError("Digest batch evidence must be an object");
+    if (!isRecord(entry)) throw new TypeError("Digest evidence must be an object");
     const entryId = positiveId(entry.entryId, "Digest evidence entry ID");
-    if (entryId < first || entryId > through || entryId <= previous) {
-      throw new TypeError("Digest evidence entry is outside or out of order in its chunk");
+    const itemIndex = nonNegative(entry.itemIndex, "Digest evidence item index");
+    if (entryId < first || entryId > through || entryId < previousEntry
+      || (entryId === previousEntry && itemIndex <= previousItem)) {
+      throw new TypeError("Digest evidence is outside or out of order in its chunk");
     }
-    previous = entryId;
-    if (entry.role !== "user" && entry.role !== "assistant") {
+    previousEntry = entryId;
+    previousItem = itemIndex;
+    if (entry.role !== "user" && entry.role !== "assistant" && entry.role !== "tool") {
       throw new TypeError("Digest evidence role is invalid");
     }
+    if (entry.trust !== "owner" && entry.trust !== "assistant" && entry.trust !== "untrusted-tool") {
+      throw new TypeError("Digest evidence trust label is invalid");
+    }
+    if (entry.itemKind !== "message" && entry.itemKind !== "tool-call" && entry.itemKind !== "tool-result") {
+      throw new TypeError("Digest evidence item kind is invalid");
+    }
     if (typeof entry.kind !== "string" || entry.kind.length === 0) {
-      throw new TypeError("Digest evidence kind must be a non-empty string");
+      throw new TypeError("Digest evidence durable kind must be a non-empty string");
     }
-    if (typeof entry.text !== "string" || typeof entry.textStart !== "number") {
-      throw new TypeError("Digest evidence text is invalid");
+    if (typeof entry.ref !== "string" || entry.ref.length === 0) {
+      throw new TypeError("Digest evidence reference must be a non-empty string");
     }
-    const textStart = offset(entry.textStart, "Digest evidence text offset");
-    const chars = offset(entry.chars, "Digest evidence length");
-    if (entry.text.length === 0 || textStart + entry.text.length > chars) {
-      throw new TypeError("Digest evidence fragment is outside its entry text");
+    if (typeof entry.text !== "string" || entry.text.length === 0) {
+      throw new TypeError("Digest evidence text must be non-empty");
+    }
+    const textStart = nonNegative(entry.textStart, "Digest evidence text offset");
+    const chars = positiveId(entry.chars, "Digest evidence length");
+    if (textStart >= chars) throw new TypeError("Digest evidence starts beyond its item");
+    if (entry.preview === null) {
+      if (textStart + entry.text.length > chars) {
+        throw new TypeError("Digest evidence fragment is outside its item text");
+      }
+    } else {
+      if (textStart !== 0) throw new TypeError("Digest preview must start at its item start");
+      if (!isRecord(entry.preview)) throw new TypeError("Digest preview is malformed");
+      const preview = entry.preview;
+      nonNegative(preview.headChars, "Digest preview head");
+      nonNegative(preview.tailChars, "Digest preview tail");
+      nonNegative(preview.omittedStart, "Digest preview omitted start");
+      nonNegative(preview.omittedEnd, "Digest preview omitted end");
+      nonNegative(preview.omittedChars, "Digest preview omitted length");
+      if (typeof preview.marker !== "string" || preview.marker.length === 0) {
+        throw new TypeError("Digest preview marker must be non-empty");
+      }
     }
   }
+  const advanced = batch.complete
+    || through > first
+    || (through === first && batch.throughItemIndex >= batch.firstItemIndex);
+  if (!advanced) throw new TypeError("Digest acknowledgement does not advance the cursor");
 }
 
 async function entryAt(
@@ -881,269 +1453,222 @@ async function entryAt(
 }
 
 /**
- * A fresh episode start is a reset entry or the conversation's first entry, and the gap
- * between the previous frontier (or the beginning of the conversation) and that start may
- * hold only reset markers: those belong to empty segments and are not evidence. The gap is
- * bounded to one read's scan budget; a longer one is refused rather than assumed, so a
- * forged start cannot hop over a closed episode. Returns the start entry for the bounds
- * check.
+ * Prove that a newly claimed segment end is a completed exchange boundary in the committed
+ * transcript. A reset or the next owner/scheduled input after the end closes it; otherwise the end
+ * must be a terminal assistant entry with no open calls. The walk is paged and reads only the
+ * segment.
  */
-async function validateFreshEpisodeStart(
+async function validateCompletedSegment(
   conversation: Conversation,
-  batch: DigestBatch,
+  startEntryId: EntryId,
+  endEntryId: EntryId,
   context: Context,
-): Promise<EntryRecord> {
-  const marker = await entryAt(conversation, batch.episodeStartEntryId, context);
-  if (marker === undefined) throw new TypeError("Digest episode start is not a committed entry");
-  if (marker.kind !== ResetEntry.kind) {
-    const below = (await conversation.entries(
-      { order: "descending", ...(batch.episodeStartEntryId > 1 ? { maxEntryId: (batch.episodeStartEntryId - 1) as EntryId } : {}) },
-      1,
-      undefined,
-      context,
-    )).items[0];
-    if (below !== undefined) throw new TypeError("Digest episode start is neither a reset nor the first entry");
-  }
-  const through = batch.cursor.throughEntryId;
-  const gapFrom = through === null ? 1 : through + 1;
-  const gapTo = batch.episodeStartEntryId - 1;
-  if (gapTo >= gapFrom) {
-    const gap = await conversation.entries(
-      { order: "ascending", minEntryId: gapFrom as EntryId, maxEntryId: gapTo as EntryId },
-      DIGEST_LIMITS.scanEntriesPerRead + 1,
-      undefined,
+): Promise<void> {
+  const start = await entryAt(conversation, startEntryId, context);
+  if (start === undefined) throw new TypeError("Digest segment start is not a committed entry");
+  let sawInput = false;
+  let hasContent = false;
+  const pending = new Set<string>();
+  let terminalEntryId: EntryId | null = null;
+  let cursor: Cursor | undefined;
+  let entryId = startEntryId;
+  while (entryId <= endEntryId) {
+    const page = await conversation.entries(
+      { order: "ascending", minEntryId: entryId, maxEntryId: endEntryId },
+      DIGEST_LIMITS.entriesPerPage,
+      cursor,
       context,
     );
-    if (gap.items.length > DIGEST_LIMITS.scanEntriesPerRead || gap.next !== undefined) {
-      throw new TypeError("Digest episode start is too far from its cursor to verify");
-    }
-    for (const entry of gap.items) {
-      if (entry.kind !== ResetEntry.kind) {
-        throw new TypeError("Digest episode start would skip an earlier segment with content");
+    if (page.items.length === 0) break;
+    for (const entry of page.items) {
+      if (entry.kind === ResetEntry.kind) {
+        if (sawInput) throw new TypeError("Digest segment spans a reset after its owner turn");
+        continue;
+      }
+      hasContent = true;
+      if (entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND) {
+        sawInput = true;
+        pending.clear();
+        terminalEntryId = null;
+      } else if (entry.kind === AssistantEntry.kind) {
+        const parsed = assistantCalls(entry);
+        for (const callId of parsed.calls) {
+          if (!pending.has(callId) && pending.size >= DIGEST_LIMITS.maxPendingToolCalls) {
+            throw new TypeError("Digest segment has too many open tool calls");
+          }
+          pending.add(callId);
+        }
+        terminalEntryId = parsed.terminal && pending.size === 0 ? entry.id : null;
+      } else if (entry.kind === ToolResultEntry.kind) {
+        for (const callId of resultCalls(entry)) pending.delete(callId);
+        terminalEntryId = null;
       }
     }
+    cursor = page.next;
+    if (cursor === undefined) break;
+    entryId = (page.items[page.items.length - 1]!.id + 1) as EntryId;
   }
-  return marker;
-}
-
-/**
- * Establish that a newly claimed episode really is the segment its start opens: walking the
- * episode from its start, the first reset that closes a non-empty segment must be the one
- * just after the claimed end. Paged reads keep memory bounded, but the walk is not
- * interruptible mid-walk (SQLite reads ignore the context); an aborted context only stops
- * the acknowledgement's commit, so no cursor advances. The walk runs only when new episode
- * bounds are established, not for every continuation chunk, so its total cost is one
- * bounded-memory pass over that episode: its length is the episode's own entry count, the same
- * episode the acknowledging chunk came from. A whole-episode batch therefore walks exactly that
- * episode, and a chunked episode walks it once, on its first chunk. Without it, a forged
- * partial batch could persist an end that spans an earlier reset; later chunks would then
- * contain that internal reset and be un-acknowledgeable forever, and the poisoned position
- * would keep winning cross-chat priority.
- */
-async function validateFreshEpisodeClosedRange(
-  conversation: Conversation,
-  batch: DigestBatch,
-  startEntry: EntryRecord,
-  context: Context,
-): Promise<void> {
-  if (batch.episodeEndEntryId === batch.episodeStartEntryId) {
-    // A single-entry episode is already covered by the bounds check: the next entry is its reset.
-    return;
-  }
-  const startsWithReset = startEntry.kind === ResetEntry.kind;
-  const scan = await scanForClosedEpisode(
-    conversation,
-    (batch.episodeStartEntryId + 1) as EntryId,
-    batch.episodeStartEntryId,
-    startsWithReset ? null : batch.episodeStartEntryId,
-    Number.POSITIVE_INFINITY,
-    context,
-  );
-  if (
-    scan.status !== "closed"
-    || scan.episodeStartEntryId !== batch.episodeStartEntryId
-    || scan.episodeEndEntryId !== batch.episodeEndEntryId
-  ) {
-    throw new TypeError("Digest episode end is not the first reset that closes its start");
-  }
-}
-
-/**
- * Validate the immutable episode bounds on every acknowledgement, not only a complete one.
- * The end must be a committed non-reset entry just before the `pi.reset` that actually
- * closes the episode; a reset-started episode must contain something besides its marker.
- * Without this, a forged partial batch could persist an inflated end and make later
- * batches cross resets or the open tail.
- */
-async function validateEpisodeBounds(
-  conversation: Conversation,
-  batch: Pick<DigestBatch, "episodeStartEntryId" | "episodeEndEntryId">,
-  startEntry: EntryRecord,
-  context: Context,
-): Promise<void> {
-  const endEntry = await entryAt(conversation, batch.episodeEndEntryId, context);
-  if (endEntry === undefined) throw new TypeError("Digest episode end is not a committed entry");
-  if (endEntry.kind === ResetEntry.kind) throw new TypeError("Digest episode end is a reset marker");
-  if (startEntry.kind === ResetEntry.kind && batch.episodeEndEntryId === batch.episodeStartEntryId) {
-    throw new TypeError("Digest episode has no content after its reset marker");
-  }
+  if (!hasContent) throw new TypeError("Digest segment holds no content");
+  if (!sawInput) throw new TypeError("Digest segment does not open an owner or scheduled turn");
   const closing = (await conversation.entries(
-    { order: "ascending", minEntryId: (batch.episodeEndEntryId + 1) as EntryId },
+    { order: "ascending", minEntryId: (endEntryId + 1) as EntryId },
     1,
     undefined,
     context,
   )).items[0];
-  if (closing === undefined || closing.kind !== ResetEntry.kind) {
-    throw new TypeError("Digest episode is not closed by a reset in the transcript");
+  if (closing !== undefined && (closing.kind === ResetEntry.kind
+    || closing.kind === UserEntry.kind || closing.kind === CRON_INPUT_ENTRY_KIND)) {
+    return;
+  }
+  if (terminalEntryId !== endEntryId || pending.size > 0) {
+    throw new TypeError("Digest segment end is not a completed exchange boundary");
   }
 }
 
 /**
- * Re-derive the batch's claimed chunk from the committed transcript. This is what makes a
- * cursor advance trustworthy: every entry the batch claims to cover must exist, every
- * evidence entry in that range must be covered by exactly the claimed fragment at the
- * claimed offset, no entry before the last may lose its tail, and a complete chunk must
- * end just before its closing reset.
- *
- * Bound: one transcript read of the claimed range, bounded by *entry count* at
- * `limits.entriesPerBatch + 1` records (2,001 with the shipped defaults), never by bytes. The
- * character bound does not cover every record: a chunk may end in evidence-free entries (reset
- * markers, system or compaction entries, `pi.tool-result` entries, tool-call-only assistant
- * entries) whose bytes contribute no evidence characters, and one individual entry may itself be
- * larger than `limits.charsPerBatch`. So the honest statement is: this re-reads exactly the chunk
- * being acknowledged (no scan, no second pass over the episode), with work proportional to that
- * chunk's entry count, and per-entry size is not bounded by the character bound. A range that does
- * not fit the captured entry bound is refused loudly instead of being truncated.
+ * Prove that a fresh segment's start did not hop over an unconsumed entry in the same conversation.
+ * Entry IDs are global and interleave other chats, so a zero-entry gap within this conversation is
+ * normal; any entry in it is refused rather than silently skipped. The gap is bounded by one read's
+ * scan budget; a longer one is refused rather than assumed.
  */
-async function validateChunkAgainstTranscript(
+async function validateFreshSegmentGap(
   conversation: Conversation,
-  batch: DigestBatch,
-  limits: DigestBatchLimits,
+  batch: Pick<DigestBatch, "firstEntryId" | "cursor">,
   context: Context,
 ): Promise<void> {
-  const page = await conversation.entries(
-    { order: "ascending", minEntryId: batch.firstEntryId, maxEntryId: batch.throughEntryId },
-    limits.entriesPerBatch + 1,
+  const gapFrom = batch.cursor.nextEntryId ?? (1 as EntryId);
+  const gapTo = (batch.firstEntryId - 1) as EntryId;
+  if (gapTo < gapFrom) return;
+  const gap = await conversation.entries(
+    { order: "ascending", minEntryId: gapFrom, maxEntryId: gapTo },
+    DIGEST_LIMITS.scanEntriesPerRead + 1,
     undefined,
     context,
   );
-  const items = page.items;
-  const last = items[items.length - 1];
-  if (last === undefined || last.id !== batch.throughEntryId) {
-    throw new TypeError("Digest batch does not cover its claimed entry range");
+  if (gap.items.length > DIGEST_LIMITS.scanEntriesPerRead || gap.next !== undefined) {
+    throw new TypeError("Digest segment start is too far from its cursor to verify");
   }
-  if (items.length > limits.entriesPerBatch) {
-    throw new TypeError(`Digest batch covers more than ${limits.entriesPerBatch} entries`);
-  }
-  if (items[0]!.id !== batch.firstEntryId) {
-    throw new TypeError("Digest batch does not start at a committed entry");
-  }
-  const inRange = new Set<number>(items.map((entry) => entry.id as number));
-  for (const evidence of batch.entries) {
-    if (!inRange.has(evidence.entryId as number)) {
-      throw new TypeError("Digest batch has evidence outside its claimed entry range");
-    }
-  }
-  const byId = new Map<number, DigestEvidence>(batch.entries.map((entry) => [entry.entryId as number, entry]));
-  let lastTotal = 0;
-  let lastFragment: DigestEvidence | undefined;
-  for (let index = 0; index < items.length; index += 1) {
-    const item = items[index]!;
-    // A closed episode contains at most its own reset marker; a later one would mean the
-    // claimed range spans an episode boundary this acknowledgement never consumed.
-    if (index > 0 && item.kind === ResetEntry.kind) {
-      throw new TypeError("Digest batch spans a reset boundary inside one episode");
-    }
-    const shape = evidenceShapeOf(item);
-    const total = shape?.length ?? 0;
-    const from = index === 0 ? batch.firstTextStart : 0;
-    const fragment = byId.get(item.id as number);
-    if (from > total) throw new TypeError("Digest batch starts beyond its first entry's evidence");
-    let end = from;
-    if (total > from) {
-      if (fragment === undefined) throw new TypeError("Digest batch omits evidence from its covered range");
-      if (fragment.textStart !== from) throw new TypeError("Digest evidence fragment does not start at its position");
-      if (fragment.chars !== total) throw new TypeError("Digest evidence length does not match the transcript entry");
-      if (fragment.kind !== shape!.kind || fragment.role !== shape!.role) {
-        throw new TypeError("Digest evidence does not match the transcript entry");
-      }
-      end = fragment.textStart + fragment.text.length;
-      if (end > total) throw new TypeError("Digest evidence fragment is outside its entry text");
-      if (evidenceSlice(shape!, fragment.textStart, end) !== fragment.text) {
-        throw new TypeError("Digest evidence text does not match the transcript entry");
-      }
-    } else if (fragment !== undefined) {
-      throw new TypeError("Digest batch claims evidence for an already consumed entry");
-    }
-    if (index < items.length - 1 && end !== total) {
-      throw new TypeError("Digest batch loses the tail of an entry before its last entry");
-    }
-    lastTotal = total;
-    lastFragment = fragment;
-  }
-  const expected = lastFragment === undefined ? lastTotal : lastFragment.textStart + lastFragment.text.length;
-  if (batch.throughChars !== expected) {
-    throw new TypeError("Digest batch through offset does not match its last entry");
-  }
-  const consumedEpisode = batch.throughEntryId === batch.episodeEndEntryId
-    && batch.throughChars === lastTotal;
-  if (batch.complete !== consumedEpisode) {
-    throw new TypeError("Digest batch completeness does not match its last entry");
+  if (gap.items.length > 0) {
+    throw new TypeError("Digest segment start would skip an earlier entry with content");
   }
 }
 
 /**
- * A batch ref is consumer-supplied: validate its shape before any transcript read. The
- * claimed end is also checked against the committed transcript, so a forged ref can only
- * read a closed segment of a mapped chat conversation, never the open tail.
+ * Check that a frontier mapped from the earlier closed-episode cursor still points at the extracted
+ * message text this reader slices. An offset beyond that entry, or one inside a surrogate pair,
+ * cannot be mapped safely; refusing is better than skipping or splitting a character.
  */
-function validateBatchRef(ref: DigestBatchRef): void {
-  if (ref === null || typeof ref !== "object") throw new TypeError("Digest batch ref must be an object");
-  if (typeof ref.sessionKey !== "string" || ref.sessionKey.length === 0) {
-    throw new TypeError("Digest batch ref session key must be a non-empty string");
+async function validateLegacyFrontier(
+  conversation: Conversation,
+  entryId: EntryId,
+  textStart: number,
+  context: Context,
+): Promise<void> {
+  const entry = await entryAt(conversation, entryId, context);
+  if (entry === undefined) {
+    throw new Error(`Digest frontier entry ${entryId} is not committed; refusing its stored offset`);
   }
-  const conversationId = ref.conversationId as number;
-  if (!Number.isSafeInteger(conversationId) || conversationId < 1) {
-    throw new TypeError("Digest batch ref conversation ID must be a positive safe integer");
+  const shape = evidenceShapeOf(entry);
+  if (shape === undefined) {
+    if (textStart !== 0) {
+      throw new Error(
+        `Digest frontier entry ${entryId} has no message evidence, so offset ${textStart} cannot be ` +
+        `mapped; refusing it`,
+      );
+    }
+    return;
   }
-  const start = positiveId(ref.episodeStartEntryId, "Digest batch ref episode start");
-  const end = positiveId(ref.episodeEndEntryId, "Digest batch ref episode end");
-  const first = positiveId(ref.firstEntryId, "Digest batch ref first entry");
-  const through = positiveId(ref.throughEntryId, "Digest batch ref through entry");
-  const firstTextStart = offset(ref.firstTextStart, "Digest batch ref first offset");
-  offset(ref.throughChars, "Digest batch ref through offset");
-  if (typeof ref.complete !== "boolean") throw new TypeError("Digest batch ref completeness must be a boolean");
-  if (!(start <= first && first <= through && through <= end)) {
-    throw new TypeError("Digest batch ref entry range is inconsistent");
+  if (textStart > shape.length) {
+    throw new Error(
+      `Digest frontier offset ${textStart} is beyond entry ${entryId}'s ${shape.length} extracted ` +
+      `characters; refusing it`,
+    );
   }
-  if (ref.complete && through !== end) {
-    throw new TypeError("Digest batch ref cannot complete before its episode end");
-  }
-  const cursor = validateCursor(ref.cursor);
-  const continues = cursor.episodeStartEntryId !== null;
-  if (continues) {
-    if (start !== cursor.episodeStartEntryId || end !== cursor.episodeEndEntryId) {
-      throw new TypeError("Digest batch ref does not continue its cursor's episode");
-    }
-    if (first !== cursor.throughEntryId || firstTextStart !== cursor.throughChars) {
-      throw new TypeError("Digest batch ref does not continue at its cursor position");
-    }
-  } else {
-    if (first !== start || firstTextStart !== 0) {
-      throw new TypeError("Digest batch ref must start its episode at the episode start");
-    }
-    if (cursor.throughEntryId !== null && first <= cursor.throughEntryId) {
-      throw new TypeError("Digest batch ref starts at or before its cursor");
-    }
+  if (textStart > 0 && textStart < shape.length && cutsSurrogatePair(shape, textStart - 1, 1)) {
+    throw new Error(
+      `Digest frontier offset ${textStart} splits a surrogate pair in entry ${entryId}; refusing it`,
+    );
   }
 }
 
+/** Start of the already-consumed prefix whose open calls must be restored at a mapped frontier. */
+async function legacyPrefixStart(
+  conversation: Conversation,
+  cursor: DigestCursor,
+  entryId: EntryId,
+  context: Context,
+): Promise<EntryId> {
+  if (cursor.episodeStartEntryId !== null) return cursor.episodeStartEntryId;
+  // A settled closed-episode cursor clears its bounds. Its closing reset is still in the immutable
+  // transcript and no call survives a reset, so the nearest preceding reset is a safe prefix start.
+  const page = await conversation.entries(
+    { order: "descending", maxEntryId: entryId },
+    DIGEST_LIMITS.scanEntriesPerRead,
+    undefined,
+    context,
+  );
+  const reset = page.items.find((entry) => entry.kind === ResetEntry.kind);
+  if (reset !== undefined) return reset.id;
+  if (page.next !== undefined) {
+    throw new Error(
+      `Digest frontier at entry ${entryId} is more than ${DIGEST_LIMITS.scanEntriesPerRead} entries ` +
+      `from a reset; refusing to derive its open tool calls`,
+    );
+  }
+  return 1 as EntryId;
+}
+
 /**
- * Reject batch bounds that could not progress, at every direct entry point: construction, each
- * `read`, `readBatch` and `acknowledge` override. Two entries per chunk is the minimum because a
- * one-entry chunk stuck on a non-evidence entry (an episode's opening reset marker, typically) would
- * be refused as non-advancing and re-offered forever; two characters is the minimum that can hold a
- * surrogate pair.
+ * Open tool calls at a mapped legacy frontier, derived by replaying pairing over the prefix that the
+ * closed-episode reader already consumed. The frontier entry itself is excluded: its tool steps
+ * follow the acknowledged message offset and are still this reader's evidence. A prefix longer than
+ * the scan bound fails closed rather than silently orphaning a later result.
+ */
+async function pendingCallsBefore(
+  conversation: Conversation,
+  cursor: DigestCursor,
+  entryId: EntryId,
+  context: Context,
+): Promise<readonly string[]> {
+  const start = await legacyPrefixStart(conversation, cursor, entryId, context);
+  if (start >= entryId) return Object.freeze([]) as readonly string[];
+  const pending = new Set<string>();
+  let remaining = DIGEST_LIMITS.scanEntriesPerRead;
+  let pageCursor: Cursor | undefined;
+  const maxEntryId = (entryId - 1) as EntryId;
+  while (remaining > 0) {
+    const page = await conversation.entries(
+      { order: "ascending", minEntryId: start, maxEntryId },
+      Math.min(DIGEST_LIMITS.entriesPerPage, remaining),
+      pageCursor,
+      context,
+    );
+    for (const entry of page.items) {
+      remaining -= 1;
+      if (entry.kind === AssistantEntry.kind) {
+        for (const id of assistantCalls(entry).calls) pending.add(id);
+      } else if (entry.kind === ToolResultEntry.kind) {
+        for (const id of resultCalls(entry)) pending.delete(id);
+      } else if (entry.kind === ResetEntry.kind) {
+        pending.clear();
+      }
+    }
+    pageCursor = page.next;
+    if (pageCursor === undefined) break;
+  }
+  if (pageCursor !== undefined || remaining < 0) {
+    throw new Error(
+      `Digest frontier prefix at entry ${entryId} is longer than ` +
+      `${DIGEST_LIMITS.scanEntriesPerRead} entries; refusing to derive its open tool calls`,
+    );
+  }
+  return Object.freeze([...pending].sort());
+}
+
+/**
+ * Reject batch bounds that could not progress, at every direct entry point. Two entries per chunk is
+ * the minimum because a one-entry chunk stuck on a non-evidence entry would be refused as
+ * non-advancing and re-offered forever; two characters is the minimum that can hold a surrogate pair.
  */
 function requireBatchLimits(limits: DigestBatchLimits): DigestBatchLimits {
   if (!isDigestEntriesBound(limits.entriesPerBatch) || !isDigestCharsBound(limits.charsPerBatch)) {
@@ -1155,17 +1680,63 @@ function requireBatchLimits(limits: DigestBatchLimits): DigestBatchLimits {
   return limits;
 }
 
+function sameEvidence(left: DigestEvidence, right: DigestEvidence): boolean {
+  return left.entryId === right.entryId
+    && left.itemIndex === right.itemIndex
+    && left.role === right.role
+    && left.trust === right.trust
+    && left.trustLabel === right.trustLabel
+    && left.itemKind === right.itemKind
+    && left.kind === right.kind
+    && left.ref === right.ref
+    && left.toolCallId === right.toolCallId
+    && left.toolName === right.toolName
+    && left.textStart === right.textStart
+    && left.chars === right.chars
+    && left.text === right.text
+    && samePreview(left.preview, right.preview);
+}
+
+function samePreview(left: DigestPreview | null, right: DigestPreview | null): boolean {
+  if (left === null || right === null) return left === right;
+  return left.headChars === right.headChars
+    && left.tailChars === right.tailChars
+    && left.omittedStart === right.omittedStart
+    && left.omittedEnd === right.omittedEnd
+    && left.omittedChars === right.omittedChars
+    && left.marker === right.marker;
+}
+
 export function createDigestSource(options: DigestSourceOptions): DigestSource {
-  const { harness } = options;
   const configured = requireBatchLimits(options.limits ?? DIGEST_LIMITS);
   // Derived scan positions only: losing them costs a repeated bounded scan, never evidence.
   const scanCache = new Map<ConversationId, ScanCacheEntry>();
-  // Scan budget rotates its starting conversation, so a chat with continuous activity cannot
-  // spend every read's budget before the others are examined. It changes discovery order only.
+  // Discovery order rotates so one busy chat cannot spend every read's budget before the others.
   let rotation = 0;
 
-  const cursorFor = async (conversationId: ConversationId, context: Context): Promise<DigestCursor> =>
-    digestCursorOf(await harness.snapshot(DigestCursorDoc, conversationId, context));
+  /**
+   * The stored cursor, plus the open tool calls of a frontier mapped from the earlier closed-episode
+   * cursor. That derivation needs the transcript, which the acknowledgement transaction cannot
+   * walk, so it happens here and is frozen by the first acknowledgement.
+   */
+  const cursorFor = async (conversationId: ConversationId, context: Context): Promise<DigestCursor> => {
+    const document = await options.harness.snapshot(DigestCursorDoc, conversationId, context);
+    const cursor = digestCursorOf(document);
+    if (!isLegacyDigestCursor(document)) return cursor;
+    if (cursor.nextEntryId === null) return cursor;
+    const conversation = await options.harness.conversation(conversationId, context);
+    if (conversation === undefined) {
+      throw new Error(
+        `Digest frontier for conversation ${conversationId} has no committed conversation; ` +
+        `refusing to map it`,
+      );
+    }
+    await validateLegacyFrontier(conversation, cursor.nextEntryId, cursor.nextTextStart, context);
+    return {
+      ...cursor,
+      pendingToolCalls: await pendingCallsBefore(conversation, cursor, cursor.nextEntryId, context),
+    };
+  };
 
   return {
     cursor(conversationId, context) {
@@ -1192,7 +1763,7 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
       const ordered = startAt === 0 ? sessions : [...sessions.slice(startAt), ...sessions.slice(0, startAt)];
       for (const session of ordered) {
         const conversationId = session.conversationId;
-        const conversation = await harness.conversation(conversationId, context);
+        const conversation = await options.harness.conversation(conversationId, context);
         if (conversation === undefined) {
           missingChats += 1;
           continue;
@@ -1208,55 +1779,46 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
           continue;
         }
         const cached = scanCache.get(conversationId);
-        const usable = cached !== undefined && cached.throughEntryId === cursor.throughEntryId
-          && cached.throughChars === cursor.throughChars;
+        const usable = cached !== undefined && sameCursor(cached.cursor, cursor);
+        if (!usable) scanCache.delete(conversationId);
+        const fromEntryId = (usable
+          ? cached!.lastEntryId + 1
+          : cursor.nextEntryId ?? 1) as EntryId;
         const tail = (await conversation.entries({ order: "descending" }, 1, undefined, context)).items[0];
         if (tail === undefined) {
           examinedChats += 1;
           continue;
         }
-        if (usable && cached.scannedThroughEntryId !== null && tail.id <= cached.scannedThroughEntryId) {
-          // Everything after this frontier was already examined and held no closed episode.
+        if (fromEntryId > tail.id) {
+          // A cached scan already examined this tail and found no completed boundary.
           examinedChats += 1;
           continue;
         }
-        const fromEntryId = (
-          usable && cached.scannedThroughEntryId !== null
-            ? cached.scannedThroughEntryId + 1
-            : (cursor.throughEntryId ?? 0) + 1
-        ) as EntryId;
-        const segmentStartEntryId = usable ? cached.segmentStartEntryId : null;
-        const segmentLastContentEntryId = usable ? cached.segmentLastContentEntryId : null;
-        const scanned = await scanForClosedEpisode(
+        const scanned = await scanForCompletedSegment(
           conversation,
           fromEntryId,
-          segmentStartEntryId,
-          segmentLastContentEntryId,
+          usable ? cached! : null,
           budget,
           context,
         );
         budget -= scanned.examined;
         examinedChats += 1;
-        if (scanned.status === "closed") {
+        if (scanned.status === "complete") {
           scanCache.delete(conversationId);
           candidates.push({
             session,
             conversation,
             cursor,
-            episode: {
-              episodeStartEntryId: scanned.episodeStartEntryId,
-              episodeEndEntryId: scanned.episodeEndEntryId,
+            segment: {
+              segmentStartEntryId: scanned.startEntryId,
+              segmentEndEntryId: scanned.endEntryId,
             },
           });
-        } else {
+        } else if (scanned.status === "open") {
           if (!scanned.reachedTail) unfinishedChats += 1;
-          scanCache.set(conversationId, {
-            throughEntryId: cursor.throughEntryId,
-            throughChars: cursor.throughChars,
-            scannedThroughEntryId: scanned.scannedThroughEntryId,
-            segmentStartEntryId: scanned.segmentStartEntryId,
-            segmentLastContentEntryId: scanned.segmentLastContentEntryId,
-          });
+          if (scanned.state !== null) {
+            scanCache.set(conversationId, { ...scanned.state, cursor });
+          }
         }
       }
       if (candidates.length === 0) {
@@ -1273,21 +1835,32 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
         const a = nextPositionOf(left);
         const b = nextPositionOf(right);
         return a.entryId - b.entryId
+          || a.item - b.item
           || a.chars - b.chars
           || (left.session.conversationId as number) - (right.session.conversationId as number);
       });
       const chosen = candidates[0]!;
-      const episode = chosen.episode ?? {
-        episodeStartEntryId: chosen.cursor.episodeStartEntryId!,
-        episodeEndEntryId: chosen.cursor.episodeEndEntryId!,
+      const segment = chosen.segment ?? {
+        segmentStartEntryId: chosen.cursor.episodeStartEntryId!,
+        segmentEndEntryId: chosen.cursor.episodeEndEntryId!,
       };
-      const firstEntryId = chosen.episode === undefined ? chosen.cursor.throughEntryId! : episode.episodeStartEntryId;
-      const firstTextStart = chosen.episode === undefined ? chosen.cursor.throughChars! : 0;
+      const firstEntryId = (chosen.segment !== undefined
+        ? segment.segmentStartEntryId
+        : chosen.cursor.nextEntryId!) as EntryId;
+      // The cursor position is this chunk's start when the chunk begins at the cursor frontier: a
+      // fresh segment starts there, and a frontier mapped from the closed-episode cursor resumes
+      // inside that entry at the already-digested message offset instead of re-emitting it.
+      const atFrontier = chosen.segment === undefined
+        || segment.segmentStartEntryId === chosen.cursor.nextEntryId;
+      const firstItemIndex = atFrontier ? chosen.cursor.nextItemIndex : 0;
+      const firstTextStart = atFrontier ? chosen.cursor.nextTextStart : 0;
       const chunk = await readChunk(
         chosen.conversation,
         firstEntryId,
+        firstItemIndex,
         firstTextStart,
-        episode.episodeEndEntryId,
+        segment.segmentEndEntryId,
+        chosen.cursor.pendingToolCalls,
         batchLimits,
         context,
       );
@@ -1295,13 +1868,18 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
         status: "batch",
         sessionKey: chosen.session.sessionKey,
         conversationId: chosen.session.conversationId,
-        episodeStartEntryId: episode.episodeStartEntryId,
-        episodeEndEntryId: episode.episodeEndEntryId,
+        episodeStartEntryId: segment.segmentStartEntryId,
+        episodeEndEntryId: segment.segmentEndEntryId,
         firstEntryId,
+        firstItemIndex,
         firstTextStart,
         throughEntryId: chunk.throughEntryId,
+        throughItemIndex: chunk.throughItemIndex,
         throughChars: chunk.throughChars,
         complete: chunk.complete,
+        nextEntryId: chunk.nextEntryId,
+        nextItemIndex: chunk.nextItemIndex,
+        nextTextStart: chunk.nextTextStart,
         entries: chunk.entries,
         cursor: chosen.cursor,
       };
@@ -1311,7 +1889,7 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
       validateBatchRef(ref);
       const batchLimits = requireBatchLimits(limits ?? configured);
       const conversationId = ref.conversationId;
-      const conversation = await harness.conversation(conversationId, context);
+      const conversation = await options.harness.conversation(conversationId, context);
       if (conversation === undefined) throw new TypeError("Digest batch ref conversation is not committed");
       const sessions = await options.sessions(context);
       validateSessions(sessions);
@@ -1319,19 +1897,30 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
       if (session === undefined || session.sessionKey !== ref.sessionKey) {
         throw new TypeError("Digest batch ref is not a currently mapped chat session");
       }
-      const startEntry = await entryAt(conversation, ref.episodeStartEntryId, context);
-      if (startEntry === undefined) throw new TypeError("Digest batch ref episode start is not committed");
-      await validateEpisodeBounds(conversation, ref, startEntry, context);
+      const start = await entryAt(conversation, ref.episodeStartEntryId, context);
+      if (start === undefined) throw new TypeError("Digest batch ref segment start is not committed");
+      if (ref.cursor.episodeStartEntryId === null) {
+        await validateFreshSegmentGap(conversation, ref, context);
+        await validateCompletedSegment(
+          conversation,
+          ref.episodeStartEntryId,
+          ref.episodeEndEntryId,
+          context,
+        );
+      }
       const chunk = await readChunk(
         conversation,
         ref.firstEntryId,
+        ref.firstItemIndex,
         ref.firstTextStart,
         ref.episodeEndEntryId,
+        ref.cursor.pendingToolCalls,
         batchLimits,
         context,
       );
       if (
         chunk.throughEntryId !== ref.throughEntryId
+        || chunk.throughItemIndex !== ref.throughItemIndex
         || chunk.throughChars !== ref.throughChars
         || chunk.complete !== ref.complete
       ) {
@@ -1344,10 +1933,15 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
         episodeStartEntryId: ref.episodeStartEntryId,
         episodeEndEntryId: ref.episodeEndEntryId,
         firstEntryId: ref.firstEntryId,
+        firstItemIndex: ref.firstItemIndex,
         firstTextStart: ref.firstTextStart,
         throughEntryId: chunk.throughEntryId,
+        throughItemIndex: chunk.throughItemIndex,
         throughChars: chunk.throughChars,
         complete: chunk.complete,
+        nextEntryId: chunk.nextEntryId,
+        nextItemIndex: chunk.nextItemIndex,
+        nextTextStart: chunk.nextTextStart,
         entries: chunk.entries,
         cursor: ref.cursor,
       };
@@ -1357,36 +1951,88 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
       validateBatchShape(batch);
       const batchLimits = requireBatchLimits(limits ?? configured);
       const conversationId = batch.conversationId;
-      const conversation = await harness.conversation(conversationId, context);
-      if (conversation === undefined) throw new TypeError("Digest batch conversation is not a committed conversation");
-      const startEntry = batch.cursor.episodeStartEntryId === null
-        ? await validateFreshEpisodeStart(conversation, batch, context)
-        : await entryAt(conversation, batch.episodeStartEntryId, context);
-      if (startEntry === undefined) throw new TypeError("Digest episode start is not a committed entry");
-      await validateEpisodeBounds(conversation, batch, startEntry, context);
-      if (batch.cursor.episodeStartEntryId === null) {
-        // New bounds are proven complete here; continuation chunks reuse them.
-        await validateFreshEpisodeClosedRange(conversation, batch, startEntry, context);
+      const conversation = await options.harness.conversation(conversationId, context);
+      if (conversation === undefined) {
+        throw new TypeError("Digest batch conversation is not a committed conversation");
       }
-      await validateChunkAgainstTranscript(conversation, batch, batchLimits, context);
-      const next: DigestCursor = {
-        throughEntryId: batch.throughEntryId,
-        throughChars: batch.throughChars,
-        episodeStartEntryId: batch.complete ? null : batch.episodeStartEntryId,
-        episodeEndEntryId: batch.complete ? null : batch.episodeEndEntryId,
-      };
-      await harness.commit(async (tx) => {
+      const sessions = await options.sessions(context);
+      validateSessions(sessions);
+      const session = sessions.find((candidate) => candidate.conversationId === conversationId);
+      if (session === undefined || session.sessionKey !== batch.sessionKey) {
+        throw new TypeError("Digest batch is not a currently mapped chat session");
+      }
+      if (batch.cursor.episodeStartEntryId === null) {
+        await validateFreshSegmentGap(conversation, batch, context);
+        await validateCompletedSegment(
+          conversation,
+          batch.episodeStartEntryId,
+          batch.episodeEndEntryId,
+          context,
+        );
+      } else if (
+        batch.episodeStartEntryId !== batch.cursor.episodeStartEntryId
+        || batch.episodeEndEntryId !== batch.cursor.episodeEndEntryId
+      ) {
+        throw new TypeError("Digest batch does not continue its cursor's segment");
+      }
+      const rederived = await readChunk(
+        conversation,
+        batch.firstEntryId,
+        batch.firstItemIndex,
+        batch.firstTextStart,
+        batch.episodeEndEntryId,
+        batch.cursor.pendingToolCalls,
+        batchLimits,
+        context,
+      );
+      if (
+        rederived.throughEntryId !== batch.throughEntryId
+        || rederived.throughItemIndex !== batch.throughItemIndex
+        || rederived.throughChars !== batch.throughChars
+        || rederived.complete !== batch.complete
+        || rederived.entries.length !== batch.entries.length
+      ) {
+        throw new TypeError("Digest batch does not match the committed transcript");
+      }
+      for (let index = 0; index < rederived.entries.length; index += 1) {
+        if (!sameEvidence(rederived.entries[index]!, batch.entries[index]!)) {
+          throw new TypeError("Digest evidence does not match the committed transcript");
+        }
+      }
+      const next: DigestCursor = rederived.complete
+        ? {
+          nextEntryId: rederived.nextEntryId,
+          nextItemIndex: 0,
+          nextTextStart: 0,
+          episodeStartEntryId: null,
+          episodeEndEntryId: null,
+          pendingToolCalls: Object.freeze([]) as readonly string[],
+        }
+        : {
+          nextEntryId: rederived.nextEntryId,
+          nextItemIndex: rederived.nextItemIndex,
+          nextTextStart: rederived.nextTextStart,
+          episodeStartEntryId: batch.episodeStartEntryId,
+          episodeEndEntryId: batch.episodeEndEntryId,
+          pendingToolCalls: rederived.pendingToolCalls,
+        };
+      await options.harness.commit(async (tx) => {
         const document = await tx.doc(DigestCursorDoc, conversationId);
-        const stored = digestCursorOf(document);
-        if (!sameCursor(stored, batch.cursor)) {
+        // Position only: open calls are written in the same commit and a mapped legacy frontier
+        // derives them from the immutable transcript, so comparing them would reject a valid batch.
+        if (!sameCursorPosition(digestCursorOf(document), batch.cursor)) {
           throw new DigestCursorConflictError(
             "Digest cursor moved after this batch was read; re-read before acknowledging",
           );
         }
-        document.throughEntryId = next.throughEntryId;
-        document.throughChars = next.throughChars;
+        document.nextEntryId = next.nextEntryId;
+        document.nextItemIndex = next.nextItemIndex;
+        document.nextTextStart = next.nextTextStart;
         document.episodeStartEntryId = next.episodeStartEntryId;
         document.episodeEndEntryId = next.episodeEndEntryId;
+        document.pendingToolCalls = [...next.pendingToolCalls];
+        document.throughEntryId = null;
+        document.throughChars = null;
       }, context);
       scanCache.delete(conversationId);
       return next;

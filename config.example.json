@@ -20,10 +20,13 @@
     "enabled": true
   },
   "digest": {
+    "preset": "fast",
     "entriesPerBatch": 2000,
     "charsPerBatch": 200000,
-    "maxToolCalls": 10,
-    "runTimeoutSeconds": 300,
+    "maxToolCalls": 24,
+    "maxRequests": 12,
+    "maxInputTokens": 500000,
+    "runTimeoutSeconds": 600,
     "maxChangedFiles": 8,
     "maxDiffChars": 32000
   },

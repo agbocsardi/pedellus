@@ -146,6 +146,10 @@ async function syntheticStore(label, options = {}) {
         }
       : { modelPresets: options.presets ?? PRESETS, modelPreset: 'fast' }),
     toolAllowlist: options.tools ?? [],
+    // Digestion never inherits the foreground model; name one explicitly.
+    digest: options.presets === false
+      ? { model: { provider: 'fixture', modelId: 'alpha' } }
+      : { preset: 'fast' },
     telegram: { tokenEnv: 'TG_SYNTHETIC_TOKEN', allowFrom: options.allowFrom ?? ['501'] },
     ...(options.workspaceContext === undefined ? {} : { workspaceContext: options.workspaceContext }),
     ...(options.episodeSummary === undefined ? {} : { episodeSummary: options.episodeSummary }),
@@ -339,7 +343,7 @@ test('/digest status, idle and malformed forms are bounded owner notices with no
     assert.equal(transport.sent.length, 3, 'an unauthenticated chat gets no digest control');
     assert.match(transport.sent[0].text, /No memory digestion run is recorded for this conversation/);
     assert.match(transport.sent[0].text, /read-only: no scan, no model call/);
-    assert.match(transport.sent[1].text, /No closed episode is pending memory digestion/);
+    assert.match(transport.sent[1].text, /No completed exchange is pending memory digestion/);
     assert.match(transport.sent[1].text, /No new digest run was started/);
     assert.match(transport.sent[2].text, /Usage: \/digest/);
     assert.equal(store.captured.length, 0, 'no digest command form reached the model');
@@ -362,6 +366,9 @@ test('/digest starts one bounded batch for this authenticated chat and stays sil
   const chat = await store.gateway.conversationFor(`telegram:${BOT_ID}:chat:${CHAT_ID}`, context);
   await store.gateway.harness.commit(async (tx) => {
     await tx.appendEntry(chat.id, { kind: 'pi.system', model: [{ role: 'system', content: 'boot', timestamp: 1_000 }] });
+    // One completed turn with no text evidence: the no-op path without a provider call.
+    await tx.appendEntry(chat.id, { kind: 'pi.user', model: [{ role: 'user', content: '', timestamp: 1_000 }] });
+    await tx.appendEntry(chat.id, { kind: 'pi.assistant', model: [fauxAssistantMessage('')] });
   }, context);
   await chat.reset(undefined, context);
   const transport = telegramMock([[textUpdate(520, 520, '/digest')]]);
@@ -369,7 +376,7 @@ test('/digest starts one bounded batch for this authenticated chat and stays sil
   try {
     harness = start(store, transport);
     await until(() => transport.sent.length >= 1, 'the bounded start acknowledgement');
-    assert.match(transport.sent[0].text, /started for one bounded closed-episode batch/);
+    assert.match(transport.sent[0].text, /started for one bounded completed-exchange batch/);
     assert.match(transport.sent[0].text, /0 evidence entries/);
     assert.match(transport.sent[0].text, /shared workspace/);
     let task;
