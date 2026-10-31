@@ -48,7 +48,7 @@
  */
 import { open, writeFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import type { Context, JsonValue } from "@earendil-works/chord";
+import type { Context, Draft, JsonValue } from "@earendil-works/chord";
 import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
   AssistantEntry,
@@ -101,7 +101,6 @@ export const MEMORY_DIGEST_RESULT_ENTRY_KIND = "nanobot.memory-digest-result";
 export const MEMORY_DIGEST_RESULT_REQUEST_PREFIX = "nanobot.memory-digest-result:";
 /** One small origin-conversation document tracking which terminal runs were already reported. */
 export const MEMORY_DIGEST_NOTICES_KIND = "nanobot.memory-digest-notices";
-const MEMORY_DIGEST_NOTICES_RETAINED = 100;
 
 interface MemoryDigestNoticeRecord {
   readonly [key: string]: JsonValue;
@@ -146,7 +145,14 @@ export const MEMORY_DIGEST_LIMITS = Object.freeze({
   maxErrorChars: 400,
   /** Bounded answer excerpt kept in the task outcome; the run transcript keeps the full text. */
   maxAnswerChars: 2_000,
+  /** Retained internal-result notice records per origin; an undelivered one is never evicted. */
+  noticeRecords: 100,
 });
+
+/** Fixed, value-free refusal when every retained notice is still undelivered or unknown. */
+export const MEMORY_DIGEST_NOTICE_FULL_REASON =
+  "memory digestion cannot start: its bounded internal-result notices are full of undelivered results; " +
+  "retry after an earlier run's result is admitted or its native task is settled";
 
 /**
  * Seeded once when no agent-owned prompt exists. It describes routing and curation habits only:
@@ -582,6 +588,12 @@ export interface MemoryDigestTaskSnapshot {
 export interface MemoryDigestStatus {
   readonly liveTaskId: number | null;
   readonly latest: MemoryDigestTaskSnapshot | null;
+  /** Retained notices that are neither definitively reported nor provably nonreportable. */
+  readonly pendingNotices: number;
+  /** True when one more notice slot is available without evicting an undelivered result. */
+  readonly canStart: boolean;
+  /** Fixed reason when `canStart` is false. */
+  readonly refusal: string | null;
 }
 
 export interface MemoryDigestPrepareDetails {
@@ -645,6 +657,38 @@ export interface MemoryDigest {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** The bounded result of a terminal digest task record, or undefined for any other shape. */
+function digestResultOf(record: unknown): MemoryDigestRunResult | undefined {
+  if (!isRecord(record)) return undefined;
+  const state = record.state;
+  if (!isRecord(state) || state.status !== "terminal" || !isRecord(state.outcome)) return undefined;
+  const value = state.outcome.result;
+  return isRecord(value) ? value as unknown as MemoryDigestRunResult : undefined;
+}
+
+/**
+ * What one retained notice's native task proves, for the bounded cap only.
+ *
+ * - `notified`: the result event was admitted and the task is terminal (or already gone), so the
+ *   record is definitively reported and evictable.
+ * - `nonreportable`: a genuinely terminal `faulted` or `orphaned` task never produced a digest
+ *   result, so nothing can be reported and the record is evictable.
+ * - `reportable`: a terminal task with a parseable bounded result that must be delivered.
+ * - `unknown`: a missing, live, or malformed record. It is never evictable and never guessed.
+ */
+export type MemoryDigestNoticeState = "notified" | "nonreportable" | "reportable" | "unknown";
+
+export function memoryDigestNoticeState(notice: unknown, task: unknown): MemoryDigestNoticeState {
+  const notified = isRecord(notice) && notice.notified === true;
+  const terminal = isRecord(task) && isRecord(task.state) && task.state.status === "terminal";
+  if (notified) return task === undefined || terminal ? "notified" : "unknown";
+  if (!terminal) return "unknown";
+  const outcome = (task as { readonly state: { readonly outcome?: unknown } }).state.outcome;
+  if (!isRecord(outcome)) return "unknown";
+  if (outcome.status === "faulted" || outcome.status === "orphaned") return "nonreportable";
+  return digestResultOf(task) === undefined ? "unknown" : "reportable";
 }
 
 function safeId(value: unknown): number | null {
@@ -890,6 +934,13 @@ export function renderMemoryDigestStatus(status: MemoryDigestStatus): string {
   lines.push(status.liveTaskId === null
     ? "Live memory digestion run: none."
     : `Live memory digestion run: ${status.liveTaskId}. One run at a time across mapped chats.`);
+  lines.push(status.pendingNotices === 0
+    ? "Internal result notices: none pending."
+    : `Internal result notices: ${status.pendingNotices} pending (bounded at ` +
+      `${MEMORY_DIGEST_LIMITS.noticeRecords} per conversation).`);
+  if (!status.canStart) {
+    lines.push(`New starts are refused: ${status.refusal ?? MEMORY_DIGEST_NOTICE_FULL_REASON}`);
+  }
   const latest = status.latest;
   if (latest === null) {
     lines.push("No memory digestion run is recorded for this conversation.");
@@ -1030,12 +1081,6 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
 
   const resultRequestId = (taskId: number): string => `${MEMORY_DIGEST_RESULT_REQUEST_PREFIX}${taskId}`;
 
-  const resultOf = (record: Awaited<ReturnType<Harness["getTask"]>>): MemoryDigestRunResult | undefined => {
-    if (record === undefined || record.state.status !== "terminal") return undefined;
-    const value = record.state.outcome.result;
-    return isRecord(value) ? value as unknown as MemoryDigestRunResult : undefined;
-  };
-
   /**
    * The one bounded internal result event. Fixed wording plus this run's bounded saved fields; no
    * file content, no raw provider error dump and no channel send. The agent in the origin
@@ -1071,6 +1116,10 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
    * Admit the internal result event for one terminal run. The write-ahead notice plus the
    * conversation-scoped request ID makes a crash between the terminal commit and this admission a
    * retry instead of a lost or duplicated parent turn.
+   *
+   * A missing notice record is not treated as "nothing to report": the terminal native task is
+   * authoritative. The event is skipped only when Durable already holds its request ID; otherwise it
+   * is admitted from the task record itself (a bounded, idempotent retry).
    */
   const notifyThrough = async (
     harness: Harness,
@@ -1085,10 +1134,33 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
     } catch {
       return false;
     }
-    if (notice === undefined || notice.notified) return false;
-    const result = resultOf(await harness.getTask(taskId as TaskId<MemoryDigestRunResult>, context));
+    if (notice?.notified === true) return false;
+    let task;
+    try {
+      task = await harness.getTask(taskId as TaskId<MemoryDigestRunResult>, context);
+    } catch {
+      return false;
+    }
+    const result = digestResultOf(task);
     if (result === undefined) return false;
-    const conversation = await harness.conversation(origin, context);
+    if (notice === undefined) {
+      try {
+        const admitted = await harness.commit(
+          (tx) => tx.submissionByRequest(origin, resultRequestId(taskId)),
+          context,
+        );
+        // Already admitted before the record was pruned or before this version wrote one: no retry.
+        if (admitted !== undefined) return false;
+      } catch {
+        return false;
+      }
+    }
+    let conversation;
+    try {
+      conversation = await harness.conversation(origin, context);
+    } catch {
+      return false;
+    }
     if (conversation === undefined) return false;
     try {
       await conversation.submit({
@@ -1102,6 +1174,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
       // re-admits the same request ID instead of losing or duplicating the result.
       return false;
     }
+    if (notice === undefined) return true;
     try {
       await harness.commit(async (tx) => {
         const current = await tx.doc(MemoryDigestNoticesDoc, origin);
@@ -1113,6 +1186,56 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
       // Admission is the durable fact; a failed flag commit only re-submits, deduplicated by request ID.
     }
     return true;
+  };
+
+  /**
+   * Remove only records the native outcome proves safe to drop: already reported, or a terminal
+   * `faulted`/`orphaned` run that never produced a report. A missing, live or malformed record is
+   * never evicted to make room.
+   */
+  const pruneNoticeSlots = async (
+    tx: Tx,
+    doc: Draft<MemoryDigestNoticesDocument>,
+    keep: number,
+  ): Promise<boolean> => {
+    while (doc.notices.length > keep) {
+      let index = -1;
+      for (let candidate = 0; candidate < doc.notices.length; candidate += 1) {
+        const notice = doc.notices[candidate]!;
+        const task = await tx.task(notice.taskId as TaskId);
+        const state = memoryDigestNoticeState(notice, task);
+        if (state === "notified" || state === "nonreportable") {
+          index = candidate;
+          break;
+        }
+      }
+      if (index < 0) return false;
+      doc.notices.splice(index, 1);
+    }
+    return true;
+  };
+
+  /**
+   * Bounded backpressure before a new start: try to admit every retained undelivered result once,
+   * outside the start commit. Failure leaves the record pending and the commit's own capacity check
+   * decides whether a start is possible. Request IDs make a concurrent flush a no-op, not a second
+   * origin turn.
+   */
+  const flushPending = async (harness: Harness, origin: ConversationId, context: Context): Promise<void> => {
+    let notices: readonly MemoryDigestNoticeRecord[];
+    try {
+      notices = (await harness.snapshot(MemoryDigestNoticesDoc, origin, context))?.notices ?? [];
+    } catch {
+      return;
+    }
+    for (const notice of notices) {
+      if (notice.notified === true) continue;
+      try {
+        await notifyThrough(harness, origin, notice.taskId, context);
+      } catch {
+        // Keep it pending; the caller's capacity check stays honest.
+      }
+    }
   };
 
   /** Stop the target's own pending work. Best effort; the terminal commit still retires authority. */
@@ -1538,6 +1661,8 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
       }
       const running = await harnessLiveTask(context);
       if (running !== undefined) return { status: "busy", taskId: running };
+      // Bounded backpressure before consuming a batch: try once to admit every retained result.
+      await flushPending(options.harness(), writer.id, context);
       const result = await options.source().read(context);
       if (result.status === "idle") return { status: "idle", idle: result };
       const batch = result;
@@ -1545,6 +1670,11 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
         // Re-check inside the commit so two host callers cannot both start a run for one frontier.
         const live = await txLiveTask(tx);
         if (live !== undefined) return { status: "busy", taskId: live };
+        // Reserve the notice slot atomically with the task. Only a definitively reported or
+        // genuinely nonreportable record may free one; an undelivered or unknown result never does.
+        const notices = await tx.doc(MemoryDigestNoticesDoc, writer.id);
+        const room = await pruneNoticeSlots(tx, notices, MEMORY_DIGEST_LIMITS.noticeRecords - 1);
+        if (!room) return { status: "refused", reason: MEMORY_DIGEST_NOTICE_FULL_REASON };
         const choice = await options.model(tx, writer.id);
         const input: MemoryDigestTaskInput = {
           sessionKey: batch.sessionKey,
@@ -1573,15 +1703,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
         });
         // Write-ahead the internal result admission in the same commit as the task itself, so a
         // crash before the terminal commit still leaves one traceable, bounded notification record.
-        const notices = await tx.doc(MemoryDigestNoticesDoc, writer.id);
         notices.notices.push({ taskId: Number(taskId), notified: false });
-        // Prefer dropping an already-reported record. If every retained record is still open, drop
-        // the oldest: the list stays bounded even when an origin can never be notified, at the cost
-        // of the oldest notice rather than unbounded metadata.
-        while (notices.notices.length > MEMORY_DIGEST_NOTICES_RETAINED) {
-          const index = notices.notices.findIndex((notice) => notice.notified);
-          notices.notices.splice(index >= 0 ? index : 0, 1);
-        }
         return {
           status: "started",
           taskId: Number(taskId),
@@ -1609,7 +1731,23 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           order: "descending",
         }, 1);
         const latest = page.items[0] === undefined ? undefined : taskSnapshot(page.items[0]);
-        return { liveTaskId: live ?? null, latest: latest ?? null };
+        // Report retained notices by what their native records prove: only a reported or
+        // faulted/orphaned record frees a slot, so the count matches the start commit's decision.
+        const notices = await tx.doc(MemoryDigestNoticesDoc, writer.id);
+        let pendingNotices = 0;
+        for (const notice of notices.notices) {
+          const task = await tx.task(notice.taskId as TaskId);
+          const state = memoryDigestNoticeState(notice, task);
+          if (state !== "notified" && state !== "nonreportable") pendingNotices += 1;
+        }
+        const canStart = pendingNotices < MEMORY_DIGEST_LIMITS.noticeRecords;
+        return {
+          liveTaskId: live ?? null,
+          latest: latest ?? null,
+          pendingNotices,
+          canStart,
+          refusal: canStart ? null : MEMORY_DIGEST_NOTICE_FULL_REASON,
+        };
       }, context);
     },
 

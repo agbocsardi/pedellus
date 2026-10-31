@@ -107,10 +107,15 @@ npm start -- agent --config config.json     # attach a terminal
   (seeded only when absent) and it can never grant authority. A terminal run
   admits exactly one bounded internal result event to its origin conversation
   (`nanobot.memory-digest-result`, deduplicated by request ID); the agent decides
-  what to relay, and a digest cron occurrence queues no channel delivery. No
-  digest run gets shell, network, worker, channel-send, history, MCP or
-  scheduling authority, and a digest cron occurrence runs from the validated
-  mapped origin with the current allowlist, never from a task-owned target.
+  what to relay, and a digest cron occurrence queues no channel delivery. The
+  bounded notice list is pruned only for definitively reported or genuinely
+  nonreportable (`faulted`/`orphaned`) native outcomes; an undelivered or unknown
+  result is never evicted, and a start refuses with fixed text when no safe slot
+  remains. Recovery re-admits from the authoritative terminal task when the
+  record is missing, without advancing the cursor. No digest run gets shell,
+  network, worker, channel-send, history, MCP or scheduling authority, and a
+  digest cron occurrence runs from the validated mapped origin with the current
+  allowlist, never from a task-owned target.
 - Native web tools are default-off and separate from `toolAllowlist`: `web.search`
   names the Brave credential environment variable, and `web.fetch` enables the
   public reader. Both are limited to authenticated mapped chats. Public fetch

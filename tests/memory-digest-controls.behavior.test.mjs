@@ -23,11 +23,16 @@ const [
   { openGateway },
   {
     MEMORY_DIGEST_ENTRY_KIND,
+    MEMORY_DIGEST_LIMITS,
+    MEMORY_DIGEST_NOTICE_FULL_REASON,
+    MEMORY_DIGEST_NOTICES_KIND,
     MEMORY_DIGEST_PROMPT_FILE,
     MEMORY_DIGEST_RESULT_ENTRY_KIND,
     MEMORY_DIGEST_TASK_NAME,
     MemoryDigestNoticesDoc,
+    memoryDigestNoticeState,
     renderMemoryDigestStart,
+    renderMemoryDigestStatus,
   },
   { DigestCursorDoc },
   { CronJobsDoc, CRON_RUN_TASK_NAME },
@@ -392,6 +397,141 @@ test('one internal result event per run: success, failure and a reopen retry tha
   }, 'the reopen notice pass');
   assert.equal((await digestNotices(reopened.harness, origin.id)).length, 2,
     'the reopen retried both admissions and the request IDs deduplicated them');
+});
+
+test('a full notice queue refuses a start without evicting an undelivered result, then reopen retries once', { timeout: 60_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, answerNothing);
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('First closed episode.'), assistant('Noted.')]);
+
+  // Controllable admission failure: the digest target and ordinary conversation lookup still work,
+  // but submitting this origin's internal result throws until the patch is removed.
+  const harness = store.gateway.harness;
+  const originalConversation = harness.conversation.bind(harness);
+  let denyNotice = true;
+  harness.conversation = async (id, ctx) => {
+    const handle = await originalConversation(id, ctx);
+    if (!denyNotice || id !== origin.id || handle === undefined) return handle;
+    return new Proxy(handle, {
+      get(target, property) {
+        if (property === 'submit') {
+          return async (draft, submitContext) => {
+            if (typeof draft?.requestId === 'string'
+              && draft.requestId.startsWith('nanobot.memory-digest-result:')) {
+              throw new Error('synthetic admission failure');
+            }
+            return target.submit(draft, submitContext);
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  };
+
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'completed');
+  const noticeDoc = async (reader) => reader.snapshot(MemoryDigestNoticesDoc, origin.id, context);
+  await waitFor(async () => {
+    const current = await noticeDoc(store.gateway.harness);
+    return current?.notices.some((notice) => notice.taskId === started.taskId && notice.notified === false) === true;
+  }, 'the retained undelivered notice');
+  const retained = await noticeDoc(store.gateway.harness);
+  assert.equal(retained.notices.length, 1);
+  const callsBeforeRefusal = store.calls.length;
+  const cursorBefore = await store.gateway.harness.snapshot(DigestCursorDoc, origin.id, context);
+
+  // Fill the bounded list with records whose native task is unknown: never evictable.
+  const maxTaskId = await store.gateway.harness.commit(async (tx) => {
+    let max = 0;
+    let cursor;
+    do {
+      const page = await tx.scanTasks({}, 1000, cursor);
+      for (const record of page.items) max = Math.max(max, Number(record.id));
+      cursor = page.next;
+    } while (cursor !== undefined);
+    return max;
+  }, context);
+  await store.gateway.harness.commit(async (tx) => {
+    const doc = await tx.doc(MemoryDigestNoticesDoc, origin.id);
+    for (let index = doc.notices.length; index < MEMORY_DIGEST_LIMITS.noticeRecords; index += 1) {
+      doc.notices.push({ taskId: maxTaskId + 10_000 + index, notified: false });
+    }
+    return undefined;
+  }, context);
+  assert.equal((await noticeDoc(store.gateway.harness)).notices.length, MEMORY_DIGEST_LIMITS.noticeRecords);
+
+  // A fresh closed batch exists, but the notice queue has no safe slot: refuse before any scan
+  // result is consumed, any task is created or any provider request is made.
+  await closedEpisode(store.gateway.harness, origin.id, [user('Second closed episode.'), assistant('Noted.')]);
+  const refused = await startDigest(store.gateway);
+  assert.equal(refused.status, 'refused');
+  assert.equal(refused.reason, MEMORY_DIGEST_NOTICE_FULL_REASON);
+  assert.equal((await digestTasks(store.gateway.harness, origin.id)).length, 1, 'no task was created');
+  assert.equal(store.calls.length, callsBeforeRefusal, 'a refused start made no model request');
+  assert.deepEqual(
+    await store.gateway.harness.snapshot(DigestCursorDoc, origin.id, context),
+    cursorBefore,
+    'a refused start leaves the digest cursor untouched',
+  );
+  const refusedStatus = await statusOf(store.gateway);
+  assert.equal(refusedStatus.pendingNotices, MEMORY_DIGEST_LIMITS.noticeRecords);
+  assert.equal(refusedStatus.canStart, false);
+  assert.equal(refusedStatus.refusal, MEMORY_DIGEST_NOTICE_FULL_REASON);
+  assert.match(renderMemoryDigestStatus(refusedStatus), /New starts are refused/);
+
+  // Reopen: recover uses the authoritative terminal task, admits its result once, and the retry
+  // leaves the shared cursor exactly where it was.
+  await store.gateway.close(context);
+  const reopened = await openGateway(store.config, context, { models: store.models });
+  t.after(async () => { await reopened.close(context).catch(() => undefined); });
+  await waitFor(async () => (await digestNotices(reopened.harness, origin.id)).length === 1, 'one recovered result');
+  assert.deepEqual(
+    await reopened.harness.snapshot(DigestCursorDoc, origin.id, context),
+    cursorBefore,
+    'notification recovery never advances or rewinds the digest cursor',
+  );
+  const afterRecover = await reopened.harness.snapshot(MemoryDigestNoticesDoc, origin.id, context);
+  assert.equal(afterRecover.notices.find((notice) => notice.taskId === started.taskId)?.notified, true);
+  const recoveredStatus = await statusOf(reopened);
+  assert.equal(recoveredStatus.pendingNotices, MEMORY_DIGEST_LIMITS.noticeRecords - 1);
+  assert.equal(recoveredStatus.canStart, true);
+
+  // One retry later, the original task's event is still admitted exactly once.
+  const next = await startDigest(reopened);
+  assert.equal(next.status, 'started');
+  await settleTask(reopened.harness, next.taskId);
+  const resultEntries = async (reader) => (await entriesOf(reader, origin.id))
+    .filter((entry) => entry.kind === MEMORY_DIGEST_RESULT_ENTRY_KIND);
+  await waitFor(async () => (await resultEntries(reopened.harness)).length === 2, 'the second internal result');
+  const originalNotices = (await resultEntries(reopened.harness))
+    .filter((entry) => entry.data?.taskId === started.taskId);
+  assert.equal(originalNotices.length, 1, 'a recovered admission is never duplicated');
+});
+
+test('notice pruning only frees reported or genuinely nonreportable outcomes', () => {
+  const live = { state: { status: 'running' } };
+  const faulted = { state: { status: 'terminal', outcome: { status: 'faulted', error: { message: 'x' } } } };
+  const orphaned = { state: { status: 'terminal', outcome: { status: 'orphaned', reason: 'x' } } };
+  const abortedWithResult = {
+    state: { status: 'terminal', outcome: { status: 'aborted', reason: 'x', result: { outcome: 'aborted' } } },
+  };
+  const completedWithoutResult = { state: { status: 'terminal', outcome: { status: 'completed' } } };
+  assert.equal(memoryDigestNoticeState({ notified: false }, undefined), 'unknown');
+  assert.equal(memoryDigestNoticeState({ notified: false }, live), 'unknown');
+  assert.equal(memoryDigestNoticeState({ notified: false }, {}), 'unknown');
+  assert.equal(memoryDigestNoticeState({ notified: false }, completedWithoutResult), 'unknown');
+  assert.equal(memoryDigestNoticeState({ notified: false }, faulted), 'nonreportable');
+  assert.equal(memoryDigestNoticeState({ notified: false }, orphaned), 'nonreportable');
+  assert.equal(memoryDigestNoticeState({ notified: false }, abortedWithResult), 'reportable');
+  assert.equal(memoryDigestNoticeState({ notified: true }, undefined), 'notified');
+  assert.equal(memoryDigestNoticeState({ notified: true }, abortedWithResult), 'notified');
+  assert.equal(memoryDigestNoticeState({ notified: true }, live), 'unknown');
+  assert.equal(MEMORY_DIGEST_NOTICES_KIND, 'nanobot.memory-digest-notices');
 });
 
 test('a new batch reloads the edited DIGEST.md while an in-flight attempt keeps its admitted text', { timeout: 40_000 }, async (t) => {

@@ -90,9 +90,12 @@ differs is only the run phase:
   internal result event reports to the origin agent; existing scheduled-message
   delivery and its dedupe/unknown-send behavior are unchanged.
 - `lastOutcome` records the bounded host settlement (`ok` when a run started, one
-  was already live or nothing was pending; `error` with fixed text for a refusal
-  or missing host entry), so `cron list` shows the outcome without a channel
-  message.
+  was already live or nothing was pending; `error` with fixed text for a refusal,
+  a full undelivered-notice queue or a missing host entry), so `cron list` shows
+  the outcome without a channel message. A crash after `start` but before the
+  occurrence's terminal commit is replayed on reopen and can process one extra
+  bounded batch before that occurrence finishes; this is not claimed to be one
+  batch per occurrence in that crash window.
 - The timer still arms the next occurrence in its own commit. The digest run is
   a separate background native task and does not affect that reschedule.
   Cancelling the job fences its occurrence and later ones; an already-started

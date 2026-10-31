@@ -95,9 +95,14 @@ answer that did not reach every mapped chat's tail says closed history may
 remain. `/digest status` is a bounded read-only view of the live run and this
 chat's newest run; it performs no transcript scan, model call or cursor change.
 The digest turn's result is one internal event for this chat's agent, never a
-direct user or channel message, and the agent decides what to relay. Only an
-authenticated allowlisted private sender can use either form. A host without the
-manual entry advertises no `/digest` and refuses a typed one with fixed text.
+direct user or channel message, and the agent decides what to relay. The retained
+result notices are bounded: a start may be refused with fixed text when 100
+undelivered or unknown results have no safely prunable slot, and `/digest status`
+reports the pending count and whether a start is possible. Undelivered results are
+never evicted, and a reopen retries each admission once from the authoritative
+native task. Only an authenticated allowlisted private sender can use either form.
+A host without the manual entry advertises no `/digest` and refuses a typed one
+with fixed text.
 
 `/model` lists the current selection and the finite configured catalog: named
 presets in named-preset mode (`/model <name>`, `/model default`), or the

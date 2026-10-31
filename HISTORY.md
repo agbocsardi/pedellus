@@ -934,6 +934,28 @@ retry a no-op instead of a duplicate turn. A successful `digested`, a provider-f
 `consumed` replay and a failed or aborted run each notify once. Digest cron jobs queue nothing in
 the channel delivery outbox, so existing scheduled-job notices and dedupe are unchanged.
 
+The notice list is bounded at 100 records per origin and treated as a delivery obligation, not a
+cache. It is pruned only when a record is definitively reported, or when the native outcome proves
+there is nothing to report (a genuinely terminal `faulted` or `orphaned` task). A missing, live or
+malformed record is unknown and is never evicted; an undelivered reportable result is never evicted.
+Before a start consumes a batch, retained undelivered results are flushed once, outside the start
+commit. The start commit then prunes only safe records and reserves its own slot atomically with the
+task; if no safe slot remains it returns `refused` with fixed text, starts no task, consumes no
+batch and makes no provider request. The same count is visible in `/digest status` (pending notices
+and whether a new start is possible), so an owner never sees a silent loss or an unexplained refusal.
+
+Recovery does not depend on the record surviving. `recover` treats the terminal native task as
+authoritative: if its notice record is missing, it re-admits the event only when Durable does not
+already hold that request ID. That keeps an event admitted exactly once while surviving a lost
+record, and neither notification recovery nor a retry ever advances or rewinds the digest cursor.
+
+Two bounded edges are stated rather than implied. A cron occurrence whose digest task starts and
+then crashes before its run commit is replayed on reopen and can process one additional bounded
+batch before the occurrence finishes; a digest cron occurrence is therefore not claimed to consume
+exactly one batch in that crash window, while manual `start` still consumes at most one accepted
+batch per call. If an origin mapping is removed at settle time, the internal result route has no tools
+or authority, exactly as the accepted worker result behaves.
+
 Status is bounded and read-only: `memoryDigest.status(writer, context)` returns the live task ID
 (one run at a time) and this origin's newest task with its outcome, batch position and recorded
 error. It performs no transcript scan, provider call or cursor change. `/digest status` renders it.
