@@ -215,6 +215,11 @@ operator input, not model input, and no tool authority is added.
 
 Every CLI attachment is path-only, photos included:
 
+- Pi's own interactive CLI turns clipboard-pasted images and `@file` images into
+native image content after resizing. This line-oriented local surface deliberately
+  does not: it receives completed lines over the private socket, has no clipboard
+  or drag input, and keeps every attachment path-only as an explicit owner
+  decision. A photo is inspectable only through a configured `read` tool.
 - The original bytes are stored unchanged and the turn carries ordinary text with
 the workspace-relative locator only. No native image content is built, no vision
 handoff or describer model is called, and no transcription or document extraction

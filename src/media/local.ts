@@ -14,10 +14,12 @@ import { MediaRejected, sanitizeOriginalName, type MediaStore, type StoredMedia 
  * extraction: whether and how to inspect the stored original is the configured
  * tools' decision. The operator's absolute path is never shown to the model.
  *
- * This is deliberate path-only handoff. Pi's interactive editor can paste or drag
- * an image and its `@file` arguments become native image content, but this local
- * surface receives only completed lines over the private socket; it has no
- * clipboard, drag or raw-terminal input to carry those forms.
+ * This is deliberate path-only handoff. Pi's interactive editor supports clipboard
+ * image paste (documented as `app.clipboard.pasteImage`) and its argv `@file`
+ * arguments run files through its image pipeline into native image content. Pi's
+ * drag-in behavior was not verified here. This local surface receives only
+ * completed lines over the private socket, so it has no clipboard or raw-terminal
+ * input to carry either form.
  */
 
 export const LOCAL_ATTACHMENT_LIMITS = {
@@ -25,13 +27,8 @@ export const LOCAL_ATTACHMENT_LIMITS = {
   readChunkBytes: 64 * 1024,
 } as const;
 
-/** CLI originals live below the configured media root, separate from Telegram's. */
+/** CLI originals live in this child of the configured media root, separate from Telegram's. */
 export const LOCAL_ATTACHMENT_DIRECTORY = "cli";
-
-/** Workspace-relative directory for CLI originals: `<media.directory>/cli`. */
-export function localAttachmentDirectory(mediaDirectory: string): string {
-  return `${mediaDirectory}/${LOCAL_ATTACHMENT_DIRECTORY}`;
-}
 
 export type LocalAttachmentRejection =
   | "path"

@@ -25,7 +25,7 @@ const { gatewaySocketPath, serveLocalGateway } = await import(pathToFileURL(`${p
 const { connectLocalGateway } = await import(pathToFileURL(`${pkg}/dist/local/client.js`).href);
 const { runTerminalConversation } = await import(pathToFileURL(`${pkg}/dist/terminal/index.js`).href);
 const { createMediaStore } = await import(pathToFileURL(`${pkg}/dist/media/attachments.js`).href);
-const { LocalAttachmentError, localAttachmentDirectory, prepareLocalAttachment } = await import(
+const { LocalAttachmentError, LOCAL_ATTACHMENT_DIRECTORY, prepareLocalAttachment } = await import(
   pathToFileURL(`${pkg}/dist/media/local.js`).href);
 const { createModels, fauxAssistantMessage, fauxProvider } = await import(pathToFileURL(`${ai}/index.js`).href);
 const { BACKGROUND_CONTEXT } = await import(pathToFileURL(`${chord}/context/index.js`).href);
@@ -34,7 +34,15 @@ const context = BACKGROUND_CONTEXT;
 const PHOTO_BYTES = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]);
 const PDF_BYTES = Buffer.from("%PDF-1.4\nsynthetic document body\n%%EOF\n");
 const AUDIO_BYTES = Buffer.from("ID3\u0004\u0000\u0000\u0000\u0000\u0000\u0000synthetic mp3 bytes");
-const CLI_DIRECTORY = localAttachmentDirectory("media");
+
+async function eventually(check, message) {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+  assert.fail(message);
+}
 
 function lines(...values) {
   return (async function* () { yield* values; })();
@@ -80,7 +88,8 @@ async function makeEnvironment(t, { media } = { media: { directory: "media" } })
           attachments: {
             store: createMediaStore({
               workspace: config.workspace,
-              directory: localAttachmentDirectory(config.media.directory),
+              directory: config.media.directory,
+              childDirectory: LOCAL_ATTACHMENT_DIRECTORY,
             }),
           },
         }),
@@ -252,7 +261,8 @@ test("a path-only photo makes no vision-handoff call for a text-only preset", { 
     attachments: {
       store: createMediaStore({
         workspace: config.workspace,
-        directory: localAttachmentDirectory(config.media.directory),
+        directory: config.media.directory,
+        childDirectory: LOCAL_ATTACHMENT_DIRECTORY,
       }),
     },
   });
@@ -291,7 +301,7 @@ test("same content is stored once and refusals stay fixed and bounded", { timeou
   provider.setResponses(Array.from({ length: 8 }, () => fauxAssistantMessage("duplicate noted")));
   const photoPath = join(directory, "same.jpg");
   await writeFile(photoPath, PHOTO_BYTES);
-  const store = createMediaStore({ workspace, directory: CLI_DIRECTORY });
+  const store = createMediaStore({ workspace, directory: "media", childDirectory: LOCAL_ATTACHMENT_DIRECTORY });
 
   const client = await connectLocalGateway({ socketPath, context });
   try {
@@ -331,7 +341,12 @@ test("same content is stored once and refusals stay fixed and bounded", { timeou
   }
 
   // The shared store's own byte limit is enforced before publication.
-  const limited = createMediaStore({ workspace, directory: CLI_DIRECTORY, maxFileBytes: 16 });
+  const limited = createMediaStore({
+    workspace,
+    directory: "media",
+    childDirectory: LOCAL_ATTACHMENT_DIRECTORY,
+    maxFileBytes: 16,
+  });
   const oversized = join(directory, "oversized.jpg");
   await writeFile(oversized, Buffer.concat([PHOTO_BYTES, Buffer.alloc(32)]));
   await assert.rejects(prepareLocalAttachment(limited, { path: oversized }),
@@ -383,9 +398,111 @@ function runAgentCli(configFile, stdinText) {
   });
 }
 
+test("a 128-character media directory keeps its operator cap and gains a validated CLI child", { timeout: 30_000 }, async (t) => {
+  const longest = "m".repeat(128);
+  const { directory, workspace, provider, socketPath } = await makeEnvironment(t, { media: { directory: longest } });
+  provider.setResponses([fauxAssistantMessage("long directory noted")]);
+  const photoPath = join(directory, "long-base.jpg");
+  await writeFile(photoPath, PHOTO_BYTES);
+
+  const client = await connectLocalGateway({ socketPath, context });
+  let relativePath;
+  try {
+    const admitted = await client.submitAttachment(photoPath, "", context);
+    relativePath = admitted.attachment.relativePath;
+    assert.equal((await admitted.submission.wait(context)).status, "done");
+  } finally {
+    await client.close();
+  }
+  assert.match(relativePath, new RegExp(`^${longest}/cli/document-[0-9a-f]{16}\\.jpg$`));
+  assert.deepEqual(
+    await readFile(join(workspace, longest, "cli", relativePath.slice(relativePath.lastIndexOf("/") + 1))),
+    PHOTO_BYTES,
+  );
+
+  // The operator directory keeps exactly its documented contract.
+  assert.equal(createMediaStore({ workspace, directory: longest }).directory, longest,
+    "a base-only (Telegram-style) store is unchanged");
+  assert.equal(
+    createMediaStore({ workspace, directory: longest, childDirectory: LOCAL_ATTACHMENT_DIRECTORY }).directory,
+    `${longest}/cli`,
+  );
+  assert.throws(() => parseConfig({
+    workspace,
+    dataDir: join(directory, "state-129"),
+    model: { provider: "deepseek", modelId: "deepseek-flash" },
+    allowedModels: [{ provider: "deepseek", modelId: "deepseek-flash" }],
+    media: { directory: "m".repeat(129) },
+  }, directory), /media.directory is too long/);
+
+  // The code-owned child is one plain segment, never an escape or the temp namespace.
+  for (const bad of ["", ".", "..", ".tmp-1", "a/b", "a\\b", " cli", "cli "]) {
+    assert.throws(() => createMediaStore({ workspace, directory: "media", childDirectory: bad }),
+      /childDirectory/);
+  }
+  assert.throws(() => createMediaStore({ workspace, directory: "media", childDirectory: "c".repeat(65) }),
+    /childDirectory is too long/);
+});
+
+test("the shipped gateway starts with a 128-character media directory", { timeout: 30_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "nanobot-long-media-gateway-"));
+  const workspace = join(directory, "workspace");
+  await mkdir(workspace);
+  const longest = "m".repeat(128);
+  const configValues = {
+    workspace,
+    dataDir: join(directory, "state"),
+    model: { provider: "deepseek", modelId: "deepseek-flash" },
+    allowedModels: [{ provider: "deepseek", modelId: "deepseek-flash" }],
+    credentials: { deepseek: "NANOBOT_SYNTHETIC_KEY" },
+    toolAllowlist: [],
+    episodeSummary: { enabled: false },
+    media: { directory: longest },
+  };
+  const config = parseConfig(configValues, directory);
+  const prepared = await prepareDataDirectory(config);
+  const socketPath = gatewaySocketPath(prepared.canonicalDataDir);
+  const configFile = join(directory, "config.json");
+  await writeFile(configFile, JSON.stringify(configValues));
+
+  const child = spawn(process.execPath, [join(pkg, "dist", "cli.js"), "gateway", "--config", configFile], {
+    stdio: ["ignore", "pipe", "pipe"],
+    // A synthetic placeholder only satisfies startup configuration resolution; no
+    // provider request is made by this test.
+    env: { ...process.env, NANOBOT_SYNTHETIC_KEY: "synthetic-not-a-key" },
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  let client;
+  t.after(async () => {
+    if (client !== undefined) await client.close().catch(() => undefined);
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+      child.kill("SIGTERM");
+      const forced = setTimeout(() => child.kill("SIGKILL"), 5_000);
+      await exited;
+      clearTimeout(forced);
+    }
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  // The socket appears only after the gateway built its CLI attachment store; a
+  // rejected 129-character composition would have exited instead.
+  await eventually(async () => {
+    try {
+      client = await connectLocalGateway({ socketPath, context });
+      return true;
+    } catch {
+      return false;
+    }
+  }, `the shipped gateway did not start: ${stderr}`);
+  assert.equal(client.attachments, true, "the gateway exposes the configured local attachment store");
+});
+
 test("opening a FIFO path cannot park the local request", { timeout: 10_000 }, async (t) => {
   const { directory, workspace } = await makeEnvironment(t);
-  const store = createMediaStore({ workspace, directory: CLI_DIRECTORY });
+  const store = createMediaStore({ workspace, directory: "media", childDirectory: LOCAL_ATTACHMENT_DIRECTORY });
   const fifo = join(directory, "swapped.jpg");
   try {
     await mkfifo(fifo);

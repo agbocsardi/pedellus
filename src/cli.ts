@@ -9,7 +9,7 @@ import { connectLocalGateway } from "./local/client.js";
 import { gatewaySocketPath, serveLocalGateway } from "./local/server.js";
 import { LocalGatewayError } from "./local/protocol.js";
 import { createMediaStore } from "./media/attachments.js";
-import { localAttachmentDirectory } from "./media/local.js";
+import { LOCAL_ATTACHMENT_DIRECTORY } from "./media/local.js";
 import { cancelPreparedContextBlock, listPreparedContextBlocks, PreparedContextRecoveryError } from "./recovery/index.js";
 import { replaceProcess, restartPlan, restartSupported, RESTART_FAILURE_DIAGNOSTIC } from "./restart.js";
 import { runTerminalConversation } from "./terminal/index.js";
@@ -136,15 +136,17 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
     const socketPath = await localSocketPath(config);
     gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
     // The gateway owns local attachments too: the CLI only names an operator path. CLI
-    // originals live in their own subdirectory of the configured media root, so a CLI
-    // locator never shares names with a Telegram original. No bytes enter the model as
-    // native image content and no vision or transcription call is made here.
+    // originals live in a code-owned child of the validated operator media root, so a
+    // CLI locator never shares names with a Telegram original and a long-but-valid
+    // operator directory is not re-checked against its own length cap. No bytes enter
+    // the model as native image content and no vision or transcription call is made here.
     const attachments = config.media === undefined
       ? undefined
       : {
           store: createMediaStore({
             workspace: config.workspace,
-            directory: localAttachmentDirectory(config.media.directory),
+            directory: config.media.directory,
+            childDirectory: LOCAL_ATTACHMENT_DIRECTORY,
           }),
         };
     server = await serveLocalGateway({
