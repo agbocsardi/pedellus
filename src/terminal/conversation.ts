@@ -11,6 +11,7 @@ import type {
   UsageState,
 } from "@earendil-works/pi-durable";
 import type { AssistantMessage, ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type { BackgroundStatus } from "../background-status.js";
 
 /** Plain typed input, or the text/image parts of a stored attachment submission. */
 export type TerminalInput = string | (TextContent | ImageContent)[];
@@ -157,6 +158,11 @@ export interface TerminalStatus {
   };
   readonly compactions: number;
   readonly usage?: UsageState;
+  /**
+   * Host-read, bounded background activity for this conversation. Absent leaves the core status
+   * unchanged: an older host adds no field and a failing read omits it rather than claiming idle.
+   */
+  readonly background?: BackgroundStatus;
 }
 
 /** Bounds shared by every projection, so a local transport carries bounded frames. */

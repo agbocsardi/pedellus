@@ -78,11 +78,18 @@ fixed failure text.
 
 `/status` prints bounded point-in-time metadata of **this** authenticated chat
 only: the selected model and its preset, whether a turn is running (turn number
-and input count) and how many native inputs are queued. It reuses the same
+and input count) and how many native inputs are queued. A bounded background
+summary follows: this chat's own live workers and its own cron jobs
+(executing, queued, parked, or with a future occurrence armed) and whether the
+one workspace-global memory-digestion run is live in this chat or another. A
+natively blocked task is named as parked instead of counted as running;
+`Background: idle` means nothing is executing or queued right now, and an armed
+future occurrence is its own `Cron:` line with the next due time. It reuses the
 native conversation projection the terminal uses, makes no model call, creates
 no watch or timer, and includes no transcript, prompt, tool argument, thinking
-content, provider error or other-chat data. There is no chat or session
-selector.
+content, provider error, host path, credential or other-chat data; the summary
+never names another chat's ID, and the agent remains the manager of that work.
+There is no chat or session selector.
 
 `/digest` is the manual memory-digestion entry. With no argument it asks the
 host for one bounded closed-episode batch from the shared, already-mapped chat

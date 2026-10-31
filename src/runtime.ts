@@ -5,7 +5,7 @@ import type { Context, Draft } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
-import { AgentDoc, AssistantEntry, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type Storage, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
+import { AgentDoc, AssistantEntry, configure, ConversationBusy, createRegistry, defineDoc, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type Storage, type TaskId, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ContextExtensionReplacement, type ConversationContextSnapshot } from "./context/index.js";
 import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./context/skill-tool.js";
 import { CRON_RUN_TASK_NAME, createCronFoundation } from "./automation/cron.js";
@@ -89,6 +89,16 @@ import { prepareDataDirectory, inside } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import { createProviderModels, nativeModelReference, resolveModelChoices, type ResolvedModelChoice } from "./providers.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
+import {
+  BACKGROUND_STATUS_LIMITS,
+  backgroundLabel,
+  emptyBackgroundStatus,
+  type BackgroundCronRun,
+  type BackgroundDigest,
+  type BackgroundStatus,
+  type BackgroundTaskState,
+  type BackgroundWorker,
+} from "./background-status.js";
 import {
   createMcpIntegration,
   mcpHasEnabledServers,
@@ -298,6 +308,14 @@ export interface Gateway {
    */
   readonly mcp: GatewayMcpStatus | undefined;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
+  /**
+   * Bounded, read-only background activity for one already-mapped conversation: its own live
+   * workers and scheduled jobs, plus whether the single workspace-global memory-digestion run is
+   * live and whether it belongs to this conversation. It starts, retries and cancels nothing, calls
+   * no model, reads no transcript, prompt, tool argument, host path or other chat, and reports no
+   * other conversation ID. A conversation that is not an authenticated mapped chat reads nothing.
+   */
+  backgroundStatus(sessionKey: string, context: Context): Promise<BackgroundStatus>;
   /** Lists the explicit allowlist and persisted selection for an already-known session key. */
   listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
   /** Persists a native pi.agent choice; rejects ConversationBusy atomically without changing it. */
@@ -493,6 +511,11 @@ function bindContextSnapshot(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** A native task state that is executing work right now; pending, waiting and sleeping are not. */
+function executingState(value: string | undefined): BackgroundTaskState | undefined {
+  return value === "running" || value === "completing" ? value : undefined;
 }
 
 /** A live background target (scheduled run or worker), recovered from its durable checkpoint. */
@@ -2379,6 +2402,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         await applyConversationPolicy(conversation, ctx);
         return conversation;
       },
+      backgroundStatus: (sessionKey, ctx) => backgroundStatusFor(sessionKey, ctx),
       async listModels(sessionKey, ctx) {
         const conversation = await existingConversationFor(sessionKey, ctx);
         await applyConversationPolicy(conversation, ctx);
@@ -2609,6 +2633,105 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const conversation = await harness!.conversation(id as ConversationId, ctx);
       if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
       return conversation;
+    }
+    /**
+     * One bounded snapshot per read, never a claim of atomicity across the parts: each foundation is
+     * read once, in order, and nothing is written. `emptyBackgroundStatus()` is returned for a
+     * conversation that is not an authenticated mapped chat, so a root, state, fork or task-owned
+     * conversation learns nothing and causes no read at all.
+     */
+    async function backgroundStatusFor(sessionKey: string, ctx: Context): Promise<BackgroundStatus> {
+      const conversation = await existingConversationFor(sessionKey, ctx);
+      const conversationId = conversation.id;
+      if (!authorizedChatConversations.has(conversationId)) return emptyBackgroundStatus();
+      // A native task record keeps its last state when Durable parks it, so "unfinished" is not the
+      // same as "will run": only the live-work inspection reports blocked tasks. It is read lazily,
+      // once, and only when something unfinished actually needs classifying.
+      let blockedTasks: Map<number, true> | undefined;
+      const blockedNow = async (): Promise<Map<number, true>> => {
+        if (blockedTasks !== undefined) return blockedTasks;
+        const blocked = new Map<number, true>();
+        for (const task of (await harness!.inspect(ctx)).tasks) {
+          if (task.state.kind === "blocked") blocked.set(Number(task.record.id), true);
+        }
+        blockedTasks = blocked;
+        return blocked;
+      };
+      // Workers: this conversation's retained records, re-checked against the native task record so a
+      // stale pointer or a record naming someone else's task is never reported as live work.
+      const workerItems: BackgroundWorker[] = [];
+      let liveWorkers = 0;
+      let parkedWorkers = 0;
+      if (workerFoundation !== undefined && workerSpawners.has(conversationId)) {
+        for (const view of await workerFoundation.list(harness!, conversationId, ctx)) {
+          if (view.status !== "queued" && view.status !== "running") continue;
+          const task = await harness!.getTask(view.taskId as TaskId, ctx);
+          if (task === undefined || task.kind !== WORKER_TASK_NAME || task.conversationId !== conversationId) continue;
+          const state = task.state.status;
+          if (state === "terminal") continue;
+          const parked = (await blockedNow()).has(view.taskId);
+          if (parked) parkedWorkers += 1;
+          else liveWorkers += 1;
+          if (workerItems.length >= BACKGROUND_STATUS_LIMITS.rows) continue;
+          workerItems.push({
+            taskId: view.taskId,
+            status: parked ? "parked" : state,
+            task: backgroundLabel(view.prompt),
+            workspace: view.workspaceMode,
+          });
+        }
+      }
+      // Cron: this conversation's own jobs, read through the same derived view the cron tool uses, so
+      // the native timer/run/target states decide what is executing, queued, parked or merely armed.
+      const cronOwner = cronOwners.get(conversationId);
+      const runningItems: BackgroundCronRun[] = [];
+      let runningTotal = 0;
+      let scheduled = 0;
+      let nextAtMs: number | null = null;
+      let pendingCron = 0;
+      let parked = 0;
+      if (cronFoundation !== undefined && cronOwner !== undefined) {
+        for (const view of await cronFoundation.list(harness!, conversationId, { owner: cronOwner }, ctx)) {
+          // `parked` is a native restart-limit block; `missing` is the same block for another reason.
+          // Either way the job cannot execute, so it is never folded into the healthy count.
+          if (view.status === "parked" || view.status === "missing") parked += 1;
+          if (view.nextAtMs !== null) {
+            scheduled += 1;
+            nextAtMs = nextAtMs === null ? view.nextAtMs : Math.min(nextAtMs, view.nextAtMs);
+          }
+          const execution = view.execution?.status;
+          const executing = executingState(execution) ?? executingState(view.target?.status);
+          if (executing !== undefined) {
+            runningTotal += 1;
+            if (runningItems.length < BACKGROUND_STATUS_LIMITS.rows) {
+              runningItems.push({ name: backgroundLabel(view.job.name), status: executing });
+            }
+            continue;
+          }
+          if (execution === "pending" || execution === "waiting" || execution === "sleeping") pendingCron += 1;
+        }
+      }
+      // One workspace-global digest run at a time: its origin decides whether this chat owns it.
+      const digestStatus = await memoryDigest.status({
+        id: conversationId,
+        commit: (change, inner) => conversation.commit(change, inner),
+      }, ctx);
+      const digestLive: BackgroundDigest["live"] = digestStatus.liveTaskId === null
+        ? "none"
+        : digestStatus.liveConversationId === conversationId ? "own" : "shared";
+      const digestParked = digestStatus.liveTaskId !== null
+        && (await blockedNow()).has(digestStatus.liveTaskId);
+      return {
+        workers: { live: liveWorkers, parked: parkedWorkers, items: workerItems },
+        cron: {
+          scheduled,
+          nextAtMs,
+          running: { total: runningTotal, items: runningItems },
+          pending: pendingCron,
+          parked,
+        },
+        digest: { live: digestLive, parked: digestParked },
+      };
     }
     // Summary policy and cut-chain repair. The opt-in watermark is recorded before any catalog pass
     // can enqueue history, so enabling summaries never spends on episodes that already existed. A

@@ -20,6 +20,7 @@ import type {
   GatewaySessionReset,
 } from "../runtime.js";
 import { inProcessTerminalConversation } from "../terminal/conversation.js";
+import { renderBackgroundStatus, type BackgroundStatus } from "../background-status.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import { MEDIA_LIMITS, MediaRejected, createMediaStore, type MediaRejectionReason, type MediaStore, type StoredMedia } from "../media/attachments.js";
 import { createTranscriber, type Transcriber, type TranscriptionBackend, type TranscriptionFailure, type WhisperCliEngine } from "../media/transcription.js";
@@ -296,6 +297,12 @@ export interface TelegramGateway {
    * conversation of its own and changes nothing.
    */
   listModels?(sessionKey: string, context: Context): Promise<GatewayModelList>;
+  /**
+   * Optional bounded background snapshot for this authenticated chat: its own live workers and
+   * scheduled jobs, plus whether the one shared workspace digestion run is live and whose it is.
+   * Absent, or a failed read, leaves `/status` with its core lines and makes no claim about work.
+   */
+  backgroundStatus?(sessionKey: string, context: Context): Promise<BackgroundStatus>;
   /**
    * Optional host preset selection: one configured preset name, or `default` for the configured one.
    * It rejects atomically (including `ConversationBusy`) instead of queueing behind a running turn.
@@ -2475,6 +2482,16 @@ export async function runTelegram(
         ? (status.model === undefined ? "unknown" : `${status.model.provider}/${status.model.modelId}`)
         : `${selection.provider}/${selection.modelId} (thinking: ${selection.thinkingLevel})`;
       const preset = listing === undefined ? undefined : matchingPresetName(listing);
+      // Additive, bounded and read-only: this chat's own workers and cron jobs, plus whether the one
+      // shared workspace digestion run is live. A read failure adds nothing; the core status stands.
+      let background: string[] = [];
+      try {
+        if (typeof gateway.backgroundStatus === "function") {
+          background = renderBackgroundStatus(await gateway.backgroundStatus(sessionKey, adapterContext));
+        }
+      } catch {
+        background = [];
+      }
       return [
         "Status for this chat (no model call, no configuration change):",
         `Model: ${boundedLabel(model, 240)}${preset === undefined ? "" : ` — preset ${boundedLabel(preset, 80)}`}`,
@@ -2483,7 +2500,8 @@ export async function runTelegram(
           : `Run: running (turn ${status.run.taskId}, ${status.run.inputs} input(s)` +
             `${status.run.attempt === undefined ? "" : `, generation attempt ${status.run.attempt}`})`,
         `Queued native inputs: ${status.inbox.total}`,
-        "Only this chat was read; no other chat, transcript, prompt or tool argument is included.",
+        ...background,
+        "Only this chat's own records were read; no other chat's transcript, prompt or tool argument is included.",
       ].join("\n");
     } catch {
       return "Status is unavailable right now: this chat's conversation metadata could not be read. " +

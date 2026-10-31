@@ -756,6 +756,11 @@ export interface MemoryDigestTaskSnapshot {
 /** The live run plus this origin conversation's newest run. Never scans chats or calls a model. */
 export interface MemoryDigestStatus {
   readonly liveTaskId: number | null;
+  /**
+   * Origin conversation of that live run, or null. One run at a time exists across all mapped chats,
+   * so a status reader can label a run that belongs to another chat instead of claiming it as its own.
+   */
+  readonly liveConversationId: number | null;
   readonly latest: MemoryDigestTaskSnapshot | null;
   /** Retained notices that are neither definitively reported nor provably nonreportable. */
   readonly pendingNotices: number;
@@ -1271,14 +1276,21 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
   });
   const clock = options.now;
 
+  const liveTaskRecord = async <T extends { readonly id: number }>(
+    scan: (status: LiveStatus) => Promise<T | undefined>,
+  ): Promise<T | undefined> => {
+    for (const status of LIVE_STATUSES) {
+      const record = await scan(status);
+      if (record !== undefined) return record;
+    }
+    return undefined;
+  };
+
   const liveTask = async (
     scan: (status: LiveStatus) => Promise<{ readonly id: number } | undefined>,
   ): Promise<number | undefined> => {
-    for (const status of LIVE_STATUSES) {
-      const record = await scan(status);
-      if (record !== undefined) return Number(record.id);
-    }
-    return undefined;
+    const record = await liveTaskRecord(scan);
+    return record === undefined ? undefined : Number(record.id);
   };
 
   const harnessLiveTask = (context: Context): Promise<number | undefined> =>
@@ -2032,7 +2044,12 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
       // one, so the notices come from a read-only snapshot and only task reads happen in the commit.
       const notices = (await harness.snapshot(MemoryDigestNoticesDoc, writer.id, context))?.notices ?? [];
       return harness.commit(async (tx) => {
-        const live = await txLiveTask(tx);
+        // The live record itself, not only its ID: the origin conversation lets a bounded status
+        // label a run that belongs to another mapped chat.
+        const live = await liveTaskRecord(async (status) => {
+          const page = await tx.scanTasks({ kind: MEMORY_DIGEST_TASK_NAME, status }, 1);
+          return page.items[0];
+        });
         const page = await tx.scanTasks({
           conversationId: writer.id,
           kind: MEMORY_DIGEST_TASK_NAME,
@@ -2049,7 +2066,8 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
         }
         const canStart = pendingNotices < MEMORY_DIGEST_LIMITS.noticeRecords;
         return {
-          liveTaskId: live ?? null,
+          liveTaskId: live === undefined ? null : Number(live.id),
+          liveConversationId: live === undefined ? null : live.conversationId,
           latest: latest ?? null,
           pendingNotices,
           canStart,

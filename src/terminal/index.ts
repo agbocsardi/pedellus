@@ -6,6 +6,7 @@ import { AssistantEntry, ConversationBusy, ToolResultEntry, UserEntry } from "@e
 import type { Cursor, EntryId, UsageState } from "@earendil-works/pi-durable";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
+import { renderBackgroundStatus } from "../background-status.js";
 import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "../history/episodes.js";
 import {
   renderMemoryDigestStart,
@@ -1040,6 +1041,8 @@ export async function runTerminalConversation(
       `Model: ${modelLabel(status.model)}`,
       `Run: ${taskSummary}`,
       `Native inbox: ${status.inbox.total} queued (${queueSummary}${queueNote}); model tools running=${status.tools.running} pending=${status.tools.pending}${toolsNote}; compactions=${status.compactions}`,
+      // Additive: an idle background is one line; an older host without the field adds nothing.
+      ...renderBackgroundStatus(status.background),
       ...formatUsage(status.usage),
       "Provider-side charges or usage not recorded by Durable: unknown (not inferred as zero).",
     ];

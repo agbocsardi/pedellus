@@ -517,6 +517,8 @@ test('/status reports bounded current-chat metadata without a model request', { 
     assert.match(running, /Model: fixture\/alpha \(thinking: off\) — preset fast/);
     assert.match(running, /Run: running \(turn \d+, 1 input\(s\)/);
     assert.match(running, /Queued native inputs: 0/);
+    // The background line is this chat's own bounded metadata: nothing runs here, so it is idle.
+    assert.match(running, /^Background: idle$/m);
     assert.match(running, /no model call/);
     assert.doesNotMatch(running, /held turn|SYNTHETIC-REPLY|AGENTS-|MEMORY-/);
 
@@ -532,6 +534,7 @@ test('/status reports bounded current-chat metadata without a model request', { 
     const idle = transport.sent.filter((entry) => entry.text.startsWith('Status for this chat'))[1].text;
     assert.match(idle, /Run: idle/);
     assert.match(idle, /Queued native inputs: 0/);
+    assert.match(idle, /^Background: idle$/m);
     assert.equal(store.captured.length, 1, 'the status view never dispatched a request');
     // No watch or timer is left behind: the adapter's own visible state is the only durable record.
     assert.deepEqual((await stateDoc(store.gateway)).controls, []);

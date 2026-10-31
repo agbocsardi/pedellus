@@ -6,6 +6,7 @@ import type { Context } from "@earendil-works/chord";
 import { withCancel } from "@earendil-works/chord/context";
 import type { Conversation, Cursor, EntryId, Tx } from "@earendil-works/pi-durable";
 import type { HistoryEpisodeQuery } from "../history/episodes.js";
+import type { BackgroundStatus } from "../background-status.js";
 import type { HistoryQuery } from "../history/index.js";
 import type { MemoryDigestWriter } from "../history/memory-digest.js";
 import type { MediaStore } from "../media/attachments.js";
@@ -286,8 +287,19 @@ class LocalConnection {
         onlyKeys(params, ["entryId"]);
         return this.surface.answer(requireInteger(params, "entryId", 1, LOCAL_PROTOCOL_LIMITS.maxEntryId), this.scope.context);
       }
-      case "status":
-        return this.surface.status(this.scope.context);
+      case "status": {
+        // The background summary is an additive capability field on the same request: it is the
+        // gateway's own bounded read for this already-attached conversation, and a host read failure
+        // leaves the core status exactly as before rather than claiming an idle background.
+        const status = await this.surface.status(this.scope.context);
+        let background: BackgroundStatus | undefined;
+        try {
+          background = await this.options.gateway.backgroundStatus(this.sessionKey, this.scope.context);
+        } catch {
+          background = undefined;
+        }
+        return background === undefined ? status : { ...status, background };
+      }
       case "entries": {
         const params = requireObject(request.params);
         onlyKeys(params, ["query", "limit", "cursor"]);
