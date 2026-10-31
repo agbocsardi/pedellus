@@ -18,6 +18,18 @@
 - [x] Owner accepts the pilot as sufficient. Defer the reminder-only follow-up; live reminder scheduling/delivery remains unverified, not a blocker for the next discussion.
 - [x] Clean up this batch's resources after owner confirms integration.
 
+## Owner follow-up — speech provisioning command
+
+- [ ] F3 — One explicit owner-run command provisions the local speech engine and
+  model for Telegram voice notes. Default faster-whisper: pinned uv/PEP 723 helper
+  and one model download. `whisper-cli`: report configured absolute paths present
+  or missing; download/build nothing. Never invoked by gateway startup, message
+  handling, config parsing or schedule; no runtime mid-message download, no second
+  runtime or config rewrite. Focused fake-uv/helper tests, no network. Voice notes
+  already transcribe automatically once provisioned.
+- [ ] Independently review, fix via the original worker, then publish on a clean
+  main fast-forward with docs/handoff updated.
+
 ## Approved parity batch — bounded digestion, delivery and agent-managed work
 
 Python is the accepted behavioral/product reference. Port onto native Durable
@@ -442,6 +454,13 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Speech provisioning follow-up
+
+Owner confirmed Telegram voice auto-transcription is the desired behavior; it is
+already automatic once the engine is provisioned. Chose an explicit provisioning
+command over implicit first-use download, keeping the runtime download-free while
+handling messages. F3 started in a fresh worktree under the same review loop.
 
 ### 2026-10-31 — P1–P7 parity batch closed
 
