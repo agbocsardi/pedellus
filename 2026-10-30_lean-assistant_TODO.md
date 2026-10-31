@@ -18,6 +18,27 @@
 - [x] Owner accepts the pilot as sufficient. Defer the reminder-only follow-up; live reminder scheduling/delivery remains unverified, not a blocker for the next discussion.
 - [x] Clean up this batch's resources after owner confirms integration.
 
+## Owner follow-up — quiet digestion and CLI path attachments
+
+- [ ] F1 — Successful digest runs, including successful no-ops, do not notify
+  or resume the origin agent. Preserve successful task/status/cursor records;
+  only issues (failed/aborted runs) notify. Suppress legacy pending success
+  notices during start/flush/reopen; retain unknown/issue results conservatively.
+- [ ] F2 — CLI attachments are path-only for every type, including images.
+  Save originals in a CLI-specific workspace attachment directory and supply a
+  workspace-relative locator; no native images or automatic vision/transcription.
+  Inspect Pi coding-agent attachment handling and reuse compatible interaction
+  patterns without transplanting its TUI or claiming unsupported paste behavior.
+  Telegram's existing native image/voice behavior and stored locators remain intact.
+- [ ] Independently review each original worker's changes, fix findings through
+  that worker, integrate passing candidates, and reconcile the final union/docs.
+
+Two fresh worktree implementers launched from `8aadbfa` using the same Pi /
+`opencode-go/deepseek-v4.1-flash` / high loop. No live/API/provider calls, installs,
+credentials, runtime activation or personal workspace use. Parent owns this plan;
+workers own code and focused regressions. These explicit owner corrections
+supersede the overnight completion-notice and native CLI-photo assumptions below.
+
 ## Approved overnight batch — memory digestion and local usability
 
 All six slices are accepted and published. Final reviewed product/docs tip:
@@ -369,6 +390,14 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Owner follow-up — assumptions corrected
+
+Owner accepted the overnight assumptions except two: digestion should notify
+its agent only on issues, not successful runs/no-ops; CLI attachments should be
+path-only, saved in a channel-specific workspace directory. CLI photos must not
+be submitted as native images. Two scoped workers started with independent
+review required before integration; Telegram media behavior remains unchanged.
 
 ### 2026-10-31 — overnight batch closed
 
