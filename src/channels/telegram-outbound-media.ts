@@ -4,7 +4,14 @@
  * The model names a workspace-relative path; the live adapter resolves it under
  * the configured workspace and pins the bytes before the external call. A later
  * write, replacement or growth cannot change what Telegram receives or make the
- * outcome ambiguous, and a symlinked path may not escape the workspace.
+ * outcome ambiguous; a file that shrinks, grows or is replaced while it is read
+ * is refused. A symlinked path may not escape the workspace.
+ *
+ * That confinement is accidental-damage protection for an owner-controlled
+ * workspace, not hostile-tenant isolation. The path is canonicalised and the
+ * final component is re-opened with `O_NOFOLLOW`, but Node has no `openat`, so a
+ * local process that replaces a parent directory between resolution and open is
+ * not fully excluded.
  *
  * This module deliberately has no remote-URL fetch, Telegram file-id reuse,
  * extraction, transcoding, FFmpeg dependency or upload-backend registry. Telegram
@@ -15,7 +22,7 @@
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
-import { sanitizeOriginalName } from "../media/attachments.js";
+import { MEDIA_LIMITS, sanitizeOriginalName } from "../media/attachments.js";
 import { validTelegramFilePath, type TelegramFileKind } from "./telegram-interactions.js";
 
 export const TELEGRAM_OUTBOUND_LIMITS = Object.freeze({
@@ -87,6 +94,28 @@ function extensionOf(filename: string): string {
 }
 
 /**
+ * Bounded upload name for an already-validated file. The kind check uses the
+ * extension of the original resolved basename before any sanitize/truncate step,
+ * and this helper keeps that suffix inside the 120-character display-name bound
+ * whenever it fits, so a long valid name is not refused as a wrong format and
+ * the service still sees the same kind hint.
+ */
+function outboundFilename(originalName: string, extension: string): string {
+  const sanitized = sanitizeOriginalName(originalName);
+  const suffix = extension === "" ? "" : `.${extension}`;
+  if (suffix === "" || suffix.length >= MEDIA_LIMITS.maxOriginalNameChars) {
+    return sanitized ?? "file";
+  }
+  if (sanitized !== undefined && sanitized.toLowerCase().endsWith(suffix)) return sanitized;
+  const stemSource = originalName.length > suffix.length
+    ? originalName.slice(0, originalName.length - suffix.length)
+    : originalName;
+  const stem = (sanitizeOriginalName(stemSource) ?? "file").replace(/[. ]+$/, "") || "file";
+  const room = MEDIA_LIMITS.maxOriginalNameChars - suffix.length;
+  return `${stem.slice(0, room)}${suffix}`;
+}
+
+/**
  * Resolve and read one workspace file for a bounded upload. Every failure is a
  * fixed pre-send refusal that never discloses the original host path.
  */
@@ -118,11 +147,15 @@ export async function readTelegramOutboundFile(options: {
   }
   if (!insideRoot(canonicalRoot, resolved)) throw new TelegramOutboundRejected("unsafe-path");
 
-  const filename = sanitizeOriginalName(basename(resolved)) ?? `${options.kind}.bin`;
+  // The kind hint is derived from the resolved file name before the display name is
+  // bounded: truncating first could drop a valid `.png` suffix and falsely refuse it.
+  const originalName = basename(resolved);
+  const extension = extensionOf(originalName);
   const allowed = KIND_EXTENSIONS[options.kind];
-  if (allowed !== undefined && !allowed.has(extensionOf(filename))) {
+  if (allowed !== undefined && !allowed.has(extension)) {
     throw new TelegramOutboundRejected("unsupported-format");
   }
+  const filename = outboundFilename(originalName, extension);
 
   let handle;
   try {

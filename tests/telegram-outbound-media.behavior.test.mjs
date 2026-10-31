@@ -453,6 +453,48 @@ test('five native kinds upload bounded workspace files with captions from the cu
   }
 });
 
+test('a long valid basename keeps its photo extension and pinned bytes', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('long-name');
+  const longName = `${'a'.repeat(200)}.png`;
+  const path = `files/${longName}`;
+  await writeFile(join(store.workspace, path), 'LONG-PHOTO-BYTES');
+  let issued = false;
+  store.faux.setResponses(Array.from({ length: 6 }, () => (request) => {
+    const transcript = JSON.stringify(request.messages);
+    if (!issued) {
+      issued = true;
+      return fauxAssistantMessage([
+        fauxToolCall('telegram', { action: 'send', kind: 'photo', path, caption: 'Long name' }, { id: 'long-photo' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('LONG-DONE');
+  }));
+  const transport = telegramMock([[messageUpdate(705, 100, 'send the long photo')]]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.some((entry) => entry.text === 'LONG-DONE'), 'long-name turn');
+    assert.equal(transport.uploads.length, 1, 'the long valid photo was not falsely refused');
+    const upload = transport.uploads[0];
+    assert.equal(upload.method, 'sendPhoto');
+    assert.equal(upload.text, 'LONG-PHOTO-BYTES', 'the pinned bytes are the long file contents');
+    assert.equal(upload.size, Buffer.byteLength('LONG-PHOTO-BYTES'));
+    assert.equal(upload.filename.length, 120, 'the display name stays inside the 120-character bound');
+    assert.match(upload.filename, /^a{116}\.png$/, 'the validated suffix survives the bound');
+
+    const chat = await store.gateway.conversationFor(`telegram:${BOT_ID}:chat:${CHAT_ID}`, context);
+    const result = await toolResults(chat, 'long-photo');
+    assert.equal(result.isError, false, result.text);
+    assert.match(result.text, /Sent one photo/);
+    assert.doesNotMatch(result.text, new RegExp(longName));
+    const record = (await stateDoc(store.gateway)).actions.find((entry) => entry.kind === 'photo');
+    assert.equal(record?.status, 'sent');
+    assert.equal(record?.path, path, 'the record keeps the workspace-relative path, not the host path');
+  } finally {
+    await cleanup(store, harness);
+  }
+});
+
 test('path, symlink, kind, size and non-regular refusals happen before any upload', { timeout: 25_000 }, async () => {
   const store = await syntheticStore('refusals');
   await prepareFiles(store.workspace);
