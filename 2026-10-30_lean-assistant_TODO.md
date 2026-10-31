@@ -20,16 +20,17 @@
 
 ## Owner follow-up — digest input correction
 
-- [ ] F4 — Digest evidence is conversation messages only: user and assistant
+- [x] F4 — Digest evidence is conversation messages only: user and assistant
   text; no tool calls and no tool-result/output text. A closed episode whose
   selected messages fit the caps is delivered and acknowledged as one whole-episode
-  pass. New defaults: 200,000 characters per pass and 2,000 entries per batch
-  (character bound governs; entry bound only stops floods of tiny messages).
-  Oversized episodes keep independent ordered chunks with separate acknowledgements;
-  no carry-over summary machinery. Lossless fragmentation, provenance, cursor
-  and acknowledgement validation stay consistent with the new selection.
-- [ ] Independently review, fix via the original worker, publish on a clean
-  fast-forward with docs/handoff reconciled.
+  pass. Current defaults: 200,000 characters per pass and 2,000 entries per batch
+  (character bound governs; entry bound only stops floods of tiny messages; both
+  minimums are 2). Oversized episodes keep independent ordered chunks with separate
+  acknowledgements; a cut entry always ends its chunk; no carry-over summary.
+  Lossless fragmentation, provenance, cursor and acknowledgement validation use the
+  same message-only selection.
+- [x] Independently reviewed (one blocking chunk-cut livelock found and fixed), then
+  published at `fca5ab5` on clean main with docs/handoff reconciled.
 
 ## Owner follow-up — speech provisioning (cancelled)
 
@@ -45,9 +46,11 @@
 Python is the accepted behavioral/product reference. Port onto native Durable
 facilities; do not redesign memory quality, holistic usability or agent loops.
 
-- [x] P1 — Configurable digest bounds: entries/batch (80), characters/batch
-  (24,000), tool calls (10 individual calls, not Python iterations), whole-run
-  timeout (300 seconds), changed files (8) and changed-text volume (32,000).
+- [x] P1 — Configurable digest bounds: entries/batch and characters/batch,
+  tool calls (10 individual calls, not Python iterations), whole-run timeout
+  (300 seconds), changed files (8) and changed-text volume (32,000). Batch defaults
+  were later superseded by owner follow-up F4 to 200,000 characters / 2,000
+  entries with message-only evidence; P1's bounds/gates and capture behavior stand.
   Preserve one bounded closed-episode chunk per invocation, partial writes and
   cursor failure guards. Next ordinary invocation may retry a native parked task
   once; no retry loop or user recovery UI. No automatic schedule activation.
@@ -464,6 +467,23 @@ passed its final gate before fast-forwarding main; no separate integration agent
 or hand-edited main source was used.
 
 ## Session log
+
+### Digest input correction published
+
+F4 published at `fca5ab5`. Digest evidence is now message text only (`pi.user`,
+`nanobot.cron` input, `pi.assistant`); tool calls and tool-result/output text are
+consumed but never curated. Defaults are 200,000 characters and 2,000 entries per
+pass (both minimum 2); an episode within both bounds is one whole-episode read and
+acknowledgement, and larger episodes keep independent ordered chunks. Independent
+review caught a blocking livelock where a chunk cut mid-message continued into an
+evidence-free entry and could never be acknowledged; a cut entry now always ends
+its chunk. A one-entry batch minimum prevents a second deterministic stall. Old
+recorded batches fail closed and are re-read. Gate: 293 behavior, 2 execution, 83
+offline acceptance; published main typecheck/build and 62 focused digest checks.
+Accepted: facts only in tool output are not digestible; re-read is entry-count
+bounded, not byte-bounded; >4,000 reset gap and 4,000-entry turn verification
+unchanged; a large episode is still curated in independent chunks with no
+carry-over. Speech provisioning command was cancelled unmerged per owner direction.
 
 ### Digest input correction
 
