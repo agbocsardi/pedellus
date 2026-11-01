@@ -116,6 +116,13 @@ cap, no listed-tool cap, and no description cap, so no text can be silently
 shortened, omitted or rejected by a size policy. This matches the Python
 reference, which loads those documents completely.
 
+What remains bounded are identifiers, never the content they identify: a
+provenance label, a skill name, a memory locator segment or path length, and the
+memory scan depth. A label is clipped with an ellipsis; a memory entry refused
+by the locator shape is counted in the manifest's visible `refused` line, and a
+refused skill directory name in the visible `skipped` list. Nothing disappears
+without a trace.
+
 The exported `CONTEXT_LIMITS` documents only what remains: 256 conversation
 snapshots (a fan-out bound on the snapshot table, not a content budget), 256
 code points per provenance label, and 128 code units per skill name. Labels and

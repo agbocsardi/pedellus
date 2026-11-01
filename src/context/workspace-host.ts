@@ -22,7 +22,7 @@ export type WorkspaceContextHostConfig = Pick<PortConfig, "workspace" | "workspa
  * files plus the explicitly named memory files. Only an explicit
  * `workspaceContext.skills` section adds Markdown skill discovery, from
  * `<workspace>/skills` and, when configured, an explicit builtin skills root.
- * Only `workspaceContext.memoryManifest: true` adds the bounded `# Memory Tree`
+ * Only `workspaceContext.memoryManifest: true` adds the `# Memory Tree`
  * manifest after those memory files; topic bodies stay on disk for the granted
  * native `read` tool. No identity, ambient configuration, default memory file,
  * package skill path, or home directory is added. The selection is copied once
@@ -30,8 +30,8 @@ export type WorkspaceContextHostConfig = Pick<PortConfig, "workspace" | "workspa
  * detached and conversation-scoped.
  *
  * A loader error rejects conversation setup; no partial snapshot is installed.
- * Oversized manifests are shortened inside the helper with a visible count, not
- * rejected.
+ * Memory manifests are composed in full (identifier and scan bounds are counted
+ * visibly in the manifest, never applied to content).
  *
  * Skills are discovery and prompt inclusion only: this host never runs a skill
  * as code. A selected skill body reaches the model, and the configured

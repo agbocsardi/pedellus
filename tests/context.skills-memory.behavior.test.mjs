@@ -87,3 +87,32 @@ test("a full manifest lists every entry instead of shortening itself", async (t)
   assert.equal(listed.length, 80);
   assert.doesNotMatch(memory.manifest, /more memory files/);
 });
+
+test("ordinary topic names with spaces or non-ASCII characters stay discoverable", async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, {
+    "memory/daily notes/2026-01-01.md": "---\ndescription: new year\n---\nbody",
+    "memory/über.md": "---\ndescription: umlaut\n---\nbody",
+  });
+
+  const memory = await loadMemoryContext({ workspaceRoot: root });
+  assert.deepEqual(memory.entries.map((entry) => entry.path), [
+    "memory/daily notes/2026-01-01.md",
+    "memory/über.md",
+  ]);
+  assert.match(memory.manifest, /memory\/daily notes\/2026-01-01\.md/);
+  assert.doesNotMatch(memory.manifest, /refused/);
+});
+
+test("an entry refused by a locator bound is counted in the manifest", async (t) => {
+  const root = await tempRoot(t);
+  const longSegment = `${"n".repeat(80)}.md`;
+  await writeFiles(root, {
+    "memory/listed.md": "body",
+    [`memory/${longSegment}`]: "body",
+  });
+
+  const memory = await loadMemoryContext({ workspaceRoot: root });
+  assert.deepEqual(memory.entries.map((entry) => entry.path), ["memory/listed.md"]);
+  assert.match(memory.manifest, /1 memory entries refused \(name, depth, or path length/);
+});

@@ -214,7 +214,7 @@ a filesystem that fails to update metadata.
 ## Limits
 
 `WORKSPACE_CONTEXT_LIMITS` exposes only label-shape limits: 256 code points per
-provenance label (identity source is also counted in code points), at most 248
+provenance label (identity source is also counted in code points), at most 246
 characters per memory path (so `workspace:` plus the path fits the label bound),
 at most 8 path segments, and at most 64 characters per path segment. UTF-8 is
 decoded with `fatal: true`; a BOM is stripped by the decoder.
@@ -224,6 +224,11 @@ memory files and host-supplied identity are read and returned in full, whatever
 their byte or character size, as in the Python reference. The loader does not
 pre-check whether the renderer would clip anything, because the renderer no
 longer clips: no accepted document can be dropped after this load.
+
+A file whose stat size the runtime cannot allocate is reported as a typed file
+failure (`io`) rather than escaping as an untyped allocation error. There is no
+per-file byte ceiling, so a pathological multi-gigabyte `AGENTS.md` is read in
+full like Python would, and the process may fail on memory instead.
 
 ## Detachment and session isolation
 

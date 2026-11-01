@@ -47,7 +47,6 @@ test("large identity survives native context composition including escaped prove
   assert.ok([...composed].filter((character) => character === "x").length === 60_000);
   assert.ok(composed.includes(runtimeTail));
   assert.ok(composed.includes("Your workspace is at: /safe/root"));
-  assert.doesNotMatch(composed, /truncated/);
 });
 
 test("snapshots map only to their conversation and are copied at construction", () => {
@@ -104,6 +103,19 @@ test("skills render as a name/description summary only, never bodies, and tools 
   assert.match(tools, /host_read/);
   assert.match(tools, /does not enable tools/);
   assert.doesNotMatch(tools, /read_file|web_search|Dream/i);
+});
+
+test("every model-facing tool name is listed without a visibility budget", () => {
+  const extension = createContextExtension([{ conversationId: 3 }]);
+  const toolSection = extension.sections.find(({ key }) => key === "nanobot_tools");
+  assert.ok(toolSection);
+  const names = Array.from({ length: 200 }, (_value, index) => `host_tool_${index}`);
+  const tools = toolSection.render({
+    conversationId: 3,
+    agent: { tools: names.map((name) => ({ name })) },
+  }, undefined) ?? "";
+  for (const name of names) assert.ok(tools.includes(name), `missing ${name}`);
+  assert.doesNotMatch(tools, /omitted/);
 });
 
 test("same Durable IDs remain isolated in dedicated registries", () => {

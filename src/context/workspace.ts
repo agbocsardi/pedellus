@@ -481,7 +481,14 @@ async function readPinnedFile(
     if (before.nlink !== 1n) throw new WorkspaceContextFileError("hardlink", source);
     const size = Number(before.size);
 
-    const buffer = Buffer.alloc(size);
+    let buffer: Buffer;
+    try {
+      buffer = Buffer.alloc(size);
+    } catch (error) {
+      // A size the runtime cannot allocate is a read failure for this file; it
+      // must stay a typed file error instead of escaping as an untyped crash.
+      throw fileFailure(error, source);
+    }
     let offset = 0;
     while (offset < size) {
       let bytesRead: number;

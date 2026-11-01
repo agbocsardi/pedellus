@@ -306,17 +306,14 @@ test("large content passes through the loader and renderer in full", async (t) =
   assert.ok(instructions.includes(agents));
   assert.ok(instructions.includes(user));
   assert.ok(instructions.includes(soul));
-  assert.doesNotMatch(instructions, /truncated/);
 
   const memory = render(extension, "nanobot_memory");
   assert.ok(memory.includes(memoryFixture[memoryFiles[39]]));
   assert.ok(memory.includes(memoryFixture[memoryFiles[0]]));
   assert.match(memory, /Memory 40\nSource: "workspace:memory\/topic-39\.md"/);
-  assert.doesNotMatch(memory, /truncated/);
 
   const identity = render(extension, "nanobot_identity");
   assert.ok(identity.includes(identityContent));
-  assert.doesNotMatch(identity, /truncated/);
 });
 
 test("provider adapts explicit session selections without shared state", async (t) => {
@@ -499,7 +496,6 @@ test("provenance labels fit CONTEXT_LIMITS.sourceChars including the workspace p
   const extension = createContextExtension([{ conversationId: 1, ...snapshot }]);
   const memory = render(extension, "nanobot_memory");
   assert.ok(memory.includes(`Source: "workspace:${accepted}"`));
-  assert.doesNotMatch(memory, /context truncated/);
 
   const rejected = buildPath(WORKSPACE_CONTEXT_LIMITS.maxPathChars + 1);
   await assert.rejects(load(root, { memoryFiles: [rejected] }), isInputError);
@@ -516,12 +512,10 @@ test("workspace documents reach the renderer without a content budget", async (t
 
   const memory = render(extension, "nanobot_memory");
   assert.match(memory, /MEMORY_TAIL_MUST_SURVIVE/);
-  assert.doesNotMatch(memory, /truncated/);
 
   const identity = render(extension, "nanobot_identity");
   assert.match(identity, /identity body/);
   assert.match(identity, /Source: "session:identity"/);
-  assert.doesNotMatch(identity, /truncated/);
 });
 
 test("root rename or replacement during a load is detected", async (t) => {

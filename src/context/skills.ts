@@ -12,15 +12,15 @@
  * rendered into the system prompt. Runtime state is not stored here.
  *
  * Metadata is parsed as a bounded subset of YAML. When a requirement-bearing
- * form cannot be read (an indented `metadata:` mapping, oversized or malformed
- * metadata, or an unusable `requires.bins`/`requires.env` list), the skill is
- * reported as unavailable with a stable reason instead of silently losing its
- * gate. Skills whose directory name is unsafe or whose files are symlinks are
- * reported in `skipped` rather than dropped without trace.
+ * form cannot be read (an indented `metadata:` mapping, malformed metadata, or
+ * an unusable `requires.bins`/`requires.env` list), the skill is reported as
+ * unavailable with a stable reason instead of silently losing its gate. Skills
+ * whose directory name is unsafe or whose files are symlinks are reported in
+ * `skipped` rather than dropped without trace.
  *
- * Scope is accidental damage, not adversarial confinement: reads are bounded,
- * UTF-8 failures are rejected, and symlinked skill entries are skipped. There
- * is no `/proc/self/fd` pinning or post-read race verification.
+ * Scope is accidental damage, not adversarial confinement: no content-size
+ * budget applies, UTF-8 failures are rejected, and symlinked skill entries are
+ * skipped. There is no `/proc/self/fd` pinning or post-read race verification.
  */
 import { constants } from "node:fs";
 import { access, lstat, readFile, readdir, stat } from "node:fs/promises";

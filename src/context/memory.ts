@@ -1,5 +1,5 @@
 /**
- * Explicit-root topic-memory discovery and a bounded context manifest.
+ * Explicit-root topic-memory discovery and a context manifest.
  *
  * Markdown files in the workspace `memory/` directory are authoritative; this
  * module stores no runtime state and creates no second store. The caller names
@@ -19,7 +19,7 @@
  * contain the absolute root.
  *
  * Scope is accidental damage, not adversarial confinement: reads use normal
- * filesystem calls with size and aggregate bounds. Symlinked topic entries are
+ * filesystem calls with no content-size budget. Symlinked topic entries are
  * skipped rather than followed; an explicitly named loaded file that is a
  * symlink is rejected. There is no `/proc/self/fd` pinning and no post-read
  * race verification, so a swap between the check and the read is not detected.
@@ -37,7 +37,6 @@ const MEMORY_DIR = "memory";
 const SYSTEM_DIR = "system";
 const RESTRICTED_ROOTS = Object.freeze(["/proc", "/sys", "/dev"]);
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
-const SAFE_MEMORY_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const PROTECTED_NAMES = Object.freeze(new Set(["MEMORY.md", "HISTORY.md"]));
 
 /**
@@ -132,6 +131,8 @@ export class MemoryContextFileError extends Error {
 interface ScanState {
   scanned: number;
   truncated: boolean;
+  /** Entries refused by the locator-shape bounds; always reported in the manifest. */
+  refused: number;
 }
 
 interface FrontmatterSplit {
@@ -198,6 +199,11 @@ function validatedRoot(value: unknown): string {
   return root;
 }
 
+/** Path-segment rule: any name the filesystem may hold, except control characters and dot segments. */
+function safeMemorySegment(segment: string): boolean {
+  return segment.length > 0 && segment !== "." && segment !== ".." && !CONTROL_CHARACTERS.test(segment);
+}
+
 /**
  * Validate one workspace-relative `memory/**\/*.md` path without touching the
  * filesystem. A topic path may not name an always-loaded or protected surface;
@@ -218,7 +224,7 @@ function validatedMemoryPath(value: unknown, loaded: boolean): string {
   }
   for (const segment of segments) {
     if (segment.length === 0 || segment.length > MEMORY_CONTEXT_LIMITS.maxPathSegmentChars ||
-        !SAFE_MEMORY_SEGMENT.test(segment)) {
+        !safeMemorySegment(segment)) {
       throw new MemoryContextInputError(`${kind} must be a workspace-relative memory/**/*.md path`);
     }
   }
@@ -234,9 +240,9 @@ function validatedMemoryPath(value: unknown, loaded: boolean): string {
 
 /**
  * Validate an explicit topic path for a host preparing a native `write`/
- * `edit`. This refuses `MEMORY.md`, `HISTORY.md`, `memory/system/`, hidden
- * entries, and paths outside `memory/`; it does not touch the filesystem and
- * does not confirm expected prior content.
+ * `edit`. This refuses `MEMORY.md`, `HISTORY.md`, `memory/system/`, control
+ * characters, dot segments, over-long segments and paths outside `memory/`; it
+ * does not touch the filesystem and does not confirm expected prior content.
  */
 export function validateMemoryTopicPath(value: unknown): string {
   return validatedMemoryPath(value, false);
@@ -352,15 +358,21 @@ async function scanTopics(
     // Dirent methods do not follow symlinks; a symlinked entry is skipped
     // rather than read through a link outside the workspace.
     if (entry.isSymbolicLink()) continue;
-    if (name.length > MEMORY_CONTEXT_LIMITS.maxPathSegmentChars ||
-        !SAFE_MEMORY_SEGMENT.test(name)) {
+    // A refused name, depth or path length is a locator-shape limit, never a
+    // content limit: it is counted in a visible manifest line so nothing
+    // disappears from the tree without a trace.
+    if (name.length > MEMORY_CONTEXT_LIMITS.maxPathSegmentChars || !safeMemorySegment(name)) {
+      state.refused++;
       continue;
     }
     if (entry.isDirectory()) {
       if (name === SYSTEM_DIR) continue;
       const nextSegments = [...segments, name];
       // `memory` + directories + `.md` file must fit the path segment bound.
-      if (nextSegments.length > MEMORY_CONTEXT_LIMITS.maxPathSegments - 2) continue;
+      if (nextSegments.length > MEMORY_CONTEXT_LIMITS.maxPathSegments - 2) {
+        state.refused++;
+        continue;
+      }
       await scanTopics(join(memoryDirPath, name), nextSegments, state, found);
       continue;
     }
@@ -368,7 +380,10 @@ async function scanTopics(
     const path = directorySource([...segments, name]);
     // The provenance label must fit the renderer's source bound; an
     // over-long workspace path is not a usable topic locator.
-    if (path.length > MEMORY_CONTEXT_LIMITS.maxPathChars) continue;
+    if (path.length > MEMORY_CONTEXT_LIMITS.maxPathChars) {
+      state.refused++;
+      continue;
+    }
     found.push(path);
   }
 }
@@ -491,9 +506,15 @@ async function readManifestEntry(
     if (before.nlink !== 1n) throw new MemoryContextFileError("hardlink", path);
     const size = Number(before.size);
     if (!Number.isSafeInteger(size)) {
-      throw new MemoryContextFileError("changed", path);
+      throw new MemoryContextFileError("io", path);
     }
-    buffer = Buffer.alloc(size);
+    try {
+      buffer = Buffer.alloc(size);
+    } catch (error) {
+      // A size the runtime cannot allocate is a read failure for this file, not
+      // a silent skip or an untyped crash; the body is never partially parsed.
+      throw fileFailure(error, path);
+    }
     let offset = 0;
     while (offset < size) {
       let bytesRead: number;
@@ -526,6 +547,7 @@ function composeManifest(
   entries: readonly MemoryTopicEntry[],
   more: number,
   skipped: number,
+  refused: number,
   scanTruncated: boolean,
 ): string {
   const lines = [
@@ -536,7 +558,10 @@ function composeManifest(
   ];
   if (more > 0) lines.push(`- \u2026 ${more} more memory files`);
   if (skipped > 0) {
-    lines.push(`- \u2026 ${skipped} memory files skipped (unreadable, oversized, or invalid)`);
+    lines.push(`- \u2026 ${skipped} memory files skipped (unreadable, changed, or not valid UTF-8)`);
+  }
+  if (refused > 0) {
+    lines.push(`- \u2026 ${refused} memory entries refused (name, depth, or path length outside the locator bound)`);
   }
   if (scanTruncated) {
     lines.push("- \u2026 more memory files were not inspected (directory-entry bound reached)");
@@ -546,31 +571,34 @@ function composeManifest(
 
 /**
  * Compose the manifest in full. Entry and scan bounds are already reflected in
- * the arguments, and every hidden entry is counted in a visible line.
+ * the arguments, and every hidden entry is counted in a visible line: a
+ * skipped or refused entry is never silently absent.
  */
 function buildManifest(
   entries: readonly MemoryTopicEntry[],
   capOmitted: number,
   skipped: number,
+  refused: number,
   scanTruncated: boolean,
 ): string {
-  if (entries.length === 0 && capOmitted === 0 && skipped === 0 && !scanTruncated) return "";
-  return composeManifest(entries, capOmitted, skipped, scanTruncated);
+  if (entries.length === 0 && capOmitted === 0 && skipped === 0 && refused === 0 && !scanTruncated) {
+    return "";
+  }
+  return composeManifest(entries, capOmitted, skipped, refused, scanTruncated);
 }
 
 /**
- * Discover topic memory under one explicit workspace root and build a bounded
- * manifest. `loadedFiles` names memory files the host already injected; every
- * other discovered `.md` file is a `topic` to read on demand. Nothing is
- * written, created, cached, or stored outside the caller's workspace.
+ * Discover topic memory under one explicit workspace root and build a manifest.
+ * `loadedFiles` names memory files the host already injected; every other
+ * discovered `.md` file is a `topic` to read on demand. Nothing is written,
+ * created, cached, or stored outside the caller's workspace.
  *
  * A missing `memory/` directory yields no entries. A missing or invalid
  * explicitly named loaded file rejects the whole load, so configured content
- * is never silently replaced. A discovered topic that is unreadable,
- * oversized, or not valid UTF-8 is skipped and counted in the manifest; a
- * missing/vanished or changed topic is skipped the same way. An over-budget
- * manifest is shortened, and every hidden entry is counted in a visible
- * `more memory files` line rather than failing the load.
+ * is never silently replaced. A discovered topic that is unreadable or not
+ * valid UTF-8, and an entry refused by a locator-shape bound, is counted in the
+ * manifest; a missing/vanished or changed topic is skipped the same way. No
+ * content-size budget applies.
  */
 export async function loadMemoryContext(request: MemoryContextRequest): Promise<MemoryContextResult> {
   if (!isRecord(request)) {
@@ -582,7 +610,7 @@ export async function loadMemoryContext(request: MemoryContextRequest): Promise<
   const loaded = new Set(loadedFiles);
 
   await assertWorkspaceDirectory(rootPath);
-  const state: ScanState = { scanned: 0, truncated: false };
+  const state: ScanState = { scanned: 0, truncated: false, refused: 0 };
   const topics: string[] = [];
   if (await hasMemoryDirectory(rootPath)) {
     await scanTopics(join(rootPath, MEMORY_DIR), [], state, topics);
@@ -621,7 +649,7 @@ export async function loadMemoryContext(request: MemoryContextRequest): Promise<
     }));
   }
 
-  const manifest = buildManifest(entries, more, skipped, state.truncated);
+  const manifest = buildManifest(entries, more, skipped, state.refused, state.truncated);
   const document = manifest.length === 0
     ? undefined
     : Object.freeze({ source: MANIFEST_SOURCE, content: manifest });

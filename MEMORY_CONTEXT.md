@@ -48,18 +48,22 @@ The result contains:
   frontmatter-stripped body length in Unicode code points.
 - `manifest`: `# Memory Tree` text with the Python intro line and one line per
   entry: ``- `memory/x.md` (topic, 123 chars): description``. More than the entry
-  cap or a stopped directory scan adds a visible `more memory files` line;
-  entries are never dropped without that line. Discovery has no character
+  cap or a stopped directory scan adds a visible `more memory files` line, and an
+  entry refused by a locator-shape bound adds a visible `N memory entries
+  refused (name, depth, or path length outside the locator bound)` line;
+  entries are never dropped without such a line. Discovery has no character
   budget, so a manifest is never shortened to fit one.
   Discovered files that cannot be read add a visible `N memory files skipped
-  (unreadable, invalid, or unreadable as UTF-8)` line instead of an entry, so the
+  (unreadable, changed, or not valid UTF-8)` line instead of an entry, so the
   manifest never claims their bodies were read.
 - `document`: a frozen `{ source: "memory:manifest", content: manifest }` for
   `ConversationContextSnapshot.memory`; absent when the manifest is empty.
 
 `validateMemoryTopicPath()` refuses `MEMORY.md`, `HISTORY.md`, `memory/system/`,
-hidden entries, non-`.md` paths, `..`, backslashes, absolute paths, and anything
-outside `memory/`. It is a naming guard only: it cannot confirm expected prior
+non-`.md` paths, `.`/`..` segments, control characters, over-long names, and
+absolute or backslash paths, and anything outside `memory/`. Any other name the
+filesystem accepts (spaces, non-ASCII) is valid, so a discoverable topic is also
+writable. It is a naming guard only: it cannot confirm expected prior
 content or make the native write atomic. `validateMemoryLoadedFiles()` validates
 an explicit injected-file list for host config parsing. It is decoupled from the
 write guard: protected names such as `HISTORY.md`, `memory/MEMORY.md` and
@@ -77,11 +81,10 @@ Under `<workspaceRoot>/memory/`, recursively:
 | `HISTORY.md` | Legacy history evidence; not a topic. |
 | `history.jsonl`, cursor files | Not `.md`; never discovered. |
 | `system/` directory | Always-loaded; not a topic. |
-| Hidden file or directory | Skipped (safe segments must start alphanumeric). |
 | Symlinked file or directory | Skipped, not followed. |
 | Non-regular file, non-`.md` file | Ignored. |
-| Unsafe/oversized segment name | Ignored. |
-| Workspace-relative path over 246 characters | Ignored; provenance would not fit. |
+| Name with a control character, or a `.`/`..` segment | Refused and counted in the visible refused line. |
+| Segment over 64 characters, more than 8 path segments, or a workspace-relative path over 246 characters | Refused and counted in the visible refused line. |
 
 Only files explicitly named in `loadedFiles` are read outside that topic set.
 Each must exist and be a regular, non-symlinked, single-link file; a missing,
