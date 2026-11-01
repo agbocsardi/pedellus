@@ -41,15 +41,14 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const PROTECTED_NAMES = Object.freeze(new Set(["MEMORY.md", "HISTORY.md"]));
 
 /**
- * Discovery limits. The entry cap and the description cap match the Python
+ * Discovery limits. There is no entry cap: every discovered topic and every
+ * explicitly loaded file is listed. The description cap matches the Python
  * memory tree, and the directory scan bound stops an unbounded walk with a
  * visible note. There is deliberately no manifest character budget and no
  * per-file or shared byte budget: the manifest lists every reached entry and a
  * topic file is read in full for its description and body length, as Python does.
  */
 export const MEMORY_CONTEXT_LIMITS = Object.freeze({
-  /** Maximum entries in one manifest, matching Python's memory-tree cap. */
-  maxEntries: 80,
   /** Description code points, matching Python's memory-tree description cap. */
   maxDescriptionChars: 240,
   maxSourceChars: CONTEXT_LIMITS.sourceChars,
@@ -569,7 +568,6 @@ function comparePaths(left: string, right: string): number {
 
 function composeManifest(
   entries: readonly MemoryTopicEntry[],
-  more: number,
   skipped: number,
   refused: number,
   scanTruncated: boolean,
@@ -580,7 +578,6 @@ function composeManifest(
     ...entries.map((entry) =>
       `- \`${entry.path}\` (${entry.state}, ${entry.bodyChars} chars): ${entry.description}`),
   ];
-  if (more > 0) lines.push(`- \u2026 ${more} more memory files`);
   if (skipped > 0) {
     lines.push(`- \u2026 ${skipped} memory files skipped (unreadable, changed, or not valid UTF-8)`);
   }
@@ -597,21 +594,17 @@ function composeManifest(
 }
 
 /**
- * Compose the manifest in full. Entry and scan bounds are already reflected in
- * the arguments, and every hidden entry is counted in a visible line: a
- * skipped or refused entry is never silently absent.
+ * Compose the manifest in full. Every entry is listed; only a skipped or
+ * refused entry is counted in a visible line, so nothing is silently absent.
  */
 function buildManifest(
   entries: readonly MemoryTopicEntry[],
-  capOmitted: number,
   skipped: number,
   refused: number,
   scanTruncated: boolean,
 ): string {
-  if (entries.length === 0 && capOmitted === 0 && skipped === 0 && refused === 0 && !scanTruncated) {
-    return "";
-  }
-  return composeManifest(entries, capOmitted, skipped, refused, scanTruncated);
+  if (entries.length === 0 && skipped === 0 && refused === 0 && !scanTruncated) return "";
+  return composeManifest(entries, skipped, refused, scanTruncated);
 }
 
 /**
@@ -643,13 +636,9 @@ export async function loadMemoryContext(request: MemoryContextRequest): Promise<
     await scanTopics(join(rootPath, MEMORY_DIR), [], state, topics);
   }
 
-  // Explicitly loaded files always appear so a typo or disappearance is not
-  // hidden by the entry cap; topics fill the remaining slots.
-  const topicSlots = Math.max(0, MEMORY_CONTEXT_LIMITS.maxEntries - loadedFiles.length);
-  const shownTopics = topics.filter((path) => !loaded.has(path)).slice(0, topicSlots);
-  const shown = [...new Set([...loadedFiles, ...shownTopics])].sort(comparePaths);
-  const shownSet = new Set(shown);
-  const more = [...topics, ...loadedFiles].filter((path) => !shownSet.has(path)).length;
+  // Every discovered topic and every explicitly loaded file is listed; there is
+  // no entry cap, so nothing is hidden behind a count.
+  const shown = [...new Set([...loadedFiles, ...topics])].sort(comparePaths);
 
   const entries: MemoryTopicEntry[] = [];
   let skipped = 0;
@@ -676,7 +665,7 @@ export async function loadMemoryContext(request: MemoryContextRequest): Promise<
     }));
   }
 
-  const manifest = buildManifest(entries, more, skipped, state.refused, state.truncated);
+  const manifest = buildManifest(entries, skipped, state.refused, state.truncated);
   const document = manifest.length === 0
     ? undefined
     : Object.freeze({ source: MANIFEST_SOURCE, content: manifest });

@@ -47,12 +47,11 @@ The result contains:
   `workspace:memory/...`; `state` is `loaded` or `topic`; `bodyChars` is the
   frontmatter-stripped body length in Unicode code points.
 - `manifest`: `# Memory Tree` text with the Python intro line and one line per
-  entry: ``- `memory/x.md` (topic, 123 chars): description``. More than the entry
-  cap adds a visible `more memory files` line, a stopped directory scan a
-  `not inspected` line, and an entry refused by a locator-shape bound a
-  `refused memory entry/entries` line; entries are never dropped without such a
-  line. Discovery has no character budget, so a manifest is never shortened to
-  fit one.
+  entry: ``- `memory/x.md` (topic, 123 chars): description``. Every discovered
+  entry is listed, with no entry cap and no character budget. A stopped
+  directory scan adds a `not inspected` line and an entry refused by a
+  locator-shape bound a `refused memory entry/entries` line; entries are never
+  dropped without such a line.
   Discovered files that cannot be read add a visible `N memory files skipped
   (unreadable, changed, or not valid UTF-8)` line instead of an entry, so the
   manifest never claims their bodies were read.
@@ -88,8 +87,8 @@ Under `<workspaceRoot>/memory/`, recursively:
 Only files explicitly named in `loadedFiles` are read outside that topic set.
 Each must exist and be a regular, non-symlinked, single-link file; a missing,
 unreadable, or non-UTF-8 explicitly named file rejects the whole load
-so configured content is never silently replaced. A supplied loaded file is
-always listed even when the entry cap is reached.
+so configured content is never silently replaced. Every supplied loaded file is
+listed.
 
 A discovered topic that is unreadable, invalid UTF-8, missing after
 discovery, or changed during the read is skipped and counted in the visible
@@ -116,17 +115,17 @@ the flat `key: value` subset used by memory files (CRLF is tolerated).
 
 ## Limits and failure behaviour
 
-`MEMORY_CONTEXT_LIMITS` is exported: 80 manifest entries (the Python memory-tree
-cap), 240 description code points (the Python description cap), 246-character
-paths, 8 path segments, 64 characters per segment, 4,096 inspected directory
-entries, and 4,096-character roots.
+`MEMORY_CONTEXT_LIMITS` is exported: 240 description code points (the Python
+description cap), 246-character paths, 8 path segments, 64 characters per
+segment, 4,096 inspected directory entries, and 4,096-character roots.
 
-There is no manifest character budget, no per-file byte cap and no aggregate
-byte cap. A manifest lists every reached entry with its full description prefix,
-and a topic file of any size is read for its description and body length, as
-Python does. Peak memory stays at one file because bodies are discarded. A
-directory tree beyond the inspected-entry bound stops discovery with a visible
-manifest line; nothing is dropped silently.
+There is no manifest entry cap, no manifest character budget, no per-file byte
+cap and no aggregate byte cap. A manifest lists every discovered entry with its
+full description prefix, and a topic file of any size is read for its
+description and body length, as Python does. Peak memory stays at one file
+because bodies are discarded. The one bound over the tree itself is the 4,096
+inspected directory entries, which stops a runaway walk and says so in the
+manifest; nothing is dropped silently.
 
 Explicitly loaded file failures fail closed with `MemoryContextFileError` (a
 stable kind and workspace-relative source, never an
@@ -172,9 +171,8 @@ archived summaries, Dream, cursor/usage state, ranking or retrieval,
 description format's Python truncation suffix. The host injects only the
 explicitly configured files, not every file Python would mark loaded. It does
 not include topic bodies, follow symlinks, or create `memory/` directories.
-Python's tree slices the combined file list to 80; this helper always includes
-explicitly loaded files first so a named file cannot be silently hidden by the
-cap.
+Unlike Python's tree, which slices the combined file list to 80, this helper
+lists every discovered topic and every explicitly loaded file.
 
 Memory writes still use the native `write`/`edit` tools without a topic-path
 wrapper; `validateMemoryTopicPath()` is available for a future tool-policy
@@ -210,6 +208,6 @@ Earlier synthetic probes exercised a fresh gateway read, a native topic write,
 close/reopen, manifest reload, invalid-UTF-8/
 unreadable discovered topics across reopen, loud loaded-file failures, empty
 configured files, protected injected names (`HISTORY.md`,
-`memory/system/MEMORY.md`), 200 topics, 80 large files, a >4,096-entry
+`memory/system/MEMORY.md`), 200 topics, 80+ large files, a >4,096-entry
 tree, and a loaded-file parent symlink. They used temporary directories only and
 were not committed.

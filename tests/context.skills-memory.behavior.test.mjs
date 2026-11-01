@@ -76,20 +76,21 @@ test("a memory topic above the old byte cap is still listed", async (t) => {
   assert.match(memory.manifest, /memory\/large\.md/);
 });
 
-test("a full manifest lists every entry instead of shortening itself", async (t) => {
+test("a manifest lists every entry, with no count cap and no shortening", async (t) => {
   const root = await tempRoot(t);
   const files = {};
-  for (let index = 0; index < 80; index++) {
-    const name = `memory/topic-${String(index).padStart(2, "0")}.md`;
+  // 120 exceeds Python's 80-entry memory-tree slice and the removed port cap.
+  for (let index = 0; index < 120; index++) {
+    const name = `memory/topic-${String(index).padStart(3, "0")}.md`;
     files[name] = `---\ndescription: ${"d".repeat(240)}\n---\nbody`;
   }
   await writeFiles(root, files);
 
   const memory = await loadMemoryContext({ workspaceRoot: root });
-  assert.equal(memory.entries.length, 80);
+  assert.equal(memory.entries.length, 120);
   const listed = memory.manifest.split("\n").filter((line) => line.startsWith("- `memory/"));
-  assert.equal(listed.length, 80);
-  assert.doesNotMatch(memory.manifest, /more memory files/);
+  assert.equal(listed.length, 120);
+  assert.doesNotMatch(memory.manifest, /more memory files|not inspected|refused/);
 });
 
 test("ordinary topic names with spaces or non-ASCII characters stay discoverable", async (t) => {
