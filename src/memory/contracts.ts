@@ -103,7 +103,7 @@ export interface MemoryScope {
 }
 /** All callbacks are read-only and revalidate mapped-chat scope at the gateway boundary. */
 export interface MemoryHost {
-  scope(caller: ConversationId, context: Context): Promise<MemoryScope>;
+  scope(caller: ConversationId, context: Context, operation: typeof MEMORY_TOOL_NAMES[number]): Promise<MemoryScope>;
   entries(session: string, query: { readonly minEntryId?: EntryId; readonly maxEntryId?: EntryId; readonly order?: "ascending" | "descending" }, limit: number, cursor: Cursor | undefined, context: Context): Promise<{ readonly items: readonly EntryRecord[]; readonly next?: Cursor }>;
   summary(session: string, episodeStart: number, context: Context): Promise<HistorySummaryView>;
   search(query: HistoryQuery, context: Context): Promise<HistoryPage>;

@@ -50,7 +50,6 @@ import { createMemoryService } from "./memory/service.js";
 import { createNotesBackend } from "./memory/notes.js";
 import { createHistoryBackend } from "./memory/history.js";
 import { MEMORY_TOOL_NAMES, type MemoryService } from "./memory/contracts.js";
-import { loadMemoryContext } from "./context/memory.js";
 import {
   TELEGRAM_TOOL_NAME,
   createTelegramActionRegistry,
@@ -2297,18 +2296,25 @@ export async function openGateway(config: PortConfig, context: Context, options:
         readEpisodeSummary(conversationId, startEntryId, ctx),
     });
     const memoryHost = {
-      async scope(caller: ConversationId, ctx: Context) {
+      async scope(caller: ConversationId, ctx: Context, operation: typeof MEMORY_TOOL_NAMES[number]) {
         const worker = workerChildConversations.has(caller);
         if (!historyConversations.has(caller) && !worker) throw new Error("Memory recall is unavailable in this conversation");
         const mapped = await mappedChatSessions(ctx);
         let workspaceRoot = workspace;
         if (worker) {
           const capture = await harness!.snapshot(ConfigToolCaptureDoc, caller, ctx);
-          if (capture === undefined || !authorizedChatConversations.has(capture.originConversationId as ConversationId)
-            || !mapped.some((session) => session.conversationId === capture.originConversationId)) {
+          const origin = capture?.originConversationId;
+          if (capture === undefined || typeof origin !== "number" || !Number.isSafeInteger(origin) || origin < 1
+            || !Array.isArray(capture.tools) || capture.tools.some((name) => typeof name !== "string")
+            || (capture.classifierModel !== null && typeof capture.classifierModel !== "string")
+            || !authorizedChatConversations.has(origin as ConversationId)
+            || !mapped.some((session) => session.conversationId === origin)
+            || !capture.tools.includes(operation) || !workerToolNames().includes(operation)) {
             throw new Error("Worker memory recall is outside its live captured authority");
           }
-          workspaceRoot = workerWorkspaceRoots.get(caller) ?? workspace;
+          const workerRoot = workerWorkspaceRoots.get(caller);
+          if (workerRoot === undefined) throw new Error("Worker workspace is unavailable; refusing memory access");
+          workspaceRoot = workerRoot;
         } else if (!mapped.some((session) => session.conversationId === caller)) {
           throw new Error("Memory recall is unavailable in this conversation");
         }
@@ -2317,14 +2323,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
           conversationId: session.conversationId,
           channel: session.sessionKey.split(":", 1)[0] ?? null,
         }));
-        const memory = await loadMemoryContext({
-          workspaceRoot,
-          loadedFiles: workspaceRoot === workspace ? config.workspaceContext?.memoryFiles ?? [] : [],
-        });
         return {
           storeId: storeIdentity.storeId,
           workspaceRoot,
-          memoryFiles: memory.entries.map((entry) => entry.path),
+          memoryFiles: config.workspaceContext?.memoryFiles ?? [],
           sessions,
         };
       },
@@ -3317,9 +3319,21 @@ export async function openGateway(config: PortConfig, context: Context, options:
     };
     const gateway: Gateway = {
       harness,
-      memorySearch: (caller, query, ctx) => memoryServiceRef.current!.search(caller, query, ctx),
-      memoryBrowse: (caller, query, ctx) => memoryServiceRef.current!.browse(caller, query, ctx),
-      memoryRead: (caller, query, ctx) => memoryServiceRef.current!.read(caller, query, ctx),
+      memorySearch: (caller, query, ctx) => {
+        const service = memoryServiceRef.current;
+        if (!service) throw new Error("Memory recall is unavailable");
+        return service.search(caller, query, ctx);
+      },
+      memoryBrowse: (caller, query, ctx) => {
+        const service = memoryServiceRef.current;
+        if (!service) throw new Error("Memory recall is unavailable");
+        return service.browse(caller, query, ctx);
+      },
+      memoryRead: (caller, query, ctx) => {
+        const service = memoryServiceRef.current;
+        if (!service) throw new Error("Memory recall is unavailable");
+        return service.read(caller, query, ctx);
+      },
       memoryDigest: {
         start: (writer, ctx) => memoryDigest.start(writer, ctx),
         status: (writer, ctx) => memoryDigest.status(writer, ctx),
@@ -3845,6 +3859,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // A failed open must not leave deferred cataloguing attached to a closed session, nor a
     // derived index handle open behind a failed gateway.
     episodeCatalog?.close();
+    memoryServiceRef.current?.close();
+    memoryServiceRef.current = undefined;
     try {
       if (harness) await harness.close(cleanup);
       else await storage?.close(cleanup);
