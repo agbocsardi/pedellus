@@ -15,7 +15,8 @@ import {
   findConversationCommand,
   SAFE_COMMAND_NAME,
 } from "../help/commands.js";
-import { renderMcpApproval, renderMcpListing, type McpAdminListing, type McpApproveResult } from "../mcp/admin.js";
+import { renderMcpListing, type McpAdminListing, type McpCallbackResult } from "../mcp/admin.js";
+import { looksLikeOAuthCallback } from "../mcp/surface.js";
 import { renderBackgroundStatus } from "../background-status.js";
 import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "../history/episodes.js";
 import {
@@ -77,6 +78,12 @@ const MAX_REMEMBERED_ANSWERS = 256;
 const MAX_REMEMBERED_LOCAL_INPUTS = 1_024;
 const MAX_EXTERNAL_RUNS = 64;
 const LITERAL_SLASH_PREFIX = "//";
+/**
+ * Only a busy refusal guarantees no effect. Other failures may follow acceptance or a lost
+ * acknowledgement, so report uncertainty without echoing an internal message.
+ */
+const RESTART_REFUSED =
+  "Gateway restart was not confirmed; the gateway may already be restarting. Check its status before retrying.";
 
 export interface TerminalModelSelectionHost {
   list(): Promise<GatewayModelList>;
@@ -114,15 +121,13 @@ export interface TerminalDigestHost {
 }
 
 /**
- * Owner-only MCP management over the already-authenticated local attach. Reading is bounded and
- * changes nothing; `approve` writes configuration or starts one owner-approved OAuth login, and
- * `deny` discards one request. Neither is a model tool, and neither grants authority by itself.
+ * MCP host surface over the already-authenticated local attach. `/mcp` is bounded read-only status.
+ * A callback-shaped input line is offered here before model admission; the host validates it against
+ * the login that originated in this exact session.
  */
 export interface TerminalMcpHost {
   list(): Promise<McpAdminListing>;
-  show(id: string): Promise<{ readonly found: boolean; readonly text: string }>;
-  approve(id: string): Promise<McpApproveResult>;
-  deny(id: string): Promise<McpApproveResult>;
+  submitCallback(text: string): Promise<McpCallbackResult>;
 }
 
 /**
@@ -1207,24 +1212,11 @@ export async function runTerminalConversation(
       }
       case "mcp": {
         const host = offeredHost(io.mcp);
-        const parts = args.trim().split(/\s+/).filter((part) => part.length > 0);
-        if (parts.length === 0) {
-          await notice(renderMcpListing(await host.list()));
+        if (args.trim() !== "") {
+          await notice(conversationCommandUsage("mcp"), true);
           return;
         }
-        const [sub, ...rest] = parts;
-        if ((sub === "show" || sub === "approve" || sub === "deny") && rest.length === 1) {
-          const id = rest[0]!;
-          if (sub === "show") {
-            const shown = await host.show(id);
-            await notice(shown.text, !shown.found);
-            return;
-          }
-          const result = sub === "approve" ? await host.approve(id) : await host.deny(id);
-          await notice(renderMcpApproval(result), result.status === "refused");
-          return;
-        }
-        await notice(conversationCommandUsage("mcp"), true);
+        await notice(renderMcpListing(await host.list()));
         return;
       }
       case "attach":
@@ -1256,13 +1248,21 @@ export async function runTerminalConversation(
         await notice("Native Durable context reset admitted for this same conversation: no handoff, summary or extra model call, earlier entries stay stored and listed by /history, and tool authority is unchanged." +
           (io.contextRefresh?.available ? " Workspace context and skills were rebuilt atomically; a busy conversation is refused." : " While busy it lands at the next safe boundary; queued inputs placed with it run in the new context."));
         return;
-      case "restart":
+      case "restart": {
         if (args.trim()) { await notice(conversationCommandUsage("restart"), true); return; }
-        await offeredHost(io.restart)();
+        try {
+          await offeredHost(io.restart)();
+        } catch (error) {
+          // Only a busy refusal is a known no-effect. A lost acknowledgement can follow acceptance.
+          const busy = error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy");
+          await notice(busy && error instanceof Error ? error.message : RESTART_REFUSED, true);
+          return;
+        }
         await notice("Gateway restarting; this terminal disconnects.");
         io.closeInput?.();
         operationController.abort(new Error("gateway restart requested"));
         return;
+      }
     }
   };
 
@@ -1307,7 +1307,13 @@ export async function runTerminalConversation(
         io.prompt?.();
         continue;
       }
-      if (leading.startsWith(LITERAL_SLASH_PREFIX)) {
+      if (looksLikeOAuthCallback(line)) {
+        // Even hosts without management must not admit an expired/foreign credential as input.
+        const result = io.mcp === undefined
+          ? { accepted: false, text: "No MCP login is available in this host; the callback was not stored or sent to the assistant." }
+          : await io.mcp.submitCallback(line);
+        await notice(result.text, !result.accepted);
+      } else if (leading.startsWith(LITERAL_SLASH_PREFIX)) {
         const prefix = line.indexOf(LITERAL_SLASH_PREFIX);
         await queueInput(`${line.slice(0, prefix)}/${line.slice(prefix + LITERAL_SLASH_PREFIX.length)}`);
       } else if (leading.startsWith("/")) {

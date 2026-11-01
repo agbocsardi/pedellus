@@ -356,6 +356,62 @@ shown as parked; this slice invents no cron retry policy, so use Durable's norma
 job (`deliveryFault`), so a malformed or full outbox is visible through the model-facing `list`
 operation even though the run itself completed.
 
+## Operator controls
+
+`durable-nanobot cron` is the owner's scheduling console. It is a process subcommand, not a chat
+slash command, and it attaches to the running gateway over the private local socket, so every
+runtime decision stays in the one owner process:
+
+```sh
+durable-nanobot cron list
+durable-nanobot cron show <jobId>
+durable-nanobot cron cancel <jobId>
+durable-nanobot cron create --origin <sessionKey> --key <requestKey> --after 600 --message "Stretch"
+durable-nanobot cron create --key daily-1 --cron "0 9 * * 1-5" --tz Europe/Budapest \
+  --origin telegram:<identity>:chat:<chatId> --message "Morning check"
+```
+
+- **Origins are host-resolved.** The wire names a mapped chat by its host-owned session key and
+  nothing else: the gateway resolves that key to its conversation and derives the owner record
+  itself, so a caller cannot supply a conversation ID or an owner. The legitimate origin set is the
+  current mapped ordinary chat sessions (the same reader history search uses); a channel-state,
+  automation, task-owned, forked or root conversation is never an origin. `--origin` may name any
+  currently mapped chat, including a Telegram chat (its exact key is printed by `list`),
+  and is required. An unmapped key is refused and schedules nothing. Operator commands do not attach or create a chat.
+- **`list` and `show` are read-only and store-wide.** `list` reports every job every legitimate
+  origin owns, ordered by the next occurrence in pages of 100 compact rows. Follow the printed
+  `list --offset <n>` to read further pages; concurrent changes can shift these point-in-time
+  pages. It names currently mapped chats so an explicit `--origin` can be given. `show` is
+  one exact job ID; its message preview is limited to 300 characters. Neither reads a transcript or calls a model.
+- **`create` needs an explicit durable request key** (`--key`). The foundation owns the idempotency:
+  an identical retry (same key, same payload, same origin) returns the same job and arms no second
+  timer; a different payload under the same key is refused; a key whose original job was cancelled
+  reports that cancelled job and is never re-armed. Exactly one of `--at` (ISO 8601 with an explicit
+  offset or `Z`), `--after`, `--every` or `--cron` (with optional `--tz`) is accepted, and `--mode`
+  chooses `background` (default) or `origin`. A background job records its outcome on the job
+  (`cron show`) and its answer is queued for a channel outbox; only the Telegram adapter consumes
+  that outbox, so a background job on a CLI chat does not print its answer in the terminal. Use
+  `--mode origin` for a CLI chat when the answer should appear in that conversation instead.
+- **`cancel` is exact-ID**, also across origins: the caller's own attachment never limits which
+  chat's job it may cancel. The foundation's fencing is unchanged — cancellation increments the
+  generation, clears both pointers and abort-signals the timer and run — and a post-commit cleanup
+  failure is reported as recorded-cancellation-plus-cleanup-failure, never as a failed removal. An
+  ID recorded under more than one origin (a damaged or forged store) is refused rather than guessed
+  at. An already terminal or settled job reports that there is nothing to cancel.
+- **A lost response is an unknown outcome.** If the gateway stops answering, `create` tells the
+  operator to re-run the identical request (the key makes that safe) and `cancel` says the
+  cancellation may already be recorded and points at `cron show` before any retry. The command never
+  reports a made-up result.
+- There is no bulk operation, run-now, re-arm, schedule editing or direct SQL path, and this
+  surface is not a model tool. With `cron.enabled` false the gateway exposes none of it and the
+  command refuses with one fixed message.
+
+Jobs are stored in their origin's document and are never deleted, so `cron list` also shows
+cancelled and finished jobs and grows with the store's history. A job whose origin conversation is
+no longer a currently mapped chat is not listed: that conversation gives no operator visibility
+either. Its native timers can still fire; losing the mapping does not cancel a job.
+Restoring such a chat's mapping is outside this surface.
+
 ## Schedule math
 
 Supported request kinds are Python-like `at`, `every`, and `cron`, plus a relative one-shot
@@ -501,8 +557,9 @@ fault document is itself ignored rather than replacing job or outbox data.
 ## Not included / limitations
 
 - No migration of the parked probe document versions or stores. They are not supported.
-- No user-facing channel command surface, model selection, or misfire policy. One run submits one
-  agent turn to a Durable conversation (the job's automation conversation, or the origin
+- No chat command surface, model selection, or misfire policy. A chat schedules through the agent's
+  `cron` tool; the owner's terminal uses [`durable-nanobot cron`](#operator-controls). One run
+  submits one agent turn to a Durable conversation (the job's automation conversation, or the origin
   conversation in `origin` mode).
 - Delivery covers both modes and is currently only consumed by the Telegram adapter. An origin-mode
   answer becomes part of the origin transcript, so an attached local CLI prints its committed final
@@ -722,3 +779,15 @@ neither suppressed occurrence nor changes the stored setting; a `silent` origin 
 whitespace-trimmed `[SILENT]` origin answer both stay undelivered while remaining in the origin
 transcript, an ordinary chat answer keeps the same literal text, and a recurring background job
 suppresses its first `[SILENT]` occurrence but delivers the next ordinary answer.
+
+Permanent operator-control coverage is in `tests/cron-operator.behavior.test.mjs`. It drives the real
+`openGateway`, the real private local server/client and a faux provider on a fresh `mkdtemp` store:
+create, list, show and cancel across a CLI chat and an explicitly selected Telegram chat; a
+conversation ID or an unmapped key on the wire refused while the host derives the owner itself; an
+identical retry deduping to the same job with no second timer; a conflicting payload under the same
+key refused with the record unchanged; a cancelled original reported and never re-armed by an
+identical replay; exact-ID cancellation of another chat's job; `already_terminal` and `not_found`
+results; compact paginated listings and read-only operator connections that create no chat;
+the CLI's create/list/show rendering and a spawned `durable-nanobot cron` process; and closing
+the server before a cancel, asserted to produce the CLI's unknown-outcome text
+instead of a claimed failure or a claimed cancellation.

@@ -56,7 +56,8 @@ edits need restart only; unit edits additionally need daemon-reload.
   `/help` paths render. Each host decides which catalogued names it offers.
 - `src/mcp/` — explicit MCP server config, the pinned `@earendil-works/pi-mcp`
   client lifecycle, deferred `mcp__<server>__<tool>` registrations, namespace
-  summaries and the call-time MCP authority hook.
+  summaries, the call-time MCP authority hook, direct owner-authorized management,
+  the login lifecycle and the channel-neutral owner-surface registry.
 - `src/media/` — shared attachment storage under the workspace, the local
   uv/faster-whisper transcriber, and the configured vision handoff; the fixed
   CPU/`small`/`int8` speech helper is `scripts/local-transcribe.py`. Telegram
@@ -66,8 +67,9 @@ edits need restart only; unit edits additionally need daemon-reload.
   `credentials.<provider>` environment reference, Durable's own file
   `CredentialStore` under the canonical `dataDir`, and the terminal-only
   `login`/`logout` commands. No provider whitelist, no Pi credential store.
-- `src/automation/` — cron timer/run tasks, persistent automation conversations and
-  the model-facing `cron` tool.
+- `src/automation/` — cron timer/run tasks, persistent automation conversations, the
+  model-facing `cron` tool and the owner's terminal scheduling console
+  (`cron create|list|show|cancel` over the private local socket).
 - `src/workers/` — bounded ordinary background workers as native Durable tasks:
   the opt-in `worker` start/list/inspect/cancel tool, an explicit
   shared-or-worktree workspace per task, captured child authority and one internal
@@ -117,10 +119,11 @@ edits need restart only; unit edits additionally need daemon-reload.
   per run (including its workspace context), and lose it on completion; persistent
   history confers no permission.
   The `skill`, `cron`, `history`, `worker`, `mcp` management and scoped
-  `telegram` tools carry no filesystem/shell authority and are exempt from the
-  coding-tool hook, so enabling a coding tool never suppresses them; `mcp`
-  still only records owner approval requests and is limited to authenticated
-  mapped chats, and history remains read-only over mapped chats. Telegram actions
+  `telegram` tools grant no coding-tool authority and are exempt from the
+  coding-tool hook, so enabling a coding tool never suppresses them. MCP management
+  can write server configuration and launch host-level stdio processes; it is limited
+  to authenticated mapped chats, with login additionally requiring a unique live
+  owner surface. History remains read-only over mapped chats. Telegram actions
   additionally require a live adapter, current private-chat
   admission and observed same-chat targets. Unknown external outcomes are retained,
   never blindly retried or evicted.
@@ -150,15 +153,24 @@ edits need restart only; unit edits additionally need daemon-reload.
   dispatches. Direct-model (non-preset) selection retains its persisted semantics.
 - Shared CLI and authenticated Telegram owner controls are `/new`, `/abort`/`/stop`,
   `/status`, `/model`, `/digest` and `/digest status`, plus `/restart` and
-  `/mcp` (`/mcp`, `/mcp show <id>`, `/mcp approve <id>`, `/mcp deny <id>`),
-  advertised only where the host implements them. `/model` selects one
+  the read-only `/mcp` status command, advertised only where the host implements
+  them. MCP configuration and login are ordinary model-management requests in an
+  authenticated mapped chat, not slash approvals. `/model` selects one
   configured preset for that chat only; `/status` is bounded read-only metadata
   with no model call; `/new` starts a new context and
   rebuilds the assembled workspace prompt, so a host with a prompt snapshot
   refuses it while that chat runs instead of half-applying; `/restart` is the
   host's full-process replacement (same executable, argv and environment through
   POSIX `process.execve`, after normal teardown), never a model tool, daemon or
-  supervisor. The CLI flushes its acknowledgement before restart tears down connections and
+  supervisor. One host gate shared by the local CLI and Telegram refuses it with
+  fixed text while live work would be interrupted: running, queued, waiting or
+  finishing tasks (generation, tool, compaction, worker, digest, cron run).
+  Sleeping native timers and parked blocked tasks are not active work, so an
+  armed schedule never blocks indefinitely. A refusal acknowledges nothing, tears
+  down nothing and may be retried after finishing or aborting; `/status` names
+  only the bounded gateway-wide count, and the inspect-then-teardown check is not
+  atomic, so work admitted in that window is not protected.
+  The CLI flushes its acknowledgement before restart tears down connections and
   does not wait for the replacement; an authenticated Telegram `/restart` records each requesting
   chat durably in the same applied commit, and the replacement posts one ordinary notice per chat
   and clears them, while a host refusal reports that nothing was restarted instead. A sender the
@@ -177,7 +189,12 @@ edits need restart only; unit edits additionally need daemon-reload.
   history. A job's persistent `silent` setting, or an exact trimmed `[SILENT]`
   successful final answer, suppresses that occurrence's automatic channel
   delivery — never the run, and never a failure notice; the marker applies only
-  to a scheduled run, not an ordinary chat reply.
+  to a scheduled run, not an ordinary chat reply. The owner's terminal has a thin
+  scheduling console (`durable-nanobot cron create|list|show|cancel`) that
+  composes the same foundation over the private local socket: creation needs an
+  explicit request key, its origin and owner are resolved from current mapped
+  ordinary chats, cancellation is exact-ID, and there is no schedule edit,
+  re-arm, run-now or bulk path.
 - Skill prompts carry names, descriptions and locators only; bodies load on
   demand through the read-only `skill` tool.
 - Markdown in the workspace is the memory source of truth. Durable owns the
@@ -270,53 +287,61 @@ edits need restart only; unit edits additionally need daemon-reload.
   not confine MCP: the server keeps its gateway-owned host cwd and authority. A configured stdio server is a native host
   process, not covered by `toolSandbox: "bwrap"`. Secrets are referenced by
   environment variable name.
-- MCP management is proposal plus owner decision, and it is the only path from a
-  model to new MCP authority. The `mcp` model tool is offered to authenticated
-  mapped chats only (never a worker, fork, root, digest or scheduled-run target)
-  and can only record one immutable, bounded, secret-free request in a
-  root-scoped document; it cannot approve, deny, write configuration, start a
-  flow or read a grant. Only the local terminal and the authenticated Telegram
-  owner chat decide, as durable owner controls, and each decision atomically
-  claims the request before any asynchronous work, then consumes it. A `config`
-  approval writes `mcp.servers.<name>` (and `mcp.enabled: true`) into the
-  gateway's own configuration file atomically after validating the whole merged
-  document, preserving the file mode and touching nothing else; it enables only
-  the approved entry (other entries are pinned to `enabled: false` when the block
-  was off), serializes managed edits, refuses to replace a file whose bytes or
-  identity changed since it was read, and refuses when the block on disk is no
-  longer the one the owner's disclosure described (its enabled flag or its entry
-  names differ from the configuration this gateway opened with), so approval
-  cannot apply a pin or an enable the owner never saw. The check and the rename
-  remain two
-  operations: an outside write in that window is lost, and no portable lock or
-  content compare-and-swap removes it. A request left `running` by a restart or
-  an interrupted flow is repaired durably as `failed` on the next read or
-  proposal, so it stops counting against the waiting bound instead of blocking
-  every later proposal. A `remove` approval deletes one entry and never
-  disables the capability. An `oauth: true` HTTP entry reads its grant from one
-  private `0600` file per exact URL under the canonical data directory, never
-  from config, transcript, entry or channel text; with no usable grant it fails
-  closed as `auth-required` instead of starting a flow. That file has the same
-  trust boundary as the provider credential store: another user cannot read it,
-  and same-user code (the coding shell, a stdio MCP server, a worker) can. The
-  runtime does not claim isolation from same-user processes; it keeps token
-  *content* out of every model-facing surface. Login is owner-approved,
+- MCP management is direct and explicitly owner-authorized in an authenticated
+  mapped ordinary chat, and it is the only path from a model to new MCP
+  authority. The `mcp` model tool (`status`, `add`/`configure`, `login`,
+  `logout`, `remove`) is offered only there — never to a worker, fork, root,
+  digest or scheduled-run target — and login requires a unique live owner surface for that
+  exact session. There is no proposal document and no separate approval command.
+  An `add` validates one entry with the start parser and writes
+  `mcp.servers.<name>` (and `mcp.enabled: true`) atomically, preserving file mode
+  and touching nothing else; it enables only the entry asked for (other entries
+  are pinned to `enabled: false` when the block was off), serializes managed
+  edits, refuses to replace a file whose bytes or identity changed since it was
+  read, and refuses when the block on disk is no longer the one this gateway
+  reflects. The check and the rename remain two operations: an outside write in
+  that window is lost, and no portable lock or content compare-and-swap removes
+  it. A `remove` deletes only the exact current entry and never disables the
+  capability. A completed write, login, logout or removal applies live: affected
+  servers connect or close, registrations and Code Mode namespaces are rebuilt,
+  and authenticated chats and live workers are re-policied. A new server never
+  widens an existing worker capture, and a removed or logged-out one is pruned
+  from the durable capture and its nested callable set immediately. No scheduled,
+  worker or automation scope can manage MCP.
+  An `oauth: true` HTTP entry reads its grant from one private `0600` file per
+  exact URL under the canonical data directory, never from config, transcript,
+  entry or channel text; with no usable grant it fails closed as `auth-required`
+  instead of starting a flow. That file has the same trust boundary as the
+  provider credential store: another user cannot read it, and same-user code (the
+  coding shell, a stdio MCP server, a worker) can. The runtime does not claim
+  isolation from same-user processes; it keeps token *content* out of every
+  model-facing surface. Login is owner-initiated from a mapped chat and
   gateway-run native PKCE with a loopback callback, one flow at a time and a
-  five-minute deadline; it works on a staged
-  grant read together with its generation, installs it only after a verification
-  connection, adopts a rotation of the stored grant that the starting connection
-  performed instead of leaving it unusable — including after a failed or canceled
-  startup connection — while a refresh of the unverified browser authorization is
-  never adopted (those tokens carry the attempt's own client registration and are
-  installed only inside the verified replacement), and a logout increments the
-  generation so a stale refresh or a late commit cannot restore it. Its
-  cancellation is rechecked up to the replacement's irreversible rename, so a
-  denial either installs nothing or is reported as the grant now being there. Its authorization URL is
-  delivered directly to the approving owner surface and never persisted in
-  channel state, and its completion places one credential-free internal result
-  in the origin chat. A configuration or grant change takes effect at the next
-  start (`/restart`); nothing hot-reloads or reconnects, and no scheduled,
-  worker or automation scope can propose or approve.
+  five-minute deadline; it works on a staged grant read together with its
+  generation, installs it only after a verification connection, adopts a
+  rotation of the stored grant that the starting connection performed instead of
+  leaving it unusable — including after a failed or canceled startup connection —
+  while a refresh of the unverified browser authorization is never adopted (those
+  tokens carry the attempt's own client registration and are installed only
+  inside the verified replacement), and a logout increments the generation so a
+  stale refresh or a late commit cannot restore it. Cancellation is rechecked up
+  to the replacement's irreversible rename, so a canceled attempt either installs
+  nothing or is reported as the grant being there. The one-time authorization URL
+  is delivered directly to the initiating owner surface only — the attached CLI
+  session or the authenticated Telegram private chat — and never persisted in
+  channel state, a transcript or a tool result. A callback-shaped ingress message
+  is intercepted before transcript admission or model dispatch and must match the
+  active attempt's exact loopback origin, port, path and state, the initiating
+  session (and the current Telegram sender binding) and be unused; malformed,
+  stale, foreign, cross-chat and replayed callbacks are consumed and refused with
+  fixed text, and their code, state, verifier and tokens never reach the model,
+  diagnostics or durable channel state. A pasted callback is replayed only to the
+  active loopback listener, never fetched from the pasted host. Multiple CLI attachments
+  sharing a session refuse login rather than guessing the origin; an active attempt
+  stays pinned to its original surface, never a replacement attachment. Completion
+  reconnects the server, refreshes registrations/namespaces/policy and sends one
+  fixed credential-free notice to the same surface, so tools are callable without
+  a restart. A delivery failure cancels the attempt and is not blindly retried.
 - Telegram outbound text is rich by default (Bot API 10.1 `sendRichMessage` /
   `editMessageText` with `rich_message.markdown`) for ordinary replies, scheduled deliveries,
   previews and their edits, and host notices. Chunking uses a persisted, capability-independent

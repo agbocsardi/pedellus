@@ -147,10 +147,9 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
   },
   {
     name: "mcp",
-    args: "[show|approve|deny <id>]",
-    summary: "Review and decide MCP owner-approval requests",
-    usage: "Usage: /mcp | /mcp show <id> | /mcp approve <id> | /mcp deny <id>.",
-    detail: "Owner actions; nothing connects before an approval, and a written entry connects at the next gateway start.",
+    summary: "Show MCP servers and pending logins",
+    usage: "Usage: /mcp",
+    detail: "Read-only bounded status. Ask the assistant to add, log in, log out or remove a server; no approval command is needed.",
     refusalGuarantee: "Nothing was changed.",
     surfaces: ["cli", "telegram"],
   },
@@ -174,7 +173,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     name: "restart",
     summary: "Replace the whole gateway process",
     usage: "Usage: /restart",
-    detail: "Affects every chat and all background work; a confirmation follows once the gateway is live.",
+    detail: "Affects every chat and all background work; refused while live work would be interrupted (count shown in /status), and a confirmation follows once the gateway is live.",
     surfaces: ["cli", "telegram"],
   },
   {

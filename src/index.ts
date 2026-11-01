@@ -56,6 +56,7 @@ export {
   type PreparedContextBlock,
   type PreparedContextCancelResult,
   type PreparedContextBlockTarget,
+  type PreparedResponseEvidence,
 } from "./recovery/index.js";
 export {
   openGateway,

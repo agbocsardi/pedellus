@@ -238,6 +238,11 @@ block, or only disabled entries means no client and no MCP namespaces. When that
 gate passes, `openGateway()` connects the configured servers before building the
 Durable registry. If every enabled server fails, Code Mode is still available
 (for authenticated mapped chats) with `tool_search` and zero MCP namespaces.
+Direct MCP management applies a new configuration or a completed login live:
+the affected server reconnects, registrations are replaced in the running
+registry, the native Code Mode namespace view is updated in place, and current
+chat/worker policy is reapplied. A live first server also installs legacy Code
+Mode when no explicit `codemode` block chooses otherwise.
 
 Code Mode itself is an independent compositor. `codemode.enabled: true` installs
 it without any MCP server; with no `codemode` block the previous rule applies

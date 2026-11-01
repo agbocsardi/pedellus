@@ -136,7 +136,7 @@ node bin/durable-nanobot.mjs agent --config demo/config.json
 ```
 
 This walkthrough uses an explicit demo config. Without `--config`, `gateway`,
-`agent` and `recovery` read the fixed primary file
+`agent`, `recovery` and `cron` read the fixed primary file
 `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
 the working directory; there is no discovery, merge or auto-generation. A
 secondary instance passes its own `--config`. See [user services](./SERVICE.md)

@@ -34,8 +34,7 @@ never reaches it. `message.text` (not a caption) is classified:
 - Matching is an exact leading command token (case-insensitive). `/new`,
   `/abort`, `/stop`, `/status` and `/restart` take no arguments; `/model` takes
   one configured preset name or `default`; `/digest` takes nothing or the literal
-  `status`; `/mcp` takes nothing, or `show <id>`, `approve <id>`, `deny <id>` with
-  one 16-hex request ID; `/help` takes nothing or one command name this host
+  `status`; `/mcp` takes nothing; `/help` takes nothing or one command name this host
   offers, and answers with that command's usage and one-sentence detail. Any
   other argument to a control gets a bounded usage notice; `/help <name>` for a
   name that is not offered gets a fixed refusal that names the reason (another
@@ -91,13 +90,13 @@ without the generic failure text, one per input; the same applies to a turn
 ended by a queued reset (reason `reset`). Other settlement reasons keep the
 fixed failure text.
 
-`/status` prints bounded point-in-time metadata of **this** authenticated chat
-only: the selected model and its preset, whether a turn is running (turn number
+`/status` prints bounded point-in-time metadata of **this** authenticated chat: the selected model and its preset, whether a turn is running (turn number
 and input count) and how many native inputs are queued. A bounded background
 summary follows: this chat's own live workers and its own cron jobs
 (executing, queued, parked, or with a future occurrence armed) and whether the
 one workspace-global memory-digestion run is live in this chat or another. A
-natively blocked task is named as parked instead of counted as running;
+natively blocked task is named as parked instead of counted as running. A separate
+`Restart:` line counts active work gateway-wide without identifying other chats;
 `Background: idle` means nothing is executing or queued right now, and an armed
 future occurrence is its own `Cron:` line with the next due time. It reuses the
 native conversation projection the terminal uses, makes no model call, creates
@@ -143,32 +142,34 @@ busy chat is refused atomically (nothing is queued and no change lands on a
 later turn); unknown names and legacy direct configs are refused with fixed
 text.
 
-`/mcp` is the owner's decision surface for the assistant's MCP proposals. With no
-argument it lists this gateway's configured MCP servers (with live state) and the
-requests waiting for a decision; `/mcp show <id>` prints the normalized shape, the
-entire exact proposed entry (never truncated), and what an approval would change
-— a stdio command verbatim and every header/environment mapping as a host
-variable *name*, never a value; `/mcp approve <id>` writes that entry into the
-gateway's configuration file (enabling only the approved entry) or starts one
-owner-approved OAuth login; `/mcp deny <id>` discards the request. Listing and
-showing are bounded read-only notices with no model call. Approve and deny are
-durable owner controls: they gate this chat, report a known refusal as refused,
-and a replayed update finds the request already consumed instead of applying it
-twice. A login's one-time authorization URL is delivered as a separate direct
-message to this authenticated private chat, after the durable acknowledgement
-and outside the stored channel state; it carries this attempt's OAuth `state`, is
-never sent to the assistant, and open it on a device that can reach the gateway
-host (a remote browser needs that loopback port forwarded). If the approval takes
-longer than the still-pending notice, the final outcome follows as a second
-notice; if the URL cannot be delivered, the login is canceled and a new request
-is needed. A written entry or new grant takes effect at the next start, so
-follow an approval with `/restart`. A gateway opened without an on-disk
-configuration file advertises no `/mcp` and refuses a typed one with fixed text.
+`/mcp` is bounded read-only status for this MCP-enabled gateway: configured
+servers with live state, and any OAuth login waiting for a callback. It is not an
+approval surface. Ask the assistant in this authenticated private chat to add or
+update a server, log in, log out or remove one; the `mcp` model tool performs the
+operation directly, and `/mcp` never reaches the model. A login's one-time
+authorization URL is delivered as a separate direct plain message to this exact
+chat, outside stored channel state. Open it as the owner, then either let the
+browser reach this host or paste the resulting callback URL back into this chat.
+The callback is intercepted before transcript admission or model dispatch; it
+must match the active attempt's loopback origin/path/state and the current
+authenticated sender binding of this private chat. Stale, foreign, cross-chat and
+replayed callbacks are refused with fixed text and their values are never stored
+or sent to the assistant. Completion verifies and stores the grant, reconnects
+the server and makes its tools callable without `/restart`. If the URL cannot be
+delivered, the login is canceled rather than left waiting. A gateway opened
+without an on-disk configuration file advertises no `/mcp` and refuses a typed
+one with fixed text.
 
 `/restart` asks the host to replace the Gateway process so current code and a
 re-read configuration are loaded. It is not a model tool, it is available only to
 an authenticated allowlisted private sender, and it affects every surface and
-background job. The host performs it only after its own graceful teardown —
+background job. The host refuses it with a fixed no-effect reason while gateway
+work would be interrupted (a running generation, tool, compaction, worker,
+digest or cron run; a sleeping cron timer does not count). Nothing is
+claimed as restarted: the initial receipt only says the host is checking the request.
+A busy refusal follows without teardown; the owner may wait or use existing cancellation
+controls where available and ask again, so the same adapter may retry later. The host
+performs an accepted restart only after its own graceful teardown —
 adapters and local clients closed, timers cleared, Harness, Code Mode sandbox and
 MCP clients closed, store lock released — and only where the Node runtime can
 replace the process image (`process.execve`, POSIX; absent on Windows and IBM i).
@@ -385,7 +386,9 @@ allowlist no longer admits is dropped like any other notice, and records that do
 not fit the admitted bound stay recorded for a later open. A process that was
 refused instead reports "Restart failed: the host refused it, so this gateway
 keeps running. Nothing was restarted." to those chats and clears them, so the
-promise is never left open. If the process
+promise is never left open; a refusal because gateway work is active reports the
+fixed busy reason instead and does not latch, so a later `/restart` asks the host
+again. If the process
 dies in between, the next open reports the command exactly once: its held
 acknowledgement is corrected to the explicit "interrupted, may not have taken
 effect" wording and released, or, when no acknowledgement record is left, a

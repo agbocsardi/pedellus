@@ -7,7 +7,7 @@
  * every Durable handle, root/state/fork conversation and model credential.
  */
 
-export const LOCAL_PROTOCOL_VERSION = 1;
+export const LOCAL_PROTOCOL_VERSION = 2;
 
 export const LOCAL_PROTOCOL_LIMITS = Object.freeze({
   /** One request line; inputs are capped well below this by the CLI itself. */
@@ -69,7 +69,9 @@ export type LocalServerMessage =
   | { readonly id: number; readonly result: unknown }
   | { readonly id: number; readonly error: LocalErrorBody }
   | { readonly event: "snapshot"; readonly snapshot: unknown }
-  | { readonly event: "settled"; readonly id: number; readonly settlement: unknown };
+  | { readonly event: "settled"; readonly id: number; readonly settlement: unknown }
+  | { readonly event: "mcpAuthorization"; readonly authorization: unknown }
+  | { readonly event: "mcpNotice"; readonly text: string };
 
 /** Parse one request line into a bounded envelope; reject everything else. */
 export function parseRequestLine(line: string): LocalRequestEnvelope {
@@ -111,6 +113,12 @@ export function parseServerLine(line: string): LocalServerMessage {
   }
   if (record.event === "settled" && typeof record.id === "number" && Number.isSafeInteger(record.id) && Object.hasOwn(record, "settlement")) {
     return { event: "settled", id: record.id, settlement: record.settlement };
+  }
+  if (record.event === "mcpAuthorization" && Object.hasOwn(record, "authorization")) {
+    return { event: "mcpAuthorization", authorization: record.authorization };
+  }
+  if (record.event === "mcpNotice" && typeof record.text === "string") {
+    return { event: "mcpNotice", text: record.text };
   }
   if (typeof record.id === "number" && Number.isSafeInteger(record.id) && record.id >= 1) {
     if (Object.hasOwn(record, "error")) {

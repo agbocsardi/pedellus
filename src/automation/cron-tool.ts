@@ -38,7 +38,7 @@ import {
   type CronScheduleReceipt,
   type CronWithdrawal,
 } from "./cron.js";
-import { CRON_DEFAULT_TIME_ZONE } from "./cron-schedule.js";
+import { CRON_DEFAULT_TIME_ZONE, cronScheduleText, parseCronInstant } from "./cron-schedule.js";
 
 export const CRON_TOOL_NAME = "cron";
 
@@ -94,26 +94,6 @@ function iso(ms: number | null): string {
   return ms === null ? "none" : new Date(ms).toISOString();
 }
 
-/**
- * A one-shot time must carry an explicit UTC offset. Interpreting a naive local time would need the
- * zone-offset arithmetic the calendar schedule avoids, and silently guessing is worse than asking
- * the caller for an unambiguous instant.
- */
-function parseAt(raw: string): number {
-  const value = raw.trim();
-  if (value === "") {
-    throw new TypeError("at must be an ISO 8601 timestamp with a UTC offset, for example 2026-11-01T09:00:00+01:00");
-  }
-  if (!/(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) {
-    throw new TypeError(
-      `at must include an explicit UTC offset or Z (got "${value}"); use cron_expr with tz for a local wall time`,
-    );
-  }
-  const parsed = Date.parse(value);
-  if (!Number.isSafeInteger(parsed)) throw new TypeError(`at is not a valid ISO 8601 timestamp: ${value}`);
-  return parsed;
-}
-
 function scheduleOf(args: CronToolArguments, zone: string): CronScheduleInput["schedule"] {
   const present = SCHEDULE_FIELDS.filter((field) => args[field] !== undefined);
   if (present.length === 0) {
@@ -122,7 +102,7 @@ function scheduleOf(args: CronToolArguments, zone: string): CronScheduleInput["s
   if (present.length > 1) {
     throw new TypeError(`add accepts one schedule, not ${present.join(" + ")}`);
   }
-  if (args.at !== undefined) return { kind: "at", at: parseAt(args.at) };
+  if (args.at !== undefined) return { kind: "at", at: parseCronInstant(args.at) };
   if (args.after_seconds !== undefined) {
     const seconds = args.after_seconds;
     if (!Number.isSafeInteger(seconds) || seconds <= 0) {
@@ -156,10 +136,7 @@ function scheduleOf(args: CronToolArguments, zone: string): CronScheduleInput["s
 }
 
 function scheduleText(view: CronJobView): string {
-  const { schedule } = view.job;
-  if (schedule.kind === "at") return `once at ${iso(schedule.at)}`;
-  if (schedule.kind === "every") return `every ${schedule.everyMs / 1000}s from ${iso(schedule.anchorMs)}`;
-  return `${schedule.expr} in ${schedule.timeZone}`;
+  return cronScheduleText(view.job.schedule);
 }
 
 function describe(view: CronJobView): string {
