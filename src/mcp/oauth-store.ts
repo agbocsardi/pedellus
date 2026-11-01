@@ -245,6 +245,40 @@ export async function commitMcpOAuthState(
 }
 
 /**
+ * Install a login's staged state only while the stored grant is still the one the attempt read.
+ *
+ * This is the path where the configured entry already authenticated the stored grant, so nothing needs
+ * replacing: a rotation was adopted as soon as the refresh returned, and a live connection can refresh the
+ * same grant since the attempt's snapshot without retiring the generation. The token material is therefore
+ * compared inside the same serialized step as the write. Tokens the store no longer holds are newer than
+ * this copy and are kept, and identical material is not rewritten at all; only a token the store is missing
+ * is installed. A logout or a committed replacement still retires the generation and is refused, so the
+ * caller reports that instead of claiming the grant was installed. The generation is not bumped: nothing
+ * was replaced, so a live writer's own refresh keeps working.
+ */
+export async function commitMcpOAuthStateIfUnchanged(
+  path: string,
+  serverUrl: string,
+  state: McpOAuthState,
+  snapshot: McpOAuthGrantSnapshot,
+  signal?: AbortSignal,
+): Promise<void> {
+  const url = String(new URL(serverUrl));
+  await serialized(path, async () => {
+    if (signal?.aborted === true) throw new Error("the MCP login was canceled before its grant was installed");
+    if (mcpOAuthGrantEpoch(path) !== snapshot.epoch) {
+      throw new Error("the stored MCP OAuth grant changed while the login was running");
+    }
+    const current = await new FileMcpOAuthStateStore(path, url).load();
+    if (current === undefined || tokensIdentity(current) !== tokensIdentity(snapshot.state)) return;
+    if (tokensIdentity(state) === tokensIdentity(current)) return;
+    await writeState(path, url, state, () => {
+      if (signal?.aborted === true) throw new Error("the MCP login was canceled before its grant was installed");
+    });
+  });
+}
+
+/**
  * One consistent view of a stored grant: the state and the generation it was read at.
  *
  * A login seeds its staged copy from this and commits against the same generation, so a logout that

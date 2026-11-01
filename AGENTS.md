@@ -294,10 +294,11 @@ edits need restart only; unit edits additionally need daemon-reload.
   gateway-run native PKCE with a loopback callback, one flow at a time and a
   five-minute deadline; it works on a staged
   grant read together with its generation, installs it only after a verification
-  connection, adopts a refresh the server already rotated instead of leaving it
-  unusable — on every exit path, including a failed or canceled startup or
-  verification connection, and without ever adopting an unverified browser
-  authorization — and a logout increments the
+  connection, adopts a rotation of the stored grant that the starting connection
+  performed instead of leaving it unusable — including after a failed or canceled
+  startup connection — while a refresh of the unverified browser authorization is
+  never adopted (those tokens carry the attempt's own client registration and are
+  installed only inside the verified replacement), and a logout increments the
   generation so a stale refresh or a late commit cannot restore it. Its
   cancellation is rechecked up to the replacement's irreversible rename, so a
   denial either installs nothing or is reported as the grant now being there. Its authorization URL is

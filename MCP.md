@@ -300,8 +300,9 @@ Login is always owner-initiated and gateway-run:
    transcript or durable channel state;
 4. the loopback callback delivers the code; the gateway exchanges it in the staged
    state, verifies the result with one real connection and tool listing, and only
-   then installs it as the stored grant (a refresh performed during the attempt is
-   adopted earlier, because the server has already issued it);
+   then installs it as the stored grant (a rotation of the stored grant that the
+   starting connection performed is adopted earlier, because the server has
+   already issued it);
 5. one internal result entry reaches the origin chat's agent, so it can relay
    "login complete / failed" and tell the owner to restart. It carries the server
    name, the request ID, the fixed outcome and the discovered tool count — never
@@ -319,14 +320,16 @@ that still works makes the login a no-op and a logout that lands in between
 retires the generation instead of handing the attempt a fresh expectation for a
 grant it copied before the deletion. A failed or canceled attempt does not delete
 or replace the stored grant. One exception is stated plainly because it is not a
-local decision: a refresh performed during the attempt has already been issued by
-the authorization server, which may have invalidated the previous refresh token,
-so the rotated grant is adopted immediately (only while the stored grant is still
-the one the attempt read) rather than discarded with the failed attempt, and that
-adoption runs on every exit path of the attempt — a failed or canceled startup
-connection and a failed or canceled verification connection included — so a
-rotation the server already issued is never thrown away with the failure. Only a
-rotation is adopted; an unverified browser authorization never is. Each
+local decision: a refresh the starting connection performed on the stored grant has
+already been issued by the authorization server, which may have invalidated the
+previous refresh token, so the rotation is adopted immediately (only while the
+stored grant is still the one the attempt read) rather than discarded with a failed
+or canceled startup connection. That is the only adopted rotation, and its
+provenance is what bounds it: a refresh after the browser step rotates the
+authorization this attempt just obtained, whose client registration is the
+attempt's own loopback one, so those tokens are installed only as part of the
+verified replacement and a failed or canceled verification discards them with the
+staging file. An unverified browser authorization is never adopted. Each
 committed grant increments a process-local generation: a logout during the
 attempt, and a refresh from a connection created before it, cannot restore the
 deleted grant. A gateway restart or crash ends a pending attempt; its URL is not

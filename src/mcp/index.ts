@@ -39,6 +39,7 @@ export {
   FileMcpOAuthStateStore,
   adoptMcpOAuthRefresh,
   commitMcpOAuthState,
+  commitMcpOAuthStateIfUnchanged,
   hasMcpOAuthTokens,
   mcpOAuthGrantEpoch,
   mcpOAuthStagingPath,

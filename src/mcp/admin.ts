@@ -321,6 +321,14 @@ function failureText(reason: McpLoginFailure): string {
   }
 }
 
+/** The stored summary of one started login, carrying the configuration write it followed when there was one. */
+function loginOutcomeText(kind: McpRequestKind, outcome: McpLoginOutcome): string {
+  const prefix = kind === "config" ? "configuration written; " : "";
+  return outcome.ok
+    ? `${prefix}login complete, ${outcome.tools} tool(s) discovered`
+    : `${prefix}login failed: ${failureText(outcome.reason)}`;
+}
+
 /**
  * The internal result entry one settled login places in its origin chat. It carries a fixed outcome,
  * the server name the owner approved and the tool count, and none of the authorization URL, the
@@ -605,6 +613,21 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
     });
   };
 
+  /**
+   * Record one started login's own result exactly as its live completion would, so a shutdown reports the
+   * login's real outcome instead of replacing a verified grant's success with a cancellation. A request the
+   * flow already settled keeps that value, and one that never started a login settled itself.
+   */
+  const settleLogin = (id: string, outcome: McpLoginOutcome): Promise<void> =>
+    options.requests.write(options.context, (requests) => {
+      const stored = requests.find((entry) => entry.id === id);
+      if (stored === undefined || stored.status !== "running") return undefined;
+      stored.status = outcome.ok ? "done" : "failed";
+      stored.outcome = bounded(loginOutcomeText(stored.kind, outcome), MCP_ADMIN_LIMITS.maxOutcomeChars);
+      prune(requests);
+      return undefined;
+    });
+
   /** Return a claimed request to pending when the decision proved to have no effect. */
   const releaseClaim = async (context: Context, id: string): Promise<void> => {
     await options.requests.write(context, (requests) => {
@@ -721,15 +744,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
     });
     void run.completion.then(async (outcome) => {
       if (silent.delete(request.id)) return;
-      const prefix = request.kind === "config" ? "configuration written; " : "";
-      await settle(
-        options.context,
-        request.id,
-        outcome.ok ? "done" : "failed",
-        outcome.ok
-          ? `${prefix}login complete, ${outcome.tools} tool(s) discovered`
-          : `${prefix}login failed: ${failureText(outcome.reason)}`,
-      ).catch(() => undefined);
+      await settleLogin(request.id, outcome).catch(() => undefined);
       await options.notify({
         requestId: request.id,
         name: request.name,
@@ -1105,19 +1120,19 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
     },
     async close() {
       for (const [id, flow] of [...inFlight]) {
-        const wasLogin = flow.phase === "login" || flow.run !== undefined;
         // Shutdown answers nobody with a model turn; the outcome stays in the request list.
         silent.add(id);
         flow.abort.abort();
-        await flow.run?.completion.catch(() => undefined);
-        // A login that has not returned its URL yet also observes the abort; wait for it to unwind.
+        // A login that has not returned its URL yet also observes the abort. Waiting for the approving call
+        // first means a started login's run is final here, and its own completion is then the outcome to
+        // keep; the store is still open, so the request is not left unapprovably `running` for the next open.
         await flow.done.catch(() => undefined);
+        const outcome = await flow.run?.completion.catch(() => undefined);
         if (inFlight.get(id) === flow) inFlight.delete(id);
-        if (!wasLogin) continue;
-        // The store is still open here: record the interruption instead of leaving an unapprovable
-        // `running` request behind for the next open.
-        await settle(options.context, id, "failed", "login canceled: the gateway is shutting down")
-          .catch(() => undefined);
+        silent.delete(id);
+        // A login whose completion rejected has no reported result; the next open repairs it as interrupted.
+        if (outcome === undefined) continue;
+        await settleLogin(id, outcome).catch(() => undefined);
       }
     },
   };
