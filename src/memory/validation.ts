@@ -137,7 +137,7 @@ export function validateRead(value: unknown): MemoryReadQuery {
   if (input.view !== undefined) output.view = enumValue(input.view, ["summary", "transcript"] as const, "view");
   if (input.cursor !== undefined) output.cursor = string(input.cursor, "cursor", MAX_CURSOR_CHARS);
   if (input.limit !== undefined) {
-    output.limit = safeInteger(input.limit, "limit", 1);
+    output.limit = safeInteger(input.limit, "limit", 2);
     if ((output.limit as number) > MEMORY_MAX_READ_CHARS) throw new TypeError(`limit must not exceed ${MEMORY_MAX_READ_CHARS} characters`);
   }
   return output as unknown as MemoryReadQuery;
