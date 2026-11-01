@@ -42,7 +42,6 @@ export const MCP_ADMIN_LIMITS = Object.freeze({
   /** One server entry, serialized. */
   maxEntryBytes: 8 * 1024,
   maxTextChars: 4_000,
-  maxOutcomeChars: 300,
   maxNameChars: 64,
 } as const);
 
@@ -103,7 +102,6 @@ export interface McpAdminOptions {
   /** True only for authenticated ordinary mapped chats: never workers, forks or task-owned scopes. */
   readonly isAuthorizedChat: (conversationId: ConversationId) => boolean;
   readonly environment?: Readonly<Record<string, string | undefined>>;
-  readonly now?: () => number;
 }
 
 export interface McpAdmin {
@@ -249,7 +247,6 @@ const CALLBACK_ACCEPTED =
   "token exchange and verification now; the callback values were not sent to the assistant or stored.";
 
 export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
-  const now = options.now ?? Date.now;
   let active: ActiveLogin | undefined;
   let closed = false;
   const silent = new Set<string>();
@@ -453,7 +450,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
         return {
           ok: true,
           text: `Server "${name}" was written to the configuration file, but live activation did not complete. ` +
-            "A later management action can retry it; no connection outcome is inferred from this failure.",
+            "The on-disk entry is present; restart the gateway to re-read it, then retry. No connection outcome is inferred from this failure.",
         };
       }
       // The integration has applied the entry; a later policy-refresh failure must not
@@ -509,7 +506,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
       return {
         ok: true,
         text: `Server "${name}" was removed from the configuration file, but the live registration refresh ` +
-          "failed. Its tools fail closed until the next management action.",
+          "failed. Restart the gateway to re-read the on-disk removal; live tool availability is not confirmed.",
       };
     }
     return {

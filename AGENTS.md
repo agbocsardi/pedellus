@@ -118,10 +118,11 @@ edits need restart only; unit edits additionally need daemon-reload.
   per run (including its workspace context), and lose it on completion; persistent
   history confers no permission.
   The `skill`, `cron`, `history`, `worker`, `mcp` management and scoped
-  `telegram` tools carry no filesystem/shell authority and are exempt from the
-  coding-tool hook, so enabling a coding tool never suppresses them; `mcp`
-  performs direct management and is limited to authenticated mapped chats with a
-  live owner surface, and history remains read-only over mapped chats. Telegram actions
+  `telegram` tools grant no coding-tool authority and are exempt from the
+  coding-tool hook, so enabling a coding tool never suppresses them. MCP management
+  can write server configuration and launch host-level stdio processes; it is limited
+  to authenticated mapped chats, with login additionally requiring a unique live
+  owner surface. History remains read-only over mapped chats. Telegram actions
   additionally require a live adapter, current private-chat
   admission and observed same-chat targets. Unknown external outcomes are retained,
   never blindly retried or evicted.
@@ -276,7 +277,7 @@ edits need restart only; unit edits additionally need daemon-reload.
   mapped ordinary chat, and it is the only path from a model to new MCP
   authority. The `mcp` model tool (`status`, `add`/`configure`, `login`,
   `logout`, `remove`) is offered only there — never to a worker, fork, root,
-  digest or scheduled-run target — and requires a live owner surface for that
+  digest or scheduled-run target — and login requires a unique live owner surface for that
   exact session. There is no proposal document and no separate approval command.
   An `add` validates one entry with the start parser and writes
   `mcp.servers.<name>` (and `mcp.enabled: true`) atomically, preserving file mode

@@ -1033,10 +1033,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
           ...(cronEnabled ? [CRON_TOOL_NAME] : []),
           ...(workersEnabled ? [WORKER_TOOL_NAME] : []),
           ...(telegramTool === undefined ? [] : [TELEGRAM_TOOL_NAME]),
-          // MCP management is a bounded host capability: it carries no filesystem or shell authority
-          // of its own, so the coding ceiling must not suppress it. Its own hook limits it to
-          // authenticated mapped chats with a live owner surface, and it exists only when the host can
-          // write configuration.
+          // MCP management is a separate host capability, not a coding-tool grant: it can
+          // write server configuration and launch stdio processes. Its own hook limits it to
+          // authenticated mapped chats; login also requires a unique live owner surface.
+          // It exists only when the host can write configuration.
           ...(config.configFile === undefined ? [] : [MCP_ADMIN_TOOL_NAME]),
           // History retrieval is read-only over mapped chats and has its own scope checks, so the
           // ceiling must not suppress it when coding tools are enabled.

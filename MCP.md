@@ -169,7 +169,8 @@ can manage MCP.
 ## Direct owner-authorized management
 
 The one model-facing management tool is `mcp`. It acts only in an authenticated
-mapped ordinary chat with a live owner surface for that exact session:
+mapped ordinary chat; OAuth login additionally needs a unique live owner surface
+for that exact session:
 
 | action | what it does |
 | --- | --- |
@@ -343,6 +344,12 @@ requires a fresh authorization instead, the connection reports `auth-required`
 rather than opening anything.
 
 Real limitations:
+
+- Paste the callback URL alone, without prose. Only a standalone HTTP(S) URL
+  carrying `state` and `code` or `error` is intercepted; a callback embedded in
+  prose is ordinary chat input and can enter the transcript/model. Matching URLs
+  are consumed even without an active login, preventing stale callback replay
+  from becoming model input.
 
 - The redirect URI is a loopback address on the **gateway host**. An owner whose
   browser runs elsewhere must forward that port over SSH; a provider that refuses

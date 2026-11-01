@@ -36,7 +36,7 @@ owner pastes the callback back there, and tools become callable without a gatewa
       keep OAuth login available after partial activation, bump local protocol version.
 - [x] Cover real double CLI attach, replacement-surface callback refusal, identical MCP
       re-add after worker revocation, and implicit Code Mode retirement.
-- [ ] Fresh independent review of the revised diff and integration with current main.
+- [x] Fresh independent review of the revised diff and integration with current main.
 - [ ] Merge only after clean review; live deployment remains a separate owner action.
 
 ## Session log
@@ -81,3 +81,10 @@ owner pastes the callback back there, and tools become callable without a gatewa
   refusal, implicit compositor retirement, a synthetic policy refresh failure, and
   same-name server re-add after durable worker capture pruning. Focused MCP suite:
   10/10 passed after separating independent Code Mode in the worker fixture.
+- Fresh independent review passed the combined branch at `a2ca9c61`: 378/378
+  behavior, 2/2 execution, 83/83 core and 34/34 budget checks, plus typecheck.
+  Nonblocking follow-ups corrected recovery instructions, authority wording and
+  dead options, and documented standalone-only callback detection. No findings
+  are silently waived: unexercised real channel/provider acceptance remains a
+  stated limitation; focused integrated CLI/Telegram accepted-callback coverage
+  and explicit-compositor/mismatch paths remain future hardening.
