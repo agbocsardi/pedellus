@@ -268,6 +268,11 @@ background run's conversation, then submits one native input with the stable req
 `cron:<jobId>:<scheduledAtMs>`. Its content is the job's own message followed by one fixed host
 instruction naming the exact `[SILENT]` answer; that committed text is what the model receives in
 either mode and what the transcript keeps, not a separate hidden prompt, and it grants nothing.
+This also applies to existing jobs after upgrade: their next new occurrence can suppress delivery
+if the model chooses `[SILENT]`, including in response to untrusted material. An already-placed
+occurrence keeps its original input. Exact trimmed `[SILENT]` cannot be delivered literally; other
+text containing it is delivered normally. Origin-mode inputs can share a settled answer, so a shared
+exact marker suppresses the scheduled occurrence too.
 Both are ordered admissions on that conversation, so the boundary is
 always ahead of the input even when the conversation was still finishing. A retry after a crash
 first looks for its own submission and then at the conversation's newest placed entry: an occurrence

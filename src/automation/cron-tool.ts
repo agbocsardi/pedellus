@@ -234,7 +234,7 @@ export function createCronTool(options: CronToolOptions): CronTool {
       ], {
         description:
           "add: `message` (default) sends `message` as a turn when due. `digest` instead runs one " +
-          "bounded memory-digestion batch for this chat; message and isolated are then ignored.",
+          "bounded memory-digestion batch for this chat; message, isolated and silent are then ignored.",
       })),
       message: Type.Optional(Type.String({
         description: "add: the instruction the agent receives when the job fires. Required unless intent is digest.",

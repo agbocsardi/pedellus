@@ -65,7 +65,7 @@ a separate conversation; origin-mode answers remain here. For a conditional
 check, a scheduled run can return exactly `[SILENT]` (ignoring surrounding
 whitespace) to suppress that occurrence's automatic success reply. Other text
 is delivered normally unless the job is silent. Untrusted material can influence
-the model's choice, and a literal `[SILENT]` answer cannot itself be delivered.
+the model's choice, and an answer consisting only of `[SILENT]` cannot be delivered.
 Use `list` to inspect a failed or cancelled run.
 
 ## Authority and limits
