@@ -127,7 +127,10 @@ export function projectEntry(entry: EntryRecord): { parts: HistoryPart[]; malfor
         malformed++;
         continue;
       }
-      omittedNonText += content.omitted;
+      const projectedCalls = raw.content.filter((block: unknown) =>
+        isRecord(block) && block.type === "toolCall" && typeof block.name === "string" && block.name.length > 0,
+      ).length;
+      omittedNonText += content.omitted - projectedCalls;
       if (content.text.trim().length > 0) {
         parts.push({ index: partIndex++, kind: "message", messageIndex, role: "assistant", timestamp, body: content.text, value: messageValue(raw, "assistant", content.value) });
       }
