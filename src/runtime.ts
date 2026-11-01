@@ -1433,7 +1433,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // notice text naming the job and occurrence only: raw provider errors, the job's message and
           // model text never leave the store. A successful answer is queued from the committed entry
           // the scheduled submission settled with, so no model turn is rerun and no nearby user
-          // answer is substituted for it. The origin session key is also the channel locator: a key
+          // answer is substituted for it. A job's `silent` setting, or an exact trimmed `[SILENT]`
+          // answer, suppresses the automatic delivery instead; a failed occurrence still queues its
+          // notice. The origin session key is also the channel locator: a key
           // outside an enabled delivery prefix is never queued.
           if (delivery === null) return;
           if (job === null || !isChatSessionKey(job.owner.sessionKey)) return;
@@ -1447,6 +1449,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
               : await tx.entry(AssistantEntry, delivery.answerEntryId);
             const message = answer?.model?.[0] as AssistantMessage | undefined;
             const body = (message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "").trim();
+            // Suppression stops only this automatic channel delivery: the answer stays in the run's
+            // conversation, and `[SILENT]` has no special meaning in an ordinary chat reply. A
+            // `silent` job suppresses every successful occurrence, including an empty answer; the
+            // marker suppresses just its own occurrence in either mode. A failed run never reaches
+            // this branch and keeps its sanitized notice.
+            if (job.silent === true || body === "[SILENT]") return;
             text = body === ""
               ? cronOutcomeNotice("empty", job.id, occurrence.scheduledAtMs)
               : body.length > CRON_DELIVERY_MAX_TEXT_CHARS

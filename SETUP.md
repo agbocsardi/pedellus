@@ -255,7 +255,9 @@ default isolated run answers in its own background conversation; an `origin`-mod
 job answers inside the original conversation. In either mode a normal settlement is
 queued for the originating Telegram private chat: the committed answer, or a fixed
 sanitized notice naming the job and occurrence when the run failed or answered with
-nothing. Cancelled, superseded and missing-job runs are not pushed; ask the agent to
+nothing. A job scheduled with `silent: true`, or a successful run whose final answer is
+exactly `[SILENT]`, suppresses that automatic message (a failure still notifies).
+Cancelled, superseded and missing-job runs are not pushed; ask the agent to
 `list` cron jobs to inspect a failure and read the reported delivery fault. See
 [cron](./CRON.md).
 

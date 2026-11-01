@@ -805,7 +805,8 @@ after a reopen.
 
 The adapter also consumes the durable, channel-neutral cron outbox
 (`nanobot.cron.deliveries` in the origin chat conversation). A normal settlement, isolated or
-origin, writes the text to send there in the same terminal commit as its outcome: the committed
+origin, writes the text to send there in the same terminal commit as its outcome unless successful
+delivery is suppressed by `silent` or an exact `[SILENT]` answer: the committed
 final answer, or fixed sanitized notice text for a failure or empty answer; no model turn is
 rerun to resend. On startup and every few seconds the adapter enumerates already-mapped chat sessions and
 accepts only candidate keys for its own bot ID (`telegram:<bot id>:chat:<chatId>`). That key is a
@@ -833,9 +834,12 @@ Delivery state lives on the outbox record, not only in this process: `pending`, 
 `unknown`, `withheld`, `delivered`, `failed`, or `unauthorized`, plus `nextChunkIndex`, `messageId`,
 `sendIntent`, `unknownSince`, `withheldSince`, `settledAt`, and a sanitized `error`. An unresolved intent at open
 becomes `unknown` and is never auto-resent; an explicit rejection becomes `failed`; 429 and proven
-pre-connect outcomes stay pending for a later scan. Every normal settlement is queued: a
-successful answer's committed text, or fixed notice text for a run error or an empty answer. A
-notice names only the job id and occurrence instant and asks the owner to list scheduled jobs; no
+pre-connect outcomes stay pending for a later scan. Every normal settlement is queued unless
+suppressed: a successful answer's committed text, or fixed notice text for a run error or an empty
+answer. A `silent` job suppresses every successful result, including the empty-answer notice, while
+a failed run still queues its notice; an exact trimmed `[SILENT]` successful answer suppresses only
+that occurrence in either mode and stays in the run's conversation. A notice names only the job id
+and occurrence instant and asks the owner to list scheduled jobs; no
 provider error, job message or model text is copied. Cancellations, superseded, fenced and
 missing-job runs remain silent externally and are visible through cron `lastOutcome`/`list`. If the channel is
 absent from the configuration, no record is created; an existing record is never redirected to

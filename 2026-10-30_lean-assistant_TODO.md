@@ -20,6 +20,10 @@
 - [x] Adopt the cron conversation model: one persistent automation conversation per recurring
   job and one catch-all per origin for one-offs, a reset-delimited episode per run, a durable
   bounded one-off queue, and per-run prepared/retired authority.
+- [x] Silent scheduled delivery: persistent per-job `silent` (default false) and an exact trimmed
+  `[SILENT]` successful final answer suppress automatic channel delivery, including an empty
+  answer; a failed occurrence keeps its sanitized notice, and `cron list`/confirmation show the
+  setting. No authority, digest, recovery or pending/unknown send semantics changed.
 
 ## Owner follow-up — digest input correction
 
@@ -1473,3 +1477,20 @@ server, faux models, no external network.
   covers the durable slot, the delivered confirmation, no re-request, no second
   model turn, and that a consumed confirmation is never repeated) and core
   acceptance. No live bot, credential or process replacement was used.
+
+### Session — silent scheduled delivery
+
+- [x] Implemented `silent` as a persistent per-job cron field (default false, absent on a legacy
+  record means false) and normalized it off for `digest`. Successful occurrences are suppressed
+  before outbox admission, including an empty answer; a failed occurrence still queues its fixed
+  sanitized notice. An exact trimmed `[SILENT]` successful final answer suppresses only its own
+  occurrence in either mode; the answer stays in the run's conversation, and an ordinary chat
+  answer keeps the literal text. `cron list` and the add confirmation show `delivery: silent`.
+- [x] Authority, digest handling, recovery and the adapter's pending/unknown send semantics are
+  unchanged. The background target still holds only its captured tools (no Telegram, cron, worker
+  or other widened tool), and a suppressed occurrence creates no outbox record across reopen.
+- [x] Verification on this branch: typecheck/build; 374 behavior checks (including new synthetic
+  gateway cases for silent success/empty/failure, legacy field absence, live target authority,
+  reopen, origin `[SILENT]`, an ordinary chat answer, and a later recurrence that still delivers);
+  2 execution checks; 83/83 offline core acceptance. No live provider, bot, credential,
+  personal data, deployment or migration was used.

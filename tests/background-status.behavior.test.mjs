@@ -16,6 +16,8 @@ import { join } from 'node:path';
 import { Writable } from 'node:stream';
 import { test } from 'node:test';
 
+import { scheduledContent } from './fixtures/cron-input.mjs';
+
 const packageRoot = process.env.PI_NANOBOT_CANDIDATE ?? new URL('../', import.meta.url).pathname;
 const modules = join(packageRoot, 'node_modules/@earendil-works');
 const [
@@ -419,7 +421,7 @@ test('a one-shot job is scheduled until its run is genuinely executing', { timeo
   let issued = false;
   const store = await syntheticGateway('cron', async (request, options) => {
     const input = lastUserText(request.messages);
-    if (input === 'deliver the reminder') {
+    if (input === scheduledContent('deliver the reminder')) {
       runEntered.resolve();
       await new Promise((resolve) => {
         const abort = () => resolve();

@@ -6,7 +6,9 @@ surface. Calendar expressions and IANA time zones are schedule math; parsing use
 datetimes stays outside. A normal settlement, isolated or origin, is also queued in a
 durable, channel-neutral outbox for an enabled channel: the committed answer text for a success, or
 fixed sanitized notice text for a failure or empty answer; the run itself still writes only its
-Durable conversation and sends no external message.
+Durable conversation and sends no external message. A job's `silent` setting, or an exact trimmed
+`[SILENT]` successful answer, suppresses that occurrence's automatic delivery; a failure is still
+queued as its fixed notice.
 
 Cron is an internal agent capability: the user asks the agent, and the agent calls the scheduling
 tool. No direct user cron UI or scheduling commands are required, and none exist.
@@ -130,12 +132,19 @@ One record per job in the origin conversation's `nanobot.cron.jobs` document, fi
 ```ts
 { id, owner, name, message, mode, schedule, idempotencyKey, createdAtMs,
   generation, timerTaskId, executionTaskId, cancelledAtMs,
-  lastOutcome, lastSkip, lastFault, intent?, conversationId? }
+  lastOutcome, lastSkip, lastFault, intent?, silent?, conversationId? }
 ```
 
 `intent` is `"message"` (also the meaning of an absent field on a historical
 record) or `"digest"`. It is set only by an explicit `cron add` with
 `intent: "digest"`.
+
+`silent` is a persistent per-job delivery setting, absent on a historical record and then meaning
+`false`. When true, every successful occurrence suppresses its automatic channel delivery,
+including an empty answer; a failed occurrence still queues its fixed sanitized notice. It is set
+to true by an explicit `cron add` with `silent: true` and is shown as `delivery: silent` in `cron
+list` and in the add confirmation. A new job stores the normalized boolean, including `false`. It
+has no effect on a `digest` occurrence, which never queues a channel delivery either way.
 
 `conversationId` is the recurring job's own automation conversation. It is optional and absent
 until that job's first run records it, so a job document written by the earlier per-occurrence
@@ -256,7 +265,15 @@ queue is a schedule.
 
 `execute` places one native reset (`Conversation.reset`, the same entry `/new` commits) in a
 background run's conversation, then submits one native input with the stable request ID
-`cron:<jobId>:<scheduledAtMs>`. Both are ordered admissions on that conversation, so the boundary is
+`cron:<jobId>:<scheduledAtMs>`. Its content is the job's own message followed by one fixed host
+instruction naming the exact `[SILENT]` answer; that committed text is what the model receives in
+either mode and what the transcript keeps, not a separate hidden prompt, and it grants nothing.
+This also applies to existing jobs after upgrade: their next new occurrence can suppress delivery
+if the model chooses `[SILENT]`, including in response to untrusted material. An already-placed
+occurrence keeps its original input. Exact trimmed `[SILENT]` cannot be delivered literally; other
+text containing it is delivered normally. Origin-mode inputs can share a settled answer, so a shared
+exact marker suppresses the scheduled occurrence too.
+Both are ordered admissions on that conversation, so the boundary is
 always ahead of the input even when the conversation was still finishing. A retry after a crash
 first looks for its own submission and then at the conversation's newest placed entry: an occurrence
 that is already placed is waited on instead of being submitted twice, and a conversation whose newest
@@ -449,12 +466,18 @@ and warning; an evicted chat's withheld result remains nonterminal and a fresh a
 it. Every valid admission refreshes that binding's recency, so active chats are not the first
 eviction candidates.
 
-Outcome policy: every normal settlement is queued, successful or not. A successful answer is
-queued from the committed answer entry of that scheduled submission; when that entry is missing or
-its text is empty, the record carries a fixed empty-result notice instead. An error settlement
+Outcome policy: every normal settlement is queued, successful or not, unless suppressed. A
+successful answer is queued from the committed answer entry of that scheduled submission; when
+that entry is missing or its text is empty, the record carries a fixed empty-result notice instead. An error settlement
 queues a fixed failure notice. Both notices name only the machine-generated `cron-<uuid>` job id and
 the occurrence's ISO instant, and ask the owner to list scheduled jobs to inspect it; no provider
-error, job message, model text or secret is copied into an external channel. A cancelled, superseded,
+error, job message, model text or secret is copied into an external channel. A job created with
+`silent: true` suppresses every successful automatic delivery, including the empty-result notice;
+a failed occurrence still queues its fixed failure notice. Independently, a successful answer whose
+trimmed text is exactly `[SILENT]` suppresses only that occurrence's delivery in either mode; the
+answer itself stays in the run's conversation, and the marker has no meaning in an ordinary chat
+reply. Both checks run before admission, so a suppressed occurrence creates no record and a reopen
+or retried terminal commit cannot create one later. A cancelled, superseded,
 fenced or missing-job run passes no settlement (`delivery: null`) and sends nothing externally, so
 abandoned work never notifies; an earlier queued result for the same occurrence is unaffected. The
 same occurrence key covers notices, so a reopen or retried terminal commit cannot queue a second
@@ -491,6 +514,10 @@ fault document is itself ignored rather than replacing job or outbox data.
 - A pending outbox record has no age limit. A channel enabled later can deliver an older queued
   result once; an ambiguous record stays quarantined until an operator resolves it through the
   adapter's documented channel-state/outbox record.
+- Silent delivery suppresses only the automatic channel message. The run still happens, its answer
+  stays in its conversation, and a failure notice is never suppressed; removing or cancelling the
+  job is the way to stop its notices. The `[SILENT]` marker is recognized only in a scheduled run's
+  successful final answer, never as a host command or an ordinary chat convention.
 - The `cron` tool parses only ISO 8601 timestamps with an explicit UTC offset for `at`; parsing
   natural-language user text stays outside.
 - The run task owns one execution, but not the conversation. Cancelling a job aborts its run task,
@@ -633,6 +660,8 @@ and that a replay after a clock advance and reopen dedupes that stored deadline 
 fired short one-shot retry still dedupes its original instant with no new job or timer; and that a
 real Gateway turn issuing `cron add` with `after_seconds` stores and acknowledges the expected
 once-at deadline. Invalid and same-key changed requests are asserted to leave the record unchanged.
+The same suite asserts that `silent` is stored, part of dedupe identity, validated as a boolean, and
+that a stored record whose field was removed still dedupes as `false` without being rewritten.
 
 Permanent conversation-model coverage is in `tests/cron-conversations.behavior.test.mjs`. It drives
 the foundation with a faux provider on fresh `mkdtemp` stores and a host that applies the real
@@ -684,4 +713,12 @@ document; isolated success delivery remains `pending`; an isolated run whose pro
 exactly one fixed failure notice, asserted against the raw provider error and job message text, and
 the finished target's captured config tools are gone; an empty origin-mode answer queues the fixed
 empty-result notice once, and reopening the same store still holds exactly that one record; and an
-aborted scheduled run queues no record at all.
+aborted scheduled run queues no record at all. Silent-delivery coverage uses the same real gateway
+path: a `silent` background job with an empty answer and a `silent` failing job queue no record and
+one fixed failure notice respectively, a stored job whose `silent` field was removed still delivers,
+the add confirmation and `list` both name `delivery: silent`, the live background target holds only its
+captured `read` tool and no Telegram, cron, worker or other widened tool, and a reopen re-admits
+neither suppressed occurrence nor changes the stored setting; a `silent` origin success and a
+whitespace-trimmed `[SILENT]` origin answer both stay undelivered while remaining in the origin
+transcript, an ordinary chat answer keeps the same literal text, and a recurring background job
+suppresses its first `[SILENT]` occurrence but delivers the next ordinary answer.

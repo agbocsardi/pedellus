@@ -176,7 +176,10 @@ edits need restart only; unit edits additionally need daemon-reload.
   with no new conversation and no cron-placed reset. Runs sharing a conversation
   never interleave; the execution task stays separate from the conversation, so
   cancelling a run retires its authority and stops its work without deleting
-  history.
+  history. A job's persistent `silent` setting, or an exact trimmed `[SILENT]`
+  successful final answer, suppresses that occurrence's automatic channel
+  delivery — never the run, and never a failure notice; the marker applies only
+  to a scheduled run, not an ordinary chat reply.
 - Skill prompts carry names, descriptions and locators only; bodies load on
   demand through the read-only `skill` tool.
 - Markdown in the workspace is the memory source of truth. Durable owns the

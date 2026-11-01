@@ -212,7 +212,9 @@ presentation of one Durable conversation, not a delivery outbox or an exactly-on
 external send. A default isolated/background cron run uses its own task-owned
 conversation and is not shown in the CLI. Normal settlements in either mode (an
 answer, or a fixed sanitized failure/empty-answer notice) can be delivered to a
-Telegram origin through its outbox; cancelled and superseded runs are not. See
+Telegram origin through its outbox; a job's persistent `silent` setting or an
+exact trimmed `[SILENT]` successful answer suppresses a successful result, while a
+failure still notifies, and cancelled or superseded runs are not. See
 [cron](./CRON.md).
 
 ## Recovery
