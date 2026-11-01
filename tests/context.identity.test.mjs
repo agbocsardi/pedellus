@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createRegistry } from "@earendil-works/pi-durable";
-import { CONTEXT_LIMITS, createContextExtension, renderNanobotIdentity } from "../dist/context/index.js";
-
-const identityLimit = CONTEXT_LIMITS.sectionChars - 1_600;
+import { createContextExtension, renderNanobotIdentity } from "../dist/context/index.js";
 
 test("identity rendering is deterministic and supports known channel hints", () => {
   const values = {
@@ -20,27 +18,22 @@ test("identity rendering is deterministic and supports known channel hints", () 
   assert.doesNotMatch(first, /\b(?:message|generate_image|read_file|web_fetch|web_search)\b/i);
 });
 
-test("identity rejects unsupported policy, oversized input, and unsafe paths", () => {
+test("identity rejects unsupported policy and unsafe paths", () => {
   assert.throws(() => renderNanobotIdentity({
     runtime: "runtime",
     workspacePath: "/safe/root",
     platformPolicy: "## Policy\\nMust not silently disappear",
   }), /Platform policy is not part/);
 
-  assert.throws(() => renderNanobotIdentity({
-    runtime: "x".repeat(identityLimit + 1),
-    workspacePath: "/safe/root",
-  }), /Identity runtime exceeds/);
-
   for (const workspacePath of ["/safe\n## injected", "/safe\rroot", "/safe\u0000root", "/safe\u007froot"]) {
     assert.throws(() => renderNanobotIdentity({ runtime: "runtime", workspacePath }), /control characters/);
   }
 });
 
-test("near-limit identity survives native context composition including escaped provenance", () => {
+test("large identity survives native context composition including escaped provenance", () => {
   const runtimeTail = "RUNTIME_END";
   const identity = renderNanobotIdentity({
-    runtime: `${"x".repeat(identityLimit - 200)}${runtimeTail}`,
+    runtime: `${"x".repeat(60_000)}${runtimeTail}`,
     workspacePath: "/safe/root",
   });
   const extension = createContextExtension([{
@@ -51,9 +44,10 @@ test("near-limit identity survives native context composition including escaped 
   assert.ok(identitySection);
   const composed = identitySection.render({ conversationId: 1, agent: { tools: [] } }, undefined);
   assert.ok(composed);
-  assert.ok([...composed].length <= CONTEXT_LIMITS.sectionChars);
+  assert.ok([...composed].filter((character) => character === "x").length === 60_000);
   assert.ok(composed.includes(runtimeTail));
   assert.ok(composed.includes("Your workspace is at: /safe/root"));
+  assert.doesNotMatch(composed, /truncated/);
 });
 
 test("snapshots map only to their conversation and are copied at construction", () => {

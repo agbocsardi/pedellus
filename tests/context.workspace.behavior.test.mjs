@@ -7,7 +7,6 @@ import test from "node:test";
 import { CONTEXT_LIMITS, createContextExtension } from "../dist/context/index.js";
 import {
   WORKSPACE_CONTEXT_LIMITS,
-  WorkspaceContextBoundsError,
   WorkspaceContextFileError,
   WorkspaceContextInputError,
   createWorkspaceContextSnapshotProvider,
@@ -40,14 +39,6 @@ function isFileError(kind, source) {
 function isInputError(error) {
   assert.ok(error instanceof WorkspaceContextInputError, `expected input error, got ${error?.name}: ${error?.message}`);
   return true;
-}
-
-function isBoundsError(bound) {
-  return (error) => {
-    assert.ok(error instanceof WorkspaceContextBoundsError, `expected bounds error, got ${error?.name}: ${error?.message}`);
-    assert.equal(error.bound, bound);
-    return true;
-  };
 }
 
 function fdTargetExists(target) {
@@ -200,10 +191,6 @@ test("explicitly selected memory must exist, be regular, and stay under memory/*
   await assert.rejects(load(root, {
     memoryFiles: ["memory/MEMORY.md", "memory/MEMORY.md"],
   }), isInputError);
-
-  const tooMany = Array.from({ length: WORKSPACE_CONTEXT_LIMITS.maxMemoryFiles + 1 }, (_, index) =>
-    `memory/file-${index}.md`);
-  await assert.rejects(load(root, { memoryFiles: tooMany }), isBoundsError("maxMemoryFiles"));
 });
 
 test("invalid roots and invalid requests fail closed", async (t) => {
@@ -220,9 +207,6 @@ test("invalid roots and invalid requests fail closed", async (t) => {
   await assert.rejects(loadWorkspaceContextSnapshot({ workspaceRoot: root, memoryFiles: "memory/MEMORY.md" }), isInputError);
   await assert.rejects(load(root, { identity: { content: "" } }), isInputError);
   await assert.rejects(load(root, { identity: { source: "bad\nsource", content: "x" } }), isInputError);
-  await assert.rejects(load(root, {
-    identity: { source: "host:identity", content: "x".repeat(WORKSPACE_CONTEXT_LIMITS.maxIdentityChars + 1) },
-  }), isBoundsError("maxIdentityChars"));
 });
 
 test("a symlinked root or bootstrap file is rejected without reading the target", async (t) => {
@@ -294,33 +278,45 @@ test("unreadable and invalid UTF-8 files fail closed", async (t) => {
   }
 });
 
-test("file and aggregate bounds are enforced before rendering", async (t) => {
-  const oversized = await tempRoot(t);
-  await writeFile(join(oversized, "AGENTS.md"), "x".repeat(WORKSPACE_CONTEXT_LIMITS.maxFileBytes + 1));
-  await assert.rejects(load(oversized), isBoundsError("maxFileBytes"));
+test("large content passes through the loader and renderer in full", async (t) => {
+  const root = await tempRoot(t);
+  const agents = `${"a".repeat(120_000)}AGENTS_TAIL_MUST_SURVIVE`;
+  const soul = "😀".repeat(30_000);
+  const user = `${"u".repeat(60_000)}USER_TAIL_MUST_SURVIVE`;
+  await writeFiles(root, { "AGENTS.md": agents, "SOUL.md": soul, "USER.md": user });
 
-  const tooManyChars = await tempRoot(t);
-  await writeFiles(tooManyChars, {
-    "AGENTS.md": "a".repeat(17_000),
-    "SOUL.md": "b".repeat(17_000),
-    "USER.md": "c".repeat(17_000),
+  const memoryFiles = [];
+  const memoryFixture = {};
+  for (let index = 0; index < 40; index++) {
+    const relative = `memory/topic-${index}.md`;
+    memoryFiles.push(relative);
+    memoryFixture[relative] = `topic ${index}\n${"m".repeat(4_000)}`;
+  }
+  await writeFiles(root, memoryFixture);
+
+  const identityContent = `i`.repeat(50_000);
+  const snapshot = await load(root, {
+    memoryFiles,
+    identity: { source: "session:large", content: identityContent },
   });
-  await assert.rejects(load(tooManyChars), isBoundsError("maxTotalChars"));
+  assert.equal(snapshot.agents.content, agents);
 
-  const tooManyBytes = await tempRoot(t);
-  const emoji = "😀".repeat(11_000);
-  await writeFiles(tooManyBytes, {
-    "AGENTS.md": emoji,
-    "SOUL.md": emoji,
-    "USER.md": emoji,
-  });
-  await assert.rejects(load(tooManyBytes), isBoundsError("maxTotalBytes"));
+  const extension = createContextExtension([{ conversationId: 1, ...snapshot }]);
+  const instructions = render(extension, "nanobot_instructions");
+  assert.ok(instructions.includes(agents));
+  assert.ok(instructions.includes(user));
+  assert.ok(instructions.includes(soul));
+  assert.doesNotMatch(instructions, /truncated/);
 
-  const identityAndFiles = await tempRoot(t);
-  await writeFile(join(identityAndFiles, "AGENTS.md"), "a".repeat(40_000));
-  await assert.rejects(load(identityAndFiles, {
-    identity: { source: "session:large", content: "i".repeat(10_000) },
-  }), isBoundsError("maxTotalChars"));
+  const memory = render(extension, "nanobot_memory");
+  assert.ok(memory.includes(memoryFixture[memoryFiles[39]]));
+  assert.ok(memory.includes(memoryFixture[memoryFiles[0]]));
+  assert.match(memory, /Memory 40\nSource: "workspace:memory\/topic-39\.md"/);
+  assert.doesNotMatch(memory, /truncated/);
+
+  const identity = render(extension, "nanobot_identity");
+  assert.ok(identity.includes(identityContent));
+  assert.doesNotMatch(identity, /truncated/);
 });
 
 test("provider adapts explicit session selections without shared state", async (t) => {
@@ -509,60 +505,23 @@ test("provenance labels fit CONTEXT_LIMITS.sourceChars including the workspace p
   await assert.rejects(load(root, { memoryFiles: [rejected] }), isInputError);
 });
 
-test("accepted documents cannot be silently truncated by the renderer", async (t) => {
-  const nearLimit = await tempRoot(t);
-  const userTail = "USER_TAIL_MUST_SURVIVE";
-  await writeFiles(nearLimit, {
-    "AGENTS.md": "A".repeat(5_000),
-    "SOUL.md": "S".repeat(5_000),
-    "USER.md": `${"U".repeat(5_000)}${userTail}`,
+test("workspace documents reach the renderer without a content budget", async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, { "memory/MEMORY.md": `${"Z".repeat(20_000)}MEMORY_TAIL_MUST_SURVIVE` });
+  const snapshot = await load(root, {
+    memoryFiles: ["memory/MEMORY.md"],
+    identity: { source: "session:identity", content: "identity body" },
   });
-  const accepted = await load(nearLimit);
-  const extension = createContextExtension([{ conversationId: 1, ...accepted }]);
-  const instructions = render(extension, "nanobot_instructions");
-  assert.match(instructions, /USER_TAIL_MUST_SURVIVE/);
-  assert.match(instructions, /## USER\.md/);
-  assert.doesNotMatch(instructions, /context truncated/);
+  const extension = createContextExtension([{ conversationId: 1, ...snapshot }]);
 
-  const instructionsTooLarge = await tempRoot(t);
-  await writeFiles(instructionsTooLarge, {
-    "AGENTS.md": "A".repeat(15_900),
-    "SOUL.md": "S".repeat(500),
-    "USER.md": "U".repeat(500),
-  });
-  await assert.rejects(load(instructionsTooLarge), isBoundsError("instructionsSection"));
+  const memory = render(extension, "nanobot_memory");
+  assert.match(memory, /MEMORY_TAIL_MUST_SURVIVE/);
+  assert.doesNotMatch(memory, /truncated/);
 
-  const memoryTooLarge = await tempRoot(t);
-  const memoryFiles = [];
-  const memoryFixture = {};
-  for (let index = 0; index < 20; index++) {
-    const relative = `memory/topic-${index}.md`;
-    memoryFiles.push(relative);
-    memoryFixture[relative] = "M".repeat(800);
-  }
-  await writeFiles(memoryTooLarge, memoryFixture);
-  await assert.rejects(load(memoryTooLarge, { memoryFiles }), isBoundsError("memorySection"));
-
-  const memoryNearLimit = await tempRoot(t);
-  await writeFiles(memoryNearLimit, { "memory/MEMORY.md": "Z".repeat(1_000) });
-  const memoryAccepted = await load(memoryNearLimit, { memoryFiles: ["memory/MEMORY.md"] });
-  const memoryExtension = createContextExtension([{ conversationId: 1, ...memoryAccepted }]);
-  const memory = render(memoryExtension, "nanobot_memory");
-  assert.equal([...memory].filter((character) => character === "Z").length, 1_000);
-  assert.doesNotMatch(memory, /context truncated/);
-
-  const identityNearLimit = await tempRoot(t);
-  const identityAccepted = await load(identityNearLimit, {
-    identity: {
-      source: "<".repeat(CONTEXT_LIMITS.sourceChars),
-      content: "J".repeat(WORKSPACE_CONTEXT_LIMITS.maxIdentityChars),
-    },
-  });
-  const identityExtension = createContextExtension([{ conversationId: 1, ...identityAccepted }]);
-  const identity = render(identityExtension, "nanobot_identity");
-  assert.ok([...identity].length <= CONTEXT_LIMITS.sectionChars);
-  assert.equal([...identity].filter((character) => character === "J").length, WORKSPACE_CONTEXT_LIMITS.maxIdentityChars);
-  assert.doesNotMatch(identity, /context truncated/);
+  const identity = render(extension, "nanobot_identity");
+  assert.match(identity, /identity body/);
+  assert.match(identity, /Source: "session:identity"/);
+  assert.doesNotMatch(identity, /truncated/);
 });
 
 test("root rename or replacement during a load is detected", async (t) => {

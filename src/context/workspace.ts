@@ -36,15 +36,13 @@ import type { GatewayContextSnapshotProvider } from "../runtime.js";
 /** Deterministic provenance prefix for workspace files. */
 const WORKSPACE_SOURCE_PREFIX = "workspace:";
 
-/** Bounded loader limits. They are enforced before content reaches the renderer. */
+/**
+ * Loader bounds. They shape identifiers and the read path, and none of them
+ * rejects or shortens instructions or memory content: `AGENTS.md`, `SOUL.md`,
+ * `USER.md`, identity and the named memory files are loaded in full, as the
+ * Python reference does. There is no per-file or shared content budget.
+ */
 export const WORKSPACE_CONTEXT_LIMITS = Object.freeze({
-  maxBootstrapFiles: 3,
-  maxMemoryFiles: CONTEXT_LIMITS.maxMemorySources,
-  maxFiles: 3 + CONTEXT_LIMITS.maxMemorySources,
-  maxFileBytes: 64 * 1024,
-  maxTotalBytes: 128 * 1024,
-  maxTotalChars: CONTEXT_LIMITS.contextChars,
-  maxIdentityChars: CONTEXT_LIMITS.sectionChars - 1_600,
   maxSourceChars: CONTEXT_LIMITS.sourceChars,
   // The renderer prepends "workspace:" when it renders this provenance label.
   maxPathChars: CONTEXT_LIMITS.sourceChars - WORKSPACE_SOURCE_PREFIX.length,
@@ -97,17 +95,6 @@ export class WorkspaceContextInputError extends TypeError {
   }
 }
 
-export class WorkspaceContextBoundsError extends RangeError {
-  readonly code = "workspace_context_bound_exceeded";
-  readonly bound: string;
-
-  constructor(bound: string) {
-    super(`Workspace context exceeds the ${bound} bound`);
-    this.name = "WorkspaceContextBoundsError";
-    this.bound = bound;
-  }
-}
-
 export class WorkspaceContextPlatformError extends Error {
   readonly code = "workspace_context_platform_unsupported";
 
@@ -142,7 +129,6 @@ const PROC_FD = "/proc/self/fd";
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const RESTRICTED_ROOTS = Object.freeze(["/proc", "/sys", "/dev"]);
-const TRUNCATION_MARKER = "\n[context truncated at configured bounds]";
 
 interface SelectedFile {
   readonly segments: readonly string[];
@@ -152,8 +138,6 @@ interface SelectedFile {
 }
 
 interface LoadState {
-  bytes: number;
-  chars: number;
   readonly files: SelectedFile[];
   readonly directories: Map<string, Readonly<{ segments: readonly string[]; stat: BigIntStats }>>;
 }
@@ -277,9 +261,6 @@ function validatedRoot(value: unknown): string {
 function validatedMemoryFiles(value: unknown): readonly string[] {
   if (value === undefined) return Object.freeze([]);
   const length = ownArrayLength(value, "memoryFiles");
-  if (length > WORKSPACE_CONTEXT_LIMITS.maxMemoryFiles) {
-    throw new WorkspaceContextBoundsError("maxMemoryFiles");
-  }
   const seen = new Set<string>();
   const paths: string[] = [];
   for (let index = 0; index < length; index++) {
@@ -338,9 +319,6 @@ function validatedIdentity(value: unknown): ContextDocumentSnapshot | undefined 
   if (typeof content !== "string" || content.length === 0) {
     throw new WorkspaceContextInputError("identity.content must be a non-empty string");
   }
-  if (codePointCount(content) > WORKSPACE_CONTEXT_LIMITS.maxIdentityChars) {
-    throw new WorkspaceContextBoundsError("maxIdentityChars");
-  }
   return frozenDocument(source, content);
 }
 
@@ -352,107 +330,6 @@ function codePointCount(value: string): number {
   let count = 0;
   for (const _character of value) count++;
   return count;
-}
-
-function codePointPrefix(value: string, limit: number): { prefix: string; truncated: boolean } {
-  let count = 0;
-  let end = 0;
-  for (const character of value) {
-    if (count >= limit) return { prefix: value.slice(0, end), truncated: true };
-    end += character.length;
-    count++;
-  }
-  return { prefix: value, truncated: false };
-}
-
-/** Mirror the renderer's bounded-text rule so budget checks measure exact output. */
-function clipToBudget(value: string, limit: number): string {
-  if (limit <= 0) return "";
-  const { prefix, truncated } = codePointPrefix(value, limit);
-  if (!truncated) return value;
-  const markerCount = codePointCount(TRUNCATION_MARKER);
-  if (limit <= markerCount) return prefix;
-  return `${codePointPrefix(value, limit - markerCount).prefix}${TRUNCATION_MARKER}`;
-}
-
-/** Mirror the renderer's provenance escaping for exact section-size accounting. */
-function safeInlineForBudget(value: string): string {
-  return JSON.stringify(value).replace(/[<>&\u2028\u2029]/g, (character) => {
-    const code = character.codePointAt(0)!.toString(16).padStart(4, "0");
-    return `\\u${code}`;
-  });
-}
-
-/**
- * Reproduce `renderDocuments()` from context/index.ts closely enough to detect
- * whether it would truncate. Returns the full section text only when nothing
- * was clipped.
- */
-function renderedDocumentsForBudget(
-  documents: readonly (readonly [string, ContextDocumentSnapshot])[],
-  limit: number,
-): { text: string; truncated: boolean } {
-  if (documents.length === 0 || limit <= 0) return { text: "", truncated: false };
-  const chunks: string[] = [];
-  let used = 0;
-  let truncated = false;
-  for (const [label, document] of documents) {
-    const header = `## ${label}\nSource: ${safeInlineForBudget(document.source)}\n\n`;
-    const headerTaken = clipToBudget(header, limit - used);
-    if (headerTaken !== header) truncated = true;
-    chunks.push(headerTaken);
-    used += codePointCount(headerTaken);
-    if (headerTaken !== header || used >= limit) break;
-
-    const contentTaken = clipToBudget(document.content, limit - used);
-    if (contentTaken !== document.content) truncated = true;
-    chunks.push(contentTaken);
-    used += codePointCount(contentTaken);
-    if (contentTaken !== document.content || used >= limit) break;
-
-    const separatorTaken = clipToBudget("\n\n", limit - used);
-    if (separatorTaken !== "\n\n") truncated = true;
-    chunks.push(separatorTaken);
-    used += codePointCount(separatorTaken);
-  }
-  return { text: chunks.join(""), truncated };
-}
-
-/**
- * Fail closed when the existing renderer would clip any accepted document.
- * Per-section and shared-total budgets are checked with the renderer's exact
- * headings, provenance escaping, separators, and truncation rules.
- */
-function enforceRenderingBudgets(snapshot: MutableWorkspaceSnapshot): void {
-  let total = 0;
-
-  if (snapshot.identity !== undefined) {
-    const rendered = renderedDocumentsForBudget([["Identity", snapshot.identity]], CONTEXT_LIMITS.sectionChars);
-    if (rendered.truncated) throw new WorkspaceContextBoundsError("identitySection");
-    total += codePointCount(rendered.text);
-  }
-
-  const instructions: [string, ContextDocumentSnapshot][] = [];
-  if (snapshot.agents !== undefined) instructions.push(["AGENTS.md", snapshot.agents]);
-  if (snapshot.soul !== undefined) instructions.push(["SOUL.md", snapshot.soul]);
-  if (snapshot.user !== undefined) instructions.push(["USER.md", snapshot.user]);
-  if (instructions.length > 0) {
-    const rendered = renderedDocumentsForBudget(instructions, CONTEXT_LIMITS.sectionChars);
-    if (rendered.truncated) throw new WorkspaceContextBoundsError("instructionsSection");
-    total += codePointCount(rendered.text);
-  }
-
-  if (snapshot.memory !== undefined && snapshot.memory.length > 0) {
-    const memory = snapshot.memory.map((document, index) =>
-      [`Memory ${index + 1}`, document] as [string, ContextDocumentSnapshot]);
-    const rendered = renderedDocumentsForBudget(memory, CONTEXT_LIMITS.sectionChars);
-    if (rendered.truncated) throw new WorkspaceContextBoundsError("memorySection");
-    total += codePointCount(rendered.text);
-  }
-
-  if (total > CONTEXT_LIMITS.contextChars) {
-    throw new WorkspaceContextBoundsError("contextTotal");
-  }
 }
 
 function failureKind(code: string | undefined): WorkspaceFileFailureKind {
@@ -602,13 +479,7 @@ async function readPinnedFile(
     const before = await statHandle(handle, source);
     if (!before.isFile()) throw new WorkspaceContextFileError("not-regular", source);
     if (before.nlink !== 1n) throw new WorkspaceContextFileError("hardlink", source);
-    if (before.size > BigInt(WORKSPACE_CONTEXT_LIMITS.maxFileBytes)) {
-      throw new WorkspaceContextBoundsError("maxFileBytes");
-    }
     const size = Number(before.size);
-    if (state.bytes + size > WORKSPACE_CONTEXT_LIMITS.maxTotalBytes) {
-      throw new WorkspaceContextBoundsError("maxTotalBytes");
-    }
 
     const buffer = Buffer.alloc(size);
     let offset = 0;
@@ -643,11 +514,6 @@ async function readPinnedFile(
     }));
 
     const content = decodeUtf8(buffer, source);
-    state.bytes += size;
-    state.chars += codePointCount(content);
-    if (state.chars > WORKSPACE_CONTEXT_LIMITS.maxTotalChars) {
-      throw new WorkspaceContextBoundsError("maxTotalChars");
-    }
     return content;
   } finally {
     await handle.close().catch(() => undefined);
@@ -831,9 +697,6 @@ export async function loadWorkspaceContextSnapshot(
   const memoryFiles = validatedMemoryFiles(memoryField.found ? memoryField.value : undefined);
   const identityField = ownDataField(request, "identity", "Workspace context request");
   const identity = validatedIdentity(identityField.found ? identityField.value : undefined);
-  if (WORKSPACE_CONTEXT_LIMITS.maxBootstrapFiles + memoryFiles.length > WORKSPACE_CONTEXT_LIMITS.maxFiles) {
-    throw new WorkspaceContextBoundsError("maxFiles");
-  }
 
   const root = await openAbsoluteDirectoryNoFollow(rootPath);
   let rootBefore: BigIntStats;
@@ -848,8 +711,6 @@ export async function loadWorkspaceContextSnapshot(
   }
   const snapshot: MutableWorkspaceSnapshot = {};
   const state: LoadState = {
-    bytes: 0,
-    chars: identity === undefined ? 0 : codePointCount(identity.content),
     files: [],
     directories: new Map(),
   };
@@ -876,7 +737,6 @@ export async function loadWorkspaceContextSnapshot(
     }
     if (memories.length > 0) snapshot.memory = Object.freeze(memories);
 
-    enforceRenderingBudgets(snapshot);
     await verifySelectedFiles(root, state);
     await verifyWorkspace(root, rootPath, rootBefore, state);
   } finally {

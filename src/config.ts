@@ -2,19 +2,15 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { CONTEXT_LIMITS } from "./context/index.js";
 import {
-  MemoryContextBoundsError,
   MemoryContextInputError,
   validateMemoryLoadedFiles,
 } from "./context/memory.js";
 import {
-  WorkspaceContextBoundsError,
   WorkspaceContextInputError,
   validateWorkspaceMemoryFiles,
 } from "./context/workspace.js";
 import {
-  SkillsContextBoundsError,
   SkillsContextInputError,
   validateSkillNames,
 } from "./context/skills.js";
@@ -642,7 +638,7 @@ function skillNames(value: unknown, label: string): readonly string[] {
   try {
     return validateSkillNames(value, label);
   } catch (error) {
-    if (error instanceof SkillsContextInputError || error instanceof SkillsContextBoundsError) {
+    if (error instanceof SkillsContextInputError) {
       throw new Error(`${label} is invalid: ${error.message}`);
     }
     throw error;
@@ -665,25 +661,19 @@ function workspaceContextConfig(value: unknown): WorkspaceContextConfig {
     try {
       memoryFiles = validateWorkspaceMemoryFiles(raw.memoryFiles);
     } catch (error) {
-      if (error instanceof WorkspaceContextInputError || error instanceof WorkspaceContextBoundsError) {
+      if (error instanceof WorkspaceContextInputError) {
         throw new Error(`workspaceContext.memoryFiles is invalid: ${error.message}`);
       }
       throw error;
     }
   }
   if (memoryManifest) {
-    // The manifest is appended as one more memory source, so the configured
-    // files must leave a source slot for it and use names the loader accepts.
-    if (memoryFiles.length >= CONTEXT_LIMITS.maxMemorySources) {
-      throw new Error(
-        `workspaceContext.memoryFiles must name at most ${CONTEXT_LIMITS.maxMemorySources - 1} files ` +
-        "when workspaceContext.memoryManifest is enabled",
-      );
-    }
+    // The manifest is appended as one more memory source; the configured files
+    // must use names the loader accepts.
     try {
       validateMemoryLoadedFiles(memoryFiles);
     } catch (error) {
-      if (error instanceof MemoryContextInputError || error instanceof MemoryContextBoundsError) {
+      if (error instanceof MemoryContextInputError) {
         throw new Error(`workspaceContext.memoryFiles is invalid for the memory manifest: ${error.message}`);
       }
       throw error;

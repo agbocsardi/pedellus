@@ -193,7 +193,6 @@ test("workspaceContext config rejects unsafe, duplicate, and unknown selections"
     "memory/MEMORY.txt",
     "memory/MEMORY.md\\..\\escape.md",
     ["memory/MEMORY.md", "memory/MEMORY.md"],
-    Array.from({ length: 33 }, (_value, index) => `memory/file-${index}.md`),
   ]) {
     assert.throws(
       () => parseConfig({ ...base, workspaceContext: { memoryFiles } }),
@@ -201,6 +200,12 @@ test("workspaceContext config rejects unsafe, duplicate, and unknown selections"
       `expected rejection for ${JSON.stringify(memoryFiles)}`,
     );
   }
+  // Selection count is the owner's choice: no source-count cap rejects a long list.
+  const manyFiles = Array.from({ length: 200 }, (_value, index) => `memory/file-${index}.md`);
+  assert.deepEqual(
+    parseConfig({ ...base, workspaceContext: { memoryFiles: manyFiles, memoryManifest: true } }).workspaceContext.memoryFiles,
+    manyFiles,
+  );
   assert.throws(
     () => parseConfig({ ...base, workspaceContext: { bootstrapFiles: ["AGENTS.md"] } }),
     /Unknown workspaceContext field/,

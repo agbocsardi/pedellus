@@ -1,6 +1,6 @@
 # Opt-in context composition
 
-`src/context/index.ts` is a bounded, opt-in Durable extension for composing context
+`src/context/index.ts` is an opt-in Durable extension for composing context
 from **host-supplied snapshots**. It does not access the filesystem, environment,
 credential store, coding-agent resource loader, or extension discovery. `openGateway`
 installs it only when the host supplies `contextSnapshotProvider`; without that option,
@@ -11,7 +11,8 @@ policy remains unchanged.
 ## API and scope
 
 Import `createContextExtension()` from the package SDK (or `src/context/index.ts`).
-Give it a bounded array of snapshots keyed by their Durable `conversationId`:
+Give it a snapshot array keyed by their Durable `conversationId` (the 256-snapshot
+fan-out bound is the only count limit):
 
 ```ts
 const context = createContextExtension([{
@@ -105,19 +106,26 @@ added. The tools section is rendered from the current `PromptInput.agent.tools`
 enable tools. Tools callable only by other tools are not listed. No legacy Python
 tool names are copied into the prompt.
 
-## Bounds and skill rules
+## Bounds
 
-The exported `CONTEXT_LIMITS` documents hard bounds: 256 conversation snapshots;
-**per conversation**, 48,000 Unicode code points for context section values,
-16,000 per context section, and 2,000 for tool visibility; 32 memory sources;
-128 listed tool names; 256 code points per provenance label; and 1,024 per
-description. There is no skill-record inspection cap: the summary is rendered in
-full subject to the section bound, and truncation is marked. Section and total
-truncation is marked, and slicing preserves Unicode code points. The
-50,000-code-point section-value bound (48,000 context + 2,000 tool visibility) is
-also **per conversation**, not an aggregate across the 256 snapshots. The
-snapshot-count cap limits fan-out; aggregate retained strings across all
-snapshots can be larger.
+This extension applies no context size budget. Everything the host selects is
+composed in full: identity, `AGENTS.md`/`SOUL.md`/`USER.md`, every memory
+document, the whole skill summary, and every model-facing tool name. There is no
+per-section, per-conversation or total character cap, no memory source count
+cap, no listed-tool cap, and no description cap, so no text can be silently
+shortened, omitted or rejected by a size policy. This matches the Python
+reference, which loads those documents completely.
+
+The exported `CONTEXT_LIMITS` documents only what remains: 256 conversation
+snapshots (a fan-out bound on the snapshot table, not a content budget), 256
+code points per provenance label, and 128 code units per skill name. Labels and
+names are metadata and locators; clipping one never removes the content it
+identifies. The snapshot-count cap limits fan-out; aggregate retained strings
+across all snapshots can be large.
+
+The real limits that still apply are the model's own context window and Durable's
+compaction, plus the operator's choice of what to include. Nothing in this
+module re-imposes a content budget on top of them.
 
 An optional host-rendered `skillSummary` is the entire skills section
 (`## Available skills`): names, descriptions and locators. Skill bodies are
@@ -129,7 +137,7 @@ An enabled skill's body is never placed in a prompt by this extension: `always`
 frontmatter, a config selection or `enabled: true` only decide whether the
 gateway's separate read-only `skill` tool may return that body on demand. The
 host applies Nanobot's disabled-skill configuration and requirement checks with
-the bounded loader in [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md); this extension
+the loader in [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md); this extension
 reads only the supplied summary and tool table. Skill frontmatter is stripped
 when the tool returns a body; YAML is not parsed here.
 
@@ -142,13 +150,11 @@ The source-backed mapping is:
   `AGENTS.md`/`SOUL.md`/`USER.md`, memory, always-skill bodies, skill summaries,
   archived summaries, runtime annotations, and a tool contract. This extension
   accepts explicit bootstrap/memory/skill snapshots. `renderNanobotIdentity()`
-  deterministically renders a bounded identity subset from host-provided runtime,
-  workspace path, and known channel values. It is not a Jinja engine and performs
-  no platform/environment discovery. It rejects control characters in the
-  workspace path and rejects over-limit inputs/output before composing text. Its
-  stricter output budget reserves room for the native identity heading and worst-
-  case escaped provenance label, so accepted identity content survives section
-  composition without truncation. Platform policy is explicitly not accepted by
+  deterministically renders a deliberately reduced identity subset from
+  host-provided runtime, workspace path, and known channel values. It is not a
+  Jinja engine and performs no platform/environment discovery. It rejects control
+  characters in the workspace path. It applies no size limit: accepted identity
+  content is composed in full. Platform policy is explicitly not accepted by
   this helper. It deliberately omits Python identity's platform-policy template,
   memory/history/skill file claims, untrusted-web snippet, and tool-use contract:
   those capabilities are not established by this package's gateway. This slice
@@ -159,7 +165,7 @@ The source-backed mapping is:
   progressive description/path summary. This extension does no discovery of its
   own: the host supplies the summary and an on-demand body table, and the
   extension renders neither `always` bodies nor any other skill body. The opt-in
-  [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md) loader performs the bounded
+  [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md) loader performs the
   explicit-root discovery, requirement checks and summary that the host passes
   in; no ambient roots are scanned and no paths are loaded here. Duplicate skill
   names in one supplied snapshot no longer need to be rejected because nothing is
@@ -167,7 +173,7 @@ The source-backed mapping is:
 - `MemoryStore.get_memory_context()` loads system memory and non-template legacy
   `MEMORY.md` material with paragraph deduplication; `get_memory_tree_context()`
   indexes topic files. This extension only inserts memory snapshots explicitly
-  supplied by the host; the opt-in workspace host can append the bounded tree
+  supplied by the host; the opt-in workspace host can append the full tree
   from [`MEMORY_CONTEXT.md`](./MEMORY_CONTEXT.md). The extension itself does not
   discover/deduplicate topics, rank or retrieve them, build a memory tree, access
   `history.jsonl`, filter archived context by session/Dream cursor, or implement
@@ -192,7 +198,7 @@ For provenance, semantic references are `nanobot/agent/context.py`,
 `nanobot/templates/memory/MEMORY.md`. The conversion decision is deliberate:
 
 - the host supplies identity values and chooses trustworthy sources; the identity
-  helper renders a bounded, deliberately reduced subset and reads no ambient state;
+  helper renders a deliberately reduced subset in full and reads no ambient state;
 - this extension only composes supplied strings and never decides whether a file
   or skill is trusted;
 - host-mapped snapshots in a dedicated per-Harness registry replace automatic

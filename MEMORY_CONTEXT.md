@@ -1,6 +1,6 @@
 # Explicit-root topic memory discovery and manifest
 
-`src/context/memory.ts` is a bounded, read-only helper for the workspace
+`src/context/memory.ts` is a read-only helper for the workspace
 Markdown memory surface. Markdown files are authoritative; Durable keeps the
 conversation transcript and runtime state. There is no second store, cache,
 index, cursor, or database here.
@@ -48,10 +48,11 @@ The result contains:
   frontmatter-stripped body length in Unicode code points.
 - `manifest`: `# Memory Tree` text with the Python intro line and one line per
   entry: ``- `memory/x.md` (topic, 123 chars): description``. More than the entry
-  cap, a short character budget, or a stopped directory scan adds a visible
-  `more memory files` line; entries are never dropped without that line.
+  cap or a stopped directory scan adds a visible `more memory files` line;
+  entries are never dropped without that line. Discovery has no character
+  budget, so a manifest is never shortened to fit one.
   Discovered files that cannot be read add a visible `N memory files skipped
-  (unreadable, oversized, or invalid)` line instead of an entry, so the
+  (unreadable, invalid, or unreadable as UTF-8)` line instead of an entry, so the
   manifest never claims their bodies were read.
 - `document`: a frozen `{ source: "memory:manifest", content: manifest }` for
   `ConversationContextSnapshot.memory`; absent when the manifest is empty.
@@ -84,16 +85,16 @@ Under `<workspaceRoot>/memory/`, recursively:
 
 Only files explicitly named in `loadedFiles` are read outside that topic set.
 Each must exist and be a regular, non-symlinked, single-link file; a missing,
-unreadable, oversized, or non-UTF-8 explicitly named file rejects the whole load
+unreadable, or non-UTF-8 explicitly named file rejects the whole load
 so configured content is never silently replaced. A supplied loaded file is
-always listed even when the entry cap is reached; only the manifest character
-budget can shorten the list, and that omission is counted visibly.
+always listed even when the entry cap is reached.
 
-A discovered topic that is unreadable, oversized, invalid UTF-8, missing after
+A discovered topic that is unreadable, invalid UTF-8, missing after
 discovery, or changed during the read is skipped and counted in the visible
 skipped line, so these file errors do not block Gateway reopen. An unreadable
 memory directory still fails discovery and can block reopen. No skipped topic is
-listed as if its body had been read.
+listed as if its body had been read. A topic's size is never a reason to skip it:
+the file is read in full to derive its description and body length.
 
 Entries are sorted by path with code-unit comparison, so ordering is stable
 across locales. Every file is re-read on each call; a topic written by the native
@@ -111,36 +112,33 @@ clipped to 240 code points with a trailing `…`; control characters are replace
 with spaces so each entry stays one line. The frontmatter reader supports only
 the flat `key: value` subset used by memory files (CRLF is tolerated).
 
-## Bounds and failure behaviour
+## Limits and failure behaviour
 
-`MEMORY_CONTEXT_LIMITS` is exported: 80 manifest entries, 32 explicit loaded
-files, 64 KiB per file, 5 MiB aggregate (80 files at the per-file cap),
-15,488 manifest code points (`sectionChars - 512` reserved for the renderer
-heading and provenance), 240 description code points, 246-character paths, 8
-path segments, 64 characters per segment, 4,096 inspected directory entries,
-and 4,096-character roots.
+`MEMORY_CONTEXT_LIMITS` is exported: 80 manifest entries (the Python memory-tree
+cap), 240 description code points (the Python description cap), 246-character
+paths, 8 path segments, 64 characters per segment, 4,096 inspected directory
+entries, and 4,096-character roots.
 
-The entry cap and byte aggregate are practical for a real workspace: the byte
-aggregate is exactly the entry cap times the per-file cap, so it cannot reject a
-load that the entry cap accepts, and peak memory stays at one file because
-bodies are discarded. An over-budget manifest is shortened, not rejected, and a
+There is no manifest character budget, no per-file byte cap and no aggregate
+byte cap. A manifest lists every reached entry with its full description prefix,
+and a topic file of any size is read for its description and body length, as
+Python does. Peak memory stays at one file because bodies are discarded. A
 directory tree beyond the inspected-entry bound stops discovery with a visible
-manifest line. Neither case silently drops entries or fails an ordinary
-workspace.
+manifest line; nothing is dropped silently.
 
-Explicitly loaded file failures fail closed with `MemoryContextBoundsError`,
-`MemoryContextFileError` (a stable kind and workspace-relative source, never an
-absolute path or file body), or `MemoryContextInputError`. A missing `memory/`
+Explicitly loaded file failures fail closed with `MemoryContextFileError` (a
+stable kind and workspace-relative source, never an
+absolute path or file body) or `MemoryContextInputError`. A missing `memory/`
 directory is not an error and is never created. Discovered-topic failures of the
 same kinds are skipped and counted as above, so one stale topic cannot prevent
-startup or reopen.
+startup or reopen. No context bound raises an error any more: the former
+`MemoryContextBoundsError` is gone with the size caps it reported.
 
-The manifest is bounded on its own, not together with other memory documents.
-A host adding it beside many other memory sources must keep the shared renderer
-section budget; the helper does not see those sources. `workspace-host.ts`
-appends the manifest after the configured memory files, matching Python's order,
-so a combined memory section that exceeds the renderer budget is clipped with
-the renderer's visible truncation marker.
+The manifest is composed on its own, not together with other memory documents.
+A host adding it beside many other memory sources reaches the renderer in full:
+the renderer applies no section or conversation budget, so the combined memory
+section is never clipped. `workspace-host.ts` appends the manifest after the
+configured memory files, matching Python's order.
 
 ## Safety and limitations
 
@@ -185,8 +183,7 @@ slice.
 `workspaceContextGatewayOptions()` reads `workspaceContext.memoryManifest`.
 When it is `true`:
 
-- configuration rejects non-boolean values and more than 31 `memoryFiles`, since
-  the manifest needs one of the 32 memory source slots;
+- configuration rejects non-boolean values; `memoryFiles` has no count cap;
 - config parsing also applies `validateMemoryLoadedFiles()` so manifest and
   workspace selections agree at startup;
 - each conversation snapshot loads `loadWorkspaceContextSnapshot()` first, then
@@ -199,7 +196,7 @@ When it is `true`:
 - the snapshot provider is re-run on every gateway open, so a topic write made
   through the configured native tools is present after reopen;
 - a loaded-file error rejects conversation setup instead of installing false
-  content. Broken discovered topics, shortened manifests, and stopped scans are
+  content. Broken discovered topics and stopped scans are
   not errors; each has a visible manifest line.
 
 The gateway's `read`/`edit`/`write` tools come from `toolAllowlist`; reopening
@@ -208,9 +205,9 @@ Compaction and per-conversation snapshot capture are unchanged: the snapshot
 is host context, not transcript state.
 
 Earlier synthetic probes exercised a fresh gateway read, a native topic write,
-close/reopen, manifest reload, oversized/invalid-UTF-8/
+close/reopen, manifest reload, invalid-UTF-8/
 unreadable discovered topics across reopen, loud loaded-file failures, empty
 configured files, protected injected names (`HISTORY.md`,
-`memory/system/MEMORY.md`), 200 topics, 80 maximum-size files, a >4,096-entry
+`memory/system/MEMORY.md`), 200 topics, 80 large files, a >4,096-entry
 tree, and a loaded-file parent symlink. They used temporary directories only and
 were not committed.

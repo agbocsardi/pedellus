@@ -37,17 +37,14 @@ const FRONTMATTER = /^---\s*\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n|$)/;
 const FRONTMATTER_KEY = /^[A-Za-z0-9_.-]+$/;
 
 /**
- * Per-file and per-name safety limits. There is deliberately no inventory count
- * cap and no aggregate byte cap: every discovered `SKILL.md` is reported, and a
- * large workspace/builtin inventory must not fail discovery. Prompt size is
- * bounded later by the renderer, which marks truncation visibly.
+ * Per-name safety limits. There is deliberately no inventory count cap, no
+ * skill-file byte cap, no frontmatter or metadata value cap, and no aggregate
+ * byte cap: every discovered `SKILL.md` is reported with its full description
+ * and body, as in the Python reference. Prompt size is not clipped by a size
+ * budget either; the renderer composes the summary in full.
  */
 export const SKILLS_CONTEXT_LIMITS = Object.freeze({
   maxSkillNameCodeUnits: CONTEXT_LIMITS.maxSkillNameCodeUnits,
-  maxSkillFileBytes: 64 * 1024,
-  maxFrontmatterChars: 16 * 1024,
-  /** Smaller than the frontmatter bound so an oversized metadata value has its own reason. */
-  maxMetadataValueChars: 8 * 1024,
   maxRequirementEntryChars: 256,
   maxRootChars: 4_096,
 });
@@ -75,10 +72,8 @@ export type SkillMetadataStatus = "absent" | "parsed" | "unsupported";
 /** Stable reason codes for metadata that this bounded parser cannot represent. */
 export type SkillMetadataReason =
   | "frontmatter-unterminated"
-  | "frontmatter-oversized"
   | "metadata-block-form"
   | "metadata-unparseable"
-  | "metadata-oversized"
   | "metadata-not-object";
 
 export interface SkillMetadataReport {
@@ -159,17 +154,6 @@ export class SkillsContextInputError extends TypeError {
   constructor(message: string) {
     super(message);
     this.name = "SkillsContextInputError";
-  }
-}
-
-export class SkillsContextBoundsError extends RangeError {
-  readonly code = "skills_context_bound_exceeded";
-  readonly bound: string;
-
-  constructor(bound: string) {
-    super(`Skills context exceeds the ${bound} bound`);
-    this.name = "SkillsContextBoundsError";
-    this.bound = bound;
   }
 }
 
@@ -331,7 +315,6 @@ function deepFreeze<T>(value: T): T {
 }
 
 function parseJsonObject(value: string): Record<string, unknown> | undefined {
-  if (value.length > SKILLS_CONTEXT_LIMITS.maxMetadataValueChars) return undefined;
   try {
     const parsed = JSON.parse(value) as unknown;
     return isRecord(parsed) ? deepFreeze(parsed) : undefined;
@@ -370,12 +353,10 @@ interface MetadataValueParse {
 }
 
 function parseMetadataValue(raw: string): MetadataValueParse {
-  if (raw.length > SKILLS_CONTEXT_LIMITS.maxMetadataValueChars) return { reason: "metadata-oversized" };
   const scalar = parseScalar(raw);
   // YAML null carries no gates; any other non-object scalar is an unrepresentable form.
   if (scalar === null) return { value: Object.freeze({}) };
   if (typeof scalar !== "string") return { reason: "metadata-not-object" };
-  if (scalar.length > SKILLS_CONTEXT_LIMITS.maxMetadataValueChars) return { reason: "metadata-oversized" };
   let parsed: unknown;
   try {
     parsed = JSON.parse(scalar) as unknown;
@@ -403,13 +384,8 @@ function hasIndentedContinuation(lines: readonly string[], start: number): boole
  */
 function parseFrontmatter(content: string): FrontmatterParse {
   if (!content.startsWith("---")) return { status: "absent" };
-  const match = FRONTMATTER.exec(content.slice(0, SKILLS_CONTEXT_LIMITS.maxFrontmatterChars));
-  if (!match) {
-    return {
-      status: "unsupported",
-      reason: FRONTMATTER.test(content) ? "frontmatter-oversized" : "frontmatter-unterminated",
-    };
-  }
+  const match = FRONTMATTER.exec(content);
+  if (!match) return { status: "unsupported", reason: "frontmatter-unterminated" };
   const parsed: Record<string, unknown> = {};
   const lines = match[1]!.split(/\r?\n/);
   let reason: SkillMetadataReason | undefined;
@@ -447,9 +423,7 @@ function ownValue(value: unknown, key: string): unknown {
 
 function parseMetadataObject(value: unknown): Record<string, unknown> | undefined {
   if (isRecord(value)) return value;
-  if (typeof value !== "string" || value.length > SKILLS_CONTEXT_LIMITS.maxMetadataValueChars) {
-    return undefined;
-  }
+  if (typeof value !== "string") return undefined;
   return parseJsonObject(value);
 }
 
@@ -648,18 +622,12 @@ async function scanSkillRoot(
       continue;
     }
     if (!info.isFile()) continue;
-    if (info.size > SKILLS_CONTEXT_LIMITS.maxSkillFileBytes) {
-      throw new SkillsContextBoundsError("maxSkillFileBytes");
-    }
 
     let buffer: Buffer;
     try {
       buffer = await readFile(skillFile);
     } catch (error) {
       throw fileFailure(error, source);
-    }
-    if (buffer.length > SKILLS_CONTEXT_LIMITS.maxSkillFileBytes) {
-      throw new SkillsContextBoundsError("maxSkillFileBytes");
     }
 
     const content = decodeUtf8(buffer, source);
@@ -767,7 +735,7 @@ export async function loadSkillsContext(
     const available = requirements.status !== "unsupported" &&
       requirements.missingBins.length === 0 && requirements.missingEnv.length === 0;
     const description = typeof record.metadata?.description === "string" && record.metadata.description.length > 0
-      ? clipCodePoints(record.metadata.description, CONTEXT_LIMITS.descriptionChars)
+      ? record.metadata.description
       : record.name;
     discovered.push(Object.freeze({
       name: record.name,

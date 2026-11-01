@@ -40,23 +40,16 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const SAFE_MEMORY_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const PROTECTED_NAMES = Object.freeze(new Set(["MEMORY.md", "HISTORY.md"]));
 
-/** Bounded discovery limits. They are enforced before the manifest is built. */
+/**
+ * Discovery limits. The entry cap and the description cap match the Python
+ * memory tree, and the directory scan bound stops an unbounded walk with a
+ * visible note. There is deliberately no manifest character budget and no
+ * per-file or shared byte budget: the manifest lists every reached entry and a
+ * topic file is read in full for its description and body length, as Python does.
+ */
 export const MEMORY_CONTEXT_LIMITS = Object.freeze({
   /** Maximum entries in one manifest, matching Python's memory-tree cap. */
   maxEntries: 80,
-  /** Explicitly loaded files the host may name. */
-  maxLoadedFiles: CONTEXT_LIMITS.maxMemorySources,
-  /** Bytes read from one memory file while deriving its manifest entry. */
-  maxFileBytes: 64 * 1024,
-  /**
-   * Bytes read across all discovered and loaded files in one call. The entry
-   * cap is the practical bound: every listed file may use the per-file cap, so
-   * the manifest never fails only because an ordinary workspace has many
-   * entries. Peak memory stays at one file because bodies are discarded.
-   */
-  maxTotalBytes: 80 * 64 * 1024,
-  /** Manifest code points. Leaves room for the renderer heading/provenance. */
-  maxManifestChars: CONTEXT_LIMITS.sectionChars - 512,
   /** Description code points, matching Python's memory-tree description cap. */
   maxDescriptionChars: 240,
   maxSourceChars: CONTEXT_LIMITS.sourceChars,
@@ -64,7 +57,7 @@ export const MEMORY_CONTEXT_LIMITS = Object.freeze({
   maxPathChars: CONTEXT_LIMITS.sourceChars - WORKSPACE_SOURCE_PREFIX.length,
   maxPathSegmentChars: 64,
   maxPathSegments: 8,
-  /** Directory entries inspected in one call; a tree beyond this fails closed. */
+  /** Directory entries inspected in one call; a tree beyond this reports a visible stop. */
   maxScannedEntries: 4_096,
   maxRootChars: 4_096,
 });
@@ -122,17 +115,6 @@ export class MemoryContextInputError extends TypeError {
   }
 }
 
-export class MemoryContextBoundsError extends RangeError {
-  readonly code = "memory_context_bound_exceeded";
-  readonly bound: string;
-
-  constructor(bound: string) {
-    super(`Memory context exceeds the ${bound} bound`);
-    this.name = "MemoryContextBoundsError";
-    this.bound = bound;
-  }
-}
-
 export class MemoryContextFileError extends Error {
   readonly code = "memory_context_file_error";
   readonly kind: MemoryFileFailureKind;
@@ -150,10 +132,6 @@ export class MemoryContextFileError extends Error {
 interface ScanState {
   scanned: number;
   truncated: boolean;
-}
-
-interface ReadState {
-  bytes: number;
 }
 
 interface FrontmatterSplit {
@@ -274,9 +252,6 @@ export function validateMemoryTopicPath(value: unknown): string {
 export function validateMemoryLoadedFiles(value: unknown): readonly string[] {
   if (value === undefined) return Object.freeze([]);
   if (!Array.isArray(value)) throw new MemoryContextInputError("loadedFiles must be an array");
-  if (value.length > MEMORY_CONTEXT_LIMITS.maxLoadedFiles) {
-    throw new MemoryContextBoundsError("maxLoadedFiles");
-  }
   const seen = new Set<string>();
   const paths: string[] = [];
   for (const entry of value) {
@@ -476,7 +451,6 @@ function decodeUtf8(buffer: Buffer, source: string): string {
 async function readManifestEntry(
   rootPath: string,
   path: string,
-  state: ReadState,
 ): Promise<{ description: string; bodyChars: number }> {
   const segments = path.split("/");
   // Check every ancestor below the workspace root. `lstat` on the full path
@@ -505,12 +479,6 @@ async function readManifestEntry(
   }
   if (info.isSymbolicLink()) throw new MemoryContextFileError("symlink", path);
   if (!info.isFile()) throw new MemoryContextFileError("not-regular", path);
-  if (info.size > MEMORY_CONTEXT_LIMITS.maxFileBytes) {
-    throw new MemoryContextBoundsError("maxFileBytes");
-  }
-  if (state.bytes + info.size > MEMORY_CONTEXT_LIMITS.maxTotalBytes) {
-    throw new MemoryContextBoundsError("maxTotalBytes");
-  }
 
   const flags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
   const handle: FileHandle = await open(absolute, flags).catch((error: unknown) => {
@@ -522,11 +490,8 @@ async function readManifestEntry(
     if (!before.isFile()) throw new MemoryContextFileError("not-regular", path);
     if (before.nlink !== 1n) throw new MemoryContextFileError("hardlink", path);
     const size = Number(before.size);
-    if (!Number.isSafeInteger(size) || size > MEMORY_CONTEXT_LIMITS.maxFileBytes) {
-      throw new MemoryContextBoundsError("maxFileBytes");
-    }
-    if (state.bytes + size > MEMORY_CONTEXT_LIMITS.maxTotalBytes) {
-      throw new MemoryContextBoundsError("maxTotalBytes");
+    if (!Number.isSafeInteger(size)) {
+      throw new MemoryContextFileError("changed", path);
     }
     buffer = Buffer.alloc(size);
     let offset = 0;
@@ -550,7 +515,6 @@ async function readManifestEntry(
     await handle.close().catch(() => undefined);
   }
 
-  state.bytes += buffer.length;
   return parseEntry(decodeUtf8(buffer, path));
 }
 
@@ -581,9 +545,8 @@ function composeManifest(
 }
 
 /**
- * Fit the manifest to its character budget by showing fewer entries, never by
- * failing the load. Every hidden entry, whether hidden by the entry cap or by
- * this budget, is counted in the visible `more memory files` line.
+ * Compose the manifest in full. Entry and scan bounds are already reflected in
+ * the arguments, and every hidden entry is counted in a visible line.
  */
 function buildManifest(
   entries: readonly MemoryTopicEntry[],
@@ -592,14 +555,7 @@ function buildManifest(
   scanTruncated: boolean,
 ): string {
   if (entries.length === 0 && capOmitted === 0 && skipped === 0 && !scanTruncated) return "";
-  for (let shown = entries.length; shown >= 0; shown--) {
-    const omitted = capOmitted + (entries.length - shown);
-    const manifest = composeManifest(entries.slice(0, shown), omitted, skipped, scanTruncated);
-    if (codePointCount(manifest) <= MEMORY_CONTEXT_LIMITS.maxManifestChars) return manifest;
-  }
-  // A header plus one `more` line is far inside the budget, so this is
-  // unreachable; return the smallest manifest rather than a partial one.
-  return composeManifest([], entries.length + capOmitted, skipped, scanTruncated);
+  return composeManifest(entries, capOmitted, skipped, scanTruncated);
 }
 
 /**
@@ -640,18 +596,17 @@ export async function loadMemoryContext(request: MemoryContextRequest): Promise<
   const shownSet = new Set(shown);
   const more = [...topics, ...loadedFiles].filter((path) => !shownSet.has(path)).length;
 
-  const readState: ReadState = { bytes: 0 };
   const entries: MemoryTopicEntry[] = [];
   let skipped = 0;
   for (const path of shown) {
     const isLoaded = loaded.has(path);
     let parsed: { description: string; bodyChars: number };
     try {
-      parsed = await readManifestEntry(rootPath, path, readState);
+      parsed = await readManifestEntry(rootPath, path);
     } catch (error) {
-      // A discovered topic may be stale, unreadable, oversized or not UTF-8;
-      // that must not block Gateway reopen. Explicitly loaded files stay loud.
-      if (!isLoaded && (error instanceof MemoryContextFileError || error instanceof MemoryContextBoundsError)) {
+      // A discovered topic may be stale, unreadable or not UTF-8; that must not
+      // block Gateway reopen. Explicitly loaded files stay loud.
+      if (!isLoaded && error instanceof MemoryContextFileError) {
         skipped++;
         continue;
       }

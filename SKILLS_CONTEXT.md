@@ -1,6 +1,6 @@
 # Explicit-root skills discovery and selection
 
-`src/context/skills.ts` is a bounded, opt-in loader that turns Markdown skill
+`src/context/skills.ts` is an opt-in loader that turns Markdown skill
 files into the existing `ContextSkillSnapshot` shape. Markdown remains
 authoritative; this module stores no runtime state, installs nothing, and never
 executes a skill. It reads only the two roots the host names.
@@ -239,8 +239,8 @@ skill fails closed (`enabled: false`, so the tool refuses it):
 | No `metadata` key | `absent`; requirements `none` |
 | Single-line JSON `metadata` object | `parsed`; requirements `evaluated` when a list is declared, else `none` |
 | `metadata:` with an indented block mapping | `unsupported` (`metadata-block-form`); requirements `unsupported` |
-| Metadata value over 8 KiB, or a JSON array/scalar | `unsupported` (`metadata-oversized`, `metadata-not-object`, `metadata-unparseable`) |
-| Frontmatter unterminated, or over 16 KiB | `unsupported` (`frontmatter-unterminated`, `frontmatter-oversized`) |
+| A JSON array/scalar, or an unparseable metadata value | `unsupported` (`metadata-not-object`, `metadata-unparseable`) |
+| Frontmatter unterminated | `unsupported` (`frontmatter-unterminated`) |
 | `requires` not an object, `bins`/`env` not a list, or a list entry that is not a bounded string | requirements `unsupported` (`requires-not-object`, `requires-bins-not-list`, `requires-env-not-list`, `requires-…-entry-unsupported`) |
 
 A `requires` list that is partly readable keeps the readable names for the
@@ -248,33 +248,31 @@ report, but the skill remains unavailable because the declared gate set is
 incomplete. `metadata: null` carries no gates and is treated as parsed, matching
 YAML `null` → Python's empty payload.
 
-## Bounds and file safety
+## Limits and file safety
 
-`SKILLS_CONTEXT_LIMITS` contains only per-file and per-name safety bounds:
-128-code-unit names, 64 KiB per `SKILL.md`, 16 KiB frontmatter, 8 KiB metadata
-value, 256-character requirement entries, and 4,096-character roots. There is
-**no inventory count cap and no aggregate byte cap**: every discovered
-`SKILL.md` is reported, every requested disabled name is accepted, and
+`SKILLS_CONTEXT_LIMITS` contains only per-name safety bounds: 128-code-unit
+names, 256-character requirement entries, and 4,096-character roots. There is
+**no inventory count cap, no per-file byte cap, no frontmatter or metadata value
+cap, and no aggregate byte cap**: every discovered `SKILL.md` is reported with
+its full description and body, every requested disabled name is accepted, and
 every refused directory entry is listed once. A realistic workspace plus builtin
 inventory (for example 55 workspace skills and 13 builtins with one duplicate)
-loads completely. Discovery fails closed only on unreadable files, invalid
-UTF-8, or a per-file bound violation; no partial result is returned. Every body
-is held in the snapshot, so inventory size is bounded by host disk/memory rather
-than by an arbitrary count.
+loads completely, and so does a skill whose `SKILL.md` or description is larger
+than those earlier caps. Discovery fails closed only on unreadable files or
+invalid UTF-8; no partial result is returned. Every body is held in the
+snapshot, so inventory size is bounded by host disk/memory rather than by an
+arbitrary count or byte policy.
 
 Scope is accidental damage, not adversarial confinement. Reads use normal
-filesystem calls with per-file bounds, and frontmatter parsing is bounded.
+filesystem calls, and frontmatter parsing is bounded by the file itself.
 Symlinked skill directories and symlinked `SKILL.md` files are refused and
 reported rather than followed; explicit roots are used as supplied. There is no
 `/proc/self/fd` pinning, hard-link rejection, or post-read race verification.
 
-Prompt size is bounded by the renderer, not by discovery: 16,000 code points per
-section and 48,000 per conversation. With a large inventory the `nanobot_skills`
-section is clipped with its visible `[context truncated at configured bounds]`
-marker. Skill bodies are not included in the prompt. Truncation is never silent. The `skill` tool remains a complete fallback:
-its listing is the full summary (bounded only by the tool's declared output
-limits), so a skill clipped out of the prompt summary can still be discovered
-and loaded on demand.
+Prompt size is not clipped by this package: the renderer composes the whole
+`nanobot_skills` summary, so every discovered name, description and locator
+reaches the model. The `skill` tool returns the full summary and any body on
+demand; only the native tool-output limit of that tool applies.
 
 ## Deliberate parity gaps
 
@@ -287,7 +285,7 @@ and loaded on demand.
   directory name; this parser keeps the text as the description. That is a
   documented difference, not parity.
 - Skill names come from directory names, as in Python; frontmatter `name` is not
-  authoritative. Directory names that are unsafe or exceed the context limit are
+  authoritative. Directory names that are unsafe or exceed the name bound are
   reported in `skipped`. Directory entries that are symlinks or not directories
   are reported and skipped, as are symlinked `SKILL.md` files.
 - `metadata.nanobot.os` gating and install hints are parsed but not acted on;

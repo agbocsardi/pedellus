@@ -34,13 +34,12 @@ snapshot provider and `openGateway` installs no context extension.
   defaults to `[]`. No memory file is discovered. Paths are validated with the
   loader's rules at config parse time and again before reading.
 - `memoryManifest` is absent or `false` by default. When `true`, each snapshot
-  also appends the bounded `# Memory Tree` manifest from
+  also appends the `# Memory Tree` manifest from
   [`MEMORY_CONTEXT.md`](./MEMORY_CONTEXT.md); configured `memoryFiles` that
   were actually injected are its `loaded` entries and every other topic is read
   on demand with the configured native `read` tool. An empty configured file is
-  omitted by this loader, so the manifest does not mark it `loaded`. The
-  manifest uses one of the 32 memory source slots, so at most 31 `memoryFiles`
-  are accepted in that mode.
+  omitted by this loader, so the manifest does not mark it `loaded`. `memoryFiles`
+  has no count cap.
 - `skills` is absent by default and adds no discovery. When present,
   `builtinSkillsRoot` must be an absolute path to an existing directory and
   `disabledSkills` is an explicit name list validated per entry, with no count
@@ -165,11 +164,9 @@ descriptor and used for a bounded indexed loop.
 | Unreadable file/directory | Rejected (`unreadable`). |
 | Invalid UTF-8 | Rejected (`encoding`). |
 | Invalid root, relative root, `/`, `~/.nanobot`, `/proc`, `/sys`, `/dev` | `WorkspaceContextInputError`. |
-| File or aggregate bound exceeded | `WorkspaceContextBoundsError`. |
 | Observable file change during read | Rejected (`changed`). |
 | Selected file replaced after its read but before return | Rejected (`changed`, file source label). |
 | Root path or an opened directory changed identity during load | Rejected (`changed`). |
-| Renderer section budget would clip any accepted document | `WorkspaceContextBoundsError` (`identitySection`, `instructionsSection`, `memorySection`, or `contextTotal`). |
 
 Any file or safety error rejects the whole load; there is no partial snapshot.
 Errors carry a stable kind and a workspace-relative source label, not an
@@ -214,22 +211,19 @@ a TOCTOU window between verification and the caller using the snapshot. It is
 not a defence against a privileged or kernel-level adversary, mount tricks, or
 a filesystem that fails to update metadata.
 
-## Bounds
+## Limits
 
-`WORKSPACE_CONTEXT_LIMITS` exposes the fixed limits: 3 bootstrap files, at most
-32 memory sources, 64 KiB per file, 128 KiB total bytes, 48,000 total code
-points (the renderer's context budget, including explicit identity), 14,400
-identity code points, 256 code points per provenance label (identity source is
-also counted in code points), at most 246
-characters per memory path (including the `workspace:` prefix), at most 8 path
-segments, and at most 64 characters per path segment. UTF-8 is decoded with
-`fatal: true`; a BOM is stripped by the decoder.
+`WORKSPACE_CONTEXT_LIMITS` exposes only label-shape limits: 256 code points per
+provenance label (identity source is also counted in code points), at most 248
+characters per memory path (so `workspace:` plus the path fits the label bound),
+at most 8 path segments, and at most 64 characters per path segment. UTF-8 is
+decoded with `fatal: true`; a BOM is stripped by the decoder.
 
-Before returning, the loader mirrors the renderer's exact heading, provenance
-escaping, separator, and truncation rules. If `AGENTS.md`/`SOUL.md`/`USER.md`,
-memory, or identity would be clipped by the per-section 16,000-code-point limit
-or the shared 48,000-code-point budget, the load fails closed. It never returns
-a snapshot whose later document would be silently dropped by the renderer.
+There is no content budget. `AGENTS.md`, `SOUL.md`, `USER.md`, explicitly named
+memory files and host-supplied identity are read and returned in full, whatever
+their byte or character size, as in the Python reference. The loader does not
+pre-check whether the renderer would clip anything, because the renderer no
+longer clips: no accepted document can be dropped after this load.
 
 ## Detachment and session isolation
 
@@ -256,13 +250,13 @@ does **not** implement or claim parity with:
   Dream;
 - Python's complete `SkillsLoader` behaviour: YAML block metadata, `os` gating,
   install hints, and progressive summary placement are not implemented (the
-  bounded subset and its explicit rejections are described in
+  supported subset and its explicit rejections are described in
   [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md));
 - Python's runtime/user-message metadata, platform policy, manifest retrieval,
   recent history injection, or tool contract;
 - any filesystem discovery beyond the named files and skill directories, or any
   default `~/.nanobot` workspace/credential lookup.
 
-The existing context extension remains responsible for rendering, limits,
+The existing context extension remains responsible for rendering,
 skills/tool visibility, and snapshot-to-conversation mapping. This module only
-hands it bounded, detached document values.
+hands it detached document values, in full.

@@ -15,19 +15,12 @@ export interface NanobotIdentityValues {
   readonly channel?: string;
 }
 
-const IDENTITY_COMPOSITION_OVERHEAD = 1_600;
-
 export function renderNanobotIdentity(values: NanobotIdentityValues): string {
   if (Object.hasOwn(values, "platformPolicy")) {
     throw new TypeError("Platform policy is not part of the reduced identity renderer");
   }
   if (/[\r\n\u0000-\u001f\u007f]/.test(values.workspacePath)) {
     throw new TypeError("Workspace path must not contain control characters or newlines");
-  }
-  for (const [label, value] of [["runtime", values.runtime], ["workspacePath", values.workspacePath]] as const) {
-    if (value !== undefined && codePointCount(value) > identityContentLimit()) {
-      throw new RangeError(`Identity ${label} exceeds ${identityContentLimit()} code points`);
-    }
   }
 
   const sections = [
@@ -42,29 +35,19 @@ export function renderNanobotIdentity(values: NanobotIdentityValues): string {
     sections.push("## Format Hint\nOutput is rendered in a terminal. Avoid markdown headings and tables. Use plain text with minimal formatting.");
   }
 
-  const outputChars = sections.reduce((total, sectionText) => total + codePointCount(sectionText), 2 * (sections.length - 1));
-  if (outputChars > identityContentLimit()) {
-    throw new RangeError(`Rendered identity exceeds ${identityContentLimit()} code points`);
-  }
   return sections.join("\n\n");
 }
 
-function identityContentLimit(): number {
-  // renderDocuments adds a heading and source label; reserve for worst-case escaped U+2028/U+2029.
-  return CONTEXT_LIMITS.sectionChars - IDENTITY_COMPOSITION_OVERHEAD;
-}
-
+/**
+ * Bounds that remain after the port's arbitrary context-size caps were removed.
+ * None of them shortens instructions, memory or skill text: the fan-out limit
+ * protects the snapshot table, and the label/name bounds shape identifiers
+ * (which are metadata and locators, never the content they identify).
+ */
 export const CONTEXT_LIMITS = Object.freeze({
-  totalChars: 50_000,
-  contextChars: 48_000,
   maxConversations: 256,
-  sectionChars: 16_000,
-  toolVisibilityChars: 2_000,
   sourceChars: 256,
-  maxMemorySources: 32,
   maxSkillNameCodeUnits: 128,
-  maxToolNames: 128,
-  descriptionChars: 1_024,
 });
 
 export const CONTEXT_SECTION_KEYS = Object.freeze({
@@ -122,7 +105,7 @@ interface PreparedContext {
   readonly sections: Readonly<Partial<Record<keyof typeof CONTEXT_SECTION_KEYS, string>>>;
 }
 
-const TRUNCATION_MARKER = "\n[context truncated at configured bounds]";
+const LABEL_TRUNCATION_MARKER = "\u2026";
 const SKILL_FRONTMATTER = /^---\s*\r?\n[\s\S]*?\r?\n---\s*\r?\n?/;
 
 /**
@@ -142,7 +125,7 @@ export function createContextExtension(
     throw new RangeError(`At most ${CONTEXT_LIMITS.maxConversations} conversation snapshots are accepted`);
   }
   const contexts = new Map<ConversationId, PreparedContext>();
-  for (const raw of readArray(snapshots, CONTEXT_LIMITS.maxConversations)) {
+  for (const raw of readArray(snapshots)) {
     const [conversationId, prepared] = prepareSnapshot(raw);
     if (contexts.has(conversationId)) {
       throw new TypeError(`Duplicate context snapshot for conversation ${conversationId}`);
@@ -242,38 +225,27 @@ function buildContextExtension(contexts: ReadonlyMap<ConversationId, PreparedCon
 function prepareContext(snapshot: unknown): PreparedContext {
 
   const sections: Partial<Record<keyof typeof CONTEXT_SECTION_KEYS, string>> = {};
-  let remaining = CONTEXT_LIMITS.contextChars;
+  // Every accepted document is composed in full. Only the host names what is
+  // selected; the renderer never shortens or drops instructions, memory or
+  // skill text to fit a size budget.
   const add = (key: keyof typeof CONTEXT_SECTION_KEYS, text: string) => {
-    if (!text || remaining <= 0) return;
-    const bounded = boundedText(text, Math.min(CONTEXT_LIMITS.sectionChars, remaining));
-    if (!bounded) return;
-    sections[key] = bounded;
-    remaining -= codePointCount(bounded);
+    if (text) sections[key] = text;
   };
 
   const identity = readDocument(ownValue(snapshot, "identity"));
-  if (identity) add("identity", renderDocuments([["Identity", identity]], CONTEXT_LIMITS.sectionChars));
+  if (identity) add("identity", renderDocuments([["Identity", identity]]));
 
   const workspaceDocuments: [string, ContextDocumentSnapshot][] = [];
   for (const [field, label] of [["agents", "AGENTS.md"], ["soul", "SOUL.md"], ["user", "USER.md"]] as const) {
     const document = readDocument(ownValue(snapshot, field));
     if (document) workspaceDocuments.push([label, document]);
   }
-  add("instructions", renderDocuments(workspaceDocuments, CONTEXT_LIMITS.sectionChars));
+  add("instructions", renderDocuments(workspaceDocuments));
 
-  const rawMemory = ownValue(snapshot, "memory");
-  const memoryLength = arrayLength(rawMemory);
-  const memoryValues = readArray(rawMemory, CONTEXT_LIMITS.maxMemorySources);
-  const memories = memoryValues
+  const memories = readArray(ownValue(snapshot, "memory"))
     .map((value, index) => readDocument(value, `memory[${index}]`))
     .filter((value): value is ContextDocumentSnapshot => value !== undefined);
-  if (memoryLength > CONTEXT_LIMITS.maxMemorySources) {
-    memories.push({
-      source: "host snapshot (omitted entries)",
-      content: `${memoryLength - CONTEXT_LIMITS.maxMemorySources} additional memory snapshots omitted by source-count bounds.`,
-    });
-  }
-  add("memory", renderDocuments(memories.map((document, index) => [`Memory ${index + 1}`, document]), CONTEXT_LIMITS.sectionChars));
+  add("memory", renderDocuments(memories.map((document, index) => [`Memory ${index + 1}`, document])));
 
   // Skills are names/descriptions/locators only. Bodies come from the on-demand tool, so
   // no `always`, selected name, or host-supplied body can enter the prompt stack.
@@ -281,7 +253,6 @@ function prepareContext(snapshot: unknown): PreparedContext {
   if (skillSummary !== undefined && skillSummary.trim().length > 0) {
     add("skills", renderDocuments(
       [["Available skills", { source: "host snapshot (skill summary)", content: skillSummary }]],
-      CONTEXT_LIMITS.sectionChars,
     ));
   }
 
@@ -299,29 +270,12 @@ function readDocument(value: unknown, fallbackSource = "host-supplied snapshot")
 
 function renderDocuments(
   documents: readonly (readonly [string, ContextDocumentSnapshot])[],
-  limit: number,
 ): string {
-  if (!documents.length || limit <= 0) return "";
   const chunks: string[] = [];
-  let used = 0;
   for (const [label, document] of documents) {
-    const header = `## ${label}\nSource: ${safeInline(document.source)}\n\n`;
-    const boundedHeader = boundedText(header, limit - used);
-    if (!boundedHeader) break;
-    chunks.push(boundedHeader);
-    used += codePointCount(boundedHeader);
-    if (boundedHeader !== header || used >= limit) break;
-
-    const boundedContent = boundedText(document.content, limit - used);
-    if (boundedContent) {
-      chunks.push(boundedContent);
-      used += codePointCount(boundedContent);
-    }
-    if (boundedContent !== document.content || used >= limit) break;
-    const separator = "\n\n";
-    const boundedSeparator = boundedText(separator, limit - used);
-    chunks.push(boundedSeparator);
-    used += codePointCount(boundedSeparator);
+    chunks.push(`## ${label}\nSource: ${safeInline(document.source)}\n\n`);
+    chunks.push(document.content);
+    chunks.push("\n\n");
   }
   return chunks.join("");
 }
@@ -329,25 +283,14 @@ function renderDocuments(
 function renderToolVisibility(tools: readonly { readonly name: string }[]): string {
   const prefix = "Model-facing tools for this request (from Durable agent.tools; this section does not enable tools): ";
   const suffix = ". Tools callable only by other tools are not listed.";
-  const names: string[] = [];
-  for (const tool of tools.slice(0, CONTEXT_LIMITS.maxToolNames)) {
-    if (typeof tool.name !== "string" || codePointPrefix(tool.name, CONTEXT_LIMITS.sourceChars).truncated) continue;
-    const candidate = [...names, safeInline(tool.name)];
-    const omitted = tools.length - candidate.length;
-    const list = candidate.join(", ");
-    const omittedNote = omitted ? `; ${omitted} model-facing tool names omitted by bounds` : "";
-    if (codePointCount(`${prefix}${list}${omittedNote}${suffix}`) > CONTEXT_LIMITS.toolVisibilityChars) break;
-    names.push(candidate[candidate.length - 1]!);
-  }
-  const omitted = tools.length - names.length;
-  const list = names.length ? names.join(", ") : "none";
-  const omittedNote = omitted ? `; ${omitted} model-facing tool names omitted by bounds` : "";
-  return `${prefix}${list}${omittedNote}${suffix}`;
+  const names = tools
+    .filter((tool) => typeof tool.name === "string")
+    .map((tool) => safeInline(tool.name));
+  return `${prefix}${names.length ? names.join(", ") : "none"}${suffix}`;
 }
 
 export function stripSkillFrontmatter(content: string): string {
-  const prefix = content.slice(0, CONTEXT_LIMITS.sectionChars + 1);
-  const match = SKILL_FRONTMATTER.exec(prefix);
+  const match = SKILL_FRONTMATTER.exec(content);
   return match ? content.slice(match[0].length) : content;
 }
 
@@ -363,13 +306,14 @@ function safeInline(value: string): string {
   });
 }
 
+/** Clip a provenance label to its shape bound. Labels identify content; they never carry it. */
 function boundedText(value: string, limit: number): string {
   if (limit <= 0) return "";
   const { prefix, truncated } = codePointPrefix(value, limit);
   if (!truncated) return value;
-  const markerCount = codePointCount(TRUNCATION_MARKER);
+  const markerCount = codePointCount(LABEL_TRUNCATION_MARKER);
   if (limit <= markerCount) return prefix;
-  return `${codePointPrefix(value, limit - markerCount).prefix}${TRUNCATION_MARKER}`;
+  return `${codePointPrefix(value, limit - markerCount).prefix}${LABEL_TRUNCATION_MARKER}`;
 }
 
 function codePointPrefix(value: string, limit: number): { prefix: string; truncated: boolean } {
@@ -395,8 +339,8 @@ function arrayLength(value: unknown): number {
   return typeof length === "number" && Number.isSafeInteger(length) && length > 0 ? length : 0;
 }
 
-function readArray(value: unknown, limit: number): unknown[] {
-  const length = Math.min(arrayLength(value), Math.max(0, limit));
+function readArray(value: unknown): unknown[] {
+  const length = arrayLength(value);
   const items: unknown[] = [];
   for (let index = 0; index < length; index++) {
     const item = ownValue(value, String(index));
