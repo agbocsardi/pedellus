@@ -25,8 +25,11 @@ export interface ConversationCommand {
   readonly surfaces: readonly ConversationSurface[];
 }
 
-/** A slash-command name that may be echoed back verbatim in any diagnostic. */
-export const SAFE_COMMAND_NAME = /^[a-z][a-z0-9-]{0,30}$/;
+/**
+ * A lowercased, bounded command-shaped token that may be echoed verbatim in any diagnostic. The
+ * parser's `_` and its 23-character bound are matched; `-` stays for process-level spellings.
+ */
+export const SAFE_COMMAND_NAME = /^[a-z][a-z0-9_-]{0,22}$/;
 
 /** Catalogue order is the listing and command-menu order for every surface. */
 export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
@@ -55,7 +58,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     name: "status",
     summary: "Show this conversation's model and run state",
     usage: "Usage: /status",
-    detail: "Read-only: no model call and no other conversation is visible.",
+    detail: "Read-only: no model call or transcript read; background status may report another chat's run.",
     surfaces: ["cli", "telegram"],
   },
   {
@@ -104,7 +107,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     summary: "List or select a model for this conversation",
     usage: "Usage: /model [preset] | /model <provider> <modelId> [thinkingLevel]",
     surfaceUsage: { telegram: "Usage: /model (list the configured presets) or /model <preset> (or /model default)." },
-    detail: "/model alone lists this host's choices; a selection applies to this conversation only, while the gateway stays open.",
+    detail: "/model alone lists this host's choices; a selection applies to this conversation only, and a preset lasts until the gateway restarts while a direct model persists.",
     surfaces: ["cli", "telegram"],
   },
   {
@@ -174,8 +177,8 @@ const HEADINGS: Record<ConversationSurface, string> = {
   telegram: "Controls for this chat (other messages go to the assistant):",
 };
 
-/** How a refusal names the surface a command belongs to. */
-const SURFACE_LABEL: Record<ConversationSurface, string> = { cli: "terminal", telegram: "Telegram" };
+/** How a refusal names the surface a command belongs to, as a complete phrase: "in the terminal", "in Telegram". */
+const SURFACE_LABEL: Record<ConversationSurface, string> = { cli: "the terminal", telegram: "Telegram" };
 
 export function findConversationCommand(name: string): ConversationCommand | undefined {
   return CONVERSATION_COMMANDS.find((command) => command.name === name);
@@ -228,9 +231,10 @@ export function conversationHelpListing(surface: ConversationSurface, names: rea
 }
 
 /**
- * A fixed refusal for a name this surface does not offer: another surface's command is named as
- * such, a catalogued-but-unoffered one says so, and anything else is unknown. Only a safe
- * slash-command name is echoed; no other argument text ever reaches the reply.
+ * A fixed refusal for a name this surface does not run: another surface's command is named as
+ * such, a catalogued-but-unoffered one says so, a malformed mention of an offered one names the
+ * typo instead of denying the command, and anything else is unknown. Only a safe slash-command
+ * name is echoed; no other argument text ever reaches the reply.
  */
 export function conversationCommandRefusal(
   surface: ConversationSurface,
@@ -243,9 +247,13 @@ export function conversationCommandRefusal(
     const echo = SAFE_COMMAND_NAME.test(name) ? ` /${name}` : "";
     return `No such command${echo} here. Available: ${available}.`;
   }
+  if (names.includes(name)) {
+    // An offered command cannot be refused as unavailable: the name that reached here is malformed.
+    return `/${name} is offered here; that mention is malformed, so use /${name} without one.`;
+  }
   const elsewhere = command.surfaces.find((candidate) => candidate !== surface);
   const reason = elsewhere !== undefined && !command.surfaces.includes(surface)
-    ? `only available in the ${SURFACE_LABEL[elsewhere]}`
+    ? `only available in ${SURFACE_LABEL[elsewhere]}`
     : "not offered by this host";
   return `/${name} is ${reason}. Available: ${available}.`;
 }

@@ -482,12 +482,14 @@ runs have no session key and are not refreshed; they pick up the snapshot on
 their next run or Gateway reopen.
 
 `/stop` aliases `/abort` in CLI and Telegram: both withdraw queued foreground inputs.
-`/restart` is available only through a supporting gateway host. `/goal`, `/interrupt`, `/btw`,
-task/policy/receipt/skill, memory/Dream and pairing commands are not implemented here. `/steer` and `/after` were removed; normal
-input is admitted by the native conversation in input order. Unsupported slash
-commands are reported locally and are never silently sent as model prompts.
-Prefix a prompt with `//` to send one literal leading slash (for example,
-`//help` sends `/help` to the model).
+`/restart` is available only through a supporting gateway host. The earlier
+`/steer`, `/after`, goal, interrupt, btw, task, policy, receipt, skill,
+memory/Dream and pairing commands no longer exist here; normal input is admitted
+by the native conversation in input order. A typed slash command this host does
+not offer is refused with the same reason `/help <command>` gives, and an
+unknown one is refused as unknown; neither is sent as a model prompt. Prefix a
+prompt with `//` to send one literal leading slash (for example, `//help` sends
+`/help` to the model).
 
 Normal input is admitted in input order by the native conversation. Controls
 are ordered between those admissions: a control observes all earlier durable

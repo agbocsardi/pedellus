@@ -26,10 +26,10 @@ export interface CommandHelp {
 /** The historical bare form: a terminal attach, kept for compatibility. */
 export const COMPATIBILITY_SYNOPSIS = "durable-nanobot --config <path>   (agent, compatibility)";
 
-/** The fixed primary configuration file, named once here and once in the usage block's note. */
+/** The fixed primary configuration file, named by the shared --config option line and the usage note. */
 const DEFAULT_CONFIG_FILE = "~/.durable-nanobot/config.json";
 
-/** The one sentence the usage block repeats, because it is the only configuration default. */
+/** The one sentence the usage block adds after its synopses, because it is the only configuration default. */
 const DEFAULT_CONFIG_NOTE = `Without --config, gateway, agent, login, logout and recovery use ${DEFAULT_CONFIG_FILE}.`;
 
 const CONFIG_OPTION: HelpOption = {

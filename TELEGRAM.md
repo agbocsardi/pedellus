@@ -40,8 +40,10 @@ never reaches it. `message.text` (not a caption) is classified:
 - `/new@bot` etc. are controls only when the mention names this bot from
   `getMe` (case-insensitive). Another bot's mention, or a mention while `getMe`
   returned no usable username, gets a bounded notice and is neither executed nor
-  forwarded to the assistant. A malformed mention (`/new@`, `/new@@x`) is an
-  unknown command as well, answered the same way.
+  forwarded to the assistant. A malformed mention (`/new@`, `/new@@x`) is a
+  command attempt, not assistant text: it is refused with a bounded notice that
+  names that command's own no-mention form instead of denying a command this
+  chat offers.
 - Any other leading slash command gets a bounded notice naming the controls this
   host implements and is **not** sent to the assistant. `/prose` is therefore not
   a prompt; `//prose` sends `/prose` literally as assistant input.
@@ -103,10 +105,10 @@ host for one bounded batch of already-completed turns from the shared,
 already-mapped chat history (the batch may come from a different mapped chat,
 because workspace memory is shared) and acknowledges only the bounded admission:
 started, busy, idle or refused. It returns immediately, starts no schedule, holds
-no chat turn while the digest runs. The command starts no new digest model turn itself, but it
-may re-admit a retained earlier internal issue report, which is an ordinary
-origin-agent turn. A digest batch
-is one bounded completed-turn range, not a loop until history is exhausted; an
+no chat turn while the digest runs. The command starts no agent turn; only a
+retained earlier internal issue report may be re-admitted, as an ordinary
+origin-agent turn. A digest batch is one bounded completed-turn range, not a
+loop until history is exhausted; an
 `idle` answer that did not reach every mapped chat's tail says closed history
 may remain. `/digest status` is a bounded read-only view of the live run and this
 chat's newest run; it performs no transcript scan, model call or cursor change.

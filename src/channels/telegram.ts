@@ -3108,8 +3108,8 @@ export async function runTelegram(
       mediaIngress === undefined
         ? "Text only: attachments are not read and /attach is not available; other slash commands are refused, " +
           "and // sends a leading slash literally."
-        : "Photos arrive as image content, voice and audio are transcribed locally, and documents are stored unread; " +
-          "video and stickers are not downloaded, and // sends a leading slash literally.",
+        : "Photos are images, voice and audio transcribe locally, documents stay unread; video and stickers are " +
+          "skipped. // sends a slash literally.",
     ].join("\n\n");
   }
 

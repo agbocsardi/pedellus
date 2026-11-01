@@ -535,7 +535,9 @@ test("without media the local surface keeps its text-only commands", { timeout: 
   try {
     await runTerminalConversation(client, context, terminal.io);
     const output = terminal.chunks.join("");
-    assert.match(output, /Local attachments are unavailable here: configure media/);
+    // The typed refusal is the catalogue's, the same reason `/help attach` gives.
+    assert.match(output, /\/attach is not offered by this host\. Available: /);
+    assert.doesNotMatch(output, /Unsupported slash command|Local attachments are unavailable/);
     assert.match(output, /text only/);
   } finally {
     await client.close();

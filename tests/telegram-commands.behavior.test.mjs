@@ -379,6 +379,30 @@ test('a narrow SDK host keeps the base commands and truthfully refuses typed hos
   }
 });
 
+test('a malformed mention of an offered command names the typo instead of denying the command', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('mention-typo');
+  const transport = telegramMock([[
+    textUpdate(310, 310, '/new@'),
+    textUpdate(311, 311, '/abort@'),
+    textUpdate(312, 312, '/digest@'),
+  ]]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.length === 3, 'three malformed-mention notices');
+    const texts = transport.sent.map((entry) => rendered(entry.text));
+    for (const [index, name] of ['new', 'abort', 'digest'].entries()) {
+      // The offered command keeps its name: it is not refused as an unavailable command it is also listed in.
+      assert.match(texts[index], new RegExp(`^/${name} is offered here; that mention is malformed, so use /${name} without one\\.`));
+      assert.doesNotMatch(texts[index], new RegExp(`/${name} is (not offered by this host|only available)`));
+    }
+    assert.equal(store.captured.length, 0, 'no malformed mention reached the model');
+  } finally {
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
 test('a full host fits its whole /help listing in one bounded notice and keeps detail on request', { timeout: 20_000 }, async () => {
   const store = await syntheticStore('help-full', { configFile: true });
   const restart = { supported: true, requested: 0, async request() { this.requested += 1; } };
@@ -400,7 +424,7 @@ test('a full host fits its whole /help listing in one bounded notice and keeps d
     // Per-command usage and detail stay on the `/help <command>` path.
     const detail = rendered(transport.sent[1].text);
     assert.match(detail, /^Usage: \/model \(list the configured presets\) or \/model <preset> \(or \/model default\)\./);
-    assert.match(detail, /\/model alone lists this host's choices; a selection applies to this conversation only, while the gateway stays open\./);
+    assert.match(detail, /\/model alone lists this host's choices; a selection applies to this conversation only, and a preset lasts until the gateway restarts while a direct model persists\./);
     assert.doesNotMatch(help, /selection applies to this conversation only/);
     assert.equal(store.captured.length, 0, 'no help path reached the model');
   } finally {
