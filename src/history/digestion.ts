@@ -126,6 +126,13 @@ export const DIGEST_CURSOR_KIND = "nanobot.digest-cursor";
 /** Maximum characters in one head-tail tool-result preview, including its omission marker. */
 export const DIGEST_PREVIEW_CHARS = 2_500;
 
+/**
+ * The preview a bound too small for the reference marker degrades to. It carries neither the omitted
+ * length nor the original reference, so a consumer that needs both (the episode-summary source) checks
+ * for it and falls back to its own counted marker instead of quoting an unlabelled cut.
+ */
+export const COMPACT_PREVIEW_MARKER = "…";
+
 export const DIGEST_LIMITS = Object.freeze({
   /** Evidence entries examined by one batch; a longer segment continues in the next batch. */
   entriesPerBatch: DIGEST_RUN_LIMITS_DEFAULT.entriesPerBatch,
@@ -874,7 +881,7 @@ export function clipPreview(parts: readonly string[], total: number, limit: numb
   }
   if (size > target) {
     // The bound cannot hold the reference marker; keep the head bounded and say so compactly.
-    const compact = "…";
+    const compact = COMPACT_PREVIEW_MARKER;
     headText = headTextOf(Math.max(0, target - compact.length));
     tailText = "";
     omitted = Math.max(0, total - headText.length);

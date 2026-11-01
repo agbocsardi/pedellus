@@ -559,6 +559,25 @@ test("episode summary source bounds one entry and previews long tool text head-t
   assert.doesNotMatch(proseThenCall.text, /AFTER-PROSE-9902/);
   assert.match(proseThenCall.text, /\[\.\.\. \d+ more characters truncated\]$/);
 
+  // A bound left too small for the preview's reference marker must still say how much was cut: the
+  // shared preview degrades to a bare ellipsis there, so the counted head cut is used instead.
+  const compact = renderEntry({
+    id: 13,
+    kind: "pi.assistant",
+    model: [{
+      role: "assistant",
+      content: [
+        { type: "text", text: "q".repeat(1_950) },
+        { type: "toolCall", id: "call-d", name: "bash", arguments: { command: "COMPACT-TAIL-4410" } },
+      ],
+      stopReason: "toolUse",
+    }],
+  });
+  assert.equal(compact.truncated, true);
+  assert.doesNotMatch(compact.text, /COMPACT-TAIL-4410/);
+  assert.doesNotMatch(compact.text, /\u2026$/);
+  assert.match(compact.text, /\[\.\.\. \d+ more characters truncated\]$/);
+
   // Ordinary message prose keeps its head cut and its exact omitted-character count.
   const prose = renderEntry({ id: 4, kind: "pi.user", model: [{ role: "user", content: "u".repeat(3_000) }] });
   assert.equal(prose.truncated, true);

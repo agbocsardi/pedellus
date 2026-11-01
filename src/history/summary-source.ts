@@ -19,17 +19,19 @@
  *
  * Every bound is explicit. One entry keeps at most {@link EPISODE_SUMMARY_SOURCE_LIMITS.entryChars}
  * characters of quoted text; a shortened entry ends with its marker, so its stored text may exceed that
- * bound by that marker alone. Ordinary message text is cut at its head with a truncation marker, like
- * before, while a tool call's arguments and a tool result that do not fit are quoted through the shared
- * memory-recall head-tail preview (`clipPreview`), with its omission marker and the durable reference of
- * the original item. Anything a shortened entry cannot quote is counted, never dropped silently. A full
- * chunk stops at the chunk bound, and the caller records how many entries were covered and how many
- * were truncated.
+ * bound by that marker and the separator before it. Ordinary message text is cut at its head with a
+ * truncation marker, like before. A tool call's arguments or a tool result that does not fit is quoted
+ * through the shared memory-recall head-tail preview (`clipPreview`), with its omission marker and the
+ * durable reference of the original item; when the entry's remaining bound cannot hold that preview's
+ * marker, or an overflowing part comes after it, the rest of the entry takes the counted head cut
+ * instead. Anything a shortened entry cannot quote is counted, never dropped silently. A full chunk
+ * stops at the chunk bound, and the caller records how many entries were covered and how many were
+ * truncated.
  */
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import type { EntryRecord } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord";
-import { clipPreview } from "./digestion.js";
+import { COMPACT_PREVIEW_MARKER, clipPreview } from "./digestion.js";
 
 export const EPISODE_SUMMARY_SOURCE_LIMITS = Object.freeze({
   /** Characters of quoted text kept per entry; a truncation marker may follow that text. */
@@ -117,9 +119,6 @@ function shorten(text: string, maxChars: number): { text: string; truncated: boo
   return { text: `${text.slice(0, bounded)}\n${omission(text.length - bounded)}`, truncated: true };
 }
 
-/** `clipPreview`'s fallback when its bound cannot hold the reference marker: no count, no provenance. */
-const COMPACT_PREVIEW_MARKER = "…";
-
 /**
  * One quoted part of an entry. The `ref` is the durable reference of a tool call or tool result; it is
  * absent for ordinary message text, which keeps the head-only cut this renderer always used.
@@ -131,9 +130,11 @@ interface RenderedSegment {
 
 /**
  * Durable provenance of one item. The shape matches the memory-recall evidence refs
- * (`entry:<id>/tool-call/<id>` and `entry:<id>/tool-result/<callId>`) whenever the stored item carries
- * its own id. Recall omits an id-less item entirely, so a positional `index-<n>` key here is this
- * renderer's own fallback: archived shapes must not lose their only reference.
+ * (`entry:<id>/tool-call/<key>` and `entry:<id>/tool-result/<callId>`). Recall pairs a tool result only
+ * with a live call id, so an unpaired or id-less result is skipped there; here it must keep a
+ * reference, which is why a positional `index-<n>` key exists at all. For a tool call, recall keys an
+ * id-less call the same way but skips one whose name is not a string, and this renderer counts it, so
+ * the two keys agree unless a stored call has no name.
  */
 function itemRef(entryId: EntryRecord["id"], item: "tool-call" | "tool-result", key: string): string {
   return `entry:${entryId}/${item}/${key}`;
@@ -141,7 +142,8 @@ function itemRef(entryId: EntryRecord["id"], item: "tool-call" | "tool-result", 
 
 /**
  * A tool call or result key: the durable call id when there is one, otherwise the item's position in
- * the entry. Recall can skip an id-less item, so only that fallback key may differ from its evidence.
+ * the entry. Recall can skip an unpaired result or a nameless call, so only such a fallback key may
+ * differ from its evidence; an archived item must never lose its only reference.
  */
 function itemKey(value: unknown, index: number): string {
   return typeof value === "string" && value.length > 0 ? value : `index-${index}`;
