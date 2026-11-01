@@ -37,6 +37,13 @@ export interface McpHttpServerConfig extends McpServerBase {
   readonly url: string;
   /** Request headers: header name -> host environment variable name that supplies its value. */
   readonly headers?: Readonly<Record<string, string>>;
+  /**
+   * Use an OAuth bearer token from this runtime's private MCP token store instead of a configured
+   * `Authorization` header. The token is obtained by an owner-approved browser login; the gateway
+   * only reads it, and never prints it, at connect time. `false` or absent requires a static header
+   * or an unauthenticated server.
+   */
+  readonly oauth?: boolean;
 }
 
 export type McpServerConfig = McpStdioServerConfig | McpHttpServerConfig;
@@ -75,12 +82,12 @@ const SERVER_KEYS = new Set([
   "env",
   "url",
   "headers",
+  "oauth",
 ]);
 const REJECTED_KEYS: Readonly<Record<string, string>> = Object.freeze({
   sse: 'MCP legacy SSE is not supported; use the server\'s Streamable HTTP endpoint (often "/mcp")',
   type: 'MCP entries select stdio with "command" or Streamable HTTP with "url"; "type" is not accepted',
-  oauth: "MCP OAuth sign-in is not supported; supply an Authorization header through an environment variable",
-  auth: "MCP provider sign-in is not supported; supply an Authorization header through an environment variable",
+  auth: "MCP provider sign-in is not supported; set \"oauth\": true or supply an Authorization header through an environment variable",
   exposure: "MCP tool exposure is not configurable; MCP tools are always discovered",
   toolExposure: "MCP tool exposure is not configurable; MCP tools are always discovered",
 });
@@ -195,7 +202,7 @@ function serverConfig(name: string, value: unknown, workspace: string): McpServe
     throw new Error(`mcp.servers.${name} must set exactly one of "command" (stdio) or "url" (Streamable HTTP)`);
   }
   if (hasCommand) {
-    for (const key of ["url", "headers"]) {
+    for (const key of ["url", "headers", "oauth"]) {
       if (raw[key] !== undefined) {
         throw new Error(`mcp.servers.${name}.${key} belongs to a Streamable HTTP server`);
       }
@@ -220,10 +227,25 @@ function serverConfig(name: string, value: unknown, workspace: string): McpServe
   for (const key of ["command", "args", "cwd", "env"]) {
     if (raw[key] !== undefined) throw new Error(`mcp.servers.${name}.${key} belongs to a stdio server`);
   }
+  const url = httpUrl(raw.url, `mcp.servers.${name}.url`);
+  if (raw.oauth !== undefined && typeof raw.oauth !== "boolean") {
+    throw new Error(`mcp.servers.${name}.oauth must be a boolean`);
+  }
+  const headers = raw.headers === undefined
+    ? undefined
+    : headerMap(raw.headers, `mcp.servers.${name}.headers`);
+  const oauth = raw.oauth === true;
+  if (oauth && headers !== undefined
+    && Object.keys(headers).some((header) => header.toLowerCase() === "authorization")) {
+    throw new Error(
+      `mcp.servers.${name} selects one HTTP credential: remove the Authorization header when "oauth" is true`,
+    );
+  }
   return Object.freeze({
     ...base,
-    url: httpUrl(raw.url, `mcp.servers.${name}.url`),
-    ...(raw.headers === undefined ? {} : { headers: headerMap(raw.headers, `mcp.servers.${name}.headers`) }),
+    url,
+    ...(headers === undefined ? {} : { headers }),
+    ...(oauth ? { oauth: true } : {}),
   });
 }
 

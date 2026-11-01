@@ -1312,3 +1312,63 @@ in CRON.md: the class restore belongs to the cron-enabled open path, so a store 
 `cron.enabled` false does not classify one, and a `:channel-state` key stays a mapped cron owner by
 design. Verified offline: typecheck, 322 behavior checks and 83 core acceptance; the cron file ran
 three times with no flakes. Execution checks were not run.
+
+## Owner follow-up — agent-driven MCP management and OAuth
+
+- [x] Let the assistant drive MCP management without letting a model grant itself
+  authority: one `mcp` tool records immutable, bounded, secret-free proposals
+  (`status`, `propose`, `login`, `logout`, `remove`) in a root-scoped document;
+  it cannot approve, deny, write configuration, start a flow or read a grant, and
+  it is offered only to authenticated mapped chats (never workers, forks, root,
+  digest or scheduled-run targets).
+- [x] Owner decisions only, from the local terminal or the authenticated Telegram
+  owner chat: `/mcp`, `/mcp show <id>`, `/mcp approve <id>`, `/mcp deny <id>`, with
+  the same durable-control acknowledgement, gating and replay semantics as
+  `/digest`. Approval consumes the request; `show` is the verbatim disclosure.
+- [x] A `config` approval writes `mcp.servers.<name>` (and `mcp.enabled: true`)
+  into the gateway's own configuration file: atomic replace, existing mode kept,
+  nothing outside the `mcp` block touched, and the whole merged document validated
+  by the same parser a start uses. `remove` deletes one entry and never disables
+  the capability. Both take effect at the next start (`/restart`).
+- [x] `"oauth": true` HTTP entries read a bearer token from one private `0600`
+  file per exact URL under the canonical data directory; no grant fails closed as
+  `auth-required` without contacting the authorization server. Login is
+  owner-approved and gateway-run: native `pi-mcp/oauth` discovery, dynamic client
+  registration, PKCE, loopback callback, one flow at a time, five-minute browser
+  deadline, abort on shutdown, verification connection, and one credential-free
+  internal result entry in the origin chat. The authorization URL goes only to
+  the approving owner surface.
+- [x] No secret reaches a model, tool result, transcript or channel text: pending
+  requests carry only config-shaped data with environment/header *names*, and the
+  grant file is never read by a tool.
+- [x] Docs and invariants: `MCP.md` (management, OAuth, authority, limitations),
+  `AGENTS.md`, `CLI.md`, `TELEGRAM.md`, `TOOLS.md`, `README.md`.
+- [x] Offline verification: typecheck/build, 347 behavior checks (8 new synthetic
+  cases: proposal/deny, config write + full OAuth login against a loopback
+  authorization server, logout/removal, `auth-required`, shutdown cancellation and
+  request repair, grant-file URL binding) and the 2 execution checks.
+
+### Session — agent-driven MCP management and OAuth
+
+Scope decided with the owner before implementation: owner approval is terminal **or**
+authenticated Telegram; approved entries rewrite the `mcp` block in `config.json`;
+both stdio and HTTP may be proposed; the OAuth flow runs in the gateway with the
+owner completing the browser step.
+
+The model-facing `mcp` tool is a request recorder only. Requests live in a
+root-scoped Durable document, are written once and consumed by the decision, are
+bounded (8 waiting, 8 settled) and are rendered verbatim for the owner. Approve is
+the only path that writes configuration or starts a login, and it runs as a
+durable owner control in both owner surfaces.
+
+Real limitations recorded rather than papered over: JSON is re-serialized (format
+and key order lost, ownership follows the gateway user) and a symlinked config is
+refused; a written entry or new grant only takes effect at the next start; OAuth
+is loopback-redirect + dynamic-registration PKCE only (no device code, fixed client
+identity, metadata override or step-up flow), a remote browser needs an SSH port
+forward, grants are plaintext private files, and a token-present-but-revoked server
+reports `auth-required` instead of opening a flow. No live OAuth provider, MCP
+server or browser consent flow was exercised.
+
+Coverage is synthetic: loopback fixture MCP endpoints, a loopback authorization
+server, faux models, no external network.

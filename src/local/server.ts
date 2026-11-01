@@ -16,7 +16,7 @@ import {
   type LocalAttachment,
   type LocalAttachmentRejection,
 } from "../media/local.js";
-import type { Gateway, GatewayModelSelectionRequest } from "../runtime.js";
+import type { Gateway, GatewayMcpAdmin, GatewayModelSelectionRequest } from "../runtime.js";
 import {
   inProcessTerminalConversation,
   projectEntry,
@@ -361,6 +361,24 @@ class LocalConnection {
         }
         return this.options.gateway.refreshContext(this.sessionKey, this.scope.context);
       }
+      case "mcpList":
+        onlyKeys(requireObject(request.params ?? {}), []);
+        return { listing: await this.mcpAdmin().list(this.scope.context) };
+      case "mcpShow": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["id"]);
+        return this.mcpAdmin().show(requireString(params, "id", 32), this.scope.context);
+      }
+      case "mcpApprove": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["id"]);
+        return this.mcpAdmin().approve(requireString(params, "id", 32), this.scope.context);
+      }
+      case "mcpDeny": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["id"]);
+        return this.mcpAdmin().deny(requireString(params, "id", 32), this.scope.context);
+      }
       case "digestStart":
         return this.options.gateway.memoryDigest.start(this.digestWriter(), this.scope.context);
       case "digestStatus": {
@@ -444,8 +462,22 @@ class LocalConnection {
       presets: this.options.presets,
       attachments: this.options.attachments !== undefined,
       digest: true,
+      mcp: this.options.gateway.mcpAdmin !== undefined,
       restart: this.options.restart?.supported === true,
     };
+  }
+
+  /**
+   * Owner-scoped MCP management is part of the same authenticated local attach: it is the gateway's
+   * own owner surface, never a model tool and never a second runtime. Absent means this gateway was
+   * opened without an on-disk configuration file, so it has nothing to write.
+   */
+  private mcpAdmin(): GatewayMcpAdmin {
+    const admin = this.options.gateway.mcpAdmin;
+    if (admin === undefined) {
+      throw new LocalRequestError("unavailable", "MCP management is unavailable in this gateway");
+    }
+    return admin;
   }
 
   /** The attached conversation is the digest origin; no other conversation is addressable here. */

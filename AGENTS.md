@@ -144,7 +144,8 @@ edits need restart only; unit edits additionally need daemon-reload.
   restart or reopen restores the configured preset without rewriting prepared
   dispatches. Direct-model (non-preset) selection retains its persisted semantics.
 - Shared CLI and authenticated Telegram owner controls are `/new`, `/abort`/`/stop`,
-  `/status`, `/model`, `/digest` and `/digest status`, plus `/restart`,
+  `/status`, `/model`, `/digest` and `/digest status`, plus `/restart` and
+  `/mcp` (`/mcp`, `/mcp show <id>`, `/mcp approve <id>`, `/mcp deny <id>`),
   advertised only where the host implements them. `/model` selects one
   configured preset for that chat only; `/status` is bounded read-only metadata
   with no model call; `/new` starts a new context and
@@ -257,6 +258,27 @@ edits need restart only; unit edits additionally need daemon-reload.
   not confine MCP: the server keeps its gateway-owned host cwd and authority. A configured stdio server is a native host
   process, not covered by `toolSandbox: "bwrap"`. Secrets are referenced by
   environment variable name.
+- MCP management is proposal plus owner decision, and it is the only path from a
+  model to new MCP authority. The `mcp` model tool is offered to authenticated
+  mapped chats only (never a worker, fork, root, digest or scheduled-run target)
+  and can only record one immutable, bounded, secret-free request in a
+  root-scoped document; it cannot approve, deny, write configuration, start a
+  flow or read a grant. Only the local terminal and the authenticated Telegram
+  owner chat decide, as durable owner controls, and each decision consumes the
+  request. A `config` approval writes `mcp.servers.<name>` (and
+  `mcp.enabled: true`) into the gateway's own configuration file atomically after
+  validating the whole merged document, preserving the file mode and touching
+  nothing else; a `remove` approval deletes one entry and never disables the
+  capability. An `oauth: true` HTTP entry reads its grant from one private
+  `0600` file per exact URL under the canonical data directory, never from
+  config, transcript, entry or channel text; with no usable grant it fails closed
+  as `auth-required` instead of starting a flow. Login is owner-approved,
+  gateway-run native PKCE with a loopback callback, one flow at a time and a
+  five-minute browser deadline; its authorization URL goes only to the approving
+  owner surface, and its completion places one credential-free internal result in
+  the origin chat. A configuration or grant change takes effect at the next start
+  (`/restart`); nothing hot-reloads or reconnects, and no scheduled, worker or
+  automation scope can propose or approve.
 - Telegram outbound text is rich by default (Bot API 10.1 `sendRichMessage` /
   `editMessageText` with `rich_message.markdown`) for ordinary replies, scheduled deliveries,
   previews and their edits, and host notices. Chunking uses a persisted, capability-independent

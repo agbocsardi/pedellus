@@ -19,7 +19,7 @@ unauthorized sender, a group, a bot, or an attachment can never be a control and
 never reaches it. `message.text` (not a caption) is classified:
 
 - The owner controls are `/new`, `/abort`, `/stop`, `/status`, `/model`,
-  `/digest`, `/restart` and `/help`. `/stop` is an alias of `/abort` with
+  `/digest`, `/mcp`, `/restart` and `/help`. `/stop` is an alias of `/abort` with
   exactly the same effect and the same durable record (it is normalized before
   admission, so there is one control kind and one code path). Which of them this
   adapter advertises depends on what the host really exposes (see
@@ -29,7 +29,9 @@ never reaches it. `message.text` (not a caption) is classified:
 - Matching is an exact leading command token (case-insensitive). `/new`,
   `/abort`, `/stop`, `/status`, `/restart`, `/digest` and `/help` take no
   arguments; `/model` takes one configured preset name or `default`; `/digest`
-  also accepts the literal `status`. Anything else gets a bounded usage notice.
+  also accepts the literal `status`; `/mcp` takes nothing, or `show <id>`,
+  `approve <id>`, `deny <id>` with one 16-hex request ID. Anything else gets a
+  bounded usage notice.
 - `/new@bot` etc. are controls only when the mention names this bot from
   `getMe` (case-insensitive). Another bot's mention, or a mention while `getMe`
   returned no usable username, gets a bounded notice and is neither executed nor
@@ -127,6 +129,24 @@ configured default preset, and a request already prepared keeps its model. A
 busy chat is refused atomically (nothing is queued and no change lands on a
 later turn); unknown names and legacy direct configs are refused with fixed
 text.
+
+`/mcp` is the owner's decision surface for the assistant's MCP proposals. With no
+argument it lists this gateway's configured MCP servers (with live state) and the
+requests waiting for a decision; `/mcp show <id>` prints the exact proposed entry
+— a stdio command verbatim and every header/environment mapping as a host
+variable *name*, never a value; `/mcp approve <id>` writes that entry into the
+gateway's configuration file or starts one owner-approved OAuth login and returns
+its one-time authorization URL in the acknowledgement; `/mcp deny <id>` discards
+the request. Listing and showing are bounded read-only notices with no model
+call. Approve and deny are durable owner controls: they gate this chat, report a
+known refusal as refused, and a replayed update finds the request already
+consumed instead of applying it twice. The URL in a login acknowledgement carries
+this attempt's OAuth `state`, is delivered only to this authenticated private
+chat, and is never sent to the assistant or written to a transcript; open it on
+a device that can reach the gateway host (a remote browser needs that loopback
+port forwarded). A written entry or new grant takes effect at the next start, so
+follow an approval with `/restart`. A gateway opened without an on-disk
+configuration file advertises no `/mcp` and refuses a typed one with fixed text.
 
 `/restart` asks the host to replace the Gateway process so current code and a
 re-read configuration are loaded. It is not a model tool, it is available only to

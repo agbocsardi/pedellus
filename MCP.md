@@ -9,11 +9,15 @@ package; Code Mode and deferred discovery are the native
 [`src/extensions/codemode.ts`](./src/extensions/codemode.ts). This port does not
 implement a parallel client, tool registry, runner, queue or retry layer.
 
-Status: accepted. Independent review passed the standalone implementation
-(`4d61f50`) with documentation corrections only (`1c38146`), then a fresh
-combined runtime/config/authority review passed the integration with current main
-(`555d34c`) with no material findings. All coverage is offline and synthetic: no
-live MCP server, provider, credential or production data has been used.
+Status: accepted, with one later authority expansion: agent-proposed server
+management and owner-approved OAuth login for HTTP servers (below). Independent
+review passed the standalone implementation (`4d61f50`) with documentation
+corrections only (`1c38146`), then a fresh combined runtime/config/authority
+review passed the integration with current main (`555d34c`) with no material
+findings. All coverage is offline and synthetic: no live MCP server, provider,
+credential or production data has been used, and no real OAuth provider has been
+contacted. The management/OAuth slice is verified against loopback fixture
+servers and a synthetic authorization server only.
 
 MCP is **off unless explicitly configured**. With no `mcp` block,
 `"enabled": false`, or no enabled server entry, the gateway starts no MCP client,
@@ -39,6 +43,10 @@ authority from `toolAllowlist`; `toolAllowlist` still names only the coding tool
       "docs": {
         "url": "https://mcp.example.com/mcp",
         "headers": { "Authorization": "DOCS_MCP_AUTHORIZATION" }
+      },
+      "calendar": {
+        "url": "https://calendar.example.com/mcp",
+        "oauth": true
       }
     }
   }
@@ -51,10 +59,9 @@ authority from `toolAllowlist`; `toolAllowlist` still names only the coding tool
   `_` and `-`. Two names that differ only by `-`/`_` (or case) are rejected
   because they would share one tool namespace.
 - Exactly one of `command` (stdio) or `url` (Streamable HTTP) is required. The
-  legacy HTTP+SSE transport, `type`, `oauth`, `auth`, `exposure` and
-  `toolExposure` are rejected with an explanation. There is no implicit
-  `mcp.json` discovery, no Pi user settings import, and no `!command` value
-  interpolation.
+  legacy HTTP+SSE transport, `type`, `auth`, `exposure` and `toolExposure` are
+  rejected with an explanation. There is no implicit `mcp.json` discovery, no Pi
+  user settings import, and no `!command` value interpolation.
 - `enabled: false` on one entry keeps it in the config without connecting it.
 - `description` is one line (at most 200 characters) used as the Code Mode
   namespace summary.
@@ -66,6 +73,11 @@ authority from `toolAllowlist`; `toolAllowlist` still names only the coding tool
 - `url` must be `https:`, or `http:` on `localhost`, `127.0.0.1` or `[::1]`.
   Credentials in the URL and fragments are rejected. Redirects are refused, so a
   configured `Authorization` header cannot be forwarded to another origin.
+- `oauth` (HTTP only, boolean) uses a bearer token from this runtime's private
+  MCP token file instead of a configured header. It cannot be combined with an
+  `Authorization` header: an entry selects one credential. With no stored grant
+  the entry fails closed as `auth-required` and no request, dynamic registration
+  or browser flow happens; see [OAuth login](#oauth-login).
 
 ### Secrets
 
@@ -127,6 +139,123 @@ used for authorization. No MCP tool call is retried by this layer: a dropped
 response may mean the server already performed the call. An interrupted call is
 Durable's default `unsafe` replay policy, so it is not rerun after a restart.
 
+Configuration and account authorization stay owner decisions. The assistant can
+*propose* a server entry, a login, a logout or a removal, but only through a
+recorded request that the owner approves; see [owner-approved
+management](#owner-approved-management). No model tool writes configuration,
+starts a browser flow, stores a token or connects a new server, and a proposal
+grants nothing until the decision.
+
+## Owner-approved management
+
+The one model-facing management tool is `mcp`. It is a thin request recorder, not
+an authority:
+
+| action | what it does |
+| --- | --- |
+| `status` | bounded read-only listing: configured servers with live connection state, plus waiting and recent requests |
+| `propose` | records one verbatim MCP config entry (`command`→stdio or `url`→HTTP, plus optional `args`, `cwd`, `env`, `headers`, `oauth`, `description`, `timeoutSeconds`, `enabled`) |
+| `login` | records an OAuth login request for a configured HTTP server |
+| `logout` | records a request to delete a stored grant |
+| `remove` | records a request to delete a configured entry |
+
+A proposal is validated with the same parser a gateway start uses, is written
+once into a root-scoped Durable document (never rewritten, surviving a restart),
+and is consumed by the decision. It is offered only to authenticated mapped
+ordinary chats — never a worker, fork, root, digest or scheduled-run
+conversation — and it cannot approve itself: it cannot approve, deny, write
+configuration, start a flow or read a grant. `env` and `headers` values are host
+environment variable *names*, so a proposal carries no secret value.
+
+Decisions come from two owner surfaces and nowhere else:
+
+- the attached terminal, `/mcp`, `/mcp show <id>`, `/mcp approve <id>`,
+  `/mcp deny <id>`;
+- the authenticated Telegram owner chat, the same four forms.
+
+`/mcp show <id>` is the disclosure: the exact entry, rendered from the validated
+shape, with a stdio command shown as "a local process the gateway would launch on
+this host" and every header/environment mapping shown as `header <- host
+environment variable NAME`. Read it before approving; approval is exactly as
+powerful as the owner writing that entry by hand. `/mcp` and `/mcp show` are
+read-only and cost no model call. Approve/deny run as durable owner controls with
+the same acknowledgement, gating and replay semantics as `/digest`.
+
+What an approval does:
+
+- `config`: writes `mcp.servers.<name>` into this gateway's own configuration
+  file and sets `mcp.enabled: true`, then removes the request. The write is
+  atomic (temporary file in the same directory, then rename), keeps the existing
+  file mode, changes nothing outside the `mcp` block, and is refused unless the
+  whole merged document parses. Limitations: JSON is re-serialized with two-space
+  indentation, so hand formatting and key order are not preserved; the rename
+  gives the file the gateway user's ownership; a symlinked configuration file is
+  refused rather than followed. A written entry connects at the **next gateway
+  start** — this gateway keeps the configuration it opened with, and `/restart`
+  is the existing owner control that re-reads it.
+- `login` (and a `config` entry with `"oauth": true`): starts the flow described
+  below and returns the one-time authorization URL to the approving surface.
+- `logout`: deletes the stored grant file. A live connection is unaffected, and
+  after the next start the entry reports `auth-required`.
+- `remove`: deletes `mcp.servers.<name>`. `mcp.enabled` is left as it is: wiping
+  the whole capability stays a separate owner decision.
+
+A refused write leaves the request available; a decision that succeeded consumes
+it. Pending/running requests are bounded (8) and further proposals are refused
+while that many wait; settled requests are pruned to the most recent 8.
+
+## OAuth login
+
+`"oauth": true` on an HTTP entry means the gateway reads a bearer token from this
+runtime's private token file (under the canonical data directory, mode `0600`,
+directory `0700`, one file per exact server URL). Tokens never appear in the
+configuration, a conversation entry, a tool result, a channel message or the
+`gateway.mcp` status.
+
+Login is always owner-initiated and gateway-run:
+
+1. the assistant, or the owner, asks for a login; the owner approves the request;
+2. the gateway starts the native `@earendil-works/pi-mcp/oauth` authorization code
+   flow with PKCE: protected-resource and authorization-server discovery, dynamic
+   client registration for this attempt's loopback redirect URI, and state
+   generation;
+3. the approving surface receives the one-time authorization URL. Open it as the
+   owner in a browser that can reach this host and finish consent. The URL carries
+   this attempt's `state`, is never sent to the model, and is never written into a
+   transcript;
+4. the loopback callback delivers the code; the gateway exchanges it, stores the
+   grant, and verifies it with one real connection and tool listing;
+5. one internal result entry reaches the origin chat's agent, so it can relay
+   "login complete / failed" and tell the owner to restart. It carries the server
+   name, the request ID, the fixed outcome and the discovered tool count — never
+   the URL, the code, the verifier or a token.
+
+Bounds and rules: one flow at a time; a 5-minute deadline for the browser step;
+the callback listener is loopback-only on `127.0.0.1` with an ephemeral port;
+`/mcp deny` cancels a running flow; closing the gateway aborts it. Each attempt
+discards stored client registration (the redirect URI changes per attempt) but
+keeps an existing token until the new one is stored, so a failed attempt does not
+destroy a working grant. A stored grant is refreshed on a `401` by the native
+provider; if the server requires a fresh authorization instead, the connection
+reports `auth-required` rather than opening anything.
+
+Real limitations:
+
+- The redirect URI is a loopback address on the **gateway host**. An owner whose
+  browser runs elsewhere must forward that port over SSH; a provider that refuses
+  a loopback public-client redirect (or requires a fixed registered redirect)
+  cannot be used.
+- Dynamic client registration must be supported. There is no configurable
+  `client_id`/`client_secret`, no authorization-server metadata override and no
+  device-code flow.
+- A step-up scope challenge after a working grant is not implemented as an owner
+  flow: the entry reports `auth-required`.
+- A grant is keyed by the exact URL, so renaming a server keeps it while changing
+  its URL does not. Logging out deletes it; nothing else does.
+- Tokens are stored in plaintext in a private file (like the provider credential
+  store). There is no OS keychain integration, and an owner with the same filesystem
+  access can read them.
+
 ## Tools and discovery
 
 Each connected server contributes one Code Mode namespace `mcp__<server>` and one
@@ -177,8 +306,10 @@ one server is enabled but every enabled server fails, the MCP extension has no
 tools and Code Mode is still installed with `tool_search` but **zero MCP
 namespaces** for authenticated mapped chats. The status
 carries only a fixed failure code (`start-failed`, `start-timeout`,
-`missing-environment`, `connection-closed`, `closed`),
+`missing-environment`, `auth-required`, `connection-closed`, `closed`),
 never a transport message, response body, stderr tail, URL or configured value.
+`auth-required` means the entry uses OAuth and has no usable stored grant (or the
+server rejected it); only an owner-approved login changes that.
 
 Tool calls pass `timeoutSeconds` (default 60) as the native per-request timeout
 and the calling turn's abort signal. The committed cancellation test covers a
@@ -192,21 +323,32 @@ that teardown.
 
 Known limits of this slice:
 
-- No OAuth, browser sign-in or token store. HTTP servers must accept a configured
-  `Authorization` header or none.
+- OAuth is authorization-code + PKCE with loopback redirect and dynamic client
+  registration only. There is no device-code flow, no configurable client
+  identity, no authorization-server metadata override and no step-up flow; see
+  the limitations under [OAuth login](#oauth-login).
+- Management is proposal + owner decision. There is no model- or chat-driven
+  automatic approval, no approval by the agent's own message, no third owner
+  surface, and no scheduled-run, worker or automation-scope proposal.
 - No implicit `mcp.json`, Pi settings, extension-registered servers, resources or
-  prompts API, resource tools, MCP Apps, or a `/mcp` management UI.
+  prompts API, resource tools, MCP Apps.
+- `/mcp` is a control surface, not a dashboard: it lists configured servers and
+  owner requests, but does not edit arbitrary configuration, change a live
+  connection, expose a transport error, or show a token.
 - A server's tool list is read at open. A `notifications/tools/list_changed`
   withdrawal makes the tool unreachable immediately; a newly added tool requires
   reopening the gateway. There is no lazy reconnect: a dropped connection makes
-  that server's tools fail until the gateway is reopened.
+  that server's tools fail until the gateway is reopened. An approved entry or a
+  new grant therefore takes effect at the next start (`/restart`).
 - No config hot reload, no per-conversation MCP selection and no scheduled-run
   MCP authority.
-- Startup failures are visible only as fixed failure codes on the SDK
-  `gateway.mcp` surface. There is no CLI notice or status UI for a failed server,
-  and the codes name no cause; inspect the server command yourself.
+- Startup and connection failures are visible only as fixed failure codes on the
+  SDK `gateway.mcp` surface and in `/mcp`. The codes name no cause; inspect the
+  server command yourself.
 - The server's declared output schema is not used as a validation contract;
   results arrive as the server sent them, bounded by native output limits.
 
-All coverage is synthetic: fixture stdio servers and loopback HTTP servers, faux
-models, no external network, provider, credential or production data.
+All coverage is synthetic: fixture stdio servers, loopback HTTP servers, a
+loopback authorization server with PKCE, faux models, and no external network,
+provider, credential or production data. No real OAuth provider has been
+contacted, and no live acceptance of a browser-consent flow has been performed.

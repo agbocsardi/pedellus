@@ -434,6 +434,18 @@ async function runAgent(
             },
           }
         : {}),
+      // Owner-only MCP management over the same authenticated attach. It is not a model tool: the
+      // gateway writes configuration or starts an OAuth login only after this explicit decision.
+      ...(client.mcp
+        ? {
+            mcp: {
+              list: () => client!.mcpList(context),
+              show: (id: string) => client!.mcpShow(id, context),
+              approve: (id: string) => client!.mcpApprove(id, context),
+              deny: (id: string) => client!.mcpDeny(id, context),
+            },
+          }
+        : {}),
       history: {
         defaultSession: client.sessionKey,
         search: (query, ctx) => client!.historySearch(query, ctx),

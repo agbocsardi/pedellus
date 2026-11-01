@@ -253,6 +253,12 @@ export interface PortConfig {
   workspace: string;
   dataDir: string;
   /**
+   * The file this configuration was loaded from. Set only by `loadConfig`, never by `parseConfig`, so
+   * an SDK host that supplies an object has no file and no managed-write surface. It is not an
+   * authority: an owner approval still decides every write.
+   */
+  configFile?: string;
+  /**
    * Explicit opt-in for bounded workspace context. Absent means the gateway
    * installs no context extension; there is no implicit workspace discovery.
    */
@@ -1124,6 +1130,6 @@ export async function loadConfig(path: string): Promise<PortConfig> {
   let value: unknown;
   try { value = JSON.parse(await readFile(absolute, "utf8")); }
   catch (cause) { throw new StartupDiagnosticError("configFile", { cause }); }
-  try { return parseConfig(value, dirname(absolute)); }
+  try { return { ...parseConfig(value, dirname(absolute)), configFile: absolute }; }
   catch (cause) { throw new StartupDiagnosticError("configInvalid", { cause }); }
 }

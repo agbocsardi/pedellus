@@ -6,6 +6,7 @@ import { AssistantEntry, ConversationBusy, ToolResultEntry, UserEntry } from "@e
 import type { Cursor, EntryId, UsageState } from "@earendil-works/pi-durable";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
+import { renderMcpApproval, renderMcpListing, type McpAdminListing, type McpApproveResult } from "../mcp/admin.js";
 import { renderBackgroundStatus } from "../background-status.js";
 import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "../history/episodes.js";
 import {
@@ -104,6 +105,18 @@ export interface TerminalDigestHost {
 }
 
 /**
+ * Owner-only MCP management over the already-authenticated local attach. Reading is bounded and
+ * changes nothing; `approve` writes configuration or starts one owner-approved OAuth login, and
+ * `deny` discards one request. Neither is a model tool, and neither grants authority by itself.
+ */
+export interface TerminalMcpHost {
+  list(): Promise<McpAdminListing>;
+  show(id: string): Promise<{ readonly found: boolean; readonly text: string }>;
+  approve(id: string): Promise<McpApproveResult>;
+  deny(id: string): Promise<McpApproveResult>;
+}
+
+/**
  * Optional host-owned history read surface. The host supplies authenticated session scope; the
  * terminal never chooses a conversation or session key for search. Search results and episodes
  * are read-only derived views, never transcript writes or tool authority.
@@ -149,6 +162,8 @@ export interface TerminalIO {
   readonly contextRefresh?: TerminalContextRefreshHost;
   /** Optional host-owned memory-digestion entry; absent leaves /digest unavailable. */
   readonly digest?: TerminalDigestHost;
+  /** Optional owner-only MCP management; absent leaves /mcp unavailable. */
+  readonly mcp?: TerminalMcpHost;
   /** Optional host-owned history search/episode reads; standalone callers leave /search and /episodes unavailable. */
   readonly history?: TerminalHistoryHost;
   /** Optional host-owned local attachment submission; absent leaves /attach unavailable. */
@@ -1098,7 +1113,7 @@ export async function runTerminalConversation(
       case "help":
         if (args.trim()) { await notice("Usage: /help", true); return; }
         await notice([
-          "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /refresh /digest [status] /compact /abort /stop /new /attach <path>[ -- <prompt>]" + (io.restart ? " /restart" : ""),
+          "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /refresh /digest [status] /mcp [show|approve|deny <id>] /compact /abort /stop /new /attach <path>[ -- <prompt>]" + (io.restart ? " /restart" : ""),
           SEARCH_USAGE,
           EPISODES_USAGE,
           EPISODE_USAGE,
@@ -1118,6 +1133,9 @@ export async function runTerminalConversation(
           io.attachments
             ? "/attach stores one local file under the workspace CLI attachment directory and submits it with the optional prompt. The original is stored unchanged and the agent decides with the configured tools whether to inspect it; no image content, vision call or transcription is added."
             : "/attach is unavailable without a configured media section.",
+          io.mcp
+            ? "/mcp lists the MCP servers this gateway opened and the assistant's owner-approval requests. `/mcp show <id>` prints the exact proposed entry; `/mcp approve <id>` writes it to the configuration file or starts an owner-approved OAuth login; `/mcp deny <id>` discards it. Nothing connects or is authorized before an approval, and a written entry connects at the next start."
+            : "/mcp is unavailable because this gateway was opened without a configuration file.",
         ].join("\n"));
         return;
       case "status":
@@ -1164,6 +1182,32 @@ export async function runTerminalConversation(
           return;
         }
         await notice("Usage: /digest (start one bounded batch) or /digest status (bounded read-only status).", true);
+        return;
+      }
+      case "mcp": {
+        const host = io.mcp;
+        if (!host) {
+          await notice("MCP management is unavailable in this host. Nothing was changed.", true);
+          return;
+        }
+        const parts = args.trim().split(/\s+/).filter((part) => part.length > 0);
+        if (parts.length === 0) {
+          await notice(renderMcpListing(await host.list()));
+          return;
+        }
+        const [sub, ...rest] = parts;
+        if ((sub === "show" || sub === "approve" || sub === "deny") && rest.length === 1) {
+          const id = rest[0]!;
+          if (sub === "show") {
+            const shown = await host.show(id);
+            await notice(shown.text, !shown.found);
+            return;
+          }
+          const result = sub === "approve" ? await host.approve(id) : await host.deny(id);
+          await notice(renderMcpApproval(result), result.status === "refused");
+          return;
+        }
+        await notice("Usage: /mcp | /mcp show <id> | /mcp approve <id> | /mcp deny <id>", true);
         return;
       }
       case "attach":

@@ -14,7 +14,9 @@ import {
   renderMemoryDigestStart,
   renderMemoryDigestStatus,
 } from "../history/memory-digest.js";
+import { renderMcpApproval, renderMcpListing } from "../mcp/admin.js";
 import type {
+  GatewayMcpAdmin,
   GatewayMemoryDigest,
   GatewayModelList,
   GatewayModelSelection,
@@ -213,7 +215,10 @@ type DeferredControl = {
   readonly updateId: number;
   readonly command: TelegramMutation;
   readonly chatId: number;
-  /** The `/model` preset argument, already validated against the configured catalog. Never a provider/model selector. */
+  /**
+   * The `/model` preset argument (already validated against the configured catalog, never a
+   * provider/model selector) or the `/mcp` request ID being decided.
+   */
   readonly target?: string;
 };
 export type TelegramChannelState = {
@@ -343,6 +348,13 @@ export interface TelegramGateway {
    * is advertised. It starts no schedule and calls no model from the command itself.
    */
   memoryDigest?: GatewayMemoryDigest;
+  /**
+   * Optional owner-only MCP management. Present only when the gateway loaded an on-disk
+   * configuration file. `approve` writes configuration or starts one owner-approved OAuth login and
+   * is reachable only from this authenticated owner chat and the local terminal, never from a model
+   * tool; `show` and `list` are read-only and bounded.
+   */
+  mcpAdmin?: GatewayMcpAdmin;
 }
 
 export async function runTelegram(
@@ -367,6 +379,8 @@ export async function runTelegram(
     status: typeof gateway.listModels === "function",
     restart: options.restart !== undefined && options.restart.supported,
     digest: typeof gateway.memoryDigest?.start === "function" && typeof gateway.memoryDigest?.status === "function",
+    mcp: typeof gateway.mcpAdmin?.list === "function" && typeof gateway.mcpAdmin?.approve === "function"
+      && typeof gateway.mcpAdmin?.deny === "function" && typeof gateway.mcpAdmin?.show === "function",
   };
   const scope = withCancel(context);
   const adapterContext = scope.context;
@@ -2381,6 +2395,39 @@ export async function runTelegram(
       await admitControl(update, message, sessionKey, "digest");
       return;
     }
+    if (parsed.command === "mcp") {
+      const admin = gateway.mcpAdmin;
+      if (!hostCommands.mcp || admin === undefined) {
+        await admitNotice(update, message, sessionKey, MCP_UNAVAILABLE_HOST);
+        drain();
+        return;
+      }
+      const parts = parsed.args.trim().split(/\s+/).filter((part) => part.length > 0);
+      if (parts.length === 0) {
+        // Read-only: bounded listing of configured servers and waiting proposals. No effect.
+        await admitNotice(update, message, sessionKey,
+          renderMcpListing(await admin.list(adapterContext), MAX_NOTICE_CHARS));
+        drain();
+        return;
+      }
+      const [sub, id, ...extra] = parts;
+      if ((sub === "show" || sub === "approve" || sub === "deny") && id !== undefined
+        && extra.length === 0 && MCP_REQUEST_ID.test(id)) {
+        if (sub === "show") {
+          const shown = await admin.show(id, adapterContext);
+          await admitNotice(update, message, sessionKey, shown.text);
+          drain();
+          return;
+        }
+        // An approval writes configuration or starts an OAuth login: it uses the same durable
+        // control record, ordered acknowledgement and chat gating as the other owner commands.
+        await admitControl(update, message, sessionKey, sub === "approve" ? "mcp-approve" : "mcp-deny", id);
+        return;
+      }
+      await admitNotice(update, message, sessionKey, MCP_USAGE);
+      drain();
+      return;
+    }
     // The remaining controls are native mutations of this same chat. `/stop` is an alias of `/abort`:
     // it normalizes to the same control kind before admission, so the durable record, gating and
     // recovery path are shared and there is no second cancellation semantics.
@@ -2569,6 +2616,24 @@ export async function runTelegram(
       : { kind: "applied", text: renderMemoryDigestStart(result) };
   }
 
+  /**
+   * `/mcp approve <id>` and `/mcp deny <id>`: one owner decision on one agent proposal. The request is
+   * consumed by the decision, so a replay finds nothing and a refusal is reported as refused. The
+   * approval text is fixed and bounded; an authorization URL is appended for the owner only, never to
+   * a model turn or transcript.
+   */
+  async function applyMcp(record: DeferredControl): Promise<ControlOutcome> {
+    const admin = gateway.mcpAdmin;
+    if (admin === undefined) return { kind: "refused", text: MCP_UNAVAILABLE_HOST };
+    const id = record.target;
+    if (id === undefined || !MCP_REQUEST_ID.test(id)) return { kind: "refused", text: MCP_USAGE };
+    const result = record.command === "mcp-approve"
+      ? await admin.approve(id, adapterContext)
+      : await admin.deny(id, adapterContext);
+    const text = renderMcpApproval(result, MAX_NOTICE_CHARS);
+    return result.status === "refused" ? { kind: "refused", text } : { kind: "applied", text };
+  }
+
   /** Bounded read-only `/digest status`; it creates no task and reads no chat transcript. */
   async function digestStatusNotice(sessionKey: string): Promise<string> {
     const host = gateway.memoryDigest;
@@ -2631,6 +2696,8 @@ export async function runTelegram(
       outcome = { kind: "applied" };
     } else if (record.command === "digest") {
       outcome = await applyDigest(sessionKey);
+    } else if (record.command === "mcp-approve" || record.command === "mcp-deny") {
+      outcome = await applyMcp(record);
     } else if (record.command === "restart") {
       // No conversation effect: the record and its acknowledgement are durable first, and the host
       // replacement is requested by the caller only after that acknowledgement was released.
@@ -2901,7 +2968,7 @@ export async function runTelegram(
   function availableCommandList(): string {
     return ["/new", "/abort", "/stop", ...(hostCommands.status ? ["/status"] : []),
       ...(hostCommands.model ? ["/model"] : []), ...(hostCommands.restart ? ["/restart"] : []),
-      ...(hostCommands.digest ? ["/digest"] : []), "/help"].join(", ");
+      ...(hostCommands.digest ? ["/digest"] : []), ...(hostCommands.mcp ? ["/mcp"] : []), "/help"].join(", ");
   }
 
   /** Help lists exactly the controls this host implements; nothing is advertised that would be refused. */
@@ -2928,6 +2995,13 @@ export async function runTelegram(
       lines.push("/digest - start one bounded completed-turn memory-digestion run from the shared workspace; the run is " +
         "background, and only a failure or cancellation reports an internal issue to this chat's agent, never a direct " +
         "user or channel message. /digest status is a bounded read-only view; both cost no model call by themselves.");
+    }
+    if (hostCommands.mcp) {
+      lines.push("/mcp - list the MCP servers this gateway opened and the assistant's owner-approval requests; " +
+        "/mcp show <id> prints the exact proposed entry; /mcp approve <id> writes it to the configuration file or " +
+        "starts an owner-approved OAuth login and returns its one-time authorization URL; /mcp deny <id> discards " +
+        "the request. Nothing connects or is authorized before an approval, and a written entry connects at the " +
+        "next gateway start. These are owner actions, never model tools.");
     }
     lines.push("/help - this list.");
     lines.push(mediaIngress === undefined
@@ -3242,6 +3316,7 @@ function telegramCommands(
     ...(host.model ? [{ command: "model", description: "List or select a configured model preset" }] : []),
     ...(host.restart ? [{ command: "restart", description: "Restart the gateway process" }] : []),
     ...(host.digest ? [{ command: "digest", description: "Run one bounded memory-digestion batch" }] : []),
+    ...(host.mcp ? [{ command: "mcp", description: "Review and approve MCP server proposals" }] : []),
     { command: "help", description: "Show the available commands" },
   ];
 }
@@ -3252,6 +3327,7 @@ type TelegramCommandHost = {
   readonly model: boolean;
   readonly restart: boolean;
   readonly digest: boolean;
+  readonly mcp: boolean;
 };
 
 type ParsedTelegramInput =
@@ -3260,13 +3336,13 @@ type ParsedTelegramInput =
   | { readonly kind: "unsupported"; readonly command: string }
   | { readonly kind: "foreign"; readonly command: string; readonly mention: string };
 
-type TelegramControl = "new" | "abort" | "stop" | "help" | "status" | "model" | "restart" | "digest";
+type TelegramControl = "new" | "abort" | "stop" | "help" | "status" | "model" | "restart" | "digest" | "mcp";
 
 /**
  * A command with a native effect on this chat or this process; a refusal is terminal, never retried.
  * `/stop` normalizes to `abort` here, so one control kind covers both spellings.
  */
-type TelegramMutation = "new" | "abort" | "model" | "restart" | "digest";
+type TelegramMutation = "new" | "abort" | "model" | "restart" | "digest" | "mcp-approve" | "mcp-deny";
 
 type ControlOutcome =
   | { readonly kind: "applied"; readonly text?: string; readonly requestRestart?: true }
@@ -3288,6 +3364,8 @@ const CONTROL_ACK: Record<TelegramMutation, string> = {
     "This acknowledgement confirms the request only; it does not confirm that the restart completed.",
   digest:
     "Memory digestion request applied for this chat; the bounded run follows separately and reports only a failure or cancellation to this chat's agent.",
+  "mcp-approve": "The MCP approval was applied; its result follows in this message.",
+  "mcp-deny": "The MCP request was denied; nothing was configured, connected or authorized.",
 };
 
 const CONTROL_PENDING: Record<TelegramMutation, string> = {
@@ -3307,6 +3385,12 @@ const CONTROL_PENDING: Record<TelegramMutation, string> = {
   digest:
     "Memory digestion is still pending for this chat: messages admitted earlier are being submitted first. " +
     "Nothing has been started yet and nothing was sent to the assistant.",
+  "mcp-approve":
+    "The MCP approval is still pending: messages admitted earlier in this chat are being submitted first. " +
+    "Nothing has been written, connected or authorized yet.",
+  "mcp-deny":
+    "The MCP denial is still pending: messages admitted earlier in this chat are being submitted first. " +
+    "The request is still waiting and nothing was applied.",
 };
 
 const UNCONFIRMED_CONTROL =
@@ -3330,6 +3414,14 @@ const MODEL_PRESETS_UNAVAILABLE =
   "Nothing was changed; /model lists the current selection read only, and this chat command never rewrites the configuration.";
 const MODEL_USAGE =
   "Usage: /model (list the configured presets) or /model <preset> (or /model default). Nothing was sent to the assistant.";
+const MCP_UNAVAILABLE_HOST =
+  "MCP management is unavailable in this host: the gateway was opened without an on-disk configuration file, " +
+  "so there is nothing to write. Nothing was sent to the assistant.";
+/** One pending owner approval request. Opaque, fixed-width and content-bound at creation. */
+const MCP_REQUEST_ID = /^[0-9a-f]{16}$/;
+const MCP_USAGE =
+  "Usage: /mcp (servers and waiting requests) | /mcp show <id> | /mcp approve <id> | /mcp deny <id>. " +
+  "Nothing was sent to the assistant.";
 const RESTART_UNAVAILABLE_HOST =
   "Restart is unavailable in this host: it cannot replace its own process with the same program and configuration. " +
   "Nothing was sent to the assistant.";
@@ -3434,7 +3526,8 @@ function parseTelegramInput(raw: string, botUsername: string | undefined): Parse
     return { kind: "foreign", command, mention: mention.toLowerCase() };
   }
   if (command === "new" || command === "abort" || command === "stop" || command === "help" ||
-      command === "status" || command === "model" || command === "restart" || command === "digest") {
+      command === "status" || command === "model" || command === "restart" || command === "digest" ||
+      command === "mcp") {
     return { kind: "control", command, args: raw.slice(match[0].length).trim() };
   }
   return { kind: "unsupported", command };

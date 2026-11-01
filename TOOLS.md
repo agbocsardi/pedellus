@@ -72,6 +72,17 @@ described below; Code Mode is not part of this slice.
   untrusted historical data. See
   [`HISTORY.md`](./HISTORY.md#agent-facing-history-tool).
 
+Every Gateway opened from an on-disk configuration file also offers one `mcp`
+management tool to authenticated mapped chat conversations (`status`, `propose`,
+`login`, `logout`, `remove`). It records one bounded, secret-free owner-approval
+request and nothing else: it cannot approve, deny, write configuration, start an
+OAuth flow, store a token or connect a server, and a worker, fork, root, digest
+or scheduled-run conversation never receives it. Only the owner's explicit
+`/mcp approve <id>`/`/mcp deny <id>` in the local terminal or the authenticated
+Telegram owner chat decides, and the resulting authority is exactly what editing
+that `mcp.servers` entry by hand would grant. It is not in the coding-tool
+ceiling and grants no coding tool. See [`MCP.md`](./MCP.md#owner-approved-management).
+
 When `telegram` is configured, mapped Telegram chat conversations also receive
 one scoped `telegram` channel-action tool (`targets`, `reply`, `react`, and
 optionally `send`). It is not
@@ -96,7 +107,11 @@ re-grant or per-channel permission list to manage.
   and coding-tool authority for its private chat. Admission is not per-tool
   authority: the owner chooses tools once in the configuration.
 - Changing a tool is a configuration change: edit `toolAllowlist` and restart.
-  Chat and terminal commands never change tool authority, and the model cannot.
+  Chat and terminal commands never change coding-tool authority, and the model
+  cannot. The owner-only `/mcp approve` decision can add an MCP *connection*
+  entry (or an OAuth grant) to the configuration file, which is the same
+  authority as writing that entry by hand; it never changes `toolAllowlist`,
+  never enables coding tools and never takes effect before the next start.
 - Scope is validated from durable state, never from a session-key string alone:
   only a conversation that is the target of a persisted chat session key and is
   ordinary (ownerless, unforked, not the root) is authorized. The root, a
