@@ -52,8 +52,10 @@ export const EPISODE_SUMMARY_SOURCE_LIMITS = Object.freeze({
   /** Backoff base and ceiling between provider attempts. */
   baseDelayMs: 2_000,
   maxDelayMs: 60_000,
-  /** Output tokens requested for one fold. */
-  maxTokens: 1_200,
+  /** Prompt target for the final summary text only, excluding hidden reasoning. */
+  targetSummaryTokens: 1_200,
+  /** Provider response allowance for one fold, including reasoning when the provider counts it. */
+  maxTokens: 4_096,
 });
 
 const USER_ENTRY_KINDS: ReadonlySet<string> = new Set(["pi.user", "nanobot.cron"]);
