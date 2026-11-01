@@ -79,6 +79,7 @@ interface CronToolArguments {
   readonly cron_expr?: string;
   readonly tz?: string;
   readonly isolated?: boolean;
+  readonly silent?: boolean;
   readonly job_id?: string;
 }
 
@@ -167,6 +168,9 @@ function describe(view: CronJobView): string {
     `  schedule: ${scheduleText(view)}`,
     `  mode: ${view.job.mode}`,
     ...(view.job.intent === "digest" ? ["  intent: digest (one bounded memory-digestion run per occurrence)"] : []),
+    ...(view.job.silent === true
+      ? ["  delivery: silent (a successful run is not sent to this chat; a failure is still reported)"]
+      : []),
     `  status: ${view.status}`,
     `  next: ${iso(view.nextAtMs)}`,
   ];
@@ -209,6 +213,11 @@ export function createCronTool(options: CronToolOptions): CronTool {
       "conversation across its runs, one-off jobs share a per-conversation background conversation " +
       "and queue there, and every run starts a fresh episode that does not carry the previous run's " +
       "context. `isolated: false` instead runs the job in this conversation once it is idle. " +
+      "Set `silent: true` when a successful run should not be sent to this chat: successes, " +
+      "including an empty answer, stay in the run's conversation only, while a failed run still " +
+      "posts a short sanitized notice. A scheduled run can also answer exactly `[SILENT]` to " +
+      "suppress only that occurrence's delivery in either mode; the marker has no meaning in an " +
+      "ordinary chat reply. " +
       "Scheduled runs inherit this conversation's enabled tools; they never " +
       "gain more. `intent: \"digest\"` schedules one bounded memory-digestion run instead of a model " +
       "turn; it needs read/write/edit authority in this conversation and reports through an internal " +
@@ -262,6 +271,12 @@ export function createCronTool(options: CronToolOptions): CronTool {
         description:
           "add: true (default) runs the job in its background automation conversation, which " +
           "accumulates one episode per run; false runs it in this conversation once it is idle.",
+      })),
+      silent: Type.Optional(Type.Boolean({
+        description:
+          "add: true suppresses this job's successful automatic delivery to the chat, including an " +
+          "empty answer; a failed run still posts a sanitized notice. Default false. A scheduled " +
+          "run's exact `[SILENT]` answer suppresses only that occurrence in either mode.",
       })),
       job_id: Type.Optional(Type.String({
         description: "remove: the job ID from `list`.",
@@ -361,6 +376,9 @@ export function createCronTool(options: CronToolOptions): CronTool {
       if (request.name !== undefined && typeof request.name !== "string") {
         return text("name must be a string when provided.", true);
       }
+      if (request.silent !== undefined && typeof request.silent !== "boolean") {
+        return text("silent must be true or false.", true);
+      }
       let receipt: CronScheduleReceipt;
       try {
         // A call ID is stable across a retried call, so a replay cannot create a second job.
@@ -370,6 +388,7 @@ export function createCronTool(options: CronToolOptions): CronTool {
           schedule: scheduleOf(request, zone),
           mode: intent === "digest" || request.isolated === false ? "origin" : "background",
           intent,
+          silent: request.silent === true,
           idempotencyKey: `tool:${api.callId}`,
         }, context);
       } catch (error) {

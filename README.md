@@ -146,7 +146,9 @@ model-callable `cron` tool (`add`/`list`/`remove`) in `openGateway`. The agent
 schedules work when the user asks; there is no direct cron UI or user scheduling
 command. Normal settlements of isolated and origin-mode runs (an answer, or a
 fixed sanitized notice for a failure or empty answer) deliver through the durable
-Telegram outbox; cancelled and superseded runs stay silent. Live-channel
+Telegram outbox; a job's persistent `silent` setting or an exact trimmed
+`[SILENT]` successful answer suppresses a successful result, while a failure
+still notifies, and cancelled or superseded runs stay silent. Live-channel
 acceptance remains open.
 
 The package root (`src/index.ts`) is a small host entry surface: config loading and

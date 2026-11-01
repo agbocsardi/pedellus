@@ -118,6 +118,12 @@ export interface CronJob {
    * never submits the message and never runs in a task-owned background conversation.
    */
   readonly intent?: CronIntent;
+  /**
+   * Silences this job's successful automatic channel delivery for every occurrence, including one
+   * whose answer is empty. A failure still queues its fixed sanitized notice. Optional so a job
+   * document written before silent delivery existed keeps working: an absent value means `false`.
+   */
+  readonly silent?: boolean;
   readonly schedule: CronSchedule;
   readonly idempotencyKey: string;
   readonly createdAtMs: number;
@@ -214,6 +220,12 @@ export interface CronScheduleInput {
   readonly mode?: CronMode;
   /** Default `message`; `digest` invokes the host's bounded memory-digestion entry. */
   readonly intent?: CronIntent;
+  /**
+   * Default `false`. When true, a successful occurrence queues no automatic channel delivery
+   * (including an empty answer); a failed occurrence still queues its sanitized notice. It has no
+   * effect on a `digest` occurrence, which never queues a delivery either way.
+   */
+  readonly silent?: boolean;
 }
 export interface CronActor {
   readonly owner: CronOwner;
@@ -441,11 +453,13 @@ interface NormalizedRequest {
   readonly name: string;
   readonly mode: CronMode;
   readonly intent: CronIntent;
+  readonly silent: boolean;
   readonly schedule: CronScheduleRequest;
   readonly idempotencyKey: string;
 }
 
 const intentOf = (job: CronJob): CronIntent => job.intent === "digest" ? "digest" : "message";
+const silentOf = (job: CronJob): boolean => job.silent === true;
 
 function normalizeRequest(actor: CronActor, request: CronScheduleInput): NormalizedRequest {
   const owner = ownerOf(actor);
@@ -463,6 +477,9 @@ function normalizeRequest(actor: CronActor, request: CronScheduleInput): Normali
   if (request.name !== undefined && typeof request.name !== "string") {
     throw new TypeError("name must be a string when provided");
   }
+  if (request.silent !== undefined && typeof request.silent !== "boolean") {
+    throw new TypeError("silent must be a boolean when provided");
+  }
   const requestedMode = request.mode === undefined ? "background" : request.mode;
   if (requestedMode !== "background" && requestedMode !== "origin") {
     throw new TypeError("mode must be 'background' or 'origin'");
@@ -476,12 +493,16 @@ function normalizeRequest(actor: CronActor, request: CronScheduleInput): Normali
   } catch (error) {
     throw new TypeError(errorText(error));
   }
+  // A digest occurrence never queues a channel delivery, so its delivery setting is normalized off
+  // instead of being stored as a meaningless difference in the dedupe identity.
+  const silent = intent === "digest" ? false : request.silent === true;
   return {
     owner,
     message: request.message.trim() === "" ? "Memory digestion run" : request.message,
     name: request.name?.trim() || (intent === "digest" ? "Memory digestion" : request.message.slice(0, 30)),
     mode,
     intent,
+    silent,
     schedule,
     idempotencyKey: request.idempotencyKey,
   };
@@ -512,6 +533,7 @@ function sameNormalizedRequest(job: CronJob, request: NormalizedRequest): boolea
     && job.name === request.name
     && job.mode === request.mode
     && intentOf(job) === request.intent
+    && silentOf(job) === request.silent
     && sameScheduleRequest(job, request.schedule);
 }
 function parseOccurrenceInput(value: unknown): CronOccurrenceInput | undefined {
@@ -1443,6 +1465,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           message: value.message,
           mode: value.mode,
           intent: value.intent,
+          silent: value.silent,
           schedule,
           idempotencyKey: value.idempotencyKey,
           createdAtMs: now,

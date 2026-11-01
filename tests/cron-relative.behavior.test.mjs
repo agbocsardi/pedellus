@@ -115,6 +115,61 @@ test("relative one-shot keeps its admitted deadline across retries, clock jumps 
   }
 });
 
+test("a persistent silent request dedupes, validates, and treats an absent legacy field as false", { timeout: 10_000 }, async () => {
+  const dir = await temp("nanobot-cron-silent-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    const clock = Date.now();
+    const foundation = createCronFoundation({ now: () => clock });
+    harness = await openHarness(db, foundation.extension, createModels());
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const writer = conversationWriter(harness, conversation);
+    const request = {
+      ...base,
+      silent: true,
+      schedule: { kind: "every", everyMs: 3_600_000 },
+      idempotencyKey: "tool:silent",
+    };
+    const receipt = await foundation.schedule(owner, writer, request, context);
+    const [created] = await readJobs(harness, conversation.id);
+    assert.equal(created.silent, true);
+
+    const replayed = await foundation.schedule(owner, writer, request, context);
+    assert.equal(replayed.deduplicated, true);
+    assert.equal(replayed.jobId, created.id);
+
+    // A different delivery setting under the same key is a different request, not a silent update.
+    await assert.rejects(
+      () => foundation.schedule(owner, writer, { ...request, silent: false }, context),
+      /already names a different cron job/,
+    );
+    await assert.rejects(
+      () => foundation.schedule(owner, writer, {
+        ...request, idempotencyKey: "tool:silent-bad", silent: "yes",
+      }, context),
+      /silent must be a boolean when provided/,
+    );
+
+    // A job document written before `silent` existed lacks the field and must compare as false.
+    await harness.commit(async (tx) => {
+      const doc = await tx.doc(CronJobsDoc, conversation.id);
+      delete doc.jobs[0].silent;
+    }, context);
+    const legacyReplay = await foundation.schedule(owner, writer, { ...request, silent: false }, context);
+    assert.equal(legacyReplay.deduplicated, true);
+    assert.equal(legacyReplay.jobId, created.id);
+    const [afterLegacy] = await readJobs(harness, conversation.id);
+    assert.equal(afterLegacy.silent, undefined, "the legacy record is not rewritten");
+
+    await harness.abortTask(receipt.timerTaskId, context);
+    await harness.waitForTask(receipt.timerTaskId, context);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("a completed relative one-shot retry dedupes its original instant with no new job or timer", { timeout: 10_000 }, async () => {
   const dir = await temp("nanobot-cron-relative-fired-");
   const db = resolve(dir, "probe.sqlite");

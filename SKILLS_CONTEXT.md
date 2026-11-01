@@ -165,7 +165,9 @@ owner's 2026-10-28 selection is:
   - `cron` — the opt-in `cron` tool (`add`/`list`/`remove`) behind
     `cron.enabled`, with `at`/`every_seconds`/`cron_expr`, IANA `tz`, isolated or
     origin mode, normal results and fixed failure/empty notices through the
-    durable channel outbox, and no per-job timeout argument.
+    durable channel outbox, an optional persistent `silent` setting and a
+    per-occurrence `[SILENT]` answer that suppress successful delivery (a failure
+    still notifies), and no per-job timeout argument.
 - **Deferred** (retained in the owner selection, but no runtime): `my` — there is
   no self-state tool, scratchpad, or model-adjustable runtime state; model and
   context settings are host configuration.
