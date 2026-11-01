@@ -66,8 +66,9 @@ edits need restart only; unit edits additionally need daemon-reload.
   `credentials.<provider>` environment reference, Durable's own file
   `CredentialStore` under the canonical `dataDir`, and the terminal-only
   `login`/`logout` commands. No provider whitelist, no Pi credential store.
-- `src/automation/` — cron timer/run tasks, persistent automation conversations and
-  the model-facing `cron` tool.
+- `src/automation/` — cron timer/run tasks, persistent automation conversations, the
+  model-facing `cron` tool and the owner's terminal scheduling console
+  (`cron create|list|show|cancel` over the private local socket).
 - `src/workers/` — bounded ordinary background workers as native Durable tasks:
   the opt-in `worker` start/list/inspect/cancel tool, an explicit
   shared-or-worktree workspace per task, captured child authority and one internal

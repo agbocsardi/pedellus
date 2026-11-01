@@ -117,7 +117,8 @@ own `./data` and `./workspace` under their instance directory. Preserve an exist
 store's configured location until a deliberate stopped-store migration is approved.
 
 `durable-nanobot gateway` without `--config` reads exactly that file. `durable-nanobot agent`
-without `--config` and `durable-nanobot recovery` without `--config` use it too, and the
+without `--config`, `durable-nanobot recovery` without `--config` and `durable-nanobot cron`
+without `--config` use it too, and the
 historical `durable-nanobot --config <path>` still attaches an agent with the explicit
 path. There is no discovery, merge, search, auto-generation, migration or
 implicit runtime activation: create the file and its workspace/data directories
