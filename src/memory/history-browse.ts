@@ -19,13 +19,13 @@ type PartHit = MemoryHit & { sortTime: number | null; tie: string };
 type Episode = {
   session: MemorySession; start: number; end: number; hasParts: boolean; state: "open" | "closed";
   count: number; messages: number; tools: number; undated: number; min: number | null; max: number | null;
-  queryMatched: boolean; summary?: { status: string; title: string | null; excerpt: string; generation: number | null; complete: boolean };
+  queryMatched: boolean; summary?: { status: string; title: string | null; excerpt: string; generation: number | null; complete: boolean; summaryTruncated?: boolean; sourceTruncatedEntries?: number; sourceEntries?: number; sourceMessages?: number; sourceToolResults?: number };
 };
-type Scan = { session: MemorySession; highwater: number; cursor?: any; done: boolean; current?: Episode; pendingStart?: number };
+type Scan = { session: MemorySession; highwater: number; cursor?: any; done: boolean; blocked?: boolean; current?: Episode; pendingStart?: number };
 type Snapshot = {
   id: string; secret: string; key: string; scope: string; query: MemoryQuery; sessions: Scan[];
   parts: PartHit[]; episodes: Episode[]; phase: "scanning" | "summaries" | "ready";
-  summaryPosition: number; unreadable: number; summaryUnreadable: number; malformed: number; undated: number; scanned: number;
+  summaryPosition: number; unreadable: number; readFailures: number; summaryUnavailable: number; summaryUnreadable: number; summaryMalformed: number; malformed: number; undated: number; scanned: number;
   expires: number; bytes: number; result?: MemoryHit[];
 };
 function fail(message: string): never { throw new Error(message); }
@@ -50,7 +50,7 @@ function episodeHit(ep: Episode, scope: MemoryScope): MemoryHit {
     preview: true, state: ep.state,
     ...(ep.summary?.title === undefined ? {} : { title: ep.summary.title }),
     ...(ep.summary?.generation === undefined ? {} : { generatedAt: iso(ep.summary.generation) }),
-    coverage: { complete: ep.summary?.complete ?? false, unreadable: 0, undated: ep.undated, rangePartial: ep.undated > 0 || ep.min === null, sourceParts: ep.count, sourceMessages: ep.messages, sourceTools: ep.tools, summary: ep.summary?.status ?? "not-read" },
+    coverage: { complete: ep.summary?.complete ?? false, unreadable: ep.summary?.status === "unreadable" ? 1 : 0, summaryUnavailable: ep.summary?.status === "missing" || ep.summary?.status === "not-ready" || ep.summary?.status === "open" || ep.summary?.status === "pending" || ep.summary?.status === "failed" ? 1 : 0, summaryMalformed: ep.summary?.status === "malformed" ? 1 : 0, undated: ep.undated, rangePartial: ep.undated > 0 || ep.min === null, sourceParts: ep.count, sourceMessages: ep.summary?.sourceMessages ?? ep.messages, sourceTools: ep.tools, summary: ep.summary?.status ?? "not-read", ...(ep.summary?.status === "ready" ? { sourceTruncatedEntries: ep.summary.sourceTruncatedEntries, shortenedEntries: ep.summary.sourceTruncatedEntries, summaryTruncated: ep.summary.summaryTruncated, coverageComplete: ep.summary.complete, sourceEntries: ep.summary.sourceEntries, sourceToolResults: ep.summary.sourceToolResults } : {}) },
   };
 }
 
@@ -82,9 +82,10 @@ export function createHistoryBrowser(host: MemoryHost): { browse: MemoryBackend[
         const tail = await host.entries(session.sessionKey, { order: "descending" }, 1, undefined, context);
         const highwater = tail.items[0]?.id ?? 0;
         scans.push({ session: { ...session }, highwater, done: highwater === 0 });
-      } catch { scans.push({ session: { ...session }, highwater: 0, done: true }); initialUnreadable++; }
+      } catch { initialUnreadable++; }
     }
-    const s: Snapshot = { id: token(), secret: token(), key, scope: authority, query: structuredClone(query), sessions: scans, parts: [], episodes: [], phase: "scanning", summaryPosition: 0, unreadable: initialUnreadable, summaryUnreadable: 0, malformed: 0, undated: 0, scanned: 0, expires: Date.now() + TTL, bytes: 0 };
+    if (initialUnreadable > 0) fail(`${initialUnreadable} source${initialUnreadable === 1 ? "" : "s"} could not be bounded; retry the history query`);
+    const s: Snapshot = { id: token(), secret: token(), key, scope: authority, query: structuredClone(query), sessions: scans, parts: [], episodes: [], phase: "scanning", summaryPosition: 0, unreadable: 0, readFailures: 0, summaryUnavailable: 0, summaryUnreadable: 0, summaryMalformed: 0, malformed: 0, undated: 0, scanned: 0, expires: Date.now() + TTL, bytes: 0 };
     snapshots.set(s.id, s); return s;
   }
   function finishEpisode(s: Snapshot, scan: Scan, end: number, closed: boolean): void {
@@ -133,8 +134,18 @@ export function createHistoryBrowser(host: MemoryHost): { browse: MemoryBackend[
       if (scan.done) continue;
       while (!scan.done && count < ENTRY_BUDGET && callbacks < SCAN_BATCH && Date.now() < deadline) {
         let page;
-        try { page = await host.entries(scan.session.sessionKey, { minEntryId: 1 as EntryId, maxEntryId: scan.highwater as EntryId, order: "ascending" }, SCAN_BATCH, scan.cursor, context); callbacks++; }
-        catch { s.unreadable++; scan.done = true; finishEpisode(s, scan, scan.highwater, false); break; }
+        callbacks++;
+        try { page = await host.entries(scan.session.sessionKey, { minEntryId: 1 as EntryId, maxEntryId: scan.highwater as EntryId, order: "ascending" }, SCAN_BATCH, scan.cursor, context); }
+        catch (error) {
+          if (scan.cursor !== undefined && error instanceof Error && /(?:invalid|expired|stale).*cursor|cursor.*(?:invalid|expired|stale)/i.test(error.message)) {
+            snapshots.delete(s.id);
+            fail("History snapshot cursor was invalidated; start again");
+          }
+          s.readFailures++;
+          if (!scan.blocked) { scan.blocked = true; s.unreadable++; }
+          break;
+        }
+        if (scan.blocked) { scan.blocked = false; s.unreadable--; }
         for (const entry of page.items) { consume(s, scan, entry, scope); count++; }
         scan.cursor = page.next;
         if (!page.next || page.items.length === 0) { scan.done = true; finishEpisode(s, scan, scan.highwater, false); }
@@ -150,10 +161,13 @@ export function createHistoryBrowser(host: MemoryHost): { browse: MemoryBackend[
       const ep = s.episodes[s.summaryPosition++]!;
       try {
         const view = await host.summary(ep.session.sessionKey, ep.start as EntryId, context);
-        if (view.state === "ready") ep.summary = { status: "ready", title: view.snapshot.title, excerpt: excerpt(view.snapshot.summary, 600), generation: view.snapshot.completedAtMs, complete: view.snapshot.coverageComplete };
+        if (view.state === "ready") ep.summary = { status: "ready", title: view.snapshot.title, excerpt: excerpt(view.snapshot.summary, 600), generation: view.snapshot.completedAtMs, complete: view.snapshot.coverageComplete, summaryTruncated: view.snapshot.summaryTruncated, sourceTruncatedEntries: view.snapshot.sourceTruncatedEntries, sourceEntries: view.snapshot.sourceEntries, sourceMessages: view.snapshot.sourceMessages, sourceToolResults: view.snapshot.sourceToolResults };
         else {
-          ep.summary = { status: view.state === "not-ready" ? view.status : view.state, title: null, excerpt: "Episode summary unavailable; use the original episode reference.", generation: null, complete: false };
+          const status = view.state === "not-ready" ? view.status : view.state;
+          ep.summary = { status, title: null, excerpt: "Episode summary unavailable; use the original episode reference.", generation: null, complete: false };
           if (view.state === "unreadable") s.summaryUnreadable++;
+          else if (view.state === "malformed") s.summaryMalformed++;
+          else s.summaryUnavailable++;
         }
       } catch { ep.summary = { status: "unreadable", title: null, excerpt: "Episode summary unavailable; use the original episode reference.", generation: null, complete: false }; s.summaryUnreadable++; }
     }
@@ -187,7 +201,7 @@ export function createHistoryBrowser(host: MemoryHost): { browse: MemoryBackend[
     s.expires = Date.now() + TTL;
     if (s.phase === "scanning") await scanSome(s, scope, context);
     if (s.phase === "summaries") await prepareSummaries(s, context);
-    if (s.phase !== "ready") return { hits: [], cursor: next(s, 0), complete: false, phase: "preparing", coverage: coverage(s, false, { highwater: s.sessions.map((x) => ({ session: x.session.sessionKey, entryId: x.highwater })), enumerationComplete: false }), freshness: { source: "authoritative", indexUsed: false, snapshot: "frozen", sourceChanges: "not-revalidated" } };
+    if (s.phase !== "ready") return { hits: [], cursor: next(s, 0), complete: false, phase: "preparing", coverage: coverage(s, false, { readFailures: s.readFailures, blockedSources: s.unreadable, summaryUnavailable: s.summaryUnavailable, summaryMalformed: s.summaryMalformed, highwater: s.sessions.map((x) => ({ session: x.session.sessionKey, entryId: x.highwater })), enumerationComplete: false }), freshness: { source: "authoritative", indexUsed: false, snapshot: "frozen", sourceChanges: "not-revalidated" } };
     if (!s.result) {
       let hits: MemoryHit[];
       if (query.target === "episodes") hits = s.episodes.filter((ep) => ep.queryMatched).map((ep) => episodeHit(ep, scope)).filter((hit) => matchesEpisode(query, hit, scope));
@@ -210,7 +224,7 @@ export function createHistoryBrowser(host: MemoryHost): { browse: MemoryBackend[
       const { sortTime: _time, tie: _tie, ...hit } = item as PartHit;
       return hit;
     });
-    return { hits, ...(complete ? {} : { cursor: next(s, nextPos) }), complete, coverage: coverage(s, s.unreadable === 0 && s.malformed === 0, { enumerationComplete: true, lowerBound: s.unreadable > 0 || s.malformed > 0, matchedHits: s.result.length, highwater: s.sessions.map((x) => ({ session: x.session.sessionKey, entryId: x.highwater })) }), freshness: { source: "authoritative", indexUsed: false, snapshot: "frozen", sourceChanges: "not-revalidated" } };
+    return { hits, ...(complete ? {} : { cursor: next(s, nextPos) }), complete, coverage: coverage(s, s.unreadable === 0 && s.malformed === 0 && s.summaryUnreadable === 0 && s.summaryMalformed === 0 && s.summaryUnavailable === 0, { readFailures: s.readFailures, blockedSources: s.unreadable, summaryUnavailable: s.summaryUnavailable, summaryUnreadable: s.summaryUnreadable, summaryMalformed: s.summaryMalformed, enumerationComplete: true, lowerBound: s.unreadable > 0 || s.malformed > 0, matchedHits: s.result.length, highwater: s.sessions.map((x) => ({ session: x.session.sessionKey, entryId: x.highwater })) }), freshness: { source: "authoritative", indexUsed: false, snapshot: "frozen", sourceChanges: "not-revalidated" } };
   }
   return { browse, close() { snapshots.clear(); } };
 }
