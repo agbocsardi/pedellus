@@ -90,13 +90,13 @@ without the generic failure text, one per input; the same applies to a turn
 ended by a queued reset (reason `reset`). Other settlement reasons keep the
 fixed failure text.
 
-`/status` prints bounded point-in-time metadata of **this** authenticated chat
-only: the selected model and its preset, whether a turn is running (turn number
+`/status` prints bounded point-in-time metadata of **this** authenticated chat: the selected model and its preset, whether a turn is running (turn number
 and input count) and how many native inputs are queued. A bounded background
 summary follows: this chat's own live workers and its own cron jobs
 (executing, queued, parked, or with a future occurrence armed) and whether the
 one workspace-global memory-digestion run is live in this chat or another. A
-natively blocked task is named as parked instead of counted as running;
+natively blocked task is named as parked instead of counted as running. A separate
+`Restart:` line counts active work gateway-wide without identifying other chats;
 `Background: idle` means nothing is executing or queued right now, and an armed
 future occurrence is its own `Cron:` line with the next due time. It reuses the
 native conversation projection the terminal uses, makes no model call, creates
@@ -163,7 +163,13 @@ one with fixed text.
 `/restart` asks the host to replace the Gateway process so current code and a
 re-read configuration are loaded. It is not a model tool, it is available only to
 an authenticated allowlisted private sender, and it affects every surface and
-background job. The host performs it only after its own graceful teardown —
+background job. The host refuses it with a fixed no-effect reason while gateway
+work would be interrupted (a running generation, tool, compaction, worker,
+digest or cron run; a sleeping cron timer does not count). Nothing is
+claimed as restarted: the initial receipt only says the host is checking the request.
+A busy refusal follows without teardown; the owner may wait or use existing cancellation
+controls where available and ask again, so the same adapter may retry later. The host
+performs an accepted restart only after its own graceful teardown —
 adapters and local clients closed, timers cleared, Harness, Code Mode sandbox and
 MCP clients closed, store lock released — and only where the Node runtime can
 replace the process image (`process.execve`, POSIX; absent on Windows and IBM i).
@@ -380,7 +386,9 @@ allowlist no longer admits is dropped like any other notice, and records that do
 not fit the admitted bound stay recorded for a later open. A process that was
 refused instead reports "Restart failed: the host refused it, so this gateway
 keeps running. Nothing was restarted." to those chats and clears them, so the
-promise is never left open. If the process
+promise is never left open; a refusal because gateway work is active reports the
+fixed busy reason instead and does not latch, so a later `/restart` asks the host
+again. If the process
 dies in between, the next open reports the command exactly once: its held
 acknowledgement is corrected to the explicit "interrupted, may not have taken
 effect" wording and released, or, when no acknowledgement record is left, a

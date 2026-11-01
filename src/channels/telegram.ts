@@ -34,6 +34,7 @@ import type {
 } from "../runtime.js";
 import { inProcessTerminalConversation } from "../terminal/conversation.js";
 import { renderBackgroundStatus, type BackgroundStatus } from "../background-status.js";
+import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import { MEDIA_LIMITS, MediaRejected, createMediaStore, type MediaRejectionReason, type MediaStore, type StoredMedia } from "../media/attachments.js";
 import { createTranscriber, type Transcriber, type TranscriptionBackend, type TranscriptionFailure, type WhisperCliEngine } from "../media/transcription.js";
@@ -2740,14 +2741,20 @@ export async function runTelegram(
     const host = options.restart;
     if (host === undefined || !host.supported) return;
     restartHostRequested = true;
-    void host.request().catch(() => {
-      restartHostRequestFailed = true;
-      console.warn("Telegram /restart request was refused by the host; the gateway keeps running.");
+    void host.request().catch((error: unknown) => {
+      // A busy refusal is a known no-effect before any acknowledgement or teardown: the owner may finish
+      // or abort the live work and ask again, so this adapter does not latch the refusal as final.
+      const busy = error instanceof RestartBusyError;
+      restartHostRequestFailed = !busy;
+      if (busy) restartHostRequested = false;
+      console.warn(busy
+        ? "Telegram /restart was refused while live work is active; the gateway keeps running."
+        : "Telegram /restart request was refused by the host; the gateway keeps running.");
       // The acknowledgement promised a follow-up, so the refusal is reported now instead of leaving that
       // promise open until some later process starts.
       void stateConversation.commit(async (tx) => {
         const doc = await tx.doc(TelegramState, stateConversation.id);
-        admitRestartNotices(doc, RESTART_FAILED);
+        admitRestartNotices(doc, busy ? RESTART_BUSY_MESSAGE : RESTART_FAILED);
         delete doc.restart;
         return copyJson(doc) as unknown as ChannelState;
       }, adapterContext).then((next) => {
@@ -3533,7 +3540,7 @@ const CONTROL_ACK: Record<TelegramMutation, string> = {
   model:
     "Model preset selection is being applied to this chat only. Nothing was sent to the assistant.",
   restart:
-    "Restarting the gateway. A confirmation follows once it is live.",
+    "Gateway restart requested; the host is checking active work. If accepted, a confirmation follows once it is live.",
   digest:
     "Memory digestion request applied for this chat; the bounded run follows separately and reports only a failure or cancellation to this chat's agent.",
 };

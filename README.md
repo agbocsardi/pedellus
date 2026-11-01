@@ -41,7 +41,7 @@ TypeScript edits: no full build, watcher or hot reload is required. Run
 command link. `npm run build` remains available for compiled output/tests. See
 [checkout and service updates](./SERVICE.md#checkout-command-and-build-workflow).
 
-Without `--config`, `gateway`, `agent`, `login`, `logout` and `recovery` use the fixed primary file
+Without `--config`, `gateway`, `agent`, `login`, `logout`, `recovery` and `cron` use the fixed primary file
 `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
 the working directory. A secondary instance passes its own explicit `--config`.
 [User services](./SERVICE.md) documents the shipped foreground systemd user

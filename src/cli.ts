@@ -5,6 +5,13 @@ import { stdin, stderr, stdout } from "node:process";
 import type { AuthType } from "@earendil-works/pi-ai";
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { runLogin, runLogout } from "./auth/cli.js";
+import {
+  CronCommandError,
+  CronUsageError,
+  parseCronInvocation,
+  runCronCommand,
+  type CronInvocation,
+} from "./automation/operator-cli.js";
 import { loadConfig, defaultConfigPath } from "./config.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { COMMANDS, commandUsage, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
@@ -15,7 +22,7 @@ import { LocalGatewayError } from "./local/protocol.js";
 import { createMediaStore } from "./media/attachments.js";
 import { LOCAL_ATTACHMENT_DIRECTORY } from "./media/local.js";
 import { cancelPreparedContextBlock, listPreparedContextBlocks, PreparedContextRecoveryError } from "./recovery/index.js";
-import { replaceProcess, restartPlan, restartSupported, RESTART_FAILURE_DIAGNOSTIC } from "./restart.js";
+import { createRestartCoordinator, replaceProcess, restartPlan, restartSupported, RESTART_FAILURE_DIAGNOSTIC } from "./restart.js";
 import { runTerminalConversation } from "./terminal/index.js";
 import { openGateway } from "./runtime.js";
 import { prepareDataDirectory } from "./store.js";
@@ -139,6 +146,18 @@ function agentInvocation(args: readonly string[]): LaunchInvocation {
   return { kind: "agent", config, ...(conversation === undefined ? {} : { conversation }) };
 }
 
+/** `cron` reads its configuration like every other process command and attaches to the gateway. */
+function cronInvocation(args: readonly string[]): { readonly invocation: CronInvocation; readonly config: ConfigSource } | undefined {
+  if (args[0] !== "cron") return undefined;
+  const invocation = parseCronInvocation(args.slice(1));
+  return {
+    invocation,
+    config: invocation.configPath === undefined
+      ? { kind: "default" }
+      : { kind: "path", path: invocation.configPath },
+  };
+}
+
 function recoveryInvocation(args: readonly string[]): RecoveryInvocation | undefined {
   if (args[0] !== "recovery") return undefined;
   let config: ConfigSource = { kind: "default" };
@@ -244,6 +263,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     await runRecovery(recovery, await readConfig(recovery.config));
     return;
   }
+  const cron = cronInvocation(args);
+  if (cron !== undefined) {
+    await runCron(cron.invocation, await readConfig(cron.config));
+    return;
+  }
   const auth = authInvocation(args);
   if (auth !== undefined) {
     await runAuthCommand(auth, await readConfig(auth.config));
@@ -312,6 +336,27 @@ async function runRecovery(recovery: RecoveryInvocation, config: Awaited<ReturnT
 }
 
 /**
+ * Owner scheduling controls: one connection to the running gateway, no chat attachment.
+ * Nothing is scheduled or cancelled in this process; the gateway owns every runtime decision.
+ */
+async function runCron(invocation: CronInvocation, config: Awaited<ReturnType<typeof loadConfig>>): Promise<void> {
+  const stop = new AbortController();
+  const context = withAbortSignal(stop.signal, BACKGROUND_CONTEXT);
+  const shutdown = () => stop.abort();
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+  let client: Awaited<ReturnType<typeof connectLocalGateway>> | undefined;
+  try {
+    client = await connectLocalGateway({ socketPath: await localSocketPath(config), operatorOnly: true, context });
+    await runCronCommand({ client, command: invocation.command, output: stdout, context });
+  } finally {
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
+    await client?.close();
+  }
+}
+
+/**
  * The gateway is the sole Durable/storage/runtime owner. It serves the local CLI
  * endpoint and, when configured, Telegram, until SIGINT/SIGTERM.
  */
@@ -323,14 +368,15 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
   process.once("SIGTERM", shutdown);
   let gateway: Awaited<ReturnType<typeof openGateway>> | undefined;
   let server: Awaited<ReturnType<typeof serveLocalGateway>> | undefined;
-  /** Set only by the authenticated owner `/restart` command; acted on after graceful teardown. */
-  let restartRequested = false;
-  const requestRestart = async (acknowledge?: () => Promise<void>): Promise<void> => {
-    if (restartRequested) throw new Error("gateway restart is already in progress");
-    restartRequested = true;
-    try { await acknowledge?.(); }
-    finally { shutdown(); }
-  };
+  /** The one host gate for both owner `/restart` surfaces: it refuses while live work would be interrupted. */
+  const restart = createRestartCoordinator({
+    activeWork: async (ctx) => {
+      if (gateway === undefined) throw new Error("gateway is not open");
+      return gateway.activeWork(ctx);
+    },
+    context: withoutAbortSignal(context),
+    teardown: shutdown,
+  });
   try {
     const socketPath = await localSocketPath(config);
     gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
@@ -355,7 +401,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       tools: config.toolAllowlist ?? [],
       contextRefresh: config.workspaceContext !== undefined,
       presets: config.modelPreset !== undefined,
-      restart: { supported: restartSupported(), request: requestRestart },
+      restart: { supported: restartSupported(), request: (acknowledge) => restart.request(acknowledge) },
       ...(attachments === undefined ? {} : { attachments }),
     });
     if (config.telegram) {
@@ -383,7 +429,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
         // shutdown, and the replacement happens here after the teardown below.
         restart: {
           supported: restartSupported(),
-          request: () => requestRestart(),
+          request: () => restart.request(),
         },
       }, context);
     } else {
@@ -395,7 +441,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
     await server?.close();
     await gateway?.close(withoutAbortSignal(context));
   }
-  if (restartRequested) replaceGatewayProcess();
+  if (restart.accepted()) replaceGatewayProcess();
 }
 
 /**
@@ -563,6 +609,10 @@ export function runCli(): Promise<void> {
   return main().catch((error) => {
     if (error instanceof PreparedContextRecoveryError) {
       console.error(`durable-nanobot recovery: ${error.message}`);
+    } else if (error instanceof CronUsageError) {
+      console.error(error.message);
+    } else if (error instanceof CronCommandError) {
+      console.error(`durable-nanobot cron: ${error.message}`);
     } else if (error instanceof UnknownCommandError) {
       // Only a safe command-shaped token is echoed; any other supplied argument stays private.
       const echo = SAFE_COMMAND_NAME.test(error.token) ? `: ${error.token}` : "";

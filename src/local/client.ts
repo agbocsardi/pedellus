@@ -10,6 +10,13 @@ import type { GatewayModelList, GatewayModelSelection, GatewayModelSelectionRequ
 import type { McpAdminListing, McpCallbackResult } from "../mcp/index.js";
 import type { McpAuthorizationLink } from "../mcp/surface.js";
 import type {
+  CronOperatorCancelOutcome,
+  CronOperatorCreateOutcome,
+  CronOperatorJob,
+  CronOperatorListing,
+} from "../automation/operator.js";
+import type { CronScheduleInput } from "../automation/cron.js";
+import type {
   TerminalAttachmentSubmission,
   TerminalConversation,
   TerminalEntryPage,
@@ -28,11 +35,25 @@ import {
   asObject,
   parseServerLine,
   type LocalErrorBody,
+  type LocalErrorCode,
 } from "./protocol.js";
 
 /** A server-side busy rejection keeps its native name so the terminal prints its busy text. */
 class RemoteConversationBusy extends Error {
   override name = "ConversationBusy";
+}
+
+/**
+ * A refusal the gateway itself sent, as opposed to a transport that stopped answering. The code
+ * distinguishes a request the host rejected (`invalid`, `unavailable`) from work that merely failed
+ * (`failed`), so an operator command can report a definitive refusal separately from an unknown
+ * outcome after a lost response.
+ */
+export class LocalRemoteError extends Error {
+  override name = "LocalRemoteError";
+  constructor(readonly code: LocalErrorCode, message: string) {
+    super(message);
+  }
 }
 
 export interface LocalGatewayClient extends TerminalConversation {
@@ -63,6 +84,11 @@ export interface LocalGatewayClient extends TerminalConversation {
   /** Direct, transient owner delivery from the gateway; never a transcript or durable outbox entry. */
   onMcpAuthorization?: ((authorization: McpAuthorizationLink) => void) | undefined;
   onMcpNotice?: ((text: string) => void) | undefined;
+  /** Owner controls for scheduled work: store-wide reads and exact-ID create/cancel. */
+  cronList(context: Context, offset?: number): Promise<CronOperatorListing>;
+  cronShow(id: string, context: Context): Promise<CronOperatorJob[]>;
+  cronCreate(origin: string, request: CronScheduleInput, context: Context): Promise<CronOperatorCreateOutcome>;
+  cronCancel(id: string, context: Context): Promise<CronOperatorCancelOutcome>;
   historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage>;
   listEpisodes(sessionKey: string, query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage>;
   episode(sessionKey: string, startEntryId: number, context: Context): Promise<HistoryEpisode | undefined>;
@@ -81,6 +107,8 @@ export interface LocalGatewayClient extends TerminalConversation {
 
 export interface ConnectLocalGatewayOptions {
   readonly socketPath: string;
+  /** Connect for store-wide operator calls without creating or configuring a chat. */
+  readonly operatorOnly?: boolean;
   /** CLI conversation name; absent is the historical `default` (`cli:default`). */
   readonly conversation?: string;
   readonly context: Context;
@@ -119,7 +147,7 @@ export async function connectLocalGateway(options: ConnectLocalGatewayOptions): 
   socket.setNoDelay(true);
   const client = new LocalGatewayConnection(socket);
   try {
-    await client.attach(options.conversation, options.context);
+    if (!options.operatorOnly) await client.attach(options.conversation, options.context);
   } catch (error) {
     await client.close();
     throw error;
@@ -307,6 +335,28 @@ class LocalGatewayConnection implements LocalGatewayClient {
 
   async mcpSubmitCallback(text: string, context: Context): Promise<McpCallbackResult> {
     return this.call("mcpCallback", { text }, context);
+  }
+
+  async cronList(context: Context, offset = 0): Promise<CronOperatorListing> {
+    const result = await this.call<CronOperatorListing>("cronList", { offset }, context);
+    if (!Array.isArray(result.jobs) || !Array.isArray(result.origins)) {
+      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected job listing");
+    }
+    return result;
+  }
+
+  async cronShow(id: string, context: Context): Promise<CronOperatorJob[]> {
+    const result = await this.call<{ readonly jobs: CronOperatorJob[] }>("cronShow", { id }, context);
+    if (!Array.isArray(result.jobs)) throw new LocalGatewayError("unavailable", "local gateway sent an unexpected job listing");
+    return result.jobs;
+  }
+
+  cronCreate(origin: string, request: CronScheduleInput, context: Context): Promise<CronOperatorCreateOutcome> {
+    return this.call("cronCreate", { origin, request }, context);
+  }
+
+  cronCancel(id: string, context: Context): Promise<CronOperatorCancelOutcome> {
+    return this.call("cronCancel", { id }, context);
   }
 
   async historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage> {
@@ -540,7 +590,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
 
 function remoteError(body: LocalErrorBody): Error {
   if (body.code === "busy") return new RemoteConversationBusy(body.message);
-  return new Error(body.message);
+  return new LocalRemoteError(body.code, body.message);
 }
 
 function asSettlement(value: unknown): TerminalSettlement | undefined {

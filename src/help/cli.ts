@@ -30,7 +30,7 @@ export const COMPATIBILITY_SYNOPSIS = "durable-nanobot --config <path>   (agent,
 const DEFAULT_CONFIG_FILE = "~/.durable-nanobot/config.json";
 
 /** The one sentence the usage block adds after its synopses, because it is the only configuration default. */
-const DEFAULT_CONFIG_NOTE = `Without --config, gateway, agent, login, logout and recovery use ${DEFAULT_CONFIG_FILE}.`;
+const DEFAULT_CONFIG_NOTE = `Without --config, gateway, agent, login, logout, recovery and cron use ${DEFAULT_CONFIG_FILE}.`;
 
 const CONFIG_OPTION: HelpOption = {
   flags: "--config <path>",
@@ -100,6 +100,33 @@ export const COMMANDS: readonly CommandHelp[] = [
     examples: [
       "durable-nanobot recovery",
       "durable-nanobot recovery --cancel 12 --fingerprint <sha256>",
+    ],
+  },
+  {
+    name: "cron",
+    synopsis: "durable-nanobot cron <list|show <jobId>|cancel <jobId>|create> [options] [--config <path>]",
+    summary: "Inspect and manage scheduled work on this store's mapped chats",
+    options: [
+      CONFIG_OPTION,
+      { flags: "--offset <n>", text: "list: read the next bounded page at the printed offset." },
+      {
+        flags: "--origin <sessionKey>",
+        text: "create: required mapped chat to schedule on; list prints available keys.",
+      },
+      { flags: "--key <requestKey>", text: "create: required durable request key; an identical retry dedupes." },
+      { flags: "--message <text> [--name <label>]", text: "create: the instruction the agent receives when the job fires." },
+      { flags: "--at <iso>|--after <s>|--every <s>|--cron <expr> [--tz <zone>]", text: "create: exactly one schedule." },
+      { flags: "--mode background|origin", text: "create: background (default) or in the origin chat." },
+    ],
+    details: [
+      "list and show are read-only; create and cancel act on one exact job through a running gateway.",
+      "Nothing is scheduled if the origin is not a mapped chat; nothing is re-armed or edited.",
+    ],
+    examples: [
+      "durable-nanobot cron list",
+      "durable-nanobot cron show <jobId>",
+      "durable-nanobot cron cancel <jobId>",
+      "durable-nanobot cron create --origin <sessionKey> --key wake-1 --after 600 --message \"Stretch\"",
     ],
   },
 ];

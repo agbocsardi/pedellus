@@ -67,8 +67,9 @@ edits need restart only; unit edits additionally need daemon-reload.
   `credentials.<provider>` environment reference, Durable's own file
   `CredentialStore` under the canonical `dataDir`, and the terminal-only
   `login`/`logout` commands. No provider whitelist, no Pi credential store.
-- `src/automation/` — cron timer/run tasks, persistent automation conversations and
-  the model-facing `cron` tool.
+- `src/automation/` — cron timer/run tasks, persistent automation conversations, the
+  model-facing `cron` tool and the owner's terminal scheduling console
+  (`cron create|list|show|cancel` over the private local socket).
 - `src/workers/` — bounded ordinary background workers as native Durable tasks:
   the opt-in `worker` start/list/inspect/cancel tool, an explicit
   shared-or-worktree workspace per task, captured child authority and one internal
@@ -161,7 +162,15 @@ edits need restart only; unit edits additionally need daemon-reload.
   refuses it while that chat runs instead of half-applying; `/restart` is the
   host's full-process replacement (same executable, argv and environment through
   POSIX `process.execve`, after normal teardown), never a model tool, daemon or
-  supervisor. The CLI flushes its acknowledgement before restart tears down connections and
+  supervisor. One host gate shared by the local CLI and Telegram refuses it with
+  fixed text while live work would be interrupted: running, queued, waiting or
+  finishing tasks (generation, tool, compaction, worker, digest, cron run).
+  Sleeping native timers and parked blocked tasks are not active work, so an
+  armed schedule never blocks indefinitely. A refusal acknowledges nothing, tears
+  down nothing and may be retried after finishing or aborting; `/status` names
+  only the bounded gateway-wide count, and the inspect-then-teardown check is not
+  atomic, so work admitted in that window is not protected.
+  The CLI flushes its acknowledgement before restart tears down connections and
   does not wait for the replacement; an authenticated Telegram `/restart` records each requesting
   chat durably in the same applied commit, and the replacement posts one ordinary notice per chat
   and clears them, while a host refusal reports that nothing was restarted instead. A sender the
@@ -180,7 +189,12 @@ edits need restart only; unit edits additionally need daemon-reload.
   history. A job's persistent `silent` setting, or an exact trimmed `[SILENT]`
   successful final answer, suppresses that occurrence's automatic channel
   delivery — never the run, and never a failure notice; the marker applies only
-  to a scheduled run, not an ordinary chat reply.
+  to a scheduled run, not an ordinary chat reply. The owner's terminal has a thin
+  scheduling console (`durable-nanobot cron create|list|show|cancel`) that
+  composes the same foundation over the private local socket: creation needs an
+  explicit request key, its origin and owner are resolved from current mapped
+  ordinary chats, cancellation is exact-ID, and there is no schedule edit,
+  re-arm, run-now or bulk path.
 - Skill prompts carry names, descriptions and locators only; bodies load on
   demand through the read-only `skill` tool.
 - Markdown in the workspace is the memory source of truth. Durable owns the

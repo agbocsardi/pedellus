@@ -21,7 +21,7 @@ durable-nanobot agent                      # attaches to the same default gatewa
 durable-nanobot agent --config /path/to/config.json     # attach a terminal to that gateway
 ```
 
-Without `--config`, `gateway`, `agent`, `login`, `logout` and `recovery` read exactly
+Without `--config`, `gateway`, `agent`, `login`, `logout`, `recovery` and `cron` read exactly
 `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
 the shell's working directory. A secondary instance passes its own explicit
 `--config`. There is no config discovery, merging, search, auto-generation or
@@ -42,6 +42,7 @@ durable-nanobot agent --help
 durable-nanobot login --help
 durable-nanobot logout --help
 durable-nanobot recovery --help
+durable-nanobot cron --help
 ```
 
 A per-command page carries that command's exact usage line, its own options, at
@@ -217,6 +218,38 @@ exact trimmed `[SILENT]` successful answer suppresses a successful result, while
 failure still notifies, and cancelled or superseded runs are not. See
 [cron](./CRON.md).
 
+## Operator scheduling
+
+`durable-nanobot cron` is the owner's scheduling console. It attaches to the running
+gateway over the same private local socket as `agent`, so the gateway resolves every
+origin, owner and cancellation; the command itself schedules nothing:
+
+```sh
+durable-nanobot cron list
+durable-nanobot cron show <jobId>
+durable-nanobot cron cancel <jobId>
+durable-nanobot cron create --origin <sessionKey> --key <requestKey> --after 600 --message "Stretch"
+durable-nanobot cron create --key daily-1 --cron "0 9 * * 1-5" --tz Europe/Budapest \
+  --origin telegram:<identity>:chat:<chatId> --message "Morning check"
+```
+
+`list` and `show` are read-only and cover every currently mapped chat; `list` order is the
+next occurrence and it names the mapped chat keys an explicit `--origin` can use.
+Listings are bounded to 100 compact rows; follow the printed `list --offset <n>` for the
+next page (a point-in-time view, not a frozen snapshot). Neither command attaches or creates a chat. `create`
+requires explicit `--origin` and `--key`; the cron foundation dedupes an identical retry, refuses
+a different payload under the same key, and never re-arms a cancelled original.
+Exactly one of `--at`, `--after`, `--every` or `--cron` (with optional `--tz`) is
+accepted, and `--mode background|origin` matches the job's run mode: a background job
+records its outcome on the job (`cron show`) and its answer is delivered only through a
+channel outbox (currently Telegram), while `--mode origin` answers in the origin
+conversation itself. `--origin` must name an already mapped chat.
+`cancel` is exact-ID, refuses an ID recorded under more than one chat, and reports a
+recorded cancellation separately from a post-commit cleanup failure. If the gateway
+stops answering, the command reports an unknown outcome and points at the retry-safe
+or verify-first path instead of claiming a result. There is no bulk, run-now,
+re-arm or schedule-editing command. See [cron](./CRON.md#operator-controls).
+
 ## Recovery
 
 Gateway startup fails closed when a prepared model dispatch still pins historical
@@ -246,7 +279,7 @@ fail-closed and is not remotely cancelled. See
 | Command | Behavior |
 |---|---|
 | `/help` | Show the owner controls this host offers, one command per line with a short description; `/help <command>` prints that command's usage and detail. |
-| `/status` | Show the conversation's current host-selected model, native run/inbox state, and Durable-recorded per-model/tool usage. Provider-side charges or unrecorded spend remain unknown. A bounded background summary follows: this conversation's own live workers and cron jobs (executing, queued, parked, or with a future occurrence armed) and whether the one workspace-global memory-digestion run is live in this chat or another. A natively blocked task is named as parked instead of counted as running; `Background: idle` means nothing is executing or queued right now, and an armed future occurrence is its own `Cron:` line with the next due time. It is read-only metadata: no model call, dashboard, management command, recovery interface or transcript read, and the agent remains the manager of that work. |
+| `/status` | Show the conversation's current host-selected model, native run/inbox state, and Durable-recorded per-model/tool usage. Provider-side charges or unrecorded spend remain unknown. A bounded background summary follows: this conversation's own live workers and cron jobs (executing, queued, parked, or with a future occurrence armed) and whether the one workspace-global memory-digestion run is live in this chat or another. A natively blocked task is named as parked instead of counted as running; `Background: idle` means nothing is executing or queued right now, and an armed future occurrence is its own `Cron:` line with the next due time. When gateway-wide work would be interrupted by `/restart`, one `Restart:` line names only the bounded count. It is read-only metadata: no model call, dashboard, management command, recovery interface or transcript read, and the agent remains the manager of that work. |
 | `/history [count]` | Show the latest user/assistant text messages only (default 10, max 50), using Durable entry pagination; each snippet is limited to 200 characters and the scan to 2,000 entries. Reasoning, tool, and non-text blocks are omitted; synthetic user-role reset or compaction messages may also appear. |
 | `/search [--scope messages\|tools\|all] [--role user\|assistant] [--limit 1-50] [--next] [--] [query]` | Search or browse the local history index. Default scope is messages; `--scope tools` searches tool names, arguments and result text only, and `--scope all` combines messages and tools. Empty text browses the selected scope. See [history search and browsing](#history-search-and-browsing). |
 | `/episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>]` | List reset-delimited episodes newest first, with entry ranges, counts and recorded summary status only. `--session` must name an existing mapped chat session; the default is this attachment's session key (normally `cli:default`). This command does not generate or show summary text. |
@@ -262,7 +295,7 @@ fail-closed and is not remotely cancelled. See
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort`, `/stop` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
 | `/new` | Start a fresh context in the same conversation and rebuild configured workspace instructions, memory and skills, exactly as Telegram does. With workspace context configured, a busy conversation is refused; prompt replacement and the reset marker commit atomically. No handoff, archive, summary, usage reset or extra model call; original entries and tool authority remain. Without configured workspace context, native reset semantics apply, including safe-boundary placement while busy. |
-| `/restart` | Ask the owner host to replace the whole gateway process after graceful teardown, using the same executable, argv and environment. Advertised only when supported. Configuration and workspace context reload; every attached CLI and Telegram surface disconnects. The local acknowledgement is flushed before shutdown. |
+| `/restart` | Ask the owner host to replace the whole gateway process after graceful teardown, using the same executable, argv and environment. Advertised only when supported. Refused with a fixed no-effect reason while live work (a running generation, tool, compaction, worker, digest or cron run) would be interrupted; a sleeping cron timer does not block. Finish or abort that work and retry; nothing is auto-cancelled. Configuration and workspace context reload; every attached CLI and Telegram surface disconnects. The local acknowledgement is flushed before shutdown. |
 
 Memory digestion reports only issues. A failed or cancelled run is one internal
 event for this conversation's agent (the same pattern as a worker result), not a
