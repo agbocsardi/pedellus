@@ -67,7 +67,10 @@ prompt snapshot refuses it while that chat has a running turn rather than
 half-applying; there is no separate `/refresh` command. `/restart` is a full
 process replacement: after the normal graceful teardown the same executable,
 argv and current environment are re-exec'd (POSIX `process.execve`), so current
-code and the re-read config load. It is not a daemon, supervisor or service
+code and the re-read config load. Its acknowledgement is short: the replacement
+posts one confirmation to each requesting Telegram chat once it is serving again,
+while the CLI disconnects and does not wait for it. It is not a daemon,
+supervisor or service
 manager, and a platform without `execve` refuses it. These controls add no tool
 authority and coexist with media ingress and MCP. See
 [Telegram controls](./TELEGRAM.md#controls).

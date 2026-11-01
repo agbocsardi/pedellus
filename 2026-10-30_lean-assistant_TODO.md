@@ -1446,3 +1446,30 @@ server, faux models, no external network.
   value, failing tool listing, snapshot/rotation/epoch contract, symlink-swap
   read), 2 execution checks, native `createEnvConformance` 24/24 and core
   acceptance 83/83. No live MCP server, provider or credential was used.
+
+### Session — quieter /restart with a live confirmation
+
+- [x] The owner-facing acknowledgement is short on both surfaces: "Restarting the
+  gateway. A confirmation follows once it is live." (Telegram) and "Gateway
+  restarting; this terminal disconnects." (CLI). The still-pending wording lost its
+  redundant subject.
+- [x] Authenticated Telegram `/restart` now records every requesting chat (`restart:
+  [{ chatId, senderId }]`, bounded at 8) in the same commit that marks the command
+  `applied`, so it is durable before the host replaces the process. The replacement
+  process turns those records into ordinary durable notices ("Gateway restarted and
+  live: current code and configuration are loaded.") and clears the ones it queued,
+  reusing the existing notice queue, chunking, rich/plain send, write-ahead intent and
+  hold/unknown rules. A refused host request reports "Restart failed: the host refused
+  it, so this gateway keeps running. Nothing was restarted." instead of leaving the
+  acknowledgement's promise open. A sender the live allowlist no longer admits is
+  dropped like any other notice, records that do not fit the admitted bound stay for a
+  later open, and queue ids for these notices are negative so they cannot collide with
+  an admitted update.
+- [x] State version 8 adds that bounded list; versions 1–7 migrate without one.
+  AGENTS.md, README.md and TELEGRAM.md describe the confirmation and its proof
+  boundary (the new process opened, loaded its configuration and serves that chat;
+  it claims nothing about later model calls).
+- [x] Verification: typecheck/build, 361 behavior checks (the `/restart` test now
+  covers the durable slot, the delivered confirmation, no re-request, no second
+  model turn, and that a consumed confirmation is never repeated) and core
+  acceptance. No live bot, credential or process replacement was used.

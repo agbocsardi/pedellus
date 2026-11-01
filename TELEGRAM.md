@@ -162,9 +162,11 @@ replace the process image (`process.execve`, POSIX; absent on Windows and IBM i)
 The replacement keeps the same executable, the same argv (script, `gateway`,
 `--config <path>`) and the current process environment; nothing is re-discovered
 from disk, and no shell respawn, supervisor or service manager is involved. The
-acknowledgement confirms the **request**, not a completed restart; a failed
-replacement leaves a fixed diagnostic and a stopped process rather than a false
-success.
+acknowledgement confirms the **request**, and the chat that made it gets one
+follow-up: the replacement process posts that it is live, or the process that
+stayed up reports that the host refused the replacement. A failed replacement
+after that point leaves a fixed diagnostic and a stopped process rather than a
+false success.
 
 The host owns that capability: the local CLI injects it, and an SDK host that
 does not gets no `/restart` entry and a fixed refusal when the command is typed.
@@ -284,9 +286,8 @@ published once:
   idle now. Queued messages were withdrawn and any running turn was stopped …"
   — phrased so an idle conversation is not claimed to have had a turn stopped —
   "Selected preset … for this chat: …", the bounded `/digest` admission
-  (started/busy/idle/refused, never evidence text), or "Restart requested for
-  this gateway … This acknowledgement confirms the request only; it does not
-  confirm that the restart completed.";
+  (started/busy/idle/refused, never evidence text), or the short "Restarting the
+  gateway. A confirmation follows once it is live.";
 - the native call proved that nothing changed (`/new` or `/model` on a busy chat,
   an unknown or unavailable preset, a legacy direct config): the acknowledgement
   is corrected to that fixed refusal; the record becomes `refused`, never
@@ -358,8 +359,20 @@ after the acknowledgement; messages admitted afterwards stay gated and run later
 
 After the native call returns, the record becomes `applied` (for `/restart`, once
 the host accepted the request), the log is pruned, and the held acknowledgement
-is released. The host replacement for `/restart` is requested only after that
-acknowledgement and offset are durable, and never more than once. If the process
+is released. For `/restart` that commit also records every requesting chat as
+`restart: [{ chatId, senderId }]` (bounded at 8), so the promise made by the
+acknowledgement is durable before the host requests the replacement — which it
+does only after the acknowledgement and offset are durable, and never more than
+once. The replacement process turns those records into one ordinary notice per
+chat — "Gateway restarted and live: current code and configuration are loaded."
+— and clears the ones it queued. The confirmation therefore proves only that the
+new process opened, loaded its configuration and is serving that chat; its own
+failure or ambiguity follows the ordinary notice hold rules. A sender the live
+allowlist no longer admits is dropped like any other notice, and records that do
+not fit the admitted bound stay recorded for a later open. A process that was
+refused instead reports "Restart failed: the host refused it, so this gateway
+keeps running. Nothing was restarted." to those chats and clears them, so the
+promise is never left open. If the process
 dies in between, the next open reports the command exactly once: its held
 acknowledgement is corrected to the explicit "interrupted, may not have taken
 effect" wording and released, or, when no acknowledgement record is left, a
@@ -387,6 +400,8 @@ Version 4 state migrates with empty `targets` and `actions` lists; versions 1 an
 migrate with an empty `controls` list. Version 6 adds admitted attachment records
 and the cached local transcript; earlier versions migrate with no attachments.
 Version 7 adds the `refused` control status; versions 1–6 migrate unchanged.
+Version 8 adds the bounded list of chats owed a restart confirmation; versions
+1–7 migrate without one.
 Invalid stored shapes fail closed.
 
 Not implemented here: tool-authority or approval commands, history commands,

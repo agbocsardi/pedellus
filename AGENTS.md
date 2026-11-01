@@ -155,7 +155,11 @@ edits need restart only; unit edits additionally need daemon-reload.
   refuses it while that chat runs instead of half-applying; `/restart` is the
   host's full-process replacement (same executable, argv and environment through
   POSIX `process.execve`, after normal teardown), never a model tool, daemon or
-  supervisor. The CLI flushes its acknowledgement before restart tears down connections.
+  supervisor. The CLI flushes its acknowledgement before restart tears down connections and
+  does not wait for the replacement; an authenticated Telegram `/restart` records each requesting
+  chat durably in the same applied commit, and the replacement posts one ordinary notice per chat
+  and clears them, while a host refusal reports that nothing was restarted instead. A sender the
+  live allowlist no longer admits gets no notice.
   Prompt rebuild and the idle reset marker share one commit across all channel attachments.
   `/refresh` is CLI-only; browsing, compaction and local attachments also remain CLI extras.
 - The cron timer never calls a model, and a run never schedules: rescheduling is

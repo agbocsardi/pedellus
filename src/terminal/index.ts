@@ -1120,7 +1120,7 @@ export async function runTerminalConversation(
           ENTRY_USAGE,
           "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
           "/abort and /stop cancel foreground work and withdraw queued inputs; background work is unchanged.",
-          ...(io.restart ? ["/restart replaces the whole gateway process, re-reads its configuration and disconnects every attached channel."] : []),
+          ...(io.restart ? ["/restart replaces the whole gateway process and re-reads its configuration; every attached channel disconnects and this terminal does not wait for it."] : []),
           io.history ? "/search --next continues the last successful query; cursors stay in this process and are never printed. History sessions default to cli:default; use --session with a key reported by /search." : "History search and episode browsing are host-controlled and unavailable here. /entry <entryId> [--radius N] still opens a bounded window in this terminal's default conversation; --session requires a history host.",
           io.modelSelection ? "/model lists host model choices; named-preset configs select with /model <name> (or /model default), direct configs with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
           io.toolPolicy
@@ -1246,7 +1246,7 @@ export async function runTerminalConversation(
           return;
         }
         await io.restart();
-        await notice("Gateway restart requested; all attached channels will disconnect.");
+        await notice("Gateway restarting; this terminal disconnects.");
         io.closeInput?.();
         operationController.abort(new Error("gateway restart requested"));
         return;
