@@ -45,7 +45,14 @@ same policy and the direct-workspace argv builder rather than a second policy.
   operation target, so a concurrent process that swaps a workspace component for
   a symbolic link between the check and the operation cannot redirect the read or
   the write. This is what keeps a private file outside the roots out of a racing
-  `read` call. Directory listings, `create`, `rename`, `remove` and `watch` keep
+  `read` call. A read-only open is nonblocking, so a path that is (or was swapped
+  to) a FIFO or a device cannot park the guard waiting for a peer — a blocking
+  open has no cancellation point and would outlive both the tool timeout and an
+  owner cancellation. The binary reads additionally refuse any opened descriptor
+  that is not a regular file (`invalid: Not a regular file`, or `is_directory`)
+  instead of reading content with no size and no cancellation point; the native
+  binary reader reaches the same refusal after its own nonblocking open.
+  Directory listings, `create`, `rename`, `remove` and `watch` keep
   the resolved-path check; they disclose no file content. Without procfs
   (non-Linux) the content operations fall back to the resolved-path check alone,
   and the sandboxed shell that makes the distinction matter is Linux-only.

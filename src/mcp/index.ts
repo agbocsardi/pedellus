@@ -48,7 +48,13 @@ export {
   type McpOAuthGrantSnapshot,
 } from "./oauth-store.js";
 export { beginMcpLogin, MCP_LOGIN_TIMEOUT_MS, type McpLoginFailure, type McpLoginOutcome, type McpLoginRun } from "./login.js";
-export { removeMcpServerEntry, writeMcpServerEntry, type McpConfigEdit, type McpConfigEditResult } from "./install.js";
+export {
+  removeMcpServerEntry,
+  writeMcpServerEntry,
+  type McpConfigBlockExpectation,
+  type McpConfigEdit,
+  type McpConfigEditResult,
+} from "./install.js";
 export {
   createMcpAdmin,
   loginNoticeText,

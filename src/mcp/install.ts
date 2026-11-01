@@ -46,6 +46,20 @@ export interface McpConfigEditResult {
   readonly enabled: boolean;
 }
 
+/**
+ * The `mcp` block one owner disclosure described, taken from the configuration a gateway opened with.
+ *
+ * A `config` approval's effects depend on the block's state on disk (whether it was already enabled, and
+ * which entries a turn-on would pin), so the disclosure and the write must read the same state. The write
+ * refuses when the block on disk no longer matches this expectation instead of applying effects the owner
+ * never saw.
+ */
+export interface McpConfigBlockExpectation {
+  readonly enabled: boolean;
+  /** Server entry names in the block, sorted. */
+  readonly servers: readonly string[];
+}
+
 const CONFIG_FILE_LIMIT_BYTES = 1024 * 1024;
 
 interface FileIdentity {
@@ -136,6 +150,17 @@ function rawServers(block: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(servers));
 }
 
+function sortedNames(servers: Record<string, unknown>): string[] {
+  return Object.keys(servers).sort((left, right) => left.localeCompare(right, "en-US"));
+}
+
+/** Whether the on-disk block is exactly the one a disclosure described. */
+function blockMatches(block: Record<string, unknown>, expected: McpConfigBlockExpectation): boolean {
+  if ((block.enabled === true) !== expected.enabled) return false;
+  const names = sortedNames(rawServers(block));
+  return names.length === expected.servers.length && names.every((name, index) => name === expected.servers[index]);
+}
+
 async function writeDocument(
   edit: McpConfigEdit,
   snapshot: DocumentSnapshot,
@@ -168,16 +193,29 @@ async function writeDocument(
 /**
  * Add or replace one validated server entry and enable the block. Only the approved entry may become
  * newly active: when the block was off, every other entry is pinned to `enabled: false` first.
+ *
+ * `expectedBlock` is the block state the approving owner was shown. When it is given and the file no longer
+ * holds it, the write is refused: the entry would otherwise land with effects the disclosure did not
+ * describe, such as pinning entries the gateway never opened with. A start re-reads the file, so the owner
+ * can restart and review again.
  */
 export async function writeMcpServerEntry(
   edit: McpConfigEdit,
   name: string,
   entry: unknown,
+  expectedBlock?: McpConfigBlockExpectation,
 ): Promise<McpConfigEditResult> {
   return serialized(edit.configFile, async () => {
     const snapshot = await readDocument(edit);
     const document = snapshot.document;
     const block = rawMcpBlock(document);
+    if (expectedBlock !== undefined && !blockMatches(block, expectedBlock)) {
+      throw new Error(
+        "The mcp block in the configuration file is not the one this gateway opened with, so the approval " +
+        "would not apply the effects that were disclosed; nothing was written. Restart the gateway to re-read " +
+        "the file, then review and approve again.",
+      );
+    }
     const servers = rawServers(block);
     const blockWasEnabled = block.enabled === true;
     const nextServers: Record<string, unknown> = { ...servers };
@@ -195,7 +233,7 @@ export async function writeMcpServerEntry(
     const validated = parseConfig({ ...document, mcp: next }, dirname(edit.configFile));
     if (validated.mcp === undefined) throw new Error("The approved MCP entry did not validate");
     await writeDocument(edit, snapshot, { ...document, mcp: next });
-    const names = Object.keys(validated.mcp.servers).sort((left, right) => left.localeCompare(right, "en-US"));
+    const names = sortedNames(validated.mcp.servers);
     return { servers: names, enabled: validated.mcp.enabled };
   });
 }

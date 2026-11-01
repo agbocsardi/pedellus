@@ -11,7 +11,7 @@ import {
   type Extension,
 } from "@earendil-works/pi-durable";
 import { parseMcpConfig, mcpServerEnabled, type McpConfig, type McpHttpServerConfig, type McpServerConfig } from "./config.js";
-import { removeMcpServerEntry, writeMcpServerEntry, type McpConfigEdit } from "./install.js";
+import { removeMcpServerEntry, writeMcpServerEntry, type McpConfigBlockExpectation, type McpConfigEdit } from "./install.js";
 import {
   beginMcpLogin,
   McpAlreadyAuthorizedError,
@@ -173,6 +173,9 @@ const NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 const ID_PATTERN = /^[0-9a-f]{16}$/;
 const KINDS: readonly McpRequestKind[] = ["config", "login", "logout", "remove"];
 
+/** Fixed outcome text for a request no live flow can settle any more. */
+const INTERRUPTED_OUTCOME = "interrupted before it settled: the gateway stopped while it was running";
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -250,9 +253,9 @@ function renderShow(
     return `${header}\nDeletes this server entry from the configuration file.`;
   }
   const blockEnabled = options.config?.enabled === true;
-  const others = blockEnabled && options.config !== undefined
-    ? Object.keys(options.config.servers).filter((name) => name !== request.name)
-    : [];
+  const others = options.config === undefined
+    ? []
+    : Object.keys(options.config.servers).filter((name) => name !== request.name).sort((left, right) => left.localeCompare(right, "en-US"));
   const normalized = describeEntry(request.name, request.server, options.edit.workspace);
   const exact = JSON.stringify(request.server);
   const pretty = JSON.stringify(request.server, null, 2);
@@ -260,15 +263,17 @@ function renderShow(
   const authority = [
     "Effective authority of an approval:",
     blockEnabled
-      ? "  mcp.enabled is already true in this gateway's open configuration, and the write leaves it true on disk. " +
+      ? "  mcp.enabled is already true in this gateway's open configuration, and the write leaves it true. " +
         "Every other entry there keeps its current state."
-      : "  the approval turns the block on if it is still off on disk. When it was off, every other entry there is " +
-        "pinned to enabled: false, so only this entry may become newly active; entries already disabled stay as they are.",
+      : "  the approval turns the block on. Every other entry present when it was off is pinned to enabled: false, " +
+        "so only this entry may become newly active; an entry already disabled stays as it is.",
     ...(others.length === 0
       ? []
-      : [`  other entries in this gateway's open configuration: ${others.join(", ")}`]),
-    "  The approval re-reads the file, refuses without changing it when it changed since it was read, and validates the " +
-      "whole merged document with the parser a gateway start uses. It takes effect at the next start (`/restart`).",
+      : [`  other entries in this gateway's open configuration, whose state is unchanged: ${others.join(", ")}`]),
+    "  The approval re-reads the file, refuses without changing it when the block there is no longer the one " +
+      "described here (its enabled flag or its entry names differ from this gateway's open configuration), and " +
+      "validates the whole merged document with the parser a gateway start uses. It takes effect at the next start " +
+      "(`/restart`).",
     ...(request.server.oauth === true
       ? ["  Approval also starts the owner-approved OAuth login for this entry and returns its one-time URL."]
       : []),
@@ -471,16 +476,44 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
   };
 
   /**
-   * Stored requests, with one repair: a `running` request with no live reservation was interrupted by
-   * a restart or shutdown, so it is reported as failed rather than blocking every later decision as
-   * "already running". A flow never resumes across a restart, and the next shutdown path settles it
-   * durably.
+   * The `mcp` block this gateway opened with: the same state `renderShow` discloses and the same state an
+   * approval requires on disk. Comparing against the live file would let the owner approve effects that
+   * were never described, so the write refuses on a difference instead.
    */
-  const read = async (context: Context): Promise<McpRequest[]> =>
-    storedRequests(await options.requests.read(context)).map((request): McpRequest =>
-      request.status === "running" && !inFlight.has(request.id)
-        ? { ...request, status: "failed", outcome: request.outcome ?? "login interrupted before it settled" }
-        : request);
+  const openBlock = (): McpConfigBlockExpectation => ({
+    enabled: options.config?.enabled === true,
+    servers: options.config === undefined
+      ? []
+      : Object.keys(options.config.servers).sort((left, right) => left.localeCompare(right, "en-US")),
+  });
+
+  /**
+   * Stored requests, durably repairing one case: a `running` request with no live reservation was
+   * interrupted by a restart or a shutdown that could not settle it. It is committed as failed instead of
+   * only being reported that way, because a `running` entry in the document counts against the waiting
+   * limit and can be neither approved nor denied, so a handful of interruptions would block every later
+   * proposal. A reservation is taken before any request is committed as `running`, so a live approval or
+   * login is never demoted here; the write re-checks the reservation inside the transaction.
+   */
+  const read = async (context: Context): Promise<McpRequest[]> => {
+    const stored = storedRequests(await options.requests.read(context));
+    const orphans = new Set(stored
+      .filter((request) => request.status === "running" && !inFlight.has(request.id))
+      .map((request) => request.id));
+    if (orphans.size > 0) {
+      await options.requests.write(context, (requests) => {
+        for (const entry of requests) {
+          if (!orphans.has(entry.id) || entry.status !== "running" || inFlight.has(entry.id)) continue;
+          entry.status = "failed";
+          entry.outcome = bounded(entry.outcome ?? INTERRUPTED_OUTCOME, MCP_ADMIN_LIMITS.maxOutcomeChars);
+        }
+        return undefined;
+      });
+    }
+    return stored.map((request): McpRequest => orphans.has(request.id) && !inFlight.has(request.id)
+      ? { ...request, status: "failed", outcome: request.outcome ?? INTERRUPTED_OUTCOME }
+      : request);
+  };
 
   const listingOf = async (context: Context): Promise<McpAdminListing> => {
     const configured = options.config?.enabled === true ? options.config.servers : {};
@@ -518,29 +551,39 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
   };
 
   /** Record one proposal. It is written once and never rewritten; approval consumes it. */
-  const propose = (context: Context, originConversationId: ConversationId, kind: McpRequestKind, name: string,
-    server?: Record<string, JsonValue>): Promise<string> => options.requests.write(context, (requests) => {
-    const waiting = requests.filter((entry) => entry.status === "pending" || entry.status === "running");
-    if (waiting.length >= MCP_ADMIN_LIMITS.maxPending) {
-      throw new Error(
-        `there are already ${waiting.length} waiting owner approval requests; ` +
-        "wait for the owner to decide on them before proposing more",
-      );
-    }
-    const id = newId();
-    requests.push({
-      id,
-      kind,
-      name,
-      server: server ?? null,
-      originConversationId,
-      createdAtMs: now(),
-      status: "pending",
-      outcome: null,
+  const propose = async (
+    context: Context,
+    originConversationId: ConversationId,
+    kind: McpRequestKind,
+    name: string,
+    server?: Record<string, JsonValue>,
+  ): Promise<string> => {
+    // Repair interrupted requests first: a `running` entry left by a restart must not count against the
+    // waiting bound and refuse a proposal the owner could otherwise accept.
+    await read(context);
+    return options.requests.write(context, (requests) => {
+      const waiting = requests.filter((entry) => entry.status === "pending" || entry.status === "running");
+      if (waiting.length >= MCP_ADMIN_LIMITS.maxPending) {
+        throw new Error(
+          `there are already ${waiting.length} waiting owner approval requests; ` +
+          "wait for the owner to decide on them before proposing more",
+        );
+      }
+      const id = newId();
+      requests.push({
+        id,
+        kind,
+        name,
+        server: server ?? null,
+        originConversationId,
+        createdAtMs: now(),
+        status: "pending",
+        outcome: null,
+      });
+      prune(requests);
+      return id;
     });
-    prune(requests);
-    return id;
-  });
+  };
 
   const findRequest = async (context: Context, id: string): Promise<McpRequest | undefined> => {
     if (!ID_PATTERN.test(id)) return undefined;
@@ -726,7 +769,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
       }
       let written;
       try {
-        written = await writeMcpServerEntry(options.edit, request.name, request.server);
+        written = await writeMcpServerEntry(options.edit, request.name, request.server, openBlock());
       } catch (error) {
         return {
           status: "refused",
@@ -992,6 +1035,9 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
       if (!ID_PATTERN.test(id)) {
         return { status: "refused", text: `No MCP owner approval request ${bounded(id, 32)} exists.` };
       }
+      // Repair any interrupted request durably first, so this decision reports it as settled instead of
+      // claiming an unknown effect is still running.
+      await read(context);
       const decided = await options.requests.write(context, (requests) => {
         const index = requests.findIndex((entry) => entry.id === id);
         if (index < 0) return { kind: "missing" as const };
@@ -1036,7 +1082,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
         return {
           status: "refused",
           text: `Request ${decided.request.id} was interrupted before it settled, so its effect is unknown and it ` +
-            "cannot be denied now. Restart the gateway to repair the request list; nothing was done by this denial.",
+            "cannot be denied now. Nothing was done by this denial; `/mcp` repairs the request list.",
         };
       }
       const live = inFlight.get(id);

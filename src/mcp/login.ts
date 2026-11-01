@@ -5,6 +5,7 @@ import {
   OAuthCallbackServer,
   adaptOAuthProvider,
   authorizeMcp,
+  type McpOAuthState,
 } from "@earendil-works/pi-mcp/oauth";
 import type { McpHttpServerConfig } from "./config.js";
 import {
@@ -37,6 +38,11 @@ import { McpServerConnection, guardedFetch, headerValues } from "./server.js";
  *   grant is adopted immediately instead of being thrown away with a failed attempt;
  * - a logout that happens while the attempt runs increments the grant generation, so the late commit
  *   is refused instead of restoring a grant the owner just deleted.
+ *
+ * A refresh is the one thing this module does not roll back: the authorization server has already issued
+ * the rotated token, so it is adopted as soon as the step that performed it returns, on every path —
+ * including a failed or canceled startup connection and a failed or canceled verification connection.
+ * Only a rotation is adopted, never an unverified browser authorization.
  *
  * Limitation: the redirect URI is a loopback address on the gateway host. An owner whose browser runs
  * on another machine must forward that port over SSH to complete the flow; a provider that refuses a
@@ -126,6 +132,7 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
     const stopStartup = (): void => { void client?.close().catch(() => undefined); };
     const startupTimer = setTimeout(stopStartup, Math.max(1, deadline - Date.now()));
     options.signal?.addEventListener("abort", stopStartup, { once: true });
+    let connectError: unknown;
     try {
       await client.connect(new StreamableHttpTransport({
         url: options.config.url,
@@ -134,18 +141,19 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
         fetch: guardedFetch,
       }));
     } catch (error) {
-      if (canceled(options.signal)) throw new CancelledLoginError();
-      // The expected first outcome: the server challenges and the native flow hands us the URL.
-      if (!(error instanceof McpOAuthAuthorizationRequiredError)) throw error;
+      connectError = error;
     } finally {
       clearTimeout(startupTimer);
       options.signal?.removeEventListener("abort", stopStartup);
     }
-    if (canceled(options.signal)) throw new CancelledLoginError();
     // A connection that refreshed the seeded grant already changed the token at the authorization
-    // server, which may have invalidated the previous refresh token. Adopt the rotated grant now, so a
-    // later browser failure or cancellation cannot leave a stored grant that no longer works.
-    await adoptStagedRefresh(staging, snapshot, options.storePath, serverUrl);
+    // server, which may have invalidated the previous refresh token. Adopt the rotated grant before a
+    // failed connection, a cancellation or the cleanup below can drop it, so the stored grant keeps the
+    // token the server most recently issued.
+    await adoptStagedRotation(staging, snapshot.state, snapshot, options.storePath, serverUrl);
+    if (canceled(options.signal)) throw new CancelledLoginError();
+    // The expected first outcome: the server challenges and the native flow hands us the URL.
+    if (connectError !== undefined && !(connectError instanceof McpOAuthAuthorizationRequiredError)) throw connectError;
     // A grant in the staging file already worked (the server accepted it without a browser step).
     const redirect = authorizationUrl;
     // A tool listing failure is reported as unknown instead of being counted as zero tools: the
@@ -176,7 +184,7 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
     const run: McpLoginRun = {
       authorizationUrl: redirect.href,
       expiresAtMs: deadline,
-      completion: complete(options, provider, callback, stagingPath, snapshot.epoch, serverUrl, state, deadline),
+      completion: complete(options, provider, callback, stagingPath, snapshot, serverUrl, state, deadline),
     };
     // `completion` owns the listener from here.
     callback = undefined;
@@ -194,19 +202,23 @@ class CancelledLoginError extends Error {
 }
 
 /**
- * Persist the grant one staged connection already refreshed.
+ * Persist a rotation the staged attempt obtained from the authorization server.
  *
- * Only a rotation of a grant the attempt read is adopted: a browser authorization that has not been
- * verified yet is never written, and `adoptMcpOAuthRefresh` refuses when the stored grant was replaced
- * or deleted meanwhile. A refusal is not an error here; the attempt keeps working from its staged copy.
+ * `baseline` is the token material the staged file held before the step that may refresh: the stored
+ * grant for the startup connection, and the unverified authorization for the verification connection.
+ * Only a difference against that baseline is a rotation, so an authorization that has not been verified is
+ * never written; and `adoptMcpOAuthRefresh` refuses when the stored grant was replaced or deleted meanwhile.
+ * A refusal is not an error here: the attempt keeps working from its staged copy. This is called on every
+ * exit path, because the server may already have invalidated the refresh token it rotated.
  */
-async function adoptStagedRefresh(
+async function adoptStagedRotation(
   staging: FileMcpOAuthStateStore,
+  baseline: McpOAuthState | undefined,
   snapshot: McpOAuthGrantSnapshot,
   storePath: string,
   serverUrl: string,
 ): Promise<void> {
-  const before = snapshot.state?.tokens;
+  const before = baseline?.tokens;
   if (before === undefined) return;
   const staged = await staging.load().catch(() => undefined);
   if (staged?.tokens === undefined) return;
@@ -244,7 +256,7 @@ async function complete(
   provider: McpOAuthProvider,
   callback: OAuthCallbackServer,
   stagingPath: string,
-  expectedEpoch: number,
+  snapshot: McpOAuthGrantSnapshot,
   serverUrl: string,
   state: string,
   deadline: number,
@@ -286,6 +298,9 @@ async function complete(
       return outcome(error, "token-exchange-failed");
     }
     if (canceled(options.signal)) return { ok: false, reason: "canceled" };
+    // The staged file now holds the authorization this attempt just obtained, which is not a rotation and
+    // must not be installed before verification. It is the baseline for the one step that may refresh.
+    const baseline = await staging.load().catch(() => undefined);
     // Verify the staged grant with one real connection before it replaces anything on disk. A failure
     // here is reported and the (possibly refreshed) stored grant is left in place. An owner denial or
     // a gateway shutdown closes that connection and is rechecked before anything is committed.
@@ -298,24 +313,36 @@ async function complete(
     });
     const stopVerify = (): void => { void connection.close().catch(() => undefined); };
     options.signal?.addEventListener("abort", stopVerify, { once: true });
-    let tools: number;
+    let connected = false;
+    let tools = 0;
+    let verifyError: unknown;
     try {
       await connection.open();
-      if (canceled(options.signal)) return { ok: false, reason: "canceled" };
-      if (!connection.connected) return { ok: false, reason: "verify-failed" };
-      tools = connection.toolNames().length;
+      if (!canceled(options.signal)) {
+        connected = connection.connected;
+        if (connected) tools = connection.toolNames().length;
+      }
+    } catch (error) {
+      verifyError = error;
     } finally {
       options.signal?.removeEventListener("abort", stopVerify);
       await connection.close().catch(() => undefined);
     }
+    // The verification connection may have refreshed the staged grant. Adopt that rotation before a failed
+    // or canceled verification discards the staged file: the server has already issued the new token.
+    await adoptStagedRotation(staging, baseline, snapshot, options.storePath, serverUrl);
+    if (verifyError !== undefined) throw verifyError;
+    if (canceled(options.signal)) return { ok: false, reason: "canceled" };
+    if (!connected) return { ok: false, reason: "verify-failed" };
     // Install the verified replacement. A cancellation, logout or another completed login since this
     // attempt began retires the generation, and this commit then refuses rather than undoing it.
     try {
       const staged = await staging.load();
       if (staged?.tokens === undefined) return { ok: false, reason: "verify-failed" };
-      // The cancellation is rechecked inside the commit, so a denial that lands between this call and
-      // the write still installs nothing.
-      await commitMcpOAuthState(options.storePath, serverUrl, staged, expectedEpoch, options.signal);
+      // The cancellation is rechecked inside the commit, up to the replacement's irreversible step, so a
+      // denial that lands during the write still installs nothing; one that lands after it is not reported
+      // as a cancellation while the grant exists.
+      await commitMcpOAuthState(options.storePath, serverUrl, staged, snapshot.epoch, options.signal);
     } catch {
       if (canceled(options.signal)) return { ok: false, reason: "canceled" };
       return { ok: false, reason: "grant-superseded" };

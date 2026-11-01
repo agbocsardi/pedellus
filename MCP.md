@@ -195,7 +195,10 @@ and every effect of an approval on the `mcp` block. A stdio command is shown as
 "a local process the gateway would launch on this host", and every
 header/environment mapping is shown as `header <- host environment variable
 NAME`. Read it before approving; approval is exactly as powerful as the owner
-writing that entry by hand. `/mcp` and `/mcp show` are read-only and cost no model
+writing that entry by hand. The disclosed block is the one this gateway opened
+with, and a `config` approval refuses when the block on disk is no longer that
+one (see below), so the owner never approves an effect that was not described.
+`/mcp` and `/mcp show` are read-only and cost no model
 call. Approve/deny run as durable owner controls with the same acknowledgement,
 gating and replay semantics as `/digest`.
 
@@ -207,7 +210,12 @@ What an approval does:
   other entry there is pinned to `enabled: false` first. The write is atomic
   (temporary file in the same directory, then rename), keeps the existing file
   mode, changes nothing outside the `mcp` block, and is refused unless the whole
-  merged document parses. Managed edits are serialized inside this process, and
+  merged document parses. It is also refused, before writing, when the block on
+  disk is not the one the disclosure described — same `enabled` flag and same
+  entry names as the configuration this gateway opened with — because otherwise an
+  entry could land with pinning or enabling effects the owner never saw; restart
+  the gateway and review again in that case. Managed edits are serialized inside
+  this process, and
   the file is reopened immediately before replacement: if its bytes or its
   identity (device, inode, size, mtime) changed since the edit was prepared, the
   approval is refused without writing. Limitations: JSON is re-serialized with
@@ -237,7 +245,10 @@ so two concurrent decisions cannot both apply it. A denial can cancel a login
 waiting for its browser (including one still starting), but it refuses to claim a
 short non-login write was stopped halfway. Pending/running requests are bounded
 (8) and further proposals are refused while that many wait; settled requests are
-pruned to the most recent 8.
+pruned to the most recent 8. A request left `running` by a restart or a shutdown
+that could not settle it is repaired durably as `failed` on the next read or
+proposal, so it stops counting against that bound and cannot leave the gateway
+permanently unable to accept proposals.
 
 ## OAuth login
 
@@ -300,8 +311,9 @@ Bounds and rules: one flow at a time, reserved before the attempt starts; a
 5-minute deadline covers the initial connection and the browser step; the callback
 listener is loopback-only on `127.0.0.1` with an ephemeral port; `/mcp deny`
 cancels a running flow, including one still setting up and one already
-verifying; closing the gateway aborts it, and cancellation is rechecked before
-anything is committed. The attempt works on a staged file seeded from the stored
+verifying; closing the gateway aborts it, and cancellation is rechecked up to the
+replacement's irreversible rename, so a denial either installs nothing or is
+reported as the grant being there. The attempt works on a staged file seeded from the stored
 grant, read together with the grant generation it will commit against, so a grant
 that still works makes the login a no-op and a logout that lands in between
 retires the generation instead of handing the attempt a fresh expectation for a
@@ -310,7 +322,11 @@ or replace the stored grant. One exception is stated plainly because it is not a
 local decision: a refresh performed during the attempt has already been issued by
 the authorization server, which may have invalidated the previous refresh token,
 so the rotated grant is adopted immediately (only while the stored grant is still
-the one the attempt read) rather than discarded with the failed attempt. Each
+the one the attempt read) rather than discarded with the failed attempt, and that
+adoption runs on every exit path of the attempt — a failed or canceled startup
+connection and a failed or canceled verification connection included — so a
+rotation the server already issued is never thrown away with the failure. Only a
+rotation is adopted; an unverified browser authorization never is. Each
 committed grant increments a process-local generation: a logout during the
 attempt, and a refresh from a connection created before it, cannot restore the
 deleted grant. A gateway restart or crash ends a pending attempt; its URL is not

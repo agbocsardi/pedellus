@@ -181,8 +181,21 @@ export class FileMcpOAuthStateStore implements McpOAuthStateStore {
   }
 }
 
-/** Write one complete state file with a private directory and mode, atomically. */
-async function writeState(path: string, serverUrl: string, state: McpOAuthState): Promise<void> {
+/**
+ * Write one complete state file with a private directory and mode, atomically.
+ *
+ * `beforeReplace` runs once the complete replacement exists under a temporary name and immediately before
+ * the rename that installs it. A caller whose install must not survive a denial puts its last cancellation
+ * check there, so the reported outcome and the file cannot disagree: the check throws and nothing is
+ * installed, or the temp file was already renamed and the install is the outcome. The window between that
+ * check and the rename is not closable: POSIX has no atomic "install unless canceled".
+ */
+async function writeState(
+  path: string,
+  serverUrl: string,
+  state: McpOAuthState,
+  beforeReplace?: () => void,
+): Promise<void> {
   if (typeof state.serverUrl !== "string" || state.serverUrl !== serverUrl) {
     throw new Error("MCP OAuth state belongs to a different server URL");
   }
@@ -193,6 +206,7 @@ async function writeState(path: string, serverUrl: string, state: McpOAuthState)
   const body: StoreFile = { version: STORE_VERSION, state };
   try {
     await writeFile(temporary, `${JSON.stringify(body)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    beforeReplace?.();
     await rename(temporary, path);
   } finally {
     await rm(temporary, { force: true });
@@ -204,8 +218,11 @@ async function writeState(path: string, serverUrl: string, state: McpOAuthState)
  *
  * `expectedEpoch` is the generation read when the login started. A logout (or another commit) that
  * happened in the meantime increments it, so the late login cannot restore a grant the owner just
- * deleted. `signal` is rechecked inside the serialized step: a denial or a gateway shutdown that lands
- * between the caller's last check and this write still installs nothing. The caller removes its
+ * deleted. `signal` is rechecked inside the serialized step and again immediately before the rename, so a
+ * denial or a gateway shutdown that lands while the replacement is being written still installs nothing
+ * and is reported as a cancellation. An abort that lands after the rename leaves the grant installed and
+ * this call succeeds: the owner learns the grant is there instead of being told it was canceled while it
+ * exists. Only the window between that last check and the rename is not closable. The caller removes its
  * staging file either way.
  */
 export async function commitMcpOAuthState(
@@ -220,7 +237,9 @@ export async function commitMcpOAuthState(
     if (mcpOAuthGrantEpoch(path) !== expectedEpoch) {
       throw new Error("the stored MCP OAuth grant changed while the login was running");
     }
-    await writeState(path, String(new URL(serverUrl)), state);
+    await writeState(path, String(new URL(serverUrl)), state, () => {
+      if (signal?.aborted === true) throw new Error("the MCP login was canceled before its grant was installed");
+    });
     bumpEpoch(path);
   });
 }

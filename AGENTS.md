@@ -272,10 +272,17 @@ edits need restart only; unit edits additionally need daemon-reload.
   gateway's own configuration file atomically after validating the whole merged
   document, preserving the file mode and touching nothing else; it enables only
   the approved entry (other entries are pinned to `enabled: false` when the block
-  was off), serializes managed edits and refuses to replace a file whose bytes or
-  identity changed since it was read. The check and the rename remain two
+  was off), serializes managed edits, refuses to replace a file whose bytes or
+  identity changed since it was read, and refuses when the block on disk is no
+  longer the one the owner's disclosure described (its enabled flag or its entry
+  names differ from the configuration this gateway opened with), so approval
+  cannot apply a pin or an enable the owner never saw. The check and the rename
+  remain two
   operations: an outside write in that window is lost, and no portable lock or
-  content compare-and-swap removes it. A `remove` approval deletes one entry and never
+  content compare-and-swap removes it. A request left `running` by a restart or
+  an interrupted flow is repaired durably as `failed` on the next read or
+  proposal, so it stops counting against the waiting bound instead of blocking
+  every later proposal. A `remove` approval deletes one entry and never
   disables the capability. An `oauth: true` HTTP entry reads its grant from one
   private `0600` file per exact URL under the canonical data directory, never
   from config, transcript, entry or channel text; with no usable grant it fails
@@ -288,8 +295,12 @@ edits need restart only; unit edits additionally need daemon-reload.
   five-minute deadline; it works on a staged
   grant read together with its generation, installs it only after a verification
   connection, adopts a refresh the server already rotated instead of leaving it
-  unusable, rechecks cancellation before committing, and a logout increments the
-  generation so a stale refresh or a late commit cannot restore it. Its authorization URL is
+  unusable — on every exit path, including a failed or canceled startup or
+  verification connection, and without ever adopting an unverified browser
+  authorization — and a logout increments the
+  generation so a stale refresh or a late commit cannot restore it. Its
+  cancellation is rechecked up to the replacement's irreversible rename, so a
+  denial either installs nothing or is reported as the grant now being there. Its authorization URL is
   delivered directly to the approving owner surface and never persisted in
   channel state, and its completion places one credential-free internal result
   in the origin chat. A configuration or grant change takes effect at the next

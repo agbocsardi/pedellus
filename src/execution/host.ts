@@ -85,6 +85,23 @@ export interface HostExecutionOptions {
 	tempDirectory?: string;
 }
 
+/** POSIX `O_ACCMODE`: the two access-mode bits, which Node's `constants` does not expose. */
+const ACCESS_MODE_MASK = 0o3;
+
+/**
+ * Read-only opens are nonblocking, so a path that became a FIFO or a device cannot park the guard waiting
+ * for a peer: a blocking `open` has no cancellation point either, so it would outlive both a tool timeout
+ * and an owner cancellation. The native reader this guard delegates to opens nonblocking for the same
+ * reason. Windows has no `O_NONBLOCK` and no procfs guard to reach this path.
+ */
+function readFlags(flags: string | number): string | number {
+	if (process.platform === "win32") return flags;
+	if (typeof flags === "number") {
+		return (flags & ACCESS_MODE_MASK) === constants.O_RDONLY ? flags | constants.O_NONBLOCK : flags;
+	}
+	return flags === "r" ? constants.O_RDONLY | constants.O_NONBLOCK : flags;
+}
+
 /**
  * A guarded host environment for accidental-damage protection, not confinement. Filesystem methods refuse lexical and
  * symlink escapes from the configured roots, but:
@@ -173,19 +190,24 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 	 *
 	 * `flags` never truncates: a refused descriptor must not have damaged the file, so the delegated
 	 * operation does its own truncate or write against the verified inode.
+	 *
+	 * `expectRegular` refuses a verified descriptor that is not a regular file, for the operations that read
+	 * content by size. A FIFO or device has no bounded content and its read has no cancellation point, so
+	 * those are refused instead of delegated (the native binary reader reaches the same refusal itself).
 	 */
 	async #throughDescriptor<T>(
 		absolute: string,
 		flags: string | number,
 		context: Context,
 		run: (target: string) => Promise<Result<T, FileError>>,
+		expectRegular = false,
 	): Promise<Result<T, FileError>> {
 		if (context.abortSignal?.aborted) return err<T, FileError>(new FileError("aborted", "aborted", absolute));
 		const root = this.#descriptorRoot;
 		if (root === undefined) return run(absolute);
 		let handle: FileHandle | undefined;
 		try {
-			handle = await open(absolute, flags);
+			handle = await open(absolute, readFlags(flags));
 			const actual = await readlink(`${root}/${handle.fd}`);
 			if (!this.#policy.roots.some((candidate) => isPathWithin(candidate, actual))) {
 				return err<T, FileError>(new FileError(
@@ -194,6 +216,15 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 					absolute,
 				));
 			}
+			if (expectRegular) {
+				const info = await handle.stat();
+				if (!info.isFile()) {
+					return err<T, FileError>(info.isDirectory()
+						? new FileError("is_directory", "EISDIR: illegal operation on a directory, read", absolute)
+						: new FileError("invalid", "Not a regular file", absolute));
+				}
+			}
+			if (context.abortSignal?.aborted) return err<T, FileError>(new FileError("aborted", "aborted", absolute));
 			return await run(`${root}/${handle.fd}`);
 		} catch (error) {
 			return err<T, FileError>(openError(error, absolute));
@@ -223,7 +254,7 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 
 	override readBinaryFile(path: string, context: Context): Promise<Result<Uint8Array, FileError>> {
 		return this.#guarded(path, context, true, (absolute) =>
-			this.#throughDescriptor(absolute, "r", context, (target) => super.readBinaryFile(target, context)));
+			this.#throughDescriptor(absolute, "r", context, (target) => super.readBinaryFile(target, context), true));
 	}
 
 	override openBinaryReader(
