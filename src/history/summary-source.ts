@@ -18,11 +18,13 @@
  *   edited model context. An entry carrying edits is otherwise rendered like any other entry.
  *
  * Every bound is explicit. One entry keeps at most {@link EPISODE_SUMMARY_SOURCE_LIMITS.entryChars}
- * characters: ordinary message text is cut at its head with a truncation marker, like before, while a
- * tool call's arguments and a tool result that do not fit are quoted through the shared memory-recall
- * head-tail preview (`clipPreview`), with its omission marker and the durable reference of the
- * original item. A full chunk stops at the chunk bound, and the caller records how many entries were
- * covered and how many were truncated. Silent truncation is not a permitted outcome.
+ * characters of quoted text; a shortened entry ends with its marker, so its stored text may exceed that
+ * bound by that marker alone. Ordinary message text is cut at its head with a truncation marker, like
+ * before, while a tool call's arguments and a tool result that do not fit are quoted through the shared
+ * memory-recall head-tail preview (`clipPreview`), with its omission marker and the durable reference of
+ * the original item. Anything a shortened entry cannot quote is counted, never dropped silently. A full
+ * chunk stops at the chunk bound, and the caller records how many entries were covered and how many
+ * were truncated.
  */
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import type { EntryRecord } from "@earendil-works/pi-durable";
@@ -30,9 +32,12 @@ import type { JsonValue } from "@earendil-works/chord";
 import { clipPreview } from "./digestion.js";
 
 export const EPISODE_SUMMARY_SOURCE_LIMITS = Object.freeze({
-  /** Characters of rendered text kept per entry. */
+  /** Characters of quoted text kept per entry; a truncation marker may follow that text. */
   entryChars: 2_000,
-  /** Target characters per fold chunk; one entry may cross it by at most `entryChars`. */
+  /**
+   * Target characters per fold chunk. The transcript can cross it by the one entry that closes the
+   * chunk, that entry's truncation marker and the fold's `\n\n` separators.
+   */
   chunkChars: 24_000,
   /** Entries visited per fold chunk, so a chunk of empty entries still terminates. */
   chunkEntries: 400,
@@ -98,14 +103,22 @@ function textParts(content: unknown): string[] {
     block.type === "text" && typeof block.text === "string" ? [block.text] : []);
 }
 
-function shorten(text: string, maxChars: number): { text: string; truncated: boolean } {
-  if (text.length <= maxChars) return { text, truncated: false };
-  const omitted = text.length - maxChars;
-  return {
-    text: `${text.slice(0, maxChars)}\n[... ${omitted} more characters truncated]`,
-    truncated: true,
-  };
+/**
+ * The marker a shortened entry ends with. It names exactly how many characters were not quoted, so a
+ * reader can neither mistake a partial entry for the whole one nor guess at what was left out.
+ */
+function omission(chars: number): string {
+  return `[... ${chars} more characters truncated]`;
 }
+
+function shorten(text: string, maxChars: number): { text: string; truncated: boolean } {
+  const bounded = Math.max(0, maxChars);
+  if (text.length <= bounded) return { text, truncated: false };
+  return { text: `${text.slice(0, bounded)}\n${omission(text.length - bounded)}`, truncated: true };
+}
+
+/** `clipPreview`'s fallback when its bound cannot hold the reference marker: no count, no provenance. */
+const COMPACT_PREVIEW_MARKER = "…";
 
 /**
  * One quoted part of an entry. The `ref` is the durable reference of a tool call or tool result; it is
@@ -116,12 +129,20 @@ interface RenderedSegment {
   readonly ref?: string;
 }
 
-/** Durable provenance of one item, spelled exactly as the memory-recall evidence spells it. */
+/**
+ * Durable provenance of one item. The shape matches the memory-recall evidence refs
+ * (`entry:<id>/tool-call/<id>` and `entry:<id>/tool-result/<callId>`) whenever the stored item carries
+ * its own id. Recall omits an id-less item entirely, so a positional `index-<n>` key here is this
+ * renderer's own fallback: archived shapes must not lose their only reference.
+ */
 function itemRef(entryId: EntryRecord["id"], item: "tool-call" | "tool-result", key: string): string {
   return `entry:${entryId}/${item}/${key}`;
 }
 
-/** A tool call or result key; an item without one is still addressed, by its position in the entry. */
+/**
+ * A tool call or result key: the durable call id when there is one, otherwise the item's position in
+ * the entry. Recall can skip an id-less item, so only that fallback key may differ from its evidence.
+ */
 function itemKey(value: unknown, index: number): string {
   return typeof value === "string" && value.length > 0 ? value : `index-${index}`;
 }
@@ -137,8 +158,11 @@ function toolCallArguments(args: unknown): string {
 /**
  * Join an entry's segments under the per-entry bound. Ordinary message text over the bound keeps the
  * head cut it always had, so the omitted characters stay counted. A tool call or tool result over the
- * bound becomes the shared head-tail preview, which names the original item, and the later segments of
- * that entry cannot fit any more; the entry is reported as truncated either way.
+ * bound becomes the shared head-tail preview, which names the original item.
+ *
+ * A preview uses whatever bound is left, so nothing after it can be quoted. Those parts are reported
+ * with the same counted marker instead of disappearing: a shortened entry never drops text silently,
+ * and a preview that cannot carry its own reference falls back to that counted head cut.
  */
 function renderSegments(
   segments: readonly RenderedSegment[],
@@ -150,19 +174,28 @@ function renderSegments(
     const segment = segments[index]!;
     const separator = parts.length === 0 ? 0 : 2;
     const remaining = maxChars - used - separator;
-    if (remaining <= 0) return { text: parts.join("\n\n"), truncated: true };
     if (segment.text.length <= remaining) {
       parts.push(segment.text);
       used += separator + segment.text.length;
       continue;
     }
-    if (segment.ref === undefined) {
-      // Message prose keeps the head cut: it counts every remaining character instead of dropping it.
-      parts.push(shorten(segments.slice(index).map((part) => part.text).join("\n\n"), remaining).text);
-      return { text: parts.join("\n\n"), truncated: true };
+    if (segment.ref !== undefined && remaining > 0) {
+      const preview = clipPreview([segment.text], segment.text.length, remaining, segment.ref);
+      if (preview.preview.marker !== COMPACT_PREVIEW_MARKER) {
+        parts.push(preview.text);
+        const later = segments.slice(index + 1);
+        if (later.length > 0) parts.push(omission(later.map((part) => part.text).join("\n\n").length));
+        return { text: parts.join("\n\n"), truncated: true };
+      }
     }
-    // Reuse the memory-recall preview: head, an omission marker naming the original item, and tail.
-    parts.push(clipPreview([segment.text], segment.text.length, remaining, segment.ref).text);
+    // Message prose, an exhausted bound, or a preview bound too small to name itself: one counted head
+    // cut over everything still unquoted, so the omitted characters stay exact.
+    const rest = segments.slice(index).map((part) => part.text).join("\n\n");
+    if (remaining <= 0) {
+      parts.push(omission(rest.length));
+    } else {
+      parts.push(shorten(rest, remaining).text);
+    }
     return { text: parts.join("\n\n"), truncated: true };
   }
   return { text: parts.join("\n\n"), truncated: false };

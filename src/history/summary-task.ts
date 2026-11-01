@@ -170,11 +170,13 @@ const terminalFailed = <S extends { phase: string }, R>(result: R, message: stri
   ({ status: "terminal", outcome: { status: "failed", error: { message }, result } });
 
 function foldPrompt(previous: string | null, transcript: string, coverage: EpisodeSummaryCoverage): string {
+  const shortened = coverage.truncatedEntries > 0
+    ? `, and ${coverage.truncatedEntries} ${coverage.truncatedEntries === 1 ? "entry is" : "entries are"} shortened`
+    : "";
   const note = coverage.complete
-    ? "The source covers the whole episode."
+    ? `The source covers the whole episode${shortened}.`
     : `The source is partial: ${coverage.uncoveredEntries} of ${coverage.sourceEntries} entries are not included`
-      + (coverage.truncatedEntries > 0 ? `, and ${coverage.truncatedEntries} entries are shortened` : "")
-      + "; do not claim to know what they contain.";
+      + `${shortened}; do not claim to know what they contain.`;
   const header = previous === null
     ? "Summarize this transcript segment of one episode."
     : "Earlier parts of this episode were already summarized. Update that summary so it covers the whole episode so far.";

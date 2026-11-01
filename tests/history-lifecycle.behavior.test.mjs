@@ -523,6 +523,42 @@ test("episode summary source bounds one entry and previews long tool text head-t
     { text: "[Tool result read]: ok", message: false, toolResult: true, truncated: false },
   );
 
+  // Multi-item entries: the preview takes the rest of the bound, so the parts after it are counted as
+  // omitted. They are never dropped without a marker the summarizer can see.
+  const multi = renderEntry({
+    id: 11,
+    kind: "pi.assistant",
+    model: [{
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "call-a", name: "write", arguments: { content: "w".repeat(4_000) } },
+        { type: "toolCall", id: "call-b", name: "bash", arguments: { command: "SECOND-CALL-LATE-8801" } },
+      ],
+      stopReason: "toolUse",
+    }],
+  });
+  assert.equal(multi.truncated, true);
+  assert.match(multi.text, /original at entry:11\/tool-call\/call-a/);
+  assert.doesNotMatch(multi.text, /SECOND-CALL-LATE-8801/);
+  assert.match(multi.text, /\[\.\.\. \d+ more characters truncated\]$/);
+
+  // Prose that already fills the bound leaves the tool call unquoted, still with an exact count.
+  const proseThenCall = renderEntry({
+    id: 12,
+    kind: "pi.assistant",
+    model: [{
+      role: "assistant",
+      content: [
+        { type: "text", text: "p".repeat(3_000) },
+        { type: "toolCall", id: "call-c", name: "bash", arguments: { command: "AFTER-PROSE-9902" } },
+      ],
+      stopReason: "toolUse",
+    }],
+  });
+  assert.equal(proseThenCall.truncated, true);
+  assert.doesNotMatch(proseThenCall.text, /AFTER-PROSE-9902/);
+  assert.match(proseThenCall.text, /\[\.\.\. \d+ more characters truncated\]$/);
+
   // Ordinary message prose keeps its head cut and its exact omitted-character count.
   const prose = renderEntry({ id: 4, kind: "pi.user", model: [{ role: "user", content: "u".repeat(3_000) }] });
   assert.equal(prose.truncated, true);
@@ -580,10 +616,14 @@ test("an episode longer than the old 12-chunk cap is covered by one bounded requ
           timestamp: 1_002,
         }],
       });
-      for (let index = 0; index < 200; index += 1) {
+      for (let index = 0; index < 1_650; index += 1) {
+        // The first 300 fillers are full-size, so the episode needs far more than the old 12 chunks; the
+        // rest are tiny, so 1,650 entries stay cheap while crossing a collect phase boundary (five
+        // 400-entry pages, four of them per phase invocation).
+        const body = index < 300 ? `Filler entry ${index}: ${"f".repeat(1_900)}` : `Small filler ${index}.`;
         await tx.appendEntry(conversation.id, {
           kind: "pi.user",
-          model: [{ role: "user", content: `Filler entry ${index}: ${"f".repeat(1_900)}`, timestamp: 2_000 + index }],
+          model: [{ role: "user", content: body, timestamp: 2_000 + index }],
         });
       }
       await tx.appendEntry(conversation.id, {
@@ -595,7 +635,17 @@ test("an episode longer than the old 12-chunk cap is covered by one bounded requ
     // Park the first fold so the worker identity is read from committed state, then let the chain run.
     const entered = built.state.summaryGate.wait();
     await conversation.reset(undefined, context);
-    await within(gateway.reconcileHistoryEpisodes(session, context).then(() => entered), 10_000, "first summary request");
+    // The catalog records episode boundaries in bounded passes, so settle it before the summary queues.
+    const settledCatalog = await within((async () => {
+      let report = await gateway.reconcileHistoryEpisodes(session, context);
+      for (let attempt = 0; attempt < 8 && !report.caughtUp; attempt += 1) {
+        report = await gateway.reconcileHistoryEpisodes(session, context);
+      }
+      assert.equal(report.caughtUp, true, "the episode catalog never caught up");
+      return report;
+    })(), 10_000, "episode catalog reconciliation");
+    assert.ok(settledCatalog.scanned > 0);
+    await within(entered, 10_000, "first summary request");
     const queue = await gateway.historySummaryQueue(session, context);
     assert.ok(Number.isSafeInteger(queue.currentTaskId) && queue.currentTaskId > 0, "summary worker is live");
     const settled = gateway.harness.waitForTask(queue.currentTaskId, context);
@@ -609,6 +659,8 @@ test("an episode longer than the old 12-chunk cap is covered by one bounded requ
     assert.equal(record.status, "ready");
     // The whole range is covered: the fold cap is gone, not merely raised.
     assert.ok(record.coverage.chunks > 12, `chunks=${record.coverage.chunks}`);
+    // More than four collect pages means the collect phase yielded and resumed from its durable
+    // checkpoint; the same episode is still covered exactly once and folded chunk by chunk.
     assert.equal(record.coverage.complete, true);
     assert.equal(record.coverage.uncoveredEntries, 0);
     assert.equal(record.coverage.entriesRead, record.coverage.sourceEntries);
@@ -629,9 +681,13 @@ test("an episode longer than the old 12-chunk cap is covered by one bounded requ
       return fenced[1];
     });
     for (const segment of segments) {
-      // One chunk closes at 24,000 characters, so it may cross that bound by at most one entry.
-      assert.ok(segment.length <= EPISODE_SUMMARY_SOURCE_LIMITS.chunkChars + EPISODE_SUMMARY_SOURCE_LIMITS.entryChars,
-        `segment=${segment.length}`);
+      // A chunk closes at 24,000 characters and may cross that by the entry that closes it, that
+      // entry's truncation marker, and one two-character separator per entry in the chunk.
+      const bound = EPISODE_SUMMARY_SOURCE_LIMITS.chunkChars
+        + EPISODE_SUMMARY_SOURCE_LIMITS.entryChars
+        + 2 * EPISODE_SUMMARY_SOURCE_LIMITS.chunkEntries
+        + 128;
+      assert.ok(segment.length <= bound, `segment=${segment.length}`);
     }
     // The long tool call and its result are quoted with the shared memory-recall head-tail preview.
     const first = segments[0];

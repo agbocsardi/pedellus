@@ -664,14 +664,18 @@ summaries can incur provider costs.
     `faults` counts from zero instead of becoming `NaN` — and since every `NaN >= cap` comparison is
     false, that normalization is what keeps the cap effective. On failure the counter is clamped to the
     cap, so the durable value stays a small exact integer that always serializes cleanly.
-- One entry keeps at most 2,000 characters with an explicit marker, never silent truncation. Ordinary
-  message text is cut at its head with a `[... N more characters truncated]` marker. A tool call's
-  arguments or a tool result that does not fit is quoted through the same memory-recall head-tail
-  preview (`clipPreview` in `digestion.ts`): a beginning, an omission marker naming how many
+- One entry keeps at most 2,000 characters of quoted text, and a shortened entry ends with an explicit
+  marker, so its stored text can exceed that bound by the marker alone. Truncation is never silent.
+  Ordinary message text is cut at its head with a `[... N more characters truncated]` marker. A tool
+  call's arguments or a tool result that does not fit is quoted through the same memory-recall
+  head-tail preview (`clipPreview` in `digestion.ts`): a beginning, an omission marker naming how many
   characters were left out and the durable `entry:<id>/tool-call|tool-result/<key>` reference of the
-  original item, then an end. The later segments of that entry are not quoted, and the entry is
-  counted as truncated. Chunks close at 24,000 characters or 400 entries (also at each read page),
-  and an episode keeps as many chunks as its range needs: the collection cursor and the chunk list are
+  original item, then an end. That preview uses the rest of the entry bound, so any later part of the
+  entry is reported with the same counted marker instead of disappearing, and a remaining bound too
+  small for the preview's own marker gives way to that counted head cut. The entry is counted as
+  truncated either way. Chunks close at 24,000 characters or 400 entries (also at each read page); a
+  transcript crosses that target by the closing entry, its marker and the fold's separators. An
+  episode keeps as many chunks as its range needs: the collection cursor and the chunk list are
   durable, so a phase boundary, a restart or a crash resumes the same episode instead of capping or
   dropping its tail. Each chunk is folded through a separate provider request that carries the
   previous answer forward.
