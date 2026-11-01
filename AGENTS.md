@@ -232,9 +232,11 @@ edits need restart only; unit edits additionally need daemon-reload.
   environment variable name.
 - Telegram outbound text is rich by default (Bot API 10.1 `sendRichMessage` /
   `editMessageText` with `rich_message.markdown`) for ordinary replies, scheduled deliveries,
-  previews and their edits, and host notices. Chunking uses the 32,768-character rich budget with
-  fence-aware cuts, never splitting a surrogate pair; host-generated notices are escaped so their
-  literal characters render unchanged, while model text is passed through as markdown. A missing
+  previews and their edits, and host notices. Chunking uses a persisted, capability-independent
+  plan: the 32,768-character rich budget normally, or 4096 when a preview must be edited so a
+  rejected rich edit can fall back safely. Older progressed records retain the legacy split.
+  Fence-aware cuts preserve whitespace and surrogate pairs; host-generated notices are escaped so
+  their literal characters render unchanged, while model text is passed through as markdown. A missing
   method latches rich off for the process and resends plain; a refused body (`can't parse`,
   unsupported tag, too long) resends that chunk as plain text split under 4096. Every other
   rejection and every ambiguous outcome keeps the existing hold semantics and is never resent.

@@ -175,6 +175,8 @@ export type TelegramPendingDelivery = {
   messageId?: number;
   lastText?: string;
   nextChunkIndex: number;
+  /** Persisted before final delivery; absent with progress uses the pre-rich chunk plan. */
+  chunkPlan?: "rich-v1" | "preview-v1" | "legacy";
   /** `unknown`: an ambiguous external outcome. `failed`: a known-rejected or repeatedly failing delivery, held. */
   deliveryStatus?: "sending" | "unknown" | "failed";
   sendIntent?: { text: string; stage: "preview" | "final"; chunkIndex?: number; startedAt: number };
@@ -485,7 +487,9 @@ export async function runTelegram(
     before(text: string): Promise<void>;
     /** The request provably did not deliver anything; drop the intent. */
     abandoned(): Promise<void>;
-    /** Telegram accepted the text; persist the id and what the chat now shows. */
+    /** Record each accepted message without advancing the whole-chunk cursor. */
+    partAccepted?(messageId: number, text: string): Promise<void>;
+    /** All parts were accepted; advance the whole-chunk cursor. */
     accepted(messageId: number, text: string): Promise<void>;
   };
 
@@ -496,13 +500,10 @@ export async function runTelegram(
     accepted: async () => undefined,
   };
 
-  /**
-   * Split one outbound text into the chunks its delivery cursor counts. Rich messages carry up to
-   * 32,768 characters, so most replies are one message; with rich support latched off the plain
-   * limit applies instead.
-   */
-  const splitOutboundText = (text: string): string[] =>
-    richMessagesEnabled() ? splitRichText(text, RICH_TEXT_LIMIT) : splitTelegramText(text);
+  /** Chunk boundaries are independent of the process-local rich capability latch. */
+  const splitOutboundText = (text: string, plan: "rich-v1" | "preview-v1" | "legacy" = "rich-v1"): string[] =>
+    plan === "legacy" ? splitTelegramText(text) :
+      splitRichText(text, plan === "preview-v1" ? PLAIN_TEXT_LIMIT : RICH_TEXT_LIMIT);
 
   /**
    * Send one outbound text, preferring a rich markdown message.
@@ -536,6 +537,7 @@ export async function runTelegram(
       ...(sendOptions.replaceable === undefined ? {} : { replaceable: sendOptions.replaceable }),
     };
     if (richMessagesEnabled()) {
+      let richAccepted = false;
       try {
         const sent = await apiCall<Message.RichMessageMessage>(api, "sendRichMessage", signal, async (callSignal) => {
           await sendOptions.hooks.before(text);
@@ -553,10 +555,13 @@ export async function runTelegram(
           }
         }, callOptions);
         if (sent === undefined) return undefined;
+        richAccepted = true;
+        await sendOptions.hooks.partAccepted?.(sent.message_id, text);
+        await rememberOutgoingTarget(chatId, sent.message_id, text);
         await sendOptions.hooks.accepted(sent.message_id, text);
         return sent.message_id;
       } catch (error) {
-        if (!(error instanceof TelegramApiError)) throw error;
+        if (richAccepted || !(error instanceof TelegramApiError) || error.outcome !== "rejected") throw error;
         if (isRichCapabilityRejection(error)) {
           disableRichMessages();
           console.warn("Telegram rich messages are unavailable here; this process now sends plain text.");
@@ -568,7 +573,7 @@ export async function runTelegram(
     // Plain fallback: the rich body was refused before anything was shown, so the same text is safe
     // to send, split inside the sendMessage limit. All parts share one recorded intent, so a crash
     // leaves the whole chunk ambiguous instead of a later replay sending part of it twice.
-    const parts = splitTelegramText(text);
+    const parts = splitPlainTextLossless(text);
     let first: number | undefined;
     for (let index = 0; index < parts.length; index += 1) {
       const part = parts[index]!;
@@ -576,7 +581,7 @@ export async function runTelegram(
         const sent = await apiCall<Message.TextMessage>(api, "sendMessage", signal, async (callSignal) => {
           await sendOptions.hooks.before(part);
           if (signal?.aborted) {
-            await sendOptions.hooks.abandoned();
+            if (index === 0) await sendOptions.hooks.abandoned();
             throw new TelegramApiError("sendMessage", 0, "not-sent");
           }
           try {
@@ -584,14 +589,19 @@ export async function runTelegram(
               chatId, part, index === 0 ? reply : {}, toGrammySignal(callSignal),
             ));
           } catch (error) {
-            if (isProvenRefusal(error)) await sendOptions.hooks.abandoned();
+            if (index === 0 && isProvenRefusal(error)) await sendOptions.hooks.abandoned();
             throw error;
           }
         }, callOptions);
-        if (sent === undefined) return first;
+        if (sent === undefined) {
+          if (first !== undefined) throw new TelegramApiError("sendMessage", 0, "unknown");
+          return undefined;
+        }
         first = first ?? sent.message_id;
+        await sendOptions.hooks.partAccepted?.(sent.message_id, part);
+        await rememberOutgoingTarget(chatId, sent.message_id, part);
       } catch (error) {
-        if (index > 0) {
+        if (first !== undefined || index > 0) {
           // Earlier parts were accepted, so this chunk as a whole is no longer a definite non-send.
           throw new TelegramApiError("sendMessage", 0, "unknown", "plain fallback lost part of the chunk");
         }
@@ -631,7 +641,7 @@ export async function runTelegram(
         callOptions);
         return edited !== undefined;
       } catch (error) {
-        if (!(error instanceof TelegramApiError)) throw error;
+        if (!(error instanceof TelegramApiError) || error.outcome !== "rejected") throw error;
         if (isRichCapabilityRejection(error)) {
           disableRichMessages();
           console.warn("Telegram rich messages are unavailable here; this process now sends plain text.");
@@ -962,15 +972,18 @@ export async function runTelegram(
           throttle: outboundThrottle,
           hooks: {
             ...idleTextHooks,
-            accepted: async (sentId, shown) => {
+            partAccepted: async (sentId) => {
               ids.push(sentId);
               await mutateState((doc) => {
                 const entry = doc.actions.find((candidate) => candidate.callId === callId);
-                if (entry === undefined) return;
-                entry.nextChunkIndex = Math.max(entry.nextChunkIndex, index + 1);
-                entry.resultMessageIds = [...(entry.resultMessageIds ?? []), sentId];
+                if (entry !== undefined) entry.resultMessageIds = [...(entry.resultMessageIds ?? []), sentId];
               });
-              await rememberOutgoingTarget(chatId, sentId, shown);
+            },
+            accepted: async () => {
+              await mutateState((doc) => {
+                const entry = doc.actions.find((candidate) => candidate.callId === callId);
+                if (entry !== undefined) entry.nextChunkIndex = Math.max(entry.nextChunkIndex, index + 1);
+              });
             },
           },
         });
@@ -1221,7 +1234,6 @@ export async function runTelegram(
               entry.nextChunkIndex = Math.max(entry.nextChunkIndex, index + 1);
               if (index === 0) entry.messageId = messageId;
             }, cleanupContext);
-            await rememberOutgoingTarget(chatId, messageId, shown);
           },
         },
       });
@@ -1314,7 +1326,11 @@ export async function runTelegram(
       }, cleanupContext);
       return;
     }
-    const chunks = splitOutboundText(record.text);
+    const plan = record.telegramChunkPlan ?? (record.nextChunkIndex > 0 ? "legacy" : "rich-v1");
+    if (record.telegramChunkPlan === undefined) {
+      await updateScheduled(sessionKey, record.id, (entry) => { entry.telegramChunkPlan = plan; });
+    }
+    const chunks = splitOutboundText(record.text, plan);
     let current = record;
     for (let index = current.nextChunkIndex; index < chunks.length; index++) {
       const result = await sendScheduledChunk(sessionKey, record.id, chatId, chunks[index]!, index);
@@ -1534,8 +1550,8 @@ export async function runTelegram(
       }
       const answer = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), adapterContext);
       const message = answer?.model?.[0] as AssistantMessage | undefined;
-      const text = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("").trim()
-        || "The assistant returned no text response.";
+      const answerText = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "";
+      const text = answerText.trim() === "" ? "The assistant returned no text response." : answerText;
       await stopPreviewWatch();
       await flushFinal(text);
       await forget(item.updateId);
@@ -1552,7 +1568,6 @@ export async function runTelegram(
       }
       const sent = await sendTelegramMessage(current.text, "final", 0, false, "literal");
       if (sent === undefined) throw new Error("Telegram send returned no result");
-      await rememberOutgoingTarget(current.chatId, sent, current.text);
       await forget(current.updateId);
     }
 
@@ -1570,8 +1585,22 @@ export async function runTelegram(
     }
 
     async function flushFinal(text: string) {
-      const chunks = splitOutboundText(text);
       let current = state.pending.find((entry) => entry.updateId === item.updateId) ?? item;
+      if (current.chunkPlan !== undefined && current.chunkPlan !== "legacy" &&
+          current.chunkPlan !== "rich-v1" && current.chunkPlan !== "preview-v1") {
+        throw new Error("Telegram delivery has an invalid chunk plan");
+      }
+      // Old in-flight cursors refer to the original 4096-character split. A preview's first
+      // final chunk must also fit a plain edit if Telegram rejects rich formatting.
+      const plan = current.chunkPlan ?? (current.nextChunkIndex > 0 ? "legacy" :
+        current.messageId === undefined ? "rich-v1" : "preview-v1");
+      if (current.chunkPlan === undefined) {
+        await mutatePending(item.updateId, (entry) => { entry.chunkPlan = plan; });
+        current = state.pending.find((entry) => entry.updateId === item.updateId) ?? current;
+      }
+      // Before rich messages, foreground answers were trimmed before legacy chunking. Preserve
+      // that exact input for an already-progressed legacy cursor during upgrade recovery.
+      const chunks = splitOutboundText(plan === "legacy" ? text.trim() : text, plan);
       for (let index = current.nextChunkIndex; index < chunks.length; index++) {
         const chunk = chunks[index]!;
         if (index === 0 && current.messageId !== undefined) {
@@ -1634,7 +1663,6 @@ export async function runTelegram(
                   entry.lastText = shown;
                 }
               }, cleanupContext);
-              await rememberOutgoingTarget(item.chatId, messageId, shown);
             },
           },
         });
@@ -2970,6 +2998,8 @@ function pendingRecordProblem(value: unknown): string | undefined {
   if (!Number.isSafeInteger(record.nextChunkIndex) || (record.nextChunkIndex as number) < 0) {
     return "delivery record has an invalid chunk cursor";
   }
+  if (record.telegramChunkPlan !== undefined && record.telegramChunkPlan !== "legacy" &&
+      record.telegramChunkPlan !== "rich-v1") return "delivery record has an invalid chunk plan";
   return undefined;
 }
 
@@ -3446,6 +3476,26 @@ function splitTelegramText(text: string): string[] {
     remaining = remaining.slice(cut).replace(/^\s+/, "");
   }
   if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
+/** Plain fallback must preserve all whitespace and stay inside Telegram's per-message limit. */
+function splitPlainTextLossless(text: string): string[] {
+  const chunks: string[] = [];
+  let offset = 0;
+  while (offset < text.length) {
+    let end = Math.min(offset + TELEGRAM_LIMIT, text.length);
+    if (end < text.length) {
+      const newline = text.lastIndexOf("\n", end - 1);
+      const space = text.lastIndexOf(" ", end - 1);
+      const boundary = newline >= offset + TELEGRAM_LIMIT / 2 ? newline + 1 :
+        space >= offset + TELEGRAM_LIMIT / 2 ? space + 1 : end;
+      end = boundary;
+      if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;
+    }
+    chunks.push(text.slice(offset, end));
+    offset = end;
+  }
   return chunks;
 }
 

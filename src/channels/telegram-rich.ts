@@ -43,6 +43,7 @@ const CAPABILITY_MARKERS = ["method not found", "unknown method"];
  * unknown method with 404/`Not Found`, and a strict server may reject the parameter as invalid.
  */
 export function isRichCapabilityRejection(failure: TelegramFailure): boolean {
+  if (failure.status !== 400 && failure.status !== 404) return false;
   if (failure.status === 404) return true;
   const description = (failure.description ?? "").toLowerCase();
   if (CAPABILITY_MARKERS.some((marker) => description.includes(marker))) return true;
@@ -123,8 +124,8 @@ function escapeInline(line: string): string {
  */
 export function splitRichText(text: string, limit: number = RICH_TEXT_LIMIT): string[] {
   const chunks: string[] = [];
-  let remaining = text.replace(/^\s+/, "");
-  if (remaining === "") return text === "" ? [] : [text];
+  if (!Number.isSafeInteger(limit) || limit < 2) throw new RangeError("rich text limit must be at least 2");
+  let remaining = text;
   while (remaining !== "") {
     if (remaining.length <= limit) {
       chunks.push(remaining);
@@ -147,13 +148,22 @@ export function splitRichText(text: string, limit: number = RICH_TEXT_LIMIT): st
       // Cutting before the fence keeps it whole in the next chunk, which is valid markdown.
       cut = fence.opening;
     } else if (fence !== undefined) {
+      // Reopening an almost-limit-sized header can consume almost no original text per chunk,
+      // multiplying a short input into gigabytes. For unusually long headers, cut raw instead.
+      if (fence.fence.length > limit / 4) {
+        let end = limit;
+        if (end < remaining.length && isHighSurrogate(remaining.charCodeAt(end - 1))) end--;
+        chunks.push(remaining.slice(0, end));
+        remaining = remaining.slice(end);
+        continue;
+      }
       const closed = closeFenceAt(remaining, cut, limit, fence.fence);
       chunks.push(closed.chunk);
-      remaining = closed.remaining.replace(/^\s+/, "");
+      remaining = closed.remaining;
       continue;
     }
     chunks.push(remaining.slice(0, cut));
-    remaining = remaining.slice(cut).replace(/^\s+/, "");
+    remaining = remaining.slice(cut);
   }
   return chunks;
 }
@@ -194,12 +204,15 @@ function closeFenceAt(
     } else {
       const within = text.slice(0, budget);
       const adjusted = within.lastIndexOf("\n") > 0 ? within.lastIndexOf("\n") : within.lastIndexOf(" ");
-      at = adjusted > 0 ? adjusted : budget;
+      at = adjusted > openingLength ? adjusted : budget;
     }
   }
+  if (at <= openingLength) at = limit - closing.length;
+  if (at > 0 && isHighSurrogate(text.charCodeAt(at - 1))) at -= 1;
+  if (at <= openingLength) return { chunk: text.slice(0, cut), remaining: text.slice(cut) };
   return {
     chunk: `${text.slice(0, at)}${closing}`,
-    remaining: `${fence}\n${text.slice(at).replace(/^\n/, "")}`,
+    remaining: `${fence}\n${text.slice(at)}`,
   };
 }
 

@@ -594,9 +594,14 @@ message.
 - Ordinary replies, scheduled cron deliveries, live previews and their final edits all use
   `sendRichMessage` with `rich_message.markdown`, or `editMessageText` with `rich_message` for
   in-place edits. No `parse_mode`, no markdown→HTML conversion, no second formatting authority.
-- Rich chunking uses Telegram's 32,768-character budget, cuts on a line then a word boundary, never
-  splits a surrogate pair, and never leaves a fenced code block open: a cut inside ``` closes the
-  fence and reopens the same fence line in the next chunk.
+- Rich chunking normally uses the 32,768-character budget, cuts on a line then a word boundary and
+  preserves whitespace and surrogate pairs. A cut inside a ``` fence closes and reopens it unless
+  its header exceeds a quarter of the chunk budget; oversized headers are cut raw to bound output
+  amplification, so their formatting may not survive the split. When an existing preview must be
+  edited, final chunks instead use a 4096-character budget so a rejected
+  rich edit can fall back to plain text without losing the rest. The chunk plan is recorded before
+  delivery and remains stable if capability changes or the gateway restarts; an older in-flight
+  cursor without a plan continues with the original 4096-character chunking.
 - Host-generated notices (status, help, digest status, control acknowledgements) are escaped so
   paths, ids, `<placeholder>`s and `*` selection markers render exactly as written; an underscore
   between two alphanumerics is left bare, and an escaped character renders as the bare character.
@@ -605,8 +610,10 @@ message.
   refused body (`can't parse`, `unsupported start tag`, `message is too long`, `rich_message`)
   resends that chunk as plain text split under the 4096-character limit. Every other rejection and
   every ambiguous outcome keeps the existing semantics: held, never blindly resent. The plain
-  fallback is all-or-nothing per chunk — if a later part fails, the record is held as an ambiguous
-  outcome rather than resent.
+  fallback is all-or-nothing per chunk — after any part is accepted, its write-ahead intent remains
+  until the whole chunk settles. If a later part fails or the process crashes, the record is held as
+  an ambiguous outcome rather than resent. Each acknowledged plain part is observed under its own
+  message ID and actual text; native reply actions also record every returned ID.
 - `sendRichMessage` is in the ambiguous-send method set, so a 5xx or transport failure is `unknown`
   like any other send.
 - Attachment captions stay plain text with no `parse_mode`, and media is sent through the upload

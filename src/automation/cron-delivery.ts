@@ -53,6 +53,8 @@ export type CronDeliveryRecord = {
   readonly createdAtMs: number;
   readonly status: CronDeliveryStatus;
   readonly nextChunkIndex: number;
+  /** Persisted Telegram chunk plan; absent with progress means the pre-rich legacy plan. */
+  readonly telegramChunkPlan?: "rich-v1" | "legacy";
   readonly messageId?: number;
   readonly sendIntent?: CronDeliverySendIntent;
   readonly unknownSince?: number;

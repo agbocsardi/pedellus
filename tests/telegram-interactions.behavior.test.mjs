@@ -160,6 +160,9 @@ function telegramMock(batches) {
       const text = rich.markdown ?? '';
       const replyTo = body.reply_parameters?.message_id;
       sendAttempts.push({ chatId: body.chat_id, text, replyTo, rich: true });
+      if (text.startsWith('FALLBACK-LONG')) {
+        return json({ ok: false, error_code: 400, description: "Bad Request: can't parse entities" }, 400);
+      }
       if (text === 'UNKNOWN-REPLY') {
         return json({ ok: false, error_code: 500, description: 'Internal Server Error' }, 500);
       }
@@ -236,6 +239,47 @@ async function stateDoc(gateway) {
     return JSON.parse(JSON.stringify(doc));
   }, context);
 }
+
+test('multipart plain native replies retain every message identity and actual part text', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('multipart-reply');
+  const reply = 'FALLBACK-LONG' + 'a'.repeat(4096 - 13) + 'b'.repeat(3900);
+  let issued = false;
+  store.faux.setResponses(Array.from({ length: 8 }, () => () => {
+    if (!issued) {
+      issued = true;
+      return fauxAssistantMessage([
+        fauxToolCall('telegram', { action: 'reply', messageId: 101, text: reply }, { id: 'multipart-1' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('MULTIPART-DONE');
+  }));
+  const transport = telegramMock([[messageUpdate(601, 101, 'request multipart reply')]]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.some((entry) => entry.text === 'MULTIPART-DONE'), 'final answer');
+    const parts = transport.sent.filter((entry) => entry.text.startsWith('FALLBACK-LONG') || /^b+$/.test(entry.text));
+    assert.equal(parts.length, 2);
+    assert.equal(parts[0].replyTo, 101);
+    assert.equal(parts[1].replyTo, undefined);
+    assert.equal(parts.map((part) => part.text).join(''), reply);
+    const state = await stateDoc(store.gateway);
+    const action = state.actions.find((entry) => entry.kind === 'reply' && entry.text === reply);
+    assert.deepEqual(action.resultMessageIds, parts.map((part) => part.messageId));
+    for (const part of parts) {
+      const target = state.targets.find((entry) => entry.messageId === part.messageId);
+      assert.ok(target, 'each accepted part is an observed target');
+      assert.ok(part.text.startsWith(target.text.replace(/…\[truncated\]$/, '')),
+        'the target excerpt comes from that part');
+    }
+    const chat = await store.gateway.conversationFor(`telegram:${BOT_ID}:chat:${CHAT_ID}`, context);
+    const result = await toolResults(chat, 'multipart-1');
+    assert.equal(result.isError, false);
+    for (const part of parts) assert.match(result.text, new RegExp(String(part.messageId)));
+  } finally {
+    await cleanup(store, harness);
+  }
+});
 
 test('the native menu lists only implemented commands', { timeout: 20_000 }, async () => {
   const store = await syntheticStore('menu');

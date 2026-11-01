@@ -167,7 +167,7 @@ function telegramMock(updates, options = {}) {
     }
     if (method === 'sendMessage') {
       const text = body.text ?? '';
-      const failure = options.plainFailure?.(text, plain.length);
+      const failure = await options.plainFailure?.(text, plain.length);
       if (failure !== undefined) {
         plain.push({ chatId: body.chat_id, text, failed: true });
         return json({ ok: false, ...failure }, failure.status);
@@ -307,6 +307,82 @@ test('a refused markdown body is resent as plain text, split inside the plain li
   }
 });
 
+for (const legacy of [false, true]) test(
+  legacy ? 'scheduled recovery keeps a pre-upgrade legacy cursor' :
+    'scheduled recovery keeps persisted rich boundaries when capability is disabled',
+  { timeout: 20_000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const store = await syntheticStore('chunk-plan');
+  const sessionKey = `telegram:${BOT_ID}:chat:${CHAT_ID}`;
+  const answer = 'a'.repeat(legacy ? 4096 : 32768) + 'b'.repeat(6000);
+  const record = {
+    id: 'cron:fixture:1', sessionKey, text: answer, createdAtMs: 1,
+    status: 'pending', nextChunkIndex: 1, ...(legacy ? {} : { telegramChunkPlan: 'rich-v1' }),
+  };
+  const outbox = {
+    async sessions() { return [{ sessionKey }]; },
+    async list() { return [structuredClone(record)]; },
+    async update(_session, _id, change) { change(record); return structuredClone(record); },
+    async recordFault() {},
+  };
+  let harness;
+  try {
+    const state = await store.gateway.conversationFor(`telegram:${BOT_ID}:channel-state`, context);
+    await state.commit(async (tx) => {
+      const doc = await tx.doc(TelegramState, state.id);
+      doc.origins[String(CHAT_ID)] = {
+        botId: String(BOT_ID), chatType: 'private', senderId: String(CHAT_ID), admittedAtMs: 1,
+      };
+    }, context);
+    telegramRichSupport.unavailable = !legacy;
+    const transport = telegramMock([]);
+    const scope = withCancel(context);
+    const host = { conversationFor: store.gateway.conversationFor.bind(store.gateway), cronOutbox: outbox };
+    const adapter = runTelegram(host, { token: TOKEN, allowFrom: ['501'], pollTimeoutSeconds: 1 }, scope.context);
+    harness = { scope, adapter, transport };
+    await advanceUntil(t, () => record.status === 'delivered', 'resumed scheduled delivery');
+    if (legacy) {
+      assert.equal(record.telegramChunkPlan, 'legacy');
+      assert.equal(transport.rich.map((entry) => entry.text).join(''), 'b'.repeat(6000));
+      assert.equal(record.nextChunkIndex, 3);
+    } else {
+      assert.equal(transport.rich.length, 0);
+      assert.equal(transport.plain.map((entry) => entry.text).join(''), 'b'.repeat(6000));
+      assert.equal(record.nextChunkIndex, 2);
+    }
+  } finally {
+    await cleanupWithClock(store, harness, t);
+  }
+});
+
+test('a partially accepted plain fallback is held unknown after a later rejection', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('partial-fallback');
+  const answer = 'x'.repeat(10_000);
+  let harness;
+  try {
+    store.faux.setResponses([fauxAssistantMessage(answer)]);
+    const transport = telegramMock([update(625, 'partial fallback')], {
+      richFailure: () => cannotParse,
+      plainFailure: async (_text, index) => {
+        if (index !== 1) return undefined;
+        const pending = await pendingRecords(store.gateway);
+        assert.equal(pending[0]?.deliveryStatus, 'sending', 'an accepted prior part retains an intent');
+        assert.ok(pending[0]?.sendIntent, 'a crash before rejection is recovered as unknown');
+        return { error_code: 400, description: 'Bad Request: rejected' };
+      },
+    });
+    harness = start(store, transport);
+    await until(async () => (await pendingRecords(store.gateway))
+      .some((entry) => entry.deliveryStatus === 'unknown'), 'partial fallback quarantine');
+    await flush();
+    assert.equal(transport.plain.length, 2, 'accepted part is never resent');
+    assert.equal(transport.plain[0].text.length, 4096);
+    assert.equal(transport.plain[1].failed, true);
+  } finally {
+    await cleanup(store, harness);
+  }
+});
+
 test('an ambiguous rich outcome is quarantined and never resent as plain text', { timeout: 20_000 }, async () => {
   const store = await syntheticStore('unknown');
   let harness;
@@ -314,7 +390,7 @@ test('an ambiguous rich outcome is quarantined and never resent as plain text', 
     store.faux.setResponses([fauxAssistantMessage('MAYBE-DELIVERED')]);
     const transport = telegramMock(
       [update(630, 'ambiguous')],
-      { richFailure: () => ({ error_code: 500, description: 'Internal Server Error' }) },
+      { richFailure: () => ({ error_code: 500, description: 'Internal Server Error: unknown method' }) },
     );
     harness = start(store, transport);
     await until(async () => (await pendingRecords(store.gateway))
@@ -356,10 +432,10 @@ test('a final answer edits the live preview in place as a rich message', { timeo
     const transport = telegramMock([update(650, 'preview please')]);
     harness = start(store, transport);
     await advanceUntil(t, () => transport.edits.some((entry) => entry.rich), 'a rich preview edit');
-    await advanceUntil(t, () => transport.edits.some((entry) => entry.text === answer),
-      'the settled answer in the same message');
-    assert.ok(transport.edits.some((entry) => entry.text === answer),
-      'the settled answer replaced that same message');
+    const chunks = splitRichText(answer, 4096);
+    await advanceUntil(t, () => transport.edits.some((entry) => entry.text === chunks[0]) &&
+      transport.rich.some((entry) => entry.text === chunks[1]), 'all final chunks');
+    assert.equal(chunks.join(''), answer, 'final chunks preserve the answer');
     assert.ok(transport.edits.every((entry) => entry.rich), 'every preview edit is a rich edit');
     assert.equal(transport.plain.length, 0, 'no plain fallback was needed');
   } finally {
@@ -379,9 +455,12 @@ test('an unparseable preview edit falls back to the plain edit', { timeout: 20_0
       editFailure: (entry) => (entry.rich ? cannotParse : undefined),
     });
     harness = start(store, transport);
+    const chunks = splitRichText(answer, 4096);
     await advanceUntil(t,
-      () => transport.edits.some((entry) => entry.rich === false && entry.text === answer),
-      'the answer as a plain edit');
+      () => transport.edits.some((entry) => entry.rich === false && entry.text === chunks[0]) &&
+        transport.rich.some((entry) => entry.text === chunks[1]),
+      'the bounded plain edit and remaining rich chunk');
+    assert.equal(chunks.join(''), answer);
     assert.ok(transport.edits.some((entry) => entry.rich === true && entry.failed === true),
       'the rich edit was attempted first');
     await advanceUntil(t, async () => (await pendingRecords(store.gateway)).length === 0,
@@ -406,6 +485,28 @@ test('rich splitting keeps every chunk inside the limit and never breaks a fence
   for (const marker of ['## one', '## two', '## three', 'print("three")']) {
     assert.ok(rejoined.includes(marker), `${marker} was lost while splitting`);
   }
+});
+
+test('a long single-line fenced block terminates and preserves its content', { timeout: 5_000 }, () => {
+  const text = '```\n' + 'x'.repeat(40_000) + '\n```';
+  const chunks = splitRichText(text);
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every((chunk) => chunk.length <= RICH_TEXT_LIMIT));
+  assert.equal(chunks.join('').replaceAll('```', '').replaceAll('\n', ''), 'x'.repeat(40_000));
+});
+
+test('oversized fence headers cannot amplify output', { timeout: 5_000 }, () => {
+  const text = '```' + 'a'.repeat(32759) + '\n' + 'b'.repeat(1000) + '\n```';
+  const chunks = splitRichText(text);
+  assert.equal(chunks.join(''), text);
+  assert.ok(chunks.length <= 2, 'raw cuts avoid repeated oversized headers');
+  assert.ok(chunks.every((chunk) => chunk.length <= RICH_TEXT_LIMIT));
+});
+
+test('splitting preserves leading and boundary whitespace', () => {
+  const text = '  abc\n    defgh';
+  assert.equal(splitRichText(text, 6).join(''), text);
+  assert.equal(splitRichText('  untouched')[0], '  untouched');
 });
 
 test('rich splitting never cuts a surrogate pair in half', () => {
