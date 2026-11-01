@@ -7,7 +7,7 @@
  * every Durable handle, root/state/fork conversation and model credential.
  */
 
-export const LOCAL_PROTOCOL_VERSION = 2;
+export const LOCAL_PROTOCOL_VERSION = 3;
 
 export const LOCAL_PROTOCOL_LIMITS = Object.freeze({
   /** One request line; inputs are capped well below this by the CLI itself. */
@@ -29,6 +29,9 @@ export const LOCAL_PROTOCOL_LIMITS = Object.freeze({
   maxConversationTokenChars: 32,
   maxLabelChars: 200,
   maxEntryId: Number.MAX_SAFE_INTEGER,
+  /** One attach carries at most this many pending host notices, delivered once each. */
+  maxNoticeIds: 8,
+  maxNoticeTextChars: 512,
 } as const);
 
 /** Fixed error codes; the message never carries dependency or path text. */
@@ -191,6 +194,19 @@ export function optionalCursor(record: Record<string, unknown>, key: string): Re
   const cursor = asObject(value);
   if (cursor === undefined) throw new LocalRequestError("invalid", `${key} is not accepted`);
   return cursor;
+}
+
+/** Bounded host-notice record ids acknowledged after an attach printed them. */
+export function noticeIds(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > LOCAL_PROTOCOL_LIMITS.maxNoticeIds || value.length === 0) {
+    throw new LocalRequestError("invalid", "ids is not accepted");
+  }
+  return value.map((entry) => {
+    if (typeof entry !== "string" || entry.length === 0 || entry.length > 200) {
+      throw new LocalRequestError("invalid", "ids is not accepted");
+    }
+    return entry;
+  });
 }
 
 export function errorBody(error: unknown): LocalErrorBody {

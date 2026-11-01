@@ -177,6 +177,27 @@ edits need restart only; unit edits additionally need daemon-reload.
   live allowlist no longer admits gets no notice.
   Prompt rebuild and the idle reset marker share one commit across all channel attachments.
   `/refresh` is CLI-only; browsing, compaction and local attachments also remain CLI extras.
+- A startup-blocking prepared dispatch (`pi.generation` request/poll or
+  `pi.compaction` summarize) whose pinned context still carries a Nanobot section
+  is cancelled automatically through native `abortTask` after the prepared-model
+  authority scan accepts it. The gateway then opens and records one bounded,
+  deduplicated interruption notice in the origin mapped chat's existing durable
+  channel outbox, cleared with a small session-scoped mark in one commit. No
+  checkpoint is rewritten, no provider/tool call or input is retried, no model
+  turn is started and no continuation is nudged; stored transcript and committed
+  progress stay, while external effects and provider billing are not undone or
+  guaranteed cancelled. Origin resolution is class-aware: a mapped chat owns
+  itself, a scheduled-run automation conversation is reported to its recorded
+  mapped origin, and a worker or digest target is reported to the mapped chat
+  whose run task created it; an unmapped target is cancelled without a guessed
+  notice. Abort-marked and terminal tasks are skipped, so ordinary cancellations
+  and already fenced jobs acquire no notice and are not rearmed. Telegram uses
+  the existing outbox admission, live allowlist and unknown-send hold; a local CLI
+  attach prints and acknowledges pending notices without a model turn. A full or
+  malformed interruption mark, an abort mark that did not persist, or a prepared
+  model outside `allowedModels` (including a revoked generation poll) remains a
+  fixed startup failure handled by stopped-store recovery; the allowlist is never
+  widened to make startup pass.
 - The cron timer never calls a model, and a run never schedules: rescheduling is
   a deterministic task commit, so a slow or failed turn cannot stop the schedule.
   A conversation is ongoing activity and an episode is one execution: a recurring

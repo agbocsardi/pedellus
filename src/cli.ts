@@ -499,6 +499,21 @@ async function runAgent(
       ].join("\n"));
     };
     client.onMcpNotice = (text) => { stdout.write(`\n${text}\n`); };
+    // A host interruption notice recorded before this attachment was live. It is ordinary host text,
+    // not a transcript entry and not a model turn; acknowledge only after writing it, so a crash
+    // repeats the notice on the next attach instead of losing it.
+    if (client.pendingNotices.length > 0) {
+      for (const notice of client.pendingNotices) {
+        await new Promise<void>((resolveWritten, rejectWritten) => {
+          stdout.write(`\n${notice.text}\n`, (error) => error ? rejectWritten(error) : resolveWritten());
+        });
+      }
+      try {
+        await client.ackNotices(client.pendingNotices.map((notice) => notice.id), context);
+      } catch {
+        // The record stays pending; the next attach shows it again.
+      }
+    }
     // Readline's post-line size check bounds admission, not its pre-newline input buffer.
     input = createInterface({ input: stdin, output: stdout, terminal: Boolean(stdin.isTTY && stdout.isTTY) });
     input.once("close", () => { inputClosed = true; });

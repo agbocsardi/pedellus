@@ -27,6 +27,15 @@ import {
   type PreparedResponseEvidence,
 } from "./prepared.js";
 
+/**
+ * Stopped-store inspection and explicit cancellation of prepared dispatches.
+ *
+ * Normal gateway startup no longer refuses solely because such a dispatch exists: after its prepared
+ * model passes the configured authority scan, the open cancels it through the same native
+ * `abortTask` and records one durable interruption notice. These functions remain the owner fallback
+ * for an unsupported or failed automatic path (for example a full interruption record, an abort mark
+ * that did not persist, or a prepared model outside `allowedModels`).
+ */
 const RECOVERY_FINGERPRINT_VERSION = "nanobot.prepared-context-recovery.v2";
 
 export type { PreparedResponseEvidence } from "./prepared.js";

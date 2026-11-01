@@ -17,6 +17,7 @@ import {
   type LocalAttachmentRejection,
 } from "../media/local.js";
 import type { Gateway, GatewayMcpAdmin, GatewayModelSelectionRequest } from "../runtime.js";
+import { isTurnInterruptionNotice } from "../recovery/interruption.js";
 import { CRON_OPERATOR_LIMITS, CronOperatorInputError, type CronOperator } from "../automation/operator.js";
 import { RestartBusyError } from "../restart.js";
 import {
@@ -34,6 +35,7 @@ import {
   LocalRequestError,
   conversationToken,
   errorBody,
+  noticeIds,
   optionalCursor,
   optionalString,
   parseRequestLine,
@@ -352,6 +354,14 @@ class LocalConnection {
         }
         return background === undefined ? status : { ...status, background };
       }
+      case "ackNotices": {
+        // The CLI prints the notices carried by its attach, then acknowledges exactly those records.
+        // A failed acknowledgement leaves them pending, so a later attach repeats rather than loses them.
+        const params = requireObject(request.params);
+        onlyKeys(params, ["ids"]);
+        await this.ackHostNotices(noticeIds(params.ids));
+        return {};
+      }
       case "entries": {
         const params = requireObject(request.params);
         onlyKeys(params, ["query", "limit", "cursor"]);
@@ -525,7 +535,50 @@ class LocalConnection {
       digest: true,
       mcp: this.options.gateway.mcpAdmin !== undefined,
       restart: this.options.restart?.supported === true,
+      notices: await this.pendingHostNotices(sessionKey),
     };
+  }
+
+  /**
+   * Pending host interruption notices for this attached CLI chat. They are ordinary bounded outbox
+   * records the same channel-neutral store uses for scheduled results; this surface only projects the
+   * host-notice ids and text, and reads no transcript or other chat's record.
+   */
+  private async pendingHostNotices(sessionKey: string): Promise<{ readonly id: string; readonly text: string }[]> {
+    const outbox = this.options.gateway.cronOutbox;
+    if (outbox === undefined) return [];
+    let records;
+    try {
+      records = await outbox.list(sessionKey, this.scope.context);
+    } catch {
+      // A notice is a side channel; an unreadable outbox must not prevent the terminal attaching.
+      return [];
+    }
+    return records
+      .filter((record) => record.status === "pending" && isTurnInterruptionNotice(record)
+        && typeof record.text === "string" && record.text.trim() !== "")
+      .slice(0, LOCAL_PROTOCOL_LIMITS.maxNoticeIds)
+      .map((record) => ({ id: record.id, text: record.text }));
+  }
+
+  /** Mark exactly the attached chat's interruption notices delivered after the terminal printed them. */
+  private async ackHostNotices(ids: readonly string[]): Promise<void> {
+    const outbox = this.options.gateway.cronOutbox;
+    const sessionKey = this.sessionKey;
+    if (outbox === undefined || sessionKey === undefined) return;
+    for (const id of ids) {
+      if (!isTurnInterruptionNotice({ id })) continue;
+      try {
+        await outbox.update(sessionKey, id, (entry) => {
+          if (entry.status !== "pending") return;
+          entry.status = "delivered";
+          entry.settledAt = Date.now();
+          delete entry.error;
+        }, this.scope.context);
+      } catch {
+        // Leave it pending: the next attach shows it again instead of losing the notice.
+      }
+    }
   }
 
   /**

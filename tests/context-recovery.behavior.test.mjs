@@ -15,6 +15,14 @@ const { listPreparedContextBlocks, cancelPreparedContextBlock } = await import(
   pathToFileURL(`${pkg}/dist/recovery/index.js`).href
 );
 const { preparedResponseEvidence } = await import(pathToFileURL(`${pkg}/dist/recovery/prepared.js`).href);
+const { CronDeliveriesDoc } = await import(pathToFileURL(`${pkg}/dist/automation/cron-delivery.js`).href);
+const { TurnInterruptionMarksDoc, TURN_INTERRUPTION_NOTICE } = await import(
+  pathToFileURL(`${pkg}/dist/recovery/interruption.js`).href
+);
+const { serveLocalGateway, gatewaySocketPath } = await import(
+  pathToFileURL(`${pkg}/dist/local/server.js`).href
+);
+const { connectLocalGateway } = await import(pathToFileURL(`${pkg}/dist/local/client.js`).href);
 const { parseConfig } = await import(pathToFileURL(`${pkg}/dist/config.js`).href);
 const { createModels, fauxAssistantMessage, fauxProvider } = await import(pathToFileURL(`${ai}/index.js`).href);
 const { getCurrentSystemPrompt } = await import(pathToFileURL(`${ai}/utils/transcript.js`).href);
@@ -296,31 +304,8 @@ test("owner recovery cancels a SIGKILLed prepared request without replay or tran
       "a dispatched request without a committed partial records no response");
     assert.match(block.fingerprint, /^[0-9a-f]{64}$/);
 
-    const changed = offlineModels(providerId);
-    await assert.rejects(
-      openGateway(config, context, {
-        models: changed.models,
-        contextSnapshotProvider: () => ({ identity: { source: "synthetic", content: "changed-secret" } }),
-      }),
-      /prepared request includes persisted Nanobot context/,
-    );
-    const unchanged = offlineModels(providerId);
-    await assert.rejects(
-      openGateway(config, context, {
-        models: unchanged.models,
-        contextSnapshotProvider: () => ({ identity: { source: "synthetic", content: "old-secret-session-a" } }),
-      }),
-      /prepared request includes persisted Nanobot context/,
-    );
-    const optedOut = offlineModels(providerId);
-    await assert.rejects(
-      openGateway(config, context, { models: optedOut.models }),
-      /prepared request includes persisted Nanobot context/,
-    );
-    assert.equal(changed.provider.state.callCount, 0);
-    assert.equal(unchanged.provider.state.callCount, 0);
-    assert.equal(optedOut.provider.state.callCount, 0);
-
+    // The explicit owner path stays available even though normal startup would auto-recover; this
+    // test keeps the task blocked until the recovery command marks it.
     await assert.rejects(
       cancelPreparedContextBlock(config, { taskId: block.taskId, fingerprint: "0".repeat(64) }, context),
       /changed since inspection/,
@@ -350,6 +335,8 @@ test("owner recovery cancels a SIGKILLed prepared request without replay or tran
     assert.ok(task);
     assert.equal(task.state.status, "terminal");
     assert.equal(task.state.outcome.status, "aborted");
+    assert.equal(await gateway.harness.snapshot(CronDeliveriesDoc, block.conversationId, context), undefined,
+      "an owner cancellation must not acquire an interruption notice");
 
     const conversation = await gateway.conversationFor("session-a", context);
     const entries = await conversation.entries({ order: "ascending" }, 100, undefined, context);
@@ -375,18 +362,20 @@ test("owner recovery cancels a SIGKILLed prepared request without replay or tran
   }
 });
 
-test("startup refusal for a blocked prepared dispatch gives the recovery action without raw values", { timeout: 30_000 }, async () => {
+test("automatic startup recovery cancels a blocked prepared turn and records one durable notice", { timeout: 40_000 }, async () => {
   const temp = await mkdtemp(resolve(tmpdir(), "nanobot-startup-prepared-"));
   const workspace = resolve(temp, "workspace");
   const dataDir = resolve(temp, "state");
+  const providerId = "recovery-startup";
   await mkdir(workspace);
   let child;
+  let gateway;
+  let server;
+  let client;
   try {
     const started = startChild(generationCrashScript({
-      workspace, dataDir, temp,
-      providerId: "deepseek",
-      modelId: "deepseek-flash",
-      sessions: ["startup-session"],
+      workspace, dataDir, temp, providerId,
+      sessions: ["cli:default"],
       secretPrefix: "old-startup-secret-",
     }));
     child = started.child;
@@ -394,25 +383,161 @@ test("startup refusal for a blocked prepared dispatch gives the recovery action 
     await killAndWait(child);
     child = undefined;
 
-    const configFile = await writeConfig(
-      temp, workspace, dataDir, "deepseek", "deepseek-flash", { deepseek: "NANOBOT_SYNTHETIC_KEY" },
-    );
-    const refused = await runStartupCli(configFile, {
-      env: { NANOBOT_SYNTHETIC_KEY: "synthetic-not-a-key" },
-    });
-    assert.deepEqual({ code: refused.code, signal: refused.signal }, { code: 1, signal: null }, refused.stderr);
-    assert.match(refused.stderr, /durable-nanobot: startup refused because a prepared model dispatch pins historical Nanobot context/);
-    assert.match(refused.stderr, /durable-nanobot recovery --config <path>/);
-    assert.match(refused.stderr, /diagnostic details suppressed/);
-    assert.ok(!refused.stderr.includes(temp), "startup refusal must not disclose the workspace or data path");
-    assert.ok(!refused.stderr.includes("old-startup-secret"), "startup refusal must not disclose pinned context");
-    assert.ok(!refused.stderr.includes("deepseek"), "startup refusal must not disclose provider values");
-    assert.ok(!refused.stderr.includes("startup-session"), "startup refusal must not disclose session values");
+    const config = gatewayConfig(workspace, dataDir, providerId);
+    const blocks = await listPreparedContextBlocks(config, context);
+    assert.equal(blocks.length, 1);
+    const block = blocks[0];
+    assert.equal(block.phase, "request");
 
-    assert.equal((await listPreparedContextBlocks(gatewayConfig(workspace, dataDir, "deepseek", "deepseek-flash"), context)).length, 1,
-      "startup refusal must not cancel or rewrite the prepared dispatch");
+    const first = offlineModels(providerId);
+    gateway = await openGateway(config, context, {
+      models: first.models,
+      contextSnapshotProvider: () => ({ identity: { source: "synthetic", content: "fresh-startup-secret" } }),
+    });
+    await gateway.harness.waitForIdle(context);
+    assert.equal(first.provider.state.callCount, 0, "automatic recovery must not dispatch or replay a model request");
+    const task = await gateway.harness.getTask(block.taskId, context);
+    assert.ok(task);
+    assert.equal(task.state.status, "terminal");
+    assert.equal(task.state.outcome.status, "aborted");
+
+    let conversation = await gateway.conversationFor("cli:default", context);
+    assert.equal(conversation.id, block.conversationId);
+    const entries = await conversation.entries({ order: "ascending" }, 100, undefined, context);
+    assert.ok(entries.items.some((entry) => (entry.model ?? []).some((message) =>
+      message.role === "user" && message.content === "request cli:default")),
+    "the interrupted turn's stored input must remain");
+
+    const noticeId = `host:turn-interrupted:${block.taskId}`;
+    const outbox = await gateway.harness.snapshot(CronDeliveriesDoc, block.conversationId, context);
+    const notices = outbox.deliveries.filter((record) => record.id === noticeId);
+    assert.equal(notices.length, 1, "one notice for the interrupted turn");
+    assert.equal(notices[0].status, "pending");
+    assert.equal(notices[0].text, TURN_INTERRUPTION_NOTICE);
+    assert.equal(notices[0].sessionKey, "cli:default");
+
+    // Reopen: the same one notice remains, no mark is left, and no model request is made.
+    await gateway.close(context);
+    gateway = undefined;
+    const second = offlineModels(providerId);
+    gateway = await openGateway(config, context, {
+      models: second.models,
+      contextSnapshotProvider: () => ({ identity: { source: "synthetic", content: "fresh-startup-secret" } }),
+    });
+    await gateway.harness.waitForIdle(context);
+    assert.equal(second.provider.state.callCount, 0);
+    const reopenedOutbox = await gateway.harness.snapshot(CronDeliveriesDoc, block.conversationId, context);
+    assert.equal(reopenedOutbox.deliveries.filter((record) => record.id === noticeId).length, 1,
+      "a reopen must not duplicate the notice");
+    const marks = await gateway.harness.snapshot(TurnInterruptionMarksDoc, context);
+    assert.deepEqual(marks?.marks ?? [], []);
+
+    // A reattached CLI sees the notice once, then acknowledges it without a model turn.
+    const socketPath = gatewaySocketPath(config.dataDir);
+    server = await serveLocalGateway({
+      socketPath, gateway, context, tools: [], contextRefresh: false, presets: false,
+    });
+    client = await connectLocalGateway({ socketPath, conversation: undefined, context });
+    assert.deepEqual(client.pendingNotices.map((notice) => notice.text), [TURN_INTERRUPTION_NOTICE]);
+    await client.ackNotices(client.pendingNotices.map((notice) => notice.id), context);
+    await client.close();
+    client = undefined;
+    const delivered = await gateway.harness.snapshot(CronDeliveriesDoc, block.conversationId, context);
+    assert.equal(delivered.deliveries.find((record) => record.id === noticeId).status, "delivered");
+
+    client = await connectLocalGateway({ socketPath, conversation: undefined, context });
+    assert.equal(client.pendingNotices.length, 0, "a delivered notice is not repeated on reattach");
+    await client.close();
+    client = undefined;
+    client = await connectLocalGateway({ socketPath, conversation: "other", context });
+    assert.equal(client.pendingNotices.length, 0, "a notice is never shown to another CLI chat");
+    await client.close();
+    client = undefined;
+
+    // Continuation is the owner's explicit next input; it renders the fresh context exactly once.
+    conversation = await gateway.conversationFor("cli:default", context);
+    const captured = [];
+    second.provider.setResponses([(request) => {
+      captured.push(getCurrentSystemPrompt(request.messages));
+      return fauxAssistantMessage("fresh reply");
+    }]);
+    const submission = await conversation.submit({ type: "input", content: "after recovery", requestId: "after-auto" }, context);
+    assert.equal((await submission.wait(context)).status, "done");
+    assert.equal(captured.length, 1);
+    assert.match(captured[0], /fresh-startup-secret/);
+    assert.doesNotMatch(captured[0], /old-startup-secret/);
+  } finally {
+    if (client) await client.close().catch(() => undefined);
+    if (server) await server.close().catch(() => undefined);
+    if (gateway) await gateway.close(context);
+    if (child && child.exitCode === null) child.kill("SIGKILL");
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a crash after the durable abort mark still delivers one notice on reopen", { timeout: 30_000 }, async () => {
+  const temp = await mkdtemp(resolve(tmpdir(), "nanobot-recovery-abort-window-"));
+  const workspace = resolve(temp, "workspace");
+  const dataDir = resolve(temp, "state");
+  const providerId = "recovery-abort-window";
+  await mkdir(workspace);
+  let child;
+  let gateway;
+  try {
+    const started = startChild(generationCrashScript({
+      workspace, dataDir, temp, providerId,
+      sessions: ["cli:default"],
+      secretPrefix: "old-window-secret-",
+    }));
+    child = started.child;
+    await waitForMarkers(child, "DISPATCHED", 1, started.stderr);
+    await killAndWait(child);
+    child = undefined;
+
+    const config = gatewayConfig(workspace, dataDir, providerId);
+    const blocks = await listPreparedContextBlocks(config, context);
+    assert.equal(blocks.length, 1);
+    const block = blocks[0];
+    // Recreate the crash window: the native abort mark and its pending interruption mark are durable,
+    // but the notice admission and the abort protocol have not run.
+    await withRawHarness(config, offlineModels(providerId).models, async (harness) => {
+      await harness.abortTask(block.taskId, context);
+      await harness.commit(async (tx) => {
+        const doc = await tx.doc(TurnInterruptionMarksDoc);
+        doc.marks = [{
+          taskId: block.taskId,
+          kind: block.kind,
+          originConversationId: block.conversationId,
+          sessionKey: "cli:default",
+          createdAtMs: 1,
+        }];
+      }, context);
+      const marked = await harness.getTask(block.taskId, context);
+      assert.ok(marked);
+      assert.equal(marked.state.status, "pending");
+      assert.equal(marked.abortRequested, true);
+    });
+
+    const reopened = offlineModels(providerId);
+    gateway = await openGateway(config, context, {
+      models: reopened.models,
+      contextSnapshotProvider: () => ({ identity: { source: "synthetic", content: "fresh-window-secret" } }),
+    });
+    await gateway.harness.waitForIdle(context);
+    assert.equal(reopened.provider.state.callCount, 0, "the interrupted request must not be resent");
+    const task = await gateway.harness.getTask(block.taskId, context);
+    assert.ok(task);
+    assert.equal(task.state.status, "terminal");
+    assert.equal(task.state.outcome.status, "aborted");
+    const noticeId = `host:turn-interrupted:${block.taskId}`;
+    const outbox = await gateway.harness.snapshot(CronDeliveriesDoc, block.conversationId, context);
+    assert.equal(outbox.deliveries.filter((record) => record.id === noticeId).length, 1);
+    assert.equal(outbox.deliveries.find((record) => record.id === noticeId).status, "pending");
+    const marks = await gateway.harness.snapshot(TurnInterruptionMarksDoc, context);
+    assert.deepEqual(marks?.marks ?? [], [], "the crash window must clear its mark in the notice commit");
   } finally {
     if (child && child.exitCode === null) child.kill("SIGKILL");
+    if (gateway) await gateway.close(context);
     await rm(temp, { recursive: true, force: true });
   }
 });
@@ -451,15 +576,8 @@ test("concurrent prepared requests are cancelled one at a time and the lock is r
     const remaining = await listPreparedContextBlocks(config, context);
     assert.deepEqual(remaining.map((block) => block.taskId), [second.taskId]);
 
-    const blockedOpen = offlineModels(providerId);
-    await assert.rejects(
-      openGateway(config, context, {
-        models: blockedOpen.models,
-        contextSnapshotProvider: () => ({ identity: { source: "synthetic", content: "current context" } }),
-      }),
-      /prepared request includes persisted Nanobot context/,
-    );
-    assert.equal(blockedOpen.provider.state.callCount, 0);
+    // The remaining dispatch is still blocked for an owner decision; automatic recovery is
+    // exercised separately and would cancel it if the gateway were opened here.
 
     assert.deepEqual(
       await cancelPreparedContextBlock(config, { taskId: second.taskId, fingerprint: second.fingerprint }, context),
@@ -511,15 +629,7 @@ test("owner recovery cancels a prepared compaction without resummarizing stale c
     assert.ok(block.at > 0);
     assert.equal(block.response, "unrecorded", "compaction records no dispatch marker");
 
-    const blockedOpen = offlineModels(providerId);
-    await assert.rejects(
-      openGateway(config, context, {
-        models: blockedOpen.models,
-        contextSnapshotProvider: () => ({ identity: { source: "synthetic", content: "old-compaction-secret" } }),
-      }),
-      /prepared request includes persisted Nanobot context/,
-    );
-    assert.equal(blockedOpen.provider.state.callCount, 0);
+    // The explicit owner path stays available; automatic startup recovery is covered separately.
 
     assert.deepEqual(
       await cancelPreparedContextBlock(config, { taskId: block.taskId, fingerprint: block.fingerprint }, context),
@@ -694,12 +804,13 @@ test("cancellation reports immediate orphaned settlement instead of a bare abort
   }
 });
 
-test("a committed partial response is reported and the dispatch still blocks", { timeout: 20_000 }, async () => {
+test("a committed partial response is reported before recovery cancels the dispatch", { timeout: 20_000 }, async () => {
   const temp = await mkdtemp(resolve(tmpdir(), "nanobot-recovery-partial-"));
   const workspace = resolve(temp, "workspace");
   const dataDir = resolve(temp, "state");
   const providerId = "recovery-partial";
   await mkdir(workspace);
+  let gateway;
   try {
     const seeded = await seedContextStore({
       workspace, dataDir, providerId, secret: "partial-context", modelIds: ["synthetic"],
@@ -735,13 +846,24 @@ test("a committed partial response is reported and the dispatch still blocks", {
     assert.equal(blocks[0].response, "partial-response",
       "a committed partial proves the provider stream produced content");
 
-    const blockedOpen = offlineModels(providerId);
-    await assert.rejects(
-      openGateway(seeded.config, context, { models: blockedOpen.models }),
-      /prepared request includes persisted Nanobot context/,
+    assert.deepEqual(
+      await cancelPreparedContextBlock(
+        seeded.config,
+        { taskId, fingerprint: blocks[0].fingerprint },
+        context,
+      ),
+      { status: "orphaned", taskId },
     );
-    assert.equal(blockedOpen.provider.state.callCount, 0);
+    const opened = offlineModels(providerId);
+    gateway = await openGateway(seeded.config, context, { models: opened.models });
+    await gateway.harness.waitForIdle(context);
+    assert.equal(opened.provider.state.callCount, 0, "the partial dispatch must not be restarted");
+    const task = await gateway.harness.getTask(taskId, context);
+    assert.ok(task);
+    assert.equal(task.state.status, "terminal");
+    assert.equal(task.state.outcome.status, "orphaned");
   } finally {
+    if (gateway) await gateway.close(context);
     await rm(temp, { recursive: true, force: true });
   }
 });

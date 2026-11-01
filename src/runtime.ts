@@ -93,6 +93,16 @@ import { modelKey, parseToolTimeoutSeconds, type ModelReference, type PortConfig
 import { createVisionHandoffExtension } from "./media/vision-hook.js";
 import { VisionHandoff, type VisionHandoffStats } from "./media/vision.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
+import {
+  addTurnInterruptionMark,
+  interruptionOrigin,
+  parseTurnInterruptionMarks,
+  removeTurnInterruptionMarks,
+  TurnInterruptionMarksDoc,
+  TURN_INTERRUPTION_MAX_MARKS,
+  turnInterruptionDelivery,
+  type TurnInterruptionMark,
+} from "./recovery/interruption.js";
 import { canonicalFuturePath, prepareDataDirectory, inside } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import {
@@ -2587,6 +2597,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // scheduling resumes, never silently moved to the configured default.
     const pinnedModelRemoved = new Set<ConversationId>();
     const runTasksById = new Map<number, { readonly originConversationId: ConversationId; readonly targetConversationId: ConversationId | null }>();
+    // A background run's target conversation is task-owned, never a chat. Interruption recovery
+    // resolves its legitimate owning surface back through the run task that created it.
+    const backgroundTargetOrigins = new Map<ConversationId, ConversationId>();
     await root.commit(async (tx) => {
       let taskCursor: Cursor | undefined;
       do {
@@ -2613,6 +2626,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
               && automationConversations.get(target.id)?.originConversationId
                 === backgroundTarget.originConversationId;
             if (ownsTarget || automationTarget) {
+              backgroundTargetOrigins.set(backgroundTarget.targetConversationId, task.conversationId as ConversationId);
               // A digest target deliberately gets no origin context snapshot: its model input is
               // its own bounded batch, so a reopened attempt renders the same framing again.
               if (snapshotTarget !== undefined) backgroundRunTargets.push(snapshotTarget);
@@ -2748,17 +2762,180 @@ export async function openGateway(config: PortConfig, context: Context, options:
       backgroundToolBounds.set(targetConversationId, tools);
     }
 
+    const readInterruptionMarks = async (): Promise<TurnInterruptionMark[]> => {
+      let stored;
+      try {
+        stored = await harness!.snapshot(TurnInterruptionMarksDoc, context);
+      } catch (cause) {
+        throw new StartupDiagnosticError("preparedContext", {
+          cause,
+          detail: "Cannot read the interruption recovery record; run the context recovery interface before gateway recovery",
+        });
+      }
+      if (stored === undefined) return [];
+      try {
+        return parseTurnInterruptionMarks(stored);
+      } catch (cause) {
+        throw new StartupDiagnosticError("preparedContext", {
+          cause,
+          detail: "The interruption recovery record is malformed; run the context recovery interface before gateway recovery",
+        });
+      }
+    };
+
+    // The origin of a prepared dispatch is the mapped chat that owns it, never the worker, digest or
+    // scheduled-run target conversation. A target is resolved through the class the open restored or
+    // the run task that still owns it; no session key is inferred from a conversation id.
+    const interruptionOriginFor = (
+      conversationId: ConversationId,
+      sessions: ReadonlyMap<ConversationId, string>,
+    ) => interruptionOrigin(conversationId, {
+      chatSessionKey: (id) => sessions.get(id),
+      automationOrigin: (id) => automationConversations.get(id)?.originConversationId,
+      backgroundOrigin: (id) => backgroundTargetOrigins.get(id),
+    });
+
+    /**
+     * Admit one notice per marked task into its origin's existing bounded channel outbox, then clear
+     * the mark in the same commit. A settled non-abort outcome (or a completed turn that won the race)
+     * is not reported as an interruption; a mark whose origin is no longer this mapped chat is dropped
+     * instead of rerouted. An unreadable/full outbox keeps gateway availability and records a bounded
+     * delivery fault; the notice is not retried and no unknown-outcome record is evicted.
+     */
+    const admitInterruptionNotices = async (sessions: ReadonlyMap<ConversationId, string>): Promise<void> => {
+      const marks = await readInterruptionMarks();
+      if (marks.length === 0) return;
+      const deliverable: TurnInterruptionMark[] = [];
+      const clear = new Set<number>();
+      for (const mark of marks) {
+        const task = await harness!.getTask(mark.taskId as TaskId, context);
+        if (task === undefined) {
+          clear.add(mark.taskId);
+          continue;
+        }
+        const interrupted = task.state.status === "terminal"
+          ? task.state.outcome.status !== "completed"
+          : task.abortRequested === true;
+        if (!interrupted) {
+          clear.add(mark.taskId);
+          continue;
+        }
+        if (sessions.get(mark.originConversationId) !== mark.sessionKey) {
+          clear.add(mark.taskId);
+          continue;
+        }
+        deliverable.push(mark);
+      }
+      if (deliverable.length === 0 && clear.size === 0) return;
+      await root.commit(async (tx) => {
+        const markDoc = await tx.doc(TurnInterruptionMarksDoc);
+        // Fail closed on damaged state instead of overwriting a mark this build does not understand.
+        parseTurnInterruptionMarks(markDoc);
+        for (const mark of deliverable) {
+          if ((await tx.conversation(mark.originConversationId)) === undefined) {
+            clear.add(mark.taskId);
+            continue;
+          }
+          let admission: "admitted" | "duplicate" | "full" | "invalid" = "invalid";
+          try {
+            const deliveries = await tx.doc(CronDeliveriesDoc, mark.originConversationId);
+            admission = admitCronDelivery(
+              deliveries,
+              turnInterruptionDelivery(mark.sessionKey, mark.taskId, now(), mark.kind),
+            );
+          } catch {
+            admission = "invalid";
+          }
+          if (admission === "full" || admission === "invalid") {
+            try {
+              const faults = await tx.doc(CronDeliveryFaultsDoc, mark.originConversationId);
+              recordCronDeliveryFault(faults, {
+                jobId: null,
+                scheduledAtMs: null,
+                recordedAtMs: now(),
+                message: admission === "full"
+                  ? "interruption notice was not queued: delivery outbox is full"
+                  : "interruption notice was not queued: delivery outbox is malformed",
+              });
+            } catch {
+              // This diagnostic is derived state; it must not stop the gateway from recovering.
+            }
+          }
+          clear.add(mark.taskId);
+        }
+        if (clear.size > 0) removeTurnInterruptionMarks(markDoc, clear);
+      }, context);
+    };
+
+    /**
+     * Cancel every prepared dispatch whose pinned context still contains Nanobot sections. The
+     * detailed error is for SDK callers; the CLI prints one fixed recovery diagnostic. A mark is
+     * written first for every dispatch with a mapped origin, so a crash between that write, the
+     * native abort and the notice admission is reconciled on the next open. A dispatch whose
+     * prepared model left `allowedModels` never reaches here: the scan above fails closed first.
+     */
+    const recoverInterruptedPreparedTurns = async (blocked: readonly NonNullable<ReturnType<typeof preparedContextReplay>>[]): Promise<void> => {
+      const pending = await readInterruptionMarks();
+      if (blocked.length === 0 && pending.length === 0) return;
+      const sessions = new Map((await mappedChatSessions(context))
+        .map(({ conversationId, sessionKey }) => [conversationId, sessionKey] as const));
+      if (blocked.length > 0) {
+        const known = new Set(pending.map((mark) => mark.taskId));
+        const additions: TurnInterruptionMark[] = [];
+        for (const replay of blocked) {
+          if (known.has(replay.id)) continue;
+          const origin = interruptionOriginFor(replay.conversationId, sessions);
+          if (origin === undefined) continue;
+          additions.push({
+            taskId: replay.id,
+            kind: replay.kind,
+            originConversationId: origin.conversationId,
+            sessionKey: origin.sessionKey,
+            createdAtMs: now(),
+          });
+        }
+        if (additions.length > 0) {
+          await harness!.commit(async (tx) => {
+            const doc = await tx.doc(TurnInterruptionMarksDoc);
+            for (const mark of additions) {
+              const result = addTurnInterruptionMark(doc, mark);
+              if (result === "full") {
+                throw new StartupDiagnosticError("preparedContext", {
+                  detail: `Cannot automatically recover interrupted turns: the bounded interruption record holds ` +
+                    `${TURN_INTERRUPTION_MAX_MARKS} pending notices; cancel the blocked prepared dispatch with the ` +
+                    "context recovery interface before gateway recovery",
+                });
+              }
+            }
+          }, context);
+        }
+        for (const replay of blocked) {
+          // A cascade from an earlier abort can already have settled this task; never abort a terminal
+          // task or repeat an existing mark.
+          const current = await harness!.getTask(replay.id as TaskId, context);
+          if (current === undefined || current.state.status === "terminal" || current.abortRequested === true) continue;
+          await harness!.abortTask(replay.id as TaskId, context);
+        }
+        for (const replay of blocked) {
+          const task = await harness!.getTask(replay.id as TaskId, context);
+          if (task === undefined || task.state.status === "terminal" || task.abortRequested === true) continue;
+          throw new StartupDiagnosticError("preparedContext", {
+            detail: `Cannot safely recover ${replay.kind} task ${replay.id} (${replay.phase}): the native abort mark ` +
+              "did not persist; cancel that prepared dispatch with the context recovery interface before gateway recovery",
+          });
+        }
+      }
+      await admitInterruptionNotices(sessions);
+    };
+
+    const blockedPreparedTurns: NonNullable<ReturnType<typeof preparedContextReplay>>[] = [];
     for (const replay of preparedContextReplays) {
       const conversation = await harness.conversation(replay.conversationId, context);
       if (!conversation) throw new Error(`Cannot safely resume ${replay.kind} task ${replay.id}: conversation is missing`);
       const view = await conversation.context(context, { at: replay.at as EntryId });
-      if (hasPersistedNanobotContext(view.messages)) {
-        throw new StartupDiagnosticError("preparedContext", {
-          detail: `Cannot safely resume ${replay.kind} task ${replay.id} (${replay.phase}): its prepared request includes ` +
-            "persisted Nanobot context; cancel that prepared dispatch with the context recovery interface before gateway recovery",
-        });
-      }
+      if (hasPersistedNanobotContext(view.messages)) blockedPreparedTurns.push(replay);
     }
+    await recoverInterruptedPreparedTurns(blockedPreparedTurns);
 
     // Apply host security, configured tool authority and context selection only after every prepared
     // dispatch passes the replay guard. A narrowed configuration is what keeps a removed tool from replaying.

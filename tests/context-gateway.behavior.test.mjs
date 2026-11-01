@@ -39,7 +39,7 @@ async function send(gateway, key, id, message) {
   return conversation;
 }
 
-test("SIGKILL prepared request is rejected before replay when context is opted out", { timeout: 20_000 }, async () => {
+test("SIGKILL prepared request is cancelled before replay when context is opted out", { timeout: 20_000 }, async () => {
   const temp = await mkdtemp(resolve(tmpdir(), "nanobot-context-sigkill-"));
   const workspace = resolve(temp, "workspace");
   const dataDir = resolve(temp, "state");
@@ -73,6 +73,7 @@ test("SIGKILL prepared request is rejected before replay when context is opted o
     setInterval(() => {}, 1000);
   `;
   let child;
+  let gateway;
   let stderr = "";
   try {
     child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] });
@@ -111,12 +112,19 @@ test("SIGKILL prepared request is rejected before replay when context is opted o
     const model = { provider: "context-sigkill", modelId: "synthetic" };
     const config = parseConfig({ workspace, dataDir, model, allowedModels: [model] }, temp);
     const openWithoutContext = () => openGateway(config, context, { models });
-    await assert.rejects(openWithoutContext(), /prepared request includes persisted Nanobot context/);
+    gateway = await openWithoutContext();
+    await gateway.harness.waitForIdle(context);
+    assert.deepEqual(replayed, [], "the interrupted prepared request must never be replayed");
+    assert.equal(provider.state.callCount, 0);
+    await gateway.close(context);
+    gateway = undefined;
+    // A second open proves the first released the per-database process lock and has nothing left to cancel.
+    gateway = await openWithoutContext();
+    await gateway.harness.waitForIdle(context);
     assert.deepEqual(replayed, []);
-    // A second rejection proves the failed open released the per-database process lock.
-    await assert.rejects(openWithoutContext(), /prepared request includes persisted Nanobot context/);
-    assert.deepEqual(replayed, []);
+    assert.equal(provider.state.callCount, 0);
   } finally {
+    if (gateway) await gateway.close(context).catch(() => undefined);
     if (child && child.exitCode === null) child.kill("SIGKILL");
     await rm(temp, { recursive: true, force: true });
   }

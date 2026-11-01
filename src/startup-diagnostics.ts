@@ -48,10 +48,10 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
     "another process already owns the configured data store; stop the other running durable-nanobot gateway process " +
     "before starting another (diagnostic details suppressed)",
   preparedContext:
-    "startup refused because a prepared model dispatch pins historical Nanobot context; run " +
-    "`durable-nanobot recovery --config <path>` with this configuration to inspect and cancel the blocked task, " +
-    "or omit `--config` for the default primary configuration, " +
-    "then start again (diagnostic details suppressed)",
+    "startup could not complete automatic interrupted-turn recovery; run " +
+    "`durable-nanobot recovery --config <path>` with this configuration to inspect and cancel a blocked prepared " +
+    "dispatch, or omit `--config` for the default primary configuration, then start again " +
+    "(diagnostic details suppressed)",
   unexpected: "command failed; diagnostic details suppressed",
 } as const);
 

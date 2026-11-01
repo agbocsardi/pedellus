@@ -56,6 +56,11 @@ export class LocalRemoteError extends Error {
   }
 }
 
+export interface LocalHostNotice {
+  readonly id: string;
+  readonly text: string;
+}
+
 export interface LocalGatewayClient extends TerminalConversation {
   readonly sessionKey: string;
   readonly tools: readonly string[];
@@ -81,6 +86,10 @@ export interface LocalGatewayClient extends TerminalConversation {
   /** MCP status and callback ingress over the already-authenticated attach. */
   mcpList(context: Context): Promise<McpAdminListing>;
   mcpSubmitCallback(text: string, context: Context): Promise<McpCallbackResult>;
+  /** Pending host notices carried by the last attach; print them, then call `ackNotices`. */
+  readonly pendingNotices: readonly LocalHostNotice[];
+  /** Mark printed host notices delivered; a failed call leaves them pending for the next attach. */
+  ackNotices(ids: readonly string[], context: Context): Promise<void>;
   /** Direct, transient owner delivery from the gateway; never a transcript or durable outbox entry. */
   onMcpAuthorization?: ((authorization: McpAuthorizationLink) => void) | undefined;
   onMcpNotice?: ((text: string) => void) | undefined;
@@ -160,6 +169,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
   sessionKey = "";
   onMcpAuthorization: ((authorization: McpAuthorizationLink) => void) | undefined;
   onMcpNotice: ((text: string) => void) | undefined;
+  pendingNotices: LocalHostNotice[] = [];
   tools: readonly string[] = [];
   contextRefresh = false;
   presets = false;
@@ -208,6 +218,28 @@ class LocalGatewayConnection implements LocalGatewayClient {
     this.digest = result.digest === true;
     this.mcp = result.mcp === true;
     this.restartSupported = result.restart === true;
+    const notices = result.notices;
+    if (notices === undefined) {
+      this.pendingNotices = [];
+    } else {
+      if (!Array.isArray(notices) || notices.length > LOCAL_PROTOCOL_LIMITS.maxNoticeIds) {
+        throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attach result");
+      }
+      this.pendingNotices = notices.map((entry) => {
+        const notice = asObject(entry);
+        if (notice === undefined || typeof notice.id !== "string" || notice.id.length === 0
+          || typeof notice.text !== "string" || notice.text.trim() === ""
+          || notice.text.length > LOCAL_PROTOCOL_LIMITS.maxNoticeTextChars) {
+          throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attach result");
+        }
+        return { id: notice.id, text: notice.text };
+      });
+    }
+  }
+
+  async ackNotices(ids: readonly string[], context: Context): Promise<void> {
+    if (ids.length === 0) return;
+    await this.call("ackNotices", { ids: [...ids] }, context);
   }
 
   async watch(context: Context): Promise<TerminalWatch> {

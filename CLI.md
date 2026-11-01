@@ -169,11 +169,21 @@ unreadable/invalid configuration,
 invalid configuration fields, unknown providers or custom-provider entries, unavailable models
 or thinking levels, missing provider credentials, a missing Telegram token
 environment variable, workspace/data-directory preparation failures, a data
-store already owned by another live process, and a prepared model dispatch that
-pins historical Nanobot context. These messages never include configuration
+store already owned by another live process, and an automatic interrupted-turn
+recovery that could not complete safely. These messages never include configuration
 values, environment values, filesystem paths, provider/dependency error text or
 the underlying exception. Unexpected failures keep the generic
 `durable-nanobot: command failed; diagnostic details suppressed` message.
+
+A prepared model dispatch that pins historical Nanobot context no longer makes a
+normal startup fail by itself. The gateway cancels exactly that dispatch through
+native Durable abort semantics, restores availability, and leaves one durable
+interruption notice for the originating chat. A local `agent`/terminal attach
+prints a pending notice once and acknowledges it; a Telegram notice uses the
+existing durable channel outbox and admission checks. No model turn is started and
+nothing is resubmitted. If the prepared model itself left `allowedModels`, or the
+bounded recovery record cannot be read, the fixed startup failure and explicit
+recovery command below remain.
 
 An `agent` (or legacy default) launch additionally fails closed when no gateway
 answers on the configured endpoint, or when the endpoint's socket path cannot be
@@ -182,10 +192,12 @@ same configuration. The CLI does not fall back to opening a store or starting a
 second runtime.
 
 For live-owner lock contention, the fixed message says to stop the other running
-durable-nanobot gateway process. For a blocked prepared dispatch, it says to run
+durable-nanobot gateway process. If automatic interrupted-turn recovery cannot
+complete, the fixed message says to run
 `durable-nanobot recovery [--config <path>]` with the same configuration to inspect and
-cancel the blocked task, then start again. The CLI does not cancel the task or
-rewrite its checkpoint automatically.
+cancel the blocked task, then start again. Normal startup cancels only the exact
+startup-blocking prepared dispatch and never rewrites its checkpoint; the recovery
+command remains the stopped-store fallback.
 
 Recovery operation errors keep their dedicated `durable-nanobot recovery:` text and
 remain governed by recovery's existing disclosure contract, not this startup
@@ -252,9 +264,13 @@ re-arm or schedule-editing command. See [cron](./CRON.md#operator-controls).
 
 ## Recovery
 
-Gateway startup fails closed when a prepared model dispatch still pins historical
-Nanobot context, with a fixed value-free message naming the recovery command
-below. The same executable exposes an owner-only recovery path that never opens
+Normal startup automatically cancels a prepared model dispatch that pins
+historical Nanobot context (after its model passed the configured authority scan),
+restores availability, and records one interruption notice. This stopped-store
+command remains the fallback when that automatic path cannot complete: a full or
+unreadable interruption record, an abort mark that did not persist, or a prepared
+model outside `allowedModels`. It prints a fixed value-free message naming this
+command. The same executable exposes an owner-only recovery path that never opens
 the gateway, resumes scheduling, or requires credentials. It does require the
 existing SQLite database and the gateway process to be stopped; a live owner is
 reported as a lock conflict. Inspection may perform Durable's native

@@ -234,11 +234,16 @@ only when the config contains a `workspaceContext` section
 (`workspaceContext.memoryFiles` and optional `workspaceContext.memoryManifest`,
 default off); the shipped example enables it, and leaving the section out keeps
 it off. It contributes no identity. The local CLI exposes `/refresh` to
-re-capture that conversation's context and skills when it is idle. Prepared
-requests containing old Nanobot context
-conservatively block recovery. With the gateway stopped and an existing database, an
-owner can inspect blocked task IDs/fingerprints and explicitly cancel them without
-resuming or rewriting the prepared request; see
+re-capture that conversation's context and skills when it is idle. A prepared
+request containing old Nanobot context is cancelled automatically at startup
+through native Durable abort semantics, so the gateway becomes available without
+replaying, resubmitting or rewriting that request. One durable, deduplicated
+interruption notice is left for the originating mapped chat; a local CLI attach
+shows it once, and Telegram delivers it through the existing outbox and admission
+checks. No model turn is started and continuation is the owner's next input. With
+the gateway stopped and an existing database, an owner can still inspect blocked
+task IDs/fingerprints and explicitly cancel a dispatch when the automatic path
+cannot complete (for example a prepared model outside `allowedModels`); see
 [prepared context recovery](./CONTEXT_RECOVERY.md) and the
 [context contract](./CONTEXT.md).
 

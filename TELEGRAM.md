@@ -816,7 +816,21 @@ The adapter also consumes the durable, channel-neutral cron outbox
 origin, writes the text to send there in the same terminal commit as its outcome unless successful
 delivery is suppressed by `silent` or an exact `[SILENT]` answer: the committed
 final answer, or fixed sanitized notice text for a failure or empty answer; no model turn is
-rerun to resend. On startup and every few seconds the adapter enumerates already-mapped chat sessions and
+rerun to resend.
+
+The same outbox carries one host interruption notice for an automatically cancelled
+startup-blocking prepared turn, with the id `host:turn-interrupted:<taskId>` and fixed
+text saying the previous turn was interrupted, stored progress is preserved, and some
+actions may have completed without confirmation; a cancelled background compaction uses
+the same record with fixed text saying the compaction was interrupted and no action is
+needed. It is recorded in the mapped origin
+chat's outbox, not a worker, digest or scheduled-run target conversation. It is ordinary
+stored text: this adapter applies the same origin admission, live `allowFrom` recheck,
+rich chunking, write-ahead intent, unknown-outcome hold and bounded-record rules, and no
+model turn is started. A local CLI attachment consumes the same record instead and never
+sends it to Telegram.
+
+On startup and every few seconds the adapter enumerates already-mapped chat sessions and
 accepts only candidate keys for its own bot ID (`telegram:<bot id>:chat:<chatId>`). That key is a
 locator, not authentication: before any send the adapter requires durable admission evidence for
 that private chat, written before the message was mapped or submitted. The evidence records the
