@@ -28,6 +28,41 @@ the shell's working directory. A secondary instance passes its own explicit
 migration, and a missing default file fails with a fixed message. See
 [user services](./SERVICE.md) for the shipped systemd unit pattern.
 
+## Help
+
+`--help`/`-h` prints to standard output and exits 0 without reading a
+configuration, opening a socket or starting a runtime, so it works in a fresh
+checkout:
+
+```sh
+durable-nanobot --help            # overview: commands, config default, slash commands
+durable-nanobot help gateway      # the same page as `gateway --help`
+durable-nanobot gateway --help
+durable-nanobot agent --help
+durable-nanobot login --help
+durable-nanobot logout --help
+durable-nanobot recovery --help
+```
+
+A per-command page carries that command's exact usage line, its own options,
+fixed details and examples. `--help` is accepted anywhere before dispatch, so it
+never reads the configuration named on the same line.
+
+An unrecognized subcommand prints one fixed `unknown command` diagnostic with
+the usage block and a help hint, and exits 1. That diagnostic echoes the typed
+token only when it is shaped like a command name; no other argument is ever
+repeated. A malformed known form still prints the full usage block on standard
+error and exits 1.
+
+Both conversation surfaces render the same command catalogue. `/help` prints the
+controls that host actually offers, and `/help <command>` prints one command's
+usage and detail:
+
+- CLI: `/help`, `/help model`. Commands this host does not offer are named in one
+  line instead of being advertised as working.
+- Telegram: `/help`, `/help digest`. Only the owner commands this gateway
+  implements are listed, so nothing is advertised that would be refused.
+
 ## Provider authentication
 
 Authentication is explicit and terminal-only; the gateway never logs in at
@@ -200,7 +235,7 @@ fail-closed and is not remotely cancelled. See
 
 | Command | Behavior |
 |---|---|
-| `/help` | Show this CLI's local controls. |
+| `/help` | Show the owner controls this host offers, one command per line with a short description; `/help <command>` prints that command's usage and detail. |
 | `/status` | Show the conversation's current host-selected model, native run/inbox state, and Durable-recorded per-model/tool usage. Provider-side charges or unrecorded spend remain unknown. A bounded background summary follows: this conversation's own live workers and cron jobs (executing, queued, parked, or with a future occurrence armed) and whether the one workspace-global memory-digestion run is live in this chat or another. A natively blocked task is named as parked instead of counted as running; `Background: idle` means nothing is executing or queued right now, and an armed future occurrence is its own `Cron:` line with the next due time. It is read-only metadata: no model call, dashboard, management command, recovery interface or transcript read, and the agent remains the manager of that work. |
 | `/history [count]` | Show the latest user/assistant text messages only (default 10, max 50), using Durable entry pagination; each snippet is limited to 200 characters and the scan to 2,000 entries. Reasoning, tool, and non-text blocks are omitted; synthetic user-role reset or compaction messages may also appear. |
 | `/search [--scope messages\|tools\|all] [--role user\|assistant] [--limit 1-50] [--next] [--] [query]` | Search or browse the local history index. Default scope is messages; `--scope tools` searches tool names, arguments and result text only, and `--scope all` combines messages and tools. Empty text browses the selected scope. See [history search and browsing](#history-search-and-browsing). |

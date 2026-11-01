@@ -27,10 +27,11 @@ never reaches it. `message.text` (not a caption) is classified:
   A typed command the host cannot perform is refused with fixed text and is
   never sent to the assistant.
 - Matching is an exact leading command token (case-insensitive). `/new`,
-  `/abort`, `/stop`, `/status`, `/restart`, `/digest` and `/help` take no
-  arguments; `/model` takes one configured preset name or `default`; `/digest`
-  also accepts the literal `status`; `/mcp` takes nothing, or `show <id>`,
-  `approve <id>`, `deny <id>` with one 16-hex request ID. Anything else gets a
+  `/abort`, `/stop`, `/status` and `/restart` take no arguments; `/model` takes
+  one configured preset name or `default`; `/digest` takes nothing or the literal
+  `status`; `/mcp` takes nothing, or `show <id>`, `approve <id>`, `deny <id>` with
+  one 16-hex request ID; `/help` takes nothing or one command name this host
+  offers, and answers with that command's usage and detail. Anything else gets a
   bounded usage notice.
 - `/new@bot` etc. are controls only when the mention names this bot from
   `getMe` (case-insensitive). Another bot's mention, or a mention while `getMe`

@@ -7,6 +7,8 @@ import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earend
 import { runLogin, runLogout } from "./auth/cli.js";
 import { loadConfig, defaultConfigPath } from "./config.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
+import { commandUsageLine, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
+import { SAFE_COMMAND_NAME } from "./help/commands.js";
 import { connectLocalGateway } from "./local/client.js";
 import { gatewaySocketPath, serveLocalGateway } from "./local/server.js";
 import { LocalGatewayError } from "./local/protocol.js";
@@ -19,15 +21,13 @@ import { openGateway } from "./runtime.js";
 import { prepareDataDirectory } from "./store.js";
 import { StartupDiagnosticError, startupDiagnostic } from "./startup-diagnostics.js";
 
-const USAGE =
-  "Usage: durable-nanobot gateway [--config <path>] | durable-nanobot agent [--config <path>] [--conversation <name>] | " +
-  "durable-nanobot login [--config <path>] [provider] [--auth api_key|oauth] | " +
-  "durable-nanobot logout [--config <path>] [provider] | " +
-  "durable-nanobot --config <path> (agent, compatibility) | " +
-  "durable-nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]\n" +
-  "Without --config, gateway, agent, login, logout and recovery use ~/.durable-nanobot/config.json.";
+/** Every synopsis, the fixed default configuration note and the help hint; never supplied arguments. */
+const USAGE = renderUsage();
 
-const RECOVERY_USAGE = "Usage: durable-nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]";
+const RECOVERY_USAGE = commandUsageLine(findCommandHelp("recovery")!);
+
+/** The subcommands this process accepts, excluding the historical bare `--config` attach. */
+const SUBCOMMANDS = new Set(["gateway", "agent", "login", "logout", "recovery"]);
 
 const CONVERSATION_NAME = /^[a-z0-9](?:[a-z0-9_-]{0,30})[a-z0-9]$|^[a-z0-9]$/;
 
@@ -57,9 +57,48 @@ type LaunchInvocation =
   | { readonly kind: "gateway"; readonly config: ConfigSource }
   | { readonly kind: "agent"; readonly config: ConfigSource; readonly conversation?: string };
 
-/** A usage mistake; the CLI prints the fixed usage line, never the supplied arguments. */
+/** A usage mistake; the CLI prints the fixed usage block, never the supplied arguments. */
 class UsageError extends Error {
   override name = "UsageError";
+}
+
+/** An unrecognized first argument; the token is echoed only when it is a safe command name. */
+class UnknownCommandError extends Error {
+  override name = "UnknownCommandError";
+  constructor(readonly token: string) {
+    super("unknown command");
+  }
+}
+
+function isHelpFlag(argument: string | undefined): boolean {
+  return argument === "--help" || argument === "-h";
+}
+
+/**
+ * A help request anywhere before dispatch. `--help`/`-h` names the page of the leading subcommand;
+ * `help [topic]` names it explicitly. Nothing here reads configuration or runtime state, so a help
+ * page prints and exits 0 in a checkout with no setup.
+ */
+function helpTopic(args: readonly string[]): { readonly topic?: string } | undefined {
+  const [first, second] = args;
+  if (first === "help") {
+    if (args.length === 1) return {};
+    if (args.length === 2 && second !== undefined && !isHelpFlag(second)) return { topic: second };
+    if (args.some(isHelpFlag)) return {};
+    throw new UsageError();
+  }
+  if (!args.some(isHelpFlag)) return undefined;
+  return first !== undefined && SUBCOMMANDS.has(first) ? { topic: first } : {};
+}
+
+function writeHelp(topic: string | undefined): void {
+  if (topic === undefined) {
+    stdout.write(`${renderOverview()}\n`);
+    return;
+  }
+  const command = findCommandHelp(topic);
+  if (command === undefined) throw new UnknownCommandError(topic);
+  stdout.write(`${renderCommandHelp(command)}\n`);
 }
 
 function configPath(args: readonly string[], start: number): ConfigSource {
@@ -193,6 +232,15 @@ function missingFile(cause: unknown): boolean {
 }
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
+  const help = helpTopic(args);
+  if (help !== undefined) {
+    writeHelp(help.topic);
+    return;
+  }
+  const leading = args[0];
+  if (leading !== undefined && leading !== "--config" && !SUBCOMMANDS.has(leading)) {
+    throw new UnknownCommandError(leading);
+  }
   const recovery = recoveryInvocation(args);
   if (recovery !== undefined) {
     await runRecovery(recovery, await readConfig(recovery.config));
@@ -506,6 +554,10 @@ export function runCli(): Promise<void> {
   return main().catch((error) => {
     if (error instanceof PreparedContextRecoveryError) {
       console.error(`durable-nanobot recovery: ${error.message}`);
+    } else if (error instanceof UnknownCommandError) {
+      // Only a safe command-shaped token is echoed; any other supplied argument stays private.
+      const echo = SAFE_COMMAND_NAME.test(error.token) ? `: ${error.token}` : "";
+      console.error(`durable-nanobot: unknown command${echo}\n${USAGE}`);
     } else if (error instanceof UsageError) {
       console.error(USAGE);
     } else if (error instanceof LocalGatewayError) {

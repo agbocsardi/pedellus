@@ -11,6 +11,13 @@ import type { AssistantMessage, ImageContent, TextContent } from "@earendil-work
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
 import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
 import {
+  conversationCommandNames,
+  conversationCommandRefusal,
+  conversationDetailBlock,
+  conversationHelpDocument,
+  findConversationCommand,
+} from "../help/commands.js";
+import {
   renderMemoryDigestStart,
   renderMemoryDigestStatus,
 } from "../history/memory-digest.js";
@@ -2284,12 +2291,17 @@ export async function runTelegram(
       return;
     }
     if (parsed.command === "help") {
-      if (parsed.args) {
-        await admitNotice(update, message, sessionKey, "Usage: /help (no arguments). Nothing was sent to the assistant.");
+      const requested = parsed.args.trim().toLowerCase();
+      if (!requested) {
+        await admitNotice(update, message, sessionKey, controlHelpText());
         drain();
         return;
       }
-      await admitNotice(update, message, sessionKey, controlHelpText());
+      const offered = availableCommandNames();
+      const command = offered.includes(requested) ? findConversationCommand(requested) : undefined;
+      await admitNotice(update, message, sessionKey, command === undefined
+        ? `${conversationCommandRefusal(requested, offered)} Nothing was sent to the assistant.`
+        : conversationDetailBlock(command));
       drain();
       return;
     }
@@ -3078,53 +3090,37 @@ export async function runTelegram(
     ].join("\n");
   }
 
-  /** The commands this host actually supports, in menu order. */
+  /** The catalogued Telegram commands this host actually supports, in menu order. */
+  function availableCommandNames(): readonly string[] {
+    const offered: Record<string, boolean> = {
+      new: true,
+      abort: true,
+      stop: true,
+      status: hostCommands.status,
+      model: hostCommands.model,
+      restart: hostCommands.restart,
+      digest: hostCommands.digest,
+      mcp: hostCommands.mcp,
+      help: true,
+    };
+    return conversationCommandNames("telegram").filter((name) => offered[name] === true);
+  }
+
   function availableCommandList(): string {
-    return ["/new", "/abort", "/stop", ...(hostCommands.status ? ["/status"] : []),
-      ...(hostCommands.model ? ["/model"] : []), ...(hostCommands.restart ? ["/restart"] : []),
-      ...(hostCommands.digest ? ["/digest"] : []), ...(hostCommands.mcp ? ["/mcp"] : []), "/help"].join(", ");
+    return availableCommandNames().map((name) => `/${name}`).join(", ");
   }
 
   /** Help lists exactly the controls this host implements; nothing is advertised that would be refused. */
   function controlHelpText(): string {
-    const lines = [
-      "Controls for this chat (other messages go to the assistant):",
-      "/new - native context reset for this conversation: fresh model context, no summary or handoff; stored history and tool authority unchanged; queued messages are kept.",
-      "/abort - withdraw queued messages and stop the current turn here; other chats, cron jobs and background work are unaffected.",
-      "/stop - alias of /abort with exactly the same effect.",
-    ];
-    if (hostCommands.status) {
-      lines.push("/status - bounded read-only status of this chat: selected model, run state and queued input count; no model call.");
-    }
-    if (hostCommands.model) {
-      lines.push("/model - list the configured model presets and this chat's selection; /model <preset> or /model default " +
-        "selects one for this chat only. A busy chat is refused, and a restart restores the configured default.");
-    }
-    if (hostCommands.restart) {
-      lines.push("/restart - stop this gateway and replace the process with the same program and configuration, so new " +
-        "code and configuration are loaded. It affects every chat and background work; the acknowledgement confirms " +
-        "the request, not the completed restart.");
-    }
-    if (hostCommands.digest) {
-      lines.push("/digest - start one bounded completed-turn memory-digestion run from the shared workspace; the run is " +
-        "background, and only a failure or cancellation reports an internal issue to this chat's agent, never a direct " +
-        "user or channel message. /digest status is a bounded read-only view; both cost no model call by themselves.");
-    }
-    if (hostCommands.mcp) {
-      lines.push("/mcp - list the MCP servers this gateway opened and the assistant's owner-approval requests; " +
-        "/mcp show <id> prints the exact proposed entry; /mcp approve <id> writes it to the configuration file or " +
-        "starts an owner-approved OAuth login and returns its one-time authorization URL; /mcp deny <id> discards " +
-        "the request. Nothing connects or is authorized before an approval, and a written entry connects at the " +
-        "next gateway start. These are owner actions, never model tools.");
-    }
-    lines.push("/help - this list.");
-    lines.push(mediaIngress === undefined
-      ? "Limits: text only (attachments are not read); no tool-authority, history, restart or media commands. " +
-        "Other slash commands are refused; prefix // to send a leading slash literally."
-      : "Attachments: photos are attached as image content, voice/audio is transcribed locally when the backend is " +
-        "provisioned, and documents are stored unread on disk under the configured media directory. Video and stickers " +
-        "are not downloaded. Other slash commands are refused; prefix // to send a leading slash literally.");
-    return lines.join("\n");
+    return [
+      conversationHelpDocument("telegram", availableCommandNames()),
+      mediaIngress === undefined
+        ? "Limits: text only (attachments are not read); no tool-authority, history, restart or media commands. " +
+          "Other slash commands are refused; prefix // to send a leading slash literally."
+        : "Attachments: photos are attached as image content, voice/audio is transcribed locally when the backend is " +
+          "provisioned, and documents are stored unread on disk under the configured media directory. Video and stickers " +
+          "are not downloaded. Other slash commands are refused; prefix // to send a leading slash literally.",
+    ].join("\n\n");
   }
 
   async function admitNotice(

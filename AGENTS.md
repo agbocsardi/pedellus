@@ -51,6 +51,9 @@ edits need restart only; unit edits additionally need daemon-reload.
   carry the bounded terminal conversation surface; no public listener.
 - `src/index.ts` — small host entry surface (config, gateway, workspace host,
   context/Code Mode factories, recovery, CLI main); import subsystems directly.
+- `src/help/` — declarative help text only: the process `--help` pages and the
+  one surface-tagged slash-command catalogue that the CLI, Telegram and both
+  `/help` paths render. Each host decides which catalogued names it offers.
 - `src/mcp/` — explicit MCP server config, the pinned `@earendil-works/pi-mcp`
   client lifecycle, deferred `mcp__<server>__<tool>` registrations, namespace
   summaries and the call-time MCP authority hook.

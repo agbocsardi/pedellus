@@ -6,6 +6,14 @@ import { AssistantEntry, ConversationBusy, ToolResultEntry, UserEntry } from "@e
 import type { Cursor, EntryId, UsageState } from "@earendil-works/pi-durable";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
+import {
+  conversationCommandNames,
+  conversationCommandRefusal,
+  conversationCommandUsage,
+  conversationDetailBlock,
+  conversationHelpDocument,
+  findConversationCommand,
+} from "../help/commands.js";
 import { renderMcpApproval, renderMcpListing, type McpAdminListing, type McpApproveResult } from "../mcp/admin.js";
 import { renderBackgroundStatus } from "../background-status.js";
 import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "../history/episodes.js";
@@ -1108,35 +1116,53 @@ export async function runTerminalConversation(
     );
   };
 
+  /** The catalogued CLI commands this host actually offers, in catalogue order. */
+  const offeredCommands = (): readonly string[] => {
+    const offered = new Set(["help", "new", "abort", "stop", "status", "history", "entry", "compact"]);
+    if (io.history) { offered.add("search"); offered.add("episodes"); offered.add("episode"); }
+    if (io.modelSelection) offered.add("model");
+    if (io.toolPolicy) offered.add("tools");
+    if (io.contextRefresh?.available) offered.add("refresh");
+    if (io.digest) offered.add("digest");
+    if (io.mcp) offered.add("mcp");
+    if (io.attachments) offered.add("attach");
+    if (io.restart) offered.add("restart");
+    return conversationCommandNames("cli").filter((name) => offered.has(name));
+  };
+
+  /**
+   * One generated document for the controls this host offers, then the behavioural notes that are
+   * not per-command help: unoffered commands are listed from the catalogue, never re-described here.
+   */
+  const offerHelp = async (args: string): Promise<void> => {
+    const available = offeredCommands();
+    const requested = args.trim().toLowerCase();
+    if (!requested) {
+      const unavailable = conversationCommandNames("cli").filter((name) => !available.includes(name));
+      await notice([
+        conversationHelpDocument("cli", available),
+        [
+          "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
+          "/abort and /stop cancel foreground work and withdraw queued inputs; background work is unchanged.",
+          ...(unavailable.length === 0
+            ? []
+            : [`Not offered by this host: ${unavailable.map((name) => `/${name}`).join(", ")}.`]),
+        ].join("\n"),
+      ].join("\n\n"));
+      return;
+    }
+    const command = available.includes(requested) ? findConversationCommand(requested) : undefined;
+    if (command === undefined) {
+      await notice(`${conversationCommandRefusal(requested, available)} It was not sent to the model.`, true);
+      return;
+    }
+    await notice(conversationDetailBlock(command));
+  };
+
   const runCommand = async (name: string, args: string): Promise<void> => {
     switch (name) {
       case "help":
-        if (args.trim()) { await notice("Usage: /help", true); return; }
-        await notice([
-          "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /refresh /digest [status] /mcp [show|approve|deny <id>] /compact /abort /stop /new /attach <path>[ -- <prompt>]" + (io.restart ? " /restart" : ""),
-          SEARCH_USAGE,
-          EPISODES_USAGE,
-          EPISODE_USAGE,
-          ENTRY_USAGE,
-          "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
-          "/abort and /stop cancel foreground work and withdraw queued inputs; background work is unchanged.",
-          ...(io.restart ? ["/restart replaces the whole gateway process, re-reads its configuration and disconnects every attached channel."] : []),
-          io.history ? "/search --next continues the last successful query; cursors stay in this process and are never printed. History sessions default to cli:default; use --session with a key reported by /search." : "History search and episode browsing are host-controlled and unavailable here. /entry <entryId> [--radius N] still opens a bounded window in this terminal's default conversation; --session requires a history host.",
-          io.modelSelection ? "/model lists host model choices; named-preset configs select with /model <name> (or /model default), direct configs with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
-          io.toolPolicy
-            ? "Coding tools are configured by toolAllowlist and apply to authenticated chats; /tools is read-only diagnostics and chat commands never change tool authority."
-            : "Coding-tool authority is host-controlled and unavailable here.",
-          io.contextRefresh?.available ? "/refresh re-reads workspace context and skills for this conversation when it is idle." : "/refresh is unavailable without configured workspace context.",
-          io.digest
-            ? "/digest starts one bounded completed-turn memory-digestion run for this conversation and reports only the bounded admission; /digest status is a read-only bounded view. The run works in the background against the shared workspace and reports to this conversation's agent, not to a user or channel."
-            : "/digest is unavailable in this host.",
-          io.attachments
-            ? "/attach stores one local file under the workspace CLI attachment directory and submits it with the optional prompt. The original is stored unchanged and the agent decides with the configured tools whether to inspect it; no image content, vision call or transcription is added."
-            : "/attach is unavailable without a configured media section.",
-          io.mcp
-            ? "/mcp lists the MCP servers this gateway opened and the assistant's owner-approval requests. `/mcp show <id>` prints the exact proposed entry; `/mcp approve <id>` writes it to the configuration file or starts an owner-approved OAuth login; `/mcp deny <id>` discards it. Nothing connects or is authorized before an approval, and a written entry connects at the next start."
-            : "/mcp is unavailable because this gateway was opened without a configuration file.",
-        ].join("\n"));
+        await offerHelp(args);
         return;
       case "status":
         if (args.trim()) { await notice("Usage: /status", true); return; }
@@ -1410,15 +1436,11 @@ function formatHistoryMessage(message: TerminalMessage): string | undefined {
   return `${message.role === "user" ? "You" : "Assistant"}: ${snippet}`;
 }
 
-const SEARCH_USAGE =
-  "Usage: /search [--scope messages|tools|all] [--role user|assistant] [--limit 1-50] [--next] [--] [query] — default scope is messages; empty text browses the selected scope.";
-const EPISODES_USAGE = "Usage: /episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>] — --session defaults to cli:default.";
-const EPISODE_USAGE = "Usage: /episode [--session <sessionKey>] <startEntryId> [--limit 1-30] — --session defaults to cli:default.";
-const ENTRY_USAGE = "Usage: /entry [--session <sessionKey>] <entryId> [--radius 0-5] — --session defaults to cli:default with a history host.";
-const ATTACH_USAGE =
-  "Usage: /attach <path>[ -- <prompt>] — store one local file under the workspace CLI attachment directory and submit it as an ordinary path-only turn. " +
-  "The path may be absolute or relative to the CLI's working directory. The original bytes are stored unchanged; the agent decides whether to read them with the configured tools. " +
-  "No native image content, vision handoff, transcription or extraction is added. Requires the media configuration.";
+const SEARCH_USAGE = conversationCommandUsage("search");
+const EPISODES_USAGE = conversationCommandUsage("episodes");
+const EPISODE_USAGE = conversationCommandUsage("episode");
+const ENTRY_USAGE = conversationCommandUsage("entry");
+const ATTACH_USAGE = conversationCommandUsage("attach");
 
 type AttachArguments =
   | { readonly kind: "usage" }
