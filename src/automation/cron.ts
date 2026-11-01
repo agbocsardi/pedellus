@@ -1163,7 +1163,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
             }
             const submission = await conversation.submit({
               type: "input",
-              content: job.message,
+              content: `${job.message}\n\nFor this scheduled run only, return exactly [SILENT] as your final answer to suppress automatic delivery when there is nothing to report.`,
               requestId,
               entry: {
                 kind: CRON_INPUT_ENTRY_KIND,

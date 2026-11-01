@@ -142,9 +142,9 @@ record) or `"digest"`. It is set only by an explicit `cron add` with
 `silent` is a persistent per-job delivery setting, absent on a historical record and then meaning
 `false`. When true, every successful occurrence suppresses its automatic channel delivery,
 including an empty answer; a failed occurrence still queues its fixed sanitized notice. It is set
-only by an explicit `cron add` with `silent: true` and is shown as `delivery: silent` in `cron
-list` and in the add confirmation. It has no effect on a `digest` occurrence, which never queues a
-channel delivery either way.
+to true by an explicit `cron add` with `silent: true` and is shown as `delivery: silent` in `cron
+list` and in the add confirmation. A new job stores the normalized boolean, including `false`. It
+has no effect on a `digest` occurrence, which never queues a channel delivery either way.
 
 `conversationId` is the recurring job's own automation conversation. It is optional and absent
 until that job's first run records it, so a job document written by the earlier per-occurrence
@@ -265,7 +265,10 @@ queue is a schedule.
 
 `execute` places one native reset (`Conversation.reset`, the same entry `/new` commits) in a
 background run's conversation, then submits one native input with the stable request ID
-`cron:<jobId>:<scheduledAtMs>`. Both are ordered admissions on that conversation, so the boundary is
+`cron:<jobId>:<scheduledAtMs>`. Its content is the job's own message followed by one fixed host
+instruction naming the exact `[SILENT]` answer; that committed text is what the model receives in
+either mode and what the transcript keeps, not a separate hidden prompt, and it grants nothing.
+Both are ordered admissions on that conversation, so the boundary is
 always ahead of the input even when the conversation was still finishing. A retry after a crash
 first looks for its own submission and then at the conversation's newest placed entry: an occurrence
 that is already placed is waited on instead of being submitted twice, and a conversation whose newest

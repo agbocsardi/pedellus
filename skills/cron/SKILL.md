@@ -8,19 +8,20 @@ description: Schedule one-shot or recurring work with the cron tool. Use when th
 The `cron` tool is an internal agent capability: it exists only when the host
 config sets `cron.enabled`. There is no user scheduler or slash command. A due
 job submits one agent turn — into a fresh background conversation, or into this
-conversation. A normal settlement in either mode is queued for delivery to the
-authenticated Telegram private chat that created the job when the Telegram
-adapter is enabled; no other channel delivers results. Delivery is the committed
-answer, or a fixed notice carrying the generated job ID and the occurrence
-instant when the run failed or produced no answer, with `list` as the next
-step. A cancelled, superseded or otherwise abandoned run sends nothing; its
-status stays visible through `list`.
+conversation. By default a normal settlement in either mode is queued for delivery
+to the authenticated Telegram private chat that created the job when the adapter
+is enabled; no other channel delivers results. The `silent` option or an exact
+`[SILENT]` answer suppresses successful automatic delivery. Failures still produce
+a fixed notice; a non-silent empty answer also produces a notice. Cancelled,
+superseded or otherwise abandoned runs send nothing; inspect status with `list`.
 
 ## Actions
 
 - `add` creates a job. `message` is required and is the instruction the agent
   receives when the job fires, so write it as a self-contained task. `name` is an
   optional short label.
+- `silent: true` on `add` suppresses automatic success replies for every run,
+  independently of `isolated`; it does not suppress failure notices.
 - `list` shows this conversation's jobs with schedule, mode, status, next run,
   last run, last skip, and last failure. There is no job-count cap.
 - `remove` cancels one job by `job_id`. It is idempotent: a finished or cancelled
@@ -59,13 +60,13 @@ and answers there. `isolated: false` runs it here, once this conversation is
 idle. Jobs are owner-scoped to the conversation that created them, so another
 conversation's jobs are invisible and its IDs are refused.
 
-Say which mode will run and where the answer appears. In background mode the
-answer appears in a separate conversation; with a Telegram origin, a normal
-settlement is also queued for delivery to that private chat, and the same applies when
-`isolated: false` answers here: either the committed answer, or a fixed notice
-with the generated job ID and occurrence instant when the run failed or
-answered with nothing. Use `list` to inspect a failed or cancelled run.
-Cancelled, superseded and missing-job runs are never delivered.
+Say which mode and delivery setting will be used. Background answers remain in
+a separate conversation; origin-mode answers remain here. For a conditional
+check, a scheduled run can return exactly `[SILENT]` (ignoring surrounding
+whitespace) to suppress that occurrence's automatic success reply. Other text
+is delivered normally unless the job is silent. Untrusted material can influence
+the model's choice, and a literal `[SILENT]` answer cannot itself be delivered.
+Use `list` to inspect a failed or cancelled run.
 
 ## Authority and limits
 

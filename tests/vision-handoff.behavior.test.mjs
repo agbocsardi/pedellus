@@ -5,6 +5,8 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
+import { scheduledContent } from "./fixtures/cron-input.mjs";
+
 const pkg = process.env.PI_MODEL_CANDIDATE ?? resolve(import.meta.dirname, "..");
 const ai = `${pkg}/node_modules/@earendil-works/pi-ai/dist`;
 const chord = `${pkg}/node_modules/@earendil-works/chord/dist`;
@@ -597,7 +599,7 @@ test("a background cron run reading an image still gets the flagged-preset hando
     calls.push({ kind: describer ? "describer" : "generation", images: imagesOf(transcript.messages).length, text });
     if (describer) return fauxAssistantMessage("CRON-DESCRIBED IMAGE");
     if (text.includes("read tool path")) return fauxAssistantMessage("IMAGE-ANSWER");
-    if (input === "inspect the image") {
+    if (input === scheduledContent("inspect the image")) {
       return fauxAssistantMessage([
         fauxToolCall("read", { path: "media/photo.png" }, { id: "cron-read-image" }),
       ], { stopReason: "toolUse" });

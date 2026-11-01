@@ -14,6 +14,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
+import { scheduledContent } from './fixtures/cron-input.mjs';
+
 const packageRoot = process.env.PI_NANOBOT_CANDIDATE ?? new URL('../', import.meta.url).pathname;
 const modules = join(packageRoot, 'node_modules/@earendil-works');
 const [
@@ -182,7 +184,7 @@ function routeByContent(handlers) {
     const transcript = JSON.stringify(request.messages);
     const input = lastUserText(request.messages);
     for (const { when, respond } of handlers) {
-      if (when({ transcript, input })) return respond();
+      if (when({ transcript, input })) return respond({ transcript, input });
     }
     return fauxAssistantMessage('synthetic fallback');
   };
@@ -291,7 +293,7 @@ test('an origin-mode scheduled answer is delivered once through the durable outb
     let toolCallIssued = false;
     store.faux.setResponses(Array.from({ length: 20 }, () => routeByContent([
       // The scheduled occurrence answer, identified by its own instruction text.
-      { when: ({ input }) => input === scheduledMessage, respond: () => fauxAssistantMessage(resultText) },
+      { when: ({ input }) => input === scheduledContent(scheduledMessage), respond: () => fauxAssistantMessage(resultText) },
       { when: ({ transcript }) => transcript.includes('origin-read'), respond: () => fauxAssistantMessage('ORIGIN-READ-OK') },
       { when: ({ input }) => input === 'read the origin note', respond: () => fauxAssistantMessage([
         fauxToolCall('read', { path: 'note.txt' }, { id: 'origin-read' }),
@@ -392,7 +394,7 @@ test('a non-Telegram origin never queues an origin-mode result', { timeout: 20_0
   const scheduledMessage = 'deliver the local reminder';
   let toolCallIssued = false;
   store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
-    { when: ({ input }) => input === scheduledMessage, respond: () => fauxAssistantMessage('LOCAL-ORIGIN-RESULT') },
+    { when: ({ input }) => input === scheduledContent(scheduledMessage), respond: () => fauxAssistantMessage('LOCAL-ORIGIN-RESULT') },
     {
       when: ({ input }) => input === 'schedule the local reminder' && !toolCallIssued,
       respond: () => {
@@ -433,7 +435,7 @@ test('isolated-mode delivery remains admitted for a Telegram origin', { timeout:
   const scheduledMessage = 'deliver the isolated reminder';
   let toolCallIssued = false;
   store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
-    { when: ({ input }) => input === scheduledMessage, respond: () => fauxAssistantMessage('ISOLATED-RESULT') },
+    { when: ({ input }) => input === scheduledContent(scheduledMessage), respond: () => fauxAssistantMessage('ISOLATED-RESULT') },
     {
       when: ({ input }) => input === 'schedule the isolated reminder' && !toolCallIssued,
       respond: () => {
@@ -480,7 +482,7 @@ test('an isolated scheduled run that errors queues one sanitized failure notice'
   let toolCallIssued = false;
   store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
     {
-      when: ({ input }) => input === scheduledMessage,
+      when: ({ input }) => input === scheduledContent(scheduledMessage),
       respond: () => fauxAssistantMessage('', { stopReason: 'error', errorMessage: providerError }),
     },
     {
@@ -542,7 +544,7 @@ test('an empty origin-mode answer queues one notice and stays one record after r
   const scheduledMessage = 'deliver the empty reminder';
   let toolCallIssued = false;
   store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
-    { when: ({ input }) => input === scheduledMessage, respond: () => fauxAssistantMessage('') },
+    { when: ({ input }) => input === scheduledContent(scheduledMessage), respond: () => fauxAssistantMessage('') },
     {
       when: ({ input }) => input === 'schedule the empty reminder' && !toolCallIssued,
       respond: () => {
@@ -609,7 +611,7 @@ test('an aborted scheduled run queues nothing', { timeout: 25_000 }, async () =>
   const held = new Promise((resolve) => { markHeld = resolve; });
   store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
     {
-      when: ({ input }) => input === scheduledMessage,
+      when: ({ input }) => input === scheduledContent(scheduledMessage),
       respond: () => new Promise((_resolve, reject) => {
         // The occurrence holds here until the test aborts its task, so the abort lands mid-run.
         releaseHeld = () => reject(new Error('held response released'));
@@ -687,12 +689,12 @@ test('silent jobs suppress success and empty answers but keep failure notices an
   let scheduled = false;
   let listed = false;
   store.faux.setResponses(Array.from({ length: 40 }, () => routeByContent([
-    { when: ({ input }) => input === 'silent empty reminder', respond: () => gate(fauxAssistantMessage('')) },
+    { when: ({ input }) => input === scheduledContent('silent empty reminder'), respond: () => gate(fauxAssistantMessage('')) },
     {
-      when: ({ input }) => input === 'silent failing reminder',
+      when: ({ input }) => input === scheduledContent('silent failing reminder'),
       respond: () => gate(fauxAssistantMessage('', { stopReason: 'error', errorMessage: providerError })),
     },
-    { when: ({ input }) => input === 'legacy reminder', respond: () => gate(fauxAssistantMessage('LEGACY-DELIVERED')) },
+    { when: ({ input }) => input === scheduledContent('legacy reminder'), respond: () => gate(fauxAssistantMessage('LEGACY-DELIVERED')) },
     {
       when: ({ input }) => input === 'schedule silent jobs' && !scheduled,
       respond: () => {
@@ -846,9 +848,22 @@ test('silent and [SILENT] origin runs stay undelivered while an ordinary chat an
   const store = await syntheticGateway('silent-origin');
   const chat = await store.gateway.conversationFor(origin, context);
   let scheduled = false;
+  const scheduledInputs = [];
   store.faux.setResponses(Array.from({ length: 20 }, () => routeByContent([
-    { when: ({ input }) => input === 'silent origin reminder', respond: () => fauxAssistantMessage('SILENT-ORIGIN-ANSWER') },
-    { when: ({ input }) => input === 'marker origin reminder', respond: () => fauxAssistantMessage('  [SILENT]  ') },
+    {
+      when: ({ input }) => input.startsWith('silent origin reminder'),
+      respond: ({ input }) => {
+        scheduledInputs.push(input);
+        return fauxAssistantMessage('SILENT-ORIGIN-ANSWER');
+      },
+    },
+    {
+      when: ({ input }) => input.startsWith('marker origin reminder'),
+      respond: ({ input }) => {
+        scheduledInputs.push(input);
+        return fauxAssistantMessage('  [SILENT]  ');
+      },
+    },
     {
       when: ({ input }) => input === 'schedule silent origin jobs' && !scheduled,
       respond: () => {
@@ -873,6 +888,11 @@ test('silent and [SILENT] origin runs stay undelivered while an ordinary chat an
     assert.equal((await submission.wait(context)).status, 'done');
     await settledWatcher.promise;
 
+    assert.deepEqual(
+      scheduledInputs.sort(),
+      [scheduledContent('silent origin reminder'), scheduledContent('marker origin reminder')].sort(),
+      'each origin run receives the appended marker instruction',
+    );
     const jobs = (await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context)).jobs;
     assert.equal(jobs.length, 2);
     for (const job of jobs) {
@@ -932,10 +952,12 @@ test('[SILENT] suppresses only its own background occurrence and a later occurre
   const chat = await store.gateway.conversationFor(origin, context);
   let occurrences = 0;
   let scheduled = false;
+  const scheduledInputs = [];
   store.faux.setResponses(Array.from({ length: 40 }, () => routeByContent([
     {
-      when: ({ input }) => input === 'marker background reminder',
-      respond: () => {
+      when: ({ input }) => input.startsWith('marker background reminder'),
+      respond: ({ input }) => {
+        scheduledInputs.push(input);
         occurrences += 1;
         // The first occurrence is a trimmed marker with surrounding whitespace; the second is real.
         return fauxAssistantMessage(occurrences === 2 ? 'MARKER-SECOND-RESULT' : '  [SILENT]  ');
@@ -962,6 +984,14 @@ test('[SILENT] suppresses only its own background occurrence and a later occurre
     assert.equal((await submission.wait(context)).status, 'done');
     await watcher.promise;
 
+    assert.equal(scheduledInputs.length, 2, 'both background occurrences reached the model');
+    for (const input of scheduledInputs) {
+      assert.equal(
+        input,
+        scheduledContent('marker background reminder'),
+        'each background run receives the appended marker instruction',
+      );
+    }
     const jobs = (await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context)).jobs;
     assert.equal(jobs.length, 1);
     const job = jobs[0];

@@ -810,7 +810,8 @@ after a reopen.
 
 The adapter also consumes the durable, channel-neutral cron outbox
 (`nanobot.cron.deliveries` in the origin chat conversation). A normal settlement, isolated or
-origin, writes the text to send there in the same terminal commit as its outcome: the committed
+origin, writes the text to send there in the same terminal commit as its outcome unless successful
+delivery is suppressed by `silent` or an exact `[SILENT]` answer: the committed
 final answer, or fixed sanitized notice text for a failure or empty answer; no model turn is
 rerun to resend. On startup and every few seconds the adapter enumerates already-mapped chat sessions and
 accepts only candidate keys for its own bot ID (`telegram:<bot id>:chat:<chatId>`). That key is a
