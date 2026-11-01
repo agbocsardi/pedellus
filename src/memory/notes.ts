@@ -1,273 +1,254 @@
 import { constants } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, open, readdir } from "node:fs/promises";
-import type { BigIntStats, Dirent } from "node:fs";
+import { open, readdir } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { Context } from "@earendil-works/chord";
-import type { MemoryBackend, MemoryCoverage, MemoryHit, MemoryPage, MemoryQuery, MemoryReadPage, MemoryRef, MemoryScope } from "./contracts.js";
-import { encodeRef, decodeToken, encodeToken, hash } from "./validation.js";
+import { isAbsolute, resolve, sep } from "node:path";
+import type { MemoryBackend, MemoryCoverage, MemoryHit, MemoryPage, MemoryQuery, MemoryReadPage, MemoryScope } from "./contracts.js";
+import { decodeToken, encodeRef, encodeToken, hash } from "./validation.js";
 
-const PAGE_DEFAULT = 20;
-const PAGE_MAX = 100;
-const TEXT_PAGE_DEFAULT = 16_384;
-const TEXT_PAGE_MAX = 65_536;
-const SCAN_LIMIT = 4_096;
-const SNAPSHOT_LIMIT = 48;
-const SNAPSHOT_TTL = 10 * 60_000;
-const PREVIEW_LIMIT = 600;
+const MAX_MANIFEST_ENTRIES = 100_000;
+const FILES_PER_PASS = 32;
+const TTL = 10 * 60_000;
+const MAX_SNAPSHOTS = 48;
+const MAX_METADATA_CHARS = 1_048_576;
 const CONTROL = /[\u0000-\u001f\u007f\u2028\u2029]/;
-type Note = { path: string; fingerprint: string; description: string; size: number; mtime: string | null; matched?: boolean };
-type Snapshot = { id: string; storeId: string; root: string; authority: string; queryHash: string; mode: "search" | "browse"; notes: Note[]; dirs: { path: string; offset: number; entries?: Dirent[] }[]; scanned: number; complete: boolean; unreadable: number; expires: number };
-const snapshots = new Map<string, Snapshot>();
+type Note = { path: string; identity: string; fingerprint?: string; description?: string; matched?: boolean };
+type Snapshot = { id: string; secret: string; root: string; authority: string; key: string; notes: Note[]; position: number; unreadable: number; expires: number };
+type NoteRead = { fingerprint: string; description: string; matched: boolean; content: string; total: number };
 
 function fail(message: string): never { throw new Error(message); }
-function isWithin(parent: string, child: string): boolean { const rel = relative(parent, child); return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)); }
-function validateScope(scope: MemoryScope): { root: string; authority: string } {
-  if (!scope || typeof scope.storeId !== "string" || !scope.storeId || typeof scope.workspaceRoot !== "string" || !isAbsolute(scope.workspaceRoot)) fail("Notes scope is invalid");
+function validPath(path: unknown): path is string {
+  return typeof path === "string" && path.length <= 1_024 && path.startsWith("memory/") && path.endsWith(".md") && !path.includes("\\") && !CONTROL.test(path) && !path.split("/").some((part) => !part || part === "." || part === "..");
+}
+function scopeIdentity(scope: MemoryScope): { root: string; authority: string } {
+  if (!scope.storeId || !isAbsolute(scope.workspaceRoot) || !Array.isArray(scope.memoryFiles) || scope.memoryFiles.some((path) => !validPath(path))) fail("Notes scope is invalid");
   const root = resolve(scope.workspaceRoot);
-  if (root === sep || ["/proc", "/sys", "/dev"].some((p) => isWithin(p, root))) fail("Notes workspace is not allowed");
-  const memoryFiles = configuredFiles(scope.memoryFiles);
-  return { root, authority: hash({ storeId: scope.storeId, root, memoryFiles }) };
+  if (root === sep || ["/proc", "/sys", "/dev"].some((path) => root === path || root.startsWith(`${path}/`))) fail("Notes workspace is not allowed");
+  return { root, authority: hash({ storeId: scope.storeId, root, memoryFiles: [...scope.memoryFiles].sort() }) };
 }
-async function assertRoot(root: string): Promise<void> {
-  const st = await lstat(root).catch(() => undefined);
-  if (!st || st.isSymbolicLink() || !st.isDirectory()) fail("Notes workspace is unavailable");
-}
-function pathOk(path: string): boolean { return typeof path === "string" && path.length <= 1_024 && path.startsWith("memory/") && path.endsWith(".md") && !path.includes("\\") && !CONTROL.test(path) && !path.split("/").some((p) => !p || p === "." || p === ".."); }
-function configuredFiles(value: readonly string[]): readonly string[] {
-  if (!Array.isArray(value)) fail("Notes scope is invalid");
-  const seen = new Set<string>();
-  for (const path of value) { if (!pathOk(path) || seen.has(path)) fail("Notes scope is invalid"); seen.add(path); }
-  return value;
-}
-function sortNotes(notes: Note[]): void { notes.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0); }
-function readLimit(value: number | undefined, fallback: number, max: number): number { return value === undefined ? fallback : Math.min(max, Math.max(1, value)); }
-function trimPreview(text: string): string { const s = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ").trim(); return s.length <= PREVIEW_LIMIT ? s : `${s.slice(0, PREVIEW_LIMIT - 1)}…`; }
-function parseDescription(text: string): string {
-  let body = text;
-  if (text.startsWith("---\n") || text.startsWith("---\r\n")) {
-    const start = text.startsWith("---\r\n") ? 5 : 4;
-    const end = text.indexOf("\n---", start);
-    if (end >= 0) {
-      for (const line of text.slice(start, end).split(/\r?\n/)) {
-        const m = /^description\s*:\s*(.*)$/i.exec(line);
-        if (m?.[1]) return trimPreview(m[1].trim().replace(/^['\"]|['\"]$/g, ""));
-      }
-      body = text.slice(end + (text[end + 4] === "\n" ? 5 : 4));
-    }
-  }
-  for (const line of body.split(/\r?\n/)) if (/^\s*#/.test(line)) return trimPreview(line.replace(/^\s*#+\s*/, ""));
-  return "(missing description)";
-}
-function jsonTime(note: Note) { return { from: null, to: null, undated: 1 }; }
-function coverage(complete: boolean, unreadable: number, extra: Record<string, unknown> = {}): MemoryCoverage { return { complete, unreadable, undated: 0, ...extra }; }
-function prune(): void {
-  const now = Date.now();
-  for (const [id, s] of snapshots) if (s.expires <= now) snapshots.delete(id);
-  while (snapshots.size >= SNAPSHOT_LIMIT) snapshots.delete(snapshots.keys().next().value!);
-}
-function cursor(snapshot: Snapshot, index: number, queryHash: string): string { return encodeToken({ v: 1, id: snapshot.id, index, storeId: snapshot.storeId, root: snapshot.root, authority: snapshot.authority, queryHash }); }
-function getSnapshot(token: string, scope: MemoryScope, root: string, authority: string, queryHash: string, mode: Snapshot["mode"]): { snapshot: Snapshot; index: number } {
-  let value: unknown;
-  try { value = decodeToken(token); } catch { return fail("Notes cursor is invalid"); }
-  if (!value || typeof value !== "object") return fail("Notes cursor is invalid");
-  const c = value as Record<string, unknown>;
-  const s = typeof c.id === "string" ? snapshots.get(c.id) : undefined;
-  if (!s || s.expires <= Date.now()) return fail("Notes snapshot expired; start again");
-  if (s.storeId !== scope.storeId || s.root !== root || s.authority !== authority || s.queryHash !== queryHash || s.mode !== mode || c.storeId !== scope.storeId || c.root !== root || c.authority !== authority || c.queryHash !== queryHash || !Number.isSafeInteger(c.index) || (c.index as number) < 0) return fail("Notes cursor does not match this request or scope");
-  s.expires = Date.now() + SNAPSHOT_TTL;
-  return { snapshot: s, index: c.index as number };
-}
-async function safeParents(root: string, path: string): Promise<boolean> {
-  let current = root;
-  for (const segment of path.split("/").slice(0, -1)) {
-    current = join(current, segment);
-    const st = await lstat(current).catch(() => undefined);
-    if (!st || st.isSymbolicLink() || !st.isDirectory()) return false;
-  }
-  return true;
-}
-async function fingerprint(root: string, path: string, searchTerm?: string): Promise<Note> {
-  if (!pathOk(path) || !await safeParents(root, path)) throw new Error("unsafe");
-  const abs = join(root, ...path.split("/"));
-  const lst = await lstat(abs);
-  if (lst.isSymbolicLink() || !lst.isFile() || lst.nlink !== 1) throw new Error("unsafe");
-  const fd = await open(abs, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+function identity(info: BigIntStats): string { return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs, info.nlink].join(":"); }
+function directoryIdentity(info: BigIntStats): string { return [info.dev, info.ino, info.mtimeNs, info.ctimeNs].join(":"); }
+function childPath(parent: FileHandle, name: string): string { return `/proc/self/fd/${parent.fd}/${name}`; }
+const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+/** Linux dirfd-style traversal: each component is opened beneath a pinned descriptor, never a checked pathname. */
+async function directory(root: string): Promise<FileHandle> {
+  let handle = await open("/", DIRECTORY_FLAGS);
   try {
-    const before = await fd.stat({ bigint: true });
-    if (!before.isFile() || before.nlink !== 1n) throw new Error("unsafe");
+    for (const part of root.split("/").filter(Boolean)) {
+      const next = await open(childPath(handle, part), DIRECTORY_FLAGS);
+      await handle.close(); handle = next;
+    }
+    return handle;
+  } catch { await handle.close().catch(() => undefined); return fail("Notes directory is unavailable or unsafe"); }
+}
+async function beneath(root: string, relative: string): Promise<FileHandle> {
+  let handle = await directory(root);
+  try {
+    for (const part of relative.split("/").filter(Boolean)) {
+      const next = await open(childPath(handle, part), DIRECTORY_FLAGS);
+      await handle.close(); handle = next;
+    }
+    return handle;
+  } catch (error) { await handle.close().catch(() => undefined); throw error; }
+}
+async function noteHandle(root: string, path: string): Promise<FileHandle> {
+  if (!validPath(path)) return fail("Note path is outside the memory scope");
+  const parts = path.split("/"); const name = parts.pop()!;
+  const parent = await beneath(root, parts.join("/"));
+  try {
+    const handle = await open(childPath(parent, name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const info = await handle.stat({ bigint: true });
+      if (!info.isFile() || info.nlink !== 1n) fail("Note is not a safe regular file");
+      return handle;
+    } catch (error) { await handle.close().catch(() => undefined); throw error; }
+  } finally { await parent.close(); }
+}
+/** A manifest is captured fully on the first call. Bounds refuse explicitly, never claim partial enumeration is complete. */
+async function manifest(root: string, configured: readonly string[]): Promise<{ notes: Note[]; unreadable: number }> {
+  const pending = ["memory"]; const dirs: { path: string; identity: string }[] = [];
+  const notes = new Map<string, Note>(); let unreadable = 0, scanned = 0;
+  while (pending.length) {
+    const path = pending.shift()!;
+    let handle: FileHandle;
+    try { handle = await beneath(root, path); }
+    catch (error) {
+      if (!(path === "memory" && (error as NodeJS.ErrnoException).code === "ENOENT")) unreadable++;
+      continue;
+    }
+    try {
+      const before = await handle.stat({ bigint: true });
+      dirs.push({ path, identity: directoryIdentity(before) });
+      const entries = await readdir(`/proc/self/fd/${handle.fd}`, { withFileTypes: true });
+      for (const entry of entries) {
+        if (++scanned > MAX_MANIFEST_ENTRIES) fail("Notes manifest exceeds the 100000-entry bound; narrow the workspace before browsing");
+        const child = `${path}/${entry.name}`;
+        if (entry.isSymbolicLink()) { unreadable++; continue; }
+        if (entry.isDirectory()) { pending.push(child); continue; }
+        if (!entry.name.endsWith(".md")) continue;
+        if (!entry.isFile() || !validPath(child)) { unreadable++; continue; }
+        try {
+          const fd = await noteHandle(root, child);
+          try { notes.set(child, { path: child, identity: identity(await fd.stat({ bigint: true })) }); }
+          finally { await fd.close(); }
+        } catch { unreadable++; }
+      }
+      if (directoryIdentity(await handle.stat({ bigint: true })) !== directoryIdentity(before)) fail("Notes directory changed while capturing the manifest; start again");
+    } finally { await handle.close(); }
+  }
+  for (const path of configured) {
+    if (notes.has(path)) continue;
+    try {
+      const handle = await noteHandle(root, path);
+      try { notes.set(path, { path, identity: identity(await handle.stat({ bigint: true })) }); }
+      finally { await handle.close(); }
+    } catch { unreadable++; }
+  }
+  for (const saved of dirs) {
+    const handle = await beneath(root, saved.path).catch(() => undefined);
+    if (!handle) fail("Notes directory changed while capturing the manifest; start again");
+    try { if (directoryIdentity(await handle.stat({ bigint: true })) !== saved.identity) fail("Notes directory changed while capturing the manifest; start again"); }
+    finally { await handle.close(); }
+  }
+  return { notes: [...notes.values()].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0), unreadable };
+}
+/** Locale-independent lowercase per code point; no context-sensitive chunk folding. */
+function fold(text: string): string { return Array.from(text, (character) => character.toLowerCase()).join(""); }
+async function readNote(root: string, path: string, options: { expectedIdentity?: string; term?: string; offset?: number; limit?: number; metadata?: boolean }): Promise<NoteRead> {
+  const handle = await noteHandle(root, path);
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (options.expectedIdentity && identity(before) !== options.expectedIdentity) fail("Note changed after the manifest was captured; start again");
     const size = Number(before.size);
-    if (!Number.isSafeInteger(size)) throw new Error("unreadable");
-    const h = createHash("sha256");
-    const decoder = new TextDecoder("utf-8", { fatal: true });
-    let desc = "";
-    let searchTail = "";
-    let matched = searchTerm === undefined;
-    // Description and frontmatter fit in this bounded prefix; fingerprint and UTF-8 validation cover the whole file.
-    let left = size, pos = 0;
-    const buf = Buffer.alloc(Math.min(64 * 1024, Math.max(1, size)));
-    while (left > 0) {
-      const { bytesRead } = await fd.read(buf, 0, Math.min(buf.length, left), pos);
-      if (!bytesRead) throw new Error("changed");
-      const chunk = buf.subarray(0, bytesRead);
-      h.update(chunk);
-      const decoded = decoder.decode(chunk, { stream: true });
-      if (desc.length < 32_768) { desc += decoded; }
-      if (searchTerm !== undefined && !matched) {
-        const searchable = (searchTail + decoded).toLocaleLowerCase();
-        matched = searchable.includes(searchTerm.toLocaleLowerCase());
-        searchTail = searchable.slice(-Math.max(1, searchTerm.length * 2));
+    if (!Number.isSafeInteger(size)) fail("Note size cannot be read safely");
+    const digest = createHash("sha256"), decoder = new TextDecoder("utf-8", { fatal: true });
+    const buffer = Buffer.alloc(64 * 1024); const term = options.term === undefined ? undefined : fold(options.term);
+    let position = 0, total = 0, content = "", tail = "", matched = term === undefined;
+    const offset = options.offset ?? 0, limit = options.limit ?? 0;
+    let firstLine = true, inHeader = false, metadataDone = false, lineBuffer = "", descriptionValue = "", headerDescription = "", firstHeading = "";
+    const line = (value: string): void => {
+      value = value.replace(/\r$/, "");
+      if (firstLine) { firstLine = false; if (value === "---") { inHeader = true; return; } }
+      if (inHeader) {
+        if (value.startsWith("---")) { inHeader = false; if (headerDescription) { descriptionValue = headerDescription; metadataDone = true; } return; }
+        const match = /^\s*description\s*:\s*(.*)$/i.exec(value);
+        if (match) headerDescription = match[1]!.trim().replace(/^["']+|["']+$/g, "");
+        if (!firstHeading && value.trim().startsWith("#")) firstHeading = value.trim().replace(/^#+/, "").trim();
+      } else if (value.trim().startsWith("#")) { descriptionValue = value.trim().replace(/^#+/, "").trim(); metadataDone = true; }
+    };
+    const consume = (chunk: string): void => {
+      if (options.metadata && !metadataDone) {
+        lineBuffer += chunk;
+        let end: number;
+        while (!metadataDone && (end = lineBuffer.indexOf("\n")) >= 0) {
+          if (end > MAX_METADATA_CHARS) fail("Note metadata line exceeds the metadata bound");
+          line(lineBuffer.slice(0, end)); lineBuffer = lineBuffer.slice(end + 1);
+        }
+        if (metadataDone) lineBuffer = "";
+        else if (lineBuffer.length > MAX_METADATA_CHARS) fail("Note metadata line exceeds the metadata bound");
       }
-      pos += bytesRead; left -= bytesRead;
+      if (term !== undefined && !matched) {
+        const searchable = tail + fold(chunk); matched = searchable.includes(term);
+        tail = searchable.slice(-Math.max(0, term.length - 1));
+      }
+      for (const character of chunk) {
+        if (total >= offset && content.length + character.length <= limit && total === offset + content.length) content += character;
+        total += character.length;
+      }
+    };
+    while (position < size) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, size - position), position);
+      if (!bytesRead) fail("Note changed while reading");
+      digest.update(buffer.subarray(0, bytesRead));
+      consume(decoder.decode(buffer.subarray(0, bytesRead), { stream: true })); position += bytesRead;
     }
-    decoder.decode();
-    const after = await fd.stat({ bigint: true });
-    if (before.dev !== after.dev || before.ino !== after.ino || before.nlink !== after.nlink || before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) throw new Error("changed");
-    // Description parser only needs a small prefix; frontmatter is conventionally at the beginning.
-    const description = parseDescription(desc);
-    return { path, fingerprint: h.digest("hex"), description, size, mtime: before.mtimeNs.toString(), ...(searchTerm === undefined ? {} : { matched }) };
-  } finally { await fd.close().catch(() => undefined); }
+    consume(decoder.decode());
+    if (identity(await handle.stat({ bigint: true })) !== identity(before)) fail("Note changed while reading");
+    if (options.metadata && !metadataDone && lineBuffer) line(lineBuffer);
+    if (!descriptionValue) descriptionValue = inHeader && firstHeading ? firstHeading : "(missing description)";
+    return { fingerprint: digest.digest("hex"), description: descriptionValue, matched, content, total };
+  } finally { await handle.close(); }
 }
-async function advance(snapshot: Snapshot, scope: MemoryScope, searchTerm?: string): Promise<void> {
-  const candidates = new Set<string>(configuredFiles(scope.memoryFiles));
-  let processed = 0;
-  while (snapshot.dirs.length && processed < SCAN_LIMIT) {
-    const frame = snapshot.dirs[0]!;
-    if (!frame.entries) {
-      try { frame.entries = await readdir(join(snapshot.root, ...frame.path.split("/")), { withFileTypes: true }); }
-      catch { snapshot.unreadable++; snapshot.dirs.shift(); continue; }
-      frame.entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-    }
-    const entries = frame.entries;
-    while (frame.offset < entries.length && processed < SCAN_LIMIT) {
-      const entry = entries[frame.offset++]!;
-      processed++; snapshot.scanned++;
-      const path = `${frame.path}/${entry.name}`;
-      if (entry.isSymbolicLink()) { snapshot.unreadable++; continue; }
-      if (entry.isDirectory()) { if (entry.name !== "system") snapshot.dirs.push({ path, offset: 0 }); continue; }
-      if (entry.isFile() && entry.name.endsWith(".md")) candidates.add(path);
-    }
-    if (frame.offset >= entries.length) snapshot.dirs.shift();
-  }
-  for (const path of candidates) {
-    if (!pathOk(path) || snapshot.notes.some((n) => n.path === path)) continue;
-    try { snapshot.notes.push(await fingerprint(snapshot.root, path, searchTerm)); } catch { snapshot.unreadable++; }
-  }
-  snapshot.complete = snapshot.dirs.length === 0;
-  if (snapshot.complete) sortNotes(snapshot.notes);
-}
-async function enumerate(root: string, scope: MemoryScope, mode: Snapshot["mode"], queryHash: string, searchTerm?: string): Promise<Snapshot> {
-  const snapshot: Snapshot = { id: randomBytes(18).toString("base64url"), storeId: scope.storeId, root, authority: validateScope(scope).authority, queryHash, mode, notes: [], dirs: [], scanned: 0, complete: true, unreadable: 0, expires: Date.now() + SNAPSHOT_TTL };
-  try {
-    const memory = await lstat(join(root, "memory"));
-    if (memory.isSymbolicLink() || !memory.isDirectory()) snapshot.unreadable++;
-    else snapshot.dirs.push({ path: "memory", offset: 0 });
-  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") snapshot.unreadable++; }
-  if (!snapshot.dirs.length) {
-    for (const path of configuredFiles(scope.memoryFiles)) try { snapshot.notes.push(await fingerprint(root, path, searchTerm)); } catch { snapshot.unreadable++; }
-    sortNotes(snapshot.notes);
-    return snapshot;
-  }
-  await advance(snapshot, scope, searchTerm);
-  return snapshot;
-}
-function matches(note: Note, query: MemoryQuery): boolean {
-  const f = query.filter;
-  if (f?.pathPrefix && !note.path.startsWith(f.pathPrefix)) return false;
-  if (f?.description && !f.description.includes(note.description)) return false;
-  if (query.query && !note.matched) return false;
-  return true;
-}
-function makeHit(note: Note, scope: MemoryScope): MemoryHit {
-  const ref: MemoryRef = { version: 1, storeId: scope.storeId, kind: "note", path: note.path, fingerprint: note.fingerprint };
-  return { ref: encodeRef(ref), source: { target: "notes", path: note.path }, time: jsonTime(note), excerpt: note.description, preview: true, coverage: { ...coverage(true, 0, { excerpt: "description" }), undated: 1 } };
-}
-function page(snapshot: Snapshot, notes: Note[], index: number, limit: number, scope: MemoryScope, qHash: string): MemoryPage {
-  const batch = notes.slice(index, index + limit);
-  const next = index + batch.length;
-  const complete = snapshot.complete && next >= notes.length;
-  return { hits: batch.map((n) => makeHit(n, scope)), ...(complete ? {} : { cursor: cursor(snapshot, next, qHash) }), complete, coverage: coverage(complete, snapshot.unreadable, { scanned: snapshot.scanned, partialEnumeration: !snapshot.complete }), freshness: { snapshot: "frozen", order: "path-ascending" } };
-}
+function coverage(complete: boolean, unreadable: number, undated: number, extra: Record<string, unknown> = {}): MemoryCoverage { return { complete, unreadable, undated, ...extra }; }
+function token(): string { return randomBytes(24).toString("base64url"); }
 
 export function createNotesBackend(): MemoryBackend {
-  const readCursors = new Map<string, { path: string; fingerprint: string; storeId: string; root: string; authority: string; offset: number; expires: number }>();
-  function issueReadCursor(value: Omit<NonNullable<ReturnType<typeof readCursors.get>>, "expires">): string {
+  const snapshots = new Map<string, Snapshot>();
+  const reads = new Map<string, { authority: string; ref: string; secret: string; expires: number }>();
+  function prune(): void {
     const now = Date.now();
-    for (const [key, entry] of readCursors) if (entry.expires <= now) readCursors.delete(key);
-    while (readCursors.size >= 256) readCursors.delete(readCursors.keys().next().value!);
-    const token = randomBytes(24).toString("base64url");
-    readCursors.set(token, { ...value, expires: now + SNAPSHOT_TTL });
-    return token;
+    for (const [id, saved] of snapshots) if (saved.expires <= now) snapshots.delete(id);
+    for (const [id, saved] of reads) if (saved.expires <= now) reads.delete(id);
   }
-  async function run(query: MemoryQuery, scope: MemoryScope, mode: Snapshot["mode"]): Promise<MemoryPage> {
-    const { root, authority } = validateScope(scope);
-    await assertRoot(root);
-    const qHash = hash({ mode, target: query.target, query: query.query, filter: query.filter, order: query.order, authority });
-    let snapshot: Snapshot, index: number;
+  function next(snapshot: Snapshot, index: number): string {
+    return encodeToken({ id: snapshot.id, index, signature: hash({ secret: snapshot.secret, index }) });
+  }
+  async function run(query: MemoryQuery, scope: MemoryScope, mode: "search" | "browse"): Promise<MemoryPage> {
+    prune();
+    const { root, authority } = scopeIdentity(scope);
+    const key = hash({ mode, query: query.query, filter: query.filter, order: query.order, authority });
+    let snapshot: Snapshot, index = 0;
     if (query.cursor) {
-      ({ snapshot, index } = getSnapshot(query.cursor, scope, root, authority, qHash, mode));
-      if (!snapshot.complete) await advance(snapshot, scope, mode === "search" ? query.query : undefined);
+      const value = decodeToken(query.cursor) as Record<string, unknown>;
+      if (!value || typeof value !== "object" || typeof value.id !== "string" || !Number.isSafeInteger(value.index) || (value.index as number) < 0) fail("Notes continuation is invalid");
+      const saved = snapshots.get(value.id);
+      if (!saved || saved.expires <= Date.now()) fail("Notes snapshot expired; start again");
+      snapshot = saved; index = value.index as number;
+      if (snapshot.authority !== authority || snapshot.key !== key || value.signature !== hash({ secret: snapshot.secret, index })) fail("Notes continuation does not match this query or scope");
     } else {
-      prune(); snapshot = await enumerate(root, scope, mode, qHash, mode === "search" ? query.query : undefined); snapshots.set(snapshot.id, snapshot); index = 0;
+      if (snapshots.size >= MAX_SNAPSHOTS) fail("Notes snapshot capacity reached; retry later");
+      const found = await manifest(root, scope.memoryFiles);
+      snapshot = { id: token(), secret: token(), root, authority, key, notes: found.notes, position: 0, unreadable: found.unreadable, expires: Date.now() + TTL };
+      snapshots.set(snapshot.id, snapshot);
     }
-    if (!snapshot.complete) return { hits: [], cursor: cursor(snapshot, 0, qHash), complete: false, phase: "preparing", coverage: coverage(false, snapshot.unreadable, { scanned: snapshot.scanned, partialEnumeration: true }), freshness: { snapshot: "frozen", order: "path-ascending" } };
-    let notes = snapshot.notes.filter((n) => matches(n, query));
-    // Notes have no occurrence timestamps; both order choices are deterministic path order.
-    sortNotes(notes);
-    const limit = readLimit(query.limit, PAGE_DEFAULT, PAGE_MAX);
-    return page(snapshot, notes, index, limit, scope, qHash);
+    const end = Math.min(snapshot.notes.length, snapshot.position + FILES_PER_PASS);
+    for (; snapshot.position < end; snapshot.position++) {
+      const note = snapshot.notes[snapshot.position]!;
+      try {
+        const read = await readNote(root, note.path, { expectedIdentity: note.identity, ...(mode === "search" && query.query !== undefined ? { term: query.query } : {}), metadata: true });
+        Object.assign(note, { fingerprint: read.fingerprint, description: read.description, matched: read.matched });
+      } catch { snapshot.unreadable++; }
+    }
+    if (snapshot.position < snapshot.notes.length) return { hits: [], cursor: next(snapshot, 0), complete: false, phase: "preparing", coverage: coverage(false, snapshot.unreadable, snapshot.position, { capturedNotes: snapshot.notes.length, processedNotes: snapshot.position }), freshness: { source: "filesystem", manifest: "frozen" } };
+    let notes = snapshot.notes.filter((note) => note.fingerprint && note.matched && (!query.filter?.pathPrefix || note.path.startsWith(query.filter.pathPrefix)) && (!query.filter?.description || query.filter.description.includes(note.description!)));
+    if (query.order === "newest") notes = notes.slice().reverse();
+    const limit = Math.min(query.limit ?? 20, 100), batch = notes.slice(index, index + limit), position = index + batch.length;
+    const complete = position >= notes.length;
+    const hits: MemoryHit[] = batch.map((note) => ({ ref: encodeRef({ version: 1, storeId: scope.storeId, kind: "note", path: note.path, fingerprint: note.fingerprint! }), source: { target: "notes", path: note.path }, time: { from: null, to: null, undated: 1 }, excerpt: note.description!.slice(0, 600), preview: true, coverage: coverage(true, 0, 1, { excerpt: "description" }) }));
+    return { hits, ...(complete ? {} : { cursor: next(snapshot, position) }), complete, coverage: coverage(snapshot.unreadable === 0, snapshot.unreadable, snapshot.notes.length, { capturedNotes: snapshot.notes.length, matchedNotes: notes.length }), freshness: { source: "filesystem", manifest: "frozen", order: query.order === "newest" ? "path-descending" : "path-ascending", matching: "literal Unicode lowercase by code point; no locale or normalization" } };
   }
   return {
-    search(query, scope, _context: Context) { return run(query, scope, "search"); },
-    browse(query, scope, _context: Context) { return run(query, scope, "browse"); },
-    async read(query, ref, scope, _context): Promise<MemoryReadPage> {
-      const { root, authority } = validateScope(scope);
-      await assertRoot(root);
-      if (ref.kind !== "note" || !ref.path || !ref.fingerprint || !pathOk(ref.path)) throw new Error("Note reference is invalid");
-      const current = await fingerprint(root, ref.path).catch(() => undefined);
-      if (!current || current.fingerprint !== ref.fingerprint) throw new Error("Note changed or is no longer available; search again");
-      const offset = 0;
-      let pageOffset = offset;
+    search: (query, scope) => run(query, scope, "search"),
+    browse: (query, scope) => run(query, scope, "browse"),
+    async read(query, ref, scope): Promise<MemoryReadPage> {
+      prune(); const { root, authority } = scopeIdentity(scope);
+      if (query.view !== undefined) fail("view applies only to episodes and summaries");
+      if (ref.kind !== "note" || !validPath(ref.path) || !ref.fingerprint) fail("Note reference is invalid");
+      let offset = 0, readId: string | undefined;
       if (query.cursor) {
-        const saved = readCursors.get(query.cursor);
-        if (!saved || saved.expires <= Date.now()) { readCursors.delete(query.cursor); throw new Error("Note continuation expired; start the read again"); }
-        if (saved.path !== ref.path || saved.fingerprint !== ref.fingerprint || saved.storeId !== scope.storeId || saved.root !== root || saved.authority !== authority) throw new Error("Note continuation does not match this resource or scope");
-        pageOffset = saved.offset;
-        readCursors.delete(query.cursor);
+        const value = decodeToken(query.cursor) as Record<string, unknown>;
+        if (!value || typeof value !== "object" || typeof value.id !== "string" || !Number.isSafeInteger(value.offset) || (value.offset as number) < 0) fail("Note continuation is invalid");
+        const saved = reads.get(value.id);
+        if (!saved || saved.expires <= Date.now()) fail("Note continuation expired; start again");
+        if (saved.authority !== authority || saved.ref !== query.ref || value.signature !== hash({ secret: saved.secret, offset: value.offset })) fail("Note continuation does not match this resource or scope");
+        offset = value.offset as number; readId = value.id;
       }
-      const limit = readLimit(query.limit, TEXT_PAGE_DEFAULT, TEXT_PAGE_MAX);
-      const abs = join(root, ...ref.path.split("/"));
-      const fd: FileHandle = await open(abs, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-      try {
-        const st = await fd.stat({ bigint: true });
-        if (!st.isFile() || st.nlink !== 1n) throw new Error("Note is not a safe regular file");
-        const decoder = new TextDecoder("utf-8", { fatal: true });
-        const digest = createHash("sha256");
-        let chars = 0, content = "", pos = 0, left = Number(st.size);
-        const buf = Buffer.alloc(64 * 1024);
-        while (left > 0) {
-          const { bytesRead } = await fd.read(buf, 0, Math.min(buf.length, left), pos);
-          if (!bytesRead) throw new Error("Note changed while reading");
-          digest.update(buf.subarray(0, bytesRead));
-          const chunk = decoder.decode(buf.subarray(0, bytesRead), { stream: true });
-          for (const ch of chunk) {
-            const width = ch.length;
-            if (chars >= pageOffset && content.length < limit) content += ch;
-            chars += width;
-          }
-          pos += bytesRead; left -= bytesRead;
+      const result = await readNote(root, ref.path, { offset, limit: Math.max(2, Math.min(query.limit ?? 4_096, 8_000)) }).catch(() => fail("Note is unsafe, changed, unreadable or no longer available"));
+      if (result.fingerprint !== ref.fingerprint) fail("Note changed; search again");
+      const nextOffset = offset + result.content.length, complete = nextOffset >= result.total;
+      let cursor: string | undefined;
+      if (!complete) {
+        if (!readId) {
+          if (reads.size >= 256) fail("Note continuation capacity reached; retry later");
+          readId = token(); reads.set(readId, { authority, ref: query.ref, secret: token(), expires: Date.now() + TTL });
         }
-        decoder.decode();
-        const after = await fd.stat({ bigint: true });
-        if (st.dev !== after.dev || st.ino !== after.ino || st.size !== after.size || st.mtimeNs !== after.mtimeNs || st.ctimeNs !== after.ctimeNs || st.nlink !== after.nlink || digest.digest("hex") !== ref.fingerprint) throw new Error("Note changed while reading");
-        const total = chars;
-        const nextOffset = pageOffset + content.length;
-        const complete = nextOffset >= total;
-        return { ref: query.ref, content, complete, coverage: coverage(true, 0, { fingerprint: "verified", resourceChars: total }), ...(!complete ? { cursor: issueReadCursor({ path: ref.path, fingerprint: ref.fingerprint, storeId: scope.storeId, root, authority, offset: nextOffset }) } : {}) };
-      } catch (e) { if (e instanceof TypeError && /encoded data/.test(e.message)) throw new Error("Note contains invalid UTF-8"); throw e; }
-      finally { await fd.close().catch(() => undefined); }
+        const saved = reads.get(readId)!;
+        saved.expires = Date.now() + TTL;
+        cursor = encodeToken({ id: readId, offset: nextOffset, signature: hash({ secret: saved.secret, offset: nextOffset }) });
+      }
+      return { ref: query.ref, content: result.content, complete, ...(cursor ? { cursor } : {}), coverage: coverage(true, 0, 1, { resourceChars: result.total, fingerprint: "verified" }) };
     },
-    close() { snapshots.clear(); readCursors.clear(); },
+    close() { snapshots.clear(); reads.clear(); },
   };
 }
