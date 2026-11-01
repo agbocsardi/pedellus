@@ -2216,13 +2216,16 @@ export async function runTelegram(
           if (origin.trusted) await releaseWithheld(sessionKey);
           // An OAuth callback is consumed before any transcript or model admission. Only the exact
           // authenticated sender bound to this chat may submit it; the text itself is never stored.
-          if (message.text !== undefined && gateway.mcpAdmin !== undefined && looksLikeOAuthCallback(message.text)) {
+          if (message.text !== undefined && looksLikeOAuthCallback(message.text)) {
             const senderId = String(message.from!.id);
             const binding = originBindingOf(state.origins, message.chat.id, identity);
             if (binding === undefined || binding.senderId !== senderId) {
               await admitNotice(update, message, sessionKey,
                 "This OAuth callback did not come from the authenticated sender that owns this chat. It was not sent " +
                 "to the assistant and was not stored.");
+            } else if (gateway.mcpAdmin === undefined) {
+              await admitNotice(update, message, sessionKey,
+                "No MCP login is available in this host; the callback was not stored or sent to the assistant.");
             } else {
               const result = await gateway.mcpAdmin.submitCallback(sessionKey, message.text, adapterContext);
               await admitNotice(update, message, sessionKey,

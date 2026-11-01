@@ -19,7 +19,7 @@ const { gatewaySocketPath, serveLocalGateway } = await import(pathToFileURL(`${p
 const { connectLocalGateway } = await import(pathToFileURL(`${pkg}/dist/local/client.js`).href);
 const { LocalGatewayError } = await import(pathToFileURL(`${pkg}/dist/local/protocol.js`).href);
 const { runTerminalConversation } = await import(pathToFileURL(`${pkg}/dist/terminal/index.js`).href);
-const { createModels, fauxAssistantMessage, fauxProvider } = await import(pathToFileURL(`${ai}/index.js`).href);
+const { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(pathToFileURL(`${ai}/index.js`).href);
 const { BACKGROUND_CONTEXT } = await import(pathToFileURL(`${chord}/context/index.js`).href);
 
 const context = BACKGROUND_CONTEXT;
@@ -273,6 +273,34 @@ test("the owner reads MCP status from the attached terminal", { timeout: 20_000 
   assert.match(printed, /MCP is not configured in this gateway/);
   assert.match(printed, /OAuth logins waiting for a callback: none/);
   assert.match(printed, /Usage: \/mcp/);
+});
+
+test("two real CLI attachments sharing a conversation refuse ambiguous login delivery", { timeout: 20_000 }, async (t) => {
+  const { gateway, provider, socketPath } = await makeEnvironment(t);
+  const first = await connectLocalGateway({ socketPath, context });
+  const second = await connectLocalGateway({ socketPath, context });
+  t.after(async () => { await first.close(); await second.close(); });
+  assert.equal(first.sessionKey, second.sessionKey);
+  assert.equal(gateway.mcpSurfaces.surfaceFor(first.sessionKey), undefined);
+  const links = [];
+  first.onMcpAuthorization = (link) => links.push(link);
+  second.onMcpAuthorization = (link) => links.push(link);
+  provider.setResponses([
+    fauxAssistantMessage(fauxToolCall("mcp", {
+      action: "add", name: "remote", server: { url: "http://127.0.0.1:1/mcp", oauth: true },
+    }, { id: "ambiguous-add" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("login refused"),
+  ]);
+  const chat = await gateway.conversationFor(first.sessionKey, context);
+  const submission = await chat.submit({ type: "input", content: "add and log in" }, context);
+  assert.equal((await submission.wait(context)).status, "done");
+  assert.equal(links.length, 0);
+  assert.equal((await gateway.mcpAdmin.list(context)).logins.length, 0);
+  const transcript = JSON.stringify((await chat.entries({}, 100, undefined, context)).items);
+  assert.match(transcript, /No unique authenticated owner surface/);
+  await first.close();
+  await eventually(() => gateway.mcpSurfaces.surfaceFor(second.sessionKey) !== undefined,
+    "remaining attachment should become the unique owner for a future login");
 });
 
 test("the CLI surface receives a direct MCP link and consumes a pasted callback before model admission", { timeout: 20_000 }, async (t) => {

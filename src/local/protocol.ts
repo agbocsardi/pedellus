@@ -7,7 +7,7 @@
  * every Durable handle, root/state/fork conversation and model credential.
  */
 
-export const LOCAL_PROTOCOL_VERSION = 1;
+export const LOCAL_PROTOCOL_VERSION = 2;
 
 export const LOCAL_PROTOCOL_LIMITS = Object.freeze({
   /** One request line; inputs are capped well below this by the CLI itself. */

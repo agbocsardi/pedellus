@@ -182,7 +182,8 @@ a native host process, not under `toolSandbox: "bwrap"`. In an authenticated map
 ordinary chat the assistant can directly add or update a server entry, start an
 OAuth login, log out, or remove an entry; there is no proposal record and no
 `/mcp approve` gate. An OAuth authorization link is delivered directly to the
-initiating CLI attachment or Telegram chat, and the owner can finish on another
+initiating CLI attachment or Telegram chat (login refuses ambiguous shared CLI
+attachments), and the owner can finish on another
 device by pasting the callback URL back into that same chat. A completed login or
 a configuration change connects/retires the affected server and refreshes tools
 without a restart. Writes keep serialized atomic edits, whole-document validation,

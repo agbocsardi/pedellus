@@ -25,7 +25,10 @@ delivery failure cancels the attempt, config edits refuse a changed file, a
 login works on a staged grant, and callback values never enter a model result
 or transcript). The scope is channel-neutral: the active foreground channel
 (attached CLI or authenticated Telegram chat) receives its own link and consumes
-its own pasted callback; nothing is broadcast to another attachment. All
+its own pasted callback; nothing is broadcast to another attachment. Login refuses
+when multiple CLI attachments share the same conversation: close the extra attachment
+or use distinct named conversations. An active login is pinned to its original surface;
+a replacement attachment cannot submit its callback or receive its completion. All
 coverage is offline and synthetic: no live MCP server, provider, credential or
 production data has been used, and no real OAuth provider has been contacted.
 The management/OAuth slice is verified against loopback fixture servers and a
@@ -407,7 +410,9 @@ unconstrained object so declarations stay bounded and the tool stays callable.
 
 With no MCP server and no explicit `codemode.enabled`, the gateway installs no
 Code Mode. An independent `codemode.enabled: true` applies on its own; the
-legacy tie installs Code Mode once a live `add` first brings an enabled server.
+legacy tie installs Code Mode once a live `add` first brings an enabled server,
+and retires it when the last enabled server is removed or disabled. An explicit
+`codemode.enabled: true` keeps its independent compositor.
 See [CODEMODE.md](./CODEMODE.md) for the native bundle's contract, budgets and
 replay semantics.
 

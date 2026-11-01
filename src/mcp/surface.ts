@@ -43,7 +43,10 @@ export function createMcpSurfaceRegistry(): McpSurfaceRegistry {
       };
     },
     surfaceFor(sessionKey) {
-      return hosts.find((host) => host.owns(sessionKey));
+      const matches = hosts.filter((host) => host.owns(sessionKey));
+      // A conversation may have several CLI attachments. Never guess which one initiated
+      // a turn: ambiguous ownership refuses login instead of leaking its link to a sibling.
+      return matches.length === 1 ? matches[0] : undefined;
     },
   };
 }

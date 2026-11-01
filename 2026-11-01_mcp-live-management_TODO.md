@@ -31,6 +31,14 @@ owner pastes the callback back there, and tools become callable without a gatewa
 - [x] Run typecheck/build, relevant behavior suites, execution checks and core acceptance; report
       actual results and commit with a why-oriented message for independent review.
 
+- [x] Address independent review: refuse ambiguous CLI attachment ownership, pin active
+      surface identity, retire implicit Code Mode, distinguish policy-refresh failure and
+      keep OAuth login available after partial activation, bump local protocol version.
+- [x] Cover real double CLI attach, replacement-surface callback refusal, identical MCP
+      re-add after worker revocation, and implicit Code Mode retirement.
+- [ ] Fresh independent review of the revised diff and integration with current main.
+- [ ] Merge only after clean review; live deployment remains a separate owner action.
+
 ## Session log
 
 ### 2026-11-01
@@ -57,8 +65,19 @@ owner pastes the callback back there, and tools become callable without a gatewa
   ingress and read-only `/mcp`.
 - Documentation updated: `MCP.md`, `README.md`, `CLI.md`, `TELEGRAM.md`,
   `TOOLS.md`, `CODEMODE.md` and the AGENTS invariants.
-- Checks run: `npm run typecheck`, `npm run build`, the full
+- Initial implementation checks run: `npm run typecheck`, `npm run build`, the full
   `npm run test:behavior` suite (371/371 pass), `npm run test:execution`
   (2/2 pass) and `npm run --silent test:core-acceptance` (83/83 checks pass in
   offline-synthetic mode; 34/34 budget guard). No live provider, real MCP
   server, credential or production data was contacted.
+- Independent review found ambiguous shared CLI attachment routing plus implicit Code
+  Mode retirement and partial activation reporting defects. Fixes refuse ambiguous
+  login (close sibling attachment or use named conversations), pin original surface
+  identity through callback/completion, retire implicit Code Mode when no enabled
+  MCP entries remain, and keep browser login available after a tool-policy refresh
+  failure without misreporting it as a connection failure. Callback-shaped input is
+  now suppressed even on hosts without management, and local protocol is version 2.
+- Added regression checks using real simultaneous local clients, replacement-surface
+  refusal, implicit compositor retirement, a synthetic policy refresh failure, and
+  same-name server re-add after durable worker capture pruning. Focused MCP suite:
+  10/10 passed after separating independent Code Mode in the worker fixture.

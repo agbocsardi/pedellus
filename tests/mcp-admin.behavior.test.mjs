@@ -18,6 +18,7 @@ const [
     hasMcpOAuthTokens,
     FileMcpOAuthStateStore,
     MCP_ADMIN_TOOL_NAME,
+    createMcpAdmin,
     adoptMcpOAuthRefresh,
     commitMcpOAuthState,
     mcpOAuthGrantEpoch,
@@ -320,8 +321,78 @@ test('direct add and remove manage the live gateway with no proposal or approval
     const afterRemove = await chat.agent(context);
     assert.ok(!callableNames(afterRemove).some((name) => name.startsWith('mcp__synthetic__')));
     assert.ok(!deferredNames(afterRemove).some((name) => name.startsWith('mcp__synthetic__')));
+    assert.ok(!toolNames(afterRemove).includes('codemode'), 'last removal retires implicit Code Mode');
+    assert.ok(!toolNames(afterRemove).includes('tool_search'), 'last removal retires implicit discovery');
   } finally {
     if (gateway) await gateway.close(context);
+    await env.cleanup();
+  }
+});
+
+test('policy refresh failure after applying an OAuth entry still delivers its login link', { timeout: 60_000 }, async () => {
+  const env = await store('policy-refresh');
+  const mcp = await startOAuthMcp();
+  const { createMcpSurfaceRegistry } = await import(join(testRoot, 'dist/mcp/surface.js'));
+  const surfaces = createMcpSurfaceRegistry();
+  const surface = attachOwnerSurface({ mcpSurfaces: surfaces }, 'cli:refresh');
+  let config;
+  const admin = createMcpAdmin({
+    context, edit: { configFile: env.configFile, workspace: env.workspace }, dataDir: env.dataDir,
+    config: () => config,
+    applyConfig: async (next) => { config = next; throw new Error('synthetic policy failure'); },
+    reconnect: async () => {},
+    servers: () => [{ name: 'remote', state: 'failed', failure: 'auth-required', tools: 0 }],
+    sessionKeyFor: () => 'cli:refresh', surfaces, isAuthorizedChat: () => true,
+  });
+  try {
+    const tool = admin.extension.tools.find((entry) => entry.name === MCP_ADMIN_TOOL_NAME);
+    const result = await tool.execute({
+      action: 'add', name: 'remote', server: { url: mcp.url, oauth: true },
+    }, { conversationId: 123 }, context);
+    const text = result.output.map((part) => part.text ?? '').join('');
+    assert.match(text, /tool-policy refresh did not complete/);
+    assert.doesNotMatch(text, /fixed connection failure/);
+    assert.equal(surface.delivered.length, 1, 'refresh failure does not suppress browser consent');
+  } finally {
+    await admin.close();
+    surface.detach();
+    await mcp.close();
+    await env.cleanup();
+  }
+});
+
+test('a replacement owner attachment cannot submit or receive an earlier login', { timeout: 60_000 }, async () => {
+  const env = await store('replaced-surface');
+  const mcp = await startOAuthMcp();
+  const { faux, models } = env.models();
+  const key = 'cli:replace';
+  faux.setResponses([
+    call(MCP_ADMIN_TOOL_NAME, { action: 'add', name: 'remote', server: { url: mcp.url, oauth: true } }, 'replace-add'),
+    final('login started'),
+  ]);
+  let gateway;
+  let first;
+  let replacement;
+  try {
+    gateway = await openGateway(await env.configFromFile(), context, { models });
+    const chat = await gateway.conversationFor(key, context);
+    first = attachOwnerSurface(gateway, key);
+    await say(chat, 'log in');
+    const callback = await callbackFromAuthorization(first.delivered[0].url);
+    first.detach();
+    replacement = attachOwnerSurface(gateway, key);
+    assert.equal((await gateway.mcpAdmin.submitCallback(key, callback, context)).accepted, false);
+    // A real browser can still reach the callback, but its outcome must not drift to the replacement.
+    assert.equal((await fetch(callback)).status, 200);
+    await until(() => gateway.mcp.servers.find((server) => server.name === 'remote')?.state === 'connected',
+      'same-host login completion after detach');
+    assert.equal(first.notices.length, 0);
+    assert.equal(replacement.notices.length, 0);
+  } finally {
+    first?.detach();
+    replacement?.detach();
+    if (gateway) await gateway.close(context);
+    await mcp.close();
     await env.cleanup();
   }
 });
@@ -371,6 +442,13 @@ test('an OAuth login link goes only to the initiating surface, a pasted callback
     assert.equal(cross.handled, true);
     assert.equal(cross.accepted, false, 'a callback from another chat is refused');
 
+    const sibling = attachOwnerSurface(gateway, chatKey);
+    try {
+      assert.equal((await admin.submitCallback(chatKey, callback, context)).accepted, false,
+        'ambiguous same-session attachment cannot submit the active callback');
+    } finally {
+      sibling.detach();
+    }
     const accepted = await admin.submitCallback(chatKey, callback, context);
     assert.equal(accepted.handled, true);
     assert.equal(accepted.accepted, true, accepted.text);
@@ -560,6 +638,10 @@ test('removing an MCP server prunes a live worker capture and retires its nested
         }, { id: 'worker-start' }),
       ], { stopReason: 'toolUse' });
     }
+    if (input.includes('re-add the server') && !issued.has('re-add')) {
+      issued.add('re-add');
+      return call(MCP_ADMIN_TOOL_NAME, { action: 'add', name: 'synthetic', server: stdioServer(env.workspace) }, 'worker-re-add');
+    }
     if (input.includes('remove the server') && !issued.has('remove')) {
       issued.add('remove');
       return fauxAssistantMessage([
@@ -577,6 +659,7 @@ test('removing an MCP server prunes a live worker capture and retires its nested
       toolAllowlist: [],
       mcp: { enabled: true, servers: { synthetic: stdioServer(env.workspace) } },
       workers: { enabled: true },
+      codemode: { enabled: true },
     }, null, 2)}\n`);
     gateway = await openGateway(await env.configFromFile(), context, { models });
     const chat = await gateway.conversationFor('telegram:7:chat:926', context);
@@ -603,6 +686,13 @@ test('removing an MCP server prunes a live worker capture and retires its nested
     const childAgent = await child.agent(context);
     assert.ok(!callableNames(childAgent).some((name) => name.startsWith('mcp__synthetic__')),
       'the live worker cannot call or compose a removed MCP tool');
+
+    await say(chat, 're-add the server');
+    const readded = await gateway.harness.snapshot(ConfigToolCaptureDoc, childConversationId, context);
+    assert.ok(!readded.tools.some((name) => name.startsWith('mcp__synthetic__')),
+      're-adding identical registration names never resurrects the pruned worker capture');
+    assert.ok(!callableNames(await child.agent(context)).some((name) => name.startsWith('mcp__synthetic__')));
+    assert.ok(callableNames(await chat.agent(context)).some((name) => name.startsWith('mcp__synthetic__')));
 
     releaseChild.resolve();
     await until(async () => {

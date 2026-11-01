@@ -21,7 +21,7 @@ import {
 } from "./login.js";
 import { FileMcpOAuthStateStore, mcpOAuthStatePath } from "./oauth-store.js";
 import { MissingEnvironmentError, type McpServerStatus } from "./server.js";
-import { looksLikeOAuthCallback, type McpSurfaceRegistry } from "./surface.js";
+import { looksLikeOAuthCallback, type McpOwnerSurface, type McpSurfaceRegistry } from "./surface.js";
 
 /**
  * Direct, explicitly owner-authorized MCP management.
@@ -125,6 +125,7 @@ interface ActiveLogin {
   readonly requestId: string;
   readonly name: string;
   readonly sessionKey: string;
+  readonly surface: McpOwnerSurface;
   readonly run: McpLoginRun;
   readonly abort: AbortController;
   submitted: boolean;
@@ -321,7 +322,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
     if (surface === undefined) {
       return {
         ok: false,
-        text: `No authenticated owner surface is attached to this chat, so the one-time authorization URL ` +
+        text: `No unique authenticated owner surface is attached to this chat (attach only one CLI per conversation), so the one-time authorization URL ` +
           `for "${name}" could not be delivered. No login was started.`,
       };
     }
@@ -373,7 +374,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
       };
     }
     const requestId = randomBytes(8).toString("hex");
-    const attempt: ActiveLogin = { requestId, name, sessionKey, run, abort, submitted: false };
+    const attempt: ActiveLogin = { requestId, name, sessionKey, surface, run, abort, submitted: false };
     active = attempt;
     try {
       await surface.deliverAuthorization(sessionKey, {
@@ -403,9 +404,11 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
           reconnectFailed = true;
         }
       }
-      const current = options.surfaces.surfaceFor(sessionKey);
-      await current?.deliverNotice(sessionKey, loginOutcomeText(name, outcome, reconnectFailed), options.context)
-        .catch(() => undefined);
+      // Pin the original attachment. A detach must not redirect the outcome to its replacement.
+      if (options.surfaces.surfaceFor(sessionKey) === surface) {
+        await surface.deliverNotice(sessionKey, loginOutcomeText(name, outcome, reconnectFailed), options.context)
+          .catch(() => undefined);
+      }
     }).catch(() => undefined);
     return { ok: true, text: loginStartText(name) };
   };
@@ -441,27 +444,33 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
         text: `Configuration not written: ${error instanceof Error ? error.message : "the write failed"}.`,
       };
     }
+    let refreshWarning = "";
     try {
       await options.applyConfig(written.config);
     } catch {
-      return {
-        ok: true,
-        text: `Server "${name}" was written to the configuration file, but live activation failed. ` +
-          "Its status reports a fixed connection failure; a later management action can retry it.",
-      };
+      refreshWarning = "The live tool-policy refresh did not complete; tool availability is not confirmed. ";
+      if (currentConfig() !== written.config) {
+        return {
+          ok: true,
+          text: `Server "${name}" was written to the configuration file, but live activation did not complete. ` +
+            "A later management action can retry it; no connection outcome is inferred from this failure.",
+        };
+      }
+      // The integration has applied the entry; a later policy-refresh failure must not
+      // suppress browser authorization for an OAuth server that still needs it.
     }
     const live = options.servers().find((server) => server.name === name);
     if (mcpServerEnabled(parsed) && "url" in parsed && parsed.oauth === true && live?.state !== "connected") {
       const login = await startLogin(sessionKey, name, parsed);
       return {
         ok: login.ok,
-        text: `Server "${name}" was written to the configuration file and the gateway now reflects it. ${login.text}`,
+        text: `Server "${name}" was written to the configuration file and the gateway now reflects it. ${refreshWarning}${login.text}`,
       };
     }
     if (!mcpServerEnabled(parsed)) {
       return {
         ok: true,
-        text: `Server "${name}" was written to the configuration file with enabled: false, so it is not ` +
+        text: refreshWarning + `Server "${name}" was written to the configuration file with enabled: false, so it is not ` +
           "connected now. Ask to add or configure it as enabled when it should become active.",
       };
     }
@@ -472,7 +481,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
         : `connection failed: ${live.failure ?? "unknown"}`;
     return {
       ok: true,
-      text: `Server "${name}" was written to the configuration file and activated now: ${state}. ` +
+      text: refreshWarning + `Server "${name}" was written to the configuration file; live status: ${state}. ` +
         (canceledLogin ? "Its earlier waiting login was canceled by this change. " : "") +
         "Authenticated mapped chats receive its tools on their next request; existing worker captures are unchanged.",
     };
@@ -671,7 +680,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
       }
       return serialize(async () => {
         if (active === undefined) return { handled: true, accepted: false, text: CALLBACK_STALE };
-        if (active.sessionKey !== sessionKey) {
+        if (active.sessionKey !== sessionKey || options.surfaces.surfaceFor(sessionKey) !== active.surface) {
           return { handled: true, accepted: false, text: CALLBACK_REJECTED };
         }
         const pasted = callbackUrl(text);

@@ -1293,9 +1293,11 @@ export async function runTerminalConversation(
         io.prompt?.();
         continue;
       }
-      if (io.mcp !== undefined && looksLikeOAuthCallback(line)) {
-        // Handled before submission: a callback is never model input and never a transcript entry.
-        const result = await io.mcp.submitCallback(line);
+      if (looksLikeOAuthCallback(line)) {
+        // Even hosts without management must not admit an expired/foreign credential as input.
+        const result = io.mcp === undefined
+          ? { accepted: false, text: "No MCP login is available in this host; the callback was not stored or sent to the assistant." }
+          : await io.mcp.submitCallback(line);
         await notice(result.text, !result.accepted);
       } else if (leading.startsWith(LITERAL_SLASH_PREFIX)) {
         const prefix = line.indexOf(LITERAL_SLASH_PREFIX);

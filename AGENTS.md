@@ -318,7 +318,9 @@ edits need restart only; unit edits additionally need daemon-reload.
   stale, foreign, cross-chat and replayed callbacks are consumed and refused with
   fixed text, and their code, state, verifier and tokens never reach the model,
   diagnostics or durable channel state. A pasted callback is replayed only to the
-  active loopback listener, never fetched from the pasted host. Completion
+  active loopback listener, never fetched from the pasted host. Multiple CLI attachments
+  sharing a session refuse login rather than guessing the origin; an active attempt
+  stays pinned to its original surface, never a replacement attachment. Completion
   reconnects the server, refreshes registrations/namespaces/policy and sends one
   fixed credential-free notice to the same surface, so tools are callable without
   a restart. A delivery failure cancels the attempt and is not blindly retried.

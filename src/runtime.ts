@@ -2102,6 +2102,17 @@ export async function openGateway(config: PortConfig, context: Context, options:
           registry.install(extension);
           for (const tool of extension.tools ?? []) toolRegistrations.set(tool.name, tool);
         }
+      } else if (codeModeConfig === undefined && !mcpHasEnabledServers(next) && codeModeRef.current !== undefined) {
+        const retired = codeModeRef.current;
+        codeModeRef.current = undefined;
+        retired.stopAdmission();
+        for (const extension of retired.extensions) {
+          registry.uninstall(extension);
+          for (const tool of extension.tools ?? []) toolRegistrations.delete(tool.name);
+        }
+        // Management may itself be nested in this sandbox. Do not wait for our own
+        // execution to exit; admission is closed synchronously and close joins it later.
+        void retired.close().catch(() => undefined);
       } else {
         codeModeRef.current?.updateNamespaces(integration.namespaces);
       }
