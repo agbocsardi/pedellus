@@ -45,7 +45,12 @@ import {
   readEpisodeDocument,
   type HistorySummaryView,
 } from "./history/summary-view.js";
-import { createHistoryTool, HISTORY_TOOL_NAME, type HistoryToolHost } from "./history/tool.js";
+import { createMemoryTools } from "./memory/tools.js";
+import { createMemoryService } from "./memory/service.js";
+import { createNotesBackend } from "./memory/notes.js";
+import { createHistoryBackend } from "./memory/history.js";
+import { MEMORY_TOOL_NAMES, type MemoryService } from "./memory/contracts.js";
+import { loadMemoryContext } from "./context/memory.js";
 import {
   TELEGRAM_TOOL_NAME,
   createTelegramActionRegistry,
@@ -260,11 +265,10 @@ export interface OpenGatewayOptions {
   /** Explicit host-owned context snapshots; absent means no context extension is installed. */
   readonly contextSnapshotProvider?: GatewayContextSnapshotProvider;
   /**
-   * Host switch for the read-only model-facing `history` tool. It is on by default for
-   * mapped chat conversations; pass `false` for a bare gateway that should expose no
-   * extra tool. The tool reads only already-mapped chat conversations under the host's
-   * single-tenant policy, creates no conversation, writes no transcript and grants no
-   * filesystem or shell authority.
+   * Host switch for model-facing approved memory recall. It is on by default for mapped
+   * chats; pass `false` to disable recall too. It reads only approved workspace notes and
+   * already-mapped chat history, creates no conversation, writes no transcript and grants
+   * no filesystem or shell authority.
    */
   readonly agentHistory?: boolean;
   /**
@@ -333,6 +337,10 @@ export interface HistoryEntryPage {
 
 export interface Gateway {
   readonly harness: HarnessType;
+  /** Approved read-only recall over notes and mapped chat history. */
+  memorySearch(caller: ConversationId, query: unknown, context: Context): ReturnType<MemoryService["search"]>;
+  memoryBrowse(caller: ConversationId, query: unknown, context: Context): ReturnType<MemoryService["browse"]>;
+  memoryRead(caller: ConversationId, query: unknown, context: Context): ReturnType<MemoryService["read"]>;
   /**
    * Bounded conversation-to-memory digestion. `start` reads one bounded completed-turn batch from the
    * mapped chat sessions and creates one native Durable task, or reports `idle`, `busy` or `refused`
@@ -994,8 +1002,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const now = () => Date.now();
   // Mirrors the shared policy's config-level default so a host-default timeout reports its duration.
   const defaultTimeoutSeconds = toolTimeoutSeconds ?? 60;
-  // The read-only history tool is on by default; its name is fixed before the tool extension exists so
-  // the coding hook can exempt it from the ceiling like the skill loader.
+  // Recall is enabled by default for mapped chats and shares the existing explicit history opt-out.
   const historyEnabled = options.agentHistory !== false;
   // Telegram interaction is a separate channel capability, not a coding-tool name. It exists only
   // when the channel is configured; the running adapter attaches its host, and the runtime offers
@@ -1077,7 +1084,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           ...(config.configFile === undefined ? [] : [MCP_ADMIN_TOOL_NAME]),
           // History retrieval is read-only over mapped chats and has its own scope checks, so the
           // ceiling must not suppress it when coding tools are enabled.
-          ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
+          ...(historyEnabled ? [...MEMORY_TOOL_NAMES] : []),
           // Web tools are a separate config capability with their own call-time scope hook. They are
           // exempt from the coding ceiling only while that gated extension is actually installed.
           ...(webTool === undefined ? [] : WEB_TOOL_NAMES),
@@ -1124,7 +1131,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ...workerCodingTools,
       ...(skillToolRegistration === undefined ? [] : [SKILL_TOOL_NAME]),
       ...webToolRegistrations.map((tool) => tool.name),
-      ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
+      ...(historyEnabled ? [...MEMORY_TOOL_NAMES] : []),
       ...(codeModeGranted
         ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]
         : []),
@@ -1239,12 +1246,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const skillTool = options.contextSnapshotProvider === undefined ? undefined : createSkillTool();
   const skillToolRegistration = skillTool?.extension.tools?.[0];
   const skillConversations = new Set<ConversationId>();
-  // Read-only prior-conversation retrieval for the assistant. It is not a coding tool: no path, no
-  // shell, no transcript write and no conversation creation. The host surface is late-bound so the
-  // extension can be registered before Harness.open() while the index itself is created afterwards.
-  const historyToolHostRef: { current: HistoryToolHost | undefined } = { current: undefined };
-  const historyTool = historyEnabled ? createHistoryTool({ host: () => historyToolHostRef.current }) : undefined;
-  const historyToolRegistration = historyTool?.extension.tools?.[0];
+  // Approved recall tools are registered before open and late-bind to the gateway-owned service.
+  const memoryServiceRef: { current: MemoryService | undefined } = { current: undefined };
+  const memoryTools = historyEnabled ? createMemoryTools({
+    service: () => memoryServiceRef.current,
+    caller: (conversationId) => historyConversations.has(conversationId) || workerChildConversations.has(conversationId),
+  }) : undefined;
+  const memoryToolRegistrations = memoryTools?.extension.tools ?? [];
   const historyConversations = new Set<ConversationId>();
   // Mapped session keys own their snapshot. A scheduled run's target is tracked separately in
   // insertion order so the cap can drop an idle target instead of failing the run, and never a
@@ -1273,7 +1281,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       selected.push(workerCapabilityExtension);
       if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
       if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
-      if (historyTool !== undefined) selected.push(historyTool.extension);
+      if (memoryTools !== undefined) selected.push(memoryTools.extension);
       if (webTool !== undefined) selected.push(webTool.extension);
     }
     // A live digest target keeps its narrowing path hook across a reopen. The hook grants nothing;
@@ -1285,7 +1293,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (skillTool && contextConversations.has(conversationId) && skillConversations.has(conversationId)) {
       selected.push(skillTool.extension);
     }
-    if (historyTool && historyConversations.has(conversationId)) selected.push(historyTool.extension);
+    if (memoryTools && historyConversations.has(conversationId)) selected.push(memoryTools.extension);
     if (webTool && webConversations.has(conversationId)) selected.push(webTool.extension);
     if (telegramTool && telegramChatConversations.has(conversationId)) selected.push(telegramTool.extension);
     if (cronFoundation && cronTool && cronOwners.has(conversationId)) {
@@ -1295,8 +1303,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     return { extensions: selected };
   };
   const toolRegistrations = new Map<string, ToolRegistration>(
-    [...(toolExtension?.tools ?? []), ...webToolRegistrations,
-      ...(historyToolRegistration === undefined ? [] : [historyToolRegistration]),
+    [...(toolExtension?.tools ?? []), ...webToolRegistrations, ...memoryToolRegistrations,
       ...(skillToolRegistration === undefined ? [] : [skillToolRegistration])]
       .map((tool) => [tool.name, tool]),
   );
@@ -1603,7 +1610,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (codeModeRef.current !== undefined) extensions.push(...codeModeRef.current.extensions);
           if (mcpRef.current !== undefined) extensions.push(mcpRef.current.extension);
           if (webTool !== undefined) extensions.push(webTool.extension);
-          if (historyTool !== undefined) extensions.push(historyTool.extension);
+          if (memoryTools !== undefined) extensions.push(memoryTools.extension);
           extensions.push(workerCapabilityExtension);
           const workerChoice = choicesByNative.get(modelKey(input.model));
           await configure(tx, target, {
@@ -1760,10 +1767,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const cronTools = cronToolRegistration !== undefined && cronOwners.has(conversationId)
       ? [cronToolRegistration]
       : [];
-    // History is read-only over mapped chats; ordinary workers may capture the retrieval tool too.
-    const historyTools = historyToolRegistration !== undefined
+    // Recall is read-only over mapped chats; workers need explicit captures for each tool.
+    const memoryToolsForConversation = historyEnabled
       && (historyConversations.has(conversationId) || workerChildConversations.has(conversationId))
-      ? [historyToolRegistration]
+      ? memoryToolRegistrations
       : [];
     // Telegram interaction is a scoped channel capability for one mapped private chat, not a coding
     // tool. The live adapter rechecks the current allowlist and observed target at call time.
@@ -1782,7 +1789,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const mcpAdminTools = mcpAdminRef.current !== undefined && authorizedChatConversations.has(conversationId)
       ? [...(mcpAdminRef.current.extension.tools ?? [])]
       : [];
-    return [...skillTools, ...cronTools, ...historyTools, ...telegramTools, ...webTools, ...workerTools, ...mcpAdminTools];
+    return [...skillTools, ...cronTools, ...memoryToolsForConversation, ...telegramTools, ...webTools, ...workerTools, ...mcpAdminTools];
   };
   /**
    * The authority-derived tool filter. The host ceiling directly authorizes authenticated mapped
@@ -2085,7 +2092,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       for (const extension of codeModeRef.current.extensions) registry.install(extension);
     }
     if (skillTool) registry.install(skillTool.extension);
-    if (historyTool) registry.install(historyTool.extension);
+    if (memoryTools) registry.install(memoryTools.extension);
     if (telegramTool) registry.install(telegramTool.extension);
     if (webTool) registry.install(webTool.extension);
     if (cronFoundation) registry.install(cronFoundation.extension);
@@ -2235,6 +2242,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       conversationId: ConversationId,
       startEntryId: EntryId,
       ctx: Context,
+      fullText = false,
     ): Promise<HistorySummaryView> {
       let episode: unknown;
       try {
@@ -2259,7 +2267,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       } catch {
         return { state: "unreadable" };
       }
-      return normalizeReadySummary(classified.body, record, classified.version);
+      return normalizeReadySummary(classified.body, record, classified.version, { fullText });
     }
 
     // Derived, rebuildable search index. Its file is separate from Durable's store, and every Durable
@@ -2288,6 +2296,53 @@ export async function openGateway(config: PortConfig, context: Context, options:
       readSummary: (ctx, conversationId, startEntryId) =>
         readEpisodeSummary(conversationId, startEntryId, ctx),
     });
+    const memoryHost = {
+      async scope(caller: ConversationId, ctx: Context) {
+        const worker = workerChildConversations.has(caller);
+        if (!historyConversations.has(caller) && !worker) throw new Error("Memory recall is unavailable in this conversation");
+        const mapped = await mappedChatSessions(ctx);
+        let workspaceRoot = workspace;
+        if (worker) {
+          const capture = await harness!.snapshot(ConfigToolCaptureDoc, caller, ctx);
+          if (capture === undefined || !authorizedChatConversations.has(capture.originConversationId as ConversationId)
+            || !mapped.some((session) => session.conversationId === capture.originConversationId)) {
+            throw new Error("Worker memory recall is outside its live captured authority");
+          }
+          workspaceRoot = workerWorkspaceRoots.get(caller) ?? workspace;
+        } else if (!mapped.some((session) => session.conversationId === caller)) {
+          throw new Error("Memory recall is unavailable in this conversation");
+        }
+        const sessions = mapped.map((session) => ({
+          sessionKey: session.sessionKey,
+          conversationId: session.conversationId,
+          channel: session.sessionKey.split(":", 1)[0] ?? null,
+        }));
+        const memory = await loadMemoryContext({
+          workspaceRoot,
+          loadedFiles: workspaceRoot === workspace ? config.workspaceContext?.memoryFiles ?? [] : [],
+        });
+        return {
+          storeId: storeIdentity.storeId,
+          workspaceRoot,
+          memoryFiles: memory.entries.map((entry) => entry.path),
+          sessions,
+        };
+      },
+      async entries(session: string, query: HistoryEntryQuery, limit: number, cursor: Cursor | undefined, ctx: Context) {
+        await mappedChatConversationFor(session, ctx);
+        return gateway.historyEntries(session, query, limit, cursor, ctx);
+      },
+      async summary(session: string, episodeStart: number, ctx: Context) {
+        const conversation = await mappedChatConversationFor(session, ctx);
+        return readEpisodeSummary(conversation.id, episodeStart as EntryId, ctx, true);
+      },
+      search: (query: HistoryQuery, ctx: Context) => gateway.historySearch(query, ctx),
+      searchSummaries: (query: HistorySummaryQuery, ctx: Context) => gateway.historySummarySearch(query, ctx),
+    };
+    const memoryService = historyEnabled ? createMemoryService(memoryHost, {
+      notes: createNotesBackend(),
+      history: createHistoryBackend(memoryHost),
+    }) : undefined;
 
     // At the snapshot cap, drop the oldest installed background target that is not running and not a
     // mapped session. Without an evictable target the builder's RangeError stays the last resort.
@@ -2542,13 +2597,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // History retrieval is independent of the context snapshot opt-in: every mapped chat
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
-    const initialMapping = historyTool === undefined && !toolsEnabled && telegramTool === undefined && !workersEnabled
+    const initialMapping = memoryTools === undefined && !toolsEnabled && telegramTool === undefined && !workersEnabled
       && webTool === undefined && !mcpConfigured && !codeModeEnabled && mcpAdminRef.current === undefined
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
     if (initialMapping !== undefined) {
       for (const { sessionKey, conversationId } of await mappedChatSessions(context)) {
-        if (historyTool !== undefined) historyConversations.add(conversationId);
+        if (memoryTools !== undefined) historyConversations.add(conversationId);
         authorizedChatConversations.add(conversationId);
         if (webTool !== undefined) webConversations.add(conversationId);
         sessionKeyForConversation.set(conversationId, sessionKey);
@@ -3262,6 +3317,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     };
     const gateway: Gateway = {
       harness,
+      memorySearch: (caller, query, ctx) => memoryServiceRef.current!.search(caller, query, ctx),
+      memoryBrowse: (caller, query, ctx) => memoryServiceRef.current!.browse(caller, query, ctx),
+      memoryRead: (caller, query, ctx) => memoryServiceRef.current!.read(caller, query, ctx),
       memoryDigest: {
         start: (writer, ctx) => memoryDigest.start(writer, ctx),
         status: (writer, ctx) => memoryDigest.status(writer, ctx),
@@ -3563,15 +3621,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
           finally {
             try { await mcpRef.current?.close(); }
             finally {
-              try { await historyIndex?.close(); }
+              try { memoryServiceRef.current?.close(); }
               finally {
-                try {
-                  for (const environments of workerEnvironments.values()) {
-                    await environments.close(cleanup).catch(() => undefined);
-                  }
-                  workerEnvironments.clear();
-                  await toolEnvironments?.close(cleanup);
-                } finally { await releaseLock(); }
+                try { await historyIndex?.close(); }
+                finally {
+                  try {
+                    for (const environments of workerEnvironments.values()) {
+                      await environments.close(cleanup).catch(() => undefined);
+                    }
+                    workerEnvironments.clear();
+                    await toolEnvironments?.close(cleanup);
+                  } finally { await releaseLock(); }
+                }
               }
             }
           }
@@ -3753,14 +3814,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
     }
     // Scheduling begins only after registry and all persisted conversation policies are ready.
-    historyToolHostRef.current = historyTool === undefined ? undefined : {
-      search: (query, ctx) => gateway.historySearch(query, ctx),
-      summaries: (query, ctx) => gateway.historySummarySearch(query, ctx),
-      summary: (sessionKey, startEntryId, ctx) => gateway.historySummary(sessionKey, startEntryId, ctx),
-      entries: (sessionKey, query, limit, cursor, ctx) => gateway.historyEntries(sessionKey, query, limit, cursor, ctx),
-      listEpisodes: (sessionKey, query, ctx) => gateway.listHistoryEpisodes(sessionKey, query, ctx),
-      episode: (sessionKey, startEntryId, ctx) => gateway.historyEpisode(sessionKey, startEntryId, ctx),
-    };
+    memoryServiceRef.current = memoryService;
     harness.resume();
     // A worker that finished while the process was gone already committed its outcome and retired its
     // authority, but may not have admitted the internal result event. Re-admitting is idempotent by the

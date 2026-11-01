@@ -62,7 +62,7 @@ export function boundedCapturedTools(
  * scheduled run's target may use only its captured names while its recorded origin is still an
  * authenticated mapped chat. Anything else (the root, a channel-state conversation, a fork, a raw
  * or task-owned conversation without a valid capture) is denied, so agent state that still names a
- * removed tool can never call it. `contextTools` (skill, cron, history) are exempt because they
+ * removed tool can never call it. `contextTools` (skill, cron, memory recall) are exempt because they
  * carry no filesystem or shell authority. `delegatedTools` names a separate authority whose own
  * call-time hook is selected in the same conversations (MCP server tools and the Code Mode/tool
  * search tools that reach them); they are exempt here but never unguarded: the delegating

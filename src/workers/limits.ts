@@ -46,7 +46,7 @@ export const WORKER_LIMITS = Object.freeze({
 
 /** Worker-specific grants. `mcp` expands to connected tools; exact MCP registration names also work. */
 export const WORKER_TOOL_GRANTS = Object.freeze([
-  "read", "write", "edit", "bash", "skill", "history",
+  "read", "write", "edit", "bash", "skill", "memory_search", "memory_browse", "memory_read",
   "web_search", "web_fetch", "codemode", "tool_search", "mcp",
 ] as const);
 

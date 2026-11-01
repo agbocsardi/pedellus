@@ -142,6 +142,7 @@ export function normalizeReadySummary(
   body: HistoryEpisodeSummaryBody,
   record: unknown,
   version: number,
+  options: { readonly fullText?: boolean } = {},
 ): HistorySummaryView {
   if (record === undefined || record === null) return { state: "missing" };
   if (!isRecord(record)) return REFUSED;
@@ -162,9 +163,9 @@ export function normalizeReadySummary(
   if (rawTitle !== null && typeof rawTitle !== "string") return REFUSED;
   const coverage = isRecord(record.coverage) ? record.coverage : undefined;
   const text = record.summary;
-  const bounded = text.length > HISTORY_SUMMARY_READ_LIMITS.maxSummaryChars
-    ? text.slice(0, HISTORY_SUMMARY_READ_LIMITS.maxSummaryChars)
-    : text;
+  const bounded = options.fullText === true || text.length <= HISTORY_SUMMARY_READ_LIMITS.maxSummaryChars
+    ? text
+    : text.slice(0, HISTORY_SUMMARY_READ_LIMITS.maxSummaryChars);
   const title = rawTitle === null || rawTitle.length === 0
     ? null
     : rawTitle.length > HISTORY_SUMMARY_READ_LIMITS.maxTitleChars
