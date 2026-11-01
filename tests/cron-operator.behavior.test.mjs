@@ -283,7 +283,12 @@ test("operator reads attach to no chat and listings have compact reachable pages
   assert.equal(new Set([...first.jobs, ...second.jobs].map((job) => job.id)).size, 101);
   const output = capture();
   await runCronCommand({ client, command: { kind: "list" }, output: output.output, context });
+  assert.match(output.text(), /100 cron jobs in 1 chat on this page \(101 total\):/);
   assert.match(output.text(), /Next page: durable-nanobot cron list --offset 100/);
+  const pastEnd = capture();
+  await runCronCommand({ client, command: { kind: "list", offset: 200 }, output: pastEnd.output, context });
+  assert.match(pastEnd.text(), /No jobs at this offset; 101 total/);
+  assert.doesNotMatch(pastEnd.text(), /No scheduled jobs/);
   assert.deepEqual(parseCronInvocation(["list", "--offset", "100"]).command, { kind: "list", offset: 100 });
 });
 

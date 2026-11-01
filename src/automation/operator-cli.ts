@@ -185,8 +185,9 @@ export function renderCronList(listing: CronOperatorListing): string {
   const { jobs, origins } = listing;
   const chats = new Set(jobs.map((job) => job.origin)).size;
   const heading = jobs.length === 0
-    ? "No scheduled jobs."
-    : `${jobs.length} cron ${jobs.length === 1 ? "job" : "jobs"} in ${chats} ${chats === 1 ? "chat" : "chats"}:`;
+    ? (listing.total === 0 ? "No scheduled jobs." : `No jobs at this offset; ${listing.total} total. Run cron list to start again.`)
+    : `${jobs.length} cron ${jobs.length === 1 ? "job" : "jobs"} in ${chats} ${chats === 1 ? "chat" : "chats"}` +
+      (listing.total > jobs.length ? ` on this page (${listing.total} total):` : ":");
   return [
     heading,
     ...jobs.map(jobLine),

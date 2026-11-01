@@ -787,7 +787,7 @@ conversation ID or an unmapped key on the wire refused while the host derives th
 identical retry deduping to the same job with no second timer; a conflicting payload under the same
 key refused with the record unchanged; a cancelled original reported and never re-armed by an
 identical replay; exact-ID cancellation of another chat's job; `already_terminal` and `not_found`
-results; an operator-created one-shot that actually fires in its origin chat, settles `ok` and makes
-exactly one model request; the CLI's create/list/show rendering and a spawned `durable-nanobot cron`
-process; and closing the server before a cancel, asserted to produce the CLI's unknown-outcome text
+results; compact paginated listings and read-only operator connections that create no chat;
+the CLI's create/list/show rendering and a spawned `durable-nanobot cron` process; and closing
+the server before a cancel, asserted to produce the CLI's unknown-outcome text
 instead of a claimed failure or a claimed cancellation.
