@@ -25,9 +25,12 @@ never reaches it. `message.text` (not a caption) is classified:
   adapter advertises depends on what the host really exposes (see
   [Host capability and the native menu](#host-capability-and-the-native-menu)).
   A typed command the host cannot perform is refused with fixed text and is
-  never sent to the assistant. The refusal is the catalogue's, derived from the
-  same reason and the same echo rule `/help <name>` uses, so the two cannot
-  drift.
+  never sent to the assistant. A control this host does not implement gets its
+  own fixed capability notice, which adds what the catalogue reason cannot: the
+  missing host surface (for example "opened without an on-disk configuration
+  file"), and for `/digest` that nothing was started. `/help <name>` for a name
+  this host does not offer, and any unknown name, gets the catalogue's reason
+  and echo rule instead.
 - Matching is an exact leading command token (case-insensitive). `/new`,
   `/abort`, `/stop`, `/status` and `/restart` take no arguments; `/model` takes
   one configured preset name or `default`; `/digest` takes nothing or the literal
@@ -44,9 +47,12 @@ never reaches it. `message.text` (not a caption) is classified:
   command attempt, not assistant text: it is refused with a bounded notice that
   names that command's own no-mention form instead of denying a command this
   chat offers.
-- Any other leading slash command gets a bounded notice naming the controls this
+- Any other leading slash command token — a run of letters, digits and `_` —
+  gets a bounded notice naming the controls this
   host implements and is **not** sent to the assistant. `/prose` is therefore not
-  a prompt; `//prose` sends `/prose` literally as assistant input.
+  a prompt; `//prose` sends `/prose` literally as assistant input. A leading
+  slash line that does not match that token shape (for example `/foo-bar` or a
+  bare `/`) is assistant text.
 - Everything else, including plain text and `/new` inside a sentence, is
   ordinary assistant input.
 
@@ -416,11 +422,15 @@ and leaves typed commands working; no unimplemented command is advertised.
 
 The menu and `/help` are both rendered from the one slash-command catalogue
 (filtered to the names this host can perform), so a menu entry, a listing line and
-a typed command cannot drift. `/help` carries the listing, one line for commands
-this host lacks, and one short limits line; per-command usage and detail stay on
-`/help <command>` and the whole notice stays inside the bounded notice limit. A
-typed command outside the host's set is refused with fixed text instead of a
-silent failure:
+the catalogue's own refusals cannot drift. A typed control outside the host's set
+keeps its reason-specific capability notice, which says which host surface is
+missing (and for `/digest`, that nothing was started); `/help <name>` gives the
+catalogue's shorter reason instead. The two answer different questions and are
+allowed to differ, and both are fixed text. `/help` carries the listing, one line
+for commands this host lacks, and one short limits line; per-command usage and
+detail stay on `/help <command>` and the whole notice stays inside the bounded
+notice limit. A typed command outside the host's set is refused with fixed text
+instead of a silent failure:
 
 - `/new`, `/abort` (with the `/stop` alias) and `/help` are always implemented.
 - `/status` and `/model` need the host model catalog; `/model` also needs preset

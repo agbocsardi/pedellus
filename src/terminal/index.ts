@@ -656,6 +656,16 @@ export async function runTerminalConversation(
   };
 
   /**
+   * A capability host the offer set already admitted. Availability is decided once, in
+   * `offeredCommands`; this narrows the optional field for the handler and fails loudly instead of
+   * repeating the refusal whenever the two disagree.
+   */
+  const offeredHost = <T>(host: T | undefined): T => {
+    if (host === undefined) throw new Error("offered conversation command has no host");
+    return host;
+  };
+
+  /**
    * One refusal for a typed slash command this host does not run: the same catalogue reason
    * `/help <command>` gives, the guarantee that it never reaches the model, and the `//` literal
    * escape for a name the catalogue does not know.
@@ -664,7 +674,11 @@ export async function runTerminalConversation(
     const literal = findConversationCommand(name) === undefined && SAFE_COMMAND_NAME.test(name)
       ? ` Use //${name} to send it literally.`
       : "";
-    await notice(`${conversationCommandRefusal("cli", name, offeredCommands())} It was not sent to the model.${literal}`, true);
+    // A host without model selection cannot change the model, but `/status` can still name it.
+    const currentModel = name === "model" && io.modelSelection === undefined
+      ? ` Current model: ${modelLabel((await conversation.status(operationContext)).model)}.`
+      : "";
+    await notice(`${conversationCommandRefusal("cli", name, offeredCommands())} It was not sent to the model.${currentModel}${literal}`, true);
   };
 
   const showHistory = async (rawCount: string): Promise<void> => {
@@ -706,8 +720,7 @@ export async function runTerminalConversation(
   };
 
   const showSearch = async (args: string): Promise<void> => {
-    const host = io.history;
-    if (!host) { await refuseTypedCommand("search"); return; }
+    const host = offeredHost(io.history);
     const parsed = parseSearchArguments(args);
     if (parsed.kind === "usage") {
       await notice(SEARCH_USAGE, true);
@@ -780,8 +793,7 @@ export async function runTerminalConversation(
   };
 
   const showEpisodes = async (args: string): Promise<void> => {
-    const host = io.history;
-    if (!host) { await refuseTypedCommand("episodes"); return; }
+    const host = offeredHost(io.history);
     const parsed = parseEpisodesArguments(args);
     if (parsed.kind === "usage") {
       await notice(EPISODES_USAGE, true);
@@ -824,8 +836,7 @@ export async function runTerminalConversation(
   };
 
   const showEpisode = async (args: string): Promise<void> => {
-    const host = io.history;
-    if (!host) { await refuseTypedCommand("episode"); return; }
+    const host = offeredHost(io.history);
     const parsed = parseEpisodeArguments(args);
     if (parsed.kind === "usage") {
       await notice(EPISODE_USAGE, true);
@@ -909,7 +920,8 @@ export async function runTerminalConversation(
     }
     const sessionKey = parsed.session ?? host?.defaultSession ?? "cli:default";
     if (parsed.session !== undefined && host === undefined) {
-      await notice("Cross-session entry browsing is host-controlled and unavailable here.", true);
+      // `/entry` itself is offered without a history host; only cross-session browsing needs one.
+      await notice("Cross-session entry browsing needs the host history surface, which this host does not expose.", true);
       return;
     }
     if (host === undefined && sessionKey !== "cli:default") {
@@ -951,8 +963,7 @@ export async function runTerminalConversation(
   };
 
   const showModel = async (args: string): Promise<void> => {
-    const host = io.modelSelection;
-    if (!host) { await refuseTypedCommand("model"); return; }
+    const host = offeredHost(io.modelSelection);
 
     const parts = args.trim() ? args.trim().split(/\s+/) : [];
     if (parts.length === 0) {
@@ -1026,8 +1037,7 @@ export async function runTerminalConversation(
 
   const refreshContext = async (args: string): Promise<void> => {
     if (args.trim()) { await notice(conversationCommandUsage("refresh"), true); return; }
-    const host = io.contextRefresh;
-    if (!host || !host.available) { await refuseTypedCommand("refresh"); return; }
+    const host = offeredHost(io.contextRefresh);
     let skills: number;
     try {
       ({ skills } = await host.refresh());
@@ -1047,8 +1057,7 @@ export async function runTerminalConversation(
 
   const showTools = async (args: string): Promise<void> => {
     if (args.trim()) { await notice(conversationCommandUsage("tools"), true); return; }
-    const policy = io.toolPolicy;
-    if (policy === undefined) { await refuseTypedCommand("tools"); return; }
+    const policy = offeredHost(io.toolPolicy);
     if (policy.tools.length === 0) {
       await notice([
         "Coding tools are disabled: config toolAllowlist is empty, so no coding tool is offered in any chat.",
@@ -1090,8 +1099,7 @@ export async function runTerminalConversation(
    * host. A refusal is reported with fixed host text and never echoed as file bytes.
    */
   const attachFile = async (args: string): Promise<void> => {
-    const host = io.attachments;
-    if (!host) { await refuseTypedCommand("attach"); return; }
+    const host = offeredHost(io.attachments);
     const parsed = parseAttachArguments(args);
     if (parsed.kind === "usage") {
       await notice(ATTACH_USAGE, true);
@@ -1184,8 +1192,7 @@ export async function runTerminalConversation(
         await refreshContext(args);
         return;
       case "digest": {
-        const host = io.digest;
-        if (!host) { await refuseTypedCommand("digest"); return; }
+        const host = offeredHost(io.digest);
         const argument = args.trim().toLowerCase();
         if (argument === "") {
           await notice(renderMemoryDigestStart(await host.start()));
@@ -1199,8 +1206,7 @@ export async function runTerminalConversation(
         return;
       }
       case "mcp": {
-        const host = io.mcp;
-        if (!host) { await refuseTypedCommand("mcp"); return; }
+        const host = offeredHost(io.mcp);
         const parts = args.trim().split(/\s+/).filter((part) => part.length > 0);
         if (parts.length === 0) {
           await notice(renderMcpListing(await host.list()));
@@ -1252,15 +1258,11 @@ export async function runTerminalConversation(
         return;
       case "restart":
         if (args.trim()) { await notice(conversationCommandUsage("restart"), true); return; }
-        if (!io.restart) { await refuseTypedCommand("restart"); return; }
-        await io.restart();
+        await offeredHost(io.restart)();
         await notice("Gateway restart requested; all attached channels will disconnect.");
         io.closeInput?.();
         operationController.abort(new Error("gateway restart requested"));
         return;
-      default:
-        // The offer set above is the catalogue's CLI subset, and every such name has a handler.
-        await notice(`/${completePrefix(name, 80)} is offered here but has no handler; it was not sent to the model.`, true);
     }
   };
 

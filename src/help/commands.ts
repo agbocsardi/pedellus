@@ -22,12 +22,20 @@ export interface ConversationCommand {
   readonly surfaceUsage?: Partial<Record<ConversationSurface, string>>;
   /** At most one short sentence, shown only by `/help <command>`. */
   readonly detail?: string;
+  /** A different true detail for one surface, when part of the general one does not apply there. */
+  readonly surfaceDetail?: Partial<Record<ConversationSurface, string>>;
+  /** One short fix for a host that lacks this capability; named only on that refusal path. */
+  readonly remediation?: string;
+  /** One short no-effect guarantee for a refused effect command, where "not offered" alone is too weak. */
+  readonly refusalGuarantee?: string;
   readonly surfaces: readonly ConversationSurface[];
 }
 
 /**
- * A lowercased, bounded command-shaped token that may be echoed verbatim in any diagnostic. The
- * parser's `_` and its 23-character bound are matched; `-` stays for process-level spellings.
+ * A lowercased, bounded command-shaped token that may be echoed verbatim in any diagnostic. Each
+ * parser bounds itself differently (`COMMAND_NAME_MAX` is 32 on Telegram, a CLI name is unbounded),
+ * so this echo bound is deliberately tighter than both; `_` and `-` are accepted by at least one
+ * surface and `-` also keeps process-level spellings working.
  */
 export const SAFE_COMMAND_NAME = /^[a-z][a-z0-9_-]{0,22}$/;
 
@@ -107,7 +115,10 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     summary: "List or select a model for this conversation",
     usage: "Usage: /model [preset] | /model <provider> <modelId> [thinkingLevel]",
     surfaceUsage: { telegram: "Usage: /model (list the configured presets) or /model <preset> (or /model default)." },
-    detail: "/model alone lists this host's choices; a selection applies to this conversation only, and a preset lasts until the gateway restarts while a direct model persists.",
+    detail: "Applies to this conversation only: a preset lasts until the gateway restarts, a direct pick persists.",
+    surfaceDetail: {
+      telegram: "Applies to this chat only while the gateway stays open; a restart restores the configured preset.",
+    },
     surfaces: ["cli", "telegram"],
   },
   {
@@ -122,6 +133,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     summary: "Rebuild this conversation's workspace context",
     usage: "Usage: /refresh",
     detail: "Requires configured workspace context; a busy conversation is refused.",
+    remediation: "Set workspaceContext in the configuration and restart.",
     surfaces: ["cli"],
   },
   {
@@ -130,6 +142,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     summary: "Start one bounded memory-digestion batch",
     usage: "Usage: /digest [status] — start a batch, or read its status.",
     detail: "Runs one bounded background model batch on the shared workspace; /digest status is free.",
+    refusalGuarantee: "Nothing was started.",
     surfaces: ["cli", "telegram"],
   },
   {
@@ -138,6 +151,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     summary: "Review and decide MCP owner-approval requests",
     usage: "Usage: /mcp | /mcp show <id> | /mcp approve <id> | /mcp deny <id>.",
     detail: "Owner actions; nothing connects before an approval, and a written entry connects at the next gateway start.",
+    refusalGuarantee: "Nothing was changed.",
     surfaces: ["cli", "telegram"],
   },
   {
@@ -153,6 +167,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     summary: "Store one local file and submit it as a turn",
     usage: "Usage: /attach <path>[ -- <prompt>] — stored unchanged, submitted path-only.",
     detail: "Requires the media configuration; originals are never auto-deleted.",
+    remediation: "Configure media in the gateway configuration and restart.",
     surfaces: ["cli"],
   },
   {
@@ -217,7 +232,8 @@ export function conversationDetailBlock(
   surface: ConversationSurface = "cli",
 ): string {
   const usage = conversationCommandUsage(command.name, surface);
-  return command.detail === undefined ? usage : `${usage}\n${command.detail}`;
+  const detail = command.surfaceDetail?.[surface] ?? command.detail;
+  return detail === undefined ? usage : `${usage}\n${detail}`;
 }
 
 /** Listing lines for the offered commands of one surface. */
@@ -252,8 +268,11 @@ export function conversationCommandRefusal(
     return `/${name} is offered here; that mention is malformed, so use /${name} without one.`;
   }
   const elsewhere = command.surfaces.find((candidate) => candidate !== surface);
-  const reason = elsewhere !== undefined && !command.surfaces.includes(surface)
-    ? `only available in ${SURFACE_LABEL[elsewhere]}`
-    : "not offered by this host";
-  return `/${name} is ${reason}. Available: ${available}.`;
+  if (elsewhere !== undefined && !command.surfaces.includes(surface)) {
+    return `/${name} is only available in ${SURFACE_LABEL[elsewhere]}. Available: ${available}.`;
+  }
+  // This host lacks the capability: the short fix and the no-effect guarantee belong on that path.
+  const fix = command.remediation === undefined ? "" : ` ${command.remediation}`;
+  const noEffect = command.refusalGuarantee === undefined ? "" : ` ${command.refusalGuarantee}`;
+  return `/${name} is not offered by this host.${fix}${noEffect} Available: ${available}.`;
 }

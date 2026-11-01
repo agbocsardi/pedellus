@@ -347,13 +347,14 @@ test('a narrow SDK host keeps the base commands and truthfully refuses typed hos
     textUpdate(305, 305, '/help refresh'),
     textUpdate(306, 306, '/help guarantee'),
     textUpdate(307, 307, '/help ../SYNTHETIC-HELP-ARGUMENT'),
+    textUpdate(308, 308, '/help digest'),
   ]]);
   let harness;
   try {
     harness = start(store, transport, { narrow: true });
     await until(() => transport.commands.length === 1, 'command menu registration');
     assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command), ['new', 'abort', 'stop', 'help']);
-    await until(() => transport.sent.length === 8, 'all eight replies');
+    await until(() => transport.sent.length === 9, 'all nine replies');
     const texts = transport.sent.map((entry) => entry.text);
     assert.ok(texts.some((text) => /Status is unavailable in this host/.test(text)));
     assert.ok(texts.some((text) => /Model commands are unavailable in this host/.test(text)));
@@ -361,6 +362,8 @@ test('a narrow SDK host keeps the base commands and truthfully refuses typed hos
     assert.ok(texts.some((text) => /Context reset applied/.test(text)), 'plain native /new still works');
     // `/refresh` is a terminal command, so `/help refresh` names that instead of "no such command".
     assert.ok(texts.some((text) => /^\/refresh is only available in the terminal\. Available: /m.test(rendered(text))));
+    // A control this host lacks keeps the catalogue reason and its no-effect guarantee.
+    assert.ok(texts.some((text) => /^\/digest is not offered by this host\. Nothing was started\. Available: /m.test(rendered(text))));
     // A truly unknown name is unknown, and an argument that is not shaped like a command is not echoed.
     const unknown = texts.map(rendered).find((text) => /^No such command \/guarantee here\. Available: /.test(text));
     assert.ok(unknown !== undefined);
@@ -424,8 +427,8 @@ test('a full host fits its whole /help listing in one bounded notice and keeps d
     // Per-command usage and detail stay on the `/help <command>` path.
     const detail = rendered(transport.sent[1].text);
     assert.match(detail, /^Usage: \/model \(list the configured presets\) or \/model <preset> \(or \/model default\)\./);
-    assert.match(detail, /\/model alone lists this host's choices; a selection applies to this conversation only, and a preset lasts until the gateway restarts while a direct model persists\./);
-    assert.doesNotMatch(help, /selection applies to this conversation only/);
+    assert.match(detail, /Applies to this chat only while the gateway stays open; a restart restores the configured preset\./);
+    assert.doesNotMatch(help, /Applies to this chat only/);
     assert.equal(store.captured.length, 0, 'no help path reached the model');
   } finally {
     await cleanup(store, harness);

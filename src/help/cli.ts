@@ -58,7 +58,7 @@ export const COMMANDS: readonly CommandHelp[] = [
       CONFIG_OPTION,
       {
         flags: "--conversation <name>",
-        text: "Attach the separate `cli:<name>` conversation; lowercase letters, digits, `_` and `-`, up to 32.",
+        text: "The `cli:<name>` conversation: lowercase/digits/`_`/`-`, 1-32, alphanumeric ends.",
       },
     ],
     details: [

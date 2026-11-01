@@ -474,7 +474,8 @@ attached conversation's host snapshot through the running Gateway:
   loader failure leaves the previous snapshot in effect. `/refresh` adds no
   tool authority, workspace root or shell authority.
 - Without `workspaceContext`, or for standalone terminal callers without the
-  host callback, `/refresh` reports that workspace context is unavailable.
+  host callback, `/refresh` is refused as not offered here and names the fix:
+  set `workspaceContext` in the configuration and restart.
 
 This is the supported way to make a skill created or edited during the current
 conversation usable without starting another conversation. Scheduled background

@@ -531,12 +531,15 @@ test("without media the local surface keeps its text-only commands", { timeout: 
   const client = await connectLocalGateway({ socketPath, context });
   assert.equal(client.attachments, false);
   await assert.rejects(client.submitAttachment("/tmp/anything.jpg", "", context), /local attachments are not configured/);
-  const terminal = terminalIO(client, lines("/attach /tmp/anything.jpg", "ordinary line"));
+  const terminal = terminalIO(client, lines("/attach /tmp/anything.jpg", "/mcp", "/model", "ordinary line"));
   try {
     await runTerminalConversation(client, context, terminal.io);
     const output = terminal.chunks.join("");
-    // The typed refusal is the catalogue's, the same reason `/help attach` gives.
-    assert.match(output, /\/attach is not offered by this host\. Available: /);
+    // The typed refusal is the catalogue's, the same reason `/help attach` gives, plus the fix.
+    assert.match(output, /\/attach is not offered by this host\. Configure media in the gateway configuration and restart\. Available: /);
+    assert.match(output, /\/mcp is not offered by this host\. Nothing was changed\. Available: /);
+    // A host without model selection cannot change the model, but it can still name it.
+    assert.match(output, /\/model is not offered by this host\.[\s\S]*It was not sent to the model\. Current model: /);
     assert.doesNotMatch(output, /Unsupported slash command|Local attachments are unavailable/);
     assert.match(output, /text only/);
   } finally {

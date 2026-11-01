@@ -303,9 +303,9 @@ test("terminal /help lists only offered commands and one command's detail on dem
   assert.match(printed, /Unknown slash commands are not sent to the model/);
   // `/help <command>` carries the catalogue's usage line and its one-sentence detail.
   assert.match(printed, /Usage: \/model \[preset\] \| \/model <provider> <modelId> \[thinkingLevel\]/);
-  assert.match(printed, /\/model alone lists this host's choices; a selection applies to this conversation only, and a preset lasts until the gateway restarts while a direct model persists\./);
+  assert.match(printed, /Applies to this conversation only: a preset lasts until the gateway restarts, a direct pick persists\./);
   // A catalogued command this host lacks is refused as such; an unknown one is unknown.
-  assert.match(printed, /\/attach is not offered by this host\. Available: \/new, \/abort, /);
+  assert.match(printed, /\/attach is not offered by this host\. Configure media in the gateway configuration and restart\. Available: \/new, \/abort, /);
   assert.match(printed, /No such command \/guarantee here\. Available: \/new, /);
   // The typed name is never echoed when it is not shaped like a command.
   assert.match(printed, /No such command here\./);
@@ -329,8 +329,11 @@ test("typed local commands share the catalogue refusal and never reach the model
   const printed = chunks.join("");
   // A catalogued command this host lacks gives the same reason `/help <command>` gives.
   for (const name of ["attach", "digest", "restart"]) {
-    assert.match(printed, new RegExp(`/${name} is not offered by this host\\. Available: /new, /abort, `));
+    assert.match(printed, new RegExp(`/${name} is not offered by this host\\.`));
   }
+  // The refusal keeps the actionable fix and the effect command's no-effect guarantee.
+  assert.match(printed, /\/attach is not offered by this host\. Configure media in the gateway configuration and restart\. Available: /);
+  assert.match(printed, /\/digest is not offered by this host\. Nothing was started\. Available: /);
   assert.doesNotMatch(printed, /Unsupported slash command|not implemented in this CLI|was removed from this CLI/);
   // An unknown bounded name keeps its name and the // escape; the former fixed list is gone.
   assert.match(printed, /No such command \/goal here\.[\s\S]*?It was not sent to the model\. Use \/\/goal to send it literally\./);
