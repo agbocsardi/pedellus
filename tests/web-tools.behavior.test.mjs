@@ -776,7 +776,7 @@ test("Code Mode composes coding, memory recall and web without an MCP server", {
           code: [
             'const read = await tools.read({ path: "note.txt" });',
             'const history = await tools.memory_search({ target: "messages", query: "NESTED-MARKER" });',
-            'const opened = await tools.memory_read({ ref: history.result.hits[0].ref });',
+            'const opened = await tools.memory_read({ ref: history.hits[0].ref });',
             'const search = await tools.web_search({ query: "example domain", count: 2 });',
             'const page = await tools.web_fetch({ url: "https://example.com/" });',
             'const writeListed = ALL_TOOLS.filter((tool) => tool.name === "write").length;',

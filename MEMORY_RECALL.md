@@ -15,7 +15,8 @@ contract; see [legacy history implementation and evidence](./HISTORY.md).
 `memory_search` requires `target` and non-empty `query`; `memory_browse` requires
 `target` and does not accept `query`. Both accept `filter`, `limit` (1–100 hits),
 and an opaque `cursor`. Browse also accepts `order: "oldest" | "newest"`; search
-does not. Search defaults to 20 hits and browse defaults to 20. A continuation
+does not. Both model-facing tools default to 8 hits; direct gateway SDK calls default
+to 20. A continuation
 repeats the same target, query/filter and mode, adding the returned cursor.
 
 ```ts
@@ -72,6 +73,20 @@ summaries only; it does not generate missing summaries. Summary `generatedAt` is
 reported separately from the episode's conversation-time range. Coverage reports
 shortened/omitted counts and other limitations; do not treat an excerpt or summary
 as the complete source.
+
+## Tool output shape
+
+The tool's structured output is the page itself: search/browse return
+`{ hits, cursor?, complete, coverage, freshness }`, and read returns
+`{ ref, view?, content, cursor?, complete, coverage }`. In Code Mode, chain the
+returned hit directly:
+`const hits = await tools.memory_search(...); await tools.memory_read({ ref: hits.hits[0].ref })`.
+There is no `.result` wrapper and
+no JSON parsing. The text result is JSON with a `notice` plus the same page fields.
+Permission failures remain tool errors, not empty pages.
+
+All current conversation provenance is `unknown`; there is no importer marker yet.
+Do not infer `native` or `imported` from source or index timestamps.
 
 ## Reading a hit
 

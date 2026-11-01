@@ -400,9 +400,8 @@ test("offline memory lifecycle preserves original evidence across compaction, re
       fauxAssistantMessage("Memory search completed."),
     ]);
     const searchResult = lastMemoryResult(built.state.generationRequests[requestCount + 1].text, "memory_search");
-    const searchPage = JSON.parse(searchResult.text).result;
-    assert.match(JSON.stringify(searchPage), new RegExp(FACT));
-    const hit = searchPage.hits.find((candidate) => candidate.excerpt.includes(FACT));
+    const searchPage = JSON.parse(searchResult.text);
+    const hit = searchPage.hits[0];
     assert.ok(hit?.ref, JSON.stringify(searchPage));
 
     const beforeOpen = built.state.generationRequests.length;
@@ -411,7 +410,7 @@ test("offline memory lifecycle preserves original evidence across compaction, re
       fauxAssistantMessage("Memory read completed."),
     ]);
     const openResult = lastMemoryResult(built.state.generationRequests[beforeOpen + 1].text, "memory_read");
-    const opened = JSON.parse(openResult.text).result;
+    const opened = JSON.parse(openResult.text);
     assert.match(opened.content, new RegExp(SENTINEL), "the original early turn remains the evidence");
     assert.match(opened.content, new RegExp(FACT));
     assert.doesNotMatch(opened.content, new RegExp(TOPIC_MARKER), "topic body stays on demand");
@@ -452,8 +451,8 @@ test("offline memory lifecycle preserves original evidence across compaction, re
       fauxAssistantMessage("Memory search completed."),
     ]);
     const failedSearchResult = lastMemoryResult(built.state.generationRequests[beforeFailedOpen + 1].text, "memory_search");
-    const failedSearchPage = JSON.parse(failedSearchResult.text).result;
-    const lateHit = failedSearchPage.hits.find((candidate) => candidate.excerpt.includes(LATE_FACT));
+    const failedSearchPage = JSON.parse(failedSearchResult.text);
+    const lateHit = failedSearchPage.hits[0];
     assert.ok(lateHit?.ref, JSON.stringify(failedSearchPage));
 
     const beforeFailedSurround = built.state.generationRequests.length;
@@ -462,7 +461,7 @@ test("offline memory lifecycle preserves original evidence across compaction, re
       fauxAssistantMessage("Late entry read."),
     ]);
     const lateOpenResult = lastMemoryResult(built.state.generationRequests[beforeFailedSurround + 1].text, "memory_read");
-    assert.match(JSON.parse(lateOpenResult.text).result.content, new RegExp(LATE_FACT), "raw evidence survives a failed summary");
+    assert.match(JSON.parse(lateOpenResult.text).content, new RegExp(LATE_FACT), "raw evidence survives a failed summary");
   } finally {
     built.state.summaryGate.release();
     if (gateway) await gateway.close(context);

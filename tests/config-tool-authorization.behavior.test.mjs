@@ -96,8 +96,12 @@ test('config authority runs read and memory recall in a mapped chat while other 
     assert.doesNotMatch(read.text, /outside the host tool ceiling/);
     const history = await toolResults(chat, 'config-history');
     assert.equal(history.isError, false, `memory search result: ${history.text.slice(0, 200)}`);
-    assert.match(history.text, new RegExp(marker));
     assert.doesNotMatch(history.text, /outside the host tool ceiling/);
+    const page = JSON.parse(history.text);
+    const hit = page.hits[0];
+    assert.ok(hit?.ref, JSON.stringify(page));
+    const original = await gateway.memoryRead(chat.id, { ref: hit.ref }, context);
+    assert.match(original.content, new RegExp(marker), 'the exact original evidence is available by locator');
 
     const raw = await gateway.harness.createConversation(
       { ownership: { kind: 'ownerless' }, agent: { model: store.model } }, context);
