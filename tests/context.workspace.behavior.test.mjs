@@ -179,13 +179,20 @@ test("explicitly selected memory must exist, be regular, and stay under memory/*
     "memory\\MEMORY.md",
     "memory/history.jsonl",
     "memory/not-markdown.txt",
-    "memory/.hidden.md",
     "outside/memory/file.md",
     "memory/",
   ];
   for (const selection of invalidSelections) {
     await assert.rejects(load(root, { memoryFiles: [selection] }), isInputError, `selection: ${selection}`);
   }
+
+  // Locator shape only: a leading dot, a space, or non-ASCII name is a valid
+  // selection, matching what topic discovery lists.
+  await writeFile(join(root, "memory", "with space.md"), "spaced");
+  await assert.equal(
+    (await load(root, { memoryFiles: ["memory/with space.md"] })).memory[0].content,
+    "spaced",
+  );
 
   await writeFile(join(root, "memory", "MEMORY.md"), "one");
   await assert.rejects(load(root, {

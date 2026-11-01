@@ -25,6 +25,7 @@
  * race verification, so a swap between the check and the read is not detected.
  */
 import { constants } from "node:fs";
+import type { BigIntStats } from "node:fs";
 import { lstat, open, readdir, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -199,9 +200,14 @@ function validatedRoot(value: unknown): string {
   return root;
 }
 
-/** Path-segment rule: any name the filesystem may hold, except control characters and dot segments. */
+/**
+ * Path-segment rule: any name the filesystem may hold, except control
+ * characters, dot segments, and Unicode line separators (which would break one
+ * entry per line in the manifest). This is a locator shape, never a content cap.
+ */
 function safeMemorySegment(segment: string): boolean {
-  return segment.length > 0 && segment !== "." && segment !== ".." && !CONTROL_CHARACTERS.test(segment);
+  return segment.length > 0 && segment !== "." && segment !== ".." &&
+    !CONTROL_CHARACTERS.test(segment) && !/[\u2028\u2029]/.test(segment);
 }
 
 /**
@@ -358,15 +364,12 @@ async function scanTopics(
     // Dirent methods do not follow symlinks; a symlinked entry is skipped
     // rather than read through a link outside the workspace.
     if (entry.isSymbolicLink()) continue;
-    // A refused name, depth or path length is a locator-shape limit, never a
-    // content limit: it is counted in a visible manifest line so nothing
-    // disappears from the tree without a trace.
-    if (name.length > MEMORY_CONTEXT_LIMITS.maxPathSegmentChars || !safeMemorySegment(name)) {
-      state.refused++;
-      continue;
-    }
     if (entry.isDirectory()) {
       if (name === SYSTEM_DIR) continue;
+      if (!locatorBoundName(name)) {
+        state.refused++;
+        continue;
+      }
       const nextSegments = [...segments, name];
       // `memory` + directories + `.md` file must fit the path segment bound.
       if (nextSegments.length > MEMORY_CONTEXT_LIMITS.maxPathSegments - 2) {
@@ -377,6 +380,13 @@ async function scanTopics(
       continue;
     }
     if (!entry.isFile() || !name.endsWith(".md") || PROTECTED_NAMES.has(name)) continue;
+    // A refused name or path length is a locator-shape limit, never a content
+    // limit: it is counted in a visible manifest line so nothing disappears
+    // from the tree without a trace.
+    if (!locatorBoundName(name)) {
+      state.refused++;
+      continue;
+    }
     const path = directorySource([...segments, name]);
     // The provenance label must fit the renderer's source bound; an
     // over-long workspace path is not a usable topic locator.
@@ -386,6 +396,11 @@ async function scanTopics(
     }
     found.push(path);
   }
+}
+
+/** A manifest entry needs a one-line, bounded name; anything else is counted as refused. */
+function locatorBoundName(name: string): boolean {
+  return name.length <= MEMORY_CONTEXT_LIMITS.maxPathSegmentChars && safeMemorySegment(name);
 }
 
 function codePointCount(value: string): number {
@@ -459,6 +474,15 @@ function decodeUtf8(buffer: Buffer, source: string): string {
   }
 }
 
+/** A failed `fstat` is a file failure for this topic, never an untyped rejection of the whole load. */
+async function statHandle(handle: FileHandle, path: string): Promise<BigIntStats> {
+  try {
+    return await handle.stat({ bigint: true });
+  } catch (error) {
+    throw fileFailure(error, path);
+  }
+}
+
 /**
  * Read one file only to derive its manifest entry. The body is discarded;
  * callers read topic content on demand with the native `read` tool.
@@ -501,7 +525,7 @@ async function readManifestEntry(
   });
   let buffer: Buffer;
   try {
-    const before = await handle.stat({ bigint: true });
+    const before = await statHandle(handle, path);
     if (!before.isFile()) throw new MemoryContextFileError("not-regular", path);
     if (before.nlink !== 1n) throw new MemoryContextFileError("hardlink", path);
     const size = Number(before.size);
@@ -526,7 +550,7 @@ async function readManifestEntry(
       if (bytesRead === 0) throw new MemoryContextFileError("changed", path);
       offset += bytesRead;
     }
-    const after = await handle.stat({ bigint: true });
+    const after = await statHandle(handle, path);
     if (before.dev !== after.dev || before.ino !== after.ino || before.nlink !== after.nlink ||
         before.size !== after.size || before.mtimeNs !== after.mtimeNs ||
         before.ctimeNs !== after.ctimeNs) {
@@ -561,7 +585,10 @@ function composeManifest(
     lines.push(`- \u2026 ${skipped} memory files skipped (unreadable, changed, or not valid UTF-8)`);
   }
   if (refused > 0) {
-    lines.push(`- \u2026 ${refused} memory entries refused (name, depth, or path length outside the locator bound)`);
+    lines.push(
+      `- \u2026 ${refused} refused memory ${refused === 1 ? "entry" : "entries"} ` +
+      "(name, depth, or path length outside the locator bound)",
+    );
   }
   if (scanTruncated) {
     lines.push("- \u2026 more memory files were not inspected (directory-entry bound reached)");

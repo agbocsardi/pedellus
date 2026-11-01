@@ -3,7 +3,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { loadMemoryContext } from "../dist/context/memory.js";
+import {
+  MemoryContextInputError,
+  loadMemoryContext,
+  validateMemoryTopicPath,
+} from "../dist/context/memory.js";
 import { loadSkillsContext } from "../dist/context/skills.js";
 
 async function tempRoot(t) {
@@ -114,5 +118,45 @@ test("an entry refused by a locator bound is counted in the manifest", async (t)
 
   const memory = await loadMemoryContext({ workspaceRoot: root });
   assert.deepEqual(memory.entries.map((entry) => entry.path), ["memory/listed.md"]);
-  assert.match(memory.manifest, /1 memory entries refused \(name, depth, or path length/);
+  assert.match(memory.manifest, /1 refused memory entry \(name, depth, or path length/);
+});
+
+test("a refusals-only tree still yields a visible manifest", async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, {
+    [`memory/${"n".repeat(80)}.md`]: "body",
+  });
+
+  const memory = await loadMemoryContext({ workspaceRoot: root });
+  assert.equal(memory.entries.length, 0);
+  assert.match(memory.manifest, /# Memory Tree/);
+  assert.match(memory.manifest, /1 refused memory entry/);
+  assert.ok(memory.document);
+});
+
+test("non-.md files are not reported as refused entries and dot segments stay refused", async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, {
+    "memory/listed.md": "body",
+    [`memory/${"t".repeat(80)}.txt`]: "not a topic",
+  });
+
+  const memory = await loadMemoryContext({ workspaceRoot: root });
+  assert.deepEqual(memory.entries.map((entry) => entry.path), ["memory/listed.md"]);
+  assert.doesNotMatch(memory.manifest, /refused/);
+
+  for (const selection of [
+    "memory/../escape.md",
+    "memory/./MEMORY.md",
+    "memory/a\u0001b.md",
+    "memory/a\u2028b.md",
+  ]) {
+    assert.throws(() => validateMemoryTopicPath(selection), MemoryContextInputError, selection);
+  }
+});
+
+test("a spaced or non-ASCII topic is writable through the topic-path guard", () => {
+  for (const path of ["memory/daily notes/2026-01-01.md", "memory/über.md", "memory/a b/c d.md"]) {
+    assert.equal(validateMemoryTopicPath(path), path);
+  }
 });

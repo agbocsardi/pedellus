@@ -48,11 +48,11 @@ The result contains:
   frontmatter-stripped body length in Unicode code points.
 - `manifest`: `# Memory Tree` text with the Python intro line and one line per
   entry: ``- `memory/x.md` (topic, 123 chars): description``. More than the entry
-  cap or a stopped directory scan adds a visible `more memory files` line, and an
-  entry refused by a locator-shape bound adds a visible `N memory entries
-  refused (name, depth, or path length outside the locator bound)` line;
-  entries are never dropped without such a line. Discovery has no character
-  budget, so a manifest is never shortened to fit one.
+  cap adds a visible `more memory files` line, a stopped directory scan a
+  `not inspected` line, and an entry refused by a locator-shape bound a
+  `refused memory entry/entries` line; entries are never dropped without such a
+  line. Discovery has no character budget, so a manifest is never shortened to
+  fit one.
   Discovered files that cannot be read add a visible `N memory files skipped
   (unreadable, changed, or not valid UTF-8)` line instead of an entry, so the
   manifest never claims their bodies were read.
@@ -83,8 +83,7 @@ Under `<workspaceRoot>/memory/`, recursively:
 | `system/` directory | Always-loaded; not a topic. |
 | Symlinked file or directory | Skipped, not followed. |
 | Non-regular file, non-`.md` file | Ignored. |
-| Name with a control character, or a `.`/`..` segment | Refused and counted in the visible refused line. |
-| Segment over 64 characters, more than 8 path segments, or a workspace-relative path over 246 characters | Refused and counted in the visible refused line. |
+| Segment over 64 characters, more than 8 path segments, a `.`/`..` segment, a control character or U+2028/U+2029 in a name, or a workspace-relative path over 246 characters | Refused and counted in the visible refused line. |
 
 Only files explicitly named in `loadedFiles` are read outside that topic set.
 Each must exist and be a regular, non-symlinked, single-link file; a missing,

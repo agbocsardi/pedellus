@@ -120,8 +120,9 @@ What remains bounded are identifiers, never the content they identify: a
 provenance label, a skill name, a memory locator segment or path length, and the
 memory scan depth. A label is clipped with an ellipsis; a memory entry refused
 by the locator shape is counted in the manifest's visible `refused` line, and a
-refused skill directory name in the visible `skipped` list. Nothing disappears
-without a trace.
+refused skill directory name in the visible `skipped` list. Security refusals
+(symlinked entries) are the documented exception: they are skipped and named in
+[`MEMORY_CONTEXT.md`](./MEMORY_CONTEXT.md) and [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md).
 
 The exported `CONTEXT_LIMITS` documents only what remains: 256 conversation
 snapshots (a fan-out bound on the snapshot table, not a content budget), 256

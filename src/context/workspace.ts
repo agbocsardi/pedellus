@@ -123,7 +123,7 @@ const BOOTSTRAP_FIELDS = Object.freeze([
   ["soul", "SOUL.md"],
   ["user", "USER.md"],
 ] as const);
-const SAFE_MEMORY_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const SAFE_NAME_LINE_BREAK = /[\u2028\u2029]/;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const PROC_FD = "/proc/self/fd";
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
@@ -292,11 +292,21 @@ function validatedMemoryPath(value: unknown): string {
   }
   for (const segment of segments) {
     if (segment.length > WORKSPACE_CONTEXT_LIMITS.maxPathSegmentChars ||
-        !SAFE_MEMORY_SEGMENT.test(segment)) {
+        !safeMemorySegment(segment)) {
       throw new WorkspaceContextInputError("memoryFiles entries must be explicit workspace-relative memory/**/*.md paths");
     }
   }
   return value;
+}
+
+/**
+ * Any name the filesystem may hold, except control characters, dot segments and
+ * Unicode line separators. The memory loader applies the same locator rule, so a
+ * topic it discovers can also be named here.
+ */
+function safeMemorySegment(segment: string): boolean {
+  return segment.length > 0 && segment !== "." && segment !== ".." &&
+    !CONTROL_CHARACTERS.test(segment) && !SAFE_NAME_LINE_BREAK.test(segment);
 }
 
 function validatedIdentity(value: unknown): ContextDocumentSnapshot | undefined {

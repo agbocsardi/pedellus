@@ -131,10 +131,10 @@ gateway/runtime attaches the conversation ID and owns snapshot mapping.
 Nothing else is discovered, scanned, or inferred. In particular there is no
 implicit `memory/MEMORY.md`, no `memory/system/` glob, no topic-memory tree, no
 skill scan without the explicit `skills` section, and no workspace-wide search. `memoryFiles` entries must be
-literal relative paths under `memory/`, end in `.md`, and use only the safe
-segment character set (`A-Z`, `a-z`, `0-9`, `.`, `_`, `-`; segments start with
-an alphanumeric). Absolute paths, `..`, `.`, empty segments, backslashes, and
-files outside `memory/` are rejected.
+literal relative paths under `memory/` that end in `.md`. Any name the filesystem
+accepts is allowed (spaces and non-ASCII included), matching the memory
+loader's locator rule; control characters, `.`/`..` segments, empty segments,
+backslashes, over-long names or paths, and files outside `memory/` are rejected.
 
 Provenance labels are deterministic (`workspace:AGENTS.md`,
 `workspace:memory/system/preferences.md`) and never contain the absolute root.
