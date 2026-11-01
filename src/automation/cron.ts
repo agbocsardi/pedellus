@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { copyJson, type Context, type Draft, type JsonValue } from "@earendil-works/chord";
-import { LiveDoc, defineDoc, defineExtension, defineTask } from "@earendil-works/pi-durable";
+import { LiveDoc, ResetEntry, defineDoc, defineExtension, defineTask } from "@earendil-works/pi-durable";
 import type {
   ConversationHandle,
   ConversationId,
@@ -29,6 +29,13 @@ import {
   latestCronDeliveryFault,
   type CronDeliveryFault,
 } from "./cron-delivery.js";
+import {
+  CRON_ONE_OFF_QUEUE_LIMIT,
+  CronConversationDoc,
+  ensureAutomationConversation,
+  readOneOffQueue,
+  type CronOneOffQueueEntry,
+} from "./cron-conversations.js";
 
 export const CRON_EXTENSION_NAME = "nanobot.cron";
 /** Entry kind for a scheduled input placed by the cron run. */
@@ -37,7 +44,27 @@ export const CRON_TIMER_TASK_NAME = "nanobot.cron.timer";
 export const CRON_RUN_TASK_NAME = "nanobot.cron.run";
 export const CRON_JOBS_KIND = "nanobot.cron.jobs";
 const DOC_VERSION = 1;
-const TASK_VERSION = 1;
+/** The timer task is unchanged; the run task gained the claim phase that picks its conversation. */
+const TIMER_TASK_VERSION = 1;
+const RUN_TASK_VERSION = 2;
+/**
+ * Fixed failure text for an occurrence whose one-off conversation already has the bound number of
+ * admitted runs. It names no message, provider error or path, and the job record keeps it visible.
+ */
+const ONE_OFF_QUEUE_FULL =
+  `one-off run queue is full (${CRON_ONE_OFF_QUEUE_LIMIT} admitted runs); this occurrence was not run`;
+/**
+ * Fixed failure text for an occurrence whose shared one-off queue cannot be read. The document is
+ * never guessed at or rewritten: the occurrence is refused with visible text instead of faulting its
+ * run task and blocking the job behind a parked task.
+ */
+const ONE_OFF_QUEUE_MALFORMED = "one-off run queue is malformed; this occurrence was not run";
+/**
+ * How long a cancelled run waits for its automation conversation to go idle. It is a bound, not a
+ * guarantee: a provider request that ignores the abort signal can keep running, and the next run
+ * then simply queues behind it.
+ */
+const CRON_TARGET_ABORT_MS = 5_000;
 
 /** Host-authenticated identity captured when the job is created. */
 export interface CronOwner {
@@ -105,10 +132,28 @@ export interface CronJob {
   readonly lastSkip: CronSkip | null;
   /** Newest execution-task fault seen by a timer before its pointer was replaced. */
   readonly lastFault: CronFault | null;
+  /**
+   * This job's own automation conversation, once a run has created one. Optional so a job document
+   * written before automation conversations existed keeps working: an absent or stale value is
+   * simply recreated by the next run. Only a recurring job records one; a one-off job uses the
+   * origin's shared catch-all conversation below.
+   */
+  readonly conversationId?: number | null;
 }
 export interface CronJobsDocument {
   readonly [key: string]: JsonValue;
   readonly jobs: CronJob[];
+  /**
+   * The catch-all automation conversation this origin's one-off jobs share. Optional for the same
+   * backward-compatibility reason as `CronJob.conversationId`, and created lazily on first use.
+   */
+  readonly oneOffConversationId?: number | null;
+  /**
+   * Durable FIFO of admitted one-off runs waiting for that conversation, in admission order. It
+   * holds one entry per admitted but unfinished run, so it is bounded by the run queue limit rather
+   * than by time or by the number of one-off jobs ever created.
+   */
+  readonly oneOffQueue?: CronOneOffQueueEntry[];
 }
 
 /** One job list per origin conversation. A fork starts empty. */
@@ -126,11 +171,24 @@ export interface CronOccurrenceInput {
   readonly generation: number;
 }
 export type CronTimerCheckpoint = { readonly phase: "fire" };
-export type CronRunCheckpoint = {
-  readonly phase: "run";
-  /** Chosen once, in the same commit as host preparation, then reused after a crash. */
-  readonly targetConversationId: ConversationId | null;
-};
+/**
+ * Two phases, because a run may have to wait for its shared conversation: `claim` resolves and
+ * records the target conversation, chooses this run's place in the durable queue and prepares the
+ * run's authority in one commit; `execute` submits the occurrence and records the result. A crash
+ * before the claim commit reruns it, and a crash after it resumes at `execute` without preparing a
+ * second time.
+ */
+export type CronRunCheckpoint =
+  | {
+      readonly phase: "claim";
+      /** No target is chosen until this claim commits. */
+      readonly targetConversationId: null;
+    }
+  | {
+      readonly phase: "execute";
+      /** Chosen once, in the same commit as host preparation, then reused after a crash. */
+      readonly targetConversationId: ConversationId;
+    };
 export interface CronTimerResult {
   readonly [key: string]: JsonValue;
   readonly jobId: string;
@@ -170,8 +228,10 @@ export interface CronConversationWriter {
 }
 /**
  * One run's durable preparation or finalization. Preparation runs in the commit that chooses the
- * run's target; finalization runs in the commit that records the run's terminal result or
- * cancellation. A crash before either commit reruns its callback; a crash after it does not.
+ * run's target conversation; finalization runs in the commit that records the run's terminal result
+ * or cancellation. A crash before either commit reruns its callback; a crash after it does not.
+ * Preparation runs once per run even when the target conversation is the same one an earlier run
+ * used, so authority and workspace context are never carried over from a previous episode.
  */
 export interface CronPreparation {
   readonly tx: Tx;
@@ -182,14 +242,16 @@ export interface CronPreparation {
   readonly background: boolean;
 }
 /**
- * Optional durable preparation for one run. It runs once, in the commit that chooses the run's
- * target conversation; a crash before that commit reruns it, and a crash after it does not.
- * This slice adds no context or tool grants of its own.
+ * Optional durable preparation for one run. It runs in the commit that claims this run's
+ * conversation and place in the queue, so its writes, the conversation choice and the queue entry
+ * are atomic; a crash before that commit reruns it, and a crash after it does not. A background
+ * run's authority therefore lives from that commit until the run's terminal commit, never across
+ * runs: a job whose captured tools were narrowed by configuration loses them on its next run.
  */
 export type CronPrepare = (preparation: CronPreparation, context: Context) => void | Promise<void>;
 /**
  * One run's durable settlement in the same commit that records its terminal result or cancellation,
- * whether the target is the origin conversation (origin mode) or a separate task-owned one. It is
+ * whether the target is the origin conversation (origin mode) or an automation conversation. It is
  * called for every terminal path that already prepared a target, so a host can retire that target's
  * captured authority when `background` is true, and can durably admit delivery for either mode. The
  * foundation itself changes no tool state and performs no external send.
@@ -268,7 +330,7 @@ export interface CronTargetSummary {
   readonly error: string | null;
   readonly reason: string | null;
 }
-export type CronJobStatus = CronTaskStatus | "scheduled" | "cancelled" | "stopped";
+export type CronJobStatus = CronTaskStatus | "scheduled" | "queued" | "cancelled" | "stopped";
 /** Job plus state derived from its actual timer and execution tasks. */
 export interface CronJobView {
   readonly job: CronJob;
@@ -280,6 +342,14 @@ export interface CronJobView {
   /** Newest durable delivery fault for this job, sanitized; `null` when none is recorded. */
   readonly deliveryFault: CronDeliveryFault | null;
 }
+
+/**
+ * Place one native reset boundary before an automation run's own input. The foundation calls it for
+ * a background run whose input is not placed yet, so the previous episode stays stored and
+ * searchable while the new run's model context starts empty. It must use Durable's own reset, never
+ * a trim of stored entries; a host without it starts no boundary and every entry stays in context.
+ */
+export type CronReset = (conversationId: ConversationId, context: Context) => Promise<void>;
 
 export interface CronFoundationOptions {
   /** Optional durable preparation. Without it no context or tool grant is added. */
@@ -297,6 +367,12 @@ export interface CronFoundationOptions {
    * successful run is silent.
    */
   readonly digest?: CronDigest;
+  /**
+   * Optional native reset boundary for one background run. Called only for an occurrence whose own
+   * input is not placed yet and whose conversation does not already end at a reset entry, never in
+   * origin mode and never for a digest occurrence.
+   */
+  readonly reset?: CronReset;
   /** The Harness clock (`HarnessOptions.now`); default `Date.now`. */
   readonly now?: () => number;
 }
@@ -567,6 +643,8 @@ function jobStatusOf(
   if (timer !== null && UNHEALTHY_TASK.has(timer.status)) return timer.status;
   if (execution !== null && UNHEALTHY_TASK.has(execution.status)) return execution.status;
   if (target !== null && UNHEALTHY_TASK.has(target.status)) return target.status;
+  // An admitted one-off run waiting for its shared conversation is queued, not running.
+  if (execution !== null && execution.status === "waiting") return "queued";
   if (execution !== null && execution.status !== "completed" && execution.status !== "aborted") {
     return "running";
   }
@@ -645,11 +723,98 @@ async function viewsOf(
   }));
 }
 
+interface RunFence {
+  readonly job?: CronJob;
+  readonly rejected?: NextTaskState<CronRunCheckpoint, CronRunResult>;
+}
+
+/**
+ * Fence one run against the job record it was admitted for. A missing record, a generation change,
+ * a cancellation, or a newer execution pointer means this task must neither run nor prepare
+ * anything for that job; the caller retires an already-prepared target in the same commit.
+ */
+function runFence(
+  found: CronJob | undefined, input: CronOccurrenceInput, taskId: TaskId<CronRunResult>,
+): RunFence {
+  if (found === undefined) {
+    return {
+      rejected: terminalFailed<CronRunCheckpoint, CronRunResult>(
+        runResult(input, "missing", "cron job record is missing"), "cron job record is missing",
+      ),
+    };
+  }
+  if (found.generation !== input.generation) {
+    return {
+      rejected: terminalAborted<CronRunCheckpoint, CronRunResult>(
+        runResult(input, "superseded", "job generation changed"), "superseded",
+      ),
+    };
+  }
+  if (found.cancelledAtMs !== null) {
+    return {
+      rejected: terminalAborted<CronRunCheckpoint, CronRunResult>(
+        runResult(input, "cancelled", "cancelled before execution"), "cancelled",
+      ),
+    };
+  }
+  if (found.executionTaskId !== taskId) {
+    return {
+      rejected: terminalAborted<CronRunCheckpoint, CronRunResult>(
+        runResult(input, "superseded", "job is owned by another execution"), "superseded",
+      ),
+    };
+  }
+  return { job: copyJob(found) };
+}
+
+/**
+ * Remove one run's catch-all queue entry. It is written in the same commit as the run's terminal
+ * outcome or cancellation, so an admitted run that will never execute leaves the queue with it.
+ */
+async function leaveOneOffQueue(
+  doc: { oneOffQueue?: CronOneOffQueueEntry[] }, taskId: number,
+): Promise<void> {
+  try {
+    const queue = readOneOffQueue(doc.oneOffQueue);
+    const remaining = queue.filter((entry) => entry.taskId !== taskId);
+    if (remaining.length === queue.length) return;
+    doc.oneOffQueue = remaining;
+  } catch {
+    // This runs in a terminal commit: a damaged queue must not fault a run's recorded outcome.
+    // A malformed queue then keeps its entries and stays visible to the claim phase that reads it.
+  }
+}
+
+type CronRunRuntime = TaskRuntime<CronOccurrenceInput, CronRunCheckpoint, CronRunResult, object>;
+
+/**
+ * Read one recorded automation conversation and its own class marker before the claim commit. It is
+ * a plain snapshot read, so an unadoptable pointer never even gets a document written onto it;
+ * `ensureAutomationConversation` then decides adoption from this exact pair.
+ */
+async function recordedAutomationConversation(
+  runtime: Pick<CronRunRuntime, "snapshot">,
+  context: Context,
+  recordedId: number | null | undefined,
+): Promise<{ readonly id: number; readonly marker: unknown } | null> {
+  if (recordedId === null || recordedId === undefined
+    || !Number.isSafeInteger(recordedId) || recordedId < 1) return null;
+  try {
+    return {
+      id: recordedId,
+      marker: await runtime.snapshot(CronConversationDoc, recordedId as ConversationId, context),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Build the deterministic timer plus execution controller. Gateway and delivery stay outside. */
 export function createCronFoundation(options: CronFoundationOptions): CronFoundation {
   const prepare = options.prepare;
   const finalize = options.finalize;
   const digest = options.digest;
+  const reset = options.reset;
   const clock = options.now ?? (() => Date.now());
 
   /**
@@ -679,122 +844,248 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
   const runTask: Task<CronOccurrenceInput, CronRunCheckpoint, CronRunResult, object> =
     defineTask<CronOccurrenceInput, CronRunCheckpoint, CronRunResult>({
       name: CRON_RUN_TASK_NAME,
-      version: TASK_VERSION,
-      initial: () => ({ phase: "run", targetConversationId: null }),
+      version: RUN_TASK_VERSION,
+      initial: () => ({ phase: "claim", targetConversationId: null }),
+      // Stored version 1 chose its target and executed in one `run` phase. Mapping it to `execute`
+      // lets an in-flight occurrence finish in the conversation it already prepared, whoever owns
+      // it; one that crashed before choosing a target claims one under the conversation model.
+      migrate: (input, checkpoint) => {
+        const stored = isRecord(checkpoint) ? checkpoint : {};
+        const target = stored.targetConversationId;
+        const chosen = Number.isSafeInteger(target) && (target as number) > 0
+          ? target as ConversationId
+          : null;
+        return {
+          input: input as CronOccurrenceInput,
+          checkpoint: (chosen === null
+            ? { phase: "claim", targetConversationId: null }
+            : { phase: "execute", targetConversationId: chosen }) as CronRunCheckpoint,
+        };
+      },
       phases: {
-        run: async (running, runtime, context) => {
+        /**
+         * Resolve this run's conversation and its place in the shared queue, then prepare this run's
+         * authority and workspace context — all in one commit. A run that has to wait behind another
+         * one commits only its waiting state, so nothing is prepared and no authority exists while
+         * it is queued.
+         */
+        claim: async (running, runtime, context) => {
           const input = parseOccurrenceInput(running.input);
           if (input === undefined) {
-            await runtime.commit(async (tx) => {
-              // A checkpoint only advances together with a parsed input, so a prepared target here
-              // means a damaged record; retire it rather than leave its copy alive.
-              const preparedTarget = running.state.checkpoint.targetConversationId;
-              if (preparedTarget !== null) {
-                await retireTarget(
-                  tx, running.conversationId, preparedTarget, null, zeroInput, null, context,
-                );
-              }
-              return terminalFailed<CronRunCheckpoint, CronRunResult>(
+            await runtime.commit(
+              () => terminalFailed<CronRunCheckpoint, CronRunResult>(
                 runResult(zeroInput, "missing", "task input is invalid"), "task input is invalid",
-              );
-            }, context);
-            return;
-          }
-          const checkpoint = running.state.checkpoint;
-          let targetConversationId = checkpoint.targetConversationId;
-          let job: CronJob | undefined;
-          let prepareError: string | null = null;
-          let terminal = false;
-
-          const inspectJob = (found: CronJob | undefined): NextTaskState<CronRunCheckpoint, CronRunResult> | undefined => {
-            if (found === undefined) {
-              terminal = true;
-              return terminalFailed<CronRunCheckpoint, CronRunResult>(
-                runResult(input, "missing", "cron job record is missing"), "cron job record is missing",
-              );
-            }
-            if (found.generation !== input.generation) {
-              terminal = true;
-              return terminalAborted<CronRunCheckpoint, CronRunResult>(
-                runResult(input, "superseded", "job generation changed"), "superseded",
-              );
-            }
-            if (found.cancelledAtMs !== null) {
-              terminal = true;
-              return terminalAborted<CronRunCheckpoint, CronRunResult>(
-                runResult(input, "cancelled", "cancelled before execution"), "cancelled",
-              );
-            }
-            if (found.executionTaskId !== running.id) {
-              terminal = true;
-              return terminalAborted<CronRunCheckpoint, CronRunResult>(
-                runResult(input, "superseded", "job is owned by another execution"), "superseded",
-              );
-            }
-            job = copyJob(found);
-            return undefined;
-          };
-
-          if (targetConversationId === null) {
-            // Real progress: choose and remember the target once, together with host preparation.
-            try {
-              await runtime.commit(async (tx) => {
-                const doc = await tx.doc(CronJobsDoc, running.conversationId);
-                const rejected = inspectJob(doc.jobs.find((candidate) => candidate.id === input.jobId));
-                if (rejected !== undefined) return rejected;
-                const found = doc.jobs.find((candidate) => candidate.id === input.jobId)!;
-                targetConversationId = found.mode === "background" && found.intent !== "digest"
-                  ? (await tx.scanConversations({ ownerTaskId: running.id }, 1)).items[0]?.id
-                    ?? (await tx.createConversation({ ownership: { kind: "task", taskId: running.id } })).id
-                  : running.conversationId;
-                if (prepare !== undefined) {
-                  await prepare({
-                    tx,
-                    job: copyJob(found),
-                    occurrence: input,
-                    originConversationId: running.conversationId,
-                    targetConversationId,
-                    background: found.mode === "background",
-                  }, context);
-                }
-                return {
-                  status: "running",
-                  checkpoint: { phase: "run", targetConversationId },
-                };
-              }, context);
-            } catch (error) {
-              if (runtime.signal.aborted) return;
-              // The preparation commit rolled back, including any conversation it created.
-              targetConversationId = checkpoint.targetConversationId;
-              prepareError = `preparation failed: ${errorText(error)}`;
-            }
-          } else {
-            // A resume after the target commit must not fabricate progress: Durable's restart
-            // counter only advances while this task fails to change its checkpoint.
-            const snapshot = await runtime.snapshot(CronJobsDoc, running.conversationId, context);
-            const rejected = inspectJob(snapshot?.jobs.find((candidate) => candidate.id === input.jobId));
-            if (rejected !== undefined) {
-              // This run is fenced out, but its target was already prepared: retire it in the same
-              // commit that records the rejection.
-              const preparedTarget = targetConversationId;
-              await runtime.commit(async (tx) => {
-                await retireTarget(
-                  tx, running.conversationId, preparedTarget, null, input, null, context,
-                );
-                return rejected;
-              }, context);
-            }
-          }
-
-          if (terminal) return;
-          if (prepareError !== null || job === undefined || targetConversationId === null) {
-            await finishRun(
-              runtime, running.conversationId, running.id, input,
-              { status: "error", error: prepareError ?? "execution could not be prepared", answerEntryId: null },
-              targetConversationId ?? running.conversationId, context,
+              ),
+              context,
             );
             return;
           }
+          let refused: string | null = null;
+          let waitFor: TaskId | null = null;
+          let fenced = false;
+          let prepareError: string | null = null;
+          let target: ConversationId | null = null;
+          // Read the recorded conversation pointers and their own class markers before the claim
+          // commit. A snapshot read creates nothing, so a damaged or hand-edited pointer cannot even
+          // have a marker written onto the chat it names; a pointer that changed before the commit
+          // is simply not adopted and costs one new conversation. `Tx` has no non-creating
+          // conversation-document read, so this pre-read is the only correct way to avoid
+          // materializing a marker on an unrelated conversation. The marker is stale evidence by
+          // commit time and `ensureAutomationConversation` re-reads owner, parent and marker there,
+          // so owner/parent/root safety is decided in the transaction that also records the pointer:
+          // no chat, root, fork or task-owned conversation can be pulled into the automation class.
+          const before = await runtime.snapshot(CronJobsDoc, running.conversationId, context);
+          const beforeJob = before?.jobs.find((candidate) => candidate.id === input.jobId);
+          const jobPointer = await recordedAutomationConversation(
+            runtime, context, beforeJob?.conversationId,
+          );
+          const oneOffPointer = await recordedAutomationConversation(
+            runtime, context, before?.oneOffConversationId,
+          );
+
+          await runtime.commit(async (tx) => {
+            const doc = await tx.doc(CronJobsDoc, running.conversationId);
+            const fence = runFence(
+              doc.jobs.find((candidate) => candidate.id === input.jobId), input, running.id,
+            );
+            if (fence.rejected !== undefined) {
+              // A fenced run leaves the catch-all queue too: a one-off cancelled while the gateway
+              // was down is claimed again on reopen and terminates here.
+              await leaveOneOffQueue(doc, running.id);
+              fenced = true;
+              return fence.rejected;
+            }
+            const stored = doc.jobs.find((candidate) => candidate.id === input.jobId)!;
+            const job = fence.job!;
+            const background = job.mode === "background" && intentOf(job) !== "digest";
+            if (!background) {
+              // Origin mode keeps its semantics: the occurrence runs in the origin chat itself, and
+              // the owner's own reset is that conversation's boundary.
+              target = running.conversationId;
+            } else if (job.schedule.kind !== "at") {
+              // A recurring job keeps one conversation for its whole life; each run is an episode.
+              target = await ensureAutomationConversation(tx, {
+                originConversationId: running.conversationId,
+                conversationClass: "recurring",
+                jobId: job.id,
+                recorded: jobPointer?.id === stored.conversationId ? jobPointer : null,
+              });
+              stored.conversationId = target;
+            } else {
+              // One-off jobs share one catch-all conversation per origin and queue on it.
+              let queue: CronOneOffQueueEntry[] | null;
+              try {
+                queue = readOneOffQueue(doc.oneOffQueue);
+              } catch {
+                queue = null;
+              }
+              if (queue === null) {
+                // A malformed queue is never guessed at or rewritten: the occurrence is refused with
+                // visible text instead of faulting its run task and blocking the job behind it.
+                refused = ONE_OFF_QUEUE_MALFORMED;
+              } else {
+                // An entry whose run task already ended can never execute, so it must not hold the
+                // queue in front of a live occurrence after a crash or a lost pointer.
+                const live: CronOneOffQueueEntry[] = [];
+                for (const entry of queue) {
+                  const record = await tx.task(entry.taskId as TaskId);
+                  if (record !== undefined && record.state.status !== "terminal") live.push(entry);
+                }
+                if (!live.some((entry) => entry.taskId === running.id)) {
+                  if (live.length >= CRON_ONE_OFF_QUEUE_LIMIT) refused = ONE_OFF_QUEUE_FULL;
+                  else {
+                    live.push({
+                      jobId: job.id,
+                      scheduledAtMs: input.scheduledAtMs,
+                      taskId: running.id,
+                    });
+                  }
+                }
+                doc.oneOffQueue = live;
+                // A refused occurrence leaves the conversation untouched: nothing is created or
+                // classified for it, so a full queue never leaves a new catch-all behind.
+                if (refused === null) {
+                  const head = live[0];
+                  if (head !== undefined && head.taskId !== running.id) {
+                    // Waiting commits only this waiting state: a queued run needs no target yet, so
+                    // it neither creates nor records a catch-all conversation. It re-reads the
+                    // document when it wakes, so the one-catch-all-per-origin identity cannot be
+                    // split by two runs claiming in the same tick.
+                    waitFor = head.taskId as TaskId;
+                  } else {
+                    target = await ensureAutomationConversation(tx, {
+                      originConversationId: running.conversationId,
+                      conversationClass: "one-off",
+                      jobId: null,
+                      recorded: oneOffPointer?.id === doc.oneOffConversationId ? oneOffPointer : null,
+                    });
+                    doc.oneOffConversationId = target;
+                  }
+                }
+              }
+            }
+            if (refused !== null) {
+              // A full or unreadable queue: this occurrence is refused with fixed text the job record
+              // keeps for `list`, the conversation is not touched, and no channel notice is invented.
+              stored.lastOutcome = {
+                scheduledAtMs: input.scheduledAtMs,
+                finishedAtMs: runtime.now(),
+                status: "error",
+                error: refused,
+                conversationId: target ?? running.conversationId,
+              };
+              return terminalCompleted<CronRunCheckpoint, CronRunResult>(
+                runResult(input, "error", refused),
+              );
+            }
+            if (waitFor !== null) {
+              // Wait for the run ahead in the durable queue, then claim again: the order is the
+              // document's order, so it survives a restart and is never decided in memory.
+              return {
+                status: "waiting",
+                on: [waitFor],
+                policy: "allSettled",
+                checkpoint: { phase: "claim", targetConversationId: null },
+              };
+            }
+            try {
+              if (background && prepare !== undefined) {
+                await prepare({
+                  tx,
+                  job: copyJob(stored),
+                  occurrence: input,
+                  originConversationId: running.conversationId,
+                  targetConversationId: target!,
+                  background: true,
+                }, context);
+              }
+            } catch (error) {
+              // Returning nothing leaves the task's state unchanged, but the staged document writes
+              // still commit: this run's conversation, its marker, the job's or the origin's pointer
+              // and the queue entry all stay, and nothing was prepared that could be retired.
+              prepareError = `preparation failed: ${errorText(error)}`;
+              return undefined;
+            }
+            return {
+              status: "running",
+              checkpoint: { phase: "execute", targetConversationId: target! },
+            };
+          }, context);
+
+          // A run whose claim committed a terminal fence has already settled: there is nothing left
+          // to finish, and finishing again would rely on the framework refusing a terminal task.
+          if (fenced) return;
+          if (runtime.signal.aborted || refused !== null) return;
+          if (prepareError !== null || target === null) {
+            await finishRun(
+              runtime, running.conversationId, running.id, input,
+              {
+                status: "error",
+                error: prepareError ?? "execution could not be prepared",
+                answerEntryId: null,
+              },
+              target ?? running.conversationId, context,
+            );
+          }
+        },
+
+        /**
+         * Submit this run's occurrence into its chosen conversation and record the settlement. The
+         * job is fenced once more here, so a run cancelled after its claim neither places an input
+         * nor keeps the authority its claim prepared.
+         */
+        execute: async (running, runtime, context) => {
+          const input = parseOccurrenceInput(running.input);
+          const targetConversationId = running.state.checkpoint.targetConversationId;
+          if (input === undefined || targetConversationId === null) {
+            await runtime.commit(
+              () => terminalFailed<CronRunCheckpoint, CronRunResult>(
+                runResult(input ?? zeroInput, "missing", "run checkpoint is invalid"),
+                "run checkpoint is invalid",
+              ),
+              context,
+            );
+            return;
+          }
+          let job: CronJob | undefined;
+          let wasRejected = false;
+          await runtime.commit(async (tx) => {
+            const doc = await tx.doc(CronJobsDoc, running.conversationId);
+            const fence = runFence(
+              doc.jobs.find((candidate) => candidate.id === input.jobId), input, running.id,
+            );
+            if (fence.rejected === undefined) {
+              job = fence.job;
+              return undefined;
+            }
+            wasRejected = true;
+            await retireTarget(
+              tx, running.conversationId, targetConversationId, null, input, null, context,
+            );
+            await leaveOneOffQueue(doc, running.id);
+            return fence.rejected;
+          }, context);
+          if (wasRejected || job === undefined) return;
 
           const conversation = await runtime.conversation(targetConversationId, context);
           if (conversation === undefined) {
@@ -828,6 +1119,26 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           }
           try {
             const requestId = occurrenceKey(input.jobId, input.scheduledAtMs);
+            let settled: unknown;
+            let boundaryPlaced = false;
+            await runtime.commit(async (tx) => {
+              settled = await tx.submissionByRequest(targetConversationId, requestId);
+              if (settled !== undefined) return undefined;
+              // The boundary is itself a durable entry: a retry after a crash between `reset(...)` and
+              // `submit(...)` finds it as the newest entry and places no second one. A boundary that
+              // is already the end of the conversation means the run's context is already empty.
+              const newest = await tx.scanEntries({ conversationId: targetConversationId, order: "descending" }, 1);
+              boundaryPlaced = newest.items[0]?.kind === ResetEntry.kind;
+              return undefined;
+            }, context);
+            // Each run is a new episode: a native reset boundary keeps every earlier entry stored
+            // and searchable while this run's model context starts empty. It is the same native
+            // reset `/new` places, admitted before this run's own input, so an ordered inbox keeps
+            // the boundary ahead of the input even if another run is still finishing.
+            if (settled === undefined && !boundaryPlaced && targetConversationId !== running.conversationId
+              && reset !== undefined) {
+              await reset(targetConversationId, context);
+            }
             const submission = await conversation.submit({
               type: "input",
               content: job.message,
@@ -859,11 +1170,28 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
         const parsed = parseOccurrenceInput(running.input);
         const input = parsed ?? zeroInput;
         const targetConversationId = running.state.checkpoint.targetConversationId;
+        // Stop the shared conversation's own live work first: a cancelled occurrence must not keep a
+        // model turn running in a conversation the next run will reuse, and a later abort would
+        // withdraw that next run's own queued input. History is untouched, and a provider request
+        // that ignores the signal only delays this bound, never the queue.
+        if (targetConversationId !== null && targetConversationId !== running.conversationId) {
+          const conversation = await runtime.conversation(targetConversationId, context);
+          if (conversation !== undefined) {
+            await new Promise<void>((resolve) => {
+              const disarm = runtime.setTimer(resolve, CRON_TARGET_ABORT_MS);
+              conversation.abort(context).then(
+                () => { disarm(); resolve(); },
+                () => { disarm(); resolve(); },
+              );
+            });
+          }
+        }
         await runtime.commit(async (tx) => {
-          // A cancelled run gives up its target's authority in this same commit: an abort is not a
-          // reason to leave a prepared copy alive for a later admission.
+          const doc = await tx.doc(CronJobsDoc, running.conversationId);
+          // A cancelled run leaves its queue, and gives up its target's authority, in this same
+          // commit: an abort is not a reason to leave a prepared copy or a queued occurrence alive.
+          await leaveOneOffQueue(doc, running.id);
           if (finalize !== undefined && targetConversationId !== null) {
-            const doc = await tx.doc(CronJobsDoc, running.conversationId);
             const job = doc.jobs.find((candidate) => candidate.id === parsed?.jobId);
             await retireTarget(
               tx, running.conversationId, targetConversationId,
@@ -880,7 +1208,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
   const timerTask: Task<CronOccurrenceInput, CronTimerCheckpoint, CronTimerResult, object> =
     defineTask<CronOccurrenceInput, CronTimerCheckpoint, CronTimerResult>({
       name: CRON_TIMER_TASK_NAME,
-      version: TASK_VERSION,
+      version: TIMER_TASK_VERSION,
       initial: () => ({ phase: "fire" }),
       phases: {
         // One phase: sleep, then rerun from the top when due and commit the atomic handoff.
@@ -999,6 +1327,9 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
     const now = runtime.now();
     await runtime.commit(async (tx) => {
       const doc = await tx.doc(CronJobsDoc, conversationId);
+      // A one-off run leaves the catch-all queue in the same commit as its outcome, whatever the
+      // outcome is; a recurring or origin-mode run was never queued, so this changes nothing.
+      await leaveOneOffQueue(doc, taskId);
       const job = doc.jobs.find((candidate) => candidate.id === input.jobId);
       if (job === undefined) {
         await retireTarget(tx, conversationId, targetConversationId, null, input, null, context);

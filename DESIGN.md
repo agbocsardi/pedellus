@@ -71,7 +71,7 @@ non-empty list may name only `read`, `write`, `edit` and `bash`. Authority is
 limited to authenticated mapped ordinary chat conversations. The root
 conversation, channel-state conversations, forks, raw and task-owned
 conversations are denied, and the call-time hook fails closed if agent state
-names a tool that is no longer configured. A scheduled isolated cron run captures
+names a tool that is no longer configured. A scheduled cron run's automation conversation captures
 a bounded subset of its authenticated origin's current tools and loses it when
 the run finishes; each call must also remain inside the current config, so
 narrowing the list and reopening narrows pending runs.

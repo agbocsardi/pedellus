@@ -17,6 +17,9 @@
 - [x] Complete the approved five-minute synthetic Telegram pilot and record the actual outcome; no personal workspace or broader rollout.
 - [x] Owner accepts the pilot as sufficient. Defer the reminder-only follow-up; live reminder scheduling/delivery remains unverified, not a blocker for the next discussion.
 - [x] Clean up this batch's resources after owner confirms integration.
+- [x] Adopt the cron conversation model: one persistent automation conversation per recurring
+  job and one catch-all per origin for one-offs, a reset-delimited episode per run, a durable
+  bounded one-off queue, and per-run prepared/retired authority.
 
 ## Owner follow-up — digest input correction
 
@@ -1201,3 +1204,111 @@ clean and the validated tip's ancestor. Product Brave search remains
 live-unverified (one bounded example.com implemented fetch smoke only); cron and
 background-worker composition remain deliberately later, and the worker branch is
 still in review. No new live provider, Telegram, credential or network run.
+
+### Session — cron conversation model
+
+Conversation and execution are now separate for scheduled work. A recurring job keeps one
+ownerless automation conversation for its lifetime and each run adds a reset-delimited episode; all
+one-off jobs of an origin share one catch-all conversation and queue on it in a document-backed FIFO
+(bounded at 16 admitted runs, refusing the occurrence with fixed text in the job record when full).
+Runs sharing a conversation execute serially: recurring jobs keep the timer's skip-on-overlap rule
+and queued one-offs wait on the native task ahead of them, so nothing is decided in memory. The run
+task still owns one execution, in two phases (`claim`, `execute`), and every run prepares its own
+model, workspace context and captured tools and retires them in its terminal commit, so persistent
+history never carries permission. `origin` mode is unchanged.
+
+Decisions: no document version bump — the new job/queue fields are optional and created lazily, so a
+job document written by the per-occurrence model keeps working and a stale conversation ID is
+recreated instead of adopted. The new class is named `automation` in the shared scope rule and
+"automation conversation" everywhere else, carried by a `nanobot.cron.conversation` marker plus the
+origin's cron documents rather than inferred from being unmapped. Episode cataloguing includes these
+conversations; the message/tool search index and the summary policy stay mapped-chat only, so no
+model call is spent on a summary nothing can read. Verified offline: typecheck/build, 309 behavior
+checks (3 new in `tests/cron-conversations.behavior.test.mjs`) and 83 core acceptance. Deliberate
+gaps: a restart while a one-off run is queued is reasoned from durable state, not exercised by a
+test; a provider request that ignores abort keeps running in the automation conversation after its
+run is cancelled (the next run queues behind it).
+
+### Session — cron conversation model review fixes
+
+An independent review of the conversation-model change verified nine findings against the code and
+probes; all are fixed at their root rather than reworded away. Channel ingress (`conversationFor`)
+now applies the shared chat-scope rule and refuses a mapped session key naming anything but an
+ordinary chat, so an automation conversation can no longer become a cron owner, gain an unevictable
+snapshot slot or have a live run's capture retired by the chat policy pass. A recorded automation
+conversation is adopted only when its own `nanobot.cron.conversation` marker names the same origin,
+class and job, read by a snapshot before the claim commit so an unadoptable pointer cannot even have
+a marker written onto it (the root and an unrelated ownerless chat are both covered). A background
+run rebuilds its workspace snapshot on every run instead of freezing the first run's bootstrap,
+memory, skills and skill table for the process. The claim phase also removes a fenced run's queue
+entry, decides capacity before creating the catch-all conversation, and refuses an unreadable queue
+with fixed visible text instead of faulting the run; the prepare-failure comment now states that
+the staged document writes commit, and classification happens before preparation so a failed
+prepare cannot leave the conversation chat-like in memory. The reset boundary is detected from the
+conversation's own newest entry, so a crash between reset and submit cannot place a second one.
+
+Docs updated where a claim changed (CRON.md, HISTORY.md, AGENTS.md). Coverage grew to 12 cases in
+`tests/cron-conversations.behavior.test.mjs`, including a queued one-off that wakes and runs in
+order, a cancelled head that lets the queue proceed, queue-full and malformed-queue refusals, the
+adoption guard, the single boundary on retry, `origin` mode with no conversation and no reset, a
+fenced claim that leaves no queue entry, ingress refusal of a forged mapping, and per-episode
+workspace context in the real gateway. Verified offline: typecheck/build, 318 behavior checks and 83
+core acceptance; the three signature tests (boundary, per-run context, fenced claim) were confirmed
+to fail against the pre-fix behaviour. Execution checks were not run for this fix.
+
+### Session — cron conversation model, second review
+
+A second independent review reproduced one major finding with a probe: the automation-conversation
+class was restored *after* the mapped-chat authority pass at gateway open, so a chat key mapped to an
+automation conversation was admitted as a chat, became a cron owner with an unevictable snapshot
+slot, and could never be reclassified for that process (`historyEntries` accepted it and
+`conversationFor` returned it with the full coding allowlist plus `cron` and `history`). The stored
+session map is now read once at open, the class is restored from the map's own origins before any
+mapped key is admitted as chat, adoption uses the same marker/owner/parent predicate a run uses
+(`classifyAutomationConversation`), and the open path skips an automation-classified id entirely (no
+`cronOwners`, no `sessionConversations`, no snapshot install). The old guard was `cronOwners.has`,
+i.e. the set the authority pass had just filled, which is why it could veto the very id it had to
+protect.
+
+Also fixed: a queued one-off committed and recorded a catch-all conversation before deciding to wait,
+so two same-tick claims could split the one-catch-all-per-origin record (it now commits only its
+waiting state and re-reads the document when it wakes); the read-then-commit exposure of the
+pre-claim marker snapshot is documented where it happens; the reopen restore shares the run's
+adoption predicate instead of re-deriving it; the claim phase returns explicitly after a terminal
+fence commit instead of relying on the framework refusing a second `finishRun`; the boundary scan
+states `order: "descending"`; and CRON.md no longer claims a crash between `reset(...)` and
+`submit(...)` can never admit a second boundary (it can, harmlessly, while the conversation is
+busy).
+
+Coverage is 14 cases: the reopened-forged-mapping case and the waiting-run case were both confirmed
+to fail against the previous commit (the reopened process accepted the forged history read, and the
+waiting run created conversation 17). Verified offline: typecheck/build, 320 behavior checks and 83
+core acceptance; the cron file ran three times with no flakes. Execution checks were not run.
+
+### Session — cron conversation model, third review
+
+A final narrow round on the two remaining holes of the class the previous review fixed. (1) The
+open-time class restore enumerated candidates from committed cron documents only, so an automation
+conversation whose pointer was lost (damaged write, hand-edited document, store restored from an
+inconsistent layout) kept its marker but was never classified, and a stale mapping to it was admitted
+as chat — `historyEntries` accepted it and `conversationFor` handed out the coding allowlist plus
+`cron` and `history`. The conversation's own marker now decides: every mapped conversation is
+classified from its marker, the document scan only enumerates candidate IDs (a live run's target is
+unmapped). Documents never decide a class, so a damaged pointer can at most fail to enumerate.
+
+(2) The mapped-session install loop skipped only this host's automation class, unlike the authority
+pass above it: a forged or stale key naming a fork, a task-owned conversation or the root still
+installed a cron owner, an unevictable snapshot slot and a cron tool. It now applies the shared
+`readChatScope` rule and skips those reasons; a missing conversation keeps its explicit failure, and
+a forked ID leaves the mapped set so its snapshot is evictable again.
+
+(3) The `ensureAutomationConversation` comment claimed the marker is re-read inside the commit; only
+the conversation record is. It now says so, and still states what the transaction does re-check.
+
+Coverage is 16 cases: the lost-pointer reopen case and the forged-fork reopen case were both
+confirmed to fail against d5b7cad5 (the reopened process accepted the stale history read and left
+`cron` on the fork), and the adoption case gained a foreign-origin/job assertion. Known gaps recorded
+in CRON.md: the class restore belongs to the cron-enabled open path, so a store opened with
+`cron.enabled` false does not classify one, and a `:channel-state` key stays a mapped cron owner by
+design. Verified offline: typecheck, 322 behavior checks and 83 core acceptance; the cron file ran
+three times with no flakes. Execution checks were not run.

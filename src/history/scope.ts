@@ -86,10 +86,11 @@ export function readChatSessions(sessions: unknown, rootId: ConversationId): His
  *
  * A session key is a host string: it can be forged, imported or left behind by an older layout, so
  * the key alone never decides scope. A chat conversation is ownerless, unforked and not the root; a
- * scheduled run's background target, a history fork and the root are never a discussion a channel
- * named.
+ * scheduled run's automation conversation, a history fork and the root are never a discussion a
+ * channel named. Automation conversations are ownerless by design — they outlive the run task that
+ * created them — so their class is carried by the host, not inferred from `owner`.
  */
-export type ChatScopeExclusion = "missing" | "root" | "task-owned" | "forked";
+export type ChatScopeExclusion = "missing" | "root" | "automation" | "task-owned" | "forked";
 
 /**
  * Classify one conversation record for chat scope, or `undefined` when it is ordinary chat.
@@ -102,6 +103,13 @@ export interface ChatScopeRecord {
   readonly id: ConversationId;
   readonly owner?: unknown;
   readonly parent?: unknown;
+  /**
+   * The host's durable classification of this conversation as a scheduled run's automation
+   * conversation. It is stated explicitly because such a conversation is ownerless and unforked,
+   * exactly like a chat; the conversation's own class marker says which it is, and the host's cron
+   * documents only enumerate candidates for a reopen.
+   */
+  readonly automation?: boolean;
 }
 
 export function chatScopeExclusion(
@@ -110,6 +118,7 @@ export function chatScopeExclusion(
 ): ChatScopeExclusion | undefined {
   if (conversation === undefined) return "missing";
   if (conversation.id === rootId) return "root";
+  if (conversation.automation === true) return "automation";
   if (conversation.owner !== undefined) return "task-owned";
   if (conversation.parent !== undefined) return "forked";
   return undefined;
@@ -165,6 +174,7 @@ export async function partitionChatScope(
 export function chatScopeMessage(reason: ChatScopeExclusion): string {
   switch (reason) {
     case "missing": return "Stored session mapping points to a missing conversation";
+    case "automation": return "Stored session mapping points to a scheduled run's automation conversation";
     case "task-owned": return "Stored session mapping points to a task-owned conversation";
     case "forked": return "Stored session mapping points to a forked conversation";
     case "root": return "Stored session mapping points to the root conversation";
