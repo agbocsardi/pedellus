@@ -13,9 +13,11 @@ import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
 import {
   conversationCommandNames,
   conversationCommandRefusal,
+  conversationCommandUsage,
   conversationDetailBlock,
-  conversationHelpDocument,
+  conversationHelpListing,
   findConversationCommand,
+  offeredConversationCommands,
 } from "../help/commands.js";
 import {
   renderMemoryDigestStart,
@@ -2300,8 +2302,8 @@ export async function runTelegram(
       const offered = availableCommandNames();
       const command = offered.includes(requested) ? findConversationCommand(requested) : undefined;
       await admitNotice(update, message, sessionKey, command === undefined
-        ? `${conversationCommandRefusal(requested, offered)} Nothing was sent to the assistant.`
-        : conversationDetailBlock(command));
+        ? `${conversationCommandRefusal("telegram", requested, offered)} Nothing was sent to the assistant.`
+        : conversationDetailBlock(command, "telegram"));
       drain();
       return;
     }
@@ -2312,7 +2314,7 @@ export async function runTelegram(
         return;
       }
       if (parsed.args) {
-        await admitNotice(update, message, sessionKey, "Usage: /status (no arguments). Nothing was sent to the assistant.");
+        await admitNotice(update, message, sessionKey, usageNotice("status"));
         drain();
         return;
       }
@@ -2329,7 +2331,7 @@ export async function runTelegram(
       }
       const argument = parseModelArgument(parsed.args);
       if (argument.kind === "usage") {
-        await admitNotice(update, message, sessionKey, MODEL_USAGE);
+        await admitNotice(update, message, sessionKey, usageNotice("model"));
         drain();
         return;
       }
@@ -2373,7 +2375,7 @@ export async function runTelegram(
         return;
       }
       if (parsed.args) {
-        await admitNotice(update, message, sessionKey, "Usage: /restart (no arguments). Nothing was sent to the assistant.");
+        await admitNotice(update, message, sessionKey, usageNotice("restart"));
         drain();
         return;
       }
@@ -2400,7 +2402,7 @@ export async function runTelegram(
         return;
       }
       if (argument !== "") {
-        await admitNotice(update, message, sessionKey, DIGEST_USAGE);
+        await admitNotice(update, message, sessionKey, usageNotice("digest"));
         drain();
         return;
       }
@@ -2438,7 +2440,7 @@ export async function runTelegram(
         await admitControl(update, message, sessionKey, sub === "approve" ? "mcp-approve" : "mcp-deny", id);
         return;
       }
-      await admitNotice(update, message, sessionKey, MCP_USAGE);
+      await admitNotice(update, message, sessionKey, usageNotice("mcp"));
       drain();
       return;
     }
@@ -2446,7 +2448,7 @@ export async function runTelegram(
     // it normalizes to the same control kind before admission, so the durable record, gating and
     // recovery path are shared and there is no second cancellation semantics.
     if (parsed.args) {
-      await admitNotice(update, message, sessionKey, `Usage: /${parsed.command} (no arguments). Nothing was sent to the assistant.`);
+      await admitNotice(update, message, sessionKey, usageNotice(parsed.command));
       drain();
       return;
     }
@@ -2664,7 +2666,7 @@ export async function runTelegram(
     const admin = gateway.mcpAdmin;
     if (admin === undefined) return { kind: "refused", text: MCP_UNAVAILABLE_HOST };
     const id = record.target;
-    if (id === undefined || !MCP_REQUEST_ID.test(id)) return { kind: "refused", text: MCP_USAGE };
+    if (id === undefined || !MCP_REQUEST_ID.test(id)) return { kind: "refused", text: usageNotice("mcp") };
     const result = record.command === "mcp-approve"
       ? await admin.approve(id, adapterContext)
       : await admin.deny(id, adapterContext);
@@ -3083,7 +3085,7 @@ export async function runTelegram(
     return [
       selectedLine,
       ...(listing.defaultPreset === undefined ? [] : [`Configured default preset: ${boundedLabel(listing.defaultPreset, 80)}.`]),
-      "Named model presets (use /model <name>, or /model default for the configured preset):",
+      "Named model presets (see /help model to select one):",
       ...rows,
       "A selection applies to this chat only and lasts while the gateway stays open; a restart restores the " +
         "configured default and prepared requests keep their model.",
@@ -3092,34 +3094,25 @@ export async function runTelegram(
 
   /** The catalogued Telegram commands this host actually supports, in menu order. */
   function availableCommandNames(): readonly string[] {
-    const offered: Record<string, boolean> = {
-      new: true,
-      abort: true,
-      stop: true,
-      status: hostCommands.status,
-      model: hostCommands.model,
-      restart: hostCommands.restart,
-      digest: hostCommands.digest,
-      mcp: hostCommands.mcp,
-      help: true,
-    };
-    return conversationCommandNames("telegram").filter((name) => offered[name] === true);
+    return offeredTelegramCommandNames(hostCommands);
   }
 
   function availableCommandList(): string {
     return availableCommandNames().map((name) => `/${name}`).join(", ");
   }
 
-  /** Help lists exactly the controls this host implements; nothing is advertised that would be refused. */
+  /** Help lists exactly the controls this host implements, one line each; detail stays in `/help <command>`. */
   function controlHelpText(): string {
+    const offered = availableCommandNames();
+    const absent = conversationCommandNames("telegram").filter((name) => !offered.includes(name));
     return [
-      conversationHelpDocument("telegram", availableCommandNames()),
+      conversationHelpListing("telegram", offered),
+      ...(absent.length === 0 ? [] : [`Not offered by this host: ${absent.map((name) => `/${name}`).join(", ")}.`]),
       mediaIngress === undefined
-        ? "Limits: text only (attachments are not read); no tool-authority, history, restart or media commands. " +
-          "Other slash commands are refused; prefix // to send a leading slash literally."
-        : "Attachments: photos are attached as image content, voice/audio is transcribed locally when the backend is " +
-          "provisioned, and documents are stored unread on disk under the configured media directory. Video and stickers " +
-          "are not downloaded. Other slash commands are refused; prefix // to send a leading slash literally.",
+        ? "Text only: attachments are not read and /attach is not available; other slash commands are refused, " +
+          "and // sends a leading slash literally."
+        : "Photos arrive as image content, voice and audio are transcribed locally, and documents are stored unread; " +
+          "video and stickers are not downloaded, and // sends a leading slash literally.",
     ].join("\n\n");
   }
 
@@ -3413,23 +3406,35 @@ function quotedMessageContext(
 }
 
 /**
- * Only commands this adapter actually implements for this host belong in the native menu. `/status`,
- * `/model`, `/digest` and `/restart` are omitted for a host that exposes no such operation.
+ * The native command menu is the shared catalogue filtered to the controls this host implements, so
+ * its names and one-line descriptions cannot drift from `/help`.
  */
 function telegramCommands(
   host: TelegramCommandHost,
 ): readonly { readonly command: string; readonly description: string }[] {
-  return [
-    { command: "new", description: "Reset this conversation's context" },
-    { command: "abort", description: "Stop this turn and withdraw queued messages" },
-    { command: "stop", description: "Alias of /abort: stop this turn here" },
-    ...(host.status ? [{ command: "status", description: "Show this chat's model and run status" }] : []),
-    ...(host.model ? [{ command: "model", description: "List or select a configured model preset" }] : []),
-    ...(host.restart ? [{ command: "restart", description: "Restart the gateway process" }] : []),
-    ...(host.digest ? [{ command: "digest", description: "Run one bounded memory-digestion batch" }] : []),
-    ...(host.mcp ? [{ command: "mcp", description: "Review and approve MCP server proposals" }] : []),
-    { command: "help", description: "Show the available commands" },
-  ];
+  // Bot API caps a menu description at 256 characters; catalogue summaries are far shorter.
+  return offeredConversationCommands("telegram", offeredTelegramCommandNames(host)).map((command) => ({
+    command: command.name,
+    description: command.summary.slice(0, TELEGRAM_MENU_DESCRIPTION_MAX),
+  }));
+}
+
+const TELEGRAM_MENU_DESCRIPTION_MAX = 256;
+
+/** The catalogued Telegram controls this host really implements, in catalogue order. */
+function offeredTelegramCommandNames(host: TelegramCommandHost): readonly string[] {
+  const offered: Record<string, boolean> = {
+    new: true,
+    abort: true,
+    stop: true,
+    help: true,
+    status: host.status,
+    model: host.model,
+    restart: host.restart,
+    digest: host.digest,
+    mcp: host.mcp,
+  };
+  return conversationCommandNames("telegram").filter((name) => offered[name] === true);
 }
 
 /** Which optional host operations this adapter may advertise and apply. */
@@ -3529,16 +3534,17 @@ const MODEL_LISTING_UNAVAILABLE =
 const MODEL_PRESETS_UNAVAILABLE =
   "Named model presets are not configured in this deployment, so /model <name> and /model default are unavailable. " +
   "Nothing was changed; /model lists the current selection read only, and this chat command never rewrites the configuration.";
-const MODEL_USAGE =
-  "Usage: /model (list the configured presets) or /model <preset> (or /model default). Nothing was sent to the assistant.";
+/** A fixed Telegram usage notice: the catalogue's line, a no-argument note, and the surface's tail. */
+function usageNotice(name: string): string {
+  const argumentsNote = findConversationCommand(name)?.args === undefined ? " (no arguments)." : "";
+  return `${conversationCommandUsage(name, "telegram")}${argumentsNote} Nothing was sent to the assistant.`;
+}
+
 const MCP_UNAVAILABLE_HOST =
   "MCP management is unavailable in this host: the gateway was opened without an on-disk configuration file, " +
   "so there is nothing to write. Nothing was sent to the assistant.";
 /** One pending owner approval request. Opaque, fixed-width and content-bound at creation. */
 const MCP_REQUEST_ID = /^[0-9a-f]{16}$/;
-const MCP_USAGE =
-  "Usage: /mcp (servers and waiting requests) | /mcp show <id> | /mcp approve <id> | /mcp deny <id>. " +
-  "Nothing was sent to the assistant.";
 const RESTART_UNAVAILABLE_HOST =
   "Restart is unavailable in this host: it cannot replace its own process with the same program and configuration. " +
   "Nothing was sent to the assistant.";
@@ -3553,8 +3559,6 @@ const RESET_BUSY =
 const DIGEST_UNAVAILABLE_HOST =
   "Memory digestion is unavailable in this host: it exposes no manual digestion entry. Nothing was started and " +
   "nothing was sent to the assistant.";
-const DIGEST_USAGE =
-  "Usage: /digest (start one bounded batch) or /digest status (bounded read-only status). Nothing was sent to the assistant.";
 
 /** Replay wording for a command this adapter recorded before a restart; it is never run twice. */
 function replayControlText(entry: TelegramControlRecord): string {

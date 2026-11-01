@@ -410,12 +410,14 @@ test('a host notice travels rich with literal characters escaped', { timeout: 20
   const store = await syntheticStore('notice');
   let harness;
   try {
-    const transport = telegramMock([update(640, '/help')]);
+    const transport = telegramMock([update(640, '/help'), update(641, '/help model')]);
     harness = start(store, transport);
-    await until(() => transport.rich.length === 1, 'one rich notice');
-    const notice = transport.rich[0].text;
-    assert.match(notice, /Controls for this chat/);
-    assert.match(notice, /\\<preset\\>/, 'the placeholder is escaped so it is not read as an HTML tag');
+    await until(() => transport.rich.length === 2, 'two rich notices');
+    const listing = transport.rich[0].text;
+    assert.match(listing, /Controls for this chat/);
+    assert.match(listing, /\\\[preset\\\]/, 'the placeholder brackets are escaped so they are literal text');
+    const detail = transport.rich[1].text;
+    assert.match(detail, /\\<preset\\>/, 'the placeholder is escaped so it is not read as an HTML tag');
     assert.equal(transport.plain.length, 0);
   } finally {
     await cleanup(store, harness);

@@ -315,8 +315,18 @@ test('a native host advertises exactly the implemented owner commands, with the 
     harness = start(store, transport, { restart });
     await until(() => transport.commands.length === 1, 'command menu registration');
     assert.deepEqual(transport.commands[0].scope, { type: 'all_private_chats' });
-    assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command),
-      ['new', 'abort', 'stop', 'status', 'model', 'restart', 'digest', 'help']);
+    // The menu is the catalogue filtered to this host, so its order and wording are not maintained
+    // here: names follow the catalogue, descriptions are its one-line summaries.
+    assert.deepEqual(transport.commands[0].commands, [
+      { command: 'new', description: 'Start a fresh context for this conversation' },
+      { command: 'abort', description: 'Stop this turn and withdraw queued messages' },
+      { command: 'stop', description: 'Alias of /abort: stop this turn here' },
+      { command: 'status', description: "Show this conversation's model and run state" },
+      { command: 'model', description: 'List or select a model for this conversation' },
+      { command: 'digest', description: 'Start one bounded memory-digestion batch' },
+      { command: 'restart', description: 'Replace the whole gateway process' },
+      { command: 'help', description: "Show these controls, or one command's detail" },
+    ]);
     // The retired `/refresh` is not an owner command: no menu entry and a truthful refusal.
     assert.ok(!transport.commands[0].commands.some((entry) => entry.command === 'refresh'));
     assert.equal(store.captured.length, 0, 'registering commands costs no model request');
@@ -334,21 +344,57 @@ test('a narrow SDK host keeps the base commands and truthfully refuses typed hos
     textUpdate(302, 302, '/restart'),
     textUpdate(303, 303, '/new'),
     textUpdate(304, 304, '/help'),
+    textUpdate(305, 305, '/help refresh'),
   ]]);
   let harness;
   try {
     harness = start(store, transport, { narrow: true });
     await until(() => transport.commands.length === 1, 'command menu registration');
     assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command), ['new', 'abort', 'stop', 'help']);
-    await until(() => transport.sent.length === 5, 'all five replies');
+    await until(() => transport.sent.length === 6, 'all six replies');
     const texts = transport.sent.map((entry) => entry.text);
     assert.ok(texts.some((text) => /Status is unavailable in this host/.test(text)));
     assert.ok(texts.some((text) => /Model commands are unavailable in this host/.test(text)));
     assert.ok(texts.some((text) => /Restart is unavailable in this host/.test(text)));
     assert.ok(texts.some((text) => /Context reset applied/.test(text)), 'plain native /new still works');
+    // `/refresh` is a terminal command, so `/help refresh` names that instead of "no such command".
+    assert.ok(texts.some((text) => /^\/refresh is only available in the terminal\. Available: /m.test(rendered(text))));
     const help = texts.find((text) => text.startsWith('Controls for this chat'));
-    assert.doesNotMatch(help, /\/status|\/model|\/restart|\/refresh/);
+    // Only the offered controls are listed as controls; the rest are named once as not offered.
+    assert.match(help, /Not offered by this host: \/status, \/model, \/digest, \/mcp, \/restart\./);
+    assert.doesNotMatch(help, /^\/(status|model|restart|digest|refresh)\b/m);
+    assert.doesNotMatch(help, /\/refresh/);
     assert.equal(store.captured.length, 0, 'no command reached the model');
+  } finally {
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('a full host fits its whole /help listing in one bounded notice and keeps detail on request', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('help-full', { configFile: true });
+  const restart = { supported: true, requested: 0, async request() { this.requested += 1; } };
+  const transport = telegramMock([[textUpdate(700, 700, '/help'), textUpdate(701, 701, '/help model')]]);
+  let harness;
+  try {
+    harness = start(store, transport, { restart });
+    await until(() => transport.sent.length === 2, 'the help listing and one command detail');
+    const help = rendered(transport.sent[0].text);
+    // Every offered control and the trailing limits line arrive: nothing is cut mid-document.
+    assert.match(help, /^Controls for this chat/);
+    for (const line of ['new', 'abort', 'stop', 'status', 'model', 'digest', 'mcp', 'restart', 'help']) {
+      assert.ok(help.includes(`/${line}`), `the listing names /${line}`);
+    }
+    assert.match(help, /\/help \[command\] — Show these controls, or one command's detail/);
+    assert.match(help, /Text only: attachments are not read and \/attach is not available/);
+    assert.doesNotMatch(help, /Not offered by this host/);
+    assert.ok(help.length < 1_500, `the help notice is ${help.length} characters, under the notice bound`);
+    // Per-command usage and detail stay on the `/help <command>` path.
+    const detail = rendered(transport.sent[1].text);
+    assert.match(detail, /^Usage: \/model \(list the configured presets\) or \/model <preset> \(or \/model default\)\./);
+    assert.match(detail, /\/model alone lists this host's choices; a selection changes this conversation only\./);
+    assert.doesNotMatch(help, /a selection changes this conversation only/);
+    assert.equal(store.captured.length, 0, 'no help path reached the model');
   } finally {
     await cleanup(store, harness);
     transport.restore();

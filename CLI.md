@@ -44,24 +44,31 @@ durable-nanobot logout --help
 durable-nanobot recovery --help
 ```
 
-A per-command page carries that command's exact usage line, its own options,
-fixed details and examples. `--help` is accepted anywhere before dispatch, so it
-never reads the configuration named on the same line.
+A per-command page carries that command's exact usage line, its own options, at
+most two short notes and two examples. A help flag is honoured before dispatch,
+so `--help` on any known subcommand line names that subcommand's page and never
+reads the configuration named on the same line.
+
+The bare `help` word is only a help request as the first argument with nothing
+else: `--help --config x` prints the overview and exits 0, while `help --config x`
+and `--config x help` are ordinary argument lists. Those print the fixed usage
+block on standard error and exit 1.
 
 An unrecognized subcommand prints one fixed `unknown command` diagnostic with
 the usage block and a help hint, and exits 1. That diagnostic echoes the typed
 token only when it is shaped like a command name; no other argument is ever
-repeated. A malformed known form still prints the full usage block on standard
-error and exits 1.
+repeated. Any other malformed known form also prints the full usage block and
+exits 1.
 
-Both conversation surfaces render the same command catalogue. `/help` prints the
-controls that host actually offers, and `/help <command>` prints one command's
-usage and detail:
+Both conversation surfaces render the same command catalogue, one short line per
+command. `/help` prints the listing this host actually offers; `/help <command>`
+prints one command's usage line and its one-sentence detail:
 
 - CLI: `/help`, `/help model`. Commands this host does not offer are named in one
   line instead of being advertised as working.
-- Telegram: `/help`, `/help digest`. Only the owner commands this gateway
-  implements are listed, so nothing is advertised that would be refused.
+- Telegram: `/help`, `/help digest`. The listing stays inside one bounded notice,
+  so only the owner commands this gateway implements are listed and nothing is
+  advertised that would be refused.
 
 ## Provider authentication
 

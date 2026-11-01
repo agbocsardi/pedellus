@@ -7,7 +7,7 @@ import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earend
 import { runLogin, runLogout } from "./auth/cli.js";
 import { loadConfig, defaultConfigPath } from "./config.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
-import { commandUsageLine, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
+import { COMMANDS, commandUsage, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
 import { SAFE_COMMAND_NAME } from "./help/commands.js";
 import { connectLocalGateway } from "./local/client.js";
 import { gatewaySocketPath, serveLocalGateway } from "./local/server.js";
@@ -24,10 +24,8 @@ import { StartupDiagnosticError, startupDiagnostic } from "./startup-diagnostics
 /** Every synopsis, the fixed default configuration note and the help hint; never supplied arguments. */
 const USAGE = renderUsage();
 
-const RECOVERY_USAGE = commandUsageLine(findCommandHelp("recovery")!);
-
 /** The subcommands this process accepts, excluding the historical bare `--config` attach. */
-const SUBCOMMANDS = new Set(["gateway", "agent", "login", "logout", "recovery"]);
+const SUBCOMMANDS = new Set(COMMANDS.map((command) => command.name));
 
 const CONVERSATION_NAME = /^[a-z0-9](?:[a-z0-9_-]{0,30})[a-z0-9]$|^[a-z0-9]$/;
 
@@ -161,14 +159,14 @@ function recoveryInvocation(args: readonly string[]): RecoveryInvocation | undef
       fingerprint = rest[index + 1];
       index += 2;
     } else {
-      throw new PreparedContextRecoveryError(RECOVERY_USAGE);
+      throw new PreparedContextRecoveryError(commandUsage("recovery"));
     }
   }
   if (cancel === undefined && fingerprint === undefined) return { kind: "list", config };
-  if (cancel === undefined || fingerprint === undefined) throw new PreparedContextRecoveryError(RECOVERY_USAGE);
+  if (cancel === undefined || fingerprint === undefined) throw new PreparedContextRecoveryError(commandUsage("recovery"));
   const taskId = Number(cancel);
   if (!/^[1-9][0-9]*$/.test(cancel) || !Number.isSafeInteger(taskId) || !/^[0-9a-f]{64}$/.test(fingerprint)) {
-    throw new PreparedContextRecoveryError(RECOVERY_USAGE);
+    throw new PreparedContextRecoveryError(commandUsage("recovery"));
   }
   return { kind: "cancel", config, taskId, fingerprint };
 }

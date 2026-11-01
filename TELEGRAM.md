@@ -31,8 +31,10 @@ never reaches it. `message.text` (not a caption) is classified:
   one configured preset name or `default`; `/digest` takes nothing or the literal
   `status`; `/mcp` takes nothing, or `show <id>`, `approve <id>`, `deny <id>` with
   one 16-hex request ID; `/help` takes nothing or one command name this host
-  offers, and answers with that command's usage and detail. Anything else gets a
-  bounded usage notice.
+  offers, and answers with that command's usage and one-sentence detail. Any
+  other argument to a control gets a bounded usage notice; `/help <name>` for a
+  name that is not offered gets a fixed refusal that names the reason (another
+  surface, or this host) instead of a false "no such command".
 - `/new@bot` etc. are controls only when the mention names this bot from
   `getMe` (case-insensitive). Another bot's mention, or a mention while `getMe`
   returned no usable username, gets a bounded notice and is neither executed nor
@@ -408,8 +410,13 @@ and leaves typed commands working; no unimplemented command is advertised.
 
 ### Host capability and the native menu
 
-The menu and `/help` list exactly the controls this host can perform, and a typed
-command outside that set is refused with fixed text instead of a silent failure:
+The menu and `/help` are both rendered from the one slash-command catalogue
+(filtered to the names this host can perform), so a menu entry, a listing line and
+a typed command cannot drift. `/help` carries the listing, one line for commands
+this host lacks, and one short limits line; per-command usage and detail stay on
+`/help <command>` and the whole notice stays inside the bounded notice limit. A
+typed command outside the host's set is refused with fixed text instead of a
+silent failure:
 
 - `/new`, `/abort` (with the `/stop` alias) and `/help` are always implemented.
 - `/status` and `/model` need the host model catalog; `/model` also needs preset
@@ -428,7 +435,7 @@ command outside that set is refused with fixed text instead of a silent failure:
 A test-only host that offers none of the optional host operations therefore
 advertises exactly `/new`, `/abort`, `/stop`, `/help`, while the shipped gateway
 with the CLI restart host advertises `/new`, `/abort`, `/stop`, `/status`,
-`/model`, `/restart`, `/digest`, `/help`.
+`/model`, `/digest`, `/mcp`, `/restart`, `/help`.
 
 An ordinary user message keeps its existing input text (including literal `//`
 handling), so literal content is unchanged. A message that replies to another

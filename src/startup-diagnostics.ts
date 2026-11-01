@@ -6,7 +6,6 @@
  * filesystem paths, provider/dependency error text or the underlying exception.
  */
 export const STARTUP_DIAGNOSTICS = Object.freeze({
-  usage: "Usage: durable-nanobot gateway|agent|login|logout|recovery [--config <path>] (without --config: ~/.durable-nanobot/config.json)",
   configHome:
     "cannot resolve the default configuration home; set HOME or pass --config <path> (diagnostic details suppressed)",
   defaultConfigFile:
@@ -94,6 +93,5 @@ export function startupDiagnostic(error: unknown): string {
   const code = error instanceof StartupDiagnosticError
     ? knownStartupDiagnosticCode(error.code)
     : "unexpected";
-  // Usage text already names the executable; avoid a `durable-nanobot: Usage: durable-nanobot` prefix.
-  return code === "usage" ? STARTUP_DIAGNOSTICS.usage : `durable-nanobot: ${STARTUP_DIAGNOSTICS[code]}`;
+  return `durable-nanobot: ${STARTUP_DIAGNOSTICS[code]}`;
 }

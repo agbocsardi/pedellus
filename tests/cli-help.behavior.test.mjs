@@ -64,8 +64,12 @@ test("process help prints the overview on stdout and reads no configuration", { 
     assert.match(result.stdout, /durable-nanobot recovery \[--config <path>\] \[--cancel <taskId> --fingerprint <sha256>\]/);
     assert.match(result.stdout, /~\/\.durable-nanobot\/config\.json/);
     // The generated slash-command catalogue is part of the overview, with its availability caveat.
-    assert.match(result.stdout, /availability depends on the running gateway's capabilities/);
-    assert.match(result.stdout, /\/help \[command\] — Show these controls/);
+    assert.match(result.stdout, /availability depends on the gateway/);
+    assert.match(result.stdout, /\/help \[command\] — Show these controls, or one command's detail/);
+    // Help text stays short: the overview is about one screen and no line is a paragraph.
+    const overviewLines = result.stdout.trimEnd().split("\n");
+    assert.ok(overviewLines.length <= 60, `the overview is ${overviewLines.length} lines`);
+    assert.ok(overviewLines.every((line) => line.length <= 120), "no overview line exceeds 120 characters");
   }
   await assert.rejects(stat(join(home, ".durable-nanobot")), /ENOENT/,
     "printing help must not create or read the default configuration directory");
@@ -80,9 +84,9 @@ test("per-subcommand help pages print only fixed text and exit 0", { timeout: 30
   const home = await emptyHome(t);
   const cases = [
     ["gateway", /Usage: durable-nanobot gateway \[--config <path>\]/, /one private Unix socket/],
-    ["agent", /Usage: durable-nanobot agent \[--config <path>\] \[--conversation <name>\]/, /never opens a second runtime/],
-    ["login", /Usage: durable-nanobot login \[--config <path>\] \[provider\] \[--auth api_key\|oauth\]/, /terminal-only/],
-    ["logout", /Usage: durable-nanobot logout \[--config <path>\] \[provider\]/, /private credential store/],
+    ["agent", /Usage: durable-nanobot agent \[--config <path>\] \[--conversation <name>\]/, /Never opens a second runtime/],
+    ["login", /Usage: durable-nanobot login \[--config <path>\] \[provider\] \[--auth api_key\|oauth\]/, /Terminal-only/],
+    ["logout", /Usage: durable-nanobot logout \[--config <path>\] \[provider\]/, /terminal-only path as login/],
     [
       "recovery",
       /Usage: durable-nanobot recovery \[--config <path>\] \[--cancel <taskId> --fingerprint <sha256>\]/,
@@ -96,7 +100,42 @@ test("per-subcommand help pages print only fixed text and exit 0", { timeout: 30
     assert.match(result.stdout, usage, `${command} page carries its exact usage line`);
     assert.match(result.stdout, detail);
     assert.match(result.stdout, /~\/\.durable-nanobot\/config\.json/);
+    assert.ok(result.stdout.trimEnd().split("\n").length <= 24, `${command} page stays short`);
   }
+  await assert.rejects(stat(join(home, ".durable-nanobot")), /ENOENT/);
+});
+
+test("a help flag is honoured before dispatch while `help` as an argument is not a help request", { timeout: 30_000 }, async (t) => {
+  const home = await emptyHome(t);
+  // A help flag anywhere on a known subcommand line names that subcommand's page and exits 0.
+  const pages = [
+    [["gateway", "--config", "--help"], /Usage: durable-nanobot gateway \[--config <path>\]/],
+    [["agent", "--conversation", "work", "--help"], /Usage: durable-nanobot agent \[--config <path>\] \[--conversation <name>\]/],
+  ];
+  for (const [args, usage] of pages) {
+    const result = await runCli(home, args);
+    assert.deepEqual({ code: result.code, signal: result.signal }, { code: 0, signal: null }, result.stderr);
+    assert.equal(result.stderr, "", "a help page is not a diagnostic");
+    assert.match(result.stdout, usage);
+    assert.doesNotMatch(result.stdout, /^Usage:\n/m, "a page is not the overview");
+  }
+  // `help` given as an option value or after `--config x` is an argument, not a help request: the
+  // dispatch parser rejects the form and the fixed usage block exits 1 without printing a page.
+  const malformed = [
+    ["help", "--config", join(home, "absent.json")],
+    ["--config", join(home, "absent.json"), "help"],
+  ];
+  for (const args of malformed) {
+    const refused = await runCli(home, args);
+    assert.deepEqual({ code: refused.code, signal: refused.signal }, { code: 1, signal: null });
+    assert.equal(refused.stdout, "", "a malformed form prints no help page");
+    assert.match(refused.stderr, /^Usage: durable-nanobot gateway \[--config <path>\]/);
+    assert.match(refused.stderr, /durable-nanobot <command> --help/);
+  }
+  // The overview form of a help flag does exit 0, even with an unused --config on the line.
+  const overview = await runCli(home, ["--help", "--config", join(home, "absent.json")]);
+  assert.deepEqual({ code: overview.code, signal: overview.signal }, { code: 0, signal: null }, overview.stderr);
+  assert.match(overview.stdout, /^durable-nanobot — local assistant gateway/);
   await assert.rejects(stat(join(home, ".durable-nanobot")), /ENOENT/);
 });
 

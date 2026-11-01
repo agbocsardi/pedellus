@@ -281,6 +281,37 @@ test("the owner reviews MCP requests from the attached terminal and refuses an u
   assert.match(printed, /Usage: \/mcp/);
 });
 
+test("terminal /help lists only offered commands and one command's detail on demand", { timeout: 20_000 }, async (t) => {
+  const { socketPath } = await makeEnvironment(t);
+  const client = await connectLocalGateway({ socketPath, context });
+  t.after(async () => { await client.close(); });
+  assert.equal(client.mcp, true, "a gateway opened from a config file exposes MCP management");
+  const { chunks, io } = terminalIO(client, lines(
+    "/help",
+    "/help model",
+    "/help attach",
+    "/help guarantee",
+    "/help ../SYNTHETIC-HELP-ARGUMENT",
+  ));
+  io.prompt = () => {};
+  await runTerminalConversation(client, context, io);
+  const printed = chunks.join("");
+  // The listing is the catalogue's one-line form, and only this host's commands are advertised.
+  assert.match(printed, /Local commands in this CLI conversation:/);
+  assert.match(printed, /\/model \[preset\] — List or select a model for this conversation/);
+  assert.match(printed, /Not offered by this host: \/digest, \/attach, \/restart\./);
+  assert.match(printed, /Unknown slash commands are not sent to the model/);
+  // `/help <command>` carries the catalogue's usage line and its one-sentence detail.
+  assert.match(printed, /Usage: \/model \[preset\] \| \/model <provider> <modelId> \[thinkingLevel\]/);
+  assert.match(printed, /\/model alone lists this host's choices; a selection changes this conversation only\./);
+  // A catalogued command this host lacks is refused as such; an unknown one is unknown.
+  assert.match(printed, /\/attach is not offered by this host\. Available: \/new, \/abort, /);
+  assert.match(printed, /No such command \/guarantee here\. Available: \/new, /);
+  // The typed name is never echoed when it is not shaped like a command.
+  assert.match(printed, /No such command here\./);
+  assert.doesNotMatch(printed, /SYNTHETIC-HELP-ARGUMENT|synthetic-help-argument/);
+});
+
 test("a second local gateway owner is refused without disturbing the live one", { timeout: 20_000 }, async (t) => {
   const { gateway, socketPath } = await makeEnvironment(t);
   await assert.rejects(

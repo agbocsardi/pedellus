@@ -11,7 +11,7 @@ import {
   conversationCommandRefusal,
   conversationCommandUsage,
   conversationDetailBlock,
-  conversationHelpDocument,
+  conversationHelpListing,
   findConversationCommand,
 } from "../help/commands.js";
 import { renderMcpApproval, renderMcpListing, type McpAdminListing, type McpApproveResult } from "../mcp/admin.js";
@@ -640,7 +640,7 @@ export async function runTerminalConversation(
     let count = DEFAULT_HISTORY_COUNT;
     if (rawCount.trim()) {
       if (!/^\d+$/.test(rawCount.trim())) {
-        await notice("Usage: /history [count] — choose a number from 1 to 50.", true);
+        await notice(conversationCommandUsage("history"), true);
         return;
       }
       count = Math.max(1, Math.min(Number(rawCount.trim()), MAX_HISTORY_COUNT));
@@ -957,7 +957,7 @@ export async function runTerminalConversation(
         await notice([
           `Current model: ${modelLabel(listing.selected)} (thinking: ${safeLabel(listing.selected.thinkingLevel, 32)}).`,
           ...(listing.defaultPreset === undefined ? [] : [`Configured default preset: ${safeLabel(listing.defaultPreset, 80)}.`]),
-          "Named model presets (use /model <name>, or /model default for the configured preset):",
+          "Named model presets (see /help model to select one):",
           ...rows,
         ].join("\n"));
         return;
@@ -970,7 +970,7 @@ export async function runTerminalConversation(
       if (listing.models.length > maxChoices) rows.push(`  … ${listing.models.length - maxChoices} more allowed models omitted`);
       await notice([
         `Current model: ${modelLabel(listing.selected)} (thinking: ${safeLabel(listing.selected.thinkingLevel, 32)}).`,
-        "Allowed models (use /model <provider> <modelId> [thinkingLevel]):",
+        "Allowed models (see /help model to select one):",
         ...rows,
       ].join("\n"));
       return;
@@ -989,11 +989,11 @@ export async function runTerminalConversation(
         }
         return;
       }
-      await notice("Usage: /model <provider> <modelId> [thinkingLevel]. Use /model to list allowed choices.", true);
+      await notice(conversationCommandUsage("model"), true);
       return;
     }
     if (parts.length > 3 || parts.some((part) => !part)) {
-      await notice("Usage: /model <provider> <modelId> [thinkingLevel]. Use /model to list allowed choices.", true);
+      await notice(conversationCommandUsage("model"), true);
       return;
     }
     const selection = { provider: parts[0]!, modelId: parts[1]!, ...(parts[2] === undefined ? {} : { thinkingLevel: parts[2]! as ModelThinkingLevel }) };
@@ -1010,7 +1010,7 @@ export async function runTerminalConversation(
   };
 
   const refreshContext = async (args: string): Promise<void> => {
-    if (args.trim()) { await notice("Usage: /refresh", true); return; }
+    if (args.trim()) { await notice(conversationCommandUsage("refresh"), true); return; }
     const host = io.contextRefresh;
     if (!host || !host.available) {
       await notice("Workspace context is not configured; /refresh is unavailable. Set workspaceContext in the config and restart.", true);
@@ -1034,7 +1034,7 @@ export async function runTerminalConversation(
   };
 
   const showTools = async (args: string): Promise<void> => {
-    if (args.trim()) { await notice("Usage: /tools", true); return; }
+    if (args.trim()) { await notice(conversationCommandUsage("tools"), true); return; }
     const policy = io.toolPolicy;
     if (policy === undefined) {
       await notice("Coding-tool authority is host-controlled and unavailable here.", true);
@@ -1119,7 +1119,11 @@ export async function runTerminalConversation(
   /** The catalogued CLI commands this host actually offers, in catalogue order. */
   const offeredCommands = (): readonly string[] => {
     const offered = new Set(["help", "new", "abort", "stop", "status", "history", "entry", "compact"]);
-    if (io.history) { offered.add("search"); offered.add("episodes"); offered.add("episode"); }
+    if (io.history) {
+      offered.add("search");
+      offered.add("episodes");
+      offered.add("episode");
+    }
     if (io.modelSelection) offered.add("model");
     if (io.toolPolicy) offered.add("tools");
     if (io.contextRefresh?.available) offered.add("refresh");
@@ -1131,8 +1135,8 @@ export async function runTerminalConversation(
   };
 
   /**
-   * One generated document for the controls this host offers, then the behavioural notes that are
-   * not per-command help: unoffered commands are listed from the catalogue, never re-described here.
+   * One screen of controls: the generated listing, then one line for a command this host lacks and
+   * one for the // escape. Per-command usage and detail stay in `/help <command>`.
    */
   const offerHelp = async (args: string): Promise<void> => {
     const available = offeredCommands();
@@ -1140,20 +1144,17 @@ export async function runTerminalConversation(
     if (!requested) {
       const unavailable = conversationCommandNames("cli").filter((name) => !available.includes(name));
       await notice([
-        conversationHelpDocument("cli", available),
-        [
-          "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
-          "/abort and /stop cancel foreground work and withdraw queued inputs; background work is unchanged.",
-          ...(unavailable.length === 0
-            ? []
-            : [`Not offered by this host: ${unavailable.map((name) => `/${name}`).join(", ")}.`]),
-        ].join("\n"),
+        conversationHelpListing("cli", available),
+        ...(unavailable.length === 0
+          ? []
+          : [`Not offered by this host: ${unavailable.map((name) => `/${name}`).join(", ")}.`]),
+        "Unknown slash commands are not sent to the model; prefix // to send one literally.",
       ].join("\n\n"));
       return;
     }
     const command = available.includes(requested) ? findConversationCommand(requested) : undefined;
     if (command === undefined) {
-      await notice(`${conversationCommandRefusal(requested, available)} It was not sent to the model.`, true);
+      await notice(`${conversationCommandRefusal("cli", requested, available)} It was not sent to the model.`, true);
       return;
     }
     await notice(conversationDetailBlock(command));
@@ -1165,7 +1166,7 @@ export async function runTerminalConversation(
         await offerHelp(args);
         return;
       case "status":
-        if (args.trim()) { await notice("Usage: /status", true); return; }
+        if (args.trim()) { await notice(conversationCommandUsage("status"), true); return; }
         await showStatus();
         return;
       case "history":
@@ -1207,7 +1208,7 @@ export async function runTerminalConversation(
           await notice(renderMemoryDigestStatus(await host.status()));
           return;
         }
-        await notice("Usage: /digest (start one bounded batch) or /digest status (bounded read-only status).", true);
+        await notice(conversationCommandUsage("digest"), true);
         return;
       }
       case "mcp": {
@@ -1233,26 +1234,26 @@ export async function runTerminalConversation(
           await notice(renderMcpApproval(result), result.status === "refused");
           return;
         }
-        await notice("Usage: /mcp | /mcp show <id> | /mcp approve <id> | /mcp deny <id>", true);
+        await notice(conversationCommandUsage("mcp"), true);
         return;
       }
       case "attach":
         await attachFile(args);
         return;
       case "compact": {
-        if (args.trim()) { await notice("Usage: /compact", true); return; }
+        if (args.trim()) { await notice(conversationCommandUsage("compact"), true); return; }
         const taskId = await conversation.compact(operationContext);
         await notice(`Native compaction task ${taskId} admitted. Summary placement follows Durable conversation boundaries.`);
         return;
       }
       case "stop":
       case "abort":
-        if (args.trim()) { await notice(`Usage: /${name}`, true); return; }
+        if (args.trim()) { await notice(conversationCommandUsage(name), true); return; }
         await conversation.abort(operationContext);
         await notice("Native Durable conversation abort completed; queued inputs were withdrawn. This does not implement Python sustained-goal abort.");
         return;
       case "new":
-        if (args.trim()) { await notice("Usage: /new", true); return; }
+        if (args.trim()) { await notice(conversationCommandUsage("new"), true); return; }
         try {
           await conversation.reset(operationContext);
         } catch (error) {
@@ -1266,7 +1267,7 @@ export async function runTerminalConversation(
           (io.contextRefresh?.available ? " Workspace context and skills were rebuilt atomically; a busy conversation is refused." : " While busy it lands at the next safe boundary; queued inputs placed with it run in the new context."));
         return;
       case "restart":
-        if (args.trim()) { await notice("Usage: /restart", true); return; }
+        if (args.trim()) { await notice(conversationCommandUsage("restart"), true); return; }
         if (!io.restart) {
           await notice("Gateway process restart is unavailable on this host.", true);
           return;
