@@ -97,8 +97,12 @@ edits need restart only; unit edits additionally need daemon-reload.
   cron owner or receive chat policy. A scheduled run's automation
   conversation is a distinct class: ownerless, recorded by its origin's cron
   documents and by its own class marker, adopted only while that marker names
-  the same origin and job and the conversation is still unforked, restored from
-  the stored map before a reopen admits any mapped key as chat, and never a
+  the same origin and job and the conversation is still unforked, and restored
+  from every mapped conversation's own marker (with the origin's documents naming
+  further candidates for a live run's unmapped target) before a reopen admits any
+  mapped key as chat, so a lost pointer is not a lost class. Open installs no cron
+  owner or context snapshot for a mapped key naming the root, a task-owned
+  conversation or a fork. Such a conversation is never a
   chat, an origin, a digest
   source, a worker, an MCP/Code Mode/compositor scope or a scheduling scope.
   Isolated cron runs capture an origin subset bounded by current config, prepare it

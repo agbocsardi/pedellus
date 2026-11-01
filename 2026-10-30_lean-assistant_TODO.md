@@ -1284,3 +1284,31 @@ Coverage is 14 cases: the reopened-forged-mapping case and the waiting-run case 
 to fail against the previous commit (the reopened process accepted the forged history read, and the
 waiting run created conversation 17). Verified offline: typecheck/build, 320 behavior checks and 83
 core acceptance; the cron file ran three times with no flakes. Execution checks were not run.
+
+### Session — cron conversation model, third review
+
+A final narrow round on the two remaining holes of the class the previous review fixed. (1) The
+open-time class restore enumerated candidates from committed cron documents only, so an automation
+conversation whose pointer was lost (damaged write, hand-edited document, store restored from an
+inconsistent layout) kept its marker but was never classified, and a stale mapping to it was admitted
+as chat — `historyEntries` accepted it and `conversationFor` handed out the coding allowlist plus
+`cron` and `history`. The conversation's own marker now decides: every mapped conversation is
+classified from its marker, the document scan only enumerates candidate IDs (a live run's target is
+unmapped). Documents never decide a class, so a damaged pointer can at most fail to enumerate.
+
+(2) The mapped-session install loop skipped only this host's automation class, unlike the authority
+pass above it: a forged or stale key naming a fork, a task-owned conversation or the root still
+installed a cron owner, an unevictable snapshot slot and a cron tool. It now applies the shared
+`readChatScope` rule and skips those reasons; a missing conversation keeps its explicit failure, and
+a forked ID leaves the mapped set so its snapshot is evictable again.
+
+(3) The `ensureAutomationConversation` comment claimed the marker is re-read inside the commit; only
+the conversation record is. It now says so, and still states what the transaction does re-check.
+
+Coverage is 16 cases: the lost-pointer reopen case and the forged-fork reopen case were both
+confirmed to fail against d5b7cad5 (the reopened process accepted the stale history read and left
+`cron` on the fork), and the adoption case gained a foreign-origin/job assertion. Known gaps recorded
+in CRON.md: the class restore belongs to the cron-enabled open path, so a store opened with
+`cron.enabled` false does not classify one, and a `:channel-state` key stays a mapped cron owner by
+design. Verified offline: typecheck, 322 behavior checks and 83 core acceptance; the cron file ran
+three times with no flakes. Execution checks were not run.

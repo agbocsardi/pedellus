@@ -74,13 +74,30 @@ chat policy, so a forged or stale map entry cannot reach either path. The shared
 classifies them explicitly (`automation`) rather
 than relying on them being absent from the session map.
 
-Opening a store reads the session map once and restores that class from the stored map's own origins
-*before* any mapped key is admitted as a chat, so a mapping forged, imported or left behind by an
-older layout is refused by the process that first reads it, not only by a process that watched the
-conversation being created. The restore decides adoption with the same rule a run applies to a
-recorded pointer (the conversation is still ownerless and unforked, and its marker names that origin
-and job), so it never takes an ordinary chat — which carries no such marker — out of chat scope, and
-the authority pass cannot veto the classification of the mapping it has to refuse.
+Opening a store reads the session map once and restores that class *before* any mapped key is
+admitted as a chat, so a mapping forged, imported or left behind by an older layout is refused by
+the process that first reads it, not only by a process that watched the conversation being created.
+The conversation's own marker decides, and it names its own class, origin and job, so every mapped
+conversation is classified whether or not its origin's job document still records it; that covers a
+conversation whose pointer was lost to a damaged write, a hand-edited document or a store restored
+from an inconsistent layout. Committed cron documents are still read, but only as an index of
+candidate IDs: a live run's target is ownerless and unmapped, so nothing else names it for the
+reopen's run-target scan. A document never decides a class, so a damaged pointer can at most fail to
+enumerate a conversation, never promote a chat or hide an automation conversation a key names. The
+restore decides adoption with the same rule a run applies to a recorded pointer (the conversation is
+still ownerless and unforked, and its marker names another conversation as its origin), so it never
+takes an ordinary chat — which carries no such marker — out of chat scope, and the authority pass
+cannot veto the classification of the mapping it has to refuse.
+
+The same open pass installs a mapped session only for a conversation the shared scope rule still
+calls chat. A key naming the root, a task-owned conversation or a fork gains no cron owner, no
+context-snapshot slot and no resume target, matching the channel ingress refusal for that key, and a
+forked ID leaves the mapped-session set so its snapshot stays evictable. A missing conversation keeps
+its explicit startup failure. Two known gaps remain. This class restore belongs to the cron-enabled
+open path: with `cron.enabled` false it does not run, so a stale key naming an automation conversation
+in a store whose cron was since disabled would be admitted as chat. And a `:channel-state` key is a
+mapped session and a cron owner by design even though no chat turn runs in it, so the cron tool it is
+offered is never exercised from there.
 
 ## Timer handoff
 
@@ -629,15 +646,23 @@ runs leave an empty queue. A fenced re-claim (a job whose generation moved on wh
 gateway was down) removes its own queue entry. A full queue refuses the occurrence with its fixed
 `lastOutcome` text without creating a catch-all conversation or adding a queue entry, and a
 malformed queue refuses it with its own fixed text instead of faulting the run. A recorded pointer
-is adopted only when the conversation's own marker names that job: a chat-like conversation and the
-root are both left untouched (no marker, no boundary, no input) and a fresh conversation is recorded
-in their place. A boundary already at the end of a conversation is not placed a second time, and
+is adopted only when the conversation's own marker names that job: a chat-like conversation, the
+root and another origin and job's conversation are all left untouched (no marker rewrite, no
+boundary, no input) and a fresh conversation is recorded in their place. A boundary already at the
+end of a conversation is not placed a second time, and
 `origin` mode creates no conversation, records no conversation ID and places no cron boundary. A
 gateway case schedules one occurrence through the real `cron` tool, then asserts the recorded
 automation conversation, its `one-off` class marker, retired capture and empty tool list, that a
 forged session mapping to it is rejected as an `automation` conversation by `historyEntries`,
 `listHistoryEpisodes` and the channel ingress path (which also leaves the real chat working), and that
-the reset scheduled an episode-catalog pass for it. A second gateway case schedules a recurring job
+the reset scheduled an episode-catalog pass for it. A reopen case forges the mapping before the next
+open and asserts the same three refusals, an empty tool list and an offer of no tools at all, while
+the real chat key keeps its configured coding tool and its cron ownership; a second reopen case
+deletes the origin's `oneOffConversationId` and every `job.conversationId` before forging the mapping,
+so the conversation's own marker is the only record left, and the same refusals hold. A third reopen
+case forges a mapping to a fork and asserts that the startup pass installed no cron extension or tool
+for it while the chat key and a `:channel-state` key keep their mapped-session behaviour. A second
+gateway case schedules a recurring job
 through the `cron` tool with a context snapshot provider whose content changes on every call, and
 asserts that each episode's request renders the snapshot rebuilt for it instead of the one the
 earlier episode installed.

@@ -416,8 +416,8 @@ be summarized into chat history or reach a provider through this pass.
 
 The `automation` reason exists because a scheduled run's conversation is ownerless by design: it
 outlives the run task that created it, so `owner`/`parent` cannot distinguish it from a chat. The
-host states the class instead, from the durable `nanobot.cron.conversation` marker plus the origin's
-cron documents, and `runtime.ts` passes it into the shared rule as `automation: true` — so a stale or
+host states the class instead, from the conversation's own durable `nanobot.cron.conversation`
+marker, and `runtime.ts` passes it into the shared rule as `automation: true` — so a stale or
 forged mapping naming one is rejected explicitly rather than by the accident of it being unmapped.
 The same class keeps every other capability set closed: an automation conversation is never in the
 authenticated mapped-chat set, the worker spawner set, the web/Telegram/MCP/Code Mode scope, the
@@ -425,10 +425,14 @@ classifier scope or the cron-owner set, and its prepared tools are retired when 
 channel ingress path reads the same record first and refuses the mapping with the same fixed message
 before anything else runs, so a mapped automation conversation cannot become a cron owner, gain an
 unevictable snapshot slot or have a live run's capture retired by the chat policy pass. Opening the
-store reads the session map once and restores that class from the map's own origins before any mapped
-key is admitted as chat, using the same marker/owner/parent predicate a run uses to adopt a recorded
-conversation, so the rejection holds for a mapping that was forged, imported or left behind *before*
-the process started — not only for one written while it ran.
+store reads the session map once and restores that class from every mapped conversation's own marker
+before any mapped key is admitted as chat, using the same marker/owner/parent predicate a run uses to
+adopt a recorded conversation, so the rejection holds for a mapping that was forged, imported or left
+behind *before* the process started — not only for one written while it ran. Because the marker is
+read from the conversation itself, a conversation whose job document no longer records it is still
+classified; that document is used only to enumerate candidates for the reopen's run-target scan. The
+class itself is restored by the cron path, so a store opened with `cron.enabled` false does not
+classify one (see the known gap in `CRON.md`).
 
 The rule itself and the read pattern live in one place: `chatScopeExclusion` (classify one record),
 `readChatScope` (read one), `partitionChatScope` (split a mapped set) and `chatScopeMessage` (the fixed

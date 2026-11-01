@@ -682,7 +682,7 @@ test("a malformed one-off queue refuses the occurrence instead of faulting its r
 });
 
 test("a recorded conversation is adopted only when its own marker names this job", { timeout: 20_000 }, async () => {
-  const scenario = await openScenario("adoption", Array.from({ length: 4 }, () => () => fauxAssistantMessage("adopted answered")));
+  const scenario = await openScenario("adoption", Array.from({ length: 5 }, () => () => fauxAssistantMessage("adopted answered")));
   try {
     // A chat-like ownerless conversation: unforked and not the origin, so only its own class marker
     // can keep it out of the automation class.
@@ -725,6 +725,33 @@ test("a recorded conversation is adopted only when its own marker names this job
     assert.equal(await scenario.harness.snapshot(CronConversationDoc, ROOT_CONVERSATION_ID, context), undefined);
     assert.equal((await scenario.harness.commit((tx) => tx.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 10), context)).items.length, 0,
       "the root received no marker, boundary or input");
+
+    // A pointer to another origin's conversation for another job: the marker names something else, so
+    // this job records a fresh conversation and leaves that marker and its transcript alone.
+    const otherOrigin = await scenario.harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const foreign = await scenario.harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    await scenario.harness.commit(async (tx) => {
+      const marker = await tx.doc(CronConversationDoc, foreign.id);
+      marker.conversationClass = "recurring";
+      marker.originConversationId = otherOrigin.id;
+      marker.jobId = "another-job";
+    }, context);
+    const misdirected = await scenario.oneOff("foreign pointer", "adoption-foreign", { schedule: { kind: "after", afterMs: 400 } });
+    await scenario.harness.commit(async (tx) => {
+      const doc = await tx.doc(CronJobsDoc, scenario.origin.id);
+      doc.oneOffConversationId = foreign.id;
+    }, context);
+    await scenario.harness.waitForTask(misdirected.timerTaskId, context);
+    const foreignStored = await settledOneOff(scenario, misdirected.jobId);
+    assert.equal(foreignStored.lastOutcome.status, "ok");
+    assert.notEqual((await readDoc(scenario.harness, scenario.origin.id)).oneOffConversationId, foreign.id,
+      "another origin and job's conversation is never adopted");
+    const foreignMarker = await scenario.harness.snapshot(CronConversationDoc, foreign.id, context);
+    assert.equal(foreignMarker.originConversationId, otherOrigin.id,
+      "the misdirected conversation keeps its own marker");
+    assert.equal(foreignMarker.jobId, "another-job");
+    assert.equal((await scenario.harness.commit((tx) => tx.scanEntries({ conversationId: foreign.id }, 10), context)).items.length, 0,
+      "it received no boundary and no input");
   } finally {
     await scenario.close();
   }
@@ -1071,6 +1098,224 @@ test("a mapping forged before the gateway opens is still automation, not chat", 
       assert.equal(chatTools.includes("read"), true);
       assert.equal(chatTools.includes("cron"), true,
         "the mapped chat stays an authenticated cron owner");
+    } finally {
+      await second.close(context);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a mapping to an automation conversation whose pointer was lost is still automation", { timeout: 30_000 }, async () => {
+  // The pointer and the marker record the same fact twice, so losing one of them cannot lose the
+  // class. A damaged write, a hand-edited document or a store restored from an inconsistent layout
+  // can drop `oneOffConversationId` while the conversation keeps its own marker; a stale key naming
+  // it must still be refused by the next open instead of being admitted as chat for its lifetime.
+  const directory = await temp("nanobot-cron-conversations-lapsed-");
+  try {
+    const workspace = resolve(directory, "workspace");
+    await mkdir(workspace);
+    const providerId = "cron-conversations-lapsed-faux";
+    const model = { provider: providerId, modelId: "synthetic" };
+    const { openGateway } = await load(`${pkg}/dist/runtime.js`);
+    const { parseConfig } = await load(`${pkg}/dist/config.js`);
+    const config = parseConfig({
+      workspace,
+      dataDir: resolve(directory, "state"),
+      model,
+      allowedModels: [model],
+      toolAllowlist: ["read"],
+      cron: { enabled: true, timeZone: "UTC" },
+    }, directory);
+    const provider = fauxProvider({ provider: providerId, models: [MODEL] });
+    let toolCallIssued = false;
+    provider.setResponses(Array.from({ length: 8 }, () => (transcript) => {
+      const input = userTexts(transcript.messages)[0];
+      if (input === "one-off reminder") return fauxAssistantMessage("ONE-OFF-ANSWER");
+      if (input === "remind me once" && !toolCallIssued) {
+        toolCallIssued = true;
+        return fauxAssistantMessage([
+          fauxToolCall("cron", {
+            action: "add",
+            message: "one-off reminder",
+            after_seconds: 1,
+          }, { id: "cron-conversations-lapsed-add" }),
+        ], { stopReason: "toolUse" });
+      }
+      return fauxAssistantMessage("Scheduled the one-off reminder.");
+    }));
+    const models = createModels();
+    models.setProvider(provider.provider);
+    const sessionKey = "cron-conversations:lapsed";
+    const forgedKey = "cron-conversations:lapsed-forged";
+    let automationId;
+    let chatId;
+
+    const first = await openGateway(config, context, { models });
+    try {
+      const chat = await first.conversationFor(sessionKey, context);
+      chatId = chat.id;
+      const settledWatcher = changeWatcher(first.harness, (changes) => changes.some((change) => {
+        if (change.type !== "document" || change.record.kind !== CRON_JOBS_KIND
+          || change.conversationId !== chat.id || change.value === null) return false;
+        return Array.isArray(change.value.jobs)
+          && change.value.jobs.some((job) => job.lastOutcome !== null && job.lastOutcome !== undefined);
+      }), "the scheduled run to settle");
+      try {
+        const submission = await chat.submit(
+          { type: "input", content: "remind me once", requestId: "cron-conversations-lapsed-request" },
+          context,
+        );
+        assert.equal((await submission.wait(context)).status, "done");
+        await settledWatcher.promise;
+      } finally {
+        settledWatcher.stop();
+      }
+      const doc = await readDoc(first.harness, chat.id);
+      automationId = doc.oneOffConversationId;
+      assert.equal(typeof automationId, "number");
+      // The pointer is lost the way document damage loses it; the marker and the stale key stay.
+      await first.harness.commit(async (tx) => {
+        const damaged = await tx.doc(CronJobsDoc, chat.id);
+        damaged.oneOffConversationId = null;
+        damaged.jobs = damaged.jobs.map((job) => ({ ...job, conversationId: null }));
+        const map = await tx.doc(SessionMap, ROOT_CONVERSATION_ID);
+        map.sessions[mappedKey(forgedKey)] = automationId;
+      }, context);
+      assert.equal((await readDoc(first.harness, chat.id)).oneOffConversationId, null,
+        "no committed pointer names the automation conversation any more");
+      assert.equal(typeof (await first.harness.snapshot(CronConversationDoc, automationId, context)), "object",
+        "the conversation keeps its own class marker");
+    } finally {
+      await first.close(context);
+    }
+
+    const second = await openGateway(config, context, { models });
+    try {
+      // The marker alone is enough to refuse the mapping on every chat surface.
+      await assert.rejects(
+        () => second.historyEntries(forgedKey, {}, 10, undefined, context),
+        /automation conversation/,
+        "history reads refuse the stale mapping even though no document records the conversation",
+      );
+      await assert.rejects(
+        () => second.listHistoryEpisodes(forgedKey, {}, context),
+        /automation conversation/,
+      );
+      await assert.rejects(
+        () => second.conversationFor(forgedKey, context),
+        /automation conversation/,
+        "the channel ingress path refuses it too",
+      );
+      const conversation = await second.harness.conversation(automationId, context);
+      assert.deepEqual((await conversation.agent(context)).tools, [],
+        "a reopened automation conversation keeps no coding, cron or history tool");
+      // The real chat key still resolves to its own conversation with its configured authority.
+      const chat = await second.conversationFor(sessionKey, context);
+      assert.equal(chat.id, chatId);
+      const chatTools = (await chat.agent(context)).tools.map((tool) => tool.name);
+      assert.equal(chatTools.includes("read"), true);
+      assert.equal(chatTools.includes("cron"), true,
+        "the mapped chat stays an authenticated cron owner");
+    } finally {
+      await second.close(context);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a mapping to a fork is not restored as a mapped session at open", { timeout: 30_000 }, async () => {
+  // The startup pass installs a cron owner and a context snapshot slot for a mapped session. Every
+  // other authority pass already refuses the root, a task-owned conversation and a fork, and so does
+  // the channel ingress; this pass has to apply the same rule instead of installing the mapping and
+  // leaving the cron tool behind on a conversation no chat surface will ever admit.
+  const directory = await temp("nanobot-cron-conversations-fork-");
+  try {
+    const workspace = resolve(directory, "workspace");
+    await mkdir(workspace);
+    const providerId = "cron-conversations-fork-faux";
+    const model = { provider: providerId, modelId: "synthetic" };
+    const { openGateway } = await load(`${pkg}/dist/runtime.js`);
+    const { parseConfig } = await load(`${pkg}/dist/config.js`);
+    const config = parseConfig({
+      workspace,
+      dataDir: resolve(directory, "state"),
+      model,
+      allowedModels: [model],
+      toolAllowlist: ["read"],
+      cron: { enabled: true, timeZone: "UTC" },
+    }, directory);
+    const provider = fauxProvider({ provider: providerId, models: [MODEL] });
+    provider.setResponses([() => fauxAssistantMessage("FORK-SOURCE-ANSWER")]);
+    const models = createModels();
+    models.setProvider(provider.provider);
+    const sessionKey = "cron-conversations:fork-chat";
+    const forgedKey = "cron-conversations:fork-forged";
+    const stateKey = "cron-conversations:fork-state:channel-state";
+    let chatId;
+    let forkId;
+    let stateId;
+
+    const first = await openGateway(config, context, { models });
+    try {
+      const chat = await first.conversationFor(sessionKey, context);
+      chatId = chat.id;
+      stateId = (await first.conversationFor(stateKey, context)).id;
+      const submission = await chat.submit(
+        { type: "input", content: "fork me", requestId: "cron-conversations-fork-request" },
+        context,
+      );
+      assert.equal((await submission.wait(context)).status, "done");
+      const entries = (await chat.entries({}, 50, undefined, context)).items;
+      assert.ok(entries.length > 0, "the mapped chat has an entry to fork at");
+      const fork = await chat.fork(
+        entries[0].id,
+        { ownership: { kind: "ownerless" }, agent: { model } },
+        context,
+      );
+      forkId = fork.id;
+      assert.equal(
+        (await first.harness.commit((tx) => tx.conversation(forkId), context)).parent !== undefined,
+        true,
+        "the seeded mapping names a fork",
+      );
+      // Forged before the next open, which is the only moment that can still choose the class.
+      await first.harness.commit(async (tx) => {
+        const map = await tx.doc(SessionMap, ROOT_CONVERSATION_ID);
+        map.sessions[mappedKey(forgedKey)] = forkId;
+      }, context);
+    } finally {
+      await first.close(context);
+    }
+
+    const second = await openGateway(config, context, { models });
+    try {
+      await assert.rejects(
+        () => second.historyEntries(forgedKey, {}, 10, undefined, context),
+        /forked conversation/,
+        "history reads still refuse the mapping",
+      );
+      await assert.rejects(
+        () => second.conversationFor(forgedKey, context),
+        /forked conversation/,
+        "and so does the channel ingress path",
+      );
+      // The startup pass installed no cron owner or tool for it. The coding extension carries no tool
+      // either: the fork has no configured authority of its own.
+      const forkAgent = await (await second.harness.conversation(forkId, context)).agent(context);
+      assert.deepEqual(forkAgent.tools, [], "a reopened fork holds no tool, cron included");
+      assert.deepEqual(forkAgent.extensions.filter((extension) => extension.name.startsWith("nanobot.cron")), [],
+        "the startup pass selected no cron extension for it");
+      // The legitimate mappings keep their current behaviour: the chat is an authenticated cron
+      // owner, and a state-only key is still a mapped session.
+      const chat = await second.conversationFor(sessionKey, context);
+      assert.equal(chat.id, chatId);
+      const chatTools = (await chat.agent(context)).tools.map((tool) => tool.name);
+      assert.equal(chatTools.includes("read"), true);
+      assert.equal(chatTools.includes("cron"), true);
+      assert.equal((await second.conversationFor(stateKey, context)).id, stateId,
+        "a channel-state key stays a mapped session");
     } finally {
       await second.close(context);
     }

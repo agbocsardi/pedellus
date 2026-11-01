@@ -138,10 +138,10 @@ export function classifyAutomationConversation(
  * `request.recorded` is a pre-commit snapshot because `Tx` has no non-creating conversation-document
  * read: materializing a marker document only to look at it would write one onto the chat a damaged
  * pointer names. That pair is therefore stale evidence by the time this commit runs, which is
- * harmless but worth stating: the conversation record and the marker are re-read here, the adoption
- * decision is made here with `classifyAutomationConversation`, and the owner/parent checks are part
- * of it. A chat, the root, a fork or a task-owned conversation can therefore never be pulled into
- * this class by a pointer that changed in between.
+ * harmless but worth stating: the conversation record is re-read here, while the marker is the
+ * pre-commit snapshot, so a marker rewritten in that window is accepted as it was read. Owner and
+ * parent — what keeps a chat, a fork and a task-owned conversation out of this class — are
+ * re-checked by this transaction, and the marker has to name this origin and job.
  */
 export async function ensureAutomationConversation(
   tx: Tx,
