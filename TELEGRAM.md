@@ -132,19 +132,23 @@ text.
 
 `/mcp` is the owner's decision surface for the assistant's MCP proposals. With no
 argument it lists this gateway's configured MCP servers (with live state) and the
-requests waiting for a decision; `/mcp show <id>` prints the exact proposed entry
+requests waiting for a decision; `/mcp show <id>` prints the normalized shape, the
+entire exact proposed entry (never truncated), and what an approval would change
 — a stdio command verbatim and every header/environment mapping as a host
 variable *name*, never a value; `/mcp approve <id>` writes that entry into the
-gateway's configuration file or starts one owner-approved OAuth login and returns
-its one-time authorization URL in the acknowledgement; `/mcp deny <id>` discards
-the request. Listing and showing are bounded read-only notices with no model
-call. Approve and deny are durable owner controls: they gate this chat, report a
-known refusal as refused, and a replayed update finds the request already
-consumed instead of applying it twice. The URL in a login acknowledgement carries
-this attempt's OAuth `state`, is delivered only to this authenticated private
-chat, and is never sent to the assistant or written to a transcript; open it on
-a device that can reach the gateway host (a remote browser needs that loopback
-port forwarded). A written entry or new grant takes effect at the next start, so
+gateway's configuration file (enabling only the approved entry) or starts one
+owner-approved OAuth login; `/mcp deny <id>` discards the request. Listing and
+showing are bounded read-only notices with no model call. Approve and deny are
+durable owner controls: they gate this chat, report a known refusal as refused,
+and a replayed update finds the request already consumed instead of applying it
+twice. A login's one-time authorization URL is delivered as a separate direct
+message to this authenticated private chat, after the durable acknowledgement
+and outside the stored channel state; it carries this attempt's OAuth `state`, is
+never sent to the assistant, and open it on a device that can reach the gateway
+host (a remote browser needs that loopback port forwarded). If the approval takes
+longer than the still-pending notice, the final outcome follows as a second
+notice; if the URL cannot be delivered, the login is canceled and a new request
+is needed. A written entry or new grant takes effect at the next start, so
 follow an approval with `/restart`. A gateway opened without an on-disk
 configuration file advertises no `/mcp` and refuses a typed one with fixed text.
 

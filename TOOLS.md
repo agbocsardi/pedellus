@@ -80,7 +80,13 @@ OAuth flow, store a token or connect a server, and a worker, fork, root, digest
 or scheduled-run conversation never receives it. Only the owner's explicit
 `/mcp approve <id>`/`/mcp deny <id>` in the local terminal or the authenticated
 Telegram owner chat decides, and the resulting authority is exactly what editing
-that `mcp.servers` entry by hand would grant. It is not in the coding-tool
+that `mcp.servers` entry by hand would grant. Approval enables only the approved
+entry: when the `mcp` block was disabled, every other entry in the file is pinned
+to `enabled: false`. `show` prints the entire exact entry and the approval's
+effects; managed config edits are serialized and refuse to replace a file that
+changed since it was read. OAuth grants are used only while a model-executed
+shell cannot read the data directory (a Bubblewrap shell, or no shell), and fail
+closed otherwise. It is not in the coding-tool
 ceiling and grants no coding tool. See [`MCP.md`](./MCP.md#owner-approved-management).
 
 When `telegram` is configured, mapped Telegram chat conversations also receive

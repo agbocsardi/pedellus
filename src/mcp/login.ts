@@ -7,8 +7,13 @@ import {
   authorizeMcp,
 } from "@earendil-works/pi-mcp/oauth";
 import type { McpHttpServerConfig } from "./config.js";
-import { FileMcpOAuthStateStore } from "./oauth-store.js";
-import { McpServerConnection, guardedFetch } from "./server.js";
+import {
+  FileMcpOAuthStateStore,
+  commitMcpOAuthState,
+  mcpOAuthGrantEpoch,
+  mcpOAuthStagingPath,
+} from "./oauth-store.js";
+import { McpServerConnection, guardedFetch, headerValues } from "./server.js";
 
 /**
  * One owner-approved OAuth login for a configured Streamable HTTP MCP server.
@@ -22,8 +27,11 @@ import { McpServerConnection, guardedFetch } from "./server.js";
  *   the `state` value, the code verifier nor any token is ever returned to the model or written to a
  *   conversation entry;
  * - the callback listener is loopback-only and one flow runs at a time;
- * - the grant is stored in this runtime's private token file and is verified by one real connection
- *   before the login is reported as complete.
+ * - the attempt works on a private staging file, so a grant that already works is never deleted to
+ *   make room for a new one. The staged state replaces the stored grant only after one real
+ *   connection and tool listing verified it;
+ * - a logout that happens while the attempt runs increments the grant generation, so the late commit
+ *   is refused instead of restoring a grant the owner just deleted.
  *
  * Limitation: the redirect URI is a loopback address on the gateway host. An owner whose browser runs
  * on another machine must forward that port over SSH to complete the flow; a provider that refuses a
@@ -37,7 +45,8 @@ export type McpLoginFailure =
   | "authorization-failed"
   | "callback-failed"
   | "token-exchange-failed"
-  | "verify-failed";
+  | "verify-failed"
+  | "grant-superseded";
 
 export type McpLoginOutcome =
   | { readonly ok: true; readonly tools: number }
@@ -54,7 +63,7 @@ export interface McpLoginRun {
 export interface McpLoginOptions {
   readonly config: McpHttpServerConfig;
   readonly workspace: string;
-  /** Private token file for this exact server URL. */
+  /** Private grant file for this exact server URL. An attempt never writes it before verification. */
   readonly storePath: string;
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly timeoutMs?: number;
@@ -66,6 +75,10 @@ function canceled(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
 }
 
+function environment(options: McpLoginOptions): Readonly<Record<string, string | undefined>> {
+  return options.environment ?? process.env;
+}
+
 /**
  * Start the flow and return once the server has told us where the owner must go. Everything after
  * that (the browser callback, the code exchange and the verification connection) settles through
@@ -75,64 +88,89 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
   if (options.config.oauth !== true) throw new Error("An MCP login needs a server entry with \"oauth\": true");
   const timeoutMs = options.timeoutMs ?? MCP_LOGIN_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
-  const callback = await OAuthCallbackServer.listen({ timeoutMs });
-  const store = new FileMcpOAuthStateStore(options.storePath, options.config.url);
-  let authorizationUrl: URL | undefined;
+
+  // The attempt starts from a staged copy of the stored grant, so a stored grant that still works
+  // makes the approved login a no-op without touching the real file, a refresh rotates the token only
+  // in the copy, and a browser attempt or failure never deletes or rewrites what is already stored.
+  const stagingPath = mcpOAuthStagingPath(options.storePath);
+  const staging = new FileMcpOAuthStateStore(stagingPath, options.config.url);
+  const real = new FileMcpOAuthStateStore(options.storePath, options.config.url);
+  const stored = await real.load().catch(() => undefined);
+  if (stored !== undefined) await staging.save(stored).catch(() => undefined);
+  const expectedEpoch = mcpOAuthGrantEpoch(options.storePath);
+  if (canceled(options.signal)) {
+    await staging.clear().catch(() => undefined);
+    throw new CancelledLoginError();
+  }
+  let callback: OAuthCallbackServer | undefined;
   let client: McpClient | undefined;
-  const provider = new McpOAuthProvider({
-    serverUrl: options.config.url,
-    redirectUrl: callback.redirectUrl,
-    clientMetadata: { client_name: "durable-nanobot" },
-    store,
-    onRedirect(url) {
-      authorizationUrl = url;
-    },
-  });
+  let authorizationUrl: URL | undefined;
   try {
-    // The redirect URI changes every attempt, so a dynamic registration made for an earlier one must
-    // not be reused. Used tokens are deliberately kept: a failed attempt must not destroy a grant that
-    // still works, and a successful exchange overwrites them.
-    try {
-      await store.load();
-    } catch {
-      // An unreadable grant is not usable and would block every read; replace it.
-      await store.clear();
-    }
-    await provider.invalidateCredentials("client");
-    const signal = options.signal === undefined
-      ? AbortSignal.timeout(Math.max(1, deadline - Date.now()))
-      : AbortSignal.any([options.signal, AbortSignal.timeout(Math.max(1, deadline - Date.now()))]);
+    callback = await OAuthCallbackServer.listen({ timeoutMs });
+    const provider = new McpOAuthProvider({
+      serverUrl: options.config.url,
+      redirectUrl: callback.redirectUrl,
+      clientMetadata: { client_name: "durable-nanobot" },
+      store: staging,
+      onRedirect(url) {
+        authorizationUrl = url;
+      },
+    });
     client = new McpClient({ name: "nanobot", version: "0.0.0", requestTimeoutMs: 60_000 });
+    // `McpClient.connect` takes no signal. Closing the client rejects the pending initialize request,
+    // so an owner denial or a gateway shutdown also stops a connection that is still being set up.
+    const stopStartup = (): void => { void client?.close().catch(() => undefined); };
+    const startupTimer = setTimeout(stopStartup, Math.max(1, deadline - Date.now()));
+    options.signal?.addEventListener("abort", stopStartup, { once: true });
     try {
       await client.connect(new StreamableHttpTransport({
         url: options.config.url,
+        headers: headerValues(options.config, environment(options)),
         authProvider: adaptOAuthProvider(provider),
         fetch: guardedFetch,
       }));
     } catch (error) {
+      if (canceled(options.signal)) throw new CancelledLoginError();
       // The expected first outcome: the server challenges and the native flow hands us the URL.
       if (!(error instanceof McpOAuthAuthorizationRequiredError)) throw error;
+    } finally {
+      clearTimeout(startupTimer);
+      options.signal?.removeEventListener("abort", stopStartup);
     }
-    // A stored grant (possibly just refreshed) already worked, so no browser step was needed. That is
-    // an honest outcome, not an unusable authorization endpoint.
+    if (canceled(options.signal)) throw new CancelledLoginError();
+    // A grant in the staging file already worked (the server accepted it without a browser step).
     const redirect = authorizationUrl;
     const discoveredTools = redirect === undefined && client.serverCapabilities?.tools !== undefined
       ? (await client.listTools().catch(() => [])).length
       : 0;
     await client.close().catch(() => undefined);
     client = undefined;
-    if (canceled(options.signal)) throw new CancelledLoginError();
-    if (redirect === undefined) throw new McpAlreadyAuthorizedError(discoveredTools);
+    if (redirect === undefined) {
+      // The stored grant (or a token it refreshed in the staged copy) already authenticated. Install
+      // the verified copy as an ordinary refresh; a logout that happened meanwhile wins instead.
+      const verified = await staging.load().catch(() => undefined);
+      if (verified !== undefined) {
+        try {
+          await commitMcpOAuthState(options.storePath, options.config.url, verified, expectedEpoch);
+        } catch {
+          throw new McpGrantSupersededError();
+        }
+      }
+      throw new McpAlreadyAuthorizedError(discoveredTools);
+    }
     const state = await provider.state();
     const run: McpLoginRun = {
       authorizationUrl: redirect.href,
       expiresAtMs: deadline,
-      completion: complete(options, provider, callback, state, deadline),
+      completion: complete(options, provider, callback, stagingPath, expectedEpoch, options.config.url, state, deadline),
     };
+    // `completion` owns the listener from here.
+    callback = undefined;
     return run;
   } catch (error) {
     await client?.close().catch(() => undefined);
-    await callback.close().catch(() => undefined);
+    await callback?.close().catch(() => undefined);
+    await staging.clear().catch(() => undefined);
     throw error;
   }
 }
@@ -152,6 +190,14 @@ export class McpAlreadyAuthorizedError extends Error {
   }
 }
 
+/** The grant was deleted or replaced while the attempt was checking or installing its replacement. */
+export class McpGrantSupersededError extends Error {
+  override name = "McpGrantSupersededError";
+  constructor() {
+    super("The stored MCP OAuth grant changed while the login was running");
+  }
+}
+
 function outcome(error: unknown, reason: McpLoginFailure): McpLoginOutcome {
   if (error instanceof CancelledLoginError) return { ok: false, reason: "canceled" };
   return { ok: false, reason };
@@ -161,6 +207,9 @@ async function complete(
   options: McpLoginOptions,
   provider: McpOAuthProvider,
   callback: OAuthCallbackServer,
+  stagingPath: string,
+  expectedEpoch: number,
+  serverUrl: string,
   state: string,
   deadline: number,
 ): Promise<McpLoginOutcome> {
@@ -174,6 +223,7 @@ async function complete(
   };
   const onAbort = (): void => { void closeCallback(); };
   options.signal?.addEventListener("abort", onAbort, { once: true });
+  const staging = new FileMcpOAuthStateStore(stagingPath, serverUrl);
   try {
     let code: string;
     let iss: string | undefined;
@@ -188,7 +238,7 @@ async function complete(
     if (canceled(options.signal)) return { ok: false, reason: "canceled" };
     try {
       await authorizeMcp(provider, {
-        serverUrl: options.config.url,
+        serverUrl,
         authorizationCode: code,
         ...(iss === undefined ? {} : { iss }),
         signal: options.signal === undefined
@@ -200,24 +250,37 @@ async function complete(
       return outcome(error, "token-exchange-failed");
     }
     if (canceled(options.signal)) return { ok: false, reason: "canceled" };
-    // Verify the grant with one real connection. A failure here is reported, and the stored grant
-    // stays on disk so the owner can retry the login instead of starting from nothing.
+    // Verify the staged grant with one real connection before it replaces anything on disk. A failure
+    // here is reported and the previously stored grant is left untouched.
     const connection = new McpServerConnection({
       name: "login-verify",
       config: options.config,
       workspace: options.workspace,
       ...(options.environment === undefined ? {} : { environment: options.environment }),
-      oauth: { storePath: options.storePath, redirectUrl: callback.redirectUrl },
+      oauth: { storePath: stagingPath, redirectUrl: callback.redirectUrl },
     });
+    let tools: number;
     try {
       await connection.open();
       if (!connection.connected) return { ok: false, reason: "verify-failed" };
-      return { ok: true, tools: connection.toolNames().length };
+      tools = connection.toolNames().length;
     } finally {
       await connection.close().catch(() => undefined);
     }
+    // Install the verified replacement. A logout or another completed login since this attempt began
+    // retired the generation, and this commit then refuses rather than undoing that decision.
+    try {
+      const staged = await staging.load();
+      if (staged?.tokens === undefined) return { ok: false, reason: "verify-failed" };
+      await commitMcpOAuthState(options.storePath, serverUrl, staged, expectedEpoch);
+    } catch {
+      return { ok: false, reason: "grant-superseded" };
+    }
+    return { ok: true, tools };
   } finally {
     options.signal?.removeEventListener("abort", onAbort);
     await closeCallback();
+    // The staging file never outlives the attempt, whether it was committed, refused or canceled.
+    await staging.clear().catch(() => undefined);
   }
 }

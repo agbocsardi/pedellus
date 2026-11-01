@@ -28,6 +28,7 @@ export {
 export { mcpNamespaceName, mcpToolNames, mcpToolPrefix, MCP_TOOL_NAME_MAX, MCP_TOOL_PREFIX } from "./naming.js";
 export {
   McpServerConnection,
+  ExposedOAuthGrantError,
   MissingEnvironmentError,
   MissingOAuthGrantError,
   type McpFailureCode,
@@ -37,7 +38,10 @@ export {
 export { createMcpToolRegistration } from "./tools.js";
 export {
   FileMcpOAuthStateStore,
+  commitMcpOAuthState,
   hasMcpOAuthTokens,
+  mcpOAuthGrantEpoch,
+  mcpOAuthStagingPath,
   mcpOAuthStatePath,
   mcpOAuthStoreDirectory,
 } from "./oauth-store.js";
@@ -48,6 +52,7 @@ export {
   loginNoticeText,
   MCP_ADMIN_LIMITS,
   MCP_ADMIN_TOOL_NAME,
+  MCP_OAUTH_UNPROTECTED,
   McpRequestsDoc,
   type McpAdmin,
   type McpAdminListing,
@@ -81,6 +86,11 @@ export interface McpIntegrationOptions {
   readonly delegatedToolNames: readonly string[];
   /** Host environment the configured variable names are resolved from. Defaults to `process.env`. */
   readonly environment?: Readonly<Record<string, string | undefined>>;
+  /**
+   * True when a model-executable shell could read the canonical data directory (the unsandboxed host
+   * shell). An `oauth: true` entry then fails closed as `credential-exposed` without reading its grant.
+   */
+  readonly oauthGrantExposed?: boolean;
 }
 
 /**
@@ -152,6 +162,7 @@ async function connect(
   workspace: string,
   dataDir: string | undefined,
   environment: Readonly<Record<string, string | undefined>> | undefined,
+  oauthGrantExposed: boolean,
 ): Promise<McpServerConnection> {
   const server = new McpServerConnection({
     name,
@@ -159,7 +170,7 @@ async function connect(
     workspace,
     ...(environment === undefined ? {} : { environment }),
     ...("url" in config && config.oauth === true && dataDir !== undefined
-      ? { oauth: { storePath: mcpOAuthStatePath(dataDir, config.url) } }
+      ? { oauth: { storePath: mcpOAuthStatePath(dataDir, config.url), grantExposed: oauthGrantExposed } }
       : {}),
   });
   await server.open();
@@ -181,7 +192,14 @@ export async function createMcpIntegration(options: McpIntegrationOptions): Prom
       .filter(([, config]) => mcpServerEnabled(config))
       .sort(([left], [right]) => left.localeCompare(right, "en-US"));
     const connected = await Promise.all(enabled.map(async ([name, config]) =>
-      connect(name, config, options.workspace, options.dataDir, options.environment)));
+      connect(
+        name,
+        config,
+        options.workspace,
+        options.dataDir,
+        options.environment,
+        options.oauthGrantExposed === true,
+      )));
     servers.push(...connected);
 
     const registrations: ToolRegistration[] = [];

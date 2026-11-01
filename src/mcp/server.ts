@@ -32,6 +32,7 @@ export type McpFailureCode =
   | "start-timeout"
   | "missing-environment"
   | "auth-required"
+  | "credential-exposed"
   | "connection-closed"
   | "closed";
 
@@ -57,6 +58,12 @@ export interface McpServerConnectionOptions {
   readonly oauth?: {
     readonly storePath: string;
     readonly redirectUrl?: string;
+    /**
+     * True when a model-executable process on this host could read the grant file. The connection
+     * then fails closed without reading it: an OAuth grant must not be usable from a mode where the
+     * model's own shell can copy it. A sandboxed shell or no shell at all leaves this false.
+     */
+    readonly grantExposed?: boolean;
   };
 }
 
@@ -74,7 +81,7 @@ function childEnvironment(
   return child;
 }
 
-function headerValues(
+export function headerValues(
   config: Extract<McpServerConfig, { url: string }>,
   environment: Readonly<Record<string, string | undefined>>,
 ): Record<string, string> {
@@ -107,6 +114,18 @@ export class MissingOAuthGrantError extends Error {
   }
 }
 
+/**
+ * This entry uses OAuth while a model-executed host shell could read the private grant file. The
+ * connection fails closed rather than making that credential reachable through the model's tools.
+ * It carries no path, URL or token.
+ */
+export class ExposedOAuthGrantError extends Error {
+  constructor() {
+    super("MCP OAuth grant is readable by a model-executable process in this execution mode");
+    this.name = "ExposedOAuthGrantError";
+  }
+}
+
 /** Refuse redirects so a configured Authorization header cannot be forwarded to another origin. */
 export const guardedFetch: McpFetch = (input, init) => fetch(input, { ...init, redirect: "error" });
 
@@ -116,6 +135,7 @@ function classifyStart(error: unknown): McpFailureCode {
   if (error instanceof MissingEnvironmentError) return "missing-environment";
   // No stored grant, or a grant the server rejected: only an owner-approved login can change that.
   if (error instanceof MissingOAuthGrantError) return "auth-required";
+  if (error instanceof ExposedOAuthGrantError) return "credential-exposed";
   if (error instanceof Error && error.name === "McpOAuthAuthorizationRequiredError") return "auth-required";
   return "start-failed";
 }
@@ -212,6 +232,7 @@ export class McpServerConnection {
     if (this.oauth === undefined) {
       throw new MissingOAuthGrantError();
     }
+    if (this.oauth.grantExposed === true) throw new ExposedOAuthGrantError();
     const provider = new McpOAuthProvider({
       serverUrl: config.url,
       redirectUrl: this.oauth.redirectUrl ?? "http://127.0.0.1/oauth-callback",

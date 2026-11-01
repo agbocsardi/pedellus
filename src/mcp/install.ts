@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, open, rename, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
+import { chmod, open, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname } from "node:path";
 import { parseConfig } from "../config.js";
 
@@ -10,16 +10,24 @@ import { parseConfig } from "../config.js";
  * Only an explicit owner approval reaches this module; no model tool, conversation, scheduled run or
  * channel message writes configuration on its own. The edit is deliberately narrow:
  *
- * - the file is read, only `mcp.enabled` and `mcp.servers.<name>` are changed, and everything else is
- *   preserved as it is on disk (a concurrent owner edit is never silently reverted by a stale copy);
+ * - edits are serialized per configuration path inside this process;
+ * - the file is read once into a snapshot, only `mcp.enabled` and `mcp.servers.<name>` are changed, and
+ *   everything else is preserved from that snapshot;
+ * - immediately before the replacement the file is read again and the edit is refused if its bytes
+ *   changed, so a concurrent owner editor or another writer is not silently reverted by a stale copy;
+ * - when the whole `mcp` block was disabled, every other entry present in the file is pinned to
+ *   `enabled: false`, so enabling the block activates only the entry the owner approved;
  * - the whole merged document is validated with the same parser a gateway start uses, so an approved
  *   entry can never write a configuration this runtime would refuse to open;
  * - the write is atomic (temporary file in the same directory, then rename) and keeps the file's
  *   existing mode.
  *
  * Limitations: JSON is re-serialized with two-space indentation, so hand-written formatting and key
- * order are not preserved. The rename gives the file the gateway user's ownership. A change takes
- * effect at the next gateway start; this module never reopens or hot-reloads a runtime.
+ * order are not preserved. The rename gives the file the gateway user's ownership. The check before
+ * the rename and the rename itself are not one atomic operation, so an outside writer that changes
+ * the file in that tiny window is still overwritten; no filesystem lock is available for an arbitrary
+ * editor. A change takes effect at the next gateway start; this module never reopens or hot-reloads a
+ * runtime.
  */
 export interface McpConfigEdit {
   /** Absolute path of the configuration file this gateway loaded. */
@@ -37,23 +45,45 @@ export interface McpConfigEditResult {
 
 const CONFIG_FILE_LIMIT_BYTES = 1024 * 1024;
 
+/** In-process serialization per configuration path. */
+const queues = new Map<string, Promise<unknown>>();
+
+function serialized<T>(path: string, operation: () => Promise<T>): Promise<T> {
+  const previous = queues.get(path) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(operation);
+  const tail = next.catch(() => undefined);
+  queues.set(path, tail);
+  void tail.finally(() => {
+    if (queues.get(path) === tail) queues.delete(path);
+  });
+  return next;
+}
+
+interface DocumentSnapshot {
+  readonly text: string;
+  readonly document: Record<string, unknown>;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-async function readDocument(edit: McpConfigEdit): Promise<Record<string, unknown>> {
-  let text: string;
+async function readText(path: string): Promise<{ readonly text: string; readonly mode: number }> {
   let handle: FileHandle | undefined;
   try {
     // O_NOFOLLOW: a symlinked configuration file is refused instead of replaced through its target.
-    handle = await open(edit.configFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     const info = await handle.stat();
     if (!info.isFile()) throw new Error("The configuration file must be a regular file");
     if (info.size > CONFIG_FILE_LIMIT_BYTES) throw new Error("The configuration file is unexpectedly large");
-    text = await handle.readFile("utf8");
+    return { text: await handle.readFile("utf8"), mode: info.mode & 0o777 };
   } finally {
     await handle?.close();
   }
+}
+
+async function readDocument(edit: McpConfigEdit): Promise<DocumentSnapshot> {
+  const { text } = await readText(edit.configFile);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -61,7 +91,7 @@ async function readDocument(edit: McpConfigEdit): Promise<Record<string, unknown
     throw new Error("The configuration file is not valid JSON");
   }
   if (!isRecord(parsed)) throw new Error("The configuration file must contain a JSON object");
-  return Object.fromEntries(Object.entries(parsed));
+  return { text, document: Object.fromEntries(Object.entries(parsed)) };
 }
 
 /** Read the on-disk `mcp` block without trusting the in-memory copy the gateway opened with. */
@@ -79,35 +109,66 @@ function rawServers(block: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(servers));
 }
 
-async function writeDocument(edit: McpConfigEdit, document: Record<string, unknown>): Promise<void> {
+async function writeDocument(
+  edit: McpConfigEdit,
+  snapshot: DocumentSnapshot,
+  document: Record<string, unknown>,
+): Promise<void> {
   // Validate exactly what a start would parse, so an approved edit cannot brick the gateway.
   parseConfig(document, dirname(edit.configFile));
-  const mode = (await stat(edit.configFile)).mode & 0o777;
+  // Detect an external update between this edit's read and the replacement. The comparison and the
+  // rename are separate syscalls; a writer in that window is not detected (documented above).
+  const current = await readText(edit.configFile);
+  if (current.text !== snapshot.text) {
+    throw new Error(
+      "The configuration file changed on disk while this edit was prepared; nothing was written. " +
+      "Review the request again and approve it before retrying.",
+    );
+  }
   const temporary = `${edit.configFile}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
   try {
     await writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    await chmod(temporary, mode);
+    // Keep the mode the file has at replacement time, so an outside chmod is not reverted.
+    await chmod(temporary, current.mode);
     await rename(temporary, edit.configFile);
   } finally {
     await rm(temporary, { force: true });
   }
 }
 
-/** Add or replace one validated server entry and enable the block. */
+/**
+ * Add or replace one validated server entry and enable the block. Only the approved entry may become
+ * newly active: when the block was off, every other entry is pinned to `enabled: false` first.
+ */
 export async function writeMcpServerEntry(
   edit: McpConfigEdit,
   name: string,
   entry: unknown,
 ): Promise<McpConfigEditResult> {
-  const document = await readDocument(edit);
-  const block = rawMcpBlock(document);
-  const servers = rawServers(block);
-  const next = { ...block, enabled: true, servers: { ...servers, [name]: entry } };
-  const validated = parseConfig({ ...document, mcp: next }, dirname(edit.configFile));
-  if (validated.mcp === undefined) throw new Error("The approved MCP entry did not validate");
-  await writeDocument(edit, { ...document, mcp: next });
-  const names = Object.keys(validated.mcp.servers).sort((left, right) => left.localeCompare(right, "en-US"));
-  return { servers: names, enabled: validated.mcp.enabled };
+  return serialized(edit.configFile, async () => {
+    const snapshot = await readDocument(edit);
+    const document = snapshot.document;
+    const block = rawMcpBlock(document);
+    const servers = rawServers(block);
+    const blockWasEnabled = block.enabled === true;
+    const nextServers: Record<string, unknown> = { ...servers };
+    if (!blockWasEnabled) {
+      // Turning the block on would otherwise activate every entry it already held. Pinning keeps the
+      // owner's approved authority to exactly this one entry; an entry that is already disabled stays
+      // as it is.
+      for (const [key, value] of Object.entries(nextServers)) {
+        if (key === name || !isRecord(value) || value.enabled === false) continue;
+        nextServers[key] = { ...value, enabled: false };
+      }
+    }
+    nextServers[name] = entry;
+    const next = { ...block, enabled: true, servers: nextServers };
+    const validated = parseConfig({ ...document, mcp: next }, dirname(edit.configFile));
+    if (validated.mcp === undefined) throw new Error("The approved MCP entry did not validate");
+    await writeDocument(edit, snapshot, { ...document, mcp: next });
+    const names = Object.keys(validated.mcp.servers).sort((left, right) => left.localeCompare(right, "en-US"));
+    return { servers: names, enabled: validated.mcp.enabled };
+  });
 }
 
 /**
@@ -115,14 +176,17 @@ export async function writeMcpServerEntry(
  * a separate owner decision, not a side effect of removing one server.
  */
 export async function removeMcpServerEntry(edit: McpConfigEdit, name: string): Promise<McpConfigEditResult> {
-  const document = await readDocument(edit);
-  const block = rawMcpBlock(document);
-  const servers = rawServers(block);
-  if (!Object.hasOwn(servers, name)) throw new Error(`Server ${name} is not in the configuration file`);
-  const remaining = Object.fromEntries(Object.entries(servers).filter(([key]) => key !== name));
-  const next = { ...block, servers: remaining };
-  const validated = parseConfig({ ...document, mcp: next }, dirname(edit.configFile));
-  await writeDocument(edit, { ...document, mcp: next });
-  const names = Object.keys(validated.mcp?.servers ?? {}).sort((left, right) => left.localeCompare(right, "en-US"));
-  return { servers: names, enabled: validated.mcp?.enabled === true };
+  return serialized(edit.configFile, async () => {
+    const snapshot = await readDocument(edit);
+    const document = snapshot.document;
+    const block = rawMcpBlock(document);
+    const servers = rawServers(block);
+    if (!Object.hasOwn(servers, name)) throw new Error(`Server ${name} is not in the configuration file`);
+    const remaining = Object.fromEntries(Object.entries(servers).filter(([key]) => key !== name));
+    const next = { ...block, servers: remaining };
+    const validated = parseConfig({ ...document, mcp: next }, dirname(edit.configFile));
+    await writeDocument(edit, snapshot, { ...document, mcp: next });
+    const names = Object.keys(validated.mcp?.servers ?? {}).sort((left, right) => left.localeCompare(right, "en-US"));
+    return { servers: names, enabled: validated.mcp?.enabled === true };
+  });
 }

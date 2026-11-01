@@ -72,6 +72,38 @@ function oauthState(value: unknown): McpOAuthState {
 /** In-process serialization per file; cross-process use of one data directory is already refused. */
 const queues = new Map<string, Promise<unknown>>();
 
+/**
+ * Grant generation per file, for this process only.
+ *
+ * An owner-approved logout must not be undone by a live connection whose OAuth provider is
+ * refreshing: its next `save()` would otherwise write a fresh grant over the deleted file. Every
+ * state store records the generation it was created with, and a store whose generation is stale (a
+ * clear or a committed replacement happened since) refuses to write. A newly created store, for
+ * example in the next gateway process or a later connection, starts at the current generation. The
+ * generation also makes an owner-approved login refuse to install its verified replacement if the
+ * grant changed while that attempt was running.
+ *
+ * The state is process-local rather than a durable marker: a process that restarts has no live
+ * provider left to flush.
+ */
+const grantEpochs = new Map<string, number>();
+
+/** The current generation of the grant file for `path`; changes only on a clear or a commit. */
+export function mcpOAuthGrantEpoch(path: string): number {
+  return grantEpochs.get(path) ?? 0;
+}
+
+function bumpEpoch(path: string): number {
+  const next = mcpOAuthGrantEpoch(path) + 1;
+  grantEpochs.set(path, next);
+  return next;
+}
+
+/** A pending, owner-approved login writes here and installs it only after verification. */
+export function mcpOAuthStagingPath(path: string): string {
+  return `${path}.${process.pid}.${randomBytes(8).toString("hex")}.pending`;
+}
+
 function serialized<T>(path: string, operation: () => Promise<T>): Promise<T> {
   const previous = queues.get(path) ?? Promise.resolve();
   const next = previous.catch(() => undefined).then(operation);
@@ -101,10 +133,13 @@ async function readFileText(path: string): Promise<string | undefined> {
 export class FileMcpOAuthStateStore implements McpOAuthStateStore {
   readonly #path: string;
   readonly #serverUrl: string;
+  /** The generation this store may write; a clear or commit since then retires it. */
+  readonly #epoch: number;
 
   constructor(path: string, serverUrl: string) {
     this.#path = path;
     this.#serverUrl = String(new URL(serverUrl));
+    this.#epoch = mcpOAuthGrantEpoch(path);
   }
 
   /** The state for this exact URL, or undefined. Another server's file content is never returned. */
@@ -126,29 +161,64 @@ export class FileMcpOAuthStateStore implements McpOAuthStateStore {
 
   save(state: McpOAuthState): Promise<void> {
     return serialized(this.#path, async () => {
-      if (typeof state.serverUrl !== "string" || state.serverUrl !== this.#serverUrl) {
-        throw new Error("MCP OAuth state belongs to a different server URL");
+      if (mcpOAuthGrantEpoch(this.#path) !== this.#epoch) {
+        throw new Error("the stored MCP OAuth grant was deleted or replaced; this stale writer does not restore it");
       }
-      const directory = dirname(this.#path);
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      await chmod(directory, 0o700);
-      const temporary = `${this.#path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-      const body: StoreFile = { version: STORE_VERSION, state };
-      try {
-        await writeFile(temporary, `${JSON.stringify(body)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-        await rename(temporary, this.#path);
-      } finally {
-        await rm(temporary, { force: true });
-      }
+      await writeState(this.#path, this.#serverUrl, state);
     });
   }
 
-  /** Remove this server's stored grant. A later login starts from no client and no token. */
+  /**
+   * Remove this server's stored grant and retire every writer created before this call. A live provider
+   * refresh that lands afterwards fails instead of resurrecting the deleted grant; only a verified
+   * replacement committed by an owner-approved login (or a store created afterwards) may write it.
+   */
   clear(): Promise<void> {
     return serialized(this.#path, async () => {
       await rm(this.#path, { force: true });
+      bumpEpoch(this.#path);
     });
   }
+}
+
+/** Write one complete state file with a private directory and mode, atomically. */
+async function writeState(path: string, serverUrl: string, state: McpOAuthState): Promise<void> {
+  if (typeof state.serverUrl !== "string" || state.serverUrl !== serverUrl) {
+    throw new Error("MCP OAuth state belongs to a different server URL");
+  }
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  const body: StoreFile = { version: STORE_VERSION, state };
+  try {
+    await writeFile(temporary, `${JSON.stringify(body)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+/**
+ * Install a login's staged, verified grant as this server's grant.
+ *
+ * `expectedEpoch` is the generation read when the login started. A logout (or another commit) that
+ * happened in the meantime increments it, so the late login cannot restore a grant the owner just
+ * deleted. The caller removes its staging file either way.
+ */
+export async function commitMcpOAuthState(
+  path: string,
+  serverUrl: string,
+  state: McpOAuthState,
+  expectedEpoch: number,
+): Promise<void> {
+  await serialized(path, async () => {
+    if (mcpOAuthGrantEpoch(path) !== expectedEpoch) {
+      throw new Error("the stored MCP OAuth grant changed while the login was running");
+    }
+    await writeState(path, String(new URL(serverUrl)), state);
+    bumpEpoch(path);
+  });
 }
 
 /** Read-only presence check for diagnostics; it never returns a token. */

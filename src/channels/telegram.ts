@@ -14,7 +14,7 @@ import {
   renderMemoryDigestStart,
   renderMemoryDigestStatus,
 } from "../history/memory-digest.js";
-import { renderMcpApproval, renderMcpListing } from "../mcp/admin.js";
+import { MCP_ADMIN_LIMITS, renderMcpApproval, renderMcpListing } from "../mcp/admin.js";
 import type {
   GatewayMcpAdmin,
   GatewayMemoryDigest,
@@ -103,6 +103,8 @@ const MAX_CONTROL_RECORDS = 64;
 /** Unresolved commands kept at most; further commands are refused so a hung or flooded chat cannot grow the log. */
 const MAX_UNRESOLVED_CONTROLS = 64;
 const MAX_NOTICE_CHARS = 1_500;
+/** A final control outcome published after its "still pending" notice; may carry one authorization URL. */
+const MAX_LATE_CONTROL_CHARS = 4_000;
 const SCHEDULED_SCAN_INTERVAL_MS = 2_000;
 const MAX_SCHEDULED_ACTIVE = 4;
 const MAX_ORIGINS = 1_000;
@@ -2415,7 +2417,7 @@ export async function runTelegram(
         && extra.length === 0 && MCP_REQUEST_ID.test(id)) {
         if (sub === "show") {
           const shown = await admin.show(id, adapterContext);
-          await admitNotice(update, message, sessionKey, shown.text);
+          await admitNotice(update, message, sessionKey, shown.text, MCP_ADMIN_LIMITS.maxShowChars);
           drain();
           return;
         }
@@ -2528,8 +2530,16 @@ export async function runTelegram(
       if (outcome.kind === "refused") {
         // A known no-effect is recorded and reported as refused, never as applied: a later replay of this update
         // must not claim a change that did not happen.
+        const wasWaiting = ack === "waiting";
         ack = "refused";
         await markControlRefused(update.update_id, outcome.text).catch(() => undefined);
+        if (!wasWaiting) {
+          // The still-pending wording was already published. Publish the final refusal as a
+          // follow-up instead of losing it, still without any authorization URL (refusals never carry one).
+          await publishLateControlNotice(
+            update.update_id, chatId, sessionKey, String(message.from!.id), outcome.text,
+          ).catch(() => undefined);
+        }
         return;
       }
       if (outcome.kind !== "applied") {
@@ -2544,8 +2554,19 @@ export async function runTelegram(
         return;
       }
       if (ack !== "waiting") {
-        // The acknowledgement was already published with the still-pending wording; the host request
-        // below still belongs to this command, so it is not skipped.
+        // The acknowledgement was already published with the still-pending wording. The final outcome
+        // still belongs to this command: deliver it as a follow-up, so a slow approval cannot lose its
+        // only answer (the authorization URL is sent separately and is never stored).
+        if (outcome.text !== undefined) {
+          await publishLateControlNotice(
+            update.update_id, chatId, sessionKey, String(message.from!.id), outcome.text,
+          ).catch(() => undefined);
+        }
+        if (outcome.authorization !== undefined) {
+          await deliverMcpAuthorization(
+            target, outcome.authorization, update.update_id, chatId, sessionKey, String(message.from!.id),
+          );
+        }
         if (outcome.requestRestart === true) requestRestart();
         return;
       }
@@ -2557,6 +2578,11 @@ export async function runTelegram(
         // still asked when the acknowledgement commit itself failed (its notice is then reported after the
         // restart by the recovery pass).
         if (outcome.requestRestart === true) requestRestart();
+      }
+      if (outcome.authorization !== undefined) {
+        await deliverMcpAuthorization(
+          target, outcome.authorization, update.update_id, chatId, sessionKey, String(message.from!.id),
+        );
       }
     }, (error: unknown) => {
       // The record stays `admitted` and the acknowledgement stays held: a reopen reports it as unconfirmed.
@@ -2630,8 +2656,60 @@ export async function runTelegram(
     const result = record.command === "mcp-approve"
       ? await admin.approve(id, adapterContext)
       : await admin.deny(id, adapterContext);
-    const text = renderMcpApproval(result, MAX_NOTICE_CHARS);
-    return result.status === "refused" ? { kind: "refused", text } : { kind: "applied", text };
+    // The authorization URL is delivered by the command completion, after the acknowledgement and
+    // directly to this chat. It is deliberately absent from `text`, so channel state never persists it.
+    const text = result.authorization === undefined ? renderMcpApproval(result, MAX_NOTICE_CHARS) : result.text;
+    return result.status === "refused"
+      ? { kind: "refused", text }
+      : { kind: "applied", text, ...(result.authorization === undefined ? {} : { authorization: result.authorization }) };
+  }
+
+  /**
+   * Deliver one authorization URL as an ordinary plain message. Not stored: a rich or queued notice
+   * would persist the value and its state in channel state, which this delivery deliberately avoids.
+   * If it cannot be delivered, the just-started login is canceled instead of leaving an attempt that
+   * nobody can finish.
+   */
+  async function deliverMcpAuthorization(
+    requestId: string | undefined,
+    authorization: { readonly url: string; readonly expiresAtMs: number },
+    updateId: number,
+    chatId: number,
+    sessionKey: string,
+    senderId: string,
+  ): Promise<void> {
+    try {
+      await sendAuthorizationUrl(chatId, senderId, authorization);
+    } catch {
+      if (requestId !== undefined) {
+        await gateway.mcpAdmin?.deny(requestId, adapterContext).catch(() => undefined);
+      }
+      await publishLateControlNotice(updateId, chatId, sessionKey, senderId,
+        "The MCP login was canceled because its one-time authorization URL could not be confirmed as delivered " +
+        "to this chat. Approve a new login request to get a fresh URL.").catch(() => undefined);
+    }
+  }
+
+  /** Send one authorization URL as an ordinary plain message; it is never put in the durable outbox. */
+  async function sendAuthorizationUrl(
+    chatId: number,
+    senderId: string,
+    authorization: { readonly url: string; readonly expiresAtMs: number },
+  ): Promise<void> {
+    // The same live allowlist check every durable notice performs: a removed sender gets no URL.
+    if (!options.allowFrom.includes(senderId)) throw new Error("the approving sender is no longer authorized");
+    if (authorization.expiresAtMs <= Date.now()) {
+      throw new Error("authorization URL expired before it could be delivered");
+    }
+    const text = [
+      "MCP OAuth authorization URL (owner only):",
+      authorization.url,
+      `Valid until ${new Date(authorization.expiresAtMs).toISOString()}.`,
+      "Open it as the owner in a browser that can reach this host. This gateway does not store this URL or its state.",
+    ].join("\n");
+    if (text.length > PLAIN_TEXT_LIMIT) throw new Error("authorization URL is too long for one message");
+    await apiCall(api, "sendMessage", signal, (callSignal) => withChatSendOrder(chatId, () =>
+      api.sendMessage(chatId, text, {}, toGrammySignal(callSignal))), { throttle: outboundThrottle });
   }
 
   /** Bounded read-only `/digest status`; it creates no task and reads no chat transcript. */
@@ -2815,6 +2893,42 @@ export async function runTelegram(
       });
       pendingControls.add(task);
     }
+  }
+
+  /**
+   * Publish a final control outcome whose "still pending" notice was already sent. When that notice is
+   * still queued it is replaced; once it was delivered (and forgotten) a fresh notice is admitted under
+   * the same update ID, which no longer collides with any pending record.
+   */
+  async function publishLateControlNotice(
+    updateId: number,
+    chatId: number,
+    sessionKey: string,
+    senderId: string,
+    text: string,
+  ): Promise<void> {
+    const body = text.slice(0, MAX_LATE_CONTROL_CHARS);
+    state = await stateConversation.commit(async (tx) => {
+      const doc = await tx.doc(TelegramState, stateConversation.id);
+      const notice = doc.pending.find((item) => item.notice === true && item.updateId === updateId);
+      if (notice !== undefined) {
+        notice.text = body;
+        delete notice.hold;
+        return copyJson(doc) as unknown as ChannelState;
+      }
+      if (doc.pending.length >= MAX_ADMITTED) return copyJson(doc) as unknown as ChannelState;
+      doc.pending.push({
+        updateId,
+        nextChunkIndex: 0,
+        chatId,
+        sessionKey,
+        senderId,
+        text: body,
+        notice: true,
+      });
+      return copyJson(doc) as unknown as ChannelState;
+    }, cleanupContext);
+    drain();
   }
 
   /** Publish the held acknowledgement, optionally as the still-pending wording. */
@@ -3018,6 +3132,7 @@ export async function runTelegram(
     message: TelegramMessage,
     sessionKey: string,
     text: string,
+    limit: number = MAX_NOTICE_CHARS,
   ): Promise<void> {
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
@@ -3029,7 +3144,7 @@ export async function runTelegram(
           chatId: message.chat.id,
           sessionKey,
           senderId: String(message.from!.id),
-          text: text.slice(0, MAX_NOTICE_CHARS),
+          text: text.slice(0, limit),
           notice: true,
         });
       }
@@ -3345,7 +3460,13 @@ type TelegramControl = "new" | "abort" | "stop" | "help" | "status" | "model" | 
 type TelegramMutation = "new" | "abort" | "model" | "restart" | "digest" | "mcp-approve" | "mcp-deny";
 
 type ControlOutcome =
-  | { readonly kind: "applied"; readonly text?: string; readonly requestRestart?: true }
+  | {
+      readonly kind: "applied";
+      readonly text?: string;
+      readonly requestRestart?: true;
+      /** One-time owner URL, delivered directly and never stored in channel state. */
+      readonly authorization?: { readonly url: string; readonly expiresAtMs: number };
+    }
   | { readonly kind: "refused"; readonly text: string }
   | { readonly kind: "deferred" }
   | { readonly kind: "abandoned" };

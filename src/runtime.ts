@@ -610,6 +610,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ? (config.workers.toolAllowlist ?? toolAllowlist).filter((name) =>
         (CODING_TOOL_NAMES as readonly string[]).includes(name)) : [];
   const registeredCodingTools = [...new Set([...toolAllowlist, ...workerCodingTools])];
+  // An OAuth grant lives under the canonical data directory, outside every tool root, but the
+  // unsandboxed host shell can still read anything this process user owns. In that execution mode a
+  // model-executed command could copy the grant, so OAuth fails closed instead of claiming a 0600
+  // file is isolation. Bubblewrap mounts only the workspace and its own private `/tmp`.
+  const oauthGrantExposed =
+    registeredCodingTools.includes("bash") && (config.toolSandbox ?? "host") !== "bwrap";
   const toolsEnabled = registeredCodingTools.length > 0;
   // MCP is a separate, explicit connection authority. Connecting starts external clients, so the
   // config switch must be on and at least one server enabled; otherwise no client is created.
@@ -1919,6 +1925,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         config: mcpConfig,
         workspace,
         dataDir: mcpDataDir,
+        oauthGrantExposed,
         isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId)
           || workerChildConversations.has(conversationId),
         delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
@@ -1948,6 +1955,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         edit: { configFile: config.configFile, workspace },
         dataDir: mcpDataDir,
         config: mcpConfig,
+        oauthGrantExposed,
         requests,
         context,
         isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),

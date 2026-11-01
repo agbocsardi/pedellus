@@ -15,12 +15,13 @@ import { removeMcpServerEntry, writeMcpServerEntry, type McpConfigEdit } from ".
 import {
   beginMcpLogin,
   McpAlreadyAuthorizedError,
+  McpGrantSupersededError,
   type McpLoginFailure,
   type McpLoginOutcome,
   type McpLoginRun,
 } from "./login.js";
 import { FileMcpOAuthStateStore, mcpOAuthStatePath } from "./oauth-store.js";
-import type { McpServerStatus } from "./server.js";
+import { MissingEnvironmentError, type McpServerStatus } from "./server.js";
 
 /**
  * Agent-driven MCP management.
@@ -46,8 +47,12 @@ export const MCP_ADMIN_LIMITS = Object.freeze({
   maxTerminal: 8,
   /** One proposed server entry, serialized. */
   maxEntryBytes: 8 * 1024,
-  /** One owner-facing request description. */
-  maxDescriptionChars: 1_500,
+  /**
+   * One full `show` disclosure. The exact entry is at most `maxEntryBytes` of JSON, so this budget
+   * leaves room for the normalized description and the authority explanation without ever hiding part
+   * of the entry the owner would approve.
+   */
+  maxShowChars: 12 * 1024,
   maxTextChars: 4_000,
   maxOutcomeChars: 300,
   maxNameChars: 64,
@@ -150,6 +155,12 @@ export interface McpAdminOptions {
   readonly servers: () => readonly McpServerStatus[];
   /** Deliver one settled login to its origin conversation's agent; never a user or channel. */
   readonly notify: (notice: McpLoginNotice) => Promise<void>;
+  /**
+   * True when a model-executable process on this host could read the private OAuth grant file (the
+   * host shell without Bubblewrap). Login and OAuth-entry approvals then fail closed instead of
+   * pretending the private file is protected.
+   */
+  readonly oauthGrantExposed?: boolean;
   readonly now?: () => number;
 }
 
@@ -168,11 +179,18 @@ const NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 const ID_PATTERN = /^[0-9a-f]{16}$/;
 const KINDS: readonly McpRequestKind[] = ["config", "login", "logout", "remove"];
 
+/** Fixed refusal used by every surface when the grant file is readable by the model's own shell. */
+export const MCP_OAUTH_UNPROTECTED =
+  "OAuth grants are unavailable in this execution mode: the host shell runs without a sandbox, so a " +
+  "model-executed command could read this runtime's private data directory. Remove \"bash\" from " +
+  "toolAllowlist or set \"toolSandbox\": \"bwrap\", then restart. Nothing was configured, connected or authorized.";
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function bounded(text: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
   return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1)}…`;
 }
 
@@ -208,7 +226,7 @@ function describeEntry(name: string, entry: Record<string, unknown>, workspace: 
   if (config.description !== undefined) lines.push(`  description: ${config.description}`);
   if (config.timeoutSeconds !== undefined) lines.push(`  timeoutSeconds: ${config.timeoutSeconds}`);
   if (config.enabled === false) lines.push("  enabled: false (configured but never connected)");
-  return bounded(lines.join("\n"), MCP_ADMIN_LIMITS.maxDescriptionChars);
+  return lines.join("\n");
 }
 
 function entrySummary(entry: Record<string, unknown>): string {
@@ -222,24 +240,68 @@ function entrySummary(entry: Record<string, unknown>): string {
   return "entry";
 }
 
-function describeRequest(request: McpRequest, workspace: string): string {
+/**
+ * Full owner disclosure for one request. A config request shows the normalized shape, the exact entry
+ * that would be written, and every effect an approval has on the `mcp` block. The exact entry is
+ * never truncated.
+ */
+function renderShow(
+  request: McpRequest,
+  options: Pick<McpAdminOptions, "edit" | "config"> & { readonly oauthGrantExposed: boolean },
+): string {
   const header = `Request ${request.id} (${request.kind}) for server "${request.name}"`;
-  if (request.kind === "config" && request.server !== null) {
-    return describeEntry(request.name, request.server, workspace);
+  if (request.kind !== "config" || request.server === null) {
+    if (request.kind === "login") {
+      return `${header}\nStarts an owner-approved OAuth login and verifies the stored grant with one connection.\n` +
+        `A stored OAuth grant is used only when the gateway's execution mode protects it from model-executed processes` +
+        (options.oauthGrantExposed
+          ? " — in this mode it is not, so approval would be refused (see MCP.md)."
+          : ".");
+    }
+    if (request.kind === "logout") {
+      return `${header}\nDeletes the stored OAuth grant for this server. A live connection is unaffected; ` +
+        "a refresh that completes afterwards cannot restore the deleted grant.";
+    }
+    return `${header}\nDeletes this server entry from the configuration file.`;
   }
-  if (request.kind === "login") {
-    return `${header}\nStarts an owner-approved OAuth login and verifies the stored grant with one connection.`;
-  }
-  if (request.kind === "logout") {
-    return `${header}\nDeletes the stored OAuth grant for this server. A live connection is unaffected.`;
-  }
-  return `${header}\nDeletes this server entry from the configuration file.`;
+  const blockEnabled = options.config?.enabled === true;
+  const others = blockEnabled && options.config !== undefined
+    ? Object.keys(options.config.servers).filter((name) => name !== request.name)
+    : [];
+  const normalized = describeEntry(request.name, request.server, options.edit.workspace);
+  const exact = JSON.stringify(request.server);
+  const pretty = JSON.stringify(request.server, null, 2);
+  const entry = pretty.length <= MCP_ADMIN_LIMITS.maxEntryBytes ? pretty : exact;
+  const authority = [
+    "Effective authority of an approval:",
+    blockEnabled
+      ? "  mcp.enabled is already true in this gateway's open configuration, and the write leaves it true on disk. " +
+        "Every other entry there keeps its current state."
+      : "  the approval turns the block on if it is still off on disk. When it was off, every other entry there is " +
+        "pinned to enabled: false, so only this entry may become newly active; entries already disabled stay as they are.",
+    ...(others.length === 0
+      ? []
+      : [`  other entries in this gateway's open configuration: ${others.join(", ")}`]),
+    "  The approval re-reads the file, refuses without changing it when it changed since it was read, and validates the " +
+      "whole merged document with the parser a gateway start uses. It takes effect at the next start (`/restart`).",
+    ...(request.server.oauth === true
+      ? ["  Approval also starts the owner-approved OAuth login for this entry and returns its one-time URL."]
+      : []),
+    ...(request.server.oauth === true && options.oauthGrantExposed
+      ? ["  OAuth grants are unavailable in this execution mode, so this approval would be refused."]
+      : []),
+  ].join("\n");
+  const head = bounded(`${header}\n${normalized}`, Math.max(
+    0,
+    MCP_ADMIN_LIMITS.maxShowChars - entry.length - authority.length - 64,
+  ));
+  return `${head}\n\nExact entry that would be written:\n${entry}\n\n${authority}`;
 }
 
 /**
- * One approval/denial rendered for an owner surface. The authorization URL is appended here and
+ * One approval/denial rendered for the local terminal. The authorization URL is appended here and
  * nowhere else, so it reaches the owner who approved the login and never a model, a tool result or a
- * conversation record.
+ * conversation record. Telegram delivers the URL separately and directly, outside durable state.
  */
 export function renderMcpApproval(result: McpApproveResult, maxChars: number = MCP_ADMIN_LIMITS.maxTextChars): string {
   if (result.authorization === undefined) return bounded(result.text, maxChars);
@@ -267,6 +329,8 @@ function failureText(reason: McpLoginFailure): string {
       return "the authorization code was not accepted";
     case "verify-failed":
       return "the stored grant was refused by the server";
+    case "grant-superseded":
+      return "the stored grant was deleted or replaced while the login was running, so the verified replacement was discarded";
   }
 }
 
@@ -337,6 +401,11 @@ function newId(): string {
   return randomBytes(8).toString("hex");
 }
 
+/** Detach a document value before a transaction closes; a committed overlay is no longer usable. */
+function detach(request: McpRequest): McpRequest {
+  return JSON.parse(JSON.stringify(request)) as McpRequest;
+}
+
 /**
  * Validate one proposed entry exactly as a gateway start would, accepting no other config field.
  * Returns the parsed entry; the caller keeps the verbatim JSON for the owner and for the write.
@@ -387,24 +456,48 @@ export function renderMcpListing(listing: McpAdminListing, maxChars: number = MC
   return bounded(lines.join("\n"), maxChars);
 }
 
+interface ActiveRequest {
+  readonly abort: AbortController;
+  phase: "applying" | "login";
+  run?: McpLoginRun;
+  /** Resolves when the approving call returns, so shutdown can wait for a start it canceled. */
+  readonly done: Promise<void>;
+  finish(): void;
+}
+
 export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
   const now = options.now ?? Date.now;
-  const activeFlows = new Map<string, { readonly run: McpLoginRun; readonly abort: AbortController }>();
+  const oauthGrantExposed = options.oauthGrantExposed === true;
   /**
-   * Flows whose result must not reach the origin chat's agent: an owner denial, or a gateway shutdown.
+   * Requests whose approval is applying or whose login is live. The reservation is taken before any
+   * asynchronous work: it makes a second decision on the same request impossible in this process, and
+   * it keeps a startup-time request from looking like a restart-interrupted one.
+   */
+  const inFlight = new Map<string, ActiveRequest>();
+  /**
+   * Requests whose result must not reach the origin chat's agent: an owner denial, or a gateway shutdown.
    * Both already answered the owner, and neither should start a model turn.
    */
   const silent = new Set<string>();
 
+  const reserve = (id: string): ActiveRequest => {
+    const abort = new AbortController();
+    let finish = (): void => undefined;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const flow: ActiveRequest = { abort, phase: "applying", done, finish };
+    inFlight.set(id, flow);
+    return flow;
+  };
+
   /**
-   * Stored requests, with one repair: a `running` request whose flow is not live in this process was
-   * interrupted by a restart or shutdown, so it is reported as failed rather than blocking every later
-   * decision as "already running". A flow never resumes across a restart, and the next shutdown path
-   * settles it durably.
+   * Stored requests, with one repair: a `running` request with no live reservation was interrupted by
+   * a restart or shutdown, so it is reported as failed rather than blocking every later decision as
+   * "already running". A flow never resumes across a restart, and the next shutdown path settles it
+   * durably.
    */
   const read = async (context: Context): Promise<McpRequest[]> =>
-    storedRequests(await options.requests.read(context)).map((request) =>
-      request.status === "running" && !activeFlows.has(request.id)
+    storedRequests(await options.requests.read(context)).map((request): McpRequest =>
+      request.status === "running" && !inFlight.has(request.id)
         ? { ...request, status: "failed", outcome: request.outcome ?? "login interrupted before it settled" }
         : request);
 
@@ -488,25 +581,60 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
     });
   };
 
+  /** Return a claimed request to pending when the decision proved to have no effect. */
+  const releaseClaim = async (context: Context, id: string): Promise<void> => {
+    await options.requests.write(context, (requests) => {
+      const stored = requests.find((entry) => entry.id === id);
+      if (stored !== undefined && stored.status === "running") {
+        stored.status = "pending";
+        stored.outcome = null;
+      }
+      return undefined;
+    });
+  };
+
+  /**
+   * Atomically move one request from `pending` to `running`. The store write is the claim: a
+   * concurrent approval or denial sees the committed status and cannot apply the same request twice.
+   */
+  const claim = (context: Context, id: string): Promise<
+    | { readonly kind: "missing" }
+    | { readonly kind: "taken"; readonly request: McpRequest }
+    | { readonly kind: "claimed"; readonly request: McpRequest }
+  > => options.requests.write(context, (requests) => {
+    const stored = requests.find((entry) => entry.id === id);
+    if (stored === undefined) return { kind: "missing" as const };
+    if (stored.status !== "pending") return { kind: "taken" as const, request: detach(stored) };
+    stored.status = "running";
+    return { kind: "claimed" as const, request: detach(stored) };
+  });
+
   /** Start one approved login. At most one flow runs; a second is refused, never queued. */
   const startLogin = async (
     context: Context,
     request: McpRequest,
     config: McpHttpServerConfig,
+    flow: ActiveRequest,
   ): Promise<McpApproveResult> => {
-    if (activeFlows.size > 0) {
-      return {
-        status: "refused",
-        text: "An MCP login is already waiting for its browser callback; finish or cancel it before starting another.",
-      };
-    }
     if (config.oauth !== true) {
       return {
         status: "refused",
         text: `Server "${request.name}" does not use OAuth (its entry needs "oauth": true first).`,
       };
     }
-    const abort = new AbortController();
+    if (oauthGrantExposed) {
+      return { status: "refused", text: MCP_OAUTH_UNPROTECTED };
+    }
+    for (const [otherId, other] of inFlight) {
+      if (otherId !== request.id && other.phase === "login") {
+        return {
+          status: "refused",
+          text: "An MCP login is already waiting for its browser callback; finish or cancel it before starting another.",
+        };
+      }
+    }
+    // Reserve the one flow slot before the asynchronous start, so a second approval cannot begin.
+    flow.phase = "login";
     let run: McpLoginRun;
     try {
       run = await beginMcpLogin({
@@ -514,9 +642,10 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
         workspace: options.edit.workspace,
         storePath: mcpOAuthStatePath(options.dataDir, config.url),
         ...(options.environment === undefined ? {} : { environment: options.environment }),
-        signal: abort.signal,
+        signal: flow.abort.signal,
       });
     } catch (error) {
+      flow.phase = "applying";
       if (error instanceof McpAlreadyAuthorizedError) {
         await settle(context, request.id, "done", `already authorized, ${error.tools} tool(s)`);
         return {
@@ -525,16 +654,39 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
             `connection (${error.tools} tool(s)), so no browser authorization was needed. Nothing changed.`,
         };
       }
-      await settle(context, request.id, "failed", error instanceof Error && error.name === "CancelledLoginError"
-        ? "login canceled before authorization"
-        : "login could not start: the authorization endpoint was not usable");
+      if (error instanceof McpGrantSupersededError) {
+        await settle(context, request.id, "failed", "the stored grant changed while the login was checking it");
+        return {
+          status: "refused",
+          text: `MCP login for "${request.name}" was not applied: its stored grant was deleted or replaced while ` +
+            "the login was checking it. A logout always wins; request a new login if one is still needed.",
+        };
+      }
+      if (error instanceof MissingEnvironmentError) {
+        await settle(context, request.id, "failed", "a configured environment variable is not set");
+        return {
+          status: "refused",
+          text: `MCP login for "${request.name}" could not start: environment variable ${error.variable} (a configured ` +
+            "header or child variable) is not set on this host. No grant was stored and nothing was connected.",
+        };
+      }
+      const canceledStart = error instanceof Error && error.name === "CancelledLoginError";
+      if (canceledStart) {
+        await settle(context, request.id, "failed", "login canceled before authorization");
+        return {
+          status: "refused",
+          text: `MCP login for "${request.name}" was canceled before it started. ` +
+            "A grant stored by an earlier successful login is untouched.",
+        };
+      }
+      await settle(context, request.id, "failed", "login could not start: the authorization endpoint was not usable");
       return {
         status: "refused",
         text: `MCP login for "${request.name}" could not start: the server's authorization endpoint was not usable. ` +
           "No grant was stored and nothing was connected.",
       };
     }
-    activeFlows.set(request.id, { run, abort });
+    flow.run = run;
     await options.requests.write(context, (requests) => {
       const stored = requests.find((entry) => entry.id === request.id);
       if (stored !== undefined) stored.status = "running";
@@ -542,11 +694,14 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
     });
     void run.completion.then(async (outcome) => {
       if (silent.delete(request.id)) return;
+      const prefix = request.kind === "config" ? "configuration written; " : "";
       await settle(
         options.context,
         request.id,
         outcome.ok ? "done" : "failed",
-        outcome.ok ? `login complete, ${outcome.tools} tool(s) discovered` : `login failed: ${failureText(outcome.reason)}`,
+        outcome.ok
+          ? `${prefix}login complete, ${outcome.tools} tool(s) discovered`
+          : `${prefix}login failed: ${failureText(outcome.reason)}`,
       ).catch(() => undefined);
       await options.notify({
         requestId: request.id,
@@ -555,7 +710,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
         outcome,
       }).catch(() => undefined);
     }).catch(() => undefined).finally(() => {
-      activeFlows.delete(request.id);
+      if (inFlight.get(request.id) === flow) inFlight.delete(request.id);
     });
     return {
       status: "login-started",
@@ -567,7 +722,11 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
     };
   };
 
-  const applyRequest = async (context: Context, request: McpRequest): Promise<McpApproveResult> => {
+  const applyRequest = async (
+    context: Context,
+    request: McpRequest,
+    flow: ActiveRequest,
+  ): Promise<McpApproveResult> => {
     if (request.kind === "config") {
       if (request.server === null) {
         return { status: "refused", text: `Request ${request.id} has no server entry to write.` };
@@ -581,6 +740,9 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
           text: `Request ${request.id} is no longer a valid entry (${error instanceof Error ? error.message : "invalid"}); nothing was written.`,
         };
       }
+      if ("url" in parsed && parsed.oauth === true && oauthGrantExposed) {
+        return { status: "refused", text: MCP_OAUTH_UNPROTECTED };
+      }
       let written;
       try {
         written = await writeMcpServerEntry(options.edit, request.name, request.server);
@@ -591,13 +753,22 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
             `Request ${request.id} stays available.`,
         };
       }
-      await settle(context, request.id, "done", "configuration written");
       const base = `Wrote server "${request.name}" to the configuration file. Configured servers now: ` +
         `${written.servers.length === 0 ? "none" : written.servers.join(", ")}. MCP is ` +
         `${written.enabled ? "enabled" : "disabled"} in that block. This gateway keeps its open configuration: ` +
         "the entry connects at the next start, and `/restart` replaces this process and re-reads the file.";
-      if (!("url" in parsed) || parsed.oauth !== true) return { status: "applied", text: base };
-      const login = await startLogin(context, request, parsed);
+      if (!("url" in parsed) || parsed.oauth !== true) {
+        await settle(context, request.id, "done", "configuration written");
+        return { status: "applied", text: base };
+      }
+      // A config entry that also starts a login stays `running` through the start, so a concurrent
+      // denial cannot report it settled while its login is about to begin.
+      const login = await startLogin(context, request, parsed, flow);
+      if (login.status !== "login-started") {
+        // The configuration write is a completed effect even when its login could not start; only a
+        // started login keeps the request running until its own completion settles it.
+        await settle(context, request.id, "done", "configuration written; login not started");
+      }
       return login.status === "login-started"
         ? { ...login, text: `${base} ${login.text}` }
         : { status: "applied", text: `${base} ${login.text}` };
@@ -636,11 +807,12 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
       await settle(context, request.id, "done", "stored grant deleted");
       return {
         status: "applied",
-        text: `Deleted the stored OAuth grant for "${request.name}". A live connection is unaffected; after the next ` +
-          "start the entry reports `auth-required` until an owner approves a new login.",
+        text: `Deleted the stored OAuth grant for "${request.name}". A live connection is unaffected; a refresh ` +
+          "that completes afterwards cannot restore the deleted grant. After the next start the entry reports " +
+          "`auth-required` until an owner approves a new login.",
       };
     }
-    return startLogin(context, request, config);
+    return startLogin(context, request, config, flow);
   };
 
   return {
@@ -704,6 +876,10 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
                 };
               }
             }
+            if (action === "login" && oauthGrantExposed
+              && configured !== undefined && "url" in configured && configured.oauth === true) {
+              return { output: [{ type: "text" as const, text: MCP_OAUTH_UNPROTECTED }], isError: true };
+            }
             if (action === "remove" && configured === undefined) {
               return {
                 output: [{ type: "text" as const, text: `Server "${name}" is not configured in this gateway's open configuration.` }],
@@ -722,6 +898,9 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
                   }],
                   isError: true,
                 };
+              }
+              if ("url" in entry && entry.oauth === true && oauthGrantExposed) {
+                return { output: [{ type: "text" as const, text: MCP_OAUTH_UNPROTECTED }], isError: true };
               }
             }
             let id: string;
@@ -777,6 +956,9 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
     }),
     list: listingOf,
     async show(id, context) {
+      if (!ID_PATTERN.test(id)) {
+        return { found: false, text: `No MCP owner approval request ${bounded(id, 32)} exists.` };
+      }
       const request = await findRequest(context, id);
       if (request === undefined) {
         return { found: false, text: `No MCP owner approval request ${bounded(id, 32)} exists.` };
@@ -784,66 +966,134 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
       const state = request.status === "pending" || request.status === "running" ? "" : ` (already ${request.status})`;
       return {
         found: true,
-        text: bounded(`${describeRequest(request, options.edit.workspace)}${state}`, MCP_ADMIN_LIMITS.maxDescriptionChars),
+        text: `${renderShow(request, { edit: options.edit, config: options.config, oauthGrantExposed })}${state}`,
       };
     },
     async approve(id, context) {
-      const request = await findRequest(context, id);
-      if (request === undefined) {
+      if (!ID_PATTERN.test(id)) {
         return { status: "refused", text: `No MCP owner approval request ${bounded(id, 32)} exists.` };
       }
-      if (request.status === "running") {
+      if (inFlight.has(id)) {
         return {
           status: "refused",
-          text: `Request ${request.id} is already running its login; finish or cancel it first.`,
+          text: `Request ${id} is already being applied or is waiting for its browser callback; finish or cancel it first.`,
         };
       }
-      if (request.status !== "pending") {
+      // Reserve first, then claim durably: no second decision can start for this request while the
+      // approval is between asynchronous steps.
+      const flow = reserve(id);
+      try {
+        const claimed = await claim(context, id);
+        if (claimed.kind === "missing") {
+          return { status: "refused", text: `No MCP owner approval request ${bounded(id, 32)} exists.` };
+        }
+        if (claimed.kind === "taken") {
+          return {
+            status: "refused",
+            text: `Request ${claimed.request.id} is already ${claimed.request.status} ` +
+              `(${claimed.request.outcome ?? "settled"}); nothing was done.`,
+          };
+        }
+        const result = await applyRequest(context, claimed.request, flow);
+        if (result.status === "refused") {
+          // A decision that proved to have no effect leaves the request available for the owner.
+          await releaseClaim(context, id).catch(() => undefined);
+        }
+        return result;
+      } catch (error) {
+        await releaseClaim(context, id).catch(() => undefined);
         return {
           status: "refused",
-          text: `Request ${request.id} is already ${request.status} (${request.outcome ?? "settled"}); nothing was done.`,
+          text: `Request ${id} could not be applied (${error instanceof Error ? error.message : "failed"}); ` +
+            "nothing was confirmed.",
         };
+      } finally {
+        // A started login keeps its reservation until its completion settles; every other outcome is
+        // done when this call returns.
+        if (flow.run === undefined && inFlight.get(id) === flow) inFlight.delete(id);
+        flow.finish();
       }
-      return applyRequest(context, request);
     },
     async deny(id, context) {
-      const request = await findRequest(context, id);
-      if (request === undefined) {
+      if (!ID_PATTERN.test(id)) {
         return { status: "refused", text: `No MCP owner approval request ${bounded(id, 32)} exists.` };
       }
-      if (request.status !== "pending" && request.status !== "running") {
+      const decided = await options.requests.write(context, (requests) => {
+        const index = requests.findIndex((entry) => entry.id === id);
+        if (index < 0) return { kind: "missing" as const };
+        const stored = requests[index]!;
+        if (stored.status === "done" || stored.status === "failed") {
+          return { kind: "settled" as const, request: detach(stored) };
+        }
+        // Read the live reservation inside the decision, so an approval that claimed between the
+        // caller's first read and this commit is still recognized.
+        const live = inFlight.get(id);
+        // A non-login approval is a short atomic write; a denial cannot stop it halfway and must not
+        // claim it did. The owner can wait for it to settle instead.
+        if (live !== undefined && live.phase === "applying") {
+          return { kind: "applying" as const, request: detach(stored) };
+        }
+        // A `running` request with no live flow was interrupted by a restart; its effect is unknown.
+        if (stored.status === "running" && live === undefined) {
+          return { kind: "interrupted" as const, request: detach(stored) };
+        }
+        // Denying is a decision, not history worth keeping: the request is consumed and nothing applied.
+        requests.splice(index, 1);
+        return { kind: "removed" as const, request: detach(stored) };
+      });
+      if (decided.kind === "missing") {
+        return { status: "refused", text: `No MCP owner approval request ${bounded(id, 32)} exists.` };
+      }
+      if (decided.kind === "settled") {
         return {
           status: "refused",
-          text: `Request ${request.id} is already ${request.status} (${request.outcome ?? "settled"}); nothing was done.`,
+          text: `Request ${decided.request.id} is already ${decided.request.status} ` +
+            `(${decided.request.outcome ?? "settled"}); nothing was done.`,
         };
       }
-      const flow = activeFlows.get(request.id);
-      if (flow !== undefined) {
-        activeFlows.delete(request.id);
-        silent.add(request.id);
-        flow.abort.abort();
+      if (decided.kind === "applying") {
+        return {
+          status: "refused",
+          text: `Request ${decided.request.id} is already being applied and cannot be stopped halfway. ` +
+            "Nothing was denied; wait for it to settle and then decide again if needed.",
+        };
       }
-      await options.requests.write(context, (requests) => {
-        const index = requests.findIndex((entry) => entry.id === request.id);
-        // Denying is a decision, not history worth keeping: the request is consumed and nothing applied.
-        if (index >= 0) requests.splice(index, 1);
-        return undefined;
-      });
+      if (decided.kind === "interrupted") {
+        return {
+          status: "refused",
+          text: `Request ${decided.request.id} was interrupted before it settled, so its effect is unknown and it ` +
+            "cannot be denied now. Restart the gateway to repair the request list; nothing was done by this denial.",
+        };
+      }
+      const live = inFlight.get(id);
+      if (live !== undefined && live.phase === "login") {
+        // The flow observes this abort during startup and through the browser wait.
+        silent.add(id);
+        live.abort.abort();
+      }
       return {
         status: "applied",
-        text: flow === undefined
-          ? `Denied MCP request ${request.id} (${request.kind} ${request.name}): nothing was configured, connected or authorized.`
-          : `Denied MCP request ${request.id}: its login was canceled. A grant stored by an earlier successful login is ` +
-            "untouched; ask for a logout to delete it.",
+        text: decided.request.status === "running"
+          ? `Denied MCP request ${decided.request.id}: it was already running, so any live login was canceled. ` +
+            (decided.request.kind === "config"
+              ? "Its configuration write may already have completed; review the configuration. "
+              : "") +
+            "A grant it had already stored is kept; ask for a logout to delete it."
+          : `Denied MCP request ${decided.request.id} (${decided.request.kind} ${decided.request.name}): nothing was ` +
+            "configured, connected or authorized.",
       };
     },
     async close() {
-      for (const [id, flow] of activeFlows) {
-        activeFlows.delete(id);
+      for (const [id, flow] of [...inFlight]) {
+        const wasLogin = flow.phase === "login" || flow.run !== undefined;
         // Shutdown answers nobody with a model turn; the outcome stays in the request list.
         silent.add(id);
         flow.abort.abort();
-        await flow.run.completion.catch(() => undefined);
+        await flow.run?.completion.catch(() => undefined);
+        // A login that has not returned its URL yet also observes the abort; wait for it to unwind.
+        await flow.done.catch(() => undefined);
+        if (inFlight.get(id) === flow) inFlight.delete(id);
+        if (!wasLogin) continue;
         // The store is still open here: record the interruption instead of leaving an unapprovable
         // `running` request behind for the next open.
         await settle(options.context, id, "failed", "login canceled: the gateway is shutting down")

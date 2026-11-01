@@ -264,21 +264,29 @@ edits need restart only; unit edits additionally need daemon-reload.
   and can only record one immutable, bounded, secret-free request in a
   root-scoped document; it cannot approve, deny, write configuration, start a
   flow or read a grant. Only the local terminal and the authenticated Telegram
-  owner chat decide, as durable owner controls, and each decision consumes the
-  request. A `config` approval writes `mcp.servers.<name>` (and
-  `mcp.enabled: true`) into the gateway's own configuration file atomically after
-  validating the whole merged document, preserving the file mode and touching
-  nothing else; a `remove` approval deletes one entry and never disables the
-  capability. An `oauth: true` HTTP entry reads its grant from one private
-  `0600` file per exact URL under the canonical data directory, never from
-  config, transcript, entry or channel text; with no usable grant it fails closed
-  as `auth-required` instead of starting a flow. Login is owner-approved,
+  owner chat decide, as durable owner controls, and each decision atomically
+  claims the request before any asynchronous work, then consumes it. A `config`
+  approval writes `mcp.servers.<name>` (and `mcp.enabled: true`) into the
+  gateway's own configuration file atomically after validating the whole merged
+  document, preserving the file mode and touching nothing else; it enables only
+  the approved entry (other entries are pinned to `enabled: false` when the block
+  was off), serializes managed edits and refuses to replace a file whose bytes
+  changed since it was read. A `remove` approval deletes one entry and never
+  disables the capability. An `oauth: true` HTTP entry reads its grant from one
+  private `0600` file per exact URL under the canonical data directory, never
+  from config, transcript, entry or channel text; with no usable grant it fails
+  closed as `auth-required` instead of starting a flow, and while an unsandboxed
+  host shell could read that file it fails closed as `credential-exposed`
+  (Bubblewrap shell or no shell is required). Login is owner-approved,
   gateway-run native PKCE with a loopback callback, one flow at a time and a
-  five-minute browser deadline; its authorization URL goes only to the approving
-  owner surface, and its completion places one credential-free internal result in
-  the origin chat. A configuration or grant change takes effect at the next start
-  (`/restart`); nothing hot-reloads or reconnects, and no scheduled, worker or
-  automation scope can propose or approve.
+  five-minute deadline; it works on a staged grant, installs it only after a
+  verification connection, and a logout increments the grant generation so a
+  stale refresh or a late commit cannot restore it. Its authorization URL is
+  delivered directly to the approving owner surface and never persisted in
+  channel state, and its completion places one credential-free internal result
+  in the origin chat. A configuration or grant change takes effect at the next
+  start (`/restart`); nothing hot-reloads or reconnects, and no scheduled,
+  worker or automation scope can propose or approve.
 - Telegram outbound text is rich by default (Bot API 10.1 `sendRichMessage` /
   `editMessageText` with `rich_message.markdown`) for ordinary replies, scheduled deliveries,
   previews and their edits, and host notices. Chunking uses a persisted, capability-independent

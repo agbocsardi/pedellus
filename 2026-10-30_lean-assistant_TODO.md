@@ -1372,3 +1372,40 @@ server or browser consent flow was exercised.
 
 Coverage is synthetic: loopback fixture MCP endpoints, a loopback authorization
 server, faux models, no external network.
+
+### Session — independent review fixes for MCP management and OAuth
+
+- [x] Grant protection: an unsandboxed host shell can read the canonical data
+  directory, so an `oauth` entry now fails closed as `credential-exposed` while
+  `bash` is enabled without `toolSandbox: "bwrap"`, and login/OAuth approvals and
+  proposals are refused with fixed text. The docs no longer imply a `0600` file
+  protects the model from itself.
+- [x] Disclosure: `/mcp show` prints the entire exact proposed entry (a proposal
+  is bounded at 8 KiB) plus the approval's block-level effects, with a 12 KiB
+  notice budget; no entry is truncated. A config approval enables only the
+  approved entry — when the block was off, other entries in the file are pinned
+  to `enabled: false`.
+- [x] Decisions: approve claims `pending -> running` atomically and reserves the
+  one login flow before any asynchronous work; deny consumes only a pending or
+  live-login request and cancels startup too. A refused decision returns the
+  request to pending. A non-login write in progress is refused rather than
+  claimed as stopped halfway.
+- [x] Config writes: serialized per path in-process; the file is re-read before
+  replacement and the edit is refused if its bytes changed. The remaining
+  check/rename window is documented, not hidden.
+- [x] Login grant safety: an attempt works on a staged copy seeded from the stored
+  grant, verifies it with one connection and only then installs it. A failed or
+  canceled attempt leaves the stored grant byte-for-byte untouched. Logout bumps
+  a process-local generation, so stale refreshes and late commits cannot restore
+  a deleted grant. The initial connection now receives the attempt deadline and
+  cancellation, and sends configured headers.
+- [x] Telegram: the authorization URL is sent as a separate direct owner-chat
+  message after the durable acknowledgement and is never stored in channel
+  state; a failure cancels the login. A slow approval that already published the
+  still-pending wording publishes its final outcome as a follow-up, so the sole
+  URL is not lost.
+- [x] Verification: typecheck/build, 347 behavior checks, the 2 execution checks,
+  core acceptance pass, and ad hoc synthetic checks for exact-entry disclosure,
+  exposed-mode refusal, concurrent approve/deny, startup cancellation, configured
+  login headers, logout during a live flow, and a failed attempt preserving the
+  prior grant. No new permanent tests were added (not requested).

@@ -179,11 +179,14 @@ a native host process, not under `toolSandbox: "bwrap"`. The assistant can propo
 server entry, an OAuth login, a logout or a removal, but only records a request: the
 owner approves it from the terminal or the authenticated Telegram owner chat
 (`/mcp approve <id>`), and only then is configuration written or a browser login run
-against a private token file. Neither takes effect until the next start. There is no
-implicit `mcp.json` discovery, no resources/prompts tool, no hot reload and no
-dashboard; failures surface as fixed codes on the SDK `gateway.mcp` surface and in
-`/mcp`. See [MCP servers, management and OAuth](./MCP.md) and [Code Mode contract and
-verified boundaries](./CODEMODE.md).
+against a private token file. Approval enables only the approved entry, `show`
+discloses the entire exact entry, and OAuth grants are used only while the model's
+shell cannot read the data directory (Bubblewrap shell or no shell; otherwise the
+entry fails closed). Neither an entry nor a grant takes effect until the next start.
+There is no implicit `mcp.json` discovery, no resources/prompts tool, no hot reload
+and no dashboard; failures surface as fixed codes on the SDK `gateway.mcp` surface
+and in `/mcp`. See [MCP servers, management and OAuth](./MCP.md) and [Code Mode
+contract and verified boundaries](./CODEMODE.md).
 
 ## Web search and public fetch (opt-in)
 
