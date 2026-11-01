@@ -100,7 +100,10 @@ edits need restart only; unit edits additionally need daemon-reload.
   the same origin and job and the conversation is still unforked, and restored
   from every mapped conversation's own marker (with the origin's documents naming
   further candidates for a live run's unmapped target) before a reopen admits any
-  mapped key as chat, so a lost pointer is not a lost class. Open installs no cron
+  mapped key as chat, so a lost pointer is not a lost class. That restore belongs to
+  the cron-enabled open path: with `cron.enabled` false it does not run, so a stale
+  key naming an automation conversation in a store whose cron was since disabled is
+  admitted as chat. Open installs no cron
   owner or context snapshot for a mapped key naming the root, a task-owned
   conversation or a fork. Such a conversation is never a
   chat, an origin, a digest

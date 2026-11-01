@@ -85,17 +85,21 @@ candidate IDs: a live run's target is ownerless and unmapped, so nothing else na
 reopen's run-target scan. A document never decides a class, so a damaged pointer can at most fail to
 enumerate a conversation, never promote a chat or hide an automation conversation a key names. The
 restore decides adoption with the same rule a run applies to a recorded pointer (the conversation is
-still ownerless and unforked, and its marker names another conversation as its origin), so it never
-takes an ordinary chat — which carries no such marker — out of chat scope, and the authority pass
-cannot veto the classification of the mapping it has to refuse.
+still ownerless and unforked, and its marker names another conversation as its origin), so a store
+this host wrote never loses an ordinary chat to it: this host only ever writes that marker on an
+automation conversation. A marker written onto a chat by hand is the other case — it buys denial of
+that chat's surfaces and of store-wide history search, never authority, and it clears when the marker
+is removed. The authority pass cannot veto the classification of the mapping it has to refuse.
 
 The same open pass installs a mapped session only for a conversation the shared scope rule still
 calls chat. A key naming the root, a task-owned conversation or a fork gains no cron owner, no
 context-snapshot slot and no resume target, matching the channel ingress refusal for that key, and a
 forked ID leaves the mapped-session set so its snapshot stays evictable. A missing conversation keeps
-its explicit startup failure. Two known gaps remain. This class restore belongs to the cron-enabled
+its explicit startup failure. Three known gaps remain. This class restore belongs to the cron-enabled
 open path: with `cron.enabled` false it does not run, so a stale key naming an automation conversation
-in a store whose cron was since disabled would be admitted as chat. And a `:channel-state` key is a
+in a store whose cron was since disabled would be admitted as chat. A hand-edited marker on an
+ordinary chat takes that chat out of chat scope and makes store-wide history search fail until the
+marker is removed: denial only, and only for a store someone already edited. And a `:channel-state` key is a
 mapped session and a cron owner by design even though no chat turn runs in it, so the cron tool it is
 offered is never exercised from there.
 

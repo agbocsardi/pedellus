@@ -106,7 +106,8 @@ export interface ChatScopeRecord {
   /**
    * The host's durable classification of this conversation as a scheduled run's automation
    * conversation. It is stated explicitly because such a conversation is ownerless and unforked,
-   * exactly like a chat; only the host's own cron documents say which it is.
+   * exactly like a chat; the conversation's own class marker says which it is, and the host's cron
+   * documents only enumerate candidates for a reopen.
    */
   readonly automation?: boolean;
 }

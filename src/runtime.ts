@@ -2256,10 +2256,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // conversation, never promote a chat or hide an automation conversation a key names. Only a
     // conversation that is still ownerless and unforked and whose marker names another conversation
     // is classified (`classifyAutomationConversation`, the same rule a run applies to a recorded
-    // pointer). An ordinary chat carries no such marker, so this never takes a chat out of chat scope,
-    // while a missing, foreign or damaged marker leaves the ID unclassified and the job's next run
-    // records a fresh conversation in its place. This is a read: it creates no document and starts
-    // nothing.
+    // pointer). This host writes that marker only on an automation conversation, so a store this host
+    // wrote never loses a chat to it; a marker written onto a chat by hand buys denial of that chat's
+    // surfaces and of store-wide history search, never authority. A missing, foreign or damaged marker
+    // leaves the ID unclassified and the job's next run records a fresh conversation in its place.
+    // This is a read: it creates no document and starts nothing.
     if (cronEnabled && storedMappedSessions !== undefined) {
       const candidates = new Set<ConversationId>();
       for (const { conversationId } of storedMappedSessions) candidates.add(conversationId);
