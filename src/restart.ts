@@ -9,6 +9,9 @@
  * discarded by the system, so the gateway must finish its own graceful teardown first.
  */
 
+import type { Context } from "@earendil-works/chord";
+import type { BackgroundActiveWork } from "./background-status.js";
+
 export type RestartPlan = {
   /** This process's own Node executable. */
   readonly file: string;
@@ -26,6 +29,62 @@ export const RESTART_FAILURE_DIAGNOSTIC =
 /** Whether this platform and Node runtime can replace the current process image. */
 export function restartSupported(): boolean {
   return typeof process.execve === "function";
+}
+
+/**
+ * Fixed refusal when a restart would interrupt live work. It names no task, chat, conversation or
+ * transcript, and it is the whole reason: nothing was acknowledged, torn down or restarted.
+ */
+export const RESTART_BUSY_MESSAGE =
+  "Gateway restart refused: live work would be interrupted, so nothing was restarted and the gateway " +
+  "keeps serving. Finish that work (it is counted in /status), or abort it with the existing /abort, " +
+  "worker or cron controls, then retry /restart.";
+
+/** A known no-effect host refusal: live work is active, so no teardown started. */
+export class RestartBusyError extends Error {
+  override name = "RestartBusyError";
+  constructor() {
+    super(RESTART_BUSY_MESSAGE);
+  }
+}
+
+export interface RestartCoordinator {
+  /**
+   * Ask for this gateway's process replacement. A busy refusal happens before the acknowledgement and
+   * before any teardown, so a refused request never claims a restart; a call after an accepted
+   * request is refused too, and never acknowledges or tears down again.
+   */
+  request(acknowledge?: () => Promise<void>): Promise<void>;
+  /** True once a restart was accepted: the host replaces the process after its own teardown returns. */
+  accepted(): boolean;
+}
+
+/**
+ * The one host-side gate behind every owner `/restart` surface (the local CLI and Telegram).
+ *
+ * The inspection and the teardown are separate operations: a task admitted after the check but
+ * before the acknowledgement/teardown is not protected by it. No drain, lock, scheduling pause or
+ * confirmation step is added here; the window is the acknowledgement round trip, and the alternative
+ * facilities for closing it do not exist in Durable today.
+ */
+export function createRestartCoordinator(options: {
+  readonly activeWork: (context: Context) => Promise<BackgroundActiveWork>;
+  /** Host owner context for the read-only inspection. */
+  readonly context: Context;
+  /** Stop this gateway's own surfaces; only called after an accepted, acknowledged request. */
+  readonly teardown: () => void;
+}): RestartCoordinator {
+  let requested = false;
+  return {
+    accepted: () => requested,
+    async request(acknowledge) {
+      if (requested) throw new Error("gateway restart is already in progress");
+      if ((await options.activeWork(options.context)).interrupting > 0) throw new RestartBusyError();
+      requested = true;
+      try { await acknowledge?.(); }
+      finally { options.teardown(); }
+    },
+  };
 }
 
 /**

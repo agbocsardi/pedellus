@@ -174,7 +174,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     name: "restart",
     summary: "Replace the whole gateway process",
     usage: "Usage: /restart",
-    detail: "Affects every chat and all background work; a confirmation follows once the gateway is live.",
+    detail: "Affects every chat and all background work; refused with a count of the live work it would interrupt (also shown in /status), and a confirmation follows once the gateway is live.",
     surfaces: ["cli", "telegram"],
   },
   {

@@ -22,7 +22,7 @@ import { LocalGatewayError } from "./local/protocol.js";
 import { createMediaStore } from "./media/attachments.js";
 import { LOCAL_ATTACHMENT_DIRECTORY } from "./media/local.js";
 import { cancelPreparedContextBlock, listPreparedContextBlocks, PreparedContextRecoveryError } from "./recovery/index.js";
-import { replaceProcess, restartPlan, restartSupported, RESTART_FAILURE_DIAGNOSTIC } from "./restart.js";
+import { createRestartCoordinator, replaceProcess, restartPlan, restartSupported, RESTART_FAILURE_DIAGNOSTIC } from "./restart.js";
 import { runTerminalConversation } from "./terminal/index.js";
 import { openGateway } from "./runtime.js";
 import { prepareDataDirectory } from "./store.js";
@@ -368,14 +368,15 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
   process.once("SIGTERM", shutdown);
   let gateway: Awaited<ReturnType<typeof openGateway>> | undefined;
   let server: Awaited<ReturnType<typeof serveLocalGateway>> | undefined;
-  /** Set only by the authenticated owner `/restart` command; acted on after graceful teardown. */
-  let restartRequested = false;
-  const requestRestart = async (acknowledge?: () => Promise<void>): Promise<void> => {
-    if (restartRequested) throw new Error("gateway restart is already in progress");
-    restartRequested = true;
-    try { await acknowledge?.(); }
-    finally { shutdown(); }
-  };
+  /** The one host gate for both owner `/restart` surfaces: it refuses while live work would be interrupted. */
+  const restart = createRestartCoordinator({
+    activeWork: async (ctx) => {
+      if (gateway === undefined) throw new Error("gateway is not open");
+      return gateway.activeWork(ctx);
+    },
+    context: withoutAbortSignal(context),
+    teardown: shutdown,
+  });
   try {
     const socketPath = await localSocketPath(config);
     gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
@@ -400,7 +401,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       tools: config.toolAllowlist ?? [],
       contextRefresh: config.workspaceContext !== undefined,
       presets: config.modelPreset !== undefined,
-      restart: { supported: restartSupported(), request: requestRestart },
+      restart: { supported: restartSupported(), request: (acknowledge) => restart.request(acknowledge) },
       ...(attachments === undefined ? {} : { attachments }),
     });
     if (config.telegram) {
@@ -428,7 +429,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
         // shutdown, and the replacement happens here after the teardown below.
         restart: {
           supported: restartSupported(),
-          request: () => requestRestart(),
+          request: () => restart.request(),
         },
       }, context);
     } else {
@@ -440,7 +441,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
     await server?.close();
     await gateway?.close(withoutAbortSignal(context));
   }
-  if (restartRequested) replaceGatewayProcess();
+  if (restart.accepted()) replaceGatewayProcess();
 }
 
 /**

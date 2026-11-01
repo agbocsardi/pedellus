@@ -18,6 +18,7 @@ import {
 } from "../media/local.js";
 import type { Gateway, GatewayMcpAdmin, GatewayModelSelectionRequest } from "../runtime.js";
 import { CRON_OPERATOR_LIMITS, CronOperatorInputError, type CronOperator } from "../automation/operator.js";
+import { RestartBusyError } from "../restart.js";
 import {
   inProcessTerminalConversation,
   projectEntry,
@@ -368,12 +369,19 @@ class LocalConnection {
         if (!this.options.restart?.supported) {
           throw new LocalRequestError("unavailable", "gateway process restart is unavailable on this host");
         }
-        await this.options.restart.request(() => new Promise<void>((resolveSent, rejectSent) => {
-          this.socket.write(`${JSON.stringify({ id: request.id, result: {} })}\n`, (error) => {
-            if (error) rejectSent(error);
-            else resolveSent();
-          });
-        }));
+        try {
+          await this.options.restart.request(() => new Promise<void>((resolveSent, rejectSent) => {
+            this.socket.write(`${JSON.stringify({ id: request.id, result: {} })}\n`, (error) => {
+              if (error) rejectSent(error);
+              else resolveSent();
+            });
+          }));
+        } catch (error) {
+          // A busy refusal is a known no-effect before any acknowledgement; the terminal prints its
+          // fixed reason instead of the generic protocol failure.
+          if (error instanceof RestartBusyError) throw new LocalRequestError("busy", error.message);
+          throw error;
+        }
         return {};
       }
       case "listModels":

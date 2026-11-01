@@ -158,7 +158,15 @@ edits need restart only; unit edits additionally need daemon-reload.
   refuses it while that chat runs instead of half-applying; `/restart` is the
   host's full-process replacement (same executable, argv and environment through
   POSIX `process.execve`, after normal teardown), never a model tool, daemon or
-  supervisor. The CLI flushes its acknowledgement before restart tears down connections and
+  supervisor. One host gate shared by the local CLI and Telegram refuses it with
+  fixed text while live work would be interrupted: running, queued, waiting or
+  finishing tasks (generation, tool, compaction, worker, digest, cron run).
+  Sleeping native timers and parked blocked tasks are not active work, so an
+  armed schedule never blocks indefinitely. A refusal acknowledges nothing, tears
+  down nothing and may be retried after finishing or aborting; `/status` names
+  only the bounded gateway-wide count, and the inspect-then-teardown check is not
+  atomic, so work admitted in that window is not protected.
+  The CLI flushes its acknowledgement before restart tears down connections and
   does not wait for the replacement; an authenticated Telegram `/restart` records each requesting
   chat durably in the same applied commit, and the replacement posts one ordinary notice per chat
   and clears them, while a host refusal reports that nothing was restarted instead. A sender the

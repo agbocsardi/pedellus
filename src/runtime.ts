@@ -109,6 +109,7 @@ import {
   BACKGROUND_STATUS_LIMITS,
   backgroundLabel,
   emptyBackgroundStatus,
+  type BackgroundActiveWork,
   type BackgroundCronRun,
   type BackgroundDigest,
   type BackgroundStatus,
@@ -365,6 +366,14 @@ export interface Gateway {
    * other conversation ID. A conversation that is not an authenticated mapped chat reads nothing.
    */
   backgroundStatus(sessionKey: string, context: Context): Promise<BackgroundStatus>;
+  /**
+   * Bounded, read-only count of live work a whole-gateway restart would interrupt: executing tasks,
+   * work queued to execute, work waiting for it, and work still finishing. A sleeping native timer is
+   * an armed schedule and a blocked task cannot run, so neither counts, and an armed cron schedule
+   * never keeps the gateway permanently busy. It starts, changes, cancels and calls nothing, and
+   * reports no task, conversation or transcript detail.
+   */
+  activeWork(context: Context): Promise<BackgroundActiveWork>;
   /** Lists the explicit allowlist and persisted selection for an already-known session key. */
   listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
   /** Persists a native pi.agent choice; rejects ConversationBusy atomically without changing it. */
@@ -2904,6 +2913,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         return conversation;
       },
       backgroundStatus: (sessionKey, ctx) => backgroundStatusFor(sessionKey, ctx),
+      activeWork: (ctx) => activeWorkFor(ctx),
       async listModels(sessionKey, ctx) {
         const conversation = await existingConversationFor(sessionKey, ctx);
         await applyConversationPolicy(conversation, ctx);
@@ -3146,6 +3156,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const conversation = await existingConversationFor(sessionKey, ctx);
       const conversationId = conversation.id;
       if (!authorizedChatConversations.has(conversationId)) return emptyBackgroundStatus();
+      // Restart is process-wide, so its count is read for the whole store, not for this chat alone.
+      const active = await activeWorkFor(ctx);
       // A native task record keeps its last state when Durable parks it, so "unfinished" is not the
       // same as "will run": only the live-work inspection reports blocked tasks. It is read lazily,
       // once, and only when something unfinished actually needs classifying.
@@ -3236,7 +3248,21 @@ export async function openGateway(config: PortConfig, context: Context, options:
           parked,
         },
         digest: { live: digestLive, parked: digestParked },
+        active,
       };
+    }
+    /**
+     * One read of the native task inspection. Sleeping is an armed timer and blocked is parked work,
+     * so neither is work a replacement could interrupt; everything else is unfinished work it would
+     * cut into. Nothing is written, aborted or retried here.
+     */
+    async function activeWorkFor(ctx: Context): Promise<BackgroundActiveWork> {
+      let interrupting = 0;
+      for (const task of (await harness!.inspect(ctx)).tasks) {
+        if (task.state.kind === "sleeping" || task.state.kind === "blocked") continue;
+        interrupting += 1;
+      }
+      return { interrupting };
     }
     // Summary policy and cut-chain repair. The opt-in watermark is recorded before any catalog pass
     // can enqueue history, so enabling summaries never spends on episodes that already existed. A

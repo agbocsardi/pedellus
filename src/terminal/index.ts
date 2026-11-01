@@ -77,6 +77,13 @@ const MAX_REMEMBERED_ANSWERS = 256;
 const MAX_REMEMBERED_LOCAL_INPUTS = 1_024;
 const MAX_EXTERNAL_RUNS = 64;
 const LITERAL_SLASH_PREFIX = "//";
+/**
+ * A restart the host refused before acknowledging or tearing anything down. Only the local protocol's
+ * `busy` refusal carries a fixed host reason; any other failure is reported without echoing an
+ * internal message.
+ */
+const RESTART_REFUSED =
+  "Gateway restart failed: the host did not perform it, so this gateway keeps running. Nothing was restarted.";
 
 export interface TerminalModelSelectionHost {
   list(): Promise<GatewayModelList>;
@@ -1256,13 +1263,22 @@ export async function runTerminalConversation(
         await notice("Native Durable context reset admitted for this same conversation: no handoff, summary or extra model call, earlier entries stay stored and listed by /history, and tool authority is unchanged." +
           (io.contextRefresh?.available ? " Workspace context and skills were rebuilt atomically; a busy conversation is refused." : " While busy it lands at the next safe boundary; queued inputs placed with it run in the new context."));
         return;
-      case "restart":
+      case "restart": {
         if (args.trim()) { await notice(conversationCommandUsage("restart"), true); return; }
-        await offeredHost(io.restart)();
+        try {
+          await offeredHost(io.restart)();
+        } catch (error) {
+          // A refusal is a known no-effect: no teardown followed, so this terminal keeps its connection
+          // and the owner may finish or abort the live work and retry.
+          const busy = error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy");
+          await notice(busy && error instanceof Error ? error.message : RESTART_REFUSED, true);
+          return;
+        }
         await notice("Gateway restarting; this terminal disconnects.");
         io.closeInput?.();
         operationController.abort(new Error("gateway restart requested"));
         return;
+      }
     }
   };
 
