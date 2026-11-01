@@ -1,3 +1,4 @@
+import { randomBytes, createHmac, timingSafeEqual } from "node:crypto";
 import { ResetEntry, type EntryRecord } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import type { MemoryBackend, MemoryHost, MemoryReadPage, MemoryRef, MemoryScope } from "./contracts.js";
@@ -5,10 +6,11 @@ import { projectEntry, entryFingerprint, scopeKey } from "./history-source.js";
 import { decodeToken, encodeToken, hash, sliceText } from "./validation.js";
 
 const MAX_PAGE = 8_000;
-const SOURCE_LIMIT = 200;
+const SOURCE_LIMIT = 1;
 const SCAN_LIMIT = 200;
 const ERROR = "memory history reference is unavailable or has changed";
 type Mode = "part" | "episode" | "summary";
+type EpisodePhase = "open" | "items" | "close" | "done";
 interface CursorState {
   readonly v: 1;
   readonly mode: Mode;
@@ -22,7 +24,12 @@ interface CursorState {
   readonly part: number;
   readonly offset: number;
   readonly emitted: boolean;
+  readonly phase?: EpisodePhase;
   readonly currentFingerprint?: string;
+  readonly unreadable?: number;
+  readonly undated?: number;
+  readonly omittedNonText?: number;
+  readonly diagnosedEntryID?: number;
 }
 
 function canonicalJSON(value: unknown): string {
@@ -40,18 +47,28 @@ function canonicalJSON(value: unknown): string {
 }
 function isReset(entry: EntryRecord): boolean { return entry.kind === ResetEntry.kind; }
 function int(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
-function makeCursor(state: CursorState): string {
+function sign(payload: string, key: Buffer): string { return createHmac("sha256", key).update(payload).digest("base64url"); }
+function makeCursor(state: CursorState, key: Buffer): string {
   const payload = encodeToken(state);
-  return encodeToken({ payload, checksum: hash(payload) });
+  return encodeToken({ payload, signature: sign(payload, key) });
 }
-function parseCursor(token: string): CursorState {
-  const envelope = decodeToken(token) as { payload?: unknown; checksum?: unknown };
-  if (typeof envelope?.payload !== "string" || typeof envelope.checksum !== "string" || hash(envelope.payload) !== envelope.checksum) throw new TypeError(ERROR);
+function parseCursor(token: string, key: Buffer): CursorState {
+  const envelope = decodeToken(token) as { payload?: unknown; signature?: unknown };
+  if (typeof envelope?.payload !== "string" || typeof envelope.signature !== "string") throw new TypeError(ERROR);
+  const expected = Buffer.from(sign(envelope.payload, key));
+  const supplied = Buffer.from(envelope.signature);
+  if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) throw new TypeError(ERROR);
   const value = decodeToken(envelope.payload) as Partial<CursorState>;
   if (value.v !== 1 || !["part", "episode", "summary"].includes(value.mode as string)
     || typeof value.binding !== "string" || typeof value.scope !== "string" || typeof value.session !== "string"
     || !int(value.start) || !int(value.high) || typeof value.anchor !== "string" || !int(value.entry)
-    || !int(value.part) || !int(value.offset) || typeof value.emitted !== "boolean") throw new TypeError(ERROR);
+    || !int(value.part) || !int(value.offset) || typeof value.emitted !== "boolean"
+    || (value.phase !== undefined && !["open", "items", "close", "done"].includes(value.phase))
+    || (value.mode === "episode" && (value.phase === undefined || value.phase === "done"))
+    || (value.unreadable !== undefined && !int(value.unreadable))
+    || (value.undated !== undefined && !int(value.undated))
+    || (value.omittedNonText !== undefined && !int(value.omittedNonText))
+    || (value.diagnosedEntryID !== undefined && !int(value.diagnosedEntryID))) throw new TypeError(ERROR);
   return value as CursorState;
 }
 async function exact(host: MemoryHost, session: string, id: number, context: Context): Promise<EntryRecord> {
@@ -70,28 +87,35 @@ async function tail(host: MemoryHost, session: string, context: Context): Promis
   if (page.items.length > 1) throw new TypeError(ERROR);
   return page.items[0];
 }
-function selectedPart(entry: EntryRecord, ref: MemoryRef): unknown {
+function selectedPart(entry: EntryRecord, ref: MemoryRef) {
   const projection = projectEntry(entry);
   const part = ref.kind === "message"
     ? projection.parts.find((candidate) => candidate.kind === "message" && candidate.messageIndex === ref.messageIndex)
     : projection.parts.find((candidate) => candidate.kind === "tool" && candidate.toolOrdinal === ref.blockIndex);
   if (!part || (ref.kind === "message" && part.kind !== "message") || (ref.kind === "tool" && part.kind !== "tool")) throw new TypeError(ERROR);
-  return part.value;
+  return { part, projection };
 }
-function pageSize(limit: number | undefined): number {
-  return limit === undefined ? MAX_PAGE : Math.min(MAX_PAGE, limit);
-}
+function pageSize(limit: number | undefined): number { return limit === undefined ? MAX_PAGE : Math.min(MAX_PAGE, limit); }
 function binding(ref: MemoryRef, view: "summary" | "transcript"): string { return hash({ ref, view }); }
 function scopeSession(scope: MemoryScope, key: string) {
   const session = scope.sessions.find((item) => item.sessionKey === key);
   if (!session) throw new TypeError(ERROR);
   return session;
 }
+function boundedSlice(text: string, offset: number, limit: number): { content: string; nextOffset?: number } {
+  let end = Math.min(text.length, offset + limit);
+  if (end < text.length && end > offset && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff
+    && text.charCodeAt(end) >= 0xdc00 && text.charCodeAt(end) <= 0xdfff) end--;
+  if (end === offset) return { content: "", nextOffset: offset };
+  return end < text.length ? { content: text.slice(offset, end), nextOffset: end } : { content: text.slice(offset, end) };
+}
 
 export function createHistoryReader(host: MemoryHost): { read: MemoryBackend["read"]; close(): void } {
+  const key = randomBytes(32);
+  let closed = false;
   const read: MemoryBackend["read"] = async (query, ref, scope, context): Promise<MemoryReadPage> => {
     try {
-      if (ref.kind === "note") throw new TypeError(ERROR);
+      if (closed || ref.kind === "note") throw new TypeError(ERROR);
       const view = query.view ?? (ref.kind === "summary" ? "summary" : "transcript");
       const sessionKey = ref.session;
       if (!sessionKey) throw new TypeError(ERROR);
@@ -103,9 +127,9 @@ export function createHistoryReader(host: MemoryHost): { read: MemoryBackend["re
         if (view !== "transcript" || ref.entryId === undefined) throw new TypeError(ERROR);
         const entry = await exact(host, sessionKey, ref.entryId, context);
         if (ref.fingerprint !== undefined && entryFingerprint(entry) !== ref.fingerprint) throw new TypeError(ERROR);
-        const projection = projectEntry(entry);
-        const serialized = canonicalJSON(selectedPart(entry, ref));
-        const state = query.cursor === undefined ? undefined : parseCursor(query.cursor);
+        const { part, projection } = selectedPart(entry, ref);
+        const serialized = canonicalJSON(part.value);
+        const state = query.cursor === undefined ? undefined : parseCursor(query.cursor, key);
         const offset = state?.offset ?? 0;
         if (state && (state.mode !== "part" || state.binding !== refBinding || state.scope !== scopeKey(scope)
           || state.session !== sessionKey || state.start !== ref.entryId || state.high !== ref.entryId
@@ -113,8 +137,10 @@ export function createHistoryReader(host: MemoryHost): { read: MemoryBackend["re
         const sliced = sliceText(serialized, offset, maxChars);
         const complete = sliced.nextOffset === undefined;
         const next = complete ? undefined : makeCursor({ v: 1, mode: "part", binding: refBinding, scope: scopeKey(scope), session: sessionKey,
-          start: ref.entryId, high: ref.entryId, anchor: entryFingerprint(entry), entry: ref.entryId, part: 0, offset: sliced.nextOffset!, emitted: true });
-        return { ref: query.ref, view, content: sliced.content, ...(next ? { cursor: next } : {}), complete, coverage: { complete, unreadable: projection.malformed, undated: 0, omittedNonText: projection.omittedNonText, projection: "user/assistant/tool text only; non-text blocks and other entry kinds omitted" } };
+          start: ref.entryId, high: ref.entryId, anchor: entryFingerprint(entry), entry: ref.entryId, part: 0, offset: sliced.nextOffset!, emitted: true }, key);
+        return { ref: query.ref, view, content: sliced.content, ...(next ? { cursor: next } : {}), complete,
+          coverage: { complete: true, pageComplete: complete, unreadable: projection.malformed, undated: part.timestamp === null ? 1 : 0,
+            omittedNonText: projection.omittedNonText, projection: "selected message/tool text only" } };
       }
 
       const start = ref.episodeStart;
@@ -136,90 +162,101 @@ export function createHistoryReader(host: MemoryHost): { read: MemoryBackend["re
         }, accounting: { completedAtMs: snap.completedAtMs }, version: snap.summarizerVersion, generation });
         const fingerprint = generation;
         if (ref.kind === "summary" && ref.fingerprint !== undefined && ref.fingerprint !== fingerprint) throw new TypeError(ERROR);
-        const state = query.cursor === undefined ? undefined : parseCursor(query.cursor);
+        const state = query.cursor === undefined ? undefined : parseCursor(query.cursor, key);
         const offset = state?.offset ?? 0;
         const summaryBinding = hash({ original: refBinding, fingerprint });
         if (state && (state.mode !== "summary" || state.binding !== summaryBinding || state.scope !== scopeKey(scope)
           || state.session !== sessionKey || state.start !== start || state.anchor !== anchor || state.high !== snap.endEntryId
           || state.entry !== start || state.part !== 0)) throw new TypeError(ERROR);
         const sliced = sliceText(resource, offset, maxChars);
-        const complete = sliced.nextOffset === undefined;
-        const next = complete ? undefined : makeCursor({ v: 1, mode: "summary", binding: summaryBinding, scope: scopeKey(scope), session: sessionKey,
-          start, high: snap.endEntryId, anchor, entry: start, part: 0, offset: sliced.nextOffset!, emitted: true });
-        return { ref: query.ref, view, content: sliced.content, ...(next ? { cursor: next } : {}), complete, coverage: { complete, unreadable: 0, undated: 0 } };
+        const pageComplete = sliced.nextOffset === undefined;
+        const next = pageComplete ? undefined : makeCursor({ v: 1, mode: "summary", binding: summaryBinding, scope: scopeKey(scope), session: sessionKey,
+          start, high: snap.endEntryId, anchor, entry: start, part: 0, offset: sliced.nextOffset!, emitted: true }, key);
+        return { ref: query.ref, view, content: sliced.content, ...(next ? { cursor: next } : {}), complete: pageComplete,
+          coverage: { complete: snap.coverageComplete, pageComplete, unreadable: 0, undated: 0,
+            sourceEntries: snap.sourceEntries, sourceMessages: snap.sourceMessages, sourceToolResults: snap.sourceToolResults,
+            sourceTruncatedEntries: snap.sourceTruncatedEntries, sourceTruncated: snap.sourceTruncatedEntries > 0,
+            summaryTruncated: snap.summaryTruncated } };
       }
 
-      const state = query.cursor === undefined ? undefined : parseCursor(query.cursor);
+      const state = query.cursor === undefined ? undefined : parseCursor(query.cursor, key);
       const highEntry = state ? undefined : await tail(host, sessionKey, context);
       const high = state?.high ?? highEntry?.id ?? start;
-      const initialEntry = state?.currentFingerprint ? await exact(host, sessionKey, state.entry, context) : startEntry;
       if (state && (state.mode !== "episode" || state.binding !== refBinding || state.scope !== scopeKey(scope)
-        || state.session !== sessionKey || state.start !== start || state.anchor !== anchor || state.entry > high)) throw new TypeError(ERROR);
-      const initialFp = state?.currentFingerprint ? entryFingerprint(initialEntry) : "";
-      if (state?.currentFingerprint && initialFp !== state.currentFingerprint) throw new TypeError(ERROR);
-
-      let content = state ? "" : "[";
-      const pageBudget = maxChars - 1;
-      let unreadable = 0;
-      let omittedNonText = 0;
+        || state.session !== sessionKey || state.start !== start || state.anchor !== anchor || state.entry > high + 1)) throw new TypeError(ERROR);
+      let phase: EpisodePhase = state?.phase ?? "open";
       let entryId = state?.entry ?? (isReset(startEntry) ? start + 1 : start);
       let partIndex = state?.part ?? 0;
       let offset = state?.offset ?? 0;
       let emitted = state?.emitted ?? false;
-      let scanned = 0;
-      let lastScanned: EntryRecord | undefined;
-      let done = high < entryId;
-      let nextState: CursorState | undefined;
-      while (!done && content.length < pageBudget && scanned < SCAN_LIMIT) {
-        const batch = await host.entries(sessionKey, { minEntryId: entryId as never, maxEntryId: high as never, order: "ascending" }, SOURCE_LIMIT, undefined, context);
-        if (batch.items.length === 0) { done = true; break; }
-        let advanced = false;
-        for (const entry of batch.items) {
-          if (entry.id < entryId || entry.id > high) continue;
-          scanned++;
-          lastScanned = entry;
-          if (isReset(entry)) { done = true; break; }
-          const fp = entryFingerprint(entry);
-          if (state && entry.id === state.entry && fp !== state.currentFingerprint) throw new TypeError(ERROR);
-          const projection = projectEntry(entry);
-          unreadable += projection.malformed;
-          omittedNonText += projection.omittedNonText;
-          for (let index = entry.id === entryId ? partIndex : 0; index < projection.parts.length; index++) {
-            const item = canonicalJSON(projection.parts[index]!.value);
-            const prefix = emitted && offset === 0 ? "," : "";
-            if (prefix.length && content.length < maxChars) content += prefix;
-            const available = pageBudget - content.length;
-            if (available <= 0) { nextState = { v: 1, mode: "episode", binding: refBinding, scope: scopeKey(scope), session: sessionKey,
-              start, high, anchor, entry: entry.id, part: index, offset, emitted, currentFingerprint: fp } as CursorState; break; }
-            const sliced = sliceText(item, offset, available);
-            content += sliced.content;
-            if (sliced.nextOffset !== undefined) {
-              nextState = { v: 1, mode: "episode", binding: refBinding, scope: scopeKey(scope), session: sessionKey,
-                start, high, anchor, entry: entry.id, part: index, offset: offset + sliced.content.length, emitted, currentFingerprint: fp } as CursorState;
-              break;
-            }
-            emitted = true; offset = 0;
-          }
-          if (nextState) break;
-          entryId = entry.id + 1; partIndex = 0; offset = 0; advanced = true;
-          if (content.length >= pageBudget) break;
+      let currentFingerprint = state?.currentFingerprint;
+      let unreadable = state?.unreadable ?? 0;
+      let undated = state?.undated ?? 0;
+      let omittedNonText = state?.omittedNonText ?? 0;
+      let diagnosedEntryID = state?.diagnosedEntryID;
+      let content = "";
+      let sourceReadCount = 0;
+      while (content.length < maxChars && sourceReadCount < SCAN_LIMIT && phase !== "done") {
+        if (phase === "open") {
+          content += "[";
+          phase = "items";
+          continue;
         }
-        if (nextState || done || content.length >= pageBudget) break;
-        if (!advanced) { done = true; break; }
-        if (batch.items.length < SOURCE_LIMIT) done = true;
+        if (phase === "items") {
+          if (entryId > high) { phase = "close"; continue; }
+          const result = await host.entries(sessionKey, { minEntryId: entryId as never, maxEntryId: high as never, order: "ascending" }, SOURCE_LIMIT, undefined, context);
+          sourceReadCount++;
+          const entry = result.items.find((item) => item.id >= entryId && item.id <= high);
+          if (!entry) {
+            if (state?.currentFingerprint && entryId === state.entry) throw new TypeError(ERROR);
+            phase = "close";
+            continue;
+          }
+          if (state?.currentFingerprint && entryId === state.entry && entry.id !== state.entry) throw new TypeError(ERROR);
+          if (isReset(entry)) { phase = "close"; continue; }
+          const fp = entryFingerprint(entry);
+          if (entry.id === state?.entry && state.currentFingerprint && fp !== state.currentFingerprint) throw new TypeError(ERROR);
+          const projection = projectEntry(entry);
+          if (diagnosedEntryID !== entry.id) {
+            unreadable += projection.malformed;
+            omittedNonText += projection.omittedNonText;
+            diagnosedEntryID = entry.id;
+          }
+          currentFingerprint = fp;
+          const part = projection.parts[partIndex];
+          if (!part) {
+            entryId = entry.id + 1; partIndex = 0; offset = 0; currentFingerprint = undefined;
+            continue;
+          }
+          const segment = `${emitted ? "," : ""}${canonicalJSON(part.value)}`;
+          const remaining = maxChars - content.length;
+          const sliced = boundedSlice(segment, offset, remaining);
+          if (sliced.content.length === 0) break;
+          if (offset === 0 && part.timestamp === null) undated++;
+          content += sliced.content;
+          offset += sliced.content.length;
+          if (sliced.nextOffset !== undefined) break;
+          emitted = true; partIndex++; offset = 0;
+          if (partIndex >= projection.parts.length) {
+            entryId = entry.id + 1; partIndex = 0; currentFingerprint = undefined;
+          }
+          continue;
+        }
+        if (phase === "close") {
+          content += "]";
+          phase = "done";
+        }
       }
-      if (!done && !nextState && (scanned >= SCAN_LIMIT || content.length >= pageBudget)) {
-        if (lastScanned) nextState = { v: 1, mode: "episode", binding: refBinding, scope: scopeKey(scope), session: sessionKey,
-          start, high, anchor, entry: lastScanned.id, part: Number.MAX_SAFE_INTEGER, offset: 0, emitted, currentFingerprint: entryFingerprint(lastScanned) };
-      }
-      if (!nextState && done) content += "]";
-      const complete = !nextState && done;
-      const next = nextState ? makeCursor(nextState) : undefined;
+      const complete = phase === "done";
+      const next = complete ? undefined : makeCursor({ v: 1, mode: "episode", binding: refBinding, scope: scopeKey(scope), session: sessionKey,
+        start, high, anchor, entry: entryId, part: partIndex, offset, emitted, phase, ...(currentFingerprint ? { currentFingerprint } : {}),
+        unreadable, undated, omittedNonText, ...(diagnosedEntryID === undefined ? {} : { diagnosedEntryID }) }, key);
       return { ref: query.ref, view, content, ...(next ? { cursor: next } : {}), complete,
-        coverage: { complete, unreadable, undated: 0, omittedNonText, projection: "user/assistant/tool text only; non-text blocks and other entry kinds omitted" } };
+        coverage: { complete, pageComplete: complete, unreadable, undated, omittedNonText,
+          projection: "user/assistant/tool text only; non-text blocks and other entry kinds omitted" } };
     } catch {
       throw new TypeError(ERROR);
     }
   };
-  return { read, close: () => undefined };
+  return { read, close: () => { closed = true; key.fill(0); } };
 }
