@@ -680,7 +680,11 @@ summaries can incur provider costs.
   episode keeps as many chunks as its range needs: the collection cursor and the chunk list are
   durable, so a phase boundary, a restart or a crash resumes the same episode instead of capping or
   dropping its tail. Each chunk is folded through a separate provider request that carries the
-  previous answer forward.
+  previous answer forward. The prompt targets at most 1,200 tokens of final summary text, excluding
+  hidden reasoning. The provider response allowance is separately 4,096 tokens so reasoning does not
+  consume that entire target before the model can answer. Providers may count reasoning and visible
+  output together against this allowance; the final-text target is a prompt instruction, not a
+  separate provider-enforced quota. Usage and cost accounting still includes all reported tokens.
 - `coverage` records the source bounds and counts from the episode document, the entries
   read/included/skipped/truncated, characters, chunks, and the uncovered count with the last covered
   entry ID. `complete` is true only when every entry in the range was read; an uncovered tail is

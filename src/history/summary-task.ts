@@ -160,7 +160,7 @@ Title: <one short line>
 ## Open questions
 ## Keywords
 
-Keep it concise. Preserve exact identifiers, paths, commands and error text when they matter.`;
+Aim for at most ${EPISODE_SUMMARY_SOURCE_LIMITS.targetSummaryTokens} tokens of final summary text; use less when sufficient. This target applies only to the final summary, not hidden reasoning. Do not include reasoning or a token-count report in the answer. Preserve exact identifiers, paths, commands and error text when they matter.`;
 
 const terminalCompleted = <S extends { phase: string }, R>(result: R): NextTaskState<S, R> =>
   ({ status: "terminal", outcome: { status: "completed", result } });
@@ -1082,6 +1082,7 @@ export function createEpisodeSummaries(options: EpisodeSummaryOptions): EpisodeS
         let responseLost = false;
         try {
           message = await runtime.models.completeSimple(selected, { messages }, {
+            sessionId: `nanobot-summary:${runtime.conversationId}:${task.input.startEntryId}:${task.input.summarizerVersion}`,
             cacheRetention: "short",
             maxTokens: EPISODE_SUMMARY_SOURCE_LIMITS.maxTokens,
             signal: runtime.signal,
