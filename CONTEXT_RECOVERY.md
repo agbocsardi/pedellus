@@ -34,13 +34,24 @@ opens; no owner action is needed and no unrecorded request is repeated. Its pinn
 model still has to stay in `allowedModels`, exactly as before.
 
 A normal CLI start does not print the task ID, pinned entry, path, provider/model
-or context text. If automatic recovery cannot complete safely (a full or unreadable
-interruption mark, an abort mark that did not persist, or a prepared model outside
-`allowedModels`), it fails with one fixed, value-free diagnostic naming
-`durable-nanobot recovery --config <path>` as the next action. SDK callers retain
-the detailed error message for inspection. The explicit recovery command below is
-the fallback, while the stopped-store recovery operation remains available for
-unsupported or failed cases.
+or context text. If automatic recovery cannot complete safely (a full interruption
+record after its settled entries were drained, a native abort that failed or did
+not persist, or a prepared model outside `allowedModels`), it fails with one fixed,
+value-free diagnostic naming `durable-nanobot recovery --config <path>` as the next
+action. SDK callers retain the detailed error message for inspection. The explicit
+recovery command below is the fallback, while the stopped-store recovery operation
+remains available for unsupported or failed cases.
+
+A record the open cannot read is not one of those cases. The interruption mark and
+the interrupted-run record carry optional bookkeeping, never authority, so an
+unreadable or foreign-version one is retired through native `retireDoc`: the
+unreadable incarnation stays in the store's document history, nothing interprets
+or repairs it in place, and the authoritative task scan still cancels the
+dispatch. Two things are lost with it: any pending notice it held (the owner may
+never see that one interruption) and the suppression record of an already-cancelled
+run, whose internal result event may then be admitted once. A single fixed,
+value-free delivery fault records the notice loss on the origin this open can still
+name; it is a `jobId: null` outbox fault, which no owner reader currently displays.
 
 ## Automatic interruption recovery
 
@@ -56,12 +67,27 @@ not undone, and a `request`-phase provider call cannot be remotely cancelled or
 refunded. A `poll` abort may ask the configured catalog to cancel its deferred
 handle best-effort, exactly as before.
 
-The notice is one fixed text per interrupted task. A cancelled generation says:
+The notice is one fixed text per interrupted class, so it never claims more than
+the host knows. A cancelled generation in a mapped owner chat says:
 
 > Previous turn was interrupted. Recorded progress is preserved, but some actions
 > may have completed without confirmation. Ask me to continue.
 
-A cancelled compaction is background maintenance, not a turn, and says:
+A worker or scheduled-run dispatch is background work, not the owner's previous
+turn, and says:
+
+> Background work was interrupted. Recorded progress is preserved, but some
+> actions may have completed without confirmation. Ask me to continue if you still
+> need it.
+
+An interrupted memory-digestion dispatch is host maintenance: its batch is not
+acknowledged, so it is offered again without the owner doing anything:
+
+> Background memory digestion was interrupted. Recorded progress is preserved;
+> the unacknowledged batch is offered again, so no action is needed.
+
+A cancelled compaction is background maintenance, not a turn, wherever it ran,
+and says:
 
 > Background context compaction was interrupted. Recorded progress is preserved;
 > no action is needed.
@@ -72,12 +98,31 @@ that clears a small session-scoped interruption mark. It creates no transcript
 entry, submits nothing, and calls no model. The record is idempotent by task ID,
 so a reopen cannot duplicate it. A local CLI attach prints pending interruption
 notices and acknowledges exactly those records; an unacknowledged notice is
-shown again on reattach rather than lost. Telegram consumes the same record
+shown again on reattach rather than lost, and a CLI that attaches while nothing is
+pending never sees an older one. Telegram consumes the same record
 through its existing outbox path: durable origin admission, the live `allowFrom`
 recheck, rich chunking, write-ahead intent and unknown-outcome hold all apply.
 An ambiguous send becomes `unknown` and is never resent; a missing admission
 binding is `withheld` until that private chat admits a fresh message; a sender no
 longer admitted is `unauthorized` and not sent.
+
+A cancelled worker or digest dispatch also fails the background run that owned it.
+Its ordinary terminal report is one internal model-facing event into the origin
+chat, which would start a model turn and duplicate the notice, so the open records
+that exact run in a small bounded session disposition before the native abort. Only
+a dispatch whose cancellation actually fails the run is recorded: the target's own
+generation, or a blocking compaction a generation waits on. A background or manual
+compaction is cancelled without failing the run, so it records nothing and cannot
+make a later ordinary failure or cancellation silent. The
+run's own terminal commit consumes the entry and marks its record already reported
+in the same commit, so a reopen, an abort, or a crash between the abort and the
+notice admission cannot resurrect the turn. The terminal state, status, history,
+frontier and every ordinary worker/digest failure or cancellation report are
+unchanged: only an automatic startup interruption is silent to the model. A
+digest target deliberately carries no host context snapshot, so in the shipped
+configuration its own batch dispatch is not startup-blocked at all; the same
+disposition exists so a digest dispatch that ever does pin host sections cannot
+start an origin turn either.
 
 The notice origin is derived from authoritative state, never guessed from a
 conversation ID:
@@ -92,17 +137,22 @@ conversation ID:
 
 Calling an already owner-abort-marked or terminal task "interrupted" is wrong, so
 the exact scanner skips it: ordinary cancellations and already fenced jobs acquire
-no notice and are not rearmed. The session mark is bounded at 8 pending entries;
-if it is full or unreadable, or native abort does not persist, the open fails
-closed with the fixed recovery diagnostic instead of silently dropping a notice.
+no notice and are not rearmed. The session mark is bounded at 8 pending entries,
+and notices already pending from an earlier open are admitted and cleared first, so
+the bound only refuses a new mark for eight genuinely undelivered notices. Native
+`abortTask` failures, a native abort mark that did not persist, and a still-full
+record fail the open with the fixed recovery diagnostic instead of leaving a
+half-cancelled dispatch behind.
 The notice outbox is bounded by the existing 1000-record/200-terminal limits. If
 admission returns `full` or `invalid`, startup still restores availability and
 records a bounded delivery fault rather than retrying or evicting an
-unknown-outcome record.
+unknown-outcome record; that occurrence then gets no owner notice, and nothing is
+ever resent or evicted to make room.
 
 A configured channel is not required to cancel: a host with no attached channel
 leaves the record pending. The notice is not redirected to another chat or
-channel.
+channel, and a notice is only ever shown by a CLI attach or delivered by Telegram:
+the gateway itself never pushes it to a terminal.
 
 ## What recovery does
 
@@ -298,9 +348,25 @@ providers only:
   notice, clears the mark in that commit, and runs the abort protocol with no
   dispatch;
 - the class mapping reports a scheduled automation, worker and digest target to
-  the mapped chat origin, and an unmapped target yields no guessed surface; a
-  pending mark whose recorded session no longer maps to that origin is cleared
-  while its dispatch is still cancelled, with no notice retargeted;
+  the mapped chat origin with its own wording class, and an unmapped target yields
+  no guessed surface; a pending mark whose recorded session no longer maps to that
+  origin is cleared while its dispatch is still cancelled, with no notice
+  retargeted;
+- an unreadable interruption record is retired instead of blocking startup: the
+  blocked dispatch is still cancelled by the authoritative task scan, the current
+  cancellation still gets one notice, and the fixed value-free loss fault is
+  recorded on the origin;
+- a real SIGKILLed worker whose child turn left a prepared generation inside the
+  worker's task-owned target: the reopen sends zero requests, the work still ends
+  terminal, exactly one background notice is pending for the mapped origin chat,
+  no internal worker result event is admitted, the run's suppression entry is
+  consumed by its own terminal commit, and a second reopen resurrects neither the
+  report nor the notice;
+- a digest terminal result that carries the automatic-interruption flag is silent
+  and prunable, while an ordinary failed or cancelled digest result stays
+  reportable and a flagged result whose native status disagrees stays unknown; the
+  digest behaviour suites still cover the real ordinary failure and cancellation
+  reports end to end;
 - a synthetic Telegram origin receives the notice once through the real adapter
   and mocked transport, and an ambiguous notice send is retained as `unknown`
   across a gateway reopen with no resend or eviction;
@@ -349,7 +415,14 @@ database/WAL copying, corrupt or torn-copy restore, and physical power-loss
 durability beyond SQLite's configured WAL/FULL behavior. The crash window between
 a CLI printing a notice and acknowledging it is at-least-once by design (the next
 attach repeats it), and a full or malformed notice outbox records a fault instead
-of delivering that one notice. A prepared dispatch whose model left
+of delivering that one notice; that fault is a `jobId: null` record, so no owner
+reader displays it yet. An unreadable interruption record loses the notices it
+held and the suppression entry of an already-cancelled run; there is no repair
+operation for that transient bookkeeping and none is needed for availability. A
+mixed client/gateway local protocol (a stale attached process against a v3
+gateway) fails with the fixed `local gateway protocol mismatch` message and no
+attach; the shipped executable always serves both halves together.
+A prepared dispatch whose model left
 `allowedModels` is never auto-cancelled, including a revoked generation `poll`
 whose abort would need that model for `cancelDeferred`; the fixed model guard
 still stops the open.

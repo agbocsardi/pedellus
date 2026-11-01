@@ -181,9 +181,16 @@ native Durable abort semantics, restores availability, and leaves one durable
 interruption notice for the originating chat. A local `agent`/terminal attach
 prints a pending notice once and acknowledges it; a Telegram notice uses the
 existing durable channel outbox and admission checks. No model turn is started and
-nothing is resubmitted. If the prepared model itself left `allowedModels`, or the
-bounded recovery record cannot be read, the fixed startup failure and explicit
-recovery command below remain.
+nothing is resubmitted. A notice says what class was interrupted: an owner turn
+suggests asking to continue, background worker or scheduled work says the same of
+background work, an interrupted memory-digestion batch says the unacknowledged
+batch is offered again, and an interrupted compaction says no action is needed.
+Notices appear only on attach; a running gateway never pushes one to the terminal.
+If the prepared model itself left `allowedModels`, the bounded recovery record is
+still full after its settled entries were drained, or native abort failed, the
+fixed startup failure and explicit recovery command below remain. An unreadable
+interruption record does not block startup: it is retired natively and the owner
+may then never see the notice it held.
 
 An `agent` (or legacy default) launch additionally fails closed when no gateway
 answers on the configured endpoint, or when the endpoint's socket path cannot be

@@ -16,8 +16,11 @@ const { listPreparedContextBlocks, cancelPreparedContextBlock } = await import(
 );
 const { preparedResponseEvidence } = await import(pathToFileURL(`${pkg}/dist/recovery/prepared.js`).href);
 const { CronDeliveriesDoc } = await import(pathToFileURL(`${pkg}/dist/automation/cron-delivery.js`).href);
-const { TurnInterruptionMarksDoc, TURN_INTERRUPTION_NOTICE } = await import(
+const { TurnInterruptionMarksDoc, TURN_INTERRUPTION_NOTICE, BACKGROUND_INTERRUPTION_NOTICE, InterruptedRunReportsDoc } = await import(
   pathToFileURL(`${pkg}/dist/recovery/interruption.js`).href
+);
+const { WORKER_RESULT_ENTRY_KIND, WorkerRecordsDoc } = await import(
+  pathToFileURL(`${pkg}/dist/workers/worker-task.js`).href
 );
 const { serveLocalGateway, gatewaySocketPath } = await import(
   pathToFileURL(`${pkg}/dist/local/server.js`).href
@@ -220,6 +223,67 @@ function compactionCrashScript({ workspace, dataDir, temp, providerId, secretPre
       if (settled.status !== "done") throw new Error("turn did not settle");
     }
     await conversation.compact(undefined, context);
+    setInterval(() => {}, 1000);
+  `;
+}
+
+/**
+ * A real mapped chat spawns one worker whose child turn is dispatched and never answers, so SIGKILL
+ * leaves a genuine prepared generation inside the worker's task-owned target conversation.
+ */
+function workerCrashScript({ workspace, dataDir, temp, providerId, session, secretPrefix }) {
+  return `
+    const { openGateway } = await import(${runtimeUrl});
+    const { parseConfig } = await import(${configModuleUrl});
+    const { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(${aiUrl});
+    const { BACKGROUND_CONTEXT } = await import(${chordContextUrl});
+    const context = BACKGROUND_CONTEXT;
+    const provider = fauxProvider({ provider: ${JSON.stringify(providerId)}, models: [{ id: "synthetic" }] });
+    const issued = new Set();
+    const lastUserText = (messages) => {
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message.role !== "user") continue;
+        return typeof message.content === "string"
+          ? message.content
+          : (message.content ?? []).map((part) => (part.type === "text" ? part.text : "")).join("");
+      }
+      return "";
+    };
+    provider.setResponses(Array.from({ length: 20 }, () => (request) => {
+      const input = lastUserText(request.messages);
+      if (input.includes("Background worker task.")) {
+        process.stdout.write("WORKER_DISPATCHED\\n");
+        return new Promise(() => {});
+      }
+      if (input === "spawn a worker" && !issued.has("spawn")) {
+        issued.add("spawn");
+        return fauxAssistantMessage([fauxToolCall("worker", {
+          action: "start",
+          task: "hold the child turn",
+          workspace_mode: "shared",
+        }, { id: "spawn-call" })], { stopReason: "toolUse" });
+      }
+      return fauxAssistantMessage("parent continued");
+    }));
+    const models = createModels();
+    models.setProvider(provider.provider);
+    const model = { provider: ${JSON.stringify(providerId)}, modelId: "synthetic" };
+    const config = parseConfig({
+      workspace: ${JSON.stringify(workspace)},
+      dataDir: ${JSON.stringify(dataDir)},
+      model,
+      allowedModels: [model],
+      toolAllowlist: ["read", "write"],
+      workers: { enabled: true },
+    }, ${JSON.stringify(temp)});
+    const gateway = await openGateway(config, context, {
+      models,
+      contextSnapshotProvider: () => ({ identity: { source: "synthetic", content: ${JSON.stringify(secretPrefix)} } }),
+    });
+    const conversation = await gateway.conversationFor(${JSON.stringify(session)}, context);
+    const submission = await conversation.submit({ type: "input", content: "spawn a worker", requestId: "spawn" }, context);
+    await submission.wait(context);
     setInterval(() => {}, 1000);
   `;
 }
@@ -471,6 +535,90 @@ test("automatic startup recovery cancels a blocked prepared turn and records one
     if (server) await server.close().catch(() => undefined);
     if (gateway) await gateway.close(context);
     if (child && child.exitCode === null) child.kill("SIGKILL");
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("an automatically interrupted worker run reports one notice and never its internal result event", { timeout: 40_000 }, async () => {
+  const temp = await mkdtemp(resolve(tmpdir(), "nanobot-startup-worker-"));
+  const workspace = resolve(temp, "workspace");
+  const dataDir = resolve(temp, "state");
+  const providerId = "recovery-startup-worker";
+  const session = "telegram:11:chat:501";
+  await mkdir(workspace);
+  let child;
+  let gateway;
+  const config = gatewayConfig(workspace, dataDir, providerId, "synthetic", ["synthetic"], {
+    toolAllowlist: ["read", "write"],
+    workers: { enabled: true },
+  });
+  const openOptions = () => ({
+    contextSnapshotProvider: () => ({ identity: { source: "synthetic", content: "fresh-worker-secret" } }),
+  });
+  try {
+    const started = startChild(workerCrashScript({
+      workspace, dataDir, temp, providerId, session, secretPrefix: "old-worker-secret-",
+    }));
+    child = started.child;
+    await waitForMarkers(child, "WORKER_DISPATCHED", 1, started.stderr);
+    await killAndWait(child);
+    child = undefined;
+
+    const blocks = await listPreparedContextBlocks(config, context);
+    assert.equal(blocks.length, 1, "the worker child left one prepared dispatch");
+    const block = blocks[0];
+    assert.equal(block.kind, "pi.generation");
+
+    const first = offlineModels(providerId);
+    gateway = await openGateway(config, context, { models: first.models, ...openOptions() });
+    await gateway.harness.waitForIdle(context);
+    assert.equal(first.provider.state.callCount, 0, "automatic recovery must not dispatch a model request");
+
+    const origin = await gateway.conversationFor(session, context);
+    const records = await gateway.harness.snapshot(WorkerRecordsDoc, origin.id, context);
+    const record = records?.workers?.[0];
+    assert.ok(record, "the worker record survives the reopen");
+    assert.equal(record.conversationId, block.conversationId, "the target is the conversation with the prepared dispatch");
+    assert.equal(record.status, "failed");
+    assert.equal(record.notified, true,
+      "the automatically interrupted run must not leave an internal result event pending");
+
+    const entries = (await origin.entries({ order: "ascending" }, 200, undefined, context)).items;
+    assert.equal(entries.filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND).length, 0,
+      "the spawning agent gets no internal worker result event");
+    assert.ok(entries.some((entry) => (entry.model ?? []).some((message) =>
+      message.role === "user" && message.content === "spawn a worker")),
+    "the owner's stored input remains");
+
+    const noticeId = `host:turn-interrupted:${block.taskId}`;
+    const outbox = await gateway.harness.snapshot(CronDeliveriesDoc, origin.id, context);
+    const notices = outbox.deliveries.filter((entry) => entry.id === noticeId);
+    assert.equal(notices.length, 1, "one host notice instead of a model turn");
+    assert.equal(notices[0].status, "pending");
+    assert.equal(notices[0].text, BACKGROUND_INTERRUPTION_NOTICE,
+      "background work must not be described as the owner's previous turn");
+    assert.equal(notices[0].sessionKey, session);
+    assert.deepEqual((await gateway.harness.snapshot(TurnInterruptionMarksDoc, context))?.marks ?? [], []);
+    assert.deepEqual((await gateway.harness.snapshot(InterruptedRunReportsDoc, context))?.runs ?? [], [],
+      "the suppression disposition is consumed by its own terminal commit");
+
+    // Reopen once more: no report is resurrected and no provider call is made.
+    await gateway.close(context);
+    gateway = undefined;
+    const second = offlineModels(providerId);
+    gateway = await openGateway(config, context, { models: second.models, ...openOptions() });
+    await gateway.harness.waitForIdle(context);
+    assert.equal(second.provider.state.callCount, 0);
+    const reopenedOrigin = await gateway.conversationFor(session, context);
+    const reopened = (await reopenedOrigin.entries({ order: "ascending" }, 200, undefined, context)).items;
+    assert.equal(reopened.filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND).length, 0,
+      "a reopen must not resurrect the suppressed report");
+    const reopenedOutbox = await gateway.harness.snapshot(CronDeliveriesDoc, reopenedOrigin.id, context);
+    assert.equal(reopenedOutbox.deliveries.filter((entry) => entry.id === noticeId).length, 1,
+      "a reopen must not duplicate the notice");
+  } finally {
+    if (child && child.exitCode === null) child.kill("SIGKILL");
+    if (gateway !== undefined) await gateway.close(context);
     await rm(temp, { recursive: true, force: true });
   }
 });

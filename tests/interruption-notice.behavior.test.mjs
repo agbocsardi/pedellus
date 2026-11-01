@@ -12,12 +12,16 @@ import { pathToFileURL } from "node:url";
 const pkg = process.env.PI_NANOBOT_CANDIDATE ?? new URL("../", import.meta.url).pathname;
 const modules = join(pkg, "node_modules/@earendil-works");
 const load = (relative) => import(pathToFileURL(resolve(pkg, "dist", relative)).href);
+const { memoryDigestNoticeState } = await load("history/memory-digest.js");
 const [
   { parseConfig },
   { openGateway },
-  { CRON_DELIVERIES_KIND, CronDeliveriesDoc },
+  { CRON_DELIVERIES_KIND, CronDeliveriesDoc, CronDeliveryFaultsDoc },
   {
     COMPACTION_INTERRUPTION_NOTICE,
+    BACKGROUND_INTERRUPTION_NOTICE,
+    DIGEST_INTERRUPTION_NOTICE,
+    INTERRUPTION_RECORD_DAMAGED_FAULT,
     interruptionNoticeText,
     interruptionOrigin,
     TURN_INTERRUPTION_NOTICE,
@@ -273,17 +277,114 @@ test("interruption origin follows the active task class rather than a target con
   const sources = {
     chatSessionKey: (id) => id === chat ? "telegram:7:chat:501" : undefined,
     automationOrigin: (id) => id === automation ? chat : undefined,
-    backgroundOrigin: (id) => id === workerTarget || id === digestTarget ? chat : undefined,
+    backgroundOrigin: (id) => id === workerTarget
+      ? { originConversationId: chat, surface: "worker" }
+      : id === digestTarget
+        ? { originConversationId: chat, surface: "digest" }
+        : undefined,
   };
-  assert.deepEqual(interruptionOrigin(chat, sources), { conversationId: chat, sessionKey: "telegram:7:chat:501" });
-  assert.deepEqual(interruptionOrigin(automation, sources), { conversationId: chat, sessionKey: "telegram:7:chat:501" });
-  assert.deepEqual(interruptionOrigin(workerTarget, sources), { conversationId: chat, sessionKey: "telegram:7:chat:501" });
-  assert.deepEqual(interruptionOrigin(digestTarget, sources), { conversationId: chat, sessionKey: "telegram:7:chat:501" });
+  assert.deepEqual(interruptionOrigin(chat, sources),
+    { conversationId: chat, sessionKey: "telegram:7:chat:501", surface: "chat" });
+  assert.deepEqual(interruptionOrigin(automation, sources),
+    { conversationId: chat, sessionKey: "telegram:7:chat:501", surface: "scheduled" });
+  assert.deepEqual(interruptionOrigin(workerTarget, sources),
+    { conversationId: chat, sessionKey: "telegram:7:chat:501", surface: "worker" });
+  assert.deepEqual(interruptionOrigin(digestTarget, sources),
+    { conversationId: chat, sessionKey: "telegram:7:chat:501", surface: "digest" });
   assert.equal(interruptionOrigin(99, sources), undefined, "an unmapped target is never guessed");
   assert.equal(interruptionNoticeText("pi.generation"), TURN_INTERRUPTION_NOTICE);
+  assert.equal(interruptionNoticeText("pi.generation", "chat"), TURN_INTERRUPTION_NOTICE);
+  assert.match(TURN_INTERRUPTION_NOTICE, /Previous turn was interrupted/);
+  assert.equal(interruptionNoticeText("pi.generation", "worker"), BACKGROUND_INTERRUPTION_NOTICE);
+  assert.equal(interruptionNoticeText("pi.generation", "scheduled"), BACKGROUND_INTERRUPTION_NOTICE);
+  assert.equal(interruptionNoticeText("pi.generation", "digest"), DIGEST_INTERRUPTION_NOTICE);
+  for (const surface of ["worker", "scheduled", "digest"]) {
+    const text = interruptionNoticeText("pi.generation", surface);
+    assert.doesNotMatch(text, /Previous turn/, `background ${surface} wording must not claim a user turn`);
+    assert.match(text, /Recorded progress is preserved/);
+  }
+  assert.match(BACKGROUND_INTERRUPTION_NOTICE, /Ask me to continue/);
+  assert.match(DIGEST_INTERRUPTION_NOTICE, /no action is needed/);
   assert.equal(interruptionNoticeText("pi.compaction"), COMPACTION_INTERRUPTION_NOTICE);
+  assert.equal(interruptionNoticeText("pi.compaction", "digest"), COMPACTION_INTERRUPTION_NOTICE);
   assert.match(COMPACTION_INTERRUPTION_NOTICE, /compaction was interrupted/);
   assert.doesNotMatch(COMPACTION_INTERRUPTION_NOTICE, /Previous turn/);
+});
+
+test("only a startup-interrupted digest run is silent; an ordinary failure still reports", () => {
+  const result = {
+    outcome: "failed",
+    error: null,
+    sessionKey: null,
+    conversationId: null,
+    throughEntryId: null,
+    complete: null,
+    evidenceEntries: 0,
+    consumed: false,
+    targetConversationId: null,
+    answerEntryId: null,
+    answer: null,
+  };
+  const task = (status, value) => ({ state: { status: "terminal", outcome: { status, result: value } } });
+  const notice = (taskId) => ({ taskId, notified: false });
+
+  assert.equal(memoryDigestNoticeState(notice(1), task("failed", result)), "reportable",
+    "an ordinary failed digest run still reports its issue");
+  assert.equal(memoryDigestNoticeState(notice(2), task("aborted", { ...result, outcome: "aborted" })), "reportable",
+    "an ordinary cancelled digest run still reports its issue");
+  assert.equal(memoryDigestNoticeState(notice(3), task("failed", { ...result, interruptedByStartupRecovery: true })),
+    "nonreportable", "an automatically interrupted run is silent and frees its slot");
+  assert.equal(memoryDigestNoticeState(notice(4),
+    task("aborted", { ...result, outcome: "aborted", interruptedByStartupRecovery: true })), "nonreportable");
+  assert.equal(memoryDigestNoticeState(notice(5),
+    task("completed", { ...result, interruptedByStartupRecovery: true })), "unknown",
+  "a flagged result whose native status disagrees is never delivered and never evicted");
+});
+
+test("an unreadable interruption record is retired so startup stays available", { timeout: 20_000 }, async () => {
+  const store = await seedBlockedStore("damaged-marks");
+  let gateway;
+  try {
+    // A record this build cannot read, exactly like a truncated or foreign-version mark.
+    const { models } = recoveredModels(store.providerId);
+    const storage = await openFullSyncNodeSqliteStorage(resolve(store.config.dataDir, "nanobot.sqlite"), context);
+    const harness = await Harness.open(storage, { models, registry: createRegistry() }, context);
+    try {
+      await harness.commit(async (tx) => {
+        const doc = await tx.doc(TurnInterruptionMarksDoc);
+        doc.marks = [{ taskId: "not-a-task" }];
+      }, context);
+    } finally {
+      await harness.close(context);
+    }
+
+    const reopened = recoveredModels(store.providerId);
+    gateway = await openGateway(store.config, context, {
+      models: reopened.models,
+      contextSnapshotProvider: () => ({ identity: { source: "synthetic", content: "pinned-context" } }),
+    });
+    await gateway.harness.waitForIdle(context);
+    assert.equal(reopened.faux.state.callCount, 0, "recovery must not dispatch a model request");
+    const task = await gateway.harness.getTask(store.taskId, context);
+    assert.ok(task);
+    assert.equal(task.state.status, "terminal", "the authoritative task scan still cancels the dispatch");
+    assert.equal(task.state.outcome.status, "orphaned");
+
+    // The retired record is replaced by a fresh one, and the current cancellation still gets its notice.
+    const outbox = await gateway.harness.snapshot(CronDeliveriesDoc, store.conversationId, context);
+    const notices = outbox.deliveries.filter((record) => record.id === turnInterruptionNoticeId(store.taskId));
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0].text, TURN_INTERRUPTION_NOTICE);
+    assert.deepEqual((await gateway.harness.snapshot(TurnInterruptionMarksDoc, context))?.marks ?? [], []);
+
+    const faults = await gateway.harness.snapshot(CronDeliveryFaultsDoc, store.conversationId, context);
+    assert.ok(faults.faults.some((fault) =>
+      fault.jobId === null && fault.message === INTERRUPTION_RECORD_DAMAGED_FAULT),
+    "the lost earlier notices are recorded as one fixed, value-free fault");
+  } finally {
+    if (gateway !== undefined) await gateway.close(context);
+    await rm(store.directory, { recursive: true, force: true });
+  }
 });
 
 test("a marked dispatch with a stale origin is cancelled without a guessed notice", { timeout: 20_000 }, async () => {

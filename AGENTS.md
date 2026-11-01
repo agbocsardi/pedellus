@@ -182,8 +182,11 @@ edits need restart only; unit edits additionally need daemon-reload.
   is cancelled automatically through native `abortTask` after the prepared-model
   authority scan accepts it. The gateway then opens and records one bounded,
   deduplicated interruption notice in the origin mapped chat's existing durable
-  channel outbox, cleared with a small session-scoped mark in one commit. No
-  checkpoint is rewritten, no provider/tool call or input is retried, no model
+  channel outbox, cleared with a small session-scoped mark in one commit. Notice
+  text is class-aware: an owner turn keeps the manual continue suggestion, worker
+  or scheduled work says background work was interrupted, a digest says its
+  unacknowledged batch is offered again, and a compaction says no action is needed.
+  No checkpoint is rewritten, no provider/tool call or input is retried, no model
   turn is started and no continuation is nudged; stored transcript and committed
   progress stay, while external effects and provider billing are not undone or
   guaranteed cancelled. Origin resolution is class-aware: a mapped chat owns
@@ -191,13 +194,28 @@ edits need restart only; unit edits additionally need daemon-reload.
   mapped origin, and a worker or digest target is reported to the mapped chat
   whose run task created it; an unmapped target is cancelled without a guessed
   notice. Abort-marked and terminal tasks are skipped, so ordinary cancellations
-  and already fenced jobs acquire no notice and are not rearmed. Telegram uses
+  and already fenced jobs acquire no notice and are not rearmed. A cancelled worker
+  or digest dispatch fails its run, and that run is recorded in a small bounded
+  session disposition before the abort so its own terminal commit suppresses only
+  the internal model-facing result event for this automatic interruption. Only a
+  dispatch whose cancellation actually fails the run is recorded (the target's own
+  generation, or a blocking compaction a generation waits on), so a background
+  compaction can never silence a later ordinary failure. All ordinary
+  worker/digest failure or cancellation reporting and all terminal outcome rules
+  are unchanged. Telegram uses
   the existing outbox admission, live allowlist and unknown-send hold; a local CLI
-  attach prints and acknowledges pending notices without a model turn. A full or
-  malformed interruption mark, an abort mark that did not persist, or a prepared
+  attach prints and acknowledges pending notices without a model turn, and no notice
+  is pushed by the gateway. Pending notices are admitted before a new mark, so the
+  bounded mark only refuses after real undelivered notices. A native abort failure or
+  mark that did not persist, a still-full bounded record, or a prepared
   model outside `allowedModels` (including a revoked generation poll) remains a
   fixed startup failure handled by stopped-store recovery; the allowlist is never
-  widened to make startup pass.
+  widened to make startup pass. An unreadable interruption record is retired through
+  native `retireDoc` without interpreting or repairing it, so startup stays
+  available and the authoritative task scan still cancels the dispatch; the notices
+  that record held, and the suppression entry of an already-cancelled run, are lost
+  with it, and a fixed value-free outbox fault records the notice loss where an
+  origin is known.
 - The cron timer never calls a model, and a run never schedules: rescheduling is
   a deterministic task commit, so a slow or failed turn cannot stop the schedule.
   A conversation is ongoing activity and an episode is one execution: a recurring

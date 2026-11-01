@@ -94,14 +94,22 @@ import { createVisionHandoffExtension } from "./media/vision-hook.js";
 import { VisionHandoff, type VisionHandoffStats } from "./media/vision.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
 import {
+  addInterruptedRunReport,
   addTurnInterruptionMark,
+  INTERRUPTED_RUN_REPORT_MAX,
+  INTERRUPTION_RECORD_DAMAGED_FAULT,
+  InterruptedRunReportsDoc,
   interruptionOrigin,
+  parseInterruptedRunReports,
   parseTurnInterruptionMarks,
   removeTurnInterruptionMarks,
   TurnInterruptionMarksDoc,
   TURN_INTERRUPTION_MAX_MARKS,
   turnInterruptionDelivery,
+  type InterruptedPreparedKind,
+  type InterruptionSurface,
   type TurnInterruptionMark,
+  type TurnInterruptionOrigin,
 } from "./recovery/interruption.js";
 import { canonicalFuturePath, prepareDataDirectory, inside } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
@@ -2598,8 +2606,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const pinnedModelRemoved = new Set<ConversationId>();
     const runTasksById = new Map<number, { readonly originConversationId: ConversationId; readonly targetConversationId: ConversationId | null }>();
     // A background run's target conversation is task-owned, never a chat. Interruption recovery
-    // resolves its legitimate owning surface back through the run task that created it.
-    const backgroundTargetOrigins = new Map<ConversationId, ConversationId>();
+    // resolves its legitimate owning surface and class back through the run task that created it.
+    const backgroundTargetRuns = new Map<ConversationId, {
+      readonly originConversationId: ConversationId;
+      readonly surface: "worker" | "digest" | "scheduled";
+    }>();
     await root.commit(async (tx) => {
       let taskCursor: Cursor | undefined;
       do {
@@ -2626,7 +2637,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
               && automationConversations.get(target.id)?.originConversationId
                 === backgroundTarget.originConversationId;
             if (ownsTarget || automationTarget) {
-              backgroundTargetOrigins.set(backgroundTarget.targetConversationId, task.conversationId as ConversationId);
+              backgroundTargetRuns.set(backgroundTarget.targetConversationId, {
+                originConversationId: task.conversationId as ConversationId,
+                surface: task.kind === WORKER_TASK_NAME
+                  ? "worker"
+                  : task.kind === MEMORY_DIGEST_TASK_NAME ? "digest" : "scheduled",
+              });
               // A digest target deliberately gets no origin context snapshot: its model input is
               // its own bounded batch, so a reopened attempt renders the same framing again.
               if (snapshotTarget !== undefined) backgroundRunTargets.push(snapshotTarget);
@@ -2762,24 +2778,60 @@ export async function openGateway(config: PortConfig, context: Context, options:
       backgroundToolBounds.set(targetConversationId, tools);
     }
 
-    const readInterruptionMarks = async (): Promise<TurnInterruptionMark[]> => {
+    /**
+     * Retire a record this build cannot read. Native `retireDoc` preserves the unreadable incarnation
+     * in the store's document history without materializing, repairing or overwriting its value, so
+     * availability does not depend on a manual repair step for optional notice bookkeeping.
+     */
+    const retireUnreadableRecord = async (retire: (tx: Tx) => Promise<void>): Promise<void> => {
+      try {
+        await harness!.commit(retire, context);
+      } catch (cause) {
+        throw new StartupDiagnosticError("preparedContext", {
+          cause,
+          detail: "Cannot retire an unreadable interruption recovery record; run the context recovery interface " +
+            "before gateway recovery",
+        });
+      }
+    };
+
+    /**
+     * Read the pending interruption facts. A record this build cannot read is retired rather than
+     * repaired: the notices it held are lost (the one thing those transient marks were for), a fixed
+     * delivery fault is recorded where an origin is known, and the authoritative task scan below still
+     * cancels the startup-blocking prepared dispatch.
+     */
+    const readInterruptionMarks = async (): Promise<{ marks: TurnInterruptionMark[]; damaged: boolean }> => {
       let stored;
       try {
         stored = await harness!.snapshot(TurnInterruptionMarksDoc, context);
-      } catch (cause) {
-        throw new StartupDiagnosticError("preparedContext", {
-          cause,
-          detail: "Cannot read the interruption recovery record; run the context recovery interface before gateway recovery",
-        });
+      } catch {
+        await retireUnreadableRecord((tx) => tx.retireDoc(TurnInterruptionMarksDoc));
+        return { marks: [], damaged: true };
       }
-      if (stored === undefined) return [];
+      if (stored === undefined) return { marks: [], damaged: false };
       try {
-        return parseTurnInterruptionMarks(stored);
-      } catch (cause) {
-        throw new StartupDiagnosticError("preparedContext", {
-          cause,
-          detail: "The interruption recovery record is malformed; run the context recovery interface before gateway recovery",
-        });
+        return { marks: parseTurnInterruptionMarks(stored), damaged: false };
+      } catch {
+        await retireUnreadableRecord((tx) => tx.retireDoc(TurnInterruptionMarksDoc));
+        return { marks: [], damaged: true };
+      }
+    };
+
+    /** The same availability rule for the interrupted-run record: retire, never repair in place. */
+    const ensureInterruptedRunReportsReadable = async (): Promise<void> => {
+      let stored;
+      try {
+        stored = await harness!.snapshot(InterruptedRunReportsDoc, context);
+      } catch {
+        await retireUnreadableRecord((tx) => tx.retireDoc(InterruptedRunReportsDoc));
+        return;
+      }
+      if (stored === undefined) return;
+      try {
+        parseInterruptedRunReports(stored);
+      } catch {
+        await retireUnreadableRecord((tx) => tx.retireDoc(InterruptedRunReportsDoc));
       }
     };
 
@@ -2792,8 +2844,27 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ) => interruptionOrigin(conversationId, {
       chatSessionKey: (id) => sessions.get(id),
       automationOrigin: (id) => automationConversations.get(id)?.originConversationId,
-      backgroundOrigin: (id) => backgroundTargetOrigins.get(id),
+      backgroundOrigin: (id) => {
+        const run = backgroundTargetRuns.get(id);
+        if (run === undefined || run.surface === "scheduled") return undefined;
+        return { originConversationId: run.originConversationId, surface: run.surface };
+      },
     });
+
+    /**
+     * The class a cancelled prepared dispatch belonged to, for wording that stays true. A target
+     * conversation's owning run task names its class even after that run is terminal, so a notice
+     * admitted after a crash window still says what was interrupted.
+     */
+    const interruptionSurfaceIn = async (tx: Tx, conversationId: ConversationId): Promise<InterruptionSurface> => {
+      const ownerTaskId = (await tx.conversation(conversationId))?.owner?.taskId;
+      if (ownerTaskId === undefined) return automationConversations.has(conversationId) ? "scheduled" : "chat";
+      const owner = await tx.task(ownerTaskId as TaskId);
+      if (owner?.kind === WORKER_TASK_NAME) return "worker";
+      if (owner?.kind === MEMORY_DIGEST_TASK_NAME) return "digest";
+      if (owner?.kind === CRON_RUN_TASK_NAME) return "scheduled";
+      return "chat";
+    };
 
     /**
      * Admit one notice per marked task into its origin's existing bounded channel outbox, then clear
@@ -2802,9 +2873,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
      * instead of rerouted. An unreadable/full outbox keeps gateway availability and records a bounded
      * delivery fault; the notice is not retried and no unknown-outcome record is evicted.
      */
-    const admitInterruptionNotices = async (sessions: ReadonlyMap<ConversationId, string>): Promise<void> => {
-      const marks = await readInterruptionMarks();
-      if (marks.length === 0) return;
+    const admitInterruptionNotices = async (
+      sessions: ReadonlyMap<ConversationId, string>,
+      marks: readonly TurnInterruptionMark[],
+      damaged: boolean,
+      origins: ReadonlyMap<number, TurnInterruptionOrigin>,
+    ): Promise<void> => {
+      if (marks.length === 0 && !damaged) return;
       const deliverable: TurnInterruptionMark[] = [];
       const clear = new Set<number>();
       for (const mark of marks) {
@@ -2826,7 +2901,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         }
         deliverable.push(mark);
       }
-      if (deliverable.length === 0 && clear.size === 0) return;
+      if (deliverable.length === 0 && clear.size === 0 && !damaged) return;
       await root.commit(async (tx) => {
         const markDoc = await tx.doc(TurnInterruptionMarksDoc);
         // Fail closed on damaged state instead of overwriting a mark this build does not understand.
@@ -2839,9 +2914,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
           let admission: "admitted" | "duplicate" | "full" | "invalid" = "invalid";
           try {
             const deliveries = await tx.doc(CronDeliveriesDoc, mark.originConversationId);
+            const interrupted = await tx.task(mark.taskId as TaskId);
             admission = admitCronDelivery(
               deliveries,
-              turnInterruptionDelivery(mark.sessionKey, mark.taskId, now(), mark.kind),
+              turnInterruptionDelivery(
+                mark.sessionKey,
+                mark.taskId,
+                now(),
+                mark.kind,
+                await interruptionSurfaceIn(tx, interrupted?.conversationId ?? mark.originConversationId),
+              ),
             );
           } catch {
             admission = "invalid";
@@ -2863,6 +2945,23 @@ export async function openGateway(config: PortConfig, context: Context, options:
           }
           clear.add(mark.taskId);
         }
+        if (damaged) {
+          // The retired record's own notices are gone; record the fixed loss once per origin this open
+          // can still name. The fault list is bounded and this text is value-free.
+          for (const originConversationId of new Set([...origins.values()].map((origin) => origin.conversationId))) {
+            try {
+              const faults = await tx.doc(CronDeliveryFaultsDoc, originConversationId);
+              recordCronDeliveryFault(faults, {
+                jobId: null,
+                scheduledAtMs: null,
+                recordedAtMs: now(),
+                message: INTERRUPTION_RECORD_DAMAGED_FAULT,
+              });
+            } catch {
+              // Same bounded diagnostic rule: never stop the gateway for derived state.
+            }
+          }
+        }
         if (clear.size > 0) removeTurnInterruptionMarks(markDoc, clear);
       }, context);
     };
@@ -2875,65 +2974,151 @@ export async function openGateway(config: PortConfig, context: Context, options:
      * prepared model left `allowedModels` never reaches here: the scan above fails closed first.
      */
     const recoverInterruptedPreparedTurns = async (blocked: readonly NonNullable<ReturnType<typeof preparedContextReplay>>[]): Promise<void> => {
-      const pending = await readInterruptionMarks();
-      if (blocked.length === 0 && pending.length === 0) return;
+      const stored = await readInterruptionMarks();
+      if (blocked.length === 0 && stored.marks.length === 0) return;
       const sessions = new Map((await mappedChatSessions(context))
         .map(({ conversationId, sessionKey }) => [conversationId, sessionKey] as const));
-      if (blocked.length > 0) {
-        const known = new Set(pending.map((mark) => mark.taskId));
-        const additions: TurnInterruptionMark[] = [];
-        for (const replay of blocked) {
-          if (known.has(replay.id)) continue;
-          const origin = interruptionOriginFor(replay.conversationId, sessions);
-          if (origin === undefined) continue;
-          additions.push({
-            taskId: replay.id,
-            kind: replay.kind,
-            originConversationId: origin.conversationId,
-            sessionKey: origin.sessionKey,
-            createdAtMs: now(),
-          });
+      const origins = new Map<number, TurnInterruptionOrigin>();
+      for (const replay of blocked) {
+        const origin = interruptionOriginFor(replay.conversationId, sessions);
+        if (origin !== undefined) origins.set(replay.id, origin);
+      }
+      // Admit notices already pending from an earlier open first, so a bounded mark list is drained
+      // of settled entries before it can refuse a new one and force a manual recovery.
+      try {
+        await admitInterruptionNotices(sessions, stored.marks, stored.damaged, origins);
+      } catch {
+        // The marks stay durable; the next open retries. Notice admission is bookkeeping, not startup
+        // authority, so it must not turn a damaged outbox into a dead end.
+      }
+      if (blocked.length === 0) return;
+      const additions: TurnInterruptionMark[] = [];
+      // Only a dispatch whose cancellation fails the owning run can leave an internal report to
+      // suppress: the conversation's own generation, or a blocking compaction a generation waits on.
+      // A background or manual compaction is cancelled without failing the run, so it records nothing.
+      const candidates: {
+        readonly replayId: number;
+        readonly kind: InterruptedPreparedKind;
+        readonly targetConversationId: ConversationId;
+      }[] = [];
+      for (const replay of blocked) {
+        if (!stored.marks.some((mark) => mark.taskId === replay.id)) {
+          const origin = origins.get(replay.id);
+          if (origin !== undefined) {
+            additions.push({
+              taskId: replay.id,
+              kind: replay.kind,
+              originConversationId: origin.conversationId,
+              sessionKey: origin.sessionKey,
+              createdAtMs: now(),
+            });
+          }
         }
-        if (additions.length > 0) {
-          await harness!.commit(async (tx) => {
-            const doc = await tx.doc(TurnInterruptionMarksDoc);
-            for (const mark of additions) {
-              const result = addTurnInterruptionMark(doc, mark);
-              if (result === "full") {
-                throw new StartupDiagnosticError("preparedContext", {
-                  detail: `Cannot automatically recover interrupted turns: the bounded interruption record holds ` +
-                    `${TURN_INTERRUPTION_MAX_MARKS} pending notices; cancel the blocked prepared dispatch with the ` +
-                    "context recovery interface before gateway recovery",
-                });
-              }
+        candidates.push({ replayId: replay.id, kind: replay.kind, targetConversationId: replay.conversationId });
+      }
+      if (additions.length > 0 || candidates.length > 0) {
+        if (candidates.length > 0) await ensureInterruptedRunReportsReadable();
+        await harness!.commit(async (tx) => {
+          const doc = await tx.doc(TurnInterruptionMarksDoc);
+          for (const mark of additions) {
+            const result = addTurnInterruptionMark(doc, mark);
+            if (result === "full") {
+              throw new StartupDiagnosticError("preparedContext", {
+                detail: `Cannot automatically recover interrupted turns: the bounded interruption record holds ` +
+                  `${TURN_INTERRUPTION_MAX_MARKS} pending notices; cancel the blocked prepared dispatch with the ` +
+                  "context recovery interface before gateway recovery",
+              });
             }
-          }, context);
-        }
-        for (const replay of blocked) {
-          // A cascade from an earlier abort can already have settled this task; never abort a terminal
-          // task or repeat an existing mark.
-          const current = await harness!.getTask(replay.id as TaskId, context);
-          if (current === undefined || current.state.status === "terminal" || current.abortRequested === true) continue;
+          }
+          if (candidates.length === 0) return;
+          const reportDoc = await tx.doc(InterruptedRunReportsDoc);
+          // Reuse slots a crashed earlier open left behind: only a live run can consume one.
+          const live: typeof reportDoc.runs = [];
+          for (const entry of parseInterruptedRunReports(reportDoc)) {
+            const task = await tx.task(entry.runTaskId as TaskId);
+            if (task === undefined || task.state.status === "terminal") continue;
+            live.push(entry);
+          }
+          reportDoc.runs = live;
+          const runByTarget = new Map<ConversationId, number | undefined>();
+          for (const candidate of candidates) {
+            if (candidate.kind === "pi.compaction") {
+              const compaction = await tx.task(candidate.replayId as TaskId);
+              if (compaction?.owner === undefined) continue;
+            }
+            if (!runByTarget.has(candidate.targetConversationId)) {
+              // The target's owning run task is the one whose internal report must stay silent. It is
+              // read here, so a failed or finished run is never guessed from a target id.
+              const ownerTaskId = (await tx.conversation(candidate.targetConversationId))?.owner?.taskId;
+              const run = ownerTaskId === undefined ? undefined : await tx.task(ownerTaskId as TaskId);
+              runByTarget.set(candidate.targetConversationId,
+                run === undefined || run.state.status === "terminal"
+                  || (run.kind !== WORKER_TASK_NAME && run.kind !== MEMORY_DIGEST_TASK_NAME)
+                  ? undefined
+                  : ownerTaskId);
+            }
+            const runTaskId = runByTarget.get(candidate.targetConversationId);
+            if (runTaskId === undefined) continue;
+            const result = addInterruptedRunReport(reportDoc, {
+              runTaskId,
+              targetConversationId: candidate.targetConversationId,
+              recordedAtMs: now(),
+            });
+            if (result === "full") {
+              throw new StartupDiagnosticError("preparedContext", {
+                detail: `Cannot automatically recover interrupted turns: the bounded interrupted-run record holds ` +
+                  `${INTERRUPTED_RUN_REPORT_MAX} live runs; cancel the blocked prepared dispatch with the context ` +
+                  "recovery interface before gateway recovery",
+              });
+            }
+          }
+        }, context);
+      }
+      for (const replay of blocked) {
+        // A cascade from an earlier abort can already have settled this task; never abort a terminal
+        // task or repeat an existing mark.
+        const current = await harness!.getTask(replay.id as TaskId, context);
+        if (current === undefined || current.state.status === "terminal" || current.abortRequested === true) continue;
+        try {
           await harness!.abortTask(replay.id as TaskId, context);
-        }
-        for (const replay of blocked) {
-          const task = await harness!.getTask(replay.id as TaskId, context);
-          if (task === undefined || task.state.status === "terminal" || task.abortRequested === true) continue;
+        } catch (cause) {
           throw new StartupDiagnosticError("preparedContext", {
-            detail: `Cannot safely recover ${replay.kind} task ${replay.id} (${replay.phase}): the native abort mark ` +
-              "did not persist; cancel that prepared dispatch with the context recovery interface before gateway recovery",
+            cause,
+            detail: `Cannot automatically cancel ${replay.kind} task ${replay.id} (${replay.phase}): the native ` +
+              "abort failed; cancel that prepared dispatch with the context recovery interface before gateway recovery",
           });
         }
       }
-      await admitInterruptionNotices(sessions);
+      for (const replay of blocked) {
+        const task = await harness!.getTask(replay.id as TaskId, context);
+        if (task === undefined || task.state.status === "terminal" || task.abortRequested === true) continue;
+        throw new StartupDiagnosticError("preparedContext", {
+          detail: `Cannot safely recover ${replay.kind} task ${replay.id} (${replay.phase}): the native abort mark ` +
+            "did not persist; cancel that prepared dispatch with the context recovery interface before gateway recovery",
+        });
+      }
+      const admitted = await readInterruptionMarks();
+      try {
+        await admitInterruptionNotices(sessions, admitted.marks, admitted.damaged, origins);
+      } catch {
+        // The marks stay durable; the next open retries and the gateway stays available.
+      }
     };
 
     const blockedPreparedTurns: NonNullable<ReturnType<typeof preparedContextReplay>>[] = [];
     for (const replay of preparedContextReplays) {
-      const conversation = await harness.conversation(replay.conversationId, context);
-      if (!conversation) throw new Error(`Cannot safely resume ${replay.kind} task ${replay.id}: conversation is missing`);
-      const view = await conversation.context(context, { at: replay.at as EntryId });
-      if (hasPersistedNanobotContext(view.messages)) blockedPreparedTurns.push(replay);
+      try {
+        const conversation = await harness.conversation(replay.conversationId, context);
+        if (!conversation) throw new Error("conversation is missing");
+        const view = await conversation.context(context, { at: replay.at as EntryId });
+        if (hasPersistedNanobotContext(view.messages)) blockedPreparedTurns.push(replay);
+      } catch (cause) {
+        throw new StartupDiagnosticError("preparedContext", {
+          cause,
+          detail: `Cannot inspect the pinned context of ${replay.kind} task ${replay.id} (${replay.phase}); ` +
+            "cancel that prepared dispatch with the context recovery interface before gateway recovery",
+        });
+      }
     }
     await recoverInterruptedPreparedTurns(blockedPreparedTurns);
 

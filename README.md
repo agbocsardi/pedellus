@@ -238,7 +238,9 @@ re-capture that conversation's context and skills when it is idle. A prepared
 request containing old Nanobot context is cancelled automatically at startup
 through native Durable abort semantics, so the gateway becomes available without
 replaying, resubmitting or rewriting that request. One durable, deduplicated
-interruption notice is left for the originating mapped chat; a local CLI attach
+interruption notice is left for the originating mapped chat, worded for the class
+that was interrupted (an owner turn, background worker or scheduled work, a
+memory-digestion batch, or a compaction); a local CLI attach
 shows it once, and Telegram delivers it through the existing outbox and admission
 checks. No model turn is started and continuation is the owner's next input. With
 the gateway stopped and an existing database, an owner can still inspect blocked

@@ -102,6 +102,11 @@ import type {
   DigestSource,
 } from "./digestion.js";
 import { DIGEST_RUN_LIMITS_DEFAULT, digestRunLimitsFrom, validateDigestRunLimits, type DigestRunLimits } from "./digest-limits.js";
+import {
+  consumeInterruptedRunReport,
+  InterruptedRunReportsDoc,
+  interruptedRunReportPending,
+} from "../recovery/interruption.js";
 
 export const MEMORY_DIGEST_TASK_NAME = "nanobot.memory-digest";
 export const MEMORY_DIGEST_EXTENSION_NAME = "nanobot.memory-digest";
@@ -902,6 +907,12 @@ export interface MemoryDigestRunResult {
   readonly answer: string | null;
   /** Pinned background model, `provider/modelId`; the foreground model is never inherited. */
   readonly model?: string | null;
+  /**
+   * Set only when automatic startup recovery cancelled this run's prepared dispatch. The run still
+   * failed or was aborted and the frontier is unchanged, but its internal issue report is suppressed:
+   * the owner gets one host interruption notice and continues manually.
+   */
+  readonly interruptedByStartupRecovery?: boolean;
   /** Committed provider responses, including retried attempts; null when not measured. */
   readonly requests?: number | null;
   readonly successfulRequests?: number | null;
@@ -1071,8 +1082,9 @@ function digestResultOf(record: unknown): MemoryDigestRunResult | undefined {
 /**
  * What one terminal digest run owes the origin agent.
  *
- * - `silent`: a successful run (`digested`, `noop` or an already-`consumed` replay) or a native
- *   `faulted`/`orphaned` task that never produced a result. Nothing is delivered, ever.
+ * - `silent`: a successful run (`digested`, `noop` or an already-`consumed` replay), an automatic
+ *   startup interruption (a failed/aborted run whose prepared dispatch the host cancelled), or a
+ *   native `faulted`/`orphaned` task that never produced a result. Nothing is delivered, ever.
  * - `issue`: a failed or cancelled run. That is the only thing the origin agent is told about.
  * - `unknown`: a live or malformed record, or a native status that disagrees with its result. It is
  *   never delivered and never evicted.
@@ -1095,6 +1107,9 @@ function digestReportability(task: unknown): DigestReportability {
     return outcome.status === "completed" ? "silent" : "unknown";
   }
   if (result.outcome === "failed" || result.outcome === "aborted") {
+    if (result.interruptedByStartupRecovery === true) {
+      return outcome.status === result.outcome ? "silent" : "unknown";
+    }
     return outcome.status === result.outcome ? "issue" : "unknown";
   }
   return "unknown";
@@ -1923,7 +1938,22 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             // Measured outside the terminal commit: reading the target's transcript from inside a
             // write transaction would deadlock the single-writer store.
             const usage = await measuredUsage();
+            // An automatic startup interruption of this run's prepared dispatch is one host notice and
+            // manual continuation, never an internal issue report. The durable disposition and the
+            // terminal result are one commit, so a reopen cannot resurrect the report.
+            let reportSuppressed = false;
+            if (target !== null && settle.status === "failed") {
+              try {
+                reportSuppressed = interruptedRunReportPending(
+                  await options.harness().snapshot(InterruptedRunReportsDoc, context), Number(running.id), target);
+              } catch {
+                // An unreadable record must not fail the terminal commit; the run reports as usual.
+              }
+            }
             await runtime.commit(async (tx) => {
+              if (reportSuppressed) {
+                consumeInterruptedRunReport(await tx.doc(InterruptedRunReportsDoc), Number(running.id), target!);
+              }
               if (target !== null) {
                 try {
                   await options.finalize({
@@ -1940,7 +1970,12 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
               const answer = result.answer ?? (answerEntryId === null
                 ? null
                 : answerText(await tx.entry(AssistantEntry, answerEntryId)));
-              const next: MemoryDigestRunResult = { ...result, answer, ...usage };
+              const next: MemoryDigestRunResult = {
+                ...result,
+                answer,
+                ...usage,
+                ...(reportSuppressed ? { interruptedByStartupRecovery: true } : {}),
+              };
               return settle.status === "completed"
                 ? terminalCompleted(next)
                 : terminalFailed(next, settle.message);
@@ -2329,6 +2364,15 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           }
         }
         if (target !== null) await withdrawTarget(runtime, target, context);
+        let reportSuppressed = false;
+        if (target !== null) {
+          try {
+            reportSuppressed = interruptedRunReportPending(
+              await options.harness().snapshot(InterruptedRunReportsDoc, context), Number(running.id), target);
+          } catch {
+            // Same bounded rule: an unreadable record never blocks the cancellation commit.
+          }
+        }
         const result: MemoryDigestRunResult = {
           outcome: "aborted",
           error: null,
@@ -2341,8 +2385,12 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           targetConversationId: target === null ? null : Number(target),
           answerEntryId: null,
           answer: null,
+          ...(reportSuppressed ? { interruptedByStartupRecovery: true } : {}),
         };
         await runtime.commit(async (tx) => {
+          if (reportSuppressed) {
+            consumeInterruptedRunReport(await tx.doc(InterruptedRunReportsDoc), Number(running.id), target!);
+          }
           if (target !== null) {
             try {
               await options.finalize({

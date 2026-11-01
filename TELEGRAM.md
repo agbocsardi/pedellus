@@ -820,9 +820,11 @@ rerun to resend.
 
 The same outbox carries one host interruption notice for an automatically cancelled
 startup-blocking prepared turn, with the id `host:turn-interrupted:<taskId>` and fixed
-text saying the previous turn was interrupted, stored progress is preserved, and some
-actions may have completed without confirmation; a cancelled background compaction uses
-the same record with fixed text saying the compaction was interrupted and no action is
+text for the class that was interrupted: an owner turn says the previous turn was
+interrupted, stored progress is preserved, and some actions may have completed without
+confirmation; background worker or scheduled work says the same of background work;
+an interrupted memory-digestion batch says the unacknowledged batch is offered again;
+and a cancelled compaction says the compaction was interrupted and no action is
 needed. It is recorded in the mapped origin
 chat's outbox, not a worker, digest or scheduled-run target conversation. It is ordinary
 stored text: this adapter applies the same origin admission, live `allowFrom` recheck,
