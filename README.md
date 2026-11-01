@@ -163,8 +163,9 @@ no `codemode` block it is installed when MCP is configured, as before. Scripts
 compose every tool the current authenticated mapped-chat conversation is already
 authorized to call, through native `executeTool` validation and `ToolTask` hooks.
 Code Mode adds no authority, is not recursive, and grants nothing to root, state,
-fork, raw/other task-owned or scheduled-run automation conversations. Ordinary workers may compose
-their captured coding, web, MCP and history tools, but never Telegram, cron or workers.
+fork, raw/other task-owned or scheduled-run automation conversations. Ordinary workers
+may compose their captured coding, web, MCP and explicitly captured memory-recall
+tools, but never Telegram, cron or workers.
 `workers.toolAllowlist` sets independent worker grants (including worker-only shell/file tools);
 omitted inherits configured chat capabilities, and `[]` grants none. Integrations still require
 their own opt-ins. See [worker grants](./WORKERS.md#separate-worker-grants) and
@@ -223,8 +224,10 @@ IDs collide across stores. `openGateway` can also accept an opt-in host snapshot
 provider and reconstructs snapshots before resume; it does not load files itself.
 An opt-in [workspace loader](./WORKSPACE_CONTEXT.md) supplies fixed bootstrap files
 and explicitly selected memory files to such a provider; it can also append a
-bounded topic-memory manifest for on-demand reads ([MEMORY_CONTEXT.md](./MEMORY_CONTEXT.md)). Skill discovery is also
-opt-in through `workspaceContext.skills`: it reads only `<workspace>/skills` and an
+bounded topic-memory manifest for on-demand reads ([MEMORY_CONTEXT.md](./MEMORY_CONTEXT.md));
+model-facing note and conversation recall has a separate three-tool contract
+([MEMORY_RECALL.md](./MEMORY_RECALL.md)). Skill discovery is also opt-in through
+`workspaceContext.skills`: it reads only `<workspace>/skills` and an
 explicitly configured builtin skills root, fails closed on metadata it cannot
 parse, never executes a skill, and supports progressive loading — a prompt
 summary plus a read-only `skill` tool that serves a discovered workspace or
@@ -256,6 +259,11 @@ repository. There is no maintained migration or archival SDK; see [the deferral
 note](./MIGRATION.md).
 
 ## Current status and checks
+
+The approved model-facing memory recall contract specifies `memory_search`,
+`memory_browse` and `memory_read`; see [MEMORY_RECALL.md](./MEMORY_RECALL.md).
+It is separate from legacy history SDK/local APIs and makes no claim of live-model
+usefulness or deployment acceptance.
 
 Run `npm run typecheck` and `npm run test:behavior` for offline Nanobot-owned
 contracts using synthetic providers, temporary SQLite stores and crash/reopen
