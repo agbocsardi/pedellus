@@ -7,6 +7,7 @@ import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "..
 import type { HistoryPage, HistoryQuery } from "../history/index.js";
 import type { MemoryDigestStartResult, MemoryDigestStatusView } from "../history/memory-digest.js";
 import type { GatewayModelList, GatewayModelSelection, GatewayModelSelectionRequest } from "../runtime.js";
+import type { McpAdminListing, McpApproveResult } from "../mcp/index.js";
 import type {
   TerminalAttachmentSubmission,
   TerminalConversation,
@@ -42,6 +43,8 @@ export interface LocalGatewayClient extends TerminalConversation {
   readonly attachments: boolean;
   /** True when this host exposes the manual memory-digestion entry and status. */
   readonly digest: boolean;
+  /** True when this gateway loaded a configuration file and exposes owner MCP management. */
+  readonly mcp: boolean;
   /** True only when the owner host supports whole-gateway process replacement. */
   readonly restartSupported: boolean;
   restart(context: Context): Promise<void>;
@@ -53,6 +56,11 @@ export interface LocalGatewayClient extends TerminalConversation {
   digestStart(context: Context): Promise<MemoryDigestStartResult>;
   /** Bounded read-only digest status: no scan, no model call, no cursor change. */
   digestStatus(context: Context): Promise<MemoryDigestStatusView>;
+  /** Owner-only MCP management: read-only listing, one exact entry, and the two decisions. */
+  mcpList(context: Context): Promise<McpAdminListing>;
+  mcpShow(id: string, context: Context): Promise<{ readonly found: boolean; readonly text: string }>;
+  mcpApprove(id: string, context: Context): Promise<McpApproveResult>;
+  mcpDeny(id: string, context: Context): Promise<McpApproveResult>;
   historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage>;
   listEpisodes(sessionKey: string, query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage>;
   episode(sessionKey: string, startEntryId: number, context: Context): Promise<HistoryEpisode | undefined>;
@@ -125,6 +133,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
   presets = false;
   attachments = false;
   digest = false;
+  mcp = false;
   restartSupported = false;
   private readonly socket: Socket;
   private nextId = 0;
@@ -165,6 +174,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
     this.presets = result.presets === true;
     this.attachments = result.attachments === true;
     this.digest = result.digest === true;
+    this.mcp = result.mcp === true;
     this.restartSupported = result.restart === true;
   }
 
@@ -284,6 +294,23 @@ class LocalGatewayConnection implements LocalGatewayClient {
 
   async digestStatus(context: Context): Promise<MemoryDigestStatusView> {
     return this.call("digestStatus", {}, context);
+  }
+
+  async mcpList(context: Context): Promise<McpAdminListing> {
+    const result = await this.call<{ readonly listing: McpAdminListing }>("mcpList", {}, context);
+    return result.listing;
+  }
+
+  async mcpShow(id: string, context: Context): Promise<{ readonly found: boolean; readonly text: string }> {
+    return this.call("mcpShow", { id }, context);
+  }
+
+  async mcpApprove(id: string, context: Context): Promise<McpApproveResult> {
+    return this.call("mcpApprove", { id }, context);
+  }
+
+  async mcpDeny(id: string, context: Context): Promise<McpApproveResult> {
+    return this.call("mcpDeny", { id }, context);
   }
 
   async historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage> {

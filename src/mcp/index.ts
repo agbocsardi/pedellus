@@ -9,6 +9,7 @@ import {
 import type { CodemodeNamespace } from "@earendil-works/pi-durable/codemode";
 import { MCP_LIMITS, mcpServerEnabled, type McpConfig, type McpServerConfig } from "./config.js";
 import { mcpNamespaceName, mcpToolNames, mcpToolPrefix, MCP_TOOL_PREFIX } from "./naming.js";
+import { mcpOAuthStatePath } from "./oauth-store.js";
 import { McpServerConnection, type McpServerStatus } from "./server.js";
 import { createMcpToolRegistration } from "./tools.js";
 
@@ -28,16 +29,59 @@ export { mcpNamespaceName, mcpToolNames, mcpToolPrefix, MCP_TOOL_NAME_MAX, MCP_T
 export {
   McpServerConnection,
   MissingEnvironmentError,
+  MissingOAuthGrantError,
   type McpFailureCode,
   type McpServerState,
   type McpServerStatus,
 } from "./server.js";
 export { createMcpToolRegistration } from "./tools.js";
+export {
+  FileMcpOAuthStateStore,
+  adoptMcpOAuthRefresh,
+  commitMcpOAuthState,
+  commitMcpOAuthStateIfUnchanged,
+  hasMcpOAuthTokens,
+  mcpOAuthGrantEpoch,
+  mcpOAuthStagingPath,
+  mcpOAuthStatePath,
+  mcpOAuthStoreDirectory,
+  snapshotMcpOAuthGrant,
+  type McpOAuthGrantSnapshot,
+} from "./oauth-store.js";
+export { beginMcpLogin, MCP_LOGIN_TIMEOUT_MS, type McpLoginFailure, type McpLoginOutcome, type McpLoginRun } from "./login.js";
+export {
+  removeMcpServerEntry,
+  writeMcpServerEntry,
+  type McpConfigBlockExpectation,
+  type McpConfigEdit,
+  type McpConfigEditResult,
+} from "./install.js";
+export {
+  createMcpAdmin,
+  loginNoticeText,
+  MCP_ADMIN_LIMITS,
+  MCP_ADMIN_TOOL_NAME,
+  McpRequestsDoc,
+  type McpAdmin,
+  type McpAdminListing,
+  type McpAdminRequestView,
+  type McpAdminServer,
+  type McpApproveResult,
+  type McpLoginNotice,
+  type McpRequest,
+  type McpRequestKind,
+  type McpRequestStore,
+} from "./admin.js";
 
 export interface McpIntegrationOptions {
   readonly config: McpConfig;
   /** Workspace root; a stdio server without `cwd` runs here. */
   readonly workspace: string;
+  /**
+   * Canonical data directory. An `oauth: true` HTTP entry reads its owner-approved grant from a private
+   * file under it. Absent means such an entry fails closed with `auth-required`.
+   */
+  readonly dataDir?: string;
   /**
    * Host predicate: true only for conversations the host has authenticated as ordinary mapped
    * chats. It is consulted on every MCP tool call, never at registration or prompt time.
@@ -119,6 +163,7 @@ async function connect(
   name: string,
   config: McpServerConfig,
   workspace: string,
+  dataDir: string | undefined,
   environment: Readonly<Record<string, string | undefined>> | undefined,
 ): Promise<McpServerConnection> {
   const server = new McpServerConnection({
@@ -126,6 +171,9 @@ async function connect(
     config,
     workspace,
     ...(environment === undefined ? {} : { environment }),
+    ...("url" in config && config.oauth === true && dataDir !== undefined
+      ? { oauth: { storePath: mcpOAuthStatePath(dataDir, config.url) } }
+      : {}),
   });
   await server.open();
   return server;
@@ -146,7 +194,13 @@ export async function createMcpIntegration(options: McpIntegrationOptions): Prom
       .filter(([, config]) => mcpServerEnabled(config))
       .sort(([left], [right]) => left.localeCompare(right, "en-US"));
     const connected = await Promise.all(enabled.map(async ([name, config]) =>
-      connect(name, config, options.workspace, options.environment)));
+      connect(
+        name,
+        config,
+        options.workspace,
+        options.dataDir,
+        options.environment,
+      )));
     servers.push(...connected);
 
     const registrations: ToolRegistration[] = [];

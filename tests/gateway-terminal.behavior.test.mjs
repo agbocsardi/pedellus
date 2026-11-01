@@ -12,7 +12,7 @@ const pkg = process.env.PI_MODEL_CANDIDATE ?? join(import.meta.dirname, "..");
 const ai = `${pkg}/node_modules/@earendil-works/pi-ai/dist`;
 const chord = `${pkg}/node_modules/@earendil-works/chord/dist`;
 const { openGateway } = await import(pathToFileURL(`${pkg}/dist/runtime.js`).href);
-const { parseConfig } = await import(pathToFileURL(`${pkg}/dist/config.js`).href);
+const { loadConfig, parseConfig } = await import(pathToFileURL(`${pkg}/dist/config.js`).href);
 const { workspaceContextGatewayOptions } = await import(pathToFileURL(`${pkg}/dist/context/workspace-host.js`).href);
 const { prepareDataDirectory } = await import(pathToFileURL(`${pkg}/dist/store.js`).href);
 const { gatewaySocketPath, serveLocalGateway } = await import(pathToFileURL(`${pkg}/dist/local/server.js`).href);
@@ -63,7 +63,8 @@ async function makeEnvironment(t) {
   };
   const configFile = join(directory, "config.json");
   await writeFile(configFile, JSON.stringify(configValues));
-  const config = parseConfig(configValues, directory);
+  // Loaded from the file so the gateway also exposes owner MCP management, exactly as `npm start` does.
+  const config = await loadConfig(configFile);
   const provider = fauxProvider({
     provider: "fixture",
     tokensPerSecond: 1000,
@@ -115,6 +116,16 @@ function terminalIO(client, input) {
         available: client.contextRefresh,
         refresh: () => client.refreshContext(context),
       },
+      ...(client.mcp
+        ? {
+            mcp: {
+              list: () => client.mcpList(context),
+              show: (id) => client.mcpShow(id, context),
+              approve: (id) => client.mcpApprove(id, context),
+              deny: (id) => client.mcpDeny(id, context),
+            },
+          }
+        : {}),
       history: {
         defaultSession: client.sessionKey,
         search: (query, ctx) => client.historySearch(query, ctx),
@@ -247,6 +258,27 @@ test("an attached CLI renders a turn admitted by another surface", { timeout: 20
     releaseInput();
     await client.close();
   }
+});
+
+test("the owner reviews MCP requests from the attached terminal and refuses an unknown one", { timeout: 20_000 }, async (t) => {
+  const { socketPath } = await makeEnvironment(t);
+  const client = await connectLocalGateway({ socketPath, context });
+  t.after(async () => { await client.close(); });
+  assert.equal(client.mcp, true, "a gateway opened from a config file exposes MCP management");
+  const { chunks, io } = terminalIO(client, lines(
+    "/mcp",
+    "/mcp show 0123456789abcdef",
+    "/mcp approve 0123456789abcdef",
+    "/mcp deny 0123456789abcdef",
+    "/mcp bogus",
+  ));
+  io.prompt = () => {};
+  await runTerminalConversation(client, context, io);
+  const printed = chunks.join("");
+  assert.match(printed, /MCP is not configured in this gateway's open configuration/);
+  assert.match(printed, /Owner approval requests: none waiting/);
+  assert.match(printed, /No MCP owner approval request 0123456789abcdef exists/);
+  assert.match(printed, /Usage: \/mcp/);
 });
 
 test("a second local gateway owner is refused without disturbing the live one", { timeout: 20_000 }, async (t) => {

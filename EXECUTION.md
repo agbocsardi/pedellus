@@ -32,10 +32,30 @@ same policy and the direct-workspace argv builder rather than a second policy.
   `remove`, `renameFile`, `fileInfo`, `exists` and `createDir` act on the link or
   parent and are not refused merely because the link target is outside. A link
   that cannot be resolved is refused rather than guessed; this includes a
-  dangling symlink whose textual target is inside the workspace. A check/use race
-  remains, so this is a damage-reduction guard, not a security boundary. A hard
-  link inside a root to an outside inode is not detectable by path and is
-  allowed; writing or removing through it affects the outside inode.
+  dangling symlink whose textual target is inside the workspace. A hard link
+  inside a root to an outside inode is not detectable by path and is allowed;
+  writing or removing through it affects the outside inode.
+- File *content* operations (`readTextFile`, `readTextLines`,
+  `openTextLineReader`, `readBinaryFile`, `openBinaryReader`, `writeFile`,
+  `appendFile`, `truncateFile`, `flushFile`) do not rely on the resolved-path
+  check alone. The operation first opens the path without truncating and then
+  identifies the opened file from `/proc/self/fd/<fd>`, which names the opened
+  inode rather than the requested path; a descriptor whose real path is outside
+  every root is refused before any byte moves. The same descriptor is then the
+  operation target, so a concurrent process that swaps a workspace component for
+  a symbolic link between the check and the operation cannot redirect the read or
+  the write. This is what keeps a private file outside the roots out of a racing
+  `read` call. A read-only open is nonblocking, so a path that is (or was swapped
+  to) a FIFO or a device cannot park the guard waiting for a peer — a blocking
+  open has no cancellation point and would outlive both the tool timeout and an
+  owner cancellation. The binary reads additionally refuse any opened descriptor
+  that is not a regular file (`invalid: Not a regular file`, or `is_directory`)
+  instead of reading content with no size and no cancellation point; the native
+  binary reader reaches the same refusal after its own nonblocking open.
+  Directory listings, `create`, `rename`, `remove` and `watch` keep
+  the resolved-path check; they disclose no file content. Without procfs
+  (non-Linux) the content operations fall back to the resolved-path check alone,
+  and the sandboxed shell that makes the distinction matter is Linux-only.
 - Timeouts match the Python tool: the config-level `timeoutSeconds` is the
   default, is not capped (a configured 900 s stays 900 s), and `0` disables the
   timeout. A caller-supplied timeout is capped at 600 s; a backend may only
@@ -100,7 +120,10 @@ process-group timeout teardown were observed; a 60 KiB output command spilled
 intact and the spill was readable through the guard; a private temp file was
 readable; and a shell `cat` of the outside sentinel succeeded, confirming the
 documented non-confinement limitation. The native `createEnvConformance` suite
-passed 24/24 cases against the host backend (temp-only, cleaned up). Config
+passed 24/24 cases against the host backend (temp-only, cleaned up), and still
+passed 24/24 after the descriptor-verified content operations were added: byte
+ranges, line scans, rename survival, `noFollow` refusal, metadata path/name,
+directory readers, watch cases and exec cases were unchanged. Config
 default 900 s survived uncapped while a 1200 s caller timeout clamped to 600 s
 and a 0 config disabled the timeout; relative roots were rejected; a symlinked
 workspace root canonicalized once to its real path; Python-style `../`, outside

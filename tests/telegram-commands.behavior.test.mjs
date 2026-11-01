@@ -14,7 +14,7 @@ import { test } from 'node:test';
 const packageRoot = process.env.PI_NANOBOT_CANDIDATE ?? new URL('../', import.meta.url).pathname;
 const modules = join(packageRoot, 'node_modules/@earendil-works');
 const [
-  { parseConfig },
+  { loadConfig, parseConfig },
   { openGateway },
   { runTelegram, TelegramState },
   { workspaceContextGatewayOptions },
@@ -136,7 +136,7 @@ async function syntheticStore(label, options = {}) {
   await writeFiles(workspace, options.files ?? {});
   const captured = [];
   const { models, gate } = fauxModels(captured);
-  const config = parseConfig({
+  const raw = {
     workspace,
     dataDir: join(directory, 'state'),
     ...(options.presets === false
@@ -153,9 +153,18 @@ async function syntheticStore(label, options = {}) {
     telegram: { tokenEnv: 'TG_SYNTHETIC_TOKEN', allowFrom: options.allowFrom ?? ['501'] },
     ...(options.workspaceContext === undefined ? {} : { workspaceContext: options.workspaceContext }),
     ...(options.episodeSummary === undefined ? {} : { episodeSummary: options.episodeSummary }),
-  }, directory);
-  const gateway = await openGateway(config, context, { models, ...workspaceContextGatewayOptions(config) });
-  return { directory, workspace, gateway, config, captured, gate };
+    ...(options.mcp === undefined ? {} : { mcp: options.mcp }),
+  };
+  // A gateway opened from a file also exposes owner MCP management; the object form does not.
+  const loaded = options.configFile === true
+    ? await (async () => {
+        const file = join(directory, 'config.json');
+        await writeFile(file, `${JSON.stringify(raw, null, 2)}\n`);
+        return loadConfig(file);
+      })()
+    : parseConfig(raw, directory);
+  const gateway = await openGateway(loaded, context, { models, ...workspaceContextGatewayOptions(loaded) });
+  return { directory, workspace, gateway, config: loaded, captured, gate };
 }
 
 function privateChat(chatId = CHAT_ID) {
@@ -340,6 +349,46 @@ test('a narrow SDK host keeps the base commands and truthfully refuses typed hos
     const help = texts.find((text) => text.startsWith('Controls for this chat'));
     assert.doesNotMatch(help, /\/status|\/model|\/restart|\/refresh/);
     assert.equal(store.captured.length, 0, 'no command reached the model');
+  } finally {
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('/mcp lists owner requests and refuses an unknown decision without a model call', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('mcp-commands', { configFile: true });
+  const updates = [
+    textUpdate(600, 600, '/mcp'),
+    textUpdate(601, 601, '/mcp show 0123456789abcdef'),
+    textUpdate(602, 602, '/mcp approve 0123456789abcdef'),
+    textUpdate(603, 603, '/mcp deny 0123456789abcdef'),
+    textUpdate(604, 604, '/mcp bogus'),
+  ];
+  // One released update at a time: an admitted control gates this chat until it is applied.
+  const gates = updates.map(() => deferred());
+  const transport = telegramMock(gates.map((gate, index) => async () => {
+    await gate.promise;
+    return [updates[index]];
+  }));
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.commands.length === 1, 'command menu registration');
+    assert.ok(transport.commands[0].commands.some((entry) => entry.command === 'mcp'));
+    for (let index = 0; index < updates.length; index += 1) {
+      gates[index].resolve();
+      await until(() => transport.sent.length >= index + 1, `bounded /mcp notice ${index + 1}`);
+    }
+    await flush();
+    const texts = transport.sent.map((entry) => entry.text);
+    assert.equal(texts.length, 5);
+    assert.match(texts[0], /MCP is not configured in this gateway's open configuration/);
+    assert.match(texts[0], /Owner approval requests: none waiting/);
+    assert.match(texts[1], /No MCP owner approval request 0123456789abcdef exists/);
+    assert.match(texts[2], /No MCP owner approval request 0123456789abcdef exists/);
+    assert.match(texts[3], /No MCP owner approval request 0123456789abcdef exists/);
+    assert.match(texts[4], /Usage: \/mcp/);
+    assert.equal(store.captured.length, 0, 'no /mcp form reached the model');
   } finally {
     await cleanup(store, harness);
     transport.restore();

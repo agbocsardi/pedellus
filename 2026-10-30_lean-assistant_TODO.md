@@ -1312,3 +1312,137 @@ in CRON.md: the class restore belongs to the cron-enabled open path, so a store 
 `cron.enabled` false does not classify one, and a `:channel-state` key stays a mapped cron owner by
 design. Verified offline: typecheck, 322 behavior checks and 83 core acceptance; the cron file ran
 three times with no flakes. Execution checks were not run.
+
+## Owner follow-up — agent-driven MCP management and OAuth
+
+- [x] Let the assistant drive MCP management without letting a model grant itself
+  authority: one `mcp` tool records immutable, bounded, secret-free proposals
+  (`status`, `propose`, `login`, `logout`, `remove`) in a root-scoped document;
+  it cannot approve, deny, write configuration, start a flow or read a grant, and
+  it is offered only to authenticated mapped chats (never workers, forks, root,
+  digest or scheduled-run targets).
+- [x] Owner decisions only, from the local terminal or the authenticated Telegram
+  owner chat: `/mcp`, `/mcp show <id>`, `/mcp approve <id>`, `/mcp deny <id>`, with
+  the same durable-control acknowledgement, gating and replay semantics as
+  `/digest`. Approval consumes the request; `show` is the verbatim disclosure.
+- [x] A `config` approval writes `mcp.servers.<name>` (and `mcp.enabled: true`)
+  into the gateway's own configuration file: atomic replace, existing mode kept,
+  nothing outside the `mcp` block touched, and the whole merged document validated
+  by the same parser a start uses. `remove` deletes one entry and never disables
+  the capability. Both take effect at the next start (`/restart`).
+- [x] `"oauth": true` HTTP entries read a bearer token from one private `0600`
+  file per exact URL under the canonical data directory; no grant fails closed as
+  `auth-required` without contacting the authorization server. Login is
+  owner-approved and gateway-run: native `pi-mcp/oauth` discovery, dynamic client
+  registration, PKCE, loopback callback, one flow at a time, five-minute browser
+  deadline, abort on shutdown, verification connection, and one credential-free
+  internal result entry in the origin chat. The authorization URL goes only to
+  the approving owner surface.
+- [x] No secret reaches a model, tool result, transcript or channel text: pending
+  requests carry only config-shaped data with environment/header *names*, and the
+  grant file is never read by a tool.
+- [x] Docs and invariants: `MCP.md` (management, OAuth, authority, limitations),
+  `AGENTS.md`, `CLI.md`, `TELEGRAM.md`, `TOOLS.md`, `README.md`.
+- [x] Offline verification: typecheck/build, 347 behavior checks (8 new synthetic
+  cases: proposal/deny, config write + full OAuth login against a loopback
+  authorization server, logout/removal, `auth-required`, shutdown cancellation and
+  request repair, grant-file URL binding) and the 2 execution checks.
+
+### Session — agent-driven MCP management and OAuth
+
+Scope decided with the owner before implementation: owner approval is terminal **or**
+authenticated Telegram; approved entries rewrite the `mcp` block in `config.json`;
+both stdio and HTTP may be proposed; the OAuth flow runs in the gateway with the
+owner completing the browser step.
+
+The model-facing `mcp` tool is a request recorder only. Requests live in a
+root-scoped Durable document, are written once and consumed by the decision, are
+bounded (8 waiting, 8 settled) and are rendered verbatim for the owner. Approve is
+the only path that writes configuration or starts a login, and it runs as a
+durable owner control in both owner surfaces.
+
+Real limitations recorded rather than papered over: JSON is re-serialized (format
+and key order lost, ownership follows the gateway user) and a symlinked config is
+refused; a written entry or new grant only takes effect at the next start; OAuth
+is loopback-redirect + dynamic-registration PKCE only (no device code, fixed client
+identity, metadata override or step-up flow), a remote browser needs an SSH port
+forward, grants are plaintext private files, and a token-present-but-revoked server
+reports `auth-required` instead of opening a flow. No live OAuth provider, MCP
+server or browser consent flow was exercised.
+
+Coverage is synthetic: loopback fixture MCP endpoints, a loopback authorization
+server, faux models, no external network.
+
+### Session — independent review fixes for MCP management and OAuth
+
+- [x] Grant protection: an unsandboxed host shell can read the canonical data
+  directory, so an `oauth` entry now fails closed as `credential-exposed` while
+  `bash` is enabled without `toolSandbox: "bwrap"`, and login/OAuth approvals and
+  proposals are refused with fixed text. The docs no longer imply a `0600` file
+  protects the model from itself.
+- [x] Disclosure: `/mcp show` prints the entire exact proposed entry (a proposal
+  is bounded at 8 KiB) plus the approval's block-level effects, with a 12 KiB
+  notice budget; no entry is truncated. A config approval enables only the
+  approved entry — when the block was off, other entries in the file are pinned
+  to `enabled: false`.
+- [x] Decisions: approve claims `pending -> running` atomically and reserves the
+  one login flow before any asynchronous work; deny consumes only a pending or
+  live-login request and cancels startup too. A refused decision returns the
+  request to pending. A non-login write in progress is refused rather than
+  claimed as stopped halfway.
+- [x] Config writes: serialized per path in-process; the file is re-read before
+  replacement and the edit is refused if its bytes changed. The remaining
+  check/rename window is documented, not hidden.
+- [x] Login grant safety: an attempt works on a staged copy seeded from the stored
+  grant, verifies it with one connection and only then installs it. A failed or
+  canceled attempt leaves the stored grant byte-for-byte untouched. Logout bumps
+  a process-local generation, so stale refreshes and late commits cannot restore
+  a deleted grant. The initial connection now receives the attempt deadline and
+  cancellation, and sends configured headers.
+- [x] Telegram: the authorization URL is sent as a separate direct owner-chat
+  message after the durable acknowledgement and is never stored in channel
+  state; a failure cancels the login. A slow approval that already published the
+  still-pending wording publishes its final outcome as a follow-up, so the sole
+  URL is not lost.
+- [x] Verification: typecheck/build, 347 behavior checks, the 2 execution checks,
+  core acceptance pass, and ad hoc synthetic checks for exact-entry disclosure,
+  exposed-mode refusal, concurrent approve/deny, startup cancellation, configured
+  login headers, logout during a live flow, and a failed attempt preserving the
+  prior grant. No new permanent tests were added (not requested).
+
+### Session — second independent review of MCP management and OAuth
+
+- [x] Trust boundary settled by the owner: a grant is a private `0600` file like
+  the provider credential store. Same-OS-user code (the host shell, a Bubblewrap
+  mount that includes the data directory, a stdio MCP server, a worker) can read
+  it, as in Python nanobot's `FileTokenStorage`, and that risk is accepted. The
+  execution-mode `credential-exposed` guard from the previous pass was removed
+  (predicate, sandbox mount-view helper, failure code, fixed refusal text and its
+  two tests), and MCP.md/AGENTS.md now state what file permissions do and do not
+  protect instead of implying a mode boundary.
+- [x] Coding-tool path race closed: content reads and writes open the path,
+  identify the opened inode from `/proc/self/fd`, refuse a descriptor outside the
+  roots and then operate on that descriptor. The old build leaked an outside file
+  through a swapped workspace symlink; the fixed build did not in 24,000 reads.
+  Directory listings, create, rename, remove and watch keep the resolved-path
+  check (no content). `createEnvConformance` still passes 24/24.
+- [x] Login races: cancellation is rechecked inside the commit, the grant
+  generation is captured together with the grant snapshot (a logout can no longer
+  land between them), and a refresh the server already rotated is adopted
+  immediately instead of being discarded, so a failed attempt cannot leave an
+  unusable grant. Docs no longer claim a preserved grant is untouched.
+- [x] Already-authorized login: a failed tool listing is reported as an unknown
+  count instead of being counted as zero tools.
+- [x] Config writes: byte comparison plus file identity (device, inode, size,
+  mtime), so an atomic-save editor is caught; the residual check/rename window is
+  documented as narrowed, not removed.
+- [x] Functional bug found by the new coverage: with any coding tool enabled, the
+  coding ceiling hook blocked the `mcp` management tool, so agent-driven setup
+  only worked with an empty `toolAllowlist`. The tool is now an exempt
+  non-effectful context tool (it only records owner approval requests) while its
+  own hook still limits it to authenticated mapped chats.
+- [x] Verification: typecheck/build, 351 behavior checks (4 new permanent
+  regression tests: accepted-mode grant use with no token on any model-facing
+  value, failing tool listing, snapshot/rotation/epoch contract, symlink-swap
+  read), 2 execution checks, native `createEnvConformance` 24/24 and core
+  acceptance 83/83. No live MCP server, provider or credential was used.

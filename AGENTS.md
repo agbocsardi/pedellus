@@ -113,10 +113,12 @@ edits need restart only; unit edits additionally need daemon-reload.
   Isolated cron runs capture an origin subset bounded by current config, prepare it
   per run (including its workspace context), and lose it on completion; persistent
   history confers no permission.
-  The `skill`,
-  `cron`, `history`, `worker` and scoped `telegram` tools carry no filesystem/shell
-  authority and are exempt from the coding-tool hook; history remains read-only
-  over mapped chats. Telegram actions additionally require a live adapter, current private-chat
+  The `skill`, `cron`, `history`, `worker`, `mcp` management and scoped
+  `telegram` tools carry no filesystem/shell authority and are exempt from the
+  coding-tool hook, so enabling a coding tool never suppresses them; `mcp`
+  still only records owner approval requests and is limited to authenticated
+  mapped chats, and history remains read-only over mapped chats. Telegram actions
+  additionally require a live adapter, current private-chat
   admission and observed same-chat targets. Unknown external outcomes are retained,
   never blindly retried or evicted.
 - Provider spellings are native Pi AI IDs, the documented legacy aliases or
@@ -144,7 +146,8 @@ edits need restart only; unit edits additionally need daemon-reload.
   restart or reopen restores the configured preset without rewriting prepared
   dispatches. Direct-model (non-preset) selection retains its persisted semantics.
 - Shared CLI and authenticated Telegram owner controls are `/new`, `/abort`/`/stop`,
-  `/status`, `/model`, `/digest` and `/digest status`, plus `/restart`,
+  `/status`, `/model`, `/digest` and `/digest status`, plus `/restart` and
+  `/mcp` (`/mcp`, `/mcp show <id>`, `/mcp approve <id>`, `/mcp deny <id>`),
   advertised only where the host implements them. `/model` selects one
   configured preset for that chat only; `/status` is bounded read-only metadata
   with no model call; `/new` starts a new context and
@@ -257,6 +260,53 @@ edits need restart only; unit edits additionally need daemon-reload.
   not confine MCP: the server keeps its gateway-owned host cwd and authority. A configured stdio server is a native host
   process, not covered by `toolSandbox: "bwrap"`. Secrets are referenced by
   environment variable name.
+- MCP management is proposal plus owner decision, and it is the only path from a
+  model to new MCP authority. The `mcp` model tool is offered to authenticated
+  mapped chats only (never a worker, fork, root, digest or scheduled-run target)
+  and can only record one immutable, bounded, secret-free request in a
+  root-scoped document; it cannot approve, deny, write configuration, start a
+  flow or read a grant. Only the local terminal and the authenticated Telegram
+  owner chat decide, as durable owner controls, and each decision atomically
+  claims the request before any asynchronous work, then consumes it. A `config`
+  approval writes `mcp.servers.<name>` (and `mcp.enabled: true`) into the
+  gateway's own configuration file atomically after validating the whole merged
+  document, preserving the file mode and touching nothing else; it enables only
+  the approved entry (other entries are pinned to `enabled: false` when the block
+  was off), serializes managed edits, refuses to replace a file whose bytes or
+  identity changed since it was read, and refuses when the block on disk is no
+  longer the one the owner's disclosure described (its enabled flag or its entry
+  names differ from the configuration this gateway opened with), so approval
+  cannot apply a pin or an enable the owner never saw. The check and the rename
+  remain two
+  operations: an outside write in that window is lost, and no portable lock or
+  content compare-and-swap removes it. A request left `running` by a restart or
+  an interrupted flow is repaired durably as `failed` on the next read or
+  proposal, so it stops counting against the waiting bound instead of blocking
+  every later proposal. A `remove` approval deletes one entry and never
+  disables the capability. An `oauth: true` HTTP entry reads its grant from one
+  private `0600` file per exact URL under the canonical data directory, never
+  from config, transcript, entry or channel text; with no usable grant it fails
+  closed as `auth-required` instead of starting a flow. That file has the same
+  trust boundary as the provider credential store: another user cannot read it,
+  and same-user code (the coding shell, a stdio MCP server, a worker) can. The
+  runtime does not claim isolation from same-user processes; it keeps token
+  *content* out of every model-facing surface. Login is owner-approved,
+  gateway-run native PKCE with a loopback callback, one flow at a time and a
+  five-minute deadline; it works on a staged
+  grant read together with its generation, installs it only after a verification
+  connection, adopts a rotation of the stored grant that the starting connection
+  performed instead of leaving it unusable — including after a failed or canceled
+  startup connection — while a refresh of the unverified browser authorization is
+  never adopted (those tokens carry the attempt's own client registration and are
+  installed only inside the verified replacement), and a logout increments the
+  generation so a stale refresh or a late commit cannot restore it. Its
+  cancellation is rechecked up to the replacement's irreversible rename, so a
+  denial either installs nothing or is reported as the grant now being there. Its authorization URL is
+  delivered directly to the approving owner surface and never persisted in
+  channel state, and its completion places one credential-free internal result
+  in the origin chat. A configuration or grant change takes effect at the next
+  start (`/restart`); nothing hot-reloads or reconnects, and no scheduled,
+  worker or automation scope can propose or approve.
 - Telegram outbound text is rich by default (Bot API 10.1 `sendRichMessage` /
   `editMessageText` with `rich_message.markdown`) for ordinary replies, scheduled deliveries,
   previews and their edits, and host notices. Chunking uses a persisted, capability-independent

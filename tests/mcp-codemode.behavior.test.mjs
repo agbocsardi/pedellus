@@ -184,7 +184,12 @@ test('MCP config is explicit, strict, and value-free', () => {
   assert.throws(() => parse({ enabled: true, servers: { s: { url: 'http://example.test/mcp' } } }), /https/);
   assert.throws(() => parse({ enabled: true, servers: { s: { url: 'https://example.test/mcp', command: 'node' } } }), /exactly one/);
   assert.throws(() => parse({ enabled: true, servers: { s: { url: 'https://user:pass@example.test/mcp' } } }), /credentials/);
-  assert.throws(() => parse({ enabled: true, servers: { s: { url: 'https://example.test/mcp', oauth: {} } } }), /OAuth/);
+  assert.throws(() => parse({ enabled: true, servers: { s: { url: 'https://example.test/mcp', oauth: {} } } }), /oauth must be a boolean/);
+  assert.throws(() => parse({ enabled: true, servers: { s: { command: 'node', oauth: true } } }), /Streamable HTTP/);
+  assert.throws(() => parse({
+    enabled: true,
+    servers: { s: { url: 'https://example.test/mcp', oauth: true, headers: { Authorization: 'MCP_HOST_TOKEN' } } },
+  }), /one HTTP credential/);
   assert.throws(() => parse({ enabled: true, servers: { s: { command: 'node', env: { TOKEN: 'Bearer raw-value' } } } }), /environment variable/);
   assert.throws(() => parse({ enabled: true, servers: { s: { command: 'node', headers: { Authorization: TOKEN } } } }), /Streamable HTTP/);
   assert.throws(() => parse({ enabled: true, servers: { s: { command: 'node', cwd: '../outside' } } }), /inside the workspace/);
@@ -209,6 +214,8 @@ test('MCP config is explicit, strict, and value-free', () => {
   assert.equal(accepted.mcp.servers.local.timeoutSeconds, 5);
   assert.deepEqual({ ...accepted.mcp.servers.local.env }, { MCP_CHILD_TOKEN: 'MCP_HOST_TOKEN' });
   assert.equal(accepted.mcp.servers.remote.url, 'http://127.0.0.1:9/mcp');
+  const oauthEntry = parse({ enabled: true, servers: { remote: { url: 'https://example.test/mcp', oauth: true } } });
+  assert.equal(oauthEntry.mcp.servers.remote.oauth, true);
 });
 
 test('a disabled MCP block starts nothing and leaves the shipped tool set unchanged', { timeout: 30_000 }, async () => {

@@ -115,9 +115,17 @@ import {
   type BackgroundWorker,
 } from "./background-status.js";
 import {
+  createMcpAdmin,
   createMcpIntegration,
+  loginNoticeText,
   mcpHasEnabledServers,
+  MCP_ADMIN_TOOL_NAME,
+  McpRequestsDoc,
+  type McpAdmin,
+  type McpAdminListing,
+  type McpApproveResult,
   type McpIntegration,
+  type McpRequestStore,
   type McpServerStatus,
 } from "./mcp/index.js";
 import {
@@ -279,6 +287,14 @@ export interface GatewayMcpStatus {
   readonly servers: readonly McpServerStatus[];
 }
 
+/** Owner-scoped MCP management surface. Every call is made by a host channel, never by a model. */
+export interface GatewayMcpAdmin {
+  list(context: Context): Promise<McpAdminListing>;
+  show(id: string, context: Context): Promise<{ readonly found: boolean; readonly text: string }>;
+  approve(id: string, context: Context): Promise<McpApproveResult>;
+  deny(id: string, context: Context): Promise<McpApproveResult>;
+}
+
 /** Read-only query for a bounded page of one mapped chat session's raw transcript entries. */
 export interface HistoryEntryQuery {
   readonly minEntryId?: EntryId;
@@ -323,6 +339,14 @@ export interface Gateway {
    * no tools; its status carries a fixed failure code, never a transport message or configured value.
    */
   readonly mcp: GatewayMcpStatus | undefined;
+  /**
+   * Owner-only MCP management: the pending agent proposals, the exact entry behind one, and the two
+   * decisions. Present only when this gateway loaded an on-disk configuration file; an SDK host that
+   * supplies a config object gets no write surface. It creates no authority by itself: `approve`
+   * writes configuration or starts one owner-authorized OAuth login, and is reachable only from the
+   * local terminal and the authenticated Telegram owner chat, never from a model tool.
+   */
+  readonly mcpAdmin?: GatewayMcpAdmin;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
   /**
    * Bounded, read-only background activity for one already-mapped conversation: its own live
@@ -601,6 +625,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // later. Absent integrations mean the ceiling blocks those names instead.
   const mcpRef: { current: McpIntegration | undefined } = { current: undefined };
   const codeModeRef: { current: CodeModeIntegration | undefined } = { current: undefined };
+  // Agent-driven MCP management: a model tool can only propose; the owner approves from a terminal
+  // or the authenticated Telegram chat. It needs an on-disk configuration file to write, so an SDK
+  // host that supplies an object keeps the read-only `gateway.mcp` status and no write surface.
+  const mcpAdminRef: { current: McpAdmin | undefined } = { current: undefined };
+  const adminRootRef: { current: Conversation | undefined } = { current: undefined };
   // Internal agent scheduling: opt-in, and independent of the coding-tool ceiling so a reminder job
   // needs no filesystem authority.
   const cronConfig = config.cron;
@@ -997,6 +1026,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
           ...(cronEnabled ? [CRON_TOOL_NAME] : []),
           ...(workersEnabled ? [WORKER_TOOL_NAME] : []),
           ...(telegramTool === undefined ? [] : [TELEGRAM_TOOL_NAME]),
+          // MCP management only records owner approval requests: it carries no filesystem or shell
+          // authority, so the coding ceiling must not suppress it. Its own hook still limits it to
+          // authenticated mapped chats, and it exists only when the host can write configuration.
+          ...(config.configFile === undefined ? [] : [MCP_ADMIN_TOOL_NAME]),
           // History retrieval is read-only over mapped chats and has its own scope checks, so the
           // ceiling must not suppress it when coding tools are enabled.
           ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
@@ -1188,6 +1221,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (authorizedChatConversations.has(conversationId)) {
       if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
       if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
+      // MCP management is a mapped-chat capability only: a worker, fork, root or scheduled run
+      // never proposes configuration or account authority.
+      if (mcpAdminRef.current !== undefined) selected.push(mcpAdminRef.current.extension);
     } else if (workerChildConversations.has(conversationId)) {
       selected.push(workerCapabilityExtension);
       if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
@@ -1688,7 +1724,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const workerTools = workerToolRegistration !== undefined && workerSpawners.has(conversationId)
       ? [workerToolRegistration]
       : [];
-    return [...skillTools, ...cronTools, ...historyTools, ...telegramTools, ...webTools, ...workerTools];
+    // MCP management records owner-approval requests only; it is exempt from the coding ceiling and
+    // is offered to authenticated mapped chats alone (never a worker or task-owned scope).
+    const mcpAdminTools = mcpAdminRef.current !== undefined && authorizedChatConversations.has(conversationId)
+      ? [...(mcpAdminRef.current.extension.tools ?? [])]
+      : [];
+    return [...skillTools, ...cronTools, ...historyTools, ...telegramTools, ...webTools, ...workerTools, ...mcpAdminTools];
   };
   /**
    * The authority-derived tool filter. The host ceiling directly authorizes authenticated mapped
@@ -1876,15 +1917,65 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // MCP connects before the registry is built so every discovered tool is in the initial
     // registry. A failed server contributes nothing and is reported through `gateway.mcp`; the
     // whole open fails only for an internal error, and the catch below tears down whatever started.
+    // OAuth grants live under the same canonical data directory as the private credential store: a
+    // private `0600` file like the provider credential store, on the same trust boundary. Any process
+    // running as this user can read it — including the model's own shell and an MCP stdio server — and
+    // that is the accepted posture; no model-facing surface returns its content (see MCP.md).
+    const mcpDataDir = credentialStoreDir ?? config.dataDir;
     if (mcpConfigured && mcpConfig !== undefined) {
       mcpRef.current = await createMcpIntegration({
         config: mcpConfig,
         workspace,
+        dataDir: mcpDataDir,
         isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId)
           || workerChildConversations.has(conversationId),
         delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
       });
       for (const tool of mcpRef.current.extension.tools ?? []) toolRegistrations.set(tool.name, tool);
+    }
+    // Owner approval is the only path from a model proposal to new authority. The request list is a
+    // root-scoped document, so it survives a restart, is written once per proposal and is consumed by
+    // the approval; configuration writes and OAuth grants stay owner actions.
+    if (config.configFile !== undefined) {
+      const requests: McpRequestStore = {
+        read: async (ctx: Context) => {
+          const root = adminRootRef.current;
+          const open = harnessRef.current;
+          if (root === undefined || open === undefined) throw new Error("The MCP request store is not open");
+          // A committed document snapshot, not a transaction draft: the draft is invalid after commit.
+          const stored = await open.snapshot(McpRequestsDoc, root.id, ctx);
+          return stored?.requests ?? [];
+        },
+        write: (ctx: Context, change) => {
+          const root = adminRootRef.current;
+          if (root === undefined) throw new Error("The MCP request store is not open");
+          return root.commit(async (tx) => change((await tx.doc(McpRequestsDoc, root.id)).requests), ctx);
+        },
+      };
+      mcpAdminRef.current = createMcpAdmin({
+        edit: { configFile: config.configFile, workspace },
+        dataDir: mcpDataDir,
+        config: mcpConfig,
+        requests,
+        context,
+        isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
+        servers: () => mcpRef.current?.status ?? [],
+        notify: async (notice) => {
+          const open = harnessRef.current;
+          if (open === undefined) return;
+          // Only an authenticated mapped chat receives the internal result; anything else is dropped.
+          if (!authorizedChatConversations.has(notice.originConversationId)) return;
+          const conversation = await open.conversation(notice.originConversationId, context);
+          if (conversation === undefined) return;
+          await conversation.submit({
+            type: "input",
+            content: loginNoticeText(notice),
+            requestId: `nanobot.mcp-login-result:${notice.requestId}`,
+            entry: { kind: "nanobot.mcp-login-result", data: { requestId: notice.requestId, ok: notice.outcome.ok } },
+          }, context);
+        },
+      });
+      for (const tool of mcpAdminRef.current.extension.tools ?? []) toolRegistrations.set(tool.name, tool);
     }
     // Code Mode is an independent compositor, not an MCP wrapper. It gets MCP namespaces only from
     // an actually connected integration; without MCP it composes the conversation's other tools.
@@ -1909,6 +2000,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (visionExtension) registry.install(visionExtension);
     if (toolExtension) registry.install(toolExtension);
     if (mcpRef.current !== undefined) registry.install(mcpRef.current.extension);
+    if (mcpAdminRef.current !== undefined) registry.install(mcpAdminRef.current.extension);
     if (codeModeRef.current !== undefined) {
       for (const extension of codeModeRef.current.extensions) registry.install(extension);
     }
@@ -1938,6 +2030,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     harness = await Harness.open(storage, harnessOptions, context);
     harnessRef.current = harness;
     const root = await harness.root(context, { agent: defaultAgentPolicy });
+    adminRootRef.current = root;
 
     // One immutable identity document per store, minted on first open. A derived index binds
     // its rows to this value instead of to a file path, which a replaced store can reuse.
@@ -2317,7 +2410,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
     const initialMapping = historyTool === undefined && !toolsEnabled && telegramTool === undefined && !workersEnabled
-      && webTool === undefined && !mcpConfigured && !codeModeEnabled
+      && webTool === undefined && !mcpConfigured && !codeModeEnabled && mcpAdminRef.current === undefined
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
     if (initialMapping !== undefined) {
@@ -2701,6 +2794,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
       get mcp() {
         return mcpRef.current === undefined ? undefined : { servers: mcpRef.current.status };
       },
+      ...(mcpAdminRef.current === undefined ? {} : {
+        mcpAdmin: {
+          list: (ctx: Context): Promise<McpAdminListing> => mcpAdminRef.current!.list(ctx),
+          show: (id: string, ctx: Context) => mcpAdminRef.current!.show(id, ctx),
+          approve: (id: string, ctx: Context): Promise<McpApproveResult> => mcpAdminRef.current!.approve(id, ctx),
+          deny: (id: string, ctx: Context): Promise<McpApproveResult> => mcpAdminRef.current!.deny(id, ctx),
+        },
+      }),
       async conversationFor(sessionKey, ctx) {
         const key = encodedSessionKey(sessionKey);
         let conversationId: ConversationId | undefined;
@@ -2959,6 +3060,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (closed) return;
         closed = true;
         const cleanup = withoutAbortSignal(ctx);
+        // An MCP login waiting for its browser callback is stopped first: it must not reach a closed
+        // Harness, and it must not store a grant while this process is tearing down.
+        try { await mcpAdminRef.current?.close(); } catch { /* best effort; teardown continues */ }
         // Stop derived background work before the session stops accepting commits.
         episodeCatalog?.close();
         try { await harness!.close(cleanup); }
