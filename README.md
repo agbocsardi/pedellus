@@ -178,18 +178,21 @@ conversations get no MCP tool and no Code Mode. `toolAllowlist` still names only
 (`read`/`write`/`edit`/`bash`), independently of MCP.
 
 MCP is a separate explicit connection authority. A configured stdio server runs as
-a native host process, not under `toolSandbox: "bwrap"`. The assistant can propose a
-server entry, an OAuth login, a logout or a removal, but only records a request: the
-owner approves it from the terminal or the authenticated Telegram owner chat
-(`/mcp approve <id>`), and only then is configuration written or a browser login run
-against a private token file. Approval enables only the approved entry, `show`
-discloses the entire exact entry, and OAuth grants are used only while the model's
-shell cannot read the data directory (Bubblewrap shell or no shell; otherwise the
-entry fails closed). Neither an entry nor a grant takes effect until the next start.
-There is no implicit `mcp.json` discovery, no resources/prompts tool, no hot reload
-and no dashboard; failures surface as fixed codes on the SDK `gateway.mcp` surface
-and in `/mcp`. See [MCP servers, management and OAuth](./MCP.md) and [Code Mode
-contract and verified boundaries](./CODEMODE.md).
+a native host process, not under `toolSandbox: "bwrap"`. In an authenticated mapped
+ordinary chat the assistant can directly add or update a server entry, start an
+OAuth login, log out, or remove an entry; there is no proposal record and no
+`/mcp approve` gate. An OAuth authorization link is delivered directly to the
+initiating CLI attachment or Telegram chat, and the owner can finish on another
+device by pasting the callback URL back into that same chat. A completed login or
+a configuration change connects/retires the affected server and refreshes tools
+without a restart. Writes keep serialized atomic edits, whole-document validation,
+stale-file refusal and exact-entry removal binding; existing worker captures are
+never widened. OAuth grants live in a private `0600` file with the same trust
+boundary as the provider credential store: protected from other users, not from
+same-user code such as the model's own shell. There is no implicit `mcp.json`
+discovery, no resources/prompts tool and no dashboard; failures surface as fixed
+codes on the SDK `gateway.mcp` surface and in `/mcp`. See [MCP servers, management
+and OAuth](./MCP.md) and [Code Mode contract and verified boundaries](./CODEMODE.md).
 
 ## Web search and public fetch (opt-in)
 

@@ -169,6 +169,7 @@ class LocalConnection {
   private surface: ReturnType<typeof inProcessTerminalConversation> | undefined;
   private watch: TerminalWatch | undefined;
   private sessionKey: string | undefined;
+  private detachMcpSurface: (() => void) | undefined;
   private readonly submissions = new Map<number, TerminalSubmission>();
   private settled = new Map<number, TerminalSettlement>();
   private settledOrder: number[] = [];
@@ -194,6 +195,8 @@ class LocalConnection {
   /** Stop the local observer; durably admitted work keeps running in the gateway. */
   async close(): Promise<void> {
     this.finished = true;
+    this.detachMcpSurface?.();
+    this.detachMcpSurface = undefined;
     this.scope.cancel(new Error("local client disconnected"));
     try {
       await this.watch?.stop();
@@ -211,6 +214,8 @@ class LocalConnection {
   private shutdown(): void {
     if (this.finished) return;
     this.finished = true;
+    this.detachMcpSurface?.();
+    this.detachMcpSurface = undefined;
     this.scope.cancel(new Error("local client disconnected"));
     void this.watch?.stop().catch(() => undefined);
     this.watch = undefined;
@@ -364,20 +369,14 @@ class LocalConnection {
       case "mcpList":
         onlyKeys(requireObject(request.params ?? {}), []);
         return { listing: await this.mcpAdmin().list(this.scope.context) };
-      case "mcpShow": {
+      case "mcpCallback": {
         const params = requireObject(request.params);
-        onlyKeys(params, ["id"]);
-        return this.mcpAdmin().show(requireString(params, "id", 32), this.scope.context);
-      }
-      case "mcpApprove": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["id"]);
-        return this.mcpAdmin().approve(requireString(params, "id", 32), this.scope.context);
-      }
-      case "mcpDeny": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["id"]);
-        return this.mcpAdmin().deny(requireString(params, "id", 32), this.scope.context);
+        onlyKeys(params, ["text"]);
+        return this.mcpAdmin().submitCallback(
+          this.sessionKey,
+          requireString(params, "text", 8_192),
+          this.scope.context,
+        );
       }
       case "digestStart":
         return this.options.gateway.memoryDigest.start(this.digestWriter(), this.scope.context);
@@ -453,6 +452,19 @@ class LocalConnection {
     this.gatewayConversation = conversation;
     this.sessionKey = sessionKey;
     this.surface = inProcessTerminalConversation(conversation);
+    this.detachMcpSurface = this.options.gateway.mcpSurfaces?.attach({
+      owns: (candidate) => candidate === sessionKey,
+      deliverAuthorization: async (target, authorization) => {
+        if (target !== sessionKey) throw new Error("MCP authorization belongs to another session");
+        if (!this.send({ event: "mcpAuthorization", authorization })) {
+          throw new Error("the local attachment is no longer connected");
+        }
+      },
+      deliverNotice: async (target, text) => {
+        if (target !== sessionKey) return;
+        this.send({ event: "mcpNotice", text });
+      },
+    });
     return {
       protocol: LOCAL_PROTOCOL_VERSION,
       sessionKey,
@@ -583,16 +595,18 @@ class LocalConnection {
     return { status: (await submission.status(this.scope.context)).status };
   }
 
-  private send(message: LocalServerMessage): void {
-    if (this.finished || this.socket.destroyed) return;
+  private send(message: LocalServerMessage): boolean {
+    if (this.finished || this.socket.destroyed) return false;
     if (this.socket.writableLength > LOCAL_PROTOCOL_LIMITS.maxOutboundBytes) {
       this.shutdown();
-      return;
+      return false;
     }
     try {
       this.socket.write(`${JSON.stringify(message)}\n`);
+      return true;
     } catch {
       this.shutdown();
+      return false;
     }
   }
 

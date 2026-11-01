@@ -436,16 +436,12 @@ test('a full host fits its whole /help listing in one bounded notice and keeps d
   }
 });
 
-test('/mcp lists owner requests and refuses an unknown decision without a model call', { timeout: 20_000 }, async () => {
+test('/mcp is bounded status and never reaches the model', { timeout: 20_000 }, async () => {
   const store = await syntheticStore('mcp-commands', { configFile: true });
   const updates = [
     textUpdate(600, 600, '/mcp'),
-    textUpdate(601, 601, '/mcp show 0123456789abcdef'),
-    textUpdate(602, 602, '/mcp approve 0123456789abcdef'),
-    textUpdate(603, 603, '/mcp deny 0123456789abcdef'),
-    textUpdate(604, 604, '/mcp bogus'),
+    textUpdate(601, 601, '/mcp bogus'),
   ];
-  // One released update at a time: an admitted control gates this chat until it is applied.
   const gates = updates.map(() => deferred());
   const transport = telegramMock(gates.map((gate, index) => async () => {
     await gate.promise;
@@ -462,16 +458,54 @@ test('/mcp lists owner requests and refuses an unknown decision without a model 
     }
     await flush();
     const texts = transport.sent.map((entry) => entry.text);
-    assert.equal(texts.length, 5);
-    assert.match(texts[0], /MCP is not configured in this gateway's open configuration/);
-    assert.match(texts[0], /Owner approval requests: none waiting/);
-    assert.match(texts[1], /No MCP owner approval request 0123456789abcdef exists/);
-    assert.match(texts[2], /No MCP owner approval request 0123456789abcdef exists/);
-    assert.match(texts[3], /No MCP owner approval request 0123456789abcdef exists/);
-    assert.match(texts[4], /Usage: \/mcp/);
+    assert.equal(texts.length, 2);
+    assert.match(texts[0], /MCP is not configured in this gateway/);
+    assert.match(texts[0], /OAuth logins waiting for a callback: none/);
+    assert.match(texts[1], /Usage: \/mcp/);
     assert.equal(store.captured.length, 0, 'no /mcp form reached the model');
   } finally {
     await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('a pasted OAuth callback is consumed before model admission and its values never enter state', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('mcp-callback');
+  const callback = 'http://127.0.0.1:43210/callback?code=SECRET-CODE&state=SECRET-STATE';
+  const submitted = [];
+  const host = {
+    conversationFor: (key, ctx) => store.gateway.conversationFor(key, ctx),
+    mcpAdmin: {
+      list: async () => ({ configured: false, servers: [], logins: [] }),
+      submitCallback: async (sessionKey, text) => {
+        submitted.push({ sessionKey, text });
+        return { handled: true, accepted: false, text: 'CALLBACK-REFUSED-FIXED' };
+      },
+    },
+    mcpSurfaces: { attach: () => () => undefined },
+  };
+  const transport = telegramMock([[
+    textUpdate(610, 610, callback),
+  ]]);
+  let harness;
+  try {
+    const scope = withCancel(context);
+    harness = { scope, adapter: runTelegram(host, { token: TOKEN, allowFrom: ['501'], pollTimeoutSeconds: 1 }, scope.context) };
+    await until(() => transport.sent.length >= 1, 'the callback refusal notice');
+    await flush();
+    assert.equal(submitted.length, 1, 'the callback was consumed once');
+    assert.equal(submitted[0].sessionKey, `telegram:${BOT_ID}:chat:${CHAT_ID}`);
+    assert.equal(submitted[0].text, callback);
+    assert.equal(store.captured.length, 0, 'the callback never became model input');
+    assert.match(transport.sent[0].text, /CALLBACK-REFUSED-FIXED/);
+    const doc = await stateDoc(store.gateway);
+    const serialized = JSON.stringify(doc);
+    assert.ok(!serialized.includes('SECRET-CODE'), 'the authorization code is not in channel state');
+    assert.ok(!serialized.includes('SECRET-STATE'), 'the authorization state is not in channel state');
+    assert.ok(!serialized.includes(callback), 'the callback URL is not in channel state');
+  } finally {
+    await stop(harness);
+    await cleanup(store, undefined);
     transport.restore();
   }
 });

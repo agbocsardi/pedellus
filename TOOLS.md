@@ -73,21 +73,19 @@ described below; Code Mode is not part of this slice.
   [`HISTORY.md`](./HISTORY.md#agent-facing-history-tool).
 
 Every Gateway opened from an on-disk configuration file also offers one `mcp`
-management tool to authenticated mapped chat conversations (`status`, `propose`,
-`login`, `logout`, `remove`). It records one bounded, secret-free owner-approval
-request and nothing else: it cannot approve, deny, write configuration, start an
-OAuth flow, store a token or connect a server, and a worker, fork, root, digest
-or scheduled-run conversation never receives it. Only the owner's explicit
-`/mcp approve <id>`/`/mcp deny <id>` in the local terminal or the authenticated
-Telegram owner chat decides, and the resulting authority is exactly what editing
-that `mcp.servers` entry by hand would grant. Approval enables only the approved
-entry: when the `mcp` block was disabled, every other entry in the file is pinned
-to `enabled: false`. `show` prints the entire exact entry and the approval's
-effects; managed config edits are serialized and refuse to replace a file that
-changed since it was read. OAuth grants are used only while a model-executed
-shell cannot read the data directory (a Bubblewrap shell, or no shell), and fail
-closed otherwise. It is not in the coding-tool
-ceiling and grants no coding tool. See [`MCP.md`](./MCP.md#owner-approved-management).
+management tool to authenticated mapped chat conversations (`status`, `add` /
+`configure`, `login`, `logout`, `remove`). It performs the requested operation:
+it validates and atomically writes one server entry and activates it live, starts
+one login whose URL goes directly to this owner surface, deletes a stored grant
+or removes an entry. There is no `/mcp approve` gate. A worker, fork, root,
+digest or scheduled-run conversation never receives it, and it never widens
+`toolAllowlist` or an existing worker capture. An add enables only the entry
+asked for: when the `mcp` block was disabled, every other entry in the file is
+pinned to `enabled: false`. Config edits are serialized and refuse to replace a
+file that changed since it was read; a remove is bound to the current exact
+entry. OAuth tokens live in a private file protected from other users, not from
+same-user code. It is not in the coding-tool ceiling and grants no coding tool.
+See [`MCP.md`](./MCP.md#direct-owner-authorized-management).
 
 When `telegram` is configured, mapped Telegram chat conversations also receive
 one scoped `telegram` channel-action tool (`targets`, `reply`, `react`, and
@@ -114,10 +112,11 @@ re-grant or per-channel permission list to manage.
   authority: the owner chooses tools once in the configuration.
 - Changing a tool is a configuration change: edit `toolAllowlist` and restart.
   Chat and terminal commands never change coding-tool authority, and the model
-  cannot. The owner-only `/mcp approve` decision can add an MCP *connection*
-  entry (or an OAuth grant) to the configuration file, which is the same
-  authority as writing that entry by hand; it never changes `toolAllowlist`,
-  never enables coding tools and never takes effect before the next start.
+  cannot. Direct MCP management can add a connection entry (or an OAuth grant)
+  on an owner's request in an authenticated mapped chat, which is the same
+  authority as writing that entry by hand; it never changes `toolAllowlist` and
+  never enables coding tools. The affected MCP tools activate without a restart;
+  a `toolAllowlist` change still needs one.
 - Scope is validated from durable state, never from a session-key string alone:
   only a conversation that is the target of a persisted chat session key and is
   ordinary (ownerless, unforked, not the root) is authorized. The root, a

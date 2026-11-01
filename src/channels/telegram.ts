@@ -23,7 +23,8 @@ import {
   renderMemoryDigestStart,
   renderMemoryDigestStatus,
 } from "../history/memory-digest.js";
-import { MCP_ADMIN_LIMITS, renderMcpApproval, renderMcpListing } from "../mcp/admin.js";
+import { renderMcpListing } from "../mcp/admin.js";
+import { looksLikeOAuthCallback } from "../mcp/surface.js";
 import type {
   GatewayMcpAdmin,
   GatewayMemoryDigest,
@@ -381,12 +382,13 @@ export interface TelegramGateway {
    */
   memoryDigest?: GatewayMemoryDigest;
   /**
-   * Optional owner-only MCP management. Present only when the gateway loaded an on-disk
-   * configuration file. `approve` writes configuration or starts one owner-approved OAuth login and
-   * is reachable only from this authenticated owner chat and the local terminal, never from a model
-   * tool; `show` and `list` are read-only and bounded.
+   * Optional MCP host surface. Present only when the gateway loaded an on-disk configuration file.
+   * `/mcp` is read-only status; callback-shaped ingress is consumed before model admission and the
+   * initiating chat receives its own login link and fixed completion notice.
    */
   mcpAdmin?: GatewayMcpAdmin;
+  /** Live MCP login delivery and callback surfaces, attached by this adapter while it runs. */
+  mcpSurfaces?: import("../mcp/surface.js").McpSurfaceRegistry;
 }
 
 export async function runTelegram(
@@ -411,8 +413,7 @@ export async function runTelegram(
     status: typeof gateway.listModels === "function",
     restart: options.restart !== undefined && options.restart.supported,
     digest: typeof gateway.memoryDigest?.start === "function" && typeof gateway.memoryDigest?.status === "function",
-    mcp: typeof gateway.mcpAdmin?.list === "function" && typeof gateway.mcpAdmin?.approve === "function"
-      && typeof gateway.mcpAdmin?.deny === "function" && typeof gateway.mcpAdmin?.show === "function",
+    mcp: typeof gateway.mcpAdmin?.list === "function" && typeof gateway.mcpAdmin?.submitCallback === "function",
   };
   const scope = withCancel(context);
   const adapterContext = scope.context;
@@ -1177,7 +1178,29 @@ export async function runTelegram(
       return performAction(chatId, callId, request);
     },
   };
+  /** The exact private chat and durable sender binding for one Telegram session key. */
+  function ownerChatFor(sessionKey: string): { readonly chatId: number; readonly senderId: string } | undefined {
+    const prefix = `telegram:${identity}:chat:`;
+    if (!sessionKey.startsWith(prefix)) return undefined;
+    const raw = sessionKey.slice(prefix.length);
+    if (!/^\d+$/.test(raw)) return undefined;
+    const chatId = Number(raw);
+    if (!Number.isSafeInteger(chatId)) return undefined;
+    const binding = originBindingOf(state.origins, chatId, identity);
+    if (binding === undefined || !options.allowFrom.includes(binding.senderId)) return undefined;
+    return { chatId, senderId: binding.senderId };
+  }
+
+  /** One direct plain owner message; never a durable outbox record or transcript entry. */
+  async function sendOwnerPlainText(chatId: number, senderId: string, text: string): Promise<void> {
+    if (!options.allowFrom.includes(senderId)) throw new Error("the owner sender is no longer authorized");
+    if (text.length > PLAIN_TEXT_LIMIT) throw new Error("owner message is too long for one message");
+    await apiCall(api, "sendMessage", signal, (callSignal) => withChatSendOrder(chatId, () =>
+      api.sendMessage(chatId, text, {}, toGrammySignal(callSignal))), { throttle: outboundThrottle });
+  }
+
   let detachTelegramActions: (() => void) | undefined;
+  let detachMcpSurface: (() => void) | undefined;
 
   // A completed background result is sent as stored text: no submission, no preview, no model turn.
   const scheduledSessions = async (): Promise<{ sessionKey: string; chatId: number }[]> => {
@@ -2135,6 +2158,26 @@ export async function runTelegram(
   requestScheduledScan();
   scheduledTimer = setInterval(requestScheduledScan, SCHEDULED_SCAN_INTERVAL_MS);
   detachTelegramActions = gateway.telegramActions?.attach(actionHost);
+  detachMcpSurface = gateway.mcpSurfaces?.attach({
+    owns: (sessionKey) => sessionKey.startsWith(`telegram:${identity}:chat:`),
+    async deliverAuthorization(sessionKey, authorization) {
+      const owner = ownerChatFor(sessionKey);
+      if (owner === undefined) throw new Error("the requesting Telegram owner chat is no longer authorized");
+      if (authorization.expiresAtMs <= Date.now()) throw new Error("authorization URL expired before delivery");
+      await sendOwnerPlainText(owner.chatId, owner.senderId, [
+        "MCP OAuth authorization URL (owner only):",
+        authorization.url,
+        `Valid until ${new Date(authorization.expiresAtMs).toISOString()}.`,
+        "Open it as the owner. If the browser cannot reach this host, paste the callback URL back into this chat.",
+        "This gateway does not store this URL or its state in channel state.",
+      ].join("\n"));
+    },
+    async deliverNotice(sessionKey, text) {
+      const owner = ownerChatFor(sessionKey);
+      if (owner === undefined) return;
+      await sendOwnerPlainText(owner.chatId, owner.senderId, text);
+    },
+  });
   drain();
 
   try {
@@ -2171,6 +2214,25 @@ export async function runTelegram(
             console.warn("Telegram origin admission binding evicted at capacity; a fresh admission restores it.");
           }
           if (origin.trusted) await releaseWithheld(sessionKey);
+          // An OAuth callback is consumed before any transcript or model admission. Only the exact
+          // authenticated sender bound to this chat may submit it; the text itself is never stored.
+          if (message.text !== undefined && gateway.mcpAdmin !== undefined && looksLikeOAuthCallback(message.text)) {
+            const senderId = String(message.from!.id);
+            const binding = originBindingOf(state.origins, message.chat.id, identity);
+            if (binding === undefined || binding.senderId !== senderId) {
+              await admitNotice(update, message, sessionKey,
+                "This OAuth callback did not come from the authenticated sender that owns this chat. It was not sent " +
+                "to the assistant and was not stored.");
+            } else {
+              const result = await gateway.mcpAdmin.submitCallback(sessionKey, message.text, adapterContext);
+              await admitNotice(update, message, sessionKey,
+                result.handled
+                  ? result.text
+                  : "This OAuth callback was not accepted. It was not sent to the assistant and was not stored.");
+            }
+            drain();
+            continue;
+          }
           // Control parsing happens only after allowlist authentication and never for attachments.
           const parsed = parseTelegramInput(message.text ?? "", me.username);
           if (parsed.kind !== "input") {
@@ -2255,6 +2317,8 @@ export async function runTelegram(
     stopping = true;
     detachTelegramActions?.();
     detachTelegramActions = undefined;
+    detachMcpSurface?.();
+    detachMcpSurface = undefined;
     stopAllTyping();
     if (scheduledTimer !== undefined) clearInterval(scheduledTimer);
     scope.cancel(new DOMException("Telegram adapter stopped", "AbortError"));
@@ -2484,29 +2548,14 @@ export async function runTelegram(
         drain();
         return;
       }
-      const parts = parsed.args.trim().split(/\s+/).filter((part) => part.length > 0);
-      if (parts.length === 0) {
-        // Read-only: bounded listing of configured servers and waiting proposals. No effect.
-        await admitNotice(update, message, sessionKey,
-          renderMcpListing(await admin.list(adapterContext), MAX_NOTICE_CHARS));
+      if (parsed.args.trim() !== "") {
+        await admitNotice(update, message, sessionKey, usageNotice("mcp"));
         drain();
         return;
       }
-      const [sub, id, ...extra] = parts;
-      if ((sub === "show" || sub === "approve" || sub === "deny") && id !== undefined
-        && extra.length === 0 && MCP_REQUEST_ID.test(id)) {
-        if (sub === "show") {
-          const shown = await admin.show(id, adapterContext);
-          await admitNotice(update, message, sessionKey, shown.text, MCP_ADMIN_LIMITS.maxShowChars);
-          drain();
-          return;
-        }
-        // An approval writes configuration or starts an OAuth login: it uses the same durable
-        // control record, ordered acknowledgement and chat gating as the other owner commands.
-        await admitControl(update, message, sessionKey, sub === "approve" ? "mcp-approve" : "mcp-deny", id);
-        return;
-      }
-      await admitNotice(update, message, sessionKey, usageNotice("mcp"));
+      // Read-only status; management itself is the model tool acting for this authenticated chat.
+      await admitNotice(update, message, sessionKey,
+        renderMcpListing(await admin.list(adapterContext), MAX_NOTICE_CHARS));
       drain();
       return;
     }
@@ -2635,17 +2684,12 @@ export async function runTelegram(
       }
       if (ack !== "waiting") {
         // The acknowledgement was already published with the still-pending wording. The final outcome
-        // still belongs to this command: deliver it as a follow-up, so a slow approval cannot lose its
-        // only answer (the authorization URL is sent separately and is never stored).
+        // still belongs to this command: deliver it as a follow-up, so a slow command cannot lose its
+        // only answer.
         if (outcome.text !== undefined) {
           await publishLateControlNotice(
             update.update_id, chatId, sessionKey, String(message.from!.id), outcome.text,
           ).catch(() => undefined);
-        }
-        if (outcome.authorization !== undefined) {
-          await deliverMcpAuthorization(
-            target, outcome.authorization, update.update_id, chatId, sessionKey, String(message.from!.id),
-          );
         }
         if (outcome.requestRestart === true) requestRestart();
         return;
@@ -2658,11 +2702,6 @@ export async function runTelegram(
         // still asked when the acknowledgement commit itself failed (its notice is then reported after the
         // restart by the recovery pass).
         if (outcome.requestRestart === true) requestRestart();
-      }
-      if (outcome.authorization !== undefined) {
-        await deliverMcpAuthorization(
-          target, outcome.authorization, update.update_id, chatId, sessionKey, String(message.from!.id),
-        );
       }
     }, (error: unknown) => {
       // The record stays `admitted` and the acknowledgement stays held: a reopen reports it as unconfirmed.
@@ -2733,76 +2772,6 @@ export async function runTelegram(
       : { kind: "applied", text: renderMemoryDigestStart(result) };
   }
 
-  /**
-   * `/mcp approve <id>` and `/mcp deny <id>`: one owner decision on one agent proposal. The request is
-   * consumed by the decision, so a replay finds nothing and a refusal is reported as refused. The
-   * approval text is fixed and bounded; an authorization URL is appended for the owner only, never to
-   * a model turn or transcript.
-   */
-  async function applyMcp(record: DeferredControl): Promise<ControlOutcome> {
-    const admin = gateway.mcpAdmin;
-    if (admin === undefined) return { kind: "refused", text: MCP_UNAVAILABLE_HOST };
-    const id = record.target;
-    if (id === undefined || !MCP_REQUEST_ID.test(id)) return { kind: "refused", text: usageNotice("mcp") };
-    const result = record.command === "mcp-approve"
-      ? await admin.approve(id, adapterContext)
-      : await admin.deny(id, adapterContext);
-    // The authorization URL is delivered by the command completion, after the acknowledgement and
-    // directly to this chat. It is deliberately absent from `text`, so channel state never persists it.
-    const text = result.authorization === undefined ? renderMcpApproval(result, MAX_NOTICE_CHARS) : result.text;
-    return result.status === "refused"
-      ? { kind: "refused", text }
-      : { kind: "applied", text, ...(result.authorization === undefined ? {} : { authorization: result.authorization }) };
-  }
-
-  /**
-   * Deliver one authorization URL as an ordinary plain message. Not stored: a rich or queued notice
-   * would persist the value and its state in channel state, which this delivery deliberately avoids.
-   * If it cannot be delivered, the just-started login is canceled instead of leaving an attempt that
-   * nobody can finish.
-   */
-  async function deliverMcpAuthorization(
-    requestId: string | undefined,
-    authorization: { readonly url: string; readonly expiresAtMs: number },
-    updateId: number,
-    chatId: number,
-    sessionKey: string,
-    senderId: string,
-  ): Promise<void> {
-    try {
-      await sendAuthorizationUrl(chatId, senderId, authorization);
-    } catch {
-      if (requestId !== undefined) {
-        await gateway.mcpAdmin?.deny(requestId, adapterContext).catch(() => undefined);
-      }
-      await publishLateControlNotice(updateId, chatId, sessionKey, senderId,
-        "The MCP login was canceled because its one-time authorization URL could not be confirmed as delivered " +
-        "to this chat. Approve a new login request to get a fresh URL.").catch(() => undefined);
-    }
-  }
-
-  /** Send one authorization URL as an ordinary plain message; it is never put in the durable outbox. */
-  async function sendAuthorizationUrl(
-    chatId: number,
-    senderId: string,
-    authorization: { readonly url: string; readonly expiresAtMs: number },
-  ): Promise<void> {
-    // The same live allowlist check every durable notice performs: a removed sender gets no URL.
-    if (!options.allowFrom.includes(senderId)) throw new Error("the approving sender is no longer authorized");
-    if (authorization.expiresAtMs <= Date.now()) {
-      throw new Error("authorization URL expired before it could be delivered");
-    }
-    const text = [
-      "MCP OAuth authorization URL (owner only):",
-      authorization.url,
-      `Valid until ${new Date(authorization.expiresAtMs).toISOString()}.`,
-      "Open it as the owner in a browser that can reach this host. This gateway does not store this URL or its state.",
-    ].join("\n");
-    if (text.length > PLAIN_TEXT_LIMIT) throw new Error("authorization URL is too long for one message");
-    await apiCall(api, "sendMessage", signal, (callSignal) => withChatSendOrder(chatId, () =>
-      api.sendMessage(chatId, text, {}, toGrammySignal(callSignal))), { throttle: outboundThrottle });
-  }
-
   /** Bounded read-only `/digest status`; it creates no task and reads no chat transcript. */
   async function digestStatusNotice(sessionKey: string): Promise<string> {
     const host = gateway.memoryDigest;
@@ -2865,8 +2834,6 @@ export async function runTelegram(
       outcome = { kind: "applied" };
     } else if (record.command === "digest") {
       outcome = await applyDigest(sessionKey);
-    } else if (record.command === "mcp-approve" || record.command === "mcp-deny") {
-      outcome = await applyMcp(record);
     } else if (record.command === "restart") {
       // No conversation effect: the record and its acknowledgement are durable first, and the host
       // replacement is requested by the caller only after that acknowledgement was released.
@@ -3541,15 +3508,13 @@ type TelegramControl = "new" | "abort" | "stop" | "help" | "status" | "model" | 
  * A command with a native effect on this chat or this process; a refusal is terminal, never retried.
  * `/stop` normalizes to `abort` here, so one control kind covers both spellings.
  */
-type TelegramMutation = "new" | "abort" | "model" | "restart" | "digest" | "mcp-approve" | "mcp-deny";
+type TelegramMutation = "new" | "abort" | "model" | "restart" | "digest";
 
 type ControlOutcome =
   | {
       readonly kind: "applied";
       readonly text?: string;
       readonly requestRestart?: true;
-      /** One-time owner URL, delivered directly and never stored in channel state. */
-      readonly authorization?: { readonly url: string; readonly expiresAtMs: number };
     }
   | { readonly kind: "refused"; readonly text: string }
   | { readonly kind: "deferred" }
@@ -3568,8 +3533,6 @@ const CONTROL_ACK: Record<TelegramMutation, string> = {
     "Restarting the gateway. A confirmation follows once it is live.",
   digest:
     "Memory digestion request applied for this chat; the bounded run follows separately and reports only a failure or cancellation to this chat's agent.",
-  "mcp-approve": "The MCP approval was applied; its result follows in this message.",
-  "mcp-deny": "The MCP request was denied; nothing was configured, connected or authorized.",
 };
 
 const CONTROL_PENDING: Record<TelegramMutation, string> = {
@@ -3588,12 +3551,6 @@ const CONTROL_PENDING: Record<TelegramMutation, string> = {
   digest:
     "Memory digestion is still pending for this chat: messages admitted earlier are being submitted first. " +
     "Nothing has been started yet and nothing was sent to the assistant.",
-  "mcp-approve":
-    "The MCP approval is still pending: messages admitted earlier in this chat are being submitted first. " +
-    "Nothing has been written, connected or authorized yet.",
-  "mcp-deny":
-    "The MCP denial is still pending: messages admitted earlier in this chat are being submitted first. " +
-    "The request is still waiting and nothing was applied.",
 };
 
 const UNCONFIRMED_CONTROL =
@@ -3637,8 +3594,7 @@ function usageNotice(name: string): string {
 const MCP_UNAVAILABLE_HOST =
   "MCP management is unavailable in this host: the gateway was opened without an on-disk configuration file, " +
   "so there is nothing to write. Nothing was sent to the assistant.";
-/** One pending owner approval request. Opaque, fixed-width and content-bound at creation. */
-const MCP_REQUEST_ID = /^[0-9a-f]{16}$/;
+/** One pending owner control command. Opaque, fixed-width and content-bound at creation. */
 const RESTART_UNAVAILABLE_HOST =
   "Restart is unavailable in this host: it cannot replace its own process with the same program and configuration. " +
   "Nothing was sent to the assistant.";

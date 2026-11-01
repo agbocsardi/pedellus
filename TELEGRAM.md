@@ -34,8 +34,7 @@ never reaches it. `message.text` (not a caption) is classified:
 - Matching is an exact leading command token (case-insensitive). `/new`,
   `/abort`, `/stop`, `/status` and `/restart` take no arguments; `/model` takes
   one configured preset name or `default`; `/digest` takes nothing or the literal
-  `status`; `/mcp` takes nothing, or `show <id>`, `approve <id>`, `deny <id>` with
-  one 16-hex request ID; `/help` takes nothing or one command name this host
+  `status`; `/mcp` takes nothing; `/help` takes nothing or one command name this host
   offers, and answers with that command's usage and one-sentence detail. Any
   other argument to a control gets a bounded usage notice; `/help <name>` for a
   name that is not offered gets a fixed refusal that names the reason (another
@@ -143,27 +142,23 @@ busy chat is refused atomically (nothing is queued and no change lands on a
 later turn); unknown names and legacy direct configs are refused with fixed
 text.
 
-`/mcp` is the owner's decision surface for the assistant's MCP proposals. With no
-argument it lists this gateway's configured MCP servers (with live state) and the
-requests waiting for a decision; `/mcp show <id>` prints the normalized shape, the
-entire exact proposed entry (never truncated), and what an approval would change
-— a stdio command verbatim and every header/environment mapping as a host
-variable *name*, never a value; `/mcp approve <id>` writes that entry into the
-gateway's configuration file (enabling only the approved entry) or starts one
-owner-approved OAuth login; `/mcp deny <id>` discards the request. Listing and
-showing are bounded read-only notices with no model call. Approve and deny are
-durable owner controls: they gate this chat, report a known refusal as refused,
-and a replayed update finds the request already consumed instead of applying it
-twice. A login's one-time authorization URL is delivered as a separate direct
-message to this authenticated private chat, after the durable acknowledgement
-and outside the stored channel state; it carries this attempt's OAuth `state`, is
-never sent to the assistant, and open it on a device that can reach the gateway
-host (a remote browser needs that loopback port forwarded). If the approval takes
-longer than the still-pending notice, the final outcome follows as a second
-notice; if the URL cannot be delivered, the login is canceled and a new request
-is needed. A written entry or new grant takes effect at the next start, so
-follow an approval with `/restart`. A gateway opened without an on-disk
-configuration file advertises no `/mcp` and refuses a typed one with fixed text.
+`/mcp` is bounded read-only status for this MCP-enabled gateway: configured
+servers with live state, and any OAuth login waiting for a callback. It is not an
+approval surface. Ask the assistant in this authenticated private chat to add or
+update a server, log in, log out or remove one; the `mcp` model tool performs the
+operation directly, and `/mcp` never reaches the model. A login's one-time
+authorization URL is delivered as a separate direct plain message to this exact
+chat, outside stored channel state. Open it as the owner, then either let the
+browser reach this host or paste the resulting callback URL back into this chat.
+The callback is intercepted before transcript admission or model dispatch; it
+must match the active attempt's loopback origin/path/state and the current
+authenticated sender binding of this private chat. Stale, foreign, cross-chat and
+replayed callbacks are refused with fixed text and their values are never stored
+or sent to the assistant. Completion verifies and stores the grant, reconnects
+the server and makes its tools callable without `/restart`. If the URL cannot be
+delivered, the login is canceled rather than left waiting. A gateway opened
+without an on-disk configuration file advertises no `/mcp` and refuses a typed
+one with fixed text.
 
 `/restart` asks the host to replace the Gateway process so current code and a
 re-read configuration are loaded. It is not a model tool, it is available only to

@@ -120,9 +120,7 @@ function terminalIO(client, input) {
         ? {
             mcp: {
               list: () => client.mcpList(context),
-              show: (id) => client.mcpShow(id, context),
-              approve: (id) => client.mcpApprove(id, context),
-              deny: (id) => client.mcpDeny(id, context),
+              submitCallback: (text) => client.mcpSubmitCallback(text, context),
             },
           }
         : {}),
@@ -260,25 +258,48 @@ test("an attached CLI renders a turn admitted by another surface", { timeout: 20
   }
 });
 
-test("the owner reviews MCP requests from the attached terminal and refuses an unknown one", { timeout: 20_000 }, async (t) => {
+test("the owner reads MCP status from the attached terminal", { timeout: 20_000 }, async (t) => {
   const { socketPath } = await makeEnvironment(t);
   const client = await connectLocalGateway({ socketPath, context });
   t.after(async () => { await client.close(); });
   assert.equal(client.mcp, true, "a gateway opened from a config file exposes MCP management");
   const { chunks, io } = terminalIO(client, lines(
     "/mcp",
-    "/mcp show 0123456789abcdef",
-    "/mcp approve 0123456789abcdef",
-    "/mcp deny 0123456789abcdef",
     "/mcp bogus",
   ));
   io.prompt = () => {};
   await runTerminalConversation(client, context, io);
   const printed = chunks.join("");
-  assert.match(printed, /MCP is not configured in this gateway's open configuration/);
-  assert.match(printed, /Owner approval requests: none waiting/);
-  assert.match(printed, /No MCP owner approval request 0123456789abcdef exists/);
+  assert.match(printed, /MCP is not configured in this gateway/);
+  assert.match(printed, /OAuth logins waiting for a callback: none/);
   assert.match(printed, /Usage: \/mcp/);
+});
+
+test("the CLI surface receives a direct MCP link and consumes a pasted callback before model admission", { timeout: 20_000 }, async (t) => {
+  const { gateway, provider, socketPath } = await makeEnvironment(t);
+  const client = await connectLocalGateway({ socketPath, context });
+  t.after(async () => { await client.close(); });
+  const authorizations = [];
+  client.onMcpAuthorization = (authorization) => authorizations.push(authorization);
+  const surface = gateway.mcpSurfaces.surfaceFor(client.sessionKey);
+  assert.ok(surface, "the attached CLI registers an owner surface for its exact session");
+  await surface.deliverAuthorization(client.sessionKey, {
+    requestId: "0123456789abcdef",
+    name: "synthetic",
+    url: "http://127.0.0.1:1234/authorize?state=SYNTHETIC-STATE",
+    expiresAtMs: Date.now() + 60_000,
+  }, context);
+  await eventually(() => authorizations.length === 1, "the CLI did not receive the direct authorization link");
+  assert.match(authorizations[0].url, /SYNTHETIC-STATE/);
+
+  const callback = "http://127.0.0.1:54321/callback?code=SYNTHETIC-CODE&state=SYNTHETIC-STATE";
+  const { chunks, io } = terminalIO(client, lines(callback));
+  io.prompt = () => {};
+  await runTerminalConversation(client, context, io);
+  const printed = chunks.join("");
+  assert.match(printed, /No MCP login is waiting for a callback in this chat/);
+  assert.ok(!printed.includes("SYNTHETIC-CODE"), "the callback code is not echoed");
+  assert.equal(provider.state.callCount, 0, "the callback never became model input");
 });
 
 test("terminal /help lists only offered commands and one command's detail on demand", { timeout: 20_000 }, async (t) => {

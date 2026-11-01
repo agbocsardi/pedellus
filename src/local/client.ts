@@ -7,7 +7,8 @@ import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "..
 import type { HistoryPage, HistoryQuery } from "../history/index.js";
 import type { MemoryDigestStartResult, MemoryDigestStatusView } from "../history/memory-digest.js";
 import type { GatewayModelList, GatewayModelSelection, GatewayModelSelectionRequest } from "../runtime.js";
-import type { McpAdminListing, McpApproveResult } from "../mcp/index.js";
+import type { McpAdminListing, McpCallbackResult } from "../mcp/index.js";
+import type { McpAuthorizationLink } from "../mcp/surface.js";
 import type {
   TerminalAttachmentSubmission,
   TerminalConversation,
@@ -56,11 +57,12 @@ export interface LocalGatewayClient extends TerminalConversation {
   digestStart(context: Context): Promise<MemoryDigestStartResult>;
   /** Bounded read-only digest status: no scan, no model call, no cursor change. */
   digestStatus(context: Context): Promise<MemoryDigestStatusView>;
-  /** Owner-only MCP management: read-only listing, one exact entry, and the two decisions. */
+  /** MCP status and callback ingress over the already-authenticated attach. */
   mcpList(context: Context): Promise<McpAdminListing>;
-  mcpShow(id: string, context: Context): Promise<{ readonly found: boolean; readonly text: string }>;
-  mcpApprove(id: string, context: Context): Promise<McpApproveResult>;
-  mcpDeny(id: string, context: Context): Promise<McpApproveResult>;
+  mcpSubmitCallback(text: string, context: Context): Promise<McpCallbackResult>;
+  /** Direct, transient owner delivery from the gateway; never a transcript or durable outbox entry. */
+  onMcpAuthorization?: ((authorization: McpAuthorizationLink) => void) | undefined;
+  onMcpNotice?: ((text: string) => void) | undefined;
   historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage>;
   listEpisodes(sessionKey: string, query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage>;
   episode(sessionKey: string, startEntryId: number, context: Context): Promise<HistoryEpisode | undefined>;
@@ -128,6 +130,8 @@ export async function connectLocalGateway(options: ConnectLocalGatewayOptions): 
 class LocalGatewayConnection implements LocalGatewayClient {
   id = 0;
   sessionKey = "";
+  onMcpAuthorization: ((authorization: McpAuthorizationLink) => void) | undefined;
+  onMcpNotice: ((text: string) => void) | undefined;
   tools: readonly string[] = [];
   contextRefresh = false;
   presets = false;
@@ -301,16 +305,8 @@ class LocalGatewayConnection implements LocalGatewayClient {
     return result.listing;
   }
 
-  async mcpShow(id: string, context: Context): Promise<{ readonly found: boolean; readonly text: string }> {
-    return this.call("mcpShow", { id }, context);
-  }
-
-  async mcpApprove(id: string, context: Context): Promise<McpApproveResult> {
-    return this.call("mcpApprove", { id }, context);
-  }
-
-  async mcpDeny(id: string, context: Context): Promise<McpApproveResult> {
-    return this.call("mcpDeny", { id }, context);
+  async mcpSubmitCallback(text: string, context: Context): Promise<McpCallbackResult> {
+    return this.call("mcpCallback", { text }, context);
   }
 
   async historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage> {
@@ -457,7 +453,19 @@ class LocalGatewayConnection implements LocalGatewayClient {
     }
     if ("event" in message) {
       if (message.event === "snapshot") this.queueSnapshot(message.snapshot);
-      else this.receiveSettlement(message.id, message.settlement);
+      else if (message.event === "settled") this.receiveSettlement(message.id, message.settlement);
+      else if (message.event === "mcpAuthorization") {
+        const authorization = asObject(message.authorization);
+        if (authorization !== undefined
+          && typeof authorization.requestId === "string"
+          && typeof authorization.name === "string"
+          && typeof authorization.url === "string"
+          && typeof authorization.expiresAtMs === "number") {
+          this.onMcpAuthorization?.(authorization as unknown as McpAuthorizationLink);
+        }
+      } else if (message.event === "mcpNotice") {
+        this.onMcpNotice?.(message.text);
+      }
       return;
     }
     const pending = this.pending.get(message.id);

@@ -15,7 +15,8 @@ import {
   findConversationCommand,
   SAFE_COMMAND_NAME,
 } from "../help/commands.js";
-import { renderMcpApproval, renderMcpListing, type McpAdminListing, type McpApproveResult } from "../mcp/admin.js";
+import { renderMcpListing, type McpAdminListing, type McpCallbackResult } from "../mcp/admin.js";
+import { looksLikeOAuthCallback } from "../mcp/surface.js";
 import { renderBackgroundStatus } from "../background-status.js";
 import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "../history/episodes.js";
 import {
@@ -114,15 +115,13 @@ export interface TerminalDigestHost {
 }
 
 /**
- * Owner-only MCP management over the already-authenticated local attach. Reading is bounded and
- * changes nothing; `approve` writes configuration or starts one owner-approved OAuth login, and
- * `deny` discards one request. Neither is a model tool, and neither grants authority by itself.
+ * MCP host surface over the already-authenticated local attach. `/mcp` is bounded read-only status.
+ * A callback-shaped input line is offered here before model admission; the host validates it against
+ * the login that originated in this exact session.
  */
 export interface TerminalMcpHost {
   list(): Promise<McpAdminListing>;
-  show(id: string): Promise<{ readonly found: boolean; readonly text: string }>;
-  approve(id: string): Promise<McpApproveResult>;
-  deny(id: string): Promise<McpApproveResult>;
+  submitCallback(text: string): Promise<McpCallbackResult>;
 }
 
 /**
@@ -1207,24 +1206,11 @@ export async function runTerminalConversation(
       }
       case "mcp": {
         const host = offeredHost(io.mcp);
-        const parts = args.trim().split(/\s+/).filter((part) => part.length > 0);
-        if (parts.length === 0) {
-          await notice(renderMcpListing(await host.list()));
+        if (args.trim() !== "") {
+          await notice(conversationCommandUsage("mcp"), true);
           return;
         }
-        const [sub, ...rest] = parts;
-        if ((sub === "show" || sub === "approve" || sub === "deny") && rest.length === 1) {
-          const id = rest[0]!;
-          if (sub === "show") {
-            const shown = await host.show(id);
-            await notice(shown.text, !shown.found);
-            return;
-          }
-          const result = sub === "approve" ? await host.approve(id) : await host.deny(id);
-          await notice(renderMcpApproval(result), result.status === "refused");
-          return;
-        }
-        await notice(conversationCommandUsage("mcp"), true);
+        await notice(renderMcpListing(await host.list()));
         return;
       }
       case "attach":
@@ -1307,7 +1293,11 @@ export async function runTerminalConversation(
         io.prompt?.();
         continue;
       }
-      if (leading.startsWith(LITERAL_SLASH_PREFIX)) {
+      if (io.mcp !== undefined && looksLikeOAuthCallback(line)) {
+        // Handled before submission: a callback is never model input and never a transcript entry.
+        const result = await io.mcp.submitCallback(line);
+        await notice(result.text, !result.accepted);
+      } else if (leading.startsWith(LITERAL_SLASH_PREFIX)) {
         const prefix = line.indexOf(LITERAL_SLASH_PREFIX);
         await queueInput(`${line.slice(0, prefix)}/${line.slice(prefix + LITERAL_SLASH_PREFIX.length)}`);
       } else if (leading.startsWith("/")) {

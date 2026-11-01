@@ -6,10 +6,11 @@ import { parseConfig } from "../config.js";
 import { parseMcpConfig, type McpServerConfig } from "./config.js";
 
 /**
- * Owner-approved writes to the `mcp` block of the gateway's own configuration file.
+ * Owner-authorized writes to the `mcp` block of the gateway's own configuration file.
  *
- * Only an explicit owner approval reaches this module; no model tool, conversation, scheduled run or
- * channel message writes configuration on its own. The edit is deliberately narrow:
+ * Only an explicit owner request in an authenticated mapped chat reaches this module; no scheduled
+ * run, worker, unattended scope or channel message writes configuration on its own. The edit is
+ * deliberately narrow:
  *
  * - edits are serialized per configuration path inside this process;
  * - the file is read once into a snapshot, only `mcp.enabled` and `mcp.servers.<name>` are changed, and
@@ -18,8 +19,8 @@ import { parseMcpConfig, type McpServerConfig } from "./config.js";
  *   immediately before the rename, and the edit is refused if its bytes changed, so a concurrent owner
  *   editor or another writer is not silently reverted by a stale copy;
  * - when the whole `mcp` block was disabled, every other entry present in the file is pinned to
- *   `enabled: false`, so enabling the block activates only the entry the owner approved;
- * - the whole merged document is validated with the same parser a gateway start uses, so an approved
+ *   `enabled: false`, so enabling the block activates only the entry the owner requested;
+ * - the whole merged document is validated with the same parser a gateway start uses, so a requested
  *   entry can never write a configuration this runtime would refuse to open;
  * - the write is atomic (temporary file in the same directory, then rename) and keeps the file's
  *   existing mode.
@@ -32,7 +33,7 @@ import { parseMcpConfig, type McpServerConfig } from "./config.js";
  * landed before that comparison, but a writer that lands in the few microseconds between the comparison,
  * the mode change and the rename is still overwritten. POSIX has no compare-and-swap for file content
  * and no lock an arbitrary editor honors, so the window is narrowed and reported, not removed. A removal
- * is bound to the entry the approving owner was shown: an entry on disk that no longer parses to that
+ * is bound to the entry this gateway currently holds: an entry on disk that no longer parses to that
  * entry is refused instead of deleted. A change takes effect at the next gateway start; this module never
  * reopens or hot-reloads a runtime.
  */
@@ -48,12 +49,14 @@ export interface McpConfigEditResult {
   readonly servers: readonly string[];
   /** Whether the block enables MCP after this edit. */
   readonly enabled: boolean;
+  /** The validated configuration a running gateway applies after this write. */
+  readonly config: import("./config.js").McpConfig;
 }
 
 /**
  * The `mcp` block one owner disclosure described, taken from the configuration a gateway opened with.
  *
- * A `config` approval's effects depend on the block's state on disk (whether it was already enabled, and
+ * A write's effects depend on the block's state on disk (whether it was already enabled, and
  * which entries a turn-on would pin), so the disclosure and the write must read the same state. The write
  * refuses when the block on disk no longer matches this expectation instead of applying effects the owner
  * never saw.
@@ -184,7 +187,7 @@ async function writeDocument(
     if (current.text !== snapshot.text || !sameIdentity(current.identity, snapshot.identity)) {
       throw new Error(
         "The configuration file changed on disk while this edit was prepared; nothing was written. " +
-        "Review the request again and approve it before retrying.",
+        "Review the change and retry it before the file changes again.",
       );
     }
     // Keep the mode the file has at replacement time, so an outside chmod is not reverted.
@@ -196,13 +199,12 @@ async function writeDocument(
 }
 
 /**
- * Add or replace one validated server entry and enable the block. Only the approved entry may become
- * newly active: when the block was off, every other entry is pinned to `enabled: false` first.
+ * Add or replace one validated server entry and enable the block. Only the requested entry may
+ * become newly active: when the block was off, every other entry is pinned to `enabled: false` first.
  *
- * `expectedBlock` is the block state the approving owner was shown. When it is given and the file no longer
- * holds it, the write is refused: the entry would otherwise land with effects the disclosure did not
- * describe, such as pinning entries the gateway never opened with. A start re-reads the file, so the owner
- * can restart and review again.
+ * `expectedBlock` is the block state this gateway reflects. When it is given and the file no longer
+ * holds it, the write is refused: the entry would otherwise land with pinning effects the owner did
+ * not request. A restart re-reads the file, so the request can be reviewed again.
  */
 export async function writeMcpServerEntry(
   edit: McpConfigEdit,
@@ -216,9 +218,9 @@ export async function writeMcpServerEntry(
     const block = rawMcpBlock(document);
     if (expectedBlock !== undefined && !blockMatches(block, expectedBlock)) {
       throw new Error(
-        "The mcp block in the configuration file is not the one this gateway opened with, so the approval " +
-        "would not apply the effects that were disclosed; nothing was written. Restart the gateway to re-read " +
-        "the file, then review and approve again.",
+        "The mcp block in the configuration file is not the one this gateway reflects, so the write " +
+        "would not apply the effects that were requested; nothing was written. Restart the gateway to re-read " +
+        "the file, then request the change again.",
       );
     }
     const servers = rawServers(block);
@@ -226,7 +228,7 @@ export async function writeMcpServerEntry(
     const nextServers: Record<string, unknown> = { ...servers };
     if (!blockWasEnabled) {
       // Turning the block on would otherwise activate every entry it already held. Pinning keeps the
-      // owner's approved authority to exactly this one entry; an entry that is already disabled stays
+      // owner's requested authority to exactly this one entry; an entry that is already disabled stays
       // as it is.
       for (const [key, value] of Object.entries(nextServers)) {
         if (key === name || !isRecord(value) || value.enabled === false) continue;
@@ -236,10 +238,10 @@ export async function writeMcpServerEntry(
     nextServers[name] = entry;
     const next = { ...block, enabled: true, servers: nextServers };
     const validated = parseConfig({ ...document, mcp: next }, dirname(edit.configFile));
-    if (validated.mcp === undefined) throw new Error("The approved MCP entry did not validate");
+    if (validated.mcp === undefined) throw new Error("The requested MCP entry did not validate");
     await writeDocument(edit, snapshot, { ...document, mcp: next });
     const names = sortedNames(validated.mcp.servers);
-    return { servers: names, enabled: validated.mcp.enabled };
+    return { servers: names, enabled: validated.mcp.enabled, config: validated.mcp };
   });
 }
 
@@ -247,7 +249,7 @@ export async function writeMcpServerEntry(
  * Remove one server entry. `mcp.enabled` is left exactly as it is: disabling the whole capability is
  * a separate owner decision, not a side effect of removing one server.
  *
- * `expectedEntry` is the entry the approving owner was shown. When it is given and the entry on disk no
+ * `expectedEntry` is the entry this gateway currently holds. When it is given and the entry on disk no
  * longer parses to that entry, nothing is removed: a bare name would otherwise delete whatever replaced
  * it, including an entry with different authority. An on-disk entry that no longer validates cannot be
  * compared to the disclosed one, so it is refused as well.
@@ -265,7 +267,7 @@ export async function removeMcpServerEntry(
     if (!Object.hasOwn(servers, name)) throw new Error(`Server ${name} is not in the configuration file`);
     if (expectedEntry !== undefined && !sameEntry(edit.workspace, name, servers[name], expectedEntry)) {
       throw new Error(
-        `Server ${name} in the configuration file is not the entry that was approved; nothing was removed. ` +
+        `Server ${name} in the configuration file is not the entry this gateway holds; nothing was removed. ` +
         "Review the change on disk, then request the removal again.",
       );
     }
@@ -274,7 +276,9 @@ export async function removeMcpServerEntry(
     const validated = parseConfig({ ...document, mcp: next }, dirname(edit.configFile));
     await writeDocument(edit, snapshot, { ...document, mcp: next });
     const names = Object.keys(validated.mcp?.servers ?? {}).sort((left, right) => left.localeCompare(right, "en-US"));
-    return { servers: names, enabled: validated.mcp?.enabled === true };
+    const mcp = validated.mcp;
+    if (mcp === undefined) throw new Error("The MCP configuration did not validate after the removal");
+    return { servers: names, enabled: mcp.enabled, config: mcp };
   });
 }
 

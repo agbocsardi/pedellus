@@ -440,6 +440,19 @@ async function runAgent(
       ...(conversation === undefined ? {} : { conversation }),
       context,
     });
+    // Direct owner delivery from a live MCP login. This is not a transcript entry and not a
+    // durable channel record; the URL exists only on this attached terminal.
+    client.onMcpAuthorization = (authorization) => {
+      stdout.write([
+        "",
+        "MCP OAuth authorization URL (owner only):",
+        authorization.url,
+        `Valid until ${new Date(authorization.expiresAtMs).toISOString()}. Open it as the owner, or paste the ` +
+          "callback URL back into this terminal.",
+        "",
+      ].join("\n"));
+    };
+    client.onMcpNotice = (text) => { stdout.write(`\n${text}\n`); };
     // Readline's post-line size check bounds admission, not its pre-newline input buffer.
     input = createInterface({ input: stdin, output: stdout, terminal: Boolean(stdin.isTTY && stdout.isTTY) });
     input.once("close", () => { inputClosed = true; });
@@ -480,15 +493,13 @@ async function runAgent(
             },
           }
         : {}),
-      // Owner-only MCP management over the same authenticated attach. It is not a model tool: the
-      // gateway writes configuration or starts an OAuth login only after this explicit decision.
+      // MCP status over the same authenticated attach. Callback-shaped lines are offered to the
+      // gateway before model admission in the terminal loop.
       ...(client.mcp
         ? {
             mcp: {
               list: () => client!.mcpList(context),
-              show: (id: string) => client!.mcpShow(id, context),
-              approve: (id: string) => client!.mcpApprove(id, context),
-              deny: (id: string) => client!.mcpDeny(id, context),
+              submitCallback: (text: string) => client!.mcpSubmitCallback(text, context),
             },
           }
         : {}),
