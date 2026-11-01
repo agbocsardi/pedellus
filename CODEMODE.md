@@ -183,7 +183,7 @@ pruned durable capture must still contain `codemode`, the current worker grants
 must still include it, and the capture records the classifier model identity:
 removing or changing `classifierModel` prunes that identity in the same commit, so
 restoring the same configuration later cannot resurrect it for an existing worker.
-Root, channel-state, fork, raw/other task-owned, isolated cron, memory-digest and
+Root, channel-state, fork, raw/other task-owned, scheduled-run automation, memory-digest and
 retired-worker scopes never receive Code Mode, so they cannot reach `models.*`.
 The local CLI attachment is an authenticated mapped `cli:<name>` chat and follows
 the same mapped-chat rule.

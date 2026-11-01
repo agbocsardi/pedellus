@@ -106,7 +106,7 @@ but never receive Telegram, cron or recursive worker delegation. A worker-specif
 call-time hook checks its durable capture; reopening prunes it against current config,
 and completion/cancellation retires it. See [worker authority](WORKERS.md).
 Code Mode can also be enabled independently (`codemode.enabled`). Root, state,
-forked, raw and other task-owned conversations, digest runs and isolated cron targets
+forked, raw and other task-owned conversations, digest runs and scheduled-run automation conversations
 remain denied. MCP connections and their configured cwd remain gateway-owned, not
 isolated inside a worker's shell sandbox or worktree.
 
