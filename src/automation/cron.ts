@@ -882,12 +882,18 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           }
           let refused: string | null = null;
           let waitFor: TaskId | null = null;
+          let fenced = false;
           let prepareError: string | null = null;
           let target: ConversationId | null = null;
           // Read the recorded conversation pointers and their own class markers before the claim
           // commit. A snapshot read creates nothing, so a damaged or hand-edited pointer cannot even
           // have a marker written onto the chat it names; a pointer that changed before the commit
-          // is simply not adopted and costs one new conversation.
+          // is simply not adopted and costs one new conversation. `Tx` has no non-creating
+          // conversation-document read, so this pre-read is the only correct way to avoid
+          // materializing a marker on an unrelated conversation. The marker is stale evidence by
+          // commit time and `ensureAutomationConversation` re-reads owner, parent and marker there,
+          // so owner/parent/root safety is decided in the transaction that also records the pointer:
+          // no chat, root, fork or task-owned conversation can be pulled into the automation class.
           const before = await runtime.snapshot(CronJobsDoc, running.conversationId, context);
           const beforeJob = before?.jobs.find((candidate) => candidate.id === input.jobId);
           const jobPointer = await recordedAutomationConversation(
@@ -906,6 +912,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
               // A fenced run leaves the catch-all queue too: a one-off cancelled while the gateway
               // was down is claimed again on reopen and terminates here.
               await leaveOneOffQueue(doc, running.id);
+              fenced = true;
               return fence.rejected;
             }
             const stored = doc.jobs.find((candidate) => candidate.id === input.jobId)!;
@@ -958,15 +965,22 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
                 // A refused occurrence leaves the conversation untouched: nothing is created or
                 // classified for it, so a full queue never leaves a new catch-all behind.
                 if (refused === null) {
-                  target = await ensureAutomationConversation(tx, {
-                    originConversationId: running.conversationId,
-                    conversationClass: "one-off",
-                    jobId: null,
-                    recorded: oneOffPointer?.id === doc.oneOffConversationId ? oneOffPointer : null,
-                  });
-                  doc.oneOffConversationId = target;
                   const head = live[0];
-                  if (head !== undefined && head.taskId !== running.id) waitFor = head.taskId as TaskId;
+                  if (head !== undefined && head.taskId !== running.id) {
+                    // Waiting commits only this waiting state: a queued run needs no target yet, so
+                    // it neither creates nor records a catch-all conversation. It re-reads the
+                    // document when it wakes, so the one-catch-all-per-origin identity cannot be
+                    // split by two runs claiming in the same tick.
+                    waitFor = head.taskId as TaskId;
+                  } else {
+                    target = await ensureAutomationConversation(tx, {
+                      originConversationId: running.conversationId,
+                      conversationClass: "one-off",
+                      jobId: null,
+                      recorded: oneOffPointer?.id === doc.oneOffConversationId ? oneOffPointer : null,
+                    });
+                    doc.oneOffConversationId = target;
+                  }
                 }
               }
             }
@@ -1018,6 +1032,9 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
             };
           }, context);
 
+          // A run whose claim committed a terminal fence has already settled: there is nothing left
+          // to finish, and finishing again would rely on the framework refusing a terminal task.
+          if (fenced) return;
           if (runtime.signal.aborted || refused !== null) return;
           if (prepareError !== null || target === null) {
             await finishRun(
@@ -1110,7 +1127,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
               // The boundary is itself a durable entry: a retry after a crash between `reset(...)` and
               // `submit(...)` finds it as the newest entry and places no second one. A boundary that
               // is already the end of the conversation means the run's context is already empty.
-              const newest = await tx.scanEntries({ conversationId: targetConversationId }, 1);
+              const newest = await tx.scanEntries({ conversationId: targetConversationId, order: "descending" }, 1);
               boundaryPlaced = newest.items[0]?.kind === ResetEntry.kind;
               return undefined;
             }, context);

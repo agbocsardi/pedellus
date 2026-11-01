@@ -24,9 +24,10 @@ import { defineDoc, type ConversationId, type Tx } from "@earendil-works/pi-dura
 export const CRON_CONVERSATION_KIND = "nanobot.cron.conversation";
 
 /**
- * Bound on the catch-all one-off queue: one entry per admitted but not yet finished one-off run,
- * plus the entry of the run holding the catch-all conversation. A full queue refuses the new
- * occurrence with a fixed, visible error instead of growing without limit or running out of order.
+ * Bound on the catch-all one-off queue: live entries for admitted but not yet finished one-off
+ * runs, counting the run that currently holds the catch-all conversation. A full queue refuses the
+ * new occurrence with a fixed, visible error instead of growing without limit or running out of
+ * order.
  */
 export const CRON_ONE_OFF_QUEUE_LIMIT = 16;
 
@@ -90,16 +91,57 @@ export interface AutomationConversationRequest {
 }
 
 /**
+ * Classify one conversation as the automation conversation `expected` names, or `undefined` when it
+ * may not be adopted.
+ *
+ * Adoption needs both halves: the conversation itself must still be ownerless and unforked, and its
+ * `nanobot.cron.conversation` marker must name this origin, this job and (when the caller already
+ * knows it) this class. A damaged or hand-edited pointer to a chat, the root, a fork, a task-owned
+ * conversation or another job's conversation therefore costs one classification instead of pulling
+ * that conversation into this class.
+ *
+ * The run's committing transaction and the host's open-time restore decide adoption with this one
+ * predicate, so a conversation the host classifies at open is classified by the same rule a run
+ * applies to the pointer it is about to reuse.
+ */
+export function classifyAutomationConversation(
+  conversation: { readonly owner?: unknown; readonly parent?: unknown } | undefined,
+  marker: unknown,
+  expected: {
+    readonly originConversationId: ConversationId;
+    readonly jobId: string | null;
+    /** Compared only when the caller knows it; the open-time restore reads it from the marker. */
+    readonly conversationClass?: CronConversationClass;
+  },
+): CronConversationRecord | undefined {
+  if (conversation === undefined || conversation.owner !== undefined || conversation.parent !== undefined) {
+    return undefined;
+  }
+  const classified = automationConversationOf(marker);
+  if (classified === undefined
+    || classified.originConversationId !== expected.originConversationId
+    || classified.jobId !== expected.jobId
+    || (expected.conversationClass !== undefined
+      && classified.conversationClass !== expected.conversationClass)) {
+    return undefined;
+  }
+  return classified;
+}
+
+/**
  * Resolve this run's automation conversation inside the committing transaction: reuse the recorded
  * one while its own marker still names this origin and this job/class, otherwise create a new
  * ownerless conversation and record it. The marker is (re)written either way, so a conversation the
  * owning document points at is always classified as this job's automation conversation and nothing
  * else's.
  *
- * Adoption needs both halves: the conversation itself must still be ownerless and unforked, and its
- * `nanobot.cron.conversation` marker must name this origin, class and job. A damaged or hand-edited
- * pointer to a chat, the root, a fork, a task-owned conversation or another job's conversation
- * therefore costs one new conversation instead of pulling that conversation into this class.
+ * `request.recorded` is a pre-commit snapshot because `Tx` has no non-creating conversation-document
+ * read: materializing a marker document only to look at it would write one onto the chat a damaged
+ * pointer names. That pair is therefore stale evidence by the time this commit runs, which is
+ * harmless but worth stating: the conversation record and the marker are re-read here, the adoption
+ * decision is made here with `classifyAutomationConversation`, and the owner/parent checks are part
+ * of it. A chat, the root, a fork or a task-owned conversation can therefore never be pulled into
+ * this class by a pointer that changed in between.
  */
 export async function ensureAutomationConversation(
   tx: Tx,
@@ -110,16 +152,9 @@ export async function ensureAutomationConversation(
     || request.recorded.id === request.originConversationId
     ? undefined
     : await tx.conversation(request.recorded.id as ConversationId);
-  const marker = automationConversationOf(request.recorded?.marker);
-  const recorded = candidate !== undefined
-    && marker !== undefined
-    && marker.originConversationId === request.originConversationId
-    && marker.conversationClass === request.conversationClass
-    && marker.jobId === request.jobId
-    && candidate.owner === undefined
-    && candidate.parent === undefined
-    ? candidate
-    : undefined;
+  const recorded = classifyAutomationConversation(candidate, request.recorded?.marker, request) === undefined
+    ? undefined
+    : candidate;
   const conversationId = recorded === undefined
     ? (await tx.createConversation({ ownership: { kind: "ownerless" } })).id
     : recorded.id;

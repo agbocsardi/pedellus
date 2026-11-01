@@ -1255,3 +1255,32 @@ fenced claim that leaves no queue entry, ingress refusal of a forged mapping, an
 workspace context in the real gateway. Verified offline: typecheck/build, 318 behavior checks and 83
 core acceptance; the three signature tests (boundary, per-run context, fenced claim) were confirmed
 to fail against the pre-fix behaviour. Execution checks were not run for this fix.
+
+### Session — cron conversation model, second review
+
+A second independent review reproduced one major finding with a probe: the automation-conversation
+class was restored *after* the mapped-chat authority pass at gateway open, so a chat key mapped to an
+automation conversation was admitted as a chat, became a cron owner with an unevictable snapshot
+slot, and could never be reclassified for that process (`historyEntries` accepted it and
+`conversationFor` returned it with the full coding allowlist plus `cron` and `history`). The stored
+session map is now read once at open, the class is restored from the map's own origins before any
+mapped key is admitted as chat, adoption uses the same marker/owner/parent predicate a run uses
+(`classifyAutomationConversation`), and the open path skips an automation-classified id entirely (no
+`cronOwners`, no `sessionConversations`, no snapshot install). The old guard was `cronOwners.has`,
+i.e. the set the authority pass had just filled, which is why it could veto the very id it had to
+protect.
+
+Also fixed: a queued one-off committed and recorded a catch-all conversation before deciding to wait,
+so two same-tick claims could split the one-catch-all-per-origin record (it now commits only its
+waiting state and re-reads the document when it wakes); the read-then-commit exposure of the
+pre-claim marker snapshot is documented where it happens; the reopen restore shares the run's
+adoption predicate instead of re-deriving it; the claim phase returns explicitly after a terminal
+fence commit instead of relying on the framework refusing a second `finishRun`; the boundary scan
+states `order: "descending"`; and CRON.md no longer claims a crash between `reset(...)` and
+`submit(...)` can never admit a second boundary (it can, harmlessly, while the conversation is
+busy).
+
+Coverage is 14 cases: the reopened-forged-mapping case and the waiting-run case were both confirmed
+to fail against the previous commit (the reopened process accepted the forged history read, and the
+waiting run created conversation 17). Verified offline: typecheck/build, 320 behavior checks and 83
+core acceptance; the cron file ran three times with no flakes. Execution checks were not run.

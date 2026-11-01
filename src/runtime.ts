@@ -11,6 +11,7 @@ import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./conte
 import { CRON_RUN_TASK_NAME, CronJobsDoc, createCronFoundation } from "./automation/cron.js";
 import {
   automationConversationOf,
+  classifyAutomationConversation,
   CronConversationDoc,
   type CronConversationClass,
 } from "./automation/cron-conversations.js";
@@ -84,6 +85,7 @@ import {
   readMappedSessions,
   type ChatScopeExclusion,
   type HistoryChatSession,
+  type MappedSession,
 } from "./history/scope.js";
 import { ensureStoreIdentity, type StoreIdentity } from "./history/store-identity.js";
 import { modelKey, parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
@@ -2230,6 +2232,79 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // the same mapping and are restored even without a context snapshot provider: the policy pass
     // below would otherwise strip the cron tool from every persisted origin session on reopen.
     const mappedSessionKeys = new Map<ConversationId, string>();
+    // The stored mapping is read once here, before any scope decision: a scheduled run's automation
+    // conversation has to be classified before a mapped key naming it can be admitted as chat, and a
+    // class applied after that admission could never be withdrawn again.
+    let storedMappedSessions: readonly MappedSession[] | undefined;
+    if (options.contextSnapshotProvider || cronEnabled) {
+      await root.commit(async (tx) => { await tx.doc(SessionMap, root.id); }, context);
+      const mapping = await harness.snapshot(SessionMap, root.id, context);
+      storedMappedSessions = readMappedSessions(mapping?.sessions, root.id);
+      if (options.contextSnapshotProvider && storedMappedSessions.length > CONTEXT_LIMITS.maxConversations) {
+        throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
+      }
+    }
+    // Restore the class of every automation conversation the committed cron documents record, before
+    // the mapped-chat authority pass below can see a key that names one. Origins are the stored
+    // mapping itself, not the owner sets that pass builds: a guard drawn from those sets would veto
+    // the classification of exactly the mapping it has to refuse. Only a conversation that is still
+    // ownerless and unforked and carries this host's marker for that origin and job is classified
+    // (`classifyAutomationConversation`, the same rule a run applies to a recorded pointer). An
+    // ordinary chat carries no such marker, so this never takes a chat out of chat scope, while a
+    // missing, foreign or damaged marker leaves the recorded ID unclassified and the job's next run
+    // records a fresh conversation in its place. This is a read: it creates no document and starts
+    // nothing.
+    if (cronEnabled && storedMappedSessions !== undefined) {
+      const recordedByOrigin = new Map<ConversationId, { conversationId: ConversationId; jobId: string | null }[]>();
+      for (const { conversationId: originConversationId } of storedMappedSessions) {
+        let doc: { readonly jobs: readonly { readonly id: string; readonly conversationId?: number | null }[]; readonly oneOffConversationId?: number | null } | undefined;
+        try {
+          doc = await harness.snapshot(CronJobsDoc, originConversationId, context);
+        } catch {
+          continue;
+        }
+        if (doc === undefined) continue;
+        const recorded: { conversationId: ConversationId; jobId: string | null }[] = [];
+        for (const job of doc.jobs) {
+          if (Number.isSafeInteger(job.conversationId) && (job.conversationId as number) > 0) {
+            recorded.push({ conversationId: job.conversationId as ConversationId, jobId: job.id });
+          }
+        }
+        if (Number.isSafeInteger(doc.oneOffConversationId) && (doc.oneOffConversationId as number) > 0) {
+          recorded.push({ conversationId: doc.oneOffConversationId as ConversationId, jobId: null });
+        }
+        if (recorded.length > 0) recordedByOrigin.set(originConversationId, recorded);
+      }
+      for (const [originConversationId, recorded] of recordedByOrigin) {
+        for (const candidate of recorded) {
+          const { conversationId } = candidate;
+          // Neither the root nor a run's own origin is ever an automation conversation, whatever a
+          // damaged document records.
+          if (conversationId === root.id || conversationId === originConversationId) continue;
+          let record: { readonly owner?: unknown; readonly parent?: unknown } | undefined;
+          let marker: unknown;
+          try {
+            record = await root.commit((tx) => tx.conversation(conversationId), context);
+          } catch {
+            record = undefined;
+          }
+          try {
+            marker = await harness.snapshot(CronConversationDoc, conversationId, context);
+          } catch {
+            marker = undefined;
+          }
+          const classified = classifyAutomationConversation(
+            record, marker, { originConversationId, jobId: candidate.jobId },
+          );
+          if (classified === undefined) continue;
+          automationConversations.set(conversationId, {
+            originConversationId,
+            conversationClass: classified.conversationClass,
+            jobId: classified.jobId,
+          });
+        }
+      }
+    }
     // History retrieval is independent of the context snapshot opt-in: every mapped chat
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
@@ -2251,15 +2326,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
         }
       }
     }
-    if (options.contextSnapshotProvider || cronEnabled) {
-      await root.commit(async (tx) => { await tx.doc(SessionMap, root.id); }, context);
-      const mapping = await harness.snapshot(SessionMap, root.id, context);
-      const sessions = mapping?.sessions;
-      const mappedSessions = readMappedSessions(sessions, root.id);
-      if (options.contextSnapshotProvider && mappedSessions.length > CONTEXT_LIMITS.maxConversations) {
-        throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
-      }
-      for (const { sessionKey, conversationId } of mappedSessions) {
+    if (storedMappedSessions !== undefined) {
+      for (const { sessionKey, conversationId } of storedMappedSessions) {
+        // A stored key naming an automation conversation is never a chat session: no cron owner, no
+        // snapshot slot that can never be evicted and no resume target, exactly as the channel
+        // ingress refuses that same key. The class pass above already decided this.
+        if (automationConversations.has(conversationId)) continue;
         if (options.contextSnapshotProvider) {
           if (!(await harness.conversation(conversationId, context))) {
             throw new Error("Stored session mapping points to a missing conversation");
@@ -2269,52 +2341,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
         cronOwners.set(conversationId, { ownerId: sessionKey, sessionKey });
         sessionConversations.add(conversationId);
         mappedSessionKeys.set(conversationId, sessionKey);
-      }
-    }
-    // Restore the class of every automation conversation the committed cron documents record, before
-    // resume can schedule a run into one. Only a conversation that still carries this host's marker
-    // for that origin counts; a missing, foreign or damaged marker leaves the recorded ID
-    // unclassified, and the job's next run records a fresh conversation in its place. This is a
-    // read: it creates no document and starts nothing.
-    if (cronEnabled) {
-      for (const originConversationId of cronOwners.keys()) {
-        let doc: { readonly jobs: readonly { readonly id: string; readonly conversationId?: number | null }[]; readonly oneOffConversationId?: number | null } | undefined;
-        try {
-          doc = await harness.snapshot(CronJobsDoc, originConversationId, context);
-        } catch {
-          continue;
-        }
-        if (doc === undefined) continue;
-        const recorded: { conversationId: number; jobId: string | null }[] = [];
-        for (const job of doc.jobs) {
-          if (Number.isSafeInteger(job.conversationId) && (job.conversationId as number) > 0) {
-            recorded.push({ conversationId: job.conversationId as number, jobId: job.id });
-          }
-        }
-        if (Number.isSafeInteger(doc.oneOffConversationId) && (doc.oneOffConversationId as number) > 0) {
-          recorded.push({ conversationId: doc.oneOffConversationId as number, jobId: null });
-        }
-        for (const candidate of recorded) {
-          const conversationId = candidate.conversationId as ConversationId;
-          // A mapped session or the root is never an automation conversation, whatever a damaged
-          // document records; classifying one would take a chat out of chat scope.
-          if (cronOwners.has(conversationId) || conversationId === root.id) continue;
-          let marker: unknown;
-          try {
-            marker = await harness.snapshot(CronConversationDoc, conversationId, context);
-          } catch {
-            marker = undefined;
-          }
-          const classified = automationConversationOf(marker);
-          if (classified === undefined
-            || classified.originConversationId !== originConversationId
-            || classified.jobId !== candidate.jobId) continue;
-          automationConversations.set(conversationId, {
-            originConversationId,
-            conversationClass: classified.conversationClass,
-            jobId: classified.jobId,
-          });
-        }
       }
     }
 

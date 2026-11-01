@@ -74,6 +74,14 @@ chat policy, so a forged or stale map entry cannot reach either path. The shared
 classifies them explicitly (`automation`) rather
 than relying on them being absent from the session map.
 
+Opening a store reads the session map once and restores that class from the stored map's own origins
+*before* any mapped key is admitted as a chat, so a mapping forged, imported or left behind by an
+older layout is refused by the process that first reads it, not only by a process that watched the
+conversation being created. The restore decides adoption with the same rule a run applies to a
+recorded pointer (the conversation is still ownerless and unforked, and its marker names that origin
+and job), so it never takes an ordinary chat — which carries no such marker — out of chat scope, and
+the authority pass cannot veto the classification of the mapping it has to refuse.
+
 ## Timer handoff
 
 When the timer wakes at `scheduledAtMs`, one commit does all of this before any model request:
@@ -153,7 +161,8 @@ Each automation conversation also carries its own class marker, one small docume
 
 It is written in the same commit that creates or reuses the conversation, and again by every run's
 host preparation. A reopen classifies a conversation only when this marker still names the origin
-and job that the job document records.
+and job that the job document records, and only while the conversation is still ownerless and
+unforked — the same predicate a run applies to the pointer it is about to reuse.
 
 `timerTaskId` is the only timer allowed to arm the next slot. `executionTaskId` is the newest run
 task and drives overlap checks. `lastOutcome` is the newest run result; `lastSkip` is the newest
@@ -217,20 +226,27 @@ boundary and the occurrence input, waits for the answer, and records the result.
 
 A run that has to wait behind another one-off run commits only its waiting state (`waiting` on the
 queue entry ahead of it) and holds no invocation, no prepared authority and no context while it is
-queued. When that task becomes terminal, the wait resolves and the queued run claims again; the
-document's order decides who is next, so the order survives a restart and is never decided in
-memory. A one-off run's timer is already terminal, so nothing about the queue is a schedule.
+queued. It also creates and records no catch-all conversation: a waiting run needs no target yet, and
+it re-reads the origin's document when it wakes, so a queued occurrence can never split or overwrite
+the one-catch-all-per-origin record. When that task becomes terminal, the wait resolves and the
+queued run claims again; the document's order decides who is next, so the order survives a restart
+and is never decided in memory. A one-off run's timer is already terminal, so nothing about the
+queue is a schedule.
 
 `execute` places one native reset (`Conversation.reset`, the same entry `/new` commits) in a
 background run's conversation, then submits one native input with the stable request ID
 `cron:<jobId>:<scheduledAtMs>`. Both are ordered admissions on that conversation, so the boundary is
 always ahead of the input even when the conversation was still finishing. A retry after a crash
-first looks for its own submission and then at the conversation's newest entry: an occurrence that
-is already placed is waited on instead of being submitted twice, and a conversation whose newest
-entry is already a reset has its boundary in place, so neither path adds a second `pi.reset` (and no
-empty closed episode). That check reads the boundary itself, which is durable, rather than separate
-state that could disagree with it. Durable's `submissionByRequest` behavior makes the submit itself
-idempotent. There is no waiting task on a submission ID; the execute phase waits directly.
+first looks for its own submission and then at the conversation's newest placed entry: an occurrence
+that is already placed is waited on instead of being submitted twice, and a conversation whose newest
+*placed* entry is already a reset has its boundary in place, so the retry adds no second `pi.reset`
+and closes no empty episode. That check reads the boundary itself, which is durable, rather than
+separate state that could disagree with it. `Conversation.reset` is an ordered write submission too,
+so a conversation that is still busy can have its newest *placed* entry be something other than that
+reset and admit a second one; that is harmless — the later boundary still precedes the retry's input
+and the empty episode between the two is omitted — but it is not prevented. Durable's
+`submissionByRequest` behavior makes the submit itself idempotent. There is no waiting task on a
+submission ID; the execute phase waits directly.
 
 `createCronFoundation({ prepare, finalize, reset })` exposes the host seams. `prepare` receives the
 transaction, the origin and target conversation IDs, the job, and the occurrence. It runs inside the
@@ -487,8 +503,11 @@ fault document is itself ignored rather than replacing job or outbox data.
 - An automation conversation deliberately has no SessionMap entry, so nothing maps to it and it
   cannot become a cron owner. The channel ingress path applies the same chat-scope rule and refuses
   a session key mapped to one instead of continuing with chat policy. After a reopen the Gateway
-  finds a live run's target from the run task's checkpoint plus the class the origin's cron documents
-  record, and restores that target's snapshot before applying conversation policy. At the
+  restores the class before it admits any mapped key as a chat, finds a live run's target from the
+  run task's checkpoint plus the class the origin's cron documents record, and restores that
+  target's snapshot before applying conversation policy. A stored key naming an automation
+  conversation therefore gets no cron ownership, no snapshot slot and no chat policy from that
+  reopen either, and the policy pass leaves it with no tools. At the
   256-snapshot cap it evicts the oldest idle background target rather than failing the run; a mapped
   session's snapshot, the cron tool and the cron foundation are never added to an automation
   conversation.

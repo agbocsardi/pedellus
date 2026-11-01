@@ -424,7 +424,11 @@ authenticated mapped-chat set, the worker spawner set, the web/Telegram/MCP/Code
 classifier scope or the cron-owner set, and its prepared tools are retired when each run ends. The
 channel ingress path reads the same record first and refuses the mapping with the same fixed message
 before anything else runs, so a mapped automation conversation cannot become a cron owner, gain an
-unevictable snapshot slot or have a live run's capture retired by the chat policy pass.
+unevictable snapshot slot or have a live run's capture retired by the chat policy pass. Opening the
+store reads the session map once and restores that class from the map's own origins before any mapped
+key is admitted as chat, using the same marker/owner/parent predicate a run uses to adopt a recorded
+conversation, so the rejection holds for a mapping that was forged, imported or left behind *before*
+the process started — not only for one written while it ran.
 
 The rule itself and the read pattern live in one place: `chatScopeExclusion` (classify one record),
 `readChatScope` (read one), `partitionChatScope` (split a mapped set) and `chatScopeMessage` (the fixed

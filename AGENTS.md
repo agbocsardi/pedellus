@@ -97,7 +97,9 @@ edits need restart only; unit edits additionally need daemon-reload.
   cron owner or receive chat policy. A scheduled run's automation
   conversation is a distinct class: ownerless, recorded by its origin's cron
   documents and by its own class marker, adopted only while that marker names
-  the same origin and job, and never a chat, an origin, a digest
+  the same origin and job and the conversation is still unforked, restored from
+  the stored map before a reopen admits any mapped key as chat, and never a
+  chat, an origin, a digest
   source, a worker, an MCP/Code Mode/compositor scope or a scheduling scope.
   Isolated cron runs capture an origin subset bounded by current config, prepare it
   per run (including its workspace context), and lose it on completion; persistent
