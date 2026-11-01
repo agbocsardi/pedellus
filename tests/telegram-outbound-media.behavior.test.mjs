@@ -176,6 +176,17 @@ function telegramMock(batches) {
         text: body.text,
       });
     }
+    if (method === 'sendRichMessage') {
+      const messageId = nextMessageId++;
+      const rich = body.rich_message ?? {};
+      sent.push({ chatId: body.chat_id, text: rich.markdown ?? '', messageId, rich });
+      return response({
+        message_id: messageId,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: body.chat_id, type: 'private' },
+        rich_message: rich,
+      });
+    }
     const field = UPLOAD_FIELDS[method];
     if (field !== undefined) {
       const parts = await readMultipart(init.body, init.headers?.['content-type'] ?? init.headers?.get?.('content-type'));

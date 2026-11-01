@@ -56,6 +56,16 @@ import {
   type TelegramQuotedContext,
 } from "./telegram-interactions.js";
 import {
+  PLAIN_TEXT_LIMIT,
+  RICH_TEXT_LIMIT,
+  disableRichMessages,
+  escapeTelegramLiteral,
+  isRichCapabilityRejection,
+  isRichFormatRejection,
+  richMessagesEnabled,
+  splitRichText,
+} from "./telegram-rich.js";
+import {
   TELEGRAM_SEND_METHODS,
   TelegramOutboundRejected,
   outboundRejectionText,
@@ -71,7 +81,8 @@ import type {
 import { isTelegramSendRequest } from "./telegram-tool.js";
 
 const API = "https://api.telegram.org";
-const TELEGRAM_LIMIT = 4096;
+/** The `sendMessage` limit; a rich message uses `RICH_TEXT_LIMIT` and falls back to this. */
+const TELEGRAM_LIMIT = PLAIN_TEXT_LIMIT;
 const MAX_ADMITTED = 1000;
 const MAX_API_ATTEMPTS = 5;
 const POLL_TIMEOUT_MAX = 50;
@@ -164,6 +175,8 @@ export type TelegramPendingDelivery = {
   messageId?: number;
   lastText?: string;
   nextChunkIndex: number;
+  /** Persisted before final delivery; absent with progress uses the pre-rich chunk plan. */
+  chunkPlan?: "rich-v1" | "preview-v1" | "legacy";
   /** `unknown`: an ambiguous external outcome. `failed`: a known-rejected or repeatedly failing delivery, held. */
   deliveryStatus?: "sending" | "unknown" | "failed";
   sendIntent?: { text: string; stage: "preview" | "final"; chunkIndex?: number; startedAt: number };
@@ -463,6 +476,184 @@ export async function runTelegram(
       if (chatSendTails.get(chatId) === tail) chatSendTails.delete(chatId);
     });
     return next;
+  };
+
+  /**
+   * Durable bookkeeping a caller supplies so a text send stays truthful about its own record: the
+   * intent precedes the request, a proven refusal drops it, and an accepted message id is persisted.
+   */
+  type TelegramTextHooks = {
+    /** Persist the write-ahead intent for this exact attempt, before the request leaves. */
+    before(text: string): Promise<void>;
+    /** The request provably did not deliver anything; drop the intent. */
+    abandoned(): Promise<void>;
+    /** Record each accepted message without advancing the whole-chunk cursor. */
+    partAccepted?(messageId: number, text: string): Promise<void>;
+    /** All parts were accepted; advance the whole-chunk cursor. */
+    accepted(messageId: number, text: string): Promise<void>;
+  };
+
+  /** A send with no durable record of its own: nothing to write before, abandon or accept. */
+  const idleTextHooks: TelegramTextHooks = {
+    before: async () => undefined,
+    abandoned: async () => undefined,
+    accepted: async () => undefined,
+  };
+
+  /** Chunk boundaries are independent of the process-local rich capability latch. */
+  const splitOutboundText = (text: string, plan: "rich-v1" | "preview-v1" | "legacy" = "rich-v1"): string[] =>
+    plan === "legacy" ? splitTelegramText(text) :
+      splitRichText(text, plan === "preview-v1" ? PLAIN_TEXT_LIMIT : RICH_TEXT_LIMIT);
+
+  /**
+   * Send one outbound text, preferring a rich markdown message.
+   *
+   * The body is sent as markdown so the visible text is what the model produced. Two rejections fall
+   * back to plain text because both are proven non-sends: the server has no rich method at all (then
+   * latched off for the process) and the body could not be parsed or was too long. Every other
+   * rejection and every ambiguous outcome propagates unchanged, so no caller resends blindly.
+   *
+   * `literal` escapes host-generated text (`/status`, help, control acknowledgements) so rich
+   * markdown renders paths, ids and placeholders exactly as written.
+   */
+  const sendOutboundText = async (
+    chatId: number,
+    text: string,
+    sendOptions: {
+      hooks: TelegramTextHooks;
+      replyTo?: number;
+      mode?: "markdown" | "literal";
+      throttle?: TelegramFloodGate;
+      replaceable?: boolean;
+    },
+  ): Promise<number | undefined> => {
+    const body = sendOptions.mode === "literal" ? escapeTelegramLiteral(text) : text;
+    const reply: { reply_parameters?: { message_id: number; allow_sending_without_reply: boolean } } =
+      sendOptions.replyTo === undefined
+        ? {}
+        : { reply_parameters: { message_id: sendOptions.replyTo, allow_sending_without_reply: false } };
+    const callOptions: ApiCallOptions = {
+      ...(sendOptions.throttle === undefined ? {} : { throttle: sendOptions.throttle }),
+      ...(sendOptions.replaceable === undefined ? {} : { replaceable: sendOptions.replaceable }),
+    };
+    if (richMessagesEnabled()) {
+      let richAccepted = false;
+      try {
+        const sent = await apiCall<Message.RichMessageMessage>(api, "sendRichMessage", signal, async (callSignal) => {
+          await sendOptions.hooks.before(text);
+          if (signal?.aborted) {
+            await sendOptions.hooks.abandoned();
+            throw new TelegramApiError("sendRichMessage", 0, "not-sent");
+          }
+          try {
+            return await withChatSendOrder(chatId, () => api.sendRichMessage(
+              chatId, { markdown: body }, reply, toGrammySignal(callSignal),
+            ));
+          } catch (error) {
+            if (isProvenRefusal(error)) await sendOptions.hooks.abandoned();
+            throw error;
+          }
+        }, callOptions);
+        if (sent === undefined) return undefined;
+        richAccepted = true;
+        await sendOptions.hooks.partAccepted?.(sent.message_id, text);
+        await rememberOutgoingTarget(chatId, sent.message_id, text);
+        await sendOptions.hooks.accepted(sent.message_id, text);
+        return sent.message_id;
+      } catch (error) {
+        if (richAccepted || !(error instanceof TelegramApiError) || error.outcome !== "rejected") throw error;
+        if (isRichCapabilityRejection(error)) {
+          disableRichMessages();
+          console.warn("Telegram rich messages are unavailable here; this process now sends plain text.");
+        } else if (!isRichFormatRejection(error)) {
+          throw error;
+        }
+      }
+    }
+    // Plain fallback: the rich body was refused before anything was shown, so the same text is safe
+    // to send, split inside the sendMessage limit. All parts share one recorded intent, so a crash
+    // leaves the whole chunk ambiguous instead of a later replay sending part of it twice.
+    const parts = splitPlainTextLossless(text);
+    let first: number | undefined;
+    for (let index = 0; index < parts.length; index += 1) {
+      const part = parts[index]!;
+      try {
+        const sent = await apiCall<Message.TextMessage>(api, "sendMessage", signal, async (callSignal) => {
+          await sendOptions.hooks.before(part);
+          if (signal?.aborted) {
+            if (index === 0) await sendOptions.hooks.abandoned();
+            throw new TelegramApiError("sendMessage", 0, "not-sent");
+          }
+          try {
+            return await withChatSendOrder(chatId, () => api.sendMessage(
+              chatId, part, index === 0 ? reply : {}, toGrammySignal(callSignal),
+            ));
+          } catch (error) {
+            if (index === 0 && isProvenRefusal(error)) await sendOptions.hooks.abandoned();
+            throw error;
+          }
+        }, callOptions);
+        if (sent === undefined) {
+          if (first !== undefined) throw new TelegramApiError("sendMessage", 0, "unknown");
+          return undefined;
+        }
+        first = first ?? sent.message_id;
+        await sendOptions.hooks.partAccepted?.(sent.message_id, part);
+        await rememberOutgoingTarget(chatId, sent.message_id, part);
+      } catch (error) {
+        if (first !== undefined || index > 0) {
+          // Earlier parts were accepted, so this chunk as a whole is no longer a definite non-send.
+          throw new TelegramApiError("sendMessage", 0, "unknown", "plain fallback lost part of the chunk");
+        }
+        throw error;
+      }
+    }
+    if (first === undefined) return undefined;
+    await sendOptions.hooks.accepted(first, text);
+    return first;
+  };
+
+  /**
+   * Edit an existing message in place, preferring rich markdown for the same reasons the send path
+   * does. A body Telegram refuses to parse falls back to the plain edit, which is a proven non-edit.
+   * "Not modified" and "not found" stay the caller's concern: they arrive unchanged as rejections.
+   * Returns false only when a replaceable edit was skipped by the flood gate.
+   */
+  const editOutboundText = async (
+    chatId: number,
+    messageId: number,
+    text: string,
+    editOptions: {
+      mode?: "markdown" | "literal";
+      throttle?: TelegramFloodGate;
+      replaceable?: boolean;
+    } = {},
+  ): Promise<boolean> => {
+    const body = editOptions.mode === "literal" ? escapeTelegramLiteral(text) : text;
+    const callOptions: ApiCallOptions = {
+      ...(editOptions.throttle === undefined ? {} : { throttle: editOptions.throttle }),
+      ...(editOptions.replaceable === undefined ? {} : { replaceable: editOptions.replaceable }),
+    };
+    if (richMessagesEnabled()) {
+      try {
+        const edited = await apiCall(api, "editMessageText", signal, (callSignal) => withChatSendOrder(chatId, () =>
+          api.editMessageText(chatId, messageId, { markdown: body }, {}, toGrammySignal(callSignal))),
+        callOptions);
+        return edited !== undefined;
+      } catch (error) {
+        if (!(error instanceof TelegramApiError) || error.outcome !== "rejected") throw error;
+        if (isRichCapabilityRejection(error)) {
+          disableRichMessages();
+          console.warn("Telegram rich messages are unavailable here; this process now sends plain text.");
+        } else if (!isRichFormatRejection(error)) {
+          throw error;
+        }
+      }
+    }
+    const edited = await apiCall(api, "editMessageText", signal, (callSignal) => withChatSendOrder(chatId, () =>
+      api.editMessageText(chatId, messageId, text, {}, toGrammySignal(callSignal))),
+    callOptions);
+    return edited !== undefined;
   };
 
   /**
@@ -772,28 +963,31 @@ export async function runTelegram(
         await settleAction(callId, "sent");
         return { ok: true, text: `Set the ${request.emoji} reaction on message ${request.messageId}.` };
       }
-      const chunks = splitTelegramText(request.text);
+      const chunks = splitOutboundText(request.text);
       const ids: number[] = [];
       for (let index = actionFor(state.actions, callId)?.nextChunkIndex ?? 0; index < chunks.length; index++) {
         const chunk = chunks[index]!;
-        const sent = await apiCall(api, "sendMessage", signal, (callSignal) => withChatSendOrder(chatId, () =>
-          api.sendMessage(
-            chatId,
-            chunk,
-            index === 0
-              ? { reply_parameters: { message_id: request.messageId, allow_sending_without_reply: false } }
-              : {},
-            toGrammySignal(callSignal),
-          )), { throttle: outboundThrottle });
-        if (sent === undefined) throw new Error("Telegram sendMessage returned no result");
-        ids.push(sent.message_id);
-        await mutateState((doc) => {
-          const entry = doc.actions.find((candidate) => candidate.callId === callId);
-          if (entry === undefined) return;
-          entry.nextChunkIndex = Math.max(entry.nextChunkIndex, index + 1);
-          entry.resultMessageIds = [...(entry.resultMessageIds ?? []), sent.message_id];
+        const sent = await sendOutboundText(chatId, chunk, {
+          ...(index === 0 ? { replyTo: request.messageId } : {}),
+          throttle: outboundThrottle,
+          hooks: {
+            ...idleTextHooks,
+            partAccepted: async (sentId) => {
+              ids.push(sentId);
+              await mutateState((doc) => {
+                const entry = doc.actions.find((candidate) => candidate.callId === callId);
+                if (entry !== undefined) entry.resultMessageIds = [...(entry.resultMessageIds ?? []), sentId];
+              });
+            },
+            accepted: async () => {
+              await mutateState((doc) => {
+                const entry = doc.actions.find((candidate) => candidate.callId === callId);
+                if (entry !== undefined) entry.nextChunkIndex = Math.max(entry.nextChunkIndex, index + 1);
+              });
+            },
+          },
         });
-        await rememberOutgoingTarget(chatId, sent.message_id, chunk);
+        if (sent === undefined) throw new Error("Telegram send returned no result");
       }
       await settleAction(callId, "sent");
       return {
@@ -1024,35 +1218,25 @@ export async function runTelegram(
     index: number,
   ): Promise<"sent" | "retry" | "stop"> => {
     try {
-      const sent = await apiCall(api, "sendMessage", signal, async (callSignal) => {
-        await updateScheduled(sessionKey, recordId, (entry) => {
-          entry.status = "sending";
-          entry.sendIntent = { text: chunk, chunkIndex: index, startedAt: Date.now() };
-        });
-        if (signal?.aborted) {
-          await clearScheduledIntent(sessionKey, recordId);
-          throw new TelegramApiError("sendMessage", 0, "not-sent");
-        }
-        let sent;
-        try {
-          sent = await withChatSendOrder(chatId, () => api.sendMessage(chatId, chunk, {}, toGrammySignal(callSignal)));
-        } catch (error) {
-          if ((error instanceof GrammyError && error.error_code < 500) ||
-              (error instanceof HttpError && isProvenPreConnectFailure(error.error))) {
-            await clearScheduledIntent(sessionKey, recordId);
-          }
-          throw error;
-        }
-        await updateScheduled(sessionKey, recordId, (entry) => {
-          entry.status = "pending";
-          delete entry.sendIntent;
-          delete entry.unknownSince;
-          entry.nextChunkIndex = Math.max(entry.nextChunkIndex, index + 1);
-          if (index === 0) entry.messageId = sent.message_id;
-        }, cleanupContext);
-        await rememberOutgoingTarget(chatId, sent.message_id, chunk);
-        return sent;
-      }, { throttle: outboundThrottle });
+      const sent = await sendOutboundText(chatId, chunk, {
+        throttle: outboundThrottle,
+        hooks: {
+          before: async (text) => { await updateScheduled(sessionKey, recordId, (entry) => {
+            entry.status = "sending";
+            entry.sendIntent = { text, chunkIndex: index, startedAt: Date.now() };
+          }); },
+          abandoned: async () => { await clearScheduledIntent(sessionKey, recordId); },
+          accepted: async (messageId, shown) => {
+            await updateScheduled(sessionKey, recordId, (entry) => {
+              entry.status = "pending";
+              delete entry.sendIntent;
+              delete entry.unknownSince;
+              entry.nextChunkIndex = Math.max(entry.nextChunkIndex, index + 1);
+              if (index === 0) entry.messageId = messageId;
+            }, cleanupContext);
+          },
+        },
+      });
       return sent === undefined ? "retry" : "sent";
     } catch (error) {
       if (error instanceof TelegramApiError) {
@@ -1142,7 +1326,11 @@ export async function runTelegram(
       }, cleanupContext);
       return;
     }
-    const chunks = splitTelegramText(record.text);
+    const plan = record.telegramChunkPlan ?? (record.nextChunkIndex > 0 ? "legacy" : "rich-v1");
+    if (record.telegramChunkPlan === undefined) {
+      await updateScheduled(sessionKey, record.id, (entry) => { entry.telegramChunkPlan = plan; });
+    }
+    const chunks = splitOutboundText(record.text, plan);
     let current = record;
     for (let index = current.nextChunkIndex; index < chunks.length; index++) {
       const result = await sendScheduledChunk(sessionKey, record.id, chatId, chunks[index]!, index);
@@ -1362,8 +1550,8 @@ export async function runTelegram(
       }
       const answer = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), adapterContext);
       const message = answer?.model?.[0] as AssistantMessage | undefined;
-      const text = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("").trim()
-        || "The assistant returned no text response.";
+      const answerText = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "";
+      const text = answerText.trim() === "" ? "The assistant returned no text response." : answerText;
       await stopPreviewWatch();
       await flushFinal(text);
       await forget(item.updateId);
@@ -1373,14 +1561,13 @@ export async function runTelegram(
     }
 
     async function deliverNotice(current: PendingReply) {
-      // One bounded message; a committed chunk cursor means the acknowledgement was already accepted.
+      // One bounded host-generated notice: `literal` keeps paths, ids and placeholders exactly as written.
       if (current.nextChunkIndex > 0) {
         await forget(current.updateId);
         return;
       }
-      const sent = await sendTelegramMessage(current.text, "final", 0);
-      if (sent === undefined) throw new Error("Telegram sendMessage returned no result");
-      await rememberOutgoingTarget(current.chatId, sent.message_id, current.text);
+      const sent = await sendTelegramMessage(current.text, "final", 0, false, "literal");
+      if (sent === undefined) throw new Error("Telegram send returned no result");
       await forget(current.updateId);
     }
 
@@ -1398,24 +1585,36 @@ export async function runTelegram(
     }
 
     async function flushFinal(text: string) {
-      const chunks = splitTelegramText(text);
       let current = state.pending.find((entry) => entry.updateId === item.updateId) ?? item;
+      if (current.chunkPlan !== undefined && current.chunkPlan !== "legacy" &&
+          current.chunkPlan !== "rich-v1" && current.chunkPlan !== "preview-v1") {
+        throw new Error("Telegram delivery has an invalid chunk plan");
+      }
+      // Old in-flight cursors refer to the original 4096-character split. A preview's first
+      // final chunk must also fit a plain edit if Telegram rejects rich formatting.
+      const plan = current.chunkPlan ?? (current.nextChunkIndex > 0 ? "legacy" :
+        current.messageId === undefined ? "rich-v1" : "preview-v1");
+      if (current.chunkPlan === undefined) {
+        await mutatePending(item.updateId, (entry) => { entry.chunkPlan = plan; });
+        current = state.pending.find((entry) => entry.updateId === item.updateId) ?? current;
+      }
+      // Before rich messages, foreground answers were trimmed before legacy chunking. Preserve
+      // that exact input for an already-progressed legacy cursor during upgrade recovery.
+      const chunks = splitOutboundText(plan === "legacy" ? text.trim() : text, plan);
       for (let index = current.nextChunkIndex; index < chunks.length; index++) {
         const chunk = chunks[index]!;
         if (index === 0 && current.messageId !== undefined) {
           if (current.lastText !== chunk) {
             try {
-              await apiCall(api, "editMessageText", signal, (callSignal) => withChatSendOrder(item.chatId, () => api.editMessageText(
-                item.chatId, current.messageId!, chunk, {}, toGrammySignal(callSignal),
-              )), { throttle: outboundThrottle });
+              await editOutboundText(item.chatId, current.messageId!, chunk, { throttle: outboundThrottle });
             } catch (error) {
               if (isNotModified(error)) {
                 // The remote edit may have succeeded before its response was lost.
               } else if (isMessageNotFound(error)) {
                 await clearPreview(item.updateId);
                 const sent = await sendTelegramMessage(chunk, "final", index);
-                if (!sent) throw new Error("Telegram sendMessage returned no result");
-                await markChunkDelivered(item.updateId, index, chunk, sent.message_id);
+                if (sent === undefined) throw new Error("Telegram send returned no result");
+                await markChunkDelivered(item.updateId, index, chunk, sent);
                 current = state.pending.find((entry) => entry.updateId === item.updateId) ?? current;
                 continue;
               } else throw error;
@@ -1426,8 +1625,8 @@ export async function runTelegram(
           }
         } else {
           const sent = await sendTelegramMessage(chunk, "final", index);
-          if (!sent) throw new Error("Telegram sendMessage returned no result");
-          await markChunkDelivered(item.updateId, index, chunk, index === 0 ? sent.message_id : undefined);
+          if (sent === undefined) throw new Error("Telegram send returned no result");
+          await markChunkDelivered(item.updateId, index, chunk, index === 0 ? sent : undefined);
         }
         current = state.pending.find((entry) => entry.updateId === item.updateId) ?? current;
       }
@@ -1438,44 +1637,35 @@ export async function runTelegram(
       stage: "preview" | "final",
       chunkIndex?: number,
       replaceable = false,
-    ) {
+      mode: "markdown" | "literal" = "markdown",
+    ): Promise<number | undefined> {
       try {
-        return await apiCall(api, "sendMessage", signal,
-          async (callSignal) => {
-            await mutatePending(item.updateId, (entry) => {
+        return await sendOutboundText(item.chatId, text, {
+          mode,
+          replaceable,
+          throttle: outboundThrottle,
+          hooks: {
+            before: (attempt) => mutatePending(item.updateId, (entry) => {
               entry.deliveryStatus = "sending";
-              entry.sendIntent = { text, stage, startedAt: Date.now(), ...(chunkIndex === undefined ? {} : { chunkIndex }) };
-            });
-            if (signal?.aborted) {
-              await clearSendIntent(item.updateId);
-              throw new TelegramApiError("sendMessage", 0, "not-sent");
-            }
-            let sent;
-            try {
-              sent = await withChatSendOrder(item.chatId, () => api.sendMessage(item.chatId, text, {}, toGrammySignal(callSignal)));
-            } catch (error) {
-              if ((error instanceof GrammyError && error.error_code < 500) ||
-                  (error instanceof HttpError && isProvenPreConnectFailure(error.error))) {
-                await clearSendIntent(item.updateId);
-              }
-              throw error;
-            }
-            await mutatePending(item.updateId, (entry) => {
-              delete entry.deliveryStatus;
-              delete entry.sendIntent;
-              delete entry.unknownStage;
-              delete entry.unknownChunkIndex;
-              delete entry.unknownSince;
-              if (stage === "final" && chunkIndex !== undefined) entry.nextChunkIndex = chunkIndex + 1;
-              if (stage === "preview" || chunkIndex === 0) {
-                entry.messageId = sent.message_id;
-                entry.lastText = text;
-              }
-            }, cleanupContext);
-            await rememberOutgoingTarget(item.chatId, sent.message_id, text);
-            return sent;
+              entry.sendIntent = { text: attempt, stage, startedAt: Date.now(), ...(chunkIndex === undefined ? {} : { chunkIndex }) };
+            }),
+            abandoned: () => clearSendIntent(item.updateId),
+            accepted: async (messageId, shown) => {
+              await mutatePending(item.updateId, (entry) => {
+                delete entry.deliveryStatus;
+                delete entry.sendIntent;
+                delete entry.unknownStage;
+                delete entry.unknownChunkIndex;
+                delete entry.unknownSince;
+                if (stage === "final" && chunkIndex !== undefined) entry.nextChunkIndex = chunkIndex + 1;
+                if (stage === "preview" || chunkIndex === 0) {
+                  entry.messageId = messageId;
+                  entry.lastText = shown;
+                }
+              }, cleanupContext);
+            },
           },
-          { throttle: outboundThrottle, replaceable });
+        });
       } catch (error) {
         if (error instanceof TelegramApiError && error.outcome === "unknown") {
           await markUnknown(item.updateId, stage, chunkIndex);
@@ -1490,26 +1680,28 @@ export async function runTelegram(
     }
 
     async function publishPreview(text: string) {
+      // Previews stay inside one plain-sized message: they are replaced repeatedly while a turn runs.
       const preview = splitTelegramText(text)[0];
       if (!preview || signal?.aborted) return;
       const current = state.pending.find((entry) => entry.updateId === item.updateId) ?? item;
       if (current.deliveryStatus === "unknown" || current.lastText === preview) return;
       if (current.messageId === undefined) {
         const sent = await sendTelegramMessage(preview, "preview", undefined, true);
-        if (sent) await rememberMessage(item.updateId, sent.message_id, preview);
+        if (sent !== undefined) await rememberMessage(item.updateId, sent, preview);
       } else {
         try {
-          const edited = await apiCall(api, "editMessageText", signal, (callSignal) => withChatSendOrder(item.chatId, () => api.editMessageText(
-            item.chatId, current.messageId!, preview, {}, toGrammySignal(callSignal),
-          )), { throttle: outboundThrottle, replaceable: true });
-          if (edited !== undefined) await rememberText(item.updateId, preview);
+          const edited = await editOutboundText(item.chatId, current.messageId!, preview, {
+            throttle: outboundThrottle,
+            replaceable: true,
+          });
+          if (edited) await rememberText(item.updateId, preview);
         } catch (error) {
           if (isNotModified(error)) {
             await rememberText(item.updateId, preview);
           } else if (isMessageNotFound(error)) {
             await clearPreview(item.updateId);
             const sent = await sendTelegramMessage(preview, "preview", undefined, true);
-            if (sent) await rememberMessage(item.updateId, sent.message_id, preview);
+            if (sent !== undefined) await rememberMessage(item.updateId, sent, preview);
           } else throw error;
         }
       }
@@ -2806,6 +2998,8 @@ function pendingRecordProblem(value: unknown): string | undefined {
   if (!Number.isSafeInteger(record.nextChunkIndex) || (record.nextChunkIndex as number) < 0) {
     return "delivery record has an invalid chunk cursor";
   }
+  if (record.telegramChunkPlan !== undefined && record.telegramChunkPlan !== "legacy" &&
+      record.telegramChunkPlan !== "rich-v1") return "delivery record has an invalid chunk plan";
   return undefined;
 }
 
@@ -3285,6 +3479,26 @@ function splitTelegramText(text: string): string[] {
   return chunks;
 }
 
+/** Plain fallback must preserve all whitespace and stay inside Telegram's per-message limit. */
+function splitPlainTextLossless(text: string): string[] {
+  const chunks: string[] = [];
+  let offset = 0;
+  while (offset < text.length) {
+    let end = Math.min(offset + TELEGRAM_LIMIT, text.length);
+    if (end < text.length) {
+      const newline = text.lastIndexOf("\n", end - 1);
+      const space = text.lastIndexOf(" ", end - 1);
+      const boundary = newline >= offset + TELEGRAM_LIMIT / 2 ? newline + 1 :
+        space >= offset + TELEGRAM_LIMIT / 2 ? space + 1 : end;
+      end = boundary;
+      if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;
+    }
+    chunks.push(text.slice(offset, end));
+    offset = end;
+  }
+  return chunks;
+}
+
 type ApiCallOptions = {
   throttle?: TelegramFloodGate;
   replaceable?: boolean;
@@ -3319,6 +3533,7 @@ export function telegramFetch(
 /** Bot API methods whose request may already have been accepted when 5xx/transport fails. */
 const AMBIGUOUS_SEND_METHODS: ReadonlySet<string> = new Set([
   "sendMessage",
+  "sendRichMessage",
   ...Object.values(TELEGRAM_SEND_METHODS),
 ]);
 
@@ -3369,7 +3584,7 @@ async function apiCall<T>(
           continue;
         }
         throw new TelegramApiError(method, error.error_code,
-          isAmbiguousSendMethod(method) && error.error_code >= 500 ? "unknown" : "rejected");
+          isAmbiguousSendMethod(method) && error.error_code >= 500 ? "unknown" : "rejected", error.description);
       }
       if (error instanceof HttpError) {
         if (isAmbiguousSendMethod(method)) {
@@ -3396,7 +3611,7 @@ async function apiCall<T>(
   throw new Error(`Telegram ${method} request attempts exhausted`);
 }
 
-class TelegramApiError extends Error {
+export class TelegramApiError extends Error {
   readonly method: string;
   readonly status: number;
   readonly outcome: "unknown" | "rejected" | "not-sent";
@@ -3425,6 +3640,12 @@ function isNotModified(error: unknown): boolean {
 function isMessageNotFound(error: unknown): boolean {
   return error instanceof TelegramApiError && error.method === "editMessageText" && error.status === 400 &&
     error.description === "Bad Request: message to edit not found";
+}
+
+/** A response that provably never produced a message: a sub-5xx refusal or a pre-connect transport failure. */
+function isProvenRefusal(error: unknown): boolean {
+  return (error instanceof GrammyError && error.error_code < 500) ||
+    (error instanceof HttpError && isProvenPreConnectFailure(error.error));
 }
 
 function isProvenPreConnectFailure(error: unknown): boolean {
