@@ -14,14 +14,16 @@ const MAX_MILLIS_PER_CALL = 1_500;
 const MAX_SEEN = 250_000;
 const MAX_CHAINS = 256;
 const MAX_CACHED_PAGES = 64;
+const MAX_CACHED_REPLIES = 2_048;
 type Coverage = Record<string, unknown>;
 type EpisodeJob = { readonly hit: HistorySummaryHit; readonly sessionKey: string; cursor?: unknown; minTime: number | null; maxTime: number | null; undated: number; malformed: number; omitted: number; unreadable: number; missing: number; sourceEntries: number };
 type CachedPage = { readonly page: MemoryPage; readonly nextToken?: string };
+type CachedView = { readonly page: MemoryPage; readonly sourceToken: string; readonly offset: number };
 type SearchState = {
   readonly id: string; readonly binding: string; readonly mode: "parts" | "episodes"; expires: number;
   indexCursor?: unknown; summaryIndexDone: boolean; indexInitialized: boolean; pendingHits: HistoryHit[]; pendingDone: boolean; complete: boolean; buffer: MemoryHit[]; seen: Set<string>;
   coverage: Coverage; freshness: Coverage; jobs: EpisodeJob[]; activeJob?: EpisodeJob;
-  pages: Map<string, CachedPage>; currentToken: string;
+  pages: Map<string, CachedPage>; views: Map<string, CachedView>; responses: Map<string, MemoryPage>; currentToken: string;
   resetIds: Map<string, number | null>; resetCursors: Map<string, unknown>; resetDone: Set<string>;
   diagnostics: { malformed: number; unreadable: number; undated: number; omittedNonText: number; summaryMissing: number; unknownProvenance: number };
   diagnosedEntries: Set<string>;
@@ -58,18 +60,35 @@ export function createHistorySearcher(host: MemoryHost): { search: MemoryBackend
   async function search(query: MemoryQuery, scope: MemoryScope, context: Context): Promise<MemoryPage> {
     clean(states, byToken); validateFilters(query, scope);
     const limit = Math.min(query.limit ?? MAX_PAGE, MAX_PAGE);
-    const binding = hash({ query: queryKey(query, scope, "search"), limit });
+    const binding = queryKey(query, scope, "search");
     let state: SearchState;
     if (query.cursor !== undefined) {
       state = byToken.get(query.cursor)!;
       if (!state || state.expires <= Date.now() || state.binding !== binding) throw new TypeError("search cursor is invalid or expired");
       const cached = state.pages.get(query.cursor);
-      if (cached) return cached.page;
+      const view = state.views.get(query.cursor);
+      if (cached || view) {
+        const prior = state.responses.get(`${query.cursor}:${limit}`);
+        if (prior) return prior;
+        if (state.responses.size >= MAX_CACHED_REPLIES) throw new Error("history search retry-cache capacity reached; restart with a narrower query");
+        const source = cached?.page ?? state.pages.get(view!.sourceToken)?.page;
+        if (!source) throw new TypeError("search cursor has expired");
+        const offset = view?.offset ?? 0;
+        const hits = source.hits.slice(offset, offset + limit);
+        const nextOffset = offset + hits.length;
+        const stillInPage = nextOffset < source.hits.length;
+        const cursor = stillInPage ? randomUUID() : source.cursor;
+        const page: MemoryPage = { ...source, hits, ...(cursor ? { cursor } : {}), complete: cursor === undefined, ...(source.phase && cursor ? { phase: source.phase } : {}) };
+        if (stillInPage && cursor) { state.views.set(cursor, { page: source, sourceToken: view?.sourceToken ?? query.cursor, offset: nextOffset }); byToken.set(cursor, state); }
+        state.responses.set(`${query.cursor}:${limit}`, page);
+        return page;
+      }
       if (query.cursor !== state.currentToken) throw new TypeError("search cursor has expired");
+      if (state.pages.size >= MAX_CACHED_PAGES) throw new Error("history search cached-page capacity reached; restart with a narrower query");
     } else {
       if (states.size >= MAX_CHAINS) throw new Error("history search continuation capacity is full; retry later");
       const id = randomUUID();
-      state = { id, binding, mode: query.target === "episodes" ? "episodes" : "parts", expires: Date.now() + TTL_MS, summaryIndexDone: false, indexInitialized: false, pendingHits: [], pendingDone: false, complete: false, buffer: [], seen: new Set(), coverage: {}, freshness: {}, jobs: [], pages: new Map(), currentToken: randomUUID(), resetIds: new Map(), resetCursors: new Map(), resetDone: new Set(), diagnostics: { malformed: 0, unreadable: 0, undated: 0, omittedNonText: 0, summaryMissing: 0, unknownProvenance: 0 }, diagnosedEntries: new Set() };
+      state = { id, binding, mode: query.target === "episodes" ? "episodes" : "parts", expires: Date.now() + TTL_MS, summaryIndexDone: false, indexInitialized: false, pendingHits: [], pendingDone: false, complete: false, buffer: [], seen: new Set(), coverage: {}, freshness: {}, jobs: [], pages: new Map(), views: new Map(), responses: new Map(), currentToken: randomUUID(), resetIds: new Map(), resetCursors: new Map(), resetDone: new Set(), diagnostics: { malformed: 0, unreadable: 0, undated: 0, omittedNonText: 0, summaryMissing: 0, unknownProvenance: 0 }, diagnosedEntries: new Set() };
       states.set(id, state); byToken.set(state.currentToken, state);
     }
     const started = Date.now(); let reads = 0; let sourceEntries = 0;
@@ -77,7 +96,10 @@ export function createHistorySearcher(host: MemoryHost): { search: MemoryBackend
       const first = await host.search(searchQuery(query, "parts"), context); reads++;
       state.pendingHits = [...first.hits]; state.pendingDone = first.next === undefined; state.indexCursor = first.next; state.coverage = { ...first.coverage }; state.freshness = { index: first.coverage }; state.indexInitialized = true;
     }
-    if (state.mode === "parts") {
+    const stateFilter = query.filter?.state;
+    const needsState = stateFilter !== undefined && stateFilter.length === 1;
+    if (stateFilter !== undefined && stateFilter.length === 0) state.complete = true;
+    if (state.mode === "parts" && needsState) {
       const requested = query.filter?.sessions ?? scope.sessions.map((item) => item.sessionKey);
       for (const sessionKey of requested) {
         if (state.resetDone.has(sessionKey) || sourceEntries >= MAX_SOURCE_PER_CALL) continue;
@@ -94,7 +116,7 @@ export function createHistorySearcher(host: MemoryHost): { search: MemoryBackend
         if (!state.resetDone.has(sessionKey) || reads >= MAX_READS_PER_CALL || Date.now() - started >= MAX_MILLIS_PER_CALL) break;
       }
     }
-    const resetPrepared = state.mode !== "parts" || (query.filter?.sessions ?? scope.sessions.map((item) => item.sessionKey)).every((key) => state.resetDone.has(key));
+    const resetPrepared = state.mode !== "parts" || !needsState || (query.filter?.sessions ?? scope.sessions.map((item) => item.sessionKey)).every((key) => state.resetDone.has(key));
     while (resetPrepared && state.buffer.length < limit + 1 && !state.complete && reads < MAX_READS_PER_CALL && sourceEntries < MAX_SOURCE_PER_CALL && Date.now() - started < MAX_MILLIS_PER_CALL) {
       if (state.mode === "episodes") {
         if (state.activeJob === undefined) {
@@ -151,10 +173,13 @@ export function createHistorySearcher(host: MemoryHost): { search: MemoryBackend
         if (hit.role === "tool" && part.kind !== "tool") continue;
         const episodeStart = Number(hit.episodeStartEntryId);
         const currentReset = state.resetIds.get(hit.sessionKey) ?? null;
-        const status = currentReset === null || episodeStart >= currentReset ? "open" : "closed";
+        const status: "open" | "closed" = currentReset === null || episodeStart >= currentReset ? "open" : "closed";
         const item = partHit(part, entry, owner, episodeStart, status, scope);
-        if (!matchesPart(query, item, status, scope)) continue;
-        const hitState = { ...item, excerpt: hit.excerpt, preview: true, coverage: { ...item.coverage, complete: Boolean(page.coverage.complete) && !hit.bodyTruncated, unreadable: 0, malformed: projected.malformed, omittedNonText: projected.omittedNonText, undated: item.time.undated, indexTruncated: hit.bodyTruncated } };
+        const { state: _stateFilter, ...filterWithoutState } = query.filter ?? {};
+        const filterlessQuery: MemoryQuery = !needsState && query.filter?.state !== undefined ? { ...query, filter: filterWithoutState } : query;
+        if (!matchesPart(filterlessQuery, item, status, scope)) continue;
+        const { state: _unknownState, ...itemWithoutState } = item;
+        const hitState = { ...itemWithoutState, ...(needsState ? { state: status } : {}), excerpt: hit.excerpt, preview: true, coverage: { ...item.coverage, complete: Boolean(page.coverage.complete) && !hit.bodyTruncated, unreadable: 0, malformed: projected.malformed, omittedNonText: projected.omittedNonText, undated: item.time.undated, indexTruncated: hit.bodyTruncated } };
         state.buffer.push(hitState);
       }
       if (page.next === undefined && state.pendingHits.length === 0) state.complete = true;
@@ -169,14 +194,7 @@ export function createHistorySearcher(host: MemoryHost): { search: MemoryBackend
     const priorToken = query.cursor ?? state.currentToken;
     const nextToken = page.cursor;
     state.pages.set(priorToken, { page, ...(nextToken ? { nextToken } : {}) });
-    while (state.pages.size > MAX_CACHED_PAGES) {
-      const oldest = state.pages.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      state.pages.delete(oldest);
-      if (oldest !== state.currentToken) byToken.delete(oldest);
-    }
     if (nextToken) { state.currentToken = nextToken; byToken.set(nextToken, state); }
-    else { states.delete(state.id); for (const [token, owner] of byToken) if (owner === state) byToken.delete(token); }
     state.expires = Date.now() + TTL_MS;
     return page;
   }

@@ -14,6 +14,8 @@ const TIME_BUDGET_MS = 1_500;
 const SUMMARY_BATCH = 20;
 const PAGE_DEFAULT = 20;
 const PAGE_MAX = 100;
+const MAX_CAPTURE_SESSIONS = 256;
+const CAPTURE_ERROR = "History snapshot could not be bounded within the capture budget; narrow the query and retry";
 
 type PartHit = MemoryHit & { sortTime: number | null; tie: string };
 type Episode = {
@@ -67,25 +69,30 @@ export function createHistoryBrowser(host: MemoryHost): { browse: MemoryBackend[
     return { snapshot: s, pos };
   }
   function boundSnapshot(s: Snapshot): void {
-    s.bytes = bytes({ query: s.query, sessions: s.sessions.map(({ session, highwater, done }) => ({ session: session.sessionKey, highwater, done })), parts: s.parts, episodes: s.episodes, result: s.result });
+    s.bytes = bytes({ id: s.id, secret: s.secret, key: s.key, scope: s.scope, query: s.query, sessions: s.sessions, parts: s.parts, episodes: s.episodes, phase: s.phase, summaryPosition: s.summaryPosition, unreadable: s.unreadable, readFailures: s.readFailures, summaryUnavailable: s.summaryUnavailable, summaryUnreadable: s.summaryUnreadable, summaryMalformed: s.summaryMalformed, malformed: s.malformed, undated: s.undated, scanned: s.scanned, expires: s.expires, bytes: s.bytes, result: s.result });
     let total = s.bytes; for (const item of snapshots.values()) if (item !== s) total += item.bytes;
     if (s.bytes > MAX_BYTES || total > MAX_BYTES) { snapshots.delete(s.id); fail("History snapshot metadata exceeds the 64 MiB bound; narrow the query"); }
   }
-  async function makeSnapshot(query: MemoryQuery, scope: MemoryScope, context: Context, key: string, authority: string): Promise<Snapshot> {
+  async function makeSnapshot(query: MemoryQuery, scope: MemoryScope, context: Context, key: string, authority: string, deadline: number): Promise<Snapshot> {
     if (snapshots.size >= MAX_SNAPSHOTS) fail("History snapshot capacity reached; retry later");
     const f = query.filter;
     const sessions = scope.sessions.filter((x) => (!f?.sessions || f.sessions.includes(x.sessionKey)) && (!f?.channel || (x.channel !== null && f.channel.includes(x.channel))));
+    if (sessions.length > MAX_CAPTURE_SESSIONS) fail("History snapshot session limit is 256; narrow the query");
     const scans: Scan[] = []; let initialUnreadable = 0;
     // Capture every tail before any ascending scan, so all boundaries are one frozen enumeration boundary.
     for (const session of sessions) {
+      if (Date.now() >= deadline) fail(CAPTURE_ERROR);
       try {
         const tail = await host.entries(session.sessionKey, { order: "descending" }, 1, undefined, context);
+        if (Date.now() >= deadline) fail(CAPTURE_ERROR);
         const highwater = tail.items[0]?.id ?? 0;
         scans.push({ session: { ...session }, highwater, done: highwater === 0 });
-      } catch { initialUnreadable++; }
+      } catch (error) { if (error instanceof Error && error.message === CAPTURE_ERROR) throw error; initialUnreadable++; }
     }
+    if (Date.now() >= deadline) fail(CAPTURE_ERROR);
     if (initialUnreadable > 0) fail(`${initialUnreadable} source${initialUnreadable === 1 ? "" : "s"} could not be bounded; retry the history query`);
     const s: Snapshot = { id: token(), secret: token(), key, scope: authority, query: structuredClone(query), sessions: scans, parts: [], episodes: [], phase: "scanning", summaryPosition: 0, unreadable: 0, readFailures: 0, summaryUnavailable: 0, summaryUnreadable: 0, summaryMalformed: 0, malformed: 0, undated: 0, scanned: 0, expires: Date.now() + TTL, bytes: 0 };
+    boundSnapshot(s);
     snapshots.set(s.id, s); return s;
   }
   function finishEpisode(s: Snapshot, scan: Scan, end: number, closed: boolean): void {
@@ -128,15 +135,18 @@ export function createHistoryBrowser(host: MemoryHost): { browse: MemoryBackend[
       s.parts.push(hit);
     }
   }
-  async function scanSome(s: Snapshot, scope: MemoryScope, context: Context): Promise<void> {
-    const deadline = Date.now() + TIME_BUDGET_MS; let count = 0, callbacks = 0;
+  async function scanSome(s: Snapshot, scope: MemoryScope, context: Context, deadline: number): Promise<void> {
+    let count = 0, callbacks = 0;
     for (const scan of s.sessions) {
       if (scan.done) continue;
       while (!scan.done && count < ENTRY_BUDGET && callbacks < SCAN_BATCH && Date.now() < deadline) {
         let page;
         callbacks++;
+        if (Date.now() >= deadline) break;
+        // Native host I/O cannot be preempted here; enforce the shared deadline immediately after it settles.
         try { page = await host.entries(scan.session.sessionKey, { minEntryId: 1 as EntryId, maxEntryId: scan.highwater as EntryId, order: "ascending" }, SCAN_BATCH, scan.cursor, context); }
         catch (error) {
+          if (Date.now() >= deadline) break;
           if (scan.cursor !== undefined && error instanceof Error && /(?:invalid|expired|stale).*cursor|cursor.*(?:invalid|expired|stale)/i.test(error.message)) {
             snapshots.delete(s.id);
             fail("History snapshot cursor was invalidated; start again");
@@ -145,6 +155,7 @@ export function createHistoryBrowser(host: MemoryHost): { browse: MemoryBackend[
           if (!scan.blocked) { scan.blocked = true; s.unreadable++; }
           break;
         }
+        if (Date.now() >= deadline) break;
         if (scan.blocked) { scan.blocked = false; s.unreadable--; }
         for (const entry of page.items) { consume(s, scan, entry, scope); count++; }
         scan.cursor = page.next;
@@ -155,12 +166,14 @@ export function createHistoryBrowser(host: MemoryHost): { browse: MemoryBackend[
     if (s.sessions.every((x) => x.done)) s.phase = s.query.target === "episodes" ? "summaries" : "ready";
     boundSnapshot(s);
   }
-  async function prepareSummaries(s: Snapshot, context: Context): Promise<void> {
+  async function prepareSummaries(s: Snapshot, context: Context, deadline: number): Promise<void> {
     let reads = 0;
-    while (s.summaryPosition < s.episodes.length && reads++ < SUMMARY_BATCH) {
+    while (s.summaryPosition < s.episodes.length && reads++ < SUMMARY_BATCH && Date.now() < deadline) {
       const ep = s.episodes[s.summaryPosition++]!;
       try {
+        if (Date.now() >= deadline) { s.summaryPosition--; return; }
         const view = await host.summary(ep.session.sessionKey, ep.start as EntryId, context);
+        if (Date.now() >= deadline) { s.summaryPosition--; return; }
         if (view.state === "ready") ep.summary = { status: "ready", title: view.snapshot.title, excerpt: excerpt(view.snapshot.summary, 600), generation: view.snapshot.completedAtMs, complete: view.snapshot.coverageComplete, summaryTruncated: view.snapshot.summaryTruncated, sourceTruncatedEntries: view.snapshot.sourceTruncatedEntries, sourceEntries: view.snapshot.sourceEntries, sourceMessages: view.snapshot.sourceMessages, sourceToolResults: view.snapshot.sourceToolResults };
         else {
           const status = view.state === "not-ready" ? view.status : view.state;
@@ -169,7 +182,10 @@ export function createHistoryBrowser(host: MemoryHost): { browse: MemoryBackend[
           else if (view.state === "malformed") s.summaryMalformed++;
           else s.summaryUnavailable++;
         }
-      } catch { ep.summary = { status: "unreadable", title: null, excerpt: "Episode summary unavailable; use the original episode reference.", generation: null, complete: false }; s.summaryUnreadable++; }
+      } catch {
+        if (Date.now() >= deadline) { s.summaryPosition--; return; }
+        ep.summary = { status: "unreadable", title: null, excerpt: "Episode summary unavailable; use the original episode reference.", generation: null, complete: false }; s.summaryUnreadable++;
+      }
     }
     if (s.summaryPosition >= s.episodes.length) s.phase = "ready";
     boundSnapshot(s);
@@ -191,16 +207,17 @@ export function createHistoryBrowser(host: MemoryHost): { browse: MemoryBackend[
   }
   async function browse(query: MemoryQuery, scope: MemoryScope, context: Context): Promise<MemoryPage> {
     prune();
+    const deadline = Date.now() + TIME_BUDGET_MS;
     if (query.target !== "episodes" && query.target !== "messages" && query.target !== "tools") fail("History browse target is unsupported");
     for (const requested of query.filter?.sessions ?? []) if (!scope.sessions.some((session) => session.sessionKey === requested)) fail("session filter is outside the current scope");
     episodeFilters(query, scope);
     const key = queryKey(query, scope, "browse"), authority = scopeKey(scope);
     let s: Snapshot, pos = 0;
     if (query.cursor) ({ snapshot: s, pos } = getCursor(query.cursor, key, authority));
-    else s = await makeSnapshot(query, scope, context, key, authority);
+    else s = await makeSnapshot(query, scope, context, key, authority, deadline);
     s.expires = Date.now() + TTL;
-    if (s.phase === "scanning") await scanSome(s, scope, context);
-    if (s.phase === "summaries") await prepareSummaries(s, context);
+    if (s.phase === "scanning") await scanSome(s, scope, context, deadline);
+    if (s.phase === "summaries" && Date.now() < deadline) await prepareSummaries(s, context, deadline);
     if (s.phase !== "ready") return { hits: [], cursor: next(s, 0), complete: false, phase: "preparing", coverage: coverage(s, false, { readFailures: s.readFailures, blockedSources: s.unreadable, summaryUnavailable: s.summaryUnavailable, summaryMalformed: s.summaryMalformed, highwater: s.sessions.map((x) => ({ session: x.session.sessionKey, entryId: x.highwater })), enumerationComplete: false }), freshness: { source: "authoritative", indexUsed: false, snapshot: "frozen", sourceChanges: "not-revalidated" } };
     if (!s.result) {
       let hits: MemoryHit[];
