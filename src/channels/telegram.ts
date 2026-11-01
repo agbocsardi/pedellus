@@ -111,6 +111,8 @@ const BOT_MENTION_MAX = 64;
 const MAX_CONTROL_RECORDS = 64;
 /** Unresolved commands kept at most; further commands are refused so a hung or flooded chat cannot grow the log. */
 const MAX_UNRESOLVED_CONTROLS = 64;
+/** Chats that may be owed a restart confirmation, which is one message per requesting chat. */
+const MAX_RESTART_CONFIRMATIONS = 8;
 const MAX_NOTICE_CHARS = 1_500;
 /** A final control outcome published after its "still pending" notice; may carry one authorization URL. */
 const MAX_LATE_CONTROL_CHARS = 4_000;
@@ -236,12 +238,22 @@ export type TelegramChannelState = {
   offset: number;
   pending: TelegramPendingDelivery[];
   controls: TelegramControlRecord[];
+  /**
+   * The chats that asked this process to replace itself, committed with their applied control records. The
+   * replacement reports once that it is live and clears them, so a finished restart is confirmed instead of
+   * leaving the owner with an unconfirmed request.
+   */
+  restart?: TelegramRestartRecord[];
   /** Durable authenticated sender-to-chat evidence keyed by decimal chat ID. */
   origins: Record<string, TelegramOriginBinding>;
   /** Bounded observed message identities that a model action may target. */
   targets: TelegramObservedTarget[];
   /** Bounded write-ahead records of model-requested native replies and reactions. */
   actions: TelegramActionRecord[];
+};
+export type TelegramRestartRecord = {
+  chatId: number;
+  senderId: string;
 };
 export type TelegramOriginBinding = {
   /** Adapter identity that admitted this private chat. */
@@ -264,13 +276,13 @@ type ChannelState = TelegramChannelState;
 // Stored alongside the adapter's stable channel conversation, not in a plaintext sidecar.
 export const TelegramState = defineDoc<ChannelState>({
   kind: "nanobot.telegram-state",
-  version: 7,
+  version: 8,
   scope: "conversation",
   history: "latest",
   fork: "initial",
   checkpointWhen: (_value, _ops, { deltasSinceBase }) => deltasSinceBase >= 64,
   migrate: (value, fromVersion) => {
-    if (fromVersion < 1 || fromVersion > 6) {
+    if (fromVersion < 1 || fromVersion > 7) {
       throw new Error(`Unsupported Telegram state version ${fromVersion}`);
     }
     if (!Array.isArray(value.pending) || value.pending.some((item) =>
@@ -292,6 +304,14 @@ export const TelegramState = defineDoc<ChannelState>({
     if (value.actions !== undefined && !Array.isArray(value.actions)) {
       throw new Error("Stored Telegram state contains invalid action records");
     }
+    // Pending restart confirmations arrived with version 8; earlier states migrate without any.
+    const storedRestart = value.restart;
+    if (storedRestart !== undefined && (!Array.isArray(storedRestart) || storedRestart.some((entry: unknown) =>
+      entry === null || typeof entry !== "object" || Array.isArray(entry) ||
+      !Number.isSafeInteger((entry as Record<string, unknown>).chatId) ||
+      typeof (entry as Record<string, unknown>).senderId !== "string"))) {
+      throw new Error("Stored Telegram state contains invalid restart records");
+    }
     for (const item of value.pending as unknown as Record<string, unknown>[]) {
       if (item.attachments !== undefined && (!Array.isArray(item.attachments) ||
         item.attachments.some((entry: unknown) => entry === null || typeof entry !== "object" ||
@@ -308,6 +328,7 @@ export const TelegramState = defineDoc<ChannelState>({
       })),
       controls: hasControls && Array.isArray(value.controls)
         ? value.controls as unknown as TelegramControlRecord[] : [],
+      ...(storedRestart === undefined ? {} : { restart: storedRestart as unknown as TelegramRestartRecord[] }),
       origins: hasControls && value.origins !== null && typeof value.origins === "object" && !Array.isArray(value.origins)
         ? value.origins as unknown as Record<string, TelegramOriginBinding> : {},
       targets: Array.isArray(value.targets) ? value.targets as unknown as TelegramObservedTarget[] : [],
@@ -2051,6 +2072,50 @@ export async function runTelegram(
       console.warn(`Telegram ${unresolved.length} control command(s) were interrupted; their effect is unconfirmed.`);
     }
   }
+  /**
+   * Queue one ordinary notice per recorded restart chat: the live confirmation in a replacement process, or
+   * the host-refusal report in the process that stayed up. A chat whose sender the live allowlist no longer
+   * admits is dropped like any other notice; records that do not fit the admitted bound are returned as still
+   * owed instead of being claimed as delivered.
+   */
+  const admitRestartNotices = (doc: ChannelState, text: string): TelegramRestartRecord[] => {
+    const remaining: TelegramRestartRecord[] = [];
+    const used = new Set(doc.pending.map((item) => item.updateId));
+    let next = RESTART_LIVE_UPDATE_ID;
+    for (const record of doc.restart ?? []) {
+      if (!options.allowFrom.includes(record.senderId)) continue;
+      if (doc.pending.length >= MAX_ADMITTED) {
+        remaining.push(record);
+        continue;
+      }
+      while (used.has(next)) next -= 1;
+      used.add(next);
+      doc.pending.push({
+        updateId: next,
+        nextChunkIndex: 0,
+        chatId: record.chatId,
+        sessionKey: `telegram:${identity}:chat:${record.chatId}`,
+        senderId: record.senderId,
+        text,
+        notice: true,
+      });
+    }
+    return remaining;
+  };
+
+  // A restart this store recorded was requested by the process this one replaced: confirm it is live in every
+  // chat that asked, through the same durable notice queue every other host notice uses, then forget them. A
+  // sender the live allowlist no longer admits is dropped like any other notice; records that do not fit the
+  // admitted bound stay recorded for a later open rather than being reported as delivered.
+  if (state.restart !== undefined && state.restart.length > 0) {
+    state = await stateConversation.commit(async (tx) => {
+      const doc = await tx.doc(TelegramState, stateConversation.id);
+      const remaining = admitRestartNotices(doc, RESTART_LIVE);
+      if (remaining.length > 0) doc.restart = remaining;
+      else delete doc.restart;
+      return copyJson(doc) as unknown as ChannelState;
+    }, adapterContext);
+  }
   // An unresolved write-ahead intent may have reached Telegram before a crash.
   for (const item of state.pending.filter((entry) => entry.sendIntent !== undefined || entry.deliveryStatus === "sending")) {
     await markUnknown(item.updateId, item.sendIntent?.stage ?? "final", item.sendIntent?.chunkIndex);
@@ -2624,9 +2689,9 @@ export async function runTelegram(
   }
 
   /**
-   * Ask the host to replace this process, at most once per adapter lifetime. The acknowledgement
-   * already told the chat that only the request is confirmed; a host refusal is logged and never
-   * retried or upgraded into a success claim.
+   * Ask the host to replace this process, at most once per adapter lifetime. The host performs it after its
+   * own graceful teardown; a refusal is a known no-effect, so it is reported to the chats that asked and
+   * never retried or upgraded into a success claim.
    */
   function requestRestart(): void {
     if (restartHostRequested) return;
@@ -2636,6 +2701,17 @@ export async function runTelegram(
     void host.request().catch(() => {
       restartHostRequestFailed = true;
       console.warn("Telegram /restart request was refused by the host; the gateway keeps running.");
+      // The acknowledgement promised a follow-up, so the refusal is reported now instead of leaving that
+      // promise open until some later process starts.
+      void stateConversation.commit(async (tx) => {
+        const doc = await tx.doc(TelegramState, stateConversation.id);
+        admitRestartNotices(doc, RESTART_FAILED);
+        delete doc.restart;
+        return copyJson(doc) as unknown as ChannelState;
+      }, adapterContext).then((next) => {
+        state = next;
+        if (!stopping && !signal?.aborted) drain();
+      }).catch(() => undefined);
     });
   }
 
@@ -2803,6 +2879,16 @@ export async function runTelegram(
       const doc = await tx.doc(TelegramState, stateConversation.id);
       const entry = doc.controls.find((item) => item.updateId === record.updateId);
       if (entry !== undefined) entry.status = "applied";
+      // The host replaces the process only after this commit, so the record of who is owed a live
+      // confirmation is durable first. Every requesting chat is recorded, not just one: chats admitted in
+      // the same poll batch each keep the answer their acknowledgement promised.
+      if (record.command === "restart" && entry !== undefined) {
+        const owed = doc.restart ?? [];
+        if (!owed.some((item) => item.chatId === record.chatId)) {
+          doc.restart = [...owed, { chatId: record.chatId, senderId: entry.senderId }]
+            .slice(-MAX_RESTART_CONFIRMATIONS);
+        }
+      }
       // Bound the log here too: only applied, refused and already-reported records are pruned.
       doc.controls = pruneControls(doc.controls, doc.pending);
       return copyJson(doc) as unknown as ChannelState;
@@ -3479,8 +3565,7 @@ const CONTROL_ACK: Record<TelegramMutation, string> = {
   model:
     "Model preset selection is being applied to this chat only. Nothing was sent to the assistant.",
   restart:
-    "Restart requested for this gateway: it is stopping so the same process can reload its code and configuration. " +
-    "This acknowledgement confirms the request only; it does not confirm that the restart completed.",
+    "Restarting the gateway. A confirmation follows once it is live.",
   digest:
     "Memory digestion request applied for this chat; the bounded run follows separately and reports only a failure or cancellation to this chat's agent.",
   "mcp-approve": "The MCP approval was applied; its result follows in this message.",
@@ -3499,8 +3584,7 @@ const CONTROL_PENDING: Record<TelegramMutation, string> = {
     "Model preset selection is still pending for this chat: messages admitted earlier are being submitted first. " +
     "This chat keeps waiting; nothing was applied yet and nothing was sent to the assistant.",
   restart:
-    "Restart is still pending for this gateway: messages admitted earlier in this chat are being submitted first. " +
-    "Nothing has been restarted yet and nothing was sent to the assistant.",
+    "Restart still pending: earlier messages are being submitted first. Nothing was restarted.",
   digest:
     "Memory digestion is still pending for this chat: messages admitted earlier are being submitted first. " +
     "Nothing has been started yet and nothing was sent to the assistant.",
@@ -3519,7 +3603,20 @@ const UNCONFIRMED_CONTROL =
 /** An interrupted restart is never repeated automatically, and resending it is the caller's decision. */
 const UNCONFIRMED_RESTART =
   "That earlier /restart was interrupted before it was confirmed: it may or may not have restarted the gateway, " +
-  "and it is not requested again.";
+  "and is not requested again.";
+
+/**
+ * The confirmation the replacement process owes the chat that asked for `/restart`. It is reserved here because it
+ * proves only that this process opened and loaded its configuration; it says nothing about later model calls.
+ */
+const RESTART_LIVE = "Gateway restarted and live: current code and configuration are loaded.";
+/** The other half of that promise: the host refused the replacement, so this process is still the one serving. */
+const RESTART_FAILED = "Restart failed: the host refused it, so this gateway keeps running. Nothing was restarted.";
+/**
+ * Starting point for the durable queue id of that confirmation. Telegram update ids are never negative, so these
+ * ids cannot collide with an admitted update, an acknowledgement or a control record.
+ */
+const RESTART_LIVE_UPDATE_ID = -1;
 
 /** Fixed, sanitized refusals: a narrow host advertises nothing it cannot do. */
 const STATUS_UNAVAILABLE_HOST =

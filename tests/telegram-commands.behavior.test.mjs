@@ -798,13 +798,14 @@ test('/restart is requested once after the durable acknowledgement and is never 
     assert.equal(doc.offset, 801);
     assert.deepEqual(doc.controls.map((entry) => ({ command: entry.command, status: entry.status })),
       [{ command: 'restart', status: 'applied' }]);
+    // The chats owed a live confirmation are durable before the process is replaced.
+    assert.deepEqual(doc.restart, [{ chatId: CHAT_ID, senderId: '501' }]);
     assert.ok(doc.pending.some((item) => item.notice === true &&
-      /Restart requested for this gateway/.test(item.text) &&
-      /does not confirm that the restart completed/.test(item.text)),
+      /^Restarting the gateway\./.test(item.text) &&
+      /A confirmation follows once it is live/.test(item.text)),
     'the durable acknowledgement exists before the host request');
     await until(() => transport.sent.some((entry) =>
-      /Restart requested for this gateway/.test(entry.text) &&
-      /does not confirm that the restart completed/.test(entry.text)), 'honest acknowledgement');
+      /^Restarting the gateway\./.test(entry.text)), 'short acknowledgement');
     await flush();
 
     releaseSecond();
@@ -813,7 +814,7 @@ test('/restart is requested once after the durable acknowledgement and is never 
     assert.equal(observed.length, 1, 'a second /restart never asks the host again');
     assert.equal(store.captured.length, 0, 'no restart command reached the model');
 
-    // A reopen never replays an already applied restart request.
+    // A reopen never replays an already applied restart request; the replacement says it is live instead.
     await stop(harness);
     harness = undefined;
     transport.restore();
@@ -821,8 +822,31 @@ test('/restart is requested once after the durable acknowledgement and is never 
     let reopenedHarness;
     try {
       reopenedHarness = start(store, reopened, { restart: { supported: true, async request() { observed.push('again'); } } });
-      await flush();
-      assert.equal(observed.length, 1);
+      await until(() => reopened.sent.some((entry) => /^Gateway restarted and live:/.test(entry.text)),
+        'live confirmation after the replacement opened');
+      const confirmation = reopened.sent.find((entry) => /^Gateway restarted and live:/.test(entry.text));
+      assert.equal(confirmation.chatId, CHAT_ID, 'the confirmation answers the chat that asked');
+      assert.equal(observed.length, 1, 'the confirmation never re-requests a restart');
+      assert.equal(store.captured.length, 0, 'the confirmation is not a model turn');
+      await untilAsync(async () => {
+        const settled = await stateDoc(store.gateway);
+        return settled.restart === undefined && settled.pending.every((item) => item.updateId >= 0);
+      }, 'confirmation delivered and forgotten');
+      // A later open owes nothing and repeats nothing.
+      await stop(reopenedHarness);
+      reopenedHarness = undefined;
+      const twice = telegramMock([[]]);
+      let twiceHarness;
+      try {
+        twiceHarness = start(store, twice, { restart: { supported: true, async request() { observed.push('third'); } } });
+        await untilAsync(async () => (await stateDoc(store.gateway)).pending.every((item) => item.updateId >= 0),
+          'a consumed confirmation leaves nothing queued');
+        assert.ok(!twice.sent.some((entry) => /^Gateway restarted and live:/.test(entry.text)),
+          'a consumed confirmation is never repeated');
+      } finally {
+        await stop(twiceHarness);
+        twice.restore();
+      }
     } finally {
       await stop(reopenedHarness);
       reopened.restore();
@@ -843,7 +867,7 @@ test('/restart is requested once after the durable acknowledgement and is never 
       await until(() => recoveryTransport.sent.some((entry) => /That earlier \/restart was interrupted/.test(entry.text)),
         'interrupted restart report');
       const recoveryNotice = recoveryTransport.sent.find((entry) => /That earlier \/restart was interrupted/.test(entry.text)).text;
-      assert.match(recoveryNotice, /it is not requested again/);
+      assert.match(recoveryNotice, /and is not requested again/);
       assert.deepEqual(observed, [observed[0]], 'recovery never re-requests a restart');
       await untilAsync(async () => (await stateDoc(store.gateway)).pending.every((item) => item.updateId !== 1500),
         'interrupted report delivered');
@@ -930,10 +954,9 @@ test('a refused host restart is reported honestly and never retried', { timeout:
   let harness;
   try {
     harness = start(store, transport, { restart });
-    // The acknowledgement was already honest: it confirmed the request, not a completed restart.
-    await until(() => transport.sent.some((entry) =>
-      /Restart requested for this gateway/.test(entry.text) &&
-      /does not confirm that the restart completed/.test(entry.text)), 'request acknowledgement');
+    // The acknowledgement is the short one: the live confirmation is a separate message.
+    await until(() => transport.sent.some((entry) => /^Restarting the gateway\./.test(entry.text)),
+      'request acknowledgement');
     await until(() => calls === 1, 'one host request');
     await flush();
     firstRefused.resolve();
@@ -941,6 +964,14 @@ test('a refused host restart is reported honestly and never retried', { timeout:
       /A restart was already requested in this gateway and the host refused it/.test(entry.text)),
     'failed request reported honestly');
     assert.equal(calls, 1, 'a refused request is not retried by a later /restart');
+    // The refusal corrects the promised confirmation: the chats that asked are told nothing was restarted.
+    await until(() => transport.sent.some((entry) =>
+      /^Restart failed: the host refused it, so this gateway keeps running/.test(entry.text)),
+    'refused restart reported to the requesting chat');
+    assert.ok(!transport.sent.some((entry) => /^Gateway restarted and live:/.test(entry.text)),
+      'a refused restart claims no confirmation');
+    assert.equal((await stateDoc(store.gateway)).restart, undefined,
+      'a refused restart leaves no confirmation owed');
     const doc = await stateDoc(store.gateway);
     assert.deepEqual(doc.controls.map((entry) => entry.status), ['applied']);
   } finally {

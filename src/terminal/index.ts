@@ -1259,7 +1259,7 @@ export async function runTerminalConversation(
       case "restart":
         if (args.trim()) { await notice(conversationCommandUsage("restart"), true); return; }
         await offeredHost(io.restart)();
-        await notice("Gateway restart requested; all attached channels will disconnect.");
+        await notice("Gateway restarting; this terminal disconnects.");
         io.closeInput?.();
         operationController.abort(new Error("gateway restart requested"));
         return;
