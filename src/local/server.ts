@@ -17,6 +17,7 @@ import {
   type LocalAttachmentRejection,
 } from "../media/local.js";
 import type { Gateway, GatewayMcpAdmin, GatewayModelSelectionRequest } from "../runtime.js";
+import { CRON_OPERATOR_LIMITS, CronOperatorInputError, type CronOperator } from "../automation/operator.js";
 import {
   inProcessTerminalConversation,
   projectEntry,
@@ -379,6 +380,40 @@ class LocalConnection {
         onlyKeys(params, ["id"]);
         return this.mcpAdmin().deny(requireString(params, "id", 32), this.scope.context);
       }
+      case "cronList":
+        onlyKeys(requireObject(request.params ?? {}), []);
+        return this.cronOperator().list(this.scope.context);
+      case "cronShow": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["id"]);
+        return {
+          jobs: await this.cronOperator().show(
+            requireString(params, "id", CRON_OPERATOR_LIMITS.maxJobIdChars),
+            this.scope.context,
+          ),
+        };
+      }
+      case "cronCreate": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["origin", "request"]);
+        const operator = this.cronOperator();
+        const origin = requireString(params, "origin", CRON_OPERATOR_LIMITS.maxSessionKeyChars);
+        try {
+          return await operator.create(origin, params.request, this.scope.context);
+        } catch (error) {
+          // A refused request carries the host's own fixed text; it reached no scheduling commit.
+          if (error instanceof CronOperatorInputError) throw new LocalRequestError("invalid", error.message);
+          throw error;
+        }
+      }
+      case "cronCancel": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["id"]);
+        return this.cronOperator().cancel(
+          requireString(params, "id", CRON_OPERATOR_LIMITS.maxJobIdChars),
+          this.scope.context,
+        );
+      }
       case "digestStart":
         return this.options.gateway.memoryDigest.start(this.digestWriter(), this.scope.context);
       case "digestStatus": {
@@ -478,6 +513,18 @@ class LocalConnection {
       throw new LocalRequestError("unavailable", "MCP management is unavailable in this gateway");
     }
     return admin;
+  }
+
+  /**
+   * Owner scheduling controls come from the gateway itself, so the local terminal never re-derives
+   * an origin or an owner: it only names a mapped chat. Absent means cron is disabled here.
+   */
+  private cronOperator(): CronOperator {
+    const operator = this.options.gateway.cronOperator;
+    if (operator === undefined) {
+      throw new LocalRequestError("unavailable", "scheduling is not enabled in this gateway");
+    }
+    return operator;
   }
 
   /** The attached conversation is the digest origin; no other conversation is addressable here. */

@@ -21,7 +21,7 @@ durable-nanobot agent                      # attaches to the same default gatewa
 durable-nanobot agent --config /path/to/config.json     # attach a terminal to that gateway
 ```
 
-Without `--config`, `gateway`, `agent`, `login`, `logout` and `recovery` read exactly
+Without `--config`, `gateway`, `agent`, `login`, `logout`, `recovery` and `cron` read exactly
 `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
 the shell's working directory. A secondary instance passes its own explicit
 `--config`. There is no config discovery, merging, search, auto-generation or
@@ -42,6 +42,7 @@ durable-nanobot agent --help
 durable-nanobot login --help
 durable-nanobot logout --help
 durable-nanobot recovery --help
+durable-nanobot cron --help
 ```
 
 A per-command page carries that command's exact usage line, its own options, at
@@ -216,6 +217,37 @@ Telegram origin through its outbox; a job's persistent `silent` setting or an
 exact trimmed `[SILENT]` successful answer suppresses a successful result, while a
 failure still notifies, and cancelled or superseded runs are not. See
 [cron](./CRON.md).
+
+## Operator scheduling
+
+`durable-nanobot cron` is the owner's scheduling console. It attaches to the running
+gateway over the same private local socket as `agent`, so the gateway resolves every
+origin, owner and cancellation; the command itself schedules nothing:
+
+```sh
+durable-nanobot cron list
+durable-nanobot cron show <jobId>
+durable-nanobot cron cancel <jobId>
+durable-nanobot cron create --key <requestKey> --after 600 --message "Stretch and check the build"
+durable-nanobot cron create --key daily-1 --cron "0 9 * * 1-5" --tz Europe/Budapest \
+  --origin telegram:<identity>:chat:<chatId> --message "Morning check"
+```
+
+`list` and `show` are read-only and cover every currently mapped chat; `list` order is the
+next occurrence and it names the mapped chat keys an explicit `--origin` can use. `create`
+requires an explicit `--key`; the cron foundation dedupes an identical retry, refuses
+a different payload under the same key, and never re-arms a cancelled original.
+Exactly one of `--at`, `--after`, `--every` or `--cron` (with optional `--tz`) is
+accepted, and `--mode background|origin` matches the job's run mode: a background job
+records its outcome on the job (`cron show`) and its answer is delivered only through a
+channel outbox (currently Telegram), while `--mode origin` answers in the origin
+conversation itself. `--origin` defaults to this CLI conversation and otherwise must name
+an already mapped chat.
+`cancel` is exact-ID, refuses an ID recorded under more than one chat, and reports a
+recorded cancellation separately from a post-commit cleanup failure. If the gateway
+stops answering, the command reports an unknown outcome and points at the retry-safe
+or verify-first path instead of claiming a result. There is no bulk, run-now,
+re-arm or schedule-editing command. See [cron](./CRON.md#operator-controls).
 
 ## Recovery
 

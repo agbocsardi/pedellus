@@ -177,7 +177,12 @@ edits need restart only; unit edits additionally need daemon-reload.
   history. A job's persistent `silent` setting, or an exact trimmed `[SILENT]`
   successful final answer, suppresses that occurrence's automatic channel
   delivery — never the run, and never a failure notice; the marker applies only
-  to a scheduled run, not an ordinary chat reply.
+  to a scheduled run, not an ordinary chat reply. The owner's terminal has a thin
+  scheduling console (`durable-nanobot cron create|list|show|cancel`) that
+  composes the same foundation over the private local socket: creation needs an
+  explicit request key, its origin and owner are resolved from current mapped
+  ordinary chats, cancellation is exact-ID, and there is no schedule edit,
+  re-arm, run-now or bulk path.
 - Skill prompts carry names, descriptions and locators only; bodies load on
   demand through the read-only `skill` tool.
 - Markdown in the workspace is the memory source of truth. Durable owns the

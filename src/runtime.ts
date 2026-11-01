@@ -16,6 +16,7 @@ import {
   type CronConversationClass,
 } from "./automation/cron-conversations.js";
 import { createCronTool, CRON_TOOL_NAME } from "./automation/cron-tool.js";
+import { createCronOperator, type CronOperator } from "./automation/operator.js";
 import {
   CRON_DELIVERY_MAX_TEXT_CHARS,
   CronDeliveriesDoc,
@@ -328,6 +329,14 @@ export interface Gateway {
    * after its own authentication; it creates no conversation, starts no run and adds no authority.
    */
   readonly cronOutbox: CronDeliveryOutbox;
+  /**
+   * Owner scheduling controls: create, list, show and cancel over the existing cron foundation.
+   * Present only when cron is enabled. Every origin is resolved through the host's current mapped
+   * ordinary chat sessions, and the owner is derived from that validated key, so a caller can name
+   * a chat but never supply a conversation ID or an owner record. It exposes no schedule editing,
+   * re-arm, bulk operation or run-now path, and it is not a model tool.
+   */
+  readonly cronOperator?: CronOperator;
   /**
    * Model-action host registry for the configured Telegram channel. The running adapter attaches
    * here; when absent, a mapped Telegram chat still sees the tool but every call is denied because
@@ -2798,6 +2807,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
         status: (writer, ctx) => memoryDigest.status(writer, ctx),
       },
       cronOutbox,
+      ...(cronFoundation === undefined ? {} : {
+        cronOperator: createCronOperator({
+          foundation: cronFoundation,
+          harness: () => {
+            if (harnessRef.current === undefined) throw new Error("The runtime is not open");
+            return harnessRef.current;
+          },
+          // The same validated reader every other derived consumer uses: a state-only, automation,
+          // task-owned, forked or root conversation is never a scheduling origin.
+          origins: (ctx) => mappedChatSessions(ctx),
+        }),
+      }),
       ...(telegramActions === undefined ? {} : { telegramActions }),
       get mcp() {
         return mcpRef.current === undefined ? undefined : { servers: mcpRef.current.status };

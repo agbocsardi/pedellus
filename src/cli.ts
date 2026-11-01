@@ -5,6 +5,13 @@ import { stdin, stderr, stdout } from "node:process";
 import type { AuthType } from "@earendil-works/pi-ai";
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { runLogin, runLogout } from "./auth/cli.js";
+import {
+  CronCommandError,
+  CronUsageError,
+  parseCronInvocation,
+  runCronCommand,
+  type CronInvocation,
+} from "./automation/operator-cli.js";
 import { loadConfig, defaultConfigPath } from "./config.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { COMMANDS, commandUsage, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
@@ -139,6 +146,18 @@ function agentInvocation(args: readonly string[]): LaunchInvocation {
   return { kind: "agent", config, ...(conversation === undefined ? {} : { conversation }) };
 }
 
+/** `cron` reads its configuration like every other process command and attaches to the gateway. */
+function cronInvocation(args: readonly string[]): { readonly invocation: CronInvocation; readonly config: ConfigSource } | undefined {
+  if (args[0] !== "cron") return undefined;
+  const invocation = parseCronInvocation(args.slice(1));
+  return {
+    invocation,
+    config: invocation.configPath === undefined
+      ? { kind: "default" }
+      : { kind: "path", path: invocation.configPath },
+  };
+}
+
 function recoveryInvocation(args: readonly string[]): RecoveryInvocation | undefined {
   if (args[0] !== "recovery") return undefined;
   let config: ConfigSource = { kind: "default" };
@@ -244,6 +263,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     await runRecovery(recovery, await readConfig(recovery.config));
     return;
   }
+  const cron = cronInvocation(args);
+  if (cron !== undefined) {
+    await runCron(cron.invocation, await readConfig(cron.config));
+    return;
+  }
   const auth = authInvocation(args);
   if (auth !== undefined) {
     await runAuthCommand(auth, await readConfig(auth.config));
@@ -308,6 +332,27 @@ async function runRecovery(recovery: RecoveryInvocation, config: Awaited<ReturnT
   } finally {
     process.off("SIGINT", shutdown);
     process.off("SIGTERM", shutdown);
+  }
+}
+
+/**
+ * Owner scheduling controls: one attach to the running gateway, one bounded request, then detach.
+ * Nothing is scheduled or cancelled in this process; the gateway owns every runtime decision.
+ */
+async function runCron(invocation: CronInvocation, config: Awaited<ReturnType<typeof loadConfig>>): Promise<void> {
+  const stop = new AbortController();
+  const context = withAbortSignal(stop.signal, BACKGROUND_CONTEXT);
+  const shutdown = () => stop.abort();
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+  let client: Awaited<ReturnType<typeof connectLocalGateway>> | undefined;
+  try {
+    client = await connectLocalGateway({ socketPath: await localSocketPath(config), context });
+    await runCronCommand({ client, command: invocation.command, output: stdout, context });
+  } finally {
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
+    await client?.close();
   }
 }
 
@@ -552,6 +597,10 @@ export function runCli(): Promise<void> {
   return main().catch((error) => {
     if (error instanceof PreparedContextRecoveryError) {
       console.error(`durable-nanobot recovery: ${error.message}`);
+    } else if (error instanceof CronUsageError) {
+      console.error(error.message);
+    } else if (error instanceof CronCommandError) {
+      console.error(`durable-nanobot cron: ${error.message}`);
     } else if (error instanceof UnknownCommandError) {
       // Only a safe command-shaped token is echoed; any other supplied argument stays private.
       const echo = SAFE_COMMAND_NAME.test(error.token) ? `: ${error.token}` : "";
