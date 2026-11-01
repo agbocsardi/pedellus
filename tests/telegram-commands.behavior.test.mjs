@@ -803,11 +803,11 @@ test('/restart is requested once after the durable acknowledgement and is never 
     // The chats owed a live confirmation are durable before the process is replaced.
     assert.deepEqual(doc.restart, [{ chatId: CHAT_ID, senderId: '501' }]);
     assert.ok(doc.pending.some((item) => item.notice === true &&
-      /^Restarting the gateway\./.test(item.text) &&
-      /A confirmation follows once it is live/.test(item.text)),
+      /^Gateway restart requested;/.test(item.text) &&
+      /a confirmation follows once it is live/.test(item.text)),
     'the durable acknowledgement exists before the host request');
     await until(() => transport.sent.some((entry) =>
-      /^Restarting the gateway\./.test(entry.text)), 'short acknowledgement');
+      /^Gateway restart requested;/.test(entry.text)), 'short acknowledgement');
     await flush();
 
     releaseSecond();
@@ -957,7 +957,7 @@ test('a refused host restart is reported honestly and never retried', { timeout:
   try {
     harness = start(store, transport, { restart });
     // The acknowledgement is the short one: the live confirmation is a separate message.
-    await until(() => transport.sent.some((entry) => /^Restarting the gateway\./.test(entry.text)),
+    await until(() => transport.sent.some((entry) => /^Gateway restart requested;/.test(entry.text)),
       'request acknowledgement');
     await until(() => calls === 1, 'one host request');
     await flush();
@@ -1002,7 +1002,7 @@ test('a busy host restart is refused with its fixed reason and may be retried', 
   let harness;
   try {
     harness = start(store, transport, { restart });
-    await until(() => transport.sent.some((entry) => /^Restarting the gateway\./.test(entry.text)),
+    await until(() => transport.sent.some((entry) => /^Gateway restart requested;/.test(entry.text)),
       'request acknowledgement');
     await until(() => transport.sent.some((entry) => entry.text === RESTART_BUSY_MESSAGE),
       'busy refusal reported to the requesting chat');

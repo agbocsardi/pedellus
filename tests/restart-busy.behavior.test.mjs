@@ -156,6 +156,25 @@ test('a busy restart is refused before any acknowledgement or teardown, and a la
   assert.deepEqual(events, ['ack', 'teardown']);
 });
 
+test('concurrent restart checks do not acknowledge or tear down twice', { timeout: 5_000 }, async () => {
+  const inspected = deferred();
+  const events = [];
+  const coordinator = createRestartCoordinator({
+    activeWork: () => inspected.promise,
+    context,
+    teardown: () => events.push('teardown'),
+  });
+  const first = coordinator.request(async () => { events.push('ack'); });
+  try {
+    await assert.rejects(coordinator.request(), /already in progress/);
+    assert.equal(coordinator.accepted(), false, 'inspection is not acceptance');
+  } finally {
+    inspected.resolve({ interrupting: 0 });
+    await first;
+  }
+  assert.deepEqual(events, ['ack', 'teardown']);
+});
+
 test('a live generation blocks a restart, an armed timer does not, and idle succeeds', { timeout: 60_000 }, async (t) => {
   const entered = deferred();
   const release = deferred();

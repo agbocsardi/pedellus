@@ -3572,7 +3572,7 @@ const CONTROL_ACK: Record<TelegramMutation, string> = {
   model:
     "Model preset selection is being applied to this chat only. Nothing was sent to the assistant.",
   restart:
-    "Restarting the gateway. A confirmation follows once it is live.",
+    "Gateway restart requested; the host is checking active work. If accepted, a confirmation follows once it is live.",
   digest:
     "Memory digestion request applied for this chat; the bounded run follows separately and reports only a failure or cancellation to this chat's agent.",
   "mcp-approve": "The MCP approval was applied; its result follows in this message.",

@@ -361,7 +361,8 @@ export interface Gateway {
   /**
    * Bounded, read-only background activity for one already-mapped conversation: its own live
    * workers and scheduled jobs, plus whether the single workspace-global memory-digestion run is
-   * live and whether it belongs to this conversation. It starts, retries and cancels nothing, calls
+   * live and whether it belongs to this conversation, plus an anonymous gateway-wide active-work
+   * count for restart safety. It starts, retries and cancels nothing, calls
    * no model, reads no transcript, prompt, tool argument, host path or other chat, and reports no
    * other conversation ID. A conversation that is not an authenticated mapped chat reads nothing.
    */

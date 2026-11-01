@@ -33,12 +33,12 @@ export function restartSupported(): boolean {
 
 /**
  * Fixed refusal when a restart would interrupt live work. It names no task, chat, conversation or
- * transcript, and it is the whole reason: nothing was acknowledged, torn down or restarted.
+ * transcript. A command receipt may already have been sent, but no teardown or restart occurred.
  */
 export const RESTART_BUSY_MESSAGE =
   "Gateway restart refused: live work would be interrupted, so nothing was restarted and the gateway " +
-  "keeps serving. Finish that work (it is counted in /status), or abort it with the existing /abort, " +
-  "worker or cron controls, then retry /restart.";
+  "keeps serving. Wait for that work to finish (it is counted in /status), or cancel it through its " +
+  "existing controls where available, then retry /restart.";
 
 /** A known no-effect host refusal: live work is active, so no teardown started. */
 export class RestartBusyError extends Error {
@@ -75,12 +75,16 @@ export function createRestartCoordinator(options: {
   readonly teardown: () => void;
 }): RestartCoordinator {
   let requested = false;
+  let checking = false;
   return {
     accepted: () => requested,
     async request(acknowledge) {
-      if (requested) throw new Error("gateway restart is already in progress");
-      if ((await options.activeWork(options.context)).interrupting > 0) throw new RestartBusyError();
-      requested = true;
+      if (requested || checking) throw new Error("gateway restart is already in progress");
+      checking = true;
+      try {
+        if ((await options.activeWork(options.context)).interrupting > 0) throw new RestartBusyError();
+        requested = true;
+      } finally { checking = false; }
       try { await acknowledge?.(); }
       finally { options.teardown(); }
     },
