@@ -155,12 +155,6 @@ export interface McpAdminOptions {
   readonly servers: () => readonly McpServerStatus[];
   /** Deliver one settled login to its origin conversation's agent; never a user or channel. */
   readonly notify: (notice: McpLoginNotice) => Promise<void>;
-  /**
-   * True when a model-executable process on this host could read the private OAuth grant file (the
-   * host shell without Bubblewrap). Login and OAuth-entry approvals then fail closed instead of
-   * pretending the private file is protected.
-   */
-  readonly oauthGrantExposed?: boolean;
   readonly now?: () => number;
 }
 
@@ -178,12 +172,6 @@ export interface McpAdmin {
 const NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 const ID_PATTERN = /^[0-9a-f]{16}$/;
 const KINDS: readonly McpRequestKind[] = ["config", "login", "logout", "remove"];
-
-/** Fixed refusal used by every surface when the grant file is readable by the model's own shell. */
-export const MCP_OAUTH_UNPROTECTED =
-  "OAuth grants are unavailable in this execution mode: the host shell runs without a sandbox, so a " +
-  "model-executed command could read this runtime's private data directory. Remove \"bash\" from " +
-  "toolAllowlist or set \"toolSandbox\": \"bwrap\", then restart. Nothing was configured, connected or authorized.";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -247,16 +235,13 @@ function entrySummary(entry: Record<string, unknown>): string {
  */
 function renderShow(
   request: McpRequest,
-  options: Pick<McpAdminOptions, "edit" | "config"> & { readonly oauthGrantExposed: boolean },
+  options: Pick<McpAdminOptions, "edit" | "config">,
 ): string {
   const header = `Request ${request.id} (${request.kind}) for server "${request.name}"`;
   if (request.kind !== "config" || request.server === null) {
     if (request.kind === "login") {
       return `${header}\nStarts an owner-approved OAuth login and verifies the stored grant with one connection.\n` +
-        `A stored OAuth grant is used only when the gateway's execution mode protects it from model-executed processes` +
-        (options.oauthGrantExposed
-          ? " — in this mode it is not, so approval would be refused (see MCP.md)."
-          : ".");
+        "The grant is kept in this runtime's private token file; model-facing surfaces never show it.";
     }
     if (request.kind === "logout") {
       return `${header}\nDeletes the stored OAuth grant for this server. A live connection is unaffected; ` +
@@ -286,9 +271,6 @@ function renderShow(
       "whole merged document with the parser a gateway start uses. It takes effect at the next start (`/restart`).",
     ...(request.server.oauth === true
       ? ["  Approval also starts the owner-approved OAuth login for this entry and returns its one-time URL."]
-      : []),
-    ...(request.server.oauth === true && options.oauthGrantExposed
-      ? ["  OAuth grants are unavailable in this execution mode, so this approval would be refused."]
       : []),
   ].join("\n");
   const head = bounded(`${header}\n${normalized}`, Math.max(
@@ -467,7 +449,6 @@ interface ActiveRequest {
 
 export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
   const now = options.now ?? Date.now;
-  const oauthGrantExposed = options.oauthGrantExposed === true;
   /**
    * Requests whose approval is applying or whose login is live. The reservation is taken before any
    * asynchronous work: it makes a second decision on the same request impossible in this process, and
@@ -622,9 +603,6 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
         text: `Server "${request.name}" does not use OAuth (its entry needs "oauth": true first).`,
       };
     }
-    if (oauthGrantExposed) {
-      return { status: "refused", text: MCP_OAUTH_UNPROTECTED };
-    }
     for (const [otherId, other] of inFlight) {
       if (otherId !== request.id && other.phase === "login") {
         return {
@@ -647,11 +625,17 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
     } catch (error) {
       flow.phase = "applying";
       if (error instanceof McpAlreadyAuthorizedError) {
-        await settle(context, request.id, "done", `already authorized, ${error.tools} tool(s)`);
+        const tools = error.tools;
+        await settle(context, request.id, "done", tools === undefined
+          ? "already authorized; the tool listing failed"
+          : `already authorized, ${tools} tool(s)`);
         return {
           status: "applied",
-          text: `Server "${request.name}" already accepted the stored grant and was verified with one ` +
-            `connection (${error.tools} tool(s)), so no browser authorization was needed. Nothing changed.`,
+          text: tools === undefined
+            ? `Server "${request.name}" already accepted the stored grant: one connection authenticated, but its ` +
+              "tool listing failed, so the tool count is unknown. No browser authorization was needed and nothing changed."
+            : `Server "${request.name}" already accepted the stored grant and was verified with one ` +
+              `connection (${tools} tool(s)), so no browser authorization was needed. Nothing changed.`,
         };
       }
       if (error instanceof McpGrantSupersededError) {
@@ -739,9 +723,6 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
           status: "refused",
           text: `Request ${request.id} is no longer a valid entry (${error instanceof Error ? error.message : "invalid"}); nothing was written.`,
         };
-      }
-      if ("url" in parsed && parsed.oauth === true && oauthGrantExposed) {
-        return { status: "refused", text: MCP_OAUTH_UNPROTECTED };
       }
       let written;
       try {
@@ -876,10 +857,6 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
                 };
               }
             }
-            if (action === "login" && oauthGrantExposed
-              && configured !== undefined && "url" in configured && configured.oauth === true) {
-              return { output: [{ type: "text" as const, text: MCP_OAUTH_UNPROTECTED }], isError: true };
-            }
             if (action === "remove" && configured === undefined) {
               return {
                 output: [{ type: "text" as const, text: `Server "${name}" is not configured in this gateway's open configuration.` }],
@@ -898,9 +875,6 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
                   }],
                   isError: true,
                 };
-              }
-              if ("url" in entry && entry.oauth === true && oauthGrantExposed) {
-                return { output: [{ type: "text" as const, text: MCP_OAUTH_UNPROTECTED }], isError: true };
               }
             }
             let id: string;
@@ -966,7 +940,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
       const state = request.status === "pending" || request.status === "running" ? "" : ` (already ${request.status})`;
       return {
         found: true,
-        text: `${renderShow(request, { edit: options.edit, config: options.config, oauthGrantExposed })}${state}`,
+        text: `${renderShow(request, { edit: options.edit, config: options.config })}${state}`,
       };
     },
     async approve(id, context) {

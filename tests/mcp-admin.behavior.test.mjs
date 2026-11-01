@@ -12,7 +12,17 @@ const modules = join(testRoot, 'node_modules/@earendil-works');
 const [
   { loadConfig, parseConfig },
   { openGateway },
-  { loginNoticeText, mcpOAuthStatePath, hasMcpOAuthTokens, FileMcpOAuthStateStore, MCP_ADMIN_TOOL_NAME },
+  {
+    loginNoticeText,
+    mcpOAuthStatePath,
+    hasMcpOAuthTokens,
+    FileMcpOAuthStateStore,
+    MCP_ADMIN_TOOL_NAME,
+    adoptMcpOAuthRefresh,
+    commitMcpOAuthState,
+    mcpOAuthGrantEpoch,
+    snapshotMcpOAuthGrant,
+  },
   { BACKGROUND_CONTEXT },
   { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall },
 ] = await Promise.all([
@@ -173,6 +183,15 @@ async function startOAuthMcp(options = {}) {
       return;
     }
     if (message.method === 'tools/list') {
+      if (options.failToolList === true) {
+        response.writeHead(200, headers);
+        response.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: message.id,
+          error: { code: -32603, message: 'synthetic listing failure' },
+        }));
+        return;
+      }
       send({
         tools: [{
           name: 'echo',
@@ -485,6 +504,173 @@ test('the private grant file is bound to one server URL and is never shared acro
     await assert.rejects(() => storeOne.save({ serverUrl: second }), /different server URL/);
     await storeOne.clear();
     assert.equal(await storeOne.load(), undefined);
+  } finally {
+    await env.cleanup();
+  }
+});
+
+test('an oauth grant is used in every execution mode and never surfaces through a model-facing value', { timeout: 60_000 }, async () => {
+  const env = await store('accepted-mode');
+  const mcp = await startOAuthMcp();
+  await writeFile(env.configFile, `${JSON.stringify({
+    workspace: env.workspace,
+    dataDir: env.dataDir,
+    model: { provider: 'mcp-faux', modelId: 'synthetic' },
+    // The coding shell runs unsandboxed and a stdio server is enabled: the accepted same-user trust
+    // boundary, which is not a reason to refuse the grant.
+    toolAllowlist: ['bash'],
+    mcp: {
+      enabled: true,
+      servers: {
+        local: { command: process.execPath, args: ['-e', 'process.exit(0)'] },
+        remote: { url: mcp.url, oauth: true },
+      },
+    },
+  }, null, 2)}\n`);
+  const grantPath = mcpOAuthStatePath(env.dataDir, mcp.url);
+  await new FileMcpOAuthStateStore(grantPath, mcp.url).save({
+    serverUrl: mcp.url,
+    tokensExpireAt: Date.now() + 3_600_000,
+    tokens: { access_token: ACCESS_TOKEN, token_type: 'Bearer', refresh_token: REFRESH_TOKEN },
+  });
+  const { faux, models } = env.models();
+  faux.setResponses([
+    call(MCP_ADMIN_TOOL_NAME, { action: 'login', name: 'remote' }, 'login-accepted'),
+    final('login recorded'),
+  ]);
+  let gateway;
+  try {
+    gateway = await openGateway(await env.configFromFile(), context, { models });
+    const remote = gateway.mcp.servers.find((server) => server.name === 'remote');
+    assert.equal(remote.state, 'connected');
+    assert.equal(remote.tools, 1);
+    // No status field carries credential material.
+    const status = JSON.stringify(gateway.mcp.servers);
+    assert.ok(!status.includes(ACCESS_TOKEN));
+    assert.ok(!status.includes(REFRESH_TOKEN));
+
+    const admin = gateway.mcpAdmin;
+    const chat = await gateway.conversationFor('telegram:7:chat:916', context);
+    await say(chat, 'log in to the remote server');
+    const request = (await admin.list(context)).requests[0];
+    assert.equal(request.kind, 'login');
+    // The listing, the full disclosure and the approval result never contain the tokens.
+    const shown = await admin.show(request.id, context);
+    assert.equal(shown.found, true);
+    for (const text of [JSON.stringify(await admin.list(context)), shown.text]) {
+      assert.ok(!text.includes(ACCESS_TOKEN));
+      assert.ok(!text.includes(REFRESH_TOKEN));
+    }
+    const approved = await admin.approve(request.id, context);
+    assert.match(approved.text, /already accepted the stored grant/);
+    assert.ok(!approved.text.includes(ACCESS_TOKEN));
+    assert.ok(!approved.text.includes(REFRESH_TOKEN));
+    // The approved no-op keeps the grant file in place.
+    assert.equal(await hasMcpOAuthTokens(grantPath, mcp.url), true);
+  } finally {
+    if (gateway) await gateway.close(context);
+    await mcp.close();
+    await env.cleanup();
+  }
+});
+
+test('an already-authorized grant whose tool listing fails reports an unknown tool count', { timeout: 60_000 }, async () => {
+  const env = await store('already-authorized');
+  const mcp = await startOAuthMcp({ failToolList: true });
+  await writeFile(env.configFile, `${JSON.stringify({
+    workspace: env.workspace,
+    dataDir: env.dataDir,
+    model: { provider: 'mcp-faux', modelId: 'synthetic' },
+    toolAllowlist: [],
+    mcp: { enabled: true, servers: { remote: { url: mcp.url, oauth: true, enabled: false } } },
+  }, null, 2)}\n`);
+  const grantPath = mcpOAuthStatePath(env.dataDir, mcp.url);
+  await new FileMcpOAuthStateStore(grantPath, mcp.url).save({
+    serverUrl: mcp.url,
+    tokensExpireAt: Date.now() + 3_600_000,
+    tokens: { access_token: ACCESS_TOKEN, token_type: 'Bearer', refresh_token: REFRESH_TOKEN },
+  });
+  const before = JSON.parse(await readFile(grantPath, 'utf8'));
+  const { faux, models } = env.models();
+  faux.setResponses([
+    call(MCP_ADMIN_TOOL_NAME, { action: 'login', name: 'remote' }, 'login-already'),
+    final('login recorded'),
+  ]);
+  let gateway;
+  try {
+    gateway = await openGateway(await env.configFromFile(), context, { models });
+    const admin = gateway.mcpAdmin;
+    const chat = await gateway.conversationFor('telegram:7:chat:915', context);
+    await say(chat, 'log in to the remote server');
+    const request = (await admin.list(context)).requests[0];
+    assert.equal(request.kind, 'login');
+    const approved = await admin.approve(request.id, context);
+    assert.equal(approved.status, 'applied', approved.text);
+    assert.match(approved.text, /tool listing failed/);
+    // It must not claim a count it did not observe.
+    assert.doesNotMatch(approved.text, /\(0 tool/);
+    const settled = (await admin.list(context)).requests.find((entry) => entry.id === request.id);
+    assert.equal(settled.status, 'done');
+    assert.match(settled.summary, /tool listing failed/);
+    // A no-op login keeps the stored grant's tokens as they were (the store re-serializes field order).
+    assert.deepEqual(JSON.parse(await readFile(grantPath, 'utf8')).state.tokens, before.state.tokens);
+  } finally {
+    if (gateway) await gateway.close(context);
+    await mcp.close();
+    await env.cleanup();
+  }
+});
+
+test('a login snapshot, a rotated refresh and a logout cannot resurrect or discard a grant', async () => {
+  const env = await store('grant-epoch');
+  const url = 'https://epoch.example.test/mcp';
+  try {
+    const path = mcpOAuthStatePath(env.dataDir, url);
+    const store = new FileMcpOAuthStateStore(path, url);
+    await store.save({
+      serverUrl: url,
+      tokens: { access_token: ACCESS_TOKEN, token_type: 'Bearer', refresh_token: REFRESH_TOKEN },
+    });
+    // The generation is read together with the grant, so a logout cannot land between the two.
+    const snapshot = await snapshotMcpOAuthGrant(path, url);
+    assert.equal(snapshot.state.tokens.refresh_token, REFRESH_TOKEN);
+    assert.equal(snapshot.epoch, 0);
+
+    // A refresh the server already issued is adopted, because it may have invalidated the old one.
+    const rotated = {
+      ...snapshot.state,
+      tokens: { access_token: 'rotated-access', token_type: 'Bearer', refresh_token: 'rotated-refresh' },
+    };
+    assert.equal(await adoptMcpOAuthRefresh(path, url, snapshot, rotated), true);
+    assert.equal((await store.load()).tokens.refresh_token, 'rotated-refresh');
+    // Adoption does not retire the generation, so the live writer and this attempt keep working.
+    assert.equal(mcpOAuthGrantEpoch(path), 0);
+    // The same snapshot cannot adopt twice: the stored grant is no longer what it read.
+    assert.equal(await adoptMcpOAuthRefresh(path, url, snapshot, {
+      ...rotated,
+      tokens: { ...rotated.tokens, refresh_token: 'third-refresh' },
+    }), false);
+
+    // A canceled attempt installs nothing, even when it reaches the commit.
+    const canceledAttempt = await snapshotMcpOAuthGrant(path, url);
+    const aborted = new AbortController();
+    aborted.abort();
+    await assert.rejects(
+      () => commitMcpOAuthState(path, url, rotated, canceledAttempt.epoch, aborted.signal),
+      /canceled/,
+    );
+    assert.equal((await store.load()).tokens.refresh_token, 'rotated-refresh');
+    assert.equal(mcpOAuthGrantEpoch(path), 0);
+
+    // A logout wins over both the adoption and a late verified commit.
+    const late = await snapshotMcpOAuthGrant(path, url);
+    await store.clear();
+    assert.equal(await adoptMcpOAuthRefresh(path, url, late, rotated), false);
+    await assert.rejects(
+      () => commitMcpOAuthState(path, url, late.state, late.epoch),
+      /changed while the login was running/,
+    );
+    assert.equal(await hasMcpOAuthTokens(path, url), false);
   } finally {
     await env.cleanup();
   }

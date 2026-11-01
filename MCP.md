@@ -19,7 +19,16 @@ credential-exposure, disclosure, race, config-write and Telegram-delivery
 defects; that pass is fixed here: OAuth fails closed around an unconfined shell,
 `show` discloses the entire exact entry, approvals claim atomically, config edits
 refuse a changed file, a login works on a staged grant, and the authorization URL
-is a direct owner message outside channel state. All coverage is offline and
+is a direct owner message outside channel state. A further review of that pass
+found a path-check/open race in the coding tools, login races around cancellation,
+generation capture and refresh rotation, a swallowed tool-listing failure and an
+over-optimistic config-write claim; those are fixed here with the residual
+limitations stated below. That review also proposed refusing OAuth whenever any
+same-user process could read the grant file. The project does not carry that
+boundary: the grant is a private `0600` file like the provider credential store,
+same-user code (including the model's own shell and any stdio MCP server) can read
+it, and no execution mode changes that. The guard is therefore removed and the
+risk is documented instead of approximated by a mode check. All coverage is offline and
 synthetic: no live MCP server, provider, credential or production data has been
 used, and no real OAuth provider has been contacted. The management/OAuth slice
 is verified against loopback fixture servers and a synthetic authorization server
@@ -83,10 +92,8 @@ authority from `toolAllowlist`; `toolAllowlist` still names only the coding tool
   MCP token file instead of a configured header. It cannot be combined with an
   `Authorization` header: an entry selects one credential. With no stored grant
   the entry fails closed as `auth-required` and no request, dynamic registration
-  or browser flow happens; see [OAuth login](#oauth-login). A grant is used only
-  when a model-executed process cannot read it: the unsandboxed host shell can,
-  so `oauth` fails closed as `credential-exposed` unless `toolSandbox` is
-  `"bwrap"` or `bash` is removed from the coding tool ceiling.
+  or browser flow happens; see [OAuth login](#oauth-login). It works in every
+  execution mode; the file's trust boundary is described there.
 
 ### Secrets
 
@@ -201,15 +208,18 @@ What an approval does:
   (temporary file in the same directory, then rename), keeps the existing file
   mode, changes nothing outside the `mcp` block, and is refused unless the whole
   merged document parses. Managed edits are serialized inside this process, and
-  the file is re-read immediately before replacement: if its bytes changed since
-  the edit was prepared, the approval is refused without writing. Limitations:
-  JSON is re-serialized with two-space indentation, so hand formatting and key
-  order are not preserved; the rename gives the file the gateway user's
-  ownership; a symlinked configuration file is refused rather than followed; the
-  check and the rename are not one atomic operation, so an outside writer in
-  that tiny window is still overwritten. A written entry connects at the **next
-  gateway start** — this gateway keeps the configuration it opened with, and
-  `/restart` is the existing owner control that re-reads it.
+  the file is reopened immediately before replacement: if its bytes or its
+  identity (device, inode, size, mtime) changed since the edit was prepared, the
+  approval is refused without writing. Limitations: JSON is re-serialized with
+  two-space indentation, so hand formatting and key order are not preserved; the
+  rename gives the file the gateway user's ownership; a symlinked configuration
+  file is refused rather than followed; and the identity/bytes check and the
+  rename are still two operations, so an outside writer that lands in the few
+  microseconds between them is overwritten. POSIX has no compare-and-swap for
+  file content and no lock an arbitrary editor honors, so that window is narrowed
+  and disclosed rather than claimed closed. A written entry connects at the
+  **next gateway start** — this gateway keeps the configuration it opened with,
+  and `/restart` is the existing owner control that re-reads it.
 - `login` (and a `config` entry with `"oauth": true`): starts the flow described
   below and returns the one-time authorization URL to the approving surface. On
   Telegram the URL is a separate direct message, not part of the durable
@@ -237,15 +247,34 @@ directory `0700`, one file per exact server URL). Tokens never appear in the
 configuration, a conversation entry, a tool result, a channel message or the
 `gateway.mcp` status.
 
-A `0600` file is private to the process user, which is not the same as private
-from the model: an unsandboxed host shell runs as that user and can read the data
-directory. The grant is therefore used only when the shell is confined
-(`toolSandbox: "bwrap"`, whose mount view excludes the data directory) or no
-shell is enabled at all. In any other mode an `oauth` entry fails closed as
-`credential-exposed` without reading the grant, and an owner approval or agent
-proposal for a new login is refused with fixed text. This is a real
-protection boundary, not a claim that the file itself is safe from a same-user
-process.
+### What the private file does and does not protect
+
+`mode 0600` in a `0700` directory means another *user* cannot read the grant. It
+does not mean the model cannot: everything the model can ask this runtime to run
+— the coding shell (`toolSandbox: "host"`, and a Bubblewrap shell whose mount view
+includes the data directory), a configured stdio MCP server, a worker — runs as
+the same OS user and can read any file that user can. That is the same trust
+boundary as the provider credential store (`auth.json`) and is accepted, as it is
+in Python nanobot's `FileTokenStorage`: the protection is file permissions against
+other users, not isolation from same-user code.
+
+What the runtime does guarantee instead:
+
+- token material never appears in the configuration, a conversation entry, a tool
+  result, a log line, a channel message or the `gateway.mcp` status and `/mcp`
+  listings; the owner-approved browser flow hands the authorization URL to the
+  owner surface only, never to the agent;
+- the file is written atomically with a private mode, one file per exact server
+  URL, and only an owner-approved logout (or an approved login/refresh, see below)
+  rewrites it;
+- a refusal or a failed attempt never deletes it.
+
+Anyone who can read the file can impersonate the owner at that server. If you
+believe it was copied — for example because you ran an untrusted stdio server or
+let the agent run shell commands with access to the data directory, and you do not
+trust that code — treat the grant as compromised: `logout` deletes the local file,
+and revoke the client at the provider's console (deleting the file does not revoke
+the token server-side).
 
 Login is always owner-initiated and gateway-run:
 
@@ -260,7 +289,8 @@ Login is always owner-initiated and gateway-run:
    transcript or durable channel state;
 4. the loopback callback delivers the code; the gateway exchanges it in the staged
    state, verifies the result with one real connection and tool listing, and only
-   then installs it as the stored grant;
+   then installs it as the stored grant (a refresh performed during the attempt is
+   adopted earlier, because the server has already issued it);
 5. one internal result entry reaches the origin chat's agent, so it can relay
    "login complete / failed" and tell the owner to restart. It carries the server
    name, the request ID, the fixed outcome and the discovered tool count — never
@@ -269,11 +299,19 @@ Login is always owner-initiated and gateway-run:
 Bounds and rules: one flow at a time, reserved before the attempt starts; a
 5-minute deadline covers the initial connection and the browser step; the callback
 listener is loopback-only on `127.0.0.1` with an ephemeral port; `/mcp deny`
-cancels a running flow, including one still setting up; closing the gateway
-aborts it. The attempt works on a staged file seeded from the stored grant, so a
-grant that still works makes the login a no-op (its verified refresh is installed)
-and a failed or canceled attempt leaves the stored grant byte-for-byte untouched.
-Each committed grant increments a process-local generation: a logout during the
+cancels a running flow, including one still setting up and one already
+verifying; closing the gateway aborts it, and cancellation is rechecked before
+anything is committed. The attempt works on a staged file seeded from the stored
+grant, read together with the grant generation it will commit against, so a grant
+that still works makes the login a no-op and a logout that lands in between
+retires the generation instead of handing the attempt a fresh expectation for a
+grant it copied before the deletion. A failed or canceled attempt does not delete
+or replace the stored grant. One exception is stated plainly because it is not a
+local decision: a refresh performed during the attempt has already been issued by
+the authorization server, which may have invalidated the previous refresh token,
+so the rotated grant is adopted immediately (only while the stored grant is still
+the one the attempt read) rather than discarded with the failed attempt. Each
+committed grant increments a process-local generation: a logout during the
 attempt, and a refresh from a connection created before it, cannot restore the
 deleted grant. A gateway restart or crash ends a pending attempt; its URL is not
 replayed, so request a new login.
@@ -303,21 +341,29 @@ Real limitations:
   flow: the entry reports `auth-required`.
 - A grant is keyed by the exact URL, so renaming a server keeps it while changing
   its URL does not. Logging out deletes it; nothing else does.
-- A staged attempt can perform a real refresh, which may rotate the token server-side
-  even if the later browser step fails. The stored file is not rewritten before
-  verification, but the provider may have invalidated the previous refresh token;
-  approve a new login in that case.
+- A staged attempt can perform a real refresh, which may rotate the token
+  server-side even if the later browser step fails. The rotated grant is adopted
+  immediately (and only while the stored grant is still the one the attempt read),
+  so the file keeps the token the server most recently issued; a provider that
+  invalidates the old refresh token therefore does not leave an unusable grant
+  behind. A logout that happens in the same window still wins, and then the token
+  the server issued is discarded along with the grant the owner deleted.
+- An already-working stored grant still makes an approved login a no-op. It is
+  verified with one connection and a tool listing; if that listing fails, the
+  result reports an unknown tool count instead of "0 tools".
 - A staged attempt starts from the stored client registration. If a refresh fails
   transiently and the server then challenges for a browser, a provider that binds
   one exact loopback redirect URI to that registration may refuse it; log out and
   request a new login to register a fresh client.
 - Tokens are stored in plaintext in a private file (like the provider credential
-  store). There is no OS keychain integration. An owner (or any process running as
-  the same user) can read them; the `credential-exposed` rule above is what keeps
-  the model's own shell out of that set.
-- The configuration write's external-change check and its rename are separate
-  operations. An outside editor writing in that window can still be overwritten;
-  no portable filesystem lock exists for an arbitrary editor.
+  store). There is no OS keychain integration and no isolation from same-user
+  code: an owner, the model's own shell, a stdio MCP server or a worker can read
+  them. What the runtime keeps out of model-facing surfaces is the token *content*
+  (tool results, listings, notices, logs), not the file.
+- The configuration write's external-change check (bytes plus file identity) and
+  its rename are separate operations. An outside editor writing in that window can
+  still be overwritten; no portable filesystem lock or content
+  compare-and-swap exists for an arbitrary editor.
 
 ## Tools and discovery
 
@@ -369,14 +415,10 @@ one server is enabled but every enabled server fails, the MCP extension has no
 tools and Code Mode is still installed with `tool_search` but **zero MCP
 namespaces** for authenticated mapped chats. The status
 carries only a fixed failure code (`start-failed`, `start-timeout`,
-`missing-environment`, `auth-required`, `credential-exposed`,
-`connection-closed`, `closed`),
+`missing-environment`, `auth-required`, `connection-closed`, `closed`),
 never a transport message, response body, stderr tail, URL or configured value.
 `auth-required` means the entry uses OAuth and has no usable stored grant (or the
 server rejected it); only an owner-approved login changes that.
-`credential-exposed` means the entry uses OAuth while a model-executed host shell
-could read the grant file, so it was not read at all; configure
-`toolSandbox: "bwrap"` or remove `bash` from the tool ceiling and restart.
 
 Tool calls pass `timeoutSeconds` (default 60) as the native per-request timeout
 and the calling turn's abort signal. The committed cancellation test covers a
@@ -393,8 +435,8 @@ Known limits of this slice:
 - OAuth is authorization-code + PKCE with loopback redirect and dynamic client
   registration only. There is no device-code flow, no configurable client
   identity, no authorization-server metadata override and no step-up flow; see
-  the limitations under [OAuth login](#oauth-login). OAuth grants are unavailable
-  while an unsandboxed host shell is enabled; see the protection rule there.
+  the limitations under [OAuth login](#oauth-login), including the trust boundary
+  of the private token file.
 - Management is proposal + owner decision. There is no model- or chat-driven
   automatic approval, no approval by the agent's own message, no third owner
   surface, and no scheduled-run, worker or automation-scope proposal.

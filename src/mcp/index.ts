@@ -28,7 +28,6 @@ export {
 export { mcpNamespaceName, mcpToolNames, mcpToolPrefix, MCP_TOOL_NAME_MAX, MCP_TOOL_PREFIX } from "./naming.js";
 export {
   McpServerConnection,
-  ExposedOAuthGrantError,
   MissingEnvironmentError,
   MissingOAuthGrantError,
   type McpFailureCode,
@@ -38,12 +37,15 @@ export {
 export { createMcpToolRegistration } from "./tools.js";
 export {
   FileMcpOAuthStateStore,
+  adoptMcpOAuthRefresh,
   commitMcpOAuthState,
   hasMcpOAuthTokens,
   mcpOAuthGrantEpoch,
   mcpOAuthStagingPath,
   mcpOAuthStatePath,
   mcpOAuthStoreDirectory,
+  snapshotMcpOAuthGrant,
+  type McpOAuthGrantSnapshot,
 } from "./oauth-store.js";
 export { beginMcpLogin, MCP_LOGIN_TIMEOUT_MS, type McpLoginFailure, type McpLoginOutcome, type McpLoginRun } from "./login.js";
 export { removeMcpServerEntry, writeMcpServerEntry, type McpConfigEdit, type McpConfigEditResult } from "./install.js";
@@ -52,7 +54,6 @@ export {
   loginNoticeText,
   MCP_ADMIN_LIMITS,
   MCP_ADMIN_TOOL_NAME,
-  MCP_OAUTH_UNPROTECTED,
   McpRequestsDoc,
   type McpAdmin,
   type McpAdminListing,
@@ -86,11 +87,6 @@ export interface McpIntegrationOptions {
   readonly delegatedToolNames: readonly string[];
   /** Host environment the configured variable names are resolved from. Defaults to `process.env`. */
   readonly environment?: Readonly<Record<string, string | undefined>>;
-  /**
-   * True when a model-executable shell could read the canonical data directory (the unsandboxed host
-   * shell). An `oauth: true` entry then fails closed as `credential-exposed` without reading its grant.
-   */
-  readonly oauthGrantExposed?: boolean;
 }
 
 /**
@@ -162,7 +158,6 @@ async function connect(
   workspace: string,
   dataDir: string | undefined,
   environment: Readonly<Record<string, string | undefined>> | undefined,
-  oauthGrantExposed: boolean,
 ): Promise<McpServerConnection> {
   const server = new McpServerConnection({
     name,
@@ -170,7 +165,7 @@ async function connect(
     workspace,
     ...(environment === undefined ? {} : { environment }),
     ...("url" in config && config.oauth === true && dataDir !== undefined
-      ? { oauth: { storePath: mcpOAuthStatePath(dataDir, config.url), grantExposed: oauthGrantExposed } }
+      ? { oauth: { storePath: mcpOAuthStatePath(dataDir, config.url) } }
       : {}),
   });
   await server.open();
@@ -198,7 +193,6 @@ export async function createMcpIntegration(options: McpIntegrationOptions): Prom
         options.workspace,
         options.dataDir,
         options.environment,
-        options.oauthGrantExposed === true,
       )));
     servers.push(...connected);
 

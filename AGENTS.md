@@ -113,10 +113,12 @@ edits need restart only; unit edits additionally need daemon-reload.
   Isolated cron runs capture an origin subset bounded by current config, prepare it
   per run (including its workspace context), and lose it on completion; persistent
   history confers no permission.
-  The `skill`,
-  `cron`, `history`, `worker` and scoped `telegram` tools carry no filesystem/shell
-  authority and are exempt from the coding-tool hook; history remains read-only
-  over mapped chats. Telegram actions additionally require a live adapter, current private-chat
+  The `skill`, `cron`, `history`, `worker`, `mcp` management and scoped
+  `telegram` tools carry no filesystem/shell authority and are exempt from the
+  coding-tool hook, so enabling a coding tool never suppresses them; `mcp`
+  still only records owner approval requests and is limited to authenticated
+  mapped chats, and history remains read-only over mapped chats. Telegram actions
+  additionally require a live adapter, current private-chat
   admission and observed same-chat targets. Unknown external outcomes are retained,
   never blindly retried or evicted.
 - Provider spellings are native Pi AI IDs, the documented legacy aliases or
@@ -270,18 +272,24 @@ edits need restart only; unit edits additionally need daemon-reload.
   gateway's own configuration file atomically after validating the whole merged
   document, preserving the file mode and touching nothing else; it enables only
   the approved entry (other entries are pinned to `enabled: false` when the block
-  was off), serializes managed edits and refuses to replace a file whose bytes
-  changed since it was read. A `remove` approval deletes one entry and never
+  was off), serializes managed edits and refuses to replace a file whose bytes or
+  identity changed since it was read. The check and the rename remain two
+  operations: an outside write in that window is lost, and no portable lock or
+  content compare-and-swap removes it. A `remove` approval deletes one entry and never
   disables the capability. An `oauth: true` HTTP entry reads its grant from one
   private `0600` file per exact URL under the canonical data directory, never
   from config, transcript, entry or channel text; with no usable grant it fails
-  closed as `auth-required` instead of starting a flow, and while an unsandboxed
-  host shell could read that file it fails closed as `credential-exposed`
-  (Bubblewrap shell or no shell is required). Login is owner-approved,
+  closed as `auth-required` instead of starting a flow. That file has the same
+  trust boundary as the provider credential store: another user cannot read it,
+  and same-user code (the coding shell, a stdio MCP server, a worker) can. The
+  runtime does not claim isolation from same-user processes; it keeps token
+  *content* out of every model-facing surface. Login is owner-approved,
   gateway-run native PKCE with a loopback callback, one flow at a time and a
-  five-minute deadline; it works on a staged grant, installs it only after a
-  verification connection, and a logout increments the grant generation so a
-  stale refresh or a late commit cannot restore it. Its authorization URL is
+  five-minute deadline; it works on a staged
+  grant read together with its generation, installs it only after a verification
+  connection, adopts a refresh the server already rotated instead of leaving it
+  unusable, rechecks cancellation before committing, and a logout increments the
+  generation so a stale refresh or a late commit cannot restore it. Its authorization URL is
   delivered directly to the approving owner surface and never persisted in
   channel state, and its completion places one credential-free internal result
   in the origin chat. A configuration or grant change takes effect at the next

@@ -204,20 +204,85 @@ async function writeState(path: string, serverUrl: string, state: McpOAuthState)
  *
  * `expectedEpoch` is the generation read when the login started. A logout (or another commit) that
  * happened in the meantime increments it, so the late login cannot restore a grant the owner just
- * deleted. The caller removes its staging file either way.
+ * deleted. `signal` is rechecked inside the serialized step: a denial or a gateway shutdown that lands
+ * between the caller's last check and this write still installs nothing. The caller removes its
+ * staging file either way.
  */
 export async function commitMcpOAuthState(
   path: string,
   serverUrl: string,
   state: McpOAuthState,
   expectedEpoch: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   await serialized(path, async () => {
+    if (signal?.aborted === true) throw new Error("the MCP login was canceled before its grant was installed");
     if (mcpOAuthGrantEpoch(path) !== expectedEpoch) {
       throw new Error("the stored MCP OAuth grant changed while the login was running");
     }
     await writeState(path, String(new URL(serverUrl)), state);
     bumpEpoch(path);
+  });
+}
+
+/**
+ * One consistent view of a stored grant: the state and the generation it was read at.
+ *
+ * A login seeds its staged copy from this and commits against the same generation, so a logout that
+ * lands between reading the grant and capturing the generation cannot make the attempt resurrect the
+ * deleted grant under a fresh expectation.
+ */
+export interface McpOAuthGrantSnapshot {
+  readonly state: McpOAuthState | undefined;
+  readonly epoch: number;
+}
+
+/** Read the stored grant and its generation as one serialized step. Never returns a foreign URL's state. */
+export function snapshotMcpOAuthGrant(path: string, serverUrl: string): Promise<McpOAuthGrantSnapshot> {
+  return serialized(path, async () => ({
+    state: await new FileMcpOAuthStateStore(path, serverUrl).load(),
+    epoch: mcpOAuthGrantEpoch(path),
+  }));
+}
+
+function tokensIdentity(state: McpOAuthState | undefined): string | undefined {
+  return state?.tokens === undefined ? undefined : JSON.stringify(state.tokens);
+}
+
+/**
+ * Persist a refresh a staged attempt obtained from the authorization server.
+ *
+ * A refresh is not a local edit: the server has already issued the new token and may have invalidated
+ * the previous refresh token. Discarding it on a later failure would leave a stored grant that no
+ * longer works, so the rotated tokens are adopted as soon as they exist. Adoption is bounded to the
+ * case where nothing else wrote the grant since the attempt's snapshot (the generation is unchanged and
+ * the stored tokens are still the ones the attempt read); then a login that started from a grant the
+ * owner has since replaced or deleted cannot overwrite that decision. Only the token material is taken
+ * from `state`; the stored client registration and discovery stay as they were, because the attempt's
+ * own may be bound to its ephemeral loopback redirect URI. It deliberately does not bump the
+ * generation: a rotation is not a replacement, and retiring the generation would also strand a live
+ * connection's own refresh.
+ */
+export async function adoptMcpOAuthRefresh(
+  path: string,
+  serverUrl: string,
+  snapshot: McpOAuthGrantSnapshot,
+  state: McpOAuthState,
+): Promise<boolean> {
+  const url = String(new URL(serverUrl));
+  return serialized(path, async () => {
+    if (state.tokens === undefined) return false;
+    if (mcpOAuthGrantEpoch(path) !== snapshot.epoch) return false;
+    const current = await new FileMcpOAuthStateStore(path, url).load();
+    if (tokensIdentity(current) !== tokensIdentity(snapshot.state)) return false;
+    if (current === undefined) return false;
+    // Adopt the rotation only: the client registration and discovery the attempt used can be bound to
+    // its ephemeral loopback redirect URI, so the stored grant keeps its own.
+    const next: McpOAuthState = { ...current, tokens: state.tokens };
+    if (state.tokensExpireAt === undefined) delete next.tokensExpireAt;
+    else next.tokensExpireAt = state.tokensExpireAt;
+    await writeState(path, url, next);
+    return true;
   });
 }
 

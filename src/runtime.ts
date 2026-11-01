@@ -119,6 +119,7 @@ import {
   createMcpIntegration,
   loginNoticeText,
   mcpHasEnabledServers,
+  MCP_ADMIN_TOOL_NAME,
   McpRequestsDoc,
   type McpAdmin,
   type McpAdminListing,
@@ -610,12 +611,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ? (config.workers.toolAllowlist ?? toolAllowlist).filter((name) =>
         (CODING_TOOL_NAMES as readonly string[]).includes(name)) : [];
   const registeredCodingTools = [...new Set([...toolAllowlist, ...workerCodingTools])];
-  // An OAuth grant lives under the canonical data directory, outside every tool root, but the
-  // unsandboxed host shell can still read anything this process user owns. In that execution mode a
-  // model-executed command could copy the grant, so OAuth fails closed instead of claiming a 0600
-  // file is isolation. Bubblewrap mounts only the workspace and its own private `/tmp`.
-  const oauthGrantExposed =
-    registeredCodingTools.includes("bash") && (config.toolSandbox ?? "host") !== "bwrap";
   const toolsEnabled = registeredCodingTools.length > 0;
   // MCP is a separate, explicit connection authority. Connecting starts external clients, so the
   // config switch must be on and at least one server enabled; otherwise no client is created.
@@ -1031,6 +1026,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
           ...(cronEnabled ? [CRON_TOOL_NAME] : []),
           ...(workersEnabled ? [WORKER_TOOL_NAME] : []),
           ...(telegramTool === undefined ? [] : [TELEGRAM_TOOL_NAME]),
+          // MCP management only records owner approval requests: it carries no filesystem or shell
+          // authority, so the coding ceiling must not suppress it. Its own hook still limits it to
+          // authenticated mapped chats, and it exists only when the host can write configuration.
+          ...(config.configFile === undefined ? [] : [MCP_ADMIN_TOOL_NAME]),
           // History retrieval is read-only over mapped chats and has its own scope checks, so the
           // ceiling must not suppress it when coding tools are enabled.
           ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
@@ -1918,14 +1917,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // MCP connects before the registry is built so every discovered tool is in the initial
     // registry. A failed server contributes nothing and is reported through `gateway.mcp`; the
     // whole open fails only for an internal error, and the catch below tears down whatever started.
-    // OAuth grants live under the same canonical data directory as the private credential store.
+    // OAuth grants live under the same canonical data directory as the private credential store: a
+    // private `0600` file like the provider credential store, on the same trust boundary. Any process
+    // running as this user can read it — including the model's own shell and an MCP stdio server — and
+    // that is the accepted posture; no model-facing surface returns its content (see MCP.md).
     const mcpDataDir = credentialStoreDir ?? config.dataDir;
     if (mcpConfigured && mcpConfig !== undefined) {
       mcpRef.current = await createMcpIntegration({
         config: mcpConfig,
         workspace,
         dataDir: mcpDataDir,
-        oauthGrantExposed,
         isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId)
           || workerChildConversations.has(conversationId),
         delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
@@ -1955,7 +1956,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
         edit: { configFile: config.configFile, workspace },
         dataDir: mcpDataDir,
         config: mcpConfig,
-        oauthGrantExposed,
         requests,
         context,
         isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),

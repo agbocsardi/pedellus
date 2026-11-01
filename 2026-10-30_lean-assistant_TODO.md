@@ -1409,3 +1409,40 @@ server, faux models, no external network.
   exposed-mode refusal, concurrent approve/deny, startup cancellation, configured
   login headers, logout during a live flow, and a failed attempt preserving the
   prior grant. No new permanent tests were added (not requested).
+
+### Session — second independent review of MCP management and OAuth
+
+- [x] Trust boundary settled by the owner: a grant is a private `0600` file like
+  the provider credential store. Same-OS-user code (the host shell, a Bubblewrap
+  mount that includes the data directory, a stdio MCP server, a worker) can read
+  it, as in Python nanobot's `FileTokenStorage`, and that risk is accepted. The
+  execution-mode `credential-exposed` guard from the previous pass was removed
+  (predicate, sandbox mount-view helper, failure code, fixed refusal text and its
+  two tests), and MCP.md/AGENTS.md now state what file permissions do and do not
+  protect instead of implying a mode boundary.
+- [x] Coding-tool path race closed: content reads and writes open the path,
+  identify the opened inode from `/proc/self/fd`, refuse a descriptor outside the
+  roots and then operate on that descriptor. The old build leaked an outside file
+  through a swapped workspace symlink; the fixed build did not in 24,000 reads.
+  Directory listings, create, rename, remove and watch keep the resolved-path
+  check (no content). `createEnvConformance` still passes 24/24.
+- [x] Login races: cancellation is rechecked inside the commit, the grant
+  generation is captured together with the grant snapshot (a logout can no longer
+  land between them), and a refresh the server already rotated is adopted
+  immediately instead of being discarded, so a failed attempt cannot leave an
+  unusable grant. Docs no longer claim a preserved grant is untouched.
+- [x] Already-authorized login: a failed tool listing is reported as an unknown
+  count instead of being counted as zero tools.
+- [x] Config writes: byte comparison plus file identity (device, inode, size,
+  mtime), so an atomic-save editor is caught; the residual check/rename window is
+  documented as narrowed, not removed.
+- [x] Functional bug found by the new coverage: with any coding tool enabled, the
+  coding ceiling hook blocked the `mcp` management tool, so agent-driven setup
+  only worked with an empty `toolAllowlist`. The tool is now an exempt
+  non-effectful context tool (it only records owner approval requests) while its
+  own hook still limits it to authenticated mapped chats.
+- [x] Verification: typecheck/build, 351 behavior checks (4 new permanent
+  regression tests: accepted-mode grant use with no token on any model-facing
+  value, failing tool listing, snapshot/rotation/epoch contract, symlink-swap
+  read), 2 execution checks, native `createEnvConformance` 24/24 and core
+  acceptance 83/83. No live MCP server, provider or credential was used.

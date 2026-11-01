@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, realpath, rm, writeFile as writeFileHost } from "node:fs/promises";
+import { constants, existsSync, statSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readlink, realpath, rm, writeFile as writeFileHost, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Context } from "@earendil-works/chord/context";
 import {
 	ExecutionError,
@@ -98,6 +98,13 @@ export interface HostExecutionOptions {
  *   creates a new session/process group (for example with `setsid`) escapes that teardown; the Bubblewrap shell adds
  *   `--unshare-pid` and `--die-with-parent` for its own descendants.
  *
+ * File *content* reads and writes do not rely on the path check alone. The policy resolves symlinks before the
+ * operation, and a concurrent process could swap a path component in between; so the operation is performed through a
+ * descriptor that is opened first and then identified from `/proc/self/fd`, and a descriptor that resolved outside the
+ * roots is refused before any byte moves. This is what keeps a private file outside the roots out of a racing read
+ * tool call, not the pre-check by itself. Directory listings, `create`, `rename`, `remove` and `watch` keep the
+ * resolved-path check; they disclose no file content.
+ *
  * The shell timeout, environment allowlist, command filters and filesystem checks all come from `./policy.ts`; the
  * Bubblewrap shell uses that same policy and the direct-workspace argv builder rather than a second policy.
  */
@@ -107,6 +114,8 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 	readonly #tempRoot: string;
 	readonly #ownsTempRoot: boolean;
 	readonly #bwrap: BwrapShell | undefined;
+	/** `/proc/self/fd` where the platform provides it: the operation-time identity check for file content. */
+	readonly #descriptorRoot: string | undefined;
 
 	constructor(options: {
 		cwd: string;
@@ -122,6 +131,7 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		this.#tempRoot = options.tempRoot;
 		this.#ownsTempRoot = options.ownsTempRoot;
 		this.#bwrap = options.bwrap;
+		this.#descriptorRoot = existsSync("/proc/self/fd") ? "/proc/self/fd" : undefined;
 	}
 
 	async #probe(context: Context): Promise<FilesystemPathProbe> {
@@ -151,12 +161,55 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		return denied === undefined ? run(absolute.value) : err<T, FileError>(denied);
 	}
 
+	/**
+	 * Run one content operation against a descriptor whose identity was verified after opening.
+	 *
+	 * The policy check resolves the path first; between that and the operation a concurrent process can
+	 * swap a component for a symbolic link. Opening here and reading `/proc/self/fd/<fd>` reports the file
+	 * the descriptor really refers to, because that entry resolves to the opened inode and not to a path.
+	 * A descriptor outside every root is refused before the operation runs; an accepted one is then the
+	 * operation target itself, so the operation's own open cannot be redirected either. Without procfs the
+	 * guard keeps its resolved-path check, as the module docs say.
+	 *
+	 * `flags` never truncates: a refused descriptor must not have damaged the file, so the delegated
+	 * operation does its own truncate or write against the verified inode.
+	 */
+	async #throughDescriptor<T>(
+		absolute: string,
+		flags: string | number,
+		context: Context,
+		run: (target: string) => Promise<Result<T, FileError>>,
+	): Promise<Result<T, FileError>> {
+		if (context.abortSignal?.aborted) return err<T, FileError>(new FileError("aborted", "aborted", absolute));
+		const root = this.#descriptorRoot;
+		if (root === undefined) return run(absolute);
+		let handle: FileHandle | undefined;
+		try {
+			handle = await open(absolute, flags);
+			const actual = await readlink(`${root}/${handle.fd}`);
+			if (!this.#policy.roots.some((candidate) => isPathWithin(candidate, actual))) {
+				return err<T, FileError>(new FileError(
+					"permission_denied",
+					`The opened file resolved outside the execution workspace: ${absolute}`,
+					absolute,
+				));
+			}
+			return await run(`${root}/${handle.fd}`);
+		} catch (error) {
+			return err<T, FileError>(openError(error, absolute));
+		} finally {
+			await handle?.close().catch(() => undefined);
+		}
+	}
+
 	override readTextFile(path: string, context: Context) {
-		return this.#guarded(path, context, true, (absolute) => super.readTextFile(absolute, context));
+		return this.#guarded(path, context, true, (absolute) =>
+			this.#throughDescriptor(absolute, "r", context, (target) => super.readTextFile(target, context)));
 	}
 
 	override openTextLineReader(path: string, context: Context): Promise<Result<TextLineReader, FileError>> {
-		return this.#guarded(path, context, true, (absolute) => super.openTextLineReader(absolute, context));
+		return this.#guarded(path, context, true, (absolute) =>
+			this.#throughDescriptor(absolute, "r", context, (target) => super.openTextLineReader(target, context)));
 	}
 
 	override readTextLines(
@@ -164,11 +217,13 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		options: { maxLines?: number } | undefined,
 		context: Context,
 	): Promise<Result<string[], FileError>> {
-		return this.#guarded(path, context, true, (absolute) => super.readTextLines(absolute, options, context));
+		// Delegates to the guarded `openTextLineReader`, so it inherits the same descriptor check.
+		return super.readTextLines(path, options, context);
 	}
 
 	override readBinaryFile(path: string, context: Context): Promise<Result<Uint8Array, FileError>> {
-		return this.#guarded(path, context, true, (absolute) => super.readBinaryFile(absolute, context));
+		return this.#guarded(path, context, true, (absolute) =>
+			this.#throughDescriptor(absolute, "r", context, (target) => super.readBinaryFile(target, context)));
 	}
 
 	override openBinaryReader(
@@ -177,13 +232,56 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		context: Context,
 	): Promise<Result<BinaryReader, FileError>> {
 		// `noFollow` means the final component is not a symlink the operation may follow, so the parent is the boundary.
-		return this.#guarded(path, context, options?.noFollow !== true, (absolute) =>
-			super.openBinaryReader(absolute, options, context),
-		);
+		const noFollow = options?.noFollow === true;
+		return this.#guarded(path, context, !noFollow, async (absolute) => {
+			const verified = await this.#throughDescriptor(
+				absolute,
+				// O_NOFOLLOW rejects a final symbolic link here; the delegated open must not then re-read the
+				// verified proc entry as a link of its own.
+				noFollow ? constants.O_RDONLY | constants.O_NOFOLLOW : "r",
+				context,
+				(target) => super.openBinaryReader(target, noFollow ? { ...options, noFollow: false } : options, context),
+			);
+			if (!verified.ok) return verified;
+			const reader = verified.value;
+			// The reader was opened through a descriptor entry, which is not the path the caller asked for:
+			// report the caller's path and name as the native reader would.
+			return ok<BinaryReader, FileError>({
+				info: async (inner) => reportedInfo(await reader.info(inner), absolute),
+				read: (offset, length, inner) => reader.read(offset, length, inner),
+				scanLines: (scan, inner) => reader.scanLines(scan, inner),
+				close: (inner) => reader.close(inner),
+			});
+		});
 	}
 
 	override writeFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
-		return this.#guarded(path, context, true, (absolute) => super.writeFile(absolute, content, context));
+		return this.#guarded(path, context, true, async (absolute) => {
+			// The native write creates missing parents; the descriptor has to exist before it can be opened.
+			const prepared = await ensureParent(absolute);
+			return prepared === undefined
+				? this.#throughDescriptor(absolute, "a", context, (target) => super.writeFile(target, content, context))
+				: err<void, FileError>(prepared);
+		});
+	}
+
+	override appendFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
+		return this.#guarded(path, context, true, async (absolute) => {
+			const prepared = await ensureParent(absolute);
+			return prepared === undefined
+				? this.#throughDescriptor(absolute, "a", context, (target) => super.appendFile(target, content, context))
+				: err<void, FileError>(prepared);
+		});
+	}
+
+	override truncateFile(path: string, size: number, context: Context): Promise<Result<void, FileError>> {
+		return this.#guarded(path, context, true, (absolute) =>
+			this.#throughDescriptor(absolute, "r+", context, (target) => super.truncateFile(target, size, context)));
+	}
+
+	override flushFile(path: string, context: Context): Promise<Result<void, FileError>> {
+		return this.#guarded(path, context, true, (absolute) =>
+			this.#throughDescriptor(absolute, "r+", context, (target) => super.flushFile(target, context)));
 	}
 
 	/**
@@ -215,18 +313,6 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 				return err<void, FileError>(toFileError(error));
 			}
 		});
-	}
-
-	override appendFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
-		return this.#guarded(path, context, true, (absolute) => super.appendFile(absolute, content, context));
-	}
-
-	override truncateFile(path: string, size: number, context: Context): Promise<Result<void, FileError>> {
-		return this.#guarded(path, context, true, (absolute) => super.truncateFile(absolute, size, context));
-	}
-
-	override flushFile(path: string, context: Context): Promise<Result<void, FileError>> {
-		return this.#guarded(path, context, true, (absolute) => super.flushFile(absolute, context));
 	}
 
 	override fileInfo(path: string, context: Context): Promise<Result<FileInfo, FileError>> {
@@ -408,6 +494,49 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 			},
 			context,
 		);
+	}
+}
+
+/** Create a write target's parent directories, as the native write does, and report a failure as a FileError. */
+async function ensureParent(absolute: string): Promise<FileError | undefined> {
+	try {
+		await mkdir(dirname(absolute), { recursive: true });
+		return undefined;
+	} catch (error) {
+		return openError(error, absolute);
+	}
+}
+
+/** Report the caller's path and name on metadata read through a verified-descriptor target. */
+function reportedInfo(result: Result<FileInfo, FileError>, path: string): Result<FileInfo, FileError> {
+	if (!result.ok) return result;
+	return ok<FileInfo, FileError>({ ...result.value, path, name: basename(path) });
+}
+
+/** Map an open failure the way the native environment does, so callers see the same codes. */
+function openError(error: unknown, path: string): FileError {
+	if (error instanceof FileError) return error;
+	const cause = error instanceof Error ? error : new Error(String(error));
+	switch ((cause as NodeJS.ErrnoException).code) {
+		case "ABORT_ERR":
+			return new FileError("aborted", cause.message, path, cause);
+		case "ENOENT":
+			return new FileError("not_found", cause.message, path, cause);
+		case "EACCES":
+		case "EPERM":
+			return new FileError("permission_denied", cause.message, path, cause);
+		case "ENOTDIR":
+			return new FileError("not_directory", cause.message, path, cause);
+		case "EISDIR":
+			return new FileError("is_directory", cause.message, path, cause);
+		case "EINVAL":
+			return new FileError("invalid", cause.message, path, cause);
+		// O_NOFOLLOW reports a final-component symlink as ELOOP (EMLINK on some BSDs).
+		case "ELOOP":
+		case "EMLINK":
+			return new FileError("invalid", `Refusing to follow a symbolic link: ${path}`, path, cause);
+		default:
+			return new FileError("unknown", cause.message, path, cause);
 	}
 }
 

@@ -9,9 +9,11 @@ import {
 import type { McpHttpServerConfig } from "./config.js";
 import {
   FileMcpOAuthStateStore,
+  adoptMcpOAuthRefresh,
   commitMcpOAuthState,
-  mcpOAuthGrantEpoch,
   mcpOAuthStagingPath,
+  snapshotMcpOAuthGrant,
+  type McpOAuthGrantSnapshot,
 } from "./oauth-store.js";
 import { McpServerConnection, guardedFetch, headerValues } from "./server.js";
 
@@ -27,9 +29,12 @@ import { McpServerConnection, guardedFetch, headerValues } from "./server.js";
  *   the `state` value, the code verifier nor any token is ever returned to the model or written to a
  *   conversation entry;
  * - the callback listener is loopback-only and one flow runs at a time;
- * - the attempt works on a private staging file, so a grant that already works is never deleted to
- *   make room for a new one. The staged state replaces the stored grant only after one real
- *   connection and tool listing verified it;
+ * - the attempt works on a private staging file seeded from the stored grant, so a grant that already
+ *   works is not deleted to make room for a new one and the stored grant is replaced only after one
+ *   real connection and tool listing verified the staged replacement. A refresh performed during the
+ *   attempt is the one exception to "the stored file is not rewritten": the authorization server has
+ *   already issued that token and may have invalidated the previous refresh token, so the rotated
+ *   grant is adopted immediately instead of being thrown away with a failed attempt;
  * - a logout that happens while the attempt runs increments the grant generation, so the late commit
  *   is refused instead of restoring a grant the owner just deleted.
  *
@@ -89,15 +94,14 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
   const timeoutMs = options.timeoutMs ?? MCP_LOGIN_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
 
-  // The attempt starts from a staged copy of the stored grant, so a stored grant that still works
-  // makes the approved login a no-op without touching the real file, a refresh rotates the token only
-  // in the copy, and a browser attempt or failure never deletes or rewrites what is already stored.
+  // The attempt starts from a staged copy of the stored grant, read together with the grant
+  // generation it will commit against, so a logout cannot land between the two and hand the attempt
+  // a fresh expectation for a grant it copied before the deletion.
+  const serverUrl = options.config.url;
   const stagingPath = mcpOAuthStagingPath(options.storePath);
-  const staging = new FileMcpOAuthStateStore(stagingPath, options.config.url);
-  const real = new FileMcpOAuthStateStore(options.storePath, options.config.url);
-  const stored = await real.load().catch(() => undefined);
-  if (stored !== undefined) await staging.save(stored).catch(() => undefined);
-  const expectedEpoch = mcpOAuthGrantEpoch(options.storePath);
+  const staging = new FileMcpOAuthStateStore(stagingPath, serverUrl);
+  const snapshot = await snapshotMcpOAuthGrant(options.storePath, serverUrl);
+  if (snapshot.state !== undefined) await staging.save(snapshot.state).catch(() => undefined);
   if (canceled(options.signal)) {
     await staging.clear().catch(() => undefined);
     throw new CancelledLoginError();
@@ -138,11 +142,20 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
       options.signal?.removeEventListener("abort", stopStartup);
     }
     if (canceled(options.signal)) throw new CancelledLoginError();
+    // A connection that refreshed the seeded grant already changed the token at the authorization
+    // server, which may have invalidated the previous refresh token. Adopt the rotated grant now, so a
+    // later browser failure or cancellation cannot leave a stored grant that no longer works.
+    await adoptStagedRefresh(staging, snapshot, options.storePath, serverUrl);
     // A grant in the staging file already worked (the server accepted it without a browser step).
     const redirect = authorizationUrl;
-    const discoveredTools = redirect === undefined && client.serverCapabilities?.tools !== undefined
-      ? (await client.listTools().catch(() => [])).length
-      : 0;
+    // A tool listing failure is reported as unknown instead of being counted as zero tools: the
+    // connection did authenticate, but verification did not see what the server offers.
+    let discovered: number | undefined;
+    if (client.serverCapabilities?.tools === undefined) {
+      discovered = 0;
+    } else {
+      discovered = await client.listTools().then((tools) => tools.length, () => undefined);
+    }
     await client.close().catch(() => undefined);
     client = undefined;
     if (redirect === undefined) {
@@ -151,18 +164,19 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
       const verified = await staging.load().catch(() => undefined);
       if (verified !== undefined) {
         try {
-          await commitMcpOAuthState(options.storePath, options.config.url, verified, expectedEpoch);
+          await commitMcpOAuthState(options.storePath, serverUrl, verified, snapshot.epoch, options.signal);
         } catch {
+          if (canceled(options.signal)) throw new CancelledLoginError();
           throw new McpGrantSupersededError();
         }
       }
-      throw new McpAlreadyAuthorizedError(discoveredTools);
+      throw new McpAlreadyAuthorizedError(discovered);
     }
     const state = await provider.state();
     const run: McpLoginRun = {
       authorizationUrl: redirect.href,
       expiresAtMs: deadline,
-      completion: complete(options, provider, callback, stagingPath, expectedEpoch, options.config.url, state, deadline),
+      completion: complete(options, provider, callback, stagingPath, snapshot.epoch, serverUrl, state, deadline),
     };
     // `completion` owns the listener from here.
     callback = undefined;
@@ -180,12 +194,34 @@ class CancelledLoginError extends Error {
 }
 
 /**
+ * Persist the grant one staged connection already refreshed.
+ *
+ * Only a rotation of a grant the attempt read is adopted: a browser authorization that has not been
+ * verified yet is never written, and `adoptMcpOAuthRefresh` refuses when the stored grant was replaced
+ * or deleted meanwhile. A refusal is not an error here; the attempt keeps working from its staged copy.
+ */
+async function adoptStagedRefresh(
+  staging: FileMcpOAuthStateStore,
+  snapshot: McpOAuthGrantSnapshot,
+  storePath: string,
+  serverUrl: string,
+): Promise<void> {
+  const before = snapshot.state?.tokens;
+  if (before === undefined) return;
+  const staged = await staging.load().catch(() => undefined);
+  if (staged?.tokens === undefined) return;
+  if (JSON.stringify(before) === JSON.stringify(staged.tokens)) return;
+  await adoptMcpOAuthRefresh(storePath, serverUrl, snapshot, staged).catch(() => false);
+}
+
+/**
  * The configured entry already authenticated with its stored (or freshly refreshed) grant, so the
- * approved login had nothing to authorize. `tools` is the discovered tool count of that connection.
+ * approved login had nothing to authorize. `tools` is the discovered tool count of that connection,
+ * or undefined when the connection authenticated but its tool listing failed.
  */
 export class McpAlreadyAuthorizedError extends Error {
   override name = "McpAlreadyAuthorizedError";
-  constructor(readonly tools: number) {
+  constructor(readonly tools: number | undefined) {
     super("The MCP server already accepted the stored grant");
   }
 }
@@ -251,7 +287,8 @@ async function complete(
     }
     if (canceled(options.signal)) return { ok: false, reason: "canceled" };
     // Verify the staged grant with one real connection before it replaces anything on disk. A failure
-    // here is reported and the previously stored grant is left untouched.
+    // here is reported and the (possibly refreshed) stored grant is left in place. An owner denial or
+    // a gateway shutdown closes that connection and is rechecked before anything is committed.
     const connection = new McpServerConnection({
       name: "login-verify",
       config: options.config,
@@ -259,21 +296,28 @@ async function complete(
       ...(options.environment === undefined ? {} : { environment: options.environment }),
       oauth: { storePath: stagingPath, redirectUrl: callback.redirectUrl },
     });
+    const stopVerify = (): void => { void connection.close().catch(() => undefined); };
+    options.signal?.addEventListener("abort", stopVerify, { once: true });
     let tools: number;
     try {
       await connection.open();
+      if (canceled(options.signal)) return { ok: false, reason: "canceled" };
       if (!connection.connected) return { ok: false, reason: "verify-failed" };
       tools = connection.toolNames().length;
     } finally {
+      options.signal?.removeEventListener("abort", stopVerify);
       await connection.close().catch(() => undefined);
     }
-    // Install the verified replacement. A logout or another completed login since this attempt began
-    // retired the generation, and this commit then refuses rather than undoing that decision.
+    // Install the verified replacement. A cancellation, logout or another completed login since this
+    // attempt began retires the generation, and this commit then refuses rather than undoing it.
     try {
       const staged = await staging.load();
       if (staged?.tokens === undefined) return { ok: false, reason: "verify-failed" };
-      await commitMcpOAuthState(options.storePath, serverUrl, staged, expectedEpoch);
+      // The cancellation is rechecked inside the commit, so a denial that lands between this call and
+      // the write still installs nothing.
+      await commitMcpOAuthState(options.storePath, serverUrl, staged, expectedEpoch, options.signal);
     } catch {
+      if (canceled(options.signal)) return { ok: false, reason: "canceled" };
       return { ok: false, reason: "grant-superseded" };
     }
     return { ok: true, tools };

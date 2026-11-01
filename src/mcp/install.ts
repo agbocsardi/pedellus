@@ -24,10 +24,13 @@ import { parseConfig } from "../config.js";
  *
  * Limitations: JSON is re-serialized with two-space indentation, so hand-written formatting and key
  * order are not preserved. The rename gives the file the gateway user's ownership. The check before
- * the rename and the rename itself are not one atomic operation, so an outside writer that changes
- * the file in that tiny window is still overwritten; no filesystem lock is available for an arbitrary
- * editor. A change takes effect at the next gateway start; this module never reopens or hot-reloads a
- * runtime.
+ * the rename and the rename itself are not one atomic operation: the bytes and the file identity are
+ * compared by reopening the file immediately before the replacement, which catches an atomic-save
+ * editor that replaced the file and any in-place edit that landed before the comparison, but a writer
+ * that lands in the few microseconds between that comparison and the rename is still overwritten.
+ * POSIX has no compare-and-swap for file content and no lock an arbitrary editor honors, so the
+ * window is narrowed and reported, not removed. A change takes effect at the next gateway start;
+ * this module never reopens or hot-reloads a runtime.
  */
 export interface McpConfigEdit {
   /** Absolute path of the configuration file this gateway loaded. */
@@ -45,6 +48,39 @@ export interface McpConfigEditResult {
 
 const CONFIG_FILE_LIMIT_BYTES = 1024 * 1024;
 
+interface FileIdentity {
+  readonly device: number;
+  readonly inode: number;
+  readonly size: number;
+  readonly modifiedMs: number;
+}
+
+interface DocumentSnapshot {
+  readonly text: string;
+  readonly document: Record<string, unknown>;
+  /** Identity of the file the snapshot was read from, compared again before the replacement. */
+  readonly identity: FileIdentity;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function identityOf(info: Awaited<ReturnType<FileHandle["stat"]>>): FileIdentity {
+  return {
+    device: Number(info.dev),
+    inode: Number(info.ino),
+    size: Number(info.size),
+    modifiedMs: Number(info.mtimeMs),
+  };
+}
+
+/** Identity plus bytes: an atomic-save editor replaces the inode, an in-place edit keeps it. */
+function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.device === right.device && left.inode === right.inode &&
+    left.size === right.size && left.modifiedMs === right.modifiedMs;
+}
+
 /** In-process serialization per configuration path. */
 const queues = new Map<string, Promise<unknown>>();
 
@@ -59,16 +95,7 @@ function serialized<T>(path: string, operation: () => Promise<T>): Promise<T> {
   return next;
 }
 
-interface DocumentSnapshot {
-  readonly text: string;
-  readonly document: Record<string, unknown>;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-async function readText(path: string): Promise<{ readonly text: string; readonly mode: number }> {
+async function readText(path: string): Promise<{ readonly text: string; readonly mode: number; readonly identity: FileIdentity }> {
   let handle: FileHandle | undefined;
   try {
     // O_NOFOLLOW: a symlinked configuration file is refused instead of replaced through its target.
@@ -76,14 +103,14 @@ async function readText(path: string): Promise<{ readonly text: string; readonly
     const info = await handle.stat();
     if (!info.isFile()) throw new Error("The configuration file must be a regular file");
     if (info.size > CONFIG_FILE_LIMIT_BYTES) throw new Error("The configuration file is unexpectedly large");
-    return { text: await handle.readFile("utf8"), mode: info.mode & 0o777 };
+    return { text: await handle.readFile("utf8"), mode: info.mode & 0o777, identity: identityOf(info) };
   } finally {
     await handle?.close();
   }
 }
 
 async function readDocument(edit: McpConfigEdit): Promise<DocumentSnapshot> {
-  const { text } = await readText(edit.configFile);
+  const { text, identity } = await readText(edit.configFile);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -91,7 +118,7 @@ async function readDocument(edit: McpConfigEdit): Promise<DocumentSnapshot> {
     throw new Error("The configuration file is not valid JSON");
   }
   if (!isRecord(parsed)) throw new Error("The configuration file must contain a JSON object");
-  return { text, document: Object.fromEntries(Object.entries(parsed)) };
+  return { text, document: Object.fromEntries(Object.entries(parsed)), identity };
 }
 
 /** Read the on-disk `mcp` block without trusting the in-memory copy the gateway opened with. */
@@ -116,10 +143,12 @@ async function writeDocument(
 ): Promise<void> {
   // Validate exactly what a start would parse, so an approved edit cannot brick the gateway.
   parseConfig(document, dirname(edit.configFile));
-  // Detect an external update between this edit's read and the replacement. The comparison and the
-  // rename are separate syscalls; a writer in that window is not detected (documented above).
+  // Detect an external update between this edit's read and the replacement. Bytes and the file identity
+  // are compared, so an atomic-save editor (a new inode) and an in-place edit are both caught. The
+  // comparison and the rename are separate syscalls; a writer that lands between them is not detected
+  // (documented above).
   const current = await readText(edit.configFile);
-  if (current.text !== snapshot.text) {
+  if (current.text !== snapshot.text || !sameIdentity(current.identity, snapshot.identity)) {
     throw new Error(
       "The configuration file changed on disk while this edit was prepared; nothing was written. " +
       "Review the request again and approve it before retrying.",
