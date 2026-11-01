@@ -250,6 +250,16 @@ function renderShow(
       return `${header}\nDeletes the stored OAuth grant for this server. A live connection is unaffected; ` +
         "a refresh that completes afterwards cannot restore the deleted grant.";
     }
+    if (request.kind === "remove" && request.server !== null) {
+      const exact = JSON.stringify(request.server, null, 2);
+      const head = bounded(
+        `${header}\n${describeEntry(request.name, request.server, options.edit.workspace)}`,
+        Math.max(0, MCP_ADMIN_LIMITS.maxShowChars - exact.length - 160),
+      );
+      return `${head}\n\nExact entry that would be deleted:\n${exact}\n\n` +
+        "The approval re-reads the configuration file and refuses, changing nothing, when the entry there is no " +
+        "longer this one.";
+    }
     return `${header}\nDeletes this server entry from the configuration file.`;
   }
   const blockEnabled = options.config?.enabled === true;
@@ -813,8 +823,19 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
         : { status: "applied", text: `${base} ${login.text}` };
     }
     if (request.kind === "remove") {
+      // The approval deletes only the entry the owner was shown. A request recorded before removals carried
+      // their entry falls back to this gateway's own entry for the name, which is still compared against the
+      // file; with neither there is nothing to bind the deletion to, so it is refused.
+      const expected = request.server ??
+        (configuredEntry(request.name) as unknown as Record<string, JsonValue> | undefined);
+      if (expected === undefined) {
+        return {
+          status: "refused",
+          text: `Request ${request.id} does not record the entry it would remove; nothing was removed.`,
+        };
+      }
       try {
-        const result = await removeMcpServerEntry(options.edit, request.name);
+        const result = await removeMcpServerEntry(options.edit, request.name, expected);
         await settle(context, request.id, "done", "configuration entry removed");
         return {
           status: "applied",
@@ -935,6 +956,13 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
                 };
               }
             }
+            // A removal records the entry as this gateway parsed it, so the approval deletes exactly the
+            // entry the owner was shown and refuses an entry that changed on disk meanwhile.
+            const recorded = action === "propose"
+              ? (args.server as Record<string, JsonValue>)
+              : action === "remove" && configured !== undefined
+                ? (configured as unknown as Record<string, JsonValue>)
+                : undefined;
             let id: string;
             try {
               id = await propose(
@@ -942,7 +970,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
                 api.conversationId,
                 action === "propose" ? "config" : action,
                 name,
-                action === "propose" ? (args.server as Record<string, JsonValue>) : undefined,
+                recorded,
               );
             } catch (error) {
               return {

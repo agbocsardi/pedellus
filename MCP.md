@@ -191,7 +191,10 @@ Decisions come from two owner surfaces and nowhere else:
 
 `/mcp show <id>` is the disclosure: the normalized shape, the **entire exact
 entry** that would be written (never truncated; a proposal is bounded at 8 KiB),
-and every effect of an approval on the `mcp` block. A stdio command is shown as
+and every effect of an approval on the `mcp` block. A `remove` request shows the
+**entire exact entry** that would be deleted, taken from this gateway's open
+configuration; its approval deletes only that entry and refuses when the entry on
+disk no longer parses to it. A stdio command is shown as
 "a local process the gateway would launch on this host", and every
 header/environment mapping is shown as `header <- host environment variable
 NAME`. Read it before approving; approval is exactly as powerful as the owner
@@ -216,7 +219,8 @@ What an approval does:
   entry could land with pinning or enabling effects the owner never saw; restart
   the gateway and review again in that case. Managed edits are serialized inside
   this process, and
-  the file is reopened immediately before replacement: if its bytes or its
+  the file is reopened once the complete replacement document has been written to
+  a temporary file and immediately before the rename: if its bytes or its
   identity (device, inode, size, mtime) changed since the edit was prepared, the
   approval is refused without writing. Limitations: JSON is re-serialized with
   two-space indentation, so hand formatting and key order are not preserved; the
@@ -236,8 +240,10 @@ What an approval does:
   decision. A live connection is unaffected, a refresh that completes afterwards
   cannot restore the deleted grant, and after the next start the entry reports
   `auth-required`.
-- `remove`: deletes `mcp.servers.<name>`. `mcp.enabled` is left as it is: wiping
-  the whole capability stays a separate owner decision.
+- `remove`: deletes `mcp.servers.<name>`, but only the entry the disclosure showed:
+  an entry on disk that no longer parses to that one is refused instead of
+  deleted, and the refusal leaves the request available. `mcp.enabled` is left as
+  it is: wiping the whole capability stays a separate owner decision.
 
 A refused write leaves the request available; a decision that succeeded consumes
 it. Approve and deny claim the request atomically before any asynchronous work,
@@ -309,13 +315,17 @@ Login is always owner-initiated and gateway-run:
    the URL, the code, the verifier or a token.
 
 Bounds and rules: one flow at a time, reserved before the attempt starts; a
-5-minute deadline covers the initial connection and the browser step; the callback
+5-minute deadline covers the initial connection, its tool listing and the browser
+step; the callback
 listener is loopback-only on `127.0.0.1` with an ephemeral port; `/mcp deny`
 cancels a running flow, including one still setting up and one already
 verifying; closing the gateway aborts it, and cancellation is rechecked up to the
 replacement's irreversible rename, so a denial either installs nothing or is
-reported as the grant being there. The attempt works on a staged file seeded from the stored
-grant, read together with the grant generation it will commit against, so a grant
+reported as the grant being there. The attempt works on a staged file seeded with
+the stored grant's durable material only (client registration, tokens, discovery):
+the transient `state` value and PKCE verifier of an earlier attempt are dropped,
+so every authorization attempt generates its own, and the staged file is read
+together with the grant generation it will commit against, so a grant
 that still works makes the login a no-op and a logout that lands in between
 retires the generation instead of handing the attempt a fresh expectation for a
 grant it copied before the deletion. A failed or canceled attempt does not delete

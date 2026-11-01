@@ -115,6 +115,23 @@ function serialized<T>(path: string, operation: () => Promise<T>): Promise<T> {
   return next;
 }
 
+/** Read one server's stored state. Never returns another URL's content. */
+async function readState(path: string, serverUrl: string): Promise<McpOAuthState | undefined> {
+  const text = await readFileText(path);
+  if (text === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("MCP OAuth state is not valid JSON");
+  }
+  if (!isRecord(parsed) || parsed.version !== STORE_VERSION) {
+    throw new Error("MCP OAuth state has an unsupported format");
+  }
+  const state = oauthState(parsed.state);
+  return state.serverUrl === serverUrl ? state : undefined;
+}
+
 async function readFileText(path: string): Promise<string | undefined> {
   let handle: FileHandle | undefined;
   try {
@@ -135,6 +152,8 @@ export class FileMcpOAuthStateStore implements McpOAuthStateStore {
   readonly #serverUrl: string;
   /** The generation this store may write; a clear or commit since then retires it. */
   readonly #epoch: number;
+  /** The state this store last handed out; the base its next save is diffed against. */
+  #observed: McpOAuthState | undefined;
 
   constructor(path: string, serverUrl: string) {
     this.#path = path;
@@ -144,27 +163,35 @@ export class FileMcpOAuthStateStore implements McpOAuthStateStore {
 
   /** The state for this exact URL, or undefined. Another server's file content is never returned. */
   async load(): Promise<McpOAuthState | undefined> {
-    const text = await readFileText(this.#path);
-    if (text === undefined) return undefined;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new Error("MCP OAuth state is not valid JSON");
-    }
-    if (!isRecord(parsed) || parsed.version !== STORE_VERSION) {
-      throw new Error("MCP OAuth state has an unsupported format");
-    }
-    const state = oauthState(parsed.state);
-    return state.serverUrl === this.#serverUrl ? state : undefined;
+    const state = await readState(this.#path, this.#serverUrl);
+    this.#observed = state === undefined ? undefined : structuredClone(state);
+    return state;
   }
 
+  /**
+   * Write one provider's whole-state copy as a change set over the file.
+   *
+   * The native provider reads, merges and writes in separate calls, so two providers for one file can
+   * interleave: each may have read the grant before the other stored a rotation. In-process serialization
+   * alone orders the writes but would still let the later, stale copy revert material it never saw. The
+   * merge is therefore against the file as it is inside the serialized step, with this store's last loaded
+   * state as the base: a field this caller did not change keeps the stored value, and token material is
+   * taken from the caller only while the stored tokens are still the ones it read. A stale save (a grant the
+   * caller saw invalidated, or a refresh it started against a token the server has since rotated) then keeps
+   * the newer tokens another writer installed instead of destroying them; the caller's own refreshed tokens
+   * still win while nothing else changed the grant. Silently keeping the stored tokens is deliberate: throwing
+   * would break the provider's write chain and leave it unable to store anything for the rest of the connection.
+   */
   save(state: McpOAuthState): Promise<void> {
     return serialized(this.#path, async () => {
       if (mcpOAuthGrantEpoch(this.#path) !== this.#epoch) {
         throw new Error("the stored MCP OAuth grant was deleted or replaced; this stale writer does not restore it");
       }
-      await writeState(this.#path, this.#serverUrl, state);
+      const observed = this.#observed;
+      const stored = observed === undefined ? undefined : await readState(this.#path, this.#serverUrl).catch(() => undefined);
+      const next = observed === undefined || stored === undefined ? state : mergeState(stored, observed, state);
+      await writeState(this.#path, this.#serverUrl, next);
+      this.#observed = structuredClone(next);
     });
   }
 
@@ -177,8 +204,42 @@ export class FileMcpOAuthStateStore implements McpOAuthStateStore {
     return serialized(this.#path, async () => {
       await rm(this.#path, { force: true });
       bumpEpoch(this.#path);
+      this.#observed = undefined;
     });
   }
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/**
+ * Apply one writer's change set (from `observed` to `next`) over the state another writer stored.
+ *
+ * Fields the writer did not touch keep `current`. Tokens and their expiry are one unit: they are taken from
+ * the writer only when it changed them and `current` still holds the material it read, so a concurrent
+ * rotation survives a stale save.
+ */
+function mergeState(current: McpOAuthState, observed: McpOAuthState, next: McpOAuthState): McpOAuthState {
+  const merged: Record<string, unknown> = { ...(current as unknown as Record<string, unknown>) };
+  const from = observed as unknown as Record<string, unknown>;
+  const to = next as unknown as Record<string, unknown>;
+  for (const key of ["serverUrl", "clientInformation", "discovery", "oauthState", "codeVerifier"]) {
+    if (sameJson(to[key], from[key])) continue;
+    if (to[key] === undefined) delete merged[key];
+    else merged[key] = to[key];
+  }
+  if (!sameJson(next.tokens, observed.tokens) && sameJson(current.tokens, observed.tokens)) {
+    if (next.tokens === undefined) {
+      delete merged.tokens;
+      delete merged.tokensExpireAt;
+    } else {
+      merged.tokens = next.tokens;
+      if (next.tokensExpireAt === undefined) delete merged.tokensExpireAt;
+      else merged.tokensExpireAt = next.tokensExpireAt;
+    }
+  }
+  return merged as unknown as McpOAuthState;
 }
 
 /**

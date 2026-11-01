@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { chmod, open, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname } from "node:path";
 import { parseConfig } from "../config.js";
+import { parseMcpConfig, type McpServerConfig } from "./config.js";
 
 /**
  * Owner-approved writes to the `mcp` block of the gateway's own configuration file.
@@ -13,8 +14,9 @@ import { parseConfig } from "../config.js";
  * - edits are serialized per configuration path inside this process;
  * - the file is read once into a snapshot, only `mcp.enabled` and `mcp.servers.<name>` are changed, and
  *   everything else is preserved from that snapshot;
- * - immediately before the replacement the file is read again and the edit is refused if its bytes
- *   changed, so a concurrent owner editor or another writer is not silently reverted by a stale copy;
+ * - the file is read again after the complete replacement has been written to a temporary file and
+ *   immediately before the rename, and the edit is refused if its bytes changed, so a concurrent owner
+ *   editor or another writer is not silently reverted by a stale copy;
  * - when the whole `mcp` block was disabled, every other entry present in the file is pinned to
  *   `enabled: false`, so enabling the block activates only the entry the owner approved;
  * - the whole merged document is validated with the same parser a gateway start uses, so an approved
@@ -25,12 +27,14 @@ import { parseConfig } from "../config.js";
  * Limitations: JSON is re-serialized with two-space indentation, so hand-written formatting and key
  * order are not preserved. The rename gives the file the gateway user's ownership. The check before
  * the rename and the rename itself are not one atomic operation: the bytes and the file identity are
- * compared by reopening the file immediately before the replacement, which catches an atomic-save
- * editor that replaced the file and any in-place edit that landed before the comparison, but a writer
- * that lands in the few microseconds between that comparison and the rename is still overwritten.
- * POSIX has no compare-and-swap for file content and no lock an arbitrary editor honors, so the
- * window is narrowed and reported, not removed. A change takes effect at the next gateway start;
- * this module never reopens or hot-reloads a runtime.
+ * compared by reopening the file once the temporary document is complete, immediately before the
+ * replacement, which catches an atomic-save editor that replaced the file and any in-place edit that
+ * landed before that comparison, but a writer that lands in the few microseconds between the comparison,
+ * the mode change and the rename is still overwritten. POSIX has no compare-and-swap for file content
+ * and no lock an arbitrary editor honors, so the window is narrowed and reported, not removed. A removal
+ * is bound to the entry the approving owner was shown: an entry on disk that no longer parses to that
+ * entry is refused instead of deleted. A change takes effect at the next gateway start; this module never
+ * reopens or hot-reloads a runtime.
  */
 export interface McpConfigEdit {
   /** Absolute path of the configuration file this gateway loaded. */
@@ -166,22 +170,23 @@ async function writeDocument(
   snapshot: DocumentSnapshot,
   document: Record<string, unknown>,
 ): Promise<void> {
-  // Validate exactly what a start would parse, so an approved edit cannot brick the gateway.
+  // Validate what a start would parse, so an approved edit cannot brick the gateway.
   parseConfig(document, dirname(edit.configFile));
-  // Detect an external update between this edit's read and the replacement. Bytes and the file identity
-  // are compared, so an atomic-save editor (a new inode) and an in-place edit are both caught. The
-  // comparison and the rename are separate syscalls; a writer that lands between them is not detected
-  // (documented above).
-  const current = await readText(edit.configFile);
-  if (current.text !== snapshot.text || !sameIdentity(current.identity, snapshot.identity)) {
-    throw new Error(
-      "The configuration file changed on disk while this edit was prepared; nothing was written. " +
-      "Review the request again and approve it before retrying.",
-    );
-  }
   const temporary = `${edit.configFile}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
   try {
     await writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    // Detect an external update once the complete replacement exists, immediately before the rename that
+    // installs it. Bytes and the file identity are compared, so an atomic-save editor (a new inode) and an
+    // in-place edit are both caught, including one that landed while the temporary file was written. The
+    // comparison and the rename are separate syscalls; a writer that lands between them is not detected
+    // (documented above).
+    const current = await readText(edit.configFile);
+    if (current.text !== snapshot.text || !sameIdentity(current.identity, snapshot.identity)) {
+      throw new Error(
+        "The configuration file changed on disk while this edit was prepared; nothing was written. " +
+        "Review the request again and approve it before retrying.",
+      );
+    }
     // Keep the mode the file has at replacement time, so an outside chmod is not reverted.
     await chmod(temporary, current.mode);
     await rename(temporary, edit.configFile);
@@ -241,14 +246,29 @@ export async function writeMcpServerEntry(
 /**
  * Remove one server entry. `mcp.enabled` is left exactly as it is: disabling the whole capability is
  * a separate owner decision, not a side effect of removing one server.
+ *
+ * `expectedEntry` is the entry the approving owner was shown. When it is given and the entry on disk no
+ * longer parses to that entry, nothing is removed: a bare name would otherwise delete whatever replaced
+ * it, including an entry with different authority. An on-disk entry that no longer validates cannot be
+ * compared to the disclosed one, so it is refused as well.
  */
-export async function removeMcpServerEntry(edit: McpConfigEdit, name: string): Promise<McpConfigEditResult> {
+export async function removeMcpServerEntry(
+  edit: McpConfigEdit,
+  name: string,
+  expectedEntry?: unknown,
+): Promise<McpConfigEditResult> {
   return serialized(edit.configFile, async () => {
     const snapshot = await readDocument(edit);
     const document = snapshot.document;
     const block = rawMcpBlock(document);
     const servers = rawServers(block);
     if (!Object.hasOwn(servers, name)) throw new Error(`Server ${name} is not in the configuration file`);
+    if (expectedEntry !== undefined && !sameEntry(edit.workspace, name, servers[name], expectedEntry)) {
+      throw new Error(
+        `Server ${name} in the configuration file is not the entry that was approved; nothing was removed. ` +
+        "Review the change on disk, then request the removal again.",
+      );
+    }
     const remaining = Object.fromEntries(Object.entries(servers).filter(([key]) => key !== name));
     const next = { ...block, servers: remaining };
     const validated = parseConfig({ ...document, mcp: next }, dirname(edit.configFile));
@@ -256,4 +276,20 @@ export async function removeMcpServerEntry(edit: McpConfigEdit, name: string): P
     const names = Object.keys(validated.mcp?.servers ?? {}).sort((left, right) => left.localeCompare(right, "en-US"));
     return { servers: names, enabled: validated.mcp?.enabled === true };
   });
+}
+
+/**
+ * Whether one on-disk entry is the disclosed entry, compared as the parsed entry a start would use: an
+ * ignored formatting or key-order difference is not a mismatch, any effective difference is.
+ */
+function sameEntry(workspace: string, name: string, stored: unknown, expected: unknown): boolean {
+  let parsed: McpServerConfig;
+  let wanted: McpServerConfig;
+  try {
+    parsed = parseMcpConfig({ enabled: true, servers: { [name]: stored } }, workspace).servers[name]!;
+    wanted = parseMcpConfig({ enabled: true, servers: { [name]: expected } }, workspace).servers[name]!;
+  } catch {
+    return false;
+  }
+  return JSON.stringify(parsed) === JSON.stringify(wanted);
 }

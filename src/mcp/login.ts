@@ -33,13 +33,19 @@ import { McpServerConnection, guardedFetch, headerValues } from "./server.js";
  * - the callback listener is loopback-only and one flow runs at a time;
  * - the attempt works on a private staging file seeded from the stored grant, so a grant that already
  *   works is not deleted to make room for a new one and the stored grant is replaced only after one
- *   real connection and tool listing verified the staged replacement. A refresh the starting connection
+ *   real connection and tool listing verified the staged replacement. Only the grant material is seeded:
+ *   the `state` value and PKCE verifier of an earlier attempt are transient flow state and are dropped, so
+ *   each authorization attempt generates and uses its own. A refresh the starting connection
  *   performed on the seeded stored grant is the one exception to "the stored file is not rewritten":
  *   the authorization server has already issued that token and may have invalidated the previous
  *   refresh token, so the rotation is adopted immediately instead of being thrown away with a failed
  *   attempt;
  * - a logout that happens while the attempt runs increments the grant generation, so the late commit
  *   is refused instead of restoring a grant the owner just deleted.
+ *
+ * The attempt deadline and the cancellation signal cover the whole startup, not only the connection: the
+ * initial connect, the startup tool listing and the adoption of a rotation are one bounded, cancellable
+ * operation.
  *
  * A rotation of the stored grant is the one thing this module does not roll back: the authorization server
  * has already issued the rotated token, so it is adopted as soon as the step that performed it returns,
@@ -128,7 +134,12 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
   const stagingPath = mcpOAuthStagingPath(options.storePath);
   const staging = new FileMcpOAuthStateStore(stagingPath, serverUrl);
   const snapshot = await snapshotMcpOAuthGrant(options.storePath, serverUrl);
-  if (snapshot.state !== undefined) await staging.save(snapshot.state).catch(() => undefined);
+  // Seed only the durable grant material. `oauthState` and `codeVerifier` are transient flow state of an
+  // earlier attempt: reusing them would present a stale `state` value to the server and exchange a code
+  // with a PKCE verifier that belongs to another flow, so each attempt starts without them.
+  if (snapshot.state !== undefined) {
+    await staging.save(grantMaterial(snapshot.state)).catch(() => undefined);
+  }
   if (canceled(options.signal)) {
     await staging.clear().catch(() => undefined);
     throw new CancelledLoginError();
@@ -136,6 +147,7 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
   let callback: OAuthCallbackServer | undefined;
   let client: McpClient | undefined;
   let authorizationUrl: URL | undefined;
+  let discovered: number | undefined;
   try {
     callback = await OAuthCallbackServer.listen({ timeoutMs });
     const provider = new McpOAuthProvider({
@@ -151,46 +163,54 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
     // `McpClient.connect` takes no signal. Closing the client rejects the pending initialize request,
     // so an owner denial or a gateway shutdown also stops a connection that is still being set up.
     const stopStartup = (): void => { void client?.close().catch(() => undefined); };
+    // The deadline and the abort stay installed through the tool listing below, not just through
+    // `connect`: a listing is a separate request that can hang on its own, and it must be stopped by a
+    // shutdown and bounded by the login deadline like the rest of the startup.
     const startupTimer = setTimeout(stopStartup, Math.max(1, deadline - Date.now()));
     const releaseStartup = onAbort(options.signal, stopStartup);
     let connectError: unknown;
     try {
-      // A signal that was already aborted when this listener was added never fires another event: the
-      // listener closed the client at once, so the connection is skipped here instead of being started
-      // only to be torn down.
-      if (!canceled(options.signal)) {
-        await client.connect(new StreamableHttpTransport({
-          url: options.config.url,
-          headers: headerValues(options.config, environment(options)),
-          authProvider: adaptOAuthProvider(provider),
-          fetch: guardedFetch,
-        }));
+      try {
+        // A signal that was already aborted when this listener was added never fires another event: the
+        // listener closed the client at once, so the connection is skipped here instead of being started
+        // only to be torn down.
+        if (!canceled(options.signal)) {
+          await client.connect(new StreamableHttpTransport({
+            url: options.config.url,
+            headers: headerValues(options.config, environment(options)),
+            authProvider: adaptOAuthProvider(provider),
+            fetch: guardedFetch,
+          }));
+        }
+      } catch (error) {
+        connectError = error;
       }
-    } catch (error) {
-      connectError = error;
+      // A connection that refreshed the seeded grant already changed the token at the authorization
+      // server, which may have invalidated the previous refresh token. Adopt the rotated grant before a
+      // failed connection, a cancellation or the cleanup below can drop it, so the stored grant keeps the
+      // token the server most recently issued. The rotation descends from the stored grant, which is the
+      // only provenance this module adopts.
+      await adoptStagedRotation(staging, snapshot.state, snapshot, options.storePath, serverUrl);
+      if (canceled(options.signal)) throw new CancelledLoginError();
+      // The expected first outcome: the server challenges and the native flow hands us the URL.
+      if (connectError !== undefined && !(connectError instanceof McpOAuthAuthorizationRequiredError)) throw connectError;
+      // A tool listing failure is reported as unknown instead of being counted as zero tools: the
+      // connection did authenticate, but verification did not see what the server offers.
+      if (client.serverCapabilities?.tools === undefined) {
+        discovered = 0;
+      } else {
+        const remaining = Math.max(1, deadline - Date.now());
+        const listingSignal = options.signal === undefined
+          ? AbortSignal.timeout(remaining)
+          : AbortSignal.any([options.signal, AbortSignal.timeout(remaining)]);
+        discovered = await client.listTools({ signal: listingSignal }).then((tools) => tools.length, () => undefined);
+      }
     } finally {
       clearTimeout(startupTimer);
       releaseStartup();
     }
-    // A connection that refreshed the seeded grant already changed the token at the authorization
-    // server, which may have invalidated the previous refresh token. Adopt the rotated grant before a
-    // failed connection, a cancellation or the cleanup below can drop it, so the stored grant keeps the
-    // token the server most recently issued. The rotation descends from the stored grant, which is the
-    // only provenance this module adopts.
-    await adoptStagedRotation(staging, snapshot.state, snapshot, options.storePath, serverUrl);
-    if (canceled(options.signal)) throw new CancelledLoginError();
-    // The expected first outcome: the server challenges and the native flow hands us the URL.
-    if (connectError !== undefined && !(connectError instanceof McpOAuthAuthorizationRequiredError)) throw connectError;
     // A grant in the staging file already worked (the server accepted it without a browser step).
     const redirect = authorizationUrl;
-    // A tool listing failure is reported as unknown instead of being counted as zero tools: the
-    // connection did authenticate, but verification did not see what the server offers.
-    let discovered: number | undefined;
-    if (client.serverCapabilities?.tools === undefined) {
-      discovered = 0;
-    } else {
-      discovered = await client.listTools().then((tools) => tools.length, () => undefined);
-    }
     await client.close().catch(() => undefined);
     client = undefined;
     if (redirect === undefined) {
@@ -228,6 +248,19 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
 
 class CancelledLoginError extends Error {
   override name = "CancelledLoginError";
+}
+
+/**
+ * The durable part of a grant: the server URL, the client registration, the tokens and the discovery
+ * document. Transient flow state (`oauthState`, `codeVerifier`) is never carried into a fresh attempt.
+ */
+function grantMaterial(state: McpOAuthState): McpOAuthState {
+  const material: McpOAuthState = { serverUrl: state.serverUrl };
+  if (state.clientInformation !== undefined) material.clientInformation = state.clientInformation;
+  if (state.tokens !== undefined) material.tokens = state.tokens;
+  if (state.tokensExpireAt !== undefined) material.tokensExpireAt = state.tokensExpireAt;
+  if (state.discovery !== undefined) material.discovery = state.discovery;
+  return material;
 }
 
 /**
