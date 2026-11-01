@@ -829,8 +829,11 @@ function resultCalls(entry: EntryRecord): readonly string[] {
  * high surrogate or a tail starting on a low surrogate is moved inward by one unit, so the preview
  * never contains half a pair. The marker names the omitted length and the original reference, so a
  * consumer can neither mistake the preview for the whole result nor claim it read the middle.
+ *
+ * The episode-summary source renderer (`summary-source.ts`) quotes tool calls and tool results through
+ * this same function, so both bounded readers show one truncation format with the same provenance.
  */
-function clipPreview(parts: readonly string[], total: number, limit: number, ref: string): {
+export function clipPreview(parts: readonly string[], total: number, limit: number, ref: string): {
   readonly text: string;
   readonly preview: DigestPreview;
 } {

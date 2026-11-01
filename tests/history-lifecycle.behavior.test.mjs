@@ -16,6 +16,9 @@ const { workspaceContextGatewayOptions } = await import(
 const { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(
   pathToFileURL(`${ai}/index.js`).href
 );
+const { EPISODE_SUMMARY_SOURCE_LIMITS, renderEntry } = await import(
+  pathToFileURL(`${pkg}/dist/history/summary-source.js`).href
+);
 const { getCurrentSystemPrompt } = await import(
   pathToFileURL(`${ai}/utils/transcript.js`).href
 );
@@ -457,6 +460,187 @@ test("offline memory lifecycle preserves original evidence across compaction, re
     ]);
     const lateOpenResult = lastHistoryResult(built.state.generationRequests[beforeFailedSurround + 1].text);
     assert.match(lateOpenResult.text, new RegExp(LATE_FACT), "raw evidence survives a failed summary");
+  } finally {
+    built.state.summaryGate.release();
+    if (gateway) await gateway.close(context);
+  }
+});
+
+test("episode summary source bounds one entry and previews long tool text head-tail", () => {
+  const entryChars = EPISODE_SUMMARY_SOURCE_LIMITS.entryChars;
+  const head = "RESULT-HEAD-1142";
+  const tail = "RESULT-TAIL-1143";
+  const result = renderEntry({
+    id: 7,
+    kind: "pi.tool-result",
+    model: [{
+      role: "toolResult",
+      toolCallId: "call-7",
+      toolName: "bash",
+      content: [{ type: "text", text: `${head}${"r".repeat(9_000)}${tail}` }],
+      isError: false,
+    }],
+  });
+  assert.equal(result.toolResult, true);
+  assert.equal(result.truncated, true);
+  assert.ok(result.text.length <= entryChars, `body=${result.text.length}`);
+  assert.ok(result.text.startsWith(`[Tool result bash]: ${head}`), result.text.slice(0, 80));
+  assert.ok(result.text.endsWith(tail), result.text.slice(-80));
+  assert.match(result.text, /characters omitted; original at entry:7\/tool-result\/call-7/);
+  // The omitted middle is really gone, not merely labelled as omitted.
+  assert.ok(!result.text.includes("r".repeat(4_650)), "the preview must not carry the middle");
+
+  const argsHead = "ARGS-HEAD-5531";
+  const argsTail = "ARGS-TAIL-5532";
+  const call = renderEntry({
+    id: 9,
+    kind: "pi.assistant",
+    model: [{
+      role: "assistant",
+      content: [{
+        type: "toolCall",
+        id: "call-9",
+        name: "edit",
+        arguments: { path: `${argsHead}${"a".repeat(4_000)}${argsTail}` },
+      }],
+      stopReason: "toolUse",
+    }],
+  });
+  assert.equal(call.truncated, true);
+  assert.ok(call.text.length <= entryChars, `body=${call.text.length}`);
+  assert.match(call.text, new RegExp(argsHead));
+  assert.match(call.text, new RegExp(argsTail));
+  assert.match(call.text, /characters omitted; original at entry:9\/tool-call\/call-9/);
+  assert.ok(!call.text.includes("a".repeat(2_050)), "the preview must not carry the middle");
+
+  // A short tool result is quoted whole, with no marker.
+  assert.deepEqual(
+    { ...renderEntry({
+      id: 3,
+      kind: "pi.tool-result",
+      model: [{ role: "toolResult", toolCallId: "call-3", toolName: "read", content: [{ type: "text", text: "ok" }] }],
+    }) },
+    { text: "[Tool result read]: ok", message: false, toolResult: true, truncated: false },
+  );
+
+  // Ordinary message prose keeps its head cut and its exact omitted-character count.
+  const prose = renderEntry({ id: 4, kind: "pi.user", model: [{ role: "user", content: "u".repeat(3_000) }] });
+  assert.equal(prose.truncated, true);
+  assert.ok(prose.text.startsWith(`[User]: ${"u".repeat(entryChars - "[User]: ".length)}`));
+  assert.match(prose.text, /\[\.\.\. 1008 more characters truncated\]$/);
+});
+
+test("an episode longer than the old 12-chunk cap is covered by one bounded request per chunk", { timeout: 60_000 }, async (t) => {
+  const root = await mkdtemp(resolve(tmpdir(), "nanobot-summary-span-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = resolve(root, "workspace");
+  const dataDir = resolve(root, "state");
+  await writeWorkspace(workspace);
+  const config = lifecycleConfig(workspace, dataDir);
+  const built = buildProviders();
+  const session = "cli:summary-span";
+  const resultHead = "SPAN-RESULT-HEAD-9142";
+  const resultTail = "SPAN-RESULT-TAIL-9143";
+  const argsHead = "SPAN-ARGS-HEAD-9144";
+  const argsTail = "SPAN-ARGS-TAIL-9145";
+  let gateway;
+  try {
+    gateway = await openGateway(config, context, {
+      models: built.models,
+      ...workspaceContextGatewayOptions(config),
+    });
+    const conversation = await gateway.conversationFor(session, context);
+    await gateway.harness.commit(async (tx) => {
+      await tx.appendEntry(conversation.id, {
+        kind: "pi.user",
+        model: [{ role: "user", content: "Long synthetic episode start.", timestamp: 1_000 }],
+      });
+      await tx.appendEntry(conversation.id, {
+        kind: "pi.assistant",
+        model: [{
+          role: "assistant",
+          content: [{
+            type: "toolCall",
+            id: "call-span",
+            name: "bash",
+            arguments: { command: `${argsHead}${"a".repeat(4_000)}${argsTail}` },
+          }],
+          stopReason: "toolUse",
+          timestamp: 1_001,
+        }],
+      });
+      await tx.appendEntry(conversation.id, {
+        kind: "pi.tool-result",
+        model: [{
+          role: "toolResult",
+          toolCallId: "call-span",
+          toolName: "bash",
+          content: [{ type: "text", text: `${resultHead}${"r".repeat(9_000)}${resultTail}` }],
+          isError: false,
+          timestamp: 1_002,
+        }],
+      });
+      for (let index = 0; index < 200; index += 1) {
+        await tx.appendEntry(conversation.id, {
+          kind: "pi.user",
+          model: [{ role: "user", content: `Filler entry ${index}: ${"f".repeat(1_900)}`, timestamp: 2_000 + index }],
+        });
+      }
+      await tx.appendEntry(conversation.id, {
+        kind: "pi.assistant",
+        model: [{ role: "assistant", content: [{ type: "text", text: "Long synthetic episode end." }], stopReason: "stop", timestamp: 9_000 }],
+      });
+    }, context);
+
+    // Park the first fold so the worker identity is read from committed state, then let the chain run.
+    const entered = built.state.summaryGate.wait();
+    await conversation.reset(undefined, context);
+    await within(gateway.reconcileHistoryEpisodes(session, context).then(() => entered), 10_000, "first summary request");
+    const queue = await gateway.historySummaryQueue(session, context);
+    assert.ok(Number.isSafeInteger(queue.currentTaskId) && queue.currentTaskId > 0, "summary worker is live");
+    const settled = gateway.harness.waitForTask(queue.currentTaskId, context);
+    built.state.summaryGate.release();
+    assert.equal((await within(settled, 30_000, "long summary task")).state.outcome.status, "completed");
+
+    const episodes = await gateway.listHistoryEpisodes(session, { limit: 5 }, context);
+    const closed = episodes.episodes.find((episode) => episode.status === "closed");
+    assert.ok(closed, JSON.stringify(episodes.episodes.map((episode) => episode.status)));
+    const record = await gateway.historyEpisodeSummary(session, closed.startEntryId, context);
+    assert.equal(record.status, "ready");
+    // The whole range is covered: the fold cap is gone, not merely raised.
+    assert.ok(record.coverage.chunks > 12, `chunks=${record.coverage.chunks}`);
+    assert.equal(record.coverage.complete, true);
+    assert.equal(record.coverage.uncoveredEntries, 0);
+    assert.equal(record.coverage.entriesRead, record.coverage.sourceEntries);
+    // Exactly one provider request per chunk: the request is bounded, and no attempt was repeated.
+    assert.equal(built.state.summaryRequests.length, record.coverage.chunks);
+    assert.equal(record.attempts, record.coverage.chunks);
+    assert.equal(record.interruptedCalls, 0);
+    const segments = built.state.summaryRequests.map((request) => {
+      const messages = JSON.parse(request);
+      const body = messages
+        .filter((message) => message.role === "user")
+        .map((message) => (typeof message.content === "string"
+          ? message.content
+          : message.content.map((block) => (block.type === "text" ? block.text : "")).join("\n")))
+        .join("\n");
+      const fenced = /«transcript»\n([\s\S]*)\n«\/transcript»/.exec(body);
+      assert.ok(fenced, "each fold carries one fenced transcript segment");
+      return fenced[1];
+    });
+    for (const segment of segments) {
+      // One chunk closes at 24,000 characters, so it may cross that bound by at most one entry.
+      assert.ok(segment.length <= EPISODE_SUMMARY_SOURCE_LIMITS.chunkChars + EPISODE_SUMMARY_SOURCE_LIMITS.entryChars,
+        `segment=${segment.length}`);
+    }
+    // The long tool call and its result are quoted with the shared memory-recall head-tail preview.
+    const first = segments[0];
+    assert.match(first, new RegExp(resultHead));
+    assert.match(first, new RegExp(resultTail));
+    assert.match(first, /characters omitted; original at entry:\d+\/tool-result\/call-span/);
+    assert.match(first, new RegExp(argsHead));
+    assert.match(first, new RegExp(argsTail));
+    assert.match(first, /characters omitted; original at entry:\d+\/tool-call\/call-span/);
   } finally {
     built.state.summaryGate.release();
     if (gateway) await gateway.close(context);

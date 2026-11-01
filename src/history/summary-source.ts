@@ -7,23 +7,27 @@
  *
  * What is included, and what is not:
  * - `pi.user` and `nanobot.cron` entries contribute their user text.
- * - `pi.assistant` entries contribute visible text and a compact list of the tool calls they
- *   made. Thinking blocks are omitted: they are not part of the stored conversation the user
- *   saw, and replaying them can exceed the source bound.
- * - `pi.tool-result` entries contribute the tool name and a shortened result.
+ * - `pi.assistant` entries contribute visible text and each tool call with its arguments. Thinking
+ *   blocks are omitted: they are not part of the stored conversation the user saw, and replaying
+ *   them can exceed the source bound.
+ * - `pi.tool-result` entries contribute the tool name and the result.
  * - `pi.reset` entries (including any handoff text in their model payload), `pi.system` and
  *   `pi.compaction` entries contribute nothing: they are synthetic context, and the episode's
  *   own reset marker is its boundary rather than its content. They are still counted.
  * - `entry.edits` are not applied: the summary describes the stored transcript, not the active
  *   edited model context. An entry carrying edits is otherwise rendered like any other entry.
  *
- * Every bound is explicit. A long entry is shortened with a visible marker, a full chunk stops
- * at the chunk bound, and the caller records how many entries were covered and how many were
- * truncated. Silent truncation is not a permitted outcome.
+ * Every bound is explicit. One entry keeps at most {@link EPISODE_SUMMARY_SOURCE_LIMITS.entryChars}
+ * characters: ordinary message text is cut at its head with a truncation marker, like before, while a
+ * tool call's arguments and a tool result that do not fit are quoted through the shared memory-recall
+ * head-tail preview (`clipPreview`), with its omission marker and the durable reference of the
+ * original item. A full chunk stops at the chunk bound, and the caller records how many entries were
+ * covered and how many were truncated. Silent truncation is not a permitted outcome.
  */
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import type { EntryRecord } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord";
+import { clipPreview } from "./digestion.js";
 
 export const EPISODE_SUMMARY_SOURCE_LIMITS = Object.freeze({
   /** Characters of rendered text kept per entry. */
@@ -32,8 +36,6 @@ export const EPISODE_SUMMARY_SOURCE_LIMITS = Object.freeze({
   chunkChars: 24_000,
   /** Entries visited per fold chunk, so a chunk of empty entries still terminates. */
   chunkEntries: 400,
-  /** Chunks (provider folds) per episode; entries beyond it are uncovered and reported. */
-  maxChunks: 12,
   /** Entries read per transaction while collecting or rendering a chunk. */
   entriesPerPage: 400,
   /** Collect transactions per phase invocation before the task yields. */
@@ -59,7 +61,7 @@ export interface RenderedEntry {
   readonly message: boolean;
   /** The entry is a tool result. */
   readonly toolResult: boolean;
-  /** Text was shortened to the per-entry bound. */
+  /** Text was shortened to the per-entry bound, by a head cut or a head-tail preview. */
   readonly truncated: boolean;
 }
 
@@ -105,16 +107,65 @@ function shorten(text: string, maxChars: number): { text: string; truncated: boo
   };
 }
 
-function callText(call: Record<string, unknown>): string {
-  let argumentsText: string;
+/**
+ * One quoted part of an entry. The `ref` is the durable reference of a tool call or tool result; it is
+ * absent for ordinary message text, which keeps the head-only cut this renderer always used.
+ */
+interface RenderedSegment {
+  readonly text: string;
+  readonly ref?: string;
+}
+
+/** Durable provenance of one item, spelled exactly as the memory-recall evidence spells it. */
+function itemRef(entryId: EntryRecord["id"], item: "tool-call" | "tool-result", key: string): string {
+  return `entry:${entryId}/${item}/${key}`;
+}
+
+/** A tool call or result key; an item without one is still addressed, by its position in the entry. */
+function itemKey(value: unknown, index: number): string {
+  return typeof value === "string" && value.length > 0 ? value : `index-${index}`;
+}
+
+function toolCallArguments(args: unknown): string {
   try {
-    argumentsText = JSON.stringify(call.arguments ?? {}) ?? "null";
+    return JSON.stringify(args ?? {}) ?? "null";
   } catch {
-    argumentsText = "[unserializable arguments]";
+    return "[unserializable arguments]";
   }
-  const name = typeof call.name === "string" && call.name.length > 0 ? call.name : "unknown-tool";
-  if (argumentsText.length > 200) argumentsText = `${argumentsText.slice(0, 200)}…`;
-  return `${name}(${argumentsText})`;
+}
+
+/**
+ * Join an entry's segments under the per-entry bound. Ordinary message text over the bound keeps the
+ * head cut it always had, so the omitted characters stay counted. A tool call or tool result over the
+ * bound becomes the shared head-tail preview, which names the original item, and the later segments of
+ * that entry cannot fit any more; the entry is reported as truncated either way.
+ */
+function renderSegments(
+  segments: readonly RenderedSegment[],
+  maxChars: number,
+): { text: string; truncated: boolean } {
+  const parts: string[] = [];
+  let used = 0;
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index]!;
+    const separator = parts.length === 0 ? 0 : 2;
+    const remaining = maxChars - used - separator;
+    if (remaining <= 0) return { text: parts.join("\n\n"), truncated: true };
+    if (segment.text.length <= remaining) {
+      parts.push(segment.text);
+      used += separator + segment.text.length;
+      continue;
+    }
+    if (segment.ref === undefined) {
+      // Message prose keeps the head cut: it counts every remaining character instead of dropping it.
+      parts.push(shorten(segments.slice(index).map((part) => part.text).join("\n\n"), remaining).text);
+      return { text: parts.join("\n\n"), truncated: true };
+    }
+    // Reuse the memory-recall preview: head, an omission marker naming the original item, and tail.
+    parts.push(clipPreview([segment.text], segment.text.length, remaining, segment.ref).text);
+    return { text: parts.join("\n\n"), truncated: true };
+  }
+  return { text: parts.join("\n\n"), truncated: false };
 }
 
 /**
@@ -138,43 +189,55 @@ function renderEntryUnsafe(entry: EntryRecord, entryChars: number): RenderedEntr
   if (!isUser && kind !== ASSISTANT_ENTRY_KIND && !isToolResult) return SKIPPED_ENTRY;
   const messages = modelMessages(entry.model);
   if (isToolResult) {
-    const lines: string[] = [];
+    const segments: RenderedSegment[] = [];
+    let position = 0;
     for (const item of messages) {
       if (!isRecord(item) || item.role !== "toolResult") continue;
+      position += 1;
       const body = textParts(item.content).join("\n").trim();
       if (body.length === 0) continue;
       const toolName = typeof item.toolName === "string" && item.toolName.length > 0
         ? item.toolName
         : "unknown-tool";
-      lines.push(`[Tool result ${toolName}]: ${body}`);
+      segments.push({
+        text: `[Tool result ${toolName}]: ${body}`,
+        ref: itemRef(entry.id, "tool-result", itemKey(item.toolCallId, position - 1)),
+      });
     }
-    if (lines.length === 0) return { ...SKIPPED_ENTRY, toolResult: true };
-    const shortened = shorten(lines.join("\n\n"), entryChars);
-    return { text: shortened.text, message: false, toolResult: true, truncated: shortened.truncated };
+    if (segments.length === 0) return { ...SKIPPED_ENTRY, toolResult: true };
+    const rendered = renderSegments(segments, entryChars);
+    return { text: rendered.text, message: false, toolResult: true, truncated: rendered.truncated };
   }
-  const lines: string[] = [];
+  const segments: RenderedSegment[] = [];
+  let callPosition = 0;
   for (const item of messages) {
     if (!isRecord(item)) continue;
     if (item.role === "user") {
       const body = textParts(item.content).join("\n").trim();
-      if (body.length > 0) lines.push(`[User]: ${body}`);
+      if (body.length > 0) segments.push({ text: `[User]: ${body}` });
       continue;
     }
     if (item.role !== "assistant") continue;
     const body = textParts(item.content).join("\n").trim();
-    if (body.length > 0) lines.push(`[Assistant]: ${body}`);
-    const calls = contentBlocks(item.content)
-      .filter((block) => block.type === "toolCall")
-      .map((block) => callText(block));
-    if (calls.length > 0) lines.push(`[Assistant tool calls]: ${calls.join("; ")}`);
+    if (body.length > 0) segments.push({ text: `[Assistant]: ${body}` });
+    for (const block of contentBlocks(item.content)) {
+      if (block.type !== "toolCall") continue;
+      const key = itemKey(block.id, callPosition);
+      callPosition += 1;
+      const name = typeof block.name === "string" && block.name.length > 0 ? block.name : "unknown-tool";
+      segments.push({
+        text: `[Assistant tool call ${name}]: ${toolCallArguments(block.arguments)}`,
+        ref: itemRef(entry.id, "tool-call", key),
+      });
+    }
   }
-  if (lines.length === 0) return { ...SKIPPED_ENTRY, message: true };
-  const shortened = shorten(lines.join("\n\n"), entryChars);
+  if (segments.length === 0) return { ...SKIPPED_ENTRY, message: true };
+  const rendered = renderSegments(segments, entryChars);
   return {
-    text: shortened.text,
+    text: rendered.text,
     message: true,
     toolResult: false,
-    truncated: shortened.truncated,
+    truncated: rendered.truncated,
   };
 }
 

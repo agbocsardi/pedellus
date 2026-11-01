@@ -139,8 +139,24 @@ After import and separate approval of summary spend:
 4. Review initial results before finishing the finite remainder. Verify all intended episode outcomes,
    coverage and summary-search drilldown. Summary indexing refreshes on demand and may need several passes.
 
+Maintenance-only run shape (no service, no channel, no schedule): open the store once in a single
+foreground process that passes the summary model explicitly —
+`openGateway(config, context, { episodeSummary: { provider, modelId, thinkingLevel, backfill: "pending" } })`
+— with `cron`, `workers` and `mcp` disabled in that process's configuration. Startup then reconciles the
+catalog, queues every pending closed episode and drains the chains; channel code is never imported, and
+task kinds whose extension is not installed wait for a registry change instead of running. The process
+must be the only owner of the store, and the service must stay stopped and disabled. That override is a
+host option, not a config field, so it cannot turn on by itself at a later service start; the committed
+config keeps `backfill: "none"` behavior. Stop the process when every queue reports no waiting job, or
+on any unexpected issue or agreed limit, and inspect `historySummaryQueue`/`historyEpisodeSummary` and
+the summary record's `coverage`/`usage`/`attempts` afterwards.
+
 Existing limits matter: entries shorten at 2,000 characters; chunks bound at 24,000 characters / 400
-entries; an episode permits at most 12 chunks. `ready` is not proof of complete, unshortened coverage.
+entries; an episode keeps as many chunks as it needs, each one its own bounded provider request, with the
+collection cursor and chunk list durable across a restart. Ordinary message text is cut at its head; a
+tool call's arguments or a tool result that does not fit is quoted as a head-tail preview with an
+omission marker and the original `entry:<id>/tool-call|tool-result/<key>` reference, so the summarizer
+never sees the omitted middle. `ready` is not proof of complete, unshortened coverage.
 Preserve source-unit episodes and inspect limitations rather than silently invent additional splits.
 Ready summaries cannot currently be replaced by a re-summarize operation. Originals remain available
 regardless of summary failure, partial coverage or truncation.

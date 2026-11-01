@@ -641,7 +641,8 @@ summaries can incur provider costs.
 **Source, coverage, chunking and untrusted text** (`summary-source.ts`).
 
 - `pi.user` and `nanobot.cron` entries contribute their user text; `pi.assistant` entries contribute
-  visible text and a compact tool-call list; `pi.tool-result` entries contribute tool name plus text.
+  visible text and each tool call with its arguments; `pi.tool-result` entries contribute tool name
+  plus text.
   Thinking blocks are omitted. `pi.reset` (including handoff text), `pi.system` and `pi.compaction`
   entries are skipped but counted: they are synthetic context, not discussion. `entry.edits` are not
   applied, so a summary describes the stored transcript.
@@ -663,9 +664,17 @@ summaries can incur provider costs.
     `faults` counts from zero instead of becoming `NaN` — and since every `NaN >= cap` comparison is
     false, that normalization is what keeps the cap effective. On failure the counter is clamped to the
     cap, so the durable value stays a small exact integer that always serializes cleanly.
-- One entry keeps at most 2,000 characters with a visible truncation marker. Chunks close at 24,000
-  characters or 400 entries (also at each read page), at most 12 chunks per episode, and each chunk is
-  folded through a separate provider request that carries the previous answer forward.
+- One entry keeps at most 2,000 characters with an explicit marker, never silent truncation. Ordinary
+  message text is cut at its head with a `[... N more characters truncated]` marker. A tool call's
+  arguments or a tool result that does not fit is quoted through the same memory-recall head-tail
+  preview (`clipPreview` in `digestion.ts`): a beginning, an omission marker naming how many
+  characters were left out and the durable `entry:<id>/tool-call|tool-result/<key>` reference of the
+  original item, then an end. The later segments of that entry are not quoted, and the entry is
+  counted as truncated. Chunks close at 24,000 characters or 400 entries (also at each read page),
+  and an episode keeps as many chunks as its range needs: the collection cursor and the chunk list are
+  durable, so a phase boundary, a restart or a crash resumes the same episode instead of capping or
+  dropping its tail. Each chunk is folded through a separate provider request that carries the
+  previous answer forward.
 - `coverage` records the source bounds and counts from the episode document, the entries
   read/included/skipped/truncated, characters, chunks, and the uncovered count with the last covered
   entry ID. `complete` is true only when every entry in the range was read; an uncovered tail is
