@@ -70,9 +70,9 @@ runtime clears extension selection before resume; native section replay removes 
 context from the effective prompt, but stored transcript history is not erased. Before
 resume, the gateway also rejects live prepared dispatches (`pi.generation` request/poll
 or `pi.compaction` summarize) whose pinned cutoff still contains a nonempty
-Nanobot section. Those phases resend/fetch/summarize the old checkpointed view, not a
-newly rendered prompt; even an apparently unchanged provider snapshot is not treated
-as proof of equivalence. This conservative guard blocks gateway recovery even if the
+Nanobot section. Generation request/poll replay pinned provider state; compaction
+summarize may repeat an unrecorded request, though its body omits system sections.
+Neither is treated as safe solely because a provider snapshot appears unchanged. This conservative guard blocks gateway recovery even if the
 host expects the snapshot to be unchanged, and reports what durable state records
 about the blocked dispatch's provider response. A `pi.compaction` `retry` is not a
 prepared replay (its previous attempt's error is stored and the attempt it schedules

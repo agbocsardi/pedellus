@@ -32,9 +32,9 @@ export interface PreparedContextReplay {
 export type PreparedResponseEvidence =
   /** A committed partial of this attempt: the provider stream produced content; its remote outcome is unknown. */
   | "partial-response"
-  /** The provider holds a deferred response to fetch; none has been fetched yet. */
+  /** A deferred handle is recorded; any fetch attempt or answer may be uncommitted. */
   | "deferred-response"
-  /** The phase that would dispatch never began, so no provider request was sent. */
+  /** This attempt was never dispatched, assuming the pinned generation and a consistent store. */
   | "not-dispatched"
   /** Nothing durable records whether a provider request was sent or answered. */
   | "unrecorded";
@@ -118,10 +118,11 @@ export function preparedContextReplay(task: unknown): PreparedContextReplay | un
  * pinned dispatch, from `pi.live` of its conversation.
  *
  * `request` commits `live.generation = { attempt }` before it calls the provider,
- * so a missing or different attempt marker proves that phase never began and no
- * request was sent; a committed `message` proves the stream produced content.
- * A `poll` checkpoint is committed together with the received deferred handle, so
- * its response already exists. Compaction records no dispatch marker at all.
+ * so a missing or different attempt marker proves this attempt was never dispatched.
+ * This depends on the pinned Durable generation and a consistent store: only the
+ * owning run changes its marker. A committed `message` proves the stream produced
+ * content. A `poll` checkpoint records a received deferred handle, not whether a
+ * fetch was attempted or answered. Compaction records no dispatch marker at all.
  */
 export function preparedResponseEvidence(
   replay: PreparedContextReplay,
@@ -129,7 +130,11 @@ export function preparedResponseEvidence(
 ): PreparedResponseEvidence {
   if (replay.kind === "pi.generation" && replay.phase === "poll") return "deferred-response";
   if (replay.kind !== "pi.generation") return "unrecorded";
-  const generation = isRecord(live) ? live.generation : undefined;
+  if (live === undefined) return "not-dispatched";
+  if (!isRecord(live)) {
+    throw new Error(`Cannot safely inspect live generation state of prepared task ${replay.id}`);
+  }
+  const generation = live.generation;
   if (generation === undefined) return "not-dispatched";
   if (!isRecord(generation) || typeof generation.attempt !== "number") {
     throw new Error(`Cannot safely inspect live generation state of prepared task ${replay.id}`);

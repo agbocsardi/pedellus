@@ -14,6 +14,7 @@ const { openGateway } = await import(pathToFileURL(`${pkg}/dist/runtime.js`).hre
 const { listPreparedContextBlocks, cancelPreparedContextBlock } = await import(
   pathToFileURL(`${pkg}/dist/recovery/index.js`).href
 );
+const { preparedResponseEvidence } = await import(pathToFileURL(`${pkg}/dist/recovery/prepared.js`).href);
 const { parseConfig } = await import(pathToFileURL(`${pkg}/dist/config.js`).href);
 const { createModels, fauxAssistantMessage, fauxProvider } = await import(pathToFileURL(`${ai}/index.js`).href);
 const { getCurrentSystemPrompt } = await import(pathToFileURL(`${ai}/utils/transcript.js`).href);
@@ -547,6 +548,13 @@ test("owner recovery cancels a prepared compaction without resummarizing stale c
   }
 });
 
+test("unreadable live state is not evidence that a request was never dispatched", () => {
+  const replay = { id: 1, kind: "pi.generation", phase: "request", attempt: 1 };
+  for (const live of [null, [], "unreadable", 1]) {
+    assert.throws(() => preparedResponseEvidence(replay, live), /Cannot safely inspect/);
+  }
+});
+
 test("a prepared compaction retry replays no host context and resumes its own next attempt", { timeout: 30_000 }, async () => {
   const temp = await mkdtemp(resolve(tmpdir(), "nanobot-recovery-compaction-retry-"));
   const workspace = resolve(temp, "workspace");
@@ -557,6 +565,12 @@ test("a prepared compaction retry replays no host context and resumes its own ne
   try {
     const seeded = await seedContextStore({
       workspace, dataDir, providerId, secret: "retry-pinned-context", modelIds: ["synthetic"],
+    });
+    await withRawHarness(seeded.config, seeded.models, async (harness) => {
+      const conversation = await harness.conversation(seeded.conversationId, context);
+      const view = await conversation.context(context, { at: seeded.cutoff });
+      assert.match(JSON.stringify(view.messages), /retry-pinned-context/,
+        "the pinned range contains host context that the old guard would reject");
     });
     // A compaction `retry` checkpoint is committed only after the previous attempt's response
     // arrived and its retryable error was stored; the attempt it schedules still has to commit its

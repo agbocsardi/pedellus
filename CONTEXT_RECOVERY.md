@@ -69,7 +69,8 @@ cover the checkpoint model, stream options, request body, task definition versio
 transcript bytes, or any other checkpoint field. Cancellation re-reads the blocked
 list under the lock and requires the exact task ID and fingerprint, so a changed
 phase, cutoff, attempt or response evidence is rejected rather than retargeted;
-unrelated checkpoint changes are not independently bound.
+unrelated checkpoint changes are not independently bound. This is fingerprint v2;
+values listed by an older build must be re-listed before cancellation.
 
 `response` is read from Durable's own durable state, so an owner can tell what a
 cancellation gives up:
@@ -77,11 +78,14 @@ cancellation gives up:
 - `partial-response`: `pi.live` holds a committed throttled partial of this attempt.
   The provider stream produced content; its remote outcome is unknown.
 - `deferred-response`: a `poll` checkpoint is committed together with the received
-  deferred handle. The provider holds a response to fetch; nothing has fetched it.
+  deferred handle. Whether a fetch was attempted or answered is not durably
+  recorded: a crash before classification commits can leave the same checkpoint.
 - `not-dispatched`: no `pi.live` attempt marker exists for the pinned attempt. The
   `request` phase commits that marker before its provider call, so this is a proof
-  that the phase never began and no request was sent for this checkpoint. What is
-  lost is the pending turn, not an external outcome.
+  that this attempt was never dispatched, assuming the pinned Durable generation
+  and a consistent store in which only the owning run changes its marker. The
+  invocation may have started without committing the marker. What is lost is the
+  pending turn, not an external outcome for this attempt.
 - `unrecorded`: the dispatching phase may have run; nothing durable records a
   response. A compaction carries no dispatch marker, and a `request` whose marker
   matches can be a fresh attempt that streamed nothing yet or a retried attempt
@@ -123,10 +127,10 @@ retried.
   checkpoint transition back to `prepare` (with its own authority and audit
   rules); approximating it here would either resend the pinned view or rewrite a
   checkpoint. Cancelling keeps the transcript and loses only the pending turn,
-  and `response` says whether a provider request was even sent. Likewise, a `poll`
-  is not resumed: fetching its deferred response resends no context and issues no
-  new model request, but the answer it returns was generated from the pre-stop
-  snapshot, so the guard treats it like the rest of the pinned view.
+  and `response` distinguishes recorded evidence from unknown outcomes. Likewise,
+  a `poll` is not resumed: fetching its deferred response makes a provider call
+  without resending the generation context, but the answer was generated from
+  the pre-stop snapshot, so the guard treats it like the rest of the pinned view.
 - **Automatic cancellation or settlement.** `openGateway` never cancels a task
   because context changed. The owner chooses the task and supplies its
   fingerprint; an incorrect or stale choice writes nothing.
@@ -237,7 +241,9 @@ providers only:
 Not covered here: an actual deferred `poll` crash fixture (the synthetic poll task
 exercises the same checkpoint scanner and abort path, but no real crash fixture), a
 real crash between a compaction `retry` checkpoint and its next attempt (the record
-is written directly, then resumed through the same native phase),
+is written directly, then resumed through the same native phase), a real crash
+between a generation's request checkpoint and its attempt-marker commit (the
+not-dispatched evidence is source-derived and exercised with a synthetic task),
 provider-side cancellation of a live remote request, recovery while a gateway is
 still running (it fails closed on the lock), live database/WAL copying, corrupt or
 torn-copy restore, and physical power-loss durability beyond SQLite's configured
