@@ -1082,6 +1082,7 @@ export function createEpisodeSummaries(options: EpisodeSummaryOptions): EpisodeS
         let responseLost = false;
         try {
           message = await runtime.models.completeSimple(selected, { messages }, {
+            sessionId: `nanobot-summary:${runtime.conversationId}:${task.input.startEntryId}:${task.input.summarizerVersion}`,
             cacheRetention: "short",
             maxTokens: EPISODE_SUMMARY_SOURCE_LIMITS.maxTokens,
             signal: runtime.signal,
