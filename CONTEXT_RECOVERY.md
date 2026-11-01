@@ -4,7 +4,7 @@
 model context that still contains Nanobot sections. Those checkpoints are:
 
 - `pi.generation` in phase `request` or `poll`, pinned at `cutoff`;
-- `pi.compaction` in phase `summarize` or `retry`, pinned at `tail`.
+- `pi.compaction` in phase `summarize`, pinned at `tail`.
 
 Resuming them would resend or fetch against the old context instead of a newly
 rendered host snapshot. The guard does not rewrite a checkpoint, clear transcript
@@ -12,6 +12,16 @@ history, or guess that an apparently unchanged snapshot is equivalent: even an
 unchanged snapshot stays blocked. This module supplies the missing owner-driven
 reconciliation: inspect exactly which dispatches are blocked, then cancel selected
 ones durably.
+
+`pi.compaction` phase `retry` is deliberately not one of them. Durable commits that
+checkpoint only after the previous attempt's provider response arrived and its
+retryable error was stored, and it still has to commit the next attempt's
+`summarize` checkpoint before that attempt can dispatch. A stored `retry` therefore
+proves that the attempt it schedules was never sent, and the summarization request
+it sends is built from non-system messages of the immutable entry range at `tail`:
+it carries no host context at all. Such a task resumes natively when the gateway
+opens; no owner action is needed and no unrecorded request is repeated. Its pinned
+model still has to stay in `allowedModels`, exactly as before.
 
 A normal CLI start that hits this guard fails with one fixed, value-free
 message naming `durable-nanobot recovery --config <path>` as the next action. SDK callers
@@ -29,9 +39,11 @@ not cancel the task. The same configuration's recovery command is the next step.
   Stop the running gateway first: a live owner is reported as a lock conflict,
   not as an empty or successful result;
 - opens storage and a Harness but never calls `resume()`;
-- scans live tasks for prepared generation/compaction dispatches;
+- scans live tasks for prepared generation request/poll and compaction `summarize`
+  dispatches;
 - reads each pinned context and reports only dispatches with a nonempty Nanobot
   section;
+- reports what durable state records about each dispatch's provider response;
 - does not resume scheduling or change a transcript entry, submission, policy, or
   provider state. Native `Harness.open()` may still perform its documented crash
   recovery of a `running` task to `pending` and increment its restart counter, so
@@ -44,19 +56,37 @@ interface PreparedContextBlock {
   taskId: number;
   kind: "pi.generation" | "pi.compaction";
   conversationId: number;
-  phase: "request" | "poll" | "summarize" | "retry";
+  phase: "request" | "poll" | "summarize";
   at: number;          // pinned cutoff/tail entry ID
+  response: "partial-response" | "deferred-response" | "not-dispatched" | "unrecorded";
   fingerprint: string; // exact task state binding, see below
 }
 ```
 
 The fingerprint is SHA-256 over a version string, task ID, kind, conversation ID,
-phase, and pinned entry ID. It does **not** cover the checkpoint model, stream
-options, request body, task definition version, transcript bytes, or any other
-checkpoint field. Cancellation re-reads the blocked list under the lock and
-requires the exact task ID and fingerprint, so a changed phase or cutoff is
-rejected rather than retargeted; unrelated checkpoint changes are not
-independently bound.
+phase, pinned entry ID, pinned attempt, and the reported `response`. It does **not**
+cover the checkpoint model, stream options, request body, task definition version,
+transcript bytes, or any other checkpoint field. Cancellation re-reads the blocked
+list under the lock and requires the exact task ID and fingerprint, so a changed
+phase, cutoff, attempt or response evidence is rejected rather than retargeted;
+unrelated checkpoint changes are not independently bound.
+
+`response` is read from Durable's own durable state, so an owner can tell what a
+cancellation gives up:
+
+- `partial-response`: `pi.live` holds a committed throttled partial of this attempt.
+  The provider stream produced content; its remote outcome is unknown.
+- `deferred-response`: a `poll` checkpoint is committed together with the received
+  deferred handle. The provider holds a response to fetch; nothing has fetched it.
+- `not-dispatched`: no `pi.live` attempt marker exists for the pinned attempt. The
+  `request` phase commits that marker before its provider call, so this is a proof
+  that the phase never began and no request was sent for this checkpoint. What is
+  lost is the pending turn, not an external outcome.
+- `unrecorded`: the dispatching phase may have run; nothing durable records a
+  response. A compaction carries no dispatch marker, and a `request` whose marker
+  matches can be a fresh attempt that streamed nothing yet or a retried attempt
+  whose marker the retry phase pre-set. The guard reports this as unknown rather
+  than guessing.
 
 `cancelPreparedContextBlock(config, { taskId, fingerprint }, context, options?)`
 re-lists blocked dispatches under the lock and requires the exact fingerprint,
@@ -87,6 +117,16 @@ retried.
   operation that rewrites a live generation/compaction checkpoint. Replacing its
   cutoff, model, or request body would bypass the persisted task protocol. Cancel
   it and let the next run prepare from the current host snapshot instead.
+- **Continue an interrupted generation request at all.** No phase-specific
+  reconciliation makes a blocked `pi.generation` `request` resumable with this
+  pinned Durable generation. A supported continuation would need an upstream
+  checkpoint transition back to `prepare` (with its own authority and audit
+  rules); approximating it here would either resend the pinned view or rewrite a
+  checkpoint. Cancelling keeps the transcript and loses only the pending turn,
+  and `response` says whether a provider request was even sent. Likewise, a `poll`
+  is not resumed: fetching its deferred response resends no context and issues no
+  new model request, but the answer it returns was generated from the pre-stop
+  snapshot, so the guard treats it like the rest of the pinned view.
 - **Automatic cancellation or settlement.** `openGateway` never cancels a task
   because context changed. The owner chooses the task and supplies its
   fingerprint; an incorrect or stale choice writes nothing.
@@ -164,6 +204,14 @@ providers only:
 - two concurrent conversations with prepared requests: one is cancelled through
   the CLI, the other still blocks, then the second is cancelled; both end terminal
   without replay;
+- `blocked` entries carry the phase, pinned entry, fingerprint and the
+  `response` evidence; `partial-response` and `deferred-response` are reported,
+  `not-dispatched` is a proof, and `unrecorded` is not treated as proof of
+  anything;
+- a prepared compaction `retry` is not listed and not blocked: reopening resumes it
+  and sends exactly the next summarize attempt, whose request carries neither the
+  pinned nor a freshly rendered Nanobot section, and places its summary at the
+  pinned first entry;
 - SIGKILL during a prepared manual compaction `summarize`; cancel prevents a
   second summarize dispatch and preserves the large original transcript;
 - an unsupported persisted task version reports `orphaned` immediately instead of
@@ -187,7 +235,9 @@ providers only:
   SQLite initialization, leaving no empty store behind.
 
 Not covered here: an actual deferred `poll` crash fixture (the synthetic poll task
-exercises the same checkpoint scanner and abort path, but no real crash fixture),
+exercises the same checkpoint scanner and abort path, but no real crash fixture), a
+real crash between a compaction `retry` checkpoint and its next attempt (the record
+is written directly, then resumed through the same native phase),
 provider-side cancellation of a live remote request, recovery while a gateway is
 still running (it fails closed on the lock), live database/WAL copying, corrupt or
 torn-copy restore, and physical power-loss durability beyond SQLite's configured

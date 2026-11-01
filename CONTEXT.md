@@ -69,11 +69,14 @@ Durable ID established by the gateway. When context is opted out on reopen, the
 runtime clears extension selection before resume; native section replay removes old
 context from the effective prompt, but stored transcript history is not erased. Before
 resume, the gateway also rejects live prepared dispatches (`pi.generation` request/poll
-or `pi.compaction` summarize/retry) whose pinned cutoff still contains a nonempty
+or `pi.compaction` summarize) whose pinned cutoff still contains a nonempty
 Nanobot section. Those phases resend/fetch/summarize the old checkpointed view, not a
 newly rendered prompt; even an apparently unchanged provider snapshot is not treated
 as proof of equivalence. This conservative guard blocks gateway recovery even if the
-host expects the snapshot to be unchanged. Owner recovery is explicit: list the
+host expects the snapshot to be unchanged, and reports what durable state records
+about the blocked dispatch's provider response. A `pi.compaction` `retry` is not a
+prepared replay (its previous attempt's error is stored and the attempt it schedules
+was never dispatched), so it resumes natively. Owner recovery is explicit: list the
 blocked tasks, then cancel selected task IDs with their state fingerprint. Cancellation
 uses native `abortTask`, writes no checkpoint or transcript change, and is completed
 by the next gateway open's abort protocol. Abort-marked tasks are skipped by the

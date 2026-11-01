@@ -18,7 +18,7 @@ const { parseConfig } = await import(pathToFileURL(`${pkg}/dist/config.js`).href
 const { createModels, fauxAssistantMessage, fauxProvider } = await import(pathToFileURL(`${ai}/index.js`).href);
 const { getCurrentSystemPrompt } = await import(pathToFileURL(`${ai}/utils/transcript.js`).href);
 const { BACKGROUND_CONTEXT } = await import(pathToFileURL(`${chord}/context/index.js`).href);
-const { createRegistry, defineTask, Harness } = await import(pathToFileURL(`${durable}/index.js`).href);
+const { createRegistry, defineTask, Harness, LiveDoc } = await import(pathToFileURL(`${durable}/index.js`).href);
 const { openFullSyncNodeSqliteStorage } = await import(pathToFileURL(`${pkg}/dist/storage/sqlite.js`).href);
 const { workspaceContextGatewayOptions } = await import(
   pathToFileURL(`${pkg}/dist/context/workspace-host.js`).href
@@ -291,6 +291,8 @@ test("owner recovery cancels a SIGKILLed prepared request without replay or tran
     assert.equal(block.kind, "pi.generation");
     assert.equal(block.phase, "request");
     assert.ok(Number.isSafeInteger(block.conversationId) && block.conversationId > 0);
+    assert.equal(block.response, "unrecorded",
+      "a dispatched request without a committed partial records no response");
     assert.match(block.fingerprint, /^[0-9a-f]{64}$/);
 
     const changed = offlineModels(providerId);
@@ -506,6 +508,7 @@ test("owner recovery cancels a prepared compaction without resummarizing stale c
     assert.equal(block.kind, "pi.compaction");
     assert.equal(block.phase, "summarize");
     assert.ok(block.at > 0);
+    assert.equal(block.response, "unrecorded", "compaction records no dispatch marker");
 
     const blockedOpen = offlineModels(providerId);
     await assert.rejects(
@@ -544,6 +547,87 @@ test("owner recovery cancels a prepared compaction without resummarizing stale c
   }
 });
 
+test("a prepared compaction retry replays no host context and resumes its own next attempt", { timeout: 30_000 }, async () => {
+  const temp = await mkdtemp(resolve(tmpdir(), "nanobot-recovery-compaction-retry-"));
+  const workspace = resolve(temp, "workspace");
+  const dataDir = resolve(temp, "state");
+  const providerId = "recovery-compaction-retry";
+  await mkdir(workspace);
+  let gateway;
+  try {
+    const seeded = await seedContextStore({
+      workspace, dataDir, providerId, secret: "retry-pinned-context", modelIds: ["synthetic"],
+    });
+    // A compaction `retry` checkpoint is committed only after the previous attempt's response
+    // arrived and its retryable error was stored; the attempt it schedules still has to commit its
+    // own `summarize` checkpoint, so this record proves that attempt was never dispatched.
+    const checkpoint = {
+      phase: "retry",
+      attempt: 1,
+      model: { provider: providerId, modelId: "synthetic" },
+      thinkingLevel: "off",
+      streamOptions: {},
+      maxTokens: 1000,
+      tail: seeded.cutoff,
+      firstKept: seeded.cutoff,
+      until: Date.now() - 1,
+    };
+    const taskId = await withRawHarness(seeded.config, seeded.models, (harness) => harness.commit(
+      (tx) => tx.createTask(
+        defineTask({
+          name: "pi.compaction",
+          version: 1,
+          initial: () => checkpoint,
+          phases: {
+            summarize: async () => { throw new Error("synthetic compaction must never summarize"); },
+            retry: async () => { throw new Error("synthetic compaction must never retry"); },
+          },
+        }),
+        { reason: "manual" },
+        { ownership: { kind: "conversation" }, conversationId: seeded.conversationId },
+      ),
+      context,
+    ));
+
+    assert.deepEqual(await listPreparedContextBlocks(seeded.config, context), [],
+      "a retry checkpoint replays neither host context nor an unrecorded request");
+
+    const callsBefore = seeded.provider.state.callCount;
+    const summarizeMessages = [];
+    seeded.provider.setResponses([(request) => {
+      summarizeMessages.push(request.messages);
+      return fauxAssistantMessage("summary of the earlier turn");
+    }]);
+    gateway = await openGateway(seeded.config, context, {
+      models: seeded.models,
+      contextSnapshotProvider: () => ({ identity: { source: "synthetic", content: "retry-fresh-context" } }),
+    });
+    await gateway.harness.waitForIdle(context);
+
+    assert.equal(seeded.provider.state.callCount, callsBefore + 1, "resume sends exactly the next summarize attempt");
+    assert.equal(summarizeMessages.length, 1);
+    const summarizeText = JSON.stringify(summarizeMessages[0]);
+    assert.match(summarizeText, /seed turn/, "the immutable entry range is still summarized");
+    assert.doesNotMatch(summarizeText, /retry-pinned-context/,
+      "the summarization request omits every persisted Nanobot system section");
+    assert.doesNotMatch(summarizeText, /retry-fresh-context/,
+      "the summarization request carries no freshly rendered host context either");
+
+    const task = await gateway.harness.getTask(taskId, context);
+    assert.ok(task);
+    assert.equal(task.state.status, "terminal");
+    assert.equal(task.state.outcome.status, "completed");
+    const conversation = await gateway.conversationFor("synthetic-task", context);
+    const entries = await conversation.entries({ order: "ascending" }, 100, undefined, context);
+    const summary = entries.items.find((entry) => entry.kind === "pi.compaction");
+    assert.ok(summary, "the resumed summary is placed");
+    assert.equal(summary.head, seeded.cutoff, "the summary keeps the pinned first entry");
+  } finally {
+    if (gateway) await gateway.close(context);
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("cancellation reports immediate orphaned settlement instead of a bare abort marker", { timeout: 20_000 }, async () => {
   const temp = await mkdtemp(resolve(tmpdir(), "nanobot-recovery-orphan-"));
   const workspace = resolve(temp, "workspace");
@@ -572,6 +656,8 @@ test("cancellation reports immediate orphaned settlement instead of a bare abort
     const blocks = await listPreparedContextBlocks(seeded.config, context);
     assert.equal(blocks.length, 1);
     assert.equal(blocks[0].taskId, taskId);
+    assert.equal(blocks[0].response, "not-dispatched",
+      "no live attempt marker proves the request phase never began");
     assert.deepEqual(
       await cancelPreparedContextBlock(
         seeded.config,
@@ -590,6 +676,58 @@ test("cancellation reports immediate orphaned settlement instead of a bare abort
     assert.equal(task.state.outcome.status, "orphaned");
   } finally {
     if (gateway) await gateway.close(context);
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a committed partial response is reported and the dispatch still blocks", { timeout: 20_000 }, async () => {
+  const temp = await mkdtemp(resolve(tmpdir(), "nanobot-recovery-partial-"));
+  const workspace = resolve(temp, "workspace");
+  const dataDir = resolve(temp, "state");
+  const providerId = "recovery-partial";
+  await mkdir(workspace);
+  try {
+    const seeded = await seedContextStore({
+      workspace, dataDir, providerId, secret: "partial-context", modelIds: ["synthetic"],
+    });
+    // The request phase commits its attempt marker and then a throttled partial of the streaming
+    // response before it can classify anything; recreate exactly that durable state.
+    const taskId = await withRawHarness(seeded.config, seeded.models, (harness) => harness.commit(
+      async (tx) => {
+        (await tx.doc(LiveDoc, seeded.conversationId)).generation = {
+          attempt: 1,
+          message: fauxAssistantMessage("partial text"),
+        };
+        return tx.createTask(syntheticGenerationTask(999, "request"), {
+          checkpoint: {
+            phase: "request",
+            attempt: 1,
+            model: { provider: providerId, modelId: "synthetic" },
+            thinkingLevel: "off",
+            streamOptions: {},
+            cutoff: seeded.cutoff,
+          },
+        }, {
+          ownership: { kind: "conversation" },
+          conversationId: seeded.conversationId,
+        });
+      },
+      context,
+    ));
+
+    const blocks = await listPreparedContextBlocks(seeded.config, context);
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0].taskId, taskId);
+    assert.equal(blocks[0].response, "partial-response",
+      "a committed partial proves the provider stream produced content");
+
+    const blockedOpen = offlineModels(providerId);
+    await assert.rejects(
+      openGateway(seeded.config, context, { models: blockedOpen.models }),
+      /prepared request includes persisted Nanobot context/,
+    );
+    assert.equal(blockedOpen.provider.state.callCount, 0);
+  } finally {
     await rm(temp, { recursive: true, force: true });
   }
 });
@@ -628,6 +766,8 @@ test("a revoked poll model stays fail-closed and never reaches cancelDeferred", 
     const blocks = await listPreparedContextBlocks(seeded.config, context);
     assert.equal(blocks.length, 1);
     assert.equal(blocks[0].phase, "poll");
+    assert.equal(blocks[0].response, "deferred-response",
+      "a poll checkpoint is committed with the received deferred handle");
     assert.deepEqual(
       await cancelPreparedContextBlock(
         seeded.config,
