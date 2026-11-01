@@ -139,17 +139,10 @@ After import and separate approval of summary spend:
 4. Review initial results before finishing the finite remainder. Verify all intended episode outcomes,
    coverage and summary-search drilldown. Summary indexing refreshes on demand and may need several passes.
 
-Maintenance-only run shape (no service, no channel, no schedule): open the store once in a single
-foreground process that passes the summary model explicitly —
-`openGateway(config, context, { episodeSummary: { provider, modelId, thinkingLevel, backfill: "pending" } })`
-— with `cron`, `workers` and `mcp` disabled in that process's configuration. Startup then reconciles the
-catalog, queues every pending closed episode and drains the chains; channel code is never imported, and
-task kinds whose extension is not installed wait for a registry change instead of running. The process
-must be the only owner of the store, and the service must stay stopped and disabled. That override is a
-host option, not a config field, so it cannot turn on by itself at a later service start; the committed
-config keeps `backfill: "none"` behavior. Stop the process when every queue reports no waiting job, or
-on any unexpected issue or agreed limit, and inspect `historySummaryQueue`/`historyEpisodeSummary` and
-the summary record's `coverage`/`usage`/`attempts` afterwards.
+**Do not run backfill until a maintenance-only path is verified.** An ordinary gateway open can resume
+persisted work, and disabling cron skips automation-conversation classification on reopen. Disabling
+integrations alone is therefore not sufficient to guarantee a safe maintenance run. Keep the service
+stopped and disabled; back up the store and obtain separate approval for model spend before execution.
 
 Existing limits matter: entries shorten at 2,000 characters; chunks bound at 24,000 characters / 400
 entries; an episode keeps as many chunks as it needs, each one its own bounded provider request, with the
