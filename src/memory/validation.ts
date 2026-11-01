@@ -7,6 +7,8 @@ const MAX_CURSOR_CHARS = 4_096;
 const MAX_QUERY_CHARS = 2_000;
 const MAX_FILTER_VALUES = 256;
 const MAX_STRING_CHARS = 4_096;
+export const MEMORY_MAX_HITS = 100;
+export const MEMORY_MAX_READ_CHARS = 8_000;
 const targets = ["notes", "episodes", "messages", "tools"] as const;
 const provenances = ["native", "imported", "unknown"] as const;
 const states = ["open", "closed"] as const;
@@ -54,7 +56,7 @@ function safePath(value: unknown, label: string): string {
 }
 function validTimestamp(value: unknown, label: string): string {
   const timestamp = string(value, label, 64);
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/.exec(timestamp);
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:\d{2})$/.exec(timestamp);
   if (!match) throw new TypeError(`${label} must be an ISO timestamp with an explicit timezone`);
   const [, y, mo, d, h, mi, s, , zone] = match;
   const year = Number(y), month = Number(mo), day = Number(d);
@@ -88,7 +90,11 @@ function validateFilter(value: unknown, target: MemoryTarget): MemoryFilter {
   if (input.state !== undefined) output.state = stringList(input.state, "filter.state", states);
   if (input.roles !== undefined) output.roles = stringList(input.roles, "filter.roles", roles);
   if (input.kinds !== undefined) output.kinds = stringList(input.kinds, "filter.kinds", kinds);
-  if (input.pathPrefix !== undefined) output.pathPrefix = safePath(input.pathPrefix, "filter.pathPrefix");
+  if (input.pathPrefix !== undefined) {
+    const prefix = string(input.pathPrefix, "filter.pathPrefix", 1_024);
+    safePath(prefix.endsWith("/") ? prefix.slice(0, -1) : prefix, "filter.pathPrefix");
+    output.pathPrefix = prefix;
+  }
   if (input.time !== undefined) {
     const time = record(input.time, "filter.time");
     keys(time, ["from", "to"], "filter.time");
@@ -115,7 +121,10 @@ export function validateQuery(value: unknown, mode: "search" | "browse"): Memory
     if (input.order !== undefined) output.order = enumValue(input.order, ["oldest", "newest"] as const, "order");
   }
   if (input.filter !== undefined) output.filter = validateFilter(input.filter, target);
-  if (input.limit !== undefined) output.limit = safeInteger(input.limit, "limit", 1);
+  if (input.limit !== undefined) {
+    output.limit = safeInteger(input.limit, "limit", 1);
+    if ((output.limit as number) > MEMORY_MAX_HITS) throw new TypeError(`limit must not exceed ${MEMORY_MAX_HITS} hits`);
+  }
   if (input.cursor !== undefined) output.cursor = string(input.cursor, "cursor", MAX_CURSOR_CHARS);
   return output as unknown as MemoryQuery;
 }
@@ -127,7 +136,10 @@ export function validateRead(value: unknown): MemoryReadQuery {
   const output: RecordValue = { ref };
   if (input.view !== undefined) output.view = enumValue(input.view, ["summary", "transcript"] as const, "view");
   if (input.cursor !== undefined) output.cursor = string(input.cursor, "cursor", MAX_CURSOR_CHARS);
-  if (input.limit !== undefined) output.limit = safeInteger(input.limit, "limit", 1);
+  if (input.limit !== undefined) {
+    output.limit = safeInteger(input.limit, "limit", 1);
+    if ((output.limit as number) > MEMORY_MAX_READ_CHARS) throw new TypeError(`limit must not exceed ${MEMORY_MAX_READ_CHARS} characters`);
+  }
   return output as unknown as MemoryReadQuery;
 }
 
