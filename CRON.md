@@ -366,7 +366,7 @@ runtime decision stays in the one owner process:
 durable-nanobot cron list
 durable-nanobot cron show <jobId>
 durable-nanobot cron cancel <jobId>
-durable-nanobot cron create --key <requestKey> --after 600 --message "Stretch and check the build"
+durable-nanobot cron create --origin <sessionKey> --key <requestKey> --after 600 --message "Stretch"
 durable-nanobot cron create --key daily-1 --cron "0 9 * * 1-5" --tz Europe/Budapest \
   --origin telegram:<identity>:chat:<chatId> --message "Morning check"
 ```
@@ -376,12 +376,13 @@ durable-nanobot cron create --key daily-1 --cron "0 9 * * 1-5" --tz Europe/Budap
   itself, so a caller cannot supply a conversation ID or an owner. The legitimate origin set is the
   current mapped ordinary chat sessions (the same reader history search uses); a channel-state,
   automation, task-owned, forked or root conversation is never an origin. `--origin` may name any
-  currently mapped chat, including a Telegram chat (its exact key is printed by `list`), and
-  defaults to the CLI conversation this process attached to. An unmapped key is refused and schedules nothing.
+  currently mapped chat, including a Telegram chat (its exact key is printed by `list`),
+  and is required. An unmapped key is refused and schedules nothing. Operator commands do not attach or create a chat.
 - **`list` and `show` are read-only and store-wide.** `list` reports every job every legitimate
-  origin owns, ordered by the next occurrence and never truncated, so no armed job hides behind a
-  page bound, and names the currently mapped chats so an explicit `--origin` can be given. `show` is
-  one exact job ID. Neither reads a transcript or calls a model.
+  origin owns, ordered by the next occurrence in pages of 100 compact rows. Follow the printed
+  `list --offset <n>` to read further pages; concurrent changes can shift these point-in-time
+  pages. It names currently mapped chats so an explicit `--origin` can be given. `show` is
+  one exact job ID; its message preview is limited to 300 characters. Neither reads a transcript or calls a model.
 - **`create` needs an explicit durable request key** (`--key`). The foundation owns the idempotency:
   an identical retry (same key, same payload, same origin) returns the same job and arms no second
   timer; a different payload under the same key is refused; a key whose original job was cancelled
@@ -408,7 +409,8 @@ durable-nanobot cron create --key daily-1 --cron "0 9 * * 1-5" --tz Europe/Budap
 Jobs are stored in their origin's document and are never deleted, so `cron list` also shows
 cancelled and finished jobs and grows with the store's history. A job whose origin conversation is
 no longer a currently mapped chat is not listed: that conversation gives no operator visibility
-either. Restoring such a chat's mapping is outside this surface.
+either. Its native timers can still fire; losing the mapping does not cancel a job.
+Restoring such a chat's mapping is outside this surface.
 
 ## Schedule math
 

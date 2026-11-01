@@ -108,9 +108,10 @@ export const COMMANDS: readonly CommandHelp[] = [
     summary: "Inspect and manage scheduled work on this store's mapped chats",
     options: [
       CONFIG_OPTION,
+      { flags: "--offset <n>", text: "list: read the next bounded page at the printed offset." },
       {
         flags: "--origin <sessionKey>",
-        text: "create: the mapped chat to schedule on; default this CLI conversation.",
+        text: "create: required mapped chat to schedule on; list prints available keys.",
       },
       { flags: "--key <requestKey>", text: "create: required durable request key; an identical retry dedupes." },
       { flags: "--message <text> [--name <label>]", text: "create: the instruction the agent receives when the job fires." },
@@ -123,9 +124,9 @@ export const COMMANDS: readonly CommandHelp[] = [
     ],
     examples: [
       "durable-nanobot cron list",
-      "durable-nanobot cron show cron-<jobId>",
-      "durable-nanobot cron cancel cron-<jobId>",
-      "durable-nanobot cron create --key wake-1 --after 600 --message \"Stretch and check the build\"",
+      "durable-nanobot cron show <jobId>",
+      "durable-nanobot cron cancel <jobId>",
+      "durable-nanobot cron create --origin <sessionKey> --key wake-1 --after 600 --message \"Stretch\"",
     ],
   },
 ];

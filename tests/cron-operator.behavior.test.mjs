@@ -89,8 +89,8 @@ async function syntheticGateway(t, label) {
     configFile,
     faux,
     harness: gateway.harness,
-    async connect(conversation) {
-      const client = await connectLocalGateway({ socketPath, conversation, context });
+    async connect(conversation, operatorOnly = false) {
+      const client = await connectLocalGateway({ socketPath, conversation, operatorOnly, context });
       clients.push(client);
       return client;
     },
@@ -258,38 +258,33 @@ test("operator controls create, list, show and cancel across every mapped chat",
   assert.equal((await stored())[0].cancelledAtMs !== null, true);
 });
 
-test("an operator-created one-shot really runs and records its outcome", { timeout: 60_000 }, async (t) => {
-  const store = await syntheticGateway(t, "run");
+test("operator reads attach to no chat and listings have compact reachable pages", { timeout: 30_000 }, async (t) => {
+  const store = await syntheticGateway(t, "pages");
+  const client = await store.connect(undefined, true);
+  assert.deepEqual((await client.cronList(context)).origins, []);
+  assert.deepEqual(await client.cronShow("cron-missing", context), []);
+  const processList = await runCronCli(store.configFile, ["list"]);
+  assert.equal(processList.code, 0, processList.stderr);
+  assert.match(processList.stdout, /Mapped chats: none/);
+  assert.deepEqual((await client.cronList(context)).origins, [], "reads create no session mapping");
+
   await store.gateway.conversationFor(CLI_CHAT, context);
-  const client = await store.connect("operator");
-  let requests = 0;
-  const answer = () => {
-    requests += 1;
-    return fauxAssistantMessage("Reminder: stretch.");
-  };
-  // Two spare responses: a second request would mean the run re-dispatched, which the count catches.
-  store.faux.setResponses([answer, answer, answer]);
-
-  const created = await client.cronCreate(CLI_CHAT, {
-    message: "stretch reminder",
-    name: "reminder",
-    mode: "origin",
-    schedule: { kind: "after", afterMs: 1_000 },
-    idempotencyKey: "run-1",
-  }, context);
-  assert.equal(created.status, "scheduled");
-
-  const deadline = Date.now() + 15_000;
-  let view = created.job;
-  while (Date.now() < deadline && view.lastOutcome === null) {
-    const [current] = await client.cronShow(created.jobId, context);
-    if (current !== undefined) view = current;
-    if (view.lastOutcome === null) await new Promise((resolve) => setTimeout(resolve, 25));
+  for (let index = 0; index < 101; index++) {
+    await client.cronCreate(CLI_CHAT, schedule({ idempotencyKey: `page-${index}` }), context);
   }
-  assert.equal(view.lastOutcome?.status, "ok", "the one-shot settled after the operator scheduled it");
-  assert.equal(view.status, "completed");
-  assert.equal(view.nextAtMs, null);
-  assert.equal(requests, 1, "the scheduled turn reached the model exactly once");
+  const first = await client.cronList(context);
+  assert.equal(first.jobs.length, 100);
+  assert.equal(first.total, 101);
+  assert.equal(first.nextOffset, 100);
+  assert.equal("message" in first.jobs[0], false, "list omits unused detailed projections");
+  const second = await client.cronList(context, first.nextOffset);
+  assert.equal(second.jobs.length, 1);
+  assert.equal(second.nextOffset, null);
+  assert.equal(new Set([...first.jobs, ...second.jobs].map((job) => job.id)).size, 101);
+  const output = capture();
+  await runCronCommand({ client, command: { kind: "list" }, output: output.output, context });
+  assert.match(output.text(), /Next page: durable-nanobot cron list --offset 100/);
+  assert.deepEqual(parseCronInvocation(["list", "--offset", "100"]).command, { kind: "list", offset: 100 });
 });
 
 test("the CLI surface creates, lists and reports a lost response as unknown", { timeout: 60_000 }, async (t) => {
@@ -301,7 +296,7 @@ test("the CLI surface creates, lists and reports a lost response as unknown", { 
   await runCronCommand({
     client,
     command: parseCronInvocation([
-      "create", "--key", "cli-1", "--after", "600", "--message", "Stretch and check the build",
+      "create", "--origin", CLI_CHAT, "--key", "cli-1", "--after", "600", "--message", "Stretch and check the build",
     ]).command,
     output: created.output,
     context,
@@ -323,7 +318,7 @@ test("the CLI surface creates, lists and reports a lost response as unknown", { 
   assert.equal(processList.code, 0, processList.stderr);
   assert.match(processList.stdout, new RegExp(`^1 cron job in 1 chat:\\n${jobId}  scheduled  next `));
   assert.match(processList.stdout, /Mapped chats: .*cli:operator/);
-  assert.match(processList.stdout, /Mapped chats: .*cli:default/);
+  assert.doesNotMatch(processList.stdout, /cli:default/, "operator reads must not create a default chat");
   const missing = await runCronCli(store.configFile, ["show", "cron-missing"]);
   assert.equal(missing.code, 1);
   assert.equal(missing.stdout, "");
@@ -389,17 +384,19 @@ test("the cron command refuses ambiguous and incomplete forms before anything is
   ]) {
     assert.throws(() => parseCronInvocation(args), CronUsageError, `usage: ${JSON.stringify(args)}`);
   }
+  assert.throws(() => parseCronInvocation(["create", "--key", "k", "--message", "m", "--after", "600"]),
+    /requires --origin, --key and --message/);
   for (const [args, message] of [
     [["create", "--key", "k", "--message", "m"], /exactly one of --at, --after, --every or --cron/],
     [["create", "--key", "k", "--message", "m", "--after", "600", "--every", "60"], /exactly one/],
-    [["create", "--message", "m", "--after", "600"], /requires --key and --message/],
-    [["create", "--key", "k", "--after", "600"], /requires --key and --message/],
+    [["create", "--message", "m", "--after", "600"], /requires --origin, --key and --message/],
+    [["create", "--key", "k", "--after", "600"], /requires --origin, --key and --message/],
     [["create", "--key", "k", "--message", "m", "--after", "600", "--tz", "UTC"], /only applies to --cron/],
     [["create", "--key", "k", "--message", "m", "--after", "0"], /positive whole number of seconds/],
     [["create", "--key", "k", "--message", "m", "--mode", "sometimes", "--after", "600"], /mode must be/],
     [["create", "--key", "k", "--message", "m", "--at", "2026-11-01T09:00:00"], /explicit UTC offset or Z/],
   ]) {
-    assert.throws(() => parseCronInvocation(args), (error) => {
+    assert.throws(() => parseCronInvocation([...args, "--origin", CLI_CHAT]), (error) => {
       assert.ok(error instanceof CronCommandError, `refusal: ${JSON.stringify(args)}`);
       assert.match(error.message, message);
       return true;

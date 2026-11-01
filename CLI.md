@@ -228,21 +228,22 @@ origin, owner and cancellation; the command itself schedules nothing:
 durable-nanobot cron list
 durable-nanobot cron show <jobId>
 durable-nanobot cron cancel <jobId>
-durable-nanobot cron create --key <requestKey> --after 600 --message "Stretch and check the build"
+durable-nanobot cron create --origin <sessionKey> --key <requestKey> --after 600 --message "Stretch"
 durable-nanobot cron create --key daily-1 --cron "0 9 * * 1-5" --tz Europe/Budapest \
   --origin telegram:<identity>:chat:<chatId> --message "Morning check"
 ```
 
 `list` and `show` are read-only and cover every currently mapped chat; `list` order is the
-next occurrence and it names the mapped chat keys an explicit `--origin` can use. `create`
-requires an explicit `--key`; the cron foundation dedupes an identical retry, refuses
+next occurrence and it names the mapped chat keys an explicit `--origin` can use.
+Listings are bounded to 100 compact rows; follow the printed `list --offset <n>` for the
+next page (a point-in-time view, not a frozen snapshot). Neither command attaches or creates a chat. `create`
+requires explicit `--origin` and `--key`; the cron foundation dedupes an identical retry, refuses
 a different payload under the same key, and never re-arms a cancelled original.
 Exactly one of `--at`, `--after`, `--every` or `--cron` (with optional `--tz`) is
 accepted, and `--mode background|origin` matches the job's run mode: a background job
 records its outcome on the job (`cron show`) and its answer is delivered only through a
 channel outbox (currently Telegram), while `--mode origin` answers in the origin
-conversation itself. `--origin` defaults to this CLI conversation and otherwise must name
-an already mapped chat.
+conversation itself. `--origin` must name an already mapped chat.
 `cancel` is exact-ID, refuses an ID recorded under more than one chat, and reports a
 recorded cancellation separately from a post-commit cleanup failure. If the gateway
 stops answering, the command reports an unknown outcome and points at the retry-safe

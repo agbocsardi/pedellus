@@ -18,6 +18,7 @@ import {
   type CronOperatorCreateOutcome,
   type CronOperatorJob,
   type CronOperatorListing,
+  type CronOperatorRow,
 } from "./operator.js";
 import { commandUsage, findCommandHelp, renderCommandHelp } from "../help/cli.js";
 import { LocalRemoteError, type LocalGatewayClient } from "../local/client.js";
@@ -33,13 +34,13 @@ export class CronUsageError extends Error {
 }
 
 export type CronCommand =
-  | { readonly kind: "list" }
+  | { readonly kind: "list"; readonly offset?: number }
   | { readonly kind: "show"; readonly jobId: string }
   | { readonly kind: "cancel"; readonly jobId: string }
   | {
       readonly kind: "create";
-      /** Explicit mapped chat; absent schedules on the CLI conversation this process attached to. */
-      readonly origin: string | undefined;
+      /** Explicit mapped chat; never implicitly creates a conversation. */
+      readonly origin: string;
       readonly request: CronScheduleInput;
     };
 
@@ -106,7 +107,7 @@ export function parseCronInvocation(args: readonly string[]): CronInvocation {
   if (action === undefined || !ACTIONS.has(action)) throw usage();
   const allowed = action === "create"
     ? new Set(["--config", "--origin", "--key", "--message", "--name", "--mode", "--at", "--after", "--every", "--cron", "--tz"])
-    : new Set(["--config"]);
+    : new Set(action === "list" ? ["--config", "--offset"] : ["--config"]);
   const flags = new Map<string, string>();
   const positional: string[] = [];
   for (let index = 0; index < rest.length;) {
@@ -126,7 +127,10 @@ export function parseCronInvocation(args: readonly string[]): CronInvocation {
 
   if (action === "list") {
     if (positional.length > 0) throw usage();
-    return { command: { kind: "list" }, ...(configPath === undefined ? {} : { configPath }) };
+    const rawOffset = flags.get("--offset");
+    if (rawOffset !== undefined && (!/^[0-9]+$/.test(rawOffset) || !Number.isSafeInteger(Number(rawOffset)))) throw usage();
+    return { command: { kind: "list", ...(rawOffset === undefined ? {} : { offset: Number(rawOffset) }) },
+      ...(configPath === undefined ? {} : { configPath }) };
   }
   if (action === "show" || action === "cancel") {
     const [jobId, ...extra] = positional;
@@ -147,8 +151,8 @@ export function parseCronInvocation(args: readonly string[]): CronInvocation {
   }
   const key = flags.get("--key");
   const message = flags.get("--message");
-  if (key === undefined || message === undefined) {
-    throw refused("create requires --key and --message.");
+  if (origin === undefined || key === undefined || message === undefined) {
+    throw refused("create requires --origin, --key and --message.");
   }
   const mode = flags.get("--mode");
   let request: CronScheduleInput;
@@ -172,8 +176,8 @@ export function parseCronInvocation(args: readonly string[]): CronInvocation {
 
 const iso = (ms: number | null): string => (ms === null ? "none" : new Date(ms).toISOString());
 
-/** One compact line per job: nothing is truncated, so no armed job can hide. */
-function jobLine(job: CronOperatorJob): string {
+/** One compact line per job in the bounded page. */
+function jobLine(job: CronOperatorRow): string {
   return `${job.id}  ${job.status}  next ${iso(job.nextAtMs)}  ${job.origin}  ${job.name}  (${job.schedule})`;
 }
 
@@ -186,6 +190,7 @@ export function renderCronList(listing: CronOperatorListing): string {
   return [
     heading,
     ...jobs.map(jobLine),
+    ...(listing.nextOffset === null ? [] : [`${listing.total} jobs total. Next page: durable-nanobot cron list --offset ${listing.nextOffset}`]),
     `Mapped chats: ${origins.length === 0 ? "none" : origins.join(", ")}`,
   ].join("\n");
 }
@@ -259,23 +264,21 @@ export interface CronCommandOptions {
 export async function runCronCommand(options: CronCommandOptions): Promise<void> {
   const { client, command, output, context } = options;
   if (command.kind === "list" || command.kind === "show") {
-    let listing: CronOperatorListing;
     try {
-      listing = command.kind === "list"
-        ? await client.cronList(context)
-        : { origins: [], jobs: await client.cronShow(command.jobId, context) };
+      if (command.kind === "list") {
+        output.write(`${renderCronList(await client.cronList(context, command.offset))}\n`);
+        return;
+      }
+      const jobs = await client.cronShow(command.jobId, context);
+      if (jobs.length === 0) throw refused(`no scheduled job with id ${command.jobId}.`);
+      output.write(`${jobs.map(renderCronJob).join("\n\n")}\n`);
+      return;
     } catch (error) {
+      if (error instanceof CronCommandError) throw error;
       throw refused(error instanceof LocalRemoteError
         ? error.message
         : "the gateway did not answer; nothing was read.");
     }
-    if (command.kind === "list") {
-      output.write(`${renderCronList(listing)}\n`);
-      return;
-    }
-    if (listing.jobs.length === 0) throw refused(`no scheduled job with id ${command.jobId}.`);
-    output.write(`${listing.jobs.map(renderCronJob).join("\n\n")}\n`);
-    return;
   }
 
   if (command.kind === "cancel") {
@@ -283,7 +286,7 @@ export async function runCronCommand(options: CronCommandOptions): Promise<void>
     try {
       result = await client.cronCancel(command.jobId, context);
     } catch (error) {
-      if (definitive(error)) throw refused(`${error.message} Nothing was cancelled.`);
+      if (definitive(error)) throw refused(`${error.message.replace(/[.\s]+$/, "")}. Nothing was cancelled.`);
       throw unknownOutcome(command);
     }
     if (result.status === "not_found") throw refused(`no scheduled job with id ${command.jobId}.`);
@@ -308,12 +311,12 @@ export async function runCronCommand(options: CronCommandOptions): Promise<void>
     return;
   }
 
-  const origin = command.origin ?? client.sessionKey;
+  const origin = command.origin;
   let result: CronOperatorCreateOutcome;
   try {
     result = await client.cronCreate(origin, command.request, context);
   } catch (error) {
-    if (definitive(error)) throw refused(`${error.message} Nothing was scheduled.`);
+    if (definitive(error)) throw refused(`${error.message.replace(/[.\s]+$/, "")}. Nothing was scheduled.`);
     throw unknownOutcome(command);
   }
   if (result.status === "unknown_origin") {

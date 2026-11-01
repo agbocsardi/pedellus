@@ -83,7 +83,7 @@ export interface LocalGatewayClient extends TerminalConversation {
   mcpApprove(id: string, context: Context): Promise<McpApproveResult>;
   mcpDeny(id: string, context: Context): Promise<McpApproveResult>;
   /** Owner controls for scheduled work: store-wide reads and exact-ID create/cancel. */
-  cronList(context: Context): Promise<CronOperatorListing>;
+  cronList(context: Context, offset?: number): Promise<CronOperatorListing>;
   cronShow(id: string, context: Context): Promise<CronOperatorJob[]>;
   cronCreate(origin: string, request: CronScheduleInput, context: Context): Promise<CronOperatorCreateOutcome>;
   cronCancel(id: string, context: Context): Promise<CronOperatorCancelOutcome>;
@@ -105,6 +105,8 @@ export interface LocalGatewayClient extends TerminalConversation {
 
 export interface ConnectLocalGatewayOptions {
   readonly socketPath: string;
+  /** Connect for store-wide operator calls without creating or configuring a chat. */
+  readonly operatorOnly?: boolean;
   /** CLI conversation name; absent is the historical `default` (`cli:default`). */
   readonly conversation?: string;
   readonly context: Context;
@@ -143,7 +145,7 @@ export async function connectLocalGateway(options: ConnectLocalGatewayOptions): 
   socket.setNoDelay(true);
   const client = new LocalGatewayConnection(socket);
   try {
-    await client.attach(options.conversation, options.context);
+    if (!options.operatorOnly) await client.attach(options.conversation, options.context);
   } catch (error) {
     await client.close();
     throw error;
@@ -339,12 +341,12 @@ class LocalGatewayConnection implements LocalGatewayClient {
     return this.call("mcpDeny", { id }, context);
   }
 
-  async cronList(context: Context): Promise<CronOperatorListing> {
-    const result = await this.call<{ readonly jobs: CronOperatorJob[]; readonly origins: string[] }>("cronList", {}, context);
+  async cronList(context: Context, offset = 0): Promise<CronOperatorListing> {
+    const result = await this.call<CronOperatorListing>("cronList", { offset }, context);
     if (!Array.isArray(result.jobs) || !Array.isArray(result.origins)) {
       throw new LocalGatewayError("unavailable", "local gateway sent an unexpected job listing");
     }
-    return { origins: result.origins, jobs: result.jobs };
+    return result;
   }
 
   async cronShow(id: string, context: Context): Promise<CronOperatorJob[]> {

@@ -31,6 +31,7 @@ import type {
 /** Bounds every value this surface renders, so one store-wide listing stays readable. */
 export const CRON_OPERATOR_LIMITS = Object.freeze({
   maxJobIdChars: 64,
+  maxListRows: 100,
   maxSessionKeyChars: 200,
   maxRequestKeyChars: 200,
   maxMessageChars: 4_000,
@@ -119,14 +120,18 @@ export type CronOperatorCancelOutcome =
   | { readonly status: "ambiguous" }
   | { readonly status: "forbidden" };
 
-/** Every job this store's mapped chats own, plus the chats themselves so one can be named. */
+export type CronOperatorRow = Pick<CronOperatorJob, "id" | "origin" | "name" | "schedule" | "status" | "nextAtMs">;
+
+/** One bounded page of mapped-chat jobs, plus the chats themselves so one can be named. */
 export interface CronOperatorListing {
   readonly origins: readonly string[];
-  readonly jobs: CronOperatorJob[];
+  readonly jobs: CronOperatorRow[];
+  readonly total: number;
+  readonly nextOffset: number | null;
 }
 
 export interface CronOperator {
-  list(context: Context): Promise<CronOperatorListing>;
+  list(context: Context, offset?: number): Promise<CronOperatorListing>;
   show(jobId: string, context: Context): Promise<CronOperatorJob[]>;
   create(origin: string, request: unknown, context: Context): Promise<CronOperatorCreateOutcome>;
   cancel(jobId: string, context: Context): Promise<CronOperatorCancelOutcome>;
@@ -149,7 +154,7 @@ function onlyFields(record: Record<string, unknown>, allowed: readonly string[])
 
 /** One line from possibly multi-line text, bounded by code points so no surrogate pair is split. */
 function projectedLine(text: string, maxChars: number): string {
-  const single = text.replace(/\s+/g, " ").trim();
+  const single = text.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").replace(/\s+/g, " ").trim();
   const points = [...single];
   return points.length <= maxChars ? single : `${points.slice(0, maxChars - 1).join("")}…`;
 }
@@ -312,11 +317,17 @@ export function createCronOperator(options: CronOperatorOptions): CronOperator {
     (await allJobs(context)).find((job) => job.id === jobId);
 
   return {
-    async list(context) {
+    async list(context, offset = 0) {
+      if (!Number.isSafeInteger(offset) || offset < 0) throw new CronOperatorInputError("offset must be a non-negative integer");
       const origins = await options.origins(context);
+      const jobs = await allJobs(context, origins);
+      const end = offset + CRON_OPERATOR_LIMITS.maxListRows;
       return {
         origins: origins.map((origin) => origin.sessionKey),
-        jobs: await allJobs(context, origins),
+        jobs: jobs.slice(offset, end).map(({ id, origin, name, schedule, status, nextAtMs }) =>
+          ({ id, origin, name, schedule, status, nextAtMs })),
+        total: jobs.length,
+        nextOffset: end < jobs.length ? end : null,
       };
     },
 

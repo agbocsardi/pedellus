@@ -276,6 +276,46 @@ class LocalConnection {
 
   private async dispatch(request: LocalRequestEnvelope): Promise<unknown> {
     if (request.method === "attach") return this.attach(request.params);
+    // Store-wide owner controls require the private socket, not a conversation attachment.
+    switch (request.method) {
+      case "cronList": {
+        const params = requireObject(request.params ?? {});
+        onlyKeys(params, ["offset"]);
+        const offset = params.offset === undefined ? 0 : requireInteger(params, "offset", 0, Number.MAX_SAFE_INTEGER);
+        return this.cronOperator().list(this.scope.context, offset);
+      }
+      case "cronShow": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["id"]);
+        return {
+          jobs: await this.cronOperator().show(
+            requireString(params, "id", CRON_OPERATOR_LIMITS.maxJobIdChars),
+            this.scope.context,
+          ),
+        };
+      }
+      case "cronCreate": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["origin", "request"]);
+        const operator = this.cronOperator();
+        const origin = requireString(params, "origin", CRON_OPERATOR_LIMITS.maxSessionKeyChars);
+        try {
+          return await operator.create(origin, params.request, this.scope.context);
+        } catch (error) {
+          // A refused request carries the host's own fixed text; it reached no scheduling commit.
+          if (error instanceof CronOperatorInputError) throw new LocalRequestError("invalid", error.message);
+          throw error;
+        }
+      }
+      case "cronCancel": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["id"]);
+        return this.cronOperator().cancel(
+          requireString(params, "id", CRON_OPERATOR_LIMITS.maxJobIdChars),
+          this.scope.context,
+        );
+      }
+    }
     if (this.surface === undefined || this.sessionKey === undefined || this.gatewayConversation === undefined) {
       throw new LocalRequestError("unavailable", "attach must be the first request");
     }
@@ -379,40 +419,6 @@ class LocalConnection {
         const params = requireObject(request.params);
         onlyKeys(params, ["id"]);
         return this.mcpAdmin().deny(requireString(params, "id", 32), this.scope.context);
-      }
-      case "cronList":
-        onlyKeys(requireObject(request.params ?? {}), []);
-        return this.cronOperator().list(this.scope.context);
-      case "cronShow": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["id"]);
-        return {
-          jobs: await this.cronOperator().show(
-            requireString(params, "id", CRON_OPERATOR_LIMITS.maxJobIdChars),
-            this.scope.context,
-          ),
-        };
-      }
-      case "cronCreate": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["origin", "request"]);
-        const operator = this.cronOperator();
-        const origin = requireString(params, "origin", CRON_OPERATOR_LIMITS.maxSessionKeyChars);
-        try {
-          return await operator.create(origin, params.request, this.scope.context);
-        } catch (error) {
-          // A refused request carries the host's own fixed text; it reached no scheduling commit.
-          if (error instanceof CronOperatorInputError) throw new LocalRequestError("invalid", error.message);
-          throw error;
-        }
-      }
-      case "cronCancel": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["id"]);
-        return this.cronOperator().cancel(
-          requireString(params, "id", CRON_OPERATOR_LIMITS.maxJobIdChars),
-          this.scope.context,
-        );
       }
       case "digestStart":
         return this.options.gateway.memoryDigest.start(this.digestWriter(), this.scope.context);

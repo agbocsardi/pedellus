@@ -336,7 +336,7 @@ async function runRecovery(recovery: RecoveryInvocation, config: Awaited<ReturnT
 }
 
 /**
- * Owner scheduling controls: one attach to the running gateway, one bounded request, then detach.
+ * Owner scheduling controls: one connection to the running gateway, no chat attachment.
  * Nothing is scheduled or cancelled in this process; the gateway owns every runtime decision.
  */
 async function runCron(invocation: CronInvocation, config: Awaited<ReturnType<typeof loadConfig>>): Promise<void> {
@@ -347,7 +347,7 @@ async function runCron(invocation: CronInvocation, config: Awaited<ReturnType<ty
   process.once("SIGTERM", shutdown);
   let client: Awaited<ReturnType<typeof connectLocalGateway>> | undefined;
   try {
-    client = await connectLocalGateway({ socketPath: await localSocketPath(config), context });
+    client = await connectLocalGateway({ socketPath: await localSocketPath(config), operatorOnly: true, context });
     await runCronCommand({ client, command: invocation.command, output: stdout, context });
   } finally {
     process.off("SIGINT", shutdown);
