@@ -49,10 +49,11 @@ most two short notes and two examples. A help flag is honoured before dispatch,
 so `--help` on any known subcommand line names that subcommand's page and never
 reads the configuration named on the same line.
 
-The bare `help` word is only a help request as the first argument with nothing
-else: `--help --config x` prints the overview and exits 0, while `help --config x`
-and `--config x help` are ordinary argument lists. Those print the fixed usage
-block on standard error and exit 1.
+The bare `help` word is a help request as the first argument with nothing after
+it, or with a help flag on the same line, so `help` and `help --help` print the
+overview and exit 0; `--help --config x` does too. `help --config x` and
+`--config x help` are ordinary argument lists: they print the fixed usage block
+on standard error and exit 1.
 
 An unrecognized subcommand prints one fixed `unknown command` diagnostic with
 the usage block and a help hint, and exits 1. That diagnostic echoes the typed

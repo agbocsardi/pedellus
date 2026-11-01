@@ -25,7 +25,9 @@ never reaches it. `message.text` (not a caption) is classified:
   adapter advertises depends on what the host really exposes (see
   [Host capability and the native menu](#host-capability-and-the-native-menu)).
   A typed command the host cannot perform is refused with fixed text and is
-  never sent to the assistant.
+  never sent to the assistant. The refusal is the catalogue's, derived from the
+  same reason and the same echo rule `/help <name>` uses, so the two cannot
+  drift.
 - Matching is an exact leading command token (case-insensitive). `/new`,
   `/abort`, `/stop`, `/status` and `/restart` take no arguments; `/model` takes
   one configured preset name or `default`; `/digest` takes nothing or the literal
@@ -431,6 +433,8 @@ silent failure:
   typed one is refused with fixed text. The shipped Gateway always exposes it;
   the run itself still refuses when this chat has no `read`/`write`/`edit`
   authority.
+- `/mcp` needs a gateway opened from an on-disk configuration file; without one
+  it is neither advertised nor performed.
 
 A test-only host that offers none of the optional host operations therefore
 advertises exactly `/new`, `/abort`, `/stop`, `/help`, while the shipped gateway

@@ -2286,8 +2286,9 @@ export async function runTelegram(
       return;
     }
     if (parsed.kind === "unsupported") {
+      // The same catalogue reason `/help <name>` gives, so the two refusals cannot drift.
       await admitNotice(update, message, sessionKey,
-        `Unsupported command /${parsed.command}. Available: ${availableCommandList()}. ` +
+        `${conversationCommandRefusal("telegram", parsed.command, availableCommandNames())} ` +
         "Any other message is sent to the assistant; prefix // to send a leading slash literally.");
       drain();
       return;
@@ -3097,10 +3098,6 @@ export async function runTelegram(
     return offeredTelegramCommandNames(hostCommands);
   }
 
-  function availableCommandList(): string {
-    return availableCommandNames().map((name) => `/${name}`).join(", ");
-  }
-
   /** Help lists exactly the controls this host implements, one line each; detail stays in `/help <command>`. */
   function controlHelpText(): string {
     const offered = availableCommandNames();
@@ -3405,6 +3402,9 @@ function quotedMessageContext(
   };
 }
 
+/** Bot API caps a menu description at 256 characters; a longer summary would be truncated here. */
+const TELEGRAM_MENU_DESCRIPTION_MAX = 256;
+
 /**
  * The native command menu is the shared catalogue filtered to the controls this host implements, so
  * its names and one-line descriptions cannot drift from `/help`.
@@ -3412,14 +3412,11 @@ function quotedMessageContext(
 function telegramCommands(
   host: TelegramCommandHost,
 ): readonly { readonly command: string; readonly description: string }[] {
-  // Bot API caps a menu description at 256 characters; catalogue summaries are far shorter.
   return offeredConversationCommands("telegram", offeredTelegramCommandNames(host)).map((command) => ({
     command: command.name,
     description: command.summary.slice(0, TELEGRAM_MENU_DESCRIPTION_MAX),
   }));
 }
-
-const TELEGRAM_MENU_DESCRIPTION_MAX = 256;
 
 /** The catalogued Telegram controls this host really implements, in catalogue order. */
 function offeredTelegramCommandNames(host: TelegramCommandHost): readonly string[] {

@@ -303,7 +303,7 @@ test("terminal /help lists only offered commands and one command's detail on dem
   assert.match(printed, /Unknown slash commands are not sent to the model/);
   // `/help <command>` carries the catalogue's usage line and its one-sentence detail.
   assert.match(printed, /Usage: \/model \[preset\] \| \/model <provider> <modelId> \[thinkingLevel\]/);
-  assert.match(printed, /\/model alone lists this host's choices; a selection changes this conversation only\./);
+  assert.match(printed, /\/model alone lists this host's choices; a selection applies to this conversation only, while the gateway stays open\./);
   // A catalogued command this host lacks is refused as such; an unknown one is unknown.
   assert.match(printed, /\/attach is not offered by this host\. Available: \/new, \/abort, /);
   assert.match(printed, /No such command \/guarantee here\. Available: \/new, /);

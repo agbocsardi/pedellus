@@ -345,13 +345,15 @@ test('a narrow SDK host keeps the base commands and truthfully refuses typed hos
     textUpdate(303, 303, '/new'),
     textUpdate(304, 304, '/help'),
     textUpdate(305, 305, '/help refresh'),
+    textUpdate(306, 306, '/help guarantee'),
+    textUpdate(307, 307, '/help ../SYNTHETIC-HELP-ARGUMENT'),
   ]]);
   let harness;
   try {
     harness = start(store, transport, { narrow: true });
     await until(() => transport.commands.length === 1, 'command menu registration');
     assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command), ['new', 'abort', 'stop', 'help']);
-    await until(() => transport.sent.length === 6, 'all six replies');
+    await until(() => transport.sent.length === 8, 'all eight replies');
     const texts = transport.sent.map((entry) => entry.text);
     assert.ok(texts.some((text) => /Status is unavailable in this host/.test(text)));
     assert.ok(texts.some((text) => /Model commands are unavailable in this host/.test(text)));
@@ -359,6 +361,12 @@ test('a narrow SDK host keeps the base commands and truthfully refuses typed hos
     assert.ok(texts.some((text) => /Context reset applied/.test(text)), 'plain native /new still works');
     // `/refresh` is a terminal command, so `/help refresh` names that instead of "no such command".
     assert.ok(texts.some((text) => /^\/refresh is only available in the terminal\. Available: /m.test(rendered(text))));
+    // A truly unknown name is unknown, and an argument that is not shaped like a command is not echoed.
+    const unknown = texts.map(rendered).find((text) => /^No such command \/guarantee here\. Available: /.test(text));
+    assert.ok(unknown !== undefined);
+    const unsafe = texts.map(rendered).find((text) => /^No such command here\. Available: /.test(text));
+    assert.ok(unsafe !== undefined);
+    assert.doesNotMatch(unsafe, /SYNTHETIC-HELP-ARGUMENT|\.\./i, 'the unsafe argument never reaches the reply');
     const help = texts.find((text) => text.startsWith('Controls for this chat'));
     // Only the offered controls are listed as controls; the rest are named once as not offered.
     assert.match(help, /Not offered by this host: \/status, \/model, \/digest, \/mcp, \/restart\./);
@@ -392,8 +400,8 @@ test('a full host fits its whole /help listing in one bounded notice and keeps d
     // Per-command usage and detail stay on the `/help <command>` path.
     const detail = rendered(transport.sent[1].text);
     assert.match(detail, /^Usage: \/model \(list the configured presets\) or \/model <preset> \(or \/model default\)\./);
-    assert.match(detail, /\/model alone lists this host's choices; a selection changes this conversation only\./);
-    assert.doesNotMatch(help, /a selection changes this conversation only/);
+    assert.match(detail, /\/model alone lists this host's choices; a selection applies to this conversation only, while the gateway stays open\./);
+    assert.doesNotMatch(help, /selection applies to this conversation only/);
     assert.equal(store.captured.length, 0, 'no help path reached the model');
   } finally {
     await cleanup(store, harness);
@@ -561,7 +569,8 @@ test('/model lists and selects one configured preset for this chat only', { time
 
     // `/refresh` was retired in favour of `/new`; it is refused and never a control. This host has no
     // restart capability, so `/restart` is not offered either.
-    assert.match(texts[6], /Unsupported command \/refresh/);
+    // A typed command is refused with the same catalogue reason `/help refresh` gives.
+    assert.match(texts[6], /^\/refresh is only available in the terminal\. Available: /m);
     assert.match(texts[6], /Available: \/new, \/abort, \/stop, \/status, \/model, \/digest, \/help/);
     assert.doesNotMatch(texts[6], /restart/);
 

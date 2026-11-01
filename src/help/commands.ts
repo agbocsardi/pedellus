@@ -34,7 +34,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     name: "new",
     summary: "Start a fresh context for this conversation",
     usage: "Usage: /new",
-    detail: "Stored history, queued input and tool authority are unchanged.",
+    detail: "A busy conversation refuses it or applies it at its next safe boundary; stored history and tool authority are unchanged.",
     surfaces: ["cli", "telegram"],
   },
   {
@@ -48,6 +48,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     name: "stop",
     summary: "Alias of /abort: stop this turn here",
     usage: "Usage: /stop",
+    detail: "Exactly the same effect and durable record as /abort.",
     surfaces: ["cli", "telegram"],
   },
   {
@@ -103,7 +104,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     summary: "List or select a model for this conversation",
     usage: "Usage: /model [preset] | /model <provider> <modelId> [thinkingLevel]",
     surfaceUsage: { telegram: "Usage: /model (list the configured presets) or /model <preset> (or /model default)." },
-    detail: "/model alone lists this host's choices; a selection changes this conversation only.",
+    detail: "/model alone lists this host's choices; a selection applies to this conversation only, while the gateway stays open.",
     surfaces: ["cli", "telegram"],
   },
   {
@@ -125,7 +126,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     args: "[status]",
     summary: "Start one bounded memory-digestion batch",
     usage: "Usage: /digest [status] — start a batch, or read its status.",
-    detail: "Background work on the shared workspace; no model call by itself.",
+    detail: "Runs one bounded background model batch on the shared workspace; /digest status is free.",
     surfaces: ["cli", "telegram"],
   },
   {
@@ -133,7 +134,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     args: "[show|approve|deny <id>]",
     summary: "Review and decide MCP owner-approval requests",
     usage: "Usage: /mcp | /mcp show <id> | /mcp approve <id> | /mcp deny <id>.",
-    detail: "Owner actions; a written entry connects at the next gateway start.",
+    detail: "Owner actions; nothing connects before an approval, and a written entry connects at the next gateway start.",
     surfaces: ["cli", "telegram"],
   },
   {
@@ -155,7 +156,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     name: "restart",
     summary: "Replace the whole gateway process",
     usage: "Usage: /restart",
-    detail: "Affects every chat and all background work.",
+    detail: "Affects every chat and all background work; the acknowledgement confirms the request, not a completed restart.",
     surfaces: ["cli", "telegram"],
   },
   {
@@ -163,6 +164,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     args: "[command]",
     summary: "Show these controls, or one command's detail",
     usage: "Usage: /help [command]",
+    detail: "Lists this host's controls; /help <command> adds that command's usage and detail.",
     surfaces: ["cli", "telegram"],
   },
 ];

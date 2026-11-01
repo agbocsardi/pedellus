@@ -26,13 +26,15 @@ export interface CommandHelp {
 /** The historical bare form: a terminal attach, kept for compatibility. */
 export const COMPATIBILITY_SYNOPSIS = "durable-nanobot --config <path>   (agent, compatibility)";
 
-/** The one sentence every page repeats, because it is the only configuration default. */
-export const DEFAULT_CONFIG_NOTE =
-  "Without --config, gateway, agent, login, logout and recovery use ~/.durable-nanobot/config.json.";
+/** The fixed primary configuration file, named once here and once in the usage block's note. */
+const DEFAULT_CONFIG_FILE = "~/.durable-nanobot/config.json";
+
+/** The one sentence the usage block repeats, because it is the only configuration default. */
+const DEFAULT_CONFIG_NOTE = `Without --config, gateway, agent, login, logout and recovery use ${DEFAULT_CONFIG_FILE}.`;
 
 const CONFIG_OPTION: HelpOption = {
   flags: "--config <path>",
-  text: "Read exactly this file; without it, the fixed default configuration is used.",
+  text: `Read exactly this file; without it, ${DEFAULT_CONFIG_FILE} is used.`,
 };
 
 /** Ordered command entries: this order is the overview and the composed usage block. */
@@ -158,8 +160,6 @@ export function renderOverview(): string {
     "Options:",
     `  ${CONFIG_OPTION.flags}   ${CONFIG_OPTION.text}`,
     "",
-    DEFAULT_CONFIG_NOTE,
-    "",
     "Slash commands in an attached CLI conversation (availability depends on the gateway):",
     conversationListing("cli", cliCommands),
     "",
@@ -183,6 +183,5 @@ export function renderCommandHelp(command: CommandHelp): string {
   }
   lines.push("Notes:", ...command.details.map((detail) => `  ${detail}`), "");
   lines.push("Examples:", ...command.examples.map((example) => `  ${example}`), "");
-  lines.push(DEFAULT_CONFIG_NOTE);
   return lines.join("\n");
 }
