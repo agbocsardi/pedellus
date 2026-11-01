@@ -37,7 +37,7 @@ owner pastes the callback back there, and tools become callable without a gatewa
 - [x] Cover real double CLI attach, replacement-surface callback refusal, identical MCP
       re-add after worker revocation, and implicit Code Mode retirement.
 - [x] Fresh independent review of the revised diff and integration with current main.
-- [ ] Merge only after clean review; live deployment remains a separate owner action.
+- [x] Merge only after clean review; live deployment remains a separate owner action.
 
 ## Session log
 
@@ -88,3 +88,10 @@ owner pastes the callback back there, and tools become callable without a gatewa
   are silently waived: unexercised real channel/provider acceptance remains a
   stated limitation; focused integrated CLI/Telegram accepted-callback coverage
   and explicit-compositor/mismatch paths remain future hardening.
+- Integrated newer scheduling/operator/restart-safety main changes in `0c389bed`;
+  resolved only the local client interface conflict, keeping both cron controls
+  and the new MCP callback/events while dropping old approval methods. Combined
+  checks passed: 390/390 behavior, 2/2 execution, 83/83 core, 34/34 budget.
+  Fresh focused integration review passed with 69/69 targeted checks plus
+  typecheck/build. Main fast-forwarded to the reviewed merge; no service was
+  restarted or deployed and no live consent/provider check was run.
