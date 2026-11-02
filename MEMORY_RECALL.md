@@ -131,11 +131,11 @@ locale-independent Unicode lowercase conversion one code point at a time; there 
 no Unicode normalization, tokenization, stemming, or model-based ranking. Note
 browse is deterministic path order (or reverse path order for `newest`).
 
-## Authority and opt-in
+## Authority and availability
 
 The tools are read-only and do not grant shell or filesystem write access. They are
-installed only when explicitly enabled by the host; SDK `agentHistory: false`
-opts out of these model-facing tools as well. This switch does not remove legacy
+enabled by default for authenticated mapped chats; SDK `agentHistory: false`
+opts out of these model-facing tools. This switch does not remove legacy
 `Gateway.history*` SDK/local APIs or their existing tests. Ordinary workers receive
 only named memory tools captured in their authority; enabling memory recall later
 does not widen an existing worker capture. No root, fork, raw, or task-owned conversation gains

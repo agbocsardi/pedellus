@@ -122,7 +122,8 @@ edits need restart only; unit edits additionally need daemon-reload.
   The `skill`, `cron`, `memory_search`, `memory_browse`, `memory_read`, `worker`,
   `mcp` management and scoped `telegram` tools grant no coding-tool authority and
   are exempt from the coding-tool hook, so enabling a coding tool never suppresses them.
-  Memory recall is explicitly opt-in and stays within validated mapped-chat scope;
+  Memory recall is enabled by default for validated mapped chats; the SDK's
+  `agentHistory: false` disables it. Worker recall still requires exact captured grants;
   legacy `Gateway.history*` SDK/local APIs and their tests do not widen model-facing
   or captured worker authority. MCP management can write server configuration and launch host-level stdio processes; it is limited
   to authenticated mapped chats, with login additionally requiring a unique live
