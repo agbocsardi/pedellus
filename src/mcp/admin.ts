@@ -304,10 +304,10 @@ export function renderMcpApproval(result: McpApproveResult, maxChars: number = M
   if (result.authorization === undefined) return bounded(result.text, maxChars);
   const tail = [
     "",
-    "Open this URL as the owner, in a browser that can reach this host:",
+    "Authorize in your browser (owner only):",
     result.authorization.url,
-    `This URL is valid until ${new Date(result.authorization.expiresAtMs).toISOString()} and carries this attempt's state.`,
-    "A remote browser needs that loopback port forwarded to this host; the URL is not sent to the assistant.",
+    `Expires ${new Date(result.authorization.expiresAtMs).toISOString()}.`,
+    "Remote browser? Forward the loopback port to this host. URL is not stored or sent to the assistant.",
   ].join("\n");
   // Never truncate the URL: only the explanatory text gives way when a channel has a smaller
   // message budget.
@@ -766,10 +766,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
     });
     return {
       status: "login-started",
-      text: `OAuth login started for "${request.name}". Open the authorization URL below as the owner in a browser ` +
-        "that can reach this host and finish the consent screen. The URL carries this attempt's state and is valid " +
-        "for a few minutes; it is not sent to the assistant and not written to any transcript. " +
-        "After consent the grant is stored privately and verified with one connection.",
+      text: `OAuth login started for "${request.name}". Authorize using the URL below.`,
       authorization: { url: run.authorizationUrl, expiresAtMs: run.expiresAtMs },
     };
   };
@@ -792,9 +789,8 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
           text: `Request ${request.id} is no longer a valid entry (${error instanceof Error ? error.message : "invalid"}); nothing was written.`,
         };
       }
-      let written;
       try {
-        written = await writeMcpServerEntry(options.edit, request.name, request.server, openBlock());
+        await writeMcpServerEntry(options.edit, request.name, request.server, openBlock());
       } catch (error) {
         return {
           status: "refused",
@@ -802,10 +798,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
             `Request ${request.id} stays available.`,
         };
       }
-      const base = `Wrote server "${request.name}" to the configuration file. Configured servers now: ` +
-        `${written.servers.length === 0 ? "none" : written.servers.join(", ")}. MCP is ` +
-        `${written.enabled ? "enabled" : "disabled"} in that block. This gateway keeps its open configuration: ` +
-        "the entry connects at the next start, and `/restart` replaces this process and re-reads the file.";
+      const base = `MCP server "${request.name}" saved. /restart to apply.`;
       if (!("url" in parsed) || parsed.oauth !== true) {
         await settle(context, request.id, "done", "configuration written");
         return { status: "applied", text: base };
@@ -835,13 +828,11 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
         };
       }
       try {
-        const result = await removeMcpServerEntry(options.edit, request.name, expected);
+        await removeMcpServerEntry(options.edit, request.name, expected);
         await settle(context, request.id, "done", "configuration entry removed");
         return {
           status: "applied",
-          text: `Removed server "${request.name}" from the configuration file. Configured servers now: ` +
-            `${result.servers.length === 0 ? "none" : result.servers.join(", ")}. This gateway keeps its open ` +
-            "configuration until the next start. A stored OAuth grant is kept; ask for a logout to delete it.",
+          text: `MCP server "${request.name}" removed. /restart to apply. OAuth grant kept; logout to delete it.`,
         };
       } catch (error) {
         return {
@@ -867,9 +858,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
       await settle(context, request.id, "done", "stored grant deleted");
       return {
         status: "applied",
-        text: `Deleted the stored OAuth grant for "${request.name}". A live connection is unaffected; a refresh ` +
-          "that completes afterwards cannot restore the deleted grant. After the next start the entry reports " +
-          "`auth-required` until an owner approves a new login.",
+        text: `MCP "${request.name}" logged out. Live connection unchanged until /restart.`,
       };
     }
     return startLogin(context, request, config, flow);
@@ -1142,8 +1131,7 @@ export function createMcpAdmin(options: McpAdminOptions): McpAdmin {
               ? "Its configuration write may already have completed; review the configuration. "
               : "") +
             "A grant it had already stored is kept; ask for a logout to delete it."
-          : `Denied MCP request ${decided.request.id} (${decided.request.kind} ${decided.request.name}): nothing was ` +
-            "configured, connected or authorized.",
+          : `MCP request ${decided.request.id} denied.`,
       };
     },
     async close() {

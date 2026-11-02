@@ -343,6 +343,9 @@ edits need restart only; unit edits additionally need daemon-reload.
 
 ## Conventions
 
+- Owner-facing receipts are terse (e.g. "Context reset."). Skip implementation
+  explanations; keep pending/failed/unknown outcomes honest and actionable.
+  Explicit status views and security/approval disclosures retain necessary detail.
 - Implementation workers own small permanent regression tests for their changes;
   reviewers check their coverage and reliability. Avoid exhaustive low-value matrices.
 - New tests use synthetic providers/controlled clocks, explicit timeouts and guaranteed

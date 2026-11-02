@@ -324,10 +324,8 @@ test('the local CLI /digest starts one batch and reports bounded status', { time
     },
   }), WAIT_MS, 'the CLI /digest commands');
   const text = chunks.join('');
-  assert.match(text, /started for one bounded completed-turn batch/);
-  assert.match(text, /shared workspace/);
+  assert.match(text, /Digest started \(\d+\)\./);
   assert.match(text, /Newest run: \d+ \((digested|running)\)/);
-  assert.match(text, /Status is read-only/);
   assert.equal(chunks.join('').includes(FACT), false, 'the host acknowledgement never echoes evidence');
 
   const task = await waitForValue(async () => {
@@ -351,15 +349,12 @@ test('an idle scan that did not reach every chat never claims that everything is
     status: 'idle',
     idle: { caughtUp: false, examinedChats: 2, postponedChats: 1, unfinishedChats: 1, missingChats: 1 },
   });
-  assert.match(pending, /did not reach the tail of every mapped chat/);
-  assert.match(pending, /completed history may remain pending/);
-  assert.doesNotMatch(pending, /No completed turn is pending/);
+  assert.equal(pending, 'No digest batch ready; scan incomplete. Retry /digest. Pending issues may still trigger the agent.');
   const complete = renderMemoryDigestStart({
     status: 'idle',
     idle: { caughtUp: true, examinedChats: 3, postponedChats: 0, unfinishedChats: 0, missingChats: 0 },
   });
-  assert.match(complete, /No completed turn is pending/);
-  assert.match(complete, /No new digest run was started/);
+  assert.equal(complete, 'Digest caught up. No run started; pending issues may still trigger the agent.');
   assert.doesNotMatch(complete, /no model was called/);
 });
 

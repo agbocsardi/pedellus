@@ -61,8 +61,8 @@ command are still submitted first, exactly as for `/abort`.
 
 A host with no prompt snapshot (or a narrow SDK gateway without `resetSession`)
 keeps the previous behaviour: `/new` is the plain native reset on the same
-mapped conversation, and its acknowledgement says nothing about a rebuild. A
-host that does have a snapshot reports `busy` instead of a half-effect.
+mapped conversation. Both paths acknowledge with "Context reset."; a host that
+has a snapshot reports `busy` instead of a half-effect.
 
 `/abort` calls `Conversation.abort(context)` without `background`, which is the
 narrowest public API: it withdraws this conversation's queued inputs, marks its
@@ -281,22 +281,20 @@ A mutating control (`/new`, `/abort`, `/model`, `/digest`, `/restart`)
 acknowledgement is committed **held** (`hold: true`) with the command intent, and
 published once:
 
-- the native call returns: "Context reset applied …" (with the rebuilt prompt
-  and skill count when the host rebuilt it), "Abort applied for this chat: it is
-  idle now. Queued messages were withdrawn and any running turn was stopped …"
-  — phrased so an idle conversation is not claimed to have had a turn stopped —
-  "Selected preset … for this chat: …", the bounded `/digest` admission
-  (started/busy/idle/refused, never evidence text), or the short "Restarting the
-  gateway. A confirmation follows once it is live.";
+- the native call returns: "Context reset.", "Idle. Queue cleared.",
+  "Model: <preset>.", the short `/digest` admission (started/busy/idle/refused,
+  never evidence text), or "Restarting.";
 - the native call proved that nothing changed (`/new` or `/model` on a busy chat,
   an unknown or unavailable preset, a legacy direct config): the acknowledgement
   is corrected to that fixed refusal; the record becomes `refused`, never
   `applied`, so a replay cannot claim a change that did not happen;
-- or the call has not returned after 30 seconds: the explicit still-pending
-  wording, e.g. "Abort is still pending for this chat … the provider may be
-  ignoring cancellation. Queued messages stay withdrawn and new messages are
-  held, never answered and never dropped, until the turn ends." No completion is
-  claimed, and no second message follows when the call finally returns.
+- or the call has not returned after 30 seconds: a short pending notice, e.g.
+  "Still stopping. New messages are held." No completion is claimed, and no
+  second message follows when the call finally returns.
+
+Routine receipts confirm the outcome without implementation details. `/help`
+lists commands briefly; explicit status/list/show commands retain their useful
+data, and MCP approval disclosures retain the exact proposed authority.
 
 A held acknowledgement is never delivered early, and it is not tied to the input
 gate: notices are never model submissions, so a released notice can still reach
@@ -364,18 +362,16 @@ is released. For `/restart` that commit also records every requesting chat as
 acknowledgement is durable before the host requests the replacement — which it
 does only after the acknowledgement and offset are durable, and never more than
 once. The replacement process turns those records into one ordinary notice per
-chat — "Gateway restarted and live: current code and configuration are loaded."
-— and clears the ones it queued. The confirmation therefore proves only that the
+chat — "Restarted." — and clears the ones it queued. The confirmation therefore proves only that the
 new process opened, loaded its configuration and is serving that chat; its own
 failure or ambiguity follows the ordinary notice hold rules. A sender the live
 allowlist no longer admits is dropped like any other notice, and records that do
 not fit the admitted bound stay recorded for a later open. A process that was
-refused instead reports "Restart failed: the host refused it, so this gateway
-keeps running. Nothing was restarted." to those chats and clears them, so the
-promise is never left open. If the process
+refused instead reports "Restart refused. Gateway still running." to those
+chats and clears them. If the process
 dies in between, the next open reports the command exactly once: its held
-acknowledgement is corrected to the explicit "interrupted, may not have taken
-effect" wording and released, or, when no acknowledgement record is left, a
+acknowledgement is corrected to the explicit "interrupted; outcome unknown"
+wording and released, or, when no acknowledgement record is left, a
 bounded report is queued for the recorded chat. `unconfirmed` and `refused` are
 terminal, so later opens do not repeat them; a replayed update (possible only if
 the offset was not committed) answers with the recorded outcome and never

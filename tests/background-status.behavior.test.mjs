@@ -615,7 +615,7 @@ test('the local CLI /status carries the background summary over the private sock
   assert.match(idle, /Run: idle/);
   assert.match(idle, /Native inbox: 0 queued/);
   assert.match(idle, /^Background: idle$/m);
-  assert.match(idle, /Provider-side charges or usage not recorded by Durable: unknown/);
+  assert.match(idle, /Unrecorded provider usage\/charges: unknown/);
 
   const origin = await store.gateway.conversationFor(SESSION, context);
   await closedEpisode(store.gateway.harness, origin.id, [user(`Remember ${FACT}`), assistant('Noted.')]);

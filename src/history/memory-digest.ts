@@ -1408,37 +1408,24 @@ function taskSnapshot(record: Awaited<ReturnType<Harness["getTask"]>>): MemoryDi
 }
 
 /**
- * Fixed, value-free wording for host command acknowledgements. It names the bounded batch shape and
- * the shared workspace scope, never a chat ID, file content or model text.
+ * Short host command receipts. Detailed batch metadata stays in `/digest status`; no file content
+ * or model text is included.
  */
 export function renderMemoryDigestStart(result: MemoryDigestStartResult): string {
   if (result.status === "started") {
-    return [
-      `Memory digestion run ${result.taskId} started for one bounded completed-turn batch.`,
-      `Batch source: conversation ${result.conversationId}, through entry ${result.throughEntryId} ` +
-        `(${result.complete ? "closed episode complete" : "exchange continues in a later batch"}), ` +
-        `${result.evidenceEntries} evidence entries.`,
-      "It runs in the background against the shared workspace; this chat is not held open and no answer is sent to a user or channel. A failed or cancelled run reports one internal issue to this conversation's agent; a successful run is silent.",
-    ].join("\n");
+    return `Digest started (${result.taskId}).`;
   }
   if (result.status === "busy") {
-    return `Memory digestion run ${result.taskId} is still active, so nothing new was started. One run at a time; retry later or cancel that task with the native controls.`;
+    return `Digest already running (${result.taskId}).`;
   }
   if (result.status === "idle") {
     const idle = result.idle;
     if (idle.caughtUp) {
-      return "No completed turn is pending memory digestion: every mapped chat was examined to its tail. " +
-        "No new digest run was started; retained issue delivery may resume this conversation's agent.";
+      return "Digest caught up. No run started; pending issues may still trigger the agent.";
     }
-    return [
-      "No bounded batch was ready, but the scan did not reach the tail of every mapped chat, so completed history may remain pending.",
-      `Examined ${idle.examinedChats}, postponed ${idle.postponedChats}, unfinished ${idle.unfinishedChats}, missing ${idle.missingChats}.`,
-      "No new digest run was started; retained issue delivery may resume this conversation's agent. " +
-        "Retry the digest to continue the bounded scan.",
-    ].join("\n");
+    return "No digest batch ready; scan incomplete. Retry /digest. Pending issues may still trigger the agent.";
   }
-  return `Memory digestion is refused: ${result.reason}. No new digest run was started; ` +
-    "retained issue delivery may resume this conversation's agent.";
+  return `Digest not started: ${result.reason}. Pending issues may still trigger the agent.`;
 }
 
 /** Fixed, value-free wording for the bounded status surface. */
@@ -1446,18 +1433,16 @@ export function renderMemoryDigestStatus(status: MemoryDigestStatusView): string
   const lines: string[] = [];
   lines.push(status.liveTaskId === null
     ? "Live memory digestion run: none."
-    : `Live memory digestion run: ${status.liveTaskId}. One run at a time across mapped chats.`);
+    : `Live memory digestion run: ${status.liveTaskId}.`);
   lines.push(status.pendingNotices === 0
     ? "Internal issue notices: none pending."
-    : `Internal issue notices: ${status.pendingNotices} pending (bounded at ` +
-      `${MEMORY_DIGEST_LIMITS.noticeRecords} per conversation).`);
+    : `Internal issue notices: ${status.pendingNotices} pending.`);
   if (!status.canStart) {
     lines.push(`New starts are refused: ${status.refusal ?? MEMORY_DIGEST_NOTICE_FULL_REASON}`);
   }
   const latest = status.latest;
   if (latest === null) {
     lines.push("No memory digestion run is recorded for this conversation.");
-    lines.push("Status is read-only: no scan, no model call and no cursor change.");
     return lines.join("\n");
   }
   lines.push(`Newest run: ${latest.taskId} (${latest.outcome ?? latest.status}).`);
@@ -1469,9 +1454,6 @@ export function renderMemoryDigestStatus(status: MemoryDigestStatusView): string
     );
   }
   if (latest.evidenceEntries !== null) lines.push(`Evidence entries: ${latest.evidenceEntries}.`);
-  if (latest.throughEntryId !== null && latest.complete === false) {
-    lines.push("The accepted exchange continues in a later batch.");
-  }
   if (latest.model !== null) lines.push(`Background model: ${latest.model}.`);
   if (latest.requests !== null) {
     lines.push(
@@ -1490,7 +1472,6 @@ export function renderMemoryDigestStatus(status: MemoryDigestStatusView): string
   }
   if (status.pendingNotices !== 0) lines.push("Backlog: retained internal issue reports may delay new starts.");
   if (latest.error !== null) lines.push(`Recorded error: ${bounded(latest.error, MEMORY_DIGEST_LIMITS.maxErrorChars)}`);
-  lines.push("Status is read-only: no scan, no model call and no cursor change.");
   return lines.join("\n");
 }
 

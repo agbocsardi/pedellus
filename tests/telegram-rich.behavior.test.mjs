@@ -414,7 +414,7 @@ test('a host notice travels rich with literal characters escaped', { timeout: 20
     harness = start(store, transport);
     await until(() => transport.rich.length === 1, 'one rich notice');
     const notice = transport.rich[0].text;
-    assert.match(notice, /Controls for this chat/);
+    assert.match(notice, /\/new - reset context/);
     assert.match(notice, /\\<preset\\>/, 'the placeholder is escaped so it is not read as an HTML tag');
     assert.equal(transport.plain.length, 0);
   } finally {

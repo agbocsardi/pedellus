@@ -170,10 +170,10 @@ test("a CLI attaches, disconnects and resumes while the gateway keeps serving", 
   const printed = session.chunks.join("");
   assert.match(printed, /Model: fixture\/alpha[\s\S]*Run: idle/);
   assert.match(printed, /Current model: fixture\/alpha/);
-  assert.match(printed, /Selected model: fixture\/beta \(thinking: high\)/);
+  assert.match(printed, /Model: fixture\/beta \(thinking: high\)/);
   assert.match(printed, /Current model: fixture\/beta/);
-  assert.match(printed, /Coding tools configured for authenticated chats: read/);
-  assert.match(printed, /Workspace context refreshed for this conversation: 0 skill\(s\)/);
+  assert.match(printed, /Coding tools: read/);
+  assert.match(printed, /Context refreshed\./);
   assert.match(printed, /synthetic answer one/);
   await first.close();
 
@@ -209,8 +209,8 @@ test("a CLI attaches, disconnects and resumes while the gateway keeps serving", 
   assert.match(resumedOutput, /Assistant: synthetic-gated-answer/);
   assert.match(resumedOutput, /session=telegram:alpha/);
   assert.match(resumedOutput, /Episodes for session telegram:alpha/);
-  assert.match(resumedOutput, /Native Durable conversation abort completed/);
-  assert.match(resumedOutput, /Native Durable context reset admitted/);
+  assert.match(resumedOutput, /Idle\. Queue cleared\./);
+  assert.match(resumedOutput, /Context reset\./);
   assert.match(resumedOutput, /Run: idle/);
   assert.match(resumedOutput, /synthetic second answer/);
   assert.doesNotMatch(resumedOutput, /telegram-only marker reply/);
@@ -389,7 +389,7 @@ test("real agent piped input is not lost while the watch attaches", { timeout: 3
   const ordered = await runAgentCli(configFile, "/status\n/tools\n/model\n/status\n");
   assert.deepEqual({ code: ordered.code, signal: ordered.signal }, { code: 0, signal: null }, ordered.stderr);
   const firstStatus = ordered.stdout.indexOf("Run: idle");
-  const tools = ordered.stdout.indexOf("Coding tools configured for authenticated chats: read");
+  const tools = ordered.stdout.indexOf("Coding tools: read");
   const model = ordered.stdout.indexOf("Current model: fixture/alpha");
   const lastStatus = ordered.stdout.lastIndexOf("Run: idle");
   assert.ok(firstStatus >= 0 && tools > firstStatus && model > tools && lastStatus > model,

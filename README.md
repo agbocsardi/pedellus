@@ -64,7 +64,9 @@ perform. `/model` selects one configured preset for that chat only. `/status` is
 bounded read-only metadata with no model call. `/new` starts a new context **and**
 rebuilds the assembled workspace prompt from the current files, so a host with a
 prompt snapshot refuses it while that chat has a running turn rather than
-half-applying; there is no separate `/refresh` command. `/restart` is a full
+half-applying; there is no separate `/refresh` command. Routine command receipts
+are terse ("Context reset.", "Idle. Queue cleared."); status views retain
+their data. `/restart` is a full
 process replacement: after the normal graceful teardown the same executable,
 argv and current environment are re-exec'd (POSIX `process.execve`), so current
 code and the re-read config load. Its acknowledgement is short: the replacement

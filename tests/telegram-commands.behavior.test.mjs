@@ -342,11 +342,11 @@ test('a narrow SDK host keeps the base commands and truthfully refuses typed hos
     assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command), ['new', 'abort', 'stop', 'help']);
     await until(() => transport.sent.length === 5, 'all five replies');
     const texts = transport.sent.map((entry) => entry.text);
-    assert.ok(texts.some((text) => /Status is unavailable in this host/.test(text)));
-    assert.ok(texts.some((text) => /Model commands are unavailable in this host/.test(text)));
-    assert.ok(texts.some((text) => /Restart is unavailable in this host/.test(text)));
-    assert.ok(texts.some((text) => /Context reset applied/.test(text)), 'plain native /new still works');
-    const help = texts.find((text) => text.startsWith('Controls for this chat'));
+    assert.ok(texts.some((text) => /Status unavailable/.test(text)));
+    assert.ok(texts.some((text) => /Model commands unavailable/.test(text)));
+    assert.ok(texts.some((text) => /Restart unavailable on this host/.test(text)));
+    assert.ok(texts.some((text) => /^Context reset\.$/.test(text)), 'plain native /new still works');
+    const help = texts.find((text) => text.startsWith('/new -'));
     assert.doesNotMatch(help, /\/status|\/model|\/restart|\/refresh/);
     assert.equal(store.captured.length, 0, 'no command reached the model');
   } finally {
@@ -411,9 +411,7 @@ test('/digest status, idle and malformed forms are bounded owner notices with no
     await flush();
     assert.equal(transport.sent.length, 3, 'an unauthenticated chat gets no digest control');
     assert.match(transport.sent[0].text, /No memory digestion run is recorded for this conversation/);
-    assert.match(transport.sent[0].text, /read-only: no scan, no model call/);
-    assert.match(transport.sent[1].text, /No completed turn is pending memory digestion/);
-    assert.match(transport.sent[1].text, /No new digest run was started/);
+    assert.equal(transport.sent[1].text, 'Digest caught up. No run started; pending issues may still trigger the agent.');
     assert.match(transport.sent[2].text, /Usage: \/digest/);
     assert.equal(store.captured.length, 0, 'no digest command form reached the model');
     const tasks = await store.gateway.harness.commit(
@@ -445,9 +443,7 @@ test('/digest starts one bounded batch for this authenticated chat and stays sil
   try {
     harness = start(store, transport);
     await until(() => transport.sent.length >= 1, 'the bounded start acknowledgement');
-    assert.match(transport.sent[0].text, /started for one bounded completed-turn batch/);
-    assert.match(transport.sent[0].text, /0 evidence entries/);
-    assert.match(transport.sent[0].text, /shared workspace/);
+    assert.match(transport.sent[0].text, /^Digest started \(\d+\)\.$/);
     let task;
     await untilAsync(async () => {
       const page = await store.gateway.harness.commit(
@@ -502,21 +498,19 @@ test('/model lists and selects one configured preset for this chat only', { time
     assert.match(listing, /\n +deep — fixture beta \[thinking: high\]/);
     assert.match(listing, /Configured default preset: fast/);
 
-    assert.match(texts[1], /Selected preset deep for this chat: fixture\/beta \(thinking: high\)/);
-    assert.match(texts[1], /Only this chat's selection changed/);
-    assert.match(texts[1], /a restart restores the configured default preset/);
+    assert.equal(texts[1], 'Model: deep.');
 
     assert.match(rendered(texts[2]), /Current model: fixture\/beta \(thinking: high\)/);
     assert.match(rendered(texts[2]), /\* deep — fixture beta \[thinking: high\]/);
 
-    assert.match(texts[3], /Unknown model preset nope: nothing was changed/);
-    assert.match(texts[4], /Usage: \/model \(list the configured presets\)/);
-    assert.match(texts[5], /Selected preset default for this chat: fixture\/alpha \(thinking: off\)/);
+    assert.match(texts[3], /Unknown preset nope/);
+    assert.match(texts[4], /Usage: \/model/);
+    assert.equal(texts[5], 'Model: default.');
 
     // `/refresh` was retired in favour of `/new`; it is refused and never a control. This host has no
     // restart capability, so `/restart` is not offered either.
-    assert.match(texts[6], /Unsupported command \/refresh/);
-    assert.match(texts[6], /Available: \/new, \/abort, \/stop, \/status, \/model, \/digest, \/help/);
+    assert.match(texts[6], /Unknown command \/refresh/);
+    assert.match(texts[6], /Use \/help/);
     assert.doesNotMatch(texts[6], /restart/);
 
     assert.deepEqual((await store.gateway.listModels(`telegram:${BOT_ID}:chat:${CHAT_ID}`, context)).selected,
@@ -549,7 +543,7 @@ test('/model is refused atomically while this chat runs a turn', { timeout: 20_0
     harness = start(store, transport);
     await entered;
     assert.equal(store.captured.length, 1);
-    await until(() => transport.sent.some((entry) => /Model preset selection rejected: this chat is busy/.test(entry.text)),
+    await until(() => transport.sent.some((entry) => /Model change refused: chat busy/.test(entry.text)),
       'busy refusal');
     // The refusal changed nothing and scheduled nothing: even before the turn ends, the selection
     // is still the configured default.
@@ -588,26 +582,25 @@ test('/status reports bounded current-chat metadata without a model request', { 
   try {
     harness = start(store, transport);
     await entered;
-    await until(() => transport.sent.some((entry) => entry.text.startsWith('Status for this chat')), 'running status');
-    const running = transport.sent.find((entry) => entry.text.startsWith('Status for this chat')).text;
+    await until(() => transport.sent.some((entry) => entry.text.startsWith('Model:')), 'running status');
+    const running = transport.sent.find((entry) => entry.text.startsWith('Model:')).text;
     assert.match(running, /Model: fixture\/alpha \(thinking: off\) — preset fast/);
     assert.match(running, /Run: running \(turn \d+, 1 input\(s\)/);
     assert.match(running, /Queued native inputs: 0/);
     // The background line is this chat's own bounded metadata: nothing runs here, so it is idle.
     assert.match(running, /^Background: idle$/m);
-    assert.match(running, /no model call/);
     assert.doesNotMatch(running, /held turn|SYNTHETIC-REPLY|AGENTS-|MEMORY-/);
 
-    await until(() => transport.sent.filter((entry) => /Usage: \/status \(no arguments\)/.test(entry.text)).length === 1,
+    await until(() => transport.sent.filter((entry) => /Usage: \/status/.test(entry.text)).length === 1,
       'status argument refusal');
     assert.equal(store.captured.length, 1, 'status and its usage refusal cost no model request');
 
     store.gate.release();
     await until(() => transport.sent.some((entry) => entry.text === 'SYNTHETIC-REPLY'), 'held turn answer');
     releaseIdle();
-    await until(() => transport.sent.filter((entry) => entry.text.startsWith('Status for this chat')).length === 2,
+    await until(() => transport.sent.filter((entry) => entry.text.startsWith('Model:')).length === 2,
       'idle status');
-    const idle = transport.sent.filter((entry) => entry.text.startsWith('Status for this chat'))[1].text;
+    const idle = transport.sent.filter((entry) => entry.text.startsWith('Model:'))[1].text;
     assert.match(idle, /Run: idle/);
     assert.match(idle, /Queued native inputs: 0/);
     assert.match(idle, /^Background: idle$/m);
@@ -663,7 +656,7 @@ test('/new rebuilds the assembled workspace prompt for the new session only', { 
     // The on-disk documents change while that turn is running. A reset+rebuild must not be a
     // mid-run half-effect: it is refused, and the prepared request keeps its captured snapshot.
     await writeFiles(store.workspace, { 'AGENTS.md': 'AGENTS-BETA', 'memory/MEMORY.md': 'MEMORY-BETA' });
-    await until(() => transport.sent.some((entry) => /Context reset rejected: this chat has a running turn/.test(entry.text)),
+    await until(() => transport.sent.some((entry) => /Reset refused: chat busy/.test(entry.text)),
       'busy reset refusal');
     assert.equal(store.captured.length, 1, 'the refusal dispatched no request');
     assert.match(store.captured[0].system, /AGENTS-ALPHA/, 'the running request kept its captured prompt');
@@ -672,7 +665,7 @@ test('/new rebuilds the assembled workspace prompt for the new session only', { 
     await until(() => transport.sent.some((entry) => entry.text === 'SYNTHETIC-REPLY'), 'held turn answer');
     releaseNew();
     await until(() => transport.sent.some((entry) =>
-      /Context reset applied for this chat[\s\S]*assembled workspace prompt was rebuilt from the current files: 1 skill/.test(entry.text)),
+      /^Context reset\.$/.test(entry.text)),
     'rebuild acknowledgement');
 
     releaseAfter();
@@ -719,15 +712,14 @@ test('/restart is requested once after the durable acknowledgement and is never 
     // The chats owed a live confirmation are durable before the process is replaced.
     assert.deepEqual(doc.restart, [{ chatId: CHAT_ID, senderId: '501' }]);
     assert.ok(doc.pending.some((item) => item.notice === true &&
-      /^Restarting the gateway\./.test(item.text) &&
-      /A confirmation follows once it is live/.test(item.text)),
+      /^Restarting\.$/.test(item.text)),
     'the durable acknowledgement exists before the host request');
     await until(() => transport.sent.some((entry) =>
-      /^Restarting the gateway\./.test(entry.text)), 'short acknowledgement');
+      /^Restarting\.$/.test(entry.text)), 'short acknowledgement');
     await flush();
 
     releaseSecond();
-    await until(() => transport.sent.some((entry) => /A restart was already requested/.test(entry.text)),
+    await until(() => transport.sent.some((entry) => /Already restarting/.test(entry.text)),
       'second restart refused');
     assert.equal(observed.length, 1, 'a second /restart never asks the host again');
     assert.equal(store.captured.length, 0, 'no restart command reached the model');
@@ -740,9 +732,9 @@ test('/restart is requested once after the durable acknowledgement and is never 
     let reopenedHarness;
     try {
       reopenedHarness = start(store, reopened, { restart: { supported: true, async request() { observed.push('again'); } } });
-      await until(() => reopened.sent.some((entry) => /^Gateway restarted and live:/.test(entry.text)),
+      await until(() => reopened.sent.some((entry) => /^Restarted\.$/.test(entry.text)),
         'live confirmation after the replacement opened');
-      const confirmation = reopened.sent.find((entry) => /^Gateway restarted and live:/.test(entry.text));
+      const confirmation = reopened.sent.find((entry) => /^Restarted\.$/.test(entry.text));
       assert.equal(confirmation.chatId, CHAT_ID, 'the confirmation answers the chat that asked');
       assert.equal(observed.length, 1, 'the confirmation never re-requests a restart');
       assert.equal(store.captured.length, 0, 'the confirmation is not a model turn');
@@ -759,7 +751,7 @@ test('/restart is requested once after the durable acknowledgement and is never 
         twiceHarness = start(store, twice, { restart: { supported: true, async request() { observed.push('third'); } } });
         await untilAsync(async () => (await stateDoc(store.gateway)).pending.every((item) => item.updateId >= 0),
           'a consumed confirmation leaves nothing queued');
-        assert.ok(!twice.sent.some((entry) => /^Gateway restarted and live:/.test(entry.text)),
+        assert.ok(!twice.sent.some((entry) => /^Restarted\.$/.test(entry.text)),
           'a consumed confirmation is never repeated');
       } finally {
         await stop(twiceHarness);
@@ -782,10 +774,10 @@ test('/restart is requested once after the durable acknowledgement and is never 
     let recoveryHarness;
     try {
       recoveryHarness = start(store, recoveryTransport, { restart: { supported: true, async request() { observed.push('recovered'); } } });
-      await until(() => recoveryTransport.sent.some((entry) => /That earlier \/restart was interrupted/.test(entry.text)),
+      await until(() => recoveryTransport.sent.some((entry) => /Restart interrupted; outcome unknown/.test(entry.text)),
         'interrupted restart report');
-      const recoveryNotice = recoveryTransport.sent.find((entry) => /That earlier \/restart was interrupted/.test(entry.text)).text;
-      assert.match(recoveryNotice, /and is not requested again/);
+      const recoveryNotice = recoveryTransport.sent.find((entry) => /Restart interrupted; outcome unknown/.test(entry.text)).text;
+      assert.match(recoveryNotice, /Not retried/);
       assert.deepEqual(observed, [observed[0]], 'recovery never re-requests a restart');
       await untilAsync(async () => (await stateDoc(store.gateway)).pending.every((item) => item.updateId !== 1500),
         'interrupted report delivered');
@@ -819,14 +811,14 @@ test('/stop is the same control as /abort: same record, same effect, one chat', 
   let harness;
   try {
     harness = start(store, transport, { allowFrom: ['501', '999'] });
-    const applied = () => transport.sent.filter((entry) => /^Abort applied for this chat/.test(entry.text)).length;
+    const applied = () => transport.sent.filter((entry) => /^Idle\. Queue cleared\.$/.test(entry.text)).length;
     await until(() => applied() === 1 && transport.sent.some((entry) => entry.text === 'SYNTHETIC-REPLY' && entry.chatId === 999),
       'first /stop and the other chat answer');
     stopMention.resolve();
     await until(() => applied() === 2, 'exact-mention /stop');
     stopArgs.resolve();
-    await until(() => transport.sent.some((entry) => entry.text.startsWith('Usage: /stop (no arguments).')) &&
-      transport.sent.some((entry) => /\/stop@other_bot did not run here/.test(entry.text)), 'argument and foreign refusals');
+    await until(() => transport.sent.some((entry) => entry.text === 'Usage: /stop') &&
+      transport.sent.some((entry) => /Wrong bot mention/.test(entry.text)), 'argument and foreign refusals');
     abortAgain.resolve();
     await until(() => applied() === 3, '/abort still works');
     afterStops.resolve();
@@ -873,20 +865,20 @@ test('a refused host restart is reported honestly and never retried', { timeout:
   try {
     harness = start(store, transport, { restart });
     // The acknowledgement is the short one: the live confirmation is a separate message.
-    await until(() => transport.sent.some((entry) => /^Restarting the gateway\./.test(entry.text)),
+    await until(() => transport.sent.some((entry) => /^Restarting\.$/.test(entry.text)),
       'request acknowledgement');
     await until(() => calls === 1, 'one host request');
     await flush();
     firstRefused.resolve();
     await until(() => transport.sent.some((entry) =>
-      /A restart was already requested in this gateway and the host refused it/.test(entry.text)),
+      /Restart refused\. Gateway still running; restart it manually/.test(entry.text)),
     'failed request reported honestly');
     assert.equal(calls, 1, 'a refused request is not retried by a later /restart');
     // The refusal corrects the promised confirmation: the chats that asked are told nothing was restarted.
     await until(() => transport.sent.some((entry) =>
-      /^Restart failed: the host refused it, so this gateway keeps running/.test(entry.text)),
+      /^Restart refused\. Gateway still running\.$/.test(entry.text)),
     'refused restart reported to the requesting chat');
-    assert.ok(!transport.sent.some((entry) => /^Gateway restarted and live:/.test(entry.text)),
+    assert.ok(!transport.sent.some((entry) => /^Restarted\.$/.test(entry.text)),
       'a refused restart claims no confirmation');
     assert.equal((await stateDoc(store.gateway)).restart, undefined,
       'a refused restart leaves no confirmation owed');

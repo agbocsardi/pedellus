@@ -1581,7 +1581,7 @@ export async function runTelegram(
         // A native abort or a queued reset deliberately ends a turn; that is not a delivery failure to report.
         const intentional = settled.status === "unanswered" &&
           (settled.reason === "aborted" || settled.reason === "reset");
-        if (!intentional) await flushFinal("Your request could not be completed. Please try again.");
+        if (!intentional) await flushFinal("Request failed. Try again.");
         await forget(item.updateId);
         return;
       }
@@ -2336,21 +2336,19 @@ export async function runTelegram(
     }
     if (parsed.kind === "foreign") {
       await admitNotice(update, message, sessionKey,
-        `/${parsed.command}@${parsed.mention} did not run here and was not sent to the assistant: this bot only ` +
-        `accepts an exact mention of its own username. Use /${parsed.command} without a mention.`);
+        `Wrong bot mention. Use /${parsed.command} without it.`);
       drain();
       return;
     }
     if (parsed.kind === "unsupported") {
       await admitNotice(update, message, sessionKey,
-        `Unsupported command /${parsed.command}. Available: ${availableCommandList()}. ` +
-        "Any other message is sent to the assistant; prefix // to send a leading slash literally.");
+        `Unknown command /${parsed.command}. Use /help, or // to send it literally.`);
       drain();
       return;
     }
     if (parsed.command === "help") {
       if (parsed.args) {
-        await admitNotice(update, message, sessionKey, "Usage: /help (no arguments). Nothing was sent to the assistant.");
+        await admitNotice(update, message, sessionKey, "Usage: /help");
         drain();
         return;
       }
@@ -2365,7 +2363,7 @@ export async function runTelegram(
         return;
       }
       if (parsed.args) {
-        await admitNotice(update, message, sessionKey, "Usage: /status (no arguments). Nothing was sent to the assistant.");
+        await admitNotice(update, message, sessionKey, "Usage: /status");
         drain();
         return;
       }
@@ -2407,8 +2405,7 @@ export async function runTelegram(
       }
       if (argument.name !== "default" && !listing.presets.some((preset) => preset.name === argument.name)) {
         await admitNotice(update, message, sessionKey,
-          `Unknown model preset ${boundedLabel(argument.name, 80)}: nothing was changed. ` +
-          "Use /model to list the configured presets.");
+          `Unknown preset ${boundedLabel(argument.name, 80)}. Use /model to list presets.`);
         drain();
         return;
       }
@@ -2426,7 +2423,7 @@ export async function runTelegram(
         return;
       }
       if (parsed.args) {
-        await admitNotice(update, message, sessionKey, "Usage: /restart (no arguments). Nothing was sent to the assistant.");
+        await admitNotice(update, message, sessionKey, "Usage: /restart");
         drain();
         return;
       }
@@ -2499,7 +2496,7 @@ export async function runTelegram(
     // it normalizes to the same control kind before admission, so the durable record, gating and
     // recovery path are shared and there is no second cancellation semantics.
     if (parsed.args) {
-      await admitNotice(update, message, sessionKey, `Usage: /${parsed.command} (no arguments). Nothing was sent to the assistant.`);
+      await admitNotice(update, message, sessionKey, `Usage: /${parsed.command}`);
       drain();
       return;
     }
@@ -2525,8 +2522,7 @@ export async function runTelegram(
     if (controlPending.has(chatId) ||
         [...deferredControls.values()].some((entry) => entry.chatId === chatId)) {
       await admitNotice(update, message, sessionKey,
-        "An earlier control command in this chat is still being applied or is still pending; this command was not " +
-        "started and was not sent to the assistant. Wait for it to finish or restart the adapter.");
+        "Previous command pending. This command wasn't started; retry later.");
       drain();
       return;
     }
@@ -2534,8 +2530,7 @@ export async function runTelegram(
     if (state.controls.filter((entry) => entry.status === "admitted" || entry.status === "unconfirmed").length >=
         MAX_UNRESOLVED_CONTROLS) {
       await admitNotice(update, message, sessionKey,
-        `Too many control commands are still unconfirmed (limit ${MAX_UNRESOLVED_CONTROLS}); this /${command} was not ` +
-        "started and was not sent to the assistant. Wait for them to finish or restart the adapter.");
+        `Too many unconfirmed commands (${MAX_UNRESOLVED_CONTROLS}). /${command} not started; retry later.`);
       drain();
       return;
     }
@@ -2761,8 +2756,7 @@ export async function runTelegram(
         await gateway.mcpAdmin?.deny(requestId, adapterContext).catch(() => undefined);
       }
       await publishLateControlNotice(updateId, chatId, sessionKey, senderId,
-        "The MCP login was canceled because its one-time authorization URL could not be confirmed as delivered " +
-        "to this chat. Approve a new login request to get a fresh URL.").catch(() => undefined);
+        "MCP login canceled: authorization URL delivery unconfirmed. Approve a new login request.").catch(() => undefined);
     }
   }
 
@@ -2778,10 +2772,10 @@ export async function runTelegram(
       throw new Error("authorization URL expired before it could be delivered");
     }
     const text = [
-      "MCP OAuth authorization URL (owner only):",
+      "MCP login (owner only):",
       authorization.url,
       `Valid until ${new Date(authorization.expiresAtMs).toISOString()}.`,
-      "Open it as the owner in a browser that can reach this host. This gateway does not store this URL or its state.",
+      "Open in a browser that can reach this host; forward the loopback port if remote. URL is not stored or sent to the assistant.",
     ].join("\n");
     if (text.length > PLAIN_TEXT_LIMIT) throw new Error("authorization URL is too long for one message");
     await apiCall(api, "sendMessage", signal, (callSignal) => withChatSendOrder(chatId, () =>
@@ -2898,16 +2892,7 @@ export async function runTelegram(
     }
     const result: GatewaySessionReset = await resetSession.call(gateway, sessionKey, adapterContext);
     if (result.status === "busy") return { kind: "refused", text: RESET_BUSY };
-    if (!result.promptRebuilt) return { kind: "applied" };
-    return {
-      kind: "applied",
-      text: [
-        CONTROL_ACK.new,
-        `This session's assembled workspace prompt was rebuilt from the current files: ${result.skills} ` +
-          "skill(s) are listed for on-demand loading. The new session's next request uses that snapshot; requests " +
-          "already prepared, other chats and the configuration are unchanged.",
-      ].join("\n"),
-    };
+    return { kind: "applied" };
   }
 
   /**
@@ -2921,30 +2906,18 @@ export async function runTelegram(
       return { kind: "refused", text: MODEL_UNAVAILABLE_HOST };
     }
     try {
-      const selected: GatewayModelSelection = await selectPreset.call(gateway, sessionKey, record.target, adapterContext);
-      return {
-        kind: "applied",
-        text: [
-          `Selected preset ${boundedLabel(record.target, 80)} for this chat: ` +
-            `${boundedLabel(selected.provider, 80)}/${boundedLabel(selected.modelId, 160)} ` +
-            `(thinking: ${boundedLabel(selected.thinkingLevel, 32)}).`,
-          "Only this chat's selection changed; other chats keep theirs and the configuration was not rewritten.",
-          "The selection lasts while this gateway stays open: a restart restores the configured default preset, and " +
-            "requests already prepared keep the model they were prepared with.",
-        ].join("\n"),
-      };
+      await selectPreset.call(gateway, sessionKey, record.target, adapterContext);
+      return { kind: "applied", text: `Model: ${boundedLabel(record.target, 80)}.` };
     } catch (error) {
       if (isConversationBusy(error)) {
         return {
           kind: "refused",
-          text: "Model preset selection rejected: this chat is busy, so nothing changed. " +
-            "Retry /model when this chat is idle. It was not queued and no other chat was affected.",
+          text: "Model change refused: chat busy. Retry when idle.",
         };
       }
       return {
         kind: "refused",
-        text: "Model preset selection was refused, so this chat's selection is unchanged. " +
-          "Use /model to list the configured presets.",
+        text: "Model unchanged. Use /model to list presets.",
       };
     }
   }
@@ -3105,7 +3078,6 @@ export async function runTelegram(
         background = [];
       }
       return [
-        "Status for this chat (no model call, no configuration change):",
         `Model: ${boundedLabel(model, 240)}${preset === undefined ? "" : ` — preset ${boundedLabel(preset, 80)}`}`,
         status.run === undefined
           ? "Run: idle"
@@ -3113,11 +3085,9 @@ export async function runTelegram(
             `${status.run.attempt === undefined ? "" : `, generation attempt ${status.run.attempt}`})`,
         `Queued native inputs: ${status.inbox.total}`,
         ...background,
-        "Only this chat's own records were read; no other chat's transcript, prompt or tool argument is included.",
       ].join("\n");
     } catch {
-      return "Status is unavailable right now: this chat's conversation metadata could not be read. " +
-        "No model call was made and nothing changed.";
+      return "Status unavailable.";
     }
   }
 
@@ -3140,9 +3110,7 @@ export async function runTelegram(
       }
       return [
         selectedLine,
-        "Named model presets are not configured in this deployment, so /model <name> and /model default are " +
-          "unavailable here; this chat command never rewrites the configuration.",
-        "Configured direct choices (read only; the direct selection belongs to the local CLI):",
+        "No presets configured. Select direct models in the CLI:",
         ...rows,
       ].join("\n");
     }
@@ -3157,58 +3125,39 @@ export async function runTelegram(
     return [
       selectedLine,
       ...(listing.defaultPreset === undefined ? [] : [`Configured default preset: ${boundedLabel(listing.defaultPreset, 80)}.`]),
-      "Named model presets (use /model <name>, or /model default for the configured preset):",
+      "Presets: /model <name> or /model default",
       ...rows,
-      "A selection applies to this chat only and lasts while the gateway stays open; a restart restores the " +
-        "configured default and prepared requests keep their model.",
+      "Chat only; resets on restart.",
     ].join("\n");
-  }
-
-  /** The commands this host actually supports, in menu order. */
-  function availableCommandList(): string {
-    return ["/new", "/abort", "/stop", ...(hostCommands.status ? ["/status"] : []),
-      ...(hostCommands.model ? ["/model"] : []), ...(hostCommands.restart ? ["/restart"] : []),
-      ...(hostCommands.digest ? ["/digest"] : []), ...(hostCommands.mcp ? ["/mcp"] : []), "/help"].join(", ");
   }
 
   /** Help lists exactly the controls this host implements; nothing is advertised that would be refused. */
   function controlHelpText(): string {
     const lines = [
-      "Controls for this chat (other messages go to the assistant):",
-      "/new - native context reset for this conversation: fresh model context, no summary or handoff; stored history and tool authority unchanged; queued messages are kept.",
-      "/abort - withdraw queued messages and stop the current turn here; other chats, cron jobs and background work are unaffected.",
-      "/stop - alias of /abort with exactly the same effect.",
+      "/new - reset context",
+      "/abort - stop this chat and clear its queue",
+      "/stop - same as /abort",
     ];
     if (hostCommands.status) {
-      lines.push("/status - bounded read-only status of this chat: selected model, run state and queued input count; no model call.");
+      lines.push("/status - model and run status");
     }
     if (hostCommands.model) {
-      lines.push("/model - list the configured model presets and this chat's selection; /model <preset> or /model default " +
-        "selects one for this chat only. A busy chat is refused, and a restart restores the configured default.");
+      lines.push("/model [<preset>|default] - list or switch model for this chat");
     }
     if (hostCommands.restart) {
-      lines.push("/restart - replace the gateway process with the same program and configuration. It affects every " +
-        "chat and background work; this chat is told once it is live.");
+      lines.push("/restart - restart the gateway (all chats)");
     }
     if (hostCommands.digest) {
-      lines.push("/digest - start one bounded completed-turn memory-digestion run from the shared workspace; the run is " +
-        "background, and only a failure or cancellation reports an internal issue to this chat's agent, never a direct " +
-        "user or channel message. /digest status is a bounded read-only view; both cost no model call by themselves.");
+      lines.push("/digest [status] - update shared memory or check progress");
     }
     if (hostCommands.mcp) {
-      lines.push("/mcp - list the MCP servers this gateway opened and the assistant's owner-approval requests; " +
-        "/mcp show <id> prints the exact proposed entry; /mcp approve <id> writes it to the configuration file or " +
-        "starts an owner-approved OAuth login and returns its one-time authorization URL; /mcp deny <id> discards " +
-        "the request. Nothing connects or is authorized before an approval, and a written entry connects at the " +
-        "next gateway start. These are owner actions, never model tools.");
+      lines.push("/mcp [show|approve|deny <id>] - servers and approval requests");
     }
-    lines.push("/help - this list.");
+    lines.push("/help - commands");
     lines.push(mediaIngress === undefined
-      ? "Limits: text only (attachments are not read); no tool-authority, history, restart or media commands. " +
-        "Other slash commands are refused; prefix // to send a leading slash literally."
-      : "Attachments: photos are attached as image content, voice/audio is transcribed locally when the backend is " +
-        "provisioned, and documents are stored unread on disk under the configured media directory. Video and stickers " +
-        "are not downloaded. Other slash commands are refused; prefix // to send a leading slash literally.");
+      ? "Text only; attachments aren't read."
+      : "Photos: images. Audio: local transcription if configured. Documents: stored unread. No video or stickers.");
+    lines.push("Prefix // to send a slash literally.");
     return lines.join("\n");
   }
 
@@ -3557,62 +3506,39 @@ type ControlOutcome =
   | { readonly kind: "abandoned" };
 
 const CONTROL_ACK: Record<TelegramMutation, string> = {
-  new:
-    "Context reset applied for this chat (native Durable reset, no handoff text, no summary). " +
-    "Stored entries and tool authority are unchanged; queued messages are kept and run in the new context.",
-  abort:
-    "Abort applied for this chat: it is idle now. Queued messages were withdrawn and any running turn was stopped; " +
-    "other chats, cron jobs and background work are unaffected.",
-  model:
-    "Model preset selection is being applied to this chat only. Nothing was sent to the assistant.",
-  restart:
-    "Restarting the gateway. A confirmation follows once it is live.",
-  digest:
-    "Memory digestion request applied for this chat; the bounded run follows separately and reports only a failure or cancellation to this chat's agent.",
-  "mcp-approve": "The MCP approval was applied; its result follows in this message.",
-  "mcp-deny": "The MCP request was denied; nothing was configured, connected or authorized.",
+  new: "Context reset.",
+  abort: "Idle. Queue cleared.",
+  model: "Model selected.",
+  restart: "Restarting.",
+  digest: "Digest requested.",
+  "mcp-approve": "MCP request approved.",
+  "mcp-deny": "MCP request denied.",
 };
 
 const CONTROL_PENDING: Record<TelegramMutation, string> = {
-  new:
-    "Context reset is still pending for this chat: Durable has not admitted it yet. Stored entries, tool authority and " +
-    "queued messages are unchanged, and this chat keeps waiting instead of losing the request.",
-  abort:
-    "Abort is still pending for this chat: Durable has not finished stopping the current turn, so the provider may be " +
-    "ignoring cancellation. Queued messages stay withdrawn and new messages are held, never answered and never " +
-    "dropped, until the turn ends. Other chats, cron jobs and background work are unaffected.",
-  model:
-    "Model preset selection is still pending for this chat: messages admitted earlier are being submitted first. " +
-    "This chat keeps waiting; nothing was applied yet and nothing was sent to the assistant.",
-  restart:
-    "Restart still pending: earlier messages are being submitted first. Nothing was restarted.",
-  digest:
-    "Memory digestion is still pending for this chat: messages admitted earlier are being submitted first. " +
-    "Nothing has been started yet and nothing was sent to the assistant.",
-  "mcp-approve":
-    "The MCP approval is still pending: messages admitted earlier in this chat are being submitted first. " +
-    "Nothing has been written, connected or authorized yet.",
-  "mcp-deny":
-    "The MCP denial is still pending: messages admitted earlier in this chat are being submitted first. " +
-    "The request is still waiting and nothing was applied.",
+  new: "Reset pending.",
+  abort: "Still stopping. New messages are held.",
+  model: "Model change pending.",
+  restart: "Restart pending.",
+  digest: "Digest pending; not started yet.",
+  "mcp-approve": "MCP approval pending.",
+  "mcp-deny": "MCP denial pending.",
 };
 
 const UNCONFIRMED_CONTROL =
-  "That earlier command was interrupted before it was confirmed, so it may not have taken effect. " +
-  "Send it again if you still need it.";
+  "Command interrupted; outcome unknown. Send it again if needed.";
 
 /** An interrupted restart is never repeated automatically, and resending it is the caller's decision. */
 const UNCONFIRMED_RESTART =
-  "That earlier /restart was interrupted before it was confirmed: it may or may not have restarted the gateway, " +
-  "and is not requested again.";
+  "Restart interrupted; outcome unknown. Not retried.";
 
 /**
  * The confirmation the replacement process owes the chat that asked for `/restart`. It is reserved here because it
  * proves only that this process opened and loaded its configuration; it says nothing about later model calls.
  */
-const RESTART_LIVE = "Gateway restarted and live: current code and configuration are loaded.";
+const RESTART_LIVE = "Restarted.";
 /** The other half of that promise: the host refused the replacement, so this process is still the one serving. */
-const RESTART_FAILED = "Restart failed: the host refused it, so this gateway keeps running. Nothing was restarted.";
+const RESTART_FAILED = "Restart refused. Gateway still running.";
 /**
  * Starting point for the durable queue id of that confirmation. Telegram update ids are never negative, so these
  * ids cannot collide with an admitted update, an acknowledgement or a control record.
@@ -3620,57 +3546,32 @@ const RESTART_FAILED = "Restart failed: the host refused it, so this gateway kee
 const RESTART_LIVE_UPDATE_ID = -1;
 
 /** Fixed, sanitized refusals: a narrow host advertises nothing it cannot do. */
-const STATUS_UNAVAILABLE_HOST =
-  "Status is unavailable in this host: it exposes no model/status metadata for this chat. Nothing was sent to the assistant.";
-const MODEL_UNAVAILABLE_HOST =
-  "Model commands are unavailable in this host: it exposes no preset catalog or preset selection. Nothing was sent to the assistant.";
-const MODEL_LISTING_UNAVAILABLE =
-  "Model choices are unavailable right now: this chat's host model catalog could not be read. Nothing changed.";
-const MODEL_PRESETS_UNAVAILABLE =
-  "Named model presets are not configured in this deployment, so /model <name> and /model default are unavailable. " +
-  "Nothing was changed; /model lists the current selection read only, and this chat command never rewrites the configuration.";
-const MODEL_USAGE =
-  "Usage: /model (list the configured presets) or /model <preset> (or /model default). Nothing was sent to the assistant.";
-const MCP_UNAVAILABLE_HOST =
-  "MCP management is unavailable in this host: the gateway was opened without an on-disk configuration file, " +
-  "so there is nothing to write. Nothing was sent to the assistant.";
+const STATUS_UNAVAILABLE_HOST = "Status unavailable.";
+const MODEL_UNAVAILABLE_HOST = "Model commands unavailable.";
+const MODEL_LISTING_UNAVAILABLE = "Model list unavailable. Nothing changed.";
+const MODEL_PRESETS_UNAVAILABLE = "No model presets configured. Nothing changed.";
+const MODEL_USAGE = "Usage: /model [<preset>|default]";
+const MCP_UNAVAILABLE_HOST = "MCP management unavailable: no configuration file.";
 /** One pending owner approval request. Opaque, fixed-width and content-bound at creation. */
 const MCP_REQUEST_ID = /^[0-9a-f]{16}$/;
-const MCP_USAGE =
-  "Usage: /mcp (servers and waiting requests) | /mcp show <id> | /mcp approve <id> | /mcp deny <id>. " +
-  "Nothing was sent to the assistant.";
-const RESTART_UNAVAILABLE_HOST =
-  "Restart is unavailable in this host: it cannot replace its own process with the same program and configuration. " +
-  "Nothing was sent to the assistant.";
-const RESTART_ALREADY_REQUESTED =
-  "A restart was already requested in this gateway and is still stopping it; this /restart was not requested again.";
-const RESTART_REQUEST_FAILED =
-  "A restart was already requested in this gateway and the host refused it, so the gateway is still running. " +
-  "This /restart was not requested again; fix the host and start the gateway yourself.";
-const RESET_BUSY =
-  "Context reset rejected: this chat has a running turn, so nothing was reset and the assembled workspace prompt was " +
-  "not rebuilt. It was not queued; /abort this chat or retry /new when it is idle. Other chats are unaffected.";
-const DIGEST_UNAVAILABLE_HOST =
-  "Memory digestion is unavailable in this host: it exposes no manual digestion entry. Nothing was started and " +
-  "nothing was sent to the assistant.";
-const DIGEST_USAGE =
-  "Usage: /digest (start one bounded batch) or /digest status (bounded read-only status). Nothing was sent to the assistant.";
+const MCP_USAGE = "Usage: /mcp | /mcp show|approve|deny <id>";
+const RESTART_UNAVAILABLE_HOST = "Restart unavailable on this host.";
+const RESTART_ALREADY_REQUESTED = "Already restarting.";
+const RESTART_REQUEST_FAILED = "Restart refused. Gateway still running; restart it manually.";
+const RESET_BUSY = "Reset refused: chat busy. /abort or retry /new when idle.";
+const DIGEST_UNAVAILABLE_HOST = "Digest unavailable. Nothing started.";
+const DIGEST_USAGE = "Usage: /digest [status]";
 
 /** Replay wording for a command this adapter recorded before a restart; it is never run twice. */
 function replayControlText(entry: TelegramControlRecord): string {
   if (entry.command === "restart") {
     return entry.status === "applied"
-      ? "That /restart was already requested before this process restarted, so it is not requested again."
-      : "That /restart was interrupted before it was confirmed: it may or may not have restarted the gateway, and it " +
-        "is not requested again.";
+      ? "Restart already requested. Not retried."
+      : UNCONFIRMED_RESTART;
   }
-  if (entry.status === "applied") return "That command was already applied before a restart, so it was not run again.";
-  if (entry.status === "refused") {
-    return "That command was refused before any effect and will not be retried; send it again if it is still needed.";
-  }
-  if (entry.status === "unconfirmed") {
-    return "That command was already reported as interrupted; send it again if you still need it.";
-  }
+  if (entry.status === "applied") return "Command already applied. Not repeated.";
+  if (entry.status === "refused") return "Command refused. Send it again if needed.";
+  if (entry.status === "unconfirmed") return "Command interrupted; outcome unknown. Send it again if needed.";
   return UNCONFIRMED_CONTROL;
 }
 

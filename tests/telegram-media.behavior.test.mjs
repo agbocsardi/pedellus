@@ -909,7 +909,7 @@ test('a control that forces an earlier media message to submit keeps its image c
   let harness;
   try {
     harness = start(store, transport);
-    await until(() => transport.sent.some((entry) => /Context reset applied/.test(entry.text)), 'reset acknowledgement');
+    await until(() => transport.sent.some((entry) => /^Context reset\.$/.test(entry.text)), 'reset acknowledgement');
     // The transient failure is retried on the next poll, after the control forced the
     // earlier media message to be submitted first.
     releaseNextPoll();
@@ -954,8 +954,8 @@ test('a transient attachment failure during a control flush keeps polling and de
     harness = start(store, transport, ['501', '999']);
     // Another chat keeps being served while this chat's command waits for its earlier input.
     await until(() => transport.sent.some((entry) => entry.chatId === 999 && entry.text === 'OK-REPLY'), 'other chat answer');
-    await until(() => transport.sent.some((entry) => /Context reset is still pending/.test(entry.text)), 'honest pending ack');
-    assert.ok(!transport.sent.some((entry) => /Context reset applied/.test(entry.text)), 'no false applied claim');
+    await until(() => transport.sent.some((entry) => /^Reset pending\.$/.test(entry.text)), 'honest pending ack');
+    assert.ok(!transport.sent.some((entry) => /^Context reset\.$/.test(entry.text)), 'no false applied claim');
     assert.equal(transport.sent.filter((entry) => entry.chatId === CHAT_ID && entry.text === 'OK-REPLY').length, 0,
       'the gated chat delivers no model reply while the command is deferred');
     assert.deepEqual(await mediaFiles(store.workspace), [], 'the failed download stored nothing');
@@ -1013,18 +1013,18 @@ test('a newer control is refused while an earlier one is still applying, so rese
     await untilAsync(async () => {
       const doc = await telegramState(store.gateway);
       const refusals = doc.pending.filter((item) => item.notice === true && item.updateId > 801 &&
-        /still being applied or is still pending/.test(item.text));
+        /Previous command pending/.test(item.text));
       return refusals.length === 2 && doc.controls.length === 1;
     }, 'both newer commands refused while the first applies');
-    assert.equal(transport.sent.filter((entry) => /Context reset applied/.test(entry.text)).length, 0,
+    assert.equal(transport.sent.filter((entry) => /^Context reset\.$/.test(entry.text)).length, 0,
       'no reset is claimed while the first command is still applying');
 
     releaseDownload();
-    await until(() => transport.sent.some((entry) => /Context reset applied/.test(entry.text)), 'the first command applied');
+    await until(() => transport.sent.some((entry) => /^Context reset\.$/.test(entry.text)), 'the first command applied');
     await until(() => transport.sent.some((entry) => entry.chatId === CHAT_ID && entry.text === 'OK-REPLY'), 'photo answer');
-    assert.equal(transport.sent.filter((entry) => /Context reset applied/.test(entry.text)).length, 1,
+    assert.equal(transport.sent.filter((entry) => /^Context reset\.$/.test(entry.text)).length, 1,
       'exactly one reset was applied');
-    await until(() => transport.sent.filter((entry) => /still being applied or is still pending/.test(entry.text)).length === 2,
+    await until(() => transport.sent.filter((entry) => /Previous command pending/.test(entry.text)).length === 2,
       'both refusals were delivered after the earlier acknowledgement');
     const photoTurns = requests.filter((request) =>
       userMessages([request]).some((message) =>

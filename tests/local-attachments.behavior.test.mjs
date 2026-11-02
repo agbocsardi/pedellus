@@ -172,9 +172,9 @@ test("photos, documents and audio are stored path-only under the CLI attachment 
   try {
     await runTerminalConversation(client, context, terminal.io);
     const output = terminal.chunks.join("");
-    assert.match(output, /Stored attachment at media\/cli\/document-[0-9a-f]{16}\.jpg \(\d+ bytes\) and admitted its turn\./);
-    assert.match(output, /Stored attachment at media\/cli\/document-[0-9a-f]{16}\.pdf \(\d+ bytes\) and admitted its turn\./);
-    assert.match(output, /Stored attachment at media\/cli\/document-[0-9a-f]{16}\.mp3 \(\d+ bytes\) and admitted its turn\./);
+    assert.match(output, /Attachment queued: media\/cli\/document-[0-9a-f]{16}\.jpg \(\d+ bytes\)\./);
+    assert.match(output, /Attachment queued: media\/cli\/document-[0-9a-f]{16}\.pdf \(\d+ bytes\)\./);
+    assert.match(output, /Attachment queued: media\/cli\/document-[0-9a-f]{16}\.mp3 \(\d+ bytes\)\./);
     assert.match(output, /attachment noted/);
   } finally {
     await client.close();
@@ -365,7 +365,7 @@ test("the shipped agent CLI wires /attach through the gateway", { timeout: 30_00
 
   const result = await runAgentCli(configFile, `/attach ${photoPath} -- what is this?\n`);
   assert.deepEqual({ code: result.code, signal: result.signal }, { code: 0, signal: null }, result.stderr);
-  assert.match(result.stdout, /Stored attachment at media\/cli\/document-[0-9a-f]{16}\.jpg \(\d+ bytes\) and admitted its turn\./);
+  assert.match(result.stdout, /Attachment queued: media\/cli\/document-[0-9a-f]{16}\.jpg \(\d+ bytes\)\./);
   assert.match(result.stdout, /cli attachment reply/);
   assert.equal(result.stderr, "");
   assert.deepEqual(await listDirectory(join(workspace, "media")), ["cli"]);
@@ -535,7 +535,7 @@ test("without media the local surface keeps its text-only commands", { timeout: 
   try {
     await runTerminalConversation(client, context, terminal.io);
     const output = terminal.chunks.join("");
-    assert.match(output, /Local attachments are unavailable here: configure media/);
+    assert.match(output, /Attachments unavailable\. Configure media/);
     assert.match(output, /text only/);
   } finally {
     await client.close();

@@ -96,7 +96,7 @@ test("EOF preserves failed-run follow-up in SQLite for reopen", { timeout: timeo
     await runTerminalConversation(inProcessTerminalConversation(conversation), BACKGROUND_CONTEXT, {
       input: inputLines("first synthetic prompt", "queued synthetic prompt"), output,
     });
-    assert.match(outputChunks.join(""), /preserving 1 Durable-queued CLI input/);
+    assert.match(outputChunks.join(""), /1 input\(s\) remain queued/);
     await harness.close(BACKGROUND_CONTEXT);
     harness = undefined;
     await storage.close(BACKGROUND_CONTEXT);
@@ -237,8 +237,8 @@ test("local model command lists, selects, rejects invalid input without disclosu
     const printed = chunks.join("");
     assert.match(printed, /Allowed models/);
     assert.match(printed, /fixture beta/);
-    assert.match(printed, /Selected model: fixture\/beta \(thinking: high\)/);
-    assert.match(printed, /Model selection rejected: choice is invalid or unavailable/);
+    assert.match(printed, /Model: fixture\/beta \(thinking: high\)/);
+    assert.match(printed, /Model unchanged: choice unavailable/);
     assert.doesNotMatch(printed, /SYNTHETIC-CREDENTIAL/);
     assert.deepEqual((await gateway.listModels("cli:default", BACKGROUND_CONTEXT)).selected, {
       provider: "fixture", modelId: "beta", thinkingLevel: "high",

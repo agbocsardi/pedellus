@@ -1473,3 +1473,15 @@ server, faux models, no external network.
   covers the durable slot, the delivered confirmation, no re-request, no second
   model turn, and that a consumed confirmation is never repeated) and core
   acceptance. No live bot, credential or process replacement was used.
+
+### 2026-11-02 — terse owner receipts
+
+- [x] Shortened Telegram/CLI command confirmations, pending/refusal/recovery
+  notices, help, attachment receipts and digest/MCP acknowledgements. `/new`
+  says "Context reset."; restart says "Restarting." then "Restarted." in
+  Telegram. No execution, persistence, scheduling or authority changes.
+- [x] Kept explicit status data, exact MCP approval disclosures, OAuth browser
+  instructions and meaningful failed/unknown-outcome warnings. Added the terse
+  receipt convention and updated existing expectations; no new test suite.
+- [x] Verification: typecheck, build via behavior suite, 361/361 behavior checks,
+  83/83 offline core acceptance, clean diff check. No subagents or live bot use.

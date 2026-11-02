@@ -678,7 +678,7 @@ export async function runTerminalConversation(
       return;
     }
     if (parsed.kind === "next" && pendingSearch === undefined) {
-      await notice("No search continuation is held. Run /search again; cursors are process-local and are never printed.", true);
+      await notice("No search to continue. Run /search again.", true);
       return;
     }
 
@@ -710,7 +710,7 @@ export async function runTerminalConversation(
       if (signal?.aborted) return;
       if (parsed.kind === "next") {
         pendingSearch = undefined;
-        await notice("Search continuation rejected: the query, index, store or session mapping changed. Run /search again; cursors are process-local and are never printed.", true);
+        await notice("Search changed. Run /search again.", true);
       } else {
         await notice(`History search failed (${errorName(error)}).`, true);
       }
@@ -970,13 +970,13 @@ export async function runTerminalConversation(
     if (parts.length === 1) {
       if (host.selectPreset) {
         try {
-          const selected = await host.selectPreset(parts[0]!);
-          await notice(`Selected preset ${safeLabel(parts[0]!, 80)}: ${modelLabel(selected)} (thinking: ${safeLabel(selected.thinkingLevel, 32)}).`);
+          await host.selectPreset(parts[0]!);
+          await notice(`Model: ${safeLabel(parts[0]!, 80)}.`);
         } catch (error) {
           if (error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy")) {
-            await notice("Model preset selection rejected: this conversation is busy. Retry when it is idle.", true);
+            await notice("Model change refused: chat busy. Retry when idle.", true);
           } else {
-            await notice("Model preset selection rejected: unknown name, unsupported thinking, or presets are not configured. Use /model to list named presets.", true);
+            await notice("Model unchanged: preset unavailable. Use /model to list presets.", true);
           }
         }
         return;
@@ -991,12 +991,12 @@ export async function runTerminalConversation(
     const selection = { provider: parts[0]!, modelId: parts[1]!, ...(parts[2] === undefined ? {} : { thinkingLevel: parts[2]! as ModelThinkingLevel }) };
     try {
       const selected = await host.select(selection);
-      await notice(`Selected model: ${modelLabel(selected)} (thinking: ${safeLabel(selected.thinkingLevel, 32)}).`);
+      await notice(`Model: ${modelLabel(selected)} (thinking: ${safeLabel(selected.thinkingLevel, 32)}).`);
     } catch (error) {
       if (error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy")) {
-        await notice("Model selection rejected: this conversation is busy. Retry when it is idle.", true);
+        await notice("Model change refused: chat busy. Retry when idle.", true);
       } else {
-        await notice("Model selection rejected: choice is invalid or unavailable. Use /model to list allowed choices.", true);
+        await notice("Model unchanged: choice unavailable. Use /model to list choices.", true);
       }
     }
   };
@@ -1005,24 +1005,20 @@ export async function runTerminalConversation(
     if (args.trim()) { await notice("Usage: /refresh", true); return; }
     const host = io.contextRefresh;
     if (!host || !host.available) {
-      await notice("Workspace context is not configured; /refresh is unavailable. Set workspaceContext in the config and restart.", true);
+      await notice("Refresh unavailable: workspace context not configured.", true);
       return;
     }
-    let skills: number;
     try {
-      ({ skills } = await host.refresh());
+      await host.refresh();
     } catch (error) {
       if (error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy")) {
-        await notice("Context refresh rejected: this conversation is busy. Retry when it is idle.", true);
+        await notice("Refresh refused: chat busy. Retry when idle.", true);
       } else {
         await notice("Context refresh failed; the previous snapshot is still in effect.", true);
       }
       return;
     }
-    await notice([
-      `Workspace context refreshed for this conversation: ${skills} skill(s) in the on-demand table.`,
-      "The refreshed summary and skill table apply to the next model request; skill bodies remain on demand.",
-    ].join("\n"));
+    await notice("Context refreshed.");
   };
 
   const showTools = async (args: string): Promise<void> => {
@@ -1033,18 +1029,10 @@ export async function runTerminalConversation(
       return;
     }
     if (policy.tools.length === 0) {
-      await notice([
-        "Coding tools are disabled: config toolAllowlist is empty, so no coding tool is offered in any chat.",
-        "Add the intended names to toolAllowlist and restart. This conversation has no grant or expiry.",
-      ].join("\n"));
+      await notice("Coding tools disabled. Set toolAllowlist and restart to enable.");
       return;
     }
-    await notice([
-      `Coding tools configured for authenticated chats: ${policy.tools.join(", ")}.`,
-      "Configuration (toolAllowlist) is the authority: the next model request may offer exactly these tools; " +
-      "there is no per-conversation grant or expiry here.",
-      "Change toolAllowlist in the configuration and restart; chat commands do not change tool authority.",
-    ].join("\n"));
+    await notice(`Coding tools: ${policy.tools.join(", ")}. Change toolAllowlist and restart to update.`);
   };
 
   const showStatus = async (): Promise<void> => {
@@ -1062,7 +1050,7 @@ export async function runTerminalConversation(
       // Additive: an idle background is one line; an older host without the field adds nothing.
       ...renderBackgroundStatus(status.background),
       ...formatUsage(status.usage),
-      "Provider-side charges or usage not recorded by Durable: unknown (not inferred as zero).",
+      "Unrecorded provider usage/charges: unknown.",
     ];
     await notice(lines.join("\n"));
   };
@@ -1075,7 +1063,7 @@ export async function runTerminalConversation(
   const attachFile = async (args: string): Promise<void> => {
     const host = io.attachments;
     if (!host) {
-      await notice("Local attachments are unavailable here: configure media in the gateway configuration and restart.", true);
+      await notice("Attachments unavailable. Configure media and restart.", true);
       return;
     }
     const parsed = parseAttachArguments(args);
@@ -1103,8 +1091,7 @@ export async function runTerminalConversation(
     rememberLocalInput(submission.id);
     waitForSubmission(submission.id, submission);
     await notice(
-      `Stored attachment at ${safeLabel(admitted.attachment.relativePath, 200)} ` +
-      `(${admitted.attachment.bytes} bytes) and admitted its turn.`,
+      `Attachment queued: ${safeLabel(admitted.attachment.relativePath, 200)} (${admitted.attachment.bytes} bytes).`,
     );
   };
 
@@ -1113,29 +1100,28 @@ export async function runTerminalConversation(
       case "help":
         if (args.trim()) { await notice("Usage: /help", true); return; }
         await notice([
-          "Local commands: /help /status /history [count] /search /episodes /episode /entry /model [provider modelId [thinkingLevel]] /tools /refresh /digest [status] /mcp [show|approve|deny <id>] /compact /abort /stop /new /attach <path>[ -- <prompt>]" + (io.restart ? " /restart" : ""),
-          SEARCH_USAGE,
-          EPISODES_USAGE,
-          EPISODE_USAGE,
-          ENTRY_USAGE,
-          "Unknown slash commands are not sent to the model. Prefix a prompt with // to send one literal leading slash.",
-          "/abort and /stop cancel foreground work and withdraw queued inputs; background work is unchanged.",
-          ...(io.restart ? ["/restart replaces the whole gateway process and re-reads its configuration; every attached channel disconnects and this terminal does not wait for it."] : []),
-          io.history ? "/search --next continues the last successful query; cursors stay in this process and are never printed. History sessions default to cli:default; use --session with a key reported by /search." : "History search and episode browsing are host-controlled and unavailable here. /entry <entryId> [--radius N] still opens a bounded window in this terminal's default conversation; --session requires a history host.",
-          io.modelSelection ? "/model lists host model choices; named-preset configs select with /model <name> (or /model default), direct configs with /model <provider> <modelId> [thinkingLevel]." : "/model is read-only without a host model-selection callback.",
-          io.toolPolicy
-            ? "Coding tools are configured by toolAllowlist and apply to authenticated chats; /tools is read-only diagnostics and chat commands never change tool authority."
-            : "Coding-tool authority is host-controlled and unavailable here.",
-          io.contextRefresh?.available ? "/refresh re-reads workspace context and skills for this conversation when it is idle." : "/refresh is unavailable without configured workspace context.",
-          io.digest
-            ? "/digest starts one bounded completed-turn memory-digestion run for this conversation and reports only the bounded admission; /digest status is a read-only bounded view. The run works in the background against the shared workspace and reports to this conversation's agent, not to a user or channel."
-            : "/digest is unavailable in this host.",
-          io.attachments
-            ? "/attach stores one local file under the workspace CLI attachment directory and submits it with the optional prompt. The original is stored unchanged and the agent decides with the configured tools whether to inspect it; no image content, vision call or transcription is added."
-            : "/attach is unavailable without a configured media section.",
-          io.mcp
-            ? "/mcp lists the MCP servers this gateway opened and the assistant's owner-approval requests. `/mcp show <id>` prints the exact proposed entry; `/mcp approve <id>` writes it to the configuration file or starts an owner-approved OAuth login; `/mcp deny <id>` discards it. Nothing connects or is authorized before an approval, and a written entry connects at the next start."
-            : "/mcp is unavailable because this gateway was opened without a configuration file.",
+          "/new - reset context",
+          "/abort, /stop - stop this chat and clear its queue",
+          "/status - model, usage and run status",
+          "/history [count] - recent messages",
+          "/entry <id> [--radius 0-5] - view an entry",
+          "/compact - queue compaction",
+          ...(io.history ? [
+            "/search <query> | /search --next - search history",
+            "/episodes - list episodes; /episode <id> - view one",
+            "History defaults to cli:default; use --session <key> for another chat.",
+          ] : []),
+          io.modelSelection
+            ? "/model [<preset>|default] or /model <provider> <modelId> [thinkingLevel] - list or switch model"
+            : "/model - current model (read-only)",
+          ...(io.toolPolicy ? ["/tools - configured coding tools (read-only)"] : []),
+          ...(io.contextRefresh?.available ? ["/refresh - reload context and skills"] : []),
+          ...(io.digest ? ["/digest [status] - update shared memory or check progress"] : []),
+          ...(io.attachments ? ["/attach <path> [-- <prompt>] - store and queue a file (unread)"] : []),
+          ...(io.mcp ? ["/mcp [show|approve|deny <id>] - servers and approval requests"] : []),
+          ...(io.restart ? ["/restart - restart all channels; this terminal disconnects"] : []),
+          "/help - commands",
+          "Prefix // to send a slash literally.",
         ].join("\n"));
         return;
       case "status":
@@ -1169,7 +1155,7 @@ export async function runTerminalConversation(
       case "digest": {
         const host = io.digest;
         if (!host) {
-          await notice("Memory digestion is unavailable in this host. Nothing was started.", true);
+          await notice("Digest unavailable. Nothing started.", true);
           return;
         }
         const argument = args.trim().toLowerCase();
@@ -1181,13 +1167,13 @@ export async function runTerminalConversation(
           await notice(renderMemoryDigestStatus(await host.status()));
           return;
         }
-        await notice("Usage: /digest (start one bounded batch) or /digest status (bounded read-only status).", true);
+        await notice("Usage: /digest [status]", true);
         return;
       }
       case "mcp": {
         const host = io.mcp;
         if (!host) {
-          await notice("MCP management is unavailable in this host. Nothing was changed.", true);
+          await notice("MCP management unavailable. Nothing changed.", true);
           return;
         }
         const parts = args.trim().split(/\s+/).filter((part) => part.length > 0);
@@ -1216,14 +1202,14 @@ export async function runTerminalConversation(
       case "compact": {
         if (args.trim()) { await notice("Usage: /compact", true); return; }
         const taskId = await conversation.compact(operationContext);
-        await notice(`Native compaction task ${taskId} admitted. Summary placement follows Durable conversation boundaries.`);
+        await notice(`Compaction queued (${taskId}).`);
         return;
       }
       case "stop":
       case "abort":
         if (args.trim()) { await notice(`Usage: /${name}`, true); return; }
         await conversation.abort(operationContext);
-        await notice("Native Durable conversation abort completed; queued inputs were withdrawn. This does not implement Python sustained-goal abort.");
+        await notice("Idle. Queue cleared.");
         return;
       case "new":
         if (args.trim()) { await notice("Usage: /new", true); return; }
@@ -1231,13 +1217,12 @@ export async function runTerminalConversation(
           await conversation.reset(operationContext);
         } catch (error) {
           if (error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy")) {
-            await notice("New context rejected: this conversation is busy. Use /abort or wait, then retry.", true);
+            await notice("Reset refused: chat busy. /abort or retry /new when idle.", true);
             return;
           }
           throw error;
         }
-        await notice("Native Durable context reset admitted for this same conversation: no handoff, summary or extra model call, earlier entries stay stored and listed by /history, and tool authority is unchanged." +
-          (io.contextRefresh?.available ? " Workspace context and skills were rebuilt atomically; a busy conversation is refused." : " While busy it lands at the next safe boundary; queued inputs placed with it run in the new context."));
+        await notice(io.contextRefresh?.available ? "Context reset." : "Context reset queued.");
         return;
       case "restart":
         if (args.trim()) { await notice("Usage: /restart", true); return; }
@@ -1246,7 +1231,7 @@ export async function runTerminalConversation(
           return;
         }
         await io.restart();
-        await notice("Gateway restarting; this terminal disconnects.");
+        await notice("Restarting; disconnecting.");
         io.closeInput?.();
         operationController.abort(new Error("gateway restart requested"));
         return;
@@ -1334,7 +1319,7 @@ export async function runTerminalConversation(
           if ((await local.submission.status(operationContext)).status === "queued") queued.push(local.submission);
         }
         if (queued.length > 0) {
-          await notice(`EOF reached after a failed/ended run; preserving ${queued.length} Durable-queued CLI input(s). Closing local observers; reopen to reconcile them or use explicit /abort to withdraw.`, true);
+          await notice(`Disconnected; ${queued.length} input(s) remain queued. Reopen or /abort to withdraw.`, true);
           observerController.abort(new Error("CLI EOF; preserve queued Durable submissions"));
           break;
         }

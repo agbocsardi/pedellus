@@ -277,7 +277,7 @@ test('an agent proposal is inert until the owner approves it, and approval write
 
     const denied = await admin.deny(request.id, context);
     assert.equal(denied.status, 'applied');
-    assert.match(denied.text, /nothing was configured/i);
+    assert.equal(denied.text, `MCP request ${request.id} denied.`);
     const afterDeny = JSON.parse(await readFile(env.configFile, 'utf8'));
     assert.equal(afterDeny.mcp, undefined);
     assert.deepEqual((await admin.list(context)).requests, []);
