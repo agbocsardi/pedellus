@@ -56,7 +56,7 @@ const ONE_OFF_QUEUE_FULL =
 /**
  * Fixed failure text for an occurrence whose shared one-off queue cannot be read. The document is
  * never guessed at or rewritten: the occurrence is refused with visible text instead of faulting its
- * run task and blocking the job behind a parked task.
+ * run task and blocking the job behind a blocked task.
  */
 const ONE_OFF_QUEUE_MALFORMED = "one-off run queue is malformed; this occurrence was not run";
 /**
@@ -699,7 +699,7 @@ function taskSummaryOf(
     : state?.status === "terminal"
       ? state.outcome.status
       : blocked !== undefined
-        ? blocked.reason === "restart_limit" ? "parked" : "missing"
+        ? "parked"
         : state!.status;
   const outcome = state?.status === "terminal" ? state.outcome : undefined;
   return {

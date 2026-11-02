@@ -158,8 +158,8 @@ async function openRecovered(store) {
 function outboxWatcher(harness, conversationId, predicate, label) {
   let stop;
   const promise = new Promise((resolveWatch, rejectWatch) => {
-    const timer = setTimeout(() => { unsubscribe(); rejectWatch(new Error(`timed out waiting for ${label}`)); }, WAIT_MS);
-    const unsubscribe = harness.subscribeCommits((publication) => {
+    const timer = setTimeout(() => { unsubscribe.detach(); rejectWatch(new Error(`timed out waiting for ${label}`)); }, WAIT_MS);
+    const unsubscribe = harness.observeCommits({ advance: (publication) => {
       for (const change of publication.changes) {
         if (change.type !== "document" || change.record.kind !== CRON_DELIVERIES_KIND) continue;
         if (change.conversationId !== conversationId || change.value === null) continue;
@@ -167,12 +167,12 @@ function outboxWatcher(harness, conversationId, predicate, label) {
         if (!Array.isArray(deliveries)) continue;
         if (!deliveries.some(predicate)) continue;
         clearTimeout(timer);
-        unsubscribe();
+        unsubscribe.detach();
         resolveWatch(undefined);
         return;
       }
-    });
-    stop = () => { clearTimeout(timer); unsubscribe(); rejectWatch(new Error(`stopped waiting for ${label}`)); };
+    }, end: () => {} })
+    stop = () => { clearTimeout(timer); unsubscribe.detach(); rejectWatch(new Error(`stopped waiting for ${label}`)); };
   });
   // A failing test may stop before awaiting; keep that rejection from surfacing as unhandled.
   void promise.catch(() => undefined);

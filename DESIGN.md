@@ -2,7 +2,7 @@
 
 ## Scope
 
-This package is the current TypeScript build target for Nanobot on the Pi 1.4.0
+This package is the current TypeScript build target for Nanobot on the Pi 1.5.0
 stack (`@earendil-works/pi-ai`, `pi-durable`, `chord`). The Python fork is a
 read-only reference; the live fork, deployment and real user data are not
 changed. Nothing here is deployed, and this document does not authorize a

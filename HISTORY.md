@@ -599,9 +599,10 @@ summaries can incur provider costs.
   - An episode that is already **ready** is never re-summarized automatically, whatever the version.
     Replacing a ready summary with a newer summarizer version would need an explicit operation that
     does not exist yet (see limitations).
-- A chain that Durable parks at its restart limit is reported, not hidden:
-  `drainEpisodeSummaries` and `historySummaryQueue` return
-  `blocked: { taskId, reason }`, and the host revives it with `Harness.retryTask(taskId)`.
+- A chain whose task Durable blocks, because no installed definition can take it, is reported rather
+  than hidden: `drainEpisodeSummaries` and `historySummaryQueue` return
+  `blocked: { taskId, reason }`. Nothing revives a blocked task: the job resumes only when a
+  definition that can take it is installed again.
 
 **Provider accounting and failure reporting.**
 
@@ -741,8 +742,8 @@ session key, and the summary text is model output over untrusted source.
   version bump would need an explicit re-summarize operation, which does not exist yet.
 - Already-closed history is summarized only through explicit backfill or retry. Default activation
   includes the currently open episode; the explicit Gateway override keeps its older watermark behavior.
-- A parked chain keeps its jobs claimed until a host calls `Harness.retryTask(taskId)` or retries the
-  failed job; nothing revives a parked task automatically.
+- A blocked chain keeps its jobs claimed until a definition that can take its task is installed
+  again; nothing revives a blocked task automatically.
 - Backfill is bounded and resumable rather than exhaustive in one call; a full queue, a catalog that
   has not recorded a page yet, or the per-call page budget stops it with `complete: false` and a
   reason, and the same page is retried later.
@@ -977,10 +978,9 @@ not defended, exactly like the rest of the workspace tools, though `O_EXCL` itse
 final symlink); `edit` cannot detect an outside process changing the file between its read and its
 write, so the in-process serialization and exact-text match are the honest boundary; a turn longer
 than 4,000 committed entries cannot be verified and fails closed; a cancelled or parked digest task
-still counts as live, so `start` reports `busy` with its task ID rather than allowing a second writer.
-Before that busy result, an ordinary start calls Durable's `retryTask` once for the live digest task,
-outside any commit; it is a no-op unless the task was parked at the restart limit and never starts a
-new task or loops. There is no digest user recovery command. The prompt is read when an attempt first
+still counts as live, so `start` reports `busy` with its task ID rather than allowing a second writer,
+and an ordinary start calls nothing native: only that task's own settlement frees the frontier. There
+is no digest user recovery command. The prompt is read when an attempt first
 submits its turn, so an owner edit applies to the next accepted batch rather than to a run already in
 flight (a resumed attempt re-submits its request ID, and text already admitted stays authoritative for
 that attempt).

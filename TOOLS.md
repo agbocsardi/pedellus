@@ -1,6 +1,6 @@
 # Opt-in coding tools and configured authority
 
-`openGateway` can register the native Pi 1.4.0 `read`, `write`, `edit` and `bash`
+`openGateway` can register the native Pi 1.5.0 `read`, `write`, `edit` and `bash`
 tools over a guarded `HostExecutionEnv` on the **actual workspace**. It stays
 disabled unless the host explicitly configures a non-empty `toolAllowlist`; that
 list is the only coding-tool authority for validated chats and for the bounded capture

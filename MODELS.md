@@ -1,7 +1,7 @@
 # Model presets and selection
 
 Named presets are the config-first model surface; direct model/allowlist configs
-remain supported. Both use the pinned Pi AI 1.4.0 registry and Durable's native
+remain supported. Both use the pinned Pi AI 1.5.0 registry and Durable's native
 `pi.agent` state. There is no second selection store, automatic model discovery,
 catalog refresh or fallback chain.
 
@@ -275,7 +275,7 @@ finish before revoking that model. Generation `prepare`/`retry` and
 compaction `select` checkpoints have not selected a request model; they resume
 using the normalized current `pi.agent` choice.
 
-This guard follows Durable 1.4.0's public task records and dispatch paths:
+This guard follows Durable 1.5.0's public task records and dispatch paths:
 `generation.ts` resolves the checkpoint model before streaming or polling, while
 `compaction.ts` resolves it before summarization. The scan covers those model
 dispatches only. A Code Mode classifier call is a nested tool task, not a chat
@@ -302,11 +302,11 @@ acquisition. Transcript and requestId identity remain intact.
   (`ModelPresetConfig`/`AgentDefaults`), `nanobot/agent/model_presets.py`, and
   `nanobot/command/builtin.py` (`cmd_model`). This port intentionally uses a
   per-conversation native choice rather than the Python process-loop preset.
-- Pinned Durable 1.4.0: `packages/durable/README.md` (Per-Conversation Agent,
+- Pinned Durable 1.5.0: `packages/durable/README.md` (Per-Conversation Agent,
   Busy Conversations), public task/`scanTasks` records, and
   `packages/durable/src/harness/{generation,compaction,tool}.ts` (checkpointed
   model dispatch and tool resolution).
-- Pinned Pi AI 1.4.0: `packages/ai/src/models.ts`
+- Pinned Pi AI 1.5.0: `packages/ai/src/models.ts`
   (`getSupportedThinkingLevels`, `checkAuth`, native provider registry), provider
   `ApiKeyAuth.resolve`, and installed `docs/models.md`,
   `docs/models-configuration.md`, and `docs/providers.md`.

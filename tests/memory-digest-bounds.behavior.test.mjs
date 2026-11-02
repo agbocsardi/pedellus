@@ -588,22 +588,13 @@ test('a product-configured run deadline wins over the host test seam, which fill
   await inspectAndAbort(seam, 'seam', 5_000);
 });
 
-test('an ordinary start retries a live digest task once through the native call and stays busy', { timeout: 15_000 }, async () => {
-  let inCommit = false;
-  const retries = [];
+test('an ordinary start against a live digest task stays busy and retries nothing natively', { timeout: 15_000 }, async () => {
   let sourceReads = 0;
+  // Durable no longer parks work at its restart limit and has no `retryTask`: a live digest task is
+  // simply busy, and only its own settlement frees the frontier.
   const harness = {
     async commit(change) {
-      inCommit = true;
-      try {
-        return await change({ scanTasks: async () => ({ items: [{ id: 42 }] }) });
-      } finally {
-        inCommit = false;
-      }
-    },
-    async retryTask(taskId) {
-      assert.equal(inCommit, false, 'retryTask runs outside the start commit');
-      retries.push(taskId);
+      return await change({ scanTasks: async () => ({ items: [{ id: 42 }] }) });
     },
   };
   const digest = createMemoryDigest({
@@ -627,9 +618,7 @@ test('an ordinary start retries a live digest task once through the native call 
     commit: async () => { throw new Error('a busy start commits nothing'); },
   };
   assert.deepEqual(await digest.start(writer, context), { status: 'busy', taskId: 42 });
-  assert.deepEqual(retries, [42], 'one retry for this invocation');
   assert.deepEqual(await digest.start(writer, context), { status: 'busy', taskId: 42 });
-  assert.deepEqual(retries, [42, 42], 'one retry per ordinary invocation, never a loop');
   assert.equal(sourceReads, 0, 'a live task is never joined by a second writer');
 });
 

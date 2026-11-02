@@ -26,16 +26,13 @@ export interface PreparedContextReplay {
 
 /**
  * What Durable's durable state records about a pinned dispatch's provider response.
- * `not-dispatched` is a proof, not a missing observation: see
- * `preparedResponseEvidence()`.
+ * Nothing is claimed as "never dispatched": see `preparedResponseEvidence()`.
  */
 export type PreparedResponseEvidence =
   /** A committed partial of this attempt: the provider stream produced content; its remote outcome is unknown. */
   | "partial-response"
   /** A deferred handle is recorded; any fetch attempt or answer may be uncommitted. */
   | "deferred-response"
-  /** This attempt was never dispatched, assuming the pinned generation and a consistent store. */
-  | "not-dispatched"
   /** Nothing durable records whether a provider request was sent or answered. */
   | "unrecorded";
 
@@ -117,12 +114,14 @@ export function preparedContextReplay(task: unknown): PreparedContextReplay | un
  * What Durable's own durable state records about the provider response of a
  * pinned dispatch, from `pi.live` of its conversation.
  *
- * `request` commits `live.generation = { attempt }` before it calls the provider,
- * so a missing or different attempt marker proves this attempt was never dispatched.
- * This depends on the pinned Durable generation and a consistent store: only the
- * owning run changes its marker. A committed `message` proves the stream produced
- * content. A `poll` checkpoint records a received deferred handle, not whether a
- * fetch was attempted or answered. Compaction records no dispatch marker at all.
+ * `request` commits `live.generation = { attempt }` before it calls the provider, but
+ * Durable stores that commit like streamed progress (`PROGRESS_COMMIT`), so a crash
+ * can lose it, and an absent `pi.live` document too. A missing or different attempt
+ * marker therefore no longer proves this attempt was never dispatched, so this
+ * reports `unrecorded` instead of claiming a proof it does not have. A committed
+ * `message` proves the stream produced content. A
+ * `poll` checkpoint records a received deferred handle, not whether a fetch was
+ * attempted or answered. Compaction records no dispatch marker at all.
  */
 export function preparedResponseEvidence(
   replay: PreparedContextReplay,
@@ -130,16 +129,16 @@ export function preparedResponseEvidence(
 ): PreparedResponseEvidence {
   if (replay.kind === "pi.generation" && replay.phase === "poll") return "deferred-response";
   if (replay.kind !== "pi.generation") return "unrecorded";
-  if (live === undefined) return "not-dispatched";
+  if (live === undefined) return "unrecorded";
   if (!isRecord(live)) {
     throw new Error(`Cannot safely inspect live generation state of prepared task ${replay.id}`);
   }
   const generation = live.generation;
-  if (generation === undefined) return "not-dispatched";
+  if (generation === undefined) return "unrecorded";
   if (!isRecord(generation) || typeof generation.attempt !== "number") {
     throw new Error(`Cannot safely inspect live generation state of prepared task ${replay.id}`);
   }
-  if (generation.attempt !== replay.attempt) return "not-dispatched";
+  if (generation.attempt !== replay.attempt) return "unrecorded";
   return generation.message === undefined ? "unrecorded" : "partial-response";
 }
 

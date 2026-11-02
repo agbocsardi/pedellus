@@ -105,12 +105,12 @@ test("EOF preserves failed-run follow-up in SQLite for reopen", { timeout: timeo
     storage = await openFullSyncNodeSqliteStorage(database, BACKGROUND_CONTEXT);
     const reopened = await makeHarness(storage);
     harness = reopened.harness;
-    const state = await reopened.conversation.viewState(BACKGROUND_CONTEXT);
+    const watch = await reopened.conversation.watch(BACKGROUND_CONTEXT);
     try {
-      const inbox = state.value.docs["pi.inbox"];
+      const inbox = watch.value.docs["pi.inbox"];
       assert.equal(inbox.items.length, 1);
       assert.match(JSON.stringify(inbox.items), /queued synthetic prompt/);
-    } finally { state.dispose(); }
+    } finally { await watch.stop(); }
   } finally {
     await harness?.close(BACKGROUND_CONTEXT);
     await storage?.close(BACKGROUND_CONTEXT);

@@ -17,7 +17,8 @@ const [{ BACKGROUND_CONTEXT: context }, ai, durable, sqlite] = await Promise.all
   import(pathToFileURL(join(modules, 'pi-durable/dist/storage/sqlite/node.js')).href),
 ]);
 
-const { createModels, fauxAssistantMessage, fauxProvider, fauxText, Type } = ai;
+const { createModels, fauxAssistantMessage, fauxProvider, fauxText } = ai;
+const { Type } = await import(join(packageRoot, 'node_modules/typebox/build/index.mjs'));
 const { Harness, ToolResultEntry, createRegistry, defineExtension, defineTool } = durable;
 const { openNodeSqliteStorage } = sqlite;
 

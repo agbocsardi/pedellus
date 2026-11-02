@@ -1,6 +1,6 @@
 # Durable Nanobot
 
-TypeScript port of Nanobot on the Pi 1.4.0 stack (`@earendil-works/pi-ai`,
+TypeScript port of Nanobot on the Pi 1.5.0 stack (`@earendil-works/pi-ai`,
 `pi-durable`, `chord`). Independent project: the Python fork at
 `~/projects/pi-nanobot` is reference material only — never merge or rebase onto
 it, and port individual changes by hand.

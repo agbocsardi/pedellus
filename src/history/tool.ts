@@ -21,7 +21,7 @@
  * explicitly selects the `tools` or `all` scope.
  */
 import type { Context } from "@earendil-works/chord";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import {
   defineExtension,
   defineTool,

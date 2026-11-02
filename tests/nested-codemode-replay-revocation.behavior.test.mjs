@@ -21,7 +21,8 @@ const [chord, ai, durable, sqlite, nativeCodeMode, nativeSearch, integrationModu
 ]);
 
 const { BACKGROUND_CONTEXT: context } = chord;
-const { createModels, fauxAssistantMessage, fauxProvider, fauxText, Type } = ai;
+const { createModels, fauxAssistantMessage, fauxProvider, fauxText } = ai;
+const { Type } = await import(join(packageRoot, 'node_modules/typebox/build/index.mjs'));
 const { Harness, ToolResultEntry, createRegistry, defineExtension, defineTool } = durable;
 const { openNodeSqliteStorage } = sqlite;
 const { CODEMODE_TOOL_NAME } = nativeCodeMode;

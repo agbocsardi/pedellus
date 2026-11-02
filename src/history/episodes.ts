@@ -437,7 +437,7 @@ export interface EpisodeCatalog {
   ): Promise<HistoryEpisode | undefined>;
   /** Catch up this conversation now; idempotent and bounded, and never schedules a summary. */
   reconcile(conversationId: ConversationId, context: Context): Promise<EpisodeReconcileReport>;
-  /** Stop background work and unsubscribe from commits. In-flight passes fail or finish harmlessly. */
+  /** Stop background work and detach the commit observer. In-flight passes fail or finish harmlessly. */
   close(): void;
 }
 
@@ -630,11 +630,16 @@ export function createEpisodeCatalog(options: EpisodeCatalogOptions): EpisodeCat
     }
   };
 
-  const unsubscribe = harness.subscribeCommits((publication) => {
-    for (const change of publication.changes) {
-      if (change.type !== "entry" || change.value.kind !== RESET_ENTRY_KIND) continue;
-      schedule(change.value.conversationId, 0);
-    }
+  // A commit observer runs synchronously on the Session line, so it only schedules: the pass itself
+  // reads and commits. The observation has no value; commits are events, not state.
+  const commits = harness.observeCommits({
+    advance: (publication) => {
+      for (const change of publication.changes) {
+        if (change.type !== "entry" || change.value.kind !== RESET_ENTRY_KIND) continue;
+        schedule(change.value.conversationId, 0);
+      }
+    },
+    end: () => {},
   });
 
   // Catch-up after reopen is deferred past gateway open and batched, so a long history
@@ -945,7 +950,7 @@ export function createEpisodeCatalog(options: EpisodeCatalogOptions): EpisodeCat
     close() {
       if (closed) return;
       closed = true;
-      unsubscribe();
+      commits.detach();
       clearTimeout(initial);
       for (const work of queued.values()) {
         if (work.timer !== undefined) clearTimeout(work.timer);

@@ -183,7 +183,7 @@ interface PreparedContextBlock {
   conversationId: number;
   phase: "request" | "poll" | "summarize";
   at: number;          // pinned cutoff/tail entry ID
-  response: "partial-response" | "deferred-response" | "not-dispatched" | "unrecorded";
+  response: "partial-response" | "deferred-response" | "unrecorded";
   fingerprint: string; // exact task state binding, see below
 }
 ```
@@ -205,14 +205,12 @@ cancellation gives up:
 - `deferred-response`: a `poll` checkpoint is committed together with the received
   deferred handle. Whether a fetch was attempted or answered is not durably
   recorded: a crash before classification commits can leave the same checkpoint.
-- `not-dispatched`: no `pi.live` attempt marker exists for the pinned attempt. The
-  `request` phase commits that marker before its provider call, so this is a proof
-  that this attempt was never dispatched, assuming the pinned Durable generation
-  and a consistent store in which only the owning run changes its marker. The
-  invocation may have started without committing the marker. What is lost is the
-  pending turn, not an external outcome for this attempt.
-- `unrecorded`: the dispatching phase may have run; nothing durable records a
-  response. A compaction carries no dispatch marker, and a `request` whose marker
+- `unrecorded`: the dispatching phase may have run; nothing durable proves it did
+  not. Durable 1.5.0 stores the `request` phase's `pi.live` attempt marker like
+  streamed progress, so a crash can lose the marker and even the document; an absent
+  marker is a missing observation, never proof that no request was sent. What a
+  cancellation gives up is the pending turn, and possibly a remote request whose
+  outcome nobody recorded. A compaction carries no dispatch marker, and a `request` whose marker
   matches can be a fresh attempt that streamed nothing yet or a retried attempt
   whose marker the retry phase pre-set. The guard reports this as unknown rather
   than guessing.
@@ -374,9 +372,8 @@ providers only:
   the CLI, the other still blocks, then the second is cancelled; both end terminal
   without replay;
 - `blocked` entries carry the phase, pinned entry, fingerprint and the
-  `response` evidence; `partial-response` and `deferred-response` are reported,
-  `not-dispatched` is a proof, and `unrecorded` is not treated as proof of
-  anything;
+  `response` evidence; `partial-response` and `deferred-response` are reported, and
+  an absent attempt marker is reported `unrecorded` rather than claimed as proof;
 - a prepared compaction `retry` is not listed and not blocked: reopening resumes it
   and sends exactly the next summarize attempt, whose request carries neither the
   pinned nor a freshly rendered Nanobot section, and places its summary at the
@@ -407,8 +404,8 @@ Not covered here: an actual deferred `poll` crash fixture (the synthetic poll ta
 exercises the same checkpoint scanner and abort path, but no real crash fixture), a
 real crash between a compaction `retry` checkpoint and its next attempt (the record
 is written directly, then resumed through the same native phase), a real crash
-between a generation's request checkpoint and its attempt-marker commit (the
-not-dispatched evidence is source-derived and exercised with a synthetic task),
+between a generation's request checkpoint and its attempt-marker commit (a crash
+there is reported `unrecorded`, so no test asserts that it was never dispatched),
 provider-side cancellation or billing of an already-dispatched remote request,
 recovery while a gateway is still running (it fails closed on the lock), live
 database/WAL copying, corrupt or torn-copy restore, and physical power-loss

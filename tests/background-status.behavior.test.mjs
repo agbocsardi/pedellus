@@ -248,17 +248,6 @@ test('the fixed renderer never calls queued, sleeping or parked work running', (
   assert.doesNotMatch(parkedLines.join('\n'), /retry/,
     'a blocked reason a retry cannot clear never promises one');
 
-  const retryablePark = {
-    ...parkedWork,
-    workers: {
-      live: 0,
-      parked: 1,
-      items: [{ taskId: 9, status: 'parked', retryable: true, task: 'probe', workspace: 'shared' }],
-    },
-  };
-  assert.deepEqual(renderBackgroundStatus(retryablePark)[1],
-    '  worker 9 (parked, blocked until a native retry): probe — shared workspace');
-
   // Rows are capped; the count is not hidden, and no count is invented for what was not read.
   const many = {
     ...emptyBackgroundStatus(),

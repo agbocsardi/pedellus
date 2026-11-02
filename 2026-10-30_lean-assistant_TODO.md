@@ -885,7 +885,7 @@ provider, credential or production run was performed for this slice.
 
 The MCP worker wired explicit `mcp` config (stdio and Streamable HTTP, env-name
 secrets, no OAuth/`mcp.json`/hot reload) to the pinned
-`@earendil-works/pi-mcp@1.4.0` client and exposed discovered tools as deferred
+`@earendil-works/pi-mcp@1.5.0` client and exposed discovered tools as deferred
 native `mcp__<server>__<tool>` registrations through the existing Code
 Mode/tool-search bundle (`4d61f50`). Authority is default-deny: mapped
 authenticated chats only, call-time hook plus per-conversation tool filter,

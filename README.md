@@ -1,6 +1,6 @@
 # Nanobot on Pi Durable (experimental)
 
-TypeScript port requiring Node >=22.19 and the pinned Pi 1.4.0 packages. This is not a production-ready replacement for the Python fork.
+TypeScript port requiring Node >=22.19 and the pinned Pi 1.5.0 packages. This is not a production-ready replacement for the Python fork.
 
 The [lean assistant plan](2026-10-30_lean-assistant_TODO.md) is the current scope
 and work-order authority: CLI + Telegram first, then tools, delegation and channels.

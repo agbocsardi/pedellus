@@ -23,7 +23,7 @@ export const BACKGROUND_STATUS_LIMITS = Object.freeze({
 
 /**
  * One native task state as the status may report it: `parked` means Durable holds the task blocked
- * (restart limit, or no definition can take it) so it is not executing even though it is unfinished.
+ * because no installed definition can take it, so it is not executing even though it is unfinished.
  */
 export type BackgroundTaskState = "pending" | "running" | "waiting" | "sleeping" | "completing" | "parked";
 
@@ -31,11 +31,6 @@ export type BackgroundTaskState = "pending" | "running" | "waiting" | "sleeping"
 export interface BackgroundWorker {
   readonly taskId: number;
   readonly status: BackgroundTaskState;
-  /**
-   * Present only when `status` is `parked`: true when the block is a restart limit, the one reason a
-   * native retry can clear. Every other blocked reason is reported without promising a retry.
-   */
-  readonly retryable?: boolean;
   readonly task: string;
   readonly workspace: "shared" | "worktree";
 }
@@ -115,16 +110,16 @@ function plural(count: number, one: string, many: string): string {
   return `${count} ${count === 1 ? one : many}`;
 }
 
-function stateWord(status: BackgroundTaskState, retryable?: boolean): string {
+function stateWord(status: BackgroundTaskState): string {
   switch (status) {
     case "pending": return "queued";
     case "running": return "running";
     case "waiting": return "waiting for another task";
     case "sleeping": return "sleeping until due";
     case "completing": return "finishing";
-    // Only a restart-limit block is cleared by a native retry; any other blocked reason is stated
-    // as it is, without promising work that no retry can resume.
-    case "parked": return retryable === true ? "parked, blocked until a native retry" : "parked, blocked";
+    // Durable parks a task whose definition no installed version can take. No native retry can
+    // resume it, so the wording promises none.
+    case "parked": return "parked, blocked";
   }
 }
 
@@ -158,7 +153,7 @@ export function renderBackgroundStatus(status: BackgroundStatus | undefined): st
       ? [`Restart: blocked by ${plural(interrupting, "active task", "active tasks")} gateway-wide; ` +
         "finish or abort that work first"]
       : []),
-    ...workers.items.map((worker) => `  worker ${worker.taskId} (${stateWord(worker.status, worker.retryable)}): ${worker.task} — ` +
+    ...workers.items.map((worker) => `  worker ${worker.taskId} (${stateWord(worker.status)}): ${worker.task} — ` +
       (worker.workspace === "worktree" ? "isolated worktree" : "shared workspace")),
     ...(workersTotal > workers.items.length
       ? [`  … ${plural(workersTotal - workers.items.length, "unfinished worker", "unfinished workers")} not shown`]

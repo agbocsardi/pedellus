@@ -101,19 +101,19 @@ function changeWatcher(harness, predicate, label) {
   });
   // A failing test may stop before awaiting; keep that rejection from surfacing as unhandled.
   void promise.catch(() => undefined);
-  const unsubscribe = harness.subscribeCommits((publication) => {
+  const unsubscribe = harness.observeCommits({ advance: (publication) => {
     try {
       if (predicate(publication.changes)) settle.resolve(publication);
     } catch (error) {
       settle.reject(error);
     }
-  });
+  }, end: () => {} })
   return {
     promise,
     stop() {
       settled = true;
       clearTimeout(timer);
-      unsubscribe();
+      unsubscribe.detach();
     },
   };
 }

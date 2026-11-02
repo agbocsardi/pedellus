@@ -928,8 +928,8 @@ test("cancellation reports immediate orphaned settlement instead of a bare abort
     const blocks = await listPreparedContextBlocks(seeded.config, context);
     assert.equal(blocks.length, 1);
     assert.equal(blocks[0].taskId, taskId);
-    assert.equal(blocks[0].response, "not-dispatched",
-      "no live attempt marker proves the request phase never began");
+    assert.equal(blocks[0].response, "unrecorded",
+      "an absent attempt marker is a missing observation, never proof of no dispatch");
     assert.deepEqual(
       await cancelPreparedContextBlock(
         seeded.config,

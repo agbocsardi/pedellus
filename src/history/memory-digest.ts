@@ -2413,14 +2413,9 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
       }
       const running = await harnessLiveTask(context);
       if (running !== undefined) {
-        // A live digest task may be parked at Durable's restart limit. This ordinary start retries
-        // that same task once through the native call (a no-op when it is not parked), outside any
-        // commit, then still reports busy: there is no second writer, retry loop or recovery command.
-        try {
-          await options.harness().retryTask(running as TaskId, context);
-        } catch {
-          // An unknown or already-settled task is handled by the busy result and the next start.
-        }
+        // One writer per frontier: a live digest task reports busy and this start writes nothing. A
+        // task cut off Durable's restart limit ends faulted instead of parking, so there is no native
+        // retry to make here: the next start after it settles takes the batch.
         return { status: "busy", taskId: running };
       }
       // Bounded backpressure before consuming a batch: try once to admit every retained result.

@@ -18,7 +18,7 @@ import {
 	type ShellExecOptions,
 	type ShellExecResult,
 	type TextLineReader,
-	type WatchChange,
+	type FileChange,
 	type WatchTarget,
 } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
@@ -403,7 +403,7 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 
 	override async watch(
 		targets: readonly WatchTarget[],
-		onChange: (change: WatchChange) => void,
+		onChange: (change: FileChange) => void,
 		context: Context,
 	): Promise<Result<FileWatcher, FileError>> {
 		const safe: WatchTarget[] = [];

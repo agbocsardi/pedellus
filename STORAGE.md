@@ -13,7 +13,7 @@ and extra allowed roots, creates the private directory, rejects a non-regular
 existing database path, and acquires Chord's OS-backed process lock for the
 canonical database path. Only then does the storage adapter open SQLite.
 
-The pinned Pi 1.4.0 `openNodeSqliteDatabase()` creates the single Node SQLite
+The pinned Pi 1.5.0 `openNodeSqliteDatabase()` creates the single Node SQLite
 connection, configures WAL, and initially sets `synchronous=NORMAL`. Before
 constructing Durable storage, `src/storage/sqlite.ts` changes `synchronous` to
 `FULL` on that same connection and reads back both `PRAGMA journal_mode` and

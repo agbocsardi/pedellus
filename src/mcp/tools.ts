@@ -1,4 +1,4 @@
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { defineTool, type JsonObject, type ToolRegistration } from "@earendil-works/pi-durable";
 import { toLlmContent, type Tool as McpTool } from "@earendil-works/pi-mcp";
 import type { JsonValue } from "@earendil-works/chord";

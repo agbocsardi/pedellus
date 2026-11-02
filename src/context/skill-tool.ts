@@ -15,7 +15,7 @@
  * granted or revoked; it is installed per conversation only when the host's
  * snapshot carried skills.
  */
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import {
   defineExtension,
   defineTool,

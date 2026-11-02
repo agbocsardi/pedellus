@@ -67,7 +67,8 @@ export interface TerminalSubmission {
 
 export interface TerminalSettlement {
   readonly status: "done" | "unanswered";
-  readonly type: "input" | "write";
+  /** Nothing yet admits a `continue` on this surface, so it has no projected answer. */
+  readonly type: "input" | "write" | "continue";
   readonly answer?: number;
   readonly reason?: string;
 }
@@ -432,7 +433,9 @@ export function inProcessTerminalConversation(
       const watch = await conversation.watch(context);
       return {
         start(listener) {
-          watch.start(async (view) => listener(projectSnapshot(view)));
+          watch.start(async (call) => {
+            if (call.kind === "value") listener(projectSnapshot(call.value));
+          });
         },
         async stop() {
           await watch.stop();
@@ -464,11 +467,11 @@ export function inProcessTerminalConversation(
     },
     async status(context) {
       const agent = await conversation.agent(context);
-      const state = await conversation.viewState(context);
+      const watch = await conversation.watch(context);
       try {
-        return projectStatus(state.value, agent.model);
+        return projectStatus(watch.value, agent.model);
       } finally {
-        state.dispose();
+        await watch.stop();
       }
     },
     async entries(query, limit, cursor, context) {

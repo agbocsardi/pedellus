@@ -1,6 +1,6 @@
 # Providers, auth, models and classifiers
 
-This slice exposes the pinned Pi AI `1.4.0` provider registry and its native auth,
+This slice exposes the pinned Pi AI `1.5.0` provider registry and its native auth,
 model and API facilities. There is no application-side provider whitelist: a
 configured provider spelling is a native Pi AI provider ID, one documented legacy
 alias, or an explicit custom provider entry. The model allowlist remains the
@@ -16,7 +16,7 @@ temporary stores, faux models and synthetic classifiers.
 The gateway registers only providers referenced by `allowedModels`, named
 `modelPresets` (which derive `allowedModels`), `credentials`, or `providers`.
 Native provider factories and catalogs come directly from
-`@earendil-works/pi-ai@1.4.0`; there is no second hand-maintained provider list,
+`@earendil-works/pi-ai@1.5.0`; there is no second hand-maintained provider list,
 catalog refresh, model discovery, fallback chain or automatic substitution.
 
 Existing configuration keeps working through these explicit legacy spellings.
@@ -211,11 +211,11 @@ fails without any provider or image-model request.
 
 ## Source basis
 
-- Pinned Pi AI `1.4.0`: `createModels`, `createProvider`, `CredentialStore`,
+- Pinned Pi AI `1.5.0`: `createModels`, `createProvider`, `CredentialStore`,
   `Models.login`/`logout`/`getAuth`/`checkAuth`, provider factories and native API
   implementations. Installed `docs/models.md`, `custom-provider.md`,
   `models-configuration.md` and the Pi AI README describe the native contracts.
-- Pinned Durable `1.4.0`: Code Mode `models.*` catalog globals, the reserved
+- Pinned Durable `1.5.0`: Code Mode `models.*` catalog globals, the reserved
   `pi.codemode.models.classify` nested tool and the `pi.codemode.models.generateImages`
   registration deliberately omitted here.
 - Nanobot reference: `nanobot/providers/registry.py`, `factory.py`,

@@ -3,7 +3,7 @@
 The gateway can connect explicitly configured [Model Context
 Protocol](https://modelcontextprotocol.io) servers over stdio or Streamable HTTP
 and make their tools reachable through Code Mode and tool search. The MCP client,
-transports and teardown come from the pinned `@earendil-works/pi-mcp@1.4.0`
+transports and teardown come from the pinned `@earendil-works/pi-mcp@1.5.0`
 package; Code Mode and deferred discovery are the native
 `@earendil-works/pi-durable` tools already wrapped by
 [`src/extensions/codemode.ts`](./src/extensions/codemode.ts). This port does not

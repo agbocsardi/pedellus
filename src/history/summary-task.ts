@@ -26,8 +26,9 @@
  * - A retryable provider error sleeps with exponential backoff at most
  *   {@link EPISODE_SUMMARY_SOURCE_LIMITS.maxAttempts} times per chunk, then records a classified
  *   failure in the episode document, the summary record and the queue. A raw crash loop is Durable's
- *   own concern: the native restart limit parks the task, which `drainEpisodeSummaries` reports (with
- *   the task ID) so a host can call `Harness.retryTask()`.
+ *   own concern: the task ends faulted at the native restart limit, and a chain whose task no
+ *   installed definition can take stays blocked, which `drainEpisodeSummaries` reports with its
+ *   task ID and reason so a host can stop retrying until that definition is back.
  *
  * Activation and backfill policy:
  * - The host can disable this module; when disabled it queues no new work or provider calls.
@@ -276,7 +277,10 @@ export interface EpisodeSummaryQueueView {
   readonly failed: number;
   readonly omittedJobs: number;
   readonly currentTaskId: number | null;
-  /** Set when the durable chain cannot continue without host action: call `Harness.retryTask(id)`. */
+  /**
+   * Set when Durable blocks the chain's task because no installed definition can take it. Nothing
+   * retries it: the job stays blocked until that definition is installed again.
+   */
   readonly blocked: { readonly taskId: number; readonly reason: string } | null;
   /** Set when queued work has no live worker: `drainEpisodeSummaries` restarts it. */
   readonly stalled: { readonly reason: "no-worker"; readonly startEntryId: number } | null;
@@ -1301,7 +1305,7 @@ export function createEpisodeSummaries(options: EpisodeSummaryOptions): EpisodeS
     },
   });
 
-  /** Durable state of the chain that cannot progress without `Harness.retryTask()`. */
+  /** Durable state of the chain whose task no installed definition can run. */
   const blockedOf = async (
     harness: Pick<Harness, "inspect">,
     taskId: number | null,

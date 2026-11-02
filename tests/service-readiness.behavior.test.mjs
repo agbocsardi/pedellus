@@ -477,9 +477,9 @@ test("bounded teardown of an attached client and an active synthetic run keeps a
     });
     const conversation = await reopened.conversationFor("cli:default", context);
     const page = await conversation.entries({}, 100, undefined, context);
-    const state = await conversation.viewState(context);
-    const inbox = JSON.stringify(state.value.docs["pi.inbox"]?.items ?? []);
-    state.dispose();
+    const watch = await conversation.watch(context);
+    const inbox = JSON.stringify(watch.value.docs["pi.inbox"]?.items ?? []);
+    await watch.stop();
     const transcript = JSON.stringify(page.items.map((entry) => entry.model ?? entry));
     assert.match(`${transcript}\n${inbox}`, /TEARDOWN-QUEUED/, "admitted queued input was lost by teardown");
   } finally {

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import type { Context } from "@earendil-works/chord";
 import {
   defineExtension,

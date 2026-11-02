@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import type { Context, JsonValue } from "@earendil-works/chord";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { defineExtension, defineTool, type ConversationId, type Extension } from "@earendil-works/pi-durable";
 import { MEMORY_TOOL_NAMES, type MemoryService } from "./contracts.js";
 import { validateQuery, validateRead } from "./validation.js";

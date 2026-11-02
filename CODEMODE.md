@@ -82,9 +82,9 @@ await codeMode.close();
 
 ## Contract and limits
 
-`createCodeModeIntegration()` composes `@earendil-works/pi-durable@1.4.0`'s
+`createCodeModeIntegration()` composes `@earendil-works/pi-durable@1.5.0`'s
 `createCodemodeExtension` and `createToolSearchExtension`, with the exact direct
-`@earendil-works/pi-codemode@1.4.0` dependency. The SDK barrel `src/index.ts`
+`@earendil-works/pi-codemode@1.5.0` dependency. The SDK barrel `src/index.ts`
 exports the factory, fixed `CODEMODE_BUDGETS`, and integration/options types.
 Importing that barrel or creating a bundle does not install it. Its extensions use Durable's registry and
 Harness; this is not the coding-agent `ExtensionAPI` / `AgentSession`. It does

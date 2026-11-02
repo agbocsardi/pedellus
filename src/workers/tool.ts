@@ -12,7 +12,7 @@
  * in this conversation; nothing here sends anything to the user.
  */
 import type { Context } from "@earendil-works/chord/context";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import {
   defineExtension,
   defineTool,

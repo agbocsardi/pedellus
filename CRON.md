@@ -350,9 +350,9 @@ aborted, and missing states with their errors/reasons. It also exposes the targe
 current generation run. If that target generation parks while the cron run is still waiting, the
 job view reports it instead of a false-healthy running state. An unhealthy timer dominates the
 canonical status over a still-running run. A faulted run is visible while it is the active execution
-and is retained in `lastFault` when the timer later replaces its pointer. A parked timer or run is
-shown as parked; this slice invents no cron retry policy, so use Durable's normal
-`harness.retryTask()` or cancel. The view also carries the newest sanitized delivery fault for the
+and is retained in `lastFault` when the timer later replaces its pointer. A timer or run whose task
+no installed definition can take is shown as parked: nothing revives it, so cancel the job or
+restore a definition that can run it. This slice invents no cron retry policy. The view also carries the newest sanitized delivery fault for the
 job (`deliveryFault`), so a malformed or full outbox is visible through the model-facing `list`
 operation even though the run itself completed.
 

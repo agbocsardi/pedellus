@@ -1638,7 +1638,10 @@ export async function runTelegram(
     };
     const stopTyping = startTyping(item.chatId);
     try {
-      watch.start(async (view) => {
+      watch.start(async (call) => {
+        // Durable's watches never send Chord's recoverable `failed` call; it ends instead.
+        if (call.kind !== "value") return;
+        const view = call.value;
         const live = view.docs["pi.live"] as {
           run?: { inputs?: SubmissionId[] };
           generation?: { message?: { content?: { type: string; text?: string }[] } };

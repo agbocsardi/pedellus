@@ -475,8 +475,8 @@ export interface Gateway {
   historySummaryQueue(sessionKey: string, context: Context): Promise<EpisodeSummaryQueueView>;
   /**
    * Start a summary worker for queued work when none is live. Idempotent; it never creates a queue
-   * entry by itself. Reports the live worker and, when Durable has parked the chain at its restart
-   * limit, the task ID to revive with `Harness.retryTask()`.
+   * entry by itself. Reports the live worker and, when Durable blocks the chain's task because no
+   * installed definition can take it, that task and reason. Nothing revives a blocked chain.
    */
   drainEpisodeSummaries(sessionKey: string, context: Context): Promise<EpisodeSummaryDrain>;
   /**
@@ -3702,7 +3702,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (blockedTasks !== undefined) return blockedTasks;
         const blocked = new Map<number, string>();
         for (const task of (await harness!.inspect(ctx)).tasks) {
-          // The reason decides whether a native retry can ever run the task again.
+          // A blocked task has no installed definition that can run it, so it is reported parked.
           if (task.state.kind === "blocked") blocked.set(Number(task.record.id), task.state.reason);
         }
         blockedTasks = blocked;
@@ -3727,8 +3727,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
           workerItems.push({
             taskId: view.taskId,
             status: blockReason === undefined ? state : "parked",
-            // Only a restart limit is cleared by a native retry; a missing or stale definition is not.
-            ...(blockReason === undefined ? {} : { retryable: blockReason === "restart_limit" }),
             task: backgroundLabel(view.prompt),
             workspace: view.workspaceMode,
           });
@@ -3745,7 +3743,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       let parked = 0;
       if (cronFoundation !== undefined && cronOwner !== undefined) {
         for (const view of await cronFoundation.list(harness!, conversationId, { owner: cronOwner }, ctx)) {
-          // `parked` is a native restart-limit block; `missing` is the same block for another reason.
+          // `parked` is a task no installed definition can take and `missing` is an absent record.
           // Either way the job cannot execute, so it is never folded into the healthy count.
           if (view.status === "parked" || view.status === "missing") parked += 1;
           if (view.nextAtMs !== null) {

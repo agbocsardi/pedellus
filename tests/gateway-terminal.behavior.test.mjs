@@ -236,7 +236,9 @@ test("an attached CLI renders a turn admitted by another surface", { timeout: 20
     const observer = await conversation.watch(context);
     let runSeen;
     const observed = new Promise((resolve) => { runSeen = resolve; });
-    observer.start(async (view) => { if (view.docs["pi.live"]?.run !== undefined) runSeen(); });
+    observer.start(async (call) => {
+      if (call.kind === "value" && call.value.docs["pi.live"]?.run !== undefined) runSeen();
+    });
     try {
       const submission = await conversation.submit({ type: "input", content: "external surface turn" }, context);
       await observed;

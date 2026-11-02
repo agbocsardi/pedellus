@@ -92,7 +92,7 @@ SOFTWARE.
 ## MCP client and Pi MCP tool adaptation
 
 MCP transport, framing, request correlation, cancellation and stdio process-group
-teardown come from `@earendil-works/pi-mcp` 1.4.0, licensed under MIT and used as
+teardown come from `@earendil-works/pi-mcp` 1.5.0, licensed under MIT and used as
 a pinned dependency. Its OAuth subset is not imported.
 
 The MCP tool registration semantics in `src/mcp/` follow the MIT-licensed Pi

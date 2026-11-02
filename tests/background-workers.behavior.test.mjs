@@ -93,19 +93,19 @@ function changeWatcher(harness, predicate, label) {
     };
   });
   void promise.catch(() => undefined);
-  const unsubscribe = harness.subscribeCommits((publication) => {
+  const unsubscribe = harness.observeCommits({ advance: (publication) => {
     try {
       if (predicate(publication.changes)) settle.resolve(publication);
     } catch (error) {
       settle.reject(error);
     }
-  });
+  }, end: () => {} })
   return {
     promise,
     stop() {
       settled = true;
       clearTimeout(timer);
-      unsubscribe();
+      unsubscribe.detach();
     },
   };
 }
@@ -395,12 +395,12 @@ test('shared writes land in the configured workspace while worktree writes never
     const conversation = await store.gateway.conversationFor(ORIGIN, context);
     const watcher = changeWatcher(store.gateway.harness, workerResultCommitted(conversation.id), 'two worker results');
     const results = [];
-    const stop = store.gateway.harness.subscribeCommits((publication) => {
+    const stop = store.gateway.harness.observeCommits({ advance: (publication) => {
       for (const change of publication.changes) {
         if (change.type === 'entry' && change.value.conversationId === conversation.id
           && change.value.kind === WORKER_RESULT_ENTRY_KIND) results.push(change.value);
       }
-    });
+    }, end: () => {} })
     try {
       for (const message of ['spawn shared', 'spawn worktree']) {
         const submission = await conversation.submit({ type: 'input', content: message, requestId: message }, context);
@@ -410,7 +410,7 @@ test('shared writes land in the configured workspace while worktree writes never
         while (results.length < 2) await new Promise((resolve) => setTimeout(resolve, 25));
       })(), WAIT_MS, 'both workers never reported');
     } finally {
-      stop();
+      stop.detach();
       watcher.stop();
     }
     assert.deepEqual(results.map((entry) => entry.data.status), ['completed', 'completed']);
@@ -618,12 +618,12 @@ test('cancellation retires the worker authority and a late child finish never re
   let stop;
   try {
     const conversation = await store.gateway.conversationFor(ORIGIN, context);
-    stop = store.gateway.harness.subscribeCommits((publication) => {
+    stop = store.gateway.harness.observeCommits({ advance: (publication) => {
       for (const change of publication.changes) {
         if (change.type === 'entry' && change.value.conversationId === conversation.id
           && change.value.kind === WORKER_RESULT_ENTRY_KIND) results.push(change.value);
       }
-    });
+    }, end: () => {} })
     const first = await conversation.submit({ type: 'input', content: 'spawn a worker', requestId: 'spawn' }, context);
     assert.equal((await first.wait(context)).status, 'done');
     await within(childStarted.promise, WAIT_MS, 'the worker never started');
@@ -669,7 +669,7 @@ test('cancellation retires the worker authority and a late child finish never re
     const finished = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
     assert.equal(finished.status, 'aborted');
   } finally {
-    stop?.();
+    stop?.detach();
     releaseChild.resolve();
     await store.gateway.close(context);
     await rm(fixture.directory, { recursive: true, force: true });

@@ -36,7 +36,7 @@ explicitly kept safe effect. The test also asserts the transcript's
 `pi.tool-result` entries and a final model answer in each of the three
 conversations.
 
-This is native Durable 1.4.0 behavior, not a product hook. Recovery resolves the
+This is native Durable 1.5.0 behavior, not a product hook. Recovery resolves the
 tool against the conversation's **current** host tool selection and replay
 policy, so removing a tool or downgrading it to `replay: "unsafe"` before
 scheduling resumes prevents re-execution even though the stored intent says
