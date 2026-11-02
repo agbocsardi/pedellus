@@ -62,7 +62,7 @@ export interface MemoryCoverage {
 export interface MemoryHit {
   readonly ref: string;
   readonly episodeRef?: string;
-  readonly source: { readonly target: MemoryTarget; readonly session?: string; readonly channel?: string | null; readonly provenance?: MemoryProvenance; readonly path?: string; readonly entryId?: number; readonly role?: string; readonly toolName?: string; readonly kind?: string };
+  readonly source: { readonly target: MemoryTarget; readonly session?: string; readonly channel?: string | null; readonly provenance?: MemoryProvenance; readonly path?: string; readonly entryId?: number; readonly entryKind?: string; readonly role?: string; readonly toolName?: string; readonly kind?: string };
   readonly time: MemoryTime;
   readonly excerpt: string;
   readonly preview: boolean;

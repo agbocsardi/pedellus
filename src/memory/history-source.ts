@@ -214,6 +214,7 @@ export function partHit(
       channel: session.channel,
       provenance: provenanceOf(session),
       entryId: entry.id,
+      entryKind: entry.kind,
       role: part.role,
       ...(part.toolName === undefined ? {} : { toolName: part.toolName }),
       ...(part.toolKind === undefined ? {} : { kind: part.toolKind }),

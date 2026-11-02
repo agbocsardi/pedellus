@@ -85,6 +85,12 @@ There is no `.result` wrapper and
 no JSON parsing. The text result is JSON with a `notice` plus the same page fields.
 Permission failures remain tool errors, not empty pages.
 
+Original message/tool hits include `source.entryKind`, the authoritative Durable
+entry kind. In particular, `pi.user` is an owner message whereas
+`nanobot.cron` is scheduled input; both can project to role `user`.
+Do not count scheduled prompts as owner activity. This is source metadata, not
+an additional filter or an authority grant.
+
 All current conversation provenance is `unknown`; there is no importer marker yet.
 Do not infer `native` or `imported` from source or index timestamps.
 
