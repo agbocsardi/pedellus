@@ -91,6 +91,22 @@ set `episodeSummary.enabled` to `false` to disable summaries. Already-closed epi
 backfilled automatically. Short cache retention is requested, but cache reuse is not guaranteed;
 see [episode summaries](./HISTORY.md#episode-summaries).
 
+## Busy owner messages
+
+`followUpMode` decides where an owner's CLI or Telegram message goes when that conversation is
+already answering. The default `"followUp"` keeps the historical queueing: the message waits and
+starts the next run when the current one answers. `"steer"` submits it with native Durable
+`whenBusy: "steer"`, so it is placed after the current tool round and joins the running work
+without interrupting the generation.
+
+The pinned native default places one queued steer per tool round, and that setting is harness-wide,
+so this repository does not turn on "place all queued steers" (it would change worker and automation
+conversations too). A steer that arrives at the final boundary is placed there and answered by the
+following run, so it answers a beat later instead of pre-empting the answer already being written.
+Telegram stores the mode with each admitted message, so a later config change or a reopen keeps that
+message's semantics, and every message a steered turn consumes delivers its single committed answer
+once. Internal worker, digest and scheduled submissions are unaffected and keep the native default.
+
 ## Media
 
 Attachment ingress is opt-in with a top-level `media` config, and the gateway owns

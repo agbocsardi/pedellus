@@ -108,6 +108,15 @@ export interface VisionHandoffConfig {
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
+/**
+ * Where an owner's message goes while that conversation is already running: `followUp` (the default)
+ * queues it for the next run, and `steer` places it after the current tool round so it joins the
+ * running work. Internal worker, digest and scheduled events never use this setting.
+ */
+export const FOLLOW_UP_MODES = ["followUp", "steer"] as const;
+
+export type FollowUpMode = typeof FOLLOW_UP_MODES[number];
+
 export interface WorkspaceSkillsConfig {
   /** Explicit absolute builtin skills root; absent means workspace skills only. */
   readonly builtinSkillsRoot?: string;
@@ -312,6 +321,12 @@ export interface PortConfig {
    * vision-capable ones. Absent leaves model requests untouched.
    */
   visionHandoff?: VisionHandoffConfig;
+  /**
+   * How an owner message is placed when its CLI or Telegram conversation is busy. `parseConfig`
+   * always resolves it; the default `followUp` keeps the historical queueing and `steer` joins the
+   * current run after its tool round instead.
+   */
+  followUpMode: FollowUpMode;
   /** Host-owned global ceiling; conversations may only narrow it. Empty means tools are disabled. */
   toolAllowlist?: readonly string[];
   /**
@@ -434,6 +449,15 @@ function providerKey(value: unknown, name: string): string {
     throw new Error(`${name} must be a provider ID using letters, digits, dot, underscore or hyphen`);
   }
   return value;
+}
+
+/** Owner busy-mode spelling; absent keeps the default follow-up queueing. */
+function followUpModeConfig(value: unknown): FollowUpMode {
+  if (value === undefined) return "followUp";
+  if (typeof value !== "string" || !(FOLLOW_UP_MODES as readonly string[]).includes(value)) {
+    throw new Error(`followUpMode must be one of ${FOLLOW_UP_MODES.join(", ")}`);
+  }
+  return value as FollowUpMode;
 }
 
 function positiveInteger(value: unknown, name: string): number {
@@ -1028,6 +1052,7 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   const config: PortConfig = {
     workspace: resolve(baseDir, nonempty(raw.workspace, "workspace")),
     dataDir: resolve(baseDir, nonempty(raw.dataDir, "dataDir")),
+    followUpMode: followUpModeConfig(raw.followUpMode),
     model,
     allowedModels,
     ...(classifierModel === undefined ? {} : { classifierModel }),

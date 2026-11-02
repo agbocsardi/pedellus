@@ -6,8 +6,9 @@ import { Api, GrammyError, HttpError, InputFile } from "grammy";
 import type { Message } from "grammy/types";
 import type { ApiClientOptions } from "grammy";
 import type { MessageReactionUpdated, ReactionType, ReactionTypeEmoji, Update } from "grammy/types";
-import type { Conversation, Submission, SubmissionId } from "@earendil-works/pi-durable";
+import type { Conversation, Submission, SubmissionId, SubmissionRecord } from "@earendil-works/pi-durable";
 import type { AssistantMessage, ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { FollowUpMode } from "../config.js";
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
 import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
 import {
@@ -172,6 +173,11 @@ export type TelegramOptions = {
   token: string;
   allowFrom: readonly string[];
   pollTimeoutSeconds?: number;
+  /**
+   * Configured owner busy-mode, persisted on each admitted message so recovery and a later config
+   * change cannot alter an already admitted message's semantics. Absent keeps follow-up queueing.
+   */
+  followUpMode?: FollowUpMode;
   /** Absent keeps the previous attachment-disabled behavior for SDK callers. */
   media?: TelegramMediaOptions;
   /** Absent means `/restart` is neither advertised nor applied in this host. */
@@ -210,6 +216,11 @@ export type TelegramPendingDelivery = {
   transcriptionFailure?: string;
   /** A command acknowledgement: delivered as fixed text, never submitted to the model. */
   notice?: boolean;
+  /**
+   * The busy-mode this message was admitted under. Absent is the historical follow-up queueing; a
+   * stored `steer` keeps steering even when the configuration changes before its delivery.
+   */
+  whenBusy?: "steer";
   /** Host-generated layout for a read-only notice; its underlying text remains plain. */
   noticeFormat?: "status" | "model";
   /** The acknowledgement is withheld until the command's native call returns (or reports that it is still pending). */
@@ -271,6 +282,29 @@ export type TelegramOriginBinding = {
 };
 type PendingReply = TelegramPendingDelivery;
 type SubmissionSlot = { readonly prior: Promise<void>; release(): void };
+/**
+ * A native settlement that identifies the inputs one run consumed: they settle together with one committed
+ * answer entry, or with the same failure. Pending membership plus that durable submission evidence is the
+ * whole shared-delivery identity; no text, in-memory set or delivery tombstone is involved.
+ */
+type SharedSettlement =
+  | { readonly kind: "done"; readonly answer: number }
+  | { readonly kind: "failed"; readonly reason: string; readonly detail?: unknown };
+/** `owner` sends the one shared reply, `sibling` stays silent behind it, `retired` is already gone. */
+type DeliveryRole = "owner" | "sibling" | "retired";
+
+/** Whether this settled submission is one of the inputs the same run consumed. */
+function consumedTogether(record: SubmissionRecord, settlement: SharedSettlement): boolean {
+  if (record.type !== "input") return false;
+  if (settlement.kind === "done") return record.status === "done" && record.answer === settlement.answer;
+  return record.status === "unanswered" && record.reason === settlement.reason &&
+    detailKey(record.detail) === detailKey(settlement.detail);
+}
+
+/** Stable comparison for a settlement detail; committed records hold strict JSON. */
+function detailKey(detail: unknown): string {
+  return detail === undefined ? "" : JSON.stringify(detail);
+}
 type TypingLoop = {
   /** Overlapping queued turns in one chat share this loop; the indicator stays until the last one settles. */
   turns: number;
@@ -444,6 +478,11 @@ export async function runTelegram(
     `telegram:${identity}${CHANNEL_STATE_SESSION_SUFFIX}`,
     context,
   );
+  /**
+   * The busy-mode written onto each admitted message, so its semantics are durable before submission and a
+   * later configuration change or recovery never re-reads them from the current config.
+   */
+  const admittedWhenBusy = options.followUpMode === "steer" ? "steer" as const : undefined;
   let state = await stateConversation.commit(async (tx) =>
     copyJson(await tx.doc(TelegramState, stateConversation.id)) as unknown as ChannelState,
   context);
@@ -1602,34 +1641,59 @@ export async function runTelegram(
           run?: { inputs?: SubmissionId[] };
           generation?: { message?: { content?: { type: string; text?: string }[] } };
         } | undefined;
-        if (submissionId === undefined || !live?.run?.inputs?.includes(submissionId)) return;
-        const text = live.generation?.message?.content
+        const inputs = live?.run?.inputs;
+        if (submissionId === undefined || inputs === undefined || !inputs.includes(submissionId)) return;
+        // One preview per run: the run's first input owns the single live preview message, so a steered
+        // sibling keeps the chat's typing indicator but never publishes a second one.
+        if (submissionId !== Math.min(...inputs)) return;
+        const text = live?.generation?.message?.content
           ?.flatMap((part) => part.type === "text" && part.text ? [part.text] : []).join("");
         if (text) queuePreview(text);
       });
       const early = earlySubmissions.get(item.updateId);
       earlySubmissions.delete(item.updateId);
-      const submission = early ?? await conversation.submit({ type: "input", content, requestId }, adapterContext);
+      // The admission itself decided the busy-mode, so a later configuration change cannot redefine this message.
+      const submission = early ?? await conversation.submit({
+        type: "input",
+        content,
+        requestId,
+        whenBusy: item.whenBusy === "steer" ? "steer" : "followUp",
+      }, adapterContext);
       // Ordering is established; free the chat's next submission place while this turn runs.
       slot.release();
       submissionId = submission.id;
       const settled = await submission.wait(adapterContext);
       if (settled.status !== "done" || settled.type !== "input") {
-        await stopPreviewWatch();
-        // A native abort or a queued reset deliberately ends a turn; that is not a delivery failure to report.
+        // A native abort or a queued reset deliberately ends the whole shared run: no input of it reports a
+        // delivery failure, exactly as a single withdrawn turn never did.
         const intentional = settled.status === "unanswered" &&
           (settled.reason === "aborted" || settled.reason === "reset");
-        if (!intentional) await flushFinal("Your request could not be completed. Please try again.");
-        await forget(item.updateId);
+        const role = intentional
+          ? undefined
+          : await sharedDeliveryRole(conversation, item, {
+            kind: "failed",
+            reason: settled.status === "unanswered" ? settled.reason : "unknown",
+            ...(settled.status === "unanswered" && settled.detail !== undefined ? { detail: settled.detail } : {}),
+          });
+        await stopPreviewWatch();
+        if (role === "owner") await flushFinal("Your request could not be completed. Please try again.");
+        if (role !== "retired") await forget(item.updateId);
         return;
       }
       const answer = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), adapterContext);
       const message = answer?.model?.[0] as AssistantMessage | undefined;
       const answerText = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "";
       const text = answerText.trim() === "" ? "The assistant returned no text response." : answerText;
+      // Inputs the run consumed settle with this same committed answer, so one of them owns its single reply.
+      const settlement = { kind: "done", answer: settled.answer } as const;
+      const role = await sharedDeliveryRole(conversation, item, settlement);
       await stopPreviewWatch();
-      await flushFinal(text);
-      await forget(item.updateId);
+      if (role === "owner") {
+        await flushFinal(text);
+        await retireSharedDelivery(conversation, item, settlement);
+      } else if (role === "sibling") {
+        await forget(item.updateId);
+      }
     } finally {
       stopTyping();
       await stopPreviewWatch();
@@ -1836,6 +1900,79 @@ export async function runTelegram(
       // Its terminal report (interrupted or refused) is now durably delivered, so the record has served its purpose.
       doc.controls = doc.controls.filter((entry) =>
         !(entry.updateId === updateId && (entry.status === "unconfirmed" || entry.status === "refused")));
+      return copyJson(doc) as unknown as ChannelState;
+    }, cleanupContext);
+  };
+
+  /**
+   * The admitted messages of this chat whose native submission settled exactly as `settlement` did, with
+   * the earliest native submission as the one that delivers their single shared reply. Durable settlement
+   * evidence plus pending membership decide it, so every observer computes the same owner without a lock,
+   * and a reopened process reaches the same answer.
+   */
+  const sharedDeliveryGroup = async (
+    conversationId: Conversation["id"],
+    current: PendingReply,
+    settlement: SharedSettlement,
+  ): Promise<{ readonly updateIds: number[]; readonly owner: number | undefined; readonly present: boolean }> => {
+    const members: { updateId: number; submissionId: number }[] = [];
+    let present = false;
+    // A read-only commit: committed pending membership and submissions are the whole identity.
+    await stateConversation.commit(async (tx) => {
+      const doc = await tx.doc(TelegramState, stateConversation.id);
+      members.length = 0;
+      present = false;
+      for (const candidate of doc.pending) {
+        if (candidate.updateId === current.updateId) present = true;
+        if (candidate.sessionKey !== current.sessionKey) continue;
+        const record = await tx.submissionByRequest(conversationId, requestIdFor(identity, candidate.updateId));
+        if (record !== undefined && consumedTogether(record, settlement)) {
+          members.push({ updateId: candidate.updateId, submissionId: record.id });
+        }
+      }
+      return undefined;
+    }, adapterContext);
+    members.sort((left, right) => left.submissionId - right.submissionId || left.updateId - right.updateId);
+    return { updateIds: members.map((member) => member.updateId), owner: members[0]?.updateId, present };
+  };
+
+  /**
+   * Whether this admitted message delivers its shared settlement or stays silent behind its owner. A
+   * record the owner already retired resolves `retired`, so an in-flight observer never sends again.
+   */
+  const sharedDeliveryRole = async (
+    conversation: Conversation,
+    current: PendingReply,
+    settlement: SharedSettlement,
+  ): Promise<DeliveryRole> => {
+    const group = await sharedDeliveryGroup(conversation.id, current, settlement);
+    if (!group.present) return "retired";
+    if (group.owner === undefined || group.owner === current.updateId) return "owner";
+    return "sibling";
+  };
+
+  /**
+   * One commit that retires this delivery owner and every still-pending sibling of the same settlement, so
+   * a delivered shared answer can never be sent again by a record left behind by a crash or a slow observer.
+   * An unknown or held sibling keeps its own evidence: only pending membership is retired here.
+   */
+  const retireSharedDelivery = async (
+    conversation: Conversation,
+    current: PendingReply,
+    settlement: SharedSettlement,
+  ) => {
+    const group = await sharedDeliveryGroup(conversation.id, current, settlement);
+    const retired = new Set(group.updateIds);
+    retired.add(current.updateId);
+    for (const updateId of retired) {
+      deliveryFailures.delete(updateId);
+      earlySubmissions.delete(updateId);
+    }
+    state = await stateConversation.commit(async (tx) => {
+      const doc = await tx.doc(TelegramState, stateConversation.id);
+      doc.pending = doc.pending.filter((entry) => !retired.has(entry.updateId));
+      doc.controls = doc.controls.filter((entry) => !(retired.has(entry.updateId) &&
+        (entry.status === "unconfirmed" || entry.status === "refused")));
       return copyJson(doc) as unknown as ChannelState;
     }, cleanupContext);
   };
@@ -2295,6 +2432,7 @@ export async function runTelegram(
                 sessionKey,
                 senderId: String(message.from!.id),
                 text: input,
+                ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
                 ...(attachments === undefined ? {} : { attachments }),
               });
             }
@@ -2397,6 +2535,7 @@ export async function runTelegram(
           sessionKey,
           senderId,
           text,
+          ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
         });
       }
       doc.offset = Math.max(doc.offset, update.update_id + 1);
@@ -2817,10 +2956,13 @@ export async function runTelegram(
         // message forced ahead of a control must not be submitted as text only.
         await submitInOrder(record.chatId, async () => {
           const content = await prepareInputContent(earlier);
-          const submission = await earlierConversation.submit(
-            { type: "input", content, requestId: requestIdFor(identity, earlier.updateId) },
-            adapterContext,
-          );
+          const submission = await earlierConversation.submit({
+            type: "input",
+            content,
+            requestId: requestIdFor(identity, earlier.updateId),
+            // The mode its own admission recorded, exactly as the normal delivery path submits it.
+            whenBusy: earlier.whenBusy === "steer" ? "steer" : "followUp",
+          }, adapterContext);
           // The normal delivery path reuses this turn, so a control-forced input is answered
           // exactly once even when it settles before the chat's gate is released.
           earlySubmissions.set(earlier.updateId, submission);

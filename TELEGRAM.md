@@ -361,6 +361,27 @@ cannot let a later message submit ahead of an earlier one. Reply deliveries and
 acknowledgements have separate concurrency bounds (eight each), so a full reply
 queue cannot hide an acknowledgement.
 
+The configured `followUpMode` is written onto each admitted message as it is
+accepted, so a later configuration change or a recovery never re-reads it: an
+absent value keeps the historical follow-up queueing, and a stored `steer`
+submits the turn with native `whenBusy: "steer"` so it is placed after the
+current tool round. Every message one run consumes settles with the same
+committed answer entry, so exactly one of those records owns the reply. The
+owner is the earliest native submission among the chat's still-pending records
+whose submission settled with that answer, which makes the choice deterministic
+without a lock and identical after a reopen. The owner sends it once and retires
+its silent siblings in the same commit that retires itself, so a crash, a reopen
+or an ambiguous send cannot let another record deliver the same answer again: a
+record the owner already retired finds no record and stays silent, and a held or
+unknown outcome is never retried through a sibling. Only the run's first input
+publishes the live preview, so steered messages share one preview message that
+the final answer edits in place while the chat keeps typing until the shared work
+settles. A message whose run never answered is reported once for that run; an
+intentional `/abort` or `/new` settlement still reports nothing. The pinned
+harness places one queued steer per tool round, and that mode is harness-wide, so
+all-pending placement is deliberately not enabled; a steer that arrives at the
+final boundary is placed there and answered by the following run instead.
+
 Before a control is applied, every message admitted before it in that chat is
 submitted, including one still parked behind that bound: the command task
 re-submits them with their stable request IDs through the chat's submission
@@ -413,7 +434,10 @@ migrate with an empty `controls` list. Version 6 adds admitted attachment record
 and the cached local transcript; earlier versions migrate with no attachments.
 Version 7 adds the `refused` control status; versions 1–6 migrate unchanged.
 Version 8 adds the bounded list of chats owed a restart confirmation; versions
-1–7 migrate without one.
+1–7 migrate without one. The same version also carries an optional per-message
+busy-mode (`whenBusy: "steer"`); an absent value is the historical follow-up
+queueing, so no further migration is needed and a record written by an earlier
+build keeps its old semantics.
 Invalid stored shapes fail closed.
 
 Not implemented here: tool-authority or approval commands, history commands,
@@ -603,7 +627,9 @@ process racing the workspace between them is not fully excluded on this host
   partial text updates into rich `editMessageText` calls. It filters to text
   blocks only (never reasoning/thinking), explicitly flushes the final assistant
   entry after `submission.wait()`, splits output under the rich-message limit and
-  bounds concurrent deliveries to eight. The remote message ID and last preview
+  bounds concurrent deliveries to eight. Only a run's first input publishes the
+  live preview, so messages steered into the same run share that one message and
+  the final answer edits it in place. The remote message ID and last preview
   are stored with the Durable pending-delivery record. Previews stay inside one
   plain-sized message because they are replaced repeatedly while a turn runs.
 - The poller continues admitting updates while up to eight deliveries wait on

@@ -132,6 +132,18 @@ edits need restart only; unit edits additionally need daemon-reload.
   additionally require a live adapter, current private-chat
   admission and observed same-chat targets. Unknown external outcomes are retained,
   never blindly retried or evicted.
+- Owner message placement is `followUpMode`, config-only and default `followUp`
+  (historical queueing): `steer` submits a CLI or Telegram owner input with native
+  `whenBusy: "steer"` so it joins the running turn after its tool round. Internal
+  worker, digest and scheduled submissions are never affected. The pinned native
+  default places one queued steer per tool round and the all-pending switch is
+  harness-wide, so it is deliberately not enabled; a steer that arrives at the
+  final boundary is placed there and answered by the following run. Telegram stores
+  the mode with the admitted message. Inputs one run consumes settle with the same
+  committed answer entry, so exactly one admitted record — the earliest native
+  submission among them — delivers that answer once, retires every still-pending
+  sibling in its own completion commit, and never lets an ambiguous or held outcome
+  reach a sibling. Only the run's first input publishes the shared live preview.
 - Provider spellings are native Pi AI IDs, the documented legacy aliases or
   custom `providers` keys; there is no application provider whitelist. A
   `credentials.<provider>` reference pins that one environment variable: when it

@@ -24,6 +24,12 @@
   `[SILENT]` successful final answer suppress automatic channel delivery, including an empty
   answer; a failed occurrence keeps its sanitized notice, and `cron list`/confirmation show the
   setting. No authority, digest, recovery or pending/unknown send semantics changed.
+- [x] Owner message steering: top-level `followUpMode` (default `followUp`, retaining queueing)
+  submits CLI and Telegram owner inputs with native `whenBusy: "steer"`, including attachments and
+  Telegram control-forced early submissions; internal worker, digest and scheduled submissions keep
+  the native default. Telegram persists the mode per admitted message and delivers a steered run's
+  one committed answer exactly once through a deterministic durable owner, retiring silent siblings
+  in its own completion commit with one shared preview.
 
 ## Owner follow-up — digest input correction
 
@@ -1500,3 +1506,36 @@ server, faux models, no external network.
 - [x] Adapted concise Telegram and CLI receipts to the newer shared command catalogue,
   busy-restart gate and direct MCP management, preserving their behavior and disclosures.
 - [x] Verified typecheck, 400 behavior checks and 83/83 offline core acceptance.
+
+### 2026-11-02 — owner message steering
+
+- [x] Added top-level `followUpMode: "followUp" | "steer"` (absent means `followUp`, which keeps
+  the historical queueing). The local gateway passes it to the terminal surface
+  (`inProcessTerminalConversation`), and `runTelegram` stores it on each admitted message, so a
+  message keeps the mode it was admitted under when the config changes or the gateway reopens.
+  `steer` submits with native `whenBusy: "steer"`; internal worker, digest and cron submissions
+  were left untouched.
+- [x] Telegram: inputs one run consumes settle with the same committed answer entry, so the
+  earliest native submission among the chat's still-pending records whose submission settled with
+  that answer owns the single delivery. The owner sends it once and retires every still-pending
+  sibling in the same completion commit, which makes an in-flight observer silent, prevents a
+  resend after a completed delivery plus a crash, and never retries an ambiguous or held outcome
+  through a sibling. Only the run's first input publishes the live preview, which the final answer
+  edits in place; typing stays until the shared work settles. A failed shared run reports its fixed
+  notice once (grouped by its identical settlement), and an intentional abort or reset reports
+  nothing.
+- [x] Investigated the native all-pending steering switch: `steeringMode`/`followUpMode: "all"` are
+  harness-wide session settings, so enabling them would also change worker and automation
+  conversations. They were deliberately not enabled, so one queued steer is placed per tool round
+  and a steer that arrives at the final boundary is answered by the following run. This limitation
+  is documented in README/CLI/TELEGRAM rather than claimed away.
+- [x] Verification: typecheck/build, 420 behavior checks (13 new: config spelling and default;
+  three-prompt CLI steer through the real local gateway prints one answer in order; default CLI
+  queueing; CLI too-late steer; Telegram shared answer once across two tool rounds; default
+  Telegram queueing; Telegram too-late steer; one shared preview edited by the final answer; an
+  ambiguous shared send attempted once and its sibling retired across reopen; a delivered shared
+  answer not resent after an adapter stop plus reopen; an attachment steered with a later message
+  keeping its stored original; aborting a steered turn reporting no failure; a queued reset ending
+  an answering steered turn silently while its placed steer is answered once in the new context),
+  2 execution checks and 83/83 offline core acceptance. No live bot, provider, credential, network,
+  migration or deployment was used.

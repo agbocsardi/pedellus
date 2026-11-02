@@ -20,6 +20,7 @@ import type { Gateway, GatewayMcpAdmin, GatewayModelSelectionRequest } from "../
 import { isTurnInterruptionNotice } from "../recovery/interruption.js";
 import { CRON_OPERATOR_LIMITS, CronOperatorInputError, type CronOperator } from "../automation/operator.js";
 import { RestartBusyError } from "../restart.js";
+import type { FollowUpMode } from "../config.js";
 import {
   inProcessTerminalConversation,
   projectEntry,
@@ -58,6 +59,11 @@ export interface LocalGatewayHostOptions {
   readonly contextRefresh: boolean;
   /** Whether named model presets are configured. */
   readonly presets: boolean;
+  /**
+   * Configured owner busy-mode for this gateway's CLI conversations. Absent keeps the historical
+   * follow-up queueing; `steer` joins a running turn after its tool round.
+   */
+  readonly followUpMode?: FollowUpMode;
   /** Configured CLI-scoped workspace media store; absent keeps local attachments unavailable. */
   readonly attachments?: { readonly store: MediaStore };
   /** Host-owned process replacement; acknowledge the request before tearing down connections. */
@@ -510,7 +516,7 @@ class LocalConnection {
     const conversation = await this.options.gateway.conversationFor(sessionKey, this.scope.context);
     this.gatewayConversation = conversation;
     this.sessionKey = sessionKey;
-    this.surface = inProcessTerminalConversation(conversation);
+    this.surface = inProcessTerminalConversation(conversation, this.options.followUpMode ?? "followUp");
     this.detachMcpSurface = this.options.gateway.mcpSurfaces?.attach({
       owns: (candidate) => candidate === sessionKey,
       deliverAuthorization: async (target, authorization) => {

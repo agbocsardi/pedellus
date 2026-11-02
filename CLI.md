@@ -297,6 +297,18 @@ abort protocol; a cancelled poll whose model is outside `allowedModels` remains
 fail-closed and is not remotely cancelled. See
 [prepared context recovery](./CONTEXT_RECOVERY.md).
 
+## Busy messages
+
+While this conversation is answering, a typed line is placed by the configured `followUpMode`:
+the default `"followUp"` queues it and starts the next run when the current answer settles, while
+`"steer"` places it after the current tool round so it joins the running turn. Only one queued
+steer is placed per tool round (the pinned native default), and a steer that arrives after the last
+tool round is placed at the final boundary, so it is answered by the following run a beat later
+instead of interrupting the answer already being written. A turn that consumes several inputs settles
+all of them with one committed answer entry, which the terminal prints once, and typing stays
+available meanwhile. `/attach` turns follow the same mode. See
+[busy owner messages](./README.md#busy-owner-messages).
+
 ## Local controls
 
 | Command | Behavior |

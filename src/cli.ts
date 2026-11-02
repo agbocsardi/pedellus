@@ -401,6 +401,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       tools: config.toolAllowlist ?? [],
       contextRefresh: config.workspaceContext !== undefined,
       presets: config.modelPreset !== undefined,
+      followUpMode: config.followUpMode,
       restart: { supported: restartSupported(), request: (acknowledge) => restart.request(acknowledge) },
       ...(attachments === undefined ? {} : { attachments }),
     });
@@ -414,6 +415,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
         token,
         allowFrom: config.telegram.allowFrom,
         ...(config.telegram.pollTimeoutSeconds === undefined ? {} : { pollTimeoutSeconds: config.telegram.pollTimeoutSeconds }),
+        followUpMode: config.followUpMode,
         ...(config.media === undefined
           ? {}
           : {

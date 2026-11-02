@@ -11,6 +11,7 @@ import type {
   UsageState,
 } from "@earendil-works/pi-durable";
 import type { AssistantMessage, ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type { FollowUpMode } from "../config.js";
 import type { BackgroundStatus } from "../background-status.js";
 
 /** Plain typed input, or the text/image parts of a stored attachment submission. */
@@ -391,8 +392,16 @@ function projectSettlement(settled: SettledSubmissionRecord): TerminalSettlement
  * The shipped CLI uses the local gateway client instead. This adapter exists so
  * terminal behaviour checks and SDK hosts can run the same UI against a conversation
  * they already own, without the terminal receiving the full handle.
+ *
+ * `followUpMode` is the configured owner busy-mode: `steer` submits the input with
+ * native `whenBusy: "steer"` so it joins the running turn, while the default keeps
+ * the historical follow-up queueing. It never reaches internal worker, digest or
+ * scheduled submissions, which keep the native default.
  */
-export function inProcessTerminalConversation(conversation: Conversation): TerminalConversation {
+export function inProcessTerminalConversation(
+  conversation: Conversation,
+  followUpMode: FollowUpMode = "followUp",
+): TerminalConversation {
   return {
     id: conversation.id,
     async watch(context) {
@@ -407,7 +416,7 @@ export function inProcessTerminalConversation(conversation: Conversation): Termi
       };
     },
     async submit(content, context) {
-      const submission = await conversation.submit({ type: "input", content }, context);
+      const submission = await conversation.submit({ type: "input", content, whenBusy: followUpMode }, context);
       return {
         id: submission.id,
         wait: async (ctx) => projectSettlement(await submission.wait(ctx)),
