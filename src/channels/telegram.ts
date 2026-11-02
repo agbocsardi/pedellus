@@ -37,7 +37,7 @@ import { renderBackgroundStatus, type BackgroundStatus } from "../background-sta
 import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import { MEDIA_LIMITS, MediaRejected, createMediaStore, type MediaRejectionReason, type MediaStore, type StoredMedia } from "../media/attachments.js";
-import { createTranscriber, type Transcriber, type TranscriptionBackend, type TranscriptionFailure, type WhisperCliEngine } from "../media/transcription.js";
+import { createTranscriber, type HexEngine, type Transcriber, type TranscriptionBackend, type TranscriptionFailure, type WhisperCliEngine } from "../media/transcription.js";
 import {
   TELEGRAM_FILE_ORIGIN,
   TELEGRAM_MEDIA_LIMITS,
@@ -134,6 +134,8 @@ export type TelegramMediaTranscriptionOptions = {
   readonly backend?: TranscriptionBackend;
   /** Required exactly when `backend` is `whisper-cli`. */
   readonly whisperCli?: WhisperCliEngine;
+  /** Required exactly when `backend` is `hex`. */
+  readonly hex?: HexEngine;
   /** Advanced: override the uv executable or the helper script path (offline checks). */
   readonly uvPath?: string;
   readonly helperPath?: string;
@@ -3276,8 +3278,8 @@ function validateOptions(options: TelegramOptions): void {
         throw new Error("media.transcription.maxDurationSeconds must be an integer from 1 to 3600");
       }
       if (transcription.timeoutMs !== undefined &&
-          (!Number.isInteger(transcription.timeoutMs) || transcription.timeoutMs < 1 || transcription.timeoutMs > 900_000)) {
-        throw new Error("media.transcription.timeoutMs must be an integer from 1 to 900000");
+          (!Number.isInteger(transcription.timeoutMs) || transcription.timeoutMs < 1 || transcription.timeoutMs > 3_600_000)) {
+        throw new Error("media.transcription.timeoutMs must be an integer from 1 to 3600000");
       }
       if (transcription.backend === "whisper-cli") {
         const engine = transcription.whisperCli;
@@ -3290,10 +3292,26 @@ function validateOptions(options: TelegramOptions): void {
             throw new Error(`media.transcription.whisperCli.${key} must be an absolute path`);
           }
         }
+      } else if (transcription.backend === "hex") {
+        const engine = transcription.hex;
+        if (engine === undefined) {
+          throw new Error("media.transcription.backend \"hex\" requires media.transcription.hex");
+        }
+        for (const key of ["binary", "ffmpeg", "ffprobe"] as const) {
+          const value = engine[key];
+          if (typeof value !== "string" || !value.startsWith("/")) {
+            throw new Error(`media.transcription.hex.${key} must be an absolute path`);
+          }
+        }
+        if (engine.model !== undefined && !/^[A-Za-z0-9_.-]{1,64}$/.test(engine.model)) {
+          throw new Error("media.transcription.hex.model must be a Hex model id");
+        }
       } else if (transcription.backend !== undefined && transcription.backend !== "faster-whisper") {
-        throw new Error("media.transcription.backend must be faster-whisper or whisper-cli");
-      } else if (transcription.whisperCli !== undefined) {
-        throw new Error("media.transcription.whisperCli is required exactly when backend is whisper-cli");
+        throw new Error("media.transcription.backend must be faster-whisper, whisper-cli or hex");
+      } else if (transcription.whisperCli !== undefined || transcription.hex !== undefined) {
+        throw new Error(
+          "media.transcription.whisperCli and media.transcription.hex are required exactly by their own backend",
+        );
       }
     }
   }

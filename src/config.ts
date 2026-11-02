@@ -218,6 +218,22 @@ export interface WhisperCliEngineConfig {
   readonly ffprobe: string;
 }
 
+/**
+ * Operator-installed Hex (`https://github.com/anomalyco/hex`) used only as a
+ * local speech engine through its `model transcribe` file command. Every path is
+ * explicit and absolute; nothing is discovered, downloaded or started at runtime.
+ */
+export interface HexEngineConfig {
+  /** Hex executable; its own data directory (models, settings) is left untouched. */
+  readonly binary: string;
+  /** `ffmpeg` executable, used only to decode the local input into 16 kHz mono WAV. */
+  readonly ffmpeg: string;
+  /** `ffprobe` executable, used for the early duration refusal. */
+  readonly ffprobe: string;
+  /** Hex model id (for example `parakeet_unified_en`); absent uses Hex's own selection. */
+  readonly model?: string;
+}
+
 export interface MediaTranscriptionConfig {
   /** Absent or true enables local transcription of stored audio. */
   readonly enabled?: boolean;
@@ -226,12 +242,20 @@ export interface MediaTranscriptionConfig {
   /** Audio longer than this is not transcribed; defaults to 120 seconds. */
   readonly maxDurationSeconds?: number;
   /**
-   * Explicit engine. Absent keeps the existing uv/faster-whisper helper exactly
-   * as configured today; `whisper-cli` opts in to the Python-free route.
+   * Wall-clock budget for the whole transcription, including decode and model
+   * load; defaults to 180000 ms. Raise it for long recordings.
    */
-  readonly backend?: "faster-whisper" | "whisper-cli";
+  readonly timeoutMs?: number;
+  /**
+   * Explicit engine. Absent keeps the existing uv/faster-whisper helper exactly
+   * as configured today; `whisper-cli` opts in to the Python-free route and `hex`
+   * to the operator-installed Hex engine.
+   */
+  readonly backend?: "faster-whisper" | "whisper-cli" | "hex";
   /** Required with `backend: "whisper-cli"`, rejected otherwise. */
   readonly whisperCli?: WhisperCliEngineConfig;
+  /** Required with `backend: "hex"`, rejected otherwise. */
+  readonly hex?: HexEngineConfig;
 }
 
 /**
@@ -768,21 +792,54 @@ function whisperCliEngineConfig(value: unknown): WhisperCliEngineConfig {
   return Object.freeze(parsed as unknown as WhisperCliEngineConfig);
 }
 
+/**
+ * Hex's own data directory (models and the selected model) is not configured
+ * here: the engine resolves it from the operator's home like any other Hex
+ * install, so a hand-run `hex model install` and this route see one model store.
+ */
+function hexEngineConfig(value: unknown): HexEngineConfig {
+  const raw = object(value, "media.transcription.hex");
+  const keys = ["binary", "ffmpeg", "ffprobe", "model"] as const;
+  for (const key of Object.keys(raw)) {
+    if (!(keys as readonly string[]).includes(key)) {
+      throw new Error(`Unknown media.transcription.hex field: ${key}`);
+    }
+  }
+  const parsed: Record<string, string> = {};
+  for (const key of ["binary", "ffmpeg", "ffprobe"] as const) {
+    const entry = raw[key];
+    if (typeof entry !== "string" || entry.trim() === "") {
+      throw new Error(`media.transcription.hex.${key} must be a non-empty path`);
+    }
+    if (!isAbsolute(entry)) {
+      throw new Error(`media.transcription.hex.${key} must be an absolute path`);
+    }
+    parsed[key] = entry;
+  }
+  if (raw.model !== undefined) {
+    if (typeof raw.model !== "string" || !/^[A-Za-z0-9_.-]{1,64}$/.test(raw.model)) {
+      throw new Error("media.transcription.hex.model must be a Hex model id");
+    }
+    parsed.model = raw.model;
+  }
+  return Object.freeze(parsed as unknown as HexEngineConfig);
+}
+
 function mediaTranscriptionConfig(value: unknown): MediaTranscriptionConfig {
   const raw = object(value, "media.transcription");
   for (const key of Object.keys(raw)) {
     if (key !== "enabled" && key !== "language" && key !== "maxDurationSeconds" &&
-        key !== "backend" && key !== "whisperCli") {
+        key !== "timeoutMs" && key !== "backend" && key !== "whisperCli" && key !== "hex") {
       throw new Error(`Unknown media.transcription field: ${key}`);
     }
   }
   if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") {
     throw new Error("media.transcription.enabled must be a boolean");
   }
-  let backend: "faster-whisper" | "whisper-cli" | undefined;
+  let backend: "faster-whisper" | "whisper-cli" | "hex" | undefined;
   if (raw.backend !== undefined) {
-    if (raw.backend !== "faster-whisper" && raw.backend !== "whisper-cli") {
-      throw new Error("media.transcription.backend must be faster-whisper or whisper-cli");
+    if (raw.backend !== "faster-whisper" && raw.backend !== "whisper-cli" && raw.backend !== "hex") {
+      throw new Error("media.transcription.backend must be faster-whisper, whisper-cli or hex");
     }
     backend = raw.backend;
   }
@@ -791,6 +848,10 @@ function mediaTranscriptionConfig(value: unknown): MediaTranscriptionConfig {
     throw new Error(
       "media.transcription.whisperCli is required exactly when backend is whisper-cli",
     );
+  }
+  const hex = raw.hex === undefined ? undefined : hexEngineConfig(raw.hex);
+  if ((backend === "hex") !== (hex !== undefined)) {
+    throw new Error("media.transcription.hex is required exactly when backend is hex");
   }
   let language: string | undefined;
   if (raw.language !== undefined) {
@@ -807,12 +868,22 @@ function mediaTranscriptionConfig(value: unknown): MediaTranscriptionConfig {
     }
     maxDurationSeconds = raw.maxDurationSeconds;
   }
+  let timeoutMs: number | undefined;
+  if (raw.timeoutMs !== undefined) {
+    if (typeof raw.timeoutMs !== "number" || !Number.isInteger(raw.timeoutMs) ||
+        raw.timeoutMs < 1 || raw.timeoutMs > 3_600_000) {
+      throw new Error("media.transcription.timeoutMs must be an integer from 1 to 3600000");
+    }
+    timeoutMs = raw.timeoutMs;
+  }
   return Object.freeze({
     ...(raw.enabled === undefined ? {} : { enabled: raw.enabled }),
     ...(backend === undefined ? {} : { backend }),
     ...(whisperCli === undefined ? {} : { whisperCli }),
+    ...(hex === undefined ? {} : { hex }),
     ...(language === undefined ? {} : { language }),
     ...(maxDurationSeconds === undefined ? {} : { maxDurationSeconds }),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
   });
 }
 

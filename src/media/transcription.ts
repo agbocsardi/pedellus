@@ -47,13 +47,11 @@ export type TranscriptionOutcome =
  * Explicit engine selection. Absent means the legacy uv/faster-whisper helper, so
  * an existing config keeps exactly the behavior it had.
  */
-export type TranscriptionBackend = "faster-whisper" | "whisper-cli";
+export type TranscriptionBackend = "faster-whisper" | "whisper-cli" | "hex";
 
 /**
- * Operator-provisioned whisper.cpp route. Every path is absolute and explicit:
- * nothing is discovered, downloaded or built at runtime, and the engine directory
- * must resolve its own shared libraries (the upstream prebuilt tarball uses an
- * `$ORIGIN` rpath; `LD_LIBRARY_PATH` is deliberately not inherited).
+ * The upstream whisper.cpp CLI. It owns its model and VAD files, so this route
+ * has no cache or hub configuration at all.
  */
 export interface WhisperCliEngine {
   /** `whisper-cli` executable. */
@@ -68,6 +66,23 @@ export interface WhisperCliEngine {
   readonly ffprobe: string;
 }
 
+/**
+ * An operator-installed Hex, driven only through its `model transcribe` file
+ * command. Hex is not a service for this route: no local API, no installed
+ * desktop app and no running listener are required, and its model store is the
+ * operator's own (`hex model install`).
+ */
+export interface HexEngine {
+  /** Hex executable. */
+  readonly binary: string;
+  /** Hex model id; absent lets Hex use its own selected model. */
+  readonly model?: string;
+  /** `ffmpeg` executable used only to decode the local input into 16 kHz mono WAV. */
+  readonly ffmpeg: string;
+  /** `ffprobe` executable used for the early duration refusal. */
+  readonly ffprobe: string;
+}
+
 export interface TranscriberOptions {
   /** Null disables local transcription; the stored audio is still available. */
   readonly enabled?: boolean;
@@ -75,6 +90,8 @@ export interface TranscriberOptions {
   readonly backend?: TranscriptionBackend;
   /** Required when `backend` is `whisper-cli`; rejected otherwise. */
   readonly whisperCli?: WhisperCliEngine;
+  /** Required when `backend` is `hex`; rejected otherwise. */
+  readonly hex?: HexEngine;
   /** uv executable; must be resolved from PATH, never a shell string. */
   readonly uvPath?: string;
   /** Absolute path of the shipped helper; defaults to this checkout's `scripts/`. */
@@ -153,6 +170,22 @@ function legacyEnvironment(): NodeJS.ProcessEnv {
 
 function engineEnvironment(): NodeJS.ProcessEnv {
   return childEnvironment(SHARED_ENV_KEYS);
+}
+
+/**
+ * Hex resolves its own data directory (models, settings) from the operator's home,
+ * exactly as a hand-run `hex model install` does, so that home is the only extra
+ * key this route needs. Hex asks for no credentials and none are inherited.
+ */
+const HEX_ENV_KEYS = [
+  ...SHARED_ENV_KEYS,
+  "HOME",
+  "USERPROFILE",
+  "XDG_DATA_HOME",
+] as const;
+
+function hexEnvironment(): NodeJS.ProcessEnv {
+  return childEnvironment(HEX_ENV_KEYS);
 }
 
 type ChildResult =
@@ -397,7 +430,6 @@ function createWhisperCliTranscriber(options: TranscriberOptions): Transcriber {
   const maxOutputBytes = clampOutputBytes(options.maxOutputBytes);
   const maxDurationSeconds = options.maxDurationSeconds ?? TRANSCRIPTION_LIMITS.maxDurationSeconds;
   const language = options.language;
-  const pcmLimit = decodedPcmLimitBytes(maxDurationSeconds);
 
   return {
     enabled,
@@ -418,80 +450,22 @@ function createWhisperCliTranscriber(options: TranscriberOptions): Transcriber {
       if (inputBytes > TRANSCRIPTION_LIMITS.maxInputBytes) return { ok: false, reason: "too-large" } as const;
 
       const deadline = Date.now() + timeoutMs;
-      let workdir: string;
-      try {
-        workdir = await mkdtemp(join(tmpdir(), "nanobot-transcribe-"));
-      } catch {
-        return { ok: false, reason: "failed" } as const;
-      }
+      const workdir = await workDirectory();
+      if (workdir === undefined) return { ok: false, reason: "failed" } as const;
 
       try {
-        const probe = await runChild({
-          command: engine.ffprobe,
-          args: [
-            "-v", "error",
-            "-protocol_whitelist", "file",
-            "-show_entries", "format=duration",
-            "-of", "default=nw=1:nk=1",
-            audioPath,
-          ],
+        const decoded = await decodeLocalAudio({
+          audioPath,
+          ffmpeg: engine.ffmpeg,
+          ffprobe: engine.ffprobe,
           env: engineEnvironment(),
           deadline,
-          maxStdoutBytes: PROBE_STDOUT_BYTES,
+          maxDurationSeconds,
+          workdir,
           ...(request.signal === undefined ? {} : { signal: request.signal }),
         });
-        const probeFailure = failureForChild(probe);
-        if (probeFailure !== undefined) return probeFailure;
-        if (probe.kind === "exit" && probe.code !== 0) return { ok: false, reason: "failed" } as const;
-
-        // Early, precise refusal when the container reports a duration; the decoder
-        // size fence below is the binding limit when metadata is absent or wrong.
-        if (probe.kind === "exit") {
-          const reported = Number.parseFloat(probe.stdout.toString("utf8").trim());
-          if (Number.isFinite(reported) && reported > maxDurationSeconds) {
-            return { ok: false, reason: "too-large" } as const;
-          }
-        }
-
-        const decodedPath = join(workdir, "audio.wav");
-        const decode = await runChild({
-          command: engine.ffmpeg,
-          args: [
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel", "error",
-            // Local file only: no concat, http, tcp or other demuxer protocols.
-            "-protocol_whitelist", "file",
-            "-i", audioPath,
-            "-vn",
-            "-map", "0:a:0",
-            "-ac", "1",
-            "-ar", "16000",
-            "-c:a", "pcm_s16le",
-            "-f", "wav",
-            // Stop writing past the bound instead of filling the disk. Reaching it
-            // is reported as too-large below, never accepted as a short transcript.
-            "-fs", String(pcmLimit),
-            "-y",
-            decodedPath,
-          ],
-          env: engineEnvironment(),
-          deadline,
-          maxStdoutBytes: PROBE_STDOUT_BYTES,
-          ...(request.signal === undefined ? {} : { signal: request.signal }),
-        });
-        const decodeFailure = failureForChild(decode);
-        if (decodeFailure !== undefined) return decodeFailure;
-        if (decode.kind === "exit" && decode.code !== 0) return { ok: false, reason: "failed" } as const;
-
-        let decodedBytes: number;
-        try {
-          decodedBytes = (await stat(decodedPath)).size;
-        } catch {
-          return { ok: false, reason: "failed" } as const;
-        }
-        if (decodedBytes === 0) return { ok: false, reason: "failed" } as const;
-        if (decodedBytes >= pcmLimit) return { ok: false, reason: "too-large" } as const;
+        if (!decoded.ok) return decoded;
+        const decodedPath = decoded.wavPath;
 
         const engineResult = await runChild({
           command: engine.binary,
@@ -530,6 +504,189 @@ function createWhisperCliTranscriber(options: TranscriberOptions): Transcriber {
   };
 }
 
+/**
+ * Operator-installed Hex as a file-transcription engine: probe, decode, then
+ * `hex model transcribe <wav>`. Hex runs in this process, needs no listener and
+ * never downloads; its model store is whatever `hex model install` provisioned.
+ *
+ * Hex reports every failure as exit 1 (unknown or missing model, undecodable
+ * audio), so this route distinguishes only a binary it could not start at all
+ * (`unavailable`) from a transcription that failed (`failed`); the stored audio
+ * stays available either way and no failure claims the speech was understood.
+ */
+function createHexTranscriber(options: TranscriberOptions): Transcriber {
+  const enabled = options.enabled !== false;
+  const engine = options.hex;
+  if (engine === undefined) throw new Error("media.transcription.hex is required for the hex backend");
+  const timeoutMs = options.timeoutMs ?? TRANSCRIPTION_LIMITS.timeoutMs;
+  const maxOutputBytes = clampOutputBytes(options.maxOutputBytes);
+  const maxDurationSeconds = options.maxDurationSeconds ?? TRANSCRIPTION_LIMITS.maxDurationSeconds;
+  const language = options.language;
+
+  return {
+    enabled,
+    maxDurationSeconds,
+    async transcribe(audioPath: string, request: { readonly signal?: AbortSignal } = {}) {
+      if (!enabled) return { ok: false, reason: "unavailable" } as const;
+      // A caller-supplied bound is a refusal, never a truncation.
+      positiveNumber(timeoutMs, TRANSCRIPTION_LIMITS.timeoutMs, "transcription timeout");
+      positiveNumber(maxDurationSeconds, TRANSCRIPTION_LIMITS.maxDurationSeconds, "transcription duration limit");
+
+      let inputBytes: number;
+      try {
+        inputBytes = (await stat(audioPath)).size;
+      } catch {
+        return { ok: false, reason: "failed" } as const;
+      }
+      if (inputBytes === 0) return { ok: false, reason: "failed" } as const;
+      if (inputBytes > TRANSCRIPTION_LIMITS.maxInputBytes) return { ok: false, reason: "too-large" } as const;
+
+      const deadline = Date.now() + timeoutMs;
+      const workdir = await workDirectory();
+      if (workdir === undefined) return { ok: false, reason: "failed" } as const;
+
+      try {
+        const decoded = await decodeLocalAudio({
+          audioPath,
+          ffmpeg: engine.ffmpeg,
+          ffprobe: engine.ffprobe,
+          env: hexEnvironment(),
+          deadline,
+          maxDurationSeconds,
+          workdir,
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
+        });
+        if (!decoded.ok) return decoded;
+
+        const engineResult = await runChild({
+          command: engine.binary,
+          args: [
+            "model", "transcribe",
+            ...(engine.model === undefined ? [] : ["--model", engine.model]),
+            ...(language === undefined ? [] : ["--language", language]),
+            decoded.wavPath,
+          ],
+          env: hexEnvironment(),
+          deadline,
+          maxStdoutBytes: maxOutputBytes,
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
+        });
+        const engineFailure = failureForChild(engineResult);
+        if (engineFailure !== undefined) return engineFailure;
+        if (engineResult.kind !== "exit") return { ok: false, reason: "failed" } as const;
+        if (engineResult.code !== 0) return { ok: false, reason: "failed" } as const;
+        const text = engineResult.stdout.toString("utf8").trim();
+        if (text === "") return { ok: false, reason: "empty" } as const;
+        return { ok: true, text: text.slice(0, maxOutputBytes) } as const;
+      } finally {
+        // Every path, including abort, timeout and partial failure, removes the WAV.
+        await rm(workdir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    },
+  };
+}
+
+type DecodedAudio =
+  | { readonly ok: false; readonly reason: TranscriptionFailure }
+  | { readonly ok: true; readonly wavPath: string };
+
+/**
+ * Probe, then decode one local file into 16 kHz mono WAV inside `workdir`. Both
+ * children share the caller's single deadline, block network protocols, and can
+ * output only a pinned number to stdout. Decoding also writes at most the PCM
+ * fence, so wrong duration metadata cannot smuggle an over-long file through.
+ */
+async function decodeLocalAudio(options: {
+  readonly audioPath: string;
+  readonly ffmpeg: string;
+  readonly ffprobe: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly deadline: number;
+  readonly maxDurationSeconds: number;
+  readonly workdir: string;
+  readonly signal?: AbortSignal;
+}): Promise<DecodedAudio> {
+  const signalOption = options.signal === undefined ? {} : { signal: options.signal };
+  const pcmLimit = decodedPcmLimitBytes(options.maxDurationSeconds);
+
+  const probe = await runChild({
+    command: options.ffprobe,
+    args: [
+      "-v", "error",
+      "-protocol_whitelist", "file",
+      "-show_entries", "format=duration",
+      "-of", "default=nw=1:nk=1",
+      options.audioPath,
+    ],
+    env: options.env,
+    deadline: options.deadline,
+    maxStdoutBytes: PROBE_STDOUT_BYTES,
+    ...signalOption,
+  });
+  const probeFailure = failureForChild(probe);
+  if (probeFailure !== undefined) return probeFailure;
+  if (probe.kind === "exit" && probe.code !== 0) return { ok: false, reason: "failed" } as const;
+
+  // Early, precise refusal when the container reports a duration; the decoder size
+  // fence below is the binding limit when metadata is absent or wrong.
+  if (probe.kind === "exit") {
+    const reported = Number.parseFloat(probe.stdout.toString("utf8").trim());
+    if (Number.isFinite(reported) && reported > options.maxDurationSeconds) {
+      return { ok: false, reason: "too-large" } as const;
+    }
+  }
+
+  const decodedPath = join(options.workdir, "audio.wav");
+  const decode = await runChild({
+    command: options.ffmpeg,
+    args: [
+      "-nostdin",
+      "-hide_banner",
+      "-loglevel", "error",
+      // Local file only: no concat, http, tcp or other demuxer protocols.
+      "-protocol_whitelist", "file",
+      "-i", options.audioPath,
+      "-vn",
+      "-map", "0:a:0",
+      "-ac", "1",
+      "-ar", "16000",
+      "-c:a", "pcm_s16le",
+      "-f", "wav",
+      // Stop writing past the bound instead of filling the disk. Reaching it
+      // is reported as too-large below, never accepted as a short transcript.
+      "-fs", String(pcmLimit),
+      "-y",
+      decodedPath,
+    ],
+    env: options.env,
+    deadline: options.deadline,
+    maxStdoutBytes: PROBE_STDOUT_BYTES,
+    ...signalOption,
+  });
+  const decodeFailure = failureForChild(decode);
+  if (decodeFailure !== undefined) return decodeFailure;
+  if (decode.kind === "exit" && decode.code !== 0) return { ok: false, reason: "failed" } as const;
+
+  let decodedBytes: number;
+  try {
+    decodedBytes = (await stat(decodedPath)).size;
+  } catch {
+    return { ok: false, reason: "failed" } as const;
+  }
+  if (decodedBytes === 0) return { ok: false, reason: "failed" } as const;
+  if (decodedBytes >= pcmLimit) return { ok: false, reason: "too-large" } as const;
+  return { ok: true, wavPath: decodedPath };
+}
+
+/** Mirrors the bounded work directory every CLI route creates, then removes. */
+async function workDirectory(): Promise<string | undefined> {
+  try {
+    return await mkdtemp(join(tmpdir(), "nanobot-transcribe-"));
+  } catch {
+    return undefined;
+  }
+}
+
 function validateEngine(engine: WhisperCliEngine): void {
   for (const key of ["binary", "model", "vadModel", "ffmpeg", "ffprobe"] as const) {
     const value = engine[key];
@@ -542,16 +699,47 @@ function validateEngine(engine: WhisperCliEngine): void {
   }
 }
 
+function validateHexEngine(engine: HexEngine): void {
+  for (const key of ["binary", "ffmpeg", "ffprobe"] as const) {
+    const value = engine[key];
+    if (typeof value !== "string" || value.trim() === "") {
+      throw new Error(`media.transcription.hex.${key} is required`);
+    }
+    if (!isAbsolute(value)) {
+      throw new Error(`media.transcription.hex.${key} must be an absolute path`);
+    }
+  }
+  if (engine.model !== undefined && !/^[A-Za-z0-9_.-]{1,64}$/.test(engine.model)) {
+    throw new Error("media.transcription.hex.model must be a Hex model id");
+  }
+}
+
 export function createTranscriber(options: TranscriberOptions = {}): Transcriber {
   const backend: TranscriptionBackend = options.backend ?? "faster-whisper";
   if (backend === "faster-whisper") {
     if (options.whisperCli !== undefined) {
       throw new Error("media.transcription.whisperCli requires backend \"whisper-cli\"");
     }
+    if (options.hex !== undefined) {
+      throw new Error("media.transcription.hex requires backend \"hex\"");
+    }
     return createFasterWhisperTranscriber(options);
+  }
+  if (backend === "hex") {
+    if (options.whisperCli !== undefined) {
+      throw new Error("media.transcription.whisperCli requires backend \"whisper-cli\"");
+    }
+    if (options.hex === undefined) {
+      throw new Error("media.transcription.backend \"hex\" requires media.transcription.hex");
+    }
+    validateHexEngine(options.hex);
+    return createHexTranscriber(options);
   }
   if (backend !== "whisper-cli") {
     throw new Error(`unknown media.transcription.backend: ${String(backend)}`);
+  }
+  if (options.hex !== undefined) {
+    throw new Error("media.transcription.hex requires backend \"hex\"");
   }
   if (options.whisperCli === undefined) {
     throw new Error("media.transcription.backend \"whisper-cli\" requires media.transcription.whisperCli");
