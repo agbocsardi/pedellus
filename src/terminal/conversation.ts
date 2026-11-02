@@ -12,6 +12,7 @@ import type {
 } from "@earendil-works/pi-durable";
 import type { AssistantMessage, ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
 import type { FollowUpMode } from "../config.js";
+import { originOccurrencePending } from "../automation/cron.js";
 import type { BackgroundStatus } from "../background-status.js";
 
 /** Plain typed input, or the text/image parts of a stored attachment submission. */
@@ -402,9 +403,11 @@ function projectSettlement(settled: SettledSubmissionRecord): TerminalSettlement
  * scheduled submissions, which keep the native default. A run this surface did not
  * start (a scheduled origin turn, a digest or a worker result) always takes the
  * follow-up queueing instead: joining it would let two delivery paths carry the same
- * answer. Native `submit` has no conditional steering, so that state is read
- * immediately before admission, and a reattached terminal conservatively queues
- * until it has admitted an input of its own.
+ * answer. So does an idle conversation (a follow-up is placed identically) and one
+ * with a live origin-mode cron occurrence (a queued occurrence must never be placed
+ * into the same boundary as an owner steer). Native `submit` has no conditional
+ * steering, so that state is read immediately before admission, and a reattached
+ * terminal conservatively queues until it has admitted an input of its own.
  */
 export function inProcessTerminalConversation(
   conversation: Conversation,
@@ -412,12 +415,13 @@ export function inProcessTerminalConversation(
 ): TerminalConversation {
   /** Native submissions this surface admitted, oldest first. */
   const admitted: number[] = [];
-  /** Whether the conversation's current run was started by one of this surface's own inputs. */
+  /** Whether the conversation's current run may take a steer from this surface. */
   const ownerRun = async (context: Context): Promise<boolean> =>
     conversation.commit(async (tx) => {
       const live = await tx.doc(LiveDoc, conversation.id);
       const inputs = live.run?.inputs;
-      if (inputs === undefined || inputs.length === 0) return true;
+      if (inputs === undefined || inputs.length === 0) return false;
+      if (await originOccurrencePending(tx, conversation.id)) return false;
       let first = inputs[0];
       for (const id of inputs) if (first === undefined || id < first) first = id;
       return first !== undefined && admitted.includes(first);

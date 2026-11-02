@@ -322,11 +322,11 @@ export interface PortConfig {
    */
   visionHandoff?: VisionHandoffConfig;
   /**
-   * How an owner message is placed when its CLI or Telegram conversation is busy. `parseConfig`
-   * always resolves it; the default `followUp` keeps the historical queueing and `steer` joins the
-   * current run after its tool round instead.
+   * How an owner message is placed when its CLI or Telegram conversation is busy. Optional so a host
+   * that builds `PortConfig` by hand stays source-compatible; `parseConfig` always normalizes it to
+   * the default `followUp` (historical queueing), and `steer` joins the current run after its tool round.
    */
-  followUpMode: FollowUpMode;
+  followUpMode?: FollowUpMode;
   /** Host-owned global ceiling; conversations may only narrow it. Empty means tools are disabled. */
   toolAllowlist?: readonly string[];
   /**

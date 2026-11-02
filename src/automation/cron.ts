@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { copyJson, type Context, type Draft, type JsonValue } from "@earendil-works/chord";
-import { LiveDoc, ResetEntry, defineDoc, defineExtension, defineTask } from "@earendil-works/pi-durable";
+import { ConversationBusy, InboxDoc, LiveDoc, ResetEntry, defineDoc, defineExtension, defineTask } from "@earendil-works/pi-durable";
 import type {
   ConversationHandle,
   ConversationId,
@@ -65,6 +65,13 @@ const ONE_OFF_QUEUE_MALFORMED = "one-off run queue is malformed; this occurrence
  * then simply queues behind it.
  */
 const CRON_TARGET_ABORT_MS = 5_000;
+/**
+ * How long an origin-mode occurrence waits before re-checking that its chat may take its input. An
+ * occurrence never waits in the chat's native inbox beside an owner steer: a final boundary would place
+ * the steer and the occurrence into the next run together, and the scheduled outbox and the chat would
+ * then deliver that one committed answer twice. It sleeps here and admits atomically instead.
+ */
+const CRON_ORIGIN_IDLE_RETRY_MS = 500;
 
 /** Host-authenticated identity captured when the job is created. */
 export interface CronOwner {
@@ -168,6 +175,24 @@ export const CronJobsDoc = defineDoc<CronJobsDocument>({
   history: "latest", fork: "initial", initial: () => ({ jobs: [] }),
   checkpointWhen: () => true,
 });
+
+/**
+ * Whether this origin conversation has a live origin-mode occurrence that could still answer a turn in
+ * it: the job's execution task is not terminal, so it is admitted and waiting for an idle chat, or it is
+ * currently running here. A `background` occurrence answers in its own task-owned conversation and a
+ * digest occurrence submits no input at all, so neither blocks an owner message from steering. This is a
+ * read-only predicate over durable records; it materializes no document.
+ */
+export async function originOccurrencePending(tx: Tx, conversationId: ConversationId): Promise<boolean> {
+  const doc = await tx.doc(CronJobsDoc, conversationId);
+  for (const job of doc.jobs) {
+    if (job.cancelledAtMs !== null || job.mode === "background" || job.intent === "digest") continue;
+    if (job.executionTaskId === null) continue;
+    const record = await tx.task(job.executionTaskId as TaskId);
+    if (record !== undefined && record.state.status !== "terminal") return true;
+  }
+  return false;
+}
 
 /** Immutable input of both finite task kinds. */
 export interface CronOccurrenceInput {
@@ -387,6 +412,13 @@ export interface CronFoundationOptions {
   readonly reset?: CronReset;
   /** The Harness clock (`HarnessOptions.now`); default `Date.now`. */
   readonly now?: () => number;
+  /**
+   * Whether owner messages are submitted with native steering. Only then can an owner steer and a queued
+   * origin occurrence be placed into the same run at one final boundary, so only then does an origin
+   * occurrence wait for a completely idle chat instead of queueing in it. Default `false` keeps the
+   * historical queueing for hosts that never steer.
+   */
+  readonly ownerSteering?: boolean;
 }
 
 /** One `digest` occurrence, handed to the host without any model or channel work here. */
@@ -585,6 +617,29 @@ function outcomeOf(record: SubmissionRecord): WaitSettlement {
     return { status: "error", error: `${record.reason}${detail}`, answerEntryId: null };
   }
   return { status: "error", error: "submission settled without an answer", answerEntryId: null };
+}
+
+/**
+ * Whether an origin-mode occurrence may admit now. A live run means the occurrence would have to queue, so
+ * it waits. A queued steer is the one remaining way an occurrence could share a final boundary, because
+ * that boundary places one steer and one follow-up into the same next run; while an origin occurrence is
+ * live an owner surface never admits a new steer, and the occurrence waits for a pre-existing one to drain.
+ * Leftover queued follow-ups do not block it: only one follow-up is placed per boundary, so they can never
+ * share a run with it.
+ */
+async function chatIdleForOccurrence(
+  runtime: TaskRuntime<CronOccurrenceInput, CronRunCheckpoint, CronRunResult, object>,
+  conversationId: ConversationId,
+  context: Context,
+): Promise<boolean> {
+  let ready = false;
+  await runtime.commit(async (tx) => {
+    const live = await tx.doc(LiveDoc, conversationId);
+    const inbox = await tx.doc(InboxDoc, conversationId);
+    ready = live.run === undefined && !inbox.items.some((item) => item.mode === "steer");
+    return undefined;
+  }, context);
+  return ready;
 }
 
 /**
@@ -838,6 +893,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
   const digest = options.digest;
   const reset = options.reset;
   const clock = options.now ?? (() => Date.now());
+  const originWaitsForIdle = options.ownerSteering === true;
 
   /**
    * Finish one already-prepared target inside the commit that ends its run. The target is the run
@@ -1141,6 +1197,12 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           }
           try {
             const requestId = occurrenceKey(input.jobId, input.scheduledAtMs);
+            // When the host steers owner messages, an origin occurrence must never wait in the chat's
+            // native inbox: one final boundary would place a queued occurrence into the next run together
+            // with a queued owner steer, and the scheduled outbox and the chat would then deliver that one
+            // committed answer twice. It waits for a completely idle chat and admits atomically instead,
+            // retrying from this checkpoint. A host that never steers keeps the historical queueing.
+            const origin = targetConversationId === running.conversationId && originWaitsForIdle;
             let settled: unknown;
             let boundaryPlaced = false;
             await runtime.commit(async (tx) => {
@@ -1153,6 +1215,10 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
               boundaryPlaced = newest.items[0]?.kind === ResetEntry.kind;
               return undefined;
             }, context);
+            if (origin && settled === undefined && !(await chatIdleForOccurrence(runtime, targetConversationId, context))) {
+              await runtime.sleepUntil(runtime.now() + CRON_ORIGIN_IDLE_RETRY_MS, running.state.checkpoint, context);
+              return;
+            }
             // Each run is a new episode: a native reset boundary keeps every earlier entry stored
             // and searchable while this run's model context starts empty. It is the same native
             // reset `/new` places, admitted before this run's own input, so an ordered inbox keeps
@@ -1174,10 +1240,17 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
                   requestId,
                 },
               },
+              // Atomic re-check: an input that arrived after the idle read makes this throw instead of
+              // queueing, so the occurrence sleeps and retries rather than joining that turn.
+              ...(origin ? { whenBusy: "reject" as const } : {}),
             }, context);
             settlement = await waitForAnswer(submission, conversation, context);
           } catch (error) {
             if (runtime.signal.aborted) return;
+            if (originWaitsForIdle && targetConversationId === running.conversationId && error instanceof ConversationBusy) {
+              await runtime.sleepUntil(runtime.now() + CRON_ORIGIN_IDLE_RETRY_MS, running.state.checkpoint, context);
+              return;
+            }
             settlement = { status: "error", error: errorText(error), answerEntryId: null };
           }
           if (runtime.signal.aborted) return;

@@ -898,3 +898,208 @@ test('a [SILENT] scheduled occurrence stays silent while the queued owner messag
     assert.equal(records.length, 0, 'a silent occurrence queues no scheduled delivery');
   });
 });
+
+/** The chat's first cron job, as the durable job document records it. */
+async function firstJob(store, origin) {
+  const chat = await store.gateway.conversationFor(origin, context);
+  const jobs = await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context);
+  return jobs.jobs[0];
+}
+
+/**
+ * The reviewer's mixed-boundary reproduction: an owner turn is held in its final generation after a tool
+ * round while an origin-mode occurrence fires and an owner message arrives. Both arrival orders must keep
+ * the scheduled occurrence out of the chat's native inbox, so the final boundary can only ever place
+ * owner inputs and the scheduled answer travels through its own outbox once.
+ */
+async function withMixedBoundary(label, options, check) {
+  const store = await syntheticStore(label, { followUpMode: 'steer', cron: true, tools: ['read'] });
+  const origin = `telegram:${BOT_ID}:chat:${CHAT_ID}`;
+  const ownerBatch = deferred();
+  const finalEntered = deferred();
+  let releaseFinal;
+  const finalHeld = new Promise((resolve) => { releaseFinal = resolve; });
+  const requests = [];
+  let scheduled = false;
+  let toolIssued = false;
+  const dispatcher = (transcript) => {
+    store.faux.appendResponses([dispatcher]);
+    const texts = userTexts(transcript.messages);
+    const input = texts.at(-1) ?? '';
+    requests.push(input);
+    // A mixed run places both owner messages at one boundary, so its two newest transcript messages are
+    // both user messages. That must never happen: answer it visibly so an assertion catches it.
+    const tail = transcript.messages.slice(-2);
+    if (tail.length === 2 && tail.every((message) => message.role === 'user')) {
+      return fauxAssistantMessage('MIXED-ANSWER');
+    }
+    if (input.startsWith('schedule the reminder') && !scheduled) {
+      scheduled = true;
+      return fauxAssistantMessage([
+        fauxToolCall('cron', {
+          action: 'add',
+          message: 'ORIGIN-PROMPT',
+          name: 'origin reminder',
+          isolated: false,
+          at: new Date(Date.now() + options.scheduleInMs).toISOString(),
+        }, { id: 'origin-cron-add' }),
+      ], { stopReason: 'toolUse' });
+    }
+    if (input.startsWith('ORIGIN-PROMPT')) return fauxAssistantMessage('CRON-ANSWER');
+    if (input.startsWith('owner A') && !toolIssued) {
+      toolIssued = true;
+      return fauxAssistantMessage(fauxToolCall('read', { path: 'note.md' }, { id: 'read-A' }), { stopReason: 'toolUse' });
+    }
+    if (input.startsWith('owner A')) {
+      finalEntered.resolve();
+      return finalHeld.then(() => fauxAssistantMessage('A-FINAL'));
+    }
+    if (input.startsWith('owner B')) return fauxAssistantMessage('B-FINAL');
+    return fauxAssistantMessage('Synthetic reply.');
+  };
+  store.faux.setResponses([dispatcher]);
+  const transport = telegramMock([
+    [textUpdate(300, 'schedule the reminder')],
+    [textUpdate(301, 'owner A')],
+    async () => {
+      await ownerBatch.promise;
+      return [textUpdate(302, 'owner B')];
+    },
+  ]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await finalEntered.promise;
+    await options.arrange({ store, origin, ownerBatch });
+    const before = await chatInbox(store.gateway);
+    releaseFinal();
+    await until(() => transport.rich.some((entry) => entry.text.includes('CRON-ANSWER')), 'the scheduled answer');
+    await until(() => transport.rich.some((entry) => entry.text.includes('B-FINAL')), 'the owner B answer');
+    await until(async () => (await telegramState(store.gateway)).pending.length === 0, 'every reply delivery to settle');
+    await until(async () => (await store.gateway.cronOutbox.list(origin, context))
+      .some((record) => record.status === 'delivered'), 'the scheduled delivery');
+    await check({ store, transport, origin, requests, before });
+  } finally {
+    releaseFinal?.();
+    ownerBatch.resolve();
+    await cleanup(store, harness);
+    transport.restore();
+  }
+}
+
+test('an origin occurrence arriving during a held owner turn never queues into its boundary', { timeout: 60_000 }, async () => {
+  await withMixedBoundary('mixed-cron-first', {
+    scheduleInMs: 1_500,
+    arrange: async ({ store, origin, ownerBatch }) => {
+      // The occurrence is admitted by its timer while the owner turn is held; it must wait for an idle
+      // chat instead of becoming a queued follow-up.
+      await until(async () => (await firstJob(store, origin))?.executionTaskId !== null, 'the occurrence to be admitted');
+      const queued = await chatInbox(store.gateway);
+      assert.equal(queued.followUp, 0, 'the occurrence never waits in the chat inbox');
+      assert.equal(queued.steer, 0);
+      // The owner message arrives second and queues because the occurrence is pending.
+      ownerBatch.resolve();
+      await until(async () => (await chatInbox(store.gateway)).followUp === 1, 'the owner message to queue');
+    },
+  }, async ({ store, transport, origin, before }) => {
+    // The owner message admitted while the occurrence is pending queues instead of steering.
+    assert.equal(before.followUp, 1);
+    assert.equal(before.steer, 0);
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('MIXED-ANSWER')).length, 0);
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('A-FINAL')).length, 1);
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('B-FINAL')).length, 1);
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('CRON-ANSWER')).length, 1);
+    const records = await store.gateway.cronOutbox.list(origin, context);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].text, 'CRON-ANSWER');
+  });
+});
+
+test('an owner steer queued before an origin occurrence still never shares its boundary', { timeout: 60_000 }, async () => {
+  await withMixedBoundary('mixed-steer-first', {
+    scheduleInMs: 2_500,
+    arrange: async ({ store, origin, ownerBatch }) => {
+      // The owner steer is admitted first, then the occurrence fires behind the same held turn.
+      ownerBatch.resolve();
+      await until(async () => (await chatInbox(store.gateway)).steer === 1, 'the owner steer to queue');
+      await until(async () => (await firstJob(store, origin))?.executionTaskId !== null, 'the occurrence to be admitted');
+      const queued = await chatInbox(store.gateway);
+      assert.equal(queued.followUp, 0, 'the occurrence never waits in the chat inbox');
+    },
+  }, async ({ transport, before }) => {
+    assert.equal(before.steer, 1);
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('MIXED-ANSWER')).length, 0);
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('A-FINAL')).length, 1);
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('B-FINAL')).length, 1);
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('CRON-ANSWER')).length, 1);
+  });
+});
+
+test('an isolated occurrence in the same origin chat never disables owner steering', { timeout: 60_000 }, async () => {
+  const store = await syntheticStore('isolated-unaffected', { followUpMode: 'steer', cron: true, tools: ['read'] });
+  const origin = `telegram:${BOT_ID}:chat:${CHAT_ID}`;
+  const ownerBatch = deferred();
+  const finalEntered = deferred();
+  let releaseFinal;
+  const finalHeld = new Promise((resolve) => { releaseFinal = resolve; });
+  let scheduled = false;
+  let toolIssued = false;
+  const dispatcher = (transcript) => {
+    store.faux.appendResponses([dispatcher]);
+    const input = userTexts(transcript.messages).at(-1) ?? '';
+    if (input.startsWith('schedule the reminder') && !scheduled) {
+      scheduled = true;
+      return fauxAssistantMessage([
+        fauxToolCall('cron', {
+          action: 'add',
+          message: 'ISOLATED-PROMPT',
+          name: 'isolated reminder',
+          isolated: true,
+          at: new Date(Date.now() + 1_500).toISOString(),
+        }, { id: 'isolated-cron-add' }),
+      ], { stopReason: 'toolUse' });
+    }
+    if (input.startsWith('ISOLATED-PROMPT')) return fauxAssistantMessage('ISOLATED-ANSWER');
+    if (input.startsWith('owner A') && !toolIssued) {
+      toolIssued = true;
+      return fauxAssistantMessage(fauxToolCall('read', { path: 'note.md' }, { id: 'read-A' }), { stopReason: 'toolUse' });
+    }
+    if (input.startsWith('owner A')) {
+      finalEntered.resolve();
+      return finalHeld.then(() => fauxAssistantMessage('A-FINAL'));
+    }
+    if (input.startsWith('owner B')) return fauxAssistantMessage('B-FINAL');
+    return fauxAssistantMessage('Synthetic reply.');
+  };
+  store.faux.setResponses([dispatcher]);
+  const transport = telegramMock([
+    [textUpdate(310, 'schedule the reminder')],
+    [textUpdate(311, 'owner A')],
+    async () => {
+      await ownerBatch.promise;
+      return [textUpdate(312, 'owner B')];
+    },
+  ]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await finalEntered.promise;
+    // A background occurrence runs in its own task-owned conversation, so it must not block steering here.
+    await until(async () => (await firstJob(store, origin))?.executionTaskId !== null, 'the isolated occurrence to be admitted');
+    ownerBatch.resolve();
+    await until(async () => (await chatInbox(store.gateway)).steer === 1, 'the owner steer to join the held turn');
+    releaseFinal();
+    await until(() => transport.rich.some((entry) => entry.text.includes('ISOLATED-ANSWER')), 'the isolated answer');
+    await until(() => transport.rich.some((entry) => entry.text.includes('B-FINAL')), 'the owner B answer');
+    await until(async () => (await store.gateway.cronOutbox.list(origin, context))
+      .some((record) => record.status === 'delivered'), 'the isolated delivery');
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('A-FINAL')).length, 1);
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('B-FINAL')).length, 1);
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('ISOLATED-ANSWER')).length, 1);
+  } finally {
+    releaseFinal?.();
+    ownerBatch.resolve();
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});

@@ -381,14 +381,22 @@ at settlement, so its failure is never guessed from the error text: each message
 that run consumed reports its own fixed notice, which may repeat the notice for a
 shared failed turn but never drops one or lets a held record own an unrelated
 failure. An intentional `/abort` or `/new` settlement reports nothing. A steer is
-never placed into a run whose first input came from another path — a scheduled
-origin-mode occurrence, a digest result or a worker result — because that path
-delivers the run's answer itself; the message queues instead. Native `submit` has
-no conditional steering, so this is a read of the running input set immediately
-before admission, and a run replaced in that instant is not re-checked. The pinned
-harness places one queued steer per tool round, and that mode is harness-wide, so
-all-pending placement is deliberately not enabled; a steer that arrives at the
-final boundary is placed there and answered by the following run instead.
+never placed into a run owned by another path — a digest result, a worker result or
+a scheduled origin-mode occurrence — and a chat with an admitted origin-mode
+occurrence queues instead, because that path delivers the run's answer itself.
+When owner steering is enabled, an origin occurrence never waits in this chat's
+native inbox: it sleeps until the chat has no running turn and no queued steer and
+then admits atomically, so one final boundary can never place a scheduled input
+together with an owner steer (that pairing was a real duplicate-delivery defect). A
+host that does not steer keeps the historical origin queueing. Native `submit` has no
+conditional steering, so the owner's decision is a read of the running input set
+and the chat's job record immediately before admission: a run replaced inside that
+window is not re-checked, so an owner run ending and an occurrence winning the
+following idle admission in it can still let that steer join the occurrence's run.
+The pinned harness places one queued steer per tool round, and that mode is
+harness-wide, so all-pending placement is deliberately not enabled; a steer that
+arrives at the final boundary is placed there and answered by the following run
+instead.
 
 Before a control is applied, every message admitted before it in that chat is
 submitted, including one still parked behind that bound: the command task
@@ -445,8 +453,9 @@ Version 8 adds the bounded list of chats owed a restart confirmation; versions
 1–7 migrate without one. The same version also carries an optional per-message
 busy-mode (`whenBusy: "steer"`); an absent value is the historical follow-up
 queueing, so no further migration is needed and a record written by an earlier
-build keeps its old semantics.
-Invalid stored shapes fail closed.
+build keeps its old semantics. A stored value other than the exact `"steer"`
+string is conservatively read as follow-up queueing rather than trusted.
+Migration validates the shapes it upgrades; invalid stored shapes fail closed.
 
 Not implemented here: tool-authority or approval commands, history commands,
 `/tools`, and any command that would widen tool authority. `/stop` is only the

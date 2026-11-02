@@ -135,25 +135,35 @@ edits need restart only; unit edits additionally need daemon-reload.
 - Owner message placement is `followUpMode`, config-only and default `followUp`
   (historical queueing): `steer` submits a CLI or Telegram owner input with native
   `whenBusy: "steer"` so it joins the running turn after its tool round. Internal
-  worker, digest and scheduled submissions are never affected, and an owner input
-  never steers into a run those paths started — its first input is not an owner
-  submission, so the message queues and the path that owns the run keeps its own
-  single delivery. Native `submit` has no conditional steering, so that decision is
-  a read of the running input set immediately before admission. The pinned native
-  default places one queued steer per tool round and the all-pending switch is
-  harness-wide, so it is deliberately not enabled; a steer that arrives at the
-  final boundary is placed there and answered by the following run. Telegram stores
-  the requested mode with the admitted message. A committed answer is the shared
-  identity: inputs one run consumed settle with it, so exactly one admitted record —
-  the earliest native submission among them — delivers that answer once, retires
-  every still-pending sibling in its own completion commit, and never lets an
-  ambiguous or held outcome reach a sibling. Only the run's first input publishes
-  the shared live preview. A failed run has no such identity and Durable exposes no
-  run reference at settlement, so failures are never grouped by their reason text:
-  each consumed message reports its own fixed notice, and a held or unknown notice
-  is never the owner of a later unrelated failure. The terminal reports one
-  `Turn ended` per shared run only from the run's first native input observed in a
-  committed snapshot, never from the error text.
+  worker, digest and scheduled submissions are never affected, and a steer never
+  joins a run another path owns: it is submitted only when the running turn's first
+  native input is one of that surface's own admitted submissions, when the chat has
+  no admitted origin-mode occurrence, and never from an idle conversation (a
+  follow-up is placed identically there). With steering enabled an origin-mode
+  occurrence also never waits in the chat's native inbox — it sleeps until the chat
+  has no running turn and no queued steer and admits with `whenBusy: "reject"`,
+  retrying from its checkpoint — because one final boundary places one steer and
+  one follow-up into the same run, which let the scheduled outbox and the chat
+  deliver one answer twice. A host that does not steer keeps origin queueing. Native `submit` has no
+  conditional steering, so each owner decision is a read of the running input set
+  and the chat's job record immediately before admission; a run replaced inside
+  that window is not re-checked, and that residual is documented, not claimed
+  closed. The pinned native default places one queued steer per tool round and the
+  all-pending switch is harness-wide, so it is deliberately not enabled; a steer
+  that arrives at the final boundary is placed there and answered by the following
+  run. Telegram stores the requested mode with the admitted message, and an absent
+  or unrecognized value is conservatively follow-up queueing. A committed answer is
+  the shared identity: inputs one run consumed settle with it, so exactly one
+  admitted record — the earliest native submission among them — delivers that
+  answer once, retires every still-pending sibling in its own completion commit,
+  and never lets an ambiguous or held outcome reach a sibling. Only the run's first
+  input publishes the shared live preview. A failed run has no such identity and
+  Durable exposes no run reference at settlement, so failures are never grouped by
+  their reason text: each consumed message reports its own fixed notice, and a held
+  or unknown notice is never the owner of a later unrelated failure. The terminal
+  reports one `Turn ended` per shared run only from the run's first native input
+  observed in a committed snapshot, never from the error text; an input whose run
+  membership was never observed reports its own end.
 - Provider spellings are native Pi AI IDs, the documented legacy aliases or
   custom `providers` keys; there is no application provider whitelist. A
   `credentials.<provider>` reference pins that one environment variable: when it

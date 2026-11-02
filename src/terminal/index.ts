@@ -633,8 +633,9 @@ export async function runTerminalConversation(
     } else if (settled.status === "unanswered") {
       if (settled.reason !== "aborted") unansweredObserved = true;
       // Inputs one run consumed settle together. Its end is reported once per run, identified by the run's
-      // first input observed in a committed snapshot; a settlement whose run was never observed (a withdrawn
-      // queued input, or a turn that ended before this terminal saw it) reports its own end.
+      // first input observed in a committed snapshot; a settlement whose membership in a run was never
+      // observed (a withdrawn queued input, or a turn that ended before this terminal saw it) reports its
+      // own end.
       const runFirst = submissions.get(submissionId)?.runFirst;
       if (runFirst !== undefined && !reportRunEnd(runFirst)) return;
       await notice(`Turn ended: ${safeReason(settled.reason ?? "unknown")}`, true);

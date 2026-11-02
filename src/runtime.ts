@@ -1348,6 +1348,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const cronFoundation = cronEnabled
     ? createCronFoundation({
         now,
+        // Only a host that steers owner messages needs the idle-only origin admission, because only then can
+        // an owner steer share a final boundary with a queued occurrence.
+        ownerSteering: config.followUpMode === "steer",
         // A `digest` occurrence is the same bounded native entry a manual command uses. It is
         // invoked with the authenticated origin conversation (the job's own document conversation),
         // never a task-owned target; `start` re-checks that origin and the current curation

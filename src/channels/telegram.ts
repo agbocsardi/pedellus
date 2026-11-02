@@ -11,6 +11,7 @@ import type { AssistantMessage, ImageContent, TextContent } from "@earendil-work
 import type { FollowUpMode } from "../config.js";
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
 import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
+import { originOccurrencePending } from "../automation/cron.js";
 import {
   conversationCommandNames,
   conversationCommandRefusal,
@@ -1901,17 +1902,19 @@ export async function runTelegram(
   };
 
   /**
-   * Whether this conversation's current run was started by one of its own admitted owner messages. Only an
-   * owner surface steers, so a run whose first input is one of these submissions contains only owner inputs;
-   * a scheduled origin-mode run, a digest result or a worker result starts its own run, and joining it would
-   * let the scheduled outbox and this chat deliver the same answer. A run's first input identifies it across
-   * tool rounds because Durable only appends later inputs to the same run.
+   * Whether this conversation's current run may take a steer from this chat. Only an owner surface steers,
+   * so a run whose first input is one of these submissions was started by an owner message; a scheduled
+   * origin-mode run, a digest result or a worker result starts its own run, and joining it would let the
+   * scheduled outbox and this chat deliver the same answer. An idle conversation and one with a live
+   * origin-mode occurrence both queue instead: an idle one places a follow-up identically, and a queued
+   * occurrence must never be placed into the same boundary as an owner steer.
    */
   const ownerRun = async (conversation: Conversation, sessionKey: string): Promise<boolean> =>
     conversation.commit(async (tx) => {
       const live = await tx.doc(LiveDoc, conversation.id);
       const inputs = live.run?.inputs;
-      if (inputs === undefined || inputs.length === 0) return true;
+      if (inputs === undefined || inputs.length === 0) return false;
+      if (await originOccurrencePending(tx, conversation.id)) return false;
       const first = firstInput(inputs);
       for (const candidate of state.pending) {
         if (candidate.sessionKey !== sessionKey) continue;

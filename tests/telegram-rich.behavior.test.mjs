@@ -458,6 +458,11 @@ test('an unparseable preview edit falls back to the plain edit', { timeout: 20_0
     });
     harness = start(store, transport);
     const chunks = splitRichText(answer, 4096);
+    // Deterministic order: the live preview is one rich send whose rich edits are refused, so a plain
+    // fallback edit of that message proves the preview path ran before the final answer is reconciled.
+    await advanceUntil(t,
+      () => transport.rich.length === 1 && transport.edits.some((entry) => entry.rich === false),
+      'the refused rich preview edit');
     await advanceUntil(t,
       () => transport.edits.some((entry) => entry.rich === false && entry.text === chunks[0]) &&
         transport.rich.some((entry) => entry.text === chunks[1]),

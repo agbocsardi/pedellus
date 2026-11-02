@@ -1574,3 +1574,47 @@ than reworded, and the docs now claim only what the code does.
   `Turn ended` per shared failed/aborted CLI turn, two ends for two distinct failed turns, and a CLI
   message queuing behind a run the terminal did not start), 2 execution checks and 83/83 offline
   core acceptance. No live bot, provider, credential, network or deployment was used.
+
+### 2026-11-02 — origin cron separation for owner steering
+
+A fresh review found `b318f476` unmergeable: the owner-run gate alone could not prevent a mixed run.
+Native final `applyBoundary` places one steer *and* one follow-up into the same next run, so an
+origin-mode occurrence queued behind a busy owner turn was swept into the boundary together with a
+queued owner steer (both arrival orders), and the scheduled outbox and the chat then delivered that
+one answer twice. `firstInput` ownership inference was therefore false, not merely racy.
+
+- [x] Scheduling/admission separation: when owner steering is enabled, an origin-mode occurrence never
+  waits in the chat's native inbox. Its execute phase requires no live run and no queued steer
+  (`chatIdleForOccurrence`; leftover queued follow-ups cannot share a run with it, and while the
+  occurrence is live the owner gate admits no new steer), submits with `whenBusy: "reject"` for an
+  atomic re-check, and sleeps (`CRON_ORIGIN_IDLE_RETRY_MS = 500`) from the same checkpoint until that
+  holds. The reviewed defect is excluded by construction: a scheduled input can no longer be placed at a
+  final boundary together with a steer. A host that does not steer keeps the historical origin queueing
+  (`CronFoundationOptions.ownerSteering`, wired from `followUpMode`).
+- [x] Owner gate: still only steers when the running turn's first native input is one of that surface's
+  own admitted submissions, now also queues when the chat has an admitted origin-mode occurrence
+  (`originOccurrencePending`, a read-only predicate over the job document and its execution task), and
+  queues when the conversation is idle (a follow-up is placed identically there).
+- [x] Residual, documented instead of claimed away: native `submit` has no conditional-steering
+  admission, so the owner's decision is a read of the running input set and the chat's job record
+  immediately before admission. A run replaced inside that one window — an owner run ending and an
+  occurrence winning the following idle admission — is not re-checked. Closing it needs a native
+  conditional admission; manual `tx.createSubmission` admission is not used. Steam-side options
+  considered and rejected as out of scope: adding an `answerEntryId` claim to the cron outbox and
+  deduplicating across delivery paths (cross-path claim machinery, not approved), or running origin
+  occurrences in a separate conversation (cron semantics redesign, not approved).
+- [x] Small corrections from the same review: `PortConfig.followUpMode` is optional again for SDK
+  source compatibility (`parseConfig` still normalizes the default and the CLI passes the resolved
+  value); the CLI `Turn ended` doc and comment now say an unobserved run *membership* reports its own
+  end; TELEGRAM.md states that a stored `whenBusy` value other than `steer` is conservatively read as
+  follow-up queueing and narrows the migration-validation claim.
+- [x] Flaky preexisting check: `tests/telegram-rich.behavior.test.mjs`'s unparseable-preview case now
+  waits deterministically for the refused rich preview edit before the final chunks, instead of one
+  combined predicate whose phases could interleave under load.
+- [x] Verification: typecheck/build, 431 behaviour checks (3 new: origin occurrence arriving before and
+  after a queued owner steer in the held-final-generation reproduction, each proving no mixed answer and
+  exactly one scheduled delivery; and an isolated occurrence in the same origin chat leaving owner
+  steering enabled — the preexisting origin-run and `[SILENT]` cases still pass), 2 execution checks and
+  83/83 offline core acceptance. The reviewer's `/tmp/rv-mix/tests/repro.test.mjs` now times out on its
+  own premise (the occurrence never queues), and the diff introduces no text-based dedupe. No live bot,
+  provider, credential, network, migration or deployment was used.
