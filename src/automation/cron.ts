@@ -66,12 +66,13 @@ const ONE_OFF_QUEUE_MALFORMED = "one-off run queue is malformed; this occurrence
  */
 const CRON_TARGET_ABORT_MS = 5_000;
 /**
- * How long an origin-mode occurrence waits before re-checking that its chat may take its input. An
- * occurrence never waits in the chat's native inbox beside an owner steer: a final boundary would place
+ * How long an origin-mode occurrence waits before re-checking that its chat may take its input. Avoid
+ * placing an occurrence in the chat's native inbox beside an owner steer: a final boundary would place
  * the steer and the occurrence into the next run together, and the scheduled outbox and the chat would
- * then deliver that one committed answer twice. It sleeps here and admits atomically instead.
+ * then deliver that one committed answer twice. It waits here and rejects admission if a run starts.
  */
-const CRON_ORIGIN_IDLE_RETRY_MS = 500;
+const CRON_ORIGIN_IDLE_RETRY_MS = 1_000;
+const CRON_ORIGIN_IDLE_WAIT_MS = 5 * 60_000;
 
 /** Host-authenticated identity captured when the job is created. */
 export interface CronOwner {
@@ -181,7 +182,7 @@ export const CronJobsDoc = defineDoc<CronJobsDocument>({
  * it: the job's execution task is not terminal, so it is admitted and waiting for an idle chat, or it is
  * currently running here. A `background` occurrence answers in its own task-owned conversation and a
  * digest occurrence submits no input at all, so neither blocks an owner message from steering. This is a
- * read-only predicate over durable records; it materializes no document.
+ * predicate over durable records. Reading an absent job document creates its empty incarnation.
  */
 export async function originOccurrencePending(tx: Tx, conversationId: ConversationId): Promise<boolean> {
   const doc = await tx.doc(CronJobsDoc, conversationId);
@@ -219,6 +220,8 @@ export type CronRunCheckpoint =
       readonly phase: "execute";
       /** Chosen once, in the same commit as host preparation, then reused after a crash. */
       readonly targetConversationId: ConversationId;
+      /** First deferred origin admission, persisted so a reopen cannot restart the wait bound. */
+      readonly originWaitStartedAtMs?: number;
     };
 export interface CronTimerResult {
   readonly [key: string]: JsonValue;
@@ -1175,6 +1178,28 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
             return;
           }
 
+          const deferOrigin = async (): Promise<void> => {
+            const checkpoint = running.state.checkpoint;
+            const startedAt = checkpoint.phase === "execute"
+              ? checkpoint.originWaitStartedAtMs ?? runtime.now()
+              : runtime.now();
+            if (runtime.now() - startedAt >= CRON_ORIGIN_IDLE_WAIT_MS) {
+              await finishRun(
+                runtime, running.conversationId, running.id, input,
+                {
+                  status: "error",
+                  error: "scheduled run could not start within five minutes; chat work or queued steering is blocking it",
+                  answerEntryId: null,
+                },
+                targetConversationId, context,
+              );
+              return;
+            }
+            await runtime.sleepUntil(runtime.now() + CRON_ORIGIN_IDLE_RETRY_MS, {
+              phase: "execute", targetConversationId, originWaitStartedAtMs: startedAt,
+            }, context);
+          };
+
           let settlement: WaitSettlement;
           if (job.intent === "digest") {
             // A digest occurrence is a host entry, not a model turn: it asks for the same bounded
@@ -1197,11 +1222,10 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           }
           try {
             const requestId = occurrenceKey(input.jobId, input.scheduledAtMs);
-            // When the host steers owner messages, an origin occurrence must never wait in the chat's
-            // native inbox: one final boundary would place a queued occurrence into the next run together
-            // with a queued owner steer, and the scheduled outbox and the chat would then deliver that one
-            // committed answer twice. It waits for a completely idle chat and admits atomically instead,
-            // retrying from this checkpoint. A host that never steers keeps the historical queueing.
+            // Keep an origin occurrence away from a queued owner steer: the native final boundary
+            // would otherwise place both into one run and both delivery paths would send its answer.
+            // Defer while a run or steer is present, then reject admission if a run starts meanwhile.
+            // Other queued follow-ups may still precede it. A non-steering host keeps historical queueing.
             const origin = targetConversationId === running.conversationId && originWaitsForIdle;
             let settled: unknown;
             let boundaryPlaced = false;
@@ -1216,7 +1240,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
               return undefined;
             }, context);
             if (origin && settled === undefined && !(await chatIdleForOccurrence(runtime, targetConversationId, context))) {
-              await runtime.sleepUntil(runtime.now() + CRON_ORIGIN_IDLE_RETRY_MS, running.state.checkpoint, context);
+              await deferOrigin();
               return;
             }
             // Each run is a new episode: a native reset boundary keeps every earlier entry stored
@@ -1248,7 +1272,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           } catch (error) {
             if (runtime.signal.aborted) return;
             if (originWaitsForIdle && targetConversationId === running.conversationId && error instanceof ConversationBusy) {
-              await runtime.sleepUntil(runtime.now() + CRON_ORIGIN_IDLE_RETRY_MS, running.state.checkpoint, context);
+              await deferOrigin();
               return;
             }
             settlement = { status: "error", error: errorText(error), answerEntryId: null };

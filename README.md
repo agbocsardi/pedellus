@@ -104,18 +104,15 @@ so this repository does not turn on "place all queued steers" (it would change w
 conversations too). A steer that arrives at the final boundary is placed there and answered by the
 following run, so it answers a beat later instead of pre-empting the answer already being written.
 
-A steer never joins a run that another path owns, and a scheduled origin-mode input is never placed at
-the same boundary as one. While an origin-mode cron occurrence is admitted for that chat — waiting for
-its turn or running in it — the owner message queues instead, and when steering is enabled such an
-occurrence never waits in the chat's native inbox at all: it sleeps until the chat has no running turn
-and no queued steer, then admits atomically, so the native final boundary can only ever place owner
-inputs. A host that does not steer keeps the historical origin queueing. Native `submit` has no
-conditional steering, so
-the owner's decision is a read of the running input set and the chat's job record immediately before
-admission: a run replaced in that window is not re-checked, so an owner run ending and an occurrence
-winning the following idle admission inside it can still let that steer join the occurrence's run.
-Closing that window needs a native conditional-steering admission; the reproduced defect — an
-occurrence queued in the inbox and swept into a boundary with a steer — is excluded by construction.
+Owner messages queue rather than steer when the observed run belongs to another path or an
+origin-mode cron occurrence is pending/running. With steering enabled, origin occurrences defer
+admission while a run or queued steer exists and use native busy rejection before submitting.
+Other queued follow-ups may still precede the occurrence. A blocked occurrence retries once per
+second for at most five minutes, then records a visible failure; it never withdraws owner input.
+A stranded queued steer can be cleared with `/abort`. Isolated cron and non-steering hosts keep
+their existing behavior. The owner's read-to-submit decision is not atomic: a run replaced in that
+narrow gap can still receive the steer and produce duplicate cron/chat delivery. This known race is
+not eliminated by the scheduling gate.
 Telegram stores the requested mode with each admitted message, so a later config change or a reopen
 keeps that message's semantics, and every message a steered turn consumes delivers its single
 committed answer once. Internal worker, digest and scheduled submissions are unaffected and keep the

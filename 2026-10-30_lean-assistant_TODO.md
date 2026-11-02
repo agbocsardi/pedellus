@@ -1583,23 +1583,21 @@ origin-mode occurrence queued behind a busy owner turn was swept into the bounda
 queued owner steer (both arrival orders), and the scheduled outbox and the chat then delivered that
 one answer twice. `firstInput` ownership inference was therefore false, not merely racy.
 
-- [x] Scheduling/admission separation: when owner steering is enabled, an origin-mode occurrence never
-  waits in the chat's native inbox. Its execute phase requires no live run and no queued steer
-  (`chatIdleForOccurrence`; leftover queued follow-ups cannot share a run with it, and while the
-  occurrence is live the owner gate admits no new steer), submits with `whenBusy: "reject"` for an
-  atomic re-check, and sleeps (`CRON_ORIGIN_IDLE_RETRY_MS = 500`) from the same checkpoint until that
-  holds. The reviewed defect is excluded by construction: a scheduled input can no longer be placed at a
-  final boundary together with a steer. A host that does not steer keeps the historical origin queueing
+- [x] Scheduling/admission separation: with owner steering enabled, an origin occurrence defers while
+  a live run or queued steer exists, then submits with native busy rejection. Other queued follow-ups
+  may still precede it in the inbox. The usual mixed-boundary reproduction is closed; the separate
+  owner read-to-submit race remains documented. Non-steering hosts keep historical origin queueing
   (`CronFoundationOptions.ownerSteering`, wired from `followUpMode`).
 - [x] Owner gate: still only steers when the running turn's first native input is one of that surface's
   own admitted submissions, now also queues when the chat has an admitted origin-mode occurrence
-  (`originOccurrencePending`, a read-only predicate over the job document and its execution task), and
+  (`originOccurrencePending`, a predicate over the job document and its execution task; reading an
+  absent document creates an empty incarnation), and
   queues when the conversation is idle (a follow-up is placed identically there).
 - [x] Residual, documented instead of claimed away: native `submit` has no conditional-steering
   admission, so the owner's decision is a read of the running input set and the chat's job record
   immediately before admission. A run replaced inside that one window — an owner run ending and an
-  occurrence winning the following idle admission — is not re-checked. Closing it needs a native
-  conditional admission; manual `tx.createSubmission` admission is not used. Steam-side options
+  occurrence winning the following idle admission — is not re-checked. A native conditional admission
+  or shared host admission mutex could close it; neither is added in this bounded change. Other options
   considered and rejected as out of scope: adding an `answerEntryId` claim to the cron outbox and
   deduplicating across delivery paths (cross-path claim machinery, not approved), or running origin
   occurrences in a separate conversation (cron semantics redesign, not approved).
@@ -1618,3 +1616,19 @@ one answer twice. `firstInput` ownership inference was therefore false, not mere
   83/83 offline core acceptance. The reviewer's `/tmp/rv-mix/tests/repro.test.mjs` now times out on its
   own premise (the occurrence never queues), and the diff introduces no text-based dedupe. No live bot,
   provider, credential, network, migration or deployment was used.
+
+### 2026-11-02 — Final review closeout, bounded scope
+
+- [x] Independent final review verified 431 behavior checks, 2 execution checks and 83 offline core
+  checks, and confirmed the deterministic mixed-boundary fix and unchanged isolated cron behavior.
+- [x] Bound the newly identified idle-admission wait: persist the first wait time in the existing run
+  checkpoint, retry once per second for at most five minutes, then finish with an error through the
+  existing job status/outbox. A stranded owner steer is retained, never automatically withdrawn.
+  Added one regression for a failed owner run leaving an idle queued steer and visible cron expiry.
+- [x] Correct inbox/atomicity and document-materialization overclaims; no new scheduler, delivery
+  claims, dependencies or configuration. Final reviewer F4's narrow owner read-to-submit race is
+  explicitly waived for this opt-in feature to honor the owner's scope constraint and predominantly
+  isolated-cron use. It can still cause duplicate delivery in a rare origin overlap; not claimed fixed.
+- [x] Final checks: typecheck/build, 432/432 behavior checks under the existing 60-second wrapper,
+  2/2 execution checks and 83/83 offline core checks pass. Ready for clean-tree fast-forward integration;
+  no live deployment. Final small review fixes were applied directly by the parent, without more agents.

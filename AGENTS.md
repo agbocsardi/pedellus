@@ -135,20 +135,16 @@ edits need restart only; unit edits additionally need daemon-reload.
 - Owner message placement is `followUpMode`, config-only and default `followUp`
   (historical queueing): `steer` submits a CLI or Telegram owner input with native
   `whenBusy: "steer"` so it joins the running turn after its tool round. Internal
-  worker, digest and scheduled submissions are never affected, and a steer never
-  joins a run another path owns: it is submitted only when the running turn's first
-  native input is one of that surface's own admitted submissions, when the chat has
-  no admitted origin-mode occurrence, and never from an idle conversation (a
-  follow-up is placed identically there). With steering enabled an origin-mode
-  occurrence also never waits in the chat's native inbox — it sleeps until the chat
-  has no running turn and no queued steer and admits with `whenBusy: "reject"`,
-  retrying from its checkpoint — because one final boundary places one steer and
-  one follow-up into the same run, which let the scheduled outbox and the chat
-  deliver one answer twice. A host that does not steer keeps origin queueing. Native `submit` has no
-  conditional steering, so each owner decision is a read of the running input set
-  and the chat's job record immediately before admission; a run replaced inside
-  that window is not re-checked, and that residual is documented, not claimed
-  closed. The pinned native default places one queued steer per tool round and the
+  worker and digest submissions are unchanged. Owner inputs queue if the observed
+  run is foreign, the chat has an admitted origin occurrence, or the chat is idle.
+  With steering enabled an origin occurrence defers while a run or queued steer
+  exists, then submits with native busy rejection. Other queued follow-ups can
+  still precede it. Its checkpoint persists the first deferred admission: after
+  five minutes it fails visibly through the existing outbox, without withdrawing
+  owner input; retries are one second apart. Isolated cron and non-steering hosts
+  keep their previous behavior. The owner gate reads before submission, so a run
+  replaced in that narrow gap can still receive a steer and cause duplicate
+  cron/chat delivery; that residual is explicitly documented, not claimed closed. The pinned native default places one queued steer per tool round and the
   all-pending switch is harness-wide, so it is deliberately not enabled; a steer
   that arrives at the final boundary is placed there and answered by the following
   run. Telegram stores the requested mode with the admitted message, and an absent

@@ -1103,3 +1103,70 @@ test('an isolated occurrence in the same origin chat never disables owner steeri
     transport.restore();
   }
 });
+
+test('a stranded steer bounds origin admission waiting and reports the occurrence failure', { timeout: 30_000 }, async (t) => {
+  // Harness captures Date.now at open, so install the controlled wall clock first.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const store = await syntheticStore('origin-wait-bound', { followUpMode: 'steer', cron: true });
+  const origin = `telegram:${BOT_ID}:chat:${CHAT_ID}`;
+  const ownerBatch = deferred();
+  const entered = deferred();
+  const failure = deferred();
+  let scheduled = false;
+  const dispatcher = (transcript) => {
+    store.faux.appendResponses([dispatcher]);
+    const input = userTexts(transcript.messages).at(-1) ?? '';
+    if (input.startsWith('schedule the reminder') && !scheduled) {
+      scheduled = true;
+      return fauxAssistantMessage(fauxToolCall('cron', {
+        action: 'add', message: 'ORIGIN-PROMPT', isolated: false,
+        at: new Date(Date.now() + 2_000).toISOString(),
+      }, { id: 'bounded-origin' }), { stopReason: 'toolUse' });
+    }
+    if (input.startsWith('owner A')) {
+      entered.resolve();
+      return failure.promise.then(() => { throw new Error('synthetic failure'); });
+    }
+    return fauxAssistantMessage('Synthetic reply.');
+  };
+  store.faux.setResponses([dispatcher]);
+  const transport = telegramMock([
+    [textUpdate(400, 'schedule the reminder')],
+    [textUpdate(401, 'owner A')],
+    async () => { await ownerBatch.promise; return [textUpdate(402, 'owner B')]; },
+  ]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await entered.promise;
+    ownerBatch.resolve();
+    await until(async () => (await chatInbox(store.gateway)).steer === 1, 'the owner steer');
+    failure.resolve();
+    await until(async () => (await chatInbox(store.gateway)).run === undefined, 'the failed run');
+    t.mock.timers.tick(2_001);
+    await until(async () => (await firstJob(store, origin))?.executionTaskId !== null, 'the occurrence');
+    const taskId = (await firstJob(store, origin)).executionTaskId;
+    await until(async () => (await store.gateway.harness.getTask(taskId, context))?.state.status === 'sleeping', 'deferred admission');
+    const checkpoint = (await store.gateway.harness.getTask(taskId, context)).state.checkpoint;
+    assert.equal(typeof checkpoint.originWaitStartedAtMs, 'number');
+    // Only advance wall time: the already-armed real retry fires within one second, not five minutes.
+    t.mock.timers.tick(5 * 60_000 + 1);
+    const deadline = performance.now() + 10_000;
+    while ((await store.gateway.harness.getTask(taskId, context)).state.status !== 'terminal') {
+      assert.ok(performance.now() < deadline, 'origin wait must expire');
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal((await chatInbox(store.gateway)).steer, 1, 'expiry never withdraws owner input');
+    const job = await firstJob(store, origin);
+    assert.equal(job.lastOutcome.status, 'error');
+    assert.match(job.lastOutcome.error, /could not start within five minutes/);
+    const records = await store.gateway.cronOutbox.list(origin, context);
+    assert.equal(records.length, 1, 'failure remains visible in the existing outbox');
+    assert.match(records[0].text, /did not complete its occurrence/);
+  } finally {
+    failure.resolve();
+    ownerBatch.resolve();
+    await cleanup(store, harness, t);
+    transport.restore();
+  }
+});

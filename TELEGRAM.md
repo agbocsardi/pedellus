@@ -380,19 +380,17 @@ settles. A failed run has no committed answer and Durable exposes no run identit
 at settlement, so its failure is never guessed from the error text: each message
 that run consumed reports its own fixed notice, which may repeat the notice for a
 shared failed turn but never drops one or lets a held record own an unrelated
-failure. An intentional `/abort` or `/new` settlement reports nothing. A steer is
-never placed into a run owned by another path — a digest result, a worker result or
-a scheduled origin-mode occurrence — and a chat with an admitted origin-mode
-occurrence queues instead, because that path delivers the run's answer itself.
-When owner steering is enabled, an origin occurrence never waits in this chat's
-native inbox: it sleeps until the chat has no running turn and no queued steer and
-then admits atomically, so one final boundary can never place a scheduled input
-together with an owner steer (that pairing was a real duplicate-delivery defect). A
-host that does not steer keeps the historical origin queueing. Native `submit` has no
-conditional steering, so the owner's decision is a read of the running input set
-and the chat's job record immediately before admission: a run replaced inside that
-window is not re-checked, so an owner run ending and an occurrence winning the
-following idle admission in it can still let that steer join the occurrence's run.
+failure. An intentional `/abort` or `/new` settlement reports nothing. An owner
+message queues when the observed run belongs to another path or an origin-mode
+occurrence is pending/running. With steering enabled, origin occurrences defer
+while a run or queued steer exists, then use native busy rejection before submission.
+Other queued follow-ups can still precede them in the inbox. A blocked occurrence
+retries once per second for at most five minutes, then reports a fixed failure
+through the existing scheduled outbox. It never withdraws owner input; `/abort`
+clears a stranded steer. Isolated cron and non-steering hosts are unchanged.
+The owner gate is a read before submission, not an atomic predicate: a run replaced
+inside that narrow window can still receive the steer and cause duplicate cron/chat
+delivery. This residual race is documented, not claimed closed.
 The pinned harness places one queued steer per tool round, and that mode is
 harness-wide, so all-pending placement is deliberately not enabled; a steer that
 arrives at the final boundary is placed there and answered by the following run
