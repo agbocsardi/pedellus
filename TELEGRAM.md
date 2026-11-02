@@ -25,21 +25,33 @@ never reaches it. `message.text` (not a caption) is classified:
   adapter advertises depends on what the host really exposes (see
   [Host capability and the native menu](#host-capability-and-the-native-menu)).
   A typed command the host cannot perform is refused with fixed text and is
-  never sent to the assistant.
+  never sent to the assistant. A control this host does not implement gets its
+  own fixed capability notice, which adds what the catalogue reason cannot: the
+  missing host surface (for example "opened without an on-disk configuration
+  file"), and for `/digest` that nothing was started. `/help <name>` for a name
+  this host does not offer, and any unknown name, gets the catalogue's reason
+  and echo rule instead.
 - Matching is an exact leading command token (case-insensitive). `/new`,
-  `/abort`, `/stop`, `/status`, `/restart`, `/digest` and `/help` take no
-  arguments; `/model` takes one configured preset name or `default`; `/digest`
-  also accepts the literal `status`; `/mcp` takes nothing, or `show <id>`,
-  `approve <id>`, `deny <id>` with one 16-hex request ID. Anything else gets a
-  bounded usage notice.
+  `/abort`, `/stop`, `/status` and `/restart` take no arguments; `/model` takes
+  one configured preset name or `default`; `/digest` takes nothing or the literal
+  `status`; `/mcp` takes nothing; `/help` takes nothing or one command name this host
+  offers, and answers with that command's usage and one-sentence detail. Any
+  other argument to a control gets a bounded usage notice; `/help <name>` for a
+  name that is not offered gets a fixed refusal that names the reason (another
+  surface, or this host) instead of a false "no such command".
 - `/new@bot` etc. are controls only when the mention names this bot from
   `getMe` (case-insensitive). Another bot's mention, or a mention while `getMe`
   returned no usable username, gets a bounded notice and is neither executed nor
-  forwarded to the assistant. A malformed mention (`/new@`, `/new@@x`) is an
-  unknown command as well, answered the same way.
-- Any other leading slash command gets a bounded notice naming the controls this
+  forwarded to the assistant. A malformed mention (`/new@`, `/new@@x`) is a
+  command attempt, not assistant text: it is refused with a bounded notice that
+  names that command's own no-mention form instead of denying a command this
+  chat offers.
+- Any other leading slash command token — a run of letters, digits and `_` —
+  gets a bounded notice naming the controls this
   host implements and is **not** sent to the assistant. `/prose` is therefore not
-  a prompt; `//prose` sends `/prose` literally as assistant input.
+  a prompt; `//prose` sends `/prose` literally as assistant input. A leading
+  slash line that does not match that token shape (for example `/foo-bar` or a
+  bare `/`) is assistant text.
 - Everything else, including plain text and `/new` inside a sentence, is
   ordinary assistant input.
 
@@ -61,8 +73,8 @@ command are still submitted first, exactly as for `/abort`.
 
 A host with no prompt snapshot (or a narrow SDK gateway without `resetSession`)
 keeps the previous behaviour: `/new` is the plain native reset on the same
-mapped conversation. Both paths acknowledge with "Context reset."; a host that
-has a snapshot reports `busy` instead of a half-effect.
+mapped conversation, and its acknowledgement says nothing about a rebuild. A
+host that does have a snapshot reports `busy` instead of a half-effect.
 
 `/abort` calls `Conversation.abort(context)` without `background`, which is the
 narrowest public API: it withdraws this conversation's queued inputs, marks its
@@ -78,13 +90,13 @@ without the generic failure text, one per input; the same applies to a turn
 ended by a queued reset (reason `reset`). Other settlement reasons keep the
 fixed failure text.
 
-`/status` prints bounded point-in-time metadata of **this** authenticated chat
-only: the selected model and its preset, whether a turn is running (turn number
+`/status` prints bounded point-in-time metadata of **this** authenticated chat: the selected model and its preset, whether a turn is running (turn number
 and input count) and how many native inputs are queued. A bounded background
 summary follows: this chat's own live workers and its own cron jobs
 (executing, queued, parked, or with a future occurrence armed) and whether the
 one workspace-global memory-digestion run is live in this chat or another. A
-natively blocked task is named as parked instead of counted as running;
+natively blocked task is named as parked instead of counted as running. A separate
+`Restart:` line counts active work gateway-wide without identifying other chats;
 `Background: idle` means nothing is executing or queued right now, and an armed
 future occurrence is its own `Cron:` line with the next due time. It reuses the
 native conversation projection the terminal uses, makes no model call, creates
@@ -98,10 +110,10 @@ host for one bounded batch of already-completed turns from the shared,
 already-mapped chat history (the batch may come from a different mapped chat,
 because workspace memory is shared) and acknowledges only the bounded admission:
 started, busy, idle or refused. It returns immediately, starts no schedule, holds
-no chat turn while the digest runs. The command starts no new digest model turn itself, but it
-may re-admit a retained earlier internal issue report, which is an ordinary
-origin-agent turn. A digest batch
-is one bounded completed-turn range, not a loop until history is exhausted; an
+no chat turn while the digest runs. The command starts no agent turn; only a
+retained earlier internal issue report may be re-admitted, as an ordinary
+origin-agent turn. A digest batch is one bounded completed-turn range, not a
+loop until history is exhausted; an
 `idle` answer that did not reach every mapped chat's tail says closed history
 may remain. `/digest status` is a bounded read-only view of the live run and this
 chat's newest run; it performs no transcript scan, model call or cursor change.
@@ -130,32 +142,34 @@ busy chat is refused atomically (nothing is queued and no change lands on a
 later turn); unknown names and legacy direct configs are refused with fixed
 text.
 
-`/mcp` is the owner's decision surface for the assistant's MCP proposals. With no
-argument it lists this gateway's configured MCP servers (with live state) and the
-requests waiting for a decision; `/mcp show <id>` prints the normalized shape, the
-entire exact proposed entry (never truncated), and what an approval would change
-— a stdio command verbatim and every header/environment mapping as a host
-variable *name*, never a value; `/mcp approve <id>` writes that entry into the
-gateway's configuration file (enabling only the approved entry) or starts one
-owner-approved OAuth login; `/mcp deny <id>` discards the request. Listing and
-showing are bounded read-only notices with no model call. Approve and deny are
-durable owner controls: they gate this chat, report a known refusal as refused,
-and a replayed update finds the request already consumed instead of applying it
-twice. A login's one-time authorization URL is delivered as a separate direct
-message to this authenticated private chat, after the durable acknowledgement
-and outside the stored channel state; it carries this attempt's OAuth `state`, is
-never sent to the assistant, and open it on a device that can reach the gateway
-host (a remote browser needs that loopback port forwarded). If the approval takes
-longer than the still-pending notice, the final outcome follows as a second
-notice; if the URL cannot be delivered, the login is canceled and a new request
-is needed. A written entry or new grant takes effect at the next start, so
-follow an approval with `/restart`. A gateway opened without an on-disk
-configuration file advertises no `/mcp` and refuses a typed one with fixed text.
+`/mcp` is bounded read-only status for this MCP-enabled gateway: configured
+servers with live state, and any OAuth login waiting for a callback. It is not an
+approval surface. Ask the assistant in this authenticated private chat to add or
+update a server, log in, log out or remove one; the `mcp` model tool performs the
+operation directly, and `/mcp` never reaches the model. A login's one-time
+authorization URL is delivered as a separate direct plain message to this exact
+chat, outside stored channel state. Open it as the owner, then either let the
+browser reach this host or paste the resulting callback URL back into this chat.
+The callback is intercepted before transcript admission or model dispatch; it
+must match the active attempt's loopback origin/path/state and the current
+authenticated sender binding of this private chat. Stale, foreign, cross-chat and
+replayed callbacks are refused with fixed text and their values are never stored
+or sent to the assistant. Completion verifies and stores the grant, reconnects
+the server and makes its tools callable without `/restart`. If the URL cannot be
+delivered, the login is canceled rather than left waiting. A gateway opened
+without an on-disk configuration file advertises no `/mcp` and refuses a typed
+one with fixed text.
 
 `/restart` asks the host to replace the Gateway process so current code and a
 re-read configuration are loaded. It is not a model tool, it is available only to
 an authenticated allowlisted private sender, and it affects every surface and
-background job. The host performs it only after its own graceful teardown —
+background job. The host refuses it with a fixed no-effect reason while gateway
+work would be interrupted (a running generation, tool, compaction, worker,
+digest or cron run; a sleeping cron timer does not count). Nothing is
+claimed as restarted: the initial receipt only says the host is checking the request.
+A busy refusal follows without teardown; the owner may wait or use existing cancellation
+controls where available and ask again, so the same adapter may retry later. The host
+performs an accepted restart only after its own graceful teardown —
 adapters and local clients closed, timers cleared, Harness, Code Mode sandbox and
 MCP clients closed, store lock released — and only where the Node runtime can
 replace the process image (`process.execve`, POSIX; absent on Windows and IBM i).
@@ -282,19 +296,15 @@ acknowledgement is committed **held** (`hold: true`) with the command intent, an
 published once:
 
 - the native call returns: "Context reset.", "Idle. Queue cleared.",
-  "Model: <preset>.", the short `/digest` admission (started/busy/idle/refused,
-  never evidence text), or "Restarting.";
+  "Model: <preset>.", a short `/digest` admission, or "Restart requested;
+  checking active work.";
 - the native call proved that nothing changed (`/new` or `/model` on a busy chat,
   an unknown or unavailable preset, a legacy direct config): the acknowledgement
   is corrected to that fixed refusal; the record becomes `refused`, never
   `applied`, so a replay cannot claim a change that did not happen;
-- or the call has not returned after 30 seconds: a short pending notice, e.g.
-  "Still stopping. New messages are held." No completion is claimed, and no
-  second message follows when the call finally returns.
-
-Routine receipts confirm the outcome without implementation details. `/help`
-lists commands briefly; explicit status/list/show commands retain their useful
-data, and MCP approval disclosures retain the exact proposed authority.
+- or the call has not returned after 30 seconds: a pending notice, e.g. "Still
+  stopping. New messages are held." No completion is claimed. `/model`, `/digest`
+  and `/restart` publish their result later; `/new` and `/abort` do not.
 
 A held acknowledgement is never delivered early, and it is not tied to the input
 gate: notices are never model submissions, so a released notice can still reach
@@ -368,10 +378,13 @@ failure or ambiguity follows the ordinary notice hold rules. A sender the live
 allowlist no longer admits is dropped like any other notice, and records that do
 not fit the admitted bound stay recorded for a later open. A process that was
 refused instead reports "Restart refused. Gateway still running." to those
-chats and clears them. If the process
+chats and clears them, so the
+promise is never left open; a refusal because gateway work is active reports the
+fixed busy reason instead and does not latch, so a later `/restart` asks the host
+again. If the process
 dies in between, the next open reports the command exactly once: its held
-acknowledgement is corrected to the explicit "interrupted; outcome unknown"
-wording and released, or, when no acknowledgement record is left, a
+acknowledgement is corrected to "Restart interrupted; outcome unknown. Not
+retried." and released, or, when no acknowledgement record is left, a
 bounded report is queued for the recorded chat. `unconfirmed` and `refused` are
 terminal, so later opens do not repeat them; a replayed update (possible only if
 the offset was not committed) answers with the recorded outcome and never
@@ -418,8 +431,17 @@ and leaves typed commands working; no unimplemented command is advertised.
 
 ### Host capability and the native menu
 
-The menu and `/help` list exactly the controls this host can perform, and a typed
-command outside that set is refused with fixed text instead of a silent failure:
+The menu and `/help` are both rendered from the one slash-command catalogue
+(filtered to the names this host can perform), so a menu entry, a listing line and
+the catalogue's own refusals cannot drift. A typed control outside the host's set
+keeps its reason-specific capability notice, which says which host surface is
+missing (and for `/digest`, that nothing was started); `/help <name>` gives the
+catalogue's shorter reason instead. The two answer different questions and are
+allowed to differ, and both are fixed text. `/help` carries the listing, one line
+for commands this host lacks, and one short limits line; per-command usage and
+detail stay on `/help <command>` and the whole notice stays inside the bounded
+notice limit. A typed command outside the host's set is refused with fixed text
+instead of a silent failure:
 
 - `/new`, `/abort` (with the `/stop` alias) and `/help` are always implemented.
 - `/status` and `/model` need the host model catalog; `/model` also needs preset
@@ -434,11 +456,13 @@ command outside that set is refused with fixed text instead of a silent failure:
   typed one is refused with fixed text. The shipped Gateway always exposes it;
   the run itself still refuses when this chat has no `read`/`write`/`edit`
   authority.
+- `/mcp` needs a gateway opened from an on-disk configuration file; without one
+  it is neither advertised nor performed.
 
 A test-only host that offers none of the optional host operations therefore
 advertises exactly `/new`, `/abort`, `/stop`, `/help`, while the shipped gateway
 with the CLI restart host advertises `/new`, `/abort`, `/stop`, `/status`,
-`/model`, `/restart`, `/digest`, `/help`.
+`/model`, `/digest`, `/mcp`, `/restart`, `/help`.
 
 An ordinary user message keeps its existing input text (including literal `//`
 handling), so literal content is unchanged. A message that replies to another
@@ -782,9 +806,26 @@ after a reopen.
 
 The adapter also consumes the durable, channel-neutral cron outbox
 (`nanobot.cron.deliveries` in the origin chat conversation). A normal settlement, isolated or
-origin, writes the text to send there in the same terminal commit as its outcome: the committed
+origin, writes the text to send there in the same terminal commit as its outcome unless successful
+delivery is suppressed by `silent` or an exact `[SILENT]` answer: the committed
 final answer, or fixed sanitized notice text for a failure or empty answer; no model turn is
-rerun to resend. On startup and every few seconds the adapter enumerates already-mapped chat sessions and
+rerun to resend.
+
+The same outbox carries one host interruption notice for an automatically cancelled
+startup-blocking prepared turn, with the id `host:turn-interrupted:<taskId>` and fixed
+text for the class that was interrupted: an owner turn says the previous turn was
+interrupted, stored progress is preserved, and some actions may have completed without
+confirmation; background worker or scheduled work says the same of background work;
+an interrupted memory-digestion batch says the unacknowledged batch is offered again;
+and a cancelled compaction says the compaction was interrupted and no action is
+needed. It is recorded in the mapped origin
+chat's outbox, not a worker, digest or scheduled-run target conversation. It is ordinary
+stored text: this adapter applies the same origin admission, live `allowFrom` recheck,
+rich chunking, write-ahead intent, unknown-outcome hold and bounded-record rules, and no
+model turn is started. A local CLI attachment consumes the same record instead and never
+sends it to Telegram.
+
+On startup and every few seconds the adapter enumerates already-mapped chat sessions and
 accepts only candidate keys for its own bot ID (`telegram:<bot id>:chat:<chatId>`). That key is a
 locator, not authentication: before any send the adapter requires durable admission evidence for
 that private chat, written before the message was mapped or submitted. The evidence records the
@@ -810,9 +851,12 @@ Delivery state lives on the outbox record, not only in this process: `pending`, 
 `unknown`, `withheld`, `delivered`, `failed`, or `unauthorized`, plus `nextChunkIndex`, `messageId`,
 `sendIntent`, `unknownSince`, `withheldSince`, `settledAt`, and a sanitized `error`. An unresolved intent at open
 becomes `unknown` and is never auto-resent; an explicit rejection becomes `failed`; 429 and proven
-pre-connect outcomes stay pending for a later scan. Every normal settlement is queued: a
-successful answer's committed text, or fixed notice text for a run error or an empty answer. A
-notice names only the job id and occurrence instant and asks the owner to list scheduled jobs; no
+pre-connect outcomes stay pending for a later scan. Every normal settlement is queued unless
+suppressed: a successful answer's committed text, or fixed notice text for a run error or an empty
+answer. A `silent` job suppresses every successful result, including the empty-answer notice, while
+a failed run still queues its notice; an exact trimmed `[SILENT]` successful answer suppresses only
+that occurrence in either mode and stays in the run's conversation. A notice names only the job id
+and occurrence instant and asks the owner to list scheduled jobs; no
 provider error, job message or model text is copied. Cancellations, superseded, fenced and
 missing-job runs remain silent externally and are visible through cron `lastOutcome`/`list`. If the channel is
 absent from the configuration, no record is created; an existing record is never redirected to

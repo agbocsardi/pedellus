@@ -4,12 +4,17 @@
 // sends the committed answer exactly once without a duplicate ordinary reply. Smaller guards cover
 // an origin answer on a non-Telegram session, isolated success delivery, a failed isolated run and an
 // empty origin-mode answer (fixed sanitized notice text, one record across reopen), and an aborted
-// run (silent).
+// run (silent). The silent-delivery cases cover a job-wide `silent` setting (success and empty
+// suppressed, failure notice kept, legacy record still delivered, list/confirmation text, reopen),
+// and the per-occurrence `[SILENT]` answer in both modes, including a later occurrence of the same
+// job that still delivers and an ordinary chat answer that keeps its literal text.
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+
+import { scheduledContent } from './fixtures/cron-input.mjs';
 
 const packageRoot = process.env.PI_NANOBOT_CANDIDATE ?? new URL('../', import.meta.url).pathname;
 const modules = join(packageRoot, 'node_modules/@earendil-works');
@@ -22,7 +27,7 @@ const [
   { ConfigToolCaptureDoc },
   { BACKGROUND_CONTEXT, withCancel },
   { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
-  { ToolResultEntry },
+  { ToolResultEntry, AssistantEntry },
 ] = await Promise.all([
   import(new URL('../dist/config.js', import.meta.url).href),
   import(new URL('../dist/runtime.js', import.meta.url).href),
@@ -126,6 +131,42 @@ const jobSettled = (conversationId) => (changes) => changes.some((change) => {
   return Array.isArray(jobs) && jobs.some((job) => job.lastOutcome !== null);
 });
 
+/** All `count` jobs in one origin document have recorded a settlement. */
+const allJobsSettled = (conversationId, count) => (changes) => changes.some((change) => {
+  if (change.type !== 'document' || change.record.kind !== CRON_JOBS_KIND
+    || change.conversationId !== conversationId || change.value === null) return false;
+  const jobs = change.value.jobs;
+  return Array.isArray(jobs) && jobs.length === count
+    && jobs.every((job) => job.lastOutcome !== null);
+});
+
+/** A delivery record whose stored text contains `text` was admitted for one origin conversation. */
+const deliveryWithText = (conversationId, text) => (changes) => changes.some((change) =>
+  change.type === 'document'
+  && change.record.kind === CRON_DELIVERIES_KIND
+  && change.conversationId === conversationId
+  && Array.isArray(change.value?.deliveries)
+  && change.value.deliveries.some((record) =>
+    typeof record.text === 'string' && record.text.includes(text)));
+
+/** The committed text of one tool result, matched by its assistant call ID. */
+async function toolResultText(conversation, callId, context) {
+  const entries = (await conversation.entries({}, 500, undefined, context)).items;
+  const entry = entries.filter(ToolResultEntry.is)
+    .find((candidate) => candidate.model?.[0]?.toolCallId === callId);
+  if (entry === undefined) return undefined;
+  return (entry.model?.[0]?.content ?? [])
+    .map((part) => (part.type === 'text' ? part.text : '')).join('\n');
+}
+
+/** Every committed assistant text block in one transcript, in order. */
+function assistantTexts(entries) {
+  return entries.filter(AssistantEntry.is).flatMap((entry) => (entry.model ?? [])
+    .flatMap((message) => (message.content ?? [])
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text)));
+}
+
 /** The last user input in a request, so a tool call's arguments never impersonate a new turn. */
 function lastUserText(messages) {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -143,7 +184,7 @@ function routeByContent(handlers) {
     const transcript = JSON.stringify(request.messages);
     const input = lastUserText(request.messages);
     for (const { when, respond } of handlers) {
-      if (when({ transcript, input })) return respond();
+      if (when({ transcript, input })) return respond({ transcript, input });
     }
     return fauxAssistantMessage('synthetic fallback');
   };
@@ -252,7 +293,7 @@ test('an origin-mode scheduled answer is delivered once through the durable outb
     let toolCallIssued = false;
     store.faux.setResponses(Array.from({ length: 20 }, () => routeByContent([
       // The scheduled occurrence answer, identified by its own instruction text.
-      { when: ({ input }) => input === scheduledMessage, respond: () => fauxAssistantMessage(resultText) },
+      { when: ({ input }) => input === scheduledContent(scheduledMessage), respond: () => fauxAssistantMessage(resultText) },
       { when: ({ transcript }) => transcript.includes('origin-read'), respond: () => fauxAssistantMessage('ORIGIN-READ-OK') },
       { when: ({ input }) => input === 'read the origin note', respond: () => fauxAssistantMessage([
         fauxToolCall('read', { path: 'note.txt' }, { id: 'origin-read' }),
@@ -353,7 +394,7 @@ test('a non-Telegram origin never queues an origin-mode result', { timeout: 20_0
   const scheduledMessage = 'deliver the local reminder';
   let toolCallIssued = false;
   store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
-    { when: ({ input }) => input === scheduledMessage, respond: () => fauxAssistantMessage('LOCAL-ORIGIN-RESULT') },
+    { when: ({ input }) => input === scheduledContent(scheduledMessage), respond: () => fauxAssistantMessage('LOCAL-ORIGIN-RESULT') },
     {
       when: ({ input }) => input === 'schedule the local reminder' && !toolCallIssued,
       respond: () => {
@@ -394,7 +435,7 @@ test('isolated-mode delivery remains admitted for a Telegram origin', { timeout:
   const scheduledMessage = 'deliver the isolated reminder';
   let toolCallIssued = false;
   store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
-    { when: ({ input }) => input === scheduledMessage, respond: () => fauxAssistantMessage('ISOLATED-RESULT') },
+    { when: ({ input }) => input === scheduledContent(scheduledMessage), respond: () => fauxAssistantMessage('ISOLATED-RESULT') },
     {
       when: ({ input }) => input === 'schedule the isolated reminder' && !toolCallIssued,
       respond: () => {
@@ -441,7 +482,7 @@ test('an isolated scheduled run that errors queues one sanitized failure notice'
   let toolCallIssued = false;
   store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
     {
-      when: ({ input }) => input === scheduledMessage,
+      when: ({ input }) => input === scheduledContent(scheduledMessage),
       respond: () => fauxAssistantMessage('', { stopReason: 'error', errorMessage: providerError }),
     },
     {
@@ -503,7 +544,7 @@ test('an empty origin-mode answer queues one notice and stays one record after r
   const scheduledMessage = 'deliver the empty reminder';
   let toolCallIssued = false;
   store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
-    { when: ({ input }) => input === scheduledMessage, respond: () => fauxAssistantMessage('') },
+    { when: ({ input }) => input === scheduledContent(scheduledMessage), respond: () => fauxAssistantMessage('') },
     {
       when: ({ input }) => input === 'schedule the empty reminder' && !toolCallIssued,
       respond: () => {
@@ -570,7 +611,7 @@ test('an aborted scheduled run queues nothing', { timeout: 25_000 }, async () =>
   const held = new Promise((resolve) => { markHeld = resolve; });
   store.faux.setResponses(Array.from({ length: 12 }, () => routeByContent([
     {
-      when: ({ input }) => input === scheduledMessage,
+      when: ({ input }) => input === scheduledContent(scheduledMessage),
       respond: () => new Promise((_resolve, reject) => {
         // The occurrence holds here until the test aborts its task, so the abort lands mid-run.
         releaseHeld = () => reject(new Error('held response released'));
@@ -622,6 +663,352 @@ test('an aborted scheduled run queues nothing', { timeout: 25_000 }, async () =>
     assert.equal((await store.gateway.cronOutbox.list(origin, context)).length, 0);
   } finally {
     releaseHeld?.();
+    await store.gateway.close(context);
+    await rm(store.directory, { recursive: true, force: true });
+  }
+});
+
+test('silent jobs suppress success and empty answers but keep failure notices and legacy delivery', { timeout: 35_000 }, async () => {
+  const origin = 'telegram:7:chat:506';
+  const store = await syntheticGateway('silent-combinations', { toolAllowlist: ['read'] });
+  const chat = await store.gateway.conversationFor(origin, context);
+  const providerError = 'SYNTHETIC-SILENT-FAILURE-TEXT';
+  let released = false;
+  let markReleased;
+  const release = new Promise((resolve) => { markReleased = resolve; });
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  // Hold every scheduled model request until the test has inspected the live target's authority.
+  const gate = async (message) => {
+    if (!released) {
+      markStarted();
+      await release;
+    }
+    return message;
+  };
+  let scheduled = false;
+  let listed = false;
+  store.faux.setResponses(Array.from({ length: 40 }, () => routeByContent([
+    { when: ({ input }) => input === scheduledContent('silent empty reminder'), respond: () => gate(fauxAssistantMessage('')) },
+    {
+      when: ({ input }) => input === scheduledContent('silent failing reminder'),
+      respond: () => gate(fauxAssistantMessage('', { stopReason: 'error', errorMessage: providerError })),
+    },
+    { when: ({ input }) => input === scheduledContent('legacy reminder'), respond: () => gate(fauxAssistantMessage('LEGACY-DELIVERED')) },
+    {
+      when: ({ input }) => input === 'schedule silent jobs' && !scheduled,
+      respond: () => {
+        scheduled = true;
+        const at = new Date(Date.now() + 1_500).toISOString();
+        return fauxAssistantMessage([
+          fauxToolCall('cron', {
+            action: 'add', message: 'silent empty reminder', name: 'silent empty', silent: true, at,
+          }, { id: 'silent-empty-add' }),
+          fauxToolCall('cron', {
+            action: 'add', message: 'silent failing reminder', name: 'silent failing', silent: true, at,
+          }, { id: 'silent-failing-add' }),
+          fauxToolCall('cron', {
+            action: 'add', message: 'legacy reminder', name: 'legacy reminder', at,
+          }, { id: 'legacy-add' }),
+        ], { stopReason: 'toolUse' });
+      },
+    },
+    {
+      when: ({ input }) => input === 'list the silent jobs' && !listed,
+      respond: () => {
+        listed = true;
+        return fauxAssistantMessage([
+          fauxToolCall('cron', { action: 'list' }, { id: 'silent-list' }),
+        ], { stopReason: 'toolUse' });
+      },
+    },
+    { when: () => true, respond: () => fauxAssistantMessage('synthetic cron fallback') },
+  ])));
+  const settledWatcher = changeWatcher(store.gateway.harness, allJobsSettled(chat.id, 3), 'silent jobs settled');
+  let reopened;
+  try {
+    const submission = await chat.submit({ type: 'input', content: 'schedule silent jobs' }, context);
+    assert.equal((await submission.wait(context)).status, 'done');
+
+    // Confirmation and list text both name the silence, so the setting is visible, not implied.
+    const confirmation = await toolResultText(chat, 'silent-empty-add', context);
+    assert.match(confirmation ?? '', /delivery: silent/);
+    const legacyConfirmation = await toolResultText(chat, 'legacy-add', context);
+    assert.ok(legacyConfirmation !== undefined, 'the legacy job has a confirmation');
+    assert.ok(!legacyConfirmation.includes('delivery: silent'), legacyConfirmation);
+
+    // A job document written before `silent` existed lacks the field; absence must mean false.
+    await store.gateway.harness.commit(async (tx) => {
+      const doc = await tx.doc(CronJobsDoc, chat.id);
+      const legacy = doc.jobs.find((job) => job.name === 'legacy reminder');
+      assert.ok(legacy !== undefined);
+      delete legacy.silent;
+    }, context);
+    assert.equal(
+      (await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context))
+        .jobs.find((job) => job.name === 'legacy reminder').silent,
+      undefined,
+    );
+
+    const listing = await chat.submit({ type: 'input', content: 'list the silent jobs' }, context);
+    assert.equal((await listing.wait(context)).status, 'done');
+    const listText = await toolResultText(chat, 'silent-list', context);
+    assert.match(listText ?? '', /delivery: silent/);
+    assert.match(listText ?? '', /legacy reminder/);
+
+    // The first scheduled request is held, so the background target's live authority is observable.
+    await started;
+    const running = (await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context)).jobs;
+    let target;
+    for (const job of running) {
+      if (job.executionTaskId === null) continue;
+      const record = await store.gateway.harness.getTask(job.executionTaskId, context);
+      const candidate = record?.state.checkpoint?.targetConversationId;
+      if (Number.isSafeInteger(candidate)) {
+        target = candidate;
+        break;
+      }
+    }
+    assert.ok(Number.isSafeInteger(target), 'the background run prepared a reachable target');
+    const targetHandle = await store.gateway.harness.conversation(target, context);
+    const targetTools = toolNames(await targetHandle.agent(context));
+    assert.ok(targetTools.includes('read'), `the target holds the captured read tool: ${targetTools}`);
+    for (const forbidden of ['telegram', 'cron', 'write', 'bash', 'worker', 'mcp']) {
+      assert.ok(!targetTools.includes(forbidden), `a background target must not hold ${forbidden}: ${targetTools}`);
+    }
+    const capture = await store.gateway.harness.snapshot(ConfigToolCaptureDoc, target, context);
+    assert.deepEqual([...capture.tools].sort(), ['read']);
+
+    released = true;
+    markReleased();
+    await settledWatcher.promise;
+
+    const jobs = (await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context)).jobs;
+    const byName = (name) => jobs.find((job) => job.name === name);
+    assert.equal(byName('silent empty').silent, true);
+    assert.equal(byName('silent failing').silent, true);
+    assert.equal(byName('legacy reminder').silent, undefined);
+    assert.equal(byName('silent empty').lastOutcome.status, 'ok');
+    assert.equal(byName('silent failing').lastOutcome.status, 'error');
+    assert.equal(byName('legacy reminder').lastOutcome.status, 'ok');
+
+    const records = await store.gateway.cronOutbox.list(origin, context);
+    assert.equal(
+      records.length, 2,
+      `only the failure notice and the legacy answer are queued: ${JSON.stringify(records.map((record) => record.text))}`,
+    );
+    const failing = byName('silent failing');
+    const failure = records.find((record) => record.id.startsWith(`cron:${failing.id}:`));
+    assert.ok(failure !== undefined, 'a silent job still queues its sanitized failure notice');
+    assert.equal(failure.text, cronOutcomeNotice('failed', failing.id, failing.lastOutcome.scheduledAtMs));
+    assert.ok(!failure.text.includes(providerError));
+    assert.ok(!failure.text.includes('silent failing reminder'));
+    assert.ok(records.some((record) => record.text === 'LEGACY-DELIVERED'), 'a legacy job still delivers');
+    const empty = byName('silent empty');
+    assert.ok(!records.some((record) =>
+      record.text === cronOutcomeNotice('empty', empty.id, empty.lastOutcome.scheduledAtMs)),
+    'a silent empty answer queues no empty-result notice');
+
+    // Each settled one-off target retired its capture; the shared catch-all holds no tools after.
+    for (const job of jobs) {
+      assert.equal(
+        await store.gateway.harness.snapshot(ConfigToolCaptureDoc, job.lastOutcome.conversationId, context),
+        undefined,
+      );
+    }
+    const targetAfter = await store.gateway.harness.conversation(jobs[0].lastOutcome.conversationId, context);
+    assert.deepEqual((await targetAfter.agent(context)).tools, []);
+
+    // Reopen: suppressed occurrences are not re-admitted and the stored setting survives.
+    await store.gateway.close(context);
+    reopened = await openGateway(store.config, context, { models: store.models });
+    await reopened.harness.waitForIdle(context).catch(() => undefined);
+    const afterReopen = await reopened.cronOutbox.list(origin, context);
+    assert.equal(afterReopen.length, 2);
+    assert.deepEqual(
+      afterReopen.map((record) => record.id).sort(),
+      records.map((record) => record.id).sort(),
+      'the same two records, no second admission after reopen',
+    );
+    const jobsAfter = (await reopened.harness.snapshot(CronJobsDoc, chat.id, context)).jobs;
+    assert.equal(jobsAfter.find((job) => job.name === 'silent empty').silent, true);
+    assert.equal(jobsAfter.find((job) => job.name === 'legacy reminder').silent, undefined);
+  } finally {
+    released = true;
+    markReleased?.();
+    settledWatcher.stop();
+    if (reopened !== undefined) await reopened.close(context).catch(() => undefined);
+    else await store.gateway.close(context).catch(() => undefined);
+    await rm(store.directory, { recursive: true, force: true });
+  }
+});
+
+test('silent and [SILENT] origin runs stay undelivered while an ordinary chat answer keeps its text', { timeout: 25_000 }, async () => {
+  const origin = 'telegram:7:chat:507';
+  const store = await syntheticGateway('silent-origin');
+  const chat = await store.gateway.conversationFor(origin, context);
+  let scheduled = false;
+  const scheduledInputs = [];
+  store.faux.setResponses(Array.from({ length: 20 }, () => routeByContent([
+    {
+      when: ({ input }) => input.startsWith('silent origin reminder'),
+      respond: ({ input }) => {
+        scheduledInputs.push(input);
+        return fauxAssistantMessage('SILENT-ORIGIN-ANSWER');
+      },
+    },
+    {
+      when: ({ input }) => input.startsWith('marker origin reminder'),
+      respond: ({ input }) => {
+        scheduledInputs.push(input);
+        return fauxAssistantMessage('  [SILENT]  ');
+      },
+    },
+    {
+      when: ({ input }) => input === 'schedule silent origin jobs' && !scheduled,
+      respond: () => {
+        scheduled = true;
+        const at = new Date(Date.now() + 1_500).toISOString();
+        return fauxAssistantMessage([
+          fauxToolCall('cron', {
+            action: 'add', message: 'silent origin reminder', name: 'silent origin', isolated: false, silent: true, at,
+          }, { id: 'silent-origin-add' }),
+          fauxToolCall('cron', {
+            action: 'add', message: 'marker origin reminder', name: 'marker origin', isolated: false, at,
+          }, { id: 'marker-origin-add' }),
+        ], { stopReason: 'toolUse' });
+      },
+    },
+    { when: ({ input }) => input === 'ordinary echo', respond: () => fauxAssistantMessage('  [SILENT]  ') },
+    { when: () => true, respond: () => fauxAssistantMessage('Scheduled the origin jobs.') },
+  ])));
+  const settledWatcher = changeWatcher(store.gateway.harness, allJobsSettled(chat.id, 2), 'origin jobs settled');
+  try {
+    const submission = await chat.submit({ type: 'input', content: 'schedule silent origin jobs' }, context);
+    assert.equal((await submission.wait(context)).status, 'done');
+    await settledWatcher.promise;
+
+    assert.deepEqual(
+      scheduledInputs.sort(),
+      [scheduledContent('silent origin reminder'), scheduledContent('marker origin reminder')].sort(),
+      'each origin run receives the appended marker instruction',
+    );
+    const jobs = (await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context)).jobs;
+    assert.equal(jobs.length, 2);
+    for (const job of jobs) {
+      assert.equal(job.mode, 'origin');
+      assert.equal(job.lastOutcome.status, 'ok');
+      assert.equal(job.lastOutcome.conversationId, chat.id);
+    }
+    assert.equal(jobs.find((job) => job.name === 'silent origin').silent, true);
+    assert.equal(jobs.find((job) => job.name === 'marker origin').silent, false);
+    assert.equal(
+      await store.gateway.harness.snapshot(CronDeliveriesDoc, chat.id, context),
+      undefined,
+      'neither suppressed origin result creates an outbox document',
+    );
+    assert.equal((await store.gateway.cronOutbox.list(origin, context)).length, 0);
+
+    // Both answers remain in the origin transcript, marker text included; only delivery is suppressed.
+    const before = (await chat.entries({}, 500, undefined, context)).items;
+    const textsBefore = assistantTexts(before);
+    assert.ok(textsBefore.includes('SILENT-ORIGIN-ANSWER'));
+    assert.equal(
+      textsBefore.filter((text) => text.trim() === '[SILENT]').length,
+      1,
+      'the marker occurrence kept one answer in the origin transcript',
+    );
+
+    // The marker has no meaning in an ordinary chat turn: the answer stays exactly as written.
+    const ordinary = await chat.submit({ type: 'input', content: 'ordinary echo' }, context);
+    assert.equal((await ordinary.wait(context)).status, 'done');
+    const after = (await chat.entries({}, 500, undefined, context)).items;
+    const textsAfter = assistantTexts(after);
+    assert.equal(
+      textsAfter.filter((text) => text.trim() === '[SILENT]').length,
+      2,
+      'an ordinary chat answer is neither suppressed nor rewritten',
+    );
+    assert.equal(
+      textsAfter.filter((text) => text === '  [SILENT]  ').length,
+      2,
+      'the ordinary answer keeps its exact literal text',
+    );
+    assert.equal(
+      await store.gateway.harness.snapshot(CronDeliveriesDoc, chat.id, context),
+      undefined,
+      'an ordinary chat answer never enters the cron outbox',
+    );
+  } finally {
+    settledWatcher.stop();
+    await store.gateway.close(context);
+    await rm(store.directory, { recursive: true, force: true });
+  }
+});
+
+test('[SILENT] suppresses only its own background occurrence and a later occurrence still delivers', { timeout: 25_000 }, async () => {
+  const origin = 'telegram:7:chat:508';
+  const store = await syntheticGateway('silent-marker-background');
+  const chat = await store.gateway.conversationFor(origin, context);
+  let occurrences = 0;
+  let scheduled = false;
+  const scheduledInputs = [];
+  store.faux.setResponses(Array.from({ length: 40 }, () => routeByContent([
+    {
+      when: ({ input }) => input.startsWith('marker background reminder'),
+      respond: ({ input }) => {
+        scheduledInputs.push(input);
+        occurrences += 1;
+        // The first occurrence is a trimmed marker with surrounding whitespace; the second is real.
+        return fauxAssistantMessage(occurrences === 2 ? 'MARKER-SECOND-RESULT' : '  [SILENT]  ');
+      },
+    },
+    {
+      when: ({ input }) => input === 'schedule the marker background job' && !scheduled,
+      respond: () => {
+        scheduled = true;
+        return fauxAssistantMessage([
+          fauxToolCall('cron', {
+            action: 'add', message: 'marker background reminder', name: 'marker background', every_seconds: 1,
+          }, { id: 'marker-background-add' }),
+        ], { stopReason: 'toolUse' });
+      },
+    },
+    { when: () => true, respond: () => fauxAssistantMessage('Scheduled the marker background job.') },
+  ])));
+  const watcher = changeWatcher(
+    store.gateway.harness, deliveryWithText(chat.id, 'MARKER-SECOND-RESULT'), 'second occurrence delivery',
+  );
+  try {
+    const submission = await chat.submit({ type: 'input', content: 'schedule the marker background job' }, context);
+    assert.equal((await submission.wait(context)).status, 'done');
+    await watcher.promise;
+
+    assert.equal(scheduledInputs.length, 2, 'both background occurrences reached the model');
+    for (const input of scheduledInputs) {
+      assert.equal(
+        input,
+        scheduledContent('marker background reminder'),
+        'each background run receives the appended marker instruction',
+      );
+    }
+    const jobs = (await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context)).jobs;
+    assert.equal(jobs.length, 1);
+    const job = jobs[0];
+    assert.equal(job.mode, 'background');
+    assert.equal(job.silent, false, 'the marker suppresses one occurrence, not the job');
+    const firstAt = job.createdAtMs + 1000;
+    const secondAt = firstAt + 1000;
+    const records = await store.gateway.cronOutbox.list(origin, context);
+    assert.equal(
+      records.length, 1,
+      `only the second occurrence is queued: ${JSON.stringify(records.map((record) => record.text))}`,
+    );
+    assert.equal(records[0].text, 'MARKER-SECOND-RESULT');
+    assert.equal(records[0].id, `cron:${job.id}:${secondAt}`);
+    assert.ok(!records.some((record) => record.id === `cron:${job.id}:${firstAt}`));
+  } finally {
+    watcher.stop();
     await store.gateway.close(context);
     await rm(store.directory, { recursive: true, force: true });
   }

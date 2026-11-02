@@ -294,11 +294,10 @@ test('the native menu lists only implemented commands', { timeout: 20_000 }, asy
     // advertised command is implemented.
     assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command),
       ['new', 'abort', 'stop', 'status', 'model', 'digest', 'help']);
-    assert.deepEqual(transport.commands[0].commands.map((entry) => entry.description),
-      ["Reset this conversation's context", 'Stop this turn and withdraw queued messages',
-        'Alias of /abort: stop this turn here', "Show this chat's model and run status",
-        'List or select a configured model preset', 'Run one bounded memory-digestion batch',
-        'Show the available commands']);
+    // Descriptions are the catalogue's own summaries, so this test asserts the bound shape only;
+    // telegram-commands.behavior.test.mjs pins the derived wording and order.
+    assert.ok(transport.commands[0].commands.every((entry) => entry.description.length > 0
+      && entry.description.length <= 256), 'every description is a catalogue summary within the Bot API bound');
   } finally {
     await cleanup(store, harness);
   }

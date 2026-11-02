@@ -6,7 +6,17 @@ import { AssistantEntry, ConversationBusy, ToolResultEntry, UserEntry } from "@e
 import type { Cursor, EntryId, UsageState } from "@earendil-works/pi-durable";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
-import { renderMcpApproval, renderMcpListing, type McpAdminListing, type McpApproveResult } from "../mcp/admin.js";
+import {
+  conversationCommandNames,
+  conversationCommandRefusal,
+  conversationCommandUsage,
+  conversationDetailBlock,
+  conversationHelpListing,
+  findConversationCommand,
+  SAFE_COMMAND_NAME,
+} from "../help/commands.js";
+import { renderMcpListing, type McpAdminListing, type McpCallbackResult } from "../mcp/admin.js";
+import { looksLikeOAuthCallback } from "../mcp/surface.js";
 import { renderBackgroundStatus } from "../background-status.js";
 import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "../history/episodes.js";
 import {
@@ -68,6 +78,12 @@ const MAX_REMEMBERED_ANSWERS = 256;
 const MAX_REMEMBERED_LOCAL_INPUTS = 1_024;
 const MAX_EXTERNAL_RUNS = 64;
 const LITERAL_SLASH_PREFIX = "//";
+/**
+ * Only a busy refusal guarantees no effect. Other failures may follow acceptance or a lost
+ * acknowledgement, so report uncertainty without echoing an internal message.
+ */
+const RESTART_REFUSED =
+  "Gateway restart was not confirmed; the gateway may already be restarting. Check its status before retrying.";
 
 export interface TerminalModelSelectionHost {
   list(): Promise<GatewayModelList>;
@@ -105,15 +121,13 @@ export interface TerminalDigestHost {
 }
 
 /**
- * Owner-only MCP management over the already-authenticated local attach. Reading is bounded and
- * changes nothing; `approve` writes configuration or starts one owner-approved OAuth login, and
- * `deny` discards one request. Neither is a model tool, and neither grants authority by itself.
+ * MCP host surface over the already-authenticated local attach. `/mcp` is bounded read-only status.
+ * A callback-shaped input line is offered here before model admission; the host validates it against
+ * the login that originated in this exact session.
  */
 export interface TerminalMcpHost {
   list(): Promise<McpAdminListing>;
-  show(id: string): Promise<{ readonly found: boolean; readonly text: string }>;
-  approve(id: string): Promise<McpApproveResult>;
-  deny(id: string): Promise<McpApproveResult>;
+  submitCallback(text: string): Promise<McpCallbackResult>;
 }
 
 /**
@@ -628,11 +642,55 @@ export async function runTerminalConversation(
     return Promise.resolve();
   };
 
+  /** The catalogued CLI commands this host actually offers, in catalogue order. */
+  const offeredCommands = (): readonly string[] => {
+    const offered = new Set(["help", "new", "abort", "stop", "status", "history", "entry", "compact"]);
+    if (io.history) {
+      offered.add("search");
+      offered.add("episodes");
+      offered.add("episode");
+    }
+    if (io.modelSelection) offered.add("model");
+    if (io.toolPolicy) offered.add("tools");
+    if (io.contextRefresh?.available) offered.add("refresh");
+    if (io.digest) offered.add("digest");
+    if (io.mcp) offered.add("mcp");
+    if (io.attachments) offered.add("attach");
+    if (io.restart) offered.add("restart");
+    return conversationCommandNames("cli").filter((name) => offered.has(name));
+  };
+
+  /**
+   * A capability host the offer set already admitted. Availability is decided once, in
+   * `offeredCommands`; this narrows the optional field for the handler and fails loudly instead of
+   * repeating the refusal whenever the two disagree.
+   */
+  const offeredHost = <T>(host: T | undefined): T => {
+    if (host === undefined) throw new Error("offered conversation command has no host");
+    return host;
+  };
+
+  /**
+   * One refusal for a typed slash command this host does not run: the same catalogue reason
+   * `/help <command>` gives, the guarantee that it never reaches the model, and the `//` literal
+   * escape for a name the catalogue does not know.
+   */
+  const refuseTypedCommand = async (name: string): Promise<void> => {
+    const literal = findConversationCommand(name) === undefined && SAFE_COMMAND_NAME.test(name)
+      ? ` Use //${name} to send it literally.`
+      : "";
+    // A host without model selection cannot change the model, but `/status` can still name it.
+    const currentModel = name === "model" && io.modelSelection === undefined
+      ? ` Current model: ${modelLabel((await conversation.status(operationContext)).model)}.`
+      : "";
+    await notice(`${conversationCommandRefusal("cli", name, offeredCommands())} It was not sent to the model.${currentModel}${literal}`, true);
+  };
+
   const showHistory = async (rawCount: string): Promise<void> => {
     let count = DEFAULT_HISTORY_COUNT;
     if (rawCount.trim()) {
       if (!/^\d+$/.test(rawCount.trim())) {
-        await notice("Usage: /history [count] — choose a number from 1 to 50.", true);
+        await notice(conversationCommandUsage("history"), true);
         return;
       }
       count = Math.max(1, Math.min(Number(rawCount.trim()), MAX_HISTORY_COUNT));
@@ -667,18 +725,14 @@ export async function runTerminalConversation(
   };
 
   const showSearch = async (args: string): Promise<void> => {
-    const host = io.history;
-    if (!host) {
-      await notice("History search is host-controlled and unavailable here.", true);
-      return;
-    }
+    const host = offeredHost(io.history);
     const parsed = parseSearchArguments(args);
     if (parsed.kind === "usage") {
       await notice(SEARCH_USAGE, true);
       return;
     }
     if (parsed.kind === "next" && pendingSearch === undefined) {
-      await notice("No search to continue. Run /search again.", true);
+      await notice("No search continuation is held. Run /search again; cursors are process-local and are never printed.", true);
       return;
     }
 
@@ -710,7 +764,7 @@ export async function runTerminalConversation(
       if (signal?.aborted) return;
       if (parsed.kind === "next") {
         pendingSearch = undefined;
-        await notice("Search changed. Run /search again.", true);
+        await notice("Search continuation rejected: the query, index, store or session mapping changed. Run /search again; cursors are process-local and are never printed.", true);
       } else {
         await notice(`History search failed (${errorName(error)}).`, true);
       }
@@ -744,11 +798,7 @@ export async function runTerminalConversation(
   };
 
   const showEpisodes = async (args: string): Promise<void> => {
-    const host = io.history;
-    if (!host) {
-      await notice("Episode browsing is host-controlled and unavailable here.", true);
-      return;
-    }
+    const host = offeredHost(io.history);
     const parsed = parseEpisodesArguments(args);
     if (parsed.kind === "usage") {
       await notice(EPISODES_USAGE, true);
@@ -791,11 +841,7 @@ export async function runTerminalConversation(
   };
 
   const showEpisode = async (args: string): Promise<void> => {
-    const host = io.history;
-    if (!host) {
-      await notice("Episode browsing is host-controlled and unavailable here.", true);
-      return;
-    }
+    const host = offeredHost(io.history);
     const parsed = parseEpisodeArguments(args);
     if (parsed.kind === "usage") {
       await notice(EPISODE_USAGE, true);
@@ -879,7 +925,8 @@ export async function runTerminalConversation(
     }
     const sessionKey = parsed.session ?? host?.defaultSession ?? "cli:default";
     if (parsed.session !== undefined && host === undefined) {
-      await notice("Cross-session entry browsing is host-controlled and unavailable here.", true);
+      // `/entry` itself is offered without a history host; only cross-session browsing needs one.
+      await notice("Cross-session entry browsing needs the host history surface, which this host does not expose.", true);
       return;
     }
     if (host === undefined && sessionKey !== "cli:default") {
@@ -921,15 +968,7 @@ export async function runTerminalConversation(
   };
 
   const showModel = async (args: string): Promise<void> => {
-    const host = io.modelSelection;
-    if (!host) {
-      const status = await conversation.status(operationContext);
-      const model = modelLabel(status.model);
-      await notice(args.trim()
-        ? `Model changes are host-controlled and unavailable here. Current model: ${model}.`
-        : `Current model: ${model}.`);
-      return;
-    }
+    const host = offeredHost(io.modelSelection);
 
     const parts = args.trim() ? args.trim().split(/\s+/) : [];
     if (parts.length === 0) {
@@ -949,7 +988,7 @@ export async function runTerminalConversation(
         await notice([
           `Current model: ${modelLabel(listing.selected)} (thinking: ${safeLabel(listing.selected.thinkingLevel, 32)}).`,
           ...(listing.defaultPreset === undefined ? [] : [`Configured default preset: ${safeLabel(listing.defaultPreset, 80)}.`]),
-          "Named model presets (use /model <name>, or /model default for the configured preset):",
+          "Named model presets (see /help model to select one):",
           ...rows,
         ].join("\n"));
         return;
@@ -962,7 +1001,7 @@ export async function runTerminalConversation(
       if (listing.models.length > maxChoices) rows.push(`  … ${listing.models.length - maxChoices} more allowed models omitted`);
       await notice([
         `Current model: ${modelLabel(listing.selected)} (thinking: ${safeLabel(listing.selected.thinkingLevel, 32)}).`,
-        "Allowed models (use /model <provider> <modelId> [thinkingLevel]):",
+        "Allowed models (see /help model to select one):",
         ...rows,
       ].join("\n"));
       return;
@@ -974,18 +1013,18 @@ export async function runTerminalConversation(
           await notice(`Model: ${safeLabel(parts[0]!, 80)}.`);
         } catch (error) {
           if (error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy")) {
-            await notice("Model change refused: chat busy. Retry when idle.", true);
+            await notice("Model preset selection rejected: this conversation is busy. Retry when it is idle.", true);
           } else {
-            await notice("Model unchanged: preset unavailable. Use /model to list presets.", true);
+            await notice("Model preset selection rejected: unknown name, unsupported thinking, or presets are not configured. Use /model to list named presets.", true);
           }
         }
         return;
       }
-      await notice("Usage: /model <provider> <modelId> [thinkingLevel]. Use /model to list allowed choices.", true);
+      await notice(conversationCommandUsage("model"), true);
       return;
     }
     if (parts.length > 3 || parts.some((part) => !part)) {
-      await notice("Usage: /model <provider> <modelId> [thinkingLevel]. Use /model to list allowed choices.", true);
+      await notice(conversationCommandUsage("model"), true);
       return;
     }
     const selection = { provider: parts[0]!, modelId: parts[1]!, ...(parts[2] === undefined ? {} : { thinkingLevel: parts[2]! as ModelThinkingLevel }) };
@@ -994,7 +1033,7 @@ export async function runTerminalConversation(
       await notice(`Model: ${modelLabel(selected)} (thinking: ${safeLabel(selected.thinkingLevel, 32)}).`);
     } catch (error) {
       if (error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy")) {
-        await notice("Model change refused: chat busy. Retry when idle.", true);
+        await notice("Model selection rejected: this conversation is busy. Retry when it is idle.", true);
       } else {
         await notice("Model unchanged: choice unavailable. Use /model to list choices.", true);
       }
@@ -1002,17 +1041,13 @@ export async function runTerminalConversation(
   };
 
   const refreshContext = async (args: string): Promise<void> => {
-    if (args.trim()) { await notice("Usage: /refresh", true); return; }
-    const host = io.contextRefresh;
-    if (!host || !host.available) {
-      await notice("Refresh unavailable: workspace context not configured.", true);
-      return;
-    }
+    if (args.trim()) { await notice(conversationCommandUsage("refresh"), true); return; }
+    const host = offeredHost(io.contextRefresh);
     try {
       await host.refresh();
     } catch (error) {
       if (error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy")) {
-        await notice("Refresh refused: chat busy. Retry when idle.", true);
+        await notice("Context refresh rejected: this conversation is busy. Retry when it is idle.", true);
       } else {
         await notice("Context refresh failed; the previous snapshot is still in effect.", true);
       }
@@ -1022,12 +1057,8 @@ export async function runTerminalConversation(
   };
 
   const showTools = async (args: string): Promise<void> => {
-    if (args.trim()) { await notice("Usage: /tools", true); return; }
-    const policy = io.toolPolicy;
-    if (policy === undefined) {
-      await notice("Coding-tool authority is host-controlled and unavailable here.", true);
-      return;
-    }
+    if (args.trim()) { await notice(conversationCommandUsage("tools"), true); return; }
+    const policy = offeredHost(io.toolPolicy);
     if (policy.tools.length === 0) {
       await notice("Coding tools disabled. Set toolAllowlist and restart to enable.");
       return;
@@ -1061,11 +1092,7 @@ export async function runTerminalConversation(
    * host. A refusal is reported with fixed host text and never echoed as file bytes.
    */
   const attachFile = async (args: string): Promise<void> => {
-    const host = io.attachments;
-    if (!host) {
-      await notice("Attachments unavailable. Configure media and restart.", true);
-      return;
-    }
+    const host = offeredHost(io.attachments);
     const parsed = parseAttachArguments(args);
     if (parsed.kind === "usage") {
       await notice(ATTACH_USAGE, true);
@@ -1091,41 +1118,46 @@ export async function runTerminalConversation(
     rememberLocalInput(submission.id);
     waitForSubmission(submission.id, submission);
     await notice(
-      `Attachment queued: ${safeLabel(admitted.attachment.relativePath, 200)} (${admitted.attachment.bytes} bytes).`,
+      `Stored attachment at ${safeLabel(admitted.attachment.relativePath, 200)} ` +
+      `(${admitted.attachment.bytes} bytes) and admitted its turn.`,
     );
   };
 
+  /**
+   * One screen of controls: the generated listing, then one line for a command this host lacks and
+   * one for the // escape. Per-command usage and detail stay in `/help <command>`.
+   */
+  const offerHelp = async (args: string): Promise<void> => {
+    const available = offeredCommands();
+    const requested = args.trim().toLowerCase();
+    if (!requested) {
+      const unavailable = conversationCommandNames("cli").filter((name) => !available.includes(name));
+      await notice([
+        conversationHelpListing("cli", available),
+        ...(unavailable.length === 0
+          ? []
+          : [`Not offered by this host: ${unavailable.map((name) => `/${name}`).join(", ")}.`]),
+        "Unknown slash commands are not sent to the model; prefix // to send one literally.",
+      ].join("\n\n"));
+      return;
+    }
+    const command = available.includes(requested) ? findConversationCommand(requested) : undefined;
+    if (command === undefined) { await refuseTypedCommand(requested); return; }
+    await notice(conversationDetailBlock(command));
+  };
+
   const runCommand = async (name: string, args: string): Promise<void> => {
+    // One catalogue refusal covers every name this host does not offer, before any handler runs.
+    if (!offeredCommands().includes(name)) {
+      await refuseTypedCommand(name);
+      return;
+    }
     switch (name) {
       case "help":
-        if (args.trim()) { await notice("Usage: /help", true); return; }
-        await notice([
-          "/new - reset context",
-          "/abort, /stop - stop this chat and clear its queue",
-          "/status - model, usage and run status",
-          "/history [count] - recent messages",
-          "/entry <id> [--radius 0-5] - view an entry",
-          "/compact - queue compaction",
-          ...(io.history ? [
-            "/search <query> | /search --next - search history",
-            "/episodes - list episodes; /episode <id> - view one",
-            "History defaults to cli:default; use --session <key> for another chat.",
-          ] : []),
-          io.modelSelection
-            ? "/model [<preset>|default] or /model <provider> <modelId> [thinkingLevel] - list or switch model"
-            : "/model - current model (read-only)",
-          ...(io.toolPolicy ? ["/tools - configured coding tools (read-only)"] : []),
-          ...(io.contextRefresh?.available ? ["/refresh - reload context and skills"] : []),
-          ...(io.digest ? ["/digest [status] - update shared memory or check progress"] : []),
-          ...(io.attachments ? ["/attach <path> [-- <prompt>] - store and queue a file (unread)"] : []),
-          ...(io.mcp ? ["/mcp [show|approve|deny <id>] - servers and approval requests"] : []),
-          ...(io.restart ? ["/restart - restart all channels; this terminal disconnects"] : []),
-          "/help - commands",
-          "Prefix // to send a slash literally.",
-        ].join("\n"));
+        await offerHelp(args);
         return;
       case "status":
-        if (args.trim()) { await notice("Usage: /status", true); return; }
+        if (args.trim()) { await notice(conversationCommandUsage("status"), true); return; }
         await showStatus();
         return;
       case "history":
@@ -1153,11 +1185,7 @@ export async function runTerminalConversation(
         await refreshContext(args);
         return;
       case "digest": {
-        const host = io.digest;
-        if (!host) {
-          await notice("Digest unavailable. Nothing started.", true);
-          return;
-        }
+        const host = offeredHost(io.digest);
         const argument = args.trim().toLowerCase();
         if (argument === "") {
           await notice(renderMemoryDigestStart(await host.start()));
@@ -1167,52 +1195,35 @@ export async function runTerminalConversation(
           await notice(renderMemoryDigestStatus(await host.status()));
           return;
         }
-        await notice("Usage: /digest [status]", true);
+        await notice(conversationCommandUsage("digest"), true);
         return;
       }
       case "mcp": {
-        const host = io.mcp;
-        if (!host) {
-          await notice("MCP management unavailable. Nothing changed.", true);
+        const host = offeredHost(io.mcp);
+        if (args.trim() !== "") {
+          await notice(conversationCommandUsage("mcp"), true);
           return;
         }
-        const parts = args.trim().split(/\s+/).filter((part) => part.length > 0);
-        if (parts.length === 0) {
-          await notice(renderMcpListing(await host.list()));
-          return;
-        }
-        const [sub, ...rest] = parts;
-        if ((sub === "show" || sub === "approve" || sub === "deny") && rest.length === 1) {
-          const id = rest[0]!;
-          if (sub === "show") {
-            const shown = await host.show(id);
-            await notice(shown.text, !shown.found);
-            return;
-          }
-          const result = sub === "approve" ? await host.approve(id) : await host.deny(id);
-          await notice(renderMcpApproval(result), result.status === "refused");
-          return;
-        }
-        await notice("Usage: /mcp | /mcp show <id> | /mcp approve <id> | /mcp deny <id>", true);
+        await notice(renderMcpListing(await host.list()));
         return;
       }
       case "attach":
         await attachFile(args);
         return;
       case "compact": {
-        if (args.trim()) { await notice("Usage: /compact", true); return; }
+        if (args.trim()) { await notice(conversationCommandUsage("compact"), true); return; }
         const taskId = await conversation.compact(operationContext);
         await notice(`Compaction queued (${taskId}).`);
         return;
       }
       case "stop":
       case "abort":
-        if (args.trim()) { await notice(`Usage: /${name}`, true); return; }
+        if (args.trim()) { await notice(conversationCommandUsage(name), true); return; }
         await conversation.abort(operationContext);
         await notice("Idle. Queue cleared.");
         return;
       case "new":
-        if (args.trim()) { await notice("Usage: /new", true); return; }
+        if (args.trim()) { await notice(conversationCommandUsage("new"), true); return; }
         try {
           await conversation.reset(operationContext);
         } catch (error) {
@@ -1224,26 +1235,21 @@ export async function runTerminalConversation(
         }
         await notice(io.contextRefresh?.available ? "Context reset." : "Context reset queued.");
         return;
-      case "restart":
-        if (args.trim()) { await notice("Usage: /restart", true); return; }
-        if (!io.restart) {
-          await notice("Gateway process restart is unavailable on this host.", true);
+      case "restart": {
+        if (args.trim()) { await notice(conversationCommandUsage("restart"), true); return; }
+        try {
+          await offeredHost(io.restart)();
+        } catch (error) {
+          // Only a busy refusal is a known no-effect. A lost acknowledgement can follow acceptance.
+          const busy = error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy");
+          await notice(busy && error instanceof Error ? error.message : RESTART_REFUSED, true);
           return;
         }
-        await io.restart();
         await notice("Restarting; disconnecting.");
         io.closeInput?.();
         operationController.abort(new Error("gateway restart requested"));
         return;
-      default:
-        if (name === "steer" || name === "after") {
-          await notice(`/${name} was removed from this CLI; the line was not sent to the model.`, true);
-        } else if (["goal", "interrupt", "btw", "skill", "policy", "receipt", "tasks", "task", "dream", "dream-log", "dream-restore", "remember", "pairing"].includes(name)) {
-          await notice(`/${name} is not implemented in this CLI; it was not sent to the model.`, true);
-        } else {
-          const safeName = completePrefix(name, 80);
-          await notice(`Unsupported slash command /${safeName}; it was not sent. Use //${safeName} to send it literally.`, true);
-        }
+      }
     }
   };
 
@@ -1288,7 +1294,13 @@ export async function runTerminalConversation(
         io.prompt?.();
         continue;
       }
-      if (leading.startsWith(LITERAL_SLASH_PREFIX)) {
+      if (looksLikeOAuthCallback(line)) {
+        // Even hosts without management must not admit an expired/foreign credential as input.
+        const result = io.mcp === undefined
+          ? { accepted: false, text: "No MCP login is available in this host; the callback was not stored or sent to the assistant." }
+          : await io.mcp.submitCallback(line);
+        await notice(result.text, !result.accepted);
+      } else if (leading.startsWith(LITERAL_SLASH_PREFIX)) {
         const prefix = line.indexOf(LITERAL_SLASH_PREFIX);
         await queueInput(`${line.slice(0, prefix)}/${line.slice(prefix + LITERAL_SLASH_PREFIX.length)}`);
       } else if (leading.startsWith("/")) {
@@ -1395,15 +1407,11 @@ function formatHistoryMessage(message: TerminalMessage): string | undefined {
   return `${message.role === "user" ? "You" : "Assistant"}: ${snippet}`;
 }
 
-const SEARCH_USAGE =
-  "Usage: /search [--scope messages|tools|all] [--role user|assistant] [--limit 1-50] [--next] [--] [query] — default scope is messages; empty text browses the selected scope.";
-const EPISODES_USAGE = "Usage: /episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>] — --session defaults to cli:default.";
-const EPISODE_USAGE = "Usage: /episode [--session <sessionKey>] <startEntryId> [--limit 1-30] — --session defaults to cli:default.";
-const ENTRY_USAGE = "Usage: /entry [--session <sessionKey>] <entryId> [--radius 0-5] — --session defaults to cli:default with a history host.";
-const ATTACH_USAGE =
-  "Usage: /attach <path>[ -- <prompt>] — store one local file under the workspace CLI attachment directory and submit it as an ordinary path-only turn. " +
-  "The path may be absolute or relative to the CLI's working directory. The original bytes are stored unchanged; the agent decides whether to read them with the configured tools. " +
-  "No native image content, vision handoff, transcription or extraction is added. Requires the media configuration.";
+const SEARCH_USAGE = conversationCommandUsage("search");
+const EPISODES_USAGE = conversationCommandUsage("episodes");
+const EPISODE_USAGE = conversationCommandUsage("episode");
+const ENTRY_USAGE = conversationCommandUsage("entry");
+const ATTACH_USAGE = conversationCommandUsage("attach");
 
 type AttachArguments =
   | { readonly kind: "usage" }

@@ -8,6 +8,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import {
   createRegistry,
   Harness,
+  LiveDoc,
   type ConversationId,
   type Cursor,
   type EntryId,
@@ -21,10 +22,23 @@ import { openFullSyncNodeSqliteStorage } from "../storage/sqlite.js";
 import {
   hasPersistedNanobotContext,
   preparedContextReplay,
+  preparedResponseEvidence,
   type PreparedContextReplay,
+  type PreparedResponseEvidence,
 } from "./prepared.js";
 
-const RECOVERY_FINGERPRINT_VERSION = "nanobot.prepared-context-recovery.v1";
+/**
+ * Stopped-store inspection and explicit cancellation of prepared dispatches.
+ *
+ * Normal gateway startup no longer refuses solely because such a dispatch exists: after its prepared
+ * model passes the configured authority scan, the open cancels it through the same native
+ * `abortTask` and records one durable interruption notice. These functions remain the owner fallback
+ * for an unsupported or failed automatic path (for example a full interruption record, an abort mark
+ * that did not persist, or a prepared model outside `allowedModels`).
+ */
+const RECOVERY_FINGERPRINT_VERSION = "nanobot.prepared-context-recovery.v2";
+
+export type { PreparedResponseEvidence } from "./prepared.js";
 
 /** Expected failure of owner-driven recovery, safe to show without suppressing context. */
 export class PreparedContextRecoveryError extends Error {
@@ -46,12 +60,15 @@ export interface PreparedContextBlock {
   readonly taskId: number;
   readonly kind: "pi.generation" | "pi.compaction";
   readonly conversationId: ConversationId;
-  readonly phase: "request" | "poll" | "summarize" | "retry";
+  readonly phase: "request" | "poll" | "summarize";
   /** Pinned cutoff (generation) or tail (compaction) entry ID. */
   readonly at: number;
+  /** What durable state records about this dispatch's provider response. */
+  readonly response: PreparedResponseEvidence;
   /**
    * SHA-256 of the fingerprint version, task ID, kind, conversation ID, phase,
-   * and pinned entry ID. It does not bind the rest of the checkpoint.
+   * pinned entry ID, pinned attempt, and response evidence. It does not bind the
+   * rest of the checkpoint.
    */
   readonly fingerprint: string;
 }
@@ -81,7 +98,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function fingerprint(replay: PreparedContextReplay): string {
+function fingerprint(replay: PreparedContextReplay, response: PreparedResponseEvidence): string {
   return createHash("sha256")
     .update(JSON.stringify([
       RECOVERY_FINGERPRINT_VERSION,
@@ -90,6 +107,8 @@ function fingerprint(replay: PreparedContextReplay): string {
       replay.conversationId,
       replay.phase,
       replay.at,
+      replay.attempt,
+      response,
     ]))
     .digest("hex");
 }
@@ -174,13 +193,18 @@ async function collectPreparedContextBlocks(
     }
     const view = await conversation.context(context, { at: replay.at as EntryId });
     if (!hasPersistedNanobotContext(view.messages)) continue;
+    const response = preparedResponseEvidence(
+      replay,
+      await harness.snapshot(LiveDoc, replay.conversationId, context),
+    );
     blocks.push({
       taskId: replay.id,
       kind: replay.kind,
       conversationId: replay.conversationId,
       phase: replay.phase,
       at: replay.at,
-      fingerprint: fingerprint(replay),
+      response,
+      fingerprint: fingerprint(replay, response),
     });
   }
   blocks.sort((left, right) => left.taskId - right.taskId);
@@ -188,12 +212,13 @@ async function collectPreparedContextBlocks(
 }
 
 /**
- * List prepared generation/compaction dispatches that still pin historical
- * Nanobot context. Opens the store under the gateway's process lock and never
- * resumes scheduling, so no provider request, tool, policy, or transcript write
- * is performed. Native Harness open recovery may still move a crashed running
- * task to pending and increment its restart counter. The conservative guard also
- * reports an unchanged host snapshot.
+ * List prepared generation request/poll or compaction summarize dispatches that
+ * still pin historical Nanobot context. Opens the store under the gateway's
+ * process lock and never resumes scheduling, so no provider request, tool,
+ * policy, or transcript write is performed. Native Harness open recovery may still
+ * move a crashed running task to pending and increment its restart counter. The
+ * conservative guard also reports an unchanged host snapshot, and it reports what
+ * durable state records about each dispatch's provider response.
  */
 export async function listPreparedContextBlocks(
   config: PortConfig,

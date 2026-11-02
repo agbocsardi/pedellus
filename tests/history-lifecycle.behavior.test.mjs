@@ -16,6 +16,9 @@ const { workspaceContextGatewayOptions } = await import(
 const { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(
   pathToFileURL(`${ai}/index.js`).href
 );
+const { EPISODE_SUMMARY_SOURCE_LIMITS, renderEntry } = await import(
+  pathToFileURL(`${pkg}/dist/history/summary-source.js`).href
+);
 const { getCurrentSystemPrompt } = await import(
   pathToFileURL(`${ai}/utils/transcript.js`).href
 );
@@ -98,10 +101,10 @@ function toolResultsOf(requestText) {
     }));
 }
 
-/** The newest history tool result in one request; earlier history results stay in the transcript. */
-function lastHistoryResult(requestText) {
-  const results = toolResultsOf(requestText).filter((result) => result.toolName === "history" && !result.isError);
-  assert.ok(results.length > 0, "expected a history tool result");
+/** The newest memory tool result in one request; earlier results stay in the transcript. */
+function lastMemoryResult(requestText, toolName) {
+  const results = toolResultsOf(requestText).filter((result) => result.toolName === toolName && !result.isError);
+  assert.ok(results.length > 0, `expected a ${toolName} tool result`);
   return results.at(-1);
 }
 
@@ -268,7 +271,8 @@ test("offline memory lifecycle preserves original evidence across compaction, re
     const names = ((await conversation.agent(context)).tools ?? []).map((tool) =>
       typeof tool === "string" ? tool : tool?.name);
     assert.ok(names.includes("skill"), names.join(","));
-    assert.ok(names.includes("history"), names.join(","));
+    for (const name of ["memory_search", "memory_browse", "memory_read"]) assert.ok(names.includes(name), names.join(","));
+    assert.ok(!names.includes("history"), names.join(","));
     assert.ok(names.includes("write") && names.includes("read"), names.join(","));
 
     // Phase 1: on-demand skill body, early fact/decision, and a topic-memory write through the
@@ -369,7 +373,7 @@ test("offline memory lifecycle preserves original evidence across compaction, re
     assert.doesNotMatch(firstSummary.summary, new RegExp(SENTINEL), "summary text is derived navigation, not raw evidence");
 
     // Phase 3: close and reopen the same durable store. The original evidence stays reachable
-    // through the model-facing history tool, which searches raw entries and opens one window.
+    // through model-facing memory search and read, which locate and open original evidence.
     await gateway.close(context);
     gateway = undefined;
     gateway = await openGateway(config, context, {
@@ -387,28 +391,29 @@ test("offline memory lifecycle preserves original evidence across compaction, re
 
     const reopenedNames = ((await reopened.agent(context)).tools ?? []).map((tool) =>
       typeof tool === "string" ? tool : tool?.name);
-    assert.ok(reopenedNames.includes("history"), reopenedNames.join(","));
+    for (const name of ["memory_search", "memory_browse", "memory_read"]) assert.ok(reopenedNames.includes(name), reopenedNames.join(","));
+    assert.ok(!reopenedNames.includes("history"), reopenedNames.join(","));
 
     const requestCount = built.state.generationRequests.length;
     await scriptedSend("Search prior history for the early decision fact.", [
-      fauxAssistantMessage([fauxToolCall("history", { action: "search", query: FACT })], { stopReason: "toolUse" }),
-      fauxAssistantMessage("History search completed."),
+      fauxAssistantMessage([fauxToolCall("memory_search", { target: "messages", query: FACT })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("Memory search completed."),
     ]);
-    const searchResult = lastHistoryResult(built.state.generationRequests[requestCount + 1].text);
-    assert.match(searchResult.text, /History search \(read-only/);
-    assert.match(unhighlight(searchResult.text), new RegExp(FACT));
-    const entryId = Number(/entry=(\d+)/.exec(searchResult.text)?.[1]);
-    assert.ok(Number.isSafeInteger(entryId) && entryId > 0, searchResult.text);
+    const searchResult = lastMemoryResult(built.state.generationRequests[requestCount + 1].text, "memory_search");
+    const searchPage = JSON.parse(searchResult.text);
+    const hit = searchPage.hits[0];
+    assert.ok(hit?.ref, JSON.stringify(searchPage));
 
     const beforeOpen = built.state.generationRequests.length;
-    await scriptedSend(`Open history entry ${entryId}.`, [
-      fauxAssistantMessage([fauxToolCall("history", { action: "open", session: SESSION, entryId })], { stopReason: "toolUse" }),
-      fauxAssistantMessage("History entry opened."),
+    await scriptedSend("Read the located original message.", [
+      fauxAssistantMessage([fauxToolCall("memory_read", { ref: hit.ref })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("Memory read completed."),
     ]);
-    const openResult = lastHistoryResult(built.state.generationRequests[beforeOpen + 1].text);
-    assert.match(openResult.text, new RegExp(SENTINEL), "the original early turn remains the evidence");
-    assert.match(openResult.text, new RegExp(FACT));
-    assert.doesNotMatch(openResult.text, new RegExp(TOPIC_MARKER), "topic body stays on demand");
+    const openResult = lastMemoryResult(built.state.generationRequests[beforeOpen + 1].text, "memory_read");
+    const opened = JSON.parse(openResult.text);
+    assert.match(opened.content, new RegExp(SENTINEL), "the original early turn remains the evidence");
+    assert.match(opened.content, new RegExp(FACT));
+    assert.doesNotMatch(opened.content, new RegExp(TOPIC_MARKER), "topic body stays on demand");
 
     // Phase 4: a second closed episode whose summary fails must not block raw recall. The summary
     // provider parks once so the worker identity is read from committed state; it then answers empty,
@@ -442,21 +447,277 @@ test("offline memory lifecycle preserves original evidence across compaction, re
 
     const beforeFailedOpen = built.state.generationRequests.length;
     await scriptedSend("Search history for the late decision despite the failed summary.", [
-      fauxAssistantMessage([fauxToolCall("history", { action: "search", query: LATE_FACT })], { stopReason: "toolUse" }),
-      fauxAssistantMessage("Raw history search completed."),
+      fauxAssistantMessage([fauxToolCall("memory_search", { target: "messages", query: LATE_FACT })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("Memory search completed."),
     ]);
-    const failedSearchResult = lastHistoryResult(built.state.generationRequests[beforeFailedOpen + 1].text);
-    assert.match(unhighlight(failedSearchResult.text), new RegExp(LATE_FACT));
-    const lateEntryId = Number(/entry=(\d+)/.exec(failedSearchResult.text)?.[1]);
-    assert.ok(Number.isSafeInteger(lateEntryId) && lateEntryId > 0, failedSearchResult.text);
+    const failedSearchResult = lastMemoryResult(built.state.generationRequests[beforeFailedOpen + 1].text, "memory_search");
+    const failedSearchPage = JSON.parse(failedSearchResult.text);
+    const lateHit = failedSearchPage.hits[0];
+    assert.ok(lateHit?.ref, JSON.stringify(failedSearchPage));
 
     const beforeFailedSurround = built.state.generationRequests.length;
-    await scriptedSend(`Open the late decision entry ${lateEntryId}.`, [
-      fauxAssistantMessage([fauxToolCall("history", { action: "open", session: SESSION, entryId: lateEntryId })], { stopReason: "toolUse" }),
-      fauxAssistantMessage("Late entry opened."),
+    await scriptedSend("Read the located late decision message.", [
+      fauxAssistantMessage([fauxToolCall("memory_read", { ref: lateHit.ref })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("Late entry read."),
     ]);
-    const lateOpenResult = lastHistoryResult(built.state.generationRequests[beforeFailedSurround + 1].text);
-    assert.match(lateOpenResult.text, new RegExp(LATE_FACT), "raw evidence survives a failed summary");
+    const lateOpenResult = lastMemoryResult(built.state.generationRequests[beforeFailedSurround + 1].text, "memory_read");
+    assert.match(JSON.parse(lateOpenResult.text).content, new RegExp(LATE_FACT), "raw evidence survives a failed summary");
+  } finally {
+    built.state.summaryGate.release();
+    if (gateway) await gateway.close(context);
+  }
+});
+
+test("episode summary source bounds one entry and previews long tool text head-tail", () => {
+  const entryChars = EPISODE_SUMMARY_SOURCE_LIMITS.entryChars;
+  const head = "RESULT-HEAD-1142";
+  const tail = "RESULT-TAIL-1143";
+  const result = renderEntry({
+    id: 7,
+    kind: "pi.tool-result",
+    model: [{
+      role: "toolResult",
+      toolCallId: "call-7",
+      toolName: "bash",
+      content: [{ type: "text", text: `${head}${"r".repeat(9_000)}${tail}` }],
+      isError: false,
+    }],
+  });
+  assert.equal(result.toolResult, true);
+  assert.equal(result.truncated, true);
+  assert.ok(result.text.length <= entryChars, `body=${result.text.length}`);
+  assert.ok(result.text.startsWith(`[Tool result bash]: ${head}`), result.text.slice(0, 80));
+  assert.ok(result.text.endsWith(tail), result.text.slice(-80));
+  assert.match(result.text, /characters omitted; original at entry:7\/tool-result\/call-7/);
+  // The omitted middle is really gone, not merely labelled as omitted.
+  assert.ok(!result.text.includes("r".repeat(4_650)), "the preview must not carry the middle");
+
+  const argsHead = "ARGS-HEAD-5531";
+  const argsTail = "ARGS-TAIL-5532";
+  const call = renderEntry({
+    id: 9,
+    kind: "pi.assistant",
+    model: [{
+      role: "assistant",
+      content: [{
+        type: "toolCall",
+        id: "call-9",
+        name: "edit",
+        arguments: { path: `${argsHead}${"a".repeat(4_000)}${argsTail}` },
+      }],
+      stopReason: "toolUse",
+    }],
+  });
+  assert.equal(call.truncated, true);
+  assert.ok(call.text.length <= entryChars, `body=${call.text.length}`);
+  assert.match(call.text, new RegExp(argsHead));
+  assert.match(call.text, new RegExp(argsTail));
+  assert.match(call.text, /characters omitted; original at entry:9\/tool-call\/call-9/);
+  assert.ok(!call.text.includes("a".repeat(2_050)), "the preview must not carry the middle");
+
+  // A short tool result is quoted whole, with no marker.
+  assert.deepEqual(
+    { ...renderEntry({
+      id: 3,
+      kind: "pi.tool-result",
+      model: [{ role: "toolResult", toolCallId: "call-3", toolName: "read", content: [{ type: "text", text: "ok" }] }],
+    }) },
+    { text: "[Tool result read]: ok", message: false, toolResult: true, truncated: false },
+  );
+
+  // Multi-item entries: the preview takes the rest of the bound, so the parts after it are counted as
+  // omitted. They are never dropped without a marker the summarizer can see.
+  const multi = renderEntry({
+    id: 11,
+    kind: "pi.assistant",
+    model: [{
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "call-a", name: "write", arguments: { content: "w".repeat(4_000) } },
+        { type: "toolCall", id: "call-b", name: "bash", arguments: { command: "SECOND-CALL-LATE-8801" } },
+      ],
+      stopReason: "toolUse",
+    }],
+  });
+  assert.equal(multi.truncated, true);
+  assert.match(multi.text, /original at entry:11\/tool-call\/call-a/);
+  assert.doesNotMatch(multi.text, /SECOND-CALL-LATE-8801/);
+  assert.match(multi.text, /\[\.\.\. \d+ more characters truncated\]$/);
+
+  // Prose that already fills the bound leaves the tool call unquoted, still with an exact count.
+  const proseThenCall = renderEntry({
+    id: 12,
+    kind: "pi.assistant",
+    model: [{
+      role: "assistant",
+      content: [
+        { type: "text", text: "p".repeat(3_000) },
+        { type: "toolCall", id: "call-c", name: "bash", arguments: { command: "AFTER-PROSE-9902" } },
+      ],
+      stopReason: "toolUse",
+    }],
+  });
+  assert.equal(proseThenCall.truncated, true);
+  assert.doesNotMatch(proseThenCall.text, /AFTER-PROSE-9902/);
+  assert.match(proseThenCall.text, /\[\.\.\. \d+ more characters truncated\]$/);
+
+  // A bound left too small for the preview's reference marker must still say how much was cut: the
+  // shared preview degrades to a bare ellipsis there, so the counted head cut is used instead.
+  const compact = renderEntry({
+    id: 13,
+    kind: "pi.assistant",
+    model: [{
+      role: "assistant",
+      content: [
+        { type: "text", text: "q".repeat(1_950) },
+        { type: "toolCall", id: "call-d", name: "bash", arguments: { command: "COMPACT-TAIL-4410" } },
+      ],
+      stopReason: "toolUse",
+    }],
+  });
+  assert.equal(compact.truncated, true);
+  assert.doesNotMatch(compact.text, /COMPACT-TAIL-4410/);
+  assert.doesNotMatch(compact.text, /\u2026$/);
+  assert.match(compact.text, /\[\.\.\. \d+ more characters truncated\]$/);
+
+  // Ordinary message prose keeps its head cut and its exact omitted-character count.
+  const prose = renderEntry({ id: 4, kind: "pi.user", model: [{ role: "user", content: "u".repeat(3_000) }] });
+  assert.equal(prose.truncated, true);
+  assert.ok(prose.text.startsWith(`[User]: ${"u".repeat(entryChars - "[User]: ".length)}`));
+  assert.match(prose.text, /\[\.\.\. 1008 more characters truncated\]$/);
+});
+
+test("an episode longer than the old 12-chunk cap is covered by one bounded request per chunk", { timeout: 60_000 }, async (t) => {
+  const root = await mkdtemp(resolve(tmpdir(), "nanobot-summary-span-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = resolve(root, "workspace");
+  const dataDir = resolve(root, "state");
+  await writeWorkspace(workspace);
+  const config = lifecycleConfig(workspace, dataDir);
+  const built = buildProviders();
+  const session = "cli:summary-span";
+  const resultHead = "SPAN-RESULT-HEAD-9142";
+  const resultTail = "SPAN-RESULT-TAIL-9143";
+  const argsHead = "SPAN-ARGS-HEAD-9144";
+  const argsTail = "SPAN-ARGS-TAIL-9145";
+  let gateway;
+  try {
+    gateway = await openGateway(config, context, {
+      models: built.models,
+      ...workspaceContextGatewayOptions(config),
+    });
+    const conversation = await gateway.conversationFor(session, context);
+    await gateway.harness.commit(async (tx) => {
+      await tx.appendEntry(conversation.id, {
+        kind: "pi.user",
+        model: [{ role: "user", content: "Long synthetic episode start.", timestamp: 1_000 }],
+      });
+      await tx.appendEntry(conversation.id, {
+        kind: "pi.assistant",
+        model: [{
+          role: "assistant",
+          content: [{
+            type: "toolCall",
+            id: "call-span",
+            name: "bash",
+            arguments: { command: `${argsHead}${"a".repeat(4_000)}${argsTail}` },
+          }],
+          stopReason: "toolUse",
+          timestamp: 1_001,
+        }],
+      });
+      await tx.appendEntry(conversation.id, {
+        kind: "pi.tool-result",
+        model: [{
+          role: "toolResult",
+          toolCallId: "call-span",
+          toolName: "bash",
+          content: [{ type: "text", text: `${resultHead}${"r".repeat(9_000)}${resultTail}` }],
+          isError: false,
+          timestamp: 1_002,
+        }],
+      });
+      for (let index = 0; index < 1_650; index += 1) {
+        // The first 300 fillers are full-size, so the episode needs far more than the old 12 chunks; the
+        // rest are tiny, so 1,650 entries stay cheap while crossing a collect phase boundary (five
+        // 400-entry pages, four of them per phase invocation).
+        const body = index < 300 ? `Filler entry ${index}: ${"f".repeat(1_900)}` : `Small filler ${index}.`;
+        await tx.appendEntry(conversation.id, {
+          kind: "pi.user",
+          model: [{ role: "user", content: body, timestamp: 2_000 + index }],
+        });
+      }
+      await tx.appendEntry(conversation.id, {
+        kind: "pi.assistant",
+        model: [{ role: "assistant", content: [{ type: "text", text: "Long synthetic episode end." }], stopReason: "stop", timestamp: 9_000 }],
+      });
+    }, context);
+
+    // Park the first fold so the worker identity is read from committed state, then let the chain run.
+    const entered = built.state.summaryGate.wait();
+    await conversation.reset(undefined, context);
+    // The catalog records episode boundaries in bounded passes, so settle it before the summary queues.
+    const settledCatalog = await within((async () => {
+      let report = await gateway.reconcileHistoryEpisodes(session, context);
+      for (let attempt = 0; attempt < 8 && !report.caughtUp; attempt += 1) {
+        report = await gateway.reconcileHistoryEpisodes(session, context);
+      }
+      assert.equal(report.caughtUp, true, "the episode catalog never caught up");
+      return report;
+    })(), 10_000, "episode catalog reconciliation");
+    assert.ok(settledCatalog.scanned > 0);
+    await within(entered, 10_000, "first summary request");
+    const queue = await gateway.historySummaryQueue(session, context);
+    assert.ok(Number.isSafeInteger(queue.currentTaskId) && queue.currentTaskId > 0, "summary worker is live");
+    const settled = gateway.harness.waitForTask(queue.currentTaskId, context);
+    built.state.summaryGate.release();
+    assert.equal((await within(settled, 30_000, "long summary task")).state.outcome.status, "completed");
+
+    const episodes = await gateway.listHistoryEpisodes(session, { limit: 5 }, context);
+    const closed = episodes.episodes.find((episode) => episode.status === "closed");
+    assert.ok(closed, JSON.stringify(episodes.episodes.map((episode) => episode.status)));
+    const record = await gateway.historyEpisodeSummary(session, closed.startEntryId, context);
+    assert.equal(record.status, "ready");
+    // The whole range is covered: the fold cap is gone, not merely raised.
+    assert.ok(record.coverage.chunks > 12, `chunks=${record.coverage.chunks}`);
+    // More than four collect pages means the collect phase yielded and resumed from its durable
+    // checkpoint; the same episode is still covered exactly once and folded chunk by chunk.
+    assert.equal(record.coverage.complete, true);
+    assert.equal(record.coverage.uncoveredEntries, 0);
+    assert.equal(record.coverage.entriesRead, record.coverage.sourceEntries);
+    // Exactly one provider request per chunk: the request is bounded, and no attempt was repeated.
+    assert.equal(built.state.summaryRequests.length, record.coverage.chunks);
+    assert.equal(record.attempts, record.coverage.chunks);
+    assert.equal(record.interruptedCalls, 0);
+    const segments = built.state.summaryRequests.map((request) => {
+      const messages = JSON.parse(request);
+      const body = messages
+        .filter((message) => message.role === "user")
+        .map((message) => (typeof message.content === "string"
+          ? message.content
+          : message.content.map((block) => (block.type === "text" ? block.text : "")).join("\n")))
+        .join("\n");
+      const fenced = /«transcript»\n([\s\S]*)\n«\/transcript»/.exec(body);
+      assert.ok(fenced, "each fold carries one fenced transcript segment");
+      return fenced[1];
+    });
+    for (const segment of segments) {
+      // A chunk closes at 24,000 characters and may cross that by the entry that closes it, that
+      // entry's truncation marker, and one two-character separator per entry in the chunk.
+      const bound = EPISODE_SUMMARY_SOURCE_LIMITS.chunkChars
+        + EPISODE_SUMMARY_SOURCE_LIMITS.entryChars
+        + 2 * EPISODE_SUMMARY_SOURCE_LIMITS.chunkEntries
+        + 128;
+      assert.ok(segment.length <= bound, `segment=${segment.length}`);
+    }
+    // The long tool call and its result are quoted with the shared memory-recall head-tail preview.
+    const first = segments[0];
+    assert.match(first, new RegExp(resultHead));
+    assert.match(first, new RegExp(resultTail));
+    assert.match(first, /characters omitted; original at entry:\d+\/tool-result\/call-span/);
+    assert.match(first, new RegExp(argsHead));
+    assert.match(first, new RegExp(argsTail));
+    assert.match(first, /characters omitted; original at entry:\d+\/tool-call\/call-span/);
   } finally {
     built.state.summaryGate.release();
     if (gateway) await gateway.close(context);

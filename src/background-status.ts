@@ -1,11 +1,12 @@
 /**
  * Concise, read-only background summary for the existing `/status` surfaces.
  *
- * The snapshot is metadata only: this conversation's own live workers and scheduled jobs, plus
- * whether one workspace-global memory-digestion run is live and whose it is. It starts nothing,
- * changes nothing, calls no model and holds no transcript, prompt, tool argument, host path or
- * credential. The host fills it from foundations it already owns; the renderer is fixed text so the
- * CLI and the Telegram owner see the same words.
+ * The snapshot is metadata only: this conversation's own live workers and scheduled jobs, whether one
+ * workspace-global memory-digestion run is live and whose it is, and one gateway-wide count of live
+ * work that a whole-gateway restart would interrupt. It starts nothing, changes nothing, calls no
+ * model and holds no transcript, prompt, tool argument, host path or credential. The host fills it
+ * from foundations it already owns; the renderer is fixed text so the CLI and the Telegram owner see
+ * the same words.
  *
  * The agent remains the manager of this work. This is a report, not a dashboard, a queue view or a
  * recovery interface.
@@ -72,18 +73,31 @@ export interface BackgroundDigest {
   readonly parked: boolean;
 }
 
+/**
+ * Live work that decides whether a whole-gateway `/restart` would interrupt something. Counts only:
+ * no task, conversation or transcript detail. It is gateway-wide, not this conversation's own work.
+ * A sleeping native timer is an armed schedule, not active work: it is never counted here.
+ */
+export interface BackgroundActiveWork {
+  /** Unfinished tasks executing, queued to execute, waiting for live work, or still finishing. */
+  readonly interrupting: number;
+}
+
 export interface BackgroundStatus {
   readonly workers: BackgroundWorkers;
   readonly cron: BackgroundCron;
   readonly digest: BackgroundDigest;
+  /** Gateway-wide active work; a whole-gateway restart is refused while it is non-zero. */
+  readonly active: BackgroundActiveWork;
 }
 
-/** An empty snapshot: nothing runs, nothing is scheduled, no digest is live. */
+/** An empty snapshot: nothing runs, nothing is scheduled, no digest is live, nothing is active. */
 export function emptyBackgroundStatus(): BackgroundStatus {
   return {
     workers: { live: 0, parked: 0, items: [] },
     cron: { scheduled: 0, nextAtMs: null, running: { total: 0, items: [] }, pending: 0, parked: 0 },
     digest: { live: "none", parked: false },
+    active: { interrupting: 0 },
   };
 }
 
@@ -116,11 +130,14 @@ function stateWord(status: BackgroundTaskState, retryable?: boolean): string {
 
 /**
  * Fixed lines appended to an existing `/status`. `undefined` means the host could not read the
- * snapshot, so nothing is added and no claim is made. An idle conversation prints one line.
+ * snapshot, so nothing is added and no claim is made. An idle conversation prints one line; a
+ * blocked restart adds one fixed `Restart:` line with its count.
  */
 export function renderBackgroundStatus(status: BackgroundStatus | undefined): string[] {
   if (status === undefined) return [];
   const { workers, cron, digest } = status;
+  // An older host has no such field; then nothing is claimed about a restart.
+  const interrupting = status.active?.interrupting ?? 0;
   const summary: string[] = [];
   if (workers.live > 0) summary.push(plural(workers.live, "live worker", "live workers"));
   if (workers.parked > 0) summary.push(plural(workers.parked, "parked worker", "parked workers"));
@@ -136,6 +153,11 @@ export function renderBackgroundStatus(status: BackgroundStatus | undefined): st
   const workersTotal = workers.live + workers.parked;
   const due = isoTime(cron.nextAtMs);
   const rows = [
+    // The operator-visible half of the `/restart` gate: fixed words and a count, no identifiers.
+    ...(interrupting > 0
+      ? [`Restart: blocked by ${plural(interrupting, "active task", "active tasks")} gateway-wide; ` +
+        "finish or abort that work first"]
+      : []),
     ...workers.items.map((worker) => `  worker ${worker.taskId} (${stateWord(worker.status, worker.retryable)}): ${worker.task} — ` +
       (worker.workspace === "worktree" ? "isolated worktree" : "shared workspace")),
     ...(workersTotal > workers.items.length

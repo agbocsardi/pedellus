@@ -2,18 +2,42 @@ import type { ConversationId } from "@earendil-works/pi-durable";
 import { CONTEXT_SECTION_KEYS } from "../context/index.js";
 
 /**
- * Prepared provider dispatches are the only task phases that resend a pinned
- * model context on resume. A generation request/poll pins `cutoff`, and a
- * compaction summarize/retry pins `tail`; every other phase re-renders or only
+ * Prepared provider dispatches are the only task phases that replay pinned
+ * provider state on resume. A generation request/poll pins `cutoff`, and a
+ * compaction summarize pins `tail`; every other phase re-renders or only
  * performs local work.
+ *
+ * A compaction `retry` is deliberately not one of them. Its checkpoint is
+ * committed only after the previous attempt's provider response arrived and its
+ * error was stored, and it still has to commit the `summarize` checkpoint of the
+ * next attempt before that attempt can dispatch. A stored `retry` therefore
+ * proves that the attempt it would send was never dispatched, so resuming it
+ * repeats no unrecorded request and replays no host context.
  */
 export interface PreparedContextReplay {
   readonly id: number;
   readonly kind: "pi.generation" | "pi.compaction";
   readonly conversationId: ConversationId;
   readonly at: number;
-  readonly phase: "request" | "poll" | "summarize" | "retry";
+  readonly phase: "request" | "poll" | "summarize";
+  /** The pinned provider attempt, used to read the live attempt marker. */
+  readonly attempt: number;
 }
+
+/**
+ * What Durable's durable state records about a pinned dispatch's provider response.
+ * `not-dispatched` is a proof, not a missing observation: see
+ * `preparedResponseEvidence()`.
+ */
+export type PreparedResponseEvidence =
+  /** A committed partial of this attempt: the provider stream produced content; its remote outcome is unknown. */
+  | "partial-response"
+  /** A deferred handle is recorded; any fetch attempt or answer may be uncommitted. */
+  | "deferred-response"
+  /** This attempt was never dispatched, assuming the pinned generation and a consistent store. */
+  | "not-dispatched"
+  /** Nothing durable records whether a provider request was sent or answered. */
+  | "unrecorded";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -57,7 +81,7 @@ export function preparedTaskModel(task: unknown): { provider: string; modelId: s
   };
 }
 
-/** The pinned context cutoff of a live generation request/poll or compaction summarize/retry. */
+/** The pinned model input of a live generation request/poll or compaction summarize. */
 export function preparedContextReplay(task: unknown): PreparedContextReplay | undefined {
   if (!isRecord(task) || (task.kind !== "pi.generation" && task.kind !== "pi.compaction")) return undefined;
   const { id, conversationId, state } = task;
@@ -66,16 +90,17 @@ export function preparedContextReplay(task: unknown): PreparedContextReplay | un
   if (!isRecord(state.checkpoint) || typeof state.checkpoint.phase !== "string") {
     throw new Error(`Cannot safely inspect prepared ${task.kind} task ${String(id)} checkpoint`);
   }
-  const { phase } = state.checkpoint;
-  // Generation request/poll pin `cutoff`; compaction summarize/retry pin `tail`.
+  const { phase, attempt } = state.checkpoint;
+  // Generation request/poll pin `cutoff`; a compaction summarize pins `tail`.
   const field = task.kind === "pi.generation"
     ? phase === "request" || phase === "poll" ? "cutoff" : undefined
-    : phase === "summarize" || phase === "retry" ? "tail" : undefined;
+    : phase === "summarize" ? "tail" : undefined;
   if (field === undefined) return undefined;
   const at = state.checkpoint[field];
   if (typeof id !== "number" || !Number.isSafeInteger(id) || id < 1 ||
       typeof conversationId !== "number" || !Number.isSafeInteger(conversationId) ||
-      conversationId < 1 || typeof at !== "number" || !Number.isSafeInteger(at) || at < 1) {
+      conversationId < 1 || typeof at !== "number" || !Number.isSafeInteger(at) || at < 1 ||
+      typeof attempt !== "number" || !Number.isSafeInteger(attempt) || attempt < 1) {
     throw new Error(`Cannot safely inspect prepared ${task.kind} task ${String(id)} checkpoint`);
   }
   return {
@@ -84,7 +109,38 @@ export function preparedContextReplay(task: unknown): PreparedContextReplay | un
     conversationId: conversationId as ConversationId,
     at,
     phase: phase as PreparedContextReplay["phase"],
+    attempt,
   };
+}
+
+/**
+ * What Durable's own durable state records about the provider response of a
+ * pinned dispatch, from `pi.live` of its conversation.
+ *
+ * `request` commits `live.generation = { attempt }` before it calls the provider,
+ * so a missing or different attempt marker proves this attempt was never dispatched.
+ * This depends on the pinned Durable generation and a consistent store: only the
+ * owning run changes its marker. A committed `message` proves the stream produced
+ * content. A `poll` checkpoint records a received deferred handle, not whether a
+ * fetch was attempted or answered. Compaction records no dispatch marker at all.
+ */
+export function preparedResponseEvidence(
+  replay: PreparedContextReplay,
+  live: unknown,
+): PreparedResponseEvidence {
+  if (replay.kind === "pi.generation" && replay.phase === "poll") return "deferred-response";
+  if (replay.kind !== "pi.generation") return "unrecorded";
+  if (live === undefined) return "not-dispatched";
+  if (!isRecord(live)) {
+    throw new Error(`Cannot safely inspect live generation state of prepared task ${replay.id}`);
+  }
+  const generation = live.generation;
+  if (generation === undefined) return "not-dispatched";
+  if (!isRecord(generation) || typeof generation.attempt !== "number") {
+    throw new Error(`Cannot safely inspect live generation state of prepared task ${replay.id}`);
+  }
+  if (generation.attempt !== replay.attempt) return "not-dispatched";
+  return generation.message === undefined ? "unrecorded" : "partial-response";
 }
 
 const NANOBOT_CONTEXT_SECTION_KEYS = new Set<string>(Object.values(CONTEXT_SECTION_KEYS));

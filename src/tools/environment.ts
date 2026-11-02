@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import { sep } from "node:path";
 import type { Context } from "@earendil-works/chord/context";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
@@ -9,6 +11,10 @@ export interface ToolEnvironmentOptions {
   readonly workspaceRoot: string;
   /** Additional canonical roots the filesystem guard accepts. */
   readonly allowedRoots?: readonly string[];
+  /** Explicit host-wide opt-in; omission preserves workspace containment. */
+  readonly restrictToWorkspace?: boolean;
+  /** Managed state remains unavailable through file tools, even with host-wide roots. */
+  readonly protectedRoots?: readonly string[];
   /** Config-level shell timeout; absent keeps the shared policy default. */
   readonly timeoutSeconds?: number;
   /** Shell backend. Absent or "host" keeps the guarded native shell; "bwrap" fails closed without Bubblewrap. */
@@ -29,6 +35,8 @@ export interface ToolEnvironments {
  */
 export function createToolEnvironments(options: ToolEnvironmentOptions): ToolEnvironments {
   const environments = new Map<ConversationId, Promise<HostExecutionEnv>>();
+  const hostAccess = options.restrictToWorkspace === false;
+  if (hostAccess && options.sandbox === "bwrap") throw new Error("Host-wide tools cannot use the workspace-only bwrap shell");
   const shellSandbox =
     options.sandbox === "bwrap"
       ? { bwrapPath: resolveDirectBwrapPath(options.bwrapPath) }
@@ -42,11 +50,11 @@ export function createToolEnvironments(options: ToolEnvironmentOptions): ToolEnv
       if (pending === undefined) {
         pending = createHostExecutionEnv({
           workspaceRoot: options.workspaceRoot,
-          ...(options.allowedRoots === undefined || options.allowedRoots.length === 0
-            ? {}
-            : { allowedRoots: options.allowedRoots }),
+          allowedRoots: hostAccess ? [sep] : options.allowedRoots ?? [],
+          ...(options.protectedRoots === undefined ? {} : { protectedRoots: options.protectedRoots }),
           shell: {
-            restrictToWorkspace: true,
+            restrictToWorkspace: !hostAccess,
+            ...(hostAccess ? { environment: { HOME: homedir() } } : {}),
             ...(options.timeoutSeconds === undefined ? {} : { timeoutSeconds: options.timeoutSeconds }),
           },
           ...(shellSandbox === undefined ? {} : { shellSandbox }),

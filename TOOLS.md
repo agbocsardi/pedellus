@@ -24,6 +24,7 @@ described below; Code Mode is not part of this slice.
   "toolAllowlist": ["read", "bash"],
   "toolTimeoutSeconds": 60,
   "toolSandbox": "host",
+  "restrictToWorkspace": true,
   "bwrapPath": "/usr/bin/bwrap"
 }
 ```
@@ -49,6 +50,17 @@ described below; Code Mode is not part of this slice.
   validated (Bubblewrap 0.9 or newer) when the Gateway opens, and a missing,
   non-executable, wrong or too-old binary fails startup. There is no unsandboxed
   fallback. The field is inert for the host backend.
+- `restrictToWorkspace` defaults to `true`. Set it to `false` for full-host file
+  paths and shell cwd as the service user, with the real user home in `HOME`.
+  This requires the host shell (`toolSandbox: "bwrap"` is incompatible). The
+  configured workspace remains the default cwd and memory/skills location.
+  File tools still refuse the managed `dataDir`, including resolved aliases and
+  removal/rename of its ancestors; use gateway APIs for live state. This is
+  accidental-damage protection, not shell confinement: host programs can still
+  access anything permitted by the OS. No sudo, secret environment inheritance,
+  additional tool grants or wider Telegram admission is implied. Shared workers
+  inherit this path mode; explicit worktree workers and memory digestion retain
+  their existing narrower scopes.
 - `extraAllowedDirs` remains an explicit list of additional canonical
   filesystem roots. They are not created, and the data directory must stay
   disjoint from them.
@@ -73,21 +85,19 @@ described below; Code Mode is not part of this slice.
   [`HISTORY.md`](./HISTORY.md#agent-facing-history-tool).
 
 Every Gateway opened from an on-disk configuration file also offers one `mcp`
-management tool to authenticated mapped chat conversations (`status`, `propose`,
-`login`, `logout`, `remove`). It records one bounded, secret-free owner-approval
-request and nothing else: it cannot approve, deny, write configuration, start an
-OAuth flow, store a token or connect a server, and a worker, fork, root, digest
-or scheduled-run conversation never receives it. Only the owner's explicit
-`/mcp approve <id>`/`/mcp deny <id>` in the local terminal or the authenticated
-Telegram owner chat decides, and the resulting authority is exactly what editing
-that `mcp.servers` entry by hand would grant. Approval enables only the approved
-entry: when the `mcp` block was disabled, every other entry in the file is pinned
-to `enabled: false`. `show` prints the entire exact entry and the approval's
-effects; managed config edits are serialized and refuse to replace a file that
-changed since it was read. OAuth grants are used only while a model-executed
-shell cannot read the data directory (a Bubblewrap shell, or no shell), and fail
-closed otherwise. It is not in the coding-tool
-ceiling and grants no coding tool. See [`MCP.md`](./MCP.md#owner-approved-management).
+management tool to authenticated mapped chat conversations (`status`, `add` /
+`configure`, `login`, `logout`, `remove`). It performs the requested operation:
+it validates and atomically writes one server entry and activates it live, starts
+one login whose URL goes directly to this owner surface, deletes a stored grant
+or removes an entry. There is no `/mcp approve` gate. A worker, fork, root,
+digest or scheduled-run conversation never receives it, and it never widens
+`toolAllowlist` or an existing worker capture. An add enables only the entry
+asked for: when the `mcp` block was disabled, every other entry in the file is
+pinned to `enabled: false`. Config edits are serialized and refuse to replace a
+file that changed since it was read; a remove is bound to the current exact
+entry. OAuth tokens live in a private file protected from other users, not from
+same-user code. It is not in the coding-tool ceiling and grants no coding tool.
+See [`MCP.md`](./MCP.md#direct-owner-authorized-management).
 
 When `telegram` is configured, mapped Telegram chat conversations also receive
 one scoped `telegram` channel-action tool (`targets`, `reply`, `react`, and
@@ -114,10 +124,11 @@ re-grant or per-channel permission list to manage.
   authority: the owner chooses tools once in the configuration.
 - Changing a tool is a configuration change: edit `toolAllowlist` and restart.
   Chat and terminal commands never change coding-tool authority, and the model
-  cannot. The owner-only `/mcp approve` decision can add an MCP *connection*
-  entry (or an OAuth grant) to the configuration file, which is the same
-  authority as writing that entry by hand; it never changes `toolAllowlist`,
-  never enables coding tools and never takes effect before the next start.
+  cannot. Direct MCP management can add a connection entry (or an OAuth grant)
+  on an owner's request in an authenticated mapped chat, which is the same
+  authority as writing that entry by hand; it never changes `toolAllowlist` and
+  never enables coding tools. The affected MCP tools activate without a restart;
+  a `toolAllowlist` change still needs one.
 - Scope is validated from durable state, never from a session-key string alone:
   only a conversation that is the target of a persisted chat session key and is
   ordinary (ownerless, unforked, not the root) is authorized. The root, a
@@ -242,14 +253,16 @@ no managed copy or publish-back.
 When tools are enabled, each conversation gets one cached `HostExecutionEnv`
 built by `createHostExecutionEnv`:
 
-- Root is the canonical configured `workspace`; extra roots are the canonical
-  `extraAllowedDirs`. File operations use the shared path guard from
+- In the default scoped mode, root is the canonical configured `workspace`;
+  extra roots are the canonical `extraAllowedDirs`. Full-host mode adds `/` to
+  file roots and protects `dataDir`. File operations use the shared path guard from
   `execution/policy.ts`. In bwrap mode this still applies to the native file
   tools; only shell commands are wrapped.
 - `restrictToWorkspace: true` applies Python's practical shell guard: textual
   `../`/`..\\` and absolute or home paths outside the roots are refused with
   the workspace-boundary note.
-- The shell gets only the policy environment (workspace `HOME`, private
+- The shell gets only the policy environment (`HOME` is the workspace in scoped
+  mode and the OS user home in full-host mode, private
   per-conversation `TMPDIR`, `PATH`/`LANG`/`TERM`); caller `env` and
   `inheritEnv` are ignored. The shared command deny list is active. In bwrap
   mode the command's `TMPDIR` is replaced with the sandbox's private `/tmp`.

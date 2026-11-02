@@ -11,10 +11,20 @@ import type { AssistantMessage, ImageContent, TextContent } from "@earendil-work
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
 import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
 import {
+  conversationCommandNames,
+  conversationCommandRefusal,
+  conversationCommandUsage,
+  conversationDetailBlock,
+  conversationHelpListing,
+  findConversationCommand,
+  offeredConversationCommands,
+} from "../help/commands.js";
+import {
   renderMemoryDigestStart,
   renderMemoryDigestStatus,
 } from "../history/memory-digest.js";
-import { MCP_ADMIN_LIMITS, renderMcpApproval, renderMcpListing } from "../mcp/admin.js";
+import { renderMcpListing } from "../mcp/admin.js";
+import { looksLikeOAuthCallback } from "../mcp/surface.js";
 import type {
   GatewayMcpAdmin,
   GatewayMemoryDigest,
@@ -24,6 +34,7 @@ import type {
 } from "../runtime.js";
 import { inProcessTerminalConversation } from "../terminal/conversation.js";
 import { renderBackgroundStatus, type BackgroundStatus } from "../background-status.js";
+import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import { MEDIA_LIMITS, MediaRejected, createMediaStore, type MediaRejectionReason, type MediaStore, type StoredMedia } from "../media/attachments.js";
 import { createTranscriber, type Transcriber, type TranscriptionBackend, type TranscriptionFailure, type WhisperCliEngine } from "../media/transcription.js";
@@ -372,12 +383,13 @@ export interface TelegramGateway {
    */
   memoryDigest?: GatewayMemoryDigest;
   /**
-   * Optional owner-only MCP management. Present only when the gateway loaded an on-disk
-   * configuration file. `approve` writes configuration or starts one owner-approved OAuth login and
-   * is reachable only from this authenticated owner chat and the local terminal, never from a model
-   * tool; `show` and `list` are read-only and bounded.
+   * Optional MCP host surface. Present only when the gateway loaded an on-disk configuration file.
+   * `/mcp` is read-only status; callback-shaped ingress is consumed before model admission and the
+   * initiating chat receives its own login link and fixed completion notice.
    */
   mcpAdmin?: GatewayMcpAdmin;
+  /** Live MCP login delivery and callback surfaces, attached by this adapter while it runs. */
+  mcpSurfaces?: import("../mcp/surface.js").McpSurfaceRegistry;
 }
 
 export async function runTelegram(
@@ -402,8 +414,7 @@ export async function runTelegram(
     status: typeof gateway.listModels === "function",
     restart: options.restart !== undefined && options.restart.supported,
     digest: typeof gateway.memoryDigest?.start === "function" && typeof gateway.memoryDigest?.status === "function",
-    mcp: typeof gateway.mcpAdmin?.list === "function" && typeof gateway.mcpAdmin?.approve === "function"
-      && typeof gateway.mcpAdmin?.deny === "function" && typeof gateway.mcpAdmin?.show === "function",
+    mcp: typeof gateway.mcpAdmin?.list === "function" && typeof gateway.mcpAdmin?.submitCallback === "function",
   };
   const scope = withCancel(context);
   const adapterContext = scope.context;
@@ -1168,7 +1179,29 @@ export async function runTelegram(
       return performAction(chatId, callId, request);
     },
   };
+  /** The exact private chat and durable sender binding for one Telegram session key. */
+  function ownerChatFor(sessionKey: string): { readonly chatId: number; readonly senderId: string } | undefined {
+    const prefix = `telegram:${identity}:chat:`;
+    if (!sessionKey.startsWith(prefix)) return undefined;
+    const raw = sessionKey.slice(prefix.length);
+    if (!/^\d+$/.test(raw)) return undefined;
+    const chatId = Number(raw);
+    if (!Number.isSafeInteger(chatId)) return undefined;
+    const binding = originBindingOf(state.origins, chatId, identity);
+    if (binding === undefined || !options.allowFrom.includes(binding.senderId)) return undefined;
+    return { chatId, senderId: binding.senderId };
+  }
+
+  /** One direct plain owner message; never a durable outbox record or transcript entry. */
+  async function sendOwnerPlainText(chatId: number, senderId: string, text: string): Promise<void> {
+    if (!options.allowFrom.includes(senderId)) throw new Error("the owner sender is no longer authorized");
+    if (text.length > PLAIN_TEXT_LIMIT) throw new Error("owner message is too long for one message");
+    await apiCall(api, "sendMessage", signal, (callSignal) => withChatSendOrder(chatId, () =>
+      api.sendMessage(chatId, text, {}, toGrammySignal(callSignal))), { throttle: outboundThrottle });
+  }
+
   let detachTelegramActions: (() => void) | undefined;
+  let detachMcpSurface: (() => void) | undefined;
 
   // A completed background result is sent as stored text: no submission, no preview, no model turn.
   const scheduledSessions = async (): Promise<{ sessionKey: string; chatId: number }[]> => {
@@ -1581,7 +1614,7 @@ export async function runTelegram(
         // A native abort or a queued reset deliberately ends a turn; that is not a delivery failure to report.
         const intentional = settled.status === "unanswered" &&
           (settled.reason === "aborted" || settled.reason === "reset");
-        if (!intentional) await flushFinal("Request failed. Try again.");
+        if (!intentional) await flushFinal("Your request could not be completed. Please try again.");
         await forget(item.updateId);
         return;
       }
@@ -2126,6 +2159,26 @@ export async function runTelegram(
   requestScheduledScan();
   scheduledTimer = setInterval(requestScheduledScan, SCHEDULED_SCAN_INTERVAL_MS);
   detachTelegramActions = gateway.telegramActions?.attach(actionHost);
+  detachMcpSurface = gateway.mcpSurfaces?.attach({
+    owns: (sessionKey) => sessionKey.startsWith(`telegram:${identity}:chat:`),
+    async deliverAuthorization(sessionKey, authorization) {
+      const owner = ownerChatFor(sessionKey);
+      if (owner === undefined) throw new Error("the requesting Telegram owner chat is no longer authorized");
+      if (authorization.expiresAtMs <= Date.now()) throw new Error("authorization URL expired before delivery");
+      await sendOwnerPlainText(owner.chatId, owner.senderId, [
+        "MCP OAuth authorization URL (owner only):",
+        authorization.url,
+        `Valid until ${new Date(authorization.expiresAtMs).toISOString()}.`,
+        "Open it as the owner. If the browser cannot reach this host, paste the callback URL back into this chat.",
+        "This gateway does not store this URL or its state in channel state.",
+      ].join("\n"));
+    },
+    async deliverNotice(sessionKey, text) {
+      const owner = ownerChatFor(sessionKey);
+      if (owner === undefined) return;
+      await sendOwnerPlainText(owner.chatId, owner.senderId, text);
+    },
+  });
   drain();
 
   try {
@@ -2162,6 +2215,28 @@ export async function runTelegram(
             console.warn("Telegram origin admission binding evicted at capacity; a fresh admission restores it.");
           }
           if (origin.trusted) await releaseWithheld(sessionKey);
+          // An OAuth callback is consumed before any transcript or model admission. Only the exact
+          // authenticated sender bound to this chat may submit it; the text itself is never stored.
+          if (message.text !== undefined && looksLikeOAuthCallback(message.text)) {
+            const senderId = String(message.from!.id);
+            const binding = originBindingOf(state.origins, message.chat.id, identity);
+            if (binding === undefined || binding.senderId !== senderId) {
+              await admitNotice(update, message, sessionKey,
+                "This OAuth callback did not come from the authenticated sender that owns this chat. It was not sent " +
+                "to the assistant and was not stored.");
+            } else if (gateway.mcpAdmin === undefined) {
+              await admitNotice(update, message, sessionKey,
+                "No MCP login is available in this host; the callback was not stored or sent to the assistant.");
+            } else {
+              const result = await gateway.mcpAdmin.submitCallback(sessionKey, message.text, adapterContext);
+              await admitNotice(update, message, sessionKey,
+                result.handled
+                  ? result.text
+                  : "This OAuth callback was not accepted. It was not sent to the assistant and was not stored.");
+            }
+            drain();
+            continue;
+          }
           // Control parsing happens only after allowlist authentication and never for attachments.
           const parsed = parseTelegramInput(message.text ?? "", me.username);
           if (parsed.kind !== "input") {
@@ -2246,6 +2321,8 @@ export async function runTelegram(
     stopping = true;
     detachTelegramActions?.();
     detachTelegramActions = undefined;
+    detachMcpSurface?.();
+    detachMcpSurface = undefined;
     stopAllTyping();
     if (scheduledTimer !== undefined) clearInterval(scheduledTimer);
     scope.cancel(new DOMException("Telegram adapter stopped", "AbortError"));
@@ -2336,23 +2413,31 @@ export async function runTelegram(
     }
     if (parsed.kind === "foreign") {
       await admitNotice(update, message, sessionKey,
-        `Wrong bot mention. Use /${parsed.command} without it.`);
+        `/${parsed.command}@${parsed.mention} did not run here and was not sent to the assistant: this bot only ` +
+        `accepts an exact mention of its own username. Use /${parsed.command} without a mention.`);
       drain();
       return;
     }
     if (parsed.kind === "unsupported") {
+      // The same catalogue reason `/help <name>` gives, so the two refusals cannot drift.
       await admitNotice(update, message, sessionKey,
-        `Unknown command /${parsed.command}. Use /help, or // to send it literally.`);
+        `${conversationCommandRefusal("telegram", parsed.command, availableCommandNames())} ` +
+        "Any other message is sent to the assistant; prefix // to send a leading slash literally.");
       drain();
       return;
     }
     if (parsed.command === "help") {
-      if (parsed.args) {
-        await admitNotice(update, message, sessionKey, "Usage: /help");
+      const requested = parsed.args.trim().toLowerCase();
+      if (!requested) {
+        await admitNotice(update, message, sessionKey, controlHelpText());
         drain();
         return;
       }
-      await admitNotice(update, message, sessionKey, controlHelpText());
+      const offered = availableCommandNames();
+      const command = offered.includes(requested) ? findConversationCommand(requested) : undefined;
+      await admitNotice(update, message, sessionKey, command === undefined
+        ? `${conversationCommandRefusal("telegram", requested, offered)} Nothing was sent to the assistant.`
+        : conversationDetailBlock(command, "telegram"));
       drain();
       return;
     }
@@ -2363,7 +2448,7 @@ export async function runTelegram(
         return;
       }
       if (parsed.args) {
-        await admitNotice(update, message, sessionKey, "Usage: /status");
+        await admitNotice(update, message, sessionKey, usageNotice("status"));
         drain();
         return;
       }
@@ -2380,7 +2465,7 @@ export async function runTelegram(
       }
       const argument = parseModelArgument(parsed.args);
       if (argument.kind === "usage") {
-        await admitNotice(update, message, sessionKey, MODEL_USAGE);
+        await admitNotice(update, message, sessionKey, usageNotice("model"));
         drain();
         return;
       }
@@ -2405,7 +2490,8 @@ export async function runTelegram(
       }
       if (argument.name !== "default" && !listing.presets.some((preset) => preset.name === argument.name)) {
         await admitNotice(update, message, sessionKey,
-          `Unknown preset ${boundedLabel(argument.name, 80)}. Use /model to list presets.`);
+          `Unknown model preset ${boundedLabel(argument.name, 80)}: nothing was changed. ` +
+          "Use /model to list the configured presets.");
         drain();
         return;
       }
@@ -2423,7 +2509,7 @@ export async function runTelegram(
         return;
       }
       if (parsed.args) {
-        await admitNotice(update, message, sessionKey, "Usage: /restart");
+        await admitNotice(update, message, sessionKey, usageNotice("restart"));
         drain();
         return;
       }
@@ -2450,7 +2536,7 @@ export async function runTelegram(
         return;
       }
       if (argument !== "") {
-        await admitNotice(update, message, sessionKey, DIGEST_USAGE);
+        await admitNotice(update, message, sessionKey, usageNotice("digest"));
         drain();
         return;
       }
@@ -2466,29 +2552,14 @@ export async function runTelegram(
         drain();
         return;
       }
-      const parts = parsed.args.trim().split(/\s+/).filter((part) => part.length > 0);
-      if (parts.length === 0) {
-        // Read-only: bounded listing of configured servers and waiting proposals. No effect.
-        await admitNotice(update, message, sessionKey,
-          renderMcpListing(await admin.list(adapterContext), MAX_NOTICE_CHARS));
+      if (parsed.args.trim() !== "") {
+        await admitNotice(update, message, sessionKey, usageNotice("mcp"));
         drain();
         return;
       }
-      const [sub, id, ...extra] = parts;
-      if ((sub === "show" || sub === "approve" || sub === "deny") && id !== undefined
-        && extra.length === 0 && MCP_REQUEST_ID.test(id)) {
-        if (sub === "show") {
-          const shown = await admin.show(id, adapterContext);
-          await admitNotice(update, message, sessionKey, shown.text, MCP_ADMIN_LIMITS.maxShowChars);
-          drain();
-          return;
-        }
-        // An approval writes configuration or starts an OAuth login: it uses the same durable
-        // control record, ordered acknowledgement and chat gating as the other owner commands.
-        await admitControl(update, message, sessionKey, sub === "approve" ? "mcp-approve" : "mcp-deny", id);
-        return;
-      }
-      await admitNotice(update, message, sessionKey, MCP_USAGE);
+      // Read-only status; management itself is the model tool acting for this authenticated chat.
+      await admitNotice(update, message, sessionKey,
+        renderMcpListing(await admin.list(adapterContext), MAX_NOTICE_CHARS));
       drain();
       return;
     }
@@ -2496,7 +2567,7 @@ export async function runTelegram(
     // it normalizes to the same control kind before admission, so the durable record, gating and
     // recovery path are shared and there is no second cancellation semantics.
     if (parsed.args) {
-      await admitNotice(update, message, sessionKey, `Usage: /${parsed.command}`);
+      await admitNotice(update, message, sessionKey, usageNotice(parsed.command));
       drain();
       return;
     }
@@ -2530,7 +2601,8 @@ export async function runTelegram(
     if (state.controls.filter((entry) => entry.status === "admitted" || entry.status === "unconfirmed").length >=
         MAX_UNRESOLVED_CONTROLS) {
       await admitNotice(update, message, sessionKey,
-        `Too many unconfirmed commands (${MAX_UNRESOLVED_CONTROLS}). /${command} not started; retry later.`);
+        `Too many control commands are still unconfirmed (limit ${MAX_UNRESOLVED_CONTROLS}); this /${command} was not ` +
+        "started and was not sent to the assistant. Wait for them to finish or restart the adapter.");
       drain();
       return;
     }
@@ -2615,17 +2687,12 @@ export async function runTelegram(
       }
       if (ack !== "waiting") {
         // The acknowledgement was already published with the still-pending wording. The final outcome
-        // still belongs to this command: deliver it as a follow-up, so a slow approval cannot lose its
-        // only answer (the authorization URL is sent separately and is never stored).
+        // still belongs to this command: deliver it as a follow-up, so a slow command cannot lose its
+        // only answer.
         if (outcome.text !== undefined) {
           await publishLateControlNotice(
             update.update_id, chatId, sessionKey, String(message.from!.id), outcome.text,
           ).catch(() => undefined);
-        }
-        if (outcome.authorization !== undefined) {
-          await deliverMcpAuthorization(
-            target, outcome.authorization, update.update_id, chatId, sessionKey, String(message.from!.id),
-          );
         }
         if (outcome.requestRestart === true) requestRestart();
         return;
@@ -2638,11 +2705,6 @@ export async function runTelegram(
         // still asked when the acknowledgement commit itself failed (its notice is then reported after the
         // restart by the recovery pass).
         if (outcome.requestRestart === true) requestRestart();
-      }
-      if (outcome.authorization !== undefined) {
-        await deliverMcpAuthorization(
-          target, outcome.authorization, update.update_id, chatId, sessionKey, String(message.from!.id),
-        );
       }
     }, (error: unknown) => {
       // The record stays `admitted` and the acknowledgement stays held: a reopen reports it as unconfirmed.
@@ -2678,14 +2740,20 @@ export async function runTelegram(
     const host = options.restart;
     if (host === undefined || !host.supported) return;
     restartHostRequested = true;
-    void host.request().catch(() => {
-      restartHostRequestFailed = true;
-      console.warn("Telegram /restart request was refused by the host; the gateway keeps running.");
+    void host.request().catch((error: unknown) => {
+      // A busy refusal is a known no-effect before any acknowledgement or teardown: the owner may finish
+      // or abort the live work and ask again, so this adapter does not latch the refusal as final.
+      const busy = error instanceof RestartBusyError;
+      restartHostRequestFailed = !busy;
+      if (busy) restartHostRequested = false;
+      console.warn(busy
+        ? "Telegram /restart was refused while live work is active; the gateway keeps running."
+        : "Telegram /restart request was refused by the host; the gateway keeps running.");
       // The acknowledgement promised a follow-up, so the refusal is reported now instead of leaving that
       // promise open until some later process starts.
       void stateConversation.commit(async (tx) => {
         const doc = await tx.doc(TelegramState, stateConversation.id);
-        admitRestartNotices(doc, RESTART_FAILED);
+        admitRestartNotices(doc, busy ? RESTART_BUSY_MESSAGE : RESTART_FAILED);
         delete doc.restart;
         return copyJson(doc) as unknown as ChannelState;
       }, adapterContext).then((next) => {
@@ -2711,75 +2779,6 @@ export async function runTelegram(
     return result.status === "refused"
       ? { kind: "refused", text: renderMemoryDigestStart(result) }
       : { kind: "applied", text: renderMemoryDigestStart(result) };
-  }
-
-  /**
-   * `/mcp approve <id>` and `/mcp deny <id>`: one owner decision on one agent proposal. The request is
-   * consumed by the decision, so a replay finds nothing and a refusal is reported as refused. The
-   * approval text is fixed and bounded; an authorization URL is appended for the owner only, never to
-   * a model turn or transcript.
-   */
-  async function applyMcp(record: DeferredControl): Promise<ControlOutcome> {
-    const admin = gateway.mcpAdmin;
-    if (admin === undefined) return { kind: "refused", text: MCP_UNAVAILABLE_HOST };
-    const id = record.target;
-    if (id === undefined || !MCP_REQUEST_ID.test(id)) return { kind: "refused", text: MCP_USAGE };
-    const result = record.command === "mcp-approve"
-      ? await admin.approve(id, adapterContext)
-      : await admin.deny(id, adapterContext);
-    // The authorization URL is delivered by the command completion, after the acknowledgement and
-    // directly to this chat. It is deliberately absent from `text`, so channel state never persists it.
-    const text = result.authorization === undefined ? renderMcpApproval(result, MAX_NOTICE_CHARS) : result.text;
-    return result.status === "refused"
-      ? { kind: "refused", text }
-      : { kind: "applied", text, ...(result.authorization === undefined ? {} : { authorization: result.authorization }) };
-  }
-
-  /**
-   * Deliver one authorization URL as an ordinary plain message. Not stored: a rich or queued notice
-   * would persist the value and its state in channel state, which this delivery deliberately avoids.
-   * If it cannot be delivered, the just-started login is canceled instead of leaving an attempt that
-   * nobody can finish.
-   */
-  async function deliverMcpAuthorization(
-    requestId: string | undefined,
-    authorization: { readonly url: string; readonly expiresAtMs: number },
-    updateId: number,
-    chatId: number,
-    sessionKey: string,
-    senderId: string,
-  ): Promise<void> {
-    try {
-      await sendAuthorizationUrl(chatId, senderId, authorization);
-    } catch {
-      if (requestId !== undefined) {
-        await gateway.mcpAdmin?.deny(requestId, adapterContext).catch(() => undefined);
-      }
-      await publishLateControlNotice(updateId, chatId, sessionKey, senderId,
-        "MCP login canceled: authorization URL delivery unconfirmed. Approve a new login request.").catch(() => undefined);
-    }
-  }
-
-  /** Send one authorization URL as an ordinary plain message; it is never put in the durable outbox. */
-  async function sendAuthorizationUrl(
-    chatId: number,
-    senderId: string,
-    authorization: { readonly url: string; readonly expiresAtMs: number },
-  ): Promise<void> {
-    // The same live allowlist check every durable notice performs: a removed sender gets no URL.
-    if (!options.allowFrom.includes(senderId)) throw new Error("the approving sender is no longer authorized");
-    if (authorization.expiresAtMs <= Date.now()) {
-      throw new Error("authorization URL expired before it could be delivered");
-    }
-    const text = [
-      "MCP login (owner only):",
-      authorization.url,
-      `Valid until ${new Date(authorization.expiresAtMs).toISOString()}.`,
-      "Open in a browser that can reach this host; forward the loopback port if remote. URL is not stored or sent to the assistant.",
-    ].join("\n");
-    if (text.length > PLAIN_TEXT_LIMIT) throw new Error("authorization URL is too long for one message");
-    await apiCall(api, "sendMessage", signal, (callSignal) => withChatSendOrder(chatId, () =>
-      api.sendMessage(chatId, text, {}, toGrammySignal(callSignal))), { throttle: outboundThrottle });
   }
 
   /** Bounded read-only `/digest status`; it creates no task and reads no chat transcript. */
@@ -2844,8 +2843,6 @@ export async function runTelegram(
       outcome = { kind: "applied" };
     } else if (record.command === "digest") {
       outcome = await applyDigest(sessionKey);
-    } else if (record.command === "mcp-approve" || record.command === "mcp-deny") {
-      outcome = await applyMcp(record);
     } else if (record.command === "restart") {
       // No conversation effect: the record and its acknowledgement are durable first, and the host
       // replacement is requested by the caller only after that acknowledgement was released.
@@ -2912,12 +2909,14 @@ export async function runTelegram(
       if (isConversationBusy(error)) {
         return {
           kind: "refused",
-          text: "Model change refused: chat busy. Retry when idle.",
+          text: "Model preset selection rejected: this chat is busy, so nothing changed. " +
+            "Retry /model when this chat is idle. It was not queued and no other chat was affected.",
         };
       }
       return {
         kind: "refused",
-        text: "Model unchanged. Use /model to list presets.",
+        text: "Model preset selection was refused, so this chat's selection is unchanged. " +
+          "Use /model to list the configured presets.",
       };
     }
   }
@@ -3078,6 +3077,7 @@ export async function runTelegram(
         background = [];
       }
       return [
+        "Status for this chat (no model call, no configuration change):",
         `Model: ${boundedLabel(model, 240)}${preset === undefined ? "" : ` — preset ${boundedLabel(preset, 80)}`}`,
         status.run === undefined
           ? "Run: idle"
@@ -3085,9 +3085,11 @@ export async function runTelegram(
             `${status.run.attempt === undefined ? "" : `, generation attempt ${status.run.attempt}`})`,
         `Queued native inputs: ${status.inbox.total}`,
         ...background,
+        "Only this chat's own records were read; no other chat's transcript, prompt or tool argument is included.",
       ].join("\n");
     } catch {
-      return "Status unavailable.";
+      return "Status is unavailable right now: this chat's conversation metadata could not be read. " +
+        "No model call was made and nothing changed.";
     }
   }
 
@@ -3110,7 +3112,9 @@ export async function runTelegram(
       }
       return [
         selectedLine,
-        "No presets configured. Select direct models in the CLI:",
+        "Named model presets are not configured in this deployment, so /model <name> and /model default are " +
+          "unavailable here; this chat command never rewrites the configuration.",
+        "Configured direct choices (read only; the direct selection belongs to the local CLI):",
         ...rows,
       ].join("\n");
     }
@@ -3125,40 +3129,31 @@ export async function runTelegram(
     return [
       selectedLine,
       ...(listing.defaultPreset === undefined ? [] : [`Configured default preset: ${boundedLabel(listing.defaultPreset, 80)}.`]),
-      "Presets: /model <name> or /model default",
+      "Named model presets (see /help model to select one):",
       ...rows,
-      "Chat only; resets on restart.",
+      "A selection applies to this chat only and lasts while the gateway stays open; a restart restores the " +
+        "configured default and prepared requests keep their model.",
     ].join("\n");
   }
 
-  /** Help lists exactly the controls this host implements; nothing is advertised that would be refused. */
+  /** The catalogued Telegram commands this host actually supports, in menu order. */
+  function availableCommandNames(): readonly string[] {
+    return offeredTelegramCommandNames(hostCommands);
+  }
+
+  /** Help lists exactly the controls this host implements, one line each; detail stays in `/help <command>`. */
   function controlHelpText(): string {
-    const lines = [
-      "/new - reset context",
-      "/abort - stop this chat and clear its queue",
-      "/stop - same as /abort",
-    ];
-    if (hostCommands.status) {
-      lines.push("/status - model and run status");
-    }
-    if (hostCommands.model) {
-      lines.push("/model [<preset>|default] - list or switch model for this chat");
-    }
-    if (hostCommands.restart) {
-      lines.push("/restart - restart the gateway (all chats)");
-    }
-    if (hostCommands.digest) {
-      lines.push("/digest [status] - update shared memory or check progress");
-    }
-    if (hostCommands.mcp) {
-      lines.push("/mcp [show|approve|deny <id>] - servers and approval requests");
-    }
-    lines.push("/help - commands");
-    lines.push(mediaIngress === undefined
-      ? "Text only; attachments aren't read."
-      : "Photos: images. Audio: local transcription if configured. Documents: stored unread. No video or stickers.");
-    lines.push("Prefix // to send a slash literally.");
-    return lines.join("\n");
+    const offered = availableCommandNames();
+    const absent = conversationCommandNames("telegram").filter((name) => !offered.includes(name));
+    return [
+      conversationHelpListing("telegram", offered),
+      ...(absent.length === 0 ? [] : [`Not offered by this host: ${absent.map((name) => `/${name}`).join(", ")}.`]),
+      mediaIngress === undefined
+        ? "Text only: attachments are not read and /attach is not available; other slash commands are refused, " +
+          "and // sends a leading slash literally."
+        : "Photos are images, voice and audio transcribe locally, documents stay unread; video and stickers are " +
+          "skipped. // sends a slash literally.",
+    ].join("\n\n");
   }
 
   async function admitNotice(
@@ -3450,24 +3445,36 @@ function quotedMessageContext(
   };
 }
 
+/** Bot API caps a menu description at 256 characters; a longer summary would be truncated here. */
+const TELEGRAM_MENU_DESCRIPTION_MAX = 256;
+
 /**
- * Only commands this adapter actually implements for this host belong in the native menu. `/status`,
- * `/model`, `/digest` and `/restart` are omitted for a host that exposes no such operation.
+ * The native command menu is the shared catalogue filtered to the controls this host implements, so
+ * its names and one-line descriptions cannot drift from `/help`.
  */
 function telegramCommands(
   host: TelegramCommandHost,
 ): readonly { readonly command: string; readonly description: string }[] {
-  return [
-    { command: "new", description: "Reset this conversation's context" },
-    { command: "abort", description: "Stop this turn and withdraw queued messages" },
-    { command: "stop", description: "Alias of /abort: stop this turn here" },
-    ...(host.status ? [{ command: "status", description: "Show this chat's model and run status" }] : []),
-    ...(host.model ? [{ command: "model", description: "List or select a configured model preset" }] : []),
-    ...(host.restart ? [{ command: "restart", description: "Restart the gateway process" }] : []),
-    ...(host.digest ? [{ command: "digest", description: "Run one bounded memory-digestion batch" }] : []),
-    ...(host.mcp ? [{ command: "mcp", description: "Review and approve MCP server proposals" }] : []),
-    { command: "help", description: "Show the available commands" },
-  ];
+  return offeredConversationCommands("telegram", offeredTelegramCommandNames(host)).map((command) => ({
+    command: command.name,
+    description: command.summary.slice(0, TELEGRAM_MENU_DESCRIPTION_MAX),
+  }));
+}
+
+/** The catalogued Telegram controls this host really implements, in catalogue order. */
+function offeredTelegramCommandNames(host: TelegramCommandHost): readonly string[] {
+  const offered: Record<string, boolean> = {
+    new: true,
+    abort: true,
+    stop: true,
+    help: true,
+    status: host.status,
+    model: host.model,
+    restart: host.restart,
+    digest: host.digest,
+    mcp: host.mcp,
+  };
+  return conversationCommandNames("telegram").filter((name) => offered[name] === true);
 }
 
 /** Which optional host operations this adapter may advertise and apply. */
@@ -3491,15 +3498,13 @@ type TelegramControl = "new" | "abort" | "stop" | "help" | "status" | "model" | 
  * A command with a native effect on this chat or this process; a refusal is terminal, never retried.
  * `/stop` normalizes to `abort` here, so one control kind covers both spellings.
  */
-type TelegramMutation = "new" | "abort" | "model" | "restart" | "digest" | "mcp-approve" | "mcp-deny";
+type TelegramMutation = "new" | "abort" | "model" | "restart" | "digest";
 
 type ControlOutcome =
   | {
       readonly kind: "applied";
       readonly text?: string;
       readonly requestRestart?: true;
-      /** One-time owner URL, delivered directly and never stored in channel state. */
-      readonly authorization?: { readonly url: string; readonly expiresAtMs: number };
     }
   | { readonly kind: "refused"; readonly text: string }
   | { readonly kind: "deferred" }
@@ -3509,10 +3514,8 @@ const CONTROL_ACK: Record<TelegramMutation, string> = {
   new: "Context reset.",
   abort: "Idle. Queue cleared.",
   model: "Model selected.",
-  restart: "Restarting.",
+  restart: "Restart requested; checking active work.",
   digest: "Digest requested.",
-  "mcp-approve": "MCP request approved.",
-  "mcp-deny": "MCP request denied.",
 };
 
 const CONTROL_PENDING: Record<TelegramMutation, string> = {
@@ -3521,8 +3524,6 @@ const CONTROL_PENDING: Record<TelegramMutation, string> = {
   model: "Model change pending.",
   restart: "Restart pending.",
   digest: "Digest pending; not started yet.",
-  "mcp-approve": "MCP approval pending.",
-  "mcp-deny": "MCP denial pending.",
 };
 
 const UNCONFIRMED_CONTROL =
@@ -3546,32 +3547,53 @@ const RESTART_FAILED = "Restart refused. Gateway still running.";
 const RESTART_LIVE_UPDATE_ID = -1;
 
 /** Fixed, sanitized refusals: a narrow host advertises nothing it cannot do. */
-const STATUS_UNAVAILABLE_HOST = "Status unavailable.";
-const MODEL_UNAVAILABLE_HOST = "Model commands unavailable.";
-const MODEL_LISTING_UNAVAILABLE = "Model list unavailable. Nothing changed.";
-const MODEL_PRESETS_UNAVAILABLE = "No model presets configured. Nothing changed.";
-const MODEL_USAGE = "Usage: /model [<preset>|default]";
-const MCP_UNAVAILABLE_HOST = "MCP management unavailable: no configuration file.";
-/** One pending owner approval request. Opaque, fixed-width and content-bound at creation. */
-const MCP_REQUEST_ID = /^[0-9a-f]{16}$/;
-const MCP_USAGE = "Usage: /mcp | /mcp show|approve|deny <id>";
-const RESTART_UNAVAILABLE_HOST = "Restart unavailable on this host.";
-const RESTART_ALREADY_REQUESTED = "Already restarting.";
-const RESTART_REQUEST_FAILED = "Restart refused. Gateway still running; restart it manually.";
+const STATUS_UNAVAILABLE_HOST =
+  "Status is unavailable in this host: it exposes no model/status metadata for this chat. Nothing was sent to the assistant.";
+const MODEL_UNAVAILABLE_HOST =
+  "Model commands are unavailable in this host: it exposes no preset catalog or preset selection. Nothing was sent to the assistant.";
+const MODEL_LISTING_UNAVAILABLE =
+  "Model choices are unavailable right now: this chat's host model catalog could not be read. Nothing changed.";
+const MODEL_PRESETS_UNAVAILABLE =
+  "Named model presets are not configured in this deployment, so /model <name> and /model default are unavailable. " +
+  "Nothing was changed; /model lists the current selection read only, and this chat command never rewrites the configuration.";
+/** A fixed Telegram usage notice: the catalogue's line, a no-argument note, and the surface's tail. */
+function usageNotice(name: string): string {
+  const argumentsNote = findConversationCommand(name)?.args === undefined ? " (no arguments)." : "";
+  return `${conversationCommandUsage(name, "telegram")}${argumentsNote} Nothing was sent to the assistant.`;
+}
+
+const MCP_UNAVAILABLE_HOST =
+  "MCP management is unavailable in this host: the gateway was opened without an on-disk configuration file, " +
+  "so there is nothing to write. Nothing was sent to the assistant.";
+/** One pending owner control command. Opaque, fixed-width and content-bound at creation. */
+const RESTART_UNAVAILABLE_HOST =
+  "Restart is unavailable in this host: it cannot replace its own process with the same program and configuration. " +
+  "Nothing was sent to the assistant.";
+const RESTART_ALREADY_REQUESTED =
+  "A restart was already requested in this gateway and is still stopping it; this /restart was not requested again.";
+const RESTART_REQUEST_FAILED =
+  "A restart was already requested in this gateway and the host refused it, so the gateway is still running. " +
+  "This /restart was not requested again; fix the host and start the gateway yourself.";
 const RESET_BUSY = "Reset refused: chat busy. /abort or retry /new when idle.";
-const DIGEST_UNAVAILABLE_HOST = "Digest unavailable. Nothing started.";
-const DIGEST_USAGE = "Usage: /digest [status]";
+const DIGEST_UNAVAILABLE_HOST =
+  "Memory digestion is unavailable in this host: it exposes no manual digestion entry. Nothing was started and " +
+  "nothing was sent to the assistant.";
 
 /** Replay wording for a command this adapter recorded before a restart; it is never run twice. */
 function replayControlText(entry: TelegramControlRecord): string {
   if (entry.command === "restart") {
     return entry.status === "applied"
-      ? "Restart already requested. Not retried."
-      : UNCONFIRMED_RESTART;
+      ? "That /restart was already requested before this process restarted, so it is not requested again."
+      : "That /restart was interrupted before it was confirmed: it may or may not have restarted the gateway, and it " +
+        "is not requested again.";
   }
-  if (entry.status === "applied") return "Command already applied. Not repeated.";
-  if (entry.status === "refused") return "Command refused. Send it again if needed.";
-  if (entry.status === "unconfirmed") return "Command interrupted; outcome unknown. Send it again if needed.";
+  if (entry.status === "applied") return "That command was already applied before a restart, so it was not run again.";
+  if (entry.status === "refused") {
+    return "That command was refused before any effect and will not be retried; send it again if it is still needed.";
+  }
+  if (entry.status === "unconfirmed") {
+    return "That command was already reported as interrupted; send it again if you still need it.";
+  }
   return UNCONFIRMED_CONTROL;
 }
 

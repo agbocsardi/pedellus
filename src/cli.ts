@@ -5,29 +5,34 @@ import { stdin, stderr, stdout } from "node:process";
 import type { AuthType } from "@earendil-works/pi-ai";
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { runLogin, runLogout } from "./auth/cli.js";
+import {
+  CronCommandError,
+  CronUsageError,
+  parseCronInvocation,
+  runCronCommand,
+  type CronInvocation,
+} from "./automation/operator-cli.js";
 import { loadConfig, defaultConfigPath } from "./config.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
+import { COMMANDS, commandUsage, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
+import { SAFE_COMMAND_NAME } from "./help/commands.js";
 import { connectLocalGateway } from "./local/client.js";
 import { gatewaySocketPath, serveLocalGateway } from "./local/server.js";
 import { LocalGatewayError } from "./local/protocol.js";
 import { createMediaStore } from "./media/attachments.js";
 import { LOCAL_ATTACHMENT_DIRECTORY } from "./media/local.js";
 import { cancelPreparedContextBlock, listPreparedContextBlocks, PreparedContextRecoveryError } from "./recovery/index.js";
-import { replaceProcess, restartPlan, restartSupported, RESTART_FAILURE_DIAGNOSTIC } from "./restart.js";
+import { createRestartCoordinator, replaceProcess, restartPlan, restartSupported, RESTART_FAILURE_DIAGNOSTIC } from "./restart.js";
 import { runTerminalConversation } from "./terminal/index.js";
 import { openGateway } from "./runtime.js";
 import { prepareDataDirectory } from "./store.js";
 import { StartupDiagnosticError, startupDiagnostic } from "./startup-diagnostics.js";
 
-const USAGE =
-  "Usage: durable-nanobot gateway [--config <path>] | durable-nanobot agent [--config <path>] [--conversation <name>] | " +
-  "durable-nanobot login [--config <path>] [provider] [--auth api_key|oauth] | " +
-  "durable-nanobot logout [--config <path>] [provider] | " +
-  "durable-nanobot --config <path> (agent, compatibility) | " +
-  "durable-nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]\n" +
-  "Without --config, gateway, agent, login, logout and recovery use ~/.durable-nanobot/config.json.";
+/** Every synopsis, the fixed default configuration note and the help hint; never supplied arguments. */
+const USAGE = renderUsage();
 
-const RECOVERY_USAGE = "Usage: durable-nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]";
+/** The subcommands this process accepts, excluding the historical bare `--config` attach. */
+const SUBCOMMANDS = new Set(COMMANDS.map((command) => command.name));
 
 const CONVERSATION_NAME = /^[a-z0-9](?:[a-z0-9_-]{0,30})[a-z0-9]$|^[a-z0-9]$/;
 
@@ -57,9 +62,48 @@ type LaunchInvocation =
   | { readonly kind: "gateway"; readonly config: ConfigSource }
   | { readonly kind: "agent"; readonly config: ConfigSource; readonly conversation?: string };
 
-/** A usage mistake; the CLI prints the fixed usage line, never the supplied arguments. */
+/** A usage mistake; the CLI prints the fixed usage block, never the supplied arguments. */
 class UsageError extends Error {
   override name = "UsageError";
+}
+
+/** An unrecognized first argument; the token is echoed only when it is a safe command name. */
+class UnknownCommandError extends Error {
+  override name = "UnknownCommandError";
+  constructor(readonly token: string) {
+    super("unknown command");
+  }
+}
+
+function isHelpFlag(argument: string | undefined): boolean {
+  return argument === "--help" || argument === "-h";
+}
+
+/**
+ * A help request anywhere before dispatch. `--help`/`-h` names the page of the leading subcommand;
+ * `help [topic]` names it explicitly. Nothing here reads configuration or runtime state, so a help
+ * page prints and exits 0 in a checkout with no setup.
+ */
+function helpTopic(args: readonly string[]): { readonly topic?: string } | undefined {
+  const [first, second] = args;
+  if (first === "help") {
+    if (args.length === 1) return {};
+    if (args.length === 2 && second !== undefined && !isHelpFlag(second)) return { topic: second };
+    if (args.some(isHelpFlag)) return {};
+    throw new UsageError();
+  }
+  if (!args.some(isHelpFlag)) return undefined;
+  return first !== undefined && SUBCOMMANDS.has(first) ? { topic: first } : {};
+}
+
+function writeHelp(topic: string | undefined): void {
+  if (topic === undefined) {
+    stdout.write(`${renderOverview()}\n`);
+    return;
+  }
+  const command = findCommandHelp(topic);
+  if (command === undefined) throw new UnknownCommandError(topic);
+  stdout.write(`${renderCommandHelp(command)}\n`);
 }
 
 function configPath(args: readonly string[], start: number): ConfigSource {
@@ -102,6 +146,18 @@ function agentInvocation(args: readonly string[]): LaunchInvocation {
   return { kind: "agent", config, ...(conversation === undefined ? {} : { conversation }) };
 }
 
+/** `cron` reads its configuration like every other process command and attaches to the gateway. */
+function cronInvocation(args: readonly string[]): { readonly invocation: CronInvocation; readonly config: ConfigSource } | undefined {
+  if (args[0] !== "cron") return undefined;
+  const invocation = parseCronInvocation(args.slice(1));
+  return {
+    invocation,
+    config: invocation.configPath === undefined
+      ? { kind: "default" }
+      : { kind: "path", path: invocation.configPath },
+  };
+}
+
 function recoveryInvocation(args: readonly string[]): RecoveryInvocation | undefined {
   if (args[0] !== "recovery") return undefined;
   let config: ConfigSource = { kind: "default" };
@@ -122,14 +178,14 @@ function recoveryInvocation(args: readonly string[]): RecoveryInvocation | undef
       fingerprint = rest[index + 1];
       index += 2;
     } else {
-      throw new PreparedContextRecoveryError(RECOVERY_USAGE);
+      throw new PreparedContextRecoveryError(commandUsage("recovery"));
     }
   }
   if (cancel === undefined && fingerprint === undefined) return { kind: "list", config };
-  if (cancel === undefined || fingerprint === undefined) throw new PreparedContextRecoveryError(RECOVERY_USAGE);
+  if (cancel === undefined || fingerprint === undefined) throw new PreparedContextRecoveryError(commandUsage("recovery"));
   const taskId = Number(cancel);
   if (!/^[1-9][0-9]*$/.test(cancel) || !Number.isSafeInteger(taskId) || !/^[0-9a-f]{64}$/.test(fingerprint)) {
-    throw new PreparedContextRecoveryError(RECOVERY_USAGE);
+    throw new PreparedContextRecoveryError(commandUsage("recovery"));
   }
   return { kind: "cancel", config, taskId, fingerprint };
 }
@@ -193,9 +249,23 @@ function missingFile(cause: unknown): boolean {
 }
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
+  const help = helpTopic(args);
+  if (help !== undefined) {
+    writeHelp(help.topic);
+    return;
+  }
+  const leading = args[0];
+  if (leading !== undefined && leading !== "--config" && !SUBCOMMANDS.has(leading)) {
+    throw new UnknownCommandError(leading);
+  }
   const recovery = recoveryInvocation(args);
   if (recovery !== undefined) {
     await runRecovery(recovery, await readConfig(recovery.config));
+    return;
+  }
+  const cron = cronInvocation(args);
+  if (cron !== undefined) {
+    await runCron(cron.invocation, await readConfig(cron.config));
     return;
   }
   const auth = authInvocation(args);
@@ -266,6 +336,27 @@ async function runRecovery(recovery: RecoveryInvocation, config: Awaited<ReturnT
 }
 
 /**
+ * Owner scheduling controls: one connection to the running gateway, no chat attachment.
+ * Nothing is scheduled or cancelled in this process; the gateway owns every runtime decision.
+ */
+async function runCron(invocation: CronInvocation, config: Awaited<ReturnType<typeof loadConfig>>): Promise<void> {
+  const stop = new AbortController();
+  const context = withAbortSignal(stop.signal, BACKGROUND_CONTEXT);
+  const shutdown = () => stop.abort();
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+  let client: Awaited<ReturnType<typeof connectLocalGateway>> | undefined;
+  try {
+    client = await connectLocalGateway({ socketPath: await localSocketPath(config), operatorOnly: true, context });
+    await runCronCommand({ client, command: invocation.command, output: stdout, context });
+  } finally {
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
+    await client?.close();
+  }
+}
+
+/**
  * The gateway is the sole Durable/storage/runtime owner. It serves the local CLI
  * endpoint and, when configured, Telegram, until SIGINT/SIGTERM.
  */
@@ -277,14 +368,15 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
   process.once("SIGTERM", shutdown);
   let gateway: Awaited<ReturnType<typeof openGateway>> | undefined;
   let server: Awaited<ReturnType<typeof serveLocalGateway>> | undefined;
-  /** Set only by the authenticated owner `/restart` command; acted on after graceful teardown. */
-  let restartRequested = false;
-  const requestRestart = async (acknowledge?: () => Promise<void>): Promise<void> => {
-    if (restartRequested) throw new Error("gateway restart is already in progress");
-    restartRequested = true;
-    try { await acknowledge?.(); }
-    finally { shutdown(); }
-  };
+  /** The one host gate for both owner `/restart` surfaces: it refuses while live work would be interrupted. */
+  const restart = createRestartCoordinator({
+    activeWork: async (ctx) => {
+      if (gateway === undefined) throw new Error("gateway is not open");
+      return gateway.activeWork(ctx);
+    },
+    context: withoutAbortSignal(context),
+    teardown: shutdown,
+  });
   try {
     const socketPath = await localSocketPath(config);
     gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
@@ -309,7 +401,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       tools: config.toolAllowlist ?? [],
       contextRefresh: config.workspaceContext !== undefined,
       presets: config.modelPreset !== undefined,
-      restart: { supported: restartSupported(), request: requestRestart },
+      restart: { supported: restartSupported(), request: (acknowledge) => restart.request(acknowledge) },
       ...(attachments === undefined ? {} : { attachments }),
     });
     if (config.telegram) {
@@ -337,7 +429,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
         // shutdown, and the replacement happens here after the teardown below.
         restart: {
           supported: restartSupported(),
-          request: () => requestRestart(),
+          request: () => restart.request(),
         },
       }, context);
     } else {
@@ -349,7 +441,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
     await server?.close();
     await gateway?.close(withoutAbortSignal(context));
   }
-  if (restartRequested) replaceGatewayProcess();
+  if (restart.accepted()) replaceGatewayProcess();
 }
 
 /**
@@ -394,6 +486,34 @@ async function runAgent(
       ...(conversation === undefined ? {} : { conversation }),
       context,
     });
+    // Direct owner delivery from a live MCP login. This is not a transcript entry and not a
+    // durable channel record; the URL exists only on this attached terminal.
+    client.onMcpAuthorization = (authorization) => {
+      stdout.write([
+        "",
+        "MCP OAuth authorization URL (owner only):",
+        authorization.url,
+        `Valid until ${new Date(authorization.expiresAtMs).toISOString()}. Open it as the owner, or paste the ` +
+          "callback URL back into this terminal.",
+        "",
+      ].join("\n"));
+    };
+    client.onMcpNotice = (text) => { stdout.write(`\n${text}\n`); };
+    // A host interruption notice recorded before this attachment was live. It is ordinary host text,
+    // not a transcript entry and not a model turn; acknowledge only after writing it, so a crash
+    // repeats the notice on the next attach instead of losing it.
+    if (client.pendingNotices.length > 0) {
+      for (const notice of client.pendingNotices) {
+        await new Promise<void>((resolveWritten, rejectWritten) => {
+          stdout.write(`\n${notice.text}\n`, (error) => error ? rejectWritten(error) : resolveWritten());
+        });
+      }
+      try {
+        await client.ackNotices(client.pendingNotices.map((notice) => notice.id), context);
+      } catch {
+        // The record stays pending; the next attach shows it again.
+      }
+    }
     // Readline's post-line size check bounds admission, not its pre-newline input buffer.
     input = createInterface({ input: stdin, output: stdout, terminal: Boolean(stdin.isTTY && stdout.isTTY) });
     input.once("close", () => { inputClosed = true; });
@@ -434,15 +554,13 @@ async function runAgent(
             },
           }
         : {}),
-      // Owner-only MCP management over the same authenticated attach. It is not a model tool: the
-      // gateway writes configuration or starts an OAuth login only after this explicit decision.
+      // MCP status over the same authenticated attach. Callback-shaped lines are offered to the
+      // gateway before model admission in the terminal loop.
       ...(client.mcp
         ? {
             mcp: {
               list: () => client!.mcpList(context),
-              show: (id: string) => client!.mcpShow(id, context),
-              approve: (id: string) => client!.mcpApprove(id, context),
-              deny: (id: string) => client!.mcpDeny(id, context),
+              submitCallback: (text: string) => client!.mcpSubmitCallback(text, context),
             },
           }
         : {}),
@@ -506,6 +624,14 @@ export function runCli(): Promise<void> {
   return main().catch((error) => {
     if (error instanceof PreparedContextRecoveryError) {
       console.error(`durable-nanobot recovery: ${error.message}`);
+    } else if (error instanceof CronUsageError) {
+      console.error(error.message);
+    } else if (error instanceof CronCommandError) {
+      console.error(`durable-nanobot cron: ${error.message}`);
+    } else if (error instanceof UnknownCommandError) {
+      // Only a safe command-shaped token is echoed; any other supplied argument stays private.
+      const echo = SAFE_COMMAND_NAME.test(error.token) ? `: ${error.token}` : "";
+      console.error(`durable-nanobot: unknown command${echo}\n${USAGE}`);
     } else if (error instanceof UsageError) {
       console.error(USAGE);
     } else if (error instanceof LocalGatewayError) {

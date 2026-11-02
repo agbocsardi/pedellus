@@ -17,6 +17,9 @@ import {
   type LocalAttachmentRejection,
 } from "../media/local.js";
 import type { Gateway, GatewayMcpAdmin, GatewayModelSelectionRequest } from "../runtime.js";
+import { isTurnInterruptionNotice } from "../recovery/interruption.js";
+import { CRON_OPERATOR_LIMITS, CronOperatorInputError, type CronOperator } from "../automation/operator.js";
+import { RestartBusyError } from "../restart.js";
 import {
   inProcessTerminalConversation,
   projectEntry,
@@ -32,6 +35,7 @@ import {
   LocalRequestError,
   conversationToken,
   errorBody,
+  noticeIds,
   optionalCursor,
   optionalString,
   parseRequestLine,
@@ -169,6 +173,7 @@ class LocalConnection {
   private surface: ReturnType<typeof inProcessTerminalConversation> | undefined;
   private watch: TerminalWatch | undefined;
   private sessionKey: string | undefined;
+  private detachMcpSurface: (() => void) | undefined;
   private readonly submissions = new Map<number, TerminalSubmission>();
   private settled = new Map<number, TerminalSettlement>();
   private settledOrder: number[] = [];
@@ -194,6 +199,8 @@ class LocalConnection {
   /** Stop the local observer; durably admitted work keeps running in the gateway. */
   async close(): Promise<void> {
     this.finished = true;
+    this.detachMcpSurface?.();
+    this.detachMcpSurface = undefined;
     this.scope.cancel(new Error("local client disconnected"));
     try {
       await this.watch?.stop();
@@ -211,6 +218,8 @@ class LocalConnection {
   private shutdown(): void {
     if (this.finished) return;
     this.finished = true;
+    this.detachMcpSurface?.();
+    this.detachMcpSurface = undefined;
     this.scope.cancel(new Error("local client disconnected"));
     void this.watch?.stop().catch(() => undefined);
     this.watch = undefined;
@@ -275,6 +284,46 @@ class LocalConnection {
 
   private async dispatch(request: LocalRequestEnvelope): Promise<unknown> {
     if (request.method === "attach") return this.attach(request.params);
+    // Store-wide owner controls require the private socket, not a conversation attachment.
+    switch (request.method) {
+      case "cronList": {
+        const params = requireObject(request.params ?? {});
+        onlyKeys(params, ["offset"]);
+        const offset = params.offset === undefined ? 0 : requireInteger(params, "offset", 0, Number.MAX_SAFE_INTEGER);
+        return this.cronOperator().list(this.scope.context, offset);
+      }
+      case "cronShow": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["id"]);
+        return {
+          jobs: await this.cronOperator().show(
+            requireString(params, "id", CRON_OPERATOR_LIMITS.maxJobIdChars),
+            this.scope.context,
+          ),
+        };
+      }
+      case "cronCreate": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["origin", "request"]);
+        const operator = this.cronOperator();
+        const origin = requireString(params, "origin", CRON_OPERATOR_LIMITS.maxSessionKeyChars);
+        try {
+          return await operator.create(origin, params.request, this.scope.context);
+        } catch (error) {
+          // A refused request carries the host's own fixed text; it reached no scheduling commit.
+          if (error instanceof CronOperatorInputError) throw new LocalRequestError("invalid", error.message);
+          throw error;
+        }
+      }
+      case "cronCancel": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["id"]);
+        return this.cronOperator().cancel(
+          requireString(params, "id", CRON_OPERATOR_LIMITS.maxJobIdChars),
+          this.scope.context,
+        );
+      }
+    }
     if (this.surface === undefined || this.sessionKey === undefined || this.gatewayConversation === undefined) {
       throw new LocalRequestError("unavailable", "attach must be the first request");
     }
@@ -305,6 +354,14 @@ class LocalConnection {
         }
         return background === undefined ? status : { ...status, background };
       }
+      case "ackNotices": {
+        // The CLI prints the notices carried by its attach, then acknowledges exactly those records.
+        // A failed acknowledgement leaves them pending, so a later attach repeats rather than loses them.
+        const params = requireObject(request.params);
+        onlyKeys(params, ["ids"]);
+        await this.ackHostNotices(noticeIds(params.ids));
+        return {};
+      }
       case "entries": {
         const params = requireObject(request.params);
         onlyKeys(params, ["query", "limit", "cursor"]);
@@ -327,12 +384,19 @@ class LocalConnection {
         if (!this.options.restart?.supported) {
           throw new LocalRequestError("unavailable", "gateway process restart is unavailable on this host");
         }
-        await this.options.restart.request(() => new Promise<void>((resolveSent, rejectSent) => {
-          this.socket.write(`${JSON.stringify({ id: request.id, result: {} })}\n`, (error) => {
-            if (error) rejectSent(error);
-            else resolveSent();
-          });
-        }));
+        try {
+          await this.options.restart.request(() => new Promise<void>((resolveSent, rejectSent) => {
+            this.socket.write(`${JSON.stringify({ id: request.id, result: {} })}\n`, (error) => {
+              if (error) rejectSent(error);
+              else resolveSent();
+            });
+          }));
+        } catch (error) {
+          // A busy refusal is a known no-effect before any acknowledgement; the terminal prints its
+          // fixed reason instead of the generic protocol failure.
+          if (error instanceof RestartBusyError) throw new LocalRequestError("busy", error.message);
+          throw error;
+        }
         return {};
       }
       case "listModels":
@@ -364,20 +428,14 @@ class LocalConnection {
       case "mcpList":
         onlyKeys(requireObject(request.params ?? {}), []);
         return { listing: await this.mcpAdmin().list(this.scope.context) };
-      case "mcpShow": {
+      case "mcpCallback": {
         const params = requireObject(request.params);
-        onlyKeys(params, ["id"]);
-        return this.mcpAdmin().show(requireString(params, "id", 32), this.scope.context);
-      }
-      case "mcpApprove": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["id"]);
-        return this.mcpAdmin().approve(requireString(params, "id", 32), this.scope.context);
-      }
-      case "mcpDeny": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["id"]);
-        return this.mcpAdmin().deny(requireString(params, "id", 32), this.scope.context);
+        onlyKeys(params, ["text"]);
+        return this.mcpAdmin().submitCallback(
+          this.sessionKey,
+          requireString(params, "text", 8_192),
+          this.scope.context,
+        );
       }
       case "digestStart":
         return this.options.gateway.memoryDigest.start(this.digestWriter(), this.scope.context);
@@ -453,6 +511,19 @@ class LocalConnection {
     this.gatewayConversation = conversation;
     this.sessionKey = sessionKey;
     this.surface = inProcessTerminalConversation(conversation);
+    this.detachMcpSurface = this.options.gateway.mcpSurfaces?.attach({
+      owns: (candidate) => candidate === sessionKey,
+      deliverAuthorization: async (target, authorization) => {
+        if (target !== sessionKey) throw new Error("MCP authorization belongs to another session");
+        if (!this.send({ event: "mcpAuthorization", authorization })) {
+          throw new Error("the local attachment is no longer connected");
+        }
+      },
+      deliverNotice: async (target, text) => {
+        if (target !== sessionKey) return;
+        this.send({ event: "mcpNotice", text });
+      },
+    });
     return {
       protocol: LOCAL_PROTOCOL_VERSION,
       sessionKey,
@@ -464,7 +535,50 @@ class LocalConnection {
       digest: true,
       mcp: this.options.gateway.mcpAdmin !== undefined,
       restart: this.options.restart?.supported === true,
+      notices: await this.pendingHostNotices(sessionKey),
     };
+  }
+
+  /**
+   * Pending host interruption notices for this attached CLI chat. They are ordinary bounded outbox
+   * records the same channel-neutral store uses for scheduled results; this surface only projects the
+   * host-notice ids and text, and reads no transcript or other chat's record.
+   */
+  private async pendingHostNotices(sessionKey: string): Promise<{ readonly id: string; readonly text: string }[]> {
+    const outbox = this.options.gateway.cronOutbox;
+    if (outbox === undefined) return [];
+    let records;
+    try {
+      records = await outbox.list(sessionKey, this.scope.context);
+    } catch {
+      // A notice is a side channel; an unreadable outbox must not prevent the terminal attaching.
+      return [];
+    }
+    return records
+      .filter((record) => record.status === "pending" && isTurnInterruptionNotice(record)
+        && typeof record.text === "string" && record.text.trim() !== "")
+      .slice(0, LOCAL_PROTOCOL_LIMITS.maxNoticeIds)
+      .map((record) => ({ id: record.id, text: record.text }));
+  }
+
+  /** Mark exactly the attached chat's interruption notices delivered after the terminal printed them. */
+  private async ackHostNotices(ids: readonly string[]): Promise<void> {
+    const outbox = this.options.gateway.cronOutbox;
+    const sessionKey = this.sessionKey;
+    if (outbox === undefined || sessionKey === undefined) return;
+    for (const id of ids) {
+      if (!isTurnInterruptionNotice({ id })) continue;
+      try {
+        await outbox.update(sessionKey, id, (entry) => {
+          if (entry.status !== "pending") return;
+          entry.status = "delivered";
+          entry.settledAt = Date.now();
+          delete entry.error;
+        }, this.scope.context);
+      } catch {
+        // Leave it pending: the next attach shows it again instead of losing the notice.
+      }
+    }
   }
 
   /**
@@ -478,6 +592,18 @@ class LocalConnection {
       throw new LocalRequestError("unavailable", "MCP management is unavailable in this gateway");
     }
     return admin;
+  }
+
+  /**
+   * Owner scheduling controls come from the gateway itself, so the local terminal never re-derives
+   * an origin or an owner: it only names a mapped chat. Absent means cron is disabled here.
+   */
+  private cronOperator(): CronOperator {
+    const operator = this.options.gateway.cronOperator;
+    if (operator === undefined) {
+      throw new LocalRequestError("unavailable", "scheduling is not enabled in this gateway");
+    }
+    return operator;
   }
 
   /** The attached conversation is the digest origin; no other conversation is addressable here. */
@@ -583,16 +709,18 @@ class LocalConnection {
     return { status: (await submission.status(this.scope.context)).status };
   }
 
-  private send(message: LocalServerMessage): void {
-    if (this.finished || this.socket.destroyed) return;
+  private send(message: LocalServerMessage): boolean {
+    if (this.finished || this.socket.destroyed) return false;
     if (this.socket.writableLength > LOCAL_PROTOCOL_LIMITS.maxOutboundBytes) {
       this.shutdown();
-      return;
+      return false;
     }
     try {
       this.socket.write(`${JSON.stringify(message)}\n`);
+      return true;
     } catch {
       this.shutdown();
+      return false;
     }
   }
 

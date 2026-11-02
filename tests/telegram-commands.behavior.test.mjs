@@ -22,6 +22,7 @@ const [
   { createModels, fauxAssistantMessage, fauxProvider },
   { getCurrentSystemPrompt },
   { MEMORY_DIGEST_RESULT_ENTRY_KIND, MEMORY_DIGEST_TASK_NAME },
+  { RESTART_BUSY_MESSAGE, RestartBusyError },
 ] = await Promise.all([
   import(new URL('../dist/config.js', import.meta.url).href),
   import(new URL('../dist/runtime.js', import.meta.url).href),
@@ -31,6 +32,7 @@ const [
   import(`${modules}/pi-ai/dist/index.js`),
   import(`${modules}/pi-ai/dist/utils/transcript.js`),
   import(new URL('../dist/history/memory-digest.js', import.meta.url).href),
+  import(new URL('../dist/restart.js', import.meta.url).href),
 ]);
 
 const context = BACKGROUND_CONTEXT;
@@ -315,8 +317,18 @@ test('a native host advertises exactly the implemented owner commands, with the 
     harness = start(store, transport, { restart });
     await until(() => transport.commands.length === 1, 'command menu registration');
     assert.deepEqual(transport.commands[0].scope, { type: 'all_private_chats' });
-    assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command),
-      ['new', 'abort', 'stop', 'status', 'model', 'restart', 'digest', 'help']);
+    // The menu is the catalogue filtered to this host, so its order and wording are not maintained
+    // here: names follow the catalogue, descriptions are its one-line summaries.
+    assert.deepEqual(transport.commands[0].commands, [
+      { command: 'new', description: 'Start a fresh context for this conversation' },
+      { command: 'abort', description: 'Stop this turn and withdraw queued messages' },
+      { command: 'stop', description: 'Alias of /abort: stop this turn here' },
+      { command: 'status', description: "Show this conversation's model and run state" },
+      { command: 'model', description: 'List or select a model for this conversation' },
+      { command: 'digest', description: 'Start one bounded memory-digestion batch' },
+      { command: 'restart', description: 'Replace the whole gateway process' },
+      { command: 'help', description: "Show these controls, or one command's detail" },
+    ]);
     // The retired `/refresh` is not an owner command: no menu entry and a truthful refusal.
     assert.ok(!transport.commands[0].commands.some((entry) => entry.command === 'refresh'));
     assert.equal(store.captured.length, 0, 'registering commands costs no model request');
@@ -334,20 +346,37 @@ test('a narrow SDK host keeps the base commands and truthfully refuses typed hos
     textUpdate(302, 302, '/restart'),
     textUpdate(303, 303, '/new'),
     textUpdate(304, 304, '/help'),
+    textUpdate(305, 305, '/help refresh'),
+    textUpdate(306, 306, '/help guarantee'),
+    textUpdate(307, 307, '/help ../SYNTHETIC-HELP-ARGUMENT'),
+    textUpdate(308, 308, '/help digest'),
   ]]);
   let harness;
   try {
     harness = start(store, transport, { narrow: true });
     await until(() => transport.commands.length === 1, 'command menu registration');
     assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command), ['new', 'abort', 'stop', 'help']);
-    await until(() => transport.sent.length === 5, 'all five replies');
+    await until(() => transport.sent.length === 9, 'all nine replies');
     const texts = transport.sent.map((entry) => entry.text);
-    assert.ok(texts.some((text) => /Status unavailable/.test(text)));
-    assert.ok(texts.some((text) => /Model commands unavailable/.test(text)));
-    assert.ok(texts.some((text) => /Restart unavailable on this host/.test(text)));
+    assert.ok(texts.some((text) => /Status is unavailable in this host/.test(text)));
+    assert.ok(texts.some((text) => /Model commands are unavailable in this host/.test(text)));
+    assert.ok(texts.some((text) => /Restart is unavailable in this host/.test(text)));
     assert.ok(texts.some((text) => /^Context reset\.$/.test(text)), 'plain native /new still works');
-    const help = texts.find((text) => text.startsWith('/new -'));
-    assert.doesNotMatch(help, /\/status|\/model|\/restart|\/refresh/);
+    // `/refresh` is a terminal command, so `/help refresh` names that instead of "no such command".
+    assert.ok(texts.some((text) => /^\/refresh is only available in the terminal\. Available: /m.test(rendered(text))));
+    // A control this host lacks keeps the catalogue reason and its no-effect guarantee.
+    assert.ok(texts.some((text) => /^\/digest is not offered by this host\. Nothing was started\. Available: /m.test(rendered(text))));
+    // A truly unknown name is unknown, and an argument that is not shaped like a command is not echoed.
+    const unknown = texts.map(rendered).find((text) => /^No such command \/guarantee here\. Available: /.test(text));
+    assert.ok(unknown !== undefined);
+    const unsafe = texts.map(rendered).find((text) => /^No such command here\. Available: /.test(text));
+    assert.ok(unsafe !== undefined);
+    assert.doesNotMatch(unsafe, /SYNTHETIC-HELP-ARGUMENT|\.\./i, 'the unsafe argument never reaches the reply');
+    const help = texts.find((text) => text.startsWith('Controls for this chat'));
+    // Only the offered controls are listed as controls; the rest are named once as not offered.
+    assert.match(help, /Not offered by this host: \/status, \/model, \/digest, \/mcp, \/restart\./);
+    assert.doesNotMatch(help, /^\/(status|model|restart|digest|refresh)\b/m);
+    assert.doesNotMatch(help, /\/refresh/);
     assert.equal(store.captured.length, 0, 'no command reached the model');
   } finally {
     await cleanup(store, harness);
@@ -355,16 +384,66 @@ test('a narrow SDK host keeps the base commands and truthfully refuses typed hos
   }
 });
 
-test('/mcp lists owner requests and refuses an unknown decision without a model call', { timeout: 20_000 }, async () => {
+test('a malformed mention of an offered command names the typo instead of denying the command', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('mention-typo');
+  const transport = telegramMock([[
+    textUpdate(310, 310, '/new@'),
+    textUpdate(311, 311, '/abort@'),
+    textUpdate(312, 312, '/digest@'),
+  ]]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.length === 3, 'three malformed-mention notices');
+    const texts = transport.sent.map((entry) => rendered(entry.text));
+    for (const [index, name] of ['new', 'abort', 'digest'].entries()) {
+      // The offered command keeps its name: it is not refused as an unavailable command it is also listed in.
+      assert.match(texts[index], new RegExp(`^/${name} is offered here; that mention is malformed, so use /${name} without one\\.`));
+      assert.doesNotMatch(texts[index], new RegExp(`/${name} is (not offered by this host|only available)`));
+    }
+    assert.equal(store.captured.length, 0, 'no malformed mention reached the model');
+  } finally {
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('a full host fits its whole /help listing in one bounded notice and keeps detail on request', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('help-full', { configFile: true });
+  const restart = { supported: true, requested: 0, async request() { this.requested += 1; } };
+  const transport = telegramMock([[textUpdate(700, 700, '/help'), textUpdate(701, 701, '/help model')]]);
+  let harness;
+  try {
+    harness = start(store, transport, { restart });
+    await until(() => transport.sent.length === 2, 'the help listing and one command detail');
+    const help = rendered(transport.sent[0].text);
+    // Every offered control and the trailing limits line arrive: nothing is cut mid-document.
+    assert.match(help, /^Controls for this chat/);
+    for (const line of ['new', 'abort', 'stop', 'status', 'model', 'digest', 'mcp', 'restart', 'help']) {
+      assert.ok(help.includes(`/${line}`), `the listing names /${line}`);
+    }
+    assert.match(help, /\/help \[command\] — Show these controls, or one command's detail/);
+    assert.match(help, /Text only: attachments are not read and \/attach is not available/);
+    assert.doesNotMatch(help, /Not offered by this host/);
+    assert.ok(help.length < 1_500, `the help notice is ${help.length} characters, under the notice bound`);
+    // Per-command usage and detail stay on the `/help <command>` path.
+    const detail = rendered(transport.sent[1].text);
+    assert.match(detail, /^Usage: \/model \(list the configured presets\) or \/model <preset> \(or \/model default\)\./);
+    assert.match(detail, /Applies to this chat only while the gateway stays open; a restart restores the configured preset\./);
+    assert.doesNotMatch(help, /Applies to this chat only/);
+    assert.equal(store.captured.length, 0, 'no help path reached the model');
+  } finally {
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('/mcp is bounded status and never reaches the model', { timeout: 20_000 }, async () => {
   const store = await syntheticStore('mcp-commands', { configFile: true });
   const updates = [
     textUpdate(600, 600, '/mcp'),
-    textUpdate(601, 601, '/mcp show 0123456789abcdef'),
-    textUpdate(602, 602, '/mcp approve 0123456789abcdef'),
-    textUpdate(603, 603, '/mcp deny 0123456789abcdef'),
-    textUpdate(604, 604, '/mcp bogus'),
+    textUpdate(601, 601, '/mcp bogus'),
   ];
-  // One released update at a time: an admitted control gates this chat until it is applied.
   const gates = updates.map(() => deferred());
   const transport = telegramMock(gates.map((gate, index) => async () => {
     await gate.promise;
@@ -381,16 +460,54 @@ test('/mcp lists owner requests and refuses an unknown decision without a model 
     }
     await flush();
     const texts = transport.sent.map((entry) => entry.text);
-    assert.equal(texts.length, 5);
-    assert.match(texts[0], /MCP is not configured in this gateway's open configuration/);
-    assert.match(texts[0], /Owner approval requests: none waiting/);
-    assert.match(texts[1], /No MCP owner approval request 0123456789abcdef exists/);
-    assert.match(texts[2], /No MCP owner approval request 0123456789abcdef exists/);
-    assert.match(texts[3], /No MCP owner approval request 0123456789abcdef exists/);
-    assert.match(texts[4], /Usage: \/mcp/);
+    assert.equal(texts.length, 2);
+    assert.match(texts[0], /MCP is not configured in this gateway/);
+    assert.match(texts[0], /OAuth logins waiting for a callback: none/);
+    assert.match(texts[1], /Usage: \/mcp/);
     assert.equal(store.captured.length, 0, 'no /mcp form reached the model');
   } finally {
     await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('a pasted OAuth callback is consumed before model admission and its values never enter state', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('mcp-callback');
+  const callback = 'http://127.0.0.1:43210/callback?code=SECRET-CODE&state=SECRET-STATE';
+  const submitted = [];
+  const host = {
+    conversationFor: (key, ctx) => store.gateway.conversationFor(key, ctx),
+    mcpAdmin: {
+      list: async () => ({ configured: false, servers: [], logins: [] }),
+      submitCallback: async (sessionKey, text) => {
+        submitted.push({ sessionKey, text });
+        return { handled: true, accepted: false, text: 'CALLBACK-REFUSED-FIXED' };
+      },
+    },
+    mcpSurfaces: { attach: () => () => undefined },
+  };
+  const transport = telegramMock([[
+    textUpdate(610, 610, callback),
+  ]]);
+  let harness;
+  try {
+    const scope = withCancel(context);
+    harness = { scope, adapter: runTelegram(host, { token: TOKEN, allowFrom: ['501'], pollTimeoutSeconds: 1 }, scope.context) };
+    await until(() => transport.sent.length >= 1, 'the callback refusal notice');
+    await flush();
+    assert.equal(submitted.length, 1, 'the callback was consumed once');
+    assert.equal(submitted[0].sessionKey, `telegram:${BOT_ID}:chat:${CHAT_ID}`);
+    assert.equal(submitted[0].text, callback);
+    assert.equal(store.captured.length, 0, 'the callback never became model input');
+    assert.match(transport.sent[0].text, /CALLBACK-REFUSED-FIXED/);
+    const doc = await stateDoc(store.gateway);
+    const serialized = JSON.stringify(doc);
+    assert.ok(!serialized.includes('SECRET-CODE'), 'the authorization code is not in channel state');
+    assert.ok(!serialized.includes('SECRET-STATE'), 'the authorization state is not in channel state');
+    assert.ok(!serialized.includes(callback), 'the callback URL is not in channel state');
+  } finally {
+    await stop(harness);
+    await cleanup(store, undefined);
     transport.restore();
   }
 });
@@ -411,7 +528,7 @@ test('/digest status, idle and malformed forms are bounded owner notices with no
     await flush();
     assert.equal(transport.sent.length, 3, 'an unauthenticated chat gets no digest control');
     assert.match(transport.sent[0].text, /No memory digestion run is recorded for this conversation/);
-    assert.equal(transport.sent[1].text, 'Digest caught up. No run started; pending issues may still trigger the agent.');
+    assert.match(transport.sent[1].text, /Digest caught up\. No run started/);
     assert.match(transport.sent[2].text, /Usage: \/digest/);
     assert.equal(store.captured.length, 0, 'no digest command form reached the model');
     const tasks = await store.gateway.harness.commit(
@@ -503,14 +620,15 @@ test('/model lists and selects one configured preset for this chat only', { time
     assert.match(rendered(texts[2]), /Current model: fixture\/beta \(thinking: high\)/);
     assert.match(rendered(texts[2]), /\* deep — fixture beta \[thinking: high\]/);
 
-    assert.match(texts[3], /Unknown preset nope/);
-    assert.match(texts[4], /Usage: \/model/);
+    assert.match(texts[3], /Unknown model preset nope: nothing was changed/);
+    assert.match(texts[4], /Usage: \/model \(list the configured presets\)/);
     assert.equal(texts[5], 'Model: default.');
 
     // `/refresh` was retired in favour of `/new`; it is refused and never a control. This host has no
     // restart capability, so `/restart` is not offered either.
-    assert.match(texts[6], /Unknown command \/refresh/);
-    assert.match(texts[6], /Use \/help/);
+    // A typed command is refused with the same catalogue reason `/help refresh` gives.
+    assert.match(texts[6], /^\/refresh is only available in the terminal\. Available: /m);
+    assert.match(texts[6], /Available: \/new, \/abort, \/stop, \/status, \/model, \/digest, \/help/);
     assert.doesNotMatch(texts[6], /restart/);
 
     assert.deepEqual((await store.gateway.listModels(`telegram:${BOT_ID}:chat:${CHAT_ID}`, context)).selected,
@@ -543,7 +661,7 @@ test('/model is refused atomically while this chat runs a turn', { timeout: 20_0
     harness = start(store, transport);
     await entered;
     assert.equal(store.captured.length, 1);
-    await until(() => transport.sent.some((entry) => /Model change refused: chat busy/.test(entry.text)),
+    await until(() => transport.sent.some((entry) => /Model preset selection rejected: this chat is busy/.test(entry.text)),
       'busy refusal');
     // The refusal changed nothing and scheduled nothing: even before the turn ends, the selection
     // is still the configured default.
@@ -582,25 +700,26 @@ test('/status reports bounded current-chat metadata without a model request', { 
   try {
     harness = start(store, transport);
     await entered;
-    await until(() => transport.sent.some((entry) => entry.text.startsWith('Model:')), 'running status');
-    const running = transport.sent.find((entry) => entry.text.startsWith('Model:')).text;
+    await until(() => transport.sent.some((entry) => entry.text.startsWith('Status for this chat')), 'running status');
+    const running = transport.sent.find((entry) => entry.text.startsWith('Status for this chat')).text;
     assert.match(running, /Model: fixture\/alpha \(thinking: off\) — preset fast/);
     assert.match(running, /Run: running \(turn \d+, 1 input\(s\)/);
     assert.match(running, /Queued native inputs: 0/);
     // The background line is this chat's own bounded metadata: nothing runs here, so it is idle.
     assert.match(running, /^Background: idle$/m);
+    assert.match(running, /no model call/);
     assert.doesNotMatch(running, /held turn|SYNTHETIC-REPLY|AGENTS-|MEMORY-/);
 
-    await until(() => transport.sent.filter((entry) => /Usage: \/status/.test(entry.text)).length === 1,
+    await until(() => transport.sent.filter((entry) => /Usage: \/status \(no arguments\)/.test(entry.text)).length === 1,
       'status argument refusal');
     assert.equal(store.captured.length, 1, 'status and its usage refusal cost no model request');
 
     store.gate.release();
     await until(() => transport.sent.some((entry) => entry.text === 'SYNTHETIC-REPLY'), 'held turn answer');
     releaseIdle();
-    await until(() => transport.sent.filter((entry) => entry.text.startsWith('Model:')).length === 2,
+    await until(() => transport.sent.filter((entry) => entry.text.startsWith('Status for this chat')).length === 2,
       'idle status');
-    const idle = transport.sent.filter((entry) => entry.text.startsWith('Model:'))[1].text;
+    const idle = transport.sent.filter((entry) => entry.text.startsWith('Status for this chat'))[1].text;
     assert.match(idle, /Run: idle/);
     assert.match(idle, /Queued native inputs: 0/);
     assert.match(idle, /^Background: idle$/m);
@@ -712,14 +831,14 @@ test('/restart is requested once after the durable acknowledgement and is never 
     // The chats owed a live confirmation are durable before the process is replaced.
     assert.deepEqual(doc.restart, [{ chatId: CHAT_ID, senderId: '501' }]);
     assert.ok(doc.pending.some((item) => item.notice === true &&
-      /^Restarting\.$/.test(item.text)),
+      /^Restart requested; checking active work\.$/.test(item.text)),
     'the durable acknowledgement exists before the host request');
     await until(() => transport.sent.some((entry) =>
-      /^Restarting\.$/.test(entry.text)), 'short acknowledgement');
+      /^Restart requested; checking active work\.$/.test(entry.text)), 'short acknowledgement');
     await flush();
 
     releaseSecond();
-    await until(() => transport.sent.some((entry) => /Already restarting/.test(entry.text)),
+    await until(() => transport.sent.some((entry) => /A restart was already requested/.test(entry.text)),
       'second restart refused');
     assert.equal(observed.length, 1, 'a second /restart never asks the host again');
     assert.equal(store.captured.length, 0, 'no restart command reached the model');
@@ -817,8 +936,8 @@ test('/stop is the same control as /abort: same record, same effect, one chat', 
     stopMention.resolve();
     await until(() => applied() === 2, 'exact-mention /stop');
     stopArgs.resolve();
-    await until(() => transport.sent.some((entry) => entry.text === 'Usage: /stop') &&
-      transport.sent.some((entry) => /Wrong bot mention/.test(entry.text)), 'argument and foreign refusals');
+    await until(() => transport.sent.some((entry) => entry.text.startsWith('Usage: /stop (no arguments).')) &&
+      transport.sent.some((entry) => /\/stop@other_bot did not run here/.test(entry.text)), 'argument and foreign refusals');
     abortAgain.resolve();
     await until(() => applied() === 3, '/abort still works');
     afterStops.resolve();
@@ -865,13 +984,13 @@ test('a refused host restart is reported honestly and never retried', { timeout:
   try {
     harness = start(store, transport, { restart });
     // The acknowledgement is the short one: the live confirmation is a separate message.
-    await until(() => transport.sent.some((entry) => /^Restarting\.$/.test(entry.text)),
+    await until(() => transport.sent.some((entry) => /^Restart requested; checking active work\.$/.test(entry.text)),
       'request acknowledgement');
     await until(() => calls === 1, 'one host request');
     await flush();
     firstRefused.resolve();
     await until(() => transport.sent.some((entry) =>
-      /Restart refused\. Gateway still running; restart it manually/.test(entry.text)),
+      /A restart was already requested in this gateway and the host refused it/.test(entry.text)),
     'failed request reported honestly');
     assert.equal(calls, 1, 'a refused request is not retried by a later /restart');
     // The refusal corrects the promised confirmation: the chats that asked are told nothing was restarted.
@@ -884,6 +1003,51 @@ test('a refused host restart is reported honestly and never retried', { timeout:
       'a refused restart leaves no confirmation owed');
     const doc = await stateDoc(store.gateway);
     assert.deepEqual(doc.controls.map((entry) => entry.status), ['applied']);
+  } finally {
+    firstRefused.resolve();
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('a busy host restart is refused with its fixed reason and may be retried', { timeout: 30_000 }, async () => {
+  const store = await syntheticStore('restart-busy');
+  let calls = 0;
+  const restart = {
+    supported: true,
+    async request() {
+      calls += 1;
+      // The host gate refuses while live work is active; nothing was torn down.
+      if (calls === 1) throw new RestartBusyError();
+    },
+  };
+  const firstRefused = deferred();
+  const transport = telegramMock([
+    [textUpdate(960, 960, '/restart')],
+    async () => { await firstRefused.promise; return [textUpdate(961, 961, '/restart')]; },
+  ]);
+  let harness;
+  try {
+    harness = start(store, transport, { restart });
+    await until(() => transport.sent.some((entry) => /^Restart requested; checking active work\.$/.test(entry.text)),
+      'request acknowledgement');
+    await until(() => transport.sent.some((entry) => entry.text === RESTART_BUSY_MESSAGE),
+      'busy refusal reported to the requesting chat');
+    assert.equal(calls, 1);
+    assert.ok(!transport.sent.some((entry) => /^Restarted\.$/.test(entry.text)),
+      'a busy refusal claims no confirmation');
+    assert.equal((await stateDoc(store.gateway)).restart, undefined,
+      'a busy refusal leaves no confirmation owed');
+
+    // The refusal is a known no-effect, so the owner may finish or abort the work and ask again.
+    firstRefused.resolve();
+    await until(() => calls === 2, 'the retried host request');
+    await untilAsync(async () => (await stateDoc(store.gateway)).restart?.length === 1,
+      'the retried restart owed a live confirmation');
+    const doc = await stateDoc(store.gateway);
+    assert.deepEqual(doc.restart, [{ chatId: CHAT_ID, senderId: '501' }]);
+    assert.ok(doc.controls.every((entry) => entry.command === 'restart' && entry.status === 'applied'),
+      'both requests are durable applied controls');
   } finally {
     firstRefused.resolve();
     await cleanup(store, harness);

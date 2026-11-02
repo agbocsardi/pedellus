@@ -7,7 +7,15 @@ import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "..
 import type { HistoryPage, HistoryQuery } from "../history/index.js";
 import type { MemoryDigestStartResult, MemoryDigestStatusView } from "../history/memory-digest.js";
 import type { GatewayModelList, GatewayModelSelection, GatewayModelSelectionRequest } from "../runtime.js";
-import type { McpAdminListing, McpApproveResult } from "../mcp/index.js";
+import type { McpAdminListing, McpCallbackResult } from "../mcp/index.js";
+import type { McpAuthorizationLink } from "../mcp/surface.js";
+import type {
+  CronOperatorCancelOutcome,
+  CronOperatorCreateOutcome,
+  CronOperatorJob,
+  CronOperatorListing,
+} from "../automation/operator.js";
+import type { CronScheduleInput } from "../automation/cron.js";
 import type {
   TerminalAttachmentSubmission,
   TerminalConversation,
@@ -27,11 +35,30 @@ import {
   asObject,
   parseServerLine,
   type LocalErrorBody,
+  type LocalErrorCode,
 } from "./protocol.js";
 
 /** A server-side busy rejection keeps its native name so the terminal prints its busy text. */
 class RemoteConversationBusy extends Error {
   override name = "ConversationBusy";
+}
+
+/**
+ * A refusal the gateway itself sent, as opposed to a transport that stopped answering. The code
+ * distinguishes a request the host rejected (`invalid`, `unavailable`) from work that merely failed
+ * (`failed`), so an operator command can report a definitive refusal separately from an unknown
+ * outcome after a lost response.
+ */
+export class LocalRemoteError extends Error {
+  override name = "LocalRemoteError";
+  constructor(readonly code: LocalErrorCode, message: string) {
+    super(message);
+  }
+}
+
+export interface LocalHostNotice {
+  readonly id: string;
+  readonly text: string;
 }
 
 export interface LocalGatewayClient extends TerminalConversation {
@@ -56,11 +83,21 @@ export interface LocalGatewayClient extends TerminalConversation {
   digestStart(context: Context): Promise<MemoryDigestStartResult>;
   /** Bounded read-only digest status: no scan, no model call, no cursor change. */
   digestStatus(context: Context): Promise<MemoryDigestStatusView>;
-  /** Owner-only MCP management: read-only listing, one exact entry, and the two decisions. */
+  /** MCP status and callback ingress over the already-authenticated attach. */
   mcpList(context: Context): Promise<McpAdminListing>;
-  mcpShow(id: string, context: Context): Promise<{ readonly found: boolean; readonly text: string }>;
-  mcpApprove(id: string, context: Context): Promise<McpApproveResult>;
-  mcpDeny(id: string, context: Context): Promise<McpApproveResult>;
+  mcpSubmitCallback(text: string, context: Context): Promise<McpCallbackResult>;
+  /** Pending host notices carried by the last attach; print them, then call `ackNotices`. */
+  readonly pendingNotices: readonly LocalHostNotice[];
+  /** Mark printed host notices delivered; a failed call leaves them pending for the next attach. */
+  ackNotices(ids: readonly string[], context: Context): Promise<void>;
+  /** Direct, transient owner delivery from the gateway; never a transcript or durable outbox entry. */
+  onMcpAuthorization?: ((authorization: McpAuthorizationLink) => void) | undefined;
+  onMcpNotice?: ((text: string) => void) | undefined;
+  /** Owner controls for scheduled work: store-wide reads and exact-ID create/cancel. */
+  cronList(context: Context, offset?: number): Promise<CronOperatorListing>;
+  cronShow(id: string, context: Context): Promise<CronOperatorJob[]>;
+  cronCreate(origin: string, request: CronScheduleInput, context: Context): Promise<CronOperatorCreateOutcome>;
+  cronCancel(id: string, context: Context): Promise<CronOperatorCancelOutcome>;
   historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage>;
   listEpisodes(sessionKey: string, query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage>;
   episode(sessionKey: string, startEntryId: number, context: Context): Promise<HistoryEpisode | undefined>;
@@ -79,6 +116,8 @@ export interface LocalGatewayClient extends TerminalConversation {
 
 export interface ConnectLocalGatewayOptions {
   readonly socketPath: string;
+  /** Connect for store-wide operator calls without creating or configuring a chat. */
+  readonly operatorOnly?: boolean;
   /** CLI conversation name; absent is the historical `default` (`cli:default`). */
   readonly conversation?: string;
   readonly context: Context;
@@ -117,7 +156,7 @@ export async function connectLocalGateway(options: ConnectLocalGatewayOptions): 
   socket.setNoDelay(true);
   const client = new LocalGatewayConnection(socket);
   try {
-    await client.attach(options.conversation, options.context);
+    if (!options.operatorOnly) await client.attach(options.conversation, options.context);
   } catch (error) {
     await client.close();
     throw error;
@@ -128,6 +167,9 @@ export async function connectLocalGateway(options: ConnectLocalGatewayOptions): 
 class LocalGatewayConnection implements LocalGatewayClient {
   id = 0;
   sessionKey = "";
+  onMcpAuthorization: ((authorization: McpAuthorizationLink) => void) | undefined;
+  onMcpNotice: ((text: string) => void) | undefined;
+  pendingNotices: LocalHostNotice[] = [];
   tools: readonly string[] = [];
   contextRefresh = false;
   presets = false;
@@ -176,6 +218,28 @@ class LocalGatewayConnection implements LocalGatewayClient {
     this.digest = result.digest === true;
     this.mcp = result.mcp === true;
     this.restartSupported = result.restart === true;
+    const notices = result.notices;
+    if (notices === undefined) {
+      this.pendingNotices = [];
+    } else {
+      if (!Array.isArray(notices) || notices.length > LOCAL_PROTOCOL_LIMITS.maxNoticeIds) {
+        throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attach result");
+      }
+      this.pendingNotices = notices.map((entry) => {
+        const notice = asObject(entry);
+        if (notice === undefined || typeof notice.id !== "string" || notice.id.length === 0
+          || typeof notice.text !== "string" || notice.text.trim() === ""
+          || notice.text.length > LOCAL_PROTOCOL_LIMITS.maxNoticeTextChars) {
+          throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attach result");
+        }
+        return { id: notice.id, text: notice.text };
+      });
+    }
+  }
+
+  async ackNotices(ids: readonly string[], context: Context): Promise<void> {
+    if (ids.length === 0) return;
+    await this.call("ackNotices", { ids: [...ids] }, context);
   }
 
   async watch(context: Context): Promise<TerminalWatch> {
@@ -301,16 +365,30 @@ class LocalGatewayConnection implements LocalGatewayClient {
     return result.listing;
   }
 
-  async mcpShow(id: string, context: Context): Promise<{ readonly found: boolean; readonly text: string }> {
-    return this.call("mcpShow", { id }, context);
+  async mcpSubmitCallback(text: string, context: Context): Promise<McpCallbackResult> {
+    return this.call("mcpCallback", { text }, context);
   }
 
-  async mcpApprove(id: string, context: Context): Promise<McpApproveResult> {
-    return this.call("mcpApprove", { id }, context);
+  async cronList(context: Context, offset = 0): Promise<CronOperatorListing> {
+    const result = await this.call<CronOperatorListing>("cronList", { offset }, context);
+    if (!Array.isArray(result.jobs) || !Array.isArray(result.origins)) {
+      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected job listing");
+    }
+    return result;
   }
 
-  async mcpDeny(id: string, context: Context): Promise<McpApproveResult> {
-    return this.call("mcpDeny", { id }, context);
+  async cronShow(id: string, context: Context): Promise<CronOperatorJob[]> {
+    const result = await this.call<{ readonly jobs: CronOperatorJob[] }>("cronShow", { id }, context);
+    if (!Array.isArray(result.jobs)) throw new LocalGatewayError("unavailable", "local gateway sent an unexpected job listing");
+    return result.jobs;
+  }
+
+  cronCreate(origin: string, request: CronScheduleInput, context: Context): Promise<CronOperatorCreateOutcome> {
+    return this.call("cronCreate", { origin, request }, context);
+  }
+
+  cronCancel(id: string, context: Context): Promise<CronOperatorCancelOutcome> {
+    return this.call("cronCancel", { id }, context);
   }
 
   async historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage> {
@@ -457,7 +535,19 @@ class LocalGatewayConnection implements LocalGatewayClient {
     }
     if ("event" in message) {
       if (message.event === "snapshot") this.queueSnapshot(message.snapshot);
-      else this.receiveSettlement(message.id, message.settlement);
+      else if (message.event === "settled") this.receiveSettlement(message.id, message.settlement);
+      else if (message.event === "mcpAuthorization") {
+        const authorization = asObject(message.authorization);
+        if (authorization !== undefined
+          && typeof authorization.requestId === "string"
+          && typeof authorization.name === "string"
+          && typeof authorization.url === "string"
+          && typeof authorization.expiresAtMs === "number") {
+          this.onMcpAuthorization?.(authorization as unknown as McpAuthorizationLink);
+        }
+      } else if (message.event === "mcpNotice") {
+        this.onMcpNotice?.(message.text);
+      }
       return;
     }
     const pending = this.pending.get(message.id);
@@ -532,7 +622,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
 
 function remoteError(body: LocalErrorBody): Error {
   if (body.code === "busy") return new RemoteConversationBusy(body.message);
-  return new Error(body.message);
+  return new LocalRemoteError(body.code, body.message);
 }
 
 function asSettlement(value: unknown): TerminalSettlement | undefined {

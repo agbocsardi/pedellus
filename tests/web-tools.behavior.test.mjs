@@ -756,7 +756,7 @@ test("native Code Mode reaches configured web and MCP tools through nested hooks
   }
 });
 
-test("Code Mode composes coding, history and web without an MCP server", { timeout: 60_000 }, async () => {
+test("Code Mode composes coding, memory recall and web without an MCP server", { timeout: 60_000 }, async () => {
   const store = await workspaceStore("compose");
   await writeFile(join(store.workspace, "note.txt"), "NESTED-READ-CONTENT\n");
   const searchCalls = [];
@@ -775,12 +775,13 @@ test("Code Mode composes coding, history and web without an MCP server", { timeo
         fauxToolCall("codemode", {
           code: [
             'const read = await tools.read({ path: "note.txt" });',
-            'const history = await tools.history({ action: "search", query: "NESTED-MARKER" });',
+            'const history = await tools.memory_search({ target: "messages", query: "NESTED-MARKER" });',
+            'const opened = await tools.memory_read({ ref: history.hits[0].ref });',
             'const search = await tools.web_search({ query: "example domain", count: 2 });',
             'const page = await tools.web_fetch({ url: "https://example.com/" });',
             'const writeListed = ALL_TOOLS.filter((tool) => tool.name === "write").length;',
             'const codemodeListed = ALL_TOOLS.filter((tool) => tool.name === "codemode").length;',
-            "return { read, history, search, page, writeListed, codemodeListed };",
+            "return { read, history, opened, search, page, writeListed, codemodeListed };",
           ].join("\n"),
         }, { id: "compose-code" }),
       ], { stopReason: "toolUse" });
@@ -811,9 +812,10 @@ test("Code Mode composes coding, history and web without an MCP server", { timeo
     assert.equal(gateway.mcp, undefined);
     const chat = await gateway.conversationFor("telegram:4:chat:44", context);
     const names = toolNames(await chat.agent(context));
-    for (const expected of ["codemode", "tool_search", "read", "history", "web_search", "web_fetch"]) {
+    for (const expected of ["codemode", "tool_search", "read", "memory_search", "memory_browse", "memory_read", "web_search", "web_fetch"]) {
       assert.ok(names.includes(expected), `missing ${expected} in ${names}`);
     }
+    assert.ok(!names.includes("history"), `model history is retired: ${names}`);
     assert.ok(!names.some((name) => name.startsWith("mcp__")));
 
     await say(chat, "remember the marker NESTED-MARKER");

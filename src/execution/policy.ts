@@ -93,6 +93,8 @@ export interface ExecutionPolicyOptions {
 	 * sandbox-virtual paths.
 	 */
 	roots: readonly string[];
+	/** Managed directories that file operations cannot access, including through aliases. */
+	protectedRoots?: readonly string[];
 	shell?: ShellPolicyOptions;
 }
 
@@ -115,6 +117,8 @@ export interface ExecutionPolicy {
 		path: string,
 		probe: FilesystemPathProbe,
 		followFinalLink: boolean,
+		/** Removal/rename must also refuse ancestors of protected directories. */
+		protectDescendants?: boolean,
 	): Promise<FileError | undefined>;
 	/**
 	 * Return a human-readable denial for a shell command, or undefined when it may run. Does not implement Python's
@@ -282,6 +286,14 @@ function extractAbsolutePaths(command: string): string[] {
 
 export function createExecutionPolicy(options: ExecutionPolicyOptions): ExecutionPolicy {
 	const roots = normalizeRoots(options.roots);
+	const protectedRoots = options.protectedRoots?.length ? normalizeRoots(options.protectedRoots) : [];
+	const protectedPath = (path: string, protectDescendants = false): FileError | undefined => {
+		const absolute = resolve(path);
+		return protectedRoots.some((root) => isPathWithin(root, absolute)
+			|| (protectDescendants && isPathWithin(absolute, root)))
+			? new FileError("permission_denied", "Path is managed gateway data; use the owning gateway APIs", path)
+			: undefined;
+	};
 	const shell = options.shell ?? {};
 	const timeoutSeconds = positiveNumber(shell.timeoutSeconds, DEFAULT_TIMEOUT_SECONDS, "timeoutSeconds", true);
 	const maxCallTimeoutSeconds = Math.min(
@@ -316,6 +328,8 @@ export function createExecutionPolicy(options: ExecutionPolicyOptions): Executio
 
 		checkPath(path: string): FileError | undefined {
 			const absolute = resolve(path);
+			const protectedError = protectedPath(absolute);
+			if (protectedError !== undefined) return protectedError;
 			if (roots.some((root) => isPathWithin(root, absolute))) return undefined;
 			return new FileError(
 				"permission_denied",
@@ -328,12 +342,18 @@ export function createExecutionPolicy(options: ExecutionPolicyOptions): Executio
 			path: string,
 			probe: FilesystemPathProbe,
 			followFinalLink: boolean,
+			protectDescendants = false,
 		): Promise<FileError | undefined> {
+			const protectedLexical = protectedPath(path, protectDescendants);
+			if (protectedLexical !== undefined) return protectedLexical;
 			const lexical = policy.checkPath(path);
 			if (lexical !== undefined) return lexical;
 			const checkRoot = followFinalLink ? resolve(path) : dirname(resolve(path));
 			const actual = await existingPath(checkRoot, probe);
 			if ("error" in actual) return actual.error;
+			const target = followFinalLink ? actual.path : resolve(actual.path, basename(resolve(path)));
+			const protectedActual = protectedPath(target, protectDescendants);
+			if (protectedActual !== undefined) return protectedActual;
 			if (roots.some((root) => isPathWithin(root, actual.path))) return undefined;
 			return new FileError(
 				"permission_denied",

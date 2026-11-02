@@ -139,8 +139,17 @@ After import and separate approval of summary spend:
 4. Review initial results before finishing the finite remainder. Verify all intended episode outcomes,
    coverage and summary-search drilldown. Summary indexing refreshes on demand and may need several passes.
 
+**Do not run backfill until a maintenance-only path is verified.** An ordinary gateway open can resume
+persisted work, and disabling cron skips automation-conversation classification on reopen. Disabling
+integrations alone is therefore not sufficient to guarantee a safe maintenance run. Keep the service
+stopped and disabled; back up the store and obtain separate approval for model spend before execution.
+
 Existing limits matter: entries shorten at 2,000 characters; chunks bound at 24,000 characters / 400
-entries; an episode permits at most 12 chunks. `ready` is not proof of complete, unshortened coverage.
+entries; an episode keeps as many chunks as it needs, each one its own bounded provider request, with the
+collection cursor and chunk list durable across a restart. Ordinary message text is cut at its head; a
+tool call's arguments or a tool result that does not fit is quoted as a head-tail preview with an
+omission marker and the original `entry:<id>/tool-call|tool-result/<key>` reference, so the summarizer
+never sees the omitted middle. `ready` is not proof of complete, unshortened coverage.
 Preserve source-unit episodes and inspect limitations rather than silently invent additional splits.
 Ready summaries cannot currently be replaced by a re-summarize operation. Originals remain available
 regardless of summary failure, partial coverage or truncation.

@@ -709,9 +709,10 @@ test('a worker cannot delegate and another conversation cannot inspect it', { ti
     const child = await store.gateway.harness.conversation(record.conversationId, context);
     const childTools = ((await child.agent(context)).tools ?? [])
       .map((tool) => (typeof tool === 'string' ? tool : tool.name));
-    // Research history is captured too, but scheduling, channel actions and delegation stay denied.
+    // Research recall is captured too, but scheduling, channel actions and delegation stay denied.
     assert.ok(childTools.includes('read'), `the captured ceiling still applies: ${childTools}`);
-    assert.ok(childTools.includes('history'), `the child can retrieve mapped-chat evidence: ${childTools}`);
+    for (const name of ['memory_search', 'memory_browse', 'memory_read']) assert.ok(childTools.includes(name), `the child can retrieve mapped-chat evidence: ${childTools}`);
+    assert.equal(childTools.includes('history'), false, `model history is retired: ${childTools}`);
     for (const forbidden of [WORKER_TOOL_NAME, 'cron', 'telegram']) {
       assert.equal(childTools.includes(forbidden), false, `a worker child must not have ${forbidden}`);
     }
@@ -1110,7 +1111,8 @@ test('native Code Mode composes the worker tool from a mapped chat without widen
     const childTools = ((await child.agent(context)).tools ?? [])
       .map((tool) => (typeof tool === 'string' ? tool : tool.name));
     assert.ok(childTools.includes('read'), `the captured ceiling still applies: ${childTools}`);
-    assert.ok(childTools.includes('history'), `the child retains captured research tools: ${childTools}`);
+    for (const name of ['memory_search', 'memory_browse', 'memory_read']) assert.ok(childTools.includes(name), `the child retains captured research tools: ${childTools}`);
+    assert.equal(childTools.includes('history'), false, `model history is retired: ${childTools}`);
     for (const forbidden of [WORKER_TOOL_NAME, 'cron', 'telegram']) {
       assert.equal(childTools.includes(forbidden), false, `Code Mode composition must not widen the child: ${forbidden}`);
     }

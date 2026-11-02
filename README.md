@@ -41,7 +41,7 @@ TypeScript edits: no full build, watcher or hot reload is required. Run
 command link. `npm run build` remains available for compiled output/tests. See
 [checkout and service updates](./SERVICE.md#checkout-command-and-build-workflow).
 
-Without `--config`, `gateway`, `agent`, `login`, `logout` and `recovery` use the fixed primary file
+Without `--config`, `gateway`, `agent`, `login`, `logout`, `recovery` and `cron` use the fixed primary file
 `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
 the working directory. A secondary instance passes its own explicit `--config`.
 [User services](./SERVICE.md) documents the shipped foreground systemd user
@@ -148,7 +148,9 @@ model-callable `cron` tool (`add`/`list`/`remove`) in `openGateway`. The agent
 schedules work when the user asks; there is no direct cron UI or user scheduling
 command. Normal settlements of isolated and origin-mode runs (an answer, or a
 fixed sanitized notice for a failure or empty answer) deliver through the durable
-Telegram outbox; cancelled and superseded runs stay silent. Live-channel
+Telegram outbox; a job's persistent `silent` setting or an exact trimmed
+`[SILENT]` successful answer suppresses a successful result, while a failure
+still notifies, and cancelled or superseded runs stay silent. Live-channel
 acceptance remains open.
 
 The package root (`src/index.ts`) is a small host entry surface: config loading and
@@ -163,8 +165,9 @@ no `codemode` block it is installed when MCP is configured, as before. Scripts
 compose every tool the current authenticated mapped-chat conversation is already
 authorized to call, through native `executeTool` validation and `ToolTask` hooks.
 Code Mode adds no authority, is not recursive, and grants nothing to root, state,
-fork, raw/other task-owned or scheduled-run automation conversations. Ordinary workers may compose
-their captured coding, web, MCP and history tools, but never Telegram, cron or workers.
+fork, raw/other task-owned or scheduled-run automation conversations. Ordinary workers
+may compose their captured coding, web, MCP and explicitly captured memory-recall
+tools, but never Telegram, cron or workers.
 `workers.toolAllowlist` sets independent worker grants (including worker-only shell/file tools);
 omitted inherits configured chat capabilities, and `[]` grants none. Integrations still require
 their own opt-ins. See [worker grants](./WORKERS.md#separate-worker-grants) and
@@ -180,18 +183,22 @@ conversations get no MCP tool and no Code Mode. `toolAllowlist` still names only
 (`read`/`write`/`edit`/`bash`), independently of MCP.
 
 MCP is a separate explicit connection authority. A configured stdio server runs as
-a native host process, not under `toolSandbox: "bwrap"`. The assistant can propose a
-server entry, an OAuth login, a logout or a removal, but only records a request: the
-owner approves it from the terminal or the authenticated Telegram owner chat
-(`/mcp approve <id>`), and only then is configuration written or a browser login run
-against a private token file. Approval enables only the approved entry, `show`
-discloses the entire exact entry, and OAuth grants are used only while the model's
-shell cannot read the data directory (Bubblewrap shell or no shell; otherwise the
-entry fails closed). Neither an entry nor a grant takes effect until the next start.
-There is no implicit `mcp.json` discovery, no resources/prompts tool, no hot reload
-and no dashboard; failures surface as fixed codes on the SDK `gateway.mcp` surface
-and in `/mcp`. See [MCP servers, management and OAuth](./MCP.md) and [Code Mode
-contract and verified boundaries](./CODEMODE.md).
+a native host process, not under `toolSandbox: "bwrap"`. In an authenticated mapped
+ordinary chat the assistant can directly add or update a server entry, start an
+OAuth login, log out, or remove an entry; there is no proposal record and no
+`/mcp approve` gate. An OAuth authorization link is delivered directly to the
+initiating CLI attachment or Telegram chat (login refuses ambiguous shared CLI
+attachments), and the owner can finish on another
+device by pasting the callback URL back into that same chat. A completed login or
+a configuration change connects/retires the affected server and refreshes tools
+without a restart. Writes keep serialized atomic edits, whole-document validation,
+stale-file refusal and exact-entry removal binding; existing worker captures are
+never widened. OAuth grants live in a private `0600` file with the same trust
+boundary as the provider credential store: protected from other users, not from
+same-user code such as the model's own shell. There is no implicit `mcp.json`
+discovery, no resources/prompts tool and no dashboard; failures surface as fixed
+codes on the SDK `gateway.mcp` surface and in `/mcp`. See [MCP servers, management
+and OAuth](./MCP.md) and [Code Mode contract and verified boundaries](./CODEMODE.md).
 
 ## Web search and public fetch (opt-in)
 
@@ -219,8 +226,10 @@ IDs collide across stores. `openGateway` can also accept an opt-in host snapshot
 provider and reconstructs snapshots before resume; it does not load files itself.
 An opt-in [workspace loader](./WORKSPACE_CONTEXT.md) supplies fixed bootstrap files
 and explicitly selected memory files to such a provider; it can also append a
-bounded topic-memory manifest for on-demand reads ([MEMORY_CONTEXT.md](./MEMORY_CONTEXT.md)). Skill discovery is also
-opt-in through `workspaceContext.skills`: it reads only `<workspace>/skills` and an
+bounded topic-memory manifest for on-demand reads ([MEMORY_CONTEXT.md](./MEMORY_CONTEXT.md));
+model-facing note and conversation recall has a separate three-tool contract
+([MEMORY_RECALL.md](./MEMORY_RECALL.md)). Skill discovery is also opt-in through
+`workspaceContext.skills`: it reads only `<workspace>/skills` and an
 explicitly configured builtin skills root, fails closed on metadata it cannot
 parse, never executes a skill, and supports progressive loading — a prompt
 summary plus a read-only `skill` tool that serves a discovered workspace or
@@ -230,11 +239,18 @@ only when the config contains a `workspaceContext` section
 (`workspaceContext.memoryFiles` and optional `workspaceContext.memoryManifest`,
 default off); the shipped example enables it, and leaving the section out keeps
 it off. It contributes no identity. The local CLI exposes `/refresh` to
-re-capture that conversation's context and skills when it is idle. Prepared
-requests containing old Nanobot context
-conservatively block recovery. With the gateway stopped and an existing database, an
-owner can inspect blocked task IDs/fingerprints and explicitly cancel them without
-resuming or rewriting the prepared request; see
+re-capture that conversation's context and skills when it is idle. A prepared
+request containing old Nanobot context is cancelled automatically at startup
+through native Durable abort semantics, so the gateway becomes available without
+replaying, resubmitting or rewriting that request. One durable, deduplicated
+interruption notice is left for the originating mapped chat, worded for the class
+that was interrupted (an owner turn, background worker or scheduled work, a
+memory-digestion batch, or a compaction); a local CLI attach
+shows it once, and Telegram delivers it through the existing outbox and admission
+checks. No model turn is started and continuation is the owner's next input. With
+the gateway stopped and an existing database, an owner can still inspect blocked
+task IDs/fingerprints and explicitly cancel a dispatch when the automatic path
+cannot complete (for example a prepared model outside `allowedModels`); see
 [prepared context recovery](./CONTEXT_RECOVERY.md) and the
 [context contract](./CONTEXT.md).
 
@@ -245,6 +261,11 @@ repository. There is no maintained migration or archival SDK; see [the deferral
 note](./MIGRATION.md).
 
 ## Current status and checks
+
+The approved model-facing memory recall contract specifies `memory_search`,
+`memory_browse` and `memory_read`; see [MEMORY_RECALL.md](./MEMORY_RECALL.md).
+It is separate from legacy history SDK/local APIs and makes no claim of live-model
+usefulness or deployment acceptance.
 
 Run `npm run typecheck` and `npm run test:behavior` for offline Nanobot-owned
 contracts using synthetic providers, temporary SQLite stores and crash/reopen

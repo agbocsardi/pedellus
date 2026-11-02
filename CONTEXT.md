@@ -68,18 +68,26 @@ snapshot in place. The callback receives the mapped session key and
 Durable ID established by the gateway. When context is opted out on reopen, the
 runtime clears extension selection before resume; native section replay removes old
 context from the effective prompt, but stored transcript history is not erased. Before
-resume, the gateway also rejects live prepared dispatches (`pi.generation` request/poll
-or `pi.compaction` summarize/retry) whose pinned cutoff still contains a nonempty
-Nanobot section. Those phases resend/fetch/summarize the old checkpointed view, not a
-newly rendered prompt; even an apparently unchanged provider snapshot is not treated
-as proof of equivalence. This conservative guard blocks gateway recovery even if the
-host expects the snapshot to be unchanged. Owner recovery is explicit: list the
-blocked tasks, then cancel selected task IDs with their state fingerprint. Cancellation
-uses native `abortTask`, writes no checkpoint or transcript change, and is completed
-by the next gateway open's abort protocol. Abort-marked tasks are skipped by the
-context guard, but an abort-marked generation poll still passes the model guard
-because its abort can call `cancelDeferred`; a revoked poll model remains fail-closed
-without a remote cancel. See [prepared context recovery](./CONTEXT_RECOVERY.md).
+resume, the gateway finds live prepared dispatches (`pi.generation` request/poll or
+`pi.compaction` summarize) whose pinned cutoff still contains a nonempty Nanobot
+section. Generation request/poll replay pinned provider state; compaction summarize
+may repeat an unrecorded request, though its body omits system sections. Neither is
+treated as safe solely because a provider snapshot appears unchanged. After the
+prepared-model authority scan accepts them, the gateway automatically cancels exactly
+those dispatches through native `abortTask`, restores availability, and records one
+bounded, deduplicated interruption notice for the originating mapped chat. It does
+not replay, resubmit, retry a provider or tool, call a model, nudge continuation, or
+rewrite a checkpoint; the owner asks to continue. A `pi.compaction` `retry` is not a
+prepared replay (its previous attempt's error is stored and the attempt it schedules
+was never dispatched), so it resumes natively. Abort-marked and terminal tasks are
+skipped, so ordinary cancellations and already fenced jobs acquire no notice.
+Explicit stopped-store recovery remains for cases automatic recovery cannot complete:
+list the blocked tasks, then cancel selected task IDs with their state fingerprint.
+Cancellation uses native `abortTask`, writes no checkpoint or transcript change, and
+is completed by the next gateway open's abort protocol. An abort-marked generation
+poll still passes the model guard because its abort can call `cancelDeferred`; a
+revoked poll model remains fail-closed without a remote cancel and without gaining an
+allowlist entry. See [prepared context recovery](./CONTEXT_RECOVERY.md).
 Stores
 with more than 256 mapped sessions fail closed when context is enabled rather than
 silently leaving some sessions without their opted-in snapshot. A missing snapshot

@@ -40,6 +40,11 @@ import {
 } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord/context";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import {
+  consumeInterruptedRunReport,
+  InterruptedRunReportsDoc,
+  interruptedRunReportPending,
+} from "../recovery/interruption.js";
 import { WORKER_LIMITS, WORKER_WORKSPACE_MODES, type WorkerWorkspaceMode } from "./limits.js";
 import type { WorkerWorkspace, WorkerWorkspaceInfo } from "./workspace.js";
 
@@ -611,7 +616,8 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
 
   /**
    * Keep the record list bounded without ever dropping a result the spawning agent has not been told
-   * about: only a terminal worker whose internal event was already admitted is evictable.
+   * about: only a terminal worker whose internal event was already admitted, or deliberately
+   * suppressed by an automatic startup interruption, is evictable.
    */
   const prune = async (tx: Tx, records: WorkerRecord[], keep: number): Promise<boolean> => {
     while (records.length > keep) {
@@ -778,6 +784,18 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
       : settlement.status === "cancelled" ? "aborted" : "failed";
     let error = settlement.error;
     let result: WorkerRunResult = { status, error, answerEntryId: settlement.answerEntryId };
+    // An automatic startup interruption of this run's prepared dispatch is one host notice, not an
+    // internal model-facing result event: the owner's rule is manual continuation only. The durable
+    // disposition is consumed in the terminal commit, so a reopen cannot resurrect the report.
+    let reportSuppressed = false;
+    if (targetConversationId !== null && status !== "completed") {
+      try {
+        reportSuppressed = interruptedRunReportPending(
+          await runtime.snapshot(InterruptedRunReportsDoc, context), Number(running.id), targetConversationId);
+      } catch {
+        // An unreadable record must not fail the terminal commit; the run reports as usual.
+      }
+    }
     await runtime.commit(async (tx) => {
       let outcome: WorkerFinalizeOutcome = { result: null, error: settlement.error };
       if (targetConversationId !== null && workspace !== null) {
@@ -822,7 +840,12 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         record.workspacePath = workspace?.path ?? record.workspacePath;
         record.branch = workspace?.branch ?? record.branch;
         record.baseCommit = workspace?.baseCommit ?? record.baseCommit;
-        record.notified = false;
+        // The admitted-or-suppressed fact is written with the terminal outcome, never afterwards.
+        record.notified = reportSuppressed;
+        if (reportSuppressed && targetConversationId !== null) {
+          consumeInterruptedRunReport(
+            await tx.doc(InterruptedRunReportsDoc), Number(running.id), targetConversationId);
+        }
       }
       return status === "completed"
         ? terminalCompleted(result)
@@ -1028,6 +1051,20 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         const parsed = parseInput(running.input) ?? zeroInput();
         const checkpoint = running.state.checkpoint;
         const result: WorkerRunResult = { status: "aborted", error: null, answerEntryId: null };
+        // Same rule as `finish`: an automatically interrupted prepared dispatch is not reported to the
+        // spawning agent as an internal result event.
+        let reportSuppressed = false;
+        if (checkpoint.targetConversationId !== null) {
+          try {
+            reportSuppressed = interruptedRunReportPending(
+              await runtime.snapshot(InterruptedRunReportsDoc, context),
+              Number(running.id),
+              checkpoint.targetConversationId as ConversationId,
+            );
+          } catch {
+            // Same bounded rule: an unreadable record never blocks the cancellation commit.
+          }
+        }
         await runtime.commit(async (tx) => {
           // The worker's captured authority ends in this same terminal commit. A cancellation is not
           // a reason to leave a configured target behind for a later admission.
@@ -1059,7 +1096,14 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
             record.status = "aborted";
             record.finishedAtMs = clock();
             record.error = "cancelled before the worker finished";
-            record.notified = false;
+            record.notified = reportSuppressed;
+            if (reportSuppressed) {
+              consumeInterruptedRunReport(
+                await tx.doc(InterruptedRunReportsDoc),
+                Number(running.id),
+                checkpoint.targetConversationId as ConversationId,
+              );
+            }
           }
           return terminalAborted(
             result,

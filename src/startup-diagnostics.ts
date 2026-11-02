@@ -6,7 +6,6 @@
  * filesystem paths, provider/dependency error text or the underlying exception.
  */
 export const STARTUP_DIAGNOSTICS = Object.freeze({
-  usage: "Usage: durable-nanobot gateway|agent|login|logout|recovery [--config <path>] (without --config: ~/.durable-nanobot/config.json)",
   configHome:
     "cannot resolve the default configuration home; set HOME or pass --config <path> (diagnostic details suppressed)",
   defaultConfigFile:
@@ -49,10 +48,10 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
     "another process already owns the configured data store; stop the other running durable-nanobot gateway process " +
     "before starting another (diagnostic details suppressed)",
   preparedContext:
-    "startup refused because a prepared model dispatch pins historical Nanobot context; run " +
-    "`durable-nanobot recovery --config <path>` with this configuration to inspect and cancel the blocked task, " +
-    "or omit `--config` for the default primary configuration, " +
-    "then start again (diagnostic details suppressed)",
+    "startup could not complete automatic interrupted-turn recovery; run " +
+    "`durable-nanobot recovery --config <path>` with this configuration to inspect and cancel a blocked prepared " +
+    "dispatch, or omit `--config` for the default primary configuration, then start again " +
+    "(diagnostic details suppressed)",
   unexpected: "command failed; diagnostic details suppressed",
 } as const);
 
@@ -94,6 +93,5 @@ export function startupDiagnostic(error: unknown): string {
   const code = error instanceof StartupDiagnosticError
     ? knownStartupDiagnosticCode(error.code)
     : "unexpected";
-  // Usage text already names the executable; avoid a `durable-nanobot: Usage: durable-nanobot` prefix.
-  return code === "usage" ? STARTUP_DIAGNOSTICS.usage : `durable-nanobot: ${STARTUP_DIAGNOSTICS[code]}`;
+  return `durable-nanobot: ${STARTUP_DIAGNOSTICS[code]}`;
 }

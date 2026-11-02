@@ -58,20 +58,22 @@ export {
 } from "./install.js";
 export {
   createMcpAdmin,
-  loginNoticeText,
   MCP_ADMIN_LIMITS,
   MCP_ADMIN_TOOL_NAME,
-  McpRequestsDoc,
+  renderMcpListing,
   type McpAdmin,
   type McpAdminListing,
-  type McpAdminRequestView,
   type McpAdminServer,
-  type McpApproveResult,
-  type McpLoginNotice,
-  type McpRequest,
-  type McpRequestKind,
-  type McpRequestStore,
+  type McpAdminStatus,
+  type McpCallbackResult,
 } from "./admin.js";
+export {
+  createMcpSurfaceRegistry,
+  looksLikeOAuthCallback,
+  type McpAuthorizationLink,
+  type McpOwnerSurface,
+  type McpSurfaceRegistry,
+} from "./surface.js";
 
 export interface McpIntegrationOptions {
   readonly config: McpConfig;
@@ -99,12 +101,14 @@ export interface McpIntegrationOptions {
 /**
  * Explicit MCP connection authority plus its model-facing registrations.
  *
- * `extension` carries the tools and one call-time hook. The host selects it only in authorized
- * conversations. Every call is rechecked against the live connection and the server's current tool
- * list, so a persisted selection, a prepared replay, a nested Code Mode call or a stale discovery
- * entry cannot reach a disabled or withdrawn tool.
+ * `extension` carries the current tools and one call-time hook. The host installs a replacement
+ * extension with the same name after a live configuration or grant change, and selects it only in
+ * authorized conversations. Every call is rechecked against the live connection and the server's
+ * current tool list, so a persisted selection, a prepared replay, a nested Code Mode call or a
+ * stale discovery entry cannot reach a disabled or withdrawn tool.
  */
 export interface McpIntegration {
+  /** Current registration set. The host reinstalls this object after a live change. */
   readonly extension: Extension;
   /** Registration names of every connected server's tools. */
   readonly toolNames: readonly string[];
@@ -112,8 +116,18 @@ export interface McpIntegration {
   readonly namespaces: readonly CodemodeNamespace[];
   /** One entry per enabled configured server; failures carry a fixed code, never a value. */
   readonly status: readonly McpServerStatus[];
+  /** The configuration this integration currently reflects. */
+  readonly config: McpConfig;
   /** Whether a registration belongs to a configured MCP server. */
   ownsTool(name: string): boolean;
+  /**
+   * Replace the live configuration: close removed or changed servers, connect new ones, retain
+   * unchanged connections, and rebuild registrations and namespaces. A failed connection remains a
+   * configured server with a fixed failure code and no tools.
+   */
+  applyConfig(config: McpConfig): Promise<void>;
+  /** Close one server and connect the current configured entry again, for example after a login. */
+  reconnect(name: string): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -179,37 +193,46 @@ async function connect(
   return server;
 }
 
+function enabledEntries(config: McpConfig): [string, McpServerConfig][] {
+  return Object.entries(config.servers)
+    .filter(([, entry]) => mcpServerEnabled(entry))
+    .sort(([left], [right]) => left.localeCompare(right, "en-US"));
+}
+
+function sameEntry(left: McpServerConfig | undefined, right: McpServerConfig | undefined): boolean {
+  return left !== undefined && right !== undefined && JSON.stringify(left) === JSON.stringify(right);
+}
+
 /**
  * Connect every enabled server, build the MCP tool registrations and namespaces, and return the
- * extension that carries them. A server that fails to start contributes no tool and no namespace and
- * is reported as `failed`, so one broken entry cannot take the gateway down. A closed or failed
- * client is torn down here; the native transport owns process-group teardown.
+ * mutable integration. A server that fails to start contributes no tool and no namespace and is
+ * reported as `failed`, so one broken entry cannot take the gateway down. Configuration and grant
+ * changes are applied in place so a running gateway activates or retires tools without a restart.
  */
 export async function createMcpIntegration(options: McpIntegrationOptions): Promise<McpIntegration> {
-  if (!options.config.enabled) throw new Error("MCP integration requires mcp.enabled");
-  const servers: McpServerConnection[] = [];
+  let config = options.config;
+  const servers = new Map<string, McpServerConnection>();
   let closed = false;
-  try {
-    const enabled = Object.entries(options.config.servers)
-      .filter(([, config]) => mcpServerEnabled(config))
-      .sort(([left], [right]) => left.localeCompare(right, "en-US"));
-    const connected = await Promise.all(enabled.map(async ([name, config]) =>
-      connect(
-        name,
-        config,
-        options.workspace,
-        options.dataDir,
-        options.environment,
-      )));
-    servers.push(...connected);
+  let queue: Promise<unknown> = Promise.resolve();
+  const delegated = new Set(options.delegatedToolNames);
+  let owners = new Map<string, ToolOwner>();
+  let extension: Extension = defineExtension({ name: "nanobot-mcp", tools: [], hooks: [] });
 
+  const run = <T>(operation: () => Promise<T>): Promise<T> => {
+    const next = queue.catch(() => undefined).then(operation);
+    queue = next.catch(() => undefined);
+    return next;
+  };
+
+  const rebuild = (): void => {
     const registrations: ToolRegistration[] = [];
-    const owners = new Map<string, ToolOwner>();
+    const nextOwners = new Map<string, ToolOwner>();
     const namespaces: CodemodeNamespace[] = [];
     const used = new Set<string>();
-    for (const server of servers.sort((left, right) => left.name.localeCompare(right.name, "en-US"))) {
+    for (const server of [...servers.values()].sort((left, right) => left.name.localeCompare(right.name, "en-US"))) {
       if (!server.connected) continue;
-      const config = options.config.servers[server.name]!;
+      const entry = config.servers[server.name];
+      if (entry === undefined || !mcpServerEnabled(entry)) continue;
       const toolNames = mcpToolNames(server.name, server.toolNames());
       for (const [serverTool, registrationName] of toolNames) {
         const tool = server.tool(serverTool);
@@ -217,14 +240,13 @@ export async function createMcpIntegration(options: McpIntegrationOptions): Prom
         // Global uniqueness: a hashed name from one server must not shadow another's registration.
         if (used.has(registrationName)) continue;
         used.add(registrationName);
-        owners.set(registrationName, { server, serverTool });
+        nextOwners.set(registrationName, { server, serverTool });
         registrations.push(createMcpToolRegistration(server, registrationName, tool));
       }
-      namespaces.push(namespaceFor(server, config));
+      namespaces.push(namespaceFor(server, entry));
     }
-
-    const delegated = new Set(options.delegatedToolNames);
-    const extension = defineExtension({
+    owners = nextOwners;
+    extension = defineExtension({
       name: "nanobot-mcp",
       tools: registrations,
       hooks: [
@@ -249,28 +271,107 @@ export async function createMcpIntegration(options: McpIntegrationOptions): Prom
         }),
       ],
     });
+  };
 
-    return {
-      extension,
-      toolNames: Object.freeze(registrations.map((tool) => tool.name)),
-      namespaces: Object.freeze(namespaces),
-      get status() {
-        return servers.map((server) => server.status);
-      },
-      ownsTool(name: string): boolean {
-        return owners.has(name);
-      },
-      async close() {
-        if (closed) return;
-        closed = true;
-        await Promise.allSettled(servers.map((server) => server.close()));
-      },
-    };
+  const closeServer = async (name: string): Promise<void> => {
+    const server = servers.get(name);
+    if (server === undefined) return;
+    servers.delete(name);
+    await server.close().catch(() => undefined);
+  };
+
+  const openServer = async (name: string, entry: McpServerConfig): Promise<void> => {
+    let server: McpServerConnection;
+    try {
+      server = await connect(name, entry, options.workspace, options.dataDir, options.environment);
+    } catch {
+      // `connect` only throws for an internal construction failure. A failed open returns a
+      // connection whose status is `failed`; keep that entry visible instead of hiding it.
+      return;
+    }
+    servers.set(name, server);
+  };
+
+  const apply = async (next: McpConfig): Promise<void> => {
+    if (closed) throw new Error("MCP integration is closed");
+    const wanted = new Map(enabledEntries(next));
+    for (const [name, server] of [...servers]) {
+      if (!wanted.has(name) || !sameEntry(config.servers[name], next.servers[name])) {
+        servers.delete(name);
+        await server.close().catch(() => undefined);
+      }
+    }
+    config = next;
+    for (const [name, entry] of wanted) {
+      if (!servers.has(name)) await openServer(name, entry);
+    }
+    rebuild();
+  };
+
+  const reconnect = async (name: string): Promise<void> => {
+    if (closed) return;
+    await closeServer(name);
+    const entry = config.servers[name];
+    if (entry === undefined || !mcpServerEnabled(entry)) return;
+    await openServer(name, entry);
+    rebuild();
+  };
+
+  try {
+    await run(async () => {
+      for (const [name, entry] of enabledEntries(config)) await openServer(name, entry);
+      rebuild();
+    });
   } catch (error) {
     closed = true;
-    await Promise.allSettled(servers.map((server) => server.close()));
+    await Promise.allSettled([...servers.values()].map((server) => server.close()));
     throw error;
   }
+
+  return {
+    get extension() {
+      return extension;
+    },
+    get toolNames() {
+      return Object.freeze((extension.tools ?? []).map((tool) => tool.name));
+    },
+    get namespaces() {
+      // Rebuilt from the same current connections; cheap enough for the few configured servers.
+      return Object.freeze([...servers.values()]
+        .filter((server) => server.connected)
+        .sort((left, right) => left.name.localeCompare(right.name, "en-US"))
+        .flatMap((server) => {
+          const entry = config.servers[server.name];
+          return entry === undefined ? [] : [namespaceFor(server, entry)];
+        }));
+    },
+    get status() {
+      return [...servers.values()]
+        .sort((left, right) => left.name.localeCompare(right.name, "en-US"))
+        .map((server) => server.status);
+    },
+    get config() {
+      return config;
+    },
+    ownsTool(name: string): boolean {
+      return owners.has(name);
+    },
+    applyConfig(next: McpConfig): Promise<void> {
+      return run(() => apply(next));
+    },
+    reconnect(name: string): Promise<void> {
+      return run(() => reconnect(name));
+    },
+    async close() {
+      if (closed) return;
+      closed = true;
+      await run(async () => {
+        await Promise.allSettled([...servers.values()].map((server) => server.close()));
+        servers.clear();
+        rebuild();
+      });
+    },
+  };
 }
 
 /** Config check used by the runtime before it starts any client. */

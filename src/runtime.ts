@@ -16,6 +16,7 @@ import {
   type CronConversationClass,
 } from "./automation/cron-conversations.js";
 import { createCronTool, CRON_TOOL_NAME } from "./automation/cron-tool.js";
+import { createCronOperator, type CronOperator } from "./automation/operator.js";
 import {
   CRON_DELIVERY_MAX_TEXT_CHARS,
   CronDeliveriesDoc,
@@ -44,7 +45,11 @@ import {
   readEpisodeDocument,
   type HistorySummaryView,
 } from "./history/summary-view.js";
-import { createHistoryTool, HISTORY_TOOL_NAME, type HistoryToolHost } from "./history/tool.js";
+import { createMemoryTools } from "./memory/tools.js";
+import { createMemoryService } from "./memory/service.js";
+import { createNotesBackend } from "./memory/notes.js";
+import { createHistoryBackend } from "./memory/history.js";
+import { MEMORY_TOOL_NAMES, type MemoryService } from "./memory/contracts.js";
 import {
   TELEGRAM_TOOL_NAME,
   createTelegramActionRegistry,
@@ -92,6 +97,24 @@ import { modelKey, parseToolTimeoutSeconds, type ModelReference, type PortConfig
 import { createVisionHandoffExtension } from "./media/vision-hook.js";
 import { VisionHandoff, type VisionHandoffStats } from "./media/vision.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
+import {
+  addInterruptedRunReport,
+  addTurnInterruptionMark,
+  INTERRUPTED_RUN_REPORT_MAX,
+  INTERRUPTION_RECORD_DAMAGED_FAULT,
+  InterruptedRunReportsDoc,
+  interruptionOrigin,
+  parseInterruptedRunReports,
+  parseTurnInterruptionMarks,
+  removeTurnInterruptionMarks,
+  TurnInterruptionMarksDoc,
+  TURN_INTERRUPTION_MAX_MARKS,
+  turnInterruptionDelivery,
+  type InterruptedPreparedKind,
+  type InterruptionSurface,
+  type TurnInterruptionMark,
+  type TurnInterruptionOrigin,
+} from "./recovery/interruption.js";
 import { canonicalFuturePath, prepareDataDirectory, inside } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
 import {
@@ -108,6 +131,7 @@ import {
   BACKGROUND_STATUS_LIMITS,
   backgroundLabel,
   emptyBackgroundStatus,
+  type BackgroundActiveWork,
   type BackgroundCronRun,
   type BackgroundDigest,
   type BackgroundStatus,
@@ -117,16 +141,15 @@ import {
 import {
   createMcpAdmin,
   createMcpIntegration,
-  loginNoticeText,
+  createMcpSurfaceRegistry,
   mcpHasEnabledServers,
   MCP_ADMIN_TOOL_NAME,
-  McpRequestsDoc,
   type McpAdmin,
   type McpAdminListing,
-  type McpApproveResult,
+  type McpConfig,
   type McpIntegration,
-  type McpRequestStore,
   type McpServerStatus,
+  type McpSurfaceRegistry,
 } from "./mcp/index.js";
 import {
   CLASSIFIER_MODEL_TOOL_NAME,
@@ -241,11 +264,10 @@ export interface OpenGatewayOptions {
   /** Explicit host-owned context snapshots; absent means no context extension is installed. */
   readonly contextSnapshotProvider?: GatewayContextSnapshotProvider;
   /**
-   * Host switch for the read-only model-facing `history` tool. It is on by default for
-   * mapped chat conversations; pass `false` for a bare gateway that should expose no
-   * extra tool. The tool reads only already-mapped chat conversations under the host's
-   * single-tenant policy, creates no conversation, writes no transcript and grants no
-   * filesystem or shell authority.
+   * Host switch for model-facing approved memory recall. It is on by default for mapped
+   * chats; pass `false` to disable recall too. It reads only approved workspace notes and
+   * already-mapped chat history, creates no conversation, writes no transcript and grants
+   * no filesystem or shell authority.
    */
   readonly agentHistory?: boolean;
   /**
@@ -287,12 +309,14 @@ export interface GatewayMcpStatus {
   readonly servers: readonly McpServerStatus[];
 }
 
-/** Owner-scoped MCP management surface. Every call is made by a host channel, never by a model. */
+/**
+ * Authenticated host surface for MCP management. The model tool performs configuration and login
+ * actions directly; this interface lets each foreground adapter consume a callback-shaped line
+ * before it becomes model input.
+ */
 export interface GatewayMcpAdmin {
   list(context: Context): Promise<McpAdminListing>;
-  show(id: string, context: Context): Promise<{ readonly found: boolean; readonly text: string }>;
-  approve(id: string, context: Context): Promise<McpApproveResult>;
-  deny(id: string, context: Context): Promise<McpApproveResult>;
+  submitCallback(sessionKey: string, text: string, context: Context): Promise<import("./mcp/index.js").McpCallbackResult>;
 }
 
 /** Read-only query for a bounded page of one mapped chat session's raw transcript entries. */
@@ -312,6 +336,10 @@ export interface HistoryEntryPage {
 
 export interface Gateway {
   readonly harness: HarnessType;
+  /** Approved read-only recall over notes and mapped chat history. */
+  memorySearch(caller: ConversationId, query: unknown, context: Context): ReturnType<MemoryService["search"]>;
+  memoryBrowse(caller: ConversationId, query: unknown, context: Context): ReturnType<MemoryService["browse"]>;
+  memoryRead(caller: ConversationId, query: unknown, context: Context): ReturnType<MemoryService["read"]>;
   /**
    * Bounded conversation-to-memory digestion. `start` reads one bounded completed-turn batch from the
    * mapped chat sessions and creates one native Durable task, or reports `idle`, `busy` or `refused`
@@ -329,6 +357,14 @@ export interface Gateway {
    */
   readonly cronOutbox: CronDeliveryOutbox;
   /**
+   * Owner scheduling controls: create, list, show and cancel over the existing cron foundation.
+   * Present only when cron is enabled. Every origin is resolved through the host's current mapped
+   * ordinary chat sessions, and the owner is derived from that validated key, so a caller can name
+   * a chat but never supply a conversation ID or an owner record. It exposes no schedule editing,
+   * re-arm, bulk operation or run-now path, and it is not a model tool.
+   */
+  readonly cronOperator?: CronOperator;
+  /**
    * Model-action host registry for the configured Telegram channel. The running adapter attaches
    * here; when absent, a mapped Telegram chat still sees the tool but every call is denied because
    * no live channel can send. Present only when `config.telegram` is configured.
@@ -340,22 +376,34 @@ export interface Gateway {
    */
   readonly mcp: GatewayMcpStatus | undefined;
   /**
-   * Owner-only MCP management: the pending agent proposals, the exact entry behind one, and the two
-   * decisions. Present only when this gateway loaded an on-disk configuration file; an SDK host that
-   * supplies a config object gets no write surface. It creates no authority by itself: `approve`
-   * writes configuration or starts one owner-authorized OAuth login, and is reachable only from the
-   * local terminal and the authenticated Telegram owner chat, never from a model tool.
+   * MCP management host surface. Present only when this gateway loaded an on-disk configuration
+   * file. The model tool performs direct management for authenticated mapped chats; this object
+   * only lists bounded status and consumes callback-shaped ingress before model admission.
    */
   readonly mcpAdmin?: GatewayMcpAdmin;
+  /**
+   * Live owner surfaces for direct MCP login delivery. Each foreground adapter attaches the exact
+   * session it authenticated; a URL or completion notice never goes to another chat or attachment.
+   */
+  readonly mcpSurfaces?: McpSurfaceRegistry;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
   /**
    * Bounded, read-only background activity for one already-mapped conversation: its own live
    * workers and scheduled jobs, plus whether the single workspace-global memory-digestion run is
-   * live and whether it belongs to this conversation. It starts, retries and cancels nothing, calls
+   * live and whether it belongs to this conversation, plus an anonymous gateway-wide active-work
+   * count for restart safety. It starts, retries and cancels nothing, calls
    * no model, reads no transcript, prompt, tool argument, host path or other chat, and reports no
    * other conversation ID. A conversation that is not an authenticated mapped chat reads nothing.
    */
   backgroundStatus(sessionKey: string, context: Context): Promise<BackgroundStatus>;
+  /**
+   * Bounded, read-only count of live work a whole-gateway restart would interrupt: executing tasks,
+   * work queued to execute, work waiting for it, and work still finishing. A sleeping native timer is
+   * an armed schedule and a blocked task cannot run, so neither counts, and an armed cron schedule
+   * never keeps the gateway permanently busy. It starts, changes, cancels and calls nothing, and
+   * reports no task, conversation or transcript detail.
+   */
+  activeWork(context: Context): Promise<BackgroundActiveWork>;
   /** Lists the explicit allowlist and persisted selection for an already-known session key. */
   listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
   /** Persists a native pi.agent choice; rejects ConversationBusy atomically without changing it. */
@@ -615,7 +663,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // MCP is a separate, explicit connection authority. Connecting starts external clients, so the
   // config switch must be on and at least one server enabled; otherwise no client is created.
   const mcpConfig = config.mcp;
+  let liveMcpConfig: McpConfig | undefined = mcpConfig;
   const mcpConfigured = mcpHasEnabledServers(mcpConfig);
+  const mcpSurfaces = config.configFile === undefined ? undefined : createMcpSurfaceRegistry();
   // Native Code Mode composes whatever tools the current conversation already holds. It is
   // independently enableable with `codemode.enabled`; when that block is absent the legacy rule
   // still ties it to configured MCP, and an explicit `false` disables it either way.
@@ -625,11 +675,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // later. Absent integrations mean the ceiling blocks those names instead.
   const mcpRef: { current: McpIntegration | undefined } = { current: undefined };
   const codeModeRef: { current: CodeModeIntegration | undefined } = { current: undefined };
-  // Agent-driven MCP management: a model tool can only propose; the owner approves from a terminal
-  // or the authenticated Telegram chat. It needs an on-disk configuration file to write, so an SDK
-  // host that supplies an object keeps the read-only `gateway.mcp` status and no write surface.
+  // Direct MCP management: the `mcp` model tool acts for an authenticated mapped chat and needs an
+  // on-disk configuration file to write. An SDK host that supplies an object keeps the read-only
+  // `gateway.mcp` status and no write surface.
   const mcpAdminRef: { current: McpAdmin | undefined } = { current: undefined };
-  const adminRootRef: { current: Conversation | undefined } = { current: undefined };
+  // Late-bound live activation: the registry and conversation policy exist only after the harness opens.
+  const mcpActivationRef: { current: ((next: McpConfig) => Promise<void>) | undefined } = { current: undefined };
   // Internal agent scheduling: opt-in, and independent of the coding-tool ceiling so a reminder job
   // needs no filesystem authority.
   const cronConfig = config.cron;
@@ -950,8 +1001,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const now = () => Date.now();
   // Mirrors the shared policy's config-level default so a host-default timeout reports its duration.
   const defaultTimeoutSeconds = toolTimeoutSeconds ?? 60;
-  // The read-only history tool is on by default; its name is fixed before the tool extension exists so
-  // the coding hook can exempt it from the ceiling like the skill loader.
+  // Recall is enabled by default for mapped chats and shares the existing explicit history opt-out.
   const historyEnabled = options.agentHistory !== false;
   // Telegram interaction is a separate channel capability, not a coding-tool name. It exists only
   // when the channel is configured; the running adapter attaches its host, and the runtime offers
@@ -1026,13 +1076,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
           ...(cronEnabled ? [CRON_TOOL_NAME] : []),
           ...(workersEnabled ? [WORKER_TOOL_NAME] : []),
           ...(telegramTool === undefined ? [] : [TELEGRAM_TOOL_NAME]),
-          // MCP management only records owner approval requests: it carries no filesystem or shell
-          // authority, so the coding ceiling must not suppress it. Its own hook still limits it to
-          // authenticated mapped chats, and it exists only when the host can write configuration.
+          // MCP management is a separate host capability, not a coding-tool grant: it can
+          // write server configuration and launch stdio processes. Its own hook limits it to
+          // authenticated mapped chats; login also requires a unique live owner surface.
+          // It exists only when the host can write configuration.
           ...(config.configFile === undefined ? [] : [MCP_ADMIN_TOOL_NAME]),
           // History retrieval is read-only over mapped chats and has its own scope checks, so the
           // ceiling must not suppress it when coding tools are enabled.
-          ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
+          ...(historyEnabled ? [...MEMORY_TOOL_NAMES] : []),
           // Web tools are a separate config capability with their own call-time scope hook. They are
           // exempt from the coding ceiling only while that gated extension is actually installed.
           ...(webTool === undefined ? [] : WEB_TOOL_NAMES),
@@ -1054,6 +1105,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ? createToolEnvironments({
         workspaceRoot: workspace,
         allowedRoots: extraRoots,
+        restrictToWorkspace: config.restrictToWorkspace !== false,
+        protectedRoots: [canonicalDataDir],
         sandbox: config.toolSandbox ?? "host",
         ...(config.bwrapPath === undefined ? {} : { bwrapPath: config.bwrapPath }),
         ...(toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: toolTimeoutSeconds }),
@@ -1079,7 +1132,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ...workerCodingTools,
       ...(skillToolRegistration === undefined ? [] : [SKILL_TOOL_NAME]),
       ...webToolRegistrations.map((tool) => tool.name),
-      ...(historyEnabled ? [HISTORY_TOOL_NAME] : []),
+      ...(historyEnabled ? [...MEMORY_TOOL_NAMES] : []),
       ...(codeModeGranted
         ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]
         : []),
@@ -1157,6 +1210,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
       environments = createToolEnvironments({
         workspaceRoot: root,
         allowedRoots: [],
+        // Shared workers inherit host access; explicit worktree workers remain checkout-scoped.
+        restrictToWorkspace: root !== workspace || config.restrictToWorkspace !== false,
+        // Worktrees live under dataDir but are already confined to their own checkout,
+        // which cannot reach the store or its siblings. Do not deny that checkout itself.
+        protectedRoots: root === workspace ? [canonicalDataDir] : [],
         sandbox: config.toolSandbox ?? "host",
         ...(config.bwrapPath === undefined ? {} : { bwrapPath: config.bwrapPath }),
         ...(toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: toolTimeoutSeconds }),
@@ -1194,12 +1252,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const skillTool = options.contextSnapshotProvider === undefined ? undefined : createSkillTool();
   const skillToolRegistration = skillTool?.extension.tools?.[0];
   const skillConversations = new Set<ConversationId>();
-  // Read-only prior-conversation retrieval for the assistant. It is not a coding tool: no path, no
-  // shell, no transcript write and no conversation creation. The host surface is late-bound so the
-  // extension can be registered before Harness.open() while the index itself is created afterwards.
-  const historyToolHostRef: { current: HistoryToolHost | undefined } = { current: undefined };
-  const historyTool = historyEnabled ? createHistoryTool({ host: () => historyToolHostRef.current }) : undefined;
-  const historyToolRegistration = historyTool?.extension.tools?.[0];
+  // Approved recall tools are registered before open and late-bind to the gateway-owned service.
+  const memoryServiceRef: { current: MemoryService | undefined } = { current: undefined };
+  const memoryTools = historyEnabled ? createMemoryTools({
+    service: () => memoryServiceRef.current,
+    caller: (conversationId) => historyConversations.has(conversationId) || workerChildConversations.has(conversationId),
+  }) : undefined;
+  const memoryToolRegistrations = memoryTools?.extension.tools ?? [];
   const historyConversations = new Set<ConversationId>();
   // Mapped session keys own their snapshot. A scheduled run's target is tracked separately in
   // insertion order so the cap can drop an idle target instead of failing the run, and never a
@@ -1228,7 +1287,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       selected.push(workerCapabilityExtension);
       if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
       if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
-      if (historyTool !== undefined) selected.push(historyTool.extension);
+      if (memoryTools !== undefined) selected.push(memoryTools.extension);
       if (webTool !== undefined) selected.push(webTool.extension);
     }
     // A live digest target keeps its narrowing path hook across a reopen. The hook grants nothing;
@@ -1240,7 +1299,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (skillTool && contextConversations.has(conversationId) && skillConversations.has(conversationId)) {
       selected.push(skillTool.extension);
     }
-    if (historyTool && historyConversations.has(conversationId)) selected.push(historyTool.extension);
+    if (memoryTools && historyConversations.has(conversationId)) selected.push(memoryTools.extension);
     if (webTool && webConversations.has(conversationId)) selected.push(webTool.extension);
     if (telegramTool && telegramChatConversations.has(conversationId)) selected.push(telegramTool.extension);
     if (cronFoundation && cronTool && cronOwners.has(conversationId)) {
@@ -1250,8 +1309,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     return { extensions: selected };
   };
   const toolRegistrations = new Map<string, ToolRegistration>(
-    [...(toolExtension?.tools ?? []), ...webToolRegistrations,
-      ...(historyToolRegistration === undefined ? [] : [historyToolRegistration]),
+    [...(toolExtension?.tools ?? []), ...webToolRegistrations, ...memoryToolRegistrations,
       ...(skillToolRegistration === undefined ? [] : [skillToolRegistration])]
       .map((tool) => [tool.name, tool]),
   );
@@ -1425,7 +1483,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // notice text naming the job and occurrence only: raw provider errors, the job's message and
           // model text never leave the store. A successful answer is queued from the committed entry
           // the scheduled submission settled with, so no model turn is rerun and no nearby user
-          // answer is substituted for it. The origin session key is also the channel locator: a key
+          // answer is substituted for it. A job's `silent` setting, or an exact trimmed `[SILENT]`
+          // answer, suppresses the automatic delivery instead; a failed occurrence still queues its
+          // notice. The origin session key is also the channel locator: a key
           // outside an enabled delivery prefix is never queued.
           if (delivery === null) return;
           if (job === null || !isChatSessionKey(job.owner.sessionKey)) return;
@@ -1439,6 +1499,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
               : await tx.entry(AssistantEntry, delivery.answerEntryId);
             const message = answer?.model?.[0] as AssistantMessage | undefined;
             const body = (message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "").trim();
+            // Suppression stops only this automatic channel delivery: the answer stays in the run's
+            // conversation, and `[SILENT]` has no special meaning in an ordinary chat reply. A
+            // `silent` job suppresses every successful occurrence, including an empty answer; the
+            // marker suppresses just its own occurrence in either mode. A failed run never reaches
+            // this branch and keeps its sanitized notice.
+            if (job.silent === true || body === "[SILENT]") return;
             text = body === ""
               ? cronOutcomeNotice("empty", job.id, occurrence.scheduledAtMs)
               : body.length > CRON_DELIVERY_MAX_TEXT_CHARS
@@ -1550,7 +1616,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (codeModeRef.current !== undefined) extensions.push(...codeModeRef.current.extensions);
           if (mcpRef.current !== undefined) extensions.push(mcpRef.current.extension);
           if (webTool !== undefined) extensions.push(webTool.extension);
-          if (historyTool !== undefined) extensions.push(historyTool.extension);
+          if (memoryTools !== undefined) extensions.push(memoryTools.extension);
           extensions.push(workerCapabilityExtension);
           const workerChoice = choicesByNative.get(modelKey(input.model));
           await configure(tx, target, {
@@ -1707,10 +1773,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const cronTools = cronToolRegistration !== undefined && cronOwners.has(conversationId)
       ? [cronToolRegistration]
       : [];
-    // History is read-only over mapped chats; ordinary workers may capture the retrieval tool too.
-    const historyTools = historyToolRegistration !== undefined
+    // Recall is read-only over mapped chats; workers need explicit captures for each tool.
+    const memoryToolsForConversation = historyEnabled
       && (historyConversations.has(conversationId) || workerChildConversations.has(conversationId))
-      ? [historyToolRegistration]
+      ? memoryToolRegistrations
       : [];
     // Telegram interaction is a scoped channel capability for one mapped private chat, not a coding
     // tool. The live adapter rechecks the current allowlist and observed target at call time.
@@ -1724,12 +1790,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const workerTools = workerToolRegistration !== undefined && workerSpawners.has(conversationId)
       ? [workerToolRegistration]
       : [];
-    // MCP management records owner-approval requests only; it is exempt from the coding ceiling and
-    // is offered to authenticated mapped chats alone (never a worker or task-owned scope).
+    // MCP management is exempt from the coding ceiling and offered to authenticated mapped chats
+    // alone (never a worker or task-owned scope); its model tool acts directly.
     const mcpAdminTools = mcpAdminRef.current !== undefined && authorizedChatConversations.has(conversationId)
       ? [...(mcpAdminRef.current.extension.tools ?? [])]
       : [];
-    return [...skillTools, ...cronTools, ...historyTools, ...telegramTools, ...webTools, ...workerTools, ...mcpAdminTools];
+    return [...skillTools, ...cronTools, ...memoryToolsForConversation, ...telegramTools, ...webTools, ...workerTools, ...mcpAdminTools];
   };
   /**
    * The authority-derived tool filter. The host ceiling directly authorizes authenticated mapped
@@ -1859,6 +1925,40 @@ export async function openGateway(config: PortConfig, context: Context, options:
       });
     }, ctx);
   }
+  /**
+   * Reapply tool and extension policy after a live MCP change. Authenticated chats may gain the new
+   * registration; existing workers are pruned against their durable capture, never widened by it.
+   */
+  async function refreshMcpConversationPolicy(): Promise<void> {
+    const open = harnessRef.current;
+    if (open === undefined) return;
+    let failure: unknown;
+    for (const conversationId of new Set([...authorizedChatConversations, ...workerChildConversations])) {
+      try {
+        const conversation = await open.conversation(conversationId, context);
+        if (conversation === undefined) continue;
+        if (!workerChildConversations.has(conversationId)) {
+          await applyConversationPolicy(conversation, context);
+          continue;
+        }
+        // A worker keeps its pinned model, cwd and thinking level. Reapply only its extension
+        // selection and the capture intersection: a newly added MCP tool is never added to an
+        // existing capture, while a removed one is pruned in this same commit.
+        await conversation.commit(async (tx) => {
+          const capture = await tx.doc(ConfigToolCaptureDoc, conversationId);
+          const alreadyCaptured = new Set(capture.tools);
+          const toolFilter = await toolFilterFor(tx, conversationId, alreadyCaptured);
+          await configure(tx, conversationId, {
+            ...extensionsPolicy(conversationId),
+            ...toolFilter,
+          });
+        }, context);
+      } catch (error) {
+        failure ??= error;
+      }
+    }
+    if (failure !== undefined) throw failure;
+  }
   let releaseLock: Awaited<ReturnType<typeof processLock>>;
   try {
     releaseLock = await processLock(`nanobot:${dbPath}`);
@@ -1922,6 +2022,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // running as this user can read it — including the model's own shell and an MCP stdio server — and
     // that is the accepted posture; no model-facing surface returns its content (see MCP.md).
     const mcpDataDir = credentialStoreDir ?? config.dataDir;
+    let registeredMcpToolNames = new Set<string>();
+    const replaceMcpRegistrations = (integration: McpIntegration): void => {
+      for (const name of registeredMcpToolNames) toolRegistrations.delete(name);
+      registeredMcpToolNames = new Set(integration.toolNames);
+      for (const tool of integration.extension.tools ?? []) {
+        if (registeredMcpToolNames.has(tool.name)) toolRegistrations.set(tool.name, tool);
+      }
+    };
     if (mcpConfigured && mcpConfig !== undefined) {
       mcpRef.current = await createMcpIntegration({
         config: mcpConfig,
@@ -1931,50 +2039,35 @@ export async function openGateway(config: PortConfig, context: Context, options:
           || workerChildConversations.has(conversationId),
         delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
       });
-      for (const tool of mcpRef.current.extension.tools ?? []) toolRegistrations.set(tool.name, tool);
+      replaceMcpRegistrations(mcpRef.current);
     }
-    // Owner approval is the only path from a model proposal to new authority. The request list is a
-    // root-scoped document, so it survives a restart, is written once per proposal and is consumed by
-    // the approval; configuration writes and OAuth grants stay owner actions.
-    if (config.configFile !== undefined) {
-      const requests: McpRequestStore = {
-        read: async (ctx: Context) => {
-          const root = adminRootRef.current;
-          const open = harnessRef.current;
-          if (root === undefined || open === undefined) throw new Error("The MCP request store is not open");
-          // A committed document snapshot, not a transaction draft: the draft is invalid after commit.
-          const stored = await open.snapshot(McpRequestsDoc, root.id, ctx);
-          return stored?.requests ?? [];
-        },
-        write: (ctx: Context, change) => {
-          const root = adminRootRef.current;
-          if (root === undefined) throw new Error("The MCP request store is not open");
-          return root.commit(async (tx) => change((await tx.doc(McpRequestsDoc, root.id)).requests), ctx);
-        },
-      };
+    // Direct MCP management is performed by the model tool for authenticated mapped chats. This host
+    // object only exposes bounded status and consumes callback-shaped ingress before model admission.
+    if (config.configFile !== undefined && mcpSurfaces !== undefined) {
       mcpAdminRef.current = createMcpAdmin({
         edit: { configFile: config.configFile, workspace },
         dataDir: mcpDataDir,
-        config: mcpConfig,
-        requests,
         context,
-        isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
-        servers: () => mcpRef.current?.status ?? [],
-        notify: async (notice) => {
-          const open = harnessRef.current;
-          if (open === undefined) return;
-          // Only an authenticated mapped chat receives the internal result; anything else is dropped.
-          if (!authorizedChatConversations.has(notice.originConversationId)) return;
-          const conversation = await open.conversation(notice.originConversationId, context);
-          if (conversation === undefined) return;
-          await conversation.submit({
-            type: "input",
-            content: loginNoticeText(notice),
-            requestId: `nanobot.mcp-login-result:${notice.requestId}`,
-            entry: { kind: "nanobot.mcp-login-result", data: { requestId: notice.requestId, ok: notice.outcome.ok } },
-          }, context);
+        config: () => liveMcpConfig,
+        applyConfig: (next) => {
+          const activate = mcpActivationRef.current;
+          if (activate === undefined) throw new Error("MCP live activation is not ready");
+          return activate(next);
         },
-      });
+        reconnect: async (name) => {
+          const integration = mcpRef.current;
+          if (integration === undefined) return;
+          await integration.reconnect(name);
+          replaceMcpRegistrations(integration);
+          registry.install(integration.extension);
+          codeModeRef.current?.updateNamespaces(integration.namespaces);
+          await refreshMcpConversationPolicy();
+        },
+        servers: () => mcpRef.current?.status ?? [],
+        sessionKeyFor: (conversationId) => sessionKeyForConversation.get(conversationId),
+        surfaces: mcpSurfaces,
+        isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
+      } as Parameters<typeof createMcpAdmin>[0]);
       for (const tool of mcpAdminRef.current.extension.tools ?? []) toolRegistrations.set(tool.name, tool);
     }
     // Code Mode is an independent compositor, not an MCP wrapper. It gets MCP namespaces only from
@@ -2005,7 +2098,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       for (const extension of codeModeRef.current.extensions) registry.install(extension);
     }
     if (skillTool) registry.install(skillTool.extension);
-    if (historyTool) registry.install(historyTool.extension);
+    if (memoryTools) registry.install(memoryTools.extension);
     if (telegramTool) registry.install(telegramTool.extension);
     if (webTool) registry.install(webTool.extension);
     if (cronFoundation) registry.install(cronFoundation.extension);
@@ -2029,8 +2122,61 @@ export async function openGateway(config: PortConfig, context: Context, options:
     };
     harness = await Harness.open(storage, harnessOptions, context);
     harnessRef.current = harness;
+    mcpActivationRef.current = async (next) => {
+      let integration = mcpRef.current;
+      if (integration === undefined) {
+        if (!mcpHasEnabledServers(next)) {
+          liveMcpConfig = next;
+          return;
+        }
+        integration = await createMcpIntegration({
+          config: next,
+          workspace,
+          dataDir: mcpDataDir,
+          isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId)
+            || workerChildConversations.has(conversationId),
+          delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
+        });
+        mcpRef.current = integration;
+        registry.install(integration.extension);
+        replaceMcpRegistrations(integration);
+      } else {
+        await integration.applyConfig(next);
+        registry.install(integration.extension);
+        replaceMcpRegistrations(integration);
+      }
+      liveMcpConfig = next;
+      // Legacy Code Mode follows MCP when its own block is absent. A live first server therefore
+      // installs it without a restart; an explicit `codemode.enabled: false` stays the owner's choice.
+      if (codeModeRef.current === undefined && codeModeConfig === undefined && mcpHasEnabledServers(next)) {
+        codeModeRef.current = createCodeModeIntegration({
+          namespaces: integration.namespaces,
+          models: true,
+          ...(classifierGrant === undefined ? {} : { classifierModel: classifierGrant }),
+          isAuthorizedChat: (conversationId: ConversationId) =>
+            authorizedChatConversations.has(conversationId) || workerChildConversations.has(conversationId),
+        });
+        for (const extension of codeModeRef.current.extensions) {
+          registry.install(extension);
+          for (const tool of extension.tools ?? []) toolRegistrations.set(tool.name, tool);
+        }
+      } else if (codeModeConfig === undefined && !mcpHasEnabledServers(next) && codeModeRef.current !== undefined) {
+        const retired = codeModeRef.current;
+        codeModeRef.current = undefined;
+        retired.stopAdmission();
+        for (const extension of retired.extensions) {
+          registry.uninstall(extension);
+          for (const tool of extension.tools ?? []) toolRegistrations.delete(tool.name);
+        }
+        // Management may itself be nested in this sandbox. Do not wait for our own
+        // execution to exit; admission is closed synchronously and close joins it later.
+        void retired.close().catch(() => undefined);
+      } else {
+        codeModeRef.current?.updateNamespaces(integration.namespaces);
+      }
+      await refreshMcpConversationPolicy();
+    };
     const root = await harness.root(context, { agent: defaultAgentPolicy });
-    adminRootRef.current = root;
 
     // One immutable identity document per store, minted on first open. A derived index binds
     // its rows to this value instead of to a file path, which a replaced store can reuse.
@@ -2102,6 +2248,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       conversationId: ConversationId,
       startEntryId: EntryId,
       ctx: Context,
+      fullText = false,
     ): Promise<HistorySummaryView> {
       let episode: unknown;
       try {
@@ -2126,7 +2273,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       } catch {
         return { state: "unreadable" };
       }
-      return normalizeReadySummary(classified.body, record, classified.version);
+      return normalizeReadySummary(classified.body, record, classified.version, { fullText });
     }
 
     // Derived, rebuildable search index. Its file is separate from Durable's store, and every Durable
@@ -2155,6 +2302,56 @@ export async function openGateway(config: PortConfig, context: Context, options:
       readSummary: (ctx, conversationId, startEntryId) =>
         readEpisodeSummary(conversationId, startEntryId, ctx),
     });
+    const memoryHost = {
+      async scope(caller: ConversationId, ctx: Context, operation: typeof MEMORY_TOOL_NAMES[number]) {
+        const worker = workerChildConversations.has(caller);
+        if (!historyConversations.has(caller) && !worker) throw new Error("Memory recall is unavailable in this conversation");
+        const mapped = await mappedChatSessions(ctx);
+        let workspaceRoot = workspace;
+        if (worker) {
+          const capture = await harness!.snapshot(ConfigToolCaptureDoc, caller, ctx);
+          const origin = capture?.originConversationId;
+          if (capture === undefined || typeof origin !== "number" || !Number.isSafeInteger(origin) || origin < 1
+            || !Array.isArray(capture.tools) || capture.tools.some((name) => typeof name !== "string")
+            || (capture.classifierModel !== null && typeof capture.classifierModel !== "string")
+            || !authorizedChatConversations.has(origin as ConversationId)
+            || !mapped.some((session) => session.conversationId === origin)
+            || !capture.tools.includes(operation) || !workerToolNames().includes(operation)) {
+            throw new Error("Worker memory recall is outside its live captured authority");
+          }
+          const workerRoot = workerWorkspaceRoots.get(caller);
+          if (workerRoot === undefined) throw new Error("Worker workspace is unavailable; refusing memory access");
+          workspaceRoot = workerRoot;
+        } else if (!mapped.some((session) => session.conversationId === caller)) {
+          throw new Error("Memory recall is unavailable in this conversation");
+        }
+        const sessions = mapped.map((session) => ({
+          sessionKey: session.sessionKey,
+          conversationId: session.conversationId,
+          channel: session.sessionKey.split(":", 1)[0] ?? null,
+        }));
+        return {
+          storeId: storeIdentity.storeId,
+          workspaceRoot,
+          memoryFiles: config.workspaceContext?.memoryFiles ?? [],
+          sessions,
+        };
+      },
+      async entries(session: string, query: HistoryEntryQuery, limit: number, cursor: Cursor | undefined, ctx: Context) {
+        await mappedChatConversationFor(session, ctx);
+        return gateway.historyEntries(session, query, limit, cursor, ctx);
+      },
+      async summary(session: string, episodeStart: number, ctx: Context) {
+        const conversation = await mappedChatConversationFor(session, ctx);
+        return readEpisodeSummary(conversation.id, episodeStart as EntryId, ctx, true);
+      },
+      search: (query: HistoryQuery, ctx: Context) => gateway.historySearch(query, ctx),
+      searchSummaries: (query: HistorySummaryQuery, ctx: Context) => gateway.historySummarySearch(query, ctx),
+    };
+    const memoryService = historyEnabled ? createMemoryService(memoryHost, {
+      notes: createNotesBackend(),
+      history: createHistoryBackend(memoryHost),
+    }) : undefined;
 
     // At the snapshot cap, drop the oldest installed background target that is not running and not a
     // mapped session. Without an evictable target the builder's RangeError stays the last resort.
@@ -2409,13 +2606,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // History retrieval is independent of the context snapshot opt-in: every mapped chat
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
-    const initialMapping = historyTool === undefined && !toolsEnabled && telegramTool === undefined && !workersEnabled
+    const initialMapping = memoryTools === undefined && !toolsEnabled && telegramTool === undefined && !workersEnabled
       && webTool === undefined && !mcpConfigured && !codeModeEnabled && mcpAdminRef.current === undefined
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
     if (initialMapping !== undefined) {
       for (const { sessionKey, conversationId } of await mappedChatSessions(context)) {
-        if (historyTool !== undefined) historyConversations.add(conversationId);
+        if (memoryTools !== undefined) historyConversations.add(conversationId);
         authorizedChatConversations.add(conversationId);
         if (webTool !== undefined) webConversations.add(conversationId);
         sessionKeyForConversation.set(conversationId, sessionKey);
@@ -2472,6 +2669,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // scheduling resumes, never silently moved to the configured default.
     const pinnedModelRemoved = new Set<ConversationId>();
     const runTasksById = new Map<number, { readonly originConversationId: ConversationId; readonly targetConversationId: ConversationId | null }>();
+    // A background run's target conversation is task-owned, never a chat. Interruption recovery
+    // resolves its legitimate owning surface and class back through the run task that created it.
+    const backgroundTargetRuns = new Map<ConversationId, {
+      readonly originConversationId: ConversationId;
+      readonly surface: "worker" | "digest" | "scheduled";
+    }>();
     await root.commit(async (tx) => {
       let taskCursor: Cursor | undefined;
       do {
@@ -2498,6 +2701,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
               && automationConversations.get(target.id)?.originConversationId
                 === backgroundTarget.originConversationId;
             if (ownsTarget || automationTarget) {
+              backgroundTargetRuns.set(backgroundTarget.targetConversationId, {
+                originConversationId: task.conversationId as ConversationId,
+                surface: task.kind === WORKER_TASK_NAME
+                  ? "worker"
+                  : task.kind === MEMORY_DIGEST_TASK_NAME ? "digest" : "scheduled",
+              });
               // A digest target deliberately gets no origin context snapshot: its model input is
               // its own bounded batch, so a reopened attempt renders the same framing again.
               if (snapshotTarget !== undefined) backgroundRunTargets.push(snapshotTarget);
@@ -2633,17 +2842,349 @@ export async function openGateway(config: PortConfig, context: Context, options:
       backgroundToolBounds.set(targetConversationId, tools);
     }
 
-    for (const replay of preparedContextReplays) {
-      const conversation = await harness.conversation(replay.conversationId, context);
-      if (!conversation) throw new Error(`Cannot safely resume ${replay.kind} task ${replay.id}: conversation is missing`);
-      const view = await conversation.context(context, { at: replay.at as EntryId });
-      if (hasPersistedNanobotContext(view.messages)) {
+    /**
+     * Retire a record this build cannot read. Native `retireDoc` preserves the unreadable incarnation
+     * in the store's document history without materializing, repairing or overwriting its value, so
+     * availability does not depend on a manual repair step for optional notice bookkeeping.
+     */
+    const retireUnreadableRecord = async (retire: (tx: Tx) => Promise<void>): Promise<void> => {
+      try {
+        await harness!.commit(retire, context);
+      } catch (cause) {
         throw new StartupDiagnosticError("preparedContext", {
-          detail: `Cannot safely resume ${replay.kind} task ${replay.id} (${replay.phase}): its prepared request includes ` +
-            "persisted Nanobot context; cancel that prepared dispatch with the context recovery interface before gateway recovery",
+          cause,
+          detail: "Cannot retire an unreadable interruption recovery record; run the context recovery interface " +
+            "before gateway recovery",
+        });
+      }
+    };
+
+    /**
+     * Read the pending interruption facts. A record this build cannot read is retired rather than
+     * repaired: the notices it held are lost (the one thing those transient marks were for), a fixed
+     * delivery fault is recorded where an origin is known, and the authoritative task scan below still
+     * cancels the startup-blocking prepared dispatch.
+     */
+    const readInterruptionMarks = async (): Promise<{ marks: TurnInterruptionMark[]; damaged: boolean }> => {
+      let stored;
+      try {
+        stored = await harness!.snapshot(TurnInterruptionMarksDoc, context);
+      } catch {
+        await retireUnreadableRecord((tx) => tx.retireDoc(TurnInterruptionMarksDoc));
+        return { marks: [], damaged: true };
+      }
+      if (stored === undefined) return { marks: [], damaged: false };
+      try {
+        return { marks: parseTurnInterruptionMarks(stored), damaged: false };
+      } catch {
+        await retireUnreadableRecord((tx) => tx.retireDoc(TurnInterruptionMarksDoc));
+        return { marks: [], damaged: true };
+      }
+    };
+
+    /** The same availability rule for the interrupted-run record: retire, never repair in place. */
+    const ensureInterruptedRunReportsReadable = async (): Promise<void> => {
+      let stored;
+      try {
+        stored = await harness!.snapshot(InterruptedRunReportsDoc, context);
+      } catch {
+        await retireUnreadableRecord((tx) => tx.retireDoc(InterruptedRunReportsDoc));
+        return;
+      }
+      if (stored === undefined) return;
+      try {
+        parseInterruptedRunReports(stored);
+      } catch {
+        await retireUnreadableRecord((tx) => tx.retireDoc(InterruptedRunReportsDoc));
+      }
+    };
+
+    // The origin of a prepared dispatch is the mapped chat that owns it, never the worker, digest or
+    // scheduled-run target conversation. A target is resolved through the class the open restored or
+    // the run task that still owns it; no session key is inferred from a conversation id.
+    const interruptionOriginFor = (
+      conversationId: ConversationId,
+      sessions: ReadonlyMap<ConversationId, string>,
+    ) => interruptionOrigin(conversationId, {
+      chatSessionKey: (id) => sessions.get(id),
+      automationOrigin: (id) => automationConversations.get(id)?.originConversationId,
+      backgroundOrigin: (id) => {
+        const run = backgroundTargetRuns.get(id);
+        if (run === undefined || run.surface === "scheduled") return undefined;
+        return { originConversationId: run.originConversationId, surface: run.surface };
+      },
+    });
+
+    /**
+     * The class a cancelled prepared dispatch belonged to, for wording that stays true. A target
+     * conversation's owning run task names its class even after that run is terminal, so a notice
+     * admitted after a crash window still says what was interrupted.
+     */
+    const interruptionSurfaceIn = async (tx: Tx, conversationId: ConversationId): Promise<InterruptionSurface> => {
+      const ownerTaskId = (await tx.conversation(conversationId))?.owner?.taskId;
+      if (ownerTaskId === undefined) return automationConversations.has(conversationId) ? "scheduled" : "chat";
+      const owner = await tx.task(ownerTaskId as TaskId);
+      if (owner?.kind === WORKER_TASK_NAME) return "worker";
+      if (owner?.kind === MEMORY_DIGEST_TASK_NAME) return "digest";
+      if (owner?.kind === CRON_RUN_TASK_NAME) return "scheduled";
+      return "chat";
+    };
+
+    /**
+     * Admit one notice per marked task into its origin's existing bounded channel outbox, then clear
+     * the mark in the same commit. A settled non-abort outcome (or a completed turn that won the race)
+     * is not reported as an interruption; a mark whose origin is no longer this mapped chat is dropped
+     * instead of rerouted. An unreadable/full outbox keeps gateway availability and records a bounded
+     * delivery fault; the notice is not retried and no unknown-outcome record is evicted.
+     */
+    const admitInterruptionNotices = async (
+      sessions: ReadonlyMap<ConversationId, string>,
+      marks: readonly TurnInterruptionMark[],
+      damaged: boolean,
+      origins: ReadonlyMap<number, TurnInterruptionOrigin>,
+    ): Promise<void> => {
+      if (marks.length === 0 && !damaged) return;
+      const deliverable: TurnInterruptionMark[] = [];
+      const clear = new Set<number>();
+      for (const mark of marks) {
+        const task = await harness!.getTask(mark.taskId as TaskId, context);
+        if (task === undefined) {
+          clear.add(mark.taskId);
+          continue;
+        }
+        const interrupted = task.state.status === "terminal"
+          ? task.state.outcome.status !== "completed"
+          : task.abortRequested === true;
+        if (!interrupted) {
+          clear.add(mark.taskId);
+          continue;
+        }
+        if (sessions.get(mark.originConversationId) !== mark.sessionKey) {
+          clear.add(mark.taskId);
+          continue;
+        }
+        deliverable.push(mark);
+      }
+      if (deliverable.length === 0 && clear.size === 0 && !damaged) return;
+      await root.commit(async (tx) => {
+        const markDoc = await tx.doc(TurnInterruptionMarksDoc);
+        // Fail closed on damaged state instead of overwriting a mark this build does not understand.
+        parseTurnInterruptionMarks(markDoc);
+        for (const mark of deliverable) {
+          if ((await tx.conversation(mark.originConversationId)) === undefined) {
+            clear.add(mark.taskId);
+            continue;
+          }
+          let admission: "admitted" | "duplicate" | "full" | "invalid" = "invalid";
+          try {
+            const deliveries = await tx.doc(CronDeliveriesDoc, mark.originConversationId);
+            const interrupted = await tx.task(mark.taskId as TaskId);
+            admission = admitCronDelivery(
+              deliveries,
+              turnInterruptionDelivery(
+                mark.sessionKey,
+                mark.taskId,
+                now(),
+                mark.kind,
+                await interruptionSurfaceIn(tx, interrupted?.conversationId ?? mark.originConversationId),
+              ),
+            );
+          } catch {
+            admission = "invalid";
+          }
+          if (admission === "full" || admission === "invalid") {
+            try {
+              const faults = await tx.doc(CronDeliveryFaultsDoc, mark.originConversationId);
+              recordCronDeliveryFault(faults, {
+                jobId: null,
+                scheduledAtMs: null,
+                recordedAtMs: now(),
+                message: admission === "full"
+                  ? "interruption notice was not queued: delivery outbox is full"
+                  : "interruption notice was not queued: delivery outbox is malformed",
+              });
+            } catch {
+              // This diagnostic is derived state; it must not stop the gateway from recovering.
+            }
+          }
+          clear.add(mark.taskId);
+        }
+        if (damaged) {
+          // The retired record's own notices are gone; record the fixed loss once per origin this open
+          // can still name. The fault list is bounded and this text is value-free.
+          for (const originConversationId of new Set([...origins.values()].map((origin) => origin.conversationId))) {
+            try {
+              const faults = await tx.doc(CronDeliveryFaultsDoc, originConversationId);
+              recordCronDeliveryFault(faults, {
+                jobId: null,
+                scheduledAtMs: null,
+                recordedAtMs: now(),
+                message: INTERRUPTION_RECORD_DAMAGED_FAULT,
+              });
+            } catch {
+              // Same bounded diagnostic rule: never stop the gateway for derived state.
+            }
+          }
+        }
+        if (clear.size > 0) removeTurnInterruptionMarks(markDoc, clear);
+      }, context);
+    };
+
+    /**
+     * Cancel every prepared dispatch whose pinned context still contains Nanobot sections. The
+     * detailed error is for SDK callers; the CLI prints one fixed recovery diagnostic. A mark is
+     * written first for every dispatch with a mapped origin, so a crash between that write, the
+     * native abort and the notice admission is reconciled on the next open. A dispatch whose
+     * prepared model left `allowedModels` never reaches here: the scan above fails closed first.
+     */
+    const recoverInterruptedPreparedTurns = async (blocked: readonly NonNullable<ReturnType<typeof preparedContextReplay>>[]): Promise<void> => {
+      const stored = await readInterruptionMarks();
+      if (blocked.length === 0 && stored.marks.length === 0) return;
+      const sessions = new Map((await mappedChatSessions(context))
+        .map(({ conversationId, sessionKey }) => [conversationId, sessionKey] as const));
+      const origins = new Map<number, TurnInterruptionOrigin>();
+      for (const replay of blocked) {
+        const origin = interruptionOriginFor(replay.conversationId, sessions);
+        if (origin !== undefined) origins.set(replay.id, origin);
+      }
+      // Admit notices already pending from an earlier open first, so a bounded mark list is drained
+      // of settled entries before it can refuse a new one and force a manual recovery.
+      try {
+        await admitInterruptionNotices(sessions, stored.marks, stored.damaged, origins);
+      } catch {
+        // The marks stay durable; the next open retries. Notice admission is bookkeeping, not startup
+        // authority, so it must not turn a damaged outbox into a dead end.
+      }
+      if (blocked.length === 0) return;
+      const additions: TurnInterruptionMark[] = [];
+      // Only a dispatch whose cancellation fails the owning run can leave an internal report to
+      // suppress: the conversation's own generation, or a blocking compaction a generation waits on.
+      // A background or manual compaction is cancelled without failing the run, so it records nothing.
+      const candidates: {
+        readonly replayId: number;
+        readonly kind: InterruptedPreparedKind;
+        readonly targetConversationId: ConversationId;
+      }[] = [];
+      for (const replay of blocked) {
+        if (!stored.marks.some((mark) => mark.taskId === replay.id)) {
+          const origin = origins.get(replay.id);
+          if (origin !== undefined) {
+            additions.push({
+              taskId: replay.id,
+              kind: replay.kind,
+              originConversationId: origin.conversationId,
+              sessionKey: origin.sessionKey,
+              createdAtMs: now(),
+            });
+          }
+        }
+        candidates.push({ replayId: replay.id, kind: replay.kind, targetConversationId: replay.conversationId });
+      }
+      if (additions.length > 0 || candidates.length > 0) {
+        if (candidates.length > 0) await ensureInterruptedRunReportsReadable();
+        await harness!.commit(async (tx) => {
+          const doc = await tx.doc(TurnInterruptionMarksDoc);
+          for (const mark of additions) {
+            const result = addTurnInterruptionMark(doc, mark);
+            if (result === "full") {
+              throw new StartupDiagnosticError("preparedContext", {
+                detail: `Cannot automatically recover interrupted turns: the bounded interruption record holds ` +
+                  `${TURN_INTERRUPTION_MAX_MARKS} pending notices; cancel the blocked prepared dispatch with the ` +
+                  "context recovery interface before gateway recovery",
+              });
+            }
+          }
+          if (candidates.length === 0) return;
+          const reportDoc = await tx.doc(InterruptedRunReportsDoc);
+          // Reuse slots a crashed earlier open left behind: only a live run can consume one.
+          const live: typeof reportDoc.runs = [];
+          for (const entry of parseInterruptedRunReports(reportDoc)) {
+            const task = await tx.task(entry.runTaskId as TaskId);
+            if (task === undefined || task.state.status === "terminal") continue;
+            live.push(entry);
+          }
+          reportDoc.runs = live;
+          const runByTarget = new Map<ConversationId, number | undefined>();
+          for (const candidate of candidates) {
+            if (candidate.kind === "pi.compaction") {
+              const compaction = await tx.task(candidate.replayId as TaskId);
+              if (compaction?.owner === undefined) continue;
+            }
+            if (!runByTarget.has(candidate.targetConversationId)) {
+              // The target's owning run task is the one whose internal report must stay silent. It is
+              // read here, so a failed or finished run is never guessed from a target id.
+              const ownerTaskId = (await tx.conversation(candidate.targetConversationId))?.owner?.taskId;
+              const run = ownerTaskId === undefined ? undefined : await tx.task(ownerTaskId as TaskId);
+              runByTarget.set(candidate.targetConversationId,
+                run === undefined || run.state.status === "terminal"
+                  || (run.kind !== WORKER_TASK_NAME && run.kind !== MEMORY_DIGEST_TASK_NAME)
+                  ? undefined
+                  : ownerTaskId);
+            }
+            const runTaskId = runByTarget.get(candidate.targetConversationId);
+            if (runTaskId === undefined) continue;
+            const result = addInterruptedRunReport(reportDoc, {
+              runTaskId,
+              targetConversationId: candidate.targetConversationId,
+              recordedAtMs: now(),
+            });
+            if (result === "full") {
+              throw new StartupDiagnosticError("preparedContext", {
+                detail: `Cannot automatically recover interrupted turns: the bounded interrupted-run record holds ` +
+                  `${INTERRUPTED_RUN_REPORT_MAX} live runs; cancel the blocked prepared dispatch with the context ` +
+                  "recovery interface before gateway recovery",
+              });
+            }
+          }
+        }, context);
+      }
+      for (const replay of blocked) {
+        // A cascade from an earlier abort can already have settled this task; never abort a terminal
+        // task or repeat an existing mark.
+        const current = await harness!.getTask(replay.id as TaskId, context);
+        if (current === undefined || current.state.status === "terminal" || current.abortRequested === true) continue;
+        try {
+          await harness!.abortTask(replay.id as TaskId, context);
+        } catch (cause) {
+          throw new StartupDiagnosticError("preparedContext", {
+            cause,
+            detail: `Cannot automatically cancel ${replay.kind} task ${replay.id} (${replay.phase}): the native ` +
+              "abort failed; cancel that prepared dispatch with the context recovery interface before gateway recovery",
+          });
+        }
+      }
+      for (const replay of blocked) {
+        const task = await harness!.getTask(replay.id as TaskId, context);
+        if (task === undefined || task.state.status === "terminal" || task.abortRequested === true) continue;
+        throw new StartupDiagnosticError("preparedContext", {
+          detail: `Cannot safely recover ${replay.kind} task ${replay.id} (${replay.phase}): the native abort mark ` +
+            "did not persist; cancel that prepared dispatch with the context recovery interface before gateway recovery",
+        });
+      }
+      const admitted = await readInterruptionMarks();
+      try {
+        await admitInterruptionNotices(sessions, admitted.marks, admitted.damaged, origins);
+      } catch {
+        // The marks stay durable; the next open retries and the gateway stays available.
+      }
+    };
+
+    const blockedPreparedTurns: NonNullable<ReturnType<typeof preparedContextReplay>>[] = [];
+    for (const replay of preparedContextReplays) {
+      try {
+        const conversation = await harness.conversation(replay.conversationId, context);
+        if (!conversation) throw new Error("conversation is missing");
+        const view = await conversation.context(context, { at: replay.at as EntryId });
+        if (hasPersistedNanobotContext(view.messages)) blockedPreparedTurns.push(replay);
+      } catch (cause) {
+        throw new StartupDiagnosticError("preparedContext", {
+          cause,
+          detail: `Cannot inspect the pinned context of ${replay.kind} task ${replay.id} (${replay.phase}); ` +
+            "cancel that prepared dispatch with the context recovery interface before gateway recovery",
         });
       }
     }
+    await recoverInterruptedPreparedTurns(blockedPreparedTurns);
 
     // Apply host security, configured tool authority and context selection only after every prepared
     // dispatch passes the replay guard. A narrowed configuration is what keeps a removed tool from replaying.
@@ -2785,11 +3326,38 @@ export async function openGateway(config: PortConfig, context: Context, options:
     };
     const gateway: Gateway = {
       harness,
+      memorySearch: (caller, query, ctx) => {
+        const service = memoryServiceRef.current;
+        if (!service) throw new Error("Memory recall is unavailable");
+        return service.search(caller, query, ctx);
+      },
+      memoryBrowse: (caller, query, ctx) => {
+        const service = memoryServiceRef.current;
+        if (!service) throw new Error("Memory recall is unavailable");
+        return service.browse(caller, query, ctx);
+      },
+      memoryRead: (caller, query, ctx) => {
+        const service = memoryServiceRef.current;
+        if (!service) throw new Error("Memory recall is unavailable");
+        return service.read(caller, query, ctx);
+      },
       memoryDigest: {
         start: (writer, ctx) => memoryDigest.start(writer, ctx),
         status: (writer, ctx) => memoryDigest.status(writer, ctx),
       },
       cronOutbox,
+      ...(cronFoundation === undefined ? {} : {
+        cronOperator: createCronOperator({
+          foundation: cronFoundation,
+          harness: () => {
+            if (harnessRef.current === undefined) throw new Error("The runtime is not open");
+            return harnessRef.current;
+          },
+          // The same validated reader every other derived consumer uses: a state-only, automation,
+          // task-owned, forked or root conversation is never a scheduling origin.
+          origins: (ctx) => mappedChatSessions(ctx),
+        }),
+      }),
       ...(telegramActions === undefined ? {} : { telegramActions }),
       get mcp() {
         return mcpRef.current === undefined ? undefined : { servers: mcpRef.current.status };
@@ -2797,11 +3365,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ...(mcpAdminRef.current === undefined ? {} : {
         mcpAdmin: {
           list: (ctx: Context): Promise<McpAdminListing> => mcpAdminRef.current!.list(ctx),
-          show: (id: string, ctx: Context) => mcpAdminRef.current!.show(id, ctx),
-          approve: (id: string, ctx: Context): Promise<McpApproveResult> => mcpAdminRef.current!.approve(id, ctx),
-          deny: (id: string, ctx: Context): Promise<McpApproveResult> => mcpAdminRef.current!.deny(id, ctx),
+          submitCallback: (sessionKey: string, text: string, ctx: Context) =>
+            mcpAdminRef.current!.submitCallback(sessionKey, text, ctx),
         },
       }),
+      ...(mcpSurfaces === undefined ? {} : { mcpSurfaces }),
       async conversationFor(sessionKey, ctx) {
         const key = encodedSessionKey(sessionKey);
         let conversationId: ConversationId | undefined;
@@ -2875,6 +3443,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         return conversation;
       },
       backgroundStatus: (sessionKey, ctx) => backgroundStatusFor(sessionKey, ctx),
+      activeWork: (ctx) => activeWorkFor(ctx),
       async listModels(sessionKey, ctx) {
         const conversation = await existingConversationFor(sessionKey, ctx);
         await applyConversationPolicy(conversation, ctx);
@@ -3073,15 +3642,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
           finally {
             try { await mcpRef.current?.close(); }
             finally {
-              try { await historyIndex?.close(); }
+              try { memoryServiceRef.current?.close(); }
               finally {
-                try {
-                  for (const environments of workerEnvironments.values()) {
-                    await environments.close(cleanup).catch(() => undefined);
-                  }
-                  workerEnvironments.clear();
-                  await toolEnvironments?.close(cleanup);
-                } finally { await releaseLock(); }
+                try { await historyIndex?.close(); }
+                finally {
+                  try {
+                    for (const environments of workerEnvironments.values()) {
+                      await environments.close(cleanup).catch(() => undefined);
+                    }
+                    workerEnvironments.clear();
+                    await toolEnvironments?.close(cleanup);
+                  } finally { await releaseLock(); }
+                }
               }
             }
           }
@@ -3117,6 +3689,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const conversation = await existingConversationFor(sessionKey, ctx);
       const conversationId = conversation.id;
       if (!authorizedChatConversations.has(conversationId)) return emptyBackgroundStatus();
+      // Restart is process-wide, so its count is read for the whole store, not for this chat alone.
+      const active = await activeWorkFor(ctx);
       // A native task record keeps its last state when Durable parks it, so "unfinished" is not the
       // same as "will run": only the live-work inspection reports blocked tasks. It is read lazily,
       // once, and only when something unfinished actually needs classifying.
@@ -3207,7 +3781,21 @@ export async function openGateway(config: PortConfig, context: Context, options:
           parked,
         },
         digest: { live: digestLive, parked: digestParked },
+        active,
       };
+    }
+    /**
+     * One read of the native task inspection. Sleeping is an armed timer and blocked is parked work,
+     * so neither is work a replacement could interrupt; everything else is unfinished work it would
+     * cut into. Nothing is written, aborted or retried here.
+     */
+    async function activeWorkFor(ctx: Context): Promise<BackgroundActiveWork> {
+      let interrupting = 0;
+      for (const task of (await harness!.inspect(ctx)).tasks) {
+        if (task.state.kind === "sleeping" || task.state.kind === "blocked") continue;
+        interrupting += 1;
+      }
+      return { interrupting };
     }
     // Summary policy and cut-chain repair. The opt-in watermark is recorded before any catalog pass
     // can enqueue history, so enabling summaries never spends on episodes that already existed. A
@@ -3247,14 +3835,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
     }
     // Scheduling begins only after registry and all persisted conversation policies are ready.
-    historyToolHostRef.current = historyTool === undefined ? undefined : {
-      search: (query, ctx) => gateway.historySearch(query, ctx),
-      summaries: (query, ctx) => gateway.historySummarySearch(query, ctx),
-      summary: (sessionKey, startEntryId, ctx) => gateway.historySummary(sessionKey, startEntryId, ctx),
-      entries: (sessionKey, query, limit, cursor, ctx) => gateway.historyEntries(sessionKey, query, limit, cursor, ctx),
-      listEpisodes: (sessionKey, query, ctx) => gateway.listHistoryEpisodes(sessionKey, query, ctx),
-      episode: (sessionKey, startEntryId, ctx) => gateway.historyEpisode(sessionKey, startEntryId, ctx),
-    };
+    memoryServiceRef.current = memoryService;
     harness.resume();
     // A worker that finished while the process was gone already committed its outcome and retired its
     // authority, but may not have admitted the internal result event. Re-admitting is idempotent by the
@@ -3285,6 +3866,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // A failed open must not leave deferred cataloguing attached to a closed session, nor a
     // derived index handle open behind a failed gateway.
     episodeCatalog?.close();
+    memoryServiceRef.current?.close();
+    memoryServiceRef.current = undefined;
     try {
       if (harness) await harness.close(cleanup);
       else await storage?.close(cleanup);

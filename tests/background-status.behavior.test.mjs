@@ -16,6 +16,8 @@ import { join } from 'node:path';
 import { Writable } from 'node:stream';
 import { test } from 'node:test';
 
+import { scheduledContent } from './fixtures/cron-input.mjs';
+
 const packageRoot = process.env.PI_NANOBOT_CANDIDATE ?? new URL('../', import.meta.url).pathname;
 const modules = join(packageRoot, 'node_modules/@earendil-works');
 const [
@@ -395,11 +397,17 @@ test('a running worker is reported inside its own spawning chat and nowhere else
     'reading a worker adds no cron document');
   assert.equal(JSON.stringify(status).includes('WORKER-CHILD-RESULT'), false);
 
-  // Another authenticated chat sees none of it.
+  // Another authenticated chat sees none of it. The restart count is gateway-wide, so it may name the
+  // worker only as one active task; no ID, task text or result crosses over.
   await store.gateway.conversationFor(OTHER, context);
   const foreign = await store.gateway.backgroundStatus(OTHER, context);
-  assert.deepEqual(foreign, emptyBackgroundStatus());
+  assert.equal(foreign.workers.live, 0);
+  assert.equal(foreign.cron.scheduled, 0);
+  assert.equal(foreign.cron.running.total, 0);
+  assert.equal(foreign.digest.live, 'none');
+  assert.ok(foreign.active.interrupting >= 1, 'the live worker is active work gateway-wide');
   assert.equal(JSON.stringify(foreign).includes(String(record.taskId)), false);
+  assert.equal(JSON.stringify(foreign).includes('read note.txt'), false);
 
   releaseChild.resolve();
   await waitFor(async () => {
@@ -419,7 +427,7 @@ test('a one-shot job is scheduled until its run is genuinely executing', { timeo
   let issued = false;
   const store = await syntheticGateway('cron', async (request, options) => {
     const input = lastUserText(request.messages);
-    if (input === 'deliver the reminder') {
+    if (input === scheduledContent('deliver the reminder')) {
       runEntered.resolve();
       await new Promise((resolve) => {
         const abort = () => resolve();
@@ -545,11 +553,17 @@ test('the shared digestion run is labelled own or another chat without leaking e
   assert.deepEqual((await tasksOf(harness)).map((task) => Number(task.id)), taskIdsBefore,
     'a status read creates no task');
 
-  // Another mapped chat sees only that one shared run is live, and nothing else about it.
+  // Another mapped chat sees only that one shared run is live (and that some gateway-wide work is
+  // active), and nothing else about it.
   await store.gateway.conversationFor(OTHER, context);
   const shared = await store.gateway.backgroundStatus(OTHER, context);
-  assert.deepEqual(shared, { ...emptyBackgroundStatus(), digest: { live: 'shared', parked: false } });
+  assert.deepEqual(shared.digest, { live: 'shared', parked: false });
+  assert.equal(shared.workers.live, 0);
+  assert.equal(shared.cron.scheduled, 0);
+  assert.ok(shared.active.interrupting >= 1, 'the live digest is active work gateway-wide');
   assert.match(renderBackgroundStatus(shared)[0], /digest running for another chat/);
+  assert.match(renderBackgroundStatus(shared).join('\n'),
+    /^Restart: blocked by \d+ active tasks? gateway-wide; finish or abort that work first$/m);
   assert.equal(JSON.stringify(shared).includes(FACT), false);
 
   releaseBatch.resolve();

@@ -14,6 +14,8 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
+import { scheduledContent } from "./fixtures/cron-input.mjs";
+
 const pkg = process.env.PI_MODEL_CANDIDATE ?? resolve(import.meta.dirname, "..");
 const ai = `${pkg}/node_modules/@earendil-works/pi-ai/dist`;
 const chord = `${pkg}/node_modules/@earendil-works/chord/dist`;
@@ -338,7 +340,7 @@ test("a recurring job keeps one conversation and starts a new episode for each r
     ], "every run is its own reset-delimited episode");
     // The reset boundary is real: the second request's context holds only its own episode.
     assert.equal(requests.length >= 2, true);
-    assert.deepEqual(requests[1], ["stretch every interval"]);
+    assert.deepEqual(requests[1], [scheduledContent("stretch every interval")]);
 
     await harness.abortTask(afterSecond.timerTaskId, context);
     await harness.waitForTask(afterSecond.timerTaskId, context);
@@ -511,7 +513,9 @@ test("a queued one-off wakes when its head finishes and runs in its own episode"
       assert.equal(job.lastOutcome.status, "ok");
       assert.equal(job.lastOutcome.conversationId, automationId);
     }
-    assert.deepEqual(scenario.requests.map((texts) => texts[0]), ["head one-off", "queued one-off"],
+    assert.deepEqual(
+      scenario.requests.map((texts) => texts[0]),
+      [scheduledContent("head one-off"), scheduledContent("queued one-off")],
       "the occurrence order is the queue's durable order");
     const conversation = await scenario.harness.conversation(automationId, context);
     const page = await conversation.entries({ order: "ascending" }, 100, undefined, context);
@@ -782,7 +786,7 @@ test("a boundary already at the end of the conversation is not placed twice", { 
     const page = await (await scenario.harness.conversation(automation.id, context))
       .entries({ order: "ascending" }, 100, undefined, context);
     assert.deepEqual(transcriptKinds(page), ["pi.reset", CRON_INPUT_ENTRY_KIND, "pi.assistant"]);
-    assert.deepEqual(scenario.requests[0], ["boundary one-off"],
+    assert.deepEqual(scenario.requests[0], [scheduledContent("boundary one-off")],
       "the already-placed boundary starts the episode with an empty context");
   } finally {
     await scenario.close();
@@ -879,7 +883,7 @@ test("a scheduled run's conversation is automation, not chat, and keeps no autho
     let toolCallIssued = false;
     provider.setResponses(Array.from({ length: 8 }, () => (transcript) => {
       const input = userTexts(transcript.messages)[0];
-      if (input === "one-off reminder") return fauxAssistantMessage("ONE-OFF-ANSWER");
+      if (input === scheduledContent("one-off reminder")) return fauxAssistantMessage("ONE-OFF-ANSWER");
       if (input === "remind me once" && !toolCallIssued) {
         toolCallIssued = true;
         return fauxAssistantMessage([
@@ -1002,7 +1006,7 @@ test("a mapping forged before the gateway opens is still automation, not chat", 
     let toolCallIssued = false;
     provider.setResponses(Array.from({ length: 8 }, () => (transcript) => {
       const input = userTexts(transcript.messages)[0];
-      if (input === "one-off reminder") return fauxAssistantMessage("ONE-OFF-ANSWER");
+      if (input === scheduledContent("one-off reminder")) return fauxAssistantMessage("ONE-OFF-ANSWER");
       if (input === "remind me once" && !toolCallIssued) {
         toolCallIssued = true;
         return fauxAssistantMessage([
@@ -1131,7 +1135,7 @@ test("a mapping to an automation conversation whose pointer was lost is still au
     let toolCallIssued = false;
     provider.setResponses(Array.from({ length: 8 }, () => (transcript) => {
       const input = userTexts(transcript.messages)[0];
-      if (input === "one-off reminder") return fauxAssistantMessage("ONE-OFF-ANSWER");
+      if (input === scheduledContent("one-off reminder")) return fauxAssistantMessage("ONE-OFF-ANSWER");
       if (input === "remind me once" && !toolCallIssued) {
         toolCallIssued = true;
         return fauxAssistantMessage([
@@ -1418,7 +1422,8 @@ test("a recurring run rebuilds the origin's workspace context for each episode",
           secondSettled.stop();
         }
         assert.equal(loads.get(automationId), 2, "the shared conversation's snapshot was prepared twice");
-        const episodes = prompts.filter((prompt) => prompt.texts.includes("scheduled context episode"));
+        const episodes = prompts.filter((prompt) =>
+          prompt.texts.includes(scheduledContent("scheduled context episode")));
         assert.equal(episodes.length, 2, "two episodes produced two model requests");
         assert.match(episodes[0].system, /cron-context-1/);
         assert.doesNotMatch(episodes[0].system, /cron-context-2/);

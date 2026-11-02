@@ -177,7 +177,7 @@ export interface EpisodeSummaryUsage {
  * `complete` means the whole episode range was read: every entry in `[sourceStart, sourceEnd]`
  * was visited. Per-entry text can still be shortened by the source bound; that is counted in
  * `truncatedEntries` and does not flip `complete`, because it is a detail limit, not a missing
- * range. Entries beyond the chunk cap are uncovered and do flip it.
+ * range. A short range is folded in one chunk and a long one in as many chunks as it needs.
  */
 export interface EpisodeSummaryCoverage {
   readonly [key: string]: JsonValue;

@@ -7,7 +7,7 @@
  * every Durable handle, root/state/fork conversation and model credential.
  */
 
-export const LOCAL_PROTOCOL_VERSION = 1;
+export const LOCAL_PROTOCOL_VERSION = 3;
 
 export const LOCAL_PROTOCOL_LIMITS = Object.freeze({
   /** One request line; inputs are capped well below this by the CLI itself. */
@@ -29,6 +29,9 @@ export const LOCAL_PROTOCOL_LIMITS = Object.freeze({
   maxConversationTokenChars: 32,
   maxLabelChars: 200,
   maxEntryId: Number.MAX_SAFE_INTEGER,
+  /** One attach carries at most this many pending host notices, delivered once each. */
+  maxNoticeIds: 8,
+  maxNoticeTextChars: 512,
 } as const);
 
 /** Fixed error codes; the message never carries dependency or path text. */
@@ -69,7 +72,9 @@ export type LocalServerMessage =
   | { readonly id: number; readonly result: unknown }
   | { readonly id: number; readonly error: LocalErrorBody }
   | { readonly event: "snapshot"; readonly snapshot: unknown }
-  | { readonly event: "settled"; readonly id: number; readonly settlement: unknown };
+  | { readonly event: "settled"; readonly id: number; readonly settlement: unknown }
+  | { readonly event: "mcpAuthorization"; readonly authorization: unknown }
+  | { readonly event: "mcpNotice"; readonly text: string };
 
 /** Parse one request line into a bounded envelope; reject everything else. */
 export function parseRequestLine(line: string): LocalRequestEnvelope {
@@ -111,6 +116,12 @@ export function parseServerLine(line: string): LocalServerMessage {
   }
   if (record.event === "settled" && typeof record.id === "number" && Number.isSafeInteger(record.id) && Object.hasOwn(record, "settlement")) {
     return { event: "settled", id: record.id, settlement: record.settlement };
+  }
+  if (record.event === "mcpAuthorization" && Object.hasOwn(record, "authorization")) {
+    return { event: "mcpAuthorization", authorization: record.authorization };
+  }
+  if (record.event === "mcpNotice" && typeof record.text === "string") {
+    return { event: "mcpNotice", text: record.text };
   }
   if (typeof record.id === "number" && Number.isSafeInteger(record.id) && record.id >= 1) {
     if (Object.hasOwn(record, "error")) {
@@ -183,6 +194,19 @@ export function optionalCursor(record: Record<string, unknown>, key: string): Re
   const cursor = asObject(value);
   if (cursor === undefined) throw new LocalRequestError("invalid", `${key} is not accepted`);
   return cursor;
+}
+
+/** Bounded host-notice record ids acknowledged after an attach printed them. */
+export function noticeIds(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > LOCAL_PROTOCOL_LIMITS.maxNoticeIds || value.length === 0) {
+    throw new LocalRequestError("invalid", "ids is not accepted");
+  }
+  return value.map((entry) => {
+    if (typeof entry !== "string" || entry.length === 0 || entry.length > 200) {
+      throw new LocalRequestError("invalid", "ids is not accepted");
+    }
+    return entry;
+  });
 }
 
 export function errorBody(error: unknown): LocalErrorBody {

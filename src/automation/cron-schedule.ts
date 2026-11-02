@@ -112,6 +112,38 @@ function calendarSchedule(expr: string, timeZone: string): CronCalendarSchedule 
   return { kind: "cron", expr: normalized, timeZone: zone };
 }
 
+/**
+ * One stored schedule as a fixed human-readable line. It reads no clock, so the same job renders
+ * identically everywhere it is shown.
+ */
+export function cronScheduleText(schedule: CronSchedule): string {
+  if (schedule.kind === "at") return `once at ${new Date(schedule.at).toISOString()}`;
+  if (schedule.kind === "every") {
+    return `every ${schedule.everyMs / 1000}s from ${new Date(schedule.anchorMs).toISOString()}`;
+  }
+  return `${schedule.expr} in ${schedule.timeZone}`;
+}
+
+/**
+ * A one-shot instant written as an ISO 8601 timestamp. An explicit UTC offset (or `Z`) is required:
+ * interpreting a naive local time would need zone-offset arithmetic the calendar schedule
+ * deliberately avoids, and guessing is worse than asking the caller for an unambiguous instant.
+ */
+export function parseCronInstant(raw: string): number {
+  const value = raw.trim();
+  if (value === "") {
+    throw new CronScheduleError("at must be an ISO 8601 timestamp with a UTC offset, for example 2026-11-01T09:00:00+01:00");
+  }
+  if (!/(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) {
+    throw new CronScheduleError(
+      `at must include an explicit UTC offset or Z (got "${value}"); use a cron expression with a time zone for a local wall time`,
+    );
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isSafeInteger(parsed)) throw new CronScheduleError(`at is not a valid ISO 8601 timestamp: ${value}`);
+  return parsed;
+}
+
 /** Validate a schedule request without comparing it to the clock. */
 export function parseCronScheduleRequest(request: CronScheduleRequest): CronScheduleRequest {
   if (request === null || typeof request !== "object" || Array.isArray(request)) {

@@ -20,14 +20,15 @@ import {
 import { McpServerConnection, guardedFetch, headerValues } from "./server.js";
 
 /**
- * One owner-approved OAuth login for a configured Streamable HTTP MCP server.
+ * One owner-initiated OAuth login for a configured Streamable HTTP MCP server.
  *
  * The authorization code flow is the native `@earendil-works/pi-mcp/oauth` implementation: protected
  * resource and authorization server discovery, dynamic client registration, PKCE, state validation
  * and RFC 9207 issuer validation. This module adds only the host policy the gateway needs:
  *
- * - the flow starts only after an explicit owner approval, never at connect time or from a model tool;
- * - the authorization URL is handed to the approving owner surface exactly once, and neither the URL,
+ * - the flow starts only from an owner's explicit request in an authenticated mapped chat, never at
+ *   connect time or from an unattended scope;
+ * - the authorization URL is handed to the initiating owner surface exactly once, and neither the URL,
  *   the `state` value, the code verifier nor any token is ever returned to the model or written to a
  *   conversation entry;
  * - the callback listener is loopback-only and one flow runs at a time;
@@ -76,11 +77,22 @@ export type McpLoginOutcome =
   | { readonly ok: false; readonly reason: McpLoginFailure };
 
 export interface McpLoginRun {
-  /** One-time authorization URL for the approving owner. Never returned to a model-facing surface. */
+  /** One-time authorization URL for the initiating owner. Never returned to a model-facing surface. */
   readonly authorizationUrl: string;
+  /** The exact loopback redirect URL registered for this attempt. Never returned to a model surface. */
+  readonly callbackUrl: string;
+  /** The authorization response state for this attempt. Never returned to a model surface. */
+  readonly state: string;
   /** When this attempt stops waiting for the browser. */
   readonly expiresAtMs: number;
   readonly completion: Promise<McpLoginOutcome>;
+  /**
+   * Complete this attempt from a pasted callback URL, for an owner whose browser cannot reach the
+   * gateway host. The callback is validated against this attempt's exact loopback origin, path and
+   * state, then replayed to the native loopback listener, which performs the same state/path checks.
+   * It never fetches the pasted host and never returns a code, state, verifier or token.
+   */
+  submitCallback(callback: URL): Promise<"accepted" | "rejected">;
 }
 
 export interface McpLoginOptions {
@@ -120,7 +132,7 @@ function environment(options: McpLoginOptions): Readonly<Record<string, string |
 /**
  * Start the flow and return once the server has told us where the owner must go. Everything after
  * that (the browser callback, the code exchange and the verification connection) settles through
- * `completion`, so the approving surface is not blocked for minutes.
+ * `completion`, so the initiating surface is not blocked for minutes.
  */
 export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginRun> {
   if (options.config.oauth !== true) throw new Error("An MCP login needs a server entry with \"oauth\": true");
@@ -230,10 +242,30 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
       throw new McpAlreadyAuthorizedError(discovered);
     }
     const state = await provider.state();
+    const callbackUrl = callback.redirectUrl;
+    let submitted = false;
     const run: McpLoginRun = {
       authorizationUrl: redirect.href,
+      callbackUrl,
+      state,
       expiresAtMs: deadline,
       completion: complete(options, provider, callback, stagingPath, snapshot, serverUrl, state, deadline),
+      async submitCallback(pasted) {
+        if (submitted) return "rejected";
+        const target = callbackTarget(callbackUrl, state, pasted);
+        if (target === undefined) return "rejected";
+        submitted = true;
+        const remaining = Math.max(1, deadline - Date.now());
+        const signal = options.signal === undefined
+          ? AbortSignal.timeout(remaining)
+          : AbortSignal.any([options.signal, AbortSignal.timeout(remaining)]);
+        try {
+          const response = await fetch(target, { redirect: "error", signal });
+          return response.ok ? "accepted" : "rejected";
+        } catch {
+          return "rejected";
+        }
+      },
     };
     // `completion` owns the listener from here.
     callback = undefined;
@@ -244,6 +276,21 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
     await staging.clear().catch(() => undefined);
     throw error;
   }
+}
+
+/**
+ * The native listener's own URL with only the pasted query. Exact origin, path and state must match
+ * this attempt, so a foreign or stale callback is refused before any request is made.
+ */
+function callbackTarget(callbackUrl: string, state: string, pasted: URL): URL | undefined {
+  if (pasted.protocol !== "http:") return undefined;
+  const expected = new URL(callbackUrl);
+  if (pasted.host !== expected.host || pasted.pathname !== expected.pathname) return undefined;
+  if (pasted.searchParams.get("state") !== state) return undefined;
+  if (!pasted.searchParams.has("code") && !pasted.searchParams.has("error")) return undefined;
+  const target = new URL(expected.href);
+  target.search = pasted.search;
+  return target;
 }
 
 class CancelledLoginError extends Error {
@@ -294,7 +341,7 @@ async function adoptStagedRotation(
 
 /**
  * The configured entry already authenticated with its stored (or freshly refreshed) grant, so the
- * approved login had nothing to authorize. `tools` is the discovered tool count of that connection,
+ * login had nothing to authorize. `tools` is the discovered tool count of that connection,
  * or undefined when the connection authenticated but its tool listing failed.
  */
 export class McpAlreadyAuthorizedError extends Error {

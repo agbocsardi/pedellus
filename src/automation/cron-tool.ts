@@ -38,7 +38,7 @@ import {
   type CronScheduleReceipt,
   type CronWithdrawal,
 } from "./cron.js";
-import { CRON_DEFAULT_TIME_ZONE } from "./cron-schedule.js";
+import { CRON_DEFAULT_TIME_ZONE, cronScheduleText, parseCronInstant } from "./cron-schedule.js";
 
 export const CRON_TOOL_NAME = "cron";
 
@@ -79,6 +79,7 @@ interface CronToolArguments {
   readonly cron_expr?: string;
   readonly tz?: string;
   readonly isolated?: boolean;
+  readonly silent?: boolean;
   readonly job_id?: string;
 }
 
@@ -93,26 +94,6 @@ function iso(ms: number | null): string {
   return ms === null ? "none" : new Date(ms).toISOString();
 }
 
-/**
- * A one-shot time must carry an explicit UTC offset. Interpreting a naive local time would need the
- * zone-offset arithmetic the calendar schedule avoids, and silently guessing is worse than asking
- * the caller for an unambiguous instant.
- */
-function parseAt(raw: string): number {
-  const value = raw.trim();
-  if (value === "") {
-    throw new TypeError("at must be an ISO 8601 timestamp with a UTC offset, for example 2026-11-01T09:00:00+01:00");
-  }
-  if (!/(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) {
-    throw new TypeError(
-      `at must include an explicit UTC offset or Z (got "${value}"); use cron_expr with tz for a local wall time`,
-    );
-  }
-  const parsed = Date.parse(value);
-  if (!Number.isSafeInteger(parsed)) throw new TypeError(`at is not a valid ISO 8601 timestamp: ${value}`);
-  return parsed;
-}
-
 function scheduleOf(args: CronToolArguments, zone: string): CronScheduleInput["schedule"] {
   const present = SCHEDULE_FIELDS.filter((field) => args[field] !== undefined);
   if (present.length === 0) {
@@ -121,7 +102,7 @@ function scheduleOf(args: CronToolArguments, zone: string): CronScheduleInput["s
   if (present.length > 1) {
     throw new TypeError(`add accepts one schedule, not ${present.join(" + ")}`);
   }
-  if (args.at !== undefined) return { kind: "at", at: parseAt(args.at) };
+  if (args.at !== undefined) return { kind: "at", at: parseCronInstant(args.at) };
   if (args.after_seconds !== undefined) {
     const seconds = args.after_seconds;
     if (!Number.isSafeInteger(seconds) || seconds <= 0) {
@@ -155,10 +136,7 @@ function scheduleOf(args: CronToolArguments, zone: string): CronScheduleInput["s
 }
 
 function scheduleText(view: CronJobView): string {
-  const { schedule } = view.job;
-  if (schedule.kind === "at") return `once at ${iso(schedule.at)}`;
-  if (schedule.kind === "every") return `every ${schedule.everyMs / 1000}s from ${iso(schedule.anchorMs)}`;
-  return `${schedule.expr} in ${schedule.timeZone}`;
+  return cronScheduleText(view.job.schedule);
 }
 
 function describe(view: CronJobView): string {
@@ -167,6 +145,9 @@ function describe(view: CronJobView): string {
     `  schedule: ${scheduleText(view)}`,
     `  mode: ${view.job.mode}`,
     ...(view.job.intent === "digest" ? ["  intent: digest (one bounded memory-digestion run per occurrence)"] : []),
+    ...(view.job.silent === true
+      ? ["  delivery: silent (a successful run is not sent to this chat; a failure is still reported)"]
+      : []),
     `  status: ${view.status}`,
     `  next: ${iso(view.nextAtMs)}`,
   ];
@@ -209,6 +190,11 @@ export function createCronTool(options: CronToolOptions): CronTool {
       "conversation across its runs, one-off jobs share a per-conversation background conversation " +
       "and queue there, and every run starts a fresh episode that does not carry the previous run's " +
       "context. `isolated: false` instead runs the job in this conversation once it is idle. " +
+      "Set `silent: true` when a successful run should not be sent to this chat: successes, " +
+      "including an empty answer, stay in the run's conversation only, while a failed run still " +
+      "posts a short sanitized notice. A scheduled run can also answer exactly `[SILENT]` to " +
+      "suppress only that occurrence's delivery in either mode; the marker has no meaning in an " +
+      "ordinary chat reply. " +
       "Scheduled runs inherit this conversation's enabled tools; they never " +
       "gain more. `intent: \"digest\"` schedules one bounded memory-digestion run instead of a model " +
       "turn; it needs read/write/edit authority in this conversation and reports through an internal " +
@@ -225,7 +211,7 @@ export function createCronTool(options: CronToolOptions): CronTool {
       ], {
         description:
           "add: `message` (default) sends `message` as a turn when due. `digest` instead runs one " +
-          "bounded memory-digestion batch for this chat; message and isolated are then ignored.",
+          "bounded memory-digestion batch for this chat; message, isolated and silent are then ignored.",
       })),
       message: Type.Optional(Type.String({
         description: "add: the instruction the agent receives when the job fires. Required unless intent is digest.",
@@ -262,6 +248,12 @@ export function createCronTool(options: CronToolOptions): CronTool {
         description:
           "add: true (default) runs the job in its background automation conversation, which " +
           "accumulates one episode per run; false runs it in this conversation once it is idle.",
+      })),
+      silent: Type.Optional(Type.Boolean({
+        description:
+          "add: true suppresses this job's successful automatic delivery to the chat, including an " +
+          "empty answer; a failed run still posts a sanitized notice. Default false. A scheduled " +
+          "run's exact `[SILENT]` answer suppresses only that occurrence in either mode.",
       })),
       job_id: Type.Optional(Type.String({
         description: "remove: the job ID from `list`.",
@@ -361,6 +353,9 @@ export function createCronTool(options: CronToolOptions): CronTool {
       if (request.name !== undefined && typeof request.name !== "string") {
         return text("name must be a string when provided.", true);
       }
+      if (request.silent !== undefined && typeof request.silent !== "boolean") {
+        return text("silent must be true or false.", true);
+      }
       let receipt: CronScheduleReceipt;
       try {
         // A call ID is stable across a retried call, so a replay cannot create a second job.
@@ -370,6 +365,7 @@ export function createCronTool(options: CronToolOptions): CronTool {
           schedule: scheduleOf(request, zone),
           mode: intent === "digest" || request.isolated === false ? "origin" : "background",
           intent,
+          silent: request.silent === true,
           idempotencyKey: `tool:${api.callId}`,
         }, context);
       } catch (error) {

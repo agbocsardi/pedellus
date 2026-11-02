@@ -66,7 +66,7 @@ async function toolResults(conversation, id) {
   return result;
 }
 
-test('config authority runs read and history in a mapped chat while other scopes get no coding authority', { timeout: 10_000 }, async () => {
+test('config authority runs read and memory recall in a mapped chat while other scopes get no coding authority', { timeout: 10_000 }, async () => {
   const store = await workspaceStore('mapped');
   const { faux, models } = syntheticModels();
   const marker = 'CONFIG-HISTORY-MARKER';
@@ -76,7 +76,7 @@ test('config authority runs read and history in a mapped chat while other scopes
       callsIssued = true;
       return fauxAssistantMessage([
         fauxToolCall('read', { path: 'note.txt' }, { id: 'config-read' }),
-        fauxToolCall('history', { action: 'search', query: marker }, { id: 'config-history' }),
+        fauxToolCall('memory_search', { target: 'messages', query: marker }, { id: 'config-history' }),
       ], { stopReason: 'toolUse' });
     }
     return fauxAssistantMessage('synthetic answer');
@@ -85,7 +85,7 @@ test('config authority runs read and history in a mapped chat while other scopes
   try {
     gateway = await openGateway(store.config(['read']), context, { models });
     const chat = await gateway.conversationFor('telegram:7:chat:501', context);
-    assert.deepEqual(toolNames(await chat.agent(context)).sort(), ['history', 'read']);
+    assert.deepEqual(toolNames(await chat.agent(context)).sort(), ['memory_browse', 'memory_read', 'memory_search', 'read']);
 
     await say(chat, `remember ${marker}`);
     await say(chat, 'recall the note');
@@ -95,9 +95,13 @@ test('config authority runs read and history in a mapped chat while other scopes
     assert.match(read.text, /CONFIG-READ-CONTENT/);
     assert.doesNotMatch(read.text, /outside the host tool ceiling/);
     const history = await toolResults(chat, 'config-history');
-    assert.equal(history.isError, false, `history result: ${history.text.slice(0, 200)}`);
-    assert.match(history.text, new RegExp(marker));
+    assert.equal(history.isError, false, `memory search result: ${history.text.slice(0, 200)}`);
     assert.doesNotMatch(history.text, /outside the host tool ceiling/);
+    const page = JSON.parse(history.text);
+    const hit = page.hits[0];
+    assert.ok(hit?.ref, JSON.stringify(page));
+    const original = await gateway.memoryRead(chat.id, { ref: hit.ref }, context);
+    assert.match(original.content, new RegExp(marker), 'the exact original evidence is available by locator');
 
     const raw = await gateway.harness.createConversation(
       { ownership: { kind: 'ownerless' }, agent: { model: store.model } }, context);
@@ -106,7 +110,7 @@ test('config authority runs read and history in a mapped chat while other scopes
     assert.ok(entries.length > 0, 'the mapped chat has an entry to fork at');
     const fork = await chat.fork(entries[0].id, { ownership: { kind: 'ownerless' }, agent: { model: store.model } }, context);
     const forkNames = toolNames(await fork.agent(context));
-    assert.ok(!forkNames.includes('read') && !forkNames.includes('history'), `fork tools: ${forkNames}`);
+    assert.ok(!forkNames.includes('read') && !forkNames.includes('memory_search') && !forkNames.includes('memory_browse') && !forkNames.includes('memory_read'), `fork tools: ${forkNames}`);
     const state = await gateway.conversationFor('telegram:7:channel-state', context);
     assert.deepEqual(toolNames(await state.agent(context)), []);
     const root = await gateway.harness.root(context);
@@ -138,7 +142,9 @@ test('config reopen follows the configured ceiling, not persisted agent tool sta
     gateway = await openGateway(store.config([]), context, { models: syntheticModels().models });
     const emptied = await gateway.conversationFor(key, context);
     assert.deepEqual(codingNames(await emptied.agent(context)), []);
-    assert.ok(toolNames(await emptied.agent(context)).includes('history'));
+    const names = toolNames(await emptied.agent(context));
+    for (const name of ['memory_search', 'memory_browse', 'memory_read']) assert.ok(names.includes(name), names.join(','));
+    assert.ok(!names.includes('history'), names.join(','));
   } finally {
     if (gateway) await gateway.close(context);
     await rm(store.directory, { recursive: true, force: true });

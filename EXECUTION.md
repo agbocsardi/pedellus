@@ -16,7 +16,7 @@ command/allowlist/path filtering, and the filesystem containment check.
 `src/execution/host.ts` imports it, and the optional Bubblewrap shell reuses that
 same policy and the direct-workspace argv builder rather than a second policy.
 
-`createHostExecutionEnv({ workspaceRoot, allowedRoots?, shell?, cwd?,
+`createHostExecutionEnv({ workspaceRoot, allowedRoots?, protectedRoots?, shell?, cwd?,
   shellSandbox?, tempDirectory? })` wraps the native `NodeExecutionEnv`:
 
 - Roots contract: roots are canonical absolute paths supplied by the backend.
@@ -25,6 +25,11 @@ same policy and the direct-workspace argv builder rather than a second policy.
   `cwd` and the scratch root with `realpath` once at creation; a sandbox passes
   canonical virtual roots such as `/workspace`. This keeps virtual sandbox paths
   usable without a host syscall.
+- Optional `protectedRoots` are canonical managed directories excluded from file
+  operations even under a wider allowed root. Checks cover lexical paths, resolved
+  aliases and opened descriptors; remove/rename also refuse protected ancestors.
+  Gateway file tools protect `dataDir`. This is not confinement against permitted
+  shell programs or hard links; the host limitations below still apply.
 - Filesystem methods reject lexical `..`/absolute escapes and paths that resolve
   through a symlink outside the configured roots. The guard returns the original
   path to the operation, never the canonical probe path. `followFinalLink`
@@ -81,6 +86,15 @@ same policy and the direct-workspace argv builder rather than a second policy.
   optional sandbox has the same lifetime shape: outer `/tmp` spill is readable
   through the environment while live, unavailable to nested bash, and lost on
   cleanup. Neither backend may assume the spill survives.
+
+## Full-host opt-in
+
+Gateway config `restrictToWorkspace: false` enables host-wide file paths and
+shell cwd with the real OS user home. The default remains scoped, and the
+workspace still owns memory, skills and default cwd. The bwrap shell cannot be
+combined with this opt-in. Tool grants, Telegram owner checks, filtered shell
+environment, command deny patterns, worktree-worker isolation, digest curation
+and gateway store locks remain unchanged; this does not grant root privileges.
 
 ## Limits
 

@@ -139,6 +139,8 @@ export { TOOL_SEARCH_TOOL_NAME, CODEMODE_TOOL_NAME };
 /** Install these extensions explicitly; close the Harness before closing this host. */
 export interface CodeModeIntegration {
   readonly extensions: readonly Extension[];
+  /** Replace the MCP namespaces used by discovery, the section and new script starts. */
+  updateNamespaces(namespaces: readonly CodemodeNamespace[]): void;
   /** Reject new executions and abort current Code Mode executions. */
   stopAdmission(): void;
   /** Stop admission, close the native sandbox, and wait for every worker thread to exit. */
@@ -193,10 +195,15 @@ export function createCodeModeIntegration(options: CodeModeIntegrationOptions = 
 
   const classifierKey = options.classifierModel === undefined ? undefined : modelKey(options.classifierModel);
 
+  let currentNamespaces: readonly CodemodeNamespace[] = options.namespaces ?? [];
   const native = createCodemodeExtension({
     sandbox,
     models: options.models === true,
-    ...(options.namespaces === undefined ? {} : { namespaces: options.namespaces }),
+    // The native extension reads this property for its prompt section and each new script start,
+    // so a live MCP change is visible without replacing the sandbox or an in-flight execution.
+    get namespaces() {
+      return currentNamespaces;
+    },
   });
   const nativeTool = native.tools?.find((tool) => tool.name === CODEMODE_TOOL_NAME);
   if (!nativeTool) throw new Error("Durable Code Mode extension did not register its codemode tool");
@@ -285,6 +292,9 @@ export function createCodeModeIntegration(options: CodeModeIntegrationOptions = 
 
   return {
     extensions,
+    updateNamespaces(namespaces) {
+      currentNamespaces = namespaces;
+    },
     stopAdmission,
     close() {
       if (closePromise) return closePromise;

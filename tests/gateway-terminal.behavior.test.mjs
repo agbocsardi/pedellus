@@ -19,7 +19,7 @@ const { gatewaySocketPath, serveLocalGateway } = await import(pathToFileURL(`${p
 const { connectLocalGateway } = await import(pathToFileURL(`${pkg}/dist/local/client.js`).href);
 const { LocalGatewayError } = await import(pathToFileURL(`${pkg}/dist/local/protocol.js`).href);
 const { runTerminalConversation } = await import(pathToFileURL(`${pkg}/dist/terminal/index.js`).href);
-const { createModels, fauxAssistantMessage, fauxProvider } = await import(pathToFileURL(`${ai}/index.js`).href);
+const { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(pathToFileURL(`${ai}/index.js`).href);
 const { BACKGROUND_CONTEXT } = await import(pathToFileURL(`${chord}/context/index.js`).href);
 
 const context = BACKGROUND_CONTEXT;
@@ -120,9 +120,7 @@ function terminalIO(client, input) {
         ? {
             mcp: {
               list: () => client.mcpList(context),
-              show: (id) => client.mcpShow(id, context),
-              approve: (id) => client.mcpApprove(id, context),
-              deny: (id) => client.mcpDeny(id, context),
+              submitCallback: (text) => client.mcpSubmitCallback(text, context),
             },
           }
         : {}),
@@ -260,25 +258,138 @@ test("an attached CLI renders a turn admitted by another surface", { timeout: 20
   }
 });
 
-test("the owner reviews MCP requests from the attached terminal and refuses an unknown one", { timeout: 20_000 }, async (t) => {
+test("the owner reads MCP status from the attached terminal", { timeout: 20_000 }, async (t) => {
   const { socketPath } = await makeEnvironment(t);
   const client = await connectLocalGateway({ socketPath, context });
   t.after(async () => { await client.close(); });
   assert.equal(client.mcp, true, "a gateway opened from a config file exposes MCP management");
   const { chunks, io } = terminalIO(client, lines(
     "/mcp",
-    "/mcp show 0123456789abcdef",
-    "/mcp approve 0123456789abcdef",
-    "/mcp deny 0123456789abcdef",
     "/mcp bogus",
   ));
   io.prompt = () => {};
   await runTerminalConversation(client, context, io);
   const printed = chunks.join("");
-  assert.match(printed, /MCP is not configured in this gateway's open configuration/);
-  assert.match(printed, /Owner approval requests: none waiting/);
-  assert.match(printed, /No MCP owner approval request 0123456789abcdef exists/);
+  assert.match(printed, /MCP is not configured in this gateway/);
+  assert.match(printed, /OAuth logins waiting for a callback: none/);
   assert.match(printed, /Usage: \/mcp/);
+});
+
+test("two real CLI attachments sharing a conversation refuse ambiguous login delivery", { timeout: 20_000 }, async (t) => {
+  const { gateway, provider, socketPath } = await makeEnvironment(t);
+  const first = await connectLocalGateway({ socketPath, context });
+  const second = await connectLocalGateway({ socketPath, context });
+  t.after(async () => { await first.close(); await second.close(); });
+  assert.equal(first.sessionKey, second.sessionKey);
+  assert.equal(gateway.mcpSurfaces.surfaceFor(first.sessionKey), undefined);
+  const links = [];
+  first.onMcpAuthorization = (link) => links.push(link);
+  second.onMcpAuthorization = (link) => links.push(link);
+  provider.setResponses([
+    fauxAssistantMessage(fauxToolCall("mcp", {
+      action: "add", name: "remote", server: { url: "http://127.0.0.1:1/mcp", oauth: true },
+    }, { id: "ambiguous-add" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("login refused"),
+  ]);
+  const chat = await gateway.conversationFor(first.sessionKey, context);
+  const submission = await chat.submit({ type: "input", content: "add and log in" }, context);
+  assert.equal((await submission.wait(context)).status, "done");
+  assert.equal(links.length, 0);
+  assert.equal((await gateway.mcpAdmin.list(context)).logins.length, 0);
+  const transcript = JSON.stringify((await chat.entries({}, 100, undefined, context)).items);
+  assert.match(transcript, /No unique authenticated owner surface/);
+  await first.close();
+  await eventually(() => gateway.mcpSurfaces.surfaceFor(second.sessionKey) !== undefined,
+    "remaining attachment should become the unique owner for a future login");
+});
+
+test("the CLI surface receives a direct MCP link and consumes a pasted callback before model admission", { timeout: 20_000 }, async (t) => {
+  const { gateway, provider, socketPath } = await makeEnvironment(t);
+  const client = await connectLocalGateway({ socketPath, context });
+  t.after(async () => { await client.close(); });
+  const authorizations = [];
+  client.onMcpAuthorization = (authorization) => authorizations.push(authorization);
+  const surface = gateway.mcpSurfaces.surfaceFor(client.sessionKey);
+  assert.ok(surface, "the attached CLI registers an owner surface for its exact session");
+  await surface.deliverAuthorization(client.sessionKey, {
+    requestId: "0123456789abcdef",
+    name: "synthetic",
+    url: "http://127.0.0.1:1234/authorize?state=SYNTHETIC-STATE",
+    expiresAtMs: Date.now() + 60_000,
+  }, context);
+  await eventually(() => authorizations.length === 1, "the CLI did not receive the direct authorization link");
+  assert.match(authorizations[0].url, /SYNTHETIC-STATE/);
+
+  const callback = "http://127.0.0.1:54321/callback?code=SYNTHETIC-CODE&state=SYNTHETIC-STATE";
+  const { chunks, io } = terminalIO(client, lines(callback));
+  io.prompt = () => {};
+  await runTerminalConversation(client, context, io);
+  const printed = chunks.join("");
+  assert.match(printed, /No MCP login is waiting for a callback in this chat/);
+  assert.ok(!printed.includes("SYNTHETIC-CODE"), "the callback code is not echoed");
+  assert.equal(provider.state.callCount, 0, "the callback never became model input");
+});
+
+test("terminal /help lists only offered commands and one command's detail on demand", { timeout: 20_000 }, async (t) => {
+  const { socketPath } = await makeEnvironment(t);
+  const client = await connectLocalGateway({ socketPath, context });
+  t.after(async () => { await client.close(); });
+  assert.equal(client.mcp, true, "a gateway opened from a config file exposes MCP management");
+  const { chunks, io } = terminalIO(client, lines(
+    "/help",
+    "/help model",
+    "/help attach",
+    "/help guarantee",
+    "/help ../SYNTHETIC-HELP-ARGUMENT",
+  ));
+  io.prompt = () => {};
+  await runTerminalConversation(client, context, io);
+  const printed = chunks.join("");
+  // The listing is the catalogue's one-line form, and only this host's commands are advertised.
+  assert.match(printed, /Local commands in this CLI conversation:/);
+  assert.match(printed, /\/model \[preset\] — List or select a model for this conversation/);
+  assert.match(printed, /Not offered by this host: \/digest, \/attach, \/restart\./);
+  assert.match(printed, /Unknown slash commands are not sent to the model/);
+  // `/help <command>` carries the catalogue's usage line and its one-sentence detail.
+  assert.match(printed, /Usage: \/model \[preset\] \| \/model <provider> <modelId> \[thinkingLevel\]/);
+  assert.match(printed, /Applies to this conversation only: a preset lasts until the gateway restarts, a direct pick persists\./);
+  // A catalogued command this host lacks is refused as such; an unknown one is unknown.
+  assert.match(printed, /\/attach is not offered by this host\. Configure media in the gateway configuration and restart\. Available: \/new, \/abort, /);
+  assert.match(printed, /No such command \/guarantee here\. Available: \/new, /);
+  // The typed name is never echoed when it is not shaped like a command.
+  assert.match(printed, /No such command here\./);
+  assert.doesNotMatch(printed, /SYNTHETIC-HELP-ARGUMENT|synthetic-help-argument/);
+});
+
+test("typed local commands share the catalogue refusal and never reach the model", { timeout: 20_000 }, async (t) => {
+  const { socketPath } = await makeEnvironment(t);
+  const client = await connectLocalGateway({ socketPath, context });
+  t.after(async () => { await client.close(); });
+  const { chunks, io } = terminalIO(client, lines(
+    "/attach",
+    "/digest",
+    "/restart",
+    "/goal",
+    "/foo_bar",
+    "/../SYNTHETIC-TYPED-ARGUMENT",
+  ));
+  io.prompt = () => {};
+  await runTerminalConversation(client, context, io);
+  const printed = chunks.join("");
+  // A catalogued command this host lacks gives the same reason `/help <command>` gives.
+  for (const name of ["attach", "digest", "restart"]) {
+    assert.match(printed, new RegExp(`/${name} is not offered by this host\\.`));
+  }
+  // The refusal keeps the actionable fix and the effect command's no-effect guarantee.
+  assert.match(printed, /\/attach is not offered by this host\. Configure media in the gateway configuration and restart\. Available: /);
+  assert.match(printed, /\/digest is not offered by this host\. Nothing was started\. Available: /);
+  assert.doesNotMatch(printed, /Unsupported slash command|not implemented in this CLI|was removed from this CLI/);
+  // An unknown bounded name keeps its name and the // escape; the former fixed list is gone.
+  assert.match(printed, /No such command \/goal here\.[\s\S]*?It was not sent to the model\. Use \/\/goal to send it literally\./);
+  assert.match(printed, /No such command \/foo_bar here\.[\s\S]*?Use \/\/foo_bar to send it literally\./);
+  // A name that is not command-shaped is never echoed, and the line still never reaches the model.
+  assert.match(printed, /No such command here\.[\s\S]*?It was not sent to the model\./);
+  assert.doesNotMatch(printed, /SYNTHETIC-TYPED-ARGUMENT|synthetic-typed-argument/);
 });
 
 test("a second local gateway owner is refused without disturbing the live one", { timeout: 20_000 }, async (t) => {

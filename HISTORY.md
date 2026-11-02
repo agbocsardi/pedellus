@@ -1,15 +1,23 @@
 # History: episode summaries and search index
 
+This document retains implementation details and historical evidence for the legacy
+history search/index surface. The `Gateway.history*` SDK/local APIs and their tests
+remain distinct from the approved model-facing recall contract in
+[MEMORY_RECALL.md](./MEMORY_RECALL.md). The former model-facing `history` tool is
+not the replacement interface; recall uses `memory_search`, `memory_browse`, and
+`memory_read`.
+
 Two derived layers sit over Durable's retained transcript:
 
 - `src/history/summary-task.ts` is a durable background summary pass, enabled by default.
 - `src/history/index.ts` is a rebuildable message/tool and episode-summary index bound to the
   committed store identity.
 
-The default agent-facing `history` tool searches raw messages/tools, browses episodes and original
-entries, discovers ready derived summaries across mapped chats, and reads one summary with
+The legacy agent-facing `history` tool searched raw messages/tools, browsed episodes and original
+entries, discovered ready derived summaries across mapped chats, and read summaries with
 provenance and drilldown. Summary text is derived navigation; original entries remain the evidence.
-CLI diagnostics are described in
+These legacy details are retained for implementation history. Current model-facing recall is
+specified in [MEMORY_RECALL.md](./MEMORY_RECALL.md). CLI diagnostics are described in
 [CLI history search and browsing](./CLI.md#history-search-and-browsing).
 
 ## Authority, identity and storage
@@ -228,15 +236,14 @@ changes, the index or store identity is replaced, the session mapping changes,
 the mapped set no longer contains the source, or the source entry at the boundary
 no longer exists or no longer matches its fingerprint.
 
-## Agent-facing history tool
+## Legacy agent-facing history tool (historical contract)
 
-`openGateway` installs one read-only, model-facing tool named `history` for mapped
-chat conversations by default. It is not in the coding-tool ceiling, cannot be
-granted or revoked, accepts no filesystem path or shell command, executes nothing,
-modifies no transcript and creates no conversation. A host that needs a bare
-gateway can pass `agentHistory: false`; the local CLI/Telegram path uses the
-default. The tool reads only conversations already mapped by the host, so channel
-authentication and the single-tenant session policy still decide what exists.
+The following describes the legacy model-facing `history` tool and its former
+behavior, not the approved replacement. The current three-tool recall contract is
+[MEMORY_RECALL.md](./MEMORY_RECALL.md). `agentHistory: false` remains an SDK host
+opt-out for model-facing history; it does not remove the legacy `Gateway.history*`
+SDK/local methods or their existing tests. The details below are retained as
+implementation history, not a promise that the old tool remains installed.
 
 The tool calls the same `Gateway.historySearch`, `Gateway.historySummarySearch`,
 `Gateway.historySummary`, `Gateway.historyEntries`, `Gateway.listHistoryEpisodes` and
@@ -641,7 +648,8 @@ summaries can incur provider costs.
 **Source, coverage, chunking and untrusted text** (`summary-source.ts`).
 
 - `pi.user` and `nanobot.cron` entries contribute their user text; `pi.assistant` entries contribute
-  visible text and a compact tool-call list; `pi.tool-result` entries contribute tool name plus text.
+  visible text and each tool call with its arguments; `pi.tool-result` entries contribute tool name
+  plus text.
   Thinking blocks are omitted. `pi.reset` (including handoff text), `pi.system` and `pi.compaction`
   entries are skipped but counted: they are synthetic context, not discussion. `entry.edits` are not
   applied, so a summary describes the stored transcript.
@@ -663,9 +671,27 @@ summaries can incur provider costs.
     `faults` counts from zero instead of becoming `NaN` — and since every `NaN >= cap` comparison is
     false, that normalization is what keeps the cap effective. On failure the counter is clamped to the
     cap, so the durable value stays a small exact integer that always serializes cleanly.
-- One entry keeps at most 2,000 characters with a visible truncation marker. Chunks close at 24,000
-  characters or 400 entries (also at each read page), at most 12 chunks per episode, and each chunk is
-  folded through a separate provider request that carries the previous answer forward.
+- One entry keeps at most 2,000 characters of quoted text, and a shortened entry ends with an explicit
+  marker, so its stored text can exceed that bound by that marker and the separator before it.
+  Truncation is never silent.
+  Ordinary message text is cut at its head with a `[... N more characters truncated]` marker. A tool
+  call's arguments or a tool result that does not fit is quoted through the same memory-recall
+  head-tail preview (`clipPreview` in `digestion.ts`): a beginning, an omission marker naming how many
+  characters were left out and the durable `entry:<id>/tool-call|tool-result/<key>` reference of the
+  original item, then an end. That preview uses the rest of the entry bound, so any later part of the
+  entry is reported with the same counted marker instead of disappearing, and a remaining bound too
+  small for the preview's own marker gives way to that counted head cut. The entry is counted as
+  truncated either way, and the fold prompt names how many entries were shortened even when the whole
+  range was covered. Chunks close at 24,000 characters or 400 entries (also at each read page); a
+  transcript crosses that target by the closing entry, its marker and the fold's separators. An
+  episode keeps as many chunks as its range needs: the collection cursor and the chunk list are
+  durable, so a phase boundary, a restart or a crash resumes the same episode instead of capping or
+  dropping its tail. Each chunk is folded through a separate provider request that carries the
+  previous answer forward. The prompt targets at most 1,200 tokens of final summary text, excluding
+  hidden reasoning. The provider response allowance is separately 4,096 tokens so reasoning does not
+  consume that entire target before the model can answer. Providers may count reasoning and visible
+  output together against this allowance; the final-text target is a prompt instruction, not a
+  separate provider-enforced quota. Usage and cost accounting still includes all reported tokens.
 - `coverage` records the source bounds and counts from the episode document, the entries
   read/included/skipped/truncated, characters, chunks, and the uncovered count with the last covered
   entry ID. `complete` is true only when every entry in the range was read; an uncovered tail is

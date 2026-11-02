@@ -8,6 +8,11 @@
  * record. A record is keyed by the occurrence, so a retried terminal commit cannot admit the same
  * result twice.
  *
+ * The same bounded document also carries one host interruption notice for an interrupted prepared
+ * turn (`host:turn-interrupted:<taskId>`), recorded by the gateway with the same admission, pruning
+ * and delivery state. That notice starts no model turn and is not a cron result; it shares the record
+ * shape so every consumer keeps one durable external-send protocol.
+ *
  * The document carries no authority. A consumer must re-authenticate the origin session key
  * against its own live allowlist before sending anything.
  *
@@ -255,8 +260,9 @@ export class CronDeliveryOutboxError extends Error {
 }
 
 /**
- * Channel-facing view of completed background results. It exposes only already-mapped chat
- * conversations and mutates one record at a time; it creates no conversation and starts no run.
+ * Channel-facing view of completed background results and host interruption notices. It exposes only
+ * already-mapped chat conversations and mutates one record at a time; it creates no conversation and
+ * starts no run.
  */
 export interface CronDeliveryOutbox {
   /** Mapped chat sessions the host may authenticate for delivery. */

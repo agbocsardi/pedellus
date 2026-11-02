@@ -21,12 +21,56 @@ durable-nanobot agent                      # attaches to the same default gatewa
 durable-nanobot agent --config /path/to/config.json     # attach a terminal to that gateway
 ```
 
-Without `--config`, `gateway`, `agent`, `login`, `logout` and `recovery` read exactly
+Without `--config`, `gateway`, `agent`, `login`, `logout`, `recovery` and `cron` read exactly
 `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
 the shell's working directory. A secondary instance passes its own explicit
 `--config`. There is no config discovery, merging, search, auto-generation or
 migration, and a missing default file fails with a fixed message. See
 [user services](./SERVICE.md) for the shipped systemd unit pattern.
+
+## Help
+
+`--help`/`-h` prints to standard output and exits 0 without reading a
+configuration, opening a socket or starting a runtime, so it works in a fresh
+checkout:
+
+```sh
+durable-nanobot --help            # overview: commands, config default, slash commands
+durable-nanobot help gateway      # the same page as `gateway --help`
+durable-nanobot gateway --help
+durable-nanobot agent --help
+durable-nanobot login --help
+durable-nanobot logout --help
+durable-nanobot recovery --help
+durable-nanobot cron --help
+```
+
+A per-command page carries that command's exact usage line, its own options, at
+most two short notes and two examples. A help flag is honoured before dispatch,
+so `--help` on any known subcommand line names that subcommand's page and never
+reads the configuration named on the same line.
+
+The bare `help` word is a help request as the first argument with nothing after
+it, or with a help flag on the same line, so `help` and `help --help` print the
+overview and exit 0; `--help --config x` does too. `help --config x` and
+`--config x help` are ordinary argument lists: they print the fixed usage block
+on standard error and exit 1.
+
+An unrecognized subcommand prints one fixed `unknown command` diagnostic with
+the usage block and a help hint, and exits 1. That diagnostic echoes the typed
+token only when it is shaped like a command name; no other argument is ever
+repeated. Any other malformed known form also prints the full usage block and
+exits 1.
+
+Both conversation surfaces render the same command catalogue, one short line per
+command. `/help` prints the listing this host actually offers; `/help <command>`
+prints one command's usage line and its one-sentence detail:
+
+- CLI: `/help`, `/help model`. Commands this host does not offer are named in one
+  line instead of being advertised as working.
+- Telegram: `/help`, `/help digest`. The listing stays inside one bounded notice,
+  so only the owner commands this gateway implements are listed and nothing is
+  advertised that would be refused.
 
 ## Provider authentication
 
@@ -125,11 +169,28 @@ unreadable/invalid configuration,
 invalid configuration fields, unknown providers or custom-provider entries, unavailable models
 or thinking levels, missing provider credentials, a missing Telegram token
 environment variable, workspace/data-directory preparation failures, a data
-store already owned by another live process, and a prepared model dispatch that
-pins historical Nanobot context. These messages never include configuration
+store already owned by another live process, and an automatic interrupted-turn
+recovery that could not complete safely. These messages never include configuration
 values, environment values, filesystem paths, provider/dependency error text or
 the underlying exception. Unexpected failures keep the generic
 `durable-nanobot: command failed; diagnostic details suppressed` message.
+
+A prepared model dispatch that pins historical Nanobot context no longer makes a
+normal startup fail by itself. The gateway cancels exactly that dispatch through
+native Durable abort semantics, restores availability, and leaves one durable
+interruption notice for the originating chat. A local `agent`/terminal attach
+prints a pending notice once and acknowledges it; a Telegram notice uses the
+existing durable channel outbox and admission checks. No model turn is started and
+nothing is resubmitted. A notice says what class was interrupted: an owner turn
+suggests asking to continue, background worker or scheduled work says the same of
+background work, an interrupted memory-digestion batch says the unacknowledged
+batch is offered again, and an interrupted compaction says no action is needed.
+Notices appear only on attach; a running gateway never pushes one to the terminal.
+If the prepared model itself left `allowedModels`, the bounded recovery record is
+still full after its settled entries were drained, or native abort failed, the
+fixed startup failure and explicit recovery command below remain. An unreadable
+interruption record does not block startup: it is retired natively and the owner
+may then never see the notice it held.
 
 An `agent` (or legacy default) launch additionally fails closed when no gateway
 answers on the configured endpoint, or when the endpoint's socket path cannot be
@@ -138,10 +199,12 @@ same configuration. The CLI does not fall back to opening a store or starting a
 second runtime.
 
 For live-owner lock contention, the fixed message says to stop the other running
-durable-nanobot gateway process. For a blocked prepared dispatch, it says to run
+durable-nanobot gateway process. If automatic interrupted-turn recovery cannot
+complete, the fixed message says to run
 `durable-nanobot recovery [--config <path>]` with the same configuration to inspect and
-cancel the blocked task, then start again. The CLI does not cancel the task or
-rewrite its checkpoint automatically.
+cancel the blocked task, then start again. Normal startup cancels only the exact
+startup-blocking prepared dispatch and never rewrites its checkpoint; the recovery
+command remains the stopped-store fallback.
 
 Recovery operation errors keep their dedicated `durable-nanobot recovery:` text and
 remain governed by recovery's existing disclosure contract, not this startup
@@ -169,14 +232,52 @@ presentation of one Durable conversation, not a delivery outbox or an exactly-on
 external send. A default isolated/background cron run uses its own task-owned
 conversation and is not shown in the CLI. Normal settlements in either mode (an
 answer, or a fixed sanitized failure/empty-answer notice) can be delivered to a
-Telegram origin through its outbox; cancelled and superseded runs are not. See
+Telegram origin through its outbox; a job's persistent `silent` setting or an
+exact trimmed `[SILENT]` successful answer suppresses a successful result, while a
+failure still notifies, and cancelled or superseded runs are not. See
 [cron](./CRON.md).
+
+## Operator scheduling
+
+`durable-nanobot cron` is the owner's scheduling console. It attaches to the running
+gateway over the same private local socket as `agent`, so the gateway resolves every
+origin, owner and cancellation; the command itself schedules nothing:
+
+```sh
+durable-nanobot cron list
+durable-nanobot cron show <jobId>
+durable-nanobot cron cancel <jobId>
+durable-nanobot cron create --origin <sessionKey> --key <requestKey> --after 600 --message "Stretch"
+durable-nanobot cron create --key daily-1 --cron "0 9 * * 1-5" --tz Europe/Budapest \
+  --origin telegram:<identity>:chat:<chatId> --message "Morning check"
+```
+
+`list` and `show` are read-only and cover every currently mapped chat; `list` order is the
+next occurrence and it names the mapped chat keys an explicit `--origin` can use.
+Listings are bounded to 100 compact rows; follow the printed `list --offset <n>` for the
+next page (a point-in-time view, not a frozen snapshot). Neither command attaches or creates a chat. `create`
+requires explicit `--origin` and `--key`; the cron foundation dedupes an identical retry, refuses
+a different payload under the same key, and never re-arms a cancelled original.
+Exactly one of `--at`, `--after`, `--every` or `--cron` (with optional `--tz`) is
+accepted, and `--mode background|origin` matches the job's run mode: a background job
+records its outcome on the job (`cron show`) and its answer is delivered only through a
+channel outbox (currently Telegram), while `--mode origin` answers in the origin
+conversation itself. `--origin` must name an already mapped chat.
+`cancel` is exact-ID, refuses an ID recorded under more than one chat, and reports a
+recorded cancellation separately from a post-commit cleanup failure. If the gateway
+stops answering, the command reports an unknown outcome and points at the retry-safe
+or verify-first path instead of claiming a result. There is no bulk, run-now,
+re-arm or schedule-editing command. See [cron](./CRON.md#operator-controls).
 
 ## Recovery
 
-Gateway startup fails closed when a prepared model dispatch still pins historical
-Nanobot context, with a fixed value-free message naming the recovery command
-below. The same executable exposes an owner-only recovery path that never opens
+Normal startup automatically cancels a prepared model dispatch that pins
+historical Nanobot context (after its model passed the configured authority scan),
+restores availability, and records one interruption notice. This stopped-store
+command remains the fallback when that automatic path cannot complete: a full or
+unreadable interruption record, an abort mark that did not persist, or a prepared
+model outside `allowedModels`. It prints a fixed value-free message naming this
+command. The same executable exposes an owner-only recovery path that never opens
 the gateway, resumes scheduling, or requires credentials. It does require the
 existing SQLite database and the gateway process to be stopped; a live owner is
 reported as a lock conflict. Inspection may perform Durable's native
@@ -200,8 +301,8 @@ fail-closed and is not remotely cancelled. See
 
 | Command | Behavior |
 |---|---|
-| `/help` | Show this CLI's local controls. |
-| `/status` | Show the conversation's current host-selected model, native run/inbox state, and Durable-recorded per-model/tool usage. Provider-side charges or unrecorded spend remain unknown. A bounded background summary follows: this conversation's own live workers and cron jobs (executing, queued, parked, or with a future occurrence armed) and whether the one workspace-global memory-digestion run is live in this chat or another. A natively blocked task is named as parked instead of counted as running; `Background: idle` means nothing is executing or queued right now, and an armed future occurrence is its own `Cron:` line with the next due time. It is read-only metadata: no model call, dashboard, management command, recovery interface or transcript read, and the agent remains the manager of that work. |
+| `/help` | Show the owner controls this host offers, one command per line with a short description; `/help <command>` prints that command's usage and detail. |
+| `/status` | Show the conversation's current host-selected model, native run/inbox state, and Durable-recorded per-model/tool usage. Provider-side charges or unrecorded spend remain unknown. A bounded background summary follows: this conversation's own live workers and cron jobs (executing, queued, parked, or with a future occurrence armed) and whether the one workspace-global memory-digestion run is live in this chat or another. A natively blocked task is named as parked instead of counted as running; `Background: idle` means nothing is executing or queued right now, and an armed future occurrence is its own `Cron:` line with the next due time. When gateway-wide work would be interrupted by `/restart`, one `Restart:` line names only the bounded count. It is read-only metadata: no model call, dashboard, management command, recovery interface or transcript read, and the agent remains the manager of that work. |
 | `/history [count]` | Show the latest user/assistant text messages only (default 10, max 50), using Durable entry pagination; each snippet is limited to 200 characters and the scan to 2,000 entries. Reasoning, tool, and non-text blocks are omitted; synthetic user-role reset or compaction messages may also appear. |
 | `/search [--scope messages\|tools\|all] [--role user\|assistant] [--limit 1-50] [--next] [--] [query]` | Search or browse the local history index. Default scope is messages; `--scope tools` searches tool names, arguments and result text only, and `--scope all` combines messages and tools. Empty text browses the selected scope. See [history search and browsing](#history-search-and-browsing). |
 | `/episodes [--session <sessionKey>] [--limit 1-50] [--before <entryId>]` | List reset-delimited episodes newest first, with entry ranges, counts and recorded summary status only. `--session` must name an existing mapped chat session; the default is this attachment's session key (normally `cli:default`). This command does not generate or show summary text. |
@@ -212,12 +313,12 @@ fail-closed and is not remotely cancelled. See
 | `/refresh` | Re-read the configured workspace bootstrap, memory files, manifest and skill inventory for this attached CLI conversation. Requires `workspaceContext`; rejected while the conversation is busy. The refreshed summary and skill table apply to the next model request. |
 | `/digest` | Start one bounded background memory run and print started, busy, idle or refused. Requires an explicit configured digest model. Shared-workspace evidence may come from any mapped chat, through a fixed completed-turn cutoff without requiring reset. A fitting completed-turn range is one batch; a larger range splits into ordered chunks, potentially within a turn. Evidence includes owner/assistant prose and paired untrusted tool calls/results, with bounded head/tail result previews and original references. It returns immediately, holds no terminal turn and creates no schedule. Successful runs are silent and remain visible under `/digest status`; retained failure reports may resume the origin agent. An incomplete idle scan says eligible history may remain; a later invocation continues it, with no drain loop. |
 | `/digest status` | Bounded read-only view of the live digestion run, this conversation's newest run, and the retained internal issue reports (pending count and whether a new start is possible): task IDs, outcome, batch position, evidence count and a bounded recorded error. It performs no transcript scan, model call or cursor change. |
-| `/mcp` | List the MCP servers this gateway opened and the assistant's owner-approval requests (bounded, read-only, no model call). `/mcp show <id>` prints the entire exact proposed entry — a stdio command verbatim, an HTTP URL, and every header/environment mapping as a host variable *name* — plus what an approval would change; `/mcp approve <id>` writes that entry into the gateway's own configuration file (enabling only that entry) or starts one owner-approved OAuth login and prints its one-time authorization URL; `/mcp deny <id>` discards the request. Nothing connects or is authorized before an approval, and a written entry or new grant takes effect at the next start (`/restart`). OAuth requires a confined shell (`toolSandbox: "bwrap"`) or no shell. Requires a gateway opened from a configuration file. |
+| `/mcp` | Bounded read-only status of configured MCP servers and any login waiting for a callback, with no model call. Ask the assistant in this attached conversation to add or update a server, log in, log out or remove one; management is direct, not an approval command. A login URL is printed here once as a transient owner line; a callback-shaped line is consumed before model admission and completes the flow. Requires a gateway opened from a configuration file. |
 | `/attach <path>[ -- <prompt>]` | Store one operator-named local file through the gateway under the CLI attachment subdirectory of the configured workspace media root and submit it as an ordinary path-only turn, optionally with prompt text after the first ` -- ` (paths may contain spaces). Requires top-level `media` config; see [local attachments](#local-attachments). |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort`, `/stop` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
 | `/new` | Start a fresh context in the same conversation and rebuild configured workspace instructions, memory and skills, exactly as Telegram does. With workspace context configured, a busy conversation is refused; prompt replacement and the reset marker commit atomically. No handoff, archive, summary, usage reset or extra model call; original entries and tool authority remain. Without configured workspace context, native reset semantics apply, including safe-boundary placement while busy. |
-| `/restart` | Ask the owner host to replace the whole gateway process after graceful teardown, using the same executable, argv and environment. Advertised only when supported. Configuration and workspace context reload; every attached CLI and Telegram surface disconnects. The local acknowledgement is flushed before shutdown. |
+| `/restart` | Ask the owner host to replace the whole gateway process after graceful teardown, using the same executable, argv and environment. Advertised only when supported. Refused with a fixed no-effect reason while live work (a running generation, tool, compaction, worker, digest or cron run) would be interrupted; a sleeping cron timer does not block. Finish or abort that work and retry; nothing is auto-cancelled. Configuration and workspace context reload; every attached CLI and Telegram surface disconnects. The local acknowledgement is flushed before shutdown. |
 
 Memory digestion reports only issues. A failed or cancelled run is one internal
 event for this conversation's agent (the same pattern as a worker result), not a
@@ -431,7 +532,8 @@ attached conversation's host snapshot through the running Gateway:
   loader failure leaves the previous snapshot in effect. `/refresh` adds no
   tool authority, workspace root or shell authority.
 - Without `workspaceContext`, or for standalone terminal callers without the
-  host callback, `/refresh` reports that workspace context is unavailable.
+  host callback, `/refresh` is refused as not offered here and names the fix:
+  set `workspaceContext` in the configuration and restart.
 
 This is the supported way to make a skill created or edited during the current
 conversation usable without starting another conversation. Scheduled background
@@ -439,12 +541,14 @@ runs have no session key and are not refreshed; they pick up the snapshot on
 their next run or Gateway reopen.
 
 `/stop` aliases `/abort` in CLI and Telegram: both withdraw queued foreground inputs.
-`/restart` is available only through a supporting gateway host. `/goal`, `/interrupt`, `/btw`,
-task/policy/receipt/skill, memory/Dream and pairing commands are not implemented here. `/steer` and `/after` were removed; normal
-input is admitted by the native conversation in input order. Unsupported slash
-commands are reported locally and are never silently sent as model prompts.
-Prefix a prompt with `//` to send one literal leading slash (for example,
-`//help` sends `/help` to the model).
+`/restart` is available only through a supporting gateway host. The earlier
+`/steer`, `/after`, goal, interrupt, btw, task, policy, receipt, skill,
+memory/Dream and pairing commands no longer exist here; normal input is admitted
+by the native conversation in input order. A typed slash command this host does
+not offer is refused with the same reason `/help <command>` gives, and an
+unknown one is refused as unknown; neither is sent as a model prompt. Prefix a
+prompt with `//` to send one literal leading slash (for example, `//help` sends
+`/help` to the model).
 
 Normal input is admitted in input order by the native conversation. Controls
 are ordered between those admissions: a control observes all earlier durable
