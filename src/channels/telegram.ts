@@ -208,6 +208,8 @@ export type TelegramPendingDelivery = {
   transcriptionFailure?: string;
   /** A command acknowledgement: delivered as fixed text, never submitted to the model. */
   notice?: boolean;
+  /** Host-generated layout for a read-only notice; its underlying text remains plain. */
+  noticeFormat?: "status" | "model";
   /** The acknowledgement is withheld until the command's native call returns (or reports that it is still pending). */
   hold?: boolean;
 };
@@ -571,11 +573,12 @@ export async function runTelegram(
       hooks: TelegramTextHooks;
       replyTo?: number;
       mode?: "markdown" | "literal";
+      richBody?: string;
       throttle?: TelegramFloodGate;
       replaceable?: boolean;
     },
   ): Promise<number | undefined> => {
-    const body = sendOptions.mode === "literal" ? escapeTelegramLiteral(text) : text;
+    const body = sendOptions.richBody ?? (sendOptions.mode === "literal" ? escapeTelegramLiteral(text) : text);
     const reply: { reply_parameters?: { message_id: number; allow_sending_without_reply: boolean } } =
       sendOptions.replyTo === undefined
         ? {}
@@ -1636,7 +1639,9 @@ export async function runTelegram(
         await forget(current.updateId);
         return;
       }
-      const sent = await sendTelegramMessage(current.text, "final", 0, false, "literal");
+      const sent = await sendTelegramMessage(current.text, "final", 0, false, "literal",
+        current.noticeFormat === "status" || current.noticeFormat === "model"
+          ? formatReadOnlyNotice(current.text, current.noticeFormat) : undefined);
       if (sent === undefined) throw new Error("Telegram send returned no result");
       await forget(current.updateId);
     }
@@ -1708,10 +1713,12 @@ export async function runTelegram(
       chunkIndex?: number,
       replaceable = false,
       mode: "markdown" | "literal" = "markdown",
+      richBody?: string,
     ): Promise<number | undefined> {
       try {
         return await sendOutboundText(item.chatId, text, {
           mode,
+          ...(richBody === undefined ? {} : { richBody }),
           replaceable,
           throttle: outboundThrottle,
           hooks: {
@@ -2453,7 +2460,7 @@ export async function runTelegram(
         return;
       }
       // Read-only: one bounded notice from the native conversation projection, no effect intent, no model call.
-      await admitNotice(update, message, sessionKey, await statusNotice(sessionKey));
+      await admitNotice(update, message, sessionKey, await statusNotice(sessionKey), MAX_NOTICE_CHARS, "status");
       drain();
       return;
     }
@@ -2472,7 +2479,7 @@ export async function runTelegram(
       const listing = await readModelListing(sessionKey);
       if (argument.kind === "list") {
         await admitNotice(update, message, sessionKey,
-          listing === undefined ? MODEL_LISTING_UNAVAILABLE : modelListingText(listing));
+          listing === undefined ? MODEL_LISTING_UNAVAILABLE : modelListingText(listing), MAX_NOTICE_CHARS, "model");
         drain();
         return;
       }
@@ -3162,6 +3169,7 @@ export async function runTelegram(
     sessionKey: string,
     text: string,
     limit: number = MAX_NOTICE_CHARS,
+    noticeFormat?: "status" | "model",
   ): Promise<void> {
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
@@ -3175,6 +3183,7 @@ export async function runTelegram(
           senderId: String(message.from!.id),
           text: text.slice(0, limit),
           notice: true,
+          ...(noticeFormat === undefined ? {} : { noticeFormat }),
         });
       }
       doc.offset = Math.max(doc.offset, update.update_id + 1);
@@ -3509,6 +3518,26 @@ type ControlOutcome =
   | { readonly kind: "refused"; readonly text: string }
   | { readonly kind: "deferred" }
   | { readonly kind: "abandoned" };
+
+/** Escape all data first; only these host-owned labels and list markers become rich formatting. */
+function formatReadOnlyNotice(text: string, kind: "status" | "model"): string {
+  let inList = false;
+  return text.split("\n").map((line) => {
+    const escaped = escapeTelegramLiteral(line);
+    if (kind === "status") {
+      return escaped.replace(/^(Model|Run|Queued native inputs|Background):/u, "**$1:**");
+    }
+    const selected = /^\s+\\\* (.+)$/u.exec(escaped);
+    const choice = /^\s{4}(.+)$/u.exec(escaped);
+    if (selected !== null || choice !== null) {
+      inList = true;
+      return selected !== null ? `- **Selected:** ${selected[1]}` : `- ${choice![1]}`;
+    }
+    const separator = inList ? "\n" : "";
+    inList = false;
+    return separator + escaped.replace(/^(Current model|Configured default preset):/u, "**$1:**");
+  }).join("\n");
+}
 
 const CONTROL_ACK: Record<TelegramMutation, string> = {
   new: "Context reset.",

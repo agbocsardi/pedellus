@@ -610,15 +610,15 @@ test('/model lists and selects one configured preset for this chat only', { time
     const texts = transport.sent.map((entry) => entry.text);
 
     const listing = rendered(texts[0]);
-    assert.match(listing, /Current model: fixture\/alpha \(thinking: off\)/);
-    assert.match(listing, /\* fast — fixture alpha \[thinking: off\]/);
-    assert.match(listing, /\n +deep — fixture beta \[thinking: high\]/);
-    assert.match(listing, /Configured default preset: fast/);
+    assert.match(listing, /\*\*Current model:\*\* fixture\/alpha \(thinking: off\)/);
+    assert.match(listing, /\*\*Selected:\*\* fast — fixture alpha \[thinking: off\]/);
+    assert.match(listing, /\n- deep — fixture beta \[thinking: high\]/);
+    assert.match(listing, /\*\*Configured default preset:\*\* fast/);
 
     assert.equal(texts[1], 'Model: deep.');
 
-    assert.match(rendered(texts[2]), /Current model: fixture\/beta \(thinking: high\)/);
-    assert.match(rendered(texts[2]), /\* deep — fixture beta \[thinking: high\]/);
+    assert.match(rendered(texts[2]), /\*\*Current model:\*\* fixture\/beta \(thinking: high\)/);
+    assert.match(rendered(texts[2]), /\*\*Selected:\*\* deep — fixture beta \[thinking: high\]/);
 
     assert.match(texts[3], /Unknown model preset nope: nothing was changed/);
     assert.match(texts[4], /Usage: \/model \(list the configured presets\)/);
@@ -672,7 +672,7 @@ test('/model is refused atomically while this chat runs a turn', { timeout: 20_0
     await until(() => transport.sent.filter((entry) => entry.text === 'SYNTHETIC-REPLY').length === 2,
       'both admitted messages answered');
     releaseListing();
-    await until(() => transport.sent.some((entry) => /Current model: fixture\/alpha/.test(entry.text)), 'later listing');
+    await until(() => transport.sent.some((entry) => /\*\*Current model:\*\* fixture\/alpha/.test(entry.text)), 'later listing');
     // The busy refusal is terminal, not deferred: no late change happened after the turn settled.
     assert.deepEqual((await store.gateway.listModels(`telegram:${BOT_ID}:chat:${CHAT_ID}`, context)).selected,
       { provider: 'fixture', modelId: 'alpha', thinkingLevel: 'off' });
@@ -701,7 +701,7 @@ test('/status reports bounded current-chat metadata without a model request', { 
     harness = start(store, transport);
     await entered;
     await until(() => transport.sent.some((entry) => entry.text.startsWith('Status for this chat')), 'running status');
-    const running = transport.sent.find((entry) => entry.text.startsWith('Status for this chat')).text;
+    const running = transport.sent.find((entry) => entry.text.startsWith('Status for this chat')).text.replaceAll('**', '');
     assert.match(running, /Model: fixture\/alpha \(thinking: off\) — preset fast/);
     assert.match(running, /Run: running \(turn \d+, 1 input\(s\)/);
     assert.match(running, /Queued native inputs: 0/);
@@ -719,7 +719,7 @@ test('/status reports bounded current-chat metadata without a model request', { 
     releaseIdle();
     await until(() => transport.sent.filter((entry) => entry.text.startsWith('Status for this chat')).length === 2,
       'idle status');
-    const idle = transport.sent.filter((entry) => entry.text.startsWith('Status for this chat'))[1].text;
+    const idle = transport.sent.filter((entry) => entry.text.startsWith('Status for this chat'))[1].text.replaceAll('**', '');
     assert.match(idle, /Run: idle/);
     assert.match(idle, /Queued native inputs: 0/);
     assert.match(idle, /^Background: idle$/m);

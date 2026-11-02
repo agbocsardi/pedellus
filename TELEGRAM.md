@@ -661,9 +661,9 @@ message.
   rich edit can fall back to plain text without losing the rest. The chunk plan is recorded before
   delivery and remains stable if capability changes or the gateway restarts; an older in-flight
   cursor without a plan continues with the original 4096-character chunking.
-- Host-generated notices (status, help, digest status, control acknowledgements) are escaped so
-  paths, ids, `<placeholder>`s and `*` selection markers render exactly as written; an underscore
-  between two alphanumerics is left bare, and an escaped character renders as the bare character.
+- Host-generated notice data is escaped so paths, IDs and `<placeholder>`s render literally.
+  `/status` and `/model` add host-owned bold labels and model-list formatting after escaping data;
+  their plain fallback retains the original text. Other notices remain literal.
 - Two rejections are proven non-sends and fall back to plain text: a server without the method
   (404/`method not found`/`invalid parameter`) latches rich off for the rest of the process, and a
   refused body (`can't parse`, `unsupported start tag`, `message is too long`, `rich_message`)

@@ -392,8 +392,8 @@ edits need restart only; unit edits additionally need daemon-reload.
   previews and their edits, and host notices. Chunking uses a persisted, capability-independent
   plan: the 32,768-character rich budget normally, or 4096 when a preview must be edited so a
   rejected rich edit can fall back safely. Older progressed records retain the legacy split.
-  Fence-aware cuts preserve whitespace and surrogate pairs; host-generated notices are escaped so
-  their literal characters render unchanged, while model text is passed through as markdown. A missing
+  Fence-aware cuts preserve whitespace and surrogate pairs; host-generated notice data is escaped,
+  with trusted rich labels and lists for `/status` and `/model`, while model text passes through as markdown. A missing
   method latches rich off for the process and resends plain; a refused body (`can't parse`,
   unsupported tag, too long) resends that chunk as plain text split under 4096. Every other
   rejection and every ambiguous outcome keeps the existing hold semantics and is never resent.
