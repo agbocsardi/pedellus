@@ -1,5 +1,5 @@
 import type { Context } from "@earendil-works/chord";
-import { AssistantEntry } from "@earendil-works/pi-durable";
+import { AssistantEntry, LiveDoc } from "@earendil-works/pi-durable";
 import type {
   Conversation,
   ConversationView,
@@ -165,6 +165,9 @@ export interface TerminalStatus {
    */
   readonly background?: BackgroundStatus;
 }
+
+/** Submissions this terminal surface remembers as its own, so a run it started stays identifiable. */
+const TERMINAL_ADMITTED_SUBMISSIONS = 256;
 
 /** Bounds shared by every projection, so a local transport carries bounded frames. */
 const TERMINAL_SURFACE_LIMITS = Object.freeze({
@@ -396,12 +399,29 @@ function projectSettlement(settled: SettledSubmissionRecord): TerminalSettlement
  * `followUpMode` is the configured owner busy-mode: `steer` submits the input with
  * native `whenBusy: "steer"` so it joins the running turn, while the default keeps
  * the historical follow-up queueing. It never reaches internal worker, digest or
- * scheduled submissions, which keep the native default.
+ * scheduled submissions, which keep the native default. A run this surface did not
+ * start (a scheduled origin turn, a digest or a worker result) always takes the
+ * follow-up queueing instead: joining it would let two delivery paths carry the same
+ * answer. Native `submit` has no conditional steering, so that state is read
+ * immediately before admission, and a reattached terminal conservatively queues
+ * until it has admitted an input of its own.
  */
 export function inProcessTerminalConversation(
   conversation: Conversation,
   followUpMode: FollowUpMode = "followUp",
 ): TerminalConversation {
+  /** Native submissions this surface admitted, oldest first. */
+  const admitted: number[] = [];
+  /** Whether the conversation's current run was started by one of this surface's own inputs. */
+  const ownerRun = async (context: Context): Promise<boolean> =>
+    conversation.commit(async (tx) => {
+      const live = await tx.doc(LiveDoc, conversation.id);
+      const inputs = live.run?.inputs;
+      if (inputs === undefined || inputs.length === 0) return true;
+      let first = inputs[0];
+      for (const id of inputs) if (first === undefined || id < first) first = id;
+      return first !== undefined && admitted.includes(first);
+    }, context);
   return {
     id: conversation.id,
     async watch(context) {
@@ -416,7 +436,13 @@ export function inProcessTerminalConversation(
       };
     },
     async submit(content, context) {
-      const submission = await conversation.submit({ type: "input", content, whenBusy: followUpMode }, context);
+      const submission = await conversation.submit({
+        type: "input",
+        content,
+        whenBusy: followUpMode === "steer" && await ownerRun(context) ? "steer" : "followUp",
+      }, context);
+      admitted.push(submission.id);
+      if (admitted.length > TERMINAL_ADMITTED_SUBMISSIONS) admitted.shift();
       return {
         id: submission.id,
         wait: async (ctx) => projectSettlement(await submission.wait(ctx)),

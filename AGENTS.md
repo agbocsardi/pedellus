@@ -135,15 +135,25 @@ edits need restart only; unit edits additionally need daemon-reload.
 - Owner message placement is `followUpMode`, config-only and default `followUp`
   (historical queueing): `steer` submits a CLI or Telegram owner input with native
   `whenBusy: "steer"` so it joins the running turn after its tool round. Internal
-  worker, digest and scheduled submissions are never affected. The pinned native
+  worker, digest and scheduled submissions are never affected, and an owner input
+  never steers into a run those paths started — its first input is not an owner
+  submission, so the message queues and the path that owns the run keeps its own
+  single delivery. Native `submit` has no conditional steering, so that decision is
+  a read of the running input set immediately before admission. The pinned native
   default places one queued steer per tool round and the all-pending switch is
   harness-wide, so it is deliberately not enabled; a steer that arrives at the
   final boundary is placed there and answered by the following run. Telegram stores
-  the mode with the admitted message. Inputs one run consumes settle with the same
-  committed answer entry, so exactly one admitted record — the earliest native
-  submission among them — delivers that answer once, retires every still-pending
-  sibling in its own completion commit, and never lets an ambiguous or held outcome
-  reach a sibling. Only the run's first input publishes the shared live preview.
+  the requested mode with the admitted message. A committed answer is the shared
+  identity: inputs one run consumed settle with it, so exactly one admitted record —
+  the earliest native submission among them — delivers that answer once, retires
+  every still-pending sibling in its own completion commit, and never lets an
+  ambiguous or held outcome reach a sibling. Only the run's first input publishes
+  the shared live preview. A failed run has no such identity and Durable exposes no
+  run reference at settlement, so failures are never grouped by their reason text:
+  each consumed message reports its own fixed notice, and a held or unknown notice
+  is never the owner of a later unrelated failure. The terminal reports one
+  `Turn ended` per shared run only from the run's first native input observed in a
+  committed snapshot, never from the error text.
 - Provider spellings are native Pi AI IDs, the documented legacy aliases or
   custom `providers` keys; there is no application provider whitelist. A
   `credentials.<provider>` reference pins that one environment variable: when it

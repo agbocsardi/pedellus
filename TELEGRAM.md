@@ -376,8 +376,16 @@ record the owner already retired finds no record and stays silent, and a held or
 unknown outcome is never retried through a sibling. Only the run's first input
 publishes the live preview, so steered messages share one preview message that
 the final answer edits in place while the chat keeps typing until the shared work
-settles. A message whose run never answered is reported once for that run; an
-intentional `/abort` or `/new` settlement still reports nothing. The pinned
+settles. A failed run has no committed answer and Durable exposes no run identity
+at settlement, so its failure is never guessed from the error text: each message
+that run consumed reports its own fixed notice, which may repeat the notice for a
+shared failed turn but never drops one or lets a held record own an unrelated
+failure. An intentional `/abort` or `/new` settlement reports nothing. A steer is
+never placed into a run whose first input came from another path — a scheduled
+origin-mode occurrence, a digest result or a worker result — because that path
+delivers the run's answer itself; the message queues instead. Native `submit` has
+no conditional steering, so this is a read of the running input set immediately
+before admission, and a run replaced in that instant is not re-checked. The pinned
 harness places one queued steer per tool round, and that mode is harness-wide, so
 all-pending placement is deliberately not enabled; a steer that arrives at the
 final boundary is placed there and answered by the following run instead.

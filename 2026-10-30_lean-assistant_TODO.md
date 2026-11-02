@@ -1539,3 +1539,38 @@ server, faux models, no external network.
   an answering steered turn silently while its placed steer is answered once in the new context),
   2 execution checks and 83/83 offline core acceptance. No live bot, provider, credential, network,
   migration or deployment was used.
+
+### 2026-11-02 — owner steering review fixes
+
+Independent review of `a885cfd1` found two material defects; both are fixed at the root rather
+than reworded, and the docs now claim only what the code does.
+
+- F1 (high): the failure path grouped records by the `unanswered` reason text, so a notice held
+  `unknown` from an earlier failed run became the phantom owner of a later, unrelated failure with
+  the same provider error, and the later message's notice was silently dropped. Durable exposes no
+  run identity at failure settlement, so failures are no longer grouped at all: each admitted
+  message that a failed run consumed reports its own fixed notice and retires itself, exactly the
+  pre-steering behaviour, and a held or unknown notice can never own another run. Success grouping
+  is untouched (the committed answer entry is the run's exact identity) and still retires siblings
+  atomically in the owner's own completion commit.
+- F2 (medium): an owner steer could join a scheduled origin-mode run in the same chat, after which
+  the cron outbox and the Telegram pending record each delivered the same answer. Both owner
+  surfaces now submit `steer` only when the current run's first native input is one of their own
+  admitted submissions; a run started by a scheduled occurrence, a digest result or a worker result
+  takes follow-up queueing instead, so the scheduled path keeps its single delivery and the owner
+  message is answered by its own turn. Native `submit` has no conditional steering, so this is a
+  read of the running input set immediately before admission; a run replaced in that instant is not
+  re-checked, which is documented instead of claimed away.
+- F3 (low/medium): the CLI printed `Turn ended` once per settlement of a shared turn. It now reports
+  one end per run identified by that run's first native input observed in a committed snapshot —
+  never by the error text — and an input whose run was never observed reports its own end.
+- F4: AGENTS.md, README.md, CLI.md and TELEGRAM.md were corrected: the atomic sibling retirement is
+  claimed for committed answers only, failure notices are described as per message, and the
+  owner-run admission gate with its residual read-to-admit window is stated.
+- [x] Verification on this branch: typecheck/build, 428 behaviour checks (8 new: a held failure notice
+  never owning a later identical failure including across reopen, per-message notices for a failed
+  shared turn, the origin-mode admission gate with its outbox-once/no-duplicate assertions and an
+  unchanged authority surface, `[SILENT]` suppression with the owner message still answered, one
+  `Turn ended` per shared failed/aborted CLI turn, two ends for two distinct failed turns, and a CLI
+  message queuing behind a run the terminal did not start), 2 execution checks and 83/83 offline
+  core acceptance. No live bot, provider, credential, network or deployment was used.

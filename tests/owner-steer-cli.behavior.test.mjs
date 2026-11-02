@@ -45,6 +45,11 @@ function deferred() {
   return box;
 }
 
+/** Yield so already-queued watch callbacks and their serialized render steps can run. */
+async function flush(rounds = 10) {
+  for (let round = 0; round < rounds; round += 1) await new Promise((resolve) => setImmediate(resolve));
+}
+
 /** A line source the test feeds one prompt at a time, so each admission is timed against a held turn. */
 function pushableInput() {
   const values = [];
@@ -151,7 +156,7 @@ async function runCli(environment, drive) {
   const input = pushableInput();
   const terminal = runTerminalConversation(client, context, { input: input.iterate(), output: capture(chunks) });
   try {
-    await drive(input);
+    await drive(input, () => chunks.join(''));
     input.end();
     await terminal;
   } finally {
@@ -160,6 +165,13 @@ async function runCli(environment, drive) {
     await Promise.allSettled([terminal]);
   }
   return chunks.join('');
+}
+
+/** The attached chat's native run and queue, read through the same surface the terminal uses. */
+async function chatStatus(environment) {
+  const conversation = await environment.gateway.conversationFor('cli:steer', context);
+  const surface = inProcessTerminalConversation(conversation, environment.config.followUpMode);
+  return surface.status(context);
 }
 
 /** Record every request's user messages, holding the first until `release`. */
@@ -258,4 +270,142 @@ test('a steer that arrives at the final boundary starts the next run instead of 
   assert.equal(script.requests[1].at(-1), 'late steer');
   assert.equal(printed.split('TOO-LATE-ANSWER').length - 1, 1);
   assert.equal(printed.split('NEXT-RUN-ANSWER').length - 1, 1);
+});
+
+test('a shared failed turn reports its ended turn once', { timeout: 30_000 }, async (t) => {
+  const environment = await makeEnvironment(t, { followUpMode: 'steer', tools: ['read'] });
+  const entered = deferred();
+  const secondEntered = deferred();
+  let release;
+  let failSecond;
+  const held = new Promise((resolve) => { release = resolve; });
+  const secondGate = new Promise((resolve) => { failSecond = resolve; });
+  environment.faux.setResponses([
+    async () => {
+      entered.resolve();
+      await held;
+      return fauxAssistantMessage(fauxToolCall('read', { path: 'note.md' }, { id: 'read-1' }), { stopReason: 'toolUse' });
+    },
+    // The steer is placed at the first tool round, so this second request consumes both prompts; it is
+    // held until the terminal has observed that shared run, then fails for both of them at once.
+    async () => {
+      secondEntered.resolve();
+      await secondGate;
+      throw new Error('synthetic provider failure');
+    },
+  ]);
+  const printed = await runCli(environment, async (input, output) => {
+    input.push('first failing prompt');
+    await entered.promise;
+    input.push('second failing prompt');
+    await eventually(async () => (await inbox(environment)).steer === 1, 'the second prompt to queue as a steer');
+    release();
+    await secondEntered.promise;
+    await eventually(async () => (await chatStatus(environment)).run?.inputs === 2, 'the shared run to hold both prompts');
+    // The committed frame carrying both inputs is already queued for the terminal's watch callback; yield
+    // until it has run, so the shared run identity is observed before the turn fails.
+    await flush();
+    failSecond();
+  });
+  assert.equal(printed.split('Turn ended:').length - 1, 1, 'the shared turn reports its end once');
+  assert.match(printed, /Turn ended: model_error/);
+});
+
+test('distinct failed turns each report their own ended turn', { timeout: 30_000 }, async (t) => {
+  const environment = await makeEnvironment(t);
+  const entered = deferred();
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  environment.faux.setResponses([
+    async () => {
+      entered.resolve();
+      await held;
+      throw new Error('synthetic provider failure');
+    },
+    () => { throw new Error('synthetic provider failure'); },
+  ]);
+  const printed = await runCli(environment, async (input, output) => {
+    input.push('first failing prompt');
+    await entered.promise;
+    release();
+    // The first turn ends before the second prompt is admitted, so they are two distinct runs with the
+    // same model error: each reports its own end and neither collapses into the other.
+    await eventually(() => output().includes('Turn ended:'), 'the first ended turn');
+    input.push('second failing prompt');
+    await eventually(() => output().split('Turn ended:').length - 1 === 2, 'the second ended turn');
+  });
+  assert.equal(printed.split('Turn ended:').length - 1, 2);
+});
+
+test('aborting a shared steered turn reports its ended turn once', { timeout: 30_000 }, async (t) => {
+  const environment = await makeEnvironment(t, { followUpMode: 'steer', tools: ['read'] });
+  const entered = deferred();
+  const secondEntered = deferred();
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  environment.faux.setResponses([
+    async () => {
+      entered.resolve();
+      await held;
+      return fauxAssistantMessage(fauxToolCall('read', { path: 'note.md' }, { id: 'read-1' }), { stopReason: 'toolUse' });
+    },
+    // A cooperative provider: the native abort cancels this request instead of waiting on it.
+    async (_transcript, options) => {
+      secondEntered.resolve();
+      await new Promise((_resolve, reject) => {
+        const signal = options?.signal;
+        if (signal === undefined) return;
+        const stop = () => reject(new DOMException('aborted', 'AbortError'));
+        if (signal.aborted) return stop();
+        signal.addEventListener('abort', stop, { once: true });
+      });
+      return fauxAssistantMessage('NEVER-DELIVERED');
+    },
+  ]);
+  const printed = await runCli(environment, async (input) => {
+    input.push('first prompt');
+    await entered.promise;
+    input.push('second prompt');
+    await eventually(async () => (await inbox(environment)).steer === 1, 'the second prompt to queue as a steer');
+    release();
+    // The steer is placed at the tool-round boundary, so both prompts belong to the live turn.
+    await secondEntered.promise;
+    input.push('/abort');
+  });
+  assert.equal(printed.split('Turn ended:').length - 1, 1, 'one shared turn reports one end');
+  assert.match(printed, /Turn ended: aborted/);
+  assert.equal(printed.split('NEVER-DELIVERED').length - 1, 0);
+});
+
+test('a CLI message does not steer into a run the terminal did not start', { timeout: 30_000 }, async (t) => {
+  const environment = await makeEnvironment(t, { followUpMode: 'steer' });
+  const entered = deferred();
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  environment.faux.setResponses([
+    async () => {
+      entered.resolve();
+      await held;
+      return fauxAssistantMessage('FOREIGN-RUN-ANSWER');
+    },
+    () => fauxAssistantMessage('OWNER-OWN-ANSWER'),
+  ]);
+  // A non-terminal submitter owns the current run, exactly as a scheduled origin-mode turn does.
+  const conversation = await environment.gateway.conversationFor('cli:steer', context);
+  const foreign = await conversation.submit(
+    { type: 'input', content: 'scheduled origin prompt', requestId: 'cron:synthetic-occurrence' },
+    context,
+  );
+  await entered.promise;
+  const printed = await runCli(environment, async (input, output) => {
+    input.push('owner prompt');
+    await eventually(async () => (await inbox(environment)).followUp === 1 && (await inbox(environment)).steer === 0,
+      'the owner prompt to queue behind the foreign run');
+    release();
+    await eventually(() => output().includes('OWNER-OWN-ANSWER'), 'the owner answer');
+  });
+  assert.equal((await foreign.wait(context)).status, 'done');
+  // The foreign turn's answer stays its own delivery, and the owner prompt is answered once by its own turn.
+  assert.equal(printed.split('FOREIGN-RUN-ANSWER').length - 1, 1);
+  assert.equal(printed.split('OWNER-OWN-ANSWER').length - 1, 1);
 });

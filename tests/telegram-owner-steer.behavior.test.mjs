@@ -21,6 +21,7 @@ const [
   { BACKGROUND_CONTEXT, withCancel },
   { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
   { inProcessTerminalConversation },
+  { CronJobsDoc },
 ] = await Promise.all([
   import(new URL('../dist/config.js', import.meta.url).href),
   import(new URL('../dist/runtime.js', import.meta.url).href),
@@ -28,6 +29,7 @@ const [
   import(`${modules}/chord/dist/context/index.js`),
   import(`${modules}/pi-ai/dist/index.js`),
   import(new URL('../dist/terminal/conversation.js', import.meta.url).href),
+  import(new URL('../dist/automation/cron.js', import.meta.url).href),
 ]);
 
 const context = BACKGROUND_CONTEXT;
@@ -92,6 +94,7 @@ async function syntheticStore(label, options = {}) {
       allowedModels: [{ provider: 'fixture', modelId: 'alpha' }],
       toolAllowlist: options.tools ?? [],
       episodeSummary: { enabled: false },
+      ...(options.cron === true ? { cron: { enabled: true } } : {}),
       ...(options.followUpMode === undefined ? {} : { followUpMode: options.followUpMode }),
       ...(options.media === undefined ? {} : { media: options.media }),
       telegram: { tokenEnv: 'TG_SYNTHETIC_TOKEN', allowFrom: ['501'] },
@@ -671,4 +674,227 @@ test('aborting a steered turn reports no delivery failure for any of its message
     await cleanup(store, harness);
     transport.restore();
   }
+});
+
+const FAILURE_NOTICE = 'Your request could not be completed. Please try again.';
+
+/** A faux provider that fails every request with the same synthetic model error. */
+function alwaysFails(faux) {
+  faux.setResponses(Array.from({ length: 8 }, () => () => { throw new Error('synthetic provider failure'); }));
+}
+
+test('a held failure notice never owns a later unrelated failure with the same model error', { timeout: 40_000 }, async () => {
+  const store = await syntheticStore('failure-independent', { followUpMode: 'steer' });
+  const secondBatch = deferred();
+  const thirdBatch = deferred();
+  const transport = telegramMock([
+    [textUpdate(90, 'first failing message')],
+    async () => {
+      await secondBatch.promise;
+      return [textUpdate(91, 'second failing message')];
+    },
+  ], {
+    // Only the very first notice is ambiguous; every later notice is an ordinary send.
+    richFailure: (_text, index) => (index === 0
+      ? { error_code: 500, description: 'Internal Server Error: unknown' }
+      : undefined),
+  });
+  alwaysFails(store.faux);
+  let harness;
+  let reopened;
+  let reopenedHarness;
+  let reopenedTransport;
+  try {
+    harness = start(store, transport);
+    // The first run fails and its notice is ambiguous: the record is held, not evicted.
+    await until(async () => {
+      const records = (await telegramState(store.gateway)).pending;
+      return records.length === 1 && records[0].deliveryStatus === 'unknown';
+    }, 'the ambiguous failure notice to be held');
+    secondBatch.resolve();
+    // An independent failure with the SAME provider error still reports itself; the held record keeps
+    // its evidence and is never treated as the owner of this run.
+    await until(() => transport.rich.length === 2, 'the second failure notice');
+    assert.ok(transport.rich[1].text.includes(FAILURE_NOTICE));
+    const afterSecond = (await telegramState(store.gateway)).pending;
+    assert.equal(afterSecond.length, 1, 'only the held first notice stays pending');
+    assert.equal(afterSecond[0].updateId, 90);
+    assert.equal(afterSecond[0].deliveryStatus, 'unknown');
+
+    // Reopen: the held outcome is never retried, and a third independent failure still reports.
+    await stop(harness);
+    harness = undefined;
+    transport.restore();
+    await store.gateway.close(context);
+    reopened = await openGateway(store.config, context, { models: store.models });
+    reopenedTransport = telegramMock([
+      async () => {
+        await thirdBatch.promise;
+        return [textUpdate(93, 'third failing message')];
+      },
+    ]);
+    reopenedHarness = { scope: withCancel(context), transport: reopenedTransport };
+    reopenedHarness.adapter = runTelegram(reopened, {
+      token: TOKEN,
+      allowFrom: ['501'],
+      pollTimeoutSeconds: 1,
+      followUpMode: store.config.followUpMode,
+    }, reopenedHarness.scope.context);
+    await flush(40);
+    assert.equal(reopenedTransport.rich.length, 0, 'recovery never retries the held notice');
+    thirdBatch.resolve();
+    await until(() => reopenedTransport.rich.length === 1, 'the third failure notice after reopen');
+    assert.ok(reopenedTransport.rich[0].text.includes(FAILURE_NOTICE));
+    const recovered = (await telegramState(reopened)).pending;
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0].deliveryStatus, 'unknown');
+  } finally {
+    secondBatch.resolve();
+    thirdBatch.resolve();
+    await stop(reopenedHarness);
+    reopenedTransport?.restore();
+    await reopened?.close(context);
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('a failed shared turn reports its fixed notice for every message it consumed', { timeout: 30_000 }, async () => {
+  const store = await syntheticStore('failure-shared', { followUpMode: 'steer', tools: ['read'] });
+  const transport = telegramMock([[
+    textUpdate(94, 'first failing steered message'),
+    textUpdate(95, 'second failing steered message'),
+  ]]);
+  const entered = deferred();
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  store.faux.setResponses([
+    async () => {
+      entered.resolve();
+      await held;
+      return fauxAssistantMessage(fauxToolCall('read', { path: 'note.md' }, { id: 'read-1' }), { stopReason: 'toolUse' });
+    },
+    // Both messages are in the run by now, so this one failure settles both of them.
+    () => { throw new Error('synthetic provider failure'); },
+  ]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await entered.promise;
+    await until(async () => (await chatInbox(store.gateway)).steer === 1, 'the second message to queue as a steer');
+    release();
+    // A failed run exposes no run identity at settlement, so its failure is never guessed from the
+    // reason text: each consumed message reports its own fixed notice and none is silently dropped.
+    await until(async () => (await telegramState(store.gateway)).pending.length === 0, 'both failure notices to settle');
+    assert.equal(transport.rich.filter((entry) => entry.text.includes(FAILURE_NOTICE)).length, 2);
+  } finally {
+    release?.();
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+/**
+ * A scheduled origin-mode run in the owner's chat plus one owner message admitted while that run is
+ * genuinely in flight. The scheduled run owns the chat's current run, so the owner message queues
+ * behind it instead of joining it: the scheduled answer is delivered once by the durable outbox, the
+ * owner message is answered once by its own run, and neither delivery is dropped or duplicated.
+ */
+async function withOriginRun(label, scheduledAnswer, body) {
+  const store = await syntheticStore(label, { followUpMode: 'steer', cron: true });
+  const origin = `telegram:${BOT_ID}:chat:${CHAT_ID}`;
+  const scheduledMessage = 'deliver the origin reminder';
+  const ownerBatch = deferred();
+  const runHeld = deferred();
+  let releaseRun;
+  const held = new Promise((resolve) => { releaseRun = resolve; });
+  let scheduled = false;
+  const dispatcher = (transcript) => {
+    store.faux.appendResponses([dispatcher]);
+    const input = userTexts(transcript.messages).at(-1) ?? '';
+    if (input.startsWith(scheduledMessage)) {
+      runHeld.resolve();
+      return held.then(() => fauxAssistantMessage(scheduledAnswer));
+    }
+    if (input === 'schedule the reminder' && !scheduled) {
+      scheduled = true;
+      return fauxAssistantMessage([
+        fauxToolCall('cron', {
+          action: 'add',
+          message: scheduledMessage,
+          name: 'origin reminder',
+          isolated: false,
+          at: new Date(Date.now() + 1_500).toISOString(),
+        }, { id: 'origin-cron-add' }),
+      ], { stopReason: 'toolUse' });
+    }
+    if (input === 'owner message during the reminder') return fauxAssistantMessage('OWNER-OWN-ANSWER');
+    return fauxAssistantMessage('Synthetic reply.');
+  };
+  store.faux.setResponses([dispatcher]);
+  const transport = telegramMock([
+    [textUpdate(120, 'schedule the reminder')],
+    async () => {
+      await ownerBatch.promise;
+      return [textUpdate(121, 'owner message during the reminder')];
+    },
+  ]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await runHeld.promise;
+    ownerBatch.resolve();
+    // The scheduled run owns this conversation, so the owner message must not steer into it.
+    await until(async () => {
+      const inbox = await chatInbox(store.gateway);
+      return inbox.followUp === 1 && inbox.steer === 0;
+    }, 'the owner message to queue behind the scheduled run');
+    releaseRun();
+    await until(() => transport.rich.some((entry) => entry.text.includes('OWNER-OWN-ANSWER')), 'the owner answer');
+    await until(async () => (await telegramState(store.gateway)).pending.length === 0, 'every reply delivery to settle');
+    // The scheduled occurrence settles through its own task, not through the chat's pending queue.
+    const chat = await store.gateway.conversationFor(origin, context);
+    await until(async () => {
+      const jobs = await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context);
+      return jobs.jobs[0]?.lastOutcome !== null && jobs.jobs[0]?.lastOutcome !== undefined;
+    }, 'the scheduled occurrence to settle');
+    await body({ store, transport, origin });
+  } finally {
+    releaseRun?.();
+    ownerBatch.resolve();
+    await cleanup(store, harness);
+    transport.restore();
+  }
+}
+
+test('an owner message admitted during an origin-mode run queues and its answer is not duplicated', { timeout: 40_000 }, async () => {
+  await withOriginRun('cron-origin-shared', 'SCHEDULED-ORIGIN-RESULT', async ({ store, transport, origin }) => {
+    await until(async () => (await store.gateway.cronOutbox.list(origin, context))
+      .some((record) => record.status === 'delivered'), 'the scheduled delivery');
+    // The scheduled answer travels once, and only through the durable outbox for that occurrence.
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('SCHEDULED-ORIGIN-RESULT')).length, 1);
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('OWNER-OWN-ANSWER')).length, 1);
+    const records = await store.gateway.cronOutbox.list(origin, context);
+    assert.equal(records.length, 1, 'one outbox record for the origin occurrence');
+    assert.equal(records[0].status, 'delivered');
+    assert.equal(records[0].text, 'SCHEDULED-ORIGIN-RESULT');
+    // The origin chat keeps exactly its own policy: the scheduled run captured nothing and widened nothing.
+    const chat = await store.gateway.conversationFor(origin, context);
+    const names = ((await chat.agent(context)).tools ?? []).map((tool) => (typeof tool === 'string' ? tool : tool.name));
+    assert.ok(names.includes('cron'), `cron ownership after the run: ${names}`);
+    assert.ok(!names.includes('read'), `no captured tool widened the chat: ${names}`);
+    const jobs = await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context);
+    assert.equal(jobs.jobs.length, 1);
+    assert.equal(jobs.jobs[0].mode, 'origin');
+    assert.equal(jobs.jobs[0].lastOutcome.status, 'ok');
+  });
+});
+
+test('a [SILENT] scheduled occurrence stays silent while the queued owner message is still answered', { timeout: 40_000 }, async () => {
+  await withOriginRun('cron-origin-silent', '[SILENT]', async ({ store, transport, origin }) => {
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('[SILENT]')).length, 0);
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('OWNER-OWN-ANSWER')).length, 1);
+    const records = await store.gateway.cronOutbox.list(origin, context);
+    assert.equal(records.length, 0, 'a silent occurrence queues no scheduled delivery');
+  });
 });

@@ -103,9 +103,18 @@ The pinned native default places one queued steer per tool round, and that setti
 so this repository does not turn on "place all queued steers" (it would change worker and automation
 conversations too). A steer that arrives at the final boundary is placed there and answered by the
 following run, so it answers a beat later instead of pre-empting the answer already being written.
-Telegram stores the mode with each admitted message, so a later config change or a reopen keeps that
+
+Only an owner turn is ever joined. A conversation's current run belongs to a scheduled origin-mode
+occurrence, a digest result or a worker result when its first native input came from that path, and
+the owner message then queues instead: joining it would let the scheduled outbox and the chat deliver
+the same answer twice. Native `submit` has no conditional steering, so this is a read of the running
+input set immediately before admission; a run replaced in that instant is not re-checked. Telegram
+stores the requested mode with each admitted message, so a later config change or a reopen keeps that
 message's semantics, and every message a steered turn consumes delivers its single committed answer
 once. Internal worker, digest and scheduled submissions are unaffected and keep the native default.
+A failed turn has no committed answer and Durable exposes no run identity at settlement, so it is
+never guessed from its error text: every message the failed turn consumed reports its own fixed
+notice, which can repeat that notice for a shared turn but never drops or misattributes one.
 
 ## Media
 

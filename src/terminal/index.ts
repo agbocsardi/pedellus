@@ -75,6 +75,8 @@ const EPISODE_ENTRY_PAGE_SIZE = 100;
 const MAX_EPISODE_SCAN_ENTRIES = 300;
 const HISTORY_VIEW_CHARS = 48_000;
 const MAX_REMEMBERED_ANSWERS = 256;
+/** Shared-turn end reports remembered, so one run reports its end once and distinct runs never collapse. */
+const MAX_REMEMBERED_RUN_ENDS = 256;
 const MAX_REMEMBERED_LOCAL_INPUTS = 1_024;
 const MAX_EXTERNAL_RUNS = 64;
 const LITERAL_SLASH_PREFIX = "//";
@@ -186,7 +188,14 @@ export interface TerminalIO {
   readonly restart?: () => Promise<void>;
 }
 
-type LocalSubmission = { id: number; submission: TerminalSubmission; runTaskId?: number; finalized?: boolean };
+type LocalSubmission = {
+  id: number;
+  submission: TerminalSubmission;
+  runTaskId?: number;
+  /** First input of the native run this submission joined, observed in a committed snapshot. */
+  runFirst?: number;
+  finalized?: boolean;
+};
 type GenerationOutput = {
   attempt: number;
   streamed: string;
@@ -228,6 +237,8 @@ export async function runTerminalConversation(
   const runOutputs = new Map<number, RunOutput>();
   const answerIds = new Set<number>();
   const answerOrder: number[] = [];
+  const endedRuns = new Set<number>();
+  const endedRunOrder: number[] = [];
   /** Every input this terminal admitted, so a run with no local input is classified as external. */
   const localInputIds = new Set<number>();
   const localInputOrder: number[] = [];
@@ -302,6 +313,22 @@ export async function runTerminalConversation(
     while (answerOrder.length > MAX_REMEMBERED_ANSWERS) {
       const oldest = answerOrder.shift();
       if (oldest !== undefined) answerIds.delete(oldest);
+    }
+    return true;
+  };
+
+  /**
+   * Remember one native run whose end was reported, keyed by its first input. That input identifies the run
+   * across tool rounds and handovers (Durable only appends later inputs to the same run) and belongs to exactly
+   * one run, so it can never collapse two distinct turns — unlike their settlement reason text.
+   */
+  const reportRunEnd = (runFirst: number): boolean => {
+    if (endedRuns.has(runFirst)) return false;
+    endedRuns.add(runFirst);
+    endedRunOrder.push(runFirst);
+    while (endedRunOrder.length > MAX_REMEMBERED_RUN_ENDS) {
+      const oldest = endedRunOrder.shift();
+      if (oldest !== undefined) endedRuns.delete(oldest);
     }
     return true;
   };
@@ -467,6 +494,13 @@ export async function runTerminalConversation(
       }
     }
     for (const id of ownedInputs) submissions.get(id)!.runTaskId = run.taskId;
+    const runFirst = run.inputs[0];
+    if (runFirst !== undefined) {
+      for (const id of ownedInputs) {
+        const local = submissions.get(id)!;
+        local.runFirst ??= runFirst;
+      }
+    }
     // A watch frame can arrive before the local admission promise records its ID. If this run turns
     // out to own a local input after all, local settlement owns its answer and partial rendering.
     dropExternalRunFor(run.inputs);
@@ -598,6 +632,11 @@ export async function runTerminalConversation(
       });
     } else if (settled.status === "unanswered") {
       if (settled.reason !== "aborted") unansweredObserved = true;
+      // Inputs one run consumed settle together. Its end is reported once per run, identified by the run's
+      // first input observed in a committed snapshot; a settlement whose run was never observed (a withdrawn
+      // queued input, or a turn that ended before this terminal saw it) reports its own end.
+      const runFirst = submissions.get(submissionId)?.runFirst;
+      if (runFirst !== undefined && !reportRunEnd(runFirst)) return;
       await notice(`Turn ended: ${safeReason(settled.reason ?? "unknown")}`, true);
     }
   };

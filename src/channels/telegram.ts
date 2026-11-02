@@ -1,4 +1,4 @@
-import { defineDoc, AssistantEntry, ConversationBusy } from "@earendil-works/pi-durable";
+import { defineDoc, AssistantEntry, ConversationBusy, LiveDoc } from "@earendil-works/pi-durable";
 import type { Context, Draft } from "@earendil-works/chord";
 import { copyJson } from "@earendil-works/chord";
 import { withCancel, withoutAbortSignal } from "@earendil-works/chord/context";
@@ -283,27 +283,28 @@ export type TelegramOriginBinding = {
 type PendingReply = TelegramPendingDelivery;
 type SubmissionSlot = { readonly prior: Promise<void>; release(): void };
 /**
- * A native settlement that identifies the inputs one run consumed: they settle together with one committed
- * answer entry, or with the same failure. Pending membership plus that durable submission evidence is the
- * whole shared-delivery identity; no text, in-memory set or delivery tombstone is involved.
+ * A committed answer that identifies the inputs one run consumed: every input that run consumed settles with
+ * the same answer entry. Pending membership plus that durable settlement evidence is the whole shared-delivery
+ * identity; no text, in-memory set or delivery tombstone is involved.
+ *
+ * A failed run has no such identity: Durable settles its inputs with a plain `unanswered` reason and exposes no
+ * run reference afterwards, so failures are never grouped — each admitted message reports its own fixed notice.
+ * Guessing from the reason text would let a held notice become the phantom owner of an unrelated failure.
  */
-type SharedSettlement =
-  | { readonly kind: "done"; readonly answer: number }
-  | { readonly kind: "failed"; readonly reason: string; readonly detail?: unknown };
+type SharedAnswer = { readonly answer: number };
 /** `owner` sends the one shared reply, `sibling` stays silent behind it, `retired` is already gone. */
 type DeliveryRole = "owner" | "sibling" | "retired";
 
-/** Whether this settled submission is one of the inputs the same run consumed. */
-function consumedTogether(record: SubmissionRecord, settlement: SharedSettlement): boolean {
-  if (record.type !== "input") return false;
-  if (settlement.kind === "done") return record.status === "done" && record.answer === settlement.answer;
-  return record.status === "unanswered" && record.reason === settlement.reason &&
-    detailKey(record.detail) === detailKey(settlement.detail);
+/** The run's first input: it identifies the run across tool rounds, which only ever append inputs. */
+function firstInput(inputs: readonly SubmissionId[]): SubmissionId | undefined {
+  let first = inputs[0];
+  for (const id of inputs) if (first === undefined || id < first) first = id;
+  return first;
 }
 
-/** Stable comparison for a settlement detail; committed records hold strict JSON. */
-function detailKey(detail: unknown): string {
-  return detail === undefined ? "" : JSON.stringify(detail);
+/** Whether this settled submission is one of the inputs the run with this committed answer consumed. */
+function answeredTogether(record: SubmissionRecord, settlement: SharedAnswer): boolean {
+  return record.type === "input" && record.status === "done" && record.answer === settlement.answer;
 }
 type TypingLoop = {
   /** Overlapping queued turns in one chat share this loop; the indicator stays until the last one settles. */
@@ -479,8 +480,8 @@ export async function runTelegram(
     context,
   );
   /**
-   * The busy-mode written onto each admitted message, so its semantics are durable before submission and a
-   * later configuration change or recovery never re-reads them from the current config.
+   * The busy-mode each admitted message *asked* for, written onto it so a later configuration change or a
+   * recovery never re-reads it. Delivery may still fall back to follow-up when another path owns the run.
    */
   const admittedWhenBusy = options.followUpMode === "steer" ? "steer" as const : undefined;
   let state = await stateConversation.commit(async (tx) =>
@@ -1645,7 +1646,7 @@ export async function runTelegram(
         if (submissionId === undefined || inputs === undefined || !inputs.includes(submissionId)) return;
         // One preview per run: the run's first input owns the single live preview message, so a steered
         // sibling keeps the chat's typing indicator but never publishes a second one.
-        if (submissionId !== Math.min(...inputs)) return;
+        if (submissionId !== firstInput(inputs)) return;
         const text = live?.generation?.message?.content
           ?.flatMap((part) => part.type === "text" && part.text ? [part.text] : []).join("");
         if (text) queuePreview(text);
@@ -1657,27 +1658,22 @@ export async function runTelegram(
         type: "input",
         content,
         requestId,
-        whenBusy: item.whenBusy === "steer" ? "steer" : "followUp",
+        whenBusy: await submissionMode(conversation, item),
       }, adapterContext);
       // Ordering is established; free the chat's next submission place while this turn runs.
       slot.release();
       submissionId = submission.id;
       const settled = await submission.wait(adapterContext);
       if (settled.status !== "done" || settled.type !== "input") {
-        // A native abort or a queued reset deliberately ends the whole shared run: no input of it reports a
-        // delivery failure, exactly as a single withdrawn turn never did.
+        // A native abort or a queued reset deliberately ends the turn: it is not a delivery failure to report.
         const intentional = settled.status === "unanswered" &&
           (settled.reason === "aborted" || settled.reason === "reset");
-        const role = intentional
-          ? undefined
-          : await sharedDeliveryRole(conversation, item, {
-            kind: "failed",
-            reason: settled.status === "unanswered" ? settled.reason : "unknown",
-            ...(settled.status === "unanswered" && settled.detail !== undefined ? { detail: settled.detail } : {}),
-          });
         await stopPreviewWatch();
-        if (role === "owner") await flushFinal("Your request could not be completed. Please try again.");
-        if (role !== "retired") await forget(item.updateId);
+        // A failed run has no committed answer and Durable exposes no run identity at settlement, so each
+        // admitted message reports its own fixed notice. Grouping by the identical reason text would let a
+        // held notice silently own an unrelated later failure.
+        if (!intentional) await flushFinal("Your request could not be completed. Please try again.");
+        await forget(item.updateId);
         return;
       }
       const answer = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), adapterContext);
@@ -1685,7 +1681,7 @@ export async function runTelegram(
       const answerText = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "";
       const text = answerText.trim() === "" ? "The assistant returned no text response." : answerText;
       // Inputs the run consumed settle with this same committed answer, so one of them owns its single reply.
-      const settlement = { kind: "done", answer: settled.answer } as const;
+      const settlement = { answer: settled.answer } as const;
       const role = await sharedDeliveryRole(conversation, item, settlement);
       await stopPreviewWatch();
       if (role === "owner") {
@@ -1905,15 +1901,47 @@ export async function runTelegram(
   };
 
   /**
-   * The admitted messages of this chat whose native submission settled exactly as `settlement` did, with
-   * the earliest native submission as the one that delivers their single shared reply. Durable settlement
-   * evidence plus pending membership decide it, so every observer computes the same owner without a lock,
-   * and a reopened process reaches the same answer.
+   * Whether this conversation's current run was started by one of its own admitted owner messages. Only an
+   * owner surface steers, so a run whose first input is one of these submissions contains only owner inputs;
+   * a scheduled origin-mode run, a digest result or a worker result starts its own run, and joining it would
+   * let the scheduled outbox and this chat deliver the same answer. A run's first input identifies it across
+   * tool rounds because Durable only appends later inputs to the same run.
+   */
+  const ownerRun = async (conversation: Conversation, sessionKey: string): Promise<boolean> =>
+    conversation.commit(async (tx) => {
+      const live = await tx.doc(LiveDoc, conversation.id);
+      const inputs = live.run?.inputs;
+      if (inputs === undefined || inputs.length === 0) return true;
+      const first = firstInput(inputs);
+      for (const candidate of state.pending) {
+        if (candidate.sessionKey !== sessionKey) continue;
+        const record = await tx.submissionByRequest(conversation.id, requestIdFor(identity, candidate.updateId));
+        if (record?.id === first) return true;
+      }
+      return false;
+    }, adapterContext);
+
+  /**
+   * The native busy-mode to submit one admitted message with. Its own durable admission decided whether the
+   * owner asked to steer; a run that another path owns always takes the conservative follow-up queueing, so no
+   * owner answer is dropped and no scheduled answer is delivered twice. Native `submit` has no conditional
+   * steering, so this state is read immediately before admission.
+   */
+  const submissionMode = async (conversation: Conversation, current: PendingReply): Promise<"steer" | "followUp"> => {
+    if (current.whenBusy !== "steer") return "followUp";
+    return (await ownerRun(conversation, current.sessionKey)) ? "steer" : "followUp";
+  };
+
+  /**
+   * The admitted messages of this chat whose native submission settled with `settlement`'s committed answer,
+   * with the earliest native submission as the one that delivers their single shared reply. Durable settlement
+   * evidence plus committed pending membership decide it, so every observer computes the same owner without a
+   * lock and a reopened process reaches the same answer.
    */
   const sharedDeliveryGroup = async (
     conversationId: Conversation["id"],
     current: PendingReply,
-    settlement: SharedSettlement,
+    settlement: SharedAnswer,
   ): Promise<{ readonly updateIds: number[]; readonly owner: number | undefined; readonly present: boolean }> => {
     const members: { updateId: number; submissionId: number }[] = [];
     let present = false;
@@ -1926,7 +1954,7 @@ export async function runTelegram(
         if (candidate.updateId === current.updateId) present = true;
         if (candidate.sessionKey !== current.sessionKey) continue;
         const record = await tx.submissionByRequest(conversationId, requestIdFor(identity, candidate.updateId));
-        if (record !== undefined && consumedTogether(record, settlement)) {
+        if (record !== undefined && answeredTogether(record, settlement)) {
           members.push({ updateId: candidate.updateId, submissionId: record.id });
         }
       }
@@ -1937,13 +1965,13 @@ export async function runTelegram(
   };
 
   /**
-   * Whether this admitted message delivers its shared settlement or stays silent behind its owner. A
-   * record the owner already retired resolves `retired`, so an in-flight observer never sends again.
+   * Whether this admitted message delivers its shared answer or stays silent behind its owner. A record the
+   * owner already retired resolves `retired`, so an in-flight observer never sends again.
    */
   const sharedDeliveryRole = async (
     conversation: Conversation,
     current: PendingReply,
-    settlement: SharedSettlement,
+    settlement: SharedAnswer,
   ): Promise<DeliveryRole> => {
     const group = await sharedDeliveryGroup(conversation.id, current, settlement);
     if (!group.present) return "retired";
@@ -1952,14 +1980,14 @@ export async function runTelegram(
   };
 
   /**
-   * One commit that retires this delivery owner and every still-pending sibling of the same settlement, so
-   * a delivered shared answer can never be sent again by a record left behind by a crash or a slow observer.
+   * One commit that retires this delivery owner and every still-pending sibling of the same answer, so a
+   * delivered shared answer can never be sent again by a record left behind by a crash or a slow observer.
    * An unknown or held sibling keeps its own evidence: only pending membership is retired here.
    */
   const retireSharedDelivery = async (
     conversation: Conversation,
     current: PendingReply,
-    settlement: SharedSettlement,
+    settlement: SharedAnswer,
   ) => {
     const group = await sharedDeliveryGroup(conversation.id, current, settlement);
     const retired = new Set(group.updateIds);
@@ -2960,8 +2988,9 @@ export async function runTelegram(
             type: "input",
             content,
             requestId: requestIdFor(identity, earlier.updateId),
-            // The mode its own admission recorded, exactly as the normal delivery path submits it.
-            whenBusy: earlier.whenBusy === "steer" ? "steer" : "followUp",
+            // The mode its own admission recorded, exactly as the normal delivery path submits it. A run that
+            // a scheduled, digest or worker path owns always queues instead of joining.
+            whenBusy: await submissionMode(earlierConversation, earlier),
           }, adapterContext);
           // The normal delivery path reuses this turn, so a control-forced input is answered
           // exactly once even when it settles before the chat's gate is released.

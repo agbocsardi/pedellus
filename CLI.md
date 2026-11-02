@@ -306,7 +306,14 @@ steer is placed per tool round (the pinned native default), and a steer that arr
 tool round is placed at the final boundary, so it is answered by the following run a beat later
 instead of interrupting the answer already being written. A turn that consumes several inputs settles
 all of them with one committed answer entry, which the terminal prints once, and typing stays
-available meanwhile. `/attach` turns follow the same mode. See
+available meanwhile. `/attach` turns follow the same mode. A run the terminal did not start — a
+scheduled origin-mode turn, a digest result or a worker result — is never joined: the typed line
+queues behind it and is answered by its own turn, because the scheduled path delivers that run's
+answer itself. Native `submit` has no conditional steering, so this is a read of the running input
+set immediately before admission, and a reattached terminal conservatively queues until it has
+admitted an input of its own. A failed turn reports `Turn ended` once when the terminal observed the
+shared run (identified by that run's first native input, never by the error text); an input whose run
+it never saw reports its own end. See
 [busy owner messages](./README.md#busy-owner-messages).
 
 ## Local controls
