@@ -192,7 +192,7 @@ test('config rejects ambiguous or partial whisper-cli selection', async () => {
         ...base,
         media: { directory: 'media', transcription: { backend: 'nope' } },
       }, area.directory),
-      /backend must be faster-whisper or whisper-cli/,
+      /backend must be faster-whisper, whisper-cli or hex/,
     );
     // A legacy config with no backend field behaves exactly as before.
     const legacy = parseConfig({
@@ -509,6 +509,304 @@ test('a disabled transcriber spawns nothing on either route', { timeout: 20_000 
       assert.equal(transcriber.enabled, false);
       assert.deepEqual(await transcriber.transcribe(audio), { ok: false, reason: 'unavailable' });
     }
+    assert.equal(await exists(set.paths.probeArgs), false);
+  } finally {
+    await area.cleanup();
+  }
+});
+
+// --- Hex route -------------------------------------------------------------
+
+/**
+ * One fake Hex install: the engine binary plus the same controlled decoder stubs.
+ * `hex` is driven only through `model transcribe`, so its argv is the contract.
+ */
+async function hexEngineSet(area, options = {}) {
+  const {
+    duration = '11.0',
+    probeExit = 0,
+    pcmBytes = 1024,
+    decodeExit = 0,
+    text = 'HEX-TRANSCRIPT',
+    engineExit = 0,
+  } = options;
+  const argsFile = area.path('hex.args');
+  const probeArgs = area.path('probe.args');
+  const decodeArgs = area.path('decode.args');
+  const engineMarker = area.path('hex.ran');
+
+  const ffprobe = await stub(area, 'fake-ffprobe', [
+    `printf '%s\\n' "$@" > "${probeArgs}"`,
+    `printf '%s\\n' "${duration}"`,
+    `exit ${probeExit}`,
+  ].join('\n'));
+
+  const ffmpeg = await stub(area, 'fake-ffmpeg', [
+    `printf '%s\\n' "$@" > "${decodeArgs}"`,
+    'for last; do :; done',
+    `dd if=/dev/zero of="$last" bs=1000 count=${Math.max(1, Math.ceil(pcmBytes / 1000))} 2>/dev/null`,
+    `exit ${decodeExit}`,
+  ].join('\n'));
+
+  const binary = await stub(area, 'fake-hex', [
+    `printf '%s\\n' "$@" > "${argsFile}"`,
+    `: > "${engineMarker}"`,
+    `printf '%s' "${text}"`,
+    `exit ${engineExit}`,
+  ].join('\n'));
+
+  return {
+    engine: { binary, ffmpeg, ffprobe, model: 'parakeet_unified_en' },
+    paths: { argsFile, probeArgs, decodeArgs, engineMarker, ffprobe, ffmpeg, binary },
+    async args(file) {
+      return (await readFile(file, 'utf8')).split('\n').filter((line) => line !== '');
+    },
+  };
+}
+
+test('config accepts an explicit hex engine and rejects a partial one', async () => {
+  const area = await scratch('hex-config');
+  const base = {
+    workspace: area.path('ws'),
+    dataDir: area.path('state'),
+    model: { provider: 'p', modelId: 'm' },
+  };
+  const engine = {
+    binary: '/opt/hex/hex',
+    ffmpeg: '/opt/ffmpeg/bin/ffmpeg',
+    ffprobe: '/opt/ffmpeg/bin/ffprobe',
+    model: 'parakeet_unified_en',
+  };
+  try {
+    const accepted = parseConfig({
+      ...base,
+      media: { directory: 'media', transcription: { backend: 'hex', hex: engine } },
+    }, area.directory);
+    assert.equal(accepted.media.transcription.backend, 'hex');
+    assert.deepEqual({ ...accepted.media.transcription.hex }, engine);
+
+    // The model id is optional: Hex then uses its own selection.
+    const noModel = parseConfig({
+      ...base,
+      media: {
+        directory: 'media',
+        transcription: { backend: 'hex', hex: { binary: engine.binary, ffmpeg: engine.ffmpeg, ffprobe: engine.ffprobe } },
+      },
+    }, area.directory);
+    assert.equal(noModel.media.transcription.hex.model, undefined);
+
+    assert.throws(
+      () => parseConfig({ ...base, media: { directory: 'media', transcription: { hex: engine } } }, area.directory),
+      /required exactly when backend is hex/,
+    );
+    assert.throws(
+      () => parseConfig({ ...base, media: { directory: 'media', transcription: { backend: 'hex' } } }, area.directory),
+      /required exactly when backend is hex/,
+    );
+    assert.throws(
+      () => parseConfig({
+        ...base,
+        media: { directory: 'media', transcription: { backend: 'faster-whisper', hex: engine } },
+      }, area.directory),
+      /required exactly when backend is hex/,
+    );
+    assert.throws(
+      () => parseConfig({
+        ...base,
+        media: { directory: 'media', transcription: { backend: 'hex', hex: { ...engine, binary: 'hex' } } },
+      }, area.directory),
+      /hex\.binary must be an absolute path/,
+    );
+    assert.throws(
+      () => parseConfig({
+        ...base,
+        media: { directory: 'media', transcription: { backend: 'hex', hex: { ...engine, extra: '/x' } } },
+      }, area.directory),
+      /Unknown media\.transcription\.hex field: extra/,
+    );
+    assert.throws(
+      () => parseConfig({
+        ...base,
+        media: { directory: 'media', transcription: { backend: 'hex', hex: { ...engine, model: 'a b' } } },
+      }, area.directory),
+      /hex\.model must be a Hex model id/,
+    );
+    // Duration and timeout bounds are generous enough for long voice notes,
+    // and both stay bounded.
+    const long = parseConfig({
+      ...base,
+      media: { directory: 'media', transcription: { maxDurationSeconds: 3_600, timeoutMs: 900_000 } },
+    }, area.directory);
+    assert.equal(long.media.transcription.maxDurationSeconds, 3_600);
+    assert.equal(long.media.transcription.timeoutMs, 900_000);
+    assert.throws(
+      () => parseConfig({
+        ...base,
+        media: { directory: 'media', transcription: { timeoutMs: 3_600_001 } },
+      }, area.directory),
+      /timeoutMs must be an integer from 1 to 3600000/,
+    );
+    assert.throws(
+      () => parseConfig({
+        ...base,
+        media: { directory: 'media', transcription: { maxDurationSeconds: 3_601 } },
+      }, area.directory),
+      /maxDurationSeconds must be an integer from 1 to 3600/,
+    );
+  } finally {
+    await area.cleanup();
+  }
+});
+
+test('the hex route decodes locally and drives `hex model transcribe`', { timeout: 20_000 }, async () => {
+  const area = await scratch('hex-happy');
+  const before = await leftoverTempDirs();
+  try {
+    const set = await hexEngineSet(area);
+    const audio = await audioFile(area);
+    const transcriber = createTranscriber({ backend: 'hex', hex: set.engine });
+    assert.deepEqual(await transcriber.transcribe(audio), { ok: true, text: 'HEX-TRANSCRIPT' });
+
+    const decodeArgs = await set.args(set.paths.decodeArgs);
+    assert.equal(decodeArgs[decodeArgs.indexOf('-protocol_whitelist') + 1], 'file');
+    assert.equal(decodeArgs[decodeArgs.indexOf('-i') + 1], audio);
+    assert.ok(decodeArgs.includes('-fs'));
+
+    const engineArgs = await set.args(set.paths.argsFile);
+    assert.deepEqual(engineArgs.slice(0, 2), ['model', 'transcribe']);
+    assert.equal(engineArgs[engineArgs.indexOf('--model') + 1], 'parakeet_unified_en');
+    // No language hint is configured, so none is invented.
+    assert.equal(engineArgs.includes('--language'), false);
+    // Hex is given the decoded temporary WAV, not the stored original.
+    assert.notEqual(engineArgs.at(-1), audio);
+    assert.ok(engineArgs.at(-1).includes(TEMP_PREFIX));
+    assert.deepEqual(await leftoverTempDirs(), before);
+  } finally {
+    await area.cleanup();
+  }
+});
+
+test('a hex model and language hint reach the engine, and a long note is not refused', { timeout: 20_000 }, async () => {
+  const area = await scratch('hex-long');
+  try {
+    // Ten minutes exactly: refused just above the configured bound, accepted below it.
+    const set = await hexEngineSet(area, { duration: '601.0' });
+    const audio = await audioFile(area);
+    const transcriber = createTranscriber({
+      backend: 'hex',
+      hex: set.engine,
+      language: 'en',
+      maxDurationSeconds: 600,
+    });
+    assert.deepEqual(await transcriber.transcribe(audio), { ok: false, reason: 'too-large' });
+    assert.equal(await exists(set.paths.engineMarker), false);
+
+    const generous = await scratch('hex-longer');
+    try {
+      const allowed = await hexEngineSet(generous, { duration: '599.0' });
+      const longer = createTranscriber({
+        backend: 'hex',
+        hex: allowed.engine,
+        language: 'en',
+        maxDurationSeconds: 600,
+      });
+      assert.deepEqual(await longer.transcribe(audio), { ok: true, text: 'HEX-TRANSCRIPT' });
+      const engineArgs = await allowed.args(allowed.paths.argsFile);
+      assert.equal(engineArgs[engineArgs.indexOf('--language') + 1], 'en');
+    } finally {
+      await generous.cleanup();
+    }
+  } finally {
+    await area.cleanup();
+  }
+});
+
+test('hex failures map honestly and a missing binary is unavailable', { timeout: 20_000 }, async () => {
+  for (const [code, reason] of [[1, 'failed'], [2, 'failed']]) {
+    const area = await scratch(`hex-exit-${code}`);
+    try {
+      const set = await hexEngineSet(area, { engineExit: code });
+      const transcriber = createTranscriber({ backend: 'hex', hex: set.engine });
+      assert.deepEqual(await transcriber.transcribe(await audioFile(area)), { ok: false, reason }, `exit ${code}`);
+    } finally {
+      await area.cleanup();
+    }
+  }
+  const area = await scratch('hex-missing');
+  try {
+    const set = await hexEngineSet(area);
+    const audio = await audioFile(area);
+    await rm(set.engine.binary, { force: true });
+    assert.deepEqual(
+      await createTranscriber({ backend: 'hex', hex: set.engine }).transcribe(audio),
+      { ok: false, reason: 'unavailable' },
+    );
+  } finally {
+    await area.cleanup();
+  }
+});
+
+test('an empty hex transcript is empty, not success', { timeout: 20_000 }, async () => {
+  const area = await scratch('hex-empty');
+  try {
+    const set = await hexEngineSet(area, { text: '  \n ' });
+    assert.deepEqual(
+      await createTranscriber({ backend: 'hex', hex: set.engine }).transcribe(await audioFile(area)),
+      { ok: false, reason: 'empty' },
+    );
+  } finally {
+    await area.cleanup();
+  }
+});
+
+test('hex children keep HOME for their model store but inherit no credentials', { timeout: 20_000 }, async () => {
+  const area = await scratch('hex-env');
+  const dump = area.path('hex.env');
+  const previous = { secret: process.env.NANOBOT_TEST_SECRET, ld: process.env.LD_LIBRARY_PATH };
+  process.env.NANOBOT_TEST_SECRET = 'must-not-leak';
+  process.env.LD_LIBRARY_PATH = '/opt/private-libs';
+  try {
+    const set = await hexEngineSet(area);
+    await writeFile(set.engine.binary, [
+      '#!/bin/sh',
+      `env > "${dump}"`,
+      'printf "%s" "ENV-OK"',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const transcriber = createTranscriber({ backend: 'hex', hex: set.engine });
+    assert.deepEqual(await transcriber.transcribe(await audioFile(area)), { ok: true, text: 'ENV-OK' });
+    const seen = await readFile(dump, 'utf8');
+    // Hex resolves its own data directory (and models) from the operator's home.
+    if (process.env.HOME !== undefined) assert.equal(/^HOME=/m.test(seen), true);
+    assert.equal(seen.includes('must-not-leak'), false);
+    assert.equal(seen.includes('private-libs'), false);
+    assert.equal(/^HF_HUB_OFFLINE=/m.test(seen), false);
+  } finally {
+    if (previous.secret === undefined) delete process.env.NANOBOT_TEST_SECRET;
+    else process.env.NANOBOT_TEST_SECRET = previous.secret;
+    if (previous.ld === undefined) delete process.env.LD_LIBRARY_PATH;
+    else process.env.LD_LIBRARY_PATH = previous.ld;
+    await area.cleanup();
+  }
+});
+
+test('the hex backend stays opt-in and never widens the other routes', { timeout: 20_000 }, async () => {
+  const area = await scratch('hex-optin');
+  try {
+    const set = await hexEngineSet(area);
+    assert.throws(() => createTranscriber({ hex: set.engine }), /requires backend "hex"/);
+    assert.throws(() => createTranscriber({ backend: 'hex' }), /requires media\.transcription\.hex/);
+    assert.throws(
+      () => createTranscriber({ backend: 'whisper-cli', hex: set.engine }),
+      /hex requires backend "hex"/,
+    );
+    assert.throws(
+      () => createTranscriber({ backend: 'hex', hex: { ...set.engine, ffprobe: 'ffprobe' } }),
+      /must be an absolute path/,
+    );
+    const audio = await audioFile(area);
+    const disabled = createTranscriber({ backend: 'hex', hex: set.engine, enabled: false });
+    assert.deepEqual(await disabled.transcribe(audio), { ok: false, reason: 'unavailable' });
     assert.equal(await exists(set.paths.probeArgs), false);
   } finally {
     await area.cleanup();

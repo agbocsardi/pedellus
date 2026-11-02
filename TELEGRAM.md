@@ -224,12 +224,15 @@ download keeps the admitted update instead of losing it, and a reopen resumes it
   read, OCR, PDF/Office conversion or automatic content extraction. The turn says
   so explicitly and leaves reading it to the configured tools.
 - **Voice/audio** is stored first and then transcribed locally by the configured
-  engine. Two explicit backends exist: the default `faster-whisper` helper
-  (`scripts/local-transcribe.py` through `uv`, model `small` on CPU with `int8`)
-  and an opt-in Python-free `whisper-cli` route (`media.transcription.backend`,
-  see [setup](./SETUP.md#optional-python-free-backend-whispercpp)). Omit `backend`
-  and the adapter behaves exactly as before; a `whisperCli` block without
-  `backend: "whisper-cli"` is refused instead of switching silently. The
+  engine. Three explicit backends exist: the default `faster-whisper` helper
+  (`scripts/local-transcribe.py` through `uv`, model `small` on CPU with `int8`),
+  an opt-in Python-free `whisper-cli` route (`media.transcription.backend`, see
+  [setup](./SETUP.md#optional-python-free-backend-whispercpp)) and an opt-in
+  [Hex](./SETUP.md#optional-hex-backend-anomalycohex) route that decodes the
+  original to WAV and runs the operator-installed Hex binary's
+  `model transcribe` command in this process. Omit `backend`
+  and the adapter behaves exactly as before; a `whisperCli` or `hex` block without
+  its own `backend` value is refused instead of switching silently. The
   transcript is bounded, labeled as automatic and untrusted user
   content, and never implies the speech was understood correctly. The caption is
   preserved. If the backend or model is not provisioned, or transcription fails

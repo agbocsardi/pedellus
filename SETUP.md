@@ -299,8 +299,10 @@ existing ones:
   itself a symlink is accepted and resolved once to its canonical path; symlinks
   below it are refused.
 - `transcription.enabled` (default `true`) turns local speech recognition on or
-  off; `language` is an optional hint and `maxDurationSeconds` (default `120`)
-  refuses longer audio. There is no cloud speech provider and no API key.
+  off; `language` is an optional hint, `maxDurationSeconds` (default `120`,
+  accepted range 1–3600) refuses longer audio, and `timeoutMs` (default `180000`,
+  accepted range 1–3600000) bounds the whole operation. There is no cloud speech
+  provider and no API key.
 - Telegram photos arrive as native image content plus a workspace-relative
   locator. Telegram documents are stored unread: no text extraction, OCR,
   PDF/Office conversion or dependency is involved, so reading one is the agent's
@@ -317,7 +319,8 @@ existing ones:
   transcription handling unchanged. See [the CLI](./CLI.md#local-attachments).
 - Bounds: 20 MB per file (also Telegram's ordinary Bot API `getFile` limit), a
   60s Telegram download timeout, two concurrent attachment jobs, a 180s
-  transcription timeout and a 120s audio-duration limit by default. Stored
+  transcription timeout and a 120s audio-duration limit by default (both
+  configurable, see below). Stored
   originals are never deleted by the adapter and there is no total-disk cap, so
   the media directory is yours to monitor and prune.
 - Outbound files are the scoped `telegram` tool's `send` action, not a general
@@ -351,9 +354,10 @@ cap, independently of the adapter's download limit.
 
 ### Optional: Python-free backend (whisper.cpp)
 
-A second engine is available and is **opt-in**: without the field below, an
+Another engine is available and is **opt-in**: without the field below, an
 existing configuration keeps the uv/faster-whisper helper exactly as it was.
-Selecting it is explicit, and the two are never mixed or switched automatically:
+Selecting it is explicit, and the engines are never mixed or switched
+automatically:
 
 ```json
 "media": {
@@ -425,3 +429,83 @@ Runtime behavior of this route, all in one bounded operation:
 On one measured 4-core/8-thread CPU, a 102 s Ogg/Opus file took about 32 s end to
 end through this route (probe, decode, VAD and `small` inference). That is one
 host's number, not a guarantee.
+
+### Optional: Hex backend (anomalyco/hex)
+
+[Hex](https://github.com/anomalyco/hex) is a local dictation engine with its own
+speech models. This route uses it only as a file transcriber through
+`hex model transcribe <wav>`: no Hex desktop app, listener, hotkey or local API
+is involved, and the gateway never starts Hex in the background. It is opt-in
+and explicit, never a fallback:
+
+```json
+"media": {
+  "directory": "media",
+  "transcription": {
+    "language": "en",
+    "maxDurationSeconds": 600,
+    "timeoutMs": 600000,
+    "backend": "hex",
+    "hex": {
+      "binary": "/home/operator/.local/opt/hex/hex",
+      "model": "parakeet_unified_en",
+      "ffmpeg": "/home/operator/.local/bin/ffmpeg",
+      "ffprobe": "/home/operator/.local/bin/ffprobe"
+    }
+  }
+}
+```
+
+`binary`, `ffmpeg` and `ffprobe` are absolute operator-provisioned paths. `model`
+is a Hex model id and is optional: without it Hex uses whatever model its own
+settings select. Hex's model store is Hex's, resolved from the operator's home
+exactly as a hand-run `hex model` command sees it; the gateway does not copy,
+verify or download models.
+
+Pinned provisioning (one-time, the only step that may use the network):
+
+- Engine: the signed release binary for the host architecture from
+  `https://anoma.ly/hex/download/linux-x64` (the redirect resolves to the current
+  stable build). Install it at a fixed operator path such as
+  `~/.local/opt/hex/hex` with mode `0700`. Record the SHA-256 you installed; this
+  route verifies nothing itself, so the operator owns provenance and updates.
+  The usual install script is optional and adds a desktop app, an autostart entry
+  and a user unit, none of which this route needs.
+- Model: `hex model install <model-id> --language <code>`, for example
+  `hex model install parakeet_unified_en --language en`. `hex model list` shows
+  the catalog, size and languages of each model; `hex model devices` shows the
+  devices it will consider.
+- `ffmpeg`/`ffprobe`: any local build with the codecs your attachments use (Opus
+  for Telegram voice notes). Hex itself takes WAV only, so the decode is required;
+  it is not a second inference step.
+
+Runtime behavior, all in one bounded operation:
+
+- One deadline (the same `timeoutMs`, default 180 s) spans the duration probe, the
+  decode and the Hex inference, so no leg can buy extra time.
+- `maxDurationSeconds` refuses rather than truncates: the probe rejects a longer
+  file up front, and the decoded PCM is additionally size-bounded, so wrong
+  duration metadata cannot smuggle an over-long file through. Raise it for long
+  voice notes (up to one hour) and raise `timeoutMs` with it; the 20 MiB input cap
+  above still applies and is Telegram's own `getFile` ceiling.
+- The 20 MiB input cap applies to every caller of this backend, not only the
+  Telegram download path.
+- Decoding blocks network protocols (`-protocol_whitelist file`) and writes one
+  temporary WAV in a private `0700` directory, removed on success, failure,
+  timeout and cancellation. On the CPU this machine decoded a 9 s Ogg/Opus note in
+  0.02–0.08 s.
+- Hex runs with the operator's `HOME` so its models resolve, plus the small
+  locale/temp environment. No other variable (credentials, `LD_LIBRARY_PATH`,
+  Hugging Face settings) is inherited.
+- Hex reports every failure as exit 1 — unknown model, uninstalled model,
+  undecodable audio. This route therefore distinguishes only a binary it could not
+  start at all (`unavailable`) from a failed transcription (`failed`); a missing
+  model appears as `failed`. Check `hex model transcribe` by hand when a
+  transcription fails. The stored audio is never consumed and the turn never
+  claims the speech was understood.
+
+The model and the hardware decide the speed. On one measured i5-1035G1 with
+integrated graphics, English Parakeet Unified transcribed a 9 s note in about
+2 s end to end, and a 359 s note in about 119 s (roughly 3x real time). Those
+are one host's numbers on one English clip, not a quality or speed guarantee.
+Benchmark and choose the model for the language and notes you actually send.
