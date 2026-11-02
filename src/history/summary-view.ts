@@ -142,6 +142,7 @@ export function normalizeReadySummary(
   body: HistoryEpisodeSummaryBody,
   record: unknown,
   version: number,
+  options: { readonly fullText?: boolean } = {},
 ): HistorySummaryView {
   if (record === undefined || record === null) return { state: "missing" };
   if (!isRecord(record)) return REFUSED;
@@ -162,14 +163,13 @@ export function normalizeReadySummary(
   if (rawTitle !== null && typeof rawTitle !== "string") return REFUSED;
   const coverage = isRecord(record.coverage) ? record.coverage : undefined;
   const text = record.summary;
-  const bounded = text.length > HISTORY_SUMMARY_READ_LIMITS.maxSummaryChars
-    ? text.slice(0, HISTORY_SUMMARY_READ_LIMITS.maxSummaryChars)
-    : text;
-  const title = rawTitle === null || rawTitle.length === 0
-    ? null
-    : rawTitle.length > HISTORY_SUMMARY_READ_LIMITS.maxTitleChars
-      ? rawTitle.slice(0, HISTORY_SUMMARY_READ_LIMITS.maxTitleChars)
-      : rawTitle;
+  const bounded = options.fullText === true || text.length <= HISTORY_SUMMARY_READ_LIMITS.maxSummaryChars
+    ? text
+    : text.slice(0, HISTORY_SUMMARY_READ_LIMITS.maxSummaryChars);
+  const boundedTitle = options.fullText === true || rawTitle === null || rawTitle.length <= HISTORY_SUMMARY_READ_LIMITS.maxTitleChars
+    ? rawTitle
+    : rawTitle.slice(0, HISTORY_SUMMARY_READ_LIMITS.maxTitleChars);
+  const title = boundedTitle === null || boundedTitle.length === 0 ? null : boundedTitle;
   const completedAtMs = typeof record.completedAtMs === "number"
     && Number.isFinite(record.completedAtMs) && record.completedAtMs >= 0
     ? record.completedAtMs

@@ -79,8 +79,9 @@ edits need restart only; unit edits additionally need daemon-reload.
 - `src/execution/` — guarded host environment and the optional Bubblewrap shell.
 - `src/context/` — bootstrap/memory/skills snapshots, skill tool, workspace host.
 - `src/history/` — durable store identity, reset-delimited episodes, background
-  summaries, rebuildable message/tool/summary search, and the read-only
-  model-facing `history` tool. Original transcript entries remain authoritative.
+  summaries, rebuildable message/tool/summary search, and legacy history SDK/local
+  APIs. Original transcript entries remain authoritative; see
+  [MEMORY_RECALL.md](./MEMORY_RECALL.md) for the approved three-tool model-facing recall contract.
 - `src/channels/` — Telegram adapter; other channels are not ported.
   `telegram-rich.ts` owns the rich-message limits, fence-aware splitting and the literal-text
   escaping the adapter uses for host notices.
@@ -118,12 +119,16 @@ edits need restart only; unit edits additionally need daemon-reload.
   Isolated cron runs capture an origin subset bounded by current config, prepare it
   per run (including its workspace context), and lose it on completion; persistent
   history confers no permission.
-  The `skill`, `cron`, `history`, `worker`, `mcp` management and scoped
-  `telegram` tools grant no coding-tool authority and are exempt from the
-  coding-tool hook, so enabling a coding tool never suppresses them. MCP management
-  can write server configuration and launch host-level stdio processes; it is limited
+  The `skill`, `cron`, `memory_search`, `memory_browse`, `memory_read`, `worker`,
+  `mcp` management and scoped `telegram` tools grant no coding-tool authority and
+  are exempt from the coding-tool hook, so enabling a coding tool never suppresses them.
+  Memory recall is enabled by default for validated mapped chats; the SDK's
+  `agentHistory: false` disables it. Worker recall still requires exact captured grants;
+  legacy `Gateway.history*` SDK/local APIs and their tests do not widen model-facing
+  or captured worker authority. MCP management can write server configuration and launch host-level stdio processes; it is limited
   to authenticated mapped chats, with login additionally requiring a unique live
-  owner surface. History remains read-only over mapped chats. Telegram actions
+  owner surface. Memory recall remains read-only over mapped chats; legacy
+  history SDK/local calls do not grant model-facing authority. Telegram actions
   additionally require a live adapter, current private-chat
   admission and observed same-chat targets. Unknown external outcomes are retained,
   never blindly retried or evicted.
@@ -313,9 +318,10 @@ edits need restart only; unit edits additionally need daemon-reload.
   root, state, fork, raw/other task-owned or scheduled-run automation conversations. It may compose
   the `worker` tool from a spawning mapped chat under that tool's own spawner and
   capture checks. A worker child also gets the compositor, but only over its
-  captured coding, web, MCP and read-only mapped-chat history tools (never `worker`,
-  Telegram or cron). A worker-specific call-time hook checks the durable capture and
-  authorized origin and, for the classifier nested tool, the captured model identity;
+  captured coding, web, MCP and explicitly captured memory-recall tools over mapped
+  chats (never `worker`, Telegram or cron); existing workers are not widened when
+  recall is enabled later. A worker-specific call-time hook checks the durable
+  capture and authorized origin and, for the classifier nested tool, the captured model identity;
   reopen permanently prunes removed names and identities, and terminal authority
   is retired with the capture. Digest and scheduled-run automation targets remain unchanged.
 - MCP is a separate, default-off connection authority from `toolAllowlist`:

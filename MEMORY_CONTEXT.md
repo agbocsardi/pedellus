@@ -6,11 +6,12 @@ conversation transcript and runtime state. There is no second store, cache,
 index, cursor, or database here.
 
 Discovery turns one explicit workspace root into a Python-style memory-tree
-manifest plus frozen provenance entries. Topic bodies are **not** returned:
-the model reads a topic on demand with the existing native `read` tool using the
-entry's workspace-relative path, and writes it with the existing native
-`write`/`edit` tools. This module never creates, writes, renames, or deletes a
-file, including a missing `memory/` directory.
+manifest plus frozen provenance entries. Topic bodies are **not** returned in
+this context snapshot. The approved model-facing recall tools read notes by hit
+reference (`memory_read`), as specified
+in [MEMORY_RECALL.md](./MEMORY_RECALL.md); workspace coding tools remain a
+separate configured capability for file edits. This module never creates, writes,
+renames, or deletes a file, including a missing `memory/` directory.
 
 The host opt-in is `workspaceContext.memoryManifest: true`. The configured
 `workspaceContext.memoryFiles` are the configured memory sources; only files
@@ -152,8 +153,8 @@ refused; a symlinked workspace root is accepted because the host named it.
 
 The helper deliberately does not duplicate the native tools:
 
-- no topic body is embedded in context; the manifest points at `memory/...`
-  for the native `read` tool;
+- no topic body is embedded in context; the manifest describes the note surface,
+  while model-facing retrieval follows the [memory recall contract](./MEMORY_RECALL.md);
 - no write implementation, atomic-write helper, or write-time frontmatter is
   added; native `write`/`edit` own those semantics;
 - `validateMemoryTopicPath()` narrows which names a memory write may use, but a
@@ -166,10 +167,12 @@ The helper deliberately does not duplicate the native tools:
 This is the memory-discovery foundation, not full Python `MemoryStore` parity.
 It does not implement `get_memory_context()` system/legacy paragraph
 deduplication, automatic `MEMORY.md`/`memory/system/` injection, `history.jsonl`,
-archived summaries, Dream, cursor/usage state, ranking or retrieval,
-`memory_read`/`memory_write`/`memory_search` tool actions, or the memory-tree
-description format's Python truncation suffix. The host injects only the
-explicitly configured files, not every file Python would mark loaded. It does
+archived summaries, Dream, cursor/usage state, ranking or retrieval, or
+model-facing tool actions. The separate approved recall tools are specified in
+[MEMORY_RECALL.md](./MEMORY_RECALL.md); this helper retains no tool cursor or
+retrieval implementation. It also omits the memory-tree description format's
+Python truncation suffix. The host injects only the explicitly configured files,
+not every file Python would mark loaded. It does
 not include topic bodies, follow symlinks, or create `memory/` directories.
 Unlike Python's tree, which slices the combined file list to 80, this helper
 lists every discovered topic and every explicitly loaded file.
@@ -199,8 +202,10 @@ When it is `true`:
   content. Broken discovered topics and stopped scans are
   not errors; each has a visible manifest line.
 
-The gateway's `read`/`edit`/`write` tools come from `toolAllowlist`; reopening
-reapplies the current configuration while memory remains in workspace files.
+The gateway's coding `read`/`edit`/`write` tools come from `toolAllowlist`; they
+remain separate from the read-only model-facing `memory_search`, `memory_browse`,
+and `memory_read` tools described in [MEMORY_RECALL.md](./MEMORY_RECALL.md).
+Reopening reapplies the current configuration while memory remains in workspace files.
 Compaction and per-conversation snapshot capture are unchanged: the snapshot
 is host context, not transcript state.
 

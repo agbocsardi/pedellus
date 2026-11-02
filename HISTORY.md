@@ -1,15 +1,23 @@
 # History: episode summaries and search index
 
+This document retains implementation details and historical evidence for the legacy
+history search/index surface. The `Gateway.history*` SDK/local APIs and their tests
+remain distinct from the approved model-facing recall contract in
+[MEMORY_RECALL.md](./MEMORY_RECALL.md). The former model-facing `history` tool is
+not the replacement interface; recall uses `memory_search`, `memory_browse`, and
+`memory_read`.
+
 Two derived layers sit over Durable's retained transcript:
 
 - `src/history/summary-task.ts` is a durable background summary pass, enabled by default.
 - `src/history/index.ts` is a rebuildable message/tool and episode-summary index bound to the
   committed store identity.
 
-The default agent-facing `history` tool searches raw messages/tools, browses episodes and original
-entries, discovers ready derived summaries across mapped chats, and reads one summary with
+The legacy agent-facing `history` tool searched raw messages/tools, browsed episodes and original
+entries, discovered ready derived summaries across mapped chats, and read summaries with
 provenance and drilldown. Summary text is derived navigation; original entries remain the evidence.
-CLI diagnostics are described in
+These legacy details are retained for implementation history. Current model-facing recall is
+specified in [MEMORY_RECALL.md](./MEMORY_RECALL.md). CLI diagnostics are described in
 [CLI history search and browsing](./CLI.md#history-search-and-browsing).
 
 ## Authority, identity and storage
@@ -228,15 +236,14 @@ changes, the index or store identity is replaced, the session mapping changes,
 the mapped set no longer contains the source, or the source entry at the boundary
 no longer exists or no longer matches its fingerprint.
 
-## Agent-facing history tool
+## Legacy agent-facing history tool (historical contract)
 
-`openGateway` installs one read-only, model-facing tool named `history` for mapped
-chat conversations by default. It is not in the coding-tool ceiling, cannot be
-granted or revoked, accepts no filesystem path or shell command, executes nothing,
-modifies no transcript and creates no conversation. A host that needs a bare
-gateway can pass `agentHistory: false`; the local CLI/Telegram path uses the
-default. The tool reads only conversations already mapped by the host, so channel
-authentication and the single-tenant session policy still decide what exists.
+The following describes the legacy model-facing `history` tool and its former
+behavior, not the approved replacement. The current three-tool recall contract is
+[MEMORY_RECALL.md](./MEMORY_RECALL.md). `agentHistory: false` remains an SDK host
+opt-out for model-facing history; it does not remove the legacy `Gateway.history*`
+SDK/local methods or their existing tests. The details below are retained as
+implementation history, not a promise that the old tool remains installed.
 
 The tool calls the same `Gateway.historySearch`, `Gateway.historySummarySearch`,
 `Gateway.historySummary`, `Gateway.historyEntries`, `Gateway.listHistoryEpisodes` and

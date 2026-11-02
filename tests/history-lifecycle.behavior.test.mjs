@@ -101,10 +101,10 @@ function toolResultsOf(requestText) {
     }));
 }
 
-/** The newest history tool result in one request; earlier history results stay in the transcript. */
-function lastHistoryResult(requestText) {
-  const results = toolResultsOf(requestText).filter((result) => result.toolName === "history" && !result.isError);
-  assert.ok(results.length > 0, "expected a history tool result");
+/** The newest memory tool result in one request; earlier results stay in the transcript. */
+function lastMemoryResult(requestText, toolName) {
+  const results = toolResultsOf(requestText).filter((result) => result.toolName === toolName && !result.isError);
+  assert.ok(results.length > 0, `expected a ${toolName} tool result`);
   return results.at(-1);
 }
 
@@ -271,7 +271,8 @@ test("offline memory lifecycle preserves original evidence across compaction, re
     const names = ((await conversation.agent(context)).tools ?? []).map((tool) =>
       typeof tool === "string" ? tool : tool?.name);
     assert.ok(names.includes("skill"), names.join(","));
-    assert.ok(names.includes("history"), names.join(","));
+    for (const name of ["memory_search", "memory_browse", "memory_read"]) assert.ok(names.includes(name), names.join(","));
+    assert.ok(!names.includes("history"), names.join(","));
     assert.ok(names.includes("write") && names.includes("read"), names.join(","));
 
     // Phase 1: on-demand skill body, early fact/decision, and a topic-memory write through the
@@ -372,7 +373,7 @@ test("offline memory lifecycle preserves original evidence across compaction, re
     assert.doesNotMatch(firstSummary.summary, new RegExp(SENTINEL), "summary text is derived navigation, not raw evidence");
 
     // Phase 3: close and reopen the same durable store. The original evidence stays reachable
-    // through the model-facing history tool, which searches raw entries and opens one window.
+    // through model-facing memory search and read, which locate and open original evidence.
     await gateway.close(context);
     gateway = undefined;
     gateway = await openGateway(config, context, {
@@ -390,28 +391,29 @@ test("offline memory lifecycle preserves original evidence across compaction, re
 
     const reopenedNames = ((await reopened.agent(context)).tools ?? []).map((tool) =>
       typeof tool === "string" ? tool : tool?.name);
-    assert.ok(reopenedNames.includes("history"), reopenedNames.join(","));
+    for (const name of ["memory_search", "memory_browse", "memory_read"]) assert.ok(reopenedNames.includes(name), reopenedNames.join(","));
+    assert.ok(!reopenedNames.includes("history"), reopenedNames.join(","));
 
     const requestCount = built.state.generationRequests.length;
     await scriptedSend("Search prior history for the early decision fact.", [
-      fauxAssistantMessage([fauxToolCall("history", { action: "search", query: FACT })], { stopReason: "toolUse" }),
-      fauxAssistantMessage("History search completed."),
+      fauxAssistantMessage([fauxToolCall("memory_search", { target: "messages", query: FACT })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("Memory search completed."),
     ]);
-    const searchResult = lastHistoryResult(built.state.generationRequests[requestCount + 1].text);
-    assert.match(searchResult.text, /History search \(read-only/);
-    assert.match(unhighlight(searchResult.text), new RegExp(FACT));
-    const entryId = Number(/entry=(\d+)/.exec(searchResult.text)?.[1]);
-    assert.ok(Number.isSafeInteger(entryId) && entryId > 0, searchResult.text);
+    const searchResult = lastMemoryResult(built.state.generationRequests[requestCount + 1].text, "memory_search");
+    const searchPage = JSON.parse(searchResult.text);
+    const hit = searchPage.hits[0];
+    assert.ok(hit?.ref, JSON.stringify(searchPage));
 
     const beforeOpen = built.state.generationRequests.length;
-    await scriptedSend(`Open history entry ${entryId}.`, [
-      fauxAssistantMessage([fauxToolCall("history", { action: "open", session: SESSION, entryId })], { stopReason: "toolUse" }),
-      fauxAssistantMessage("History entry opened."),
+    await scriptedSend("Read the located original message.", [
+      fauxAssistantMessage([fauxToolCall("memory_read", { ref: hit.ref })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("Memory read completed."),
     ]);
-    const openResult = lastHistoryResult(built.state.generationRequests[beforeOpen + 1].text);
-    assert.match(openResult.text, new RegExp(SENTINEL), "the original early turn remains the evidence");
-    assert.match(openResult.text, new RegExp(FACT));
-    assert.doesNotMatch(openResult.text, new RegExp(TOPIC_MARKER), "topic body stays on demand");
+    const openResult = lastMemoryResult(built.state.generationRequests[beforeOpen + 1].text, "memory_read");
+    const opened = JSON.parse(openResult.text);
+    assert.match(opened.content, new RegExp(SENTINEL), "the original early turn remains the evidence");
+    assert.match(opened.content, new RegExp(FACT));
+    assert.doesNotMatch(opened.content, new RegExp(TOPIC_MARKER), "topic body stays on demand");
 
     // Phase 4: a second closed episode whose summary fails must not block raw recall. The summary
     // provider parks once so the worker identity is read from committed state; it then answers empty,
@@ -445,21 +447,21 @@ test("offline memory lifecycle preserves original evidence across compaction, re
 
     const beforeFailedOpen = built.state.generationRequests.length;
     await scriptedSend("Search history for the late decision despite the failed summary.", [
-      fauxAssistantMessage([fauxToolCall("history", { action: "search", query: LATE_FACT })], { stopReason: "toolUse" }),
-      fauxAssistantMessage("Raw history search completed."),
+      fauxAssistantMessage([fauxToolCall("memory_search", { target: "messages", query: LATE_FACT })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("Memory search completed."),
     ]);
-    const failedSearchResult = lastHistoryResult(built.state.generationRequests[beforeFailedOpen + 1].text);
-    assert.match(unhighlight(failedSearchResult.text), new RegExp(LATE_FACT));
-    const lateEntryId = Number(/entry=(\d+)/.exec(failedSearchResult.text)?.[1]);
-    assert.ok(Number.isSafeInteger(lateEntryId) && lateEntryId > 0, failedSearchResult.text);
+    const failedSearchResult = lastMemoryResult(built.state.generationRequests[beforeFailedOpen + 1].text, "memory_search");
+    const failedSearchPage = JSON.parse(failedSearchResult.text);
+    const lateHit = failedSearchPage.hits[0];
+    assert.ok(lateHit?.ref, JSON.stringify(failedSearchPage));
 
     const beforeFailedSurround = built.state.generationRequests.length;
-    await scriptedSend(`Open the late decision entry ${lateEntryId}.`, [
-      fauxAssistantMessage([fauxToolCall("history", { action: "open", session: SESSION, entryId: lateEntryId })], { stopReason: "toolUse" }),
-      fauxAssistantMessage("Late entry opened."),
+    await scriptedSend("Read the located late decision message.", [
+      fauxAssistantMessage([fauxToolCall("memory_read", { ref: lateHit.ref })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("Late entry read."),
     ]);
-    const lateOpenResult = lastHistoryResult(built.state.generationRequests[beforeFailedSurround + 1].text);
-    assert.match(lateOpenResult.text, new RegExp(LATE_FACT), "raw evidence survives a failed summary");
+    const lateOpenResult = lastMemoryResult(built.state.generationRequests[beforeFailedSurround + 1].text, "memory_read");
+    assert.match(JSON.parse(lateOpenResult.text).content, new RegExp(LATE_FACT), "raw evidence survives a failed summary");
   } finally {
     built.state.summaryGate.release();
     if (gateway) await gateway.close(context);
