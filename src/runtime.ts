@@ -1105,6 +1105,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ? createToolEnvironments({
         workspaceRoot: workspace,
         allowedRoots: extraRoots,
+        restrictToWorkspace: config.restrictToWorkspace !== false,
+        protectedRoots: [canonicalDataDir],
         sandbox: config.toolSandbox ?? "host",
         ...(config.bwrapPath === undefined ? {} : { bwrapPath: config.bwrapPath }),
         ...(toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: toolTimeoutSeconds }),
@@ -1208,6 +1210,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
       environments = createToolEnvironments({
         workspaceRoot: root,
         allowedRoots: [],
+        // Shared workers inherit host access; explicit worktree workers remain checkout-scoped.
+        restrictToWorkspace: root !== workspace || config.restrictToWorkspace !== false,
+        // Worktrees live under dataDir but are already confined to their own checkout,
+        // which cannot reach the store or its siblings. Do not deny that checkout itself.
+        protectedRoots: root === workspace ? [canonicalDataDir] : [],
         sandbox: config.toolSandbox ?? "host",
         ...(config.bwrapPath === undefined ? {} : { bwrapPath: config.bwrapPath }),
         ...(toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: toolTimeoutSeconds }),

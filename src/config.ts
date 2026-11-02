@@ -300,6 +300,8 @@ export interface PortConfig {
    * `bwrap` runs shell commands under direct-workspace Bubblewrap and fails closed when unavailable.
    */
   toolSandbox?: "host" | "bwrap";
+  /** Default true. False grants host-wide file/shell paths as the service user, except managed data. */
+  restrictToWorkspace?: boolean;
   /** Internal agent scheduling. Absent or disabled leaves the runtime without cron. */
   cron?: CronConfig;
   /**
@@ -983,6 +985,13 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
       throw new Error('toolSandbox must be "host" or "bwrap"');
     }
     Object.assign(config, { toolSandbox: raw.toolSandbox });
+  }
+  if (raw.restrictToWorkspace !== undefined) {
+    if (typeof raw.restrictToWorkspace !== "boolean") throw new Error("restrictToWorkspace must be a boolean");
+    if (raw.restrictToWorkspace === false && raw.toolSandbox === "bwrap") {
+      throw new Error("restrictToWorkspace: false requires the host shell, not bwrap");
+    }
+    Object.assign(config, { restrictToWorkspace: raw.restrictToWorkspace });
   }
   if (raw.workspaceContext !== undefined) {
     Object.assign(config, { workspaceContext: workspaceContextConfig(raw.workspaceContext) });

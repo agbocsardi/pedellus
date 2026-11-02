@@ -24,6 +24,7 @@ described below; Code Mode is not part of this slice.
   "toolAllowlist": ["read", "bash"],
   "toolTimeoutSeconds": 60,
   "toolSandbox": "host",
+  "restrictToWorkspace": true,
   "bwrapPath": "/usr/bin/bwrap"
 }
 ```
@@ -49,6 +50,17 @@ described below; Code Mode is not part of this slice.
   validated (Bubblewrap 0.9 or newer) when the Gateway opens, and a missing,
   non-executable, wrong or too-old binary fails startup. There is no unsandboxed
   fallback. The field is inert for the host backend.
+- `restrictToWorkspace` defaults to `true`. Set it to `false` for full-host file
+  paths and shell cwd as the service user, with the real user home in `HOME`.
+  This requires the host shell (`toolSandbox: "bwrap"` is incompatible). The
+  configured workspace remains the default cwd and memory/skills location.
+  File tools still refuse the managed `dataDir`, including resolved aliases and
+  removal/rename of its ancestors; use gateway APIs for live state. This is
+  accidental-damage protection, not shell confinement: host programs can still
+  access anything permitted by the OS. No sudo, secret environment inheritance,
+  additional tool grants or wider Telegram admission is implied. Shared workers
+  inherit this path mode; explicit worktree workers and memory digestion retain
+  their existing narrower scopes.
 - `extraAllowedDirs` remains an explicit list of additional canonical
   filesystem roots. They are not created, and the data directory must stay
   disjoint from them.
@@ -241,14 +253,16 @@ no managed copy or publish-back.
 When tools are enabled, each conversation gets one cached `HostExecutionEnv`
 built by `createHostExecutionEnv`:
 
-- Root is the canonical configured `workspace`; extra roots are the canonical
-  `extraAllowedDirs`. File operations use the shared path guard from
+- In the default scoped mode, root is the canonical configured `workspace`;
+  extra roots are the canonical `extraAllowedDirs`. Full-host mode adds `/` to
+  file roots and protects `dataDir`. File operations use the shared path guard from
   `execution/policy.ts`. In bwrap mode this still applies to the native file
   tools; only shell commands are wrapped.
 - `restrictToWorkspace: true` applies Python's practical shell guard: textual
   `../`/`..\\` and absolute or home paths outside the roots are refused with
   the workspace-boundary note.
-- The shell gets only the policy environment (workspace `HOME`, private
+- The shell gets only the policy environment (`HOME` is the workspace in scoped
+  mode and the OS user home in full-host mode, private
   per-conversation `TMPDIR`, `PATH`/`LANG`/`TERM`); caller `env` and
   `inheritEnv` are ignored. The shared command deny list is active. In bwrap
   mode the command's `TMPDIR` is replaced with the sandbox's private `/tmp`.

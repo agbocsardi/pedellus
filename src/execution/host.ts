@@ -66,6 +66,8 @@ export interface HostExecutionOptions {
 	workspaceRoot: string;
 	/** Extra roots the filesystem guard accepts, in addition to the workspace and the private scratch directory. */
 	allowedRoots?: readonly string[];
+	/** Canonicalized managed directories excluded from file operations. */
+	protectedRoots?: readonly string[];
 	/** Shared shell policy overrides. The host supplies HOME, TMPDIR, PATH and LANG defaults. */
 	shell?: ShellPolicyOptions;
 	/** Initial cwd, absolute or relative to `workspaceRoot`; must be inside the configured roots. */
@@ -167,6 +169,7 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		context: Context,
 		followFinalLink: boolean,
 		run: (absolutePath: string) => Promise<Result<T, FileError>>,
+		protectDescendants = false,
 	): Promise<Result<T, FileError>> {
 		const absolute = await this.#absolutePath(path, context);
 		if (!absolute.ok) return absolute;
@@ -174,6 +177,7 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 			absolute.value,
 			await this.#probe(context),
 			followFinalLink,
+			protectDescendants,
 		);
 		return denied === undefined ? run(absolute.value) : err<T, FileError>(denied);
 	}
@@ -209,13 +213,8 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		try {
 			handle = await open(absolute, readFlags(flags));
 			const actual = await readlink(`${root}/${handle.fd}`);
-			if (!this.#policy.roots.some((candidate) => isPathWithin(candidate, actual))) {
-				return err<T, FileError>(new FileError(
-					"permission_denied",
-					`The opened file resolved outside the execution workspace: ${absolute}`,
-					absolute,
-				));
-			}
+			const denied = this.#policy.checkPath(actual);
+			if (denied !== undefined) return err<T, FileError>(denied);
 			if (expectRegular) {
 				const info = await handle.stat();
 				if (!info.isFile()) {
@@ -382,7 +381,7 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		context: Context,
 	): Promise<Result<void, FileError>> {
 		// Removing a symbolic link removes the link, not what it points at.
-		return this.#guarded(path, context, false, (absolute) => super.remove(absolute, options, context));
+		return this.#guarded(path, context, false, (absolute) => super.remove(absolute, options, context), true);
 	}
 
 	override async renameFile(
@@ -395,9 +394,9 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		const destination = await this.#absolutePath(destinationPath, context);
 		if (!destination.ok) return destination;
 		const probe = await this.#probe(context);
-		const deniedSource = await this.#policy.checkFilesystemPath(source.value, probe, false);
+		const deniedSource = await this.#policy.checkFilesystemPath(source.value, probe, false, true);
 		if (deniedSource !== undefined) return err<void, FileError>(deniedSource);
-		const deniedDestination = await this.#policy.checkFilesystemPath(destination.value, probe, false);
+		const deniedDestination = await this.#policy.checkFilesystemPath(destination.value, probe, false, true);
 		if (deniedDestination !== undefined) return err<void, FileError>(deniedDestination);
 		return super.renameFile(source.value, destination.value, context);
 	}
@@ -597,6 +596,10 @@ export async function createHostExecutionEnv(options: HostExecutionOptions): Pro
 	for (const allowed of options.allowedRoots ?? []) {
 		allowedRoots.push(await canonicalDirectory(allowed, "allowedRoots entry"));
 	}
+	const protectedRoots: string[] = [];
+	for (const protectedRoot of options.protectedRoots ?? []) {
+		protectedRoots.push(await canonicalDirectory(protectedRoot, "protectedRoots entry"));
+	}
 	let tempRoot: string | undefined;
 	let ownsTempRoot = false;
 	try {
@@ -617,7 +620,7 @@ export async function createHostExecutionEnv(options: HostExecutionOptions): Pro
 				...options.shell?.environment,
 			},
 		};
-		const policy = createExecutionPolicy({ roots, shell });
+		const policy = createExecutionPolicy({ roots, protectedRoots, shell });
 		const bwrap = resolveBwrapShell(options.shellSandbox);
 		return new HostExecutionEnv({
 			cwd,
