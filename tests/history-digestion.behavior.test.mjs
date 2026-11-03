@@ -189,6 +189,80 @@ function hasLoneSurrogate(text) {
   return false;
 }
 
+test("empty resets do not move an interleaved non-empty episode ahead of an older episode", { timeout: 15_000 }, async () => {
+  const directory = await temp("nanobot-digest-reset-order-");
+  const harness = await openStore(resolve(directory, "state.sqlite"));
+  try {
+    const a = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const b = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const [emptyReset] = await append(harness, a, reset());
+    await append(harness, b, reset(), user("OLDER-B"), assistant("Done."), reset());
+    await append(harness, a, reset(), user("NEWER-A"), assistant("Done."), reset());
+    const source = sourcesFor(harness, [{ key: "cli:a", conversation: a }, { key: "cli:b", conversation: b }]);
+    const first = batched(await source.readClosed(context));
+    assert.equal(first.sessionKey, "cli:b");
+    await source.acknowledge(first, context);
+    const second = batched(await source.readClosed(context));
+    assert.equal(second.sessionKey, "cli:a");
+    assert.equal(second.firstEntryId, emptyReset.id, "consume empty resets rather than silently skip the frontier");
+    await source.acknowledge(second, context);
+    assert.equal((await source.readClosed(context)).status, "idle");
+  } finally {
+    await harness.close(context);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("episode ordering retains the real opening when an older cursor consumed its prefix", { timeout: 15_000 }, async () => {
+  const directory = await temp("nanobot-digest-partial-order-");
+  const harness = await openStore(resolve(directory, "state.sqlite"));
+  try {
+    const a = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const b = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    await append(harness, a, reset(), user("ALREADY-CONSUMED"), assistant("Done."));
+    await append(harness, b, reset(), user("NEWER-EPISODE"), assistant("Done."), reset());
+    const [later] = await append(harness, a, user("OLDER-EPISODE-REMAINDER"), assistant("Done."), reset());
+    await harness.commit(async (tx) => {
+      const cursor = await tx.doc(DigestCursorDoc, a.id);
+      cursor.nextEntryId = later.id;
+    }, context);
+    const source = sourcesFor(harness, [{ key: "cli:b", conversation: b }, { key: "cli:a", conversation: a }]);
+    const first = batched(await source.readClosed(context));
+    assert.equal(first.sessionKey, "cli:a");
+    assert.ok(first.entries.every((entry) => !entry.text.includes("ALREADY-CONSUMED")));
+    await source.acknowledge(first, context);
+    assert.equal(batched(await source.readClosed(context)).sessionKey, "cli:b");
+  } finally {
+    await harness.close(context);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("admission chunk counts use actual packing when entry and character limits interact", { timeout: 15_000 }, async () => {
+  const directory = await temp("nanobot-digest-packing-");
+  const harness = await openStore(resolve(directory, "state.sqlite"));
+  try {
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    await append(harness, conversation, ...Array.from({ length: 5 }, () => user("abcdef")), reset());
+    const source = sourceFor(harness, conversation, { entriesPerBatch: 2, charsPerBatch: 10 });
+    const first = batched(await source.readClosed(context));
+    assert.equal(first.estimatedChars, 30);
+    assert.equal(first.estimatedChunks, 4, "max(ceil(chars/10), ceil(entries/2)) would underestimate this as three");
+    let chunks = 0;
+    for (let n = 0; n < 10; n += 1) {
+      const next = await source.readClosed(context);
+      if (next.status === "idle") break;
+      chunks += 1;
+      await source.acknowledge(next, context);
+    }
+    assert.equal(chunks, first.estimatedChunks);
+    assert.equal((await source.readClosed(context)).status, "idle");
+  } finally {
+    await harness.close(context);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("closed selection preserves an imported frontier across reopen and offers only future closed evidence", { timeout: 15_000 }, async () => {
   const directory = await temp("nanobot-digest-closed-import-");
   const dbPath = resolve(directory, "state.sqlite");

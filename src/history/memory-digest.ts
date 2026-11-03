@@ -1627,10 +1627,12 @@ function acceptEpisodeBatch(
 }
 
 /** Admission heuristic, not a tokenizer or financial guarantee: three rounds plus framing per chunk. */
-function estimateEpisode(batch: DigestBatch, limits: DigestRunLimits): { tokens: number; requests: number } {
-  const chunks = Math.max(1, Math.ceil((batch.estimatedChars ?? 0) / limits.charsPerBatch),
-    Math.ceil((batch.estimatedEntries ?? 0) / limits.entriesPerBatch));
-  return { tokens: Math.ceil(1.25 * 3 * ((batch.estimatedChars ?? 0) / 4 + chunks * 8_192)), requests: chunks * 3 };
+function estimateEpisode(batch: DigestBatch): { tokens: number; requests: number } {
+  if (batch.estimatedChunks === undefined || batch.estimatedChars === undefined) {
+    throw new Error("the next episode has no chunk-packing estimate");
+  }
+  return { tokens: Math.ceil(1.25 * 3 * (batch.estimatedChars / 4 + batch.estimatedChunks * 8_192)),
+    requests: batch.estimatedChunks * 3 };
 }
 
 export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
@@ -1996,12 +1998,12 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
                   const next = await options.source().readClosed(context, parsed.limits,
                     complete ? undefined : parsed.conversationId as ConversationId);
                   if (next.status === "batch") {
-                    const estimate = estimateEpisode(next, parsed.limits);
+                    const estimate = complete ? estimateEpisode(next) : undefined;
                     // Finishing an admitted episode is unconditional. Budgets decide only whether
                     // to start another one; actual usage can overshoot these soft targets.
                     if (!complete || (!usageUnknown
-                      && (totals.inputTokens ?? 0) + estimate.tokens <= parsed.limits.maxInputTokens
-                      && (totals.successfulRequests ?? 0) + estimate.requests <= parsed.limits.maxRequests)) {
+                      && (totals.inputTokens ?? 0) + estimate!.tokens <= parsed.limits.maxInputTokens
+                      && (totals.successfulRequests ?? 0) + estimate!.requests <= parsed.limits.maxRequests)) {
                       nextInput = acceptEpisodeBatch(next, parsed.model, parsed.thinkingLevel, parsed.limits, parsed.episodesPerRun!);
                     } else result = { ...result, deferredByBudget: true };
                   } else if (!complete) {

@@ -345,8 +345,9 @@ Digest sizing: `digest.episodesPerRun` is the whole-episode ceiling (default 1).
 `maxInputTokens` (500,000 including cached input) and `maxRequests` (12 successful
 responses) are invocation targets for admitting **additional** episodes. The first
 pending episode is always admitted, and admitted episodes may overshoot these targets.
-The next-episode estimate allows three rounds plus framing per internal chunk with
-25% headroom; it is not an exact token count or financial cap. Native retries,
+The next-episode estimate uses the actual reader's chunk packing (including character,
+entry and fixed evidence-step limits), then allows three rounds plus framing per chunk
+with 25% headroom. It is not an exact token count or financial cap. Native retries,
 compaction and uncommitted provider work prevent exact network-spend accounting.
 
 Internal chunk safeguards remain: `charsPerBatch` (200,000, narrowed for model context),

@@ -310,7 +310,8 @@ edits need restart only; unit edits additionally need daemon-reload.
   boundaries, not successful partial outcomes. Invocation admission targets default to
   500,000 reported input tokens including cached input and 12 successful responses. Successful
   responses include tool-call responses; native retries are recorded separately. The next-episode
-  estimate allows three rounds plus framing per chunk with 25% headroom, but is neither exact
+  estimate counts chunks with the actual reader (including interacting character, entry and
+  evidence-step bounds), then allows three rounds plus framing per chunk with 25% headroom, but is neither exact
   tokenization nor a financial ceiling. A failed tool ends the run before another model round.
   Missing usage fails the chunk closed; native retries, polls, compaction and crashes prevent
   exact network-spend accounting. Finished chunks keep their acknowledgements on failure.

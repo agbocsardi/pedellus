@@ -231,9 +231,9 @@ export interface DigestBatch {
   readonly status: "batch";
   /** Present for closed-episode selection; distinct from a historical frozen segment's end. */
   readonly closedEpisodeEndEntryId?: EntryId;
-  /** Remaining rendered evidence size and source entries, for between-episode admission estimates. */
+  /** Remaining rendered evidence size and actual packed chunks, for additional-episode admission. */
   readonly estimatedChars?: number;
-  readonly estimatedEntries?: number;
+  readonly estimatedChunks?: number;
   /** Mapped chat session that owns the conversation; the source label for the batch. */
   readonly sessionKey: string;
   readonly conversationId: ConversationId;
@@ -1744,6 +1744,22 @@ function samePreview(left: DigestPreview | null, right: DigestPreview | null): b
     && left.marker === right.marker;
 }
 
+/** Find the real episode opening even when an older cursor already consumed its prefix. */
+async function episodeStartAt(conversation: Conversation, at: EntryId, context: Context): Promise<EntryId> {
+  let pageCursor: Cursor | undefined;
+  let first = at;
+  do {
+    const page = await conversation.entries({ order: "descending", maxEntryId: at },
+      DIGEST_LIMITS.entriesPerPage, pageCursor, context);
+    for (const entry of page.items) {
+      if (entry.kind === ResetEntry.kind) return entry.id;
+      first = entry.id;
+    }
+    pageCursor = page.next;
+  } while (pageCursor !== undefined);
+  return first;
+}
+
 export function createDigestSource(options: DigestSourceOptions): DigestSource {
   const configured = requireBatchLimits(options.limits ?? DIGEST_LIMITS);
   // Derived scan positions only: losing them costs a repeated bounded scan, never evidence.
@@ -1935,7 +1951,7 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
       const sessions = await options.sessions(context);
       validateSessions(sessions);
       const candidates: { session: HistoryChatSession; conversation: Conversation; cursor: DigestCursor;
-        start: EntryId; end: EntryId; chars: number; entries: number }[] = [];
+        start: EntryId; orderStart: EntryId; end: EntryId }[] = [];
       let missingChats = 0;
       let examinedChats = 0;
       for (const session of sessions) {
@@ -1949,9 +1965,9 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
         let pageCursor: Cursor | undefined;
         let start: EntryId | undefined;
         let end: EntryId | undefined;
+        let orderStart: EntryId | undefined;
         let content = false;
         let closed = false;
-        let entries = 0;
         do {
           const page = await conversation.entries(
             { order: "ascending", minEntryId: cursor.nextEntryId ?? (1 as EntryId) },
@@ -1960,48 +1976,26 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
           for (const entry of page.items) {
             start ??= entry.id;
             if (entry.kind === ResetEntry.kind && content) { closed = true; break; }
-            if (entry.kind !== ResetEntry.kind) content = true;
+            if (entry.kind === ResetEntry.kind) orderStart = entry.id;
+            else content = true;
             end = entry.id;
-            entries += 1;
           }
           if (closed) break;
           pageCursor = page.next;
         } while (pageCursor !== undefined);
         if (closed && start !== undefined && end !== undefined) {
-          candidates.push({ session, conversation, cursor, start, end, chars: 0, entries });
+          // Consumption still starts at the frontier: empty resets must not be skipped by an
+          // acknowledgement. Ordering uses the real non-empty episode's latest opening reset.
+          orderStart ??= await episodeStartAt(conversation, start, context);
+          candidates.push({ session, conversation, cursor, start, orderStart, end });
         }
       }
-      candidates.sort((a, b) => a.start - b.start || a.session.conversationId - b.session.conversationId);
+      candidates.sort((a, b) => a.orderStart - b.orderStart || a.session.conversationId - b.session.conversationId);
       const chosen = candidates[0];
       if (chosen === undefined) return {
         status: "idle", caughtUp: missingChats === 0, examinedChats, postponedChats: 0,
         unfinishedChats: 0, missingChats,
       };
-      // Estimate only the selected CLOSED episode. Ineligible open tails are never interpreted
-      // as evidence (even malformed tool text in one cannot poison another chat's digestion).
-      const pending = new Set(chosen.cursor.pendingToolCalls);
-      let estimateCursor: Cursor | undefined;
-      do {
-        const page = await chosen.conversation.entries({ order: "ascending", minEntryId: chosen.start,
-          maxEntryId: chosen.end }, DIGEST_LIMITS.entriesPerPage, estimateCursor, context);
-        for (const entry of page.items) {
-          const plan = planOf(entry, pending);
-          const fromItem = entry.id === chosen.cursor.nextEntryId ? chosen.cursor.nextItemIndex : 0;
-          for (let index = fromItem; index < plan.steps.length; index += 1) {
-            const step = plan.steps[index]!;
-            if (step.item !== undefined) {
-              const from = entry.id === chosen.cursor.nextEntryId && index === fromItem ? chosen.cursor.nextTextStart : 0;
-              chosen.chars += step.item.preview ? Math.min(step.item.length, DIGEST_PREVIEW_CHARS)
-                : Math.max(0, step.item.length - from);
-            }
-            if (step.effect !== undefined) {
-              if (step.effect.add) pending.add(step.effect.callId);
-              else pending.delete(step.effect.callId);
-            }
-          }
-        }
-        estimateCursor = page.next;
-      } while (estimateCursor !== undefined);
       // An upgrade may resume a frozen completed-turn segment inside this closed episode. Finish
       // that immutable segment first; the caller continues through the real closing boundary.
       const start = chosen.cursor.episodeStartEntryId ?? chosen.start;
@@ -2009,9 +2003,28 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
       const first = chosen.cursor.episodeStartEntryId === null ? chosen.start : chosen.cursor.nextEntryId!;
       const chunk = await readChunk(chosen.conversation, first, chosen.cursor.nextItemIndex,
         chosen.cursor.nextTextStart, end, chosen.cursor.pendingToolCalls, batchLimits, context);
+      let estimatedChars: number | undefined;
+      let estimatedChunks: number | undefined;
+      if (onlyConversationId === undefined) {
+        // Use the actual chunk reader, not ratios of total characters/entries/steps: those limits
+        // interact, and previews, UTF-16 cuts and resumed entries also change packing. Retain only
+        // the first bounded chunk. Pinned internal continuation needs no admission estimate.
+        let packed = chunk;
+        let packedEnd = end;
+        estimatedChunks = 1;
+        estimatedChars = packed.entries.reduce((total, entry) => total + entry.text.length, 0);
+        while (packed.nextEntryId <= chosen.end) {
+          if (packed.complete) packedEnd = chosen.end;
+          packed = await readChunk(chosen.conversation, packed.nextEntryId, packed.nextItemIndex,
+            packed.nextTextStart, packedEnd, packed.complete ? [] : packed.pendingToolCalls, batchLimits, context);
+          estimatedChunks += 1;
+          estimatedChars += packed.entries.reduce((total, entry) => total + entry.text.length, 0);
+        }
+      }
       return {
         status: "batch", sessionKey: chosen.session.sessionKey, conversationId: chosen.session.conversationId,
-        closedEpisodeEndEntryId: chosen.end, estimatedChars: chosen.chars, estimatedEntries: chosen.entries,
+        closedEpisodeEndEntryId: chosen.end,
+        ...(estimatedChunks === undefined ? {} : { estimatedChars: estimatedChars!, estimatedChunks }),
         episodeStartEntryId: start, episodeEndEntryId: end, firstEntryId: first,
         firstItemIndex: chosen.cursor.nextItemIndex, firstTextStart: chosen.cursor.nextTextStart,
         throughEntryId: chunk.throughEntryId, throughItemIndex: chunk.throughItemIndex,

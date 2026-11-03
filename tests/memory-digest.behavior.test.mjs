@@ -89,8 +89,8 @@ function user(text) {
   return { kind: 'pi.user', model: [{ role: 'user', content: text, timestamp: 1_000 }] };
 }
 
-function assistant(text) {
-  return { kind: 'pi.assistant', model: [fauxAssistantMessage(text)] };
+function assistant(text, options = {}) {
+  return { kind: 'pi.assistant', model: [fauxAssistantMessage(text, options)] };
 }
 
 /** A completed turn with no text evidence: an image-only owner entry and a thinking-only answer. */
@@ -926,6 +926,45 @@ test('open episodes are ineligible, then the first closed episode finishes every
   assert.ok(store.calls.every((input) => !input.includes('SECOND-EPISODE')));
   const after = await store.gateway.listHistoryEpisodes(SESSION, {}, context);
   assert.deepEqual(after.episodes.map((episode) => episode.digestion.status), ['not-started', 'digested']);
+});
+
+test('additional-episode admission includes step-limited packed chunks in its response estimate', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, () => fauxAssistantMessage('Nothing new to save.'), {
+    digest: { episodesPerRun: 2, maxInputTokens: 5_000_000, maxRequests: 4 },
+  });
+  t.after(() => store.gateway.close(context));
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('FIRST-EPISODE'), assistant('Done.')]);
+  const dense = [user('STEP-DENSE-NEXT-EPISODE')];
+  // Valid entries stay below the per-entry step and pending-call limits, but together exceed
+  // maxStepsPerBatch with only a few thousand characters and a dozen source entries.
+  for (let group = 0; group < 5; group += 1) {
+    const ids = Array.from({ length: 256 }, (_, index) => `g${group}-${index}`);
+    dense.push(assistant(ids.map((id) => fauxToolCall('read', {}, { id })), { stopReason: 'toolUse' }));
+    dense.push({ kind: 'pi.tool-result', model: ids.map((id) => ({ role: 'toolResult', toolCallId: id,
+      toolName: 'read', content: [{ type: 'text', text: 'x' }], isError: false, timestamp: 1_000 })) });
+  }
+  dense.push(assistant('Done.'));
+  await closedEpisode(store.gateway.harness, origin.id, dense);
+  const started = await startDigest(store.gateway);
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'completed', JSON.stringify(task.state.outcome));
+  assert.equal(task.state.outcome.result.episodesDone, 1);
+  assert.equal(task.state.outcome.result.successfulRequests, 1);
+  assert.equal(task.state.outcome.result.deferredByBudget, true,
+    'three remaining responses fit the old one-chunk estimate, but not the required two chunks');
+  assert.ok(store.calls.every((input) => !input.includes('STEP-DENSE-NEXT-EPISODE')));
+  const source = createDigestSource({ harness: store.gateway.harness,
+    sessions: async () => [{ sessionKey: SESSION, conversationId: origin.id }] });
+  const frontier = await cursorDoc(store.gateway.harness, origin.id);
+  const next = await source.readClosed(context);
+  assert.equal(next.status, 'batch');
+  assert.equal(next.estimatedChunks, 2);
+  assert.deepEqual(await cursorDoc(store.gateway.harness, origin.id), frontier, 'estimating never consumes the deferred episode');
+  const page = await store.gateway.listHistoryEpisodes(SESSION, {}, context);
+  assert.deepEqual(page.episodes.map((episode) => episode.digestion.status), ['not-started', 'digested']);
 });
 
 test('an invocation processes up to X whole episodes and leaves the next untouched', { timeout: 30_000 }, async (t) => {
