@@ -5,13 +5,13 @@
 - [x] Add bounded, credential-free failure records with stage, safe error codes, cause chain, code locations and stable fingerprint.
 - [x] Preserve failures across gateway startup, adapter execution and shutdown; retain transport causes.
 - [x] Validate redaction and the real CLI boundary with synthetic offline checks; reconcile docs.
-- [ ] Independent review and integration.
+- [x] Independent review and integration.
   - [x] Preserve all caught Telegram transport/API causes without widening retry semantics.
   - [x] Forward allowlisted Durable report reasons and bounded restart counts.
   - [x] Make formatting/output best-effort and mark deduplication only after output succeeds.
   - [x] Preserve primary exceptions through CLI and runtime cleanup failures.
   - [x] Make normal SDK shutdown attempt every resource, report each failure and retain the first exception.
-  - [ ] Fresh independent re-check of the fixes.
+  - [x] Fresh independent re-check of the fixes.
 - [ ] Owner-approved activation; verify health without triggering work.
 
 ## Log
@@ -29,3 +29,5 @@ The first independent review found four medium-severity gaps; none are waived. F
 Added focused regressions for failing formatter/stderr and later retry, simultaneous SDK open/cleanup failures with lock release and report metadata, simultaneous CLI Telegram-token/shutdown failures, and controlled-clock real adapter sends showing unchanged unknown outcomes and five attempts only for the existing proven pre-connect category. ECONNREFUSED remains conservatively unknown as before; retry policy was not widened. Post-review validation: typecheck/build, all 451 behavior checks, 2 execution checks and 83 offline acceptance checks pass; whitespace check clean. Fresh independent re-check remains pending. No live changes or activation.
 
 Fresh review found one remaining medium-severity gap in normal `gateway.close()`: an early catalog failure could skip native teardown/lock release, and nested `finally` failures could mask the first shutdown exception. No waiver: normal shutdown now independently attempts all cleanup in the existing order, records every observed failure and returns the first. Added normal SDK close regressions (native failure alone and catalog plus native failures, idempotence and successful ownership re-acquisition) plus an otherwise successful CLI startup/normal-stop check that must reject with its cleanup-only error. The CLI check invokes only that temporary host's installed stop callback; it sends no OS signal and touches no live service. Typecheck/build, all 453 behavior checks, 2 execution checks and 83 offline acceptance checks pass; whitespace clean. Another fresh re-check is required before integration, and owner-approved activation is still pending.
+
+Final independent Pi `openai-codex/gpt-6.1-terra` / high review of candidate `bfe8b43d`: **no material findings**, with independent typecheck/build, all 35 targeted offline tests and whitespace check passing. It reviewed the full candidate, shutdown ordering, MCP login teardown, CLI exception propagation, diagnostics and regressions. All earlier findings were fixed, none waived. The reviewed candidate plus this sign-off is fast-forwarded into `main`; owner-approved activation and health verification remain the only pending step. No service, configuration, retention, retry policy or live data changes were made during review/integration.
