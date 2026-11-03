@@ -322,13 +322,13 @@ test('messages steered across tool rounds deliver their one shared answer exactl
   try {
     harness = start(store, transport);
     await script.entered;
-    // One steer is placed after each tool round, so the third request carries all three in order.
+    // Both pending steers are placed together after the first tool round, in order.
     await until(async () => (await chatInbox(store.gateway)).steer === 2, 'both later messages to queue as steers');
     script.release();
     await until(() => transport.rich.some((entry) => entry.text.includes('SHARED-STEER-ANSWER')), 'the shared answer');
     await until(async () => (await telegramState(store.gateway)).pending.length === 0, 'both sibling records to retire');
     assert.deepEqual(script.requests[0], ['first steered message']);
-    assert.deepEqual(script.requests[1], ['first steered message', 'second steered message']);
+    assert.deepEqual(script.requests[1], ['first steered message', 'second steered message', 'third steered message']);
     assert.deepEqual(script.requests[2], [
       'first steered message',
       'second steered message',

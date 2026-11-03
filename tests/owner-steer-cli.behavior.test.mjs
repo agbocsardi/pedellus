@@ -207,8 +207,8 @@ test('followUpMode parses to a fixed spelling and defaults to follow-up queueing
 test('two steered prompts are consumed in order after the tool rounds and their one answer is printed once', { timeout: 30_000 }, async (t) => {
   const environment = await makeEnvironment(t, { followUpMode: 'steer', tools: ['read'] });
   const toolCall = (id) => () => fauxAssistantMessage(fauxToolCall('read', { path: 'note.md' }, { id }), { stopReason: 'toolUse' });
-  // Round one is held so both prompts are admitted into the running turn; each following tool round
-  // places one queued steer, and the third request therefore carries all three prompts in order.
+  // Round one is held so both prompts are admitted into the running turn; the next boundary
+  // places the entire steering burst in order.
   const script = scriptedRequests(environment.faux, [
     toolCall('read-1'),
     toolCall('read-2'),
@@ -223,7 +223,7 @@ test('two steered prompts are consumed in order after the tool rounds and their 
     script.release();
   });
   assert.deepEqual(script.requests[0], ['first steered prompt']);
-  assert.deepEqual(script.requests[1], ['first steered prompt', 'second steered prompt']);
+  assert.deepEqual(script.requests[1], ['first steered prompt', 'second steered prompt', 'third steered prompt']);
   assert.deepEqual(script.requests[2], ['first steered prompt', 'second steered prompt', 'third steered prompt']);
   assert.equal(printed.split('SHARED-STEER-ANSWER').length - 1, 1, 'the shared answer is printed once');
 });

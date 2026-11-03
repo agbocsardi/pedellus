@@ -99,9 +99,9 @@ starts the next run when the current one answers. `"steer"` submits it with nati
 `whenBusy: "steer"`, so it is placed after the current tool round and joins the running work
 without interrupting the generation.
 
-The pinned native default places one queued steer per tool round, and that setting is harness-wide,
-so this repository does not turn on "place all queued steers" (it would change worker and automation
-conversations too). A steer that arrives at the final boundary is placed there and answered by the
+All pending steers are placed together at each tool-round boundary, in admission order. This is a
+fixed harness-wide policy, including worker steering; follow-up queueing is unchanged.
+A steer that arrives at the final boundary is placed there and answered by the
 following run, so it answers a beat later instead of pre-empting the answer already being written.
 
 Owner messages queue rather than steer when the observed run belongs to another path or an

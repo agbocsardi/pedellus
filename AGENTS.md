@@ -144,8 +144,8 @@ edits need restart only; unit edits additionally need daemon-reload.
   owner input; retries are one second apart. Isolated cron and non-steering hosts
   keep their previous behavior. The owner gate reads before submission, so a run
   replaced in that narrow gap can still receive a steer and cause duplicate
-  cron/chat delivery; that residual is explicitly documented, not claimed closed. The pinned native default places one queued steer per tool round and the
-  all-pending switch is harness-wide, so it is deliberately not enabled; a steer
+  cron/chat delivery; that residual is explicitly documented, not claimed closed. The harness always uses native `steeringMode: "all"`: every queued steer is
+  placed together at a boundary, including worker steers; follow-up queueing is unchanged. A steer
   that arrives at the final boundary is placed there and answered by the following
   run. Telegram stores the requested mode with the admitted message, and an absent
   or unrecognized value is conservatively follow-up queueing. A committed answer is

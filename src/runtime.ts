@@ -2113,6 +2113,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     registry.install(digestScopeExtension);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
     const harnessOptions = {
+      // Consume the whole pending steering burst at each native boundary, including worker steers.
+      settings: { steeringMode: "all" as const },
       models,
       registry,
       conversationCreated: denyNewConversation,
