@@ -3647,35 +3647,31 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (closed) return;
         closed = true;
         const cleanup = withoutAbortSignal(ctx);
+        let failure: { error: unknown } | undefined;
+        const close = async (operation: () => unknown): Promise<void> => {
+          try { await operation(); }
+          catch (error) {
+            failure ??= { error };
+            reportFailure(error, "gateway.close.runtime");
+          }
+        };
         // An MCP login waiting for its browser callback is stopped first: it must not reach a closed
         // Harness, and it must not store a grant while this process is tearing down.
-        try { await mcpAdminRef.current?.close(); } catch { /* best effort; teardown continues */ }
+        await close(() => mcpAdminRef.current?.close());
         // Stop derived background work before the session stops accepting commits.
-        episodeCatalog?.close();
-        try { await harness!.close(cleanup); }
-        finally {
-          // Code Mode first: it owns sandbox workers that may be calling MCP tools. Then the MCP
-          // clients, whose native transports tear down their server process groups.
-          try { await codeModeRef.current?.close(); }
-          finally {
-            try { await mcpRef.current?.close(); }
-            finally {
-              try { memoryServiceRef.current?.close(); }
-              finally {
-                try { await historyIndex?.close(); }
-                finally {
-                  try {
-                    for (const environments of workerEnvironments.values()) {
-                      await environments.close(cleanup).catch(() => undefined);
-                    }
-                    workerEnvironments.clear();
-                    await toolEnvironments?.close(cleanup);
-                  } finally { await releaseLock(); }
-                }
-              }
-            }
-          }
-        }
+        await close(() => episodeCatalog?.close());
+        await close(() => harness!.close(cleanup));
+        // Code Mode first: it owns sandbox workers that may be calling MCP tools. Then the MCP
+        // clients, whose native transports tear down their server process groups.
+        await close(() => codeModeRef.current?.close());
+        await close(() => mcpRef.current?.close());
+        await close(() => memoryServiceRef.current?.close());
+        await close(() => historyIndex?.close());
+        for (const environments of workerEnvironments.values()) await close(() => environments.close(cleanup));
+        workerEnvironments.clear();
+        await close(() => toolEnvironments?.close(cleanup));
+        await close(() => releaseLock());
+        if (failure !== undefined) throw failure.error;
       },
     };
     async function digestEpisodeView(episode: HistoryEpisode, ctx: Context): Promise<HistoryEpisode> {

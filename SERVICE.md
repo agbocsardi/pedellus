@@ -106,8 +106,10 @@ counts where available, and a fingerprint.
 No raw request payloads, credentials or transcript text are logged. Only known
 safe Durable invariant messages are included verbatim; other error messages stay
 private. A later shutdown failure does not replace the primary exception returned
-to callers. Reporting is best-effort: an unavailable stderr cannot block cleanup,
-and an unsuccessful output attempt does not suppress a later attempt.
+to callers. Normal shutdown attempts every resource and returns its first failure;
+subsequent failures are reported separately. Reporting is best-effort: an unavailable
+stderr cannot block cleanup, and an unsuccessful output attempt does not suppress
+a later attempt.
 
 No verbosity switch, extra log file, retention change, systemd override or new
 retry loop is needed for these records. Journald retention remains host-managed;

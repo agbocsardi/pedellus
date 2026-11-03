@@ -186,10 +186,11 @@ Known value-free Durable invariant messages are included; arbitrary exception
 messages, absolute host paths, provider request objects, credentials, URLs and
 transcript text are not. This is diagnostic metadata, not an unrestricted debug
 trace. Primary gateway/open errors remain the errors returned to callers, even
-when cleanup also fails; those shutdown failures are reported separately. Reporting
-is best-effort and cannot throw into application cleanup. Telegram transport wrappers retain the
-native cause for this formatter. Log retention and service restart policy are
-unchanged. See [service logs](./SERVICE.md#logs).
+when cleanup also fails; those shutdown failures are reported separately. Normal
+shutdown attempts every resource and returns the first cleanup failure, if any.
+Reporting is best-effort and cannot throw into application cleanup. Telegram
+transport wrappers retain the native cause for this formatter. Log retention and
+service restart policy are unchanged. See [service logs](./SERVICE.md#logs).
 
 A prepared model dispatch that pins historical Nanobot context no longer makes a
 normal startup fail by itself. The gateway cancels exactly that dispatch through

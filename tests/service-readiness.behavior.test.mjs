@@ -252,6 +252,116 @@ test("open keeps its primary exception through cleanup failures and forwards Dur
   }
 });
 
+test("normal SDK shutdown attempts teardown and releases ownership while keeping its first failure", { timeout: 30_000 }, async () => {
+  const originalOpen = Harness.open;
+  const originalLog = console.error;
+  for (const catalogFails of [false, true]) {
+    const home = await mkdtemp(join(tmpdir(), 'nanobot-close-failures-'));
+    let gateway;
+    let reopened;
+    let nativeClose;
+    try {
+      const instance = await writeDefaultInstance(home, 'gpt-6-luna');
+      const config = parseConfig({ workspace: instance.workspace, dataDir: instance.dataDir,
+        model: { provider: 'close-faux', modelId: 'alpha' }, episodeSummary: { enabled: false } }, home);
+      const models = createModels();
+      models.setProvider(fauxProvider({ provider: 'close-faux', models: [{ id: 'alpha', name: 'Synthetic' }] }).provider);
+      const catalogFailure = Object.assign(new Error('PRIVATE-CATALOG-CLOSE'), { code: 'ENOSPC' });
+      const harnessFailure = Object.assign(new Error('PRIVATE-HARNESS-CLOSE'), { code: 'EIO' });
+      const observations = [];
+      const logs = [];
+      let harnessCloses = 0;
+      console.error = (line) => logs.push(line);
+      Harness.open = async (...args) => {
+        const harness = await originalOpen(...args);
+        const observe = harness.observeCommits.bind(harness);
+        harness.observeCommits = (...input) => {
+          const observation = observe(...input);
+          observations.push(observation);
+          return observation;
+        };
+        nativeClose = harness.close.bind(harness);
+        harness.close = async (ctx) => { harnessCloses += 1; await nativeClose(ctx); throw harnessFailure; };
+        return harness;
+      };
+      gateway = await openGateway(config, context, { models });
+      assert.equal(observations.length, 1, 'the catalog owns the host commit observer');
+      if (catalogFails) {
+        const detach = observations[0].detach;
+        observations[0].detach = () => { detach(); throw catalogFailure; };
+      }
+      await assert.rejects(gateway.close(context), (error) => error === (catalogFails ? catalogFailure : harnessFailure));
+      assert.equal(harnessCloses, 1, 'an early catalog failure must not skip native teardown');
+      const records = logs.map((line) => JSON.parse(line.slice('durable-nanobot diagnostic: '.length)))
+        .filter((record) => record.stage === 'gateway.close.runtime');
+      assert.deepEqual(records.map((record) => record.errors[0].code), catalogFails ? ['ENOSPC', 'EIO'] : ['EIO']);
+      assert.ok(logs.every((line) => !line.includes('PRIVATE-')));
+      await gateway.close(context);
+      assert.equal(harnessCloses, 1, 'a completed teardown remains idempotent');
+      Harness.open = originalOpen;
+      reopened = await openGateway(config, context, { models });
+    } finally {
+      Harness.open = originalOpen;
+      console.error = originalLog;
+      await gateway?.close(context).catch(() => undefined);
+      await nativeClose?.(context);
+      await reopened?.close(context);
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+});
+
+test("CLI fails with the original cleanup-only error after an otherwise normal stop", { timeout: 30_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'nanobot-stop-failure-'));
+  const originalOpen = Harness.open;
+  const originalLog = console.error;
+  const originalOutput = console.log;
+  const priorKey = process.env.SYNTHETIC_STOP_KEY;
+  const priorHandlers = new Set(process.listeners('SIGTERM'));
+  const primary = Object.assign(new Error('PRIVATE-STOP-ERROR'), { code: 'EIO' });
+  const logs = [];
+  let pending;
+  let outcome;
+  let nativeClose;
+  try {
+    const instance = await writeDefaultInstance(home, 'gpt-6-luna');
+    const file = join(instance.configDir, 'config.json');
+    const raw = JSON.parse(await readFile(file, 'utf8'));
+    raw.credentials = { openai: 'SYNTHETIC_STOP_KEY' };
+    await writeFile(file, JSON.stringify(raw));
+    process.env.SYNTHETIC_STOP_KEY = SYNTHETIC_ENV;
+    console.error = (line) => logs.push(line);
+    console.log = () => {};
+    Harness.open = async (...args) => {
+      const harness = await originalOpen(...args);
+      nativeClose = harness.close.bind(harness);
+      harness.close = async (ctx) => { await nativeClose(ctx); throw primary; };
+      return harness;
+    };
+    pending = main(['gateway', '--config', file]).then(
+      () => { outcome = { ok: true }; }, (error) => { outcome = { error }; });
+    await eventually(async () => outcome !== undefined || await pathExists(instance.socketPath), 'temporary CLI socket to open');
+    assert.equal(outcome, undefined, 'the gateway must start successfully before stopping');
+    const stop = process.listeners('SIGTERM').find((handler) => !priorHandlers.has(handler));
+    assert.ok(stop);
+    stop(); // Only this CLI's installed handler; no OS signal or other test/service is affected.
+    await pending;
+    assert.equal(outcome.error, primary);
+    assert.equal(await pathExists(instance.socketPath), false);
+    assert.ok(logs.some((line) => line.includes('gateway.close.runtime') && line.includes('EIO')));
+    assert.ok(logs.every((line) => !line.includes('PRIVATE-') && !line.includes(SYNTHETIC_ENV)));
+  } finally {
+    for (const handler of process.listeners('SIGTERM')) if (!priorHandlers.has(handler)) handler();
+    await pending;
+    await nativeClose?.(context);
+    Harness.open = originalOpen;
+    console.error = originalLog;
+    console.log = originalOutput;
+    if (priorKey === undefined) delete process.env.SYNTHETIC_STOP_KEY; else process.env.SYNTHETIC_STOP_KEY = priorKey;
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("CLI keeps its Telegram-token failure when gateway shutdown also throws", { timeout: 30_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'nanobot-cli-cleanup-'));
   const instance = await writeDefaultInstance(home, 'gpt-6-luna');
