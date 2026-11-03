@@ -1,12 +1,15 @@
 /**
- * Canonical default bounds for one memory-digestion invocation.
+ * Canonical default bounds for memory digestion. Evidence/tool/write/time/context bounds apply
+ * to each internal chunk. New episode tasks use cumulative input/response targets only to admit
+ * additional episodes, never to stop the first or truncate an admitted episode. Historical tasks
+ * without spendingAdmissionOnly retain their captured per-turn spending semantics.
  *
  * Configuration may narrow or widen them, but a started run captures the values it accepted in its
  * task input and uses those for every later attempt. These are the only defaults; nothing here
  * schedules, enables or activates digestion.
  */
 
-/** Bounds on the one completed-turn chunk a digest run may consume. */
+/** Bounds on one internal evidence chunk, not the whole admitted episode. */
 export interface DigestBatchLimits {
   /**
    * Entries examined by one batch; a longer range or entry continues in the next batch.
@@ -32,21 +35,25 @@ export interface DigestBatchLimits {
 
 /** Every bound one digest run accepts at start: its batch, tool budget, deadline and write budget. */
 export interface DigestRunLimits extends DigestBatchLimits {
+  /** New episode tasks use token/response budgets only to admit additional episodes. */
+  readonly spendingAdmissionOnly?: boolean;
   /** Individual model-issued tool calls allowed in the run, failed and refused calls included. */
   readonly maxToolCalls: number;
   /**
-   * Successful provider responses allowed in the run, including tool-call responses. Native failed
+   * Invocation response target for additional-episode admission (hard per turn on legacy tasks).
+   * Includes tool-call responses. Native failed
    * attempts/retries are reported but do not consume this owner-approved limit. The committed
    * transcript supplies the count; this is not a cap on network requests or financial cost.
    */
   readonly maxRequests: number;
   /**
-   * Cumulative input tokens allowed in the run, counted from actual reported usage: `input` plus the
+   * Invocation input target for additional-episode admission (hard per turn on legacy tasks).
+   * Counted from actual reported usage: `input` plus the
    * `cacheRead` and `cacheWrite` counters (pi-ai reports those separately, so this is not doubled).
    * A response that reports no usage is charged the whole bound instead of a fresh allowance.
    */
   readonly maxInputTokens: number;
-  /** Whole-run deadline from preparation; an expired run fails without acknowledging its batch. */
+  /** Internal chunk deadline from preparation; expiry fails without acknowledging that chunk. */
   readonly runTimeoutMs: number;
   /** Distinct workspace files the run may successfully change. */
   readonly maxChangedFiles: number;
@@ -124,7 +131,9 @@ export function digestRunLimitsFrom(value: unknown): DigestRunLimits | undefined
     if (!isDigestBoundOf(field, bound)) return undefined;
     parsed[field] = bound as number;
   }
+  if ("spendingAdmissionOnly" in record && typeof record.spendingAdmissionOnly !== "boolean") return undefined;
   return {
+    ...(record.spendingAdmissionOnly === true ? { spendingAdmissionOnly: true } : {}),
     entriesPerBatch: parsed.entriesPerBatch!,
     charsPerBatch: parsed.charsPerBatch!,
     maxToolCalls: parsed.maxToolCalls!,
@@ -146,6 +155,7 @@ function isDigestBoundOf(name: string, value: unknown): value is number {
 /** Reject an invalid in-process bound set before any task, provider call or cursor move. */
 export function validateDigestRunLimits(limits: DigestRunLimits): void {
   for (const [name, value] of Object.entries(limits)) {
+    if (name === "spendingAdmissionOnly" && typeof value === "boolean") continue;
     if (isDigestBoundOf(name, value)) continue;
     if (name === "charsPerBatch") {
       throw new TypeError(

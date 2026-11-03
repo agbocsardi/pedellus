@@ -26,6 +26,7 @@
   },
   "digest": {
     "preset": "fast",
+    "episodesPerRun": 1,
     "entriesPerBatch": 2000,
     "charsPerBatch": 200000,
     "maxToolCalls": 24,

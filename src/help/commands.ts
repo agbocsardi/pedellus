@@ -139,9 +139,9 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
   {
     name: "digest",
     args: "[status]",
-    summary: "Start one bounded memory-digestion batch",
+    summary: "Digest closed conversation episodes",
     usage: "Usage: /digest [status] — start a batch, or read its status.",
-    detail: "Runs one bounded background model batch on the shared workspace; /digest status is free.",
+    detail: "Finishes admitted closed episodes in the shared workspace; /digest status is free.",
     refusalGuarantee: "Nothing was started.",
     surfaces: ["cli", "telegram"],
   },

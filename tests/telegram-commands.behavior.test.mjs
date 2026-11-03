@@ -325,7 +325,7 @@ test('a native host advertises exactly the implemented owner commands, with the 
       { command: 'stop', description: 'Alias of /abort: stop this turn here' },
       { command: 'status', description: "Show this conversation's model and run state" },
       { command: 'model', description: 'List or select a model for this conversation' },
-      { command: 'digest', description: 'Start one bounded memory-digestion batch' },
+      { command: 'digest', description: 'Digest closed conversation episodes' },
       { command: 'restart', description: 'Replace the whole gateway process' },
       { command: 'help', description: "Show these controls, or one command's detail" },
     ]);

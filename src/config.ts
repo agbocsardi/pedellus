@@ -172,28 +172,30 @@ export interface DigestConfig {
   readonly model?: ModelReference;
   /** Explicit named preset for a background digestion run; its thinking level applies as configured. */
   readonly preset?: string;
+  /** Maximum closed episodes per invocation (default 1). The first is always admitted. */
+  readonly episodesPerRun?: number;
   /**
-   * Message and tool entries examined by one completed-turn chunk. The minimum is 2: a one-entry chunk cannot
+   * Message and tool entries examined by one internal chunk. The minimum is 2: a one-entry chunk cannot
    * always advance past an episode's opening reset marker, so it would refuse its own
    * acknowledgement and wedge the cursor.
    */
   readonly entriesPerBatch?: number;
   /**
-   * Extracted evidence characters in one completed-turn chunk, in UTF-16 code units.
+   * Extracted evidence characters in one internal chunk, in UTF-16 code units.
    * The minimum is 2 so one surrogate pair always fits.
    */
   readonly charsPerBatch?: number;
-  /** Individual tool calls allowed in one run, failed and refused calls included. */
+  /** Safety limit on tool calls per internal chunk, failed and refused calls included. */
   readonly maxToolCalls?: number;
-  /** Successful model responses allowed in one run, including tool rounds; native retries excluded. */
+  /** Soft invocation response target for admitting another episode, never a mid-episode stop. */
   readonly maxRequests?: number;
-  /** Soft cumulative reported-input ceiling including cached input, not a hard pre-dispatch cap. */
+  /** Soft invocation input target including cached input; governs additional-episode admission only. */
   readonly maxInputTokens?: number;
-  /** Whole-run deadline in seconds, from the run's preparation to its settled turn. */
+  /** Internal chunk deadline in seconds. A timeout is a genuine failure, not successful partial work. */
   readonly runTimeoutSeconds?: number;
-  /** Distinct workspace files one run may successfully change. */
+  /** Safety limit on distinct changed files per internal chunk. */
   readonly maxChangedFiles?: number;
-  /** Inserted plus removed text units one run may successfully write. */
+  /** Safety limit on inserted-plus-removed text per internal chunk. */
   readonly maxDiffChars?: number;
 }
 
@@ -921,6 +923,7 @@ function codeModeConfig(value: unknown): CodeModeConfig {
 }
 
 const DIGEST_CONFIG_FIELDS = [
+  "episodesPerRun",
   "entriesPerBatch",
   "charsPerBatch",
   "maxToolCalls",

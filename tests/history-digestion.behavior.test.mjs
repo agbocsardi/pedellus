@@ -189,6 +189,71 @@ function hasLoneSurrogate(text) {
   return false;
 }
 
+test("closed selection preserves an imported frontier across reopen and offers only future closed evidence", { timeout: 15_000 }, async () => {
+  const directory = await temp("nanobot-digest-closed-import-");
+  const dbPath = resolve(directory, "state.sqlite");
+  let harness;
+  try {
+    harness = await openStore(dbPath);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    await harness.commit(async (tx) => {
+      await tx.appendEntry(conversation.id, reset());
+      await tx.appendEntry(conversation.id, user("IMPORTED-DO-NOT-REPLAY"));
+      const closing = await tx.appendEntry(conversation.id, reset());
+      const cursor = await tx.doc(DigestCursorDoc, conversation.id);
+      Object.assign(cursor, { nextEntryId: closing.id, nextItemIndex: 0, nextTextStart: 0,
+        episodeStartEntryId: null, episodeEndEntryId: null, pendingToolCalls: [] });
+    }, context);
+    assert.equal((await sourceFor(harness, conversation).readClosed(context)).status, "idle");
+    await harness.close(context);
+    harness = await openStore(dbPath);
+    const reopened = await harness.conversation(conversation.id, context);
+    const source = sourceFor(harness, reopened, { entriesPerBatch: 5, charsPerBatch: 12 });
+    assert.equal((await source.readClosed(context)).status, "idle");
+    await append(harness, reopened, user("FUTURE-EVIDENCE"), assistant("New answer."));
+    assert.equal((await source.readClosed(context)).status, "idle", "completed turns in open episodes remain ineligible");
+    await append(harness, reopened, reset());
+    const evidence = [];
+    for (let n = 0; n < 10; n += 1) {
+      const result = await source.readClosed(context);
+      if (result.status === "idle") break;
+      evidence.push(...result.entries.map((entry) => entry.text));
+      await source.acknowledge(result, context);
+    }
+    assert.equal((await source.readClosed(context)).status, "idle");
+    assert.equal(evidence.join(""), "FUTURE-EVIDENCENew answer.");
+  } finally {
+    await harness?.close(context);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("closed selection resumes an older completed-turn segment without replaying its consumed prefix", { timeout: 15_000 }, async () => {
+  const directory = await temp("nanobot-digest-closed-upgrade-");
+  const harness = await openStore(resolve(directory, "state.sqlite"));
+  try {
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    await append(harness, conversation, user("abcdefghij"), assistant("old answer"));
+    const source = sourceFor(harness, conversation, { entriesPerBatch: 10, charsPerBatch: 5 });
+    const oldChunk = batched(await source.read(context));
+    await source.acknowledge(oldChunk, context);
+    assert.equal((await source.readClosed(context)).status, "idle", "a frozen segment does not make an open episode eligible");
+    await append(harness, conversation, user("later exchange"), assistant("later answer"), reset());
+    const evidence = [];
+    for (let n = 0; n < 30; n += 1) {
+      const result = await source.readClosed(context);
+      if (result.status === "idle") break;
+      evidence.push(...result.entries.map((entry) => entry.text));
+      await source.acknowledge(result, context);
+    }
+    assert.equal((await source.readClosed(context)).status, "idle");
+    assert.equal(evidence.join(""), "fghijold answerlater exchangelater answer");
+  } finally {
+    await harness.close(context);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("three fitting completed turns are one batch and an open tail waits for its answer", { timeout: 15_000 }, async () => {
   const dir = await temp("nanobot-digest-open-");
   const db = resolve(dir, "probe.sqlite");

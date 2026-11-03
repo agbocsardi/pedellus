@@ -59,6 +59,10 @@ fixed, value-free diagnostics; unexpected failures stay suppressed. See
 
 The authenticated owner also drives that gateway from a private Telegram chat:
 `/new`, `/abort` (also spelled `/stop`), `/status`, `/model`, `/digest` and `/restart`.
+`/digest` processes closed episodes only, automatically finishing every admitted episode across
+internal chunks. The first pending episode is always admitted; spending targets only decide whether
+to start another, up to `digest.episodesPerRun` (default 1). See [digest controls](./CLI.md#local-controls).
+
 Each host advertises only what it implements and refuses a typed command it cannot
 perform. `/model` selects one configured preset for that chat only. `/status` is
 bounded read-only metadata with no model call. `/new` starts a new context **and**

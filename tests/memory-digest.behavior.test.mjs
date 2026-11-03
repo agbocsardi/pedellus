@@ -240,6 +240,10 @@ function toolWrite(path, content, id) {
   return fauxAssistantMessage([fauxToolCall('write', { path, content }, { id })], { stopReason: 'toolUse' });
 }
 
+function toolRead(path, id) {
+  return fauxAssistantMessage([fauxToolCall('read', { path }, { id })], { stopReason: 'toolUse' });
+}
+
 function toolEdit(path, oldText, newText, id) {
   return fauxAssistantMessage([fauxToolCall('edit', { path, edits: [{ oldText, newText }] }, { id })], { stopReason: 'toolUse' });
 }
@@ -840,6 +844,171 @@ test('a reopen resumes the interrupted run with its pinned model and curation sc
       [['write', false], ['read', false]],
       'the first attempt wrote once and the reopened target read it back, both clean');
   }
+});
+
+test('a live later chunk reopens with its own checkpoint, captured limits and scope', { timeout: 40_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const entered = deferred();
+  let requests = 0;
+  const store = await openStore(fixture, async (_request, options) => {
+    requests += 1;
+    if (requests === 1) return fauxAssistantMessage('First chunk done.');
+    if (requests === 2) return toolWrite('memory/second-chunk.md', '- preserved\n', 'second-chunk-write');
+    entered.resolve();
+    await new Promise((resolve) => {
+      if (options?.signal?.aborted) return resolve();
+      options?.signal?.addEventListener('abort', resolve, { once: true });
+    });
+    return fauxAssistantMessage('Interrupted response.');
+  }, { digest: { charsPerBatch: 40 } });
+  let reopened;
+  t.after(async () => { await reopened?.close(context).catch(() => undefined); await store.gateway.close(context).catch(() => undefined); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('L'.repeat(120)), assistant('Done.')]);
+  const started = await startDigest(store.gateway);
+  await within(entered.promise, WAIT_MS, 'second chunk to pause after writing');
+  const live = await taskOf(store.gateway.harness, started.taskId);
+  assert.equal(live.state.checkpoint.batch.firstTextStart, 40);
+  assert.equal(live.state.checkpoint.chunksDone, 1);
+  const activeTarget = live.state.checkpoint.targetConversationId;
+  await store.gateway.close(context);
+  const replacement = await openStore(fixture, (request) => {
+    const text = transcriptText(request.messages);
+    if (text.includes('second-chunk-write') && !text.includes('second-chunk-read')) {
+      return toolRead('memory/second-chunk.md', 'second-chunk-read');
+    }
+    return fauxAssistantMessage('Nothing else to save.');
+  }, { digest: { charsPerBatch: 2 } });
+  reopened = replacement.gateway;
+  const task = await settleTask(reopened.harness, started.taskId);
+  const active = await reopened.harness.conversation(activeTarget, context);
+  const diagnostics = (await active.entries({ order: 'ascending' }, 100, undefined, context)).items
+    .flatMap((entry) => entry.model ?? []).map(({ role, stopReason, errorMessage, toolName, isError }) => ({ role, stopReason, errorMessage, toolName, isError }));
+  assert.equal(task.state.outcome.status, 'completed', JSON.stringify({ outcome: task.state.outcome, diagnostics, requests: replacement.calls.length }));
+  assert.equal(task.state.outcome.result.episodesDone, 1);
+  assert.equal(task.state.outcome.result.chunksDone, 4, 'reopen keeps the captured 40-character chunks');
+  const results = await toolResults(reopened.harness, activeTarget);
+  assert.deepEqual(results.map((result) => [result.name, result.isError]), [['write', false], ['read', false]]);
+  assert.equal(await readFile(join(fixture.workspace, 'memory/second-chunk.md'), 'utf8'), '- preserved\n');
+});
+
+test('open episodes are ineligible, then the first closed episode finishes every chunk despite spending targets', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, () => fauxAssistantMessage('Nothing new to save.'), {
+    digest: { charsPerBatch: 40, maxInputTokens: 1, maxRequests: 1, episodesPerRun: 3 },
+  });
+  t.after(() => store.gateway.close(context));
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await store.gateway.harness.commit(async (tx) => {
+    await tx.appendEntry(origin.id, user('FIRST-EPISODE '.repeat(12)));
+    await tx.appendEntry(origin.id, assistant('Completed answer, but the episode is still open.'));
+  }, context);
+  assert.equal((await startDigest(store.gateway)).status, 'idle');
+  assert.equal(store.calls.length, 0);
+  const open = await store.gateway.listHistoryEpisodes(SESSION, {}, context);
+  assert.equal(open.episodes[0].digestion.status, 'open-ineligible');
+  await origin.reset(undefined, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('SECOND-EPISODE '.repeat(20)), assistant('Noted.')]);
+  const before = await store.gateway.listHistoryEpisodes(SESSION, {}, context);
+  assert.ok(before.episodes.every((episode) => episode.digestion.status === 'not-started'));
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'completed', JSON.stringify(task.state.outcome));
+  assert.equal(task.state.outcome.result.episodesDone, 1);
+  assert.ok(task.state.outcome.result.chunksDone > 1);
+  assert.ok(task.state.outcome.result.inputTokens > 1);
+  assert.ok(task.state.outcome.result.successfulRequests > 1);
+  assert.equal(task.state.outcome.result.complete, true);
+  assert.equal(task.state.outcome.result.deferredByBudget, true);
+  assert.ok(store.calls.every((input) => !input.includes('SECOND-EPISODE')));
+  const after = await store.gateway.listHistoryEpisodes(SESSION, {}, context);
+  assert.deepEqual(after.episodes.map((episode) => episode.digestion.status), ['not-started', 'digested']);
+});
+
+test('an invocation processes up to X whole episodes and leaves the next untouched', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, () => fauxAssistantMessage('Nothing new to save.'), {
+    digest: { episodesPerRun: 2, maxInputTokens: 5_000_000, maxRequests: 100 },
+  });
+  t.after(() => store.gateway.close(context));
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  for (const name of ['ONE', 'TWO', 'THREE']) {
+    await closedEpisode(store.gateway.harness, origin.id, [user(`EPISODE-${name}`), assistant('Noted.')]);
+  }
+  const started = await startDigest(store.gateway);
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'completed', JSON.stringify(task.state.outcome));
+  assert.equal(task.state.outcome.result.episodesDone, 2);
+  assert.equal(store.calls.filter((input) => input.startsWith('[memory digestion task]')).length, 2);
+  assert.ok(store.calls.every((input) => !input.includes('EPISODE-THREE')));
+  const page = await store.gateway.listHistoryEpisodes(SESSION, {}, context);
+  assert.deepEqual(page.episodes.map((episode) => episode.digestion.status), ['not-started', 'digested', 'digested']);
+});
+
+test('an interrupted multi-chunk episode resumes its partial frontier after reopen', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  let chunks = 0;
+  const store = await openStore(fixture, () => ++chunks === 1
+    ? fauxAssistantMessage('Nothing new to save.') : toolRead('memory/missing.md', 'fail-second-chunk'), {
+    digest: { charsPerBatch: 40 },
+  });
+  let reopened;
+  t.after(async () => { await reopened?.close(context); await store.gateway.close(context); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('A'.repeat(120)), assistant('Noted.')]);
+  const first = await startDigest(store.gateway);
+  const failed = await settleTask(store.gateway.harness, first.taskId);
+  assert.equal(failed.state.outcome.status, 'failed');
+  assert.equal(failed.state.outcome.result.complete, false);
+  const frontier = await cursorDoc(store.gateway.harness, origin.id);
+  assert.equal(frontier.nextTextStart, 40);
+  assert.equal((await store.gateway.listHistoryEpisodes(SESSION, {}, context)).episodes.find((episode) => episode.status === 'closed').digestion.status, 'partial');
+  await store.gateway.close(context);
+  const replacement = await openStore(fixture, () => fauxAssistantMessage('Nothing new to save.'), { digest: { charsPerBatch: 40 } });
+  reopened = replacement.gateway;
+  const second = await startDigest(reopened);
+  const completed = await settleTask(reopened.harness, second.taskId);
+  assert.equal(completed.state.outcome.status, 'completed', JSON.stringify(completed.state.outcome));
+  assert.equal(completed.state.outcome.result.episodesDone, 1);
+  assert.equal((await reopened.listHistoryEpisodes(SESSION, {}, context)).episodes.find((episode) => episode.status === 'closed').digestion.status, 'digested');
+  const firstInput = replacement.calls.find((input) => input.startsWith('[memory digestion task]'));
+  assert.match(firstInput, /offset 40/);
+});
+
+test('imported prefixes stay consumed and searchable while future closed episodes remain digestible', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, () => fauxAssistantMessage('Nothing new to save.'));
+  t.after(() => store.gateway.close(context));
+  const key = 'cli-legacy:archive';
+  const archive = await store.gateway.conversationFor(key, context);
+  await store.gateway.harness.commit(async (tx) => {
+    await tx.appendEntry(archive.id, { kind: 'pi.reset', head: 'self', data: { legacy: { source: 'synthetic' } } });
+    await tx.appendEntry(archive.id, user('IMPORTEDFACT7712'));
+    await tx.appendEntry(archive.id, assistant('Already folded into imported memory.'));
+    const closing = await tx.appendEntry(archive.id, { kind: 'pi.reset', head: 'self' });
+    const cursor = await tx.doc(DigestCursorDoc, archive.id);
+    Object.assign(cursor, { nextEntryId: closing.id, nextItemIndex: 0, nextTextStart: 0,
+      episodeStartEntryId: null, episodeEndEntryId: null, pendingToolCalls: [] });
+  }, context);
+  assert.equal((await startDigest(store.gateway)).status, 'idle');
+  const baseline = await store.gateway.listHistoryEpisodes(key, {}, context);
+  assert.equal(baseline.episodes[0].digestion.status, 'imported-baseline');
+  const search = await store.gateway.historySearch({ text: 'IMPORTEDFACT7712', scope: 'messages', limit: 5 }, context);
+  assert.equal(search.hits.length, 1);
+  await closedEpisode(store.gateway.harness, archive.id, [user('FUTUREFACT8823'), assistant('New work.')]);
+  const started = await startDigest(store.gateway);
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'completed', JSON.stringify(task.state.outcome));
+  assert.ok(store.calls.some((input) => input.includes('FUTUREFACT8823')));
+  assert.ok(store.calls.every((input) => !input.includes('IMPORTEDFACT7712')));
+  const page = await store.gateway.listHistoryEpisodes(key, {}, context);
+  assert.deepEqual(page.episodes.map((episode) => episode.digestion.status), ['digested', 'imported-baseline']);
 });
 
 test('a failed tool ends the run without another request and remains failed after reopen', { timeout: 40_000 }, async (t) => {

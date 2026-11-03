@@ -275,18 +275,20 @@ edits need restart only; unit edits additionally need daemon-reload.
   ordinary cron intent (`intent: "digest"`); opening the gateway and parsing
   configuration start nothing. `/digest` and `/digest status` are host commands
   in the local CLI and for the authenticated Telegram owner, not model tools.
-  One `gateway.memoryDigest.start` consumes one bounded completed-turn batch in
-  a task-owned conversation whose only tools are the origin's captured
-  `read`/`write`/`edit`, confined to `SOUL.md`, `USER.md`, `memory/**/*.md` and
-  `skills/<name>/SKILL.md`. Eligibility is a completed-turn high-water over open
-  and reset chats: a reset that follows an owner turn, the next owner/scheduled
-  input, or a terminal assistant entry whose calls are all paired closes a
-  segment, and an in-progress turn is never offered. One read scans once and
-  takes the furthest completed turn within its scan bound. A completed-turn range
-  that fits the entry, character and fixed step bounds is one batch and one
-  acknowledgement; a larger range splits into independent ordered chunks, and a
-  turn may straddle chunks. Each chunk is acknowledged on its own, with no carry-over summary. An open trailing turn is
-  never cut into a range. The evidence is owner and
+  One `gateway.memoryDigest.start` processes up to `digest.episodesPerRun` closed episodes
+  (default 1), oldest unconsumed first. Open episodes are entirely ineligible. The first
+  pending closed episode is always admitted regardless of estimated spending. Bounded internal
+  chunks run in fresh task-owned conversations with only the origin's captured `read`/`write`/`edit`,
+  confined to `SOUL.md`, `USER.md`, `memory/**/*.md` and `skills/<name>/SKILL.md`.
+  Each validated chunk is acknowledged durably and automatically continued until its episode
+  finishes. Only then are remaining cumulative input/response targets and the next episode's
+  estimated cost checked to decide whether to admit another. Spending targets never deliberately
+  truncate an admitted episode. Real failures/cancellation retain partial cursor progress and
+  ordinary memory writes; no transactional staging or rollback. Imported prefixes retain their
+  migration-seeded consumed frontiers, not a blanket legacy-channel exclusion: future closed
+  episodes in those chats remain eligible, and recall/search are unchanged. Episode listing/detail
+  exposes read-only cursor-based `digestion` progress (including partial, imported baseline,
+  open/ineligible and unknown); summary readiness never implies digestion. Evidence is owner and
   assistant message text plus paired assistant tool calls and results labeled as
   untrusted machine output; a long result is a bounded head-tail preview with an
   omission marker and the original entry reference, never a claim that the
@@ -302,17 +304,18 @@ edits need restart only; unit edits additionally need daemon-reload.
   `pi.tool-result` fails the batch even if the model answers later, and a
   non-empty report is required. A run uses an explicitly configured background
   model (`digest.preset` or `digest.model`) and never inherits the foreground
-  model or thinking level; absent one, a start is refused. Its captured bounds
-  (200,000 evidence characters, 2,000 entries, 500,000 input tokens including
-  cached input, 12 successful model responses, 24 tool calls, 600,000 ms,
-  8 files and 32,000 inserted-plus-removed characters) are checked from the committed
-  target transcript, including before acknowledgement. Successful responses include
-  tool-call responses; native failed attempts/retries are allowed and reported separately.
-  A failed tool ends the run before another model round. Tool/time/write limits are the
-  primary operational bounds. Input tokens are a soft reported-usage ceiling, not a hard
-  pre-dispatch or financial cap: native retries, deferred polls, compaction and a crash
-  before a response is committed prevent precise network-request accounting. Missing
-  usage fails closed, and an over-budget settled run never acknowledges its batch. The editable workspace policy is `DIGEST.md`
+  model or thinking level; absent one, a start is refused. Captured internal chunk safeguards are
+  200,000 evidence characters (narrowed for model context), 2,000 entries, 24 tool calls,
+  600,000 ms, 8 files and 32,000 inserted-plus-removed characters. These are real failure
+  boundaries, not successful partial outcomes. Invocation admission targets default to
+  500,000 reported input tokens including cached input and 12 successful responses. Successful
+  responses include tool-call responses; native retries are recorded separately. The next-episode
+  estimate allows three rounds plus framing per chunk with 25% headroom, but is neither exact
+  tokenization nor a financial ceiling. A failed tool ends the run before another model round.
+  Missing usage fails the chunk closed; native retries, polls, compaction and crashes prevent
+  exact network-spend accounting. Finished chunks keep their acknowledgements on failure.
+  Write/file counts are summed per chunk for invocation reporting, not a cross-chunk distinct-file
+  count. The editable workspace policy is `DIGEST.md`
   (seeded only when absent) and it can never grant authority. Only a failed or
   cancelled run admits one bounded internal issue report to its origin
   conversation (`nanobot.memory-digest-result`, deduplicated by request ID); a

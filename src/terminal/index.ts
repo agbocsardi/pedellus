@@ -861,7 +861,7 @@ export async function runTerminalConversation(
     }
     const rows = page.episodes.map((episode) => {
       const end = episode.endEntryId === null ? "open" : String(episode.endEntryId);
-      return `  #${episode.startEntryId}-${end} ${episode.status}; entries=${episode.entries ?? "uncounted"} messages=${episode.messages ?? "uncounted"} tools=${episode.toolResults ?? "uncounted"}; ${episode.resetEntryId === null ? "pre-reset segment" : `reset=${episode.resetEntryId}`}; summary=${episode.summary.status}`;
+      return `  #${episode.startEntryId}-${end} ${episode.status}; entries=${episode.entries ?? "uncounted"} messages=${episode.messages ?? "uncounted"} tools=${episode.toolResults ?? "uncounted"}; ${episode.resetEntryId === null ? "pre-reset segment" : `reset=${episode.resetEntryId}`}; summary=${episode.summary.status}; digest=${episode.digestion?.status ?? "unknown"}`;
     });
     const lines = [
       `Episodes for session ${safeLabel(sessionKey, 120)} (newest first), ${page.episodes.length} selected:`,
@@ -936,7 +936,7 @@ export async function runTerminalConversation(
 
     const end = episode.endEntryId === null ? "open" : String(episode.endEntryId);
     const lines = [
-      `Episode #${episode.startEntryId}-${end} for session ${safeLabel(sessionKey, 120)} (${episode.status}; summary=${episode.summary.status}); conversation=${episode.conversationId}; entries=${episode.entries ?? "uncounted"} messages=${episode.messages ?? "uncounted"} tools=${episode.toolResults ?? "uncounted"}.`,
+      `Episode #${episode.startEntryId}-${end} for session ${safeLabel(sessionKey, 120)} (${episode.status}; summary=${episode.summary.status}; digest=${episode.digestion?.status ?? "unknown"}); conversation=${episode.conversationId}; entries=${episode.entries ?? "uncounted"} messages=${episode.messages ?? "uncounted"} tools=${episode.toolResults ?? "uncounted"}.`,
     ];
     if (episode.resetEntryId !== null) lines.push(`Reset boundary: entry #${episode.resetEntryId} (reset handoff text is not shown).`);
     const footer: string[] = [];

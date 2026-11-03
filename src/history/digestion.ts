@@ -1,6 +1,13 @@
 /**
  * Bounded, source-labeled evidence for memory digestion, plus its one durable cursor.
  *
+ * Product digestion uses `readClosed()`: only reset-closed episodes, beginning at the existing
+ * frontier. It preserves historical frozen segment bounds and separately identifies the real
+ * episode end. Its paged metadata walk reaches a reset/tail without a fixed whole-episode size
+ * cap; only the selected closed episode is rendered, one bounded chunk at a time. Open episodes
+ * are never offered. The lower-level `read()` completed-turn API remains for historical SDK
+ * compatibility and cursor checks; it is not the product's model-execution selector.
+ *
  * This module reads only; it calls no model, writes no memory, creates no task and schedules
  * nothing. `read()` returns one bounded chunk of one mapped chat conversation, covering every new
  * completed turn the cursor can reach inside one scan bound rather than stopping at the first turn,
@@ -222,6 +229,11 @@ export interface DigestEvidence {
 /** One bounded chunk of one completed segment. */
 export interface DigestBatch {
   readonly status: "batch";
+  /** Present for closed-episode selection; distinct from a historical frozen segment's end. */
+  readonly closedEpisodeEndEntryId?: EntryId;
+  /** Remaining rendered evidence size and source entries, for between-episode admission estimates. */
+  readonly estimatedChars?: number;
+  readonly estimatedEntries?: number;
   /** Mapped chat session that owns the conversation; the source label for the batch. */
   readonly sessionKey: string;
   readonly conversationId: ConversationId;
@@ -309,6 +321,8 @@ export interface DigestSource {
   cursor(conversationId: ConversationId, context: Context): Promise<DigestCursor>;
   /** The oldest unprocessed completed chunk across the mapped chats. Writes nothing. */
   read(context: Context, limits?: DigestBatchLimits): Promise<DigestReadResult>;
+  /** Product digest selection: closed episodes only. Optional conversation pins internal continuation. */
+  readClosed(context: Context, limits?: DigestBatchLimits, conversationId?: ConversationId): Promise<DigestReadResult>;
   /**
    * Re-derive one chunk this source previously returned, from its recorded identity. Reads only.
    * The ref must name a currently mapped chat conversation and a range inside one completed
@@ -982,6 +996,9 @@ async function readChunk(
         start = Math.min(itemIndex, plan.steps.length);
         startOffset = textStart;
       }
+      // IDs are global: a zero-entry gap may precede this actual entry. A mid-item cut must
+      // checkpoint THIS ID, not the nominal lower bound, or the next read would replay its head.
+      entryId = entry.id;
       if (start >= plan.steps.length) {
         // The entry was already consumed (or carries no steps): move to the next entry.
         lastEntryId = entry.id;
@@ -1531,17 +1548,15 @@ async function validateCompletedSegment(
     entryId = (page.items[page.items.length - 1]!.id + 1) as EntryId;
   }
   if (!hasContent) throw new TypeError("Digest segment holds no content");
-  if (!sawInput) throw new TypeError("Digest segment does not open an owner or scheduled turn");
   const closing = (await conversation.entries(
     { order: "ascending", minEntryId: (endEntryId + 1) as EntryId },
     1,
     undefined,
     context,
   )).items[0];
-  if (closing !== undefined && (closing.kind === ResetEntry.kind
-    || closing.kind === UserEntry.kind || closing.kind === CRON_INPUT_ENTRY_KIND)) {
-    return;
-  }
+  if (closing?.kind === ResetEntry.kind) return;
+  if (!sawInput) throw new TypeError("Digest segment does not open an owner or scheduled turn");
+  if (closing !== undefined && (closing.kind === UserEntry.kind || closing.kind === CRON_INPUT_ENTRY_KIND)) return;
   if (terminalEntryId !== endEntryId || pending.size > 0) {
     throw new TypeError("Digest segment end is not a completed exchange boundary");
   }
@@ -1744,7 +1759,15 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
   const cursorFor = async (conversationId: ConversationId, context: Context): Promise<DigestCursor> => {
     const document = await options.harness.snapshot(DigestCursorDoc, conversationId, context);
     const cursor = digestCursorOf(document);
-    if (!isLegacyDigestCursor(document)) return cursor;
+    if (!isLegacyDigestCursor(document)) {
+      if (cursor.nextEntryId !== null && (cursor.nextItemIndex > 0 || cursor.nextTextStart > 0)) {
+        const conversation = await options.harness.conversation(conversationId, context);
+        if (conversation === undefined || await entryAt(conversation, cursor.nextEntryId, context) === undefined) {
+          throw new Error("Stored digest item offset has no committed entry; refusing to replay evidence");
+        }
+      }
+      return cursor;
+    }
     if (cursor.nextEntryId === null) return cursor;
     const conversation = await options.harness.conversation(conversationId, context);
     if (conversation === undefined) {
@@ -1904,6 +1927,97 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
         nextTextStart: chunk.nextTextStart,
         entries: chunk.entries,
         cursor: chosen.cursor,
+      };
+    },
+
+    async readClosed(context, limits, onlyConversationId) {
+      const batchLimits = requireBatchLimits(limits ?? configured);
+      const sessions = await options.sessions(context);
+      validateSessions(sessions);
+      const candidates: { session: HistoryChatSession; conversation: Conversation; cursor: DigestCursor;
+        start: EntryId; end: EntryId; chars: number; entries: number }[] = [];
+      let missingChats = 0;
+      let examinedChats = 0;
+      for (const session of sessions) {
+        if (onlyConversationId !== undefined && session.conversationId !== onlyConversationId) continue;
+        const conversation = await options.harness.conversation(session.conversationId, context);
+        if (conversation === undefined) { missingChats += 1; continue; }
+        examinedChats += 1;
+        const cursor = await cursorFor(session.conversationId, context);
+        // Walk pages, never accumulate an episode's transcript. A reset, not an assistant answer,
+        // closes eligibility. Start at the existing frontier, never replay its consumed prefix.
+        let pageCursor: Cursor | undefined;
+        let start: EntryId | undefined;
+        let end: EntryId | undefined;
+        let content = false;
+        let closed = false;
+        let entries = 0;
+        do {
+          const page = await conversation.entries(
+            { order: "ascending", minEntryId: cursor.nextEntryId ?? (1 as EntryId) },
+            DIGEST_LIMITS.entriesPerPage, pageCursor, context,
+          );
+          for (const entry of page.items) {
+            start ??= entry.id;
+            if (entry.kind === ResetEntry.kind && content) { closed = true; break; }
+            if (entry.kind !== ResetEntry.kind) content = true;
+            end = entry.id;
+            entries += 1;
+          }
+          if (closed) break;
+          pageCursor = page.next;
+        } while (pageCursor !== undefined);
+        if (closed && start !== undefined && end !== undefined) {
+          candidates.push({ session, conversation, cursor, start, end, chars: 0, entries });
+        }
+      }
+      candidates.sort((a, b) => a.start - b.start || a.session.conversationId - b.session.conversationId);
+      const chosen = candidates[0];
+      if (chosen === undefined) return {
+        status: "idle", caughtUp: missingChats === 0, examinedChats, postponedChats: 0,
+        unfinishedChats: 0, missingChats,
+      };
+      // Estimate only the selected CLOSED episode. Ineligible open tails are never interpreted
+      // as evidence (even malformed tool text in one cannot poison another chat's digestion).
+      const pending = new Set(chosen.cursor.pendingToolCalls);
+      let estimateCursor: Cursor | undefined;
+      do {
+        const page = await chosen.conversation.entries({ order: "ascending", minEntryId: chosen.start,
+          maxEntryId: chosen.end }, DIGEST_LIMITS.entriesPerPage, estimateCursor, context);
+        for (const entry of page.items) {
+          const plan = planOf(entry, pending);
+          const fromItem = entry.id === chosen.cursor.nextEntryId ? chosen.cursor.nextItemIndex : 0;
+          for (let index = fromItem; index < plan.steps.length; index += 1) {
+            const step = plan.steps[index]!;
+            if (step.item !== undefined) {
+              const from = entry.id === chosen.cursor.nextEntryId && index === fromItem ? chosen.cursor.nextTextStart : 0;
+              chosen.chars += step.item.preview ? Math.min(step.item.length, DIGEST_PREVIEW_CHARS)
+                : Math.max(0, step.item.length - from);
+            }
+            if (step.effect !== undefined) {
+              if (step.effect.add) pending.add(step.effect.callId);
+              else pending.delete(step.effect.callId);
+            }
+          }
+        }
+        estimateCursor = page.next;
+      } while (estimateCursor !== undefined);
+      // An upgrade may resume a frozen completed-turn segment inside this closed episode. Finish
+      // that immutable segment first; the caller continues through the real closing boundary.
+      const start = chosen.cursor.episodeStartEntryId ?? chosen.start;
+      const end = chosen.cursor.episodeEndEntryId ?? chosen.end;
+      const first = chosen.cursor.episodeStartEntryId === null ? chosen.start : chosen.cursor.nextEntryId!;
+      const chunk = await readChunk(chosen.conversation, first, chosen.cursor.nextItemIndex,
+        chosen.cursor.nextTextStart, end, chosen.cursor.pendingToolCalls, batchLimits, context);
+      return {
+        status: "batch", sessionKey: chosen.session.sessionKey, conversationId: chosen.session.conversationId,
+        closedEpisodeEndEntryId: chosen.end, estimatedChars: chosen.chars, estimatedEntries: chosen.entries,
+        episodeStartEntryId: start, episodeEndEntryId: end, firstEntryId: first,
+        firstItemIndex: chosen.cursor.nextItemIndex, firstTextStart: chosen.cursor.nextTextStart,
+        throughEntryId: chunk.throughEntryId, throughItemIndex: chunk.throughItemIndex,
+        throughChars: chunk.throughChars, complete: chunk.complete, nextEntryId: chunk.nextEntryId,
+        nextItemIndex: chunk.nextItemIndex, nextTextStart: chunk.nextTextStart,
+        entries: chunk.entries, cursor: chosen.cursor,
       };
     },
 

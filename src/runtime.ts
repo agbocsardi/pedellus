@@ -87,7 +87,6 @@ import {
   partitionChatScope,
   readChatScope,
   readChatSessions,
-  isLegacySessionKey,
   readMappedSessions,
   type ChatScopeExclusion,
   type HistoryChatSession,
@@ -342,8 +341,8 @@ export interface Gateway {
   memoryBrowse(caller: ConversationId, query: unknown, context: Context): ReturnType<MemoryService["browse"]>;
   memoryRead(caller: ConversationId, query: unknown, context: Context): ReturnType<MemoryService["read"]>;
   /**
-   * Bounded conversation-to-memory digestion. `start` reads one bounded completed-turn batch from the
-   * mapped chat sessions and creates one native Durable task, or reports `idle`, `busy` or `refused`
+   * Whole-episode conversation-to-memory digestion. `start` selects a closed episode from the
+   * mapped chat sessions and creates one continuing Durable task, or reports `idle`, `busy` or `refused`
    * without starting anything. It is inert until a host calls it: no command, tool, schedule or
    * provider call exists here, and nothing is sent to a user or channel. A run's cursor advance is
    * durable and only happens after a settled, answered turn. The owner command (`/digest`, also
@@ -1700,6 +1699,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     now,
     scopeExtension: digestScopeExtension,
     limits: digestLimits,
+    episodesPerRun: config.digest?.episodesPerRun ?? 1,
     // Explicit background selection only: never the origin conversation's current model or thinking.
     model: async () => digestChoice,
     allowModel: (candidate) => choicesByNative.has(modelKey(candidate)),
@@ -2226,15 +2226,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // therefore never presents these conversations as chats.
     const episodeSessions = async (ctx: Context): Promise<readonly HistoryChatSession[]> =>
       [...(await mappedChatSessions(ctx)), ...automationSessions()];
-    // The digest source shares the host-validated mapped chat sessions of the history index, minus
-    // history imported from the legacy harness: that transcript was processed into memory before the
-    // migration, so digesting it would derive memory again from evidence already marked consumed. It
-    // never includes automation conversations: a scheduled run is not a digest origin.
-    const digestSessions = async (ctx: Context): Promise<readonly HistoryChatSession[]> =>
-      (await mappedChatSessions(ctx)).filter(({ sessionKey }) => !isLegacySessionKey(sessionKey));
+    // The imported prefix is already consumed by its atomically seeded cursor. Do not exclude
+    // entire legacy channels: that would also suppress future closed episodes. Recall is unchanged.
+    // Automation conversations remain excluded by the shared mapped ordinary-chat scope.
     digestSourceRef.current = createDigestSource({
       harness: harness!,
-      sessions: digestSessions,
+      sessions: mappedChatSessions,
       limits: { entriesPerBatch: digestLimits.entriesPerBatch, charsPerBatch: digestLimits.charsPerBatch },
     });
     // Bounded, background-only derived state: reset-delimited episode boundaries and their
@@ -3506,11 +3503,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
       },
       async listHistoryEpisodes(sessionKey, query, ctx) {
         const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        return episodeCatalog!.list(conversationId, query, ctx);
+        const page = await episodeCatalog!.list(conversationId, query, ctx);
+        return { ...page, episodes: await Promise.all(page.episodes.map((episode) => digestEpisodeView(episode, ctx))) };
       },
       async historyEpisode(sessionKey, startEntryId, ctx) {
         const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        return episodeCatalog!.episode(conversationId, startEntryId as EntryId, ctx);
+        const episode = await episodeCatalog!.episode(conversationId, startEntryId as EntryId, ctx);
+        return episode === undefined ? undefined : digestEpisodeView(episode, ctx);
       },
       async reconcileHistoryEpisodes(sessionKey, ctx) {
         const conversationId = await chatConversationIdFor(sessionKey, ctx);
@@ -3670,6 +3669,33 @@ export async function openGateway(config: PortConfig, context: Context, options:
         }
       },
     };
+    async function digestEpisodeView(episode: HistoryEpisode, ctx: Context): Promise<HistoryEpisode> {
+      let status: NonNullable<HistoryEpisode["digestion"]>["status"] = "unknown";
+      let nextEntryId: number | null = null;
+      let nextItemIndex: number | null = null;
+      let nextTextStart: number | null = null;
+      try {
+        const cursor = await digestSourceRef.current!.cursor(episode.conversationId, ctx);
+        nextEntryId = cursor.nextEntryId;
+        nextItemIndex = cursor.nextItemIndex;
+        nextTextStart = cursor.nextTextStart;
+        if (episode.endEntryId !== null) {
+          if (nextEntryId !== null && nextEntryId > episode.endEntryId) {
+            status = "digested";
+            // The importer's reset provenance identifies the baseline, not a name suffix or a
+            // fake successful digest task. Future episodes in the same chat are not legacy units.
+            const conversation = await harness!.conversation(episode.conversationId, ctx);
+            const first = (await conversation?.entries({ order: "ascending", minEntryId: episode.startEntryId,
+              maxEntryId: episode.startEntryId }, 1, undefined, ctx))?.items[0];
+            if (first?.data && typeof first.data === "object" && "legacy" in first.data) status = "imported-baseline";
+          } else status = nextEntryId !== null && (nextEntryId > episode.startEntryId
+            || (nextEntryId === episode.startEntryId && (cursor.nextItemIndex > 0 || cursor.nextTextStart > 0)))
+            ? "partial" : "not-started";
+        }
+      } catch { /* An unreadable frontier is unknown, never guessed as pending or consumed. */ }
+      if (episode.status === "open") status = "open-ineligible";
+      return { ...episode, digestion: { status, nextEntryId, nextItemIndex, nextTextStart } };
+    }
     async function chatConversationIdFor(sessionKey: string, ctx: Context): Promise<ConversationId> {
       return (await mappedChatConversationFor(sessionKey, ctx)).id;
     }

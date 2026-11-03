@@ -203,7 +203,7 @@ function toolEdit(path, oldText, newText, id) {
   return fauxAssistantMessage([fauxToolCall('edit', { path, edits: [{ oldText, newText }] }, { id })], { stopReason: 'toolUse' });
 }
 
-test('digest config accepts only its six positive integer bounds and starts nothing by itself', () => {
+test('digest config validates its episode ceiling and positive integer bounds without starting work', () => {
   const fixture = { directory: tmpdir(), workspace: join(tmpdir(), 'digest-config-ws'), dataDir: join(tmpdir(), 'digest-config-data') };
   const base = { workspace: fixture.workspace, dataDir: fixture.dataDir, model: MODEL, toolAllowlist: [] };
   assert.equal(parseConfig(base, fixture.directory).digest, undefined, 'absent config keeps the defaults');
@@ -259,6 +259,8 @@ test('digest config accepts only its six positive integer bounds and starts noth
     { charsPerBatch: 1 },
     { charsPerBatch: -1 },
     { maxToolCalls: 1.5 },
+    { episodesPerRun: 0 },
+    { episodesPerRun: 1.5 },
     { maxChangedFiles: '8' },
     { maxDiffChars: null },
     { runTimeoutSeconds: 0 },
@@ -340,6 +342,7 @@ test('configured batch bounds reach the source and are captured in the accepted 
     runTimeoutMs: 120_000,
     maxChangedFiles: 1,
     maxDiffChars: 1_000,
+    spendingAdmissionOnly: true,
   });
   assert.equal((await settleTask(store.gateway.harness, started.taskId)).state.outcome.result.outcome, 'digested');
 });
@@ -577,10 +580,12 @@ test('a product-configured run deadline wins over the host test seam, which fill
     assert.equal(started.status, 'started');
     const task = await taskOf(store.gateway.harness, started.taskId);
     assert.equal(task.input.limits.runTimeoutMs, expectedMs);
-    assert.deepEqual({ ...task.input.limits }, {
-      ...DIGEST_RUN_LIMITS_DEFAULT,
-      runTimeoutMs: expectedMs,
-    }, `${fixture} keeps every other shared default`);
+    const { charsPerBatch, spendingAdmissionOnly, ...captured } = task.input.limits;
+    assert.equal(spendingAdmissionOnly, true);
+    assert.ok(charsPerBatch >= 2 && charsPerBatch <= DIGEST_RUN_LIMITS_DEFAULT.charsPerBatch,
+      'context headroom may narrow the internal character bound');
+    const { charsPerBatch: _defaultChars, ...defaults } = DIGEST_RUN_LIMITS_DEFAULT;
+    assert.deepEqual(captured, { ...defaults, runTimeoutMs: expectedMs }, `${fixture} keeps the other shared defaults`);
     await store.gateway.harness.abortTask(started.taskId, context);
     await settleTask(store.gateway.harness, started.taskId);
   };
@@ -740,14 +745,15 @@ test('a two-unit character bound accepts one emoji per chunk and still progresse
   );
 });
 
-test('the successful-response budget aborts the refused round without another request', { timeout: 30_000 }, async (t) => {
+test('the successful-response target never truncates an admitted episode', { timeout: 30_000 }, async (t) => {
   const fixture = await fixtureWorkspace();
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await writeFile(join(fixture.workspace, 'SOUL.md'), 'Synthetic policy.\n');
   const store = await openStore(fixture, (request) => {
     const text = transcriptText(request.messages);
     if (!text.includes('read-budget')) return toolRead('SOUL.md', 'read-budget');
     if (!text.includes('write-budget')) return toolWrite('memory/budget.md', '- fact\n', 'write-budget');
-    return fauxAssistantMessage('This round should never be admitted.');
+    return fauxAssistantMessage('The admitted episode is finished.');
   }, { digest: { maxRequests: 1 } });
   t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
   const origin = await store.gateway.conversationFor(SESSION, context);
@@ -756,19 +762,17 @@ test('the successful-response budget aborts the refused round without another re
   const started = await startDigest(store.gateway);
   assert.equal(started.status, 'started');
   const task = await settleTask(store.gateway.harness, started.taskId);
-  assert.equal(task.state.outcome.status, 'failed');
-  assert.match(task.state.outcome.error.message, /tool call failed/);
-  assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined, 'exhausting the request budget writes no cursor');
+  assert.equal(task.state.outcome.status, 'completed', JSON.stringify(task.state.outcome));
+  assert.ok(await cursorDoc(store.gateway.harness, origin.id));
   const target = await targetOf(store.gateway.harness, started.taskId);
   const results = await toolResults(store.gateway.harness, target.id);
-  assert.deepEqual(results.map((result) => result.isError), [true], 'the first refused round is the last one');
-  assert.match(results[0].text, /successful-response budget/);
-  assert.equal(task.state.outcome.result.successfulRequests, 1);
-  assert.equal(store.calls.filter((input) => input.startsWith('[memory digestion task]')).length, 1,
-    'a refused tool result must not invite another model request');
+  assert.deepEqual(results.map((result) => result.isError), [false, false]);
+  assert.equal(task.state.outcome.result.successfulRequests, 3);
+  assert.equal(task.state.outcome.result.episodesDone, 1);
+  assert.equal(store.calls.filter((input) => input.startsWith('[memory digestion task]')).length, 3);
 });
 
-test('a final answer over the input-token ceiling cannot acknowledge the batch', { timeout: 30_000 }, async (t) => {
+test('a final answer over the soft input target still completes the first episode', { timeout: 30_000 }, async (t) => {
   const fixture = await fixtureWorkspace();
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
   const store = await openStore(fixture, () => fauxAssistantMessage('Nothing new worth keeping.'), {
@@ -780,10 +784,10 @@ test('a final answer over the input-token ceiling cannot acknowledge the batch',
   const started = await startDigest(store.gateway);
   assert.equal(started.status, 'started');
   const task = await settleTask(store.gateway.harness, started.taskId);
-  assert.equal(task.state.outcome.status, 'failed');
-  assert.match(task.state.outcome.error.message, /input-token budget/);
+  assert.equal(task.state.outcome.status, 'completed');
   assert.ok(task.state.outcome.result.inputTokens > 1);
-  assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+  assert.equal(task.state.outcome.result.episodesDone, 1);
+  assert.ok(await cursorDoc(store.gateway.harness, origin.id));
 });
 
 test('an undersized model context refuses input before a digest provider request', { timeout: 30_000 }, async (t) => {
@@ -795,10 +799,8 @@ test('an undersized model context refuses input before a digest provider request
   const origin = await store.gateway.conversationFor(SESSION, context);
   await closedEpisode(store.gateway.harness, origin.id, [user('A durable fact.'), assistant('Noted.')]);
   const started = await startDigest(store.gateway);
-  assert.equal(started.status, 'started');
-  const task = await settleTask(store.gateway.harness, started.taskId);
-  assert.equal(task.state.outcome.status, 'failed');
-  assert.match(task.state.outcome.error.message, /model context/);
+  assert.equal(started.status, 'refused');
+  assert.match(started.reason, /evidence context/);
   assert.equal(store.calls.filter((input) => input.startsWith('[memory digestion task]')).length, 0);
   assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
 });

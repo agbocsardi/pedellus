@@ -332,14 +332,37 @@ it never observed reports its own end. See
 | `/model` | List named presets and the current/default choice. `/model <name>` temporarily selects one; `/model default` returns to the configured preset. A CLI reattach keeps the temporary selection; a gateway restart also returns to the configured preset. Direct-model configs retain `/model <provider> <modelId> [thinkingLevel]` and persisted selection. Busy selection is rejected atomically; retry when idle. In-process/SDK terminal callers without a host callback remain read-only. |
 | `/tools` | Read-only diagnostic of the config-selected coding tools for this conversation. |
 | `/refresh` | Re-read the configured workspace bootstrap, memory files, manifest and skill inventory for this attached CLI conversation. Requires `workspaceContext`; rejected while the conversation is busy. The refreshed summary and skill table apply to the next model request. |
-| `/digest` | Start one bounded background memory run and print started, busy, idle or refused. Requires an explicit configured digest model. Shared-workspace evidence may come from any mapped chat, through a fixed completed-turn cutoff without requiring reset. A fitting completed-turn range is one batch; a larger range splits into ordered chunks, potentially within a turn. Evidence includes owner/assistant prose and paired untrusted tool calls/results, with bounded head/tail result previews and original references. It returns immediately, holds no terminal turn and creates no schedule. Successful runs are silent and remain visible under `/digest status`; retained failure reports may resume the origin agent. An incomplete idle scan says eligible history may remain; a later invocation continues it, with no drain loop. |
-| `/digest status` | Bounded read-only view of the live digestion run, this conversation's newest run, and the retained internal issue reports (pending count and whether a new start is possible): task IDs, outcome, batch position, evidence count and a bounded recorded error. It performs no transcript scan, model call or cursor change. |
+| `/digest` | Start a background closed-episode memory invocation; print started, busy, idle or refused. Requires an explicit digest model. The first pending closed episode is always admitted regardless of estimated cost; internal chunks automatically continue until it finishes. After each episode, budget remaining input/responses against the next episode's estimated cost, up to `digest.episodesPerRun` (default 1). Never processes an open episode. Real failures or cancellation retain partial cursor progress and ordinary writes; invocation budgets never deliberately truncate an admitted episode. Returns immediately and creates no schedule. Success is silent; failures may resume the origin agent. |
+| `/digest status` | Bounded read-only view of the live digestion run, this conversation's newest run, and the retained internal issue reports (pending count and whether a new start is possible): task IDs, outcome, whole episodes/internal chunks completed, budget deferral, last position, evidence count and a bounded recorded error. Episode listing/detail additionally shows cursor-derived digestion progress, including imported baseline, partial and open/ineligible. It performs no transcript scan, model call or cursor change. |
 | `/mcp` | Bounded read-only status of configured MCP servers and any login waiting for a callback, with no model call. Ask the assistant in this attached conversation to add or update a server, log in, log out or remove one; management is direct, not an approval command. A login URL is printed here once as a transient owner line; a callback-shaped line is consumed before model admission and completes the flow. Requires a gateway opened from a configuration file. |
 | `/attach <path>[ -- <prompt>]` | Store one operator-named local file through the gateway under the CLI attachment subdirectory of the configured workspace media root and submit it as an ordinary path-only turn, optionally with prompt text after the first ` -- ` (paths may contain spaces). Requires top-level `media` config; see [local attachments](#local-attachments). |
 | `/compact` | Admit native Durable manual compaction. Summarization is asynchronous; summary placement follows native inbox boundaries and original entries remain stored. |
 | `/abort`, `/stop` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
 | `/new` | Start a fresh context in the same conversation and rebuild configured workspace instructions, memory and skills, exactly as Telegram does. With workspace context configured, a busy conversation is refused; prompt replacement and the reset marker commit atomically. No handoff, archive, summary, usage reset or extra model call; original entries and tool authority remain. Without configured workspace context, native reset semantics apply, including safe-boundary placement while busy. |
 | `/restart` | Ask the owner host to replace the whole gateway process after graceful teardown, using the same executable, argv and environment. Advertised only when supported. Refused with a fixed no-effect reason while live work (a running generation, tool, compaction, worker, digest or cron run) would be interrupted; a sleeping cron timer does not block. Finish or abort that work and retry; nothing is auto-cancelled. Configuration and workspace context reload; every attached CLI and Telegram surface disconnects. The local acknowledgement is flushed before shutdown. |
+
+Digest sizing: `digest.episodesPerRun` is the whole-episode ceiling (default 1).
+`maxInputTokens` (500,000 including cached input) and `maxRequests` (12 successful
+responses) are invocation targets for admitting **additional** episodes. The first
+pending episode is always admitted, and admitted episodes may overshoot these targets.
+The next-episode estimate allows three rounds plus framing per internal chunk with
+25% headroom; it is not an exact token count or financial cap. Native retries,
+compaction and uncommitted provider work prevent exact network-spend accounting.
+
+Internal chunk safeguards remain: `charsPerBatch` (200,000, narrowed for model context),
+`entriesPerBatch` (2,000), `maxToolCalls` (24), `runTimeoutSeconds` (600),
+`maxChangedFiles` (8), `maxDiffChars` (32,000 inserted plus removed).
+A safety failure, provider/tool error or cancellation can interrupt an episode; its
+acknowledged prefix stays consumed and ordinary writes are not rolled back. Reopen
+restores the accepted current chunk and captured bounds; a later invocation resumes
+unfinished evidence. Invocation write counts sum per-chunk reservations, not distinct
+files across chunks. Historical already-admitted tasks keep their original captured
+single-chunk spending semantics; new invocations use whole-episode admission.
+
+Imported transcript prefixes remain consumed via migration-seeded cursors. There is
+no blanket legacy-channel exclusion: new closed episodes in those chats can be digested.
+Original history remains searchable/recallable. Episode summaries are navigation only,
+never evidence of full digestion or a substitute for transcript facts.
 
 Memory digestion reports only issues. A failed or cancelled run is one internal
 event for this conversation's agent (the same pattern as a worker result), not a

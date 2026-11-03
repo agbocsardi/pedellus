@@ -113,6 +113,13 @@ export interface HistoryEpisode {
   /** Tool result entries in the range; null when uncounted. */
   readonly toolResults: number | null;
   readonly summary: HistoryEpisodeSummary;
+  /** Gateway-only read-only projection from the existing digest frontier; never summary readiness. */
+  readonly digestion?: {
+    readonly status: "not-started" | "partial" | "digested" | "imported-baseline" | "open-ineligible" | "unknown";
+    readonly nextEntryId: number | null;
+    readonly nextItemIndex: number | null;
+    readonly nextTextStart: number | null;
+  };
 }
 
 export interface HistoryEpisodeQuery {
