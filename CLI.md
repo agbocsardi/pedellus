@@ -177,15 +177,17 @@ the underlying exception. Unexpected failures keep the generic
 
 Failures additionally emit a bounded `durable-nanobot diagnostic:` JSON record to
 stderr (journald in the shipped units). It records the failure stage, stable
-fingerprint, allowlisted error class/code/reason, a task ID when Durable supplies
-one, code-relative stack locations and up to four errors in the cause chain.
+fingerprint, allowlisted error class/code/reason, a task ID and report reason when
+Durable supplies them, bounded restart counts, code-relative stack locations and
+up to four errors in the cause chain.
 Native Durable `onReport` events also reach that log, including asynchronous
 storage, task, hook and listener failures that do not fail the calling operation.
 Known value-free Durable invariant messages are included; arbitrary exception
 messages, absolute host paths, provider request objects, credentials, URLs and
 transcript text are not. This is diagnostic metadata, not an unrestricted debug
-trace. Primary gateway/open errors are logged before cleanup can replace them;
-shutdown failures have their own stage. Telegram transport wrappers retain the
+trace. Primary gateway/open errors remain the errors returned to callers, even
+when cleanup also fails; those shutdown failures are reported separately. Reporting
+is best-effort and cannot throw into application cleanup. Telegram transport wrappers retain the
 native cause for this formatter. Log retention and service restart policy are
 unchanged. See [service logs](./SERVICE.md#logs).
 

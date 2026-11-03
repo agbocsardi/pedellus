@@ -8,9 +8,11 @@ import { fileURLToPath } from "node:url";
 
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
-import { ReadAfterWrite, SessionFailed } from "@earendil-works/pi-durable";
+import { Harness, ReadAfterWrite, SessionFailed } from "@earendil-works/pi-durable";
 
-const { failureDiagnostic } = await import(new URL("../dist/failure-diagnostics.js", import.meta.url).href);
+const { main } = await import(new URL("../dist/cli.js", import.meta.url).href);
+const { StartupDiagnosticError, startupDiagnostic } = await import(new URL("../dist/startup-diagnostics.js", import.meta.url).href);
+const { failureDiagnostic, reportFailure } = await import(new URL("../dist/failure-diagnostics.js", import.meta.url).href);
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const cli = join(repoRoot, "bin", "durable-nanobot.mjs");
@@ -179,6 +181,116 @@ test("failure records keep Durable causes and code locations without serializing
   const hostile = new Error();
   Object.defineProperty(hostile, 'stack', { get() { throw new Error(secret); } });
   assert.deepEqual(parse(failureDiagnostic(hostile, 'command')).errors, [{ name: 'UninspectableError' }]);
+  const missing = parse(failureDiagnostic(durable, 'durable.task_outdated', 42, { reason: 'missing_task' }));
+  const outdated = parse(failureDiagnostic(durable, 'durable.task_outdated', 42, { reason: 'task_too_old' }));
+  assert.equal(missing.reason, 'missing_task');
+  assert.notEqual(missing.fingerprint, outdated.fingerprint);
+  const interrupted = parse(failureDiagnostic(durable, 'durable.task_interrupted', 42, { reason: 'restart_limit', restarts: 3 }));
+  assert.equal(interrupted.restarts, 3);
+  assert.ok(!failureDiagnostic(durable, 'durable.task_interrupted', 42, { reason: secret, restarts: Infinity }).includes(secret));
+});
+
+test("a failed diagnostic formatter or sink cannot throw or suppress a later reporting attempt", () => {
+  const original = console.error;
+  const primary = new Error('PRIVATE-REPORT-PRIMARY');
+  const lines = [];
+  try {
+    console.error = () => { throw new Error('sink failed'); };
+    assert.doesNotThrow(() => reportFailure(primary, 'gateway.open'));
+    console.error = (line) => lines.push(line);
+    const hostile = { get reason() { throw new Error('formatter failed'); } };
+    assert.doesNotThrow(() => reportFailure(primary, 'gateway.open', undefined, hostile));
+    assert.equal(lines.length, 0);
+    reportFailure(primary, 'gateway.open');
+    assert.equal(lines.length, 1, 'only a completed output call marks the error reported');
+    reportFailure(primary, 'command');
+    assert.equal(lines.length, 1, 'successful reporting still deduplicates the CLI boundary');
+  } finally { console.error = original; }
+});
+
+test("open keeps its primary exception through cleanup failures and forwards Durable report reasons", { timeout: 30_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'nanobot-open-cleanup-'));
+  const instance = await writeDefaultInstance(home, 'gpt-6-luna');
+  const config = parseConfig({ workspace: instance.workspace, dataDir: instance.dataDir,
+    model: { provider: 'cleanup-faux', modelId: 'alpha' }, episodeSummary: { enabled: false } }, home);
+  const models = createModels();
+  models.setProvider(fauxProvider({ provider: 'cleanup-faux', models: [{ id: 'alpha', name: 'Synthetic' }] }).provider);
+  const originalOpen = Harness.open;
+  const originalLog = console.error;
+  const primary = new StartupDiagnosticError('configInvalid');
+  const cleanup = new Error('PRIVATE-CLEANUP-ERROR');
+  const lines = [];
+  let onReport;
+  let reopened;
+  try {
+    console.error = (line) => lines.push(line);
+    Harness.open = async (...args) => {
+      const harness = await originalOpen(...args);
+      onReport = args[1].onReport;
+      const close = harness.close.bind(harness);
+      harness.root = async () => { throw primary; };
+      harness.close = async (ctx) => { await close(ctx); throw cleanup; };
+      return harness;
+    };
+    await assert.rejects(openGateway(config, context, { models }), (error) => error === primary);
+    const task = { id: 42, kind: 'synthetic', conversationId: 1 };
+    onReport({ kind: 'task_outdated', reason: 'missing_task', task, error: new Error('PRIVATE-REPORT-ERROR') });
+    onReport({ kind: 'task_interrupted', reason: 'restart_limit', restarts: 3, task, error: new Error('PRIVATE-REPORT-ERROR') });
+    const records = lines.map((line) => JSON.parse(line.slice('durable-nanobot diagnostic: '.length)));
+    assert.ok(records.some((record) => record.stage === 'gateway.open'));
+    assert.ok(records.some((record) => record.stage === 'gateway.close.runtime'));
+    assert.ok(records.some((record) => record.reason === 'missing_task' && record.taskId === 42));
+    assert.ok(records.some((record) => record.reason === 'restart_limit' && record.restarts === 3));
+    assert.ok(lines.every((line) => !line.includes('PRIVATE-')));
+    Harness.open = originalOpen;
+    reopened = await openGateway(config, context, { models }); // Cleanup must also release ownership.
+  } finally {
+    Harness.open = originalOpen;
+    console.error = originalLog;
+    await reopened?.close(context);
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("CLI keeps its Telegram-token failure when gateway shutdown also throws", { timeout: 30_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'nanobot-cli-cleanup-'));
+  const instance = await writeDefaultInstance(home, 'gpt-6-luna');
+  const file = join(instance.configDir, 'config.json');
+  const raw = JSON.parse(await readFile(file, 'utf8'));
+  raw.credentials = { openai: 'SYNTHETIC_CLEANUP_KEY' };
+  raw.telegram = { tokenEnv: 'SYNTHETIC_MISSING_TOKEN', allowFrom: ['1'] };
+  await writeFile(file, JSON.stringify(raw));
+  const priorKey = process.env.SYNTHETIC_CLEANUP_KEY;
+  const priorToken = process.env.SYNTHETIC_MISSING_TOKEN;
+  const originalOpen = Harness.open;
+  const originalLog = console.error;
+  const lines = [];
+  try {
+    process.env.SYNTHETIC_CLEANUP_KEY = SYNTHETIC_ENV;
+    process.env.SYNTHETIC_MISSING_TOKEN = '';
+    console.error = (line) => lines.push(line);
+    Harness.open = async (...args) => {
+      const harness = await originalOpen(...args);
+      const close = harness.close.bind(harness);
+      harness.close = async (ctx) => { await close(ctx); throw new Error('PRIVATE-CLOSE-ERROR'); };
+      return harness;
+    };
+    await assert.rejects(main(['gateway', '--config', file]), (error) => {
+      assert.equal(error.code, 'telegramToken');
+      assert.match(startupDiagnostic(error), /missing Telegram bot token/);
+      return true;
+    });
+    assert.ok(lines.some((line) => line.includes('gateway.telegram')));
+    assert.ok(lines.some((line) => line.includes('gateway.close.runtime')));
+    assert.ok(lines.every((line) => !line.includes('PRIVATE-') && !line.includes(SYNTHETIC_ENV)));
+    assert.equal(await pathExists(instance.socketPath), false);
+  } finally {
+    Harness.open = originalOpen;
+    console.error = originalLog;
+    if (priorKey === undefined) delete process.env.SYNTHETIC_CLEANUP_KEY; else process.env.SYNTHETIC_CLEANUP_KEY = priorKey;
+    if (priorToken === undefined) delete process.env.SYNTHETIC_MISSING_TOKEN; else process.env.SYNTHETIC_MISSING_TOKEN = priorToken;
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test("unexpected CLI startup failures emit a safe staged cause record", { timeout: 30_000 }, async () => {

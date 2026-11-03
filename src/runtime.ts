@@ -2123,7 +2123,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
       // Durable reports asynchronous storage, scheduler, hook and listener failures here even
       // when no public operation throws. Record the original cause before it is otherwise lost.
       onReport: (report: Report) => reportFailure(report.error, `durable.${report.kind}`,
-        "task" in report && report.task !== undefined ? Number(report.task.id) : undefined),
+        "task" in report && report.task !== undefined ? Number(report.task.id) : undefined, {
+          reason: "reason" in report ? report.reason : undefined,
+          restarts: "restarts" in report ? report.restarts : undefined,
+        }),
       conversationCreated: denyNewConversation,
       ...(toolEnvironments === undefined
         ? {}
@@ -3907,28 +3910,20 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const cleanup = withoutAbortSignal(context);
     // A failed open must not leave deferred cataloguing attached to a closed session, nor a
     // derived index handle open behind a failed gateway.
-    episodeCatalog?.close();
-    memoryServiceRef.current?.close();
+    const close = async (operation: () => unknown): Promise<void> => {
+      try { await operation(); }
+      catch (cleanupError) { reportFailure(cleanupError, "gateway.close.runtime"); }
+    };
+    await close(() => episodeCatalog?.close());
+    await close(() => memoryServiceRef.current?.close());
     memoryServiceRef.current = undefined;
-    try {
-      if (harness) await harness.close(cleanup);
-      else await storage?.close(cleanup);
-    } finally {
-      try { await codeModeRef.current?.close(); }
-      catch { /* a sandbox close failure must not mask the startup error */ }
-      try { await mcpRef.current?.close(); }
-      catch { /* a failed server connection is already closed; never mask the startup error */ }
-      try { await historyIndex?.close(); }
-      catch { /* a derived index close failure leaves a rebuildable file, not source data */ }
-      finally {
-        try {
-          for (const environments of workerEnvironments.values()) {
-            await environments.close(cleanup).catch(() => undefined);
-          }
-          await toolEnvironments?.close(cleanup).catch(() => undefined);
-        } finally { await releaseLock(); }
-      }
-    }
+    await close(() => harness ? harness.close(cleanup) : storage?.close(cleanup));
+    await close(() => codeModeRef.current?.close());
+    await close(() => mcpRef.current?.close());
+    await close(() => historyIndex?.close());
+    for (const environments of workerEnvironments.values()) await close(() => environments.close(cleanup));
+    await close(() => toolEnvironments?.close(cleanup));
+    await close(() => releaseLock());
     throw error;
   }
 }

@@ -370,6 +370,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
   let gateway: Awaited<ReturnType<typeof openGateway>> | undefined;
   let server: Awaited<ReturnType<typeof serveLocalGateway>> | undefined;
   let stage: FailureStage = "gateway.open";
+  let failure: { error: unknown } | undefined;
   /** The one host gate for both owner `/restart` surfaces: it refuses while live work would be interrupted. */
   const restart = createRestartCoordinator({
     activeWork: async (ctx) => {
@@ -443,8 +444,8 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       await aborted(stop.signal);
     }
   } catch (error) {
+    failure = { error };
     reportFailure(error, stage);
-    throw error;
   } finally {
     process.off("SIGINT", shutdown);
     process.off("SIGTERM", shutdown);
@@ -452,16 +453,17 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       await server?.close();
     } catch (error) {
       reportFailure(error, "gateway.close.local");
-      throw error;
+      failure ??= { error };
     } finally {
       try {
         await gateway?.close(withoutAbortSignal(context));
       } catch (error) {
         reportFailure(error, "gateway.close.runtime");
-        throw error;
+        failure ??= { error };
       }
     }
   }
+  if (failure !== undefined) throw failure.error;
   if (restart.accepted()) replaceGatewayProcess();
 }
 

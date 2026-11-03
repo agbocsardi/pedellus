@@ -16,12 +16,20 @@ const NAMES = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "Refer
   "SessionFailed", "ReadOnlySession", "ConversationBusy", "ConversationIdle"]);
 const CODES = new Set([...Object.keys(STARTUP_DIAGNOSTICS), "EACCES", "EPERM", "ENOENT", "ENOSPC", "EIO",
   "EMFILE", "ENFILE", "EADDRINUSE", "EADDRNOTAVAIL", "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "EPIPE",
-  "ETIMEDOUT", "ENETUNREACH", "EHOSTUNREACH", "ENOTFOUND", "EAI_AGAIN", "ERR_SQLITE_ERROR", "SQLITE_BUSY",
+  "ETIMEDOUT", "ENETUNREACH", "ENETDOWN", "EHOSTUNREACH", "ENOTFOUND", "EAI_AGAIN", "ERR_SQLITE_ERROR", "SQLITE_BUSY",
   "SQLITE_LOCKED", "SQLITE_CORRUPT", "SQLITE_FULL", "ERR_INVALID_ARG_TYPE", "ERR_INVALID_STATE",
   "ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND", "ABORT_ERR", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT",
   "UND_ERR_BODY_TIMEOUT", "UND_ERR_SOCKET", "CERT_HAS_EXPIRED", "UNABLE_TO_VERIFY_LEAF_SIGNATURE"]);
 const REASONS = new Set(["locked", "closed", "aborted", "cancelled", "unavailable", "interrupted", "timeout"]);
-const METHODS = new Set(["getMe", "getUpdates", "setMyCommands", "getFile"]);
+const METHODS = new Set(["getMe", "getUpdates", "setMyCommands", "getFile", "sendMessage", "sendRichMessage",
+  "sendDocument", "sendPhoto", "sendAudio", "sendVoice", "sendVideo", "sendAnimation", "sendSticker",
+  "sendMediaGroup", "editMessageText", "deleteMessage", "setMessageReaction", "sendChatAction"]);
+const REPORT_REASONS = new Set(["threw", "restart_limit", "interrupted", "missing_task", "task_too_old", "migration_failed"]);
+
+export interface FailureReportDetails {
+  readonly reason?: unknown;
+  readonly restarts?: unknown;
+}
 const REPORTED = new WeakSet<object>();
 
 /** Only actual code locations in this checkout, never exception headers, function names or external paths. */
@@ -58,7 +66,7 @@ function durableMessage(message: unknown, locations: readonly string[]): string 
 }
 
 /** Bounded journal record. No arbitrary messages, request objects, credentials, URLs or transcript text. */
-export function failureDiagnostic(error: unknown, stage: FailureStage, taskId?: number): string {
+export function failureDiagnostic(error: unknown, stage: FailureStage, taskId?: number, report?: FailureReportDetails): string {
   const errors: Record<string, unknown>[] = [];
   const queue: unknown[] = [error];
   const seen = new Set<unknown>();
@@ -89,16 +97,26 @@ export function failureDiagnostic(error: unknown, stage: FailureStage, taskId?: 
   } catch {
     if (errors.length < 4) errors.push({ name: "UninspectableError" });
   }
-  const fingerprint = createHash("sha256").update(JSON.stringify({ stage, errors })).digest("hex").slice(0, 16);
-  return `durable-nanobot diagnostic: ${JSON.stringify({ stage, fingerprint,
+  const reason = report?.reason;
+  const restarts = report?.restarts;
+  const details = {
+    ...(typeof reason === "string" && REPORT_REASONS.has(reason) ? { reason } : {}),
+    ...(typeof restarts === "number" && Number.isSafeInteger(restarts) && restarts >= 0 && restarts <= 1_000_000 ? { restarts } : {}),
+  };
+  const fingerprint = createHash("sha256").update(JSON.stringify({ stage, reason: details.reason, errors })).digest("hex").slice(0, 16);
+  return `durable-nanobot diagnostic: ${JSON.stringify({ stage, fingerprint, ...details,
     ...(Number.isSafeInteger(taskId) && taskId! > 0 ? { taskId } : {}), errors })}`;
 }
 
 /** Log before cleanup can replace the primary failure; skip the same error when the CLI catches it again. */
-export function reportFailure(error: unknown, stage: FailureStage, taskId?: number): void {
-  if (typeof error === "object" && error !== null) {
-    if (REPORTED.has(error) && !stage.startsWith("durable.")) return;
-    REPORTED.add(error);
+export function reportFailure(error: unknown, stage: FailureStage, taskId?: number, report?: FailureReportDetails): void {
+  try {
+    const object = typeof error === "object" && error !== null ? error : undefined;
+    if (object !== undefined && REPORTED.has(object) && !stage.startsWith("durable.")) return;
+    console.error(failureDiagnostic(error, stage, taskId, report));
+    // A failed formatter/sink must not suppress a later reporting attempt or replace the error.
+    if (object !== undefined) REPORTED.add(object);
+  } catch {
+    // Best effort only: reporting must never prevent cleanup or change the primary exception.
   }
-  console.error(failureDiagnostic(error, stage, taskId));
 }

@@ -101,10 +101,13 @@ journalctl --user -u durable-nanobot.service -f
 
 Durable report callbacks and gateway/CLI failure boundaries emit bounded
 `durable-nanobot diagnostic:` records: stages, safe error classes/codes, cause
-chains, code-relative stack locations, task IDs where available and a fingerprint.
+chains, code-relative stack locations, task IDs, report reasons/bounded restart
+counts where available, and a fingerprint.
 No raw request payloads, credentials or transcript text are logged. Only known
 safe Durable invariant messages are included verbatim; other error messages stay
-private. A later shutdown failure does not erase the primary failure record.
+private. A later shutdown failure does not replace the primary exception returned
+to callers. Reporting is best-effort: an unavailable stderr cannot block cleanup,
+and an unsuccessful output attempt does not suppress a later attempt.
 
 No verbosity switch, extra log file, retention change, systemd override or new
 retry loop is needed for these records. Journald retention remains host-managed;

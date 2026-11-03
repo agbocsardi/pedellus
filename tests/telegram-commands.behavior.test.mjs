@@ -16,7 +16,7 @@ const modules = join(packageRoot, 'node_modules/@earendil-works');
 const [
   { loadConfig, parseConfig },
   { openGateway },
-  { runTelegram, TelegramState },
+  { runTelegram, TelegramState, TelegramApiError },
   { workspaceContextGatewayOptions },
   { BACKGROUND_CONTEXT, withCancel },
   { createModels, fauxAssistantMessage, fauxProvider },
@@ -34,6 +34,8 @@ const [
   import(new URL('../dist/history/memory-digest.js', import.meta.url).href),
   import(new URL('../dist/restart.js', import.meta.url).href),
 ]);
+
+const { failureDiagnostic } = await import(new URL('../dist/failure-diagnostics.js', import.meta.url).href);
 
 const context = BACKGROUND_CONTEXT;
 const WAIT_MS = 15_000;
@@ -307,6 +309,49 @@ function userTexts(messages) {
 function rendered(text) {
   return text.replace(/\\([\\`*_[\]<>~$])/g, '$1');
 }
+
+test('owner sends preserve failed transport causes without changing unknown or pre-connect retry semantics', { timeout: 30_000 }, async (t) => {
+  const store = await syntheticStore('send-causes', { configFile: true });
+  const transport = telegramMock([[textUpdate(71, 71, '/help')]]);
+  const mockedFetch = globalThis.fetch;
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.length > 0, 'owner binding to be admitted');
+    await untilAsync(async () => (await stateDoc(store.gateway)).pending.length === 0, 'help delivery to settle');
+    const surface = store.gateway.mcpSurfaces.surfaceFor(`telegram:${BOT_ID}:chat:${CHAT_ID}`);
+    assert.ok(surface);
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+    for (const [code, expected, attempts] of [['ECONNRESET', 'unknown', 1], ['ECONNREFUSED', 'unknown', 1], ['EHOSTUNREACH', 'not-sent', 5]]) {
+      const native = Object.assign(new Error('PRIVATE-SEND-CAUSE'), { code });
+      let requests = 0;
+      globalThis.fetch = async (input, init) => {
+        if (new URL(String(input)).pathname.endsWith('/sendMessage')) { requests += 1; throw native; }
+        return mockedFetch(input, init);
+      };
+      let outcome;
+      const pending = surface.deliverNotice(`telegram:${BOT_ID}:chat:${CHAT_ID}`, 'Synthetic owner notice.', context)
+        .then(() => { outcome = { ok: true }; }, (error) => { outcome = { error }; });
+      for (let n = 0; n < 100 && outcome === undefined; n += 1) {
+        await flush(4);
+        t.mock.timers.tick(100);
+      }
+      assert.ok(outcome, 'bounded retry clock did not settle');
+      await pending;
+      assert.ok(outcome.error instanceof TelegramApiError);
+      assert.equal(outcome.error.outcome, expected);
+      assert.equal(outcome.error.cause.error, native);
+      assert.equal(requests, attempts, 'unknown sends are never resent; only proven pre-connect failures retry');
+      const log = failureDiagnostic(outcome.error, 'gateway.telegram');
+      assert.ok(log.includes(code) && !log.includes('PRIVATE-SEND-CAUSE') && !log.includes(TOKEN));
+    }
+  } finally {
+    t.mock.timers.reset();
+    globalThis.fetch = mockedFetch;
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
 
 test('a native host advertises exactly the implemented owner commands, with the /stop alias', { timeout: 20_000 }, async () => {
   const store = await syntheticStore('menu');

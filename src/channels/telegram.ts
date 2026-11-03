@@ -4022,19 +4022,19 @@ async function apiCall<T>(
       if (error instanceof GrammyError) {
         if (method === "editMessageText" && error.error_code === 400 &&
             (isNotModifiedDescription(error.description) || error.description === "Bad Request: message to edit not found")) {
-          throw new TelegramApiError(method, error.error_code, "rejected", error.description);
+          throw new TelegramApiError(method, error.error_code, "rejected", error.description, { cause: error });
         }
         if (error.error_code === 429) {
           const retryAfter = error.parameters.retry_after;
           if (retryAfter !== undefined && (!Number.isFinite(retryAfter) || retryAfter <= 0)) {
-            throw new TelegramApiError(method, 429, "rejected");
+            throw new TelegramApiError(method, 429, "rejected", undefined, { cause: error });
           }
           const deadline = Date.now() + (retryAfter === undefined ? FLOOD_WAIT_WITHOUT_HINT_MS : retryAfter * 1000);
-          if (!Number.isFinite(deadline)) throw new TelegramApiError(method, 429, "rejected");
+          if (!Number.isFinite(deadline)) throw new TelegramApiError(method, 429, "rejected", undefined, { cause: error });
           options.throttle?.defer(deadline);
           if (options.replaceable) return undefined;
           if (attempt < MAX_API_ATTEMPTS - 1) continue;
-          throw new TelegramApiError(method, 429, "rejected");
+          throw new TelegramApiError(method, 429, "rejected", undefined, { cause: error });
         }
         if (options.retryNetwork && error.error_code >= 500 && attempt < MAX_API_ATTEMPTS - 1) {
           await delay(backoff(attempt), signal);
@@ -4050,9 +4050,9 @@ async function apiCall<T>(
               await delay(backoff(attempt), signal);
               continue;
             }
-            throw new TelegramApiError(method, 0, "not-sent");
+            throw new TelegramApiError(method, 0, "not-sent", undefined, { cause: error });
           }
-          throw new TelegramApiError(method, 0, "unknown");
+          throw new TelegramApiError(method, 0, "unknown", undefined, { cause: error });
         }
         if (signal?.aborted) throw signal.reason;
         if (options.retryNetwork && attempt < MAX_API_ATTEMPTS - 1) {
@@ -4061,7 +4061,7 @@ async function apiCall<T>(
         }
       }
       if (signal?.aborted) throw signal.reason;
-      if (isAmbiguousSendMethod(method)) throw new TelegramApiError(method, 0, "unknown");
+      if (isAmbiguousSendMethod(method)) throw new TelegramApiError(method, 0, "unknown", undefined, { cause: error });
       throw new Error(`Telegram ${method} transport failed`, { cause: error });
     }
   }
