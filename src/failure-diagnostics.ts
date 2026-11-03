@@ -6,13 +6,15 @@ import type { Report } from "@earendil-works/pi-durable";
 import { STARTUP_DIAGNOSTICS } from "./startup-diagnostics.js";
 
 export type FailureStage = "command" | "gateway.open" | "gateway.local" | "gateway.telegram"
-  | "gateway.wait" | "gateway.close.local" | "gateway.close.runtime" | "gateway.lock" | "gateway.restart"
+  | "gateway.discord" | "gateway.channels" | "gateway.wait" | "gateway.close.local"
+  | "gateway.close.runtime" | "gateway.lock" | "gateway.restart"
   | `durable.${Report["kind"]}`;
 
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const NAMES = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "AggregateError",
   "AbortError", "TimeoutError", "ChordError", "StartupDiagnosticError", "LocalGatewayError",
-  "TelegramApiError", "GrammyError", "HttpError", "SqliteError", "ReadAfterWrite", "StorageRequestError",
+  "TelegramApiError", "GrammyError", "HttpError", "DiscordTransportError", "SqliteError",
+  "ReadAfterWrite", "StorageRequestError",
   "SessionFailed", "ReadOnlySession", "ConversationBusy", "ConversationIdle"]);
 const CODES = new Set([...Object.keys(STARTUP_DIAGNOSTICS), "EACCES", "EPERM", "ENOENT", "ENOSPC", "EIO",
   "EMFILE", "ENFILE", "EADDRINUSE", "EADDRNOTAVAIL", "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "EPIPE",

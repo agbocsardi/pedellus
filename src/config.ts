@@ -392,6 +392,21 @@ export interface PortConfig {
    */
   media?: MediaConfig;
   telegram?: { tokenEnv: string; allowFrom: readonly string[]; pollTimeoutSeconds?: number };
+  /**
+   * Opt-in Discord channel. Absent keeps every Discord code path unloaded. The bot token is read
+   * from `tokenEnv`; senders, channels and direct messages are explicitly allowlisted (there is no
+   * wildcard), and a guild message is admitted only when this bot is mentioned or replied to unless
+   * `groupPolicy` is `open`.
+   */
+  discord?: {
+    readonly tokenEnv: string;
+    readonly allowFrom: readonly string[];
+    readonly dmAllowFrom?: readonly string[];
+    readonly allowChannels?: readonly string[];
+    readonly groupPolicy?: "mention" | "open";
+    readonly streaming?: boolean;
+    readonly receipts?: { readonly read?: string | false; readonly working?: string | false; readonly delayMs?: number };
+  };
 }
 
 function object(value: unknown, name: string): Record<string, unknown> {
@@ -1199,10 +1214,76 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
     }
     Object.assign(config, { telegram });
   }
+  if (raw.discord !== undefined) {
+    Object.assign(config, { discord: discordConfig(raw.discord) });
+  }
   if (raw.web !== undefined) {
     Object.assign(config, { web: parseWebConfig(raw.web) });
   }
   return config;
+}
+
+/**
+ * One explicit snowflake allowlist. An empty list is only accepted where empty has a documented
+ * meaning ("no narrowing"); an empty sender list is refused, because it would leave every sender
+ * refused and the channel unusable while looking configured.
+ */
+function snowflakeList(value: unknown, name: string, allowEmpty: boolean): string[] {
+  if (!Array.isArray(value) || value.some((id) => typeof id !== "string" || !/^[1-9][0-9]{0,19}$/.test(id))) {
+    throw new Error(`${name} must be a list of decimal Discord snowflakes`);
+  }
+  if (!allowEmpty && value.length === 0) throw new Error(`${name} must not be empty`);
+  if (new Set(value).size !== value.length) throw new Error(`${name} must not repeat an ID`);
+  return value as string[];
+}
+
+/** `discord`: opt-in, default-deny, and no wildcard spelling in any list. */
+function discordConfig(value: unknown): NonNullable<PortConfig["discord"]> {
+  const d = object(value, "discord");
+  const discord: { -readonly [K in keyof NonNullable<PortConfig["discord"]>]: NonNullable<PortConfig["discord"]>[K] } = {
+    tokenEnv: envName(d.tokenEnv, "discord.tokenEnv"),
+    allowFrom: snowflakeList(d.allowFrom, "discord.allowFrom", false),
+  };
+  if (d.dmAllowFrom !== undefined) {
+    discord.dmAllowFrom = snowflakeList(d.dmAllowFrom, "discord.dmAllowFrom", true);
+  }
+  if (d.allowChannels !== undefined) {
+    discord.allowChannels = snowflakeList(d.allowChannels, "discord.allowChannels", true);
+  }
+  if (d.groupPolicy !== undefined) {
+    if (d.groupPolicy !== "mention" && d.groupPolicy !== "open") {
+      throw new Error("discord.groupPolicy must be mention or open");
+    }
+    discord.groupPolicy = d.groupPolicy;
+  }
+  if (d.streaming !== undefined) {
+    if (typeof d.streaming !== "boolean") throw new Error("discord.streaming must be a boolean");
+    discord.streaming = d.streaming;
+  }
+  if (d.receipts !== undefined) {
+    const r = object(d.receipts, "discord.receipts");
+    const receipts: { read?: string | false; working?: string | false; delayMs?: number } = {};
+    for (const key of ["read", "working"] as const) {
+      const emoji = r[key];
+      if (emoji === undefined) continue;
+      if (emoji === false) {
+        receipts[key] = false;
+        continue;
+      }
+      if (typeof emoji !== "string" || emoji.trim() === "" || emoji.length > 32 || /[\r\n]/.test(emoji)) {
+        throw new Error(`discord.receipts.${key} must be false or a short single-line emoji`);
+      }
+      receipts[key] = emoji;
+    }
+    if (r.delayMs !== undefined) {
+      if (typeof r.delayMs !== "number" || !Number.isFinite(r.delayMs) || r.delayMs < 0 || r.delayMs > 10_000) {
+        throw new Error("discord.receipts.delayMs must be from 0 to 10000");
+      }
+      receipts.delayMs = r.delayMs;
+    }
+    discord.receipts = Object.freeze(receipts);
+  }
+  return Object.freeze(discord);
 }
 
 /**

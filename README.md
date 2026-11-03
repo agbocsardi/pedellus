@@ -49,7 +49,11 @@ units; this repository does not install or start them.
 
 The gateway is the single owner: it opens storage, config tools, cron and, when
 configured, the restricted Telegram adapter (explicit decimal user allowlist
-only). One or more `agent` CLIs attach to it as conversation surfaces; the
+only) and the opt-in Discord adapter. Every configured channel starts
+concurrently and none is awaited before another starts. Discord needs its own
+explicit sender/channel allowlists, a bot token environment reference and the
+privileged message-content intent; see [Discord](./DISCORD.md). One or more
+`agent` CLIs attach to it as conversation surfaces; the
 historical bare `node bin/durable-nanobot.mjs --config ...` is the same attach and never opens
 a second runtime. A CLI disconnect leaves the gateway, Telegram polling, admitted
 turns and queued work running; a gateway restart stops all of them. Do not use

@@ -693,7 +693,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // A completed background result is queued only for an origin session that belongs to a channel
   // enabled in this configuration. A disabled channel creates no record, so no later enable can
   // deliver a stale result through a channel the host had switched off.
-  const cronDeliveryPrefixes: readonly string[] = config.telegram === undefined ? [] : ["telegram:"];
+  const cronDeliveryPrefixes: readonly string[] = [
+    ...(config.telegram === undefined ? [] : ["telegram:"]),
+    ...(config.discord === undefined ? [] : ["discord:"]),
+  ];
   // Fail at startup, not at the first tool call, when the default cannot be represented by the host shell.
   const toolTimeoutSeconds = parseToolTimeoutSeconds(config.toolTimeoutSeconds);
   const allowedModels = config.allowedModels ?? [config.model];

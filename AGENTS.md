@@ -84,7 +84,10 @@ edits need restart only; unit edits additionally need daemon-reload.
   summaries, rebuildable message/tool/summary search, and legacy history SDK/local
   APIs. Original transcript entries remain authoritative; see
   [MEMORY_RECALL.md](./MEMORY_RECALL.md) for the approved three-tool model-facing recall contract.
-- `src/channels/` — Telegram adapter; other channels are not ported.
+- `src/channels/` — Telegram and opt-in Discord adapters (`discord.ts` adapter,
+  `discord-js.ts` the real discord.js transport, `discord-transport.ts` the narrow
+  contract and pure text/failure rules); no other channel is ported. Channels start
+  concurrently and never await one another.
   `telegram-rich.ts` owns the rich-message limits, fence-aware splitting and the literal-text
   escaping the adapter uses for host notices.
 - `2026-10-30_lean-assistant_TODO.md` — single current work order:

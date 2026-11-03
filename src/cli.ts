@@ -409,39 +409,81 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       restart: { supported: restartSupported(), request: (acknowledge) => restart.request(acknowledge) },
       ...(attachments === undefined ? {} : { attachments }),
     });
+    // Every configured channel starts concurrently and none waits for another to end. A failure in
+    // one channel aborts the shared context, so the others stop through their own cleanup instead of
+    // running against a gateway this process is about to close.
+    const channels: ChannelRun[] = [];
+    // The host owns the process: a restart stops every surface through the same graceful shutdown,
+    // and the replacement happens here after the teardown below.
+    const restartHost = { supported: restartSupported(), request: () => restart.request() };
     if (config.telegram) {
+      // A channel's own startup failure keeps its specific stage in the journal diagnostic.
       stage = "gateway.telegram";
       const token = Object.hasOwn(process.env, config.telegram.tokenEnv)
         ? process.env[config.telegram.tokenEnv]
         : undefined;
       if (typeof token !== "string" || token.trim() === "") throw new StartupDiagnosticError("telegramToken");
       const { runTelegram } = await import("./channels/telegram.js");
-      await runTelegram(gateway, {
-        token,
-        allowFrom: config.telegram.allowFrom,
-        ...(config.telegram.pollTimeoutSeconds === undefined ? {} : { pollTimeoutSeconds: config.telegram.pollTimeoutSeconds }),
-        followUpMode: config.followUpMode ?? "followUp",
-        ...(config.media === undefined
-          ? {}
-          : {
-              media: {
-                workspace: config.workspace,
-                directory: config.media.directory,
-                ...(config.media.transcription === undefined
-                  ? {}
-                  : { transcription: config.media.transcription }),
-              },
-            }),
-        // The host owns the process: a restart stops every surface through the same graceful
-        // shutdown, and the replacement happens here after the teardown below.
-        restart: {
-          supported: restartSupported(),
-          request: () => restart.request(),
-        },
-      }, context);
-    } else {
+      channels.push({
+        stage: "gateway.telegram",
+        run: runTelegram(gateway, {
+          token,
+          allowFrom: config.telegram.allowFrom,
+          ...(config.telegram.pollTimeoutSeconds === undefined ? {} : { pollTimeoutSeconds: config.telegram.pollTimeoutSeconds }),
+          followUpMode: config.followUpMode ?? "followUp",
+          ...(config.media === undefined
+            ? {}
+            : {
+                media: {
+                  workspace: config.workspace,
+                  directory: config.media.directory,
+                  ...(config.media.transcription === undefined
+                    ? {}
+                    : { transcription: config.media.transcription }),
+                },
+              }),
+          restart: restartHost,
+        }, context),
+      });
+    }
+    if (config.discord) {
+      stage = "gateway.discord";
+      const token = Object.hasOwn(process.env, config.discord.tokenEnv)
+        ? process.env[config.discord.tokenEnv]
+        : undefined;
+      if (typeof token !== "string" || token.trim() === "") throw new StartupDiagnosticError("discordToken");
+      const [{ runDiscord }, { createDiscordJsTransport }] = await Promise.all([
+        import("./channels/discord.js"),
+        import("./channels/discord-js.js"),
+      ]);
+      channels.push({
+        stage: "gateway.discord",
+        run: runDiscord(gateway, createDiscordJsTransport({ token }), {
+          allowFrom: config.discord.allowFrom,
+          ...(config.discord.dmAllowFrom === undefined ? {} : { dmAllowFrom: config.discord.dmAllowFrom }),
+          ...(config.discord.allowChannels === undefined ? {} : { allowChannels: config.discord.allowChannels }),
+          ...(config.discord.groupPolicy === undefined ? {} : { groupPolicy: config.discord.groupPolicy }),
+          ...(config.discord.streaming === undefined ? {} : { streaming: config.discord.streaming }),
+          ...(config.discord.receipts === undefined ? {} : { receipts: config.discord.receipts }),
+          followUpMode: config.followUpMode ?? "followUp",
+          ...(config.media === undefined
+            ? {}
+            : { media: { workspace: config.workspace, directory: config.media.directory } }),
+          restart: restartHost,
+        }, context),
+      });
+    }
+    if (channels.length === 0) {
       stage = "gateway.wait";
       await aborted(stop.signal);
+    } else {
+      // A channel that fails while running reports its own stage from `runChannels`.
+      stage = "gateway.channels";
+      const failed = await runChannels(channels, shutdown);
+      if (failed !== undefined) {
+        stage = failed.stage;
+        throw failed.error;
+      }
     }
   } catch (error) {
     failure = { error };
@@ -465,6 +507,28 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
   }
   if (failure !== undefined) throw failure.error;
   if (restart.accepted()) replaceGatewayProcess();
+}
+
+/** One configured channel attachment: its own failure stage and its run promise. */
+export type ChannelRun = { readonly stage: FailureStage; readonly run: Promise<void> };
+
+/**
+ * Run every configured channel concurrently and return the first failure (with its own stage) only
+ * after all of them stopped. A failure asks the host to shut the shared gateway down first, so a
+ * sibling channel never keeps serving against a runtime this process is about to close. This is the
+ * one place that ordering is decided, so no channel can be awaited before another starts.
+ */
+export async function runChannels(
+  channels: readonly ChannelRun[],
+  shutdown: () => void,
+): Promise<{ readonly stage: FailureStage; readonly error: unknown } | undefined> {
+  let failed: { readonly stage: FailureStage; readonly error: unknown } | undefined;
+  await Promise.allSettled(channels.map((channel) => channel.run.catch((error: unknown) => {
+    failed ??= { stage: channel.stage, error };
+    shutdown();
+    throw error;
+  })));
+  return failed;
 }
 
 /**

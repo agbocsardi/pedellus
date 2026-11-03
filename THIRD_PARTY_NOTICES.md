@@ -37,6 +37,12 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## discord.js
+
+The Discord channel uses discord.js 14.28.0 (Apache-2.0) and its `@discordjs/*`
+packages for the Gateway and REST client. No discord.js source is modified or
+vendored; it is an ordinary pinned dependency.
+
 ## croner
 
 Calendar expression parsing and recurrence use croner 10.0.1, licensed under MIT.
