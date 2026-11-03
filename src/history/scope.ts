@@ -23,6 +23,27 @@ export function isChatSessionKey(sessionKey: string): boolean {
   return sessionKey.length > 0 && !sessionKey.endsWith(CHANNEL_STATE_SESSION_SUFFIX);
 }
 
+/**
+ * Suffix of the channel segment on a session key imported from the retired Python harness.
+ * The importer renamed each source channel (`telegram` -> `telegram-legacy`), so the marker is
+ * carried by the key's channel part and not by the conversation's contents.
+ */
+export const LEGACY_CHANNEL_SUFFIX = "-legacy";
+
+/**
+ * True for a session imported from the legacy harness, whose transcript was already processed
+ * into memory before the migration.
+ *
+ * Imported history stays recallable and searchable as chat history. It is not new evidence, so a
+ * consumer that derives new durable memory from conversation must skip it rather than re-read a
+ * transcript that was consumed once already.
+ */
+export function isLegacySessionKey(sessionKey: string): boolean {
+  const separator = sessionKey.indexOf(":");
+  const channel = separator === -1 ? sessionKey : sessionKey.slice(0, separator);
+  return channel.endsWith(LEGACY_CHANNEL_SUFFIX);
+}
+
 /** One entry of the stored map after validation; it may or may not be chat. */
 export interface MappedSession {
   readonly sessionKey: string;

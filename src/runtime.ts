@@ -87,6 +87,7 @@ import {
   partitionChatScope,
   readChatScope,
   readChatSessions,
+  isLegacySessionKey,
   readMappedSessions,
   type ChatScopeExclusion,
   type HistoryChatSession,
@@ -2225,11 +2226,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // therefore never presents these conversations as chats.
     const episodeSessions = async (ctx: Context): Promise<readonly HistoryChatSession[]> =>
       [...(await mappedChatSessions(ctx)), ...automationSessions()];
-    // The digest source shares the host-validated mapped chat sessions of the history index. It never
-    // includes automation conversations: a scheduled run is not a digest origin.
+    // The digest source shares the host-validated mapped chat sessions of the history index, minus
+    // history imported from the legacy harness: that transcript was processed into memory before the
+    // migration, so digesting it would derive memory again from evidence already marked consumed. It
+    // never includes automation conversations: a scheduled run is not a digest origin.
+    const digestSessions = async (ctx: Context): Promise<readonly HistoryChatSession[]> =>
+      (await mappedChatSessions(ctx)).filter(({ sessionKey }) => !isLegacySessionKey(sessionKey));
     digestSourceRef.current = createDigestSource({
       harness: harness!,
-      sessions: mappedChatSessions,
+      sessions: digestSessions,
       limits: { entriesPerBatch: digestLimits.entriesPerBatch, charsPerBatch: digestLimits.charsPerBatch },
     });
     // Bounded, background-only derived state: reset-delimited episode boundaries and their
