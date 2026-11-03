@@ -1237,9 +1237,20 @@ function snowflakeList(value: unknown, name: string, allowEmpty: boolean): strin
   return value as string[];
 }
 
+/** Exactly the accepted `discord` keys; an unknown key is a typo that must not silently widen access. */
+const DISCORD_KEYS = ["tokenEnv", "allowFrom", "dmAllowFrom", "allowChannels", "groupPolicy", "streaming", "receipts"] as const;
+const DISCORD_RECEIPT_KEYS = ["read", "working", "delayMs"] as const;
+
+function rejectUnknownKeys(value: Record<string, unknown>, allowed: readonly string[], name: string): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) throw new Error(`${name}.${key} is not a recognized option`);
+  }
+}
+
 /** `discord`: opt-in, default-deny, and no wildcard spelling in any list. */
 function discordConfig(value: unknown): NonNullable<PortConfig["discord"]> {
   const d = object(value, "discord");
+  rejectUnknownKeys(d, DISCORD_KEYS, "discord");
   const discord: { -readonly [K in keyof NonNullable<PortConfig["discord"]>]: NonNullable<PortConfig["discord"]>[K] } = {
     tokenEnv: envName(d.tokenEnv, "discord.tokenEnv"),
     allowFrom: snowflakeList(d.allowFrom, "discord.allowFrom", false),
@@ -1262,6 +1273,7 @@ function discordConfig(value: unknown): NonNullable<PortConfig["discord"]> {
   }
   if (d.receipts !== undefined) {
     const r = object(d.receipts, "discord.receipts");
+    rejectUnknownKeys(r, DISCORD_RECEIPT_KEYS, "discord.receipts");
     const receipts: { read?: string | false; working?: string | false; delayMs?: number } = {};
     for (const key of ["read", "working"] as const) {
       const emoji = r[key];

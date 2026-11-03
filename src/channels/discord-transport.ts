@@ -27,6 +27,8 @@ export const DISCORD_LIMITS = {
   maxSenderNameChars: 64,
   /** Bounded quoted context pulled from a replied-to message. */
   maxQuoteChars: 600,
+  /** Attachments pulled from the replied-to message (same store and limits as the message's own). */
+  maxReferencedAttachments: 4,
   /** Stored inbound identities kept for event dedupe. */
   maxAdmittedKeys: 1_000,
   /** Durable admitted work kept at once; further messages are refused, never silently dropped. */
@@ -35,8 +37,6 @@ export const DISCORD_LIMITS = {
   maxControls: 64,
   /** Chats whose admission evidence is remembered (allowlist re-checks and scheduled delivery). */
   maxOrigins: 1_000,
-  /** Reply targets remembered per chat for non-pinging replies. */
-  maxReplyTargets: 256,
   /** Discord's typing indicator expires after about ten seconds. */
   typingRefreshMs: 8_000,
   /** Minimum spacing between progressive edits of one preview message. */
@@ -62,14 +62,14 @@ export interface DiscordInboundAttachment {
   readonly url: string;
 }
 
-/** A complete snapshot of one earlier message, for bounded quoted context. */
+/** A complete snapshot of one earlier message, for bounded quoted context and its attachments. */
 export interface DiscordReplyReference {
   readonly messageId: string;
   readonly authorId: string;
   readonly authorName: string;
   readonly authorIsBot: boolean;
   readonly text: string;
-  readonly attachmentCount: number;
+  readonly attachments: readonly DiscordInboundAttachment[];
 }
 
 /**
@@ -283,15 +283,25 @@ export function resolveDiscordMentions(
   });
 }
 
-/** Bounded, labeled context from the message this one replies to; never a second model turn. */
-export function discordQuotedContext(reference: DiscordReplyReference | undefined): string | undefined {
+/**
+ * Bounded, labeled context from the message this one replies to; never a second model turn.
+ * `includedAttachments` says whether that message's attachments are stored with this turn, so the
+ * quoted line never claims something the model cannot see.
+ */
+export function discordQuotedContext(
+  reference: DiscordReplyReference | undefined,
+  includedAttachments = false,
+): string | undefined {
   if (reference === undefined) return undefined;
   const author = boundedDiscordLabel(reference.authorName, DISCORD_LIMITS.maxSenderNameChars);
   const text = String(reference.text ?? "").replace(/[\u0000-\u001f\u007f]+/gu, " ").replace(/\s+/gu, " ").trim();
   const bounded = text.length === 0 ? "(no text)" : text.slice(0, DISCORD_LIMITS.maxQuoteChars);
-  const attachments = reference.attachmentCount === 0
+  const count = reference.attachments.length;
+  const attachments = count === 0
     ? ""
-    : ` [${reference.attachmentCount} attachment(s), not included]`;
+    : includedAttachments
+      ? ` [${count} attachment(s) from that message follow]`
+      : ` [${count} attachment(s), not included]`;
   return `[Replying to ${author} (@${reference.authorId}): "${bounded}"${attachments}]`;
 }
 

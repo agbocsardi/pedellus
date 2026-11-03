@@ -79,13 +79,23 @@ test('speaker labels, mention resolution and quoted context are bounded and unam
   assert.equal(resolveDiscordMentions('no mentions', []), 'no mentions');
 
   assert.equal(discordQuotedContext(undefined), undefined);
+  const attachments = [
+    { id: '1', filename: 'a.png', sizeBytes: 4, url: 'https://cdn.example/a' },
+    { id: '2', filename: 'b.png', sizeBytes: 4, url: 'https://cdn.example/b' },
+  ];
   const quoted = discordQuotedContext({
     messageId: '10', authorId: '777', authorName: 'Bob', authorIsBot: false,
-    text: 'x'.repeat(2_000), attachmentCount: 2,
+    text: 'x'.repeat(2_000), attachments,
   });
   assert.ok(quoted !== undefined);
   assert.ok(quoted.length < 800);
-  assert.match(quoted, /^\[Replying to Bob \(@777\): "x+…?"? \[2 attachment\(s\), not included\]\]$/u);
+  assert.match(quoted, /^\[Replying to Bob \(@777\): "x+" \[2 attachment\(s\), not included\]\]$/u);
+  assert.match(discordQuotedContext({
+    messageId: '10', authorId: '777', authorName: 'Bob', authorIsBot: false, text: 'hi', attachments,
+  }, true), /\[2 attachment\(s\) from that message follow\]/u);
+  assert.match(discordQuotedContext({
+    messageId: '10', authorId: '777', authorName: 'Bob', authorIsBot: false, text: 'hi', attachments: [],
+  }), /"hi"\]$/u);
 
   assert.deepEqual(decodeDiscordSessionKey('discord:4242:dm:8001', BOT_ID), { channelId: '8001', kind: 'dm' });
   assert.deepEqual(decodeDiscordSessionKey('discord:4242:guild:9001:channel:6001', BOT_ID), { channelId: '6001', kind: 'channel' });

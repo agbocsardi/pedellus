@@ -23,6 +23,7 @@ import {
   classifyDiscordError,
   type DiscordChannelKind,
   type DiscordCommandSpec,
+  type DiscordInboundAttachment,
   type DiscordInboundMessage,
   type DiscordInteraction,
   type DiscordInteractionResponse,
@@ -37,10 +38,50 @@ export type DiscordJsTransportOptions = {
   readonly intents?: number;
   /** Advanced: override the discord.js REST timeout. */
   readonly restTimeoutMs?: number;
+  /**
+   * Advanced: build the client instead of `new Client(...)`. Offline checks use it to exercise the
+   * real event/interaction/error mapping against a synthetic client; it never changes what the
+   * adapter sees.
+   */
+  readonly createClient?: DiscordClientFactory;
 };
 
+/** The client surface this transport uses; the real discord.js client satisfies it structurally. */
+export interface DiscordClientLike {
+  user: { readonly id: string; readonly username?: string } | null;
+  application: { readonly commands: { set(commands: readonly unknown[]): Promise<Map<string, unknown>> } } | null;
+  channels: {
+    readonly cache: { get(id: string): unknown };
+    fetch(id: string): Promise<unknown>;
+  };
+  on(event: string, handler: (payload: never) => void): unknown;
+  once(event: string, handler: (...args: never[]) => void): unknown;
+  off(event: string, handler: (...args: never[]) => void): unknown;
+  removeAllListeners(): unknown;
+  login(token: string): Promise<unknown>;
+  destroy(): Promise<void>;
+}
+
+/** One client-factory request: the loaded module, the resolved intents and the transport's bounds. */
+export interface DiscordClientFactoryRequest {
+  readonly module: DiscordModule;
+  readonly intents: number;
+  readonly partials: readonly unknown[];
+  readonly restTimeoutMs?: number;
+}
+
+export type DiscordClientFactory = (request: DiscordClientFactoryRequest) => DiscordClientLike;
+
+/** The production factory: a discord.js client with non-pinging defaults and the DM channel partial. */
+const createDiscordJsClient: DiscordClientFactory = ({ module, intents, partials, restTimeoutMs }) =>
+  new module.Client({
+    intents,
+    partials: partials as never[],
+    allowedMentions: { parse: [], repliedUser: false },
+    ...(restTimeoutMs === undefined ? {} : { rest: { timeout: restTimeoutMs } }),
+  }) as unknown as DiscordClientLike;
+
 type DiscordModule = typeof import("discord.js");
-type DiscordClient = import("discord.js").Client;
 type DiscordMessage = import("discord.js").Message;
 
 /** Discord's own message types that carry a conversational prompt. */
@@ -77,7 +118,7 @@ export function createDiscordJsTransport(options: DiscordJsTransportOptions): Di
     throw new Error("Discord token is required and must be a single line");
   }
   let discord: DiscordModule | undefined;
-  let client: DiscordClient | undefined;
+  let client: DiscordClientLike | undefined;
   let botId = "";
   let botName: string | undefined;
 
@@ -99,13 +140,13 @@ export function createDiscordJsTransport(options: DiscordJsTransportOptions): Di
         d.GatewayIntentBits.MessageContent
       );
       const ready = deferred<void>();
-      const created = new d.Client({
+      const createClient = options.createClient ?? createDiscordJsClient;
+      const created = createClient({
+        module: d,
         intents,
         // Direct-message channels arrive as partials; without this a DM event is never delivered.
         partials: [d.Partials.Channel],
-        // Defence in depth only; the adapter sets the same rules per request.
-        allowedMentions: { parse: [], repliedUser: false },
-        ...(options.restTimeoutMs === undefined ? {} : { rest: { timeout: options.restTimeoutMs } }),
+        ...(options.restTimeoutMs === undefined ? {} : { restTimeoutMs: options.restTimeoutMs }),
       });
       client = created;
       const onReady = () => {
@@ -189,7 +230,7 @@ export function createDiscordJsTransport(options: DiscordJsTransportOptions): Di
           void replyInteraction(raw, {
             text: "This interaction is not implemented by this bot. Nothing was changed.",
             ephemeral: true,
-          });
+          }, d);
           return;
         }
         const channel = raw.channel as DiscordChannelLike | null;
@@ -209,8 +250,8 @@ export function createDiscordJsTransport(options: DiscordJsTransportOptions): Di
         };
         void Promise.resolve()
           .then(() => listener(mapped))
-          .then((response) => replyInteraction(raw, response ?? { text: "Processing…", ephemeral: true }))
-          .catch(() => replyInteraction(raw, { text: "This command could not be accepted.", ephemeral: true }));
+          .then((response) => replyInteraction(raw, response ?? { text: "Processing…", ephemeral: true }, d))
+          .catch(() => replyInteraction(raw, { text: "This command could not be accepted.", ephemeral: true }, d));
       };
       current.on(d.Events.InteractionCreate, handler);
       return () => { current.off(d.Events.InteractionCreate, handler); };
@@ -366,13 +407,7 @@ async function mapMessage(raw: DiscordMessage): Promise<DiscordInboundMessage | 
     })),
     mentionsEveryone: raw.mentions.everyone,
     ...(replyTarget === undefined ? {} : { reply: replyTarget }),
-    attachments: raw.attachments.map((attachment) => ({
-      id: attachment.id,
-      filename: attachment.name,
-      sizeBytes: attachment.size,
-      ...(attachment.contentType === null ? {} : { contentType: attachment.contentType }),
-      url: attachment.url,
-    })),
+    attachments: raw.attachments.map(attachmentSnapshot),
   };
 }
 
@@ -383,7 +418,24 @@ function replySnapshot(message: DiscordMessage): DiscordReplyReference {
     authorName: message.member?.displayName ?? message.author.displayName ?? message.author.username,
     authorIsBot: message.author.bot,
     text: message.content,
-    attachmentCount: message.attachments.size,
+    attachments: message.attachments.map(attachmentSnapshot),
+  };
+}
+
+/** One attachment's metadata; its signed CDN URL is used once at admission, never stored. */
+function attachmentSnapshot(attachment: {
+  readonly id: string;
+  readonly name: string;
+  readonly size: number;
+  readonly contentType: string | null;
+  readonly url: string;
+}): DiscordInboundAttachment {
+  return {
+    id: attachment.id,
+    filename: attachment.name,
+    sizeBytes: attachment.size,
+    ...(attachment.contentType === null ? {} : { contentType: attachment.contentType }),
+    url: attachment.url,
   };
 }
 
@@ -398,7 +450,7 @@ function asChannelLike(channel: unknown): DiscordChannelLike | undefined {
   return channel !== null && typeof channel === "object" ? channel as DiscordChannelLike : undefined;
 }
 
-async function resolveChannel(client: DiscordClient, channelId: string): Promise<unknown> {
+async function resolveChannel(client: DiscordClientLike, channelId: string): Promise<unknown> {
   const cached = client.channels.cache.get(channelId);
   if (cached !== undefined) return cached;
   try {
@@ -414,7 +466,7 @@ async function resolveChannel(client: DiscordClient, channelId: string): Promise
 }
 
 async function resolveMessage(
-  client: DiscordClient | undefined,
+  client: DiscordClientLike | undefined,
   channelId: string,
   messageId: string,
 ): Promise<DiscordMessage | undefined> {
@@ -431,10 +483,15 @@ async function resolveMessage(
 async function replyInteraction(
   raw: import("discord.js").Interaction,
   response: DiscordInteractionResponse,
+  module: DiscordModule,
 ): Promise<void> {
   if (!raw.isRepliable()) return;
   try {
-    await raw.reply({ content: response.text, ephemeral: response.ephemeral });
+    // The current API spells an ephemeral reply with a message flag; `ephemeral` is deprecated.
+    await raw.reply({
+      content: response.text,
+      ...(response.ephemeral ? { flags: module.MessageFlags.Ephemeral } : {}),
+    });
   } catch {
     // The three-second window may already be closed; the durable notice still carries the result.
   }

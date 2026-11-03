@@ -14,9 +14,10 @@ const modules = join(packageRoot, 'node_modules/@earendil-works');
 export const context = (await import(`${modules}/chord/dist/context/index.js`)).BACKGROUND_CONTEXT;
 export const { withCancel } = await import(`${modules}/chord/dist/context/index.js`);
 export const { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(`${modules}/pi-ai/dist/index.js`);
+export const { superviseChannels } = await import(new URL('../../dist/cli.js', import.meta.url).href);
 export const { inProcessTerminalConversation } = await import(new URL('../../dist/terminal/conversation.js', import.meta.url).href);
 export const { getCurrentSystemPrompt } = await import(`${modules}/pi-ai/dist/utils/transcript.js`);
-export const { parseConfig } = await import(new URL('../../dist/config.js', import.meta.url).href);
+export const { parseConfig, loadConfig } = await import(new URL('../../dist/config.js', import.meta.url).href);
 export const { openGateway } = await import(new URL('../../dist/runtime.js', import.meta.url).href);
 export const { runDiscord, DiscordState, validateOptions, decodeDiscordSessionKey } = await import(
   new URL('../../dist/channels/discord.js', import.meta.url).href
@@ -142,7 +143,7 @@ export async function openDiscordStore(label, options = {}) {
     const captured = [];
     const { models, gate } = fauxModels(captured, options);
     const model = { provider: 'fixture', modelId: 'alpha' };
-    const config = parseConfig({
+    const raw = {
       workspace,
       dataDir: join(directory, 'state'),
       ...(options.presets === undefined
@@ -161,7 +162,16 @@ export async function openDiscordStore(label, options = {}) {
       },
       ...(options.media === true ? { media: {} } : {}),
       ...(options.followUpMode === undefined ? {} : { followUpMode: options.followUpMode }),
-    }, directory);
+    };
+    // A gateway opened from a file also exposes owner MCP management; the object form does not.
+    let config;
+    if (options.configFile === true) {
+      const file = join(directory, 'config.json');
+      await writeFile(file, `${JSON.stringify(raw, null, 2)}\n`);
+      config = await loadConfig(file);
+    } else {
+      config = parseConfig(raw, directory);
+    }
     const gateway = await openGateway(config, context, { models });
     return {
       directory,
@@ -205,6 +215,8 @@ export function syntheticTransport(options = {}) {
     nextEditFailure: undefined,
     /** Resolve this promise before the next send completes, to hold an in-flight send. */
     sendGate: undefined,
+    /** Sends currently inside `transport.send` (before any result). */
+    inFlight: 0,
   };
   const transport = {
     botId: BOT_ID,
@@ -230,19 +242,24 @@ export function syntheticTransport(options = {}) {
       };
     },
     async send(request) {
-      if (state.sendGate !== undefined) {
-        const gate = state.sendGate;
-        state.sendGate = undefined;
-        await gate;
+      state.inFlight += 1;
+      try {
+        if (state.sendGate !== undefined) {
+          const gate = state.sendGate;
+          state.sendGate = undefined;
+          await gate;
+        }
+        if (state.nextSendFailure !== undefined) {
+          const failure = state.nextSendFailure;
+          state.nextSendFailure = undefined;
+          throw failure;
+        }
+        const messageId = String(nextMessageId++);
+        sent.push({ ...request, messageId });
+        return { messageId, text: request.text };
+      } finally {
+        state.inFlight -= 1;
       }
-      if (state.nextSendFailure !== undefined) {
-        const failure = state.nextSendFailure;
-        state.nextSendFailure = undefined;
-        throw failure;
-      }
-      const messageId = String(nextMessageId++);
-      sent.push({ ...request, messageId });
-      return { messageId, text: request.text };
     },
     async edit(channelId, messageId, text) {
       if (state.nextEditFailure !== undefined) {
@@ -343,7 +360,9 @@ export function startDiscord(store, harness, options = {}) {
   const adapter = runDiscord(store.gateway, harness.transport, {
     allowFrom: options.allowFrom ?? store.config.discord.allowFrom,
     ...(store.config.discord.dmAllowFrom === undefined ? {} : { dmAllowFrom: store.config.discord.dmAllowFrom }),
-    ...(store.config.discord.allowChannels === undefined ? {} : { allowChannels: store.config.discord.allowChannels }),
+    ...(options.allowChannels !== undefined
+      ? { allowChannels: options.allowChannels }
+      : store.config.discord.allowChannels === undefined ? {} : { allowChannels: store.config.discord.allowChannels }),
     ...(store.config.discord.groupPolicy === undefined ? {} : { groupPolicy: store.config.discord.groupPolicy }),
     ...(store.config.discord.receipts === undefined ? {} : { receipts: store.config.discord.receipts }),
     ...(store.config.discord.streaming === undefined ? {} : { streaming: store.config.discord.streaming }),

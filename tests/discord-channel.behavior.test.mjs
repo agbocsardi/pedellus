@@ -85,6 +85,9 @@ test('discord config is opt-in, default-deny and refuses wildcards', { timeout: 
   assert.throws(() => parseConfig({ ...base, discord: { tokenEnv: 'T', allowFrom: ['501'], allowChannels: ['#general'] } }, '/tmp'), /snowflake/);
   assert.throws(() => parseConfig({ ...base, discord: { tokenEnv: 'T', allowFrom: ['501'], receipts: { read: 'a\nb' } } }, '/tmp'), /receipts/);
   assert.throws(() => parseConfig({ ...base, discord: { tokenEnv: 'not a name', allowFrom: ['501'] } }, '/tmp'), /environment variable/);
+  // A misspelled key must not silently widen access: `allowChannel` is not a narrowing option.
+  assert.throws(() => parseConfig({ ...base, discord: { tokenEnv: 'T', allowFrom: ['501'], allowChannel: ['6001'] } }, '/tmp'), /not a recognized option/u);
+  assert.throws(() => parseConfig({ ...base, discord: { tokenEnv: 'T', allowFrom: ['501'], receipts: { reed: '👀' } } }, '/tmp'), /not a recognized option/u);
 
   assert.doesNotThrow(() => validateOptions({ allowFrom: ['501'] }));
   assert.throws(() => validateOptions({ allowFrom: [] }), /non-empty/);
@@ -99,7 +102,7 @@ test('a mention-gated guild message is answered once and unaddressed traffic is 
     await harness.receive(guildMessage({ id: '11', authorId: '999', content: `<@${BOT_ID}> hi` }));
     await harness.receive(guildMessage({ id: '12', content: 'no mention here' }));
     await harness.receive(guildMessage({ id: '13', authorId: BOT_ID, content: `<@${BOT_ID}> self` }));
-    await harness.receive(guildMessage({ id: '14', authorIsBot: true, content: `<@${BOT_ID}> other bot` }));
+    await harness.receive(guildMessage({ id: '14', authorId: '999', authorIsBot: true, content: `<@${BOT_ID}> unlisted bot` }));
     await harness.receive(guildMessage({ id: '15', system: true, content: `<@${BOT_ID}> joined` }));
     await harness.receive(guildMessage({ id: '16', mentionsEveryone: true, content: '@everyone hello' }));
     await harness.receive(guildMessage({ id: '17', content: '   ' }));
@@ -184,7 +187,7 @@ test('mentions are resolved, a reply to this bot is admitted, and quoted context
       authorName: 'Bob',
       authorIsBot: false,
       text: 'the earlier picture',
-      attachmentCount: 1,
+      attachments: [],
     };
     await harness.receive(guildMessage({
       id: '51',
@@ -194,7 +197,7 @@ test('mentions are resolved, a reply to this bot is admitted, and quoted context
     }));
     await until(() => harness.sent.length === 1, 'attributed answer');
     const text = userTexts(store.captured[0].messages)[0];
-    assert.match(text, /\[Replying to Bob \(@777\): "the earlier picture" \[1 attachment\(s\), not included\]\]/u);
+    assert.match(text, /\[Replying to Bob \(@777\): "the earlier picture"\]/u);
     assert.match(text, /\[Alice \(id=501\)\]: @Bob and @Carol look, @synthetic_bot$/u);
 
     // A reply to this bot's own message is a mention even without a token in the body.
@@ -367,7 +370,8 @@ test('a steering owner message joins the tool round and the pair is answered exa
       'the second message to queue as a steer');
     store.gate.release();
     await until(() => harness.sent.length === 1, 'one shared answer');
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // The shared answer's retirement is durable: once no pending record remains, a sibling cannot answer.
+    await untilAsync(async () => (await channelState(store.gateway)).pending.length === 0, 'shared delivery retired');
     assert.equal(harness.sent.length, 1, 'the steered sibling must not answer again');
     assert.equal(harness.sent[0].text, 'SHARED-STEER-ANSWER');
     const texts = userTexts(store.captured.at(-1).messages);
@@ -394,5 +398,116 @@ test('state keeps bounded admission evidence and no pending work after an answer
     const first = await store.gateway.conversationFor(sessionKeys.channel, context);
     const again = await store.gateway.conversationFor(sessionKeys.channel, context);
     assert.equal(first.id, again.id);
+  });
+});
+
+test('an allowlisted other bot is admitted when addressed, and an unlisted one never is', { timeout: 30_000 }, async () => {
+  const OTHER_BOT = '888';
+  await withStore('bots', { allowFrom: [USER_ID, OTHER_BOT] }, async ({ harness, store }) => {
+    // An explicitly allowlisted bot is a legitimate multi-agent participant.
+    await harness.receive(guildMessage({
+      id: '901', authorId: OTHER_BOT, authorName: 'Helper', authorIsBot: true,
+      content: `<@${BOT_ID}> please summarise`, mentions: [{ id: BOT_ID, name: 'synthetic_bot' }],
+    }));
+    await until(() => harness.sent.length === 1, 'allowlisted bot answer');
+    assert.equal(store.captured.length, 1);
+    assert.match(userTexts(store.captured[0].messages)[0], /^\[Helper \(id=888\)\]:/u);
+
+    // The same bot with no mention in a mention-gated guild is not addressed.
+    await harness.receive(guildMessage({
+      id: '902', authorId: OTHER_BOT, authorName: 'Helper', authorIsBot: true, content: 'unaddressed chatter',
+    }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(store.captured.length, 1);
+
+    // This bot's own account is refused before the allowlist is even consulted.
+    await harness.receive(guildMessage({
+      id: '903', authorId: BOT_ID, authorName: 'synthetic_bot', authorIsBot: true,
+      content: `<@${BOT_ID}> self`,
+    }));
+    // An unlisted bot stays out even when it is addressed.
+    await harness.receive(guildMessage({ id: '904', authorId: '999', authorName: 'Stranger', authorIsBot: true, content: `<@${BOT_ID}> hi` }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(store.captured.length, 1);
+    assert.equal(harness.sent.length, 1);
+  });
+});
+
+test('a message beyond the input bound is truncated with a visible marker', { timeout: 30_000 }, async () => {
+  await withStore('input-bound', {}, async ({ harness, store }) => {
+    const long = `<@${BOT_ID}> ${'z'.repeat(20_000)}`;
+    await harness.receive(guildMessage({ id: '911', content: long }));
+    await until(() => harness.sent.length === 1, 'truncated input answer');
+    const text = userTexts(store.captured[0].messages)[0];
+    assert.ok(text.length <= 16_000 + 64, 'the admitted input stays inside the host bound');
+    assert.match(text, /… \(truncated: message exceeded this host's input bound\)$/u);
+  });
+});
+
+test('an attachment on the replied-to message is stored and read, like a python reference', { timeout: 30_000 }, async () => {
+  const originalFetch = globalThis.fetch;
+  const png = Buffer.from(
+    '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6360000002000154a24f9d0000000049454e44ae426082',
+    'hex',
+  );
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes('cdn.example/quoted')) {
+      return new Response(png, { status: 200, headers: { 'content-type': 'image/png', 'content-length': String(png.length) } });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  try {
+    await withStore('referenced-media', { media: true }, async ({ harness, store }) => {
+      harness.state.quoted = {
+        messageId: '920',
+        authorId: '777',
+        authorName: 'Bob',
+        authorIsBot: false,
+        text: 'the earlier picture',
+        attachments: [{ id: '931', filename: 'quoted.png', sizeBytes: png.length, contentType: 'image/png', url: 'https://cdn.example/quoted' }],
+      };
+      await harness.receive(guildMessage({
+        id: '921',
+        content: `<@${BOT_ID}> what is this`,
+        reply: { messageId: '920', authorId: '777', authorIsBot: false },
+      }));
+      await until(() => harness.sent.length === 1, 'referenced media answer');
+      const content = store.captured[0].messages.at(-1).content;
+      assert.ok(Array.isArray(content));
+      const text = content.filter((part) => part.type === 'text').map((part) => part.text).join('');
+      assert.match(text, /\[Replying to Bob \(@777\): "the earlier picture" \[1 attachment\(s\) from that message follow\]\]/u);
+      assert.match(text, /\[from replied message by Bob\] \[attachment: media\/discord\/photo-[0-9a-f]+\.png — quoted\.png, \d+ bytes, image\/png\]/u);
+      assert.equal(content.filter((part) => part.type === 'image').length, 1);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a completed turn clears only its own receipt, never a newer input feedback', { timeout: 30_000 }, async () => {
+  await withStore('feedback-order', { receipts: { read: '👀', working: false, delayMs: 0 } }, async ({ store, harness }) => {
+    // The first message answers normally; the second is held so its receipt is the current one.
+    store.script([
+      () => fauxAssistantMessage('FIRST-ANSWER'),
+      () => fauxAssistantMessage('SECOND-ANSWER'),
+    ]);
+    await harness.receive(guildMessage({ id: '941', content: `<@${BOT_ID}> first` }));
+    await until(() => harness.sent.length === 1, 'first answer');
+
+    const entered = store.gate.hold();
+    await harness.receive(guildMessage({ id: '942', content: `<@${BOT_ID}> second` }));
+    await entered;
+    // The newer message owns the channel receipt now: its predecessor's completion must not clear it.
+    await untilAsync(async () => harness.reactions.some((entry) => entry.op === 'add' && entry.messageId === '942'), 'newer receipt');
+    assert.equal(
+      harness.reactions.some((entry) => entry.op === 'remove' && entry.messageId === '942'),
+      false,
+      'an earlier completion removed the newer input feedback',
+    );
+    store.gate.release();
+    await until(() => harness.sent.length === 2, 'second answer');
+    await untilAsync(async () => harness.reactions.some((entry) => entry.op === 'remove' && entry.messageId === '942'), 'newer receipt cleanup');
+    void store;
   });
 });

@@ -262,6 +262,39 @@ Cancelled, superseded and missing-job runs are not pushed; ask the agent to
 `list` cron jobs to inspect a failure and read the reported delivery fault. See
 [cron](./CRON.md).
 
+## 6b. Optional: Discord
+
+Discord is opt-in and independent of Telegram: both can run at once, and adding
+one never changes the other's authority. Add a `discord` block to the config and
+restart:
+
+```json
+"discord": {
+  "tokenEnv": "DISCORD_BOT_TOKEN",
+  "allowFrom": ["111111111111111111"],
+  "dmAllowFrom": ["111111111111111111"],
+  "allowChannels": ["222222222222222222"],
+  "groupPolicy": "mention"
+}
+```
+
+- Put the bot token in the environment variable named by `tokenEnv`; the config
+  never contains the token. A missing variable fails startup with a fixed
+  diagnostic.
+- `allowFrom` is required and has no wildcard. `allowChannels` limits guild
+  channels (a thread matches its own or its parent's ID), and `dmAllowFrom`
+  additionally narrows direct messages. Unknown keys inside `discord` are refused,
+  so a misspelled `allowChannel` cannot silently widen access.
+- Enable the **Message Content** privileged intent for the bot, or guild messages
+  arrive empty. Invite it with the `bot` and `applications.commands` scopes for the
+  command menu; typed commands work without the second scope.
+- In a mention-gated guild, address the bot (`@bot /status`, `@bot hello`).
+  `groupPolicy: "open"` answers every message in an allowed channel.
+- Attachments require the top-level `media` block; Discord originals then live in
+  `workspace/media/discord/` under the same size bound as Telegram's.
+- Commands, delivery behavior, limits and known gaps are documented in
+  [Discord](./DISCORD.md). No live bot login has been exercised in this checkout.
+
 ## 7. Optional: shell, sandbox, builtin skills
 
 - `bash`: add `"bash"` to `toolAllowlist` and restart. It runs on the real

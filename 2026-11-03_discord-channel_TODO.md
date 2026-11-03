@@ -23,6 +23,11 @@ not copied here; this file is the Discord channel's own work order and log.
 - [x] Start every configured channel concurrently in the gateway CLI
 - [x] Register offline regressions in `npm run test:behavior`
 - [x] Document setup, intents, privacy, limits and parity gaps in `DISCORD.md`
+- [x] Corrective review pass: pre-send intents for sends and edits, resumable deferred
+      controls, channel supervisor for setup failures, mention-stripped callback
+      interception, allowlisted-bot interop, strict config keys, MCP authority
+      re-checks, notice chunking/truncation markers, referenced attachments, input
+      bound, per-delivery feedback cleanup, injected-client transport mapping checks
 - [ ] Live bot login, guild/thread/DM round trip, attachment download and rate-limit
       behavior (needs a real bot token and a supervised deployment)
 - [ ] Decide whether a model-facing Discord action/history tool is wanted (unported)
@@ -49,5 +54,22 @@ retried on the adapter scan cadence, and an ambiguous outcome is quarantined.
 Checks: `npm run typecheck`, `npm run build`, the four new Discord test files
 (38 checks) and `npm run test:behavior` (491 checks before the doc-only edits).
 
+### 2026-11-03 — corrective pass after independent review
+
+Fixed every reported finding rather than waiving it: H1 now writes a true
+pre-send intent before each send/edit and clears it only on acceptance, so an
+accepted-but-uncommitted request is quarantined on reopen; H2 retries deferred
+commands on the scan cadence, keeps the channel gated while unresolved, and
+reports an exhausted command once; H3 replaced the two-phase channel list with a
+supervisor that a *setup* failure drains before the gateway closes. Also: callback
+interception now runs on the mention-stripped body; allowlisted other bots are
+admitted again; strict config keys; MCP ownership and scheduled delivery re-check
+`allowChannels`/`dmAllowFrom`; notices are chunked with a truncation marker;
+referenced attachments are stored; the input bound is enforced; receipts clear
+per delivery; the transport is exercised through an injected discord.js client.
+
+Checks after the pass: typecheck, build, 55 Discord checks, the full behaviour
+suite, execution checks and core acceptance.
+
 Next: live acceptance with a real bot token, then decide on a model-facing
-Discord tool and on referenced-message attachments.
+Discord tool.

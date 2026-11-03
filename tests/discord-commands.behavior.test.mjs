@@ -11,13 +11,18 @@ import {
   CHANNEL_ID,
   USER_ID,
   channelState,
+  context,
+  dmMessage,
+  flush,
   guildMessage,
   openDiscordStore,
+  runDiscord,
   sessionKeys,
   startDiscord,
   syntheticTransport,
   until,
   untilAsync,
+  withCancel,
 } from './fixtures/discord-harness.mjs';
 
 const PRESETS = {
@@ -133,9 +138,9 @@ test('/new resets this channel and /abort ends a live turn without a failure not
     store.gate.release();
     await until(() => harness.sent.length === 2, 'abort ack');
     assert.equal(harness.texts()[1], 'Idle. Queue cleared.');
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // The aborted turn's record retiring is the positive marker: it would have sent its notice first.
+    await untilAsync(async () => (await channelState(store.gateway)).pending.length === 0, 'aborted delivery retired');
     assert.equal(harness.sent.length, 2, 'an aborted turn must not send a failure notice');
-    assert.deepEqual((await channelState(store.gateway)).pending, []);
   });
 });
 
@@ -324,6 +329,143 @@ test('an interrupted control is reported once as unconfirmed on reopen and never
     // The interrupted record is reported and pruned with its notice: nothing stays unresolved.
     assert.deepEqual(state.pending, []);
     assert.equal(state.controls.some((entry) => entry.status === 'admitted'), false);
+  } finally {
+    await adapter.stop();
+    await store.close();
+  }
+});
+
+/**
+ * A gateway whose `conversationFor` fails a bounded number of times for one session key, so a
+ * transient failure while placing an admitted input is exercised through the real adapter path.
+ */
+function flakyGateway(gateway, sessionKey, failures) {
+  let remaining = failures;
+  return {
+    ...gateway,
+    async conversationFor(key, ctx) {
+      if (key === sessionKey && remaining > 0) {
+        remaining -= 1;
+        throw new Error('synthetic transient conversation failure');
+      }
+      return gateway.conversationFor(key, ctx);
+    },
+  };
+}
+
+async function withFlakyHost(label, failures, body) {
+  const store = await openDiscordStore(label, {});
+  const harness = syntheticTransport();
+  const scope = withCancel(context);
+  const adapter = runDiscord(flakyGateway(store.gateway, sessionKeys.channel, failures), harness.transport, {
+    allowFrom: [USER_ID],
+    streaming: false,
+  }, scope.context);
+  try {
+    await body({ store, harness });
+  } finally {
+    scope.cancel(new DOMException('test finished', 'AbortError'));
+    await adapter.catch(() => undefined);
+    await store.close();
+  }
+}
+
+test('a deferred control retries on the adapter cadence and releases the channel when it settles', { timeout: 30_000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
+  // Two transient failures: the first message's own delivery and the control's first flush attempt.
+  const store = await openDiscordStore('deferred-applied', {});
+  const harness = syntheticTransport();
+  const scope = withCancel(context);
+  const adapter = runDiscord(flakyGateway(store.gateway, sessionKeys.channel, 2), harness.transport, {
+    allowFrom: [USER_ID],
+    streaming: false,
+  }, scope.context);
+  try {
+    await harness.receive(guildMessage({ id: '701', content: `<@${BOT_ID}> first` }));
+    await harness.receive(say('702', '/abort'));
+    await untilAsync(async () => harness.texts().includes('Still stopping. New messages are held.'), 'deferred acknowledgement');
+    // The command is still admitted and the channel stays gated: nothing overtakes it.
+    assert.equal((await channelState(store.gateway)).controls.at(-1).status, 'admitted');
+    await harness.receive(guildMessage({ id: '703', content: `<@${BOT_ID}> must wait` }));
+    assert.equal(harness.sent.filter((entry) => entry.text === 'SYNTHETIC-REPLY').length, 0);
+
+    // One scan cadence later the retry places the earlier input and applies the command.
+    for (let elapsed = 0; elapsed < 20_000; elapsed += 2_000) {
+      t.mock.timers.tick(2_000);
+      await flush(6);
+      const state = await channelState(store.gateway);
+      if (state.controls.at(-1).status !== 'admitted') break;
+    }
+    const state = await channelState(store.gateway);
+    assert.equal(state.controls.at(-1).status, 'applied');
+    // Exactly one final outcome follows the pending wording; the mutation was not repeated.
+    assert.equal(harness.texts().filter((text) => text === 'Idle. Queue cleared.').length, 1);
+    // The gate is released: the message admitted during the deferral is answered on its own turn.
+    await until(() => harness.sent.filter((entry) => entry.text === 'SYNTHETIC-REPLY').length >= 1, 'channel unblocked');
+    assert.deepEqual((await channelState(store.gateway)).pending.filter((entry) => entry.notice !== true), []);
+  } finally {
+    scope.cancel(new DOMException('test finished', 'AbortError'));
+    await adapter.catch(() => undefined);
+    await store.close();
+  }
+});
+
+test('an exhausted deferred control is reported unconfirmed once and never applied', { timeout: 40_000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
+  await withFlakyHost('deferred-exhausted', Number.MAX_SAFE_INTEGER, async ({ store, harness }) => {
+    await harness.receive(guildMessage({ id: '711', content: `<@${BOT_ID}> first` }));
+    await harness.receive(say('712', '/new'));
+    await untilAsync(async () => harness.texts().includes('Reset pending.'), 'deferred acknowledgement');
+    for (let elapsed = 0; elapsed < 40_000; elapsed += 2_000) {
+      t.mock.timers.tick(2_000);
+      await flush(4);
+      if (harness.texts().some((text) => /Command interrupted; outcome unknown/u.test(text))) break;
+    }
+    assert.ok(harness.texts().some((text) => /Command interrupted; outcome unknown/u.test(text)),
+      'the exhausted command is reported once instead of staying silently pending');
+    assert.ok(harness.texts().every((text) => text !== 'Context reset.'), 'a reset that never ran is not claimed');
+    const state = await channelState(store.gateway);
+    assert.notEqual(state.controls.at(-1).status, 'admitted');
+    assert.equal(state.pending.some((entry) => entry.notice === true && entry.hold === true), false,
+      'no acknowledgement is left held after the terminal report');
+  });
+});
+
+test('a callback-shaped message is consumed before admission, mention-prefixed or bare', { timeout: 30_000 }, async () => {
+  const CODE = 'SECRET-AUTH-CODE-9182';
+  const STATE = 'SECRET-AUTH-STATE-4711';
+  const link = `https://127.0.0.1:1/oauth/callback?code=${CODE}&state=${STATE}`;
+  const store = await openDiscordStore('callback', { configFile: true, allowFrom: [USER_ID, '777'] });
+  const harness = syntheticTransport();
+  const adapter = startDiscord(store, harness, { streaming: false });
+  try {
+    // One ordinary message first: it records the channel's authenticated sender.
+    await harness.receive(guildMessage({ id: '801', content: `<@${BOT_ID}> hello` }));
+    await until(() => harness.sent.length === 1, 'ordinary answer');
+    const capturedBefore = store.captured.length;
+
+    // Mention-prefixed: in a mention-gated guild the callback follows the mention.
+    await harness.receive(guildMessage({ id: '802', content: `<@${BOT_ID}> ${link}` }));
+    await until(() => harness.sent.length === 2, 'callback notice');
+    assert.match(harness.texts()[1], /OAuth callback was not accepted|did not come from|No MCP login/u);
+
+    // Bare callback in a direct message: still intercepted before any transcript admission.
+    await harness.receive(dmMessage({ id: '803', content: link }));
+    await until(() => harness.sent.length === 3, 'bare callback notice');
+
+    // A foreign sender in the same channel: refused with fixed text, never forwarded.
+    await harness.receive(guildMessage({ id: '804', authorId: '777', authorName: 'Bob', content: `<@${BOT_ID}> ${link}` }));
+    await until(() => harness.sent.length === 4, 'foreign callback notice');
+    assert.match(harness.texts()[3], /did not come from the authenticated sender/u);
+
+    assert.equal(store.captured.length, capturedBefore, 'a callback never becomes a model turn');
+    for (const text of harness.texts()) assert.ok(!text.includes(CODE) && !text.includes(STATE));
+    for (const request of store.captured) {
+      assert.ok(!JSON.stringify(request.messages).includes(CODE));
+      assert.ok(!JSON.stringify(request.messages).includes(STATE));
+    }
+    const persisted = JSON.stringify(await channelState(store.gateway));
+    assert.ok(!persisted.includes(CODE) && !persisted.includes(STATE), 'no callback secret is stored in channel state');
   } finally {
     await adapter.stop();
     await store.close();

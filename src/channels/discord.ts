@@ -65,7 +65,6 @@ import {
 } from "../media/attachments.js";
 import {
   DISCORD_LIMITS,
-  DiscordTransportError,
   boundedDiscordLabel,
   classifyDiscordError,
   discordAttachmentText,
@@ -190,7 +189,17 @@ export type DiscordPendingDelivery = {
   sentMessageId?: string;
   /** `unknown`: an ambiguous external outcome. `failed`: a known rejection, held for inspection. */
   deliveryStatus?: "sending" | "unknown" | "failed";
-  sendIntent?: { text: string; chunkIndex: number; startedAt: number };
+  /**
+   * Written before one external request leaves and cleared only with its result. An intent left by a
+   * crash is ambiguous: a reopen quarantines the record and never resends it.
+   */
+  sendIntent?: {
+    text: string;
+    stage: "preview" | "final";
+    /** Final chunk this request would deliver; absent for a preview edit. */
+    chunkIndex?: number;
+    startedAt: number;
+  };
   unknownSince?: number;
   /** A command acknowledgement: delivered as fixed text, never submitted to the model. */
   notice?: boolean;
@@ -555,9 +564,14 @@ export async function runDiscord(
     }
   };
 
-  const settleFeedback = async (channelId: string): Promise<void> => {
+  /**
+   * Clear the receipt this delivery painted. A newer admitted message in the same channel owns its
+   * own receipt, so an earlier turn's completion must not remove the indicator that later one shows.
+   */
+  const settleFeedback = async (channelId: string, admittedMessageId: string | undefined): Promise<void> => {
     const receipt = receipts.get(channelId);
     if (receipt === undefined) return;
+    if (admittedMessageId !== undefined && receipt.messageId !== admittedMessageId) return;
     if (receipt.workingTimer !== undefined) {
       // A working indicator that has not fired yet must not fire after the answer.
       clearTimeout(receipt.workingTimer);
@@ -585,12 +599,9 @@ export async function runDiscord(
     (message.reply?.authorIsBot === true && message.reply.authorId === identity);
 
   const admitted = (message: DiscordInboundMessage): boolean => {
+    // Only an explicitly allowlisted sender is admitted, bot or human. This bot's own account is
+    // refused before this check, so a bot cannot answer itself and an unlisted bot can never enter.
     if (!senderAllowed(message)) return false;
-    if (message.authorIsBot && message.authorId !== identity) {
-      // Another bot is admitted only when the operator listed it explicitly; its own loop guard
-      // never applies here.
-      return false;
-    }
     if (message.channelKind === "dm") {
       const dm = options.dmAllowFrom;
       // Direct messages are governed by `allowFrom` alone unless a DM list is configured.
@@ -627,9 +638,15 @@ export async function runDiscord(
     const channelId = message.channelId;
     const parentChannelId = message.parentChannelId;
 
-    // A callback-shaped message is consumed before any transcript or model admission. Only the
-    // authenticated sender this channel recorded may submit it, and its text is never stored.
-    if (looksLikeOAuthCallback(message.content)) {
+    // One leading self-mention is dropped before anything else reads the body: in a mention-gated
+    // guild the user's text follows the mention (`@bot /status`, `@bot <callback URL>`), and the
+    // mention must not be able to smuggle a callback past interception.
+    const commandText = stripLeadingSelfMention(message.content, identity);
+
+    // A callback-shaped message is consumed before any transcript or model admission, including a
+    // malformed, stale, foreign or replayed one. Only the authenticated sender this channel recorded
+    // may submit it, and neither its code nor its state is ever stored or logged.
+    if (looksLikeOAuthCallback(commandText)) {
       const binding = originBindingOf(state.origins, channelId, identity);
       const text = binding === undefined || binding.senderId !== message.authorId
         ? "This OAuth callback did not come from the authenticated sender that owns this channel. It was not sent " +
@@ -637,7 +654,7 @@ export async function runDiscord(
         : gateway.mcpAdmin === undefined
           ? "No MCP login is available in this host; the callback was not stored or sent to the assistant."
           : await (async () => {
-              const result = await gateway.mcpAdmin!.submitCallback(sessionKey, message.content, adapterContext);
+              const result = await gateway.mcpAdmin!.submitCallback(sessionKey, commandText, adapterContext);
               return result.handled
                 ? result.text
                 : "This OAuth callback was not accepted. It was not sent to the assistant and was not stored.";
@@ -646,10 +663,7 @@ export async function runDiscord(
       return;
     }
 
-    // Control parsing happens only after allowlist authentication and never for attachments. In a
-    // mention-gated guild the command follows the mention (`@bot /status`), so that one leading
-    // self-mention is dropped first; nothing else in the body is rewritten.
-    const commandText = stripLeadingSelfMention(message.content, identity);
+    // Control parsing happens only after allowlist authentication and never for attachments.
     if (message.attachments.length === 0 && looksLikeDiscordCommand(commandText)) {
       const parsed = parseDiscordInput(commandText);
       if (parsed.kind !== "input") {
@@ -658,10 +672,18 @@ export async function runDiscord(
       }
     }
 
+    // A reply does not carry the quoted message's attachments, so they are pulled in from that
+    // message with the same store, size bound and concurrency gate as this message's own files.
+    const quoted = message.quoted ?? await fetchQuoted(message);
+    const referenced = await storeReferencedAttachments(quoted);
     const stored = await storeAttachments(message);
-    const body = [await composeInboundText(message, stored.attachments.length > 0), stored.text]
-      .filter((part) => part !== "")
-      .join("\n");
+    const attachments = [...referenced.attachments, ...stored.attachments];
+    const composed = [
+      composeInboundText(message, stored.attachments.length > 0, quoted, referenced.attachments.length > 0),
+      referenced.text,
+      stored.text,
+    ].filter((part) => part !== "").join("\n");
+    const body = boundInput(composed, message.authorId);
     if (body.trim() === "") return;
     const origin = await rememberOrigin(channelId, message.authorId, message.channelKind, parentChannelId);
     if (origin.evictedSessionKey !== null) {
@@ -689,7 +711,7 @@ export async function runDiscord(
         admittedAtMs,
         nextChunkIndex: 0,
         ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
-        ...(stored.attachments.length === 0 ? {} : { attachments: stored.attachments }),
+        ...(attachments.length === 0 ? {} : { attachments }),
         replyToMessageId: message.id,
       });
       pushAdmitted(doc, key);
@@ -747,7 +769,12 @@ export async function runDiscord(
    * message is read at most once, only for an already admitted message, and only when it was not
    * this bot's own message: answering our own text needs no copy of it.
    */
-  async function composeInboundText(message: DiscordInboundMessage, hasAttachments: boolean): Promise<string> {
+  function composeInboundText(
+    message: DiscordInboundMessage,
+    hasAttachments: boolean,
+    quoted: import("./discord-transport.js").DiscordReplyReference | undefined,
+    includedReferencedAttachments: boolean,
+  ): string {
     const speaker = discordSpeakerLabel(message.authorName, message.authorId);
     const resolved = resolveDiscordMentions(message.content, message.mentions).trim();
     const attributed = resolved !== ""
@@ -757,8 +784,7 @@ export async function runDiscord(
     if (message.channelKind === "thread" && message.parentChannelId !== undefined) {
       lines.push(`[Discord thread; parent channel id ${message.parentChannelId}]`);
     }
-    const quoted = message.quoted ?? await fetchQuoted(message);
-    const context = discordQuotedContext(quoted);
+    const context = discordQuotedContext(quoted, includedReferencedAttachments);
     if (context !== undefined) lines.push(context);
     lines.push(attributed);
     return lines.join("\n");
@@ -802,6 +828,42 @@ export async function runDiscord(
       lines.push(`[${ignored} further attachment(s) were not read: only ${DISCORD_LIMITS.maxAttachments} per message are supported.]`);
     }
     return { text: lines.join("\n"), attachments: admitted };
+  }
+
+  /**
+   * Store the replied-to message's attachments, bounded and labeled with their author, so "reply and
+   * tag" can see the picture that was quoted. A message from this bot needs no copy of its own files.
+   */
+  async function storeReferencedAttachments(
+    quoted: import("./discord-transport.js").DiscordReplyReference | undefined,
+  ): Promise<{ readonly text: string; readonly attachments: DiscordPendingAttachment[] }> {
+    const store = mediaStore;
+    if (store === undefined || quoted === undefined || quoted.attachments.length === 0) {
+      return { text: "", attachments: [] };
+    }
+    const author = boundedDiscordLabel(quoted.authorName, DISCORD_LIMITS.maxSenderNameChars);
+    const bounded = quoted.attachments.slice(0, DISCORD_LIMITS.maxReferencedAttachments);
+    const ignored = quoted.attachments.length - bounded.length;
+    const lines: string[] = [];
+    const admitted: DiscordPendingAttachment[] = [];
+    for (const attachment of bounded) {
+      const stored = await storeOneAttachment(store, attachment, quoted.authorId);
+      admitted.push(stored);
+      lines.push(`[from replied message by ${author}] ${discordAttachmentText(stored, stored.status === "failed" ? stored.note : undefined)}`);
+    }
+    if (ignored > 0) {
+      lines.push(`[${ignored} further attachment(s) from the replied message were not read: only ${DISCORD_LIMITS.maxReferencedAttachments} are supported.]`);
+    }
+    return { text: lines.join("\n"), attachments: admitted };
+  }
+
+  /** Bound one admitted input; a truncated body says so instead of silently dropping its tail. */
+  function boundInput(text: string, senderId: string): string {
+    if (text.length <= DISCORD_LIMITS.maxInputChars) return text;
+    let end = DISCORD_LIMITS.maxInputChars;
+    if (end > 0 && /[\uD800-\uDBFF]/u.test(text[end - 1]!)) end -= 1;
+    console.warn(`Discord input from ${senderId} exceeded ${DISCORD_LIMITS.maxInputChars} characters and was truncated.`);
+    return `${text.slice(0, end)}\n… (truncated: message exceeded this host's input bound)`;
   }
 
   async function storeOneAttachment(
@@ -1001,16 +1063,18 @@ export async function runDiscord(
     } finally {
       await stopPreviewWatch();
       releaseTyping();
-      await settleFeedback(item.channelId);
+      await settleFeedback(item.channelId, item.replyToMessageId);
     }
 
     async function deliverNotice(current: DiscordPendingDelivery): Promise<void> {
-      if (current.nextChunkIndex > 0) {
-        await forget(current.key);
-        return;
+      // A host notice is ordinary text to Discord, so it obeys the same chunk bound and cursor.
+      const chunks = splitDiscordText(current.text);
+      let latest = state.pending.find((entry) => entry.key === item.key) ?? current;
+      for (let index = latest.nextChunkIndex; index < chunks.length; index++) {
+        await sendDiscordMessage(latest, chunks[index]!, "final", index);
+        latest = state.pending.find((entry) => entry.key === item.key) ?? latest;
       }
-      await sendDiscordMessage(current, current.text, "final", 0);
-      await forget(current.key);
+      await forget(item.key);
     }
 
     async function stopPreviewWatch() {
@@ -1057,6 +1121,53 @@ export async function runDiscord(
       }
     }
 
+    /**
+     * Record the write-ahead intent for one external request. It is committed before the request
+     * leaves, so a crash between an accepted send and its bookkeeping is observable as ambiguous and
+     * can never be mistaken for a request that never happened.
+     */
+    async function beginExternal(key: string, text: string, stage: "preview" | "final", chunkIndex: number | undefined): Promise<void> {
+      await mutatePending(key, (entry) => {
+        entry.deliveryStatus = "sending";
+        entry.sendIntent = {
+          text,
+          stage,
+          ...(chunkIndex === undefined ? {} : { chunkIndex }),
+          startedAt: Date.now(),
+        };
+      });
+    }
+
+    /** The request provably did not deliver anything: drop its intent and let the caller retry. */
+    async function abandonExternal(key: string): Promise<void> {
+      await mutatePending(key, (entry) => {
+        if (entry.deliveryStatus === "unknown") return;
+        delete entry.deliveryStatus;
+        delete entry.sendIntent;
+      });
+    }
+
+    /** The request was accepted: clear the intent and advance the durable cursor in one commit. */
+    async function acceptExternal(
+      key: string,
+      accepted: { readonly messageId?: string; readonly text: string },
+      stage: "preview" | "final",
+      chunkIndex: number | undefined,
+    ): Promise<void> {
+      await mutatePending(key, (entry) => {
+        delete entry.deliveryStatus;
+        delete entry.sendIntent;
+        delete entry.unknownSince;
+        if (stage === "final" && chunkIndex !== undefined) {
+          entry.nextChunkIndex = Math.max(entry.nextChunkIndex, chunkIndex + 1);
+        }
+        if (stage === "preview" || chunkIndex === 0) {
+          entry.lastText = accepted.text;
+          if (accepted.messageId !== undefined) entry.sentMessageId = accepted.messageId;
+        }
+      });
+    }
+
     async function sendDiscordMessage(
       current: DiscordPendingDelivery,
       text: string,
@@ -1065,59 +1176,49 @@ export async function runDiscord(
     ): Promise<DiscordSendResult> {
       const fresh = state.pending.find((entry) => entry.key === item.key) ?? current;
       const replyTo = fresh.sentMessageId === undefined ? fresh.replyToMessageId : undefined;
+      await beginExternal(item.key, text, stage, chunkIndex);
       try {
         const sent = await transport.send({
           channelId: item.channelId,
           text,
           ...(replyTo === undefined ? {} : { replyToMessageId: replyTo }),
         });
-        await mutatePending(item.key, (entry) => {
-          delete entry.deliveryStatus;
-          delete entry.sendIntent;
-          delete entry.unknownSince;
-          if (stage === "final") entry.nextChunkIndex = Math.max(entry.nextChunkIndex, chunkIndex + 1);
-          if (stage === "preview" || chunkIndex === 0) {
-            entry.sentMessageId = sent.messageId;
-            entry.lastText = sent.text;
-          }
-        });
+        await acceptExternal(item.key, sent, stage, chunkIndex);
         return sent;
       } catch (error) {
         const classified = classifyDiscordError(error);
         if (classified.outcome === "unknown") {
+          // Keep the intent: the record is ambiguous until a human inspects it, and is never resent.
           await markUnknown(item.key);
           console.warn(`Discord delivery outcome unknown for ${item.key}; inspect the Durable channel-state record.`);
         } else {
-          await mutatePending(item.key, (entry) => {
-            if (entry.deliveryStatus === "unknown") return;
-            delete entry.deliveryStatus;
-            delete entry.sendIntent;
-          });
+          await abandonExternal(item.key);
         }
         throw error;
       }
     }
 
-    /** Edit the message this turn owns. `chunkIndex` advances the final cursor; a preview omits it. */
+    /**
+     * Edit the message this turn owns. `chunkIndex` advances the final cursor; a preview omits it.
+     * An edit is an external mutation too, so it keeps the same write-ahead intent as a send.
+     */
     async function editDiscordMessage(
       messageId: string,
       text: string,
       chunkIndex: number | undefined,
     ): Promise<void> {
+      const stage = chunkIndex === undefined ? "preview" : "final";
+      await beginExternal(item.key, text, stage, chunkIndex);
       try {
         await transport.edit(item.channelId, messageId, text);
-        await mutatePending(item.key, (entry) => {
-          delete entry.deliveryStatus;
-          delete entry.sendIntent;
-          delete entry.unknownSince;
-          if (chunkIndex !== undefined) entry.nextChunkIndex = Math.max(entry.nextChunkIndex, chunkIndex + 1);
-          entry.lastText = text;
-        });
+        await acceptExternal(item.key, { text }, stage, chunkIndex);
       } catch (error) {
         const classified = classifyDiscordError(error);
         if (classified.outcome === "unknown") {
           await markUnknown(item.key);
           console.warn(`Discord edit outcome unknown for ${item.key}; inspect the Durable channel-state record.`);
+        } else {
+          await abandonExternal(item.key);
         }
         throw error;
       }
@@ -1167,11 +1268,13 @@ export async function runDiscord(
    * ambiguous send was already quarantined with its write-ahead intent and is never downgraded.
    */
   async function holdFailedDelivery(key: string, error: unknown): Promise<void> {
-    if (error instanceof DiscordTransportError && error.outcome === "unknown") return;
+    // Classify the thrown value itself: a client error may carry only a numeric status, so relying on
+    // this module's own wrapper would treat a proven refusal as an ordinary retryable failure.
+    const classified = classifyDiscordError(error);
+    if (classified.outcome === "unknown") return;
     const attempts = (deliveryFailures.get(key) ?? 0) + 1;
     deliveryFailures.set(key, attempts);
-    const rejected = error instanceof DiscordTransportError && error.outcome === "rejected";
-    if (!rejected && attempts < DISCORD_LIMITS.maxDeliveryFailures) return;
+    if (classified.outcome !== "rejected" && attempts < DISCORD_LIMITS.maxDeliveryFailures) return;
     deliveryFailures.delete(key);
     await mutatePending(key, (item) => {
       if (item.deliveryStatus === "unknown") return;
@@ -1320,7 +1423,7 @@ export async function runDiscord(
         channelId: target.channelId,
         sessionKey: target.sessionKey,
         senderId: target.senderId,
-        text: text.slice(0, limit),
+        text: boundNotice(text, limit),
         admittedAtMs: Date.now(),
         nextChunkIndex: 0,
         notice: true,
@@ -1666,6 +1769,77 @@ export async function runDiscord(
     return outcome;
   }
 
+  /** Whether one recorded command still has an undelivered notice queued in this adapter. */
+  const noticeQueued = (key: string): boolean =>
+    state.pending.some((entry) => entry.notice === true && entry.key === key);
+
+  /**
+   * Retry every deferred command on the adapter's own scan cadence. A transient failure while
+   * placing the inputs admitted before the command is retried, never treated as final: the channel
+   * stays gated for as long as the command is unresolved, so no later message can overtake it. On a
+   * terminal outcome the gate is released and the owner gets one fixed report, because its earlier
+   * acknowledgement already said the command was still pending. An applied mutation is never
+   * re-entered: only a record still `admitted` in durable state is retried.
+   */
+  const resumeDeferredControls = (): void => {
+    if (stopping || signal?.aborted) return;
+    for (const [key, record] of [...deferredControls]) {
+      if (controlChains.has(record.channelId)) continue;
+      const durable = state.controls.find((entry) => entry.key === key);
+      if (durable === undefined || durable.status !== "admitted") {
+        // Another observer settled it (or a reopen reported it): release the gate without repeating it.
+        deferredControls.delete(key);
+        controlFailures.delete(key);
+        controlPending.delete(record.channelId);
+        continue;
+      }
+      const prior = controlChains.get(record.channelId) ?? Promise.resolve();
+      let finish!: () => void;
+      const held = new Promise<void>((resolve) => { finish = resolve; });
+      const chain = prior.then(() => held);
+      controlChains.set(record.channelId, chain);
+      const task = prior
+        .then(() => applyDeferred(record))
+        .catch((error: unknown) => {
+          if (signal?.aborted) return;
+          fatal ??= error;
+          scope.cancel(error instanceof Error ? error : new Error("Discord deferred control failed"));
+        })
+        .finally(() => {
+          finish();
+          if (controlChains.get(record.channelId) === chain) controlChains.delete(record.channelId);
+          pendingControls.delete(task);
+          if (!stopping && !signal?.aborted) drain();
+        });
+      pendingControls.add(task);
+    }
+  };
+
+  /** Finish one deferred command after its earlier inputs were placed. */
+  async function applyDeferred(record: DeferredControl): Promise<void> {
+    const outcome = await applyControl(record);
+    if (outcome.kind === "deferred") return;
+    deferredControls.delete(record.key);
+    controlFailures.delete(record.key);
+    if (outcome.kind === "applied") {
+      // A published "still pending" wording already promised the outcome, so the fixed completion
+      // receipt is delivered even when the command itself produced no text of its own.
+      const text = outcome.text ?? CONTROL_ACK[record.command];
+      if (noticeQueued(record.key)) await releaseControlNotice(record.key, text).catch(() => undefined);
+      else await publishLateControlNotice(record, text).catch(() => undefined);
+      if (outcome.requestRestart === true) requestRestart();
+    } else if (outcome.kind === "refused") {
+      if (noticeQueued(record.key)) await markControlRefused(record.key, outcome.text).catch(() => undefined);
+      else await publishLateControlNotice(record, outcome.text).catch(() => undefined);
+    } else {
+      // Attempts are exhausted: the command may or may not have taken effect, so it is reported once
+      // and never applied again.
+      if (noticeQueued(record.key)) await markControlUnconfirmed(record.key).catch(() => undefined);
+      else await publishLateControlNotice(record, UNCONFIRMED_CONTROL).catch(() => undefined);
+    }
+    controlPending.delete(record.channelId);
+  }
+
   /** `/new`: a native reset plus, when the host offers it, a rebuild of this session's prompt snapshot. */
   async function applyNewSession(sessionKey: string): Promise<ControlOutcome> {
     const resetSession = gateway.resetSession;
@@ -1836,7 +2010,7 @@ export async function runDiscord(
       const notice = doc.pending.find((item) => item.notice === true && item.key === key);
       if (notice === undefined) return;
       delete notice.hold;
-      if (text !== undefined) notice.text = text.slice(0, MAX_NOTICE_CHARS);
+      if (text !== undefined) notice.text = boundNotice(text, MAX_NOTICE_CHARS);
     }, cleanupContext);
     drain();
   };
@@ -1853,7 +2027,7 @@ export async function runDiscord(
   };
 
   const markControlRefused = async (key: string, text: string): Promise<void> => {
-    const bounded = text.slice(0, MAX_NOTICE_CHARS);
+    const bounded = boundNotice(text, MAX_NOTICE_CHARS);
     await mutateState((doc) => {
       const entry = doc.controls.find((item) => item.key === key);
       if (entry !== undefined) entry.status = "refused";
@@ -2209,12 +2383,33 @@ export async function runDiscord(
   // ── MCP owner surface ─────────────────────────────────────────────────────
 
   /** The exact channel and durable sender binding for one Discord session key, or `undefined`. */
+  /**
+   * One channel's durable admission evidence, re-checked against the live configuration the same way
+   * ingress is. Reply destinations, scheduled results and MCP notices all come through here, so a
+   * channel removed from `allowChannels`, a DM sender removed from `dmAllowFrom` or a sender removed
+   * from `allowFrom` stops receiving anything without waiting for a restart.
+   */
+  const authorizedOrigin = (channelId: string): { readonly channelId: string; readonly senderId: string } | undefined => {
+    const binding = originBindingOf(state.origins, channelId, identity);
+    if (binding === undefined) return undefined;
+    if (!options.allowFrom.includes(binding.senderId)) return undefined;
+    if (binding.kind === "dm") {
+      const dm = options.dmAllowFrom;
+      if (dm !== undefined && dm.length > 0 && !dm.includes(binding.senderId)) return undefined;
+    } else if (!channelAllowed(channelId, binding.parentChannelId)) {
+      return undefined;
+    }
+    return { channelId, senderId: binding.senderId };
+  };
+
   const ownerChannelFor = (sessionKey: string): { readonly channelId: string; readonly senderId: string } | undefined => {
     const decoded = decodeDiscordSessionKey(sessionKey, identity);
     if (decoded === undefined) return undefined;
+    const owner = authorizedOrigin(decoded.channelId);
+    // The session key also names the placement; a channel whose key kind changed is not the owner.
+    if (owner === undefined) return undefined;
     const binding = originBindingOf(state.origins, decoded.channelId, identity);
-    if (binding === undefined || !options.allowFrom.includes(binding.senderId)) return undefined;
-    return { channelId: decoded.channelId, senderId: binding.senderId };
+    return binding === undefined || binding.kind !== decoded.kind ? undefined : owner;
   };
 
   const detachMcpSurface = gateway.mcpSurfaces?.attach({
@@ -2311,6 +2506,7 @@ export async function runDiscord(
   requestScheduledScan();
   scanTimer = setInterval(() => {
     failedThisCycle.clear();
+    resumeDeferredControls();
     drain();
     requestScheduledScan();
   }, DISCORD_LIMITS.scheduledScanMs);
@@ -2761,6 +2957,15 @@ const DIGEST_UNAVAILABLE_HOST =
   "Memory digestion is unavailable in this host: it exposes no manual digestion entry. Nothing was started and " +
   "nothing was sent to the assistant.";
 const DELIVERY_FAILED_TEXT = "Your request could not be completed. Please try again.";
+
+/** Bound one host notice; a shortened notice says so instead of dropping its tail silently. */
+function boundNotice(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const marker = "\n… (truncated)";
+  let end = Math.max(0, limit - marker.length);
+  if (end > 0 && /[\uD800-\uDBFF]/u.test(text[end - 1]!)) end -= 1;
+  return `${text.slice(0, end)}${marker}`;
+}
 
 /** A fixed Discord usage notice: the catalogue's line, a no-argument note, and the surface's tail. */
 function usageNotice(name: string): string {

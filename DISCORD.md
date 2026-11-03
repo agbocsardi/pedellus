@@ -35,11 +35,15 @@ Discord code, dependency or connection is loaded.
 | --- | --- |
 | `tokenEnv` | Environment variable **name** holding the bot token. A missing or blank variable fails startup with a fixed diagnostic; the token is never read from config, a transcript or channel text. |
 | `allowFrom` | Required, non-empty list of user snowflakes. There is no wildcard. Anyone else is ignored silently. |
-| `dmAllowFrom` | Optional. When set, direct messages additionally require this list, so an open guild policy cannot also open private messages. It can only narrow. |
+| `dmAllowFrom` | Optional. When set, direct messages additionally require this list, so an open guild policy cannot also open private messages. It can only narrow. A literal `*` is refused: Python's wildcard DM opening is intentionally not imported. |
 | `allowChannels` | Optional list of channel or thread IDs. A thread is allowed when its own ID or its parent channel ID is listed. Empty means every channel the bot can read. |
 | `groupPolicy` | `mention` (default) admits a guild message only when the bot is mentioned, a raw mention token names it, or the message replies to the bot. `open` answers every message in an allowed channel. |
 | `streaming` | Default true. A progressive preview message is edited while a turn runs, and the final answer edits that same message. |
-| `receipts` | Best-effort `👀` receipt on the admitted message and a delayed `🔧` working indicator, both removed after the answer. `false` disables one; `delayMs` is 0–10 000. |
+| `receipts` | Best-effort `👀` receipt on the admitted message and a delayed `🔧` working indicator, both removed by the turn that painted them. `false` disables one; `delayMs` is 0–10 000. |
+
+The block is strict: an unrecognized key is refused at startup instead of being
+ignored, so a misspelling such as `allowChannel` cannot appear to narrow access
+while actually leaving every readable channel open.
 
 ### Discord application setup
 
@@ -63,8 +67,10 @@ Ingress is admitted only when all of these hold: the author is in `allowFrom`;
 the author is not this bot; the message is not a Discord system message; for a
 direct message `dmAllowFrom` (when set) also allows the author; for a guild
 message the channel (or thread parent) is in `allowChannels` and the guild
-policy is satisfied. Another bot needs an explicit `allowFrom` entry; its own
-messages are never echoed.
+policy is satisfied. Another bot is admitted only when the operator lists it
+explicitly, and then the same mention, channel and DM rules apply; an unlisted
+bot is ignored and this bot's own messages are always refused, so a bot can
+never answer itself.
 
 The session key is derived from that evidence only:
 
@@ -89,7 +95,11 @@ unauthorized when the original sender has left `allowFrom`.
 
 * Inputs are attributed as `[DisplayName (id=<snowflake>)]: text`, with mention
   tokens resolved to names when the event carried them. A reply contributes one
-  bounded quoted line from the message it answers.
+  bounded quoted line from the message it answers, and up to four attachments
+  from that message are stored with the same limits and labeled
+  `[from replied message by <author>]`, so "reply and tag" sees the quoted image.
+  One admitted input is bounded at 16 000 characters; a longer body keeps its
+  head and ends with an explicit truncation marker.
 * Answers are split inside Discord's 2 000-character limit with the same
   fence-aware splitter the Telegram adapter uses, so a code block is closed and
   reopened instead of cut.
@@ -97,7 +107,9 @@ unauthorized when the original sender has left `allowFrom`.
   `repliedUser: false`; every send and edit passes
   `allowedMentions: { parse: [], repliedUser: false }`, so no answer, notice or
   scheduled result can ping a user, role, `@everyone` or `@here`.
-* A write-ahead intent is committed before every external send. A proven refusal
+* A write-ahead intent is committed before every external send **and edit**, and
+  cleared only with that request's result, so an accepted request that crashes
+  before its local commit is quarantined as ambiguous and never repeated. A proven refusal
   (a 4xx rejection) is held for inspection after the retry bound; a proven
   non-send (a 429 cooldown) is retried on the adapter's own scan cadence; an
   ambiguous outcome (dropped connection, timeout, 5xx) is quarantined as
@@ -113,6 +125,13 @@ unauthorized when the original sender has left `allowFrom`.
   recorded durably and told once when a replacement process is live, or told that
   the host refused. `/status` names only the bounded gateway-wide active-work
   count.
+* A command whose earlier inputs keep failing transiently is retried on the
+  adapter's scan cadence (bounded) while its channel stays gated, then reported
+  once as unconfirmed or applied; it is never applied twice. An interrupted
+  command found at reopen is reported once, never replayed.
+* Host notices are chunked inside the same 2 000-character bound; a notice that
+  exceeds its own cap keeps its head and ends with `… (truncated)` rather than
+  dropping text silently.
 
 ## Controls
 
@@ -133,8 +152,11 @@ only from the sender that owns the channel.
 
 ## Bounded and default-deny behavior
 
-* At most 500 admitted items and 64 control records are kept; further messages
-  are refused visibly, never silently dropped.
+* At most 500 admitted items and 64 control records are kept. Further messages are
+  refused at admission — the durable record is not created and the refusal is
+  reported in the gateway journal, **not** in the Discord chat, because a full
+  queue has no room for the notice either. This is the same bound the Telegram
+  adapter has; it is not a silent drop of an admitted message.
 * At most 4 attachments per message, each bounded by the shared 20 MiB media
   limit; originals are stored under `<workspace>/media/discord/` and are never
   auto-deleted. Discord's signed CDN URL is used once at admission and never
@@ -152,9 +174,6 @@ These are deliberate or unported, not implied capabilities:
   message-history tool; this port offers no channel tool on Discord. Replies,
   reactions and history reads therefore come from the ordinary answer path only.
   Python's `react` tool is Telegram-only there as well.
-* **No referenced-message attachments.** A reply's quoted text is fetched
-  (bounded), but images attached to the message being replied to are not pulled
-  into the turn. Python downloads up to four.
 * **No member roster index.** Mention names come from the event, not from a
   per-guild index with previous display names.
 * **No local transcription.** Stored audio attachments are labeled by locator and
@@ -172,13 +191,26 @@ These are deliberate or unported, not implied capabilities:
   protocol: a dropped socket can lose events, and duplicates are deduplicated by
   message ID, not replayed.
 
+## Dependency
+
+`discord.js` 14.28.0 (Apache-2.0) with its `@discordjs/*` packages is a pinned
+runtime dependency, imported lazily from `discord-js.ts`. A gateway without a
+`discord` block never loads it, but `npm ci` installs it because the lockfile
+includes it. `createDiscordJsTransport` also accepts an injected client factory;
+the offline checks use that to exercise the real event, interaction and error
+mapping without a token or a live Gateway.
+
 ## Checks
 
 `tests/discord-channel.behavior.test.mjs`, `tests/discord-commands.behavior.test.mjs`,
-`tests/discord-delivery.behavior.test.mjs` and `tests/discord-transport.behavior.test.mjs`
-run offline in `npm run test:behavior`: a synthetic transport, a faux provider
-and a temporary store, with admission, session isolation, attribution, chunking,
-mentions, receipts, chunked/withheld/unauthorized/unknown scheduled delivery,
-interruption notices, restart confirmation, control recovery, progressive edits
-and the concurrent channel startup all asserted. No token, network, live guild
-or paid inference is used.
+`tests/discord-delivery.behavior.test.mjs`, `tests/discord-transport.behavior.test.mjs`
+and `tests/discord-js-transport.behavior.test.mjs` run offline in
+`npm run test:behavior`: a synthetic adapter transport plus an injected
+discord.js client, a faux provider and a temporary store. They assert admission,
+session isolation, attribution, chunking, mentions, receipts, referenced
+attachments, the input bound, bots, strict config keys, chunked/withheld/
+unauthorized/unknown scheduled delivery, interruption notices, restart
+confirmation, deferred-control retry and exhaustion, pre-send intents, callback
+interception, progressive edits, the real event/interaction/error mapping and
+concurrent channel startup. No token, network, live guild or paid inference is
+used.

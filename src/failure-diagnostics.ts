@@ -6,7 +6,7 @@ import type { Report } from "@earendil-works/pi-durable";
 import { STARTUP_DIAGNOSTICS } from "./startup-diagnostics.js";
 
 export type FailureStage = "command" | "gateway.open" | "gateway.local" | "gateway.telegram"
-  | "gateway.discord" | "gateway.channels" | "gateway.wait" | "gateway.close.local"
+  | "gateway.discord" | "gateway.wait" | "gateway.close.local"
   | "gateway.close.runtime" | "gateway.lock" | "gateway.restart"
   | `durable.${Report["kind"]}`;
 

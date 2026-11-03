@@ -15,6 +15,7 @@ import {
   admitDelivery,
   channelState,
   context,
+  deferred,
   guildMessage,
   openDiscordStore,
   outboxRecords,
@@ -26,7 +27,7 @@ import {
   untilAsync,
 } from './fixtures/discord-harness.mjs';
 
-const { runChannels } = await import(new URL('../dist/cli.js', import.meta.url).href);
+const { superviseChannels } = await import(new URL('../dist/cli.js', import.meta.url).href);
 const { DiscordState } = await import(new URL('../dist/channels/discord.js', import.meta.url).href);
 const { turnInterruptionDelivery } = await import(new URL('../dist/recovery/interruption.js', import.meta.url).href);
 
@@ -63,25 +64,55 @@ test('channels start together and a failing one shuts the others down before rep
   };
   const failure = new Error('synthetic channel failure');
 
-  // Both runs are created (and started) before the helper is awaited: it must never await one
-  // channel before the other exists.
+  // Both channels are started (their promises created) before anything is awaited: the supervisor
+  // must never await one channel before the other exists.
+  const supervisor = superviseChannels(shutdown);
   const longRun = Promise.resolve().then(() => { order.push('long-started'); return long; });
   const failingRun = Promise.resolve().then(() => { order.push('failing-started'); throw failure; });
+  supervisor.start('gateway.discord', longRun);
+  supervisor.start('gateway.telegram', failingRun);
+  assert.equal(supervisor.started(), true);
+  const result = await supervisor.settle();
 
-  const result = await runChannels([
-    { stage: 'gateway.discord', run: longRun },
-    { stage: 'gateway.telegram', run: failingRun },
-  ], shutdown);
   assert.deepEqual(order.slice(0, 3), ['long-started', 'failing-started', 'shutdown']);
-  assert.ok(order.includes('long-stopped'), 'the helper waited for the sibling to stop');
+  assert.ok(order.includes('long-stopped'), 'the supervisor waited for the sibling to stop');
   assert.equal(result.stage, 'gateway.telegram');
   assert.equal(result.error, failure);
   assert.equal(shutdowns, 1);
 
-  // A clean stop of every channel reports no failure.
-  assert.equal(await runChannels([{ stage: 'gateway.discord', run: Promise.resolve() }], shutdown), undefined);
+  // A clean stop of every channel reports no failure, and an unused supervisor never started one.
+  const clean = superviseChannels(shutdown);
+  clean.start('gateway.discord', Promise.resolve());
+  assert.equal(await clean.settle(), undefined);
+  assert.equal(superviseChannels(shutdown).started(), false);
   assert.equal(shutdowns, 1);
-  assert.equal(await runChannels([], shutdown), undefined);
+});
+
+test('a later channel setup failure stops and awaits the channel that already started', { timeout: 15_000 }, async () => {
+  // This mirrors the gateway's own order: Telegram starts, Discord setup then fails before starting.
+  const order = [];
+  let stopTelegram;
+  const telegram = new Promise((resolve) => { stopTelegram = () => { order.push('telegram-stopped'); resolve(); }; });
+  const shutdown = () => {
+    order.push('shutdown');
+    stopTelegram();
+  };
+  const supervisor = superviseChannels(shutdown);
+  supervisor.start('gateway.telegram', Promise.resolve().then(() => { order.push('telegram-started'); return telegram; }));
+  // Setup continues on a later tick, exactly as a real adapter start does.
+  await new Promise((resolve) => setImmediate(resolve));
+  // The second channel never starts: its setup throws. The gateway's catch does exactly this.
+  let setupError;
+  try {
+    throw new Error('discord setup failed');
+  } catch (error) {
+    setupError = error;
+    shutdown();
+    const failed = await supervisor.settle();
+    assert.equal(failed, undefined, 'a setup failure is not a channel failure');
+  }
+  assert.deepEqual(order, ['telegram-started', 'shutdown', 'telegram-stopped']);
+  assert.match(setupError.message, /discord setup failed/u);
 });
 
 test('a scheduled result is delivered once, chunked, unthreaded and marked delivered', { timeout: 30_000 }, async () => {
@@ -164,9 +195,14 @@ test('an ambiguous scheduled outcome is quarantined and never resent', { timeout
     const record = (await outboxRecords(store.gateway, sessionKeys.channel)).find((entry) => entry.id === 'cron:job-4:1');
     assert.ok(record.unknownSince > 0);
     assert.equal(record.sendIntent, undefined);
-    // The scan keeps running; a quarantined record is never sent again.
-    await new Promise((resolve) => setTimeout(resolve, 2_500));
-    assert.equal(harness.sent.length, 1);
+
+    // A later admission runs a full delivery after the quarantined record; the ambiguous result is
+    // still never resent, which a positive ordering marker proves without a sleep.
+    await harness.receive(guildMessage({ id: '322', content: `<@${BOT_ID}> later` }));
+    await until(() => harness.sent.length === 2, 'later answer after the quarantine');
+    assert.equal(harness.texts()[1], 'SYNTHETIC-REPLY');
+    assert.equal(harness.texts().filter((text) => text === 'scheduled answer').length, 0,
+      'the quarantined scheduled result was never sent');
   } finally {
     await adapter.stop();
     await store.close();
@@ -252,12 +288,14 @@ test('a replacement process confirms a recorded restart once per requesting chan
     // A requesting sender the live allowlist no longer admits gets no notice and no owed record.
     assert.equal(state.restart, undefined);
 
-    // A second open reports nothing new for the confirmed channel.
+    // A second open reports nothing new for the confirmed channel: the dropped record is the
+    // positive marker that recovery ran, and no message was sent while it did.
     await adapter.stop();
     const second = syntheticTransport();
     const again = startDiscord(store, second, { streaming: false });
     try {
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await untilAsync(async () => (await channelState(store.gateway)).restart === undefined,
+        'restart recovery to run on the second open');
       assert.equal(second.sent.length, 0);
     } finally {
       await again.stop();
@@ -283,6 +321,150 @@ test('an admitted notice with a held acknowledgement survives a reopen as unconf
     assert.equal(harness.texts()[0], 'Command interrupted; outcome unknown. Send it again if needed.');
   } finally {
     await adapter.stop();
+    await store.close();
+  }
+});
+
+test('an ordinary send persists its intent before the request and clears it only on acceptance', { timeout: 30_000 }, async () => {
+  const store = await openDiscordStore('ordinal-intent', {});
+  const harness = syntheticTransport();
+  const adapter = startDiscord(store, harness, { streaming: false });
+  try {
+    const gate = deferred();
+    harness.state.sendGate = gate.promise;
+    await harness.receive(guildMessage({ id: '601', content: `<@${BOT_ID}> answer me` }));
+    await until(() => harness.state.inFlight === 1, 'an in-flight send');
+    // The intent is durable while the request is still in flight: a crash right here is ambiguous.
+    const inFlight = (await channelState(store.gateway)).pending.find((entry) => entry.key === 'm:601');
+    assert.ok(inFlight !== undefined);
+    assert.equal(inFlight.deliveryStatus, 'sending');
+    assert.equal(inFlight.sendIntent.stage, 'final');
+    assert.equal(inFlight.sendIntent.chunkIndex, 0);
+    assert.equal(inFlight.sendIntent.text, 'SYNTHETIC-REPLY');
+
+    gate.resolve();
+    await until(() => harness.sent.length === 1, 'accepted answer');
+    await untilAsync(async () => (await channelState(store.gateway)).pending.length === 0, 'intent cleared');
+    assert.equal(harness.sent[0].text, 'SYNTHETIC-REPLY');
+  } finally {
+    await adapter.stop();
+    await store.close();
+  }
+});
+
+test('an accepted-but-uncommitted ordinary send is quarantined on reopen and never repeated', { timeout: 30_000 }, async () => {
+  const store = await openDiscordStore('ordinal-recovery', {});
+  // The exact durable shape a crash between Discord accepting the message and the local commit leaves.
+  await writeState(store, (doc) => {
+    doc.origins[CHANNEL_ID] = { botId: BOT_ID, senderId: USER_ID, kind: 'channel', admittedAtMs: Date.now() };
+    doc.pending.push({
+      key: 'm:611',
+      channelId: CHANNEL_ID,
+      sessionKey: sessionKeys.channel,
+      senderId: USER_ID,
+      text: '[Alice (id=501)]: answer me',
+      admittedAtMs: Date.now(),
+      nextChunkIndex: 0,
+      deliveryStatus: 'sending',
+      sendIntent: { text: 'SYNTHETIC-REPLY', stage: 'final', chunkIndex: 0, startedAt: Date.now() },
+    });
+  });
+  const harness = syntheticTransport();
+  const adapter = startDiscord(store, harness, { streaming: false });
+  try {
+    await untilAsync(async () => (await channelState(store.gateway)).pending
+      .some((entry) => entry.deliveryStatus === 'unknown'), 'quarantined intent');
+    const record = (await channelState(store.gateway)).pending.find((entry) => entry.key === 'm:611');
+    // The exact ambiguous attempt stays with the record as evidence; the status is what stops a resend.
+    assert.equal(record.sendIntent.text, 'SYNTHETIC-REPLY');
+    assert.equal(record.deliveryStatus, 'unknown');
+    assert.ok(record.unknownSince > 0);
+    // A later admission is a full delivery after recovery: the ambiguous answer is still unsent.
+    await harness.receive(guildMessage({ id: '612', content: `<@${BOT_ID}> later` }));
+    await until(() => harness.sent.length === 1, 'later answer');
+    assert.equal(harness.sent[0].replyToMessageId, '612');
+  } finally {
+    await adapter.stop();
+    await store.close();
+  }
+});
+
+test('a plain status-carrying transport failure is classified without a wrapper class', { timeout: 30_000 }, async () => {
+  const store = await openDiscordStore('plain-status', {});
+  const harness = syntheticTransport();
+  const adapter = startDiscord(store, harness, { streaming: false });
+  try {
+    // A proven 4xx refusal from the real client arrives as an error carrying a numeric status.
+    harness.state.nextSendFailure = Object.assign(new Error('refused by Discord'), { status: 400 });
+    await harness.receive(guildMessage({ id: '621', content: `<@${BOT_ID}> refused` }));
+    await untilAsync(async () => (await channelState(store.gateway)).pending
+      .some((entry) => entry.deliveryStatus === 'failed'), 'proven refusal held');
+    assert.equal(harness.sent.length, 0);
+
+    // A 5xx leaves the outcome ambiguous: quarantined, not retried.
+    harness.state.nextSendFailure = Object.assign(new Error('gateway error'), { status: 502 });
+    await harness.receive(guildMessage({ id: '622', content: `<@${BOT_ID}> maybe` }));
+    await untilAsync(async () => (await channelState(store.gateway)).pending
+      .some((entry) => entry.key === 'm:622' && entry.deliveryStatus === 'unknown'), 'ambiguous held');
+    assert.equal(harness.sent.length, 0);
+  } finally {
+    await adapter.stop();
+    await store.close();
+  }
+});
+
+test('a host notice longer than one message is delivered in bounded chunks with a cursor', { timeout: 30_000 }, async () => {
+  const store = await openDiscordStore('notice-chunks', {});
+  const notice = 'n'.repeat(4_500);
+  await writeState(store, (doc) => {
+    doc.pending.push({
+      key: 'unconfirmed:m:901',
+      channelId: CHANNEL_ID,
+      sessionKey: sessionKeys.channel,
+      senderId: USER_ID,
+      text: notice,
+      admittedAtMs: Date.now(),
+      nextChunkIndex: 0,
+      notice: true,
+    });
+  });
+  const harness = syntheticTransport();
+  const adapter = startDiscord(store, harness, { streaming: false });
+  try {
+    await until(() => harness.sent.length === 3, 'three notice chunks');
+    assert.ok(harness.texts().every((chunk) => chunk.length <= 2_000));
+    assert.equal(harness.texts().join(''), notice);
+    await untilAsync(async () => (await channelState(store.gateway)).pending.length === 0, 'notice settled');
+  } finally {
+    await adapter.stop();
+    await store.close();
+  }
+});
+
+test('a channel removed from allowChannels loses MCP ownership and scheduled delivery', { timeout: 30_000 }, async () => {
+  // A gateway opened from a file is the host shape that exposes owner MCP surfaces.
+  const store = await openDiscordStore('policy-narrowing', { allowChannels: [CHANNEL_ID], configFile: true });
+  const first = syntheticTransport();
+  const firstAdapter = startDiscord(store, first, { streaming: false });
+  try {
+    await first.receive(guildMessage({ id: '631', content: `<@${BOT_ID}> hello` }));
+    await until(() => first.sent.length === 1, 'first answer');
+    // The live adapter owns the MCP surface for this authenticated channel.
+    assert.ok(store.gateway.mcpSurfaces.surfaceFor(sessionKeys.channel) !== undefined);
+  } finally {
+    await firstAdapter.stop();
+  }
+  // The same store reopens with the channel no longer allowed: admission evidence alone is not authority.
+  const narrowed = syntheticTransport();
+  const narrowedAdapter = startDiscord(store, narrowed, { streaming: false, allowChannels: ['999'] });
+  try {
+    assert.equal(store.gateway.mcpSurfaces.surfaceFor(sessionKeys.channel), undefined);
+    await admitDelivery(store.gateway, sessionKeys.channel, delivery('cron:job-7:1'));
+    await untilAsync(async () => (await outboxRecords(store.gateway, sessionKeys.channel))
+      .find((record) => record.id === 'cron:job-7:1')?.status === 'unauthorized', 'narrowed delivery refused');
+    assert.equal(narrowed.sent.length, 0);
+  } finally {
+    await narrowedAdapter.stop();
     await store.close();
   }
 });
