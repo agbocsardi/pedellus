@@ -6,11 +6,11 @@
 - [x] Durable internal chunk continuation, first episode unconditional, budget admission for additional episodes and X ceiling.
 - [x] Read-only episode progress and honest documentation.
 - [x] Focused synthetic regressions and existing bounded checks.
-- [ ] Independent Pi Terra/high review and fixes.
+- [x] Independent Pi Terra/high review and fixes.
   - [x] Fix non-empty episode ordering across consecutive resets and consumed prefixes.
   - [x] Count actual packed chunks for additional-episode admission, including the step bound.
-  - [ ] Fresh independent re-check of the fixes and candidate.
-- [ ] Commit reviewed implementation; no live activation.
+  - [x] Fresh independent re-check of the fixes and candidate.
+- [x] Commit reviewed implementation; no live activation.
 
 ## Log
 
@@ -26,4 +26,4 @@ Validation: typecheck/build; all 439 registered behavior checks (GNU timeout); 2
 
 Independent Pi Terra/high review of a4c9283b found two P2 issues (no waived findings): consecutive empty resets could order a later non-empty episode too early, and the admission estimate ignored step-limited chunks and interactions among packing limits. Fixed ordering using the real episode opening while still consuming every empty reset from the saved frontier; also recover the real opening for a previously consumed prefix. Replaced ratio-based chunk counts with the actual bounded chunk reader, including historical frozen segment transitions, previews and all packing limits. Pinned internal continuation skips the unneeded admission estimate. Added four permanent regressions: interleaved empty resets, consumed-prefix episode ordering, combined entry/character packing, and a valid step-dense next episode whose required chunks exceed the remaining response allowance. No per-entry evidence limits were weakened.
 
-Post-review validation: typecheck/build, all 443 behavior checks, 2 execution checks, 83 offline acceptance checks and `git diff --check` pass. A fresh independent re-check remains pending; no merge, deployment or live runtime/config/schedule change.
+Post-review validation: typecheck/build, all 443 behavior checks, 2 execution checks, 83 offline acceptance checks and `git diff --check` pass. The fresh independent Pi Terra/high re-check of 911f28aa found no material issues and independently passed typecheck, all 443 behavior checks, 2 execution checks, offline core acceptance and the base-to-candidate whitespace check. Both original findings are fixed; none waived. Reviewed implementation is committed for fast-forward integration into main. No deployment or live runtime/config/schedule change; activation and current live-frontier inspection still require separate approval.
