@@ -27,6 +27,7 @@ import { runTerminalConversation } from "./terminal/index.js";
 import { openGateway } from "./runtime.js";
 import { prepareDataDirectory } from "./store.js";
 import { StartupDiagnosticError, startupDiagnostic } from "./startup-diagnostics.js";
+import { reportFailure, type FailureStage } from "./failure-diagnostics.js";
 
 /** Every synopsis, the fixed default configuration note and the help hint; never supplied arguments. */
 const USAGE = renderUsage();
@@ -368,6 +369,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
   process.once("SIGTERM", shutdown);
   let gateway: Awaited<ReturnType<typeof openGateway>> | undefined;
   let server: Awaited<ReturnType<typeof serveLocalGateway>> | undefined;
+  let stage: FailureStage = "gateway.open";
   /** The one host gate for both owner `/restart` surfaces: it refuses while live work would be interrupted. */
   const restart = createRestartCoordinator({
     activeWork: async (ctx) => {
@@ -380,6 +382,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
   try {
     const socketPath = await localSocketPath(config);
     gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
+    stage = "gateway.local";
     // The gateway owns local attachments too: the CLI only names an operator path. CLI
     // originals live in a code-owned child of the validated operator media root, so a
     // CLI locator never shares names with a Telegram original and a long-but-valid
@@ -406,6 +409,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       ...(attachments === undefined ? {} : { attachments }),
     });
     if (config.telegram) {
+      stage = "gateway.telegram";
       const token = Object.hasOwn(process.env, config.telegram.tokenEnv)
         ? process.env[config.telegram.tokenEnv]
         : undefined;
@@ -435,13 +439,28 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
         },
       }, context);
     } else {
+      stage = "gateway.wait";
       await aborted(stop.signal);
     }
+  } catch (error) {
+    reportFailure(error, stage);
+    throw error;
   } finally {
     process.off("SIGINT", shutdown);
     process.off("SIGTERM", shutdown);
-    await server?.close();
-    await gateway?.close(withoutAbortSignal(context));
+    try {
+      await server?.close();
+    } catch (error) {
+      reportFailure(error, "gateway.close.local");
+      throw error;
+    } finally {
+      try {
+        await gateway?.close(withoutAbortSignal(context));
+      } catch (error) {
+        reportFailure(error, "gateway.close.runtime");
+        throw error;
+      }
+    }
   }
   if (restart.accepted()) replaceGatewayProcess();
 }
@@ -455,7 +474,8 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
 function replaceGatewayProcess(): void {
   try {
     replaceProcess(restartPlan());
-  } catch {
+  } catch (error) {
+    reportFailure(error, "gateway.restart");
     process.stderr.write(`${RESTART_FAILURE_DIAGNOSTIC}\n`);
     process.exitCode = 1;
   }
@@ -642,6 +662,7 @@ export function runCli(): Promise<void> {
       // Known startup failures use fixed text; everything else stays suppressed because
       // dependency/config errors may embed credentials or paths.
       console.error(startupDiagnostic(error));
+      reportFailure(error, "command");
     }
     process.exitCode = 1;
   });

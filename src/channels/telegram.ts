@@ -4041,7 +4041,7 @@ async function apiCall<T>(
           continue;
         }
         throw new TelegramApiError(method, error.error_code,
-          isAmbiguousSendMethod(method) && error.error_code >= 500 ? "unknown" : "rejected", error.description);
+          isAmbiguousSendMethod(method) && error.error_code >= 500 ? "unknown" : "rejected", error.description, { cause: error });
       }
       if (error instanceof HttpError) {
         if (isAmbiguousSendMethod(method)) {
@@ -4062,7 +4062,7 @@ async function apiCall<T>(
       }
       if (signal?.aborted) throw signal.reason;
       if (isAmbiguousSendMethod(method)) throw new TelegramApiError(method, 0, "unknown");
-      throw new Error(`Telegram ${method} transport failed`);
+      throw new Error(`Telegram ${method} transport failed`, { cause: error });
     }
   }
   throw new Error(`Telegram ${method} request attempts exhausted`);
@@ -4074,8 +4074,8 @@ export class TelegramApiError extends Error {
   readonly outcome: "unknown" | "rejected" | "not-sent";
   readonly description: string | undefined;
 
-  constructor(method: string, status: number, outcome: "unknown" | "rejected" | "not-sent", description?: string) {
-    super(`Telegram ${method} failed with status ${status}`);
+  constructor(method: string, status: number, outcome: "unknown" | "rejected" | "not-sent", description?: string, options?: ErrorOptions) {
+    super(`Telegram ${method} failed with status ${status}`, options);
     this.method = method;
     this.status = status;
     this.outcome = outcome;

@@ -8,6 +8,9 @@ import { fileURLToPath } from "node:url";
 
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { ReadAfterWrite, SessionFailed } from "@earendil-works/pi-durable";
+
+const { failureDiagnostic } = await import(new URL("../dist/failure-diagnostics.js", import.meta.url).href);
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const cli = join(repoRoot, "bin", "durable-nanobot.mjs");
@@ -134,6 +137,102 @@ async function pathExists(path) {
     return false;
   }
 }
+
+test("failure records keep Durable causes and code locations without serializing sensitive values", () => {
+  const parse = (line) => JSON.parse(line.slice('durable-nanobot diagnostic: '.length));
+  const durable = new SessionFailed(new ReadAfterWrite('Tx.scanTasks()'));
+  // These are real Durable error classes; supply a controlled library throw location because
+  // constructing them directly here otherwise points at this test, not a Durable call site.
+  for (const error of [durable, durable.cause]) {
+    error.stack = `${error.name}: ${error.message}\n    at nativeFailure (${join(repoRoot, 'node_modules/@earendil-works/pi-durable/dist/errors.js')}:20:5)`;
+  }
+  const record = parse(failureDiagnostic(durable, 'durable.storage_failed'));
+  assert.equal(record.errors[0].name, 'SessionFailed');
+  assert.equal(record.errors[0].message, 'Session failed after a storage error; close and reopen it');
+  assert.equal(record.errors[1].name, 'ReadAfterWrite');
+  assert.equal(record.errors[1].message, 'Tx.scanTasks() cannot read tables after the first table write');
+  assert.ok(record.errors[1].locations.some((location) => location.startsWith('node_modules/@earendil-works/pi-durable/')));
+  assert.equal(failureDiagnostic(durable, 'durable.storage_failed'), failureDiagnostic(durable, 'durable.storage_failed'));
+  durable.cause.stack = `ReadAfterWrite\n    at nativeFailure (${join(repoRoot, 'node_modules/@earendil-works/pi-durable/src/errors.ts')}:20:5)`;
+  assert.equal(parse(failureDiagnostic(durable, 'durable.storage_failed')).errors[1].message,
+    'Tx.scanTasks() cannot read tables after the first table write', 'source-mapped SDK frames survive the source launcher');
+
+  const secret = 'SENSITIVE-VALUE-DO-NOT-LOG-6617';
+  const cause = Object.assign(new Error(secret), { code: 'ECONNRESET' });
+  const error = Object.assign(new Error(secret, { cause: new AggregateError([cause], secret) }), {
+    name: secret, reason: secret, method: secret, request: { token: secret },
+  });
+  let codeReads = 0;
+  Object.defineProperty(error, 'code', { get: () => ++codeReads === 1 ? 'ECONNREFUSED' : secret });
+  error.stack = `${secret}\n    at ${secret} (${join(repoRoot, 'src/cli.ts')}:20:5)\n    at ${secret} (/private/${secret}.js:1:1)`;
+  cause.cause = error; // Cyclic and aggregate causes must remain bounded.
+  const line = failureDiagnostic(error, 'gateway.telegram');
+  const safe = parse(line);
+  assert.equal(codeReads, 1);
+  assert.equal(safe.errors[0].code, 'ECONNREFUSED');
+  assert.ok(safe.errors.some((entry) => entry.code === 'ECONNRESET'));
+  assert.deepEqual(safe.errors[0].locations, ['src/cli.ts:20:5']);
+  assert.ok(safe.errors.length <= 4 && line.length < 10_000);
+  assert.doesNotMatch(line, new RegExp(secret));
+  assert.ok(!line.includes(repoRoot));
+  assert.ok(!failureDiagnostic(secret, 'command').includes(secret));
+  const hostile = new Error();
+  Object.defineProperty(hostile, 'stack', { get() { throw new Error(secret); } });
+  assert.deepEqual(parse(failureDiagnostic(hostile, 'command')).errors, [{ name: 'UninspectableError' }]);
+});
+
+test("unexpected CLI startup failures emit a safe staged cause record", { timeout: 30_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'nanobot-failure-log-'));
+  try {
+    const instance = await writeDefaultInstance(home, 'gpt-6-luna');
+    await mkdir(instance.dataDir);
+    await writeFile(join(instance.dataDir, 'nanobot.sqlite'), 'synthetic-not-a-database');
+    const gateway = startCli(home, ['gateway'], home);
+    const exit = await waitForExit(gateway);
+    assert.equal(exit.code, 1);
+    const records = gateway.stderr.split('\n').filter((line) => line.startsWith('durable-nanobot diagnostic: '))
+      .map((line) => JSON.parse(line.slice('durable-nanobot diagnostic: '.length)));
+    assert.ok(records.some((record) => record.stage === 'gateway.open'), gateway.stderr);
+    assert.ok(records.some((record) => record.errors.some((error) => error.code === 'ERR_SQLITE_ERROR')));
+    assert.ok(records.some((record) => record.errors.some((error) => error.locations.length > 0)));
+    assert.ok(!gateway.stderr.includes(home));
+    assert.ok(!gateway.stderr.includes(SYNTHETIC_ENV));
+    assert.ok(!gateway.stderr.includes('synthetic-not-a-database'));
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("native Durable listener reports reach the journal without failing the gateway", { timeout: 30_000 }, async () => {
+  const instance = await makeSyntheticInstance('reports', 'SYNTHETIC');
+  const original = console.error;
+  const logs = [];
+  let observation;
+  let timer;
+  try {
+    let reported;
+    const received = new Promise((resolve) => { reported = resolve; });
+    console.error = (line) => {
+      logs.push(String(line));
+      if (String(line).includes('durable.listener_error')) reported();
+    };
+    observation = instance.gateway.harness.observeCommits({
+      advance() { throw new Error('PRIVATE-LISTENER-PAYLOAD-7719'); }, end() {},
+    });
+    const chat = await instance.gateway.conversationFor('cli:diagnostics', instance.instanceContext);
+    await Promise.race([received, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('missing Durable report')), timeoutMs);
+    })]);
+    assert.ok(logs.some((line) => line.includes('durable.listener_error')));
+    assert.ok(logs.every((line) => !line.includes('PRIVATE-LISTENER-PAYLOAD-7719') && !line.includes(instance.directory)));
+    await chat.commit((tx) => tx.appendEntry(chat.id, { kind: 'pi.user', model: [{ role: 'user', content: 'still usable', timestamp: 1 }] }), instance.instanceContext);
+  } finally {
+    clearTimeout(timer);
+    observation?.detach();
+    console.error = original;
+    await instance.close();
+  }
+});
 
 test("default config is read from HOME, SIGTERM stops cleanly, the lock releases, and recovery uses the same default", { timeout: 45_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "nanobot-default-home-"));

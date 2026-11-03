@@ -6,7 +6,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Api, HttpError } from 'grammy';
 
-const { telegramFetch } = await import(new URL('../dist/channels/telegram.js', import.meta.url).href);
+const { telegramFetch, runTelegram } = await import(new URL('../dist/channels/telegram.js', import.meta.url).href);
+const { failureDiagnostic } = await import(new URL('../dist/failure-diagnostics.js', import.meta.url).href);
+const { BACKGROUND_CONTEXT } = await import('@earendil-works/chord/context');
 
 const getMeResult = {
   id: 1, is_bot: true, first_name: 'Synthetic', username: 'synthetic_bot',
@@ -38,6 +40,25 @@ test('native fetch rejects grammY\'s signal while the bridge is accepted', { tim
 
   const response = await telegramFetch('data:text/plain,bridged', { signal: foreign });
   assert.equal(await response.text(), 'bridged');
+});
+
+test('a failed Telegram transport preserves its native cause for safe journal diagnostics', { timeout: 10_000 }, async () => {
+  const original = globalThis.fetch;
+  const secret = 'PRIVATE-TRANSPORT-VALUE-8892';
+  const native = Object.assign(new Error(secret), { code: 'ECONNREFUSED' });
+  globalThis.fetch = async () => { throw new TypeError(secret, { cause: native }); };
+  try {
+    await assert.rejects(runTelegram({}, { token: '123:synthetic-token', allowFrom: ['1'] }, BACKGROUND_CONTEXT), (error) => {
+      assert.ok(error.cause instanceof HttpError);
+      assert.equal(error.cause.error.cause, native);
+      const log = failureDiagnostic(error, 'gateway.telegram');
+      assert.match(log, /ECONNREFUSED/);
+      assert.ok(!log.includes(secret) && !log.includes('123:synthetic-token'));
+      return true;
+    });
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
 test('grammY cancellation still aborts the in-flight native request', { timeout: 10_000 }, async () => {

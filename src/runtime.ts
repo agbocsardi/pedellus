@@ -5,7 +5,7 @@ import type { Context, Draft } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
-import { AgentDoc, AssistantEntry, ResetEntry, ToolTask, configure, ConversationBusy, createRegistry, defineDoc, defineExtension, hook, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type Storage, type TaskId, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
+import { AgentDoc, AssistantEntry, ResetEntry, ToolTask, configure, ConversationBusy, createRegistry, defineDoc, defineExtension, hook, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type Report, type Storage, type TaskId, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ContextExtensionReplacement, type ConversationContextSnapshot } from "./context/index.js";
 import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./context/skill-tool.js";
 import { CRON_RUN_TASK_NAME, CronJobsDoc, createCronFoundation } from "./automation/cron.js";
@@ -127,6 +127,7 @@ import {
 } from "./providers.js";
 import { authStorePath, FileCredentialStore } from "./auth/store.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
+import { reportFailure } from "./failure-diagnostics.js";
 import {
   BACKGROUND_STATUS_LIMITS,
   backgroundLabel,
@@ -1971,6 +1972,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (isChordError(cause) && cause.reason === "locked") {
       throw new StartupDiagnosticError("storeLocked", { cause });
     }
+    reportFailure(cause, "gateway.lock");
     throw cause;
   }
   let harness: HarnessType | undefined;
@@ -2118,6 +2120,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
       settings: { steeringMode: "all" as const },
       models,
       registry,
+      // Durable reports asynchronous storage, scheduler, hook and listener failures here even
+      // when no public operation throws. Record the original cause before it is otherwise lost.
+      onReport: (report: Report) => reportFailure(report.error, `durable.${report.kind}`,
+        "task" in report && report.task !== undefined ? Number(report.task.id) : undefined),
       conversationCreated: denyNewConversation,
       ...(toolEnvironments === undefined
         ? {}
@@ -3896,6 +3902,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     }
     return gateway;
   } catch (error) {
+    // Keep the primary Durable/open failure even if cleanup itself throws afterwards.
+    reportFailure(error, "gateway.open");
     const cleanup = withoutAbortSignal(context);
     // A failed open must not leave deferred cataloguing attached to a closed session, nor a
     // derived index handle open behind a failed gateway.

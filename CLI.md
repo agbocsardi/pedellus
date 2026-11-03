@@ -173,7 +173,21 @@ store already owned by another live process, and an automatic interrupted-turn
 recovery that could not complete safely. These messages never include configuration
 values, environment values, filesystem paths, provider/dependency error text or
 the underlying exception. Unexpected failures keep the generic
-`durable-nanobot: command failed; diagnostic details suppressed` message.
+`durable-nanobot: command failed; diagnostic details suppressed` summary.
+
+Failures additionally emit a bounded `durable-nanobot diagnostic:` JSON record to
+stderr (journald in the shipped units). It records the failure stage, stable
+fingerprint, allowlisted error class/code/reason, a task ID when Durable supplies
+one, code-relative stack locations and up to four errors in the cause chain.
+Native Durable `onReport` events also reach that log, including asynchronous
+storage, task, hook and listener failures that do not fail the calling operation.
+Known value-free Durable invariant messages are included; arbitrary exception
+messages, absolute host paths, provider request objects, credentials, URLs and
+transcript text are not. This is diagnostic metadata, not an unrestricted debug
+trace. Primary gateway/open errors are logged before cleanup can replace them;
+shutdown failures have their own stage. Telegram transport wrappers retain the
+native cause for this formatter. Log retention and service restart policy are
+unchanged. See [service logs](./SERVICE.md#logs).
 
 A prepared model dispatch that pins historical Nanobot context no longer makes a
 normal startup fail by itself. The gateway cancels exactly that dispatch through

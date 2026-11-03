@@ -29,7 +29,9 @@ operator step after dependency installation, not part of checks. Package bin,
 source with pinned `tsx` in the same process; restart reloads edits without tsc
 or a watcher. The launcher disables esbuild's persistent sync compiler worker so
 native execve restart does not leave an unreapable compiler child. Keep the
-source/compiled error boundary shared through `src/cli.ts:runCli`.
+source/compiled error boundary shared through `src/cli.ts:runCli`. Native Durable
+`onReport` and gateway/CLI failure boundaries emit bounded journal diagnostics through
+`src/failure-diagnostics.ts`; never replace that formatter with raw exception/payload logging.
 `npm run typecheck` remains separate; `npm run build` still supports compiled
 output/tests. Units use an absolute Node path and do not need a CLI link. Code
 edits need restart only; unit edits additionally need daemon-reload.

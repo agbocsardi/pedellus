@@ -89,6 +89,29 @@ same `dataDir` after reinstalling: selecting a different directory opens a diffe
 store, not the old history. The database and its storage identities are not renamed
 by the `durable-nanobot` command/unit rename.
 
+## Logs
+
+The shipped units already send stdout and stderr to journald. Inspect the gateway
+without starting another process:
+
+```sh
+journalctl --user -u durable-nanobot.service --since "1 hour ago"
+journalctl --user -u durable-nanobot.service -f
+```
+
+Durable report callbacks and gateway/CLI failure boundaries emit bounded
+`durable-nanobot diagnostic:` records: stages, safe error classes/codes, cause
+chains, code-relative stack locations, task IDs where available and a fingerprint.
+No raw request payloads, credentials or transcript text are logged. Only known
+safe Durable invariant messages are included verbatim; other error messages stay
+private. A later shutdown failure does not erase the primary failure record.
+
+No verbosity switch, extra log file, retention change, systemd override or new
+retry loop is needed for these records. Journald retention remains host-managed;
+this project does not promise a fixed number of days or survival of a host reboot.
+Systemd still records exits, signals and restart-limit failures independently of
+the application. These diagnostics require a gateway restart to load new code.
+
 ## Primary instance
 
 The default launch path is fixed and independent of the process working

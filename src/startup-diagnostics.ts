@@ -1,9 +1,9 @@
 /**
  * Fixed startup diagnostics for the local CLI.
  *
- * The `STARTUP_DIAGNOSTICS` text is the only text the CLI prints for a failed
- * start. It never interpolates configuration values, environment values,
- * filesystem paths, provider/dependency error text or the underlying exception.
+ * `STARTUP_DIAGNOSTICS` supplies the CLI's fixed human-facing summaries. A separate bounded
+ * failure record includes safe classes/codes, causes and code-relative locations. These summaries
+ * never interpolate configuration/environment values, paths or raw provider/dependency errors.
  */
 export const STARTUP_DIAGNOSTICS = Object.freeze({
   configHome:
