@@ -10,9 +10,10 @@ config sets `cron.enabled`. There is no user scheduler or slash command. A due
 job submits one agent turn — into a fresh background conversation, or into this
 conversation. By default a normal settlement in either mode is queued for delivery
 to the authenticated Telegram private chat that created the job when the adapter
-is enabled; no other channel delivers results. The `silent` option or an exact
-`[SILENT]` answer suppresses successful automatic delivery. Failures still produce
-a fixed notice; a non-silent empty answer also produces a notice. Cancelled,
+is enabled; no other channel delivers results. The `silent` option is the only way to
+suppress successful automatic delivery, and a scheduled run cannot choose it for
+itself. Failures still produce a fixed notice; a non-silent empty or unusable answer
+also produces one. Cancelled,
 superseded or otherwise abandoned runs send nothing; inspect status with `list`.
 
 ## Actions
@@ -61,11 +62,13 @@ idle. Jobs are owner-scoped to the conversation that created them, so another
 conversation's jobs are invisible and its IDs are refused.
 
 Say which mode and delivery setting will be used. Background answers remain in
-a separate conversation; origin-mode answers remain here. For a conditional
-check, a scheduled run can return exactly `[SILENT]` (ignoring surrounding
-whitespace) to suppress that occurrence's automatic success reply. Other text
-is delivered normally unless the job is silent. Untrusted material can influence
-the model's choice, and an answer consisting only of `[SILENT]` cannot be delivered.
+a separate conversation; origin-mode answers remain here. A normal job's committed
+final answer is what the owner receives, so write it as the message they should get
+when the job fires. A scheduled run cannot suppress its own delivery: only
+`silent: true` on the job does that. Return the text to send; an empty answer, or one
+that is only `[SILENT]`, is replaced by a fixed notice saying the occurrence finished
+without an answer, so the owner still learns the job ran. Untrusted material cannot
+silence an explicit reminder.
 Use `list` to inspect a failed or cancelled run.
 
 ## Authority and limits

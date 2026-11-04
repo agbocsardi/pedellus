@@ -6,8 +6,9 @@
 // empty origin-mode answer (fixed sanitized notice text, one record across reopen), and an aborted
 // run (silent). The silent-delivery cases cover a job-wide `silent` setting (success and empty
 // suppressed, failure notice kept, legacy record still delivered, list/confirmation text, reopen),
-// and the per-occurrence `[SILENT]` answer in both modes, including a later occurrence of the same
-// job that still delivers and an ordinary chat answer that keeps its literal text.
+// and the retired per-occurrence `[SILENT]` answer, which no longer suppresses anything: a
+// non-silent run that produces it queues the fixed empty-result notice in both modes, while an
+// ordinary chat answer that contains it keeps its literal text.
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -843,7 +844,7 @@ test('silent jobs suppress success and empty answers but keep failure notices an
   }
 });
 
-test('silent and [SILENT] origin runs stay undelivered while an ordinary chat answer keeps its text', { timeout: 25_000 }, async () => {
+test('a silent origin run stays undelivered while a non-silent unusable answer queues its notice', { timeout: 25_000 }, async () => {
   const origin = 'telegram:7:chat:507';
   const store = await syntheticGateway('silent-origin');
   const chat = await store.gateway.conversationFor(origin, context);
@@ -891,7 +892,7 @@ test('silent and [SILENT] origin runs stay undelivered while an ordinary chat an
     assert.deepEqual(
       scheduledInputs.sort(),
       [scheduledContent('silent origin reminder'), scheduledContent('marker origin reminder')].sort(),
-      'each origin run receives the appended marker instruction',
+      'each origin run receives only the job message, with no host delivery instruction',
     );
     const jobs = (await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context)).jobs;
     assert.equal(jobs.length, 2);
@@ -900,23 +901,37 @@ test('silent and [SILENT] origin runs stay undelivered while an ordinary chat an
       assert.equal(job.lastOutcome.status, 'ok');
       assert.equal(job.lastOutcome.conversationId, chat.id);
     }
-    assert.equal(jobs.find((job) => job.name === 'silent origin').silent, true);
-    assert.equal(jobs.find((job) => job.name === 'marker origin').silent, false);
+    const silent = jobs.find((job) => job.name === 'silent origin');
+    const marker = jobs.find((job) => job.name === 'marker origin');
+    assert.equal(silent.silent, true);
+    assert.equal(marker.silent, false);
+    // Only the job's own `silent` setting suppresses a successful delivery. The non-silent job's
+    // unusable answer becomes the fixed empty-result notice instead of disappearing, so a reminder
+    // that answered with a marker is still visible to the owner.
+    const records = await store.gateway.cronOutbox.list(origin, context);
     assert.equal(
-      await store.gateway.harness.snapshot(CronDeliveriesDoc, chat.id, context),
-      undefined,
-      'neither suppressed origin result creates an outbox document',
+      records.length, 1,
+      `only the unusable non-silent answer is queued: ${JSON.stringify(records.map((record) => record.text))}`,
     );
-    assert.equal((await store.gateway.cronOutbox.list(origin, context)).length, 0);
+    assert.equal(records[0].id, `cron:${marker.id}:${marker.lastOutcome.scheduledAtMs}`);
+    assert.equal(
+      records[0].text,
+      cronOutcomeNotice('empty', marker.id, marker.lastOutcome.scheduledAtMs),
+      'a non-silent marker answer queues the fixed empty-result notice',
+    );
+    assert.ok(
+      !records.some((record) => record.id.startsWith(`cron:${silent.id}:`)),
+      'the silent job queues nothing for its successful occurrence',
+    );
 
-    // Both answers remain in the origin transcript, marker text included; only delivery is suppressed.
+    // Both answers remain in the origin transcript, marker text included; only delivery differs.
     const before = (await chat.entries({}, 500, undefined, context)).items;
     const textsBefore = assistantTexts(before);
     assert.ok(textsBefore.includes('SILENT-ORIGIN-ANSWER'));
     assert.equal(
       textsBefore.filter((text) => text.trim() === '[SILENT]').length,
       1,
-      'the marker occurrence kept one answer in the origin transcript',
+      'the unusable answer stays one entry in the origin transcript',
     );
 
     // The marker has no meaning in an ordinary chat turn: the answer stays exactly as written.
@@ -935,8 +950,8 @@ test('silent and [SILENT] origin runs stay undelivered while an ordinary chat an
       'the ordinary answer keeps its exact literal text',
     );
     assert.equal(
-      await store.gateway.harness.snapshot(CronDeliveriesDoc, chat.id, context),
-      undefined,
+      (await store.gateway.cronOutbox.list(origin, context)).length,
+      1,
       'an ordinary chat answer never enters the cron outbox',
     );
   } finally {
@@ -946,7 +961,7 @@ test('silent and [SILENT] origin runs stay undelivered while an ordinary chat an
   }
 });
 
-test('[SILENT] suppresses only its own background occurrence and a later occurrence still delivers', { timeout: 25_000 }, async () => {
+test('an unusable non-silent background occurrence queues its notice and a later one still delivers', { timeout: 25_000 }, async () => {
   const origin = 'telegram:7:chat:508';
   const store = await syntheticGateway('silent-marker-background');
   const chat = await store.gateway.conversationFor(origin, context);
@@ -959,7 +974,7 @@ test('[SILENT] suppresses only its own background occurrence and a later occurre
       respond: ({ input }) => {
         scheduledInputs.push(input);
         occurrences += 1;
-        // The first occurrence is a trimmed marker with surrounding whitespace; the second is real.
+        // The first occurrence is the retired marker with surrounding whitespace; the second is a real answer.
         return fauxAssistantMessage(occurrences === 2 ? 'MARKER-SECOND-RESULT' : '  [SILENT]  ');
       },
     },
@@ -989,24 +1004,30 @@ test('[SILENT] suppresses only its own background occurrence and a later occurre
       assert.equal(
         input,
         scheduledContent('marker background reminder'),
-        'each background run receives the appended marker instruction',
+        'each background run receives only the job message, with no host delivery instruction',
       );
     }
     const jobs = (await store.gateway.harness.snapshot(CronJobsDoc, chat.id, context)).jobs;
     assert.equal(jobs.length, 1);
     const job = jobs[0];
     assert.equal(job.mode, 'background');
-    assert.equal(job.silent, false, 'the marker suppresses one occurrence, not the job');
+    assert.equal(job.silent, false, 'delivery is the job setting, and this job is not silent');
     const firstAt = job.createdAtMs + 1000;
     const secondAt = firstAt + 1000;
     const records = await store.gateway.cronOutbox.list(origin, context);
     assert.equal(
-      records.length, 1,
-      `only the second occurrence is queued: ${JSON.stringify(records.map((record) => record.text))}`,
+      records.length, 2,
+      `both occurrences are queued: ${JSON.stringify(records.map((record) => record.text))}`,
     );
-    assert.equal(records[0].text, 'MARKER-SECOND-RESULT');
-    assert.equal(records[0].id, `cron:${job.id}:${secondAt}`);
-    assert.ok(!records.some((record) => record.id === `cron:${job.id}:${firstAt}`));
+    const notice = records.find((record) => record.id === `cron:${job.id}:${firstAt}`);
+    assert.equal(
+      notice?.text,
+      cronOutcomeNotice('empty', job.id, firstAt),
+      'the marker occurrence is queued as the fixed empty-result notice, never dropped',
+    );
+    const delivered = records.find((record) => record.id === `cron:${job.id}:${secondAt}`);
+    assert.equal(delivered?.text, 'MARKER-SECOND-RESULT');
+    assert.ok(!records.some((record) => record.text === '[SILENT]'), 'the marker is never sent as a message');
   } finally {
     watcher.stop();
     await store.gateway.close(context);

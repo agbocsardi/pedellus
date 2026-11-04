@@ -1253,7 +1253,9 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
             }
             const submission = await conversation.submit({
               type: "input",
-              content: `${job.message}\n\nFor this scheduled run only, return exactly [SILENT] as your final answer to suppress automatic delivery when there is nothing to report.`,
+              // The job's own message is the whole input: the host appends no delivery instruction,
+              // because delivery is the job's `silent` setting, never the run's own choice.
+              content: job.message,
               requestId,
               entry: {
                 kind: CRON_INPUT_ENTRY_KIND,
