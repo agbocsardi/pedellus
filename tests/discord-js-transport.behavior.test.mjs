@@ -13,6 +13,7 @@ import { BOT_ID, CHANNEL_ID, context, until } from './fixtures/discord-harness.m
 const { createDiscordJsTransport } = await import(
   new URL('../dist/channels/discord-js.js', import.meta.url).href
 );
+const { renderDiscordHistory } = await import(new URL('../dist/channels/discord-history.js', import.meta.url).href);
 const discord = await import('discord.js');
 
 const GUILD_ID = '9001';
@@ -392,10 +393,18 @@ function historyMessage(id, timestamp, content = `message ${id}`) {
   };
 }
 
-/** A message collection with Discord's newest-first paging and an exclusive `before` cursor. */
-function messageCollection(getMessages) {
+/**
+ * A message collection with Discord's newest-first paging and an exclusive `before` cursor.
+ * `failAfterPages` makes a later page throw, which must never look like a complete window.
+ */
+function messageCollection(getMessages, options = {}) {
+  let pages = 0;
   return {
     async fetch({ limit, before }) {
+      pages += 1;
+      if (options.failAfterPages !== undefined && pages > options.failAfterPages) {
+        throw Object.assign(new Error('synthetic service unavailable'), { status: 503 });
+      }
       const list = [...getMessages()]
         .sort((left, right) => (BigInt(right.id) > BigInt(left.id) ? 1 : -1))
         .filter((entry) => before === undefined || BigInt(entry.id) < BigInt(before));
@@ -418,7 +427,7 @@ function historyChannel(over = {}) {
     isDMBased: () => over.dm === true,
     permissionsFor: (member) =>
       (member?.id === '4242' ? over.botPermissions ?? permissions() : over.viewerPermissions ?? permissions()),
-    messages: messageCollection(() => over.messages ?? []),
+    messages: messageCollection(() => over.messages ?? [], over.fetchOptions ?? {}),
     ...(over.threads === undefined ? {} : { threads: over.threads }),
     ...(over.members === undefined ? {} : { members: over.members }),
   };
@@ -450,10 +459,19 @@ function historyGuild(over = {}) {
 }
 
 /** Start the real transport over a synthetic client whose channel map holds every reachable channel. */
-async function historyTransport(guild, extraChannels = new Map()) {
+async function historyTransport(guild, extraChannels = new Map(), fetchFailures = new Map()) {
   const channelMap = new Map([...guild.channels.cache.values()].map((channel) => [channel.id, channel]));
   for (const [id, channel] of extraChannels) channelMap.set(id, channel);
   const fake = fakeClient({ channels: channelMap, user: { id: BOT_ID, username: 'synthetic_bot' } });
+  if (fetchFailures.size > 0) {
+    fake.client.channels.fetch = async (id) => {
+      const failure = fetchFailures.get(id);
+      if (failure !== undefined) throw failure;
+      const channel = channelMap.get(id);
+      if (channel === undefined) throw Object.assign(new Error('unknown channel'), { status: 404 });
+      return channel;
+    };
+  }
   fake.client.guilds = {
     cache: { get: (id) => (id === guild.id ? guild : undefined) },
     fetch: async (id) => {
@@ -649,6 +667,208 @@ test('history resolves a channel name, enumerates archived threads and refuses a
     } finally {
       await second.stop();
     }
+  } finally {
+    await transport.stop();
+  }
+});
+
+test('a later page failure keeps the rows read but never claims a complete window', { timeout: 15_000 }, async () => {
+  const messages = Array.from({ length: 150 }, (_, index) =>
+    historyMessage(1_000 + index, Date.UTC(2026, 0, 1) + index * 60_000, `line ${index}`));
+  const general = historyChannel({
+    id: '6001', name: 'general', messages,
+    fetchOptions: { failAfterPages: 1 },
+  });
+  const transport = await historyTransport(historyGuild({ channels: [general] }));
+  try {
+    const read = await transport.history({ ...baseQuery, perSourceLimit: 150 });
+    assert.equal(read.ok, true);
+    // Page one is real evidence and is kept; the shape itself says the window is unfinished.
+    assert.equal(read.snapshot.messages.length, 100);
+    assert.equal(read.snapshot.partial, true);
+    assert.equal(read.snapshot.unreadUnknown, true);
+    assert.deepEqual(read.snapshot.warnings.find((warning) => warning.code === 'fetch-failed'),
+      { code: 'fetch-failed', count: 1, sourceIds: ['6001'] });
+    // Nothing about the failure text reaches the model.
+    assert.equal(JSON.stringify(read.snapshot).includes('synthetic service unavailable'), false);
+
+    const rendered = JSON.parse(renderDiscordHistory(read.snapshot, {
+      ...baseQuery, perSourceLimit: 150, maxChars: 12_000,
+    }));
+    assert.equal(rendered.coverage.partial, true);
+    assert.equal(rendered.coverage.complete, false);
+    assert.equal(rendered.coverage.truncated, true);
+    assert.equal(rendered.coverage.unreadMessages, 'unknown');
+    // The character budget may cut further; the whole-page evidence is kept and the cut is exact.
+    assert.ok(rendered.messages.length > 0);
+    assert.equal(rendered.coverage.messagesReturned, rendered.messages.length);
+    assert.equal(rendered.coverage.messagesCut, 100 - rendered.messages.length);
+  } finally {
+    await transport.stop();
+  }
+});
+
+test('a row without a usable timestamp is counted as skipped instead of silently dropped', { timeout: 15_000 }, async () => {
+  const good = historyMessage(1, Date.UTC(2026, 0, 1), 'good');
+  const timestampLess = { ...historyMessage(2, 0, 'no timestamp') };
+  delete timestampLess.createdTimestamp;
+  delete timestampLess.createdAt;
+  const channel = historyChannel({ id: '6001', name: 'general', messages: [good, timestampLess] });
+  const transport = await historyTransport(historyGuild({ channels: [channel] }));
+  try {
+    const read = await transport.history({ ...baseQuery, channelId: '6001' });
+    assert.equal(read.ok, true);
+    assert.equal(read.snapshot.messages.length, 1);
+    assert.equal(read.snapshot.skippedMessages, 1);
+    assert.equal(read.snapshot.partial, true);
+    assert.deepEqual(read.snapshot.warnings.find((warning) => warning.code === 'rows-unusable'),
+      { code: 'rows-unusable', count: 1, sourceIds: ['6001'] });
+    const rendered = JSON.parse(renderDiscordHistory(read.snapshot, baseQuery));
+    assert.equal(rendered.coverage.skippedMessages, 1);
+    assert.equal(rendered.coverage.complete, false);
+    assert.equal(rendered.coverage.partial, true);
+  } finally {
+    await transport.stop();
+  }
+});
+
+test('a global message limit, a DM limit and a character budget each mark the read incomplete', { timeout: 15_000 }, async () => {
+  const messages = Array.from({ length: 10 }, (_, index) =>
+    historyMessage(1_000 + index, Date.UTC(2026, 0, 1) + index * 60_000, `line ${index}`));
+  const general = historyChannel({ id: '6001', name: 'general', messages });
+  const transport = await historyTransport(historyGuild({ channels: [general] }));
+  try {
+    const limited = await transport.history({ ...baseQuery, limit: 2 });
+    assert.equal(limited.ok, true);
+    assert.equal(limited.snapshot.messages.length, 2);
+    assert.equal(limited.snapshot.unreadUnknown, true);
+    assert.ok(limited.snapshot.warnings.some((warning) => warning.code === 'source-limit-reached'));
+    const limitedRendered = JSON.parse(renderDiscordHistory(limited.snapshot, { ...baseQuery, limit: 2 }));
+    assert.equal(limitedRendered.coverage.truncated, true);
+    assert.equal(limitedRendered.coverage.complete, false);
+    assert.equal(limitedRendered.coverage.unreadMessages, 'unknown');
+
+    // A character budget is an exact cut: the message count that did not fit is known.
+    const many = Array.from({ length: 40 }, (_, index) =>
+      historyMessage(2_000 + index, Date.UTC(2026, 0, 2) + index * 60_000, 'x'.repeat(300)));
+    general.messages = messageCollection(() => many);
+    const cut = await transport.history({ ...baseQuery, perSourceLimit: 40 });
+    const cutRendered = JSON.parse(renderDiscordHistory(cut.snapshot, {
+      ...baseQuery, perSourceLimit: 40, maxChars: 2_000,
+    }));
+    assert.ok(cutRendered.messages.length < 40);
+    assert.equal(cutRendered.coverage.messagesCut, 40 - cutRendered.messages.length);
+    assert.equal(cutRendered.coverage.truncated, true);
+    assert.equal(cutRendered.coverage.complete, false);
+  } finally {
+    await transport.stop();
+  }
+
+  const dmMessages = Array.from({ length: 5 }, (_, index) =>
+    historyMessage(3_000 + index, Date.UTC(2026, 0, 1) + index * 60_000, `dm ${index}`));
+  const dm = historyChannel({ id: '8001', name: undefined, dm: true, guildId: null, messages: dmMessages });
+  const dmTransport = await historyTransport(historyGuild({ channels: [] }), new Map([['8001', dm]]));
+  try {
+    const limited = await dmTransport.history({
+      ...baseQuery, sessionMode: 'dm', sessionChannelId: '8001', guildId: null, limit: 2,
+    });
+    assert.equal(limited.ok, true);
+    assert.equal(limited.snapshot.messages.length, 2);
+    assert.equal(limited.snapshot.unreadUnknown, true);
+    const rendered = JSON.parse(renderDiscordHistory(limited.snapshot, {
+      ...baseQuery, sessionMode: 'dm', sessionChannelId: '8001', guildId: null, limit: 2,
+    }));
+    assert.equal(rendered.coverage.truncated, true);
+    assert.equal(rendered.coverage.complete, false);
+    assert.equal(rendered.coverage.unreadMessages, 'unknown');
+  } finally {
+    await dmTransport.stop();
+  }
+});
+
+test('sources beyond the scan bound are counted as unread, with one deduped warning', { timeout: 15_000 }, async () => {
+  const messages = [historyMessage(1, Date.UTC(2026, 0, 1))];
+  const parent = historyChannel({ id: '6001', name: 'general', messages });
+  const threads = Array.from({ length: 120 }, (_, index) => historyChannel({
+    id: String(7_000 + index),
+    name: `thread-${index}`,
+    thread: true,
+    type: discord.ChannelType.PublicThread,
+    parentId: '6001',
+    parent,
+    messages: [historyMessage(9_000 + index, Date.UTC(2026, 0, 1, 1) + index * 60_000, `thread ${index}`)],
+  }));
+  const guild = historyGuild({ channels: [parent, ...threads], activeThreads: threads });
+  const transport = await historyTransport(guild);
+  try {
+    const read = await transport.history({ ...baseQuery, perSourceLimit: 1, limit: 2_000 });
+    assert.equal(read.ok, true);
+    assert.equal(read.snapshot.sourcesScanned, 100);
+    assert.equal(read.snapshot.sourcesUnscanned, 21);
+    assert.equal(read.snapshot.unreadUnknown, true);
+    // One warning row, carrying the count and a bounded sample of ids — not one row per source.
+    const limitWarnings = read.snapshot.warnings.filter((warning) => warning.code === 'source-limit-reached');
+    assert.equal(limitWarnings.length, 1);
+    assert.equal(limitWarnings[0].count, 100);
+    assert.ok(limitWarnings[0].sourceIds.length <= 5);
+    const rendered = JSON.parse(renderDiscordHistory(read.snapshot, { ...baseQuery, perSourceLimit: 1, limit: 2_000 }));
+    assert.equal(rendered.coverage.sourcesUnscanned, 21);
+    assert.equal(rendered.coverage.truncated, true);
+    assert.equal(rendered.coverage.complete, false);
+    assert.equal(rendered.coverage.unreadMessages, 'unknown');
+    assert.equal(rendered.warnings.filter((warning) => warning.code === 'source-limit-reached').length, 1);
+  } finally {
+    await transport.stop();
+  }
+});
+
+test('a bounded archived listing marks the enumeration limited', { timeout: 15_000 }, async () => {
+  const parent = historyChannel({ id: '6001', name: 'general', messages: [] });
+  const archived = Array.from({ length: 2 }, (_, index) => historyChannel({
+    id: String(7_500 + index),
+    name: `archived-${index}`,
+    thread: true,
+    type: discord.ChannelType.PublicThread,
+    parentId: '6001',
+    parent,
+    messages: [historyMessage(9_500 + index, Date.UTC(2026, 0, 1), `archived ${index}`)],
+  }));
+  parent.threads = {
+    cache: { values: () => [].values() },
+    fetchArchived: async ({ type }) => ({
+      threads: { values: () => (type === 'public' ? archived : []).values() },
+    }),
+  };
+  const transport = await historyTransport(historyGuild({ channels: [parent, ...archived] }));
+  try {
+    const read = await transport.history({ ...baseQuery, includeArchivedThreads: true, archivedThreadLimit: 2 });
+    assert.equal(read.ok, true);
+    assert.equal(read.snapshot.enumerationLimited, true);
+    assert.equal(read.snapshot.unreadUnknown, true);
+    const rendered = JSON.parse(renderDiscordHistory(read.snapshot, {
+      ...baseQuery, includeArchivedThreads: true, archivedThreadLimit: 2,
+    }));
+    assert.equal(rendered.coverage.truncated, true);
+    assert.equal(rendered.coverage.complete, false);
+    assert.equal(rendered.coverage.unreadMessages, 'unknown');
+  } finally {
+    await transport.stop();
+  }
+});
+
+test('a missing, refused or failing channel maps to its own fixed refusal', { timeout: 15_000 }, async () => {
+  const general = historyChannel({ id: '6001', name: 'general', messages: [historyMessage(1, Date.UTC(2026, 0, 1))] });
+  const guild = historyGuild({ channels: [general] });
+  const transport = await historyTransport(guild, new Map(), new Map([
+    ['6601', Object.assign(new Error('unknown channel'), { status: 404 })],
+    ['6602', Object.assign(new Error('missing access'), { status: 403 })],
+    ['6603', Object.assign(new Error('service unavailable'), { status: 503 })],
+  ]));
+  try {
+    assert.deepEqual(await transport.history({ ...baseQuery, channelId: '6601' }), { ok: false, refusal: 'not-found' });
+    assert.deepEqual(await transport.history({ ...baseQuery, channelId: '6602' }), { ok: false, refusal: 'forbidden' });
+    // The capability is live; the read itself failed. That is not "history is unavailable".
+    assert.deepEqual(await transport.history({ ...baseQuery, channelId: '6603' }), { ok: false, refusal: 'read-failed' });
   } finally {
     await transport.stop();
   }

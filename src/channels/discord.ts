@@ -2563,14 +2563,19 @@ export async function runDiscord(
       if (decoded.kind === "dm" && (request.channelId !== undefined || request.channelName !== undefined)) {
         return { ok: false, refusal: "forbidden" };
       }
-      return transport.history({
-        ...request,
-        viewerId: owner.senderId,
-        guildId: decoded.kind === "dm" ? null : decoded.guildId!,
-        sessionMode: decoded.kind,
-        sessionChannelId: decoded.channelId,
-        allowChannels: options.allowChannels ?? [],
-      });
+      try {
+        return await transport.history({
+          ...request,
+          viewerId: owner.senderId,
+          guildId: decoded.kind === "dm" ? null : decoded.guildId!,
+          sessionMode: decoded.kind,
+          sessionChannelId: decoded.channelId,
+          allowChannels: options.allowChannels ?? [],
+        });
+      } catch {
+        // The capability is live; the read itself failed. Never surface transport text.
+        return { ok: false, refusal: "read-failed" };
+      }
     },
   });
   if (gateway.discordHistory !== undefined && transport.history === undefined) {

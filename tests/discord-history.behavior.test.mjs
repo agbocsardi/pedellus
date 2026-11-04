@@ -62,7 +62,12 @@ function snapshot(overrides = {}) {
     messages: [message()],
     sourcesScanned: 1,
     sourcesSkipped: 0,
-    omittedMessages: 0,
+    sourcesUnscanned: 0,
+    cutMessages: 0,
+    skippedMessages: 0,
+    partial: false,
+    unreadUnknown: false,
+    enumerationLimited: false,
     warnings: [],
     ...overrides,
   };
@@ -137,28 +142,42 @@ test('rendered history states coverage, omission and provenance instead of imply
   const rendered = renderDiscordHistory(snapshot({
     messages: [message({ messageId: '1' }), message({ messageId: '2', threadId: '7001', threadName: 'topic' })],
     sourcesSkipped: 2,
-    omittedMessages: 3,
-    warnings: [{ code: 'source-limit-reached', sourceId: '6001' }],
+    warnings: [{ code: 'source-limit-reached', count: 3, sourceIds: ['6001', '6002'] }],
   }), request);
   const data = JSON.parse(rendered);
   assert.equal(data.provenance, DISCORD_HISTORY_PROVENANCE);
   assert.equal(data.coverage.sourcesSkipped, 2);
-  assert.equal(data.coverage.omittedMessages, 3);
+  assert.equal(data.coverage.messagesCut, 0);
   assert.equal(data.coverage.messagesReturned, 2);
+  assert.equal(data.coverage.complete, true);
+  assert.equal(data.coverage.partial, false);
   assert.equal(data.coverage.truncated, false);
-  assert.deepEqual(data.warnings, [{ code: 'source-limit-reached', sourceId: '6001' }]);
+  assert.equal(data.coverage.unreadMessages, 0);
+  assert.deepEqual(data.warnings, [{ code: 'source-limit-reached', count: 3, sourceIds: ['6001', '6002'] }]);
   assert.equal(data.messages[1].threadId, '7001');
   // Every returned message keeps stable IDs for citation.
   assert.deepEqual([data.messages[0].channelId, data.messages[0].authorId, data.messages[0].messageId],
     ['6001', '501', '1']);
 
-  // A tight budget drops whole messages and says so, never returning partial JSON.
+  // A tight budget drops whole messages, counts the exact cut, and never claims completeness.
   const many = Array.from({ length: 40 }, (_, index) => message({ messageId: String(index + 1), content: 'x'.repeat(200) }));
   const tight = JSON.parse(renderDiscordHistory(snapshot({ messages: many }), { ...request, maxChars: 1_500 }));
   assert.equal(tight.coverage.truncated, true);
+  assert.equal(tight.coverage.complete, false);
   assert.ok(tight.messages.length < 40);
-  assert.ok(tight.coverage.omittedMessages > 0);
+  assert.equal(tight.coverage.messagesCut, 40 - tight.messages.length);
   assert.ok(JSON.stringify(tight).length <= 1_500);
+
+  // A source bound leaves an unknown unread count, and every kind of gap marks the read incomplete.
+  const bounded = JSON.parse(renderDiscordHistory(snapshot({
+    sourcesUnscanned: 21,
+    unreadUnknown: true,
+    warnings: [{ code: 'source-limit-reached', count: 100, sourceIds: ['6001'] }],
+  }), request));
+  assert.equal(bounded.coverage.sourcesUnscanned, 21);
+  assert.equal(bounded.coverage.unreadMessages, 'unknown');
+  assert.equal(bounded.coverage.truncated, true);
+  assert.equal(bounded.coverage.complete, false);
 
   // Long content and names are bounded, and control characters cannot forge transcript lines.
   const hostile = JSON.parse(renderDiscordHistory(snapshot({
@@ -177,9 +196,9 @@ test('rendered history states coverage, omission and provenance instead of imply
 });
 
 test('the history tool is offered only in a mapped Discord chat, not to a non-Discord chat', { timeout: 30_000 }, async () => {
-  // Like every context tool in this host, the capability needs the coding-tool extension installed
-  // (a non-empty `toolAllowlist`); it is exempt from that ceiling, not from its installation.
-  const store = await openDiscordStore('history-scope', { tools: ['read'] });
+  // The read-only capability is independent of the coding-tool ceiling: an empty `toolAllowlist`
+  // still offers it in a mapped Discord chat, and still never offers it to another chat class.
+  const store = await openDiscordStore('history-scope', { tools: [] });
   const harness = syntheticTransport();
   harness.transport.history = async () => ({ ok: true, snapshot: snapshot() });
   const adapter = startDiscord(store, harness, { streaming: false });
@@ -191,8 +210,7 @@ test('the history tool is offered only in a mapped Discord chat, not to a non-Di
     const discordAgent = await store.gateway.harness.conversation(discordConversation.id, context)
       .then((conversation) => conversation.agent(context));
     assert.ok(discordAgent.tools.some((tool) => tool.name === DISCORD_HISTORY_TOOL_NAME),
-      'a mapped Discord chat is offered the read-only history tool');
-    assert.ok(discordAgent.tools.some((tool) => tool.name === 'read'), 'the configured coding tool is still offered');
+      'a mapped Discord chat is offered the read-only history tool without a coding ceiling');
 
     // A CLI conversation is not a Discord chat, even when the config names the tool explicitly.
     const cliConversation = await store.gateway.conversationFor('cli:default', context);
@@ -200,7 +218,6 @@ test('the history tool is offered only in a mapped Discord chat, not to a non-Di
       .then((conversation) => conversation.agent(context));
     assert.equal(cliAgent.tools.some((tool) => tool.name === DISCORD_HISTORY_TOOL_NAME), false,
       'a non-Discord chat never receives the Discord history tool');
-    assert.equal(cliAgent.tools.some((tool) => tool.name === 'read'), true);
 
     // A worker grant cannot name it: the configuration refuses the entry outright.
     assert.throws(() => parseConfig({
@@ -357,5 +374,30 @@ test('a model tool call returns bounded history JSON and a refusal never leaks t
   } finally {
     await adapter.stop();
     await store.close();
+  }
+});
+
+test('a reopened gateway restores the mapping when only the history capability needs it', { timeout: 30_000 }, async () => {
+  // `agentHistory: false` removes every other reason to load the session map; the history tool alone
+  // must still restore it, so a Discord chat keeps its conversation across a gateway restart.
+  const options = { tools: [], gatewayOptions: { agentHistory: false } };
+  const first = await openDiscordStore('ceiling-only-mapping', options);
+  const context = (await import('./fixtures/discord-harness.mjs')).context;
+  const conversation = await first.gateway.conversationFor(sessionKeys.channel, context);
+  const firstAgent = await first.gateway.harness.conversation(conversation.id, context)
+    .then((entry) => entry.agent(context));
+  assert.ok(firstAgent.tools.some((tool) => tool.name === DISCORD_HISTORY_TOOL_NAME),
+    'an empty coding ceiling still offers the read-only history tool');
+  await first.gateway.close(context);
+
+  const second = await openDiscordStore('ceiling-only-mapping', { ...options, directory: first.directory });
+  try {
+    const again = await second.gateway.conversationFor(sessionKeys.channel, context);
+    assert.equal(again.id, conversation.id, 'the mapped conversation survives the reopen');
+    const agent = await second.gateway.harness.conversation(again.id, context)
+      .then((entry) => entry.agent(context));
+    assert.ok(agent.tools.some((tool) => tool.name === DISCORD_HISTORY_TOOL_NAME));
+  } finally {
+    await second.close();
   }
 });

@@ -301,6 +301,8 @@ export type DiscordHistoryRead =
   | { readonly ok: true; readonly snapshot: DiscordHistorySnapshot }
   | { readonly ok: false; readonly refusal: DiscordHistoryRefusalCode };
 
+export type { DiscordHistoryRefusalCode };
+
 export type {
   DiscordHistoryMessage,
   DiscordHistorySnapshot,

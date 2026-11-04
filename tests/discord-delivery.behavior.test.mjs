@@ -88,6 +88,24 @@ test('channels start together and a failing one shuts the others down before rep
   assert.equal(shutdowns, 1);
 });
 
+test('a channel that fails before the supervisor is awaited emits no unhandled rejection', { timeout: 15_000 }, async () => {
+  const unhandled = [];
+  const listener = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', listener);
+  try {
+    const supervisor = superviseChannels(() => {});
+    // The run rejects immediately, before anything awaits the supervisor's bookkeeping.
+    supervisor.start('gateway.discord', Promise.reject(new Error('early channel failure')));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, [], 'an early channel failure must be retained, not rethrown into nothing');
+    const failed = await supervisor.settle();
+    assert.equal(failed.stage, 'gateway.discord');
+    assert.match(failed.error.message, /early channel failure/u);
+  } finally {
+    process.off('unhandledRejection', listener);
+  }
+});
+
 test('a later channel setup failure stops and awaits the channel that already started', { timeout: 15_000 }, async () => {
   // This mirrors the gateway's own order: Telegram starts, Discord setup then fails before starting.
   const order = [];

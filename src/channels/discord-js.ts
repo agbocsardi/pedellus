@@ -36,7 +36,7 @@ import {
   type DiscordHistoryRead,
   type DiscordHistoryWarning,
 } from "./discord-history.js";
-import type { DiscordHistoryQuery } from "./discord-transport.js";
+import type { DiscordHistoryQuery, DiscordHistoryRefusalCode } from "./discord-transport.js";
 
 export type DiscordJsTransportOptions = {
   /** Bot token, read by the host from the configured environment reference. Never logged. */
@@ -774,7 +774,10 @@ function historyAttachmentList(message: HistoryRawMessageLike): HistoryAttachmen
 
 /**
  * Read one source's messages inside the window, newest page first, bounded by the per-source limit.
- * Reports a source-limit warning when the cap stopped a read that may have older in-window messages.
+ *
+ * A later page failure keeps the rows already read but marks the source incomplete; it never returns
+ * a "complete" window. A row with no usable timestamp is skipped and counted, so the renderer can say
+ * the window is partial without inventing content.
  */
 async function readHistorySource(
   d: DiscordModule,
@@ -782,18 +785,29 @@ async function readHistorySource(
   parent: HistoryChannelLike | undefined,
   query: DiscordHistoryQuery,
   budget: number,
-): Promise<{ messages: DiscordHistoryMessage[]; warning: boolean }> {
+): Promise<{
+  readonly messages: DiscordHistoryMessage[];
+  /** The per-source budget stopped a page that may have older in-window messages. */
+  readonly capped: boolean;
+  /** Why the source is incomplete, if it is: a failed page or no readable collection. */
+  readonly failure: "fetch-failed" | "channel-unavailable" | undefined;
+  /** Retrieved rows that carried no usable timestamp. */
+  readonly skippedRows: number;
+}> {
   const messages = source.messages;
-  if (messages === undefined) return { messages: [], warning: false };
+  if (messages === undefined) {
+    return { messages: [], capped: false, failure: "channel-unavailable", skippedRows: 0 };
+  }
   const cap = Math.max(0, Math.min(query.perSourceLimit, budget));
-  if (cap === 0) return { messages: [], warning: false };
+  if (cap === 0) return { messages: [], capped: true, failure: undefined, skippedRows: 0 };
   const collected: HistoryMessageRow[] = [];
   let before = query.untilMs === undefined ? undefined : discordSnowflakeAt(query.untilMs);
-  let capReached = false;
+  let capped = false;
+  let skippedRows = 0;
   for (;;) {
     const remaining = cap - collected.length;
     if (remaining <= 0) {
-      capReached = true;
+      capped = true;
       break;
     }
     const pageLimit = Math.min(100, remaining);
@@ -801,14 +815,18 @@ async function readHistorySource(
     try {
       page = await messages.fetch({ limit: pageLimit, ...(before === undefined ? {} : { before }) });
     } catch {
-      return { messages: collected.map((row) => row.message), warning: false };
+      // Keep the rows already read, but the source is explicitly incomplete.
+      return { messages: sortedRows(collected), capped, failure: "fetch-failed", skippedRows };
     }
     const rows = [...page.values()];
     if (rows.length === 0) break;
     let crossedSince = false;
     for (const row of rows) {
       const timestamp = historyMessageTimestamp(row);
-      if (timestamp === undefined) continue;
+      if (timestamp === undefined) {
+        skippedRows += 1;
+        continue;
+      }
       if (query.untilMs !== undefined && timestamp >= query.untilMs) continue;
       if (query.sinceMs !== undefined && timestamp < query.sinceMs) {
         crossedSince = true;
@@ -823,11 +841,31 @@ async function readHistorySource(
     before = oldest.id;
     if (rows.length < pageLimit) break;
   }
-  collected.sort((left, right) => left.timestamp - right.timestamp || compareSnowflake(left.message.messageId, right.message.messageId));
-  return { messages: collected.map((row) => row.message), warning: capReached && collected.length >= cap };
+  return { messages: sortedRows(collected), capped, failure: undefined, skippedRows };
+}
+
+function sortedRows(rows: HistoryMessageRow[]): DiscordHistoryMessage[] {
+  return [...rows]
+    .sort((left, right) => left.timestamp - right.timestamp || compareSnowflake(left.message.messageId, right.message.messageId))
+    .map((row) => row.message);
 }
 
 type HistoryMessageRow = { readonly message: DiscordHistoryMessage; readonly timestamp: number };
+
+/** Deduplicated diagnostics: one row per code, with a count and a bounded sample of source ids. */
+function warn(warnings: DiscordHistoryWarning[], code: DiscordHistoryWarning["code"], sourceId: string | null, count = 1): void {
+  if (count <= 0) return;
+  const existing = warnings.find((entry) => entry.code === code);
+  if (existing === undefined) {
+    warnings.push({ code, count, sourceIds: sourceId === null ? [] : [sourceId] });
+    return;
+  }
+  const sourceIds = sourceId === null || existing.sourceIds.includes(sourceId)
+    ? existing.sourceIds
+    : [...existing.sourceIds, sourceId].slice(0, 5);
+  const index = warnings.indexOf(existing);
+  warnings[index] = { code, count: existing.count + count, sourceIds };
+}
 
 function compareSnowflake(left: string, right: string): number {
   if (left === right) return 0;
@@ -903,10 +941,17 @@ async function collectHistorySources(
   query: DiscordHistoryQuery,
   viewer: unknown,
   bot: unknown,
-): Promise<{ sources: { source: HistoryChannelLike; parent: HistoryChannelLike | undefined }[]; skipped: number; warnings: DiscordHistoryWarning[] }> {
+): Promise<{
+  sources: { source: HistoryChannelLike; parent: HistoryChannelLike | undefined }[];
+  skipped: number;
+  warnings: DiscordHistoryWarning[];
+  /** A listing bound or failure means further sources may exist that were never enumerated. */
+  enumerationLimited: boolean;
+}> {
   const sources: { source: HistoryChannelLike; parent: HistoryChannelLike | undefined }[] = [];
   const warnings: DiscordHistoryWarning[] = [];
   let skipped = 0;
+  let enumerationLimited = false;
   const seen = new Set<string>();
   const allowed = (channel: HistoryChannelLike): boolean => {
     if (query.allowChannels.length === 0) return true;
@@ -958,7 +1003,8 @@ async function collectHistorySources(
           await tryAdd(thread, selected);
         }
       } catch {
-        warnings.push({ code: "active-threads-unavailable", sourceId: selected.id });
+        warn(warnings, "active-threads-unavailable", selected.id);
+        enumerationLimited = true;
       }
     }
   }
@@ -968,17 +1014,41 @@ async function collectHistorySources(
       for (const type of ["public", "private"] as const) {
         try {
           const archived = await threads.fetchArchived({ type, limit: query.archivedThreadLimit });
-          for (const value of archived.threads?.values() ?? []) {
+          const listed = [...(archived.threads?.values() ?? [])];
+          // A full page means the archived listing itself is bounded: more threads may exist.
+          if (listed.length >= query.archivedThreadLimit) enumerationLimited = true;
+          for (const value of listed) {
             const thread = historyChannel(value);
             if (thread !== undefined) await tryAdd(thread, selected);
           }
         } catch {
-          warnings.push({ code: "archived-threads-unavailable", sourceId: selected.id });
+          warn(warnings, "archived-threads-unavailable", selected.id);
+          enumerationLimited = true;
         }
       }
     }
   }
-  return { sources, skipped, warnings };
+  return { sources, skipped, warnings, enumerationLimited };
+}
+
+/**
+ * Resolve one channel for a history read and map a resolution failure to its own fixed refusal.
+ * A missing channel is `not-found`, a refused one is `forbidden`, and anything else is a failed read
+ * of a live capability — not a missing capability.
+ */
+async function resolveHistoryChannel(
+  current: DiscordClientLike,
+  channelId: string,
+): Promise<HistoryChannelLike | DiscordHistoryRefusalCode> {
+  try {
+    const channel = historyChannel(await resolveChannel(current, channelId));
+    return channel ?? "not-found";
+  } catch (error) {
+    const classified = classifyDiscordError(error);
+    if (classified.status === 404) return "not-found";
+    if (classified.status === 403) return "forbidden";
+    return "read-failed";
+  }
 }
 
 async function readHistory(
@@ -988,9 +1058,14 @@ async function readHistory(
   query: DiscordHistoryQuery,
 ): Promise<DiscordHistoryRead> {
   if (query.sessionMode === "dm") {
-    const dm = historyChannel(await resolveChannel(current, query.sessionChannelId));
-    if (dm === undefined || !isDmChannel(dm)) return { ok: false, refusal: "forbidden" };
+    const dm = await resolveHistoryChannel(current, query.sessionChannelId);
+    if (typeof dm === "string") return { ok: false, refusal: dm };
+    if (!isDmChannel(dm)) return { ok: false, refusal: "forbidden" };
     const read = await readHistorySource(d, dm, undefined, query, query.limit);
+    const warnings: DiscordHistoryWarning[] = [];
+    if (read.capped) warn(warnings, "source-limit-reached", dm.id);
+    if (read.failure !== undefined) warn(warnings, read.failure, dm.id);
+    if (read.skippedRows > 0) warn(warnings, "rows-unusable", dm.id, read.skippedRows);
     return {
       ok: true,
       snapshot: {
@@ -1000,8 +1075,13 @@ async function readHistory(
         messages: read.messages,
         sourcesScanned: 1,
         sourcesSkipped: 0,
-        omittedMessages: 0,
-        warnings: read.warning ? [{ code: "source-limit-reached", sourceId: dm.id }] : [],
+        sourcesUnscanned: 0,
+        cutMessages: 0,
+        skippedMessages: read.skippedRows,
+        partial: read.failure !== undefined || read.skippedRows > 0,
+        unreadUnknown: read.capped || read.failure !== undefined,
+        enumerationLimited: false,
+        warnings,
       },
     };
   }
@@ -1015,40 +1095,72 @@ async function readHistory(
   // A sender who is no longer a guild member has no Discord permissions to verify: fail closed.
   if (viewer === undefined) return { ok: false, refusal: "forbidden" };
 
-  let selected: HistoryChannelLike | undefined;
   const explicit = query.channelId !== undefined || query.channelName !== undefined;
+  let selected: HistoryChannelLike;
   if (query.channelId !== undefined) {
-    selected = historyChannel(await resolveChannel(current, query.channelId));
+    const resolved = await resolveHistoryChannel(current, query.channelId);
+    if (typeof resolved === "string") return { ok: false, refusal: resolved };
+    selected = resolved;
   } else if (query.channelName !== undefined) {
     const byName = await findHistoryChannelByName(guild, query.channelName);
     if (byName === "none" || byName === "ambiguous") return { ok: false, refusal: "not-found" };
     selected = byName;
   } else {
-    selected = historyChannel(await resolveChannel(current, query.sessionChannelId));
+    const resolved = await resolveHistoryChannel(current, query.sessionChannelId);
+    if (typeof resolved === "string") return { ok: false, refusal: resolved };
+    selected = resolved;
   }
-  if (selected === undefined || channelGuildId(selected) !== query.guildId) {
+  if (channelGuildId(selected) !== query.guildId) {
     return { ok: false, refusal: explicit ? "not-found" : "forbidden" };
   }
   // An explicit selection must itself be readable; otherwise the generic refusal keeps the reason private.
-  const { sources, skipped, warnings } = await collectHistorySources(d, guild, selected, query, viewer, bot);
+  const { sources, skipped, warnings, enumerationLimited } =
+    await collectHistorySources(d, guild, selected, query, viewer, bot);
   if (sources.length === 0) {
     return { ok: false, refusal: skipped > 0 || explicit ? "forbidden" : "not-found" };
   }
   const messages: DiscordHistoryMessage[] = [];
   let scanned = 0;
+  let partial = false;
+  let skippedMessages = 0;
+  let unreadUnknown = enumerationLimited;
   for (const { source, parent } of sources) {
-      if (scanned >= DISCORD_HISTORY_LIMITS.maxSources || messages.length >= query.limit) break;
+    if (scanned >= DISCORD_HISTORY_LIMITS.maxSources) {
+      // A hard source bound: the remaining listed sources stay unread and their messages uncounted.
+      unreadUnknown = true;
+      break;
+    }
+    if (messages.length >= query.limit) {
+      // The global limit stopped the scan; later sources were not read and cannot be counted.
+      unreadUnknown = true;
+      break;
+    }
     const budget = query.limit - messages.length;
-    if (budget <= 0) break;
     const read = await readHistorySource(d, source, parent, query, budget);
     scanned += 1;
-    if (read.warning) warnings.push({ code: "source-limit-reached", sourceId: source.id });
+    if (read.capped) {
+      warn(warnings, "source-limit-reached", source.id);
+      unreadUnknown = true;
+    }
+    if (read.failure !== undefined) {
+      warn(warnings, read.failure, source.id);
+      partial = true;
+      unreadUnknown = true;
+    }
+    if (read.skippedRows > 0) {
+      warn(warnings, "rows-unusable", source.id, read.skippedRows);
+      skippedMessages += read.skippedRows;
+      // Unusable rows mean the returned window is not the window that exists.
+      partial = true;
+    }
     messages.push(...read.messages);
   }
+  const sourcesUnscanned = Math.max(0, sources.length - scanned);
+  if (sourcesUnscanned > 0) unreadUnknown = true;
   messages.sort((left, right) =>
     (left.timestampMs ?? 0) - (right.timestampMs ?? 0) || compareSnowflake(left.messageId, right.messageId));
-  const omitted = Math.max(0, messages.length - query.limit);
-  const kept = omitted === 0 ? messages : messages.slice(0, query.limit);
+  const cutMessages = Math.max(0, messages.length - query.limit);
+  const kept = cutMessages === 0 ? messages : messages.slice(0, query.limit);
   return {
     ok: true,
     snapshot: {
@@ -1058,7 +1170,12 @@ async function readHistory(
       messages: kept,
       sourcesScanned: scanned,
       sourcesSkipped: skipped,
-      omittedMessages: omitted,
+      sourcesUnscanned,
+      cutMessages,
+      skippedMessages,
+      partial,
+      unreadUnknown,
+      enumerationLimited,
       warnings,
     },
   };

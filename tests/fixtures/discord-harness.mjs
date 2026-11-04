@@ -149,10 +149,11 @@ async function writeFiles(root, files) {
 
 /** A real Gateway over a temporary store, configured with a Discord block. */
 export async function openDiscordStore(label, options = {}) {
-  const directory = await mkdtemp(join(tmpdir(), `nanobot-discord-${label}-`));
+  // A caller may reopen an existing store directory (a gateway restart over the same data).
+  const directory = options.directory ?? await mkdtemp(join(tmpdir(), `nanobot-discord-${label}-`));
   try {
     const workspace = join(directory, 'workspace');
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFiles(workspace, options.files ?? {});
     const captured = [];
     const { models, gate } = fauxModels(captured, options);
@@ -186,7 +187,7 @@ export async function openDiscordStore(label, options = {}) {
     } else {
       config = parseConfig(raw, directory);
     }
-    const gateway = await openGateway(config, context, { models });
+    const gateway = await openGateway(config, context, { models, ...(options.gatewayOptions ?? {}) });
     return {
       directory,
       workspace,

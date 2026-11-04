@@ -208,30 +208,56 @@ export interface DiscordHistoryMessage {
 }
 
 export type DiscordHistoryWarningCode =
+  /** Thread enumeration failed, so sources may exist that were never listed. */
   | "active-threads-unavailable"
   | "archived-threads-unavailable"
+  /** A source read failed partway; the rows above are real but the window was not finished. */
   | "fetch-failed"
-  | "channel-not-readable"
+  /** A source has no readable message collection for this transport. */
   | "channel-unavailable"
+  /** Rows were retrieved but could not be used because they carried no usable timestamp. */
+  | "rows-unusable"
   /** A per-source cap stopped a read that may have older in-window messages; the extra count is unknown. */
   | "source-limit-reached";
 
-/** A fixed diagnostic; a source id is stable metadata, never a transport or token value. */
+/**
+ * A fixed, deduplicated diagnostic. `count` is the number of occurrences and `sourceIds` names at
+ * most a bounded sample of the affected stable ids, so a bound never produces one warning per source.
+ */
 export interface DiscordHistoryWarning {
   readonly code: DiscordHistoryWarningCode;
-  readonly sourceId: string | null;
+  readonly count: number;
+  readonly sourceIds: readonly string[];
 }
 
-/** What the live transport returns; the tool applies the character budget and renders it. */
+/**
+ * What the live transport returns; the tool applies the character budget and renders it.
+ *
+ * The three kinds of "not returned" stay distinct:
+ * - `cutMessages` — retrieved messages dropped by the global limit (exact);
+ * - `sourcesUnscanned`/`enumerationLimited` — sources a bound left unread (known count or a flag);
+ * - `unreadUnknown` — a bound or a failure prevents counting how many messages remain unread.
+ */
 export interface DiscordHistorySnapshot {
   readonly guild: { readonly id: string | null; readonly name: string };
   readonly channel: { readonly id: string; readonly name: string | null };
   readonly mode: DiscordHistoryMode;
   readonly messages: readonly DiscordHistoryMessage[];
   readonly sourcesScanned: number;
+  /** Sources excluded by configuration, Discord permissions or private-thread membership. */
   readonly sourcesSkipped: number;
-  /** Messages a per-source or global limit cut, so a partial read never looks complete. */
-  readonly omittedMessages: number;
+  /** Eligible sources a bound left unread; their messages may exist and are not counted exactly. */
+  readonly sourcesUnscanned: number;
+  /** Retrieved messages dropped by the global limit before rendering (exact). */
+  readonly cutMessages: number;
+  /** Retrieved rows that could not be used (no usable timestamp), so the window is incomplete. */
+  readonly skippedMessages: number;
+  /** A source read failed partway or returned unusable rows. */
+  readonly partial: boolean;
+  /** A message bound or failure leaves an unknown number of in-window messages unread. */
+  readonly unreadUnknown: boolean;
+  /** Thread enumeration itself hit a bound or failed, so further sources may exist unlisted. */
+  readonly enumerationLimited: boolean;
   readonly warnings: readonly DiscordHistoryWarning[];
 }
 
@@ -241,7 +267,9 @@ export type DiscordHistoryRefusalCode =
   | "unsupported"
   | "forbidden"
   | "not-found"
-  | "guild-unavailable";
+  | "guild-unavailable"
+  /** The capability is live but the read failed; nothing was returned. */
+  | "read-failed";
 
 export const DISCORD_HISTORY_REFUSALS: Readonly<Record<DiscordHistoryRefusalCode, string>> = {
   unavailable:
@@ -253,6 +281,7 @@ export const DISCORD_HISTORY_REFUSALS: Readonly<Record<DiscordHistoryRefusalCode
     "Nothing was read.",
   "not-found": "No Discord channel matches that selection in the current guild. Nothing was read.",
   "guild-unavailable": "The current Discord guild is unavailable to this bot. Nothing was read.",
+  "read-failed": "The Discord history read failed, so nothing was returned. Try again later.",
 };
 
 export const DISCORD_HISTORY_SESSION_DENIED =
@@ -327,8 +356,10 @@ export function createDiscordHistoryTool(options: DiscordHistoryToolOptions): { 
     description:
       "Read bounded, read-only Discord history for the current conversation's channel or thread. Use it before " +
       "answering questions about earlier discussion, decisions or who said what. It returns oldest-first messages " +
-      "with stable channel, thread, author and message IDs, plus explicit coverage: the window, the limits, skipped " +
-      "sources and whether anything was cut. It never sends, reacts, deletes or reads another guild, and it only " +
+      "with stable channel, thread, author and message IDs, plus explicit coverage: the window, the limits, how many " +
+      "sources were scanned/skipped/unread, exactly how many messages were cut or unusable, and whether the read was " +
+      "complete, partial or truncated; unreadMessages is \"unknown\" when a bound or failure prevents counting. " +
+      "Anything not returned was NOT read. It never sends, reacts, deletes or reads another guild, and it only " +
       "returns channels this sender can actually read under the current configuration and Discord permissions. " +
       "Optionally select one channel by name (#general) or id in the current guild, include accessible threads " +
       "and archived threads, and narrow the window with since/until (ISO-8601 with a timezone, or now, today, " +
@@ -388,8 +419,9 @@ export function createDiscordHistoryTool(options: DiscordHistoryToolOptions): { 
       try {
         read = await host.read(sessionKey, parsed.request, context);
       } catch {
-        // The host never surfaces transport text; an unexpected throw is a fixed refusal.
-        return errorResult(DISCORD_HISTORY_REFUSALS.unavailable);
+        // The host never surfaces transport text; an unexpected throw is a failed read, not a
+        // missing capability.
+        return errorResult(DISCORD_HISTORY_REFUSALS["read-failed"]);
       }
       if (!read.ok) return errorResult(DISCORD_HISTORY_REFUSALS[read.refusal]);
       return textResult(renderDiscordHistory(read.snapshot, parsed.request));
@@ -400,8 +432,12 @@ export function createDiscordHistoryTool(options: DiscordHistoryToolOptions): { 
 
 /**
  * Render one snapshot inside `maxChars`, oldest-first, with the coverage that makes a partial read
- * honest. Messages are added one at a time; the first one that does not fit is not included and the
- * result says the character budget cut it.
+ * honest.
+ *
+ * `complete` is true only when every in-window message of every eligible source was read, every
+ * bounded source and row is accounted for, and the character budget kept them all. A character cut is
+ * an exact known omission; a per-source cap, an unread source or a failed page leaves the remaining
+ * message count unknown, which is reported as `"unknown"` rather than as zero.
  */
 export function renderDiscordHistory(snapshot: DiscordHistorySnapshot, request: DiscordHistoryRequest): string {
   const messages = snapshot.messages.map(boundMessage);
@@ -416,8 +452,14 @@ export function renderDiscordHistory(snapshot: DiscordHistorySnapshot, request: 
     coverage: {
       sourcesScanned: snapshot.sourcesScanned,
       sourcesSkipped: snapshot.sourcesSkipped,
+      sourcesUnscanned: snapshot.sourcesUnscanned,
       messagesReturned: 0,
-      omittedMessages: snapshot.omittedMessages,
+      /** Retrieved messages the global limit or the character budget dropped (exact). */
+      messagesCut: snapshot.cutMessages,
+      /** Retrieved rows that carried no usable timestamp (exact). */
+      skippedMessages: snapshot.skippedMessages,
+      /** `"unknown"` whenever a bound/failure could leave further in-window messages unread. */
+      unreadMessages: snapshot.unreadUnknown ? "unknown" as const : 0,
       limits: {
         limit: request.limit,
         perSource: request.perSourceLimit,
@@ -426,9 +468,20 @@ export function renderDiscordHistory(snapshot: DiscordHistorySnapshot, request: 
         archivedLimit: request.includeArchivedThreads ? request.archivedThreadLimit : null,
       },
       charBudget: request.maxChars,
-      truncated: false,
+      /** A source read failed partway or rows were unusable: the window was not finished. */
+      partial: snapshot.partial,
+      /** A bound left sources or messages unread, or the character budget dropped messages. */
+      truncated: snapshot.sourcesUnscanned > 0 || snapshot.cutMessages > 0
+        || snapshot.unreadUnknown || snapshot.enumerationLimited,
+      /** Nothing was cut, skipped, unread or partially read. */
+      complete: !snapshot.partial && snapshot.sourcesUnscanned === 0 && snapshot.cutMessages === 0
+        && snapshot.skippedMessages === 0 && !snapshot.unreadUnknown && !snapshot.enumerationLimited,
     },
-    warnings: snapshot.warnings.map((warning) => ({ code: warning.code, sourceId: warning.sourceId })),
+    warnings: snapshot.warnings.map((warning) => ({
+      code: warning.code,
+      count: warning.count,
+      sourceIds: warning.sourceIds.slice(0, 5),
+    })),
     provenance: DISCORD_HISTORY_PROVENANCE,
     messages: [] as unknown[],
   };
@@ -437,26 +490,27 @@ export function renderDiscordHistory(snapshot: DiscordHistorySnapshot, request: 
   const budget = request.maxChars - (empty.length - 2);
   const kept: unknown[] = [];
   let used = 0;
-  let truncated = false;
+  let charCut = false;
   for (const message of messages) {
     const serialized = JSON.stringify(message);
     const extra = serialized.length + (kept.length === 0 ? 0 : 1);
     if (used + extra > budget) {
-      truncated = true;
+      charCut = true;
       break;
     }
     kept.push(message);
     used += extra;
   }
-  const omittedByBudget = messages.length - kept.length;
+  const coverageFor = (returned: number, cutByBudget: number) => ({
+    ...base.coverage,
+    messagesReturned: returned,
+    messagesCut: snapshot.cutMessages + cutByBudget,
+    truncated: base.coverage.truncated || cutByBudget > 0,
+    complete: base.coverage.complete && cutByBudget === 0,
+  });
   const result = {
     ...base,
-    coverage: {
-      ...base.coverage,
-      messagesReturned: kept.length,
-      omittedMessages: snapshot.omittedMessages + (truncated ? omittedByBudget : 0),
-      truncated,
-    },
+    coverage: coverageFor(kept.length, charCut ? messages.length - kept.length : 0),
     messages: kept,
   };
   const rendered = JSON.stringify(result);
@@ -465,13 +519,8 @@ export function renderDiscordHistory(snapshot: DiscordHistorySnapshot, request: 
   while (kept.length > 0) {
     kept.pop();
     const fallback = {
-      ...result,
-      coverage: {
-        ...base.coverage,
-        messagesReturned: kept.length,
-        omittedMessages: snapshot.omittedMessages + (messages.length - kept.length),
-        truncated: true,
-      },
+      ...base,
+      coverage: coverageFor(kept.length, messages.length - kept.length),
       messages: kept,
     };
     const text = JSON.stringify(fallback);
@@ -479,12 +528,7 @@ export function renderDiscordHistory(snapshot: DiscordHistorySnapshot, request: 
   }
   return JSON.stringify({
     ...base,
-    coverage: {
-      ...base.coverage,
-      messagesReturned: 0,
-      omittedMessages: snapshot.omittedMessages + messages.length,
-      truncated: true,
-    },
+    coverage: coverageFor(0, messages.length),
     messages: [],
   });
 }

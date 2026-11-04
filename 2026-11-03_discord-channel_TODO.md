@@ -36,6 +36,25 @@ not copied here; this file is the Discord channel's own work order and log.
 
 ## Log
 
+### 2026-11-04 — honest history coverage after review
+
+The history reader could return a failed page as a complete window, silently skip rows without a
+timestamp, hide unread sources behind `maxSources`/the global limit, and report `omitted: 0` after a
+cut. Rewritten so every gap is explicit: per-source reads report `capped`/`failure`
+(`fetch-failed`/`channel-unavailable`)/`skippedRows`; the snapshot carries `sourcesUnscanned`,
+`cutMessages`, `skippedMessages`, `partial`, `unreadUnknown` and `enumerationLimited` alongside the
+known `sourcesSkipped`; the renderer derives `complete`/`partial`/`truncated` and reports
+`unreadMessages: "unknown"` whenever a bound or failure prevents counting, never zero. Warnings are
+deduplicated per code with an occurrence count and a bounded sample of source IDs. A whole-read failure
+is `read-failed` (the capability is live); a missing or refused explicit channel is
+`not-found`/`forbidden`. The tool description and DISCORD.md state the taxonomy.
+
+Regressions use the real injected client for a failed second page, an unusable timestamp, a global and
+DM limit, a character budget, 121 sources beyond the scan bound and a bounded archived listing, and
+assert the *rendered* flags; the adapter's non-Discord/channel refusals are unchanged. Also added the
+parent's fixes as permanent checks: an empty coding ceiling still offers the tool and the mapping is
+restored across a reopen, and an early-rejected channel run emits no unhandled rejection.
+
 ### 2026-11-03 — full history review follow-up
 
 Independent review confirmed permissions/privacy but blocked misleading history coverage: failed pages silently look complete, global/source limits omit no honest accounting. Coordinator fixed smaller findings before returning the substantive accounting work: supervisor records rather than rethrows an early rejected channel promise; restored mappings load when Discord history alone needs them; removed duplicate runtime registry spread; shutdown stops ingress and awaits its chain before task snapshot/transport teardown. Corrected coding-ceiling/local-timezone/startup-buffer docs. Typecheck/build and88 Discord+service-readiness checks passed; temporary delayed-settlement probe saw zero unhandled rejections and preserved original failure stage. History page failures/omission accounting and not-found classification remain for original implementer, followed by fresh review. No findings waived, no merge.

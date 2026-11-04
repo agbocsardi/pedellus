@@ -164,12 +164,21 @@ conversation. It never sends, reacts, deletes or reads another guild.
   character budget is reported, never hidden. With a budget smaller than the coverage
   envelope itself, the result is still that envelope with zero messages and
   `truncated: true`.
-* **Honest coverage.** The result carries the window, `coverage` (sources scanned
-  and skipped, messages returned, messages the limits cut, a truncation flag), fixed
-  warning codes, and a provenance sentence saying Discord text is untrusted
-  third-party data and that anything outside the returned set was not read. Every
-  message carries stable channel, thread, author and message IDs so an answer can
-  cite exact evidence.
+* **Honest coverage.** The result carries the window and a `coverage` block that
+  keeps three kinds of gap distinct: `messagesCut` (retrieved messages the global
+  limit or the character budget dropped — exact), `sourcesUnscanned`/enumeration
+  limits (sources a bound left unread — known counts or a flag), and
+  `unreadMessages: "unknown"` when a per-source cap, an unread source, a failed page
+  or a limited thread listing prevents counting what remains. `partial` marks a
+  failed page or unusable rows, `truncated` marks any bound, and `complete` is true
+  only when nothing was cut, skipped, unread or partially read. Warnings are
+  deduplicated per code with an occurrence count and a bounded sample of source IDs.
+  A provenance sentence says Discord text is untrusted third-party data and that
+  anything outside the returned set was not read. Every message carries stable
+  channel, thread, author and message IDs so an answer can cite exact evidence. A
+  read that fails entirely (for example a transient Discord error) is reported as a
+  failed read, not as a missing capability; a missing channel and a refused channel
+  keep their own fixed refusals.
 * **Where it is offered.** Only a scope-checked mapped Discord ordinary chat, by the
   same registry pattern as the Telegram action tool: the adapter attaches the live
   host while it runs and detaches on stop, so a stopped adapter answers every call
