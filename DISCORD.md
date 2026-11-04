@@ -159,14 +159,16 @@ conversation. It never sends, reacts, deletes or reads another guild.
 * **Window and limits.** `since`/`until` accept ISO-8601 with a timezone, or `now`,
   `today`, `yesterday`, `30m`, `6h`, `2d`, `1w`. `today` and `yesterday`
   use the host process timezone, not `cron.timeZone`. `limit` is 1–2000 (default 500),
-  `perSource` 1–500 (default 200), `archivedLimit` 1–200 (default 50), `maxChars`
-  1–16000 (default 12000). Only the selected window is read; a per-source cap or the
-  character budget is reported, never hidden. With a budget smaller than the coverage
-  envelope itself, the result is still that envelope with zero messages and
-  `truncated: true`.
+  `perSource` 1–500 (default 200), `archivedLimit` 1–100 (default 50) per public/private
+  listing, `maxChars` 1–16000 (default 12000). Archived listings read one page per
+  type; a full page is conservatively reported as limited, not complete. `since`
+  is inclusive and `until` exclusive. Only the selected window is read; a
+  per-source cap or character cut is reported, never hidden. The mandatory
+  coverage envelope may itself exceed a tiny `maxChars` budget. Messages cut to
+  fit make `truncated: true`; a fully read empty window remains complete.
 * **Honest coverage.** The result carries the window and a `coverage` block that
-  keeps three kinds of gap distinct: `messagesCut` (retrieved messages the global
-  limit or the character budget dropped — exact), `sourcesUnscanned`/enumeration
+  keeps three kinds of gap distinct: `messagesCut` (retrieved messages dropped
+  by the character budget — exact), `sourcesUnscanned`/enumeration
   limits (sources a bound left unread — known counts or a flag), and
   `unreadMessages: "unknown"` when a per-source cap, an unread source, a failed page
   or a limited thread listing prevents counting what remains. `partial` marks a
@@ -177,8 +179,10 @@ conversation. It never sends, reacts, deletes or reads another guild.
   anything outside the returned set was not read. Every message carries stable
   channel, thread, author and message IDs so an answer can cite exact evidence. A
   read that fails entirely (for example a transient Discord error) is reported as a
-  failed read, not as a missing capability; a missing channel and a refused channel
-  keep their own fixed refusals.
+  failed read, not as a missing capability. Missing and unreadable channel
+  selections share one model-facing refusal so it does not reveal hidden
+  channel existence. Message metadata includes at most ten attachments and
+  ten embeds; these are descriptors, not downloaded or fully read contents.
 * **Where it is offered.** Only a scope-checked mapped Discord ordinary chat, by the
   same registry pattern as the Telegram action tool: the adapter attaches the live
   host while it runs and detaches on stop, so a stopped adapter answers every call

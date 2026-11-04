@@ -24,7 +24,7 @@ export const DISCORD_HISTORY_LIMITS = {
   defaultPerSource: 200,
   maxPerSource: 500,
   defaultArchived: 50,
-  maxArchived: 200,
+  maxArchived: 100,
   defaultChars: 12_000,
   maxChars: 16_000,
   /** One message body kept from Discord; longer text is cut with a marker. */
@@ -276,10 +276,10 @@ export const DISCORD_HISTORY_REFUSALS: Readonly<Record<DiscordHistoryRefusalCode
     "Discord history is unavailable: this host has no live read-only Discord history source. Nothing was read.",
   unsupported:
     "Discord history is unavailable: the connected Discord transport cannot read history. Nothing was read.",
-  forbidden:
-    "That Discord history is not readable for this sender with the current configuration and Discord permissions. " +
-    "Nothing was read.",
-  "not-found": "No Discord channel matches that selection in the current guild. Nothing was read.",
+  // Missing and unreadable selections must not reveal whether a hidden
+  // channel exists. Internal refusal codes remain distinct for host callers.
+  forbidden: "No readable Discord channel matches that selection for this sender. Nothing was read.",
+  "not-found": "No readable Discord channel matches that selection for this sender. Nothing was read.",
   "guild-unavailable": "The current Discord guild is unavailable to this bot. Nothing was read.",
   "read-failed": "The Discord history read failed, so nothing was returned. Try again later.",
 };
@@ -372,7 +372,7 @@ export function createDiscordHistoryTool(options: DiscordHistoryToolOptions): { 
         description: "One channel, thread or forum post id in the current guild. Pass either channel or channelId, not both.",
       })),
       since: Type.Optional(Type.String({
-        description: "Exclusive lower bound: ISO-8601 with a timezone, or now, today, yesterday, <n>m, <n>h, <n>d, <n>w.",
+        description: "Inclusive lower bound: ISO-8601 with a timezone, or now, today, yesterday, <n>m, <n>h, <n>d, <n>w.",
       })),
       until: Type.Optional(Type.String({
         description: "Exclusive upper bound, same forms as since.",
@@ -396,7 +396,7 @@ export function createDiscordHistoryTool(options: DiscordHistoryToolOptions): { 
       archivedLimit: Type.Optional(Type.Integer({
         minimum: 1,
         maximum: DISCORD_HISTORY_LIMITS.maxArchived,
-        description: `Maximum archived threads enumerated per parent (default ${DISCORD_HISTORY_LIMITS.defaultArchived}).`,
+        description: `Maximum archived threads per public/private listing (one page each, default ${DISCORD_HISTORY_LIMITS.defaultArchived}).`,
       })),
       maxChars: Type.Optional(Type.Integer({
         minimum: 1,

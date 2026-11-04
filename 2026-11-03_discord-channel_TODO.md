@@ -36,6 +36,10 @@ not copied here; this file is the Discord channel's own work order and log.
 
 ## Log
 
+### 2026-11-03 — archive-page bound correction
+
+Fresh independent re-review reproduced one narrower false-complete path: advertised archivedLimit up to200 was compared against a Discord endpoint page capped at100. Coordinator capped model/schema limit at100 per public/private page and defensively clamps actual transport requests/completeness comparison to100 even for internal callers. Updated existing archived-listing regression to100 returned rows with one unreadable source and an internal200 request, proving the separate source cap cannot hide the missing flag. Also mapped unexpected live-reader exceptions to read-failed, aligned since documentation to inclusive implementation, corrected empty-envelope/global-cut docs, and made missing/unreadable model-facing selection refusals identical to avoid revealing hidden-channel existence. Typecheck/build +82 Discord checks passed; real-client regression also covers malformed-row reader exceptions. No findings waived; fresh independent re-check required.
+
 ### 2026-11-04 — honest history coverage after review
 
 The history reader could return a failed page as a complete window, silently skip rows without a

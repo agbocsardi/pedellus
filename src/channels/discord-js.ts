@@ -355,8 +355,9 @@ export function createDiscordJsTransport(options: DiscordJsTransportOptions): Di
       try {
         return await readHistory(d, current, botId, query);
       } catch {
-        // A fixed refusal: never a transport message, URL or token.
-        return { ok: false, refusal: "unavailable" };
+        // The client is live; malformed rows or unexpected reader failures do
+        // not mean the capability is absent. Never echo transport data.
+        return { ok: false, refusal: "read-failed" };
       }
     },
     async registerCommands(commands: readonly DiscordCommandSpec[]) {
@@ -1013,10 +1014,13 @@ async function collectHistorySources(
     if (threads !== undefined && typeof threads.fetchArchived === "function") {
       for (const type of ["public", "private"] as const) {
         try {
-          const archived = await threads.fetchArchived({ type, limit: query.archivedThreadLimit });
+          // Discord's archived endpoints return at most 100 per page, even
+          // when an internal caller bypasses model-argument validation.
+          const pageLimit = Math.min(query.archivedThreadLimit, 100);
+          const archived = await threads.fetchArchived({ type, limit: pageLimit });
           const listed = [...(archived.threads?.values() ?? [])];
-          // A full page means the archived listing itself is bounded: more threads may exist.
-          if (listed.length >= query.archivedThreadLimit) enumerationLimited = true;
+          // Compare with the actual API bound, never an unattainable request.
+          if (listed.length >= pageLimit) enumerationLimited = true;
           for (const value of listed) {
             const thread = historyChannel(value);
             if (thread !== undefined) await tryAdd(thread, selected);

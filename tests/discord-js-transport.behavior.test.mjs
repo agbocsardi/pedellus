@@ -822,11 +822,12 @@ test('sources beyond the scan bound are counted as unread, with one deduped warn
   }
 });
 
-test('a bounded archived listing marks the enumeration limited', { timeout: 15_000 }, async () => {
+test('an archived API page cap stays incomplete even if an internal request exceeds 100', { timeout: 15_000 }, async () => {
   const parent = historyChannel({ id: '6001', name: 'general', messages: [] });
-  const archived = Array.from({ length: 2 }, (_, index) => historyChannel({
+  const archived = Array.from({ length: 100 }, (_, index) => historyChannel({
     id: String(7_500 + index),
     name: `archived-${index}`,
+    viewerPermissions: permissions({ view: index !== 0 }),
     thread: true,
     type: discord.ChannelType.PublicThread,
     parentId: '6001',
@@ -835,18 +836,21 @@ test('a bounded archived listing marks the enumeration limited', { timeout: 15_0
   }));
   parent.threads = {
     cache: { values: () => [].values() },
-    fetchArchived: async ({ type }) => ({
-      threads: { values: () => (type === 'public' ? archived : []).values() },
-    }),
+    fetchArchived: async ({ type, limit }) => {
+      assert.equal(limit, 100, 'the actual API request never exceeds one 100-thread page');
+      return { threads: { values: () => (type === 'public' ? archived : []).values() } };
+    },
   };
   const transport = await historyTransport(historyGuild({ channels: [parent, ...archived] }));
   try {
-    const read = await transport.history({ ...baseQuery, includeArchivedThreads: true, archivedThreadLimit: 2 });
+    const read = await transport.history({ ...baseQuery, includeArchivedThreads: true, archivedThreadLimit: 200 });
     assert.equal(read.ok, true);
     assert.equal(read.snapshot.enumerationLimited, true);
+    assert.equal(read.snapshot.sourcesUnscanned, 0, 'the separate source cap must not mask the archive cap');
+    assert.equal(read.snapshot.sourcesSkipped, 1);
     assert.equal(read.snapshot.unreadUnknown, true);
     const rendered = JSON.parse(renderDiscordHistory(read.snapshot, {
-      ...baseQuery, includeArchivedThreads: true, archivedThreadLimit: 2,
+      ...baseQuery, includeArchivedThreads: true, archivedThreadLimit: 200,
     }));
     assert.equal(rendered.coverage.truncated, true);
     assert.equal(rendered.coverage.complete, false);
@@ -869,6 +873,10 @@ test('a missing, refused or failing channel maps to its own fixed refusal', { ti
     assert.deepEqual(await transport.history({ ...baseQuery, channelId: '6602' }), { ok: false, refusal: 'forbidden' });
     // The capability is live; the read itself failed. That is not "history is unavailable".
     assert.deepEqual(await transport.history({ ...baseQuery, channelId: '6603' }), { ok: false, refusal: 'read-failed' });
+    // Unexpected malformed rows must not pretend this live client is absent.
+    const malformed = ['invalid-a', 'invalid-b'].map((id) => historyMessage(id, Date.UTC(2026, 0, 1)));
+    general.messages.fetch = async () => ({ size: malformed.length, values: () => malformed.values() });
+    assert.deepEqual(await transport.history(baseQuery), { ok: false, refusal: 'read-failed' });
   } finally {
     await transport.stop();
   }
