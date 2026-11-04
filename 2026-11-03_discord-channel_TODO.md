@@ -36,6 +36,10 @@ not copied here; this file is the Discord channel's own work order and log.
 
 ## Log
 
+### 2026-11-03 — full history review follow-up
+
+Independent review confirmed permissions/privacy but blocked misleading history coverage: failed pages silently look complete, global/source limits omit no honest accounting. Coordinator fixed smaller findings before returning the substantive accounting work: supervisor records rather than rethrows an early rejected channel promise; restored mappings load when Discord history alone needs them; removed duplicate runtime registry spread; shutdown stops ingress and awaits its chain before task snapshot/transport teardown. Corrected coding-ceiling/local-timezone/startup-buffer docs. Typecheck/build and88 Discord+service-readiness checks passed; temporary delayed-settlement probe saw zero unhandled rejections and preserved original failure stage. History page failures/omission accounting and not-found classification remain for original implementer, followed by fresh review. No findings waived, no merge.
+
 ### 2026-11-04 — owner-approved history port and remaining re-review fixes
 
 `discord_history` is a read-only model tool with a live, call-time-checked host: the

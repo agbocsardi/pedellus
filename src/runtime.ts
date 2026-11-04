@@ -2662,7 +2662,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // History retrieval is independent of the context snapshot opt-in: every mapped chat
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
-    const initialMapping = memoryTools === undefined && !toolsEnabled && telegramTool === undefined && !workersEnabled
+    const initialMapping = memoryTools === undefined && !toolsEnabled && telegramTool === undefined
+      && discordHistoryTool === undefined && !workersEnabled
       && webTool === undefined && !mcpConfigured && !codeModeEnabled && mcpAdminRef.current === undefined
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
@@ -3418,7 +3419,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
         }),
       }),
       ...(telegramActions === undefined ? {} : { telegramActions }),
-      ...(discordHistory === undefined ? {} : { discordHistory }),
       ...(discordHistory === undefined ? {} : { discordHistory }),
       get mcp() {
         return mcpRef.current === undefined ? undefined : { servers: mcpRef.current.status };

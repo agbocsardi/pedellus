@@ -545,7 +545,8 @@ export function superviseChannels(shutdown: () => void): ChannelSupervisor {
       runs.push(run.catch((error: unknown) => {
         failure ??= { stage, error };
         shutdown();
-        throw error;
+        // The failure is retained above and returned by settle(). Do not
+        // rethrow into a promise that setup has not started awaiting yet.
       }));
     },
     started() {

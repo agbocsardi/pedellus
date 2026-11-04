@@ -157,7 +157,8 @@ conversation. It never sends, reacts, deletes or reads another guild.
   require both to be members. An empty `allowChannels` therefore never bypasses
   Discord permissions.
 * **Window and limits.** `since`/`until` accept ISO-8601 with a timezone, or `now`,
-  `today`, `yesterday`, `30m`, `6h`, `2d`, `1w`; `limit` is 1–2000 (default 500),
+  `today`, `yesterday`, `30m`, `6h`, `2d`, `1w`. `today` and `yesterday`
+  use the host process timezone, not `cron.timeZone`. `limit` is 1–2000 (default 500),
   `perSource` 1–500 (default 200), `archivedLimit` 1–200 (default 50), `maxChars`
   1–16000 (default 12000). Only the selected window is read; a per-source cap or the
   character budget is reported, never hidden. With a budget smaller than the coverage
@@ -175,9 +176,9 @@ conversation. It never sends, reacts, deletes or reads another guild.
   with a fixed refusal. Code Mode may compose it from such a chat; the call-time
   checks are identical. It is not a `toolAllowlist` coding tool, so configuration
   cannot hand it to workers, forks, roots, scheduled runs or digest targets (and
-  `workers.toolAllowlist` refuses the name outright). Like every context tool in
-  this host it is offered when the coding-tool extension is installed (a non-empty
-  `toolAllowlist`), but it is exempt from that ceiling.
+  `workers.toolAllowlist` refuses the name outright). Its availability is
+  independent of the coding-tool ceiling: `toolAllowlist: []` does not disable
+  this separately configured, live, permission-checked integration.
 
 This is narrower than the Python reference: there is no `guild_id` parameter
 because another guild is never readable from this session, and no default
@@ -203,6 +204,11 @@ callback-shaped message is consumed before transcript admission and is accepted
 only from the sender that owns the channel.
 
 ## Bounded and default-deny behavior
+
+* During durable startup recovery, at most 64 Gateway message events are buffered
+  in memory and replayed in order after recovery. Overflow is not admitted and
+  is reported only in the journal. Application commands received during recovery
+  get a fixed refusal and can be retried once startup finishes.
 
 * At most 500 admitted items and 64 control records are kept. Further messages are
   refused at admission — the durable record is not created and the refusal is

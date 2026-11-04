@@ -2677,9 +2677,16 @@ export async function runDiscord(
     await aborted(signal);
   } finally {
     stopping = true;
+    // Stop accepting events, then abort and drain already-admitted ingress
+    // before taking the active-task snapshot or closing the transport/store.
+    unsubscribeMessage?.();
+    unsubscribeInteraction?.();
+    detachHistory?.();
+    detachMcpSurface?.();
+    scope.cancel(new DOMException("Discord adapter stopped", "AbortError"));
+    await ingressChain;
     stopAllTyping();
     for (const receipt of [...receipts.values()]) await clearReceipt(receipt).catch(() => undefined);
-    scope.cancel(new DOMException("Discord adapter stopped", "AbortError"));
     await Promise.allSettled([...active, ...pendingControls, ...scheduledTasks]);
     await teardownAdapters();
   }
