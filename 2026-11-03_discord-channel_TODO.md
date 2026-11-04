@@ -31,10 +31,37 @@ not copied here; this file is the Discord channel's own work order and log.
 - [ ] Live bot login, guild/thread/DM round trip, attachment download and rate-limit
       behavior (needs a real bot token and a supervised deployment)
 - [x] Owner decided to port bounded read-only Discord history.
-- [ ] Implement and independently review history with current mapped-chat/sender/channel authority checks.
-- [ ] Resolve remaining review findings: startup ingress window and rate-limit backoff; reconcile AGENTS invariants.
+- [x] Implement history with current mapped-chat/sender/channel authority checks (awaiting independent review).
+- [x] Resolve remaining review findings: startup ingress window and rate-limit backoff; reconcile AGENTS invariants.
 
 ## Log
+
+### 2026-11-04 — owner-approved history port and remaining re-review fixes
+
+`discord_history` is a read-only model tool with a live, call-time-checked host: the
+adapter derives the session from the mapped key, re-checks current admission,
+`allowFrom`/`dmAllowFrom`/`allowChannels` (thread parents included) and the live
+sender's own Discord `ViewChannel`+`ReadMessageHistory` on every source (the bot's
+too; private threads need membership), failing closed when permissions are unknown.
+The current guild is the only guild and a DM reads only that DM; no `guild_id`
+parameter exists, which is narrower than Python and deliberate. Results carry an
+explicit window, coverage, fixed warning codes, stable IDs and an untrusted-data
+provenance sentence; a per-source cap or character budget is reported, never hidden.
+The runtime offers the tool only in a scope-checked mapped Discord chat through its
+own registry, so config cannot hand it to workers, forks, roots, scheduled or digest
+targets (and `workers.toolAllowlist` refuses the name).
+
+Also fixed the remaining re-review findings: ingress events between Gateway READY
+and the end of durable recovery are buffered in memory (bounded, ordered) and
+replayed, with a fixed refusal for commands inside the three-second window; a
+validated 429 hint now opens a shared cooldown that is waited out without spending
+delivery attempts (ordinary and scheduled); the AGENTS invariants now describe
+Discord and the history tool accurately. Parent fixes (quoted-data escaping,
+label bracket stripping, failed-admission gate release, unconfirmed pruning,
+pre-request intent failures) were traced and kept, with focused regressions.
+
+Checks: typecheck, build, 527 behaviour checks (19 new), execution checks and core
+acceptance. Still no live bot/token/guild/DM/API use.
 
 ### 2026-11-03 — coordinator fixes and owner history decision
 

@@ -310,6 +310,17 @@ test('the transport classifies real client failures by status and never leaks th
       return true;
     });
 
+    // A surfaced 429 keeps the server's cooldown so the adapter can wait instead of retrying at once.
+    fake.client.channels.cache.get = () => rawChannel({
+      sendError: Object.assign(new Error('rate limited'), { status: 429, retry_after: 2 }),
+    });
+    await assert.rejects(transport.send({ channelId: CHANNEL_ID, text: 'hello' }), (error) => {
+      assert.equal(error.outcome, 'not-sent');
+      assert.equal(error.status, 429);
+      assert.equal(error.retryAfterMs, 2_000);
+      return true;
+    });
+
     // An unreachable channel is a proven refusal; an edit of a gone message stays a final-cursor signal.
     fake.client.channels.cache.get = () => undefined;
     await assert.rejects(transport.send({ channelId: '404404', text: 'hello' }), (error) => error.outcome === 'rejected');
@@ -348,5 +359,297 @@ test('application command registration is best effort and never blocks the trans
     assert.equal(command.options[0].type, discord.ApplicationCommandOptionType.String);
   } finally {
     await second.stop();
+  }
+});
+
+// ── Read-only history through the real transport ─────────────────────────────
+
+const VIEW = discord.PermissionsBitField.Flags.ViewChannel;
+const READ_HISTORY = discord.PermissionsBitField.Flags.ReadMessageHistory;
+
+/** A permission set that can answer for the two flags this transport checks. */
+function permissions({ view = true, history = true } = {}) {
+  return {
+    has(flag) {
+      if (flag === VIEW) return view;
+      if (flag === READ_HISTORY) return history;
+      return false;
+    },
+  };
+}
+
+function historyMessage(id, timestamp, content = `message ${id}`) {
+  return {
+    id: String(id),
+    content,
+    type: 0,
+    createdTimestamp: timestamp,
+    author: { id: '777', username: 'alice', displayName: 'Alice' },
+    member: { displayName: 'Alice (member)' },
+    reference: null,
+    attachments: collection([]),
+    embeds: [],
+  };
+}
+
+/** A message collection with Discord's newest-first paging and an exclusive `before` cursor. */
+function messageCollection(getMessages) {
+  return {
+    async fetch({ limit, before }) {
+      const list = [...getMessages()]
+        .sort((left, right) => (BigInt(right.id) > BigInt(left.id) ? 1 : -1))
+        .filter((entry) => before === undefined || BigInt(entry.id) < BigInt(before));
+      const page = list.slice(0, limit);
+      return { size: page.length, values: () => page[Symbol.iterator]() };
+    },
+  };
+}
+
+function historyChannel(over = {}) {
+  return {
+    id: over.id,
+    name: over.name,
+    type: over.type ?? discord.ChannelType.GuildText,
+    guildId: over.guildId ?? GUILD_ID,
+    parentId: over.parentId ?? null,
+    parent: over.parent,
+    guild: over.guild,
+    isThread: () => over.thread === true,
+    isDMBased: () => over.dm === true,
+    permissionsFor: (member) =>
+      (member?.id === '4242' ? over.botPermissions ?? permissions() : over.viewerPermissions ?? permissions()),
+    messages: messageCollection(() => over.messages ?? []),
+    ...(over.threads === undefined ? {} : { threads: over.threads }),
+    ...(over.members === undefined ? {} : { members: over.members }),
+  };
+}
+
+function historyGuild(over = {}) {
+  const channels = new Map((over.channels ?? []).map((channel) => [channel.id, channel]));
+  const members = new Map([
+    ['501', { id: '501', permissions: over.viewerPermissions ?? permissions() }],
+    ['4242', { id: '4242', permissions: over.botPermissions ?? permissions() }],
+  ]);
+  return {
+    id: over.id ?? GUILD_ID,
+    name: over.name ?? 'Synthetic Guild',
+    members: {
+      get me() { return members.get('4242'); },
+      cache: { get: (id) => members.get(id) },
+      fetch: async (id) => {
+        const member = members.get(id);
+        if (member === undefined) throw Object.assign(new Error('unknown member'), { status: 404 });
+        return member;
+      },
+    },
+    channels: {
+      cache: { get: (id) => channels.get(id), values: () => channels.values() },
+      fetchActiveThreads: async () => ({ threads: { values: () => (over.activeThreads ?? []).values() } }),
+    },
+  };
+}
+
+/** Start the real transport over a synthetic client whose channel map holds every reachable channel. */
+async function historyTransport(guild, extraChannels = new Map()) {
+  const channelMap = new Map([...guild.channels.cache.values()].map((channel) => [channel.id, channel]));
+  for (const [id, channel] of extraChannels) channelMap.set(id, channel);
+  const fake = fakeClient({ channels: channelMap, user: { id: BOT_ID, username: 'synthetic_bot' } });
+  fake.client.guilds = {
+    cache: { get: (id) => (id === guild.id ? guild : undefined) },
+    fetch: async (id) => {
+      if (id !== guild.id) throw new Error('unknown guild');
+      return guild;
+    },
+  };
+  const transport = createDiscordJsTransport({ token: 'synthetic-token', createClient: () => fake.client });
+  await transport.start(context);
+  return transport;
+}
+
+const baseQuery = {
+  viewerId: '501',
+  guildId: GUILD_ID,
+  sessionMode: 'channel',
+  sessionChannelId: '6001',
+  allowChannels: [],
+  limit: 500,
+  perSourceLimit: 200,
+  includeThreads: true,
+  includeArchivedThreads: false,
+  archivedThreadLimit: 50,
+  maxChars: 12_000,
+};
+
+test('history reads a text channel oldest-first with paging and stable ids', { timeout: 15_000 }, async () => {
+  const messages = Array.from({ length: 150 }, (_, index) =>
+    historyMessage(1_000 + index, Date.UTC(2026, 0, 1) + index * 60_000, `line ${index}`));
+  const general = historyChannel({ id: '6001', name: 'general', messages });
+  const transport = await historyTransport(historyGuild({ channels: [general] }));
+  try {
+    const read = await transport.history({ ...baseQuery, perSourceLimit: 150 });
+    assert.equal(read.ok, true);
+    assert.equal(read.snapshot.mode, 'channel');
+    assert.equal(read.snapshot.messages.length, 150);
+    assert.equal(read.snapshot.messages[0].messageId, '1000');
+    assert.equal(read.snapshot.messages.at(-1).messageId, '1149');
+    assert.equal(read.snapshot.messages[0].channelId, '6001');
+    assert.equal(read.snapshot.messages[0].authorId, '777');
+    assert.equal(read.snapshot.sourcesScanned, 1);
+
+    // An exclusive window is honored, and a tight per-source cap is reported rather than hidden.
+    const windowed = await transport.history({
+      ...baseQuery,
+      sinceMs: Date.UTC(2026, 0, 1) + 10 * 60_000,
+      untilMs: Date.UTC(2026, 0, 1) + 20 * 60_000,
+    });
+    assert.equal(windowed.ok, true);
+    assert.deepEqual(windowed.snapshot.messages.map((entry) => entry.messageId),
+      ['1010', '1011', '1012', '1013', '1014', '1015', '1016', '1017', '1018', '1019']);
+    const capped = await transport.history({ ...baseQuery, perSourceLimit: 5 });
+    assert.equal(capped.ok, true);
+    assert.equal(capped.snapshot.messages.length, 5);
+    assert.ok(capped.snapshot.warnings.some((warning) => warning.code === 'source-limit-reached'));
+  } finally {
+    await transport.stop();
+  }
+});
+
+test('history requires both the sender and the bot to read a source', { timeout: 15_000 }, async () => {
+  const messages = [historyMessage(1, Date.UTC(2026, 0, 1))];
+  const viewerDenied = historyChannel({
+    id: '6001', name: 'general', messages,
+    viewerPermissions: permissions({ view: false, history: false }),
+  });
+  const transport = await historyTransport(historyGuild({ channels: [viewerDenied] }));
+  try {
+    // The bot can read it, but this sender cannot: the read fails closed.
+    assert.deepEqual(await transport.history({ ...baseQuery, channelId: '6001' }), { ok: false, refusal: 'forbidden' });
+  } finally {
+    await transport.stop();
+  }
+
+  const botDenied = historyChannel({
+    id: '6001', name: 'general', messages,
+    botPermissions: permissions({ view: true, history: false }),
+  });
+  const second = await historyTransport(historyGuild({ channels: [botDenied] }));
+  try {
+    assert.deepEqual(await second.history({ ...baseQuery, channelId: '6001' }), { ok: false, refusal: 'forbidden' });
+  } finally {
+    await second.stop();
+  }
+
+  // Discovery without a selection also refuses when the current channel is unreadable.
+  const denied = historyChannel({
+    id: '6001', name: 'general', messages,
+    viewerPermissions: permissions({ history: false }),
+  });
+  const third = await historyTransport(historyGuild({ channels: [denied] }));
+  try {
+    assert.deepEqual(await third.history(baseQuery), { ok: false, refusal: 'forbidden' });
+  } finally {
+    await third.stop();
+  }
+});
+
+test('history includes private threads only for a member and keeps thread identity', { timeout: 15_000 }, async () => {
+  const parent = historyChannel({ id: '6001', name: 'general', messages: [historyMessage(1, Date.UTC(2026, 0, 1))] });
+  const thread = historyChannel({
+    id: '7001', name: 'secret', thread: true, type: discord.ChannelType.PrivateThread,
+    parentId: '6001', parent, messages: [historyMessage(9, Date.UTC(2026, 0, 1, 1), 'in thread')],
+    members: { cache: { has: () => false }, fetch: async () => { throw new Error('not a member'); } },
+  });
+  const transport = await historyTransport(historyGuild({ channels: [parent, thread] }));
+  try {
+    // Not a member: even an explicit id is refused.
+    assert.deepEqual(await transport.history({ ...baseQuery, channelId: '7001' }), { ok: false, refusal: 'forbidden' });
+
+    // A member sees it, with the thread id and the parent channel id.
+    thread.members = { cache: { has: () => true }, fetch: async () => ({}) };
+    const read = await transport.history({ ...baseQuery, channelId: '7001' });
+    assert.equal(read.ok, true);
+    assert.equal(read.snapshot.mode, 'thread');
+    assert.equal(read.snapshot.messages[0].threadId, '7001');
+    assert.equal(read.snapshot.messages[0].channelId, '6001');
+    assert.equal(read.snapshot.messages[0].channelName, 'general');
+  } finally {
+    await transport.stop();
+  }
+});
+
+test('history never widens beyond the current guild and reads a DM only as a DM', { timeout: 15_000 }, async () => {
+  const general = historyChannel({ id: '6001', name: 'general', messages: [historyMessage(1, Date.UTC(2026, 0, 1))] });
+  const foreign = historyChannel({
+    id: '6601', name: 'other-guild', guildId: '9999',
+    messages: [historyMessage(2, Date.UTC(2026, 0, 1))],
+  });
+  const transport = await historyTransport(historyGuild({ channels: [general] }), new Map([['6601', foreign]]));
+  try {
+    // A channel whose own guild differs from the session's guild is refused, never read.
+    assert.deepEqual(await transport.history({ ...baseQuery, channelId: '6601' }), { ok: false, refusal: 'not-found' });
+  } finally {
+    await transport.stop();
+  }
+
+  const dm = historyChannel({
+    id: '8001', name: undefined, dm: true, guildId: null,
+    messages: [historyMessage(5, Date.UTC(2026, 0, 1), 'direct hello')],
+  });
+  const dmTransport = await historyTransport(historyGuild({ channels: [] }), new Map([['8001', dm]]));
+  try {
+    const read = await dmTransport.history({
+      ...baseQuery,
+      sessionMode: 'dm',
+      sessionChannelId: '8001',
+      guildId: null,
+    });
+    assert.equal(read.ok, true);
+    assert.equal(read.snapshot.mode, 'dm');
+    assert.equal(read.snapshot.guild.id, null);
+    assert.equal(read.snapshot.messages[0].channelId, '8001');
+  } finally {
+    await dmTransport.stop();
+  }
+});
+
+test('history resolves a channel name, enumerates archived threads and refuses ambiguity', { timeout: 15_000 }, async () => {
+  const parent = historyChannel({ id: '6001', name: 'general', messages: [] });
+  const archivedPublic = historyChannel({
+    id: '7101', name: 'old-public', thread: true, type: discord.ChannelType.PublicThread,
+    parentId: '6001', parent, messages: [historyMessage(11, Date.UTC(2026, 0, 1), 'archived public')],
+  });
+  const archivedPrivate = historyChannel({
+    id: '7102', name: 'old-private', thread: true, type: discord.ChannelType.PrivateThread,
+    parentId: '6001', parent, messages: [historyMessage(12, Date.UTC(2026, 0, 1), 'archived private')],
+    members: { cache: { has: (id) => id === '501' || id === '4242' }, fetch: async () => ({}) },
+  });
+  const archivedCalls = [];
+  parent.threads = {
+    cache: { values: () => [].values() },
+    fetchArchived: async ({ type, limit }) => {
+      archivedCalls.push({ type, limit });
+      return { threads: { values: () => (type === 'private' ? [archivedPrivate] : [archivedPublic]).values() } };
+    },
+  };
+  const transport = await historyTransport(
+    historyGuild({ channels: [parent, archivedPublic, archivedPrivate] }),
+  );
+  try {
+    const byName = await transport.history({ ...baseQuery, channelName: '#general', includeArchivedThreads: true });
+    assert.equal(byName.ok, true);
+    assert.deepEqual(archivedCalls.map((call) => call.type), ['public', 'private']);
+    assert.deepEqual(new Set(byName.snapshot.messages.map((entry) => entry.threadId)), new Set(['7101', '7102']));
+    assert.equal(byName.snapshot.channel.id, '6001');
+
+    // Two channels sharing a name are ambiguous: the model must use an id.
+    const duplicate = historyChannel({ id: '6002', name: 'general', messages: [] });
+    const second = await historyTransport(historyGuild({ channels: [parent, duplicate] }));
+    try {
+      assert.deepEqual(await second.history({ ...baseQuery, channelName: 'general' }), { ok: false, refusal: 'not-found' });
+    } finally {
+      await second.stop();
+    }
+  } finally {
+    await transport.stop();
   }
 });

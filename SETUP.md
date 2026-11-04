@@ -292,6 +292,10 @@ restart:
   `groupPolicy: "open"` answers every message in an allowed channel.
 - Attachments require the top-level `media` block; Discord originals then live in
   `workspace/media/discord/` under the same size bound as Telegram's.
+- The model can read bounded channel/thread history from an admitted Discord chat
+  with `discord_history`; it is read-only, limited to the current guild (or the
+  current direct message), and requires both the sender's and the bot's Discord
+  `ViewChannel` + `ReadMessageHistory` permissions.
 - Commands, delivery behavior, limits and known gaps are documented in
   [Discord](./DISCORD.md). No live bot login has been exercised in this checkout.
 

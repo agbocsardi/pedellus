@@ -51,15 +51,26 @@ test('assistant text is split inside Discord limits, fences and surrogate pairs'
 });
 
 test('failures are classified by what they prove about the external outcome', { timeout: 10_000 }, () => {
-  assert.deepEqual(classifyDiscordError(Object.assign(new Error('rate'), { status: 429 })), { outcome: 'not-sent', status: 429 });
-  assert.deepEqual(classifyDiscordError(Object.assign(new Error('bad'), { status: 400 })), { outcome: 'rejected', status: 400 });
-  assert.deepEqual(classifyDiscordError(Object.assign(new Error('unauth'), { status: 401 })), { outcome: 'rejected', status: 401 });
-  assert.deepEqual(classifyDiscordError(Object.assign(new Error('server'), { status: 503 })), { outcome: 'unknown', status: 503 });
-  assert.deepEqual(classifyDiscordError(new TypeError('socket hang up')), { outcome: 'unknown', status: undefined });
+  assert.deepEqual(classifyDiscordError(Object.assign(new Error('rate'), { status: 429 })),
+    { outcome: 'not-sent', status: 429, retryAfterMs: undefined });
+  assert.deepEqual(classifyDiscordError(Object.assign(new Error('bad'), { status: 400 })),
+    { outcome: 'rejected', status: 400, retryAfterMs: undefined });
+  assert.deepEqual(classifyDiscordError(Object.assign(new Error('unauth'), { status: 401 })),
+    { outcome: 'rejected', status: 401, retryAfterMs: undefined });
+  assert.deepEqual(classifyDiscordError(Object.assign(new Error('server'), { status: 503 })),
+    { outcome: 'unknown', status: 503, retryAfterMs: undefined });
+  assert.deepEqual(classifyDiscordError(new TypeError('socket hang up')),
+    { outcome: 'unknown', status: undefined, retryAfterMs: undefined });
   assert.deepEqual(
     classifyDiscordError(new DiscordTransportError('held', { outcome: 'not-sent', status: 429 })),
-    { outcome: 'not-sent', status: 429 },
+    { outcome: 'not-sent', status: 429, retryAfterMs: undefined },
   );
+  // Discord's REST body names seconds; @discordjs/rest names milliseconds.
+  assert.equal(classifyDiscordError(Object.assign(new Error('rate'), { status: 429, retry_after: 2.5 })).retryAfterMs, 2_500);
+  assert.equal(classifyDiscordError(Object.assign(new Error('rate'), { status: 429, retryAfter: 4 })).retryAfterMs, 4_000);
+  assert.equal(classifyDiscordError(Object.assign(new Error('rate'), { status: 429, timeToReset: 1_500 })).retryAfterMs, 1_500);
+  assert.equal(classifyDiscordError(Object.assign(new Error('rate'), { status: 429, retry_after: -1 })).retryAfterMs, undefined);
+  assert.equal(classifyDiscordError(Object.assign(new Error('rate'), { status: 429, retry_after: 'soon' })).retryAfterMs, undefined);
   assert.equal(isGoneError(Object.assign(new Error('gone'), { status: 404 })), true);
   assert.equal(isGoneError(new DiscordTransportError('gone', { outcome: 'rejected', status: 404 })), true);
   assert.equal(isGoneError(new TypeError('nope')), false);
@@ -98,8 +109,10 @@ test('speaker labels, mention resolution and quoted context are bounded and unam
   }), /"hi"\]$/u);
 
   assert.deepEqual(decodeDiscordSessionKey('discord:4242:dm:8001', BOT_ID), { channelId: '8001', kind: 'dm' });
-  assert.deepEqual(decodeDiscordSessionKey('discord:4242:guild:9001:channel:6001', BOT_ID), { channelId: '6001', kind: 'channel' });
-  assert.deepEqual(decodeDiscordSessionKey('discord:4242:guild:9001:thread:7001', BOT_ID), { channelId: '7001', kind: 'thread' });
+  assert.deepEqual(decodeDiscordSessionKey('discord:4242:guild:9001:channel:6001', BOT_ID),
+    { channelId: '6001', kind: 'channel', guildId: '9001' });
+  assert.deepEqual(decodeDiscordSessionKey('discord:4242:guild:9001:thread:7001', BOT_ID),
+    { channelId: '7001', kind: 'thread', guildId: '9001' });
   assert.equal(decodeDiscordSessionKey('telegram:4242:chat:1', BOT_ID), undefined);
   assert.equal(decodeDiscordSessionKey('discord:4242:channel-state', BOT_ID), undefined);
   assert.equal(decodeDiscordSessionKey('discord:9999:dm:8001', BOT_ID), undefined);

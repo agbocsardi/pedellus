@@ -64,6 +64,12 @@ import {
   type MediaStore,
 } from "../media/attachments.js";
 import {
+  DISCORD_HISTORY_SESSION_DENIED,
+  type DiscordHistoryRead,
+  type DiscordHistoryRegistry,
+  type DiscordHistoryRequest,
+} from "./discord-history.js";
+import {
   DISCORD_LIMITS,
   boundedDiscordLabel,
   classifyDiscordError,
@@ -271,6 +277,12 @@ export interface DiscordGateway {
   mcpAdmin?: GatewayMcpAdmin;
   /** Manual memory-digestion entry for `/digest` and `/digest status`. */
   memoryDigest?: GatewayMemoryDigest;
+  /**
+   * Late-bound registry for the read-only Discord history capability. The runtime creates it when
+   * Discord is configured and offers the tool only in a mapped Discord chat; this adapter attaches
+   * the live, call-time-checked host while it runs.
+   */
+  discordHistory?: DiscordHistoryRegistry;
   listModels?(sessionKey: string, context: Context): Promise<GatewayModelList>;
   selectModelPreset?(sessionKey: string, name: string, context: Context): Promise<GatewayModelSelection>;
   resetSession?(sessionKey: string, context: Context): Promise<GatewaySessionReset>;
@@ -342,14 +354,76 @@ export async function runDiscord(
     await transport.stop().catch(() => undefined);
     throw new Error("Discord transport connected without a valid bot identity");
   }
-  const stateConversation = await gateway.conversationFor(
-    `discord:${identity}${CHANNEL_STATE_SESSION_SUFFIX}`,
-    context,
-  );
+  let detachMcpSurface: (() => void) | undefined;
+  let scanTimer: ReturnType<typeof setInterval> | undefined;
+  /**
+   * Ingress that arrives between the Gateway's READY and the end of durable recovery is buffered in
+   * memory (bounded, never durable) and replayed in its original order afterwards. The alternative
+   * would silently lose a message the owner already saw; the buffer grants no authority, because
+   * every replayed event goes through the same admission checks it would have had.
+   */
+  let ingressReady = false;
+  let ingressChain: Promise<void> = Promise.resolve();
+  const startupIngress: DiscordInboundMessage[] = [];
+  let startupOverflow = 0;
+  let unsubscribeMessage: (() => void) | undefined;
+  let unsubscribeInteraction: (() => void) | undefined;
+  let detachHistory: (() => void) | undefined;
+  /** One serial ingress order: a buffered replay and a live event never race for admission. */
+  const enqueueIngress = (message: DiscordInboundMessage): void => {
+    ingressChain = ingressChain
+      .then(() => handleInbound(message))
+      .catch(() => {
+        if (!signal?.aborted) console.warn("Discord inbound message was not admitted.");
+      });
+  };
+  /** Release every handle this adapter took, in the order a failed setup or a stop needs. */
+  const teardownAdapters = async (): Promise<void> => {
+    unsubscribeMessage?.();
+    unsubscribeInteraction?.();
+    detachHistory?.();
+    detachMcpSurface?.();
+    if (scanTimer !== undefined) clearInterval(scanTimer);
+    await transport.stop().catch(() => undefined);
+  };
+  // Ingress capture is attached before any durable work: the Gateway has already reported READY, so
+  // an event arriving now must be buffered (bounded, in memory) rather than silently lost.
+  unsubscribeMessage = transport.onMessage((message) => {
+    if (!ingressReady) {
+      if (startupIngress.length >= DISCORD_LIMITS.maxStartupIngress) {
+        startupOverflow += 1;
+        return;
+      }
+      startupIngress.push(message);
+      return;
+    }
+    enqueueIngress(message);
+  });
+  unsubscribeInteraction = transport.onInteraction((interaction) => {
+    if (!ingressReady) {
+      // A command cannot be acknowledged with its real outcome while recovery is still running, and
+      // the acknowledgement window is three seconds. Answer with one fixed refusal; nothing is
+      // admitted, stored or echoed, and the owner may retry once the gateway is serving.
+      return Promise.resolve({ text: STARTUP_COMMAND_REFUSED, ephemeral: true });
+    }
+    return handleInteraction(interaction);
+  });
+
+  let stateConversation: Conversation;
+  let state: ChannelState;
+  try {
+    stateConversation = await gateway.conversationFor(
+      `discord:${identity}${CHANNEL_STATE_SESSION_SUFFIX}`,
+      context,
+    );
+    state = await stateConversation.commit(async (tx) =>
+      copyJson(await tx.doc(DiscordState, stateConversation.id)) as unknown as ChannelState,
+    context);
+  } catch (error) {
+    await teardownAdapters();
+    throw error;
+  }
   const admittedWhenBusy = options.followUpMode === "steer" ? "steer" as const : undefined;
-  let state = await stateConversation.commit(async (tx) =>
-    copyJson(await tx.doc(DiscordState, stateConversation.id)) as unknown as ChannelState,
-  context);
 
   const active = new Set<Promise<void>>();
   let activeReplies = 0;
@@ -370,10 +444,20 @@ export async function runDiscord(
   const deliveryFailures = new Map<string, number>();
   let restartHostRequested = false;
   let restartHostRequestFailed = false;
+  /**
+   * A rate-limit window from a validated 429 hint. Discord's limits are per bot/token, so one shared
+   * deadline gates ordinary sends and scheduled deliveries alike; waiting out the window never counts
+   * as a failed attempt.
+   */
+  let cooldownUntilMs = 0;
+  const cooldownOpen = (): boolean => Date.now() >= cooldownUntilMs;
+  const noteRateLimit = (classified: { readonly status: number | undefined; readonly retryAfterMs: number | undefined }): void => {
+    if (classified.status !== 429) return;
+    const wait = Math.min(Math.max(classified.retryAfterMs ?? 1_000, 1_000), DISCORD_LIMITS.maxCooldownMs);
+    cooldownUntilMs = Math.max(cooldownUntilMs, Date.now() + wait);
+  };
   let fatal: unknown;
   let stopping = false;
-  /** Ingress handlers wait for recovery so an early Gateway event is neither lost nor reordered. */
-  const ready = deferred<void>();
 
   /**
    * Reserve one channel's next submission place when the delivery is dispatched, before any
@@ -412,7 +496,6 @@ export async function runDiscord(
   const scheduledChannelActive = new Set<string>();
   const scheduledTasks = new Set<Promise<void>>();
   let scheduledScanning = false;
-  let scanTimer: ReturnType<typeof setInterval> | undefined;
   let recoveryComplete = false;
 
   // ── State helpers ─────────────────────────────────────────────────────────
@@ -628,7 +711,6 @@ export async function runDiscord(
   const interactionKey = (interactionId: string): string => `i:${interactionId}`;
 
   const handleInbound = async (message: DiscordInboundMessage): Promise<void> => {
-    await ready.promise;
     if (stopping || signal?.aborted) return;
     // Only this bot's own account is always refused; another bot needs an explicit allowlist entry.
     if (message.authorId === identity) return;
@@ -724,7 +806,6 @@ export async function runDiscord(
   };
 
   const handleInteraction = async (interaction: DiscordInteraction): Promise<DiscordInteractionResponse> => {
-    await ready.promise;
     if (stopping || signal?.aborted) {
       return { text: "The gateway is stopping; nothing was accepted.", ephemeral: true };
     }
@@ -928,6 +1009,9 @@ export async function runDiscord(
 
   const drain = (): void => {
     if (stopping || signal?.aborted || !recoveryComplete) return;
+    // A known rate-limit window is waited out deliberately: no request is attempted and no failure
+    // counter moves until it opens, so a long cooldown cannot exhaust the retry bound.
+    if (!cooldownOpen()) return;
     const heldChannels = new Set<string>();
     for (const item of state.pending) {
       const notice = item.notice === true;
@@ -1188,6 +1272,7 @@ export async function runDiscord(
         return sent;
       } catch (error) {
         const classified = classifyDiscordError(error);
+        noteRateLimit(classified);
         if (classified.outcome === "unknown") {
           // Keep the intent: the record is ambiguous until a human inspects it, and is never resent.
           await markUnknown(item.key);
@@ -1215,6 +1300,7 @@ export async function runDiscord(
         await acceptExternal(item.key, { text }, stage, chunkIndex);
       } catch (error) {
         const classified = classifyDiscordError(error);
+        noteRateLimit(classified);
         if (classified.outcome === "unknown") {
           await markUnknown(item.key);
           console.warn(`Discord edit outcome unknown for ${item.key}; inspect the Durable channel-state record.`);
@@ -2230,6 +2316,7 @@ export async function runDiscord(
         return "stop";
       }
       const classified = classifyDiscordError(error);
+      noteRateLimit(classified);
       if (classified.outcome === "unknown") {
         await updateScheduled(sessionKey, recordId, (entry) => {
           entry.status = "unknown";
@@ -2313,7 +2400,7 @@ export async function runDiscord(
   };
 
   const scanScheduled = async (): Promise<void> => {
-    if (outbox === undefined || stopping || signal?.aborted) return;
+    if (outbox === undefined || stopping || signal?.aborted || !cooldownOpen()) return;
     for (const { sessionKey, channelId } of await scheduledSessions()) {
       if (stopping || signal?.aborted) return;
       let records: readonly unknown[];
@@ -2430,7 +2517,7 @@ export async function runDiscord(
     return binding === undefined || binding.kind !== decoded.kind ? undefined : owner;
   };
 
-  const detachMcpSurface = gateway.mcpSurfaces?.attach({
+  detachMcpSurface = gateway.mcpSurfaces?.attach({
     owns: (sessionKey) => ownerChannelFor(sessionKey) !== undefined,
     async deliverAuthorization(sessionKey, authorization, _context) {
       const owner = ownerChannelFor(sessionKey);
@@ -2454,6 +2541,47 @@ export async function runDiscord(
       await transport.send({ channelId: owner.channelId, text });
     },
   });
+
+  // ── Read-only history host ────────────────────────────────────────────────
+
+  /**
+   * The model-facing history tool resolves this at call time. Authorization is recomputed from the
+   * durable admission evidence and the *current* configuration on every read, so a channel removed
+   * from the allowlist, a sender removed from `allowFrom`/`dmAllowFrom`, or a stopped adapter loses
+   * access immediately. The transport then checks this sender's own Discord permissions (never only
+   * the bot's) and fails closed when it cannot.
+   */
+  detachHistory = gateway.discordHistory?.attach({
+    async read(sessionKey, request: DiscordHistoryRequest): Promise<DiscordHistoryRead> {
+      const decoded = decodeDiscordSessionKey(sessionKey, identity);
+      if (decoded === undefined) return { ok: false, refusal: "forbidden" };
+      const owner = ownerChannelFor(sessionKey);
+      if (owner === undefined) return { ok: false, refusal: "forbidden" };
+      if (transport.history === undefined) return { ok: false, refusal: "unsupported" };
+      if (decoded.kind !== "dm" && decoded.guildId === undefined) return { ok: false, refusal: "forbidden" };
+      // A direct message has no guild to select a channel in: the only readable history is that DM.
+      if (decoded.kind === "dm" && (request.channelId !== undefined || request.channelName !== undefined)) {
+        return { ok: false, refusal: "forbidden" };
+      }
+      return transport.history({
+        ...request,
+        viewerId: owner.senderId,
+        guildId: decoded.kind === "dm" ? null : decoded.guildId!,
+        sessionMode: decoded.kind,
+        sessionChannelId: decoded.channelId,
+        allowChannels: options.allowChannels ?? [],
+      });
+    },
+  });
+  if (gateway.discordHistory !== undefined && transport.history === undefined) {
+    // A registry with a transport that cannot read history still answers every call with one fixed
+    // refusal; the tool is never listed as a capability that silently returns nothing.
+    detachHistory ??= gateway.discordHistory.attach({
+      async read(): Promise<DiscordHistoryRead> {
+        return { ok: false, refusal: "unsupported" };
+      },
+    });
+  }
 
   // ── Recovery on open ──────────────────────────────────────────────────────
 
@@ -2515,46 +2643,45 @@ export async function runDiscord(
     await markUnknown(item.key);
     console.warn(`Discord delivery outcome unknown for ${item.key}; inspect the Durable channel-state record.`);
   }
-  await recoverScheduled();
-  recoveryComplete = true;
-  drain();
-
-  // Cosmetic and best effort: a slow or failed registration must not delay ingress.
-  void transport.registerCommands(discordCommandSpecs(availableCommandNames())).catch(() => undefined);
-  requestScheduledScan();
-  scanTimer = setInterval(() => {
-    failedThisCycle.clear();
-    resumeDeferredControls();
+  try {
+    await recoverScheduled();
+    recoveryComplete = true;
     drain();
+    // Cosmetic and best effort: a slow or failed registration must not delay ingress.
+    void transport.registerCommands(discordCommandSpecs(availableCommandNames())).catch(() => undefined);
     requestScheduledScan();
-  }, DISCORD_LIMITS.scheduledScanMs);
-  scanTimer.unref?.();
+    scanTimer = setInterval(() => {
+      failedThisCycle.clear();
+      resumeDeferredControls();
+      drain();
+      requestScheduledScan();
+    }, DISCORD_LIMITS.scheduledScanMs);
+    scanTimer.unref?.();
+  } catch (error) {
+    // A failed recovery or service start must not leave a half-open Gateway with buffered ingress.
+    await teardownAdapters();
+    throw error;
+  }
 
-  const unsubscribeMessage = transport.onMessage((message) => {
-    void handleInbound(message).catch((error: unknown) => {
-      if (!signal?.aborted) {
-        // A refused admission (for example a full durable queue) is reported without any message text.
-        console.warn("Discord inbound message was not admitted.");
-        void error;
-      }
-    });
-  });
-  const unsubscribeInteraction = transport.onInteraction((interaction) => handleInteraction(interaction));
-  ready.resolve();
+  // Recovery is done: replay the buffered ingress in its original order, then admit live events
+  // directly. Both paths use the same serial chain, so ordering never depends on arrival timing.
+  ingressReady = true;
+  if (startupOverflow > 0) {
+    console.warn(
+      `Discord startup ingress overflow: ${startupOverflow} event(s) arrived before recovery finished and were not admitted.`,
+    );
+  }
+  for (const buffered of startupIngress.splice(0)) enqueueIngress(buffered);
 
   try {
     await aborted(signal);
   } finally {
     stopping = true;
-    unsubscribeMessage();
-    unsubscribeInteraction();
-    detachMcpSurface?.();
-    if (scanTimer !== undefined) clearInterval(scanTimer);
     stopAllTyping();
     for (const receipt of [...receipts.values()]) await clearReceipt(receipt).catch(() => undefined);
     scope.cancel(new DOMException("Discord adapter stopped", "AbortError"));
     await Promise.allSettled([...active, ...pendingControls, ...scheduledTasks]);
-    await transport.stop().catch(() => undefined);
+    await teardownAdapters();
   }
   if (fatal !== undefined) throw fatal;
 }
@@ -2685,14 +2812,16 @@ function requestIdFor(botId: string, key: string): string {
 export function decodeDiscordSessionKey(
   sessionKey: string,
   botId: string,
-): { readonly channelId: string; readonly kind: "channel" | "thread" | "dm" } | undefined {
+): { readonly channelId: string; readonly kind: "channel" | "thread" | "dm"; readonly guildId?: string } | undefined {
   const dm = new RegExp(`^discord:${escapeRegExp(botId)}:dm:(\\d{1,20})$`, "u").exec(sessionKey);
   if (dm !== null) return { channelId: dm[1]!, kind: "dm" };
   const guild = new RegExp(
     `^discord:${escapeRegExp(botId)}:guild:(\\d{1,20}):(channel|thread):(\\d{1,20})$`,
     "u",
   ).exec(sessionKey);
-  if (guild !== null) return { channelId: guild[3]!, kind: guild[2] as "channel" | "thread" };
+  if (guild !== null) {
+    return { channelId: guild[3]!, kind: guild[2] as "channel" | "thread", guildId: guild[1]! };
+  }
   return undefined;
 }
 
@@ -2976,6 +3105,9 @@ const DIGEST_UNAVAILABLE_HOST =
   "Memory digestion is unavailable in this host: it exposes no manual digestion entry. Nothing was started and " +
   "nothing was sent to the assistant.";
 const DELIVERY_FAILED_TEXT = "Your request could not be completed. Please try again.";
+/** One fixed reply for a command that arrived before durable recovery finished. */
+const STARTUP_COMMAND_REFUSED =
+  "The gateway is still starting, so this command was not accepted and nothing changed. Try again in a moment.";
 
 /** Bound one host notice; a shortened notice says so instead of dropping its tail silently. */
 function boundNotice(text: string, limit: number): string {

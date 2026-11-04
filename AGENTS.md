@@ -96,15 +96,15 @@ edits need restart only; unit edits additionally need daemon-reload.
 
 ## Invariants worth not breaking
 
-- Shipped CLI/Telegram coding tools come directly from config `toolAllowlist`;
+- Shipped CLI/Telegram/Discord coding tools come directly from config `toolAllowlist`;
   empty disables them. Config remains the only authority for SDK gateway callers.
   `workers.toolAllowlist` is an independent ordinary-worker ceiling: omitted inherits
   configured chat tools; `[]` grants no tools; explicit worker-only coding names never
   widen foreground, cron or digest authority. `mcp` expands to connected tools at launch,
   or exact MCP registration names can be selected. Integrations still require their
-  own opt-ins; Telegram, cron and recursive worker grants are forbidden.
+  own opt-ins; Telegram, Discord history, cron and recursive worker grants are forbidden.
   Only validated mapped chats receive foreground authority, and
-  every admitted Telegram user shares the configured workspace/tools. Raw, root,
+  every admitted Telegram or Discord user shares the configured workspace/tools. Raw, root,
   forked and state conversations remain denied; a mapped session key naming
   anything but an ordinary chat is refused at ingress, before it can become a
   cron owner or receive chat policy. A scheduled run's automation
@@ -135,8 +135,21 @@ edits need restart only; unit edits additionally need daemon-reload.
   owner surface. Memory recall remains read-only over mapped chats; legacy
   history SDK/local calls do not grant model-facing authority. Telegram actions
   additionally require a live adapter, current private-chat
-  admission and observed same-chat targets. Unknown external outcomes are retained,
-  never blindly retried or evicted.
+  admission and observed same-chat targets. Discord is a second opt-in channel:
+  `discord.allowFrom` is a required explicit sender list (no wildcard) and
+  `dmAllowFrom`/`allowChannels` narrow direct messages and guild channels, with a
+  mention-or-reply guild policy unless `open`; the session key is host-derived and
+  an allowlisted other bot is admitted only through that same evidence. Its durable
+  outbox, control records, scheduled/interruption delivery and MCP owner surface
+  mirror Telegram's, and both channels start concurrently without awaiting each
+  other. The read-only `discord_history` tool is offered only in a mapped Discord
+  ordinary chat: the live adapter re-checks that exact session and sender, the
+  current configuration, the current guild (a DM can read only that DM) and the
+  sender's own Discord ViewChannel/ReadMessageHistory permissions (private threads
+  also require membership), failing closed when permissions are unknown. It is
+  independent of `toolAllowlist`, is never inherited by workers, forks, roots,
+  scheduled or digest targets, and detaches with the adapter. Unknown external
+  outcomes are retained, never blindly retried or evicted.
 - Owner message placement is `followUpMode`, config-only and default `followUp`
   (historical queueing): `steer` submits a CLI or Telegram owner input with native
   `whenBusy: "steer"` so it joins the running turn after its tool round. Internal
@@ -189,8 +202,8 @@ edits need restart only; unit edits additionally need daemon-reload.
   are temporary: a CLI reattach keeps the temporary selection, while a gateway
   restart or reopen restores the configured preset without rewriting prepared
   dispatches. Direct-model (non-preset) selection retains its persisted semantics.
-- Shared CLI and authenticated Telegram owner controls are `/new`, `/abort`/`/stop`,
-  `/status`, `/model`, `/digest` and `/digest status`, plus `/restart` and
+- Shared CLI, authenticated Telegram and authenticated Discord owner controls are `/new`,
+  `/abort`/`/stop`, `/status`, `/model`, `/digest` and `/digest status`, plus `/restart` and
   the read-only `/mcp` status command, advertised only where the host implements
   them. MCP configuration and login are ordinary model-management requests in an
   authenticated mapped chat, not slash approvals. `/model` selects one
@@ -436,7 +449,9 @@ edits need restart only; unit edits additionally need daemon-reload.
   rejection and every ambiguous outcome keeps the existing hold semantics and is never resent.
   Attachment captions remain plain text with no `parse_mode`, and no media block is used for
   attachments.
-- Media ingress is opt-in (`media` config) and owned by the gateway. Telegram
+- Media ingress is opt-in (`media` config) and owned by the gateway. Discord
+  attachments are stored once at admission under `media/discord/` with the same
+  size bound; Discord audio is never transcribed. Telegram
   photos are native pi-ai image content plus a workspace-relative locator, and
   configured vision handoff describes them for flagged text-only presets;
   Telegram documents are stored unread and Telegram voice/audio is transcribed

@@ -137,6 +137,54 @@ unauthorized when the original sender has left `allowFrom`.
   exceeds its own cap keeps its head and ends with `… (truncated)` rather than
   dropping text silently.
 
+## Read-only history
+
+The model-facing `discord_history` tool reads bounded history for the current
+conversation. It never sends, reacts, deletes or reads another guild.
+
+* **Scope.** The current guild is the only guild, and a direct-message session can
+  read only that DM. A message in a channel reads that channel (plus its accessible
+  active/archived threads when asked); a message in a thread reads that thread. The
+  model may name one other channel, forum or thread in the current guild by `#name`
+  or id; naming two channels with the same name is refused, and a channel in another
+  guild is refused.
+* **Live authority, every call.** The adapter re-derives the session from the
+  authenticated session key, re-checks the current `allowFrom`, `dmAllowFrom` and
+  `allowChannels` (including thread parents), and requires durable admission
+  evidence. The transport then requires **this sender's own** Discord
+  `ViewChannel` + `ReadMessageHistory` on every source, as well as the bot's, and
+  fails closed when permission data is unavailable. Private threads additionally
+  require both to be members. An empty `allowChannels` therefore never bypasses
+  Discord permissions.
+* **Window and limits.** `since`/`until` accept ISO-8601 with a timezone, or `now`,
+  `today`, `yesterday`, `30m`, `6h`, `2d`, `1w`; `limit` is 1–2000 (default 500),
+  `perSource` 1–500 (default 200), `archivedLimit` 1–200 (default 50), `maxChars`
+  1–16000 (default 12000). Only the selected window is read; a per-source cap or the
+  character budget is reported, never hidden. With a budget smaller than the coverage
+  envelope itself, the result is still that envelope with zero messages and
+  `truncated: true`.
+* **Honest coverage.** The result carries the window, `coverage` (sources scanned
+  and skipped, messages returned, messages the limits cut, a truncation flag), fixed
+  warning codes, and a provenance sentence saying Discord text is untrusted
+  third-party data and that anything outside the returned set was not read. Every
+  message carries stable channel, thread, author and message IDs so an answer can
+  cite exact evidence.
+* **Where it is offered.** Only a scope-checked mapped Discord ordinary chat, by the
+  same registry pattern as the Telegram action tool: the adapter attaches the live
+  host while it runs and detaches on stop, so a stopped adapter answers every call
+  with a fixed refusal. Code Mode may compose it from such a chat; the call-time
+  checks are identical. It is not a `toolAllowlist` coding tool, so configuration
+  cannot hand it to workers, forks, roots, scheduled runs or digest targets (and
+  `workers.toolAllowlist` refuses the name outright). Like every context tool in
+  this host it is offered when the coding-tool extension is installed (a non-empty
+  `toolAllowlist`), but it is exempt from that ceiling.
+
+This is narrower than the Python reference: there is no `guild_id` parameter
+because another guild is never readable from this session, and no default
+guild-wide scan. `channel`/`channelId` selection inside the current guild, thread
+and forum-post discovery, archived public threads, joined archived private threads
+and channel-name resolution are provided.
+
 ## Controls
 
 The Discord chat offers the shared owner commands, and `/help` lists exactly
@@ -174,12 +222,12 @@ only from the sender that owns the channel.
 
 These are deliberate or unported, not implied capabilities:
 
-* **No model-facing Discord tool.** The Python reference exposes a Discord
-  message-history tool; this port offers no channel tool on Discord. Replies,
-  reactions and history reads therefore come from the ordinary answer path only.
-  Python's `react` tool is Telegram-only there as well.
+* **No message/reaction action tool.** Discord history is read-only. The Python
+  reference's `react` tool is Telegram-only there as well, so this port adds no
+  Discord send, react or delete capability.
 * **No member roster index.** Mention names come from the event, not from a
-  per-guild index with previous display names.
+  per-guild index with previous display names, and history author names come from
+  the message as Discord reported them.
 * **No local transcription.** Stored audio attachments are labeled by locator and
   never transcribed, matching the Python Discord channel.
 * **No message deletion.** A sender removed from `allowFrom` after admission is
@@ -208,13 +256,17 @@ mapping without a token or a live Gateway.
 
 `tests/discord-channel.behavior.test.mjs`, `tests/discord-commands.behavior.test.mjs`,
 `tests/discord-delivery.behavior.test.mjs`, `tests/discord-transport.behavior.test.mjs`
-and `tests/discord-js-transport.behavior.test.mjs` run offline in
+`tests/discord-js-transport.behavior.test.mjs`, `tests/discord-history.behavior.test.mjs`
+and `tests/discord-lifecycle.behavior.test.mjs` run offline in
 `npm run test:behavior`: a synthetic adapter transport plus an injected
 discord.js client, a faux provider and a temporary store. They assert admission,
 session isolation, attribution, chunking, mentions, receipts, referenced
 attachments, the input bound, bots, strict config keys, chunked/withheld/
 unauthorized/unknown scheduled delivery, interruption notices, restart
 confirmation, deferred-control retry and exhaustion, pre-send intents, callback
-interception, progressive edits, the real event/interaction/error mapping and
+interception, progressive edits, the real event/interaction/error mapping,
+startup ingress capture and replay, rate-limit cooldowns, control-admission
+failure, unconfirmed-control pruning, scheduled intent-commit failure, quoted-text
+injection, the history read's live authority and transport permissions, and
 concurrent channel startup. No token, network, live guild or paid inference is
 used.

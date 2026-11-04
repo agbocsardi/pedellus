@@ -15,6 +15,16 @@ export const context = (await import(`${modules}/chord/dist/context/index.js`)).
 export const { withCancel } = await import(`${modules}/chord/dist/context/index.js`);
 export const { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(`${modules}/pi-ai/dist/index.js`);
 export const { superviseChannels } = await import(new URL('../../dist/cli.js', import.meta.url).href);
+export const {
+  DISCORD_HISTORY_LIMITS,
+  DISCORD_HISTORY_PROVENANCE,
+  DISCORD_HISTORY_REFUSALS,
+  DISCORD_HISTORY_SESSION_DENIED,
+  DISCORD_HISTORY_TOOL_NAME,
+  parseDiscordHistoryArguments,
+  parseDiscordHistoryBound,
+  renderDiscordHistory,
+} = await import(new URL('../../dist/channels/discord-history.js', import.meta.url).href);
 export const { inProcessTerminalConversation } = await import(new URL('../../dist/terminal/conversation.js', import.meta.url).href);
 export const { getCurrentSystemPrompt } = await import(`${modules}/pi-ai/dist/utils/transcript.js`);
 export const { parseConfig, loadConfig } = await import(new URL('../../dist/config.js', import.meta.url).href);
@@ -92,7 +102,11 @@ export function fauxModels(captured, options = {}) {
     provider.appendResponses([dispatcher]);
     const system = getCurrentSystemPrompt(request.messages);
     if (system.startsWith(SUMMARY_PROMPT_PREFIX)) return fauxAssistantMessage(SUMMARY_BODY);
-    captured.push({ system, messages: request.messages });
+    captured.push({
+      system,
+      messages: request.messages,
+      tools: (request.tools ?? []).map((tool) => tool.name),
+    });
     const next = () => gate.step < gate.steps.length
       ? gate.steps[gate.step++](request)
       : fauxAssistantMessage(gate.answer ?? 'SYNTHETIC-REPLY');

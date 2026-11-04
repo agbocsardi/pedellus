@@ -11,6 +11,14 @@
  * before every later send.
  */
 import type { Context } from "@earendil-works/chord";
+import type {
+  DiscordHistoryMessage,
+  DiscordHistoryMode,
+  DiscordHistoryRefusalCode,
+  DiscordHistoryRequest,
+  DiscordHistorySnapshot,
+  DiscordHistoryWarning,
+} from "./discord-history.js";
 import { splitRichText } from "./telegram-rich.js";
 
 /** Discord's per-message text bound, in UTF-16 code units (JavaScript string length). */
@@ -41,6 +49,8 @@ export const DISCORD_LIMITS = {
   typingRefreshMs: 8_000,
   /** Minimum spacing between progressive edits of one preview message. */
   previewEditMs: 1_200,
+  /** Ingress events buffered between Gateway READY and the end of durable recovery. */
+  maxStartupIngress: 64,
   /** Consecutive proven-not-sent delivery failures before a record is held instead of retried. */
   maxDeliveryFailures: 10,
   /** Background scheduled/interruption deliveries in flight at once. */
@@ -49,6 +59,8 @@ export const DISCORD_LIMITS = {
   scheduledScanMs: 2_000,
   /** Attachment download ceiling for one original. */
   downloadTimeoutMs: 30_000,
+  /** Longest rate-limit window this adapter will wait out from one hint (Discord's own can be longer). */
+  maxCooldownMs: 300_000,
 } as const;
 
 export type DiscordChannelKind = "channel" | "thread" | "dm";
@@ -161,15 +173,23 @@ export type DiscordFailureOutcome = "not-sent" | "rejected" | "unknown";
 export class DiscordTransportError extends Error {
   readonly outcome: DiscordFailureOutcome;
   readonly status: number | undefined;
+  /** A validated server cooldown in milliseconds; only a 429 response carries one. */
+  readonly retryAfterMs: number | undefined;
 
   constructor(
     message: string,
-    options: { readonly outcome: DiscordFailureOutcome; readonly status?: number; readonly cause?: unknown },
+    options: {
+      readonly outcome: DiscordFailureOutcome;
+      readonly status?: number;
+      readonly retryAfterMs?: number;
+      readonly cause?: unknown;
+    },
   ) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = "DiscordTransportError";
     this.outcome = options.outcome;
     this.status = options.status;
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 
@@ -183,17 +203,43 @@ function numericStatus(error: unknown): number | undefined {
 /**
  * classify one thrown send failure without reading message text: a 4xx response proves the request
  * was refused, a 429 proves it was not applied but may succeed later, everything else leaves the
- * external outcome ambiguous.
+ * external outcome ambiguous. A 429 additionally carries the server's cooldown when it names one, so
+ * the adapter can wait deliberately instead of spending attempts on a rate-limit window.
  */
 export function classifyDiscordError(error: unknown): {
   readonly outcome: DiscordFailureOutcome;
   readonly status: number | undefined;
+  readonly retryAfterMs: number | undefined;
 } {
-  if (error instanceof DiscordTransportError) return { outcome: error.outcome, status: error.status };
+  if (error instanceof DiscordTransportError) {
+    return { outcome: error.outcome, status: error.status, retryAfterMs: error.retryAfterMs };
+  }
   const status = numericStatus(error);
-  if (status === 429) return { outcome: "not-sent", status };
-  if (status !== undefined && status >= 400 && status < 500) return { outcome: "rejected", status };
-  return { outcome: "unknown", status };
+  if (status === 429) return { outcome: "not-sent", status, retryAfterMs: retryAfterHint(error) };
+  if (status !== undefined && status >= 400 && status < 500) {
+    return { outcome: "rejected", status, retryAfterMs: undefined };
+  }
+  return { outcome: "unknown", status, retryAfterMs: undefined };
+}
+
+/**
+ * Read a Discord rate-limit hint from the shapes a client may surface: the REST body's
+ * `retry_after` and `retryAfter` are seconds, while @discordjs/rest's `RateLimitError.timeToReset`
+ * is milliseconds. Only a finite positive number is accepted; anything else is ignored.
+ */
+function retryAfterHint(error: unknown): number | undefined {
+  if (error === null || typeof error !== "object") return undefined;
+  const fields = error as { retry_after?: unknown; retryAfter?: unknown; timeToReset?: unknown };
+  for (const [value, unitMs] of [
+    [fields.retry_after, 1_000],
+    [fields.retryAfter, 1_000],
+    [fields.timeToReset, 1],
+  ] as const) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) continue;
+    const ms = Math.round(value * unitMs);
+    if (ms > 0) return ms;
+  }
+  return undefined;
 }
 
 /** A Discord API error whose status is 404: the channel or message this action named is gone. */
@@ -227,7 +273,39 @@ export interface DiscordTransport {
   fetchMessage(channelId: string, messageId: string): Promise<DiscordReplyReference | undefined>;
   /** Register the exact application commands this adapter implements; a failure keeps typed commands working. */
   registerCommands(commands: readonly DiscordCommandSpec[]): Promise<void>;
+  /**
+   * Bounded read-only history for the live session. Absent means this transport cannot read history.
+   *
+   * The query carries the authenticated sender and the session's own placement, so an implementation
+   * must check that sender's Discord permissions for every source (never only the bot's), refuse a
+   * channel in another guild, and fail closed when permission data is unavailable.
+   */
+  history?(query: DiscordHistoryQuery): Promise<DiscordHistoryRead>;
 }
+
+/** One history read requested by the live adapter for an authenticated session. */
+export interface DiscordHistoryQuery extends DiscordHistoryRequest {
+  /** The authenticated sender whose own Discord permissions must allow every source. */
+  readonly viewerId: string;
+  /** The current guild; `null` for a direct-message session, where only that DM is readable. */
+  readonly guildId: string | null;
+  /** Placement of the current session, so a DM can never widen into a guild read. */
+  readonly sessionMode: DiscordHistoryMode;
+  /** The current channel/thread (or DM channel) id. */
+  readonly sessionChannelId: string;
+  /** Explicit configured allowlist entries; a thread source matches its own or its parent's id. */
+  readonly allowChannels: readonly string[];
+}
+
+export type DiscordHistoryRead =
+  | { readonly ok: true; readonly snapshot: DiscordHistorySnapshot }
+  | { readonly ok: false; readonly refusal: DiscordHistoryRefusalCode };
+
+export type {
+  DiscordHistoryMessage,
+  DiscordHistorySnapshot,
+  DiscordHistoryWarning,
+};
 
 /** A decimal Discord snowflake: never zero, at most 20 digits, no sign or leading zero. */
 export function isSnowflake(value: unknown): value is string {

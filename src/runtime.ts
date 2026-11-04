@@ -56,6 +56,12 @@ import {
   createTelegramTool,
   type TelegramActionRegistry,
 } from "./channels/telegram-tool.js";
+import {
+  DISCORD_HISTORY_TOOL_NAME,
+  createDiscordHistoryRegistry,
+  createDiscordHistoryTool,
+  type DiscordHistoryRegistry,
+} from "./channels/discord-history.js";
 import type { CronOwner } from "./automation/cron.js";
 import {
   EpisodeDoc,
@@ -371,6 +377,12 @@ export interface Gateway {
    * no live channel can send. Present only when `config.telegram` is configured.
    */
   readonly telegramActions?: TelegramActionRegistry;
+  /**
+   * Live host registry for the read-only Discord history capability. Present only when `config.discord`
+   * is configured; the running adapter attaches its call-time-checked host, and the runtime offers the
+   * tool only in a scope-checked mapped Discord chat conversation.
+   */
+  readonly discordHistory?: DiscordHistoryRegistry;
   /**
    * MCP server connection state; absent when MCP is not configured and enabled. A failed server has
    * no tools; its status carries a fixed failure code, never a transport message or configured value.
@@ -1013,8 +1025,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // task-owned cron targets are never in that set.
   const telegramActions: TelegramActionRegistry | undefined =
     config.telegram === undefined ? undefined : createTelegramActionRegistry();
+  // Discord history is the same shape of capability: a channel-only read surface with a late-bound
+  // live host. It is independent of `toolAllowlist`, so no configuration entry can hand it to a
+  // worker, a fork, a root conversation or a scheduled/digest target.
+  const discordHistory: DiscordHistoryRegistry | undefined =
+    config.discord === undefined ? undefined : createDiscordHistoryRegistry();
   const sessionKeyForConversation = new Map<ConversationId, string>();
   const telegramChatConversations = new Set<ConversationId>();
+  const discordChatConversations = new Set<ConversationId>();
   const telegramTool = telegramActions === undefined
     ? undefined
     : createTelegramTool({
@@ -1026,6 +1044,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
         fileSend: config.media !== undefined && toolAllowlist.includes("read"),
       });
   const telegramToolRegistration = telegramTool?.extension.tools?.[0];
+  const discordHistoryTool = discordHistory === undefined
+    ? undefined
+    : createDiscordHistoryTool({
+        registry: discordHistory,
+        sessionKeyFor: (conversationId) => sessionKeyForConversation.get(conversationId),
+      });
+  const discordHistoryToolRegistration = discordHistoryTool?.extension.tools?.[0];
   // Config authorization names only mapped ordinary chat conversations (loaded map + scope checked).
   // The call-time hook consults this set; the policy filter reads the same rule from committed state.
   const authorizedChatConversations = new Set<ConversationId>();
@@ -1080,6 +1105,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
           ...(cronEnabled ? [CRON_TOOL_NAME] : []),
           ...(workersEnabled ? [WORKER_TOOL_NAME] : []),
           ...(telegramTool === undefined ? [] : [TELEGRAM_TOOL_NAME]),
+          // The read-only Discord history capability is a scoped channel integration, not a coding
+          // tool: its own call-time hook decides every scope, so the ceiling must not suppress it.
+          ...(discordHistoryTool === undefined ? [] : [DISCORD_HISTORY_TOOL_NAME]),
           // MCP management is a separate host capability, not a coding-tool grant: it can
           // write server configuration and launch stdio processes. Its own hook limits it to
           // authenticated mapped chats; login also requires a unique live owner surface.
@@ -1306,6 +1334,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (memoryTools && historyConversations.has(conversationId)) selected.push(memoryTools.extension);
     if (webTool && webConversations.has(conversationId)) selected.push(webTool.extension);
     if (telegramTool && telegramChatConversations.has(conversationId)) selected.push(telegramTool.extension);
+    if (discordHistoryTool && discordChatConversations.has(conversationId)) selected.push(discordHistoryTool.extension);
     if (cronFoundation && cronTool && cronOwners.has(conversationId)) {
       selected.push(cronFoundation.extension, cronTool.extension);
     }
@@ -1791,6 +1820,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const telegramTools = telegramToolRegistration !== undefined && telegramChatConversations.has(conversationId)
       ? [telegramToolRegistration]
       : [];
+    // Discord history is read-only and host-scoped: the live adapter rechecks the exact session,
+    // sender, channel and Discord permissions at call time, so it is offered only in a mapped
+    // Discord chat and is never inherited by a worker or a task-owned scope.
+    const discordHistoryTools = discordHistoryToolRegistration !== undefined && discordChatConversations.has(conversationId)
+      ? [discordHistoryToolRegistration]
+      : [];
     const webTools = webConversations.has(conversationId) || workerChildConversations.has(conversationId)
       ? [...webToolRegistrations] : [];
     // Worker management is a spawning-conversation capability, not filesystem or shell authority. The
@@ -1803,7 +1838,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const mcpAdminTools = mcpAdminRef.current !== undefined && authorizedChatConversations.has(conversationId)
       ? [...(mcpAdminRef.current.extension.tools ?? [])]
       : [];
-    return [...skillTools, ...cronTools, ...memoryToolsForConversation, ...telegramTools, ...webTools, ...workerTools, ...mcpAdminTools];
+    return [...skillTools, ...cronTools, ...memoryToolsForConversation, ...telegramTools,
+      ...discordHistoryTools, ...webTools, ...workerTools, ...mcpAdminTools];
   };
   /**
    * The authority-derived tool filter. The host ceiling directly authorizes authenticated mapped
@@ -2109,6 +2145,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (skillTool) registry.install(skillTool.extension);
     if (memoryTools) registry.install(memoryTools.extension);
     if (telegramTool) registry.install(telegramTool.extension);
+    if (discordHistoryTool) registry.install(discordHistoryTool.extension);
     if (webTool) registry.install(webTool.extension);
     if (cronFoundation) registry.install(cronFoundation.extension);
     if (cronTool) registry.install(cronTool.extension);
@@ -2640,6 +2677,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (workersEnabled) workerSpawners.add(conversationId);
         if (telegramTool !== undefined && sessionKey.startsWith("telegram:")) {
           telegramChatConversations.add(conversationId);
+        }
+        if (discordHistoryTool !== undefined && sessionKey.startsWith("discord:")) {
+          discordChatConversations.add(conversationId);
         }
       }
     }
@@ -3378,6 +3418,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
         }),
       }),
       ...(telegramActions === undefined ? {} : { telegramActions }),
+      ...(discordHistory === undefined ? {} : { discordHistory }),
+      ...(discordHistory === undefined ? {} : { discordHistory }),
       get mcp() {
         return mcpRef.current === undefined ? undefined : { servers: mcpRef.current.status };
       },
@@ -3444,6 +3486,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
           telegramChatConversations.add(conversationId!);
         } else {
           telegramChatConversations.delete(conversationId!);
+        }
+        // The same rule for Discord: a scope-checked mapped chat key is the only conversation class
+        // offered the read-only history capability.
+        if (mappedChat && sessionKey.startsWith("discord:")) {
+          discordChatConversations.add(conversationId!);
+        } else {
+          discordChatConversations.delete(conversationId!);
         }
         if (createdNow !== undefined && episodeSummaries !== undefined) {
           try {

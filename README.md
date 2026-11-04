@@ -52,7 +52,9 @@ configured, the restricted Telegram adapter (explicit decimal user allowlist
 only) and the opt-in Discord adapter. Every configured channel starts
 concurrently and none is awaited before another starts. Discord needs its own
 explicit sender/channel allowlists, a bot token environment reference and the
-privileged message-content intent; see [Discord](./DISCORD.md). One or more
+privileged message-content intent; a mapped Discord chat can also ask the model
+for bounded, read-only channel/thread history under that sender's own Discord
+permissions; see [Discord](./DISCORD.md). One or more
 `agent` CLIs attach to it as conversation surfaces; the
 historical bare `node bin/durable-nanobot.mjs --config ...` is the same attach and never opens
 a second runtime. A CLI disconnect leaves the gateway, Telegram polling, admitted

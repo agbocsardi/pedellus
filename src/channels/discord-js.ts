@@ -30,6 +30,13 @@ import {
   type DiscordReplyReference,
   type DiscordTransport,
 } from "./discord-transport.js";
+import {
+  DISCORD_HISTORY_LIMITS,
+  type DiscordHistoryMessage,
+  type DiscordHistoryRead,
+  type DiscordHistoryWarning,
+} from "./discord-history.js";
+import type { DiscordHistoryQuery } from "./discord-transport.js";
 
 export type DiscordJsTransportOptions = {
   /** Bot token, read by the host from the configured environment reference. Never logged. */
@@ -339,6 +346,19 @@ export function createDiscordJsTransport(options: DiscordJsTransportOptions): Di
       const message = await resolveMessage(client, channelId, messageId);
       return message === undefined ? undefined : replySnapshot(message);
     },
+    async history(query) {
+      const d = discord;
+      const current = client;
+      if (d === undefined || current === undefined || botId === "") {
+        return { ok: false, refusal: "unavailable" };
+      }
+      try {
+        return await readHistory(d, current, botId, query);
+      } catch {
+        // A fixed refusal: never a transport message, URL or token.
+        return { ok: false, refusal: "unavailable" };
+      }
+    },
     async registerCommands(commands: readonly DiscordCommandSpec[]) {
       const d = discord;
       const current = client;
@@ -507,6 +527,7 @@ function sendFailure(error: unknown): DiscordTransportError {
       outcome: classified.outcome,
       cause: error,
       ...(classified.status === undefined ? {} : { status: classified.status }),
+      ...(classified.retryAfterMs === undefined ? {} : { retryAfterMs: classified.retryAfterMs }),
     },
   );
 }
@@ -519,4 +540,526 @@ function deferred<T>(): { readonly promise: Promise<T>; resolve(value: T): void;
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+// ── Read-only history ────────────────────────────────────────────────────────
+//
+// Every source is checked twice: this sender must hold ViewChannel + ReadMessageHistory there, and so
+// must this bot. The current guild is the only guild, a direct-message session can only read that DM,
+// private threads additionally require the sender (and the bot) to be members, and any unavailable
+// permission information fails closed. Discord returns newest-first in pages of at most 100, so a read
+// walks backwards with a `before` cursor and stops at the window's `since` bound.
+
+type HistoryPermissionsLike = { has(flag: unknown): boolean };
+
+type HistoryMembersLike = {
+  readonly cache?: { get?(id: string): unknown; has?(id: string): boolean };
+  readonly me?: unknown;
+  fetch?(id: string): Promise<unknown>;
+};
+
+type HistoryPageLike = {
+  readonly size?: number;
+  values(): IterableIterator<HistoryRawMessageLike>;
+};
+
+type HistoryMessageCollection = {
+  fetch(options: { limit: number; before?: string }): Promise<{
+    readonly size?: number;
+    values(): IterableIterator<HistoryRawMessageLike>;
+  }>;
+};
+
+type HistoryThreadCollection = {
+  readonly cache?: { values(): IterableIterator<unknown> };
+  fetchArchived?(options: {
+    type?: string;
+    limit?: number;
+  }): Promise<{ readonly threads?: { values(): IterableIterator<unknown> } }>;
+};
+
+type HistoryRawMessageLike = {
+  readonly id: string;
+  readonly content?: string | null;
+  readonly type?: number;
+  readonly createdTimestamp?: number;
+  readonly createdAt?: Date;
+  readonly author?: {
+    readonly id?: string;
+    readonly username?: string;
+    readonly displayName?: string;
+  };
+  readonly member?: { readonly displayName?: string } | null;
+  readonly reference?: { readonly messageId?: string | null } | null;
+  readonly attachments?: { values?(): IterableIterator<HistoryAttachmentLike>; size?: number; map?(fn: (value: never) => unknown): unknown[] };
+  readonly embeds?: readonly HistoryEmbedLike[];
+};
+
+type HistoryAttachmentLike = { readonly name?: string; readonly filename?: string; readonly url?: string | null };
+type HistoryEmbedLike = { readonly type?: string | null; readonly title?: string | null; readonly url?: string | null };
+
+type HistoryChannelLike = {
+  readonly id: string;
+  readonly name?: string;
+  readonly type?: number;
+  readonly guildId?: string | null;
+  readonly parentId?: string | null;
+  readonly parent?: HistoryChannelLike | null;
+  readonly guild?: HistoryGuildLike | null;
+  isThread?(): boolean;
+  isDMBased?(): boolean;
+  permissionsFor?(member: unknown): unknown;
+  messages?: HistoryMessageCollection;
+  threads?: HistoryThreadCollection;
+  members?: HistoryMembersLike;
+};
+
+type HistoryGuildLike = {
+  readonly id: string;
+  readonly name: string;
+  readonly members?: HistoryMembersLike;
+  readonly channels?: {
+    readonly cache?: {
+      get(id: string): unknown;
+      values?(): IterableIterator<unknown>;
+    };
+    fetchActiveThreads?(): Promise<{ readonly threads?: { values(): IterableIterator<unknown> } }>;
+  };
+};
+
+function historyChannel(value: unknown): HistoryChannelLike | undefined {
+  return value !== null && typeof value === "object" && typeof (value as { id?: unknown }).id === "string"
+    ? value as HistoryChannelLike
+    : undefined;
+}
+
+function historyGuild(value: unknown): HistoryGuildLike | undefined {
+  return value !== null && typeof value === "object" && typeof (value as { id?: unknown }).id === "string"
+    ? value as HistoryGuildLike
+    : undefined;
+}
+
+function channelGuildId(channel: HistoryChannelLike): string | undefined {
+  const direct = channel.guildId;
+  if (typeof direct === "string" && direct !== "") return direct;
+  const guild = channel.guild;
+  return guild === null || guild === undefined ? undefined : guild.id;
+}
+
+function channelParentId(channel: HistoryChannelLike): string | undefined {
+  const direct = channel.parentId;
+  if (typeof direct === "string" && direct !== "") return direct;
+  const parent = channel.parent;
+  return parent === null || parent === undefined ? undefined : parent.id;
+}
+
+function isThreadChannel(channel: HistoryChannelLike): boolean {
+  return typeof channel.isThread === "function" && channel.isThread();
+}
+
+function isDmChannel(channel: HistoryChannelLike): boolean {
+  return typeof channel.isDMBased === "function" && channel.isDMBased();
+}
+
+function isPrivateThread(d: DiscordModule, channel: HistoryChannelLike): boolean {
+  const type = channel.type;
+  if (type === undefined) return false;
+  const privateThread = (d.ChannelType as unknown as Record<string, number>).PrivateThread;
+  return typeof privateThread === "number" && type === privateThread;
+}
+
+/** This sender's or the bot's resolved permissions on one channel; `undefined` fails closed. */
+function channelPermissions(channel: HistoryChannelLike, member: unknown): HistoryPermissionsLike | undefined {
+  if (typeof channel.permissionsFor !== "function" || member === undefined || member === null) return undefined;
+  let permissions: unknown;
+  try {
+    permissions = channel.permissionsFor(member);
+  } catch {
+    return undefined;
+  }
+  if (permissions === null || permissions === undefined) return undefined;
+  const has = (permissions as { has?: unknown }).has;
+  if (typeof has !== "function") return undefined;
+  return permissions as HistoryPermissionsLike;
+}
+
+/** Both this sender and this bot must be able to view the source and read its message history. */
+function canReadSource(d: DiscordModule, channel: HistoryChannelLike, viewer: unknown, bot: unknown): boolean {
+  const viewerPermissions = channelPermissions(channel, viewer);
+  const botPermissions = channelPermissions(channel, bot);
+  if (viewerPermissions === undefined || botPermissions === undefined) return false;
+  const flags = (d.PermissionsBitField as unknown as { Flags: Record<string, unknown> }).Flags;
+  const view = flags.ViewChannel;
+  const history = flags.ReadMessageHistory;
+  if (view === undefined || history === undefined) return false;
+  const check = (permissions: HistoryPermissionsLike): boolean =>
+    permissions.has(view) === true && permissions.has(history) === true;
+  return check(viewerPermissions) && check(botPermissions);
+}
+
+/** A private thread is readable only for a member; the sender must be one, and so must the bot. */
+async function privateThreadMember(
+  channel: HistoryChannelLike,
+  memberId: string,
+  allowFetch: boolean,
+): Promise<boolean | undefined> {
+  const members = channel.members;
+  if (members === undefined) return undefined;
+  const cache = members.cache;
+  if (cache?.has?.(memberId) === true) return true;
+  if (typeof cache?.get === "function" && cache.get(memberId) !== undefined) return true;
+  const fetchMember = members.fetch;
+  if (typeof fetchMember !== "function" || !allowFetch) return false;
+  try {
+    await fetchMember.call(members, memberId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveHistoryMember(
+  members: HistoryMembersLike | undefined,
+  id: string,
+): Promise<unknown | undefined> {
+  if (members === undefined) return undefined;
+  const cached = typeof members.cache?.get === "function" ? members.cache.get(id) : undefined;
+  if (cached !== undefined) return cached;
+  const fetchMember = members.fetch;
+  if (typeof fetchMember !== "function") return undefined;
+  try {
+    return await fetchMember.call(members, id);
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolveHistoryGuild(current: DiscordClientLike, guildId: string): Promise<HistoryGuildLike | undefined> {
+  // Guilds live on `client.guilds`, not in the channel cache.
+  const guilds = (current as unknown as { guilds?: { cache?: { get(id: string): unknown }; fetch?(id: string): Promise<unknown> } }).guilds;
+  const fromCache = guilds?.cache?.get(guildId);
+  if (fromCache !== undefined) return historyGuild(fromCache);
+  const fetchGuild = guilds?.fetch;
+  if (typeof fetchGuild !== "function") return undefined;
+  try {
+    return historyGuild(await fetchGuild.call(guilds, guildId));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Discord ids encode their creation time; use it as an exclusive page cursor for `until`. */
+export function discordSnowflakeAt(ms: number): string {
+  const epoch = 1_420_070_400_000n;
+  const value = BigInt(Math.max(0, Math.floor(ms)));
+  return ((value - epoch < 0n ? 0n : value - epoch) << 22n).toString();
+}
+
+function historyMessageTimestamp(message: HistoryRawMessageLike): number | undefined {
+  if (typeof message.createdTimestamp === "number" && Number.isFinite(message.createdTimestamp)) {
+    return message.createdTimestamp;
+  }
+  const created = message.createdAt;
+  if (created instanceof Date && Number.isFinite(created.getTime())) return created.getTime();
+  return undefined;
+}
+
+function historyAttachmentList(message: HistoryRawMessageLike): HistoryAttachmentLike[] {
+  const attachments = message.attachments;
+  if (attachments === undefined) return [];
+  if (typeof attachments.values === "function") return [...attachments.values()];
+  if (Array.isArray(attachments)) return attachments as HistoryAttachmentLike[];
+  return [];
+}
+
+/**
+ * Read one source's messages inside the window, newest page first, bounded by the per-source limit.
+ * Reports a source-limit warning when the cap stopped a read that may have older in-window messages.
+ */
+async function readHistorySource(
+  d: DiscordModule,
+  source: HistoryChannelLike,
+  parent: HistoryChannelLike | undefined,
+  query: DiscordHistoryQuery,
+  budget: number,
+): Promise<{ messages: DiscordHistoryMessage[]; warning: boolean }> {
+  const messages = source.messages;
+  if (messages === undefined) return { messages: [], warning: false };
+  const cap = Math.max(0, Math.min(query.perSourceLimit, budget));
+  if (cap === 0) return { messages: [], warning: false };
+  const collected: HistoryMessageRow[] = [];
+  let before = query.untilMs === undefined ? undefined : discordSnowflakeAt(query.untilMs);
+  let capReached = false;
+  for (;;) {
+    const remaining = cap - collected.length;
+    if (remaining <= 0) {
+      capReached = true;
+      break;
+    }
+    const pageLimit = Math.min(100, remaining);
+    let page: { readonly size?: number; values(): IterableIterator<HistoryRawMessageLike> };
+    try {
+      page = await messages.fetch({ limit: pageLimit, ...(before === undefined ? {} : { before }) });
+    } catch {
+      return { messages: collected.map((row) => row.message), warning: false };
+    }
+    const rows = [...page.values()];
+    if (rows.length === 0) break;
+    let crossedSince = false;
+    for (const row of rows) {
+      const timestamp = historyMessageTimestamp(row);
+      if (timestamp === undefined) continue;
+      if (query.untilMs !== undefined && timestamp >= query.untilMs) continue;
+      if (query.sinceMs !== undefined && timestamp < query.sinceMs) {
+        crossedSince = true;
+        break;
+      }
+      collected.push({ message: serializeHistoryMessage(d, row, source, parent), timestamp });
+    }
+    if (crossedSince) break;
+    // Discord pages newest-first; the oldest row in this page becomes the next exclusive cursor.
+    const oldest = rows[rows.length - 1];
+    if (oldest === undefined || oldest.id === before) break;
+    before = oldest.id;
+    if (rows.length < pageLimit) break;
+  }
+  collected.sort((left, right) => left.timestamp - right.timestamp || compareSnowflake(left.message.messageId, right.message.messageId));
+  return { messages: collected.map((row) => row.message), warning: capReached && collected.length >= cap };
+}
+
+type HistoryMessageRow = { readonly message: DiscordHistoryMessage; readonly timestamp: number };
+
+function compareSnowflake(left: string, right: string): number {
+  if (left === right) return 0;
+  return BigInt(left.length === 0 ? "0" : left) < BigInt(right.length === 0 ? "0" : right) ? -1 : 1;
+}
+
+function serializeHistoryMessage(
+  d: DiscordModule,
+  message: HistoryRawMessageLike,
+  source: HistoryChannelLike,
+  parent: HistoryChannelLike | undefined,
+): DiscordHistoryMessage {
+  const author = message.author ?? {};
+  const attachments = historyAttachmentList(message);
+  const referenceId = message.reference?.messageId;
+  const typeName = typeof message.type === "number"
+    ? (d.MessageType as unknown as Record<number, string>)[message.type] ?? String(message.type)
+    : "unknown";
+  return {
+    messageId: message.id,
+    channelId: isThreadChannel(source) ? (parent?.id ?? null) : source.id,
+    channelName: isThreadChannel(source) ? (parent?.name ?? null) : (source.name ?? null),
+    threadId: isThreadChannel(source) ? source.id : null,
+    threadName: isThreadChannel(source) ? (source.name ?? null) : null,
+    authorId: author.id ?? "",
+    authorName: message.member?.displayName ?? author.displayName ?? author.username ?? author.id ?? "",
+    timestampMs: historyMessageTimestamp(message) ?? null,
+    messageType: typeName,
+    content: message.content ?? "",
+    replyToId: typeof referenceId === "string" && referenceId !== "" ? referenceId : null,
+    attachments: attachments.slice(0, 10).map((attachment) => ({
+      filename: attachment.name ?? attachment.filename ?? "(unnamed)",
+      url: attachment.url ?? null,
+    })),
+    embeds: (message.embeds ?? []).slice(0, 10).map((embed) => ({
+      type: embed.type ?? null,
+      title: embed.title ?? null,
+      url: embed.url ?? null,
+    })),
+  };
+}
+
+/** `#name`, case-insensitive, or `category/name`; ambiguity and absence are one fixed refusal. */
+async function findHistoryChannelByName(
+  guild: HistoryGuildLike,
+  wanted: string,
+): Promise<HistoryChannelLike | "none" | "ambiguous"> {
+  // `guild.channels.cache` is a Collection; `values()` is what this function needs.
+  const needle = wanted.trim().replace(/^#+/u, "").trim().toLowerCase();
+  if (needle === "") return "none";
+  const cache = guild.channels?.cache;
+  if (cache === undefined || typeof cache.values !== "function") return "none";
+  const lastSegment = needle.includes("/") ? needle.slice(needle.lastIndexOf("/") + 1) : needle;
+  const matches: HistoryChannelLike[] = [];
+  for (const value of cache.values()) {
+    const channel = historyChannel(value);
+    if (channel === undefined) continue;
+    const name = (channel.name ?? "").toLowerCase();
+    if (name === "") continue;
+    const parent = channel.parent?.name?.toLowerCase();
+    const display = parent === undefined ? name : `${parent}/${name}`;
+    if (needle === name || needle === display || lastSegment === name) matches.push(channel);
+  }
+  if (matches.length === 0) return "none";
+  return matches.length === 1 ? matches[0]! : "ambiguous";
+}
+
+/** Sources of one selected channel: itself, its active threads and optionally archived threads/posts. */
+async function collectHistorySources(
+  d: DiscordModule,
+  guild: HistoryGuildLike,
+  selected: HistoryChannelLike,
+  query: DiscordHistoryQuery,
+  viewer: unknown,
+  bot: unknown,
+): Promise<{ sources: { source: HistoryChannelLike; parent: HistoryChannelLike | undefined }[]; skipped: number; warnings: DiscordHistoryWarning[] }> {
+  const sources: { source: HistoryChannelLike; parent: HistoryChannelLike | undefined }[] = [];
+  const warnings: DiscordHistoryWarning[] = [];
+  let skipped = 0;
+  const seen = new Set<string>();
+  const allowed = (channel: HistoryChannelLike): boolean => {
+    if (query.allowChannels.length === 0) return true;
+    const ids = new Set<string>([channel.id]);
+    const parentId = channelParentId(channel);
+    if (parentId !== undefined) ids.add(parentId);
+    return query.allowChannels.some((id) => ids.has(id));
+  };
+  const tryAdd = async (source: HistoryChannelLike, parent: HistoryChannelLike | undefined): Promise<void> => {
+    if (seen.has(source.id)) return;
+    seen.add(source.id);
+    if (!allowed(source)) {
+      skipped += 1;
+      return;
+    }
+    if (!canReadSource(d, source, viewer, bot)) {
+      skipped += 1;
+      return;
+    }
+    if (isPrivateThread(d, source)) {
+      const viewerMember = await privateThreadMember(source, query.viewerId, true);
+      const botMember = await privateThreadMember(source, (bot as { id?: string })?.id ?? "", false);
+      // Unknown or false membership fails closed: a private thread is never read on a guess.
+      if (viewerMember !== true || botMember !== true) {
+        skipped += 1;
+        return;
+      }
+    }
+    sources.push({ source, parent });
+  };
+  await tryAdd(selected, isThreadChannel(selected) ? selected.parent ?? undefined : undefined);
+  if (query.includeThreads && !isThreadChannel(selected)) {
+    // Active threads are listed once for the guild and filtered to this parent; forum posts live in
+    // the forum's own thread collection.
+    const forumPosts = selected.threads?.cache;
+    if (forumPosts !== undefined && typeof forumPosts.values === "function") {
+      for (const value of forumPosts.values()) {
+        const thread = historyChannel(value);
+        if (thread !== undefined) await tryAdd(thread, selected);
+      }
+    }
+    const fetchActive = guild.channels?.fetchActiveThreads;
+    if (typeof fetchActive === "function") {
+      try {
+        const active = await fetchActive.call(guild.channels);
+        for (const value of active.threads?.values() ?? []) {
+          const thread = historyChannel(value);
+          if (thread === undefined || channelParentId(thread) !== selected.id) continue;
+          await tryAdd(thread, selected);
+        }
+      } catch {
+        warnings.push({ code: "active-threads-unavailable", sourceId: selected.id });
+      }
+    }
+  }
+  if (query.includeArchivedThreads) {
+    const threads = selected.threads;
+    if (threads !== undefined && typeof threads.fetchArchived === "function") {
+      for (const type of ["public", "private"] as const) {
+        try {
+          const archived = await threads.fetchArchived({ type, limit: query.archivedThreadLimit });
+          for (const value of archived.threads?.values() ?? []) {
+            const thread = historyChannel(value);
+            if (thread !== undefined) await tryAdd(thread, selected);
+          }
+        } catch {
+          warnings.push({ code: "archived-threads-unavailable", sourceId: selected.id });
+        }
+      }
+    }
+  }
+  return { sources, skipped, warnings };
+}
+
+async function readHistory(
+  d: DiscordModule,
+  current: DiscordClientLike,
+  botId: string,
+  query: DiscordHistoryQuery,
+): Promise<DiscordHistoryRead> {
+  if (query.sessionMode === "dm") {
+    const dm = historyChannel(await resolveChannel(current, query.sessionChannelId));
+    if (dm === undefined || !isDmChannel(dm)) return { ok: false, refusal: "forbidden" };
+    const read = await readHistorySource(d, dm, undefined, query, query.limit);
+    return {
+      ok: true,
+      snapshot: {
+        guild: { id: null, name: "Direct message" },
+        channel: { id: dm.id, name: dm.name ?? null },
+        mode: "dm",
+        messages: read.messages,
+        sourcesScanned: 1,
+        sourcesSkipped: 0,
+        omittedMessages: 0,
+        warnings: read.warning ? [{ code: "source-limit-reached", sourceId: dm.id }] : [],
+      },
+    };
+  }
+  if (query.guildId === null) return { ok: false, refusal: "guild-unavailable" };
+  const guild = await resolveHistoryGuild(current, query.guildId);
+  if (guild === undefined) return { ok: false, refusal: "guild-unavailable" };
+  const members = guild.members;
+  const viewer = await resolveHistoryMember(members, query.viewerId);
+  const bot = members?.me ?? await resolveHistoryMember(members, botId);
+  if (bot === undefined || bot === null) return { ok: false, refusal: "guild-unavailable" };
+  // A sender who is no longer a guild member has no Discord permissions to verify: fail closed.
+  if (viewer === undefined) return { ok: false, refusal: "forbidden" };
+
+  let selected: HistoryChannelLike | undefined;
+  const explicit = query.channelId !== undefined || query.channelName !== undefined;
+  if (query.channelId !== undefined) {
+    selected = historyChannel(await resolveChannel(current, query.channelId));
+  } else if (query.channelName !== undefined) {
+    const byName = await findHistoryChannelByName(guild, query.channelName);
+    if (byName === "none" || byName === "ambiguous") return { ok: false, refusal: "not-found" };
+    selected = byName;
+  } else {
+    selected = historyChannel(await resolveChannel(current, query.sessionChannelId));
+  }
+  if (selected === undefined || channelGuildId(selected) !== query.guildId) {
+    return { ok: false, refusal: explicit ? "not-found" : "forbidden" };
+  }
+  // An explicit selection must itself be readable; otherwise the generic refusal keeps the reason private.
+  const { sources, skipped, warnings } = await collectHistorySources(d, guild, selected, query, viewer, bot);
+  if (sources.length === 0) {
+    return { ok: false, refusal: skipped > 0 || explicit ? "forbidden" : "not-found" };
+  }
+  const messages: DiscordHistoryMessage[] = [];
+  let scanned = 0;
+  for (const { source, parent } of sources) {
+      if (scanned >= DISCORD_HISTORY_LIMITS.maxSources || messages.length >= query.limit) break;
+    const budget = query.limit - messages.length;
+    if (budget <= 0) break;
+    const read = await readHistorySource(d, source, parent, query, budget);
+    scanned += 1;
+    if (read.warning) warnings.push({ code: "source-limit-reached", sourceId: source.id });
+    messages.push(...read.messages);
+  }
+  messages.sort((left, right) =>
+    (left.timestampMs ?? 0) - (right.timestampMs ?? 0) || compareSnowflake(left.messageId, right.messageId));
+  const omitted = Math.max(0, messages.length - query.limit);
+  const kept = omitted === 0 ? messages : messages.slice(0, query.limit);
+  return {
+    ok: true,
+    snapshot: {
+      guild: { id: guild.id, name: guild.name },
+      channel: { id: selected.id, name: selected.name ?? null },
+      mode: isThreadChannel(selected) ? "thread" : "channel",
+      messages: kept,
+      sourcesScanned: scanned,
+      sourcesSkipped: skipped,
+      omittedMessages: omitted,
+      warnings,
+    },
+  };
 }
