@@ -851,7 +851,7 @@ after a reopen.
 The adapter also consumes the durable, channel-neutral cron outbox
 (`nanobot.cron.deliveries` in the origin chat conversation). A normal settlement, isolated or
 origin, writes the text to send there in the same terminal commit as its outcome unless successful
-delivery is suppressed by `silent` or an exact `[SILENT]` answer: the committed
+delivery is suppressed by the job's `silent` setting: the committed
 final answer, or fixed sanitized notice text for a failure or empty answer; no model turn is
 rerun to resend.
 
@@ -898,8 +898,9 @@ becomes `unknown` and is never auto-resent; an explicit rejection becomes `faile
 pre-connect outcomes stay pending for a later scan. Every normal settlement is queued unless
 suppressed: a successful answer's committed text, or fixed notice text for a run error or an empty
 answer. A `silent` job suppresses every successful result, including the empty-answer notice, while
-a failed run still queues its notice; an exact trimmed `[SILENT]` successful answer suppresses only
-that occurrence in either mode and stays in the run's conversation. A notice names only the job id
+a failed run still queues its notice; nothing else suppresses a successful delivery, so a scheduled
+run cannot withhold its own message. An answer that is only the retired `[SILENT]` marker counts as
+unusable and is replaced by the empty-result notice; the answer stays in the run's conversation. A notice names only the job id
 and occurrence instant and asks the owner to list scheduled jobs; no
 provider error, job message or model text is copied. Cancellations, superseded, fenced and
 missing-job runs remain silent externally and are visible through cron `lastOutcome`/`list`. If the channel is

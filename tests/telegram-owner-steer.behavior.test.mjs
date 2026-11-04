@@ -800,7 +800,7 @@ test('a failed shared turn reports its fixed notice for every message it consume
  * behind it instead of joining it: the scheduled answer is delivered once by the durable outbox, the
  * owner message is answered once by its own run, and neither delivery is dropped or duplicated.
  */
-async function withOriginRun(label, scheduledAnswer, body) {
+async function withOriginRun(label, scheduledAnswer, body, options = {}) {
   const store = await syntheticStore(label, { followUpMode: 'steer', cron: true });
   const origin = `telegram:${BOT_ID}:chat:${CHAT_ID}`;
   const scheduledMessage = 'deliver the origin reminder';
@@ -824,6 +824,7 @@ async function withOriginRun(label, scheduledAnswer, body) {
           message: scheduledMessage,
           name: 'origin reminder',
           isolated: false,
+          ...(options.silent === true ? { silent: true } : {}),
           at: new Date(Date.now() + 1_500).toISOString(),
         }, { id: 'origin-cron-add' }),
       ], { stopReason: 'toolUse' });
@@ -890,13 +891,13 @@ test('an owner message admitted during an origin-mode run queues and its answer 
   });
 });
 
-test('a [SILENT] scheduled occurrence stays silent while the queued owner message is still answered', { timeout: 40_000 }, async () => {
-  await withOriginRun('cron-origin-silent', '[SILENT]', async ({ store, transport, origin }) => {
-    assert.equal(transport.rich.filter((entry) => entry.text.includes('[SILENT]')).length, 0);
+test('a silent scheduled occurrence stays silent while the queued owner message is still answered', { timeout: 40_000 }, async () => {
+  await withOriginRun('cron-origin-silent', 'SCHEDULED-SILENT-RESULT', async ({ store, transport, origin }) => {
+    assert.equal(transport.rich.filter((entry) => entry.text.includes('SCHEDULED-SILENT-RESULT')).length, 0);
     assert.equal(transport.rich.filter((entry) => entry.text.includes('OWNER-OWN-ANSWER')).length, 1);
     const records = await store.gateway.cronOutbox.list(origin, context);
     assert.equal(records.length, 0, 'a silent occurrence queues no scheduled delivery');
-  });
+  }, { silent: true });
 });
 
 /** The chat's first cron job, as the durable job document records it. */

@@ -276,10 +276,13 @@ edits need restart only; unit edits additionally need daemon-reload.
   with no new conversation and no cron-placed reset. Runs sharing a conversation
   never interleave; the execution task stays separate from the conversation, so
   cancelling a run retires its authority and stops its work without deleting
-  history. A job's persistent `silent` setting, or an exact trimmed `[SILENT]`
-  successful final answer, suppresses that occurrence's automatic channel
-  delivery — never the run, and never a failure notice; the marker applies only
-  to a scheduled run, not an ordinary chat reply. The owner's terminal has a thin
+  history. A job's persistent `silent` setting is the only way an occurrence's
+  automatic channel delivery is suppressed, and never its run or a failure notice:
+  a scheduled run is offered no per-occurrence opt-out, so a reminder cannot be
+  silenced by its own answer. A non-silent successful answer is delivered; an
+  empty answer, or one that is only the retired `[SILENT]` marker, queues the fixed
+  empty-result notice instead. The marker has no meaning in an ordinary chat reply.
+  The owner's terminal has a thin
   scheduling console (`durable-nanobot cron create|list|show|cancel`) that
   composes the same foundation over the private local socket: creation needs an
   explicit request key, its origin and owner are resolved from current mapped

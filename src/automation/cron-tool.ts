@@ -192,9 +192,9 @@ export function createCronTool(options: CronToolOptions): CronTool {
       "context. `isolated: false` instead runs the job in this conversation once it is idle. " +
       "Set `silent: true` when a successful run should not be sent to this chat: successes, " +
       "including an empty answer, stay in the run's conversation only, while a failed run still " +
-      "posts a short sanitized notice. A scheduled run can also answer exactly `[SILENT]` to " +
-      "suppress only that occurrence's delivery in either mode; the marker has no meaning in an " +
-      "ordinary chat reply. " +
+      "posts a short sanitized notice. A job that is not silent always sends its committed final " +
+      "answer, so write the message with the reminder or report you expect back, and answer with " +
+      "that text when it fires. " +
       "Scheduled runs inherit this conversation's enabled tools; they never " +
       "gain more. `intent: \"digest\"` schedules one bounded memory-digestion run instead of a model " +
       "turn; it needs read/write/edit authority in this conversation and reports through an internal " +
@@ -252,8 +252,8 @@ export function createCronTool(options: CronToolOptions): CronTool {
       silent: Type.Optional(Type.Boolean({
         description:
           "add: true suppresses this job's successful automatic delivery to the chat, including an " +
-          "empty answer; a failed run still posts a sanitized notice. Default false. A scheduled " +
-          "run's exact `[SILENT]` answer suppresses only that occurrence in either mode.",
+          "empty answer; a failed run still posts a sanitized notice. Default false, which always " +
+          "delivers the run's committed answer (or a fixed notice when it produced none).",
       })),
       job_id: Type.Optional(Type.String({
         description: "remove: the job ID from `list`.",
