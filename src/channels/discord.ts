@@ -475,7 +475,8 @@ export async function runDiscord(
     await mutateState((doc) => {
       doc.pending = doc.pending.filter((entry) => entry.key !== key);
       doc.controls = doc.controls.filter((entry) =>
-        !(entry.key === key && (entry.status === "unconfirmed" || entry.status === "refused")));
+        !((entry.key === key || `unconfirmed:${entry.key}` === key) &&
+          (entry.status === "unconfirmed" || entry.status === "refused")));
     }, cleanupContext);
   };
 
@@ -1591,42 +1592,48 @@ export async function runDiscord(
         "Previous command pending. This command wasn't started; retry later.");
       return;
     }
-    if (state.controls.filter((entry) => entry.status === "admitted" || entry.status === "unconfirmed").length >=
-        MAX_UNRESOLVED_CONTROLS) {
+    if (pruneControls(state.controls, state.pending)
+      .filter((entry) => entry.status === "admitted" || entry.status === "unconfirmed").length >= MAX_UNRESOLVED_CONTROLS) {
       await admitNotice(target.key, target,
         `Too many control commands are still unconfirmed (limit ${MAX_UNRESOLVED_CONTROLS}); this /${command} was not ` +
         "started and was not sent to the assistant. Wait for them to finish or restart the adapter.");
       return;
     }
     controlPending.add(channelId);
-    await mutateState((doc) => {
-      if (!doc.controls.some((entry) => entry.key === target.key)) {
-        doc.controls = pruneControls([
-          ...doc.controls,
-          {
+    try {
+      await mutateState((doc) => {
+        if (!doc.controls.some((entry) => entry.key === target.key)) {
+          doc.controls = pruneControls([
+            ...doc.controls,
+            {
+              key: target.key,
+              command,
+              status: "admitted" as const,
+              channelId,
+              senderId: target.senderId,
+            },
+          ], doc.pending);
+        }
+        if (!doc.pending.some((entry) => entry.key === target.key)) {
+          if (doc.pending.length >= MAX_ADMITTED) throw new Error("Discord durable output queue is full");
+          doc.pending.push({
             key: target.key,
-            command,
-            status: "admitted" as const,
             channelId,
+            sessionKey: target.sessionKey,
             senderId: target.senderId,
-          },
-        ], doc.pending);
-      }
-      if (!doc.pending.some((entry) => entry.key === target.key)) {
-        if (doc.pending.length >= MAX_ADMITTED) throw new Error("Discord durable output queue is full");
-        doc.pending.push({
-          key: target.key,
-          channelId,
-          sessionKey: target.sessionKey,
-          senderId: target.senderId,
-          text: CONTROL_ACK[command],
-          admittedAtMs: Date.now(),
-          nextChunkIndex: 0,
-          notice: true,
-          hold: true,
-        });
-      }
-    });
+            text: CONTROL_ACK[command],
+            admittedAtMs: Date.now(),
+            nextChunkIndex: 0,
+            notice: true,
+            hold: true,
+          });
+        }
+      });
+    } catch (error) {
+      // No control task exists to release this gate when admission itself fails.
+      controlPending.delete(channelId);
+      throw error;
+    }
     const admittedAtMs = state.pending.find((entry) => entry.key === target.key)?.admittedAtMs ?? Date.now();
     const record: DeferredControl = {
       key: target.key,
@@ -2197,11 +2204,13 @@ export async function runDiscord(
     chunk: string,
     index: number,
   ): Promise<"sent" | "retry" | "stop"> => {
+    let requestStarted = false;
     try {
       await updateScheduled(sessionKey, recordId, (entry) => {
         entry.status = "sending";
         entry.sendIntent = { text: chunk, chunkIndex: index, startedAt: Date.now() };
       });
+      requestStarted = true;
       await transport.send({ channelId, text: chunk });
       await updateScheduled(sessionKey, recordId, (entry) => {
         entry.status = "pending";
@@ -2211,6 +2220,15 @@ export async function runDiscord(
       }, cleanupContext);
       return "sent";
     } catch (error) {
+      if (!requestStarted) {
+        // A failed/aborted intent commit made no external request. Do not
+        // quarantine it as an ambiguous Discord send; keep it retryable.
+        await clearScheduledIntent(sessionKey, recordId).catch(async (clearError: unknown) => {
+          await reportOutboxFault(sessionKey, outboxFaultMessage(clearError));
+        });
+        if (!signal?.aborted) await reportOutboxFault(sessionKey, outboxFaultMessage(error));
+        return "stop";
+      }
       const classified = classifyDiscordError(error);
       if (classified.outcome === "unknown") {
         await updateScheduled(sessionKey, recordId, (entry) => {
@@ -2635,7 +2653,8 @@ function pruneControls(
 ): DiscordControlRecord[] {
   const totalApplied = controls.filter((entry) => entry.status === "applied").length;
   let drop = Math.max(0, totalApplied - MAX_UNRESOLVED_CONTROLS);
-  const reported = new Set(pending.filter((item) => item.notice === true).map((item) => item.key));
+  const reported = new Set(pending.filter((item) => item.notice === true).flatMap((item) =>
+    item.key.startsWith("unconfirmed:") ? [item.key, item.key.slice("unconfirmed:".length)] : [item.key]));
   return controls.filter((entry) => {
     if ((entry.status === "unconfirmed" || entry.status === "refused") && !reported.has(entry.key)) return false;
     if (entry.status !== "applied" || drop === 0) return true;

@@ -30,9 +30,15 @@ not copied here; this file is the Discord channel's own work order and log.
       bound, per-delivery feedback cleanup, injected-client transport mapping checks
 - [ ] Live bot login, guild/thread/DM round trip, attachment download and rate-limit
       behavior (needs a real bot token and a supervised deployment)
-- [ ] Decide whether a model-facing Discord action/history tool is wanted (unported)
+- [x] Owner decided to port bounded read-only Discord history.
+- [ ] Implement and independently review history with current mapped-chat/sender/channel authority checks.
+- [ ] Resolve remaining review findings: startup ingress window and rate-limit backoff; reconcile AGENTS invariants.
 
 ## Log
+
+### 2026-11-03 — coordinator fixes and owner history decision
+
+Fresh re-review verified previous high findings fixed but found quoted third-party attribution injection and smaller lifecycle edges. Coordinator escaped quoted-body bracket/quote syntax, marked it untrusted, stripped label brackets (including filenames/referenced authors), released failed-admission control gates, corrected unconfirmed-notice/control identity pruning, and distinguished pre-request scheduled intent failures from ambiguous external sends. Documented frozen-preview ambiguity and immediate 4xx hold. Updated affected existing expectations. Typecheck/build and all55 Discord checks passed, plus temporary adversarial attribution output checks and diff --check. These changes await fresh independent review; nothing waived. Owner explicitly approved a bounded read-only history port. Existing implementer will continue that substantive feature and resolve startup/backoff transport issues without merging email.
 
 ### 2026-11-03
 

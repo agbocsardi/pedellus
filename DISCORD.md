@@ -95,7 +95,9 @@ unauthorized when the original sender has left `allowFrom`.
 
 * Inputs are attributed as `[DisplayName (id=<snowflake>)]: text`, with mention
   tokens resolved to names when the event carried them. A reply contributes one
-  bounded quoted line from the message it answers, and up to four attachments
+  bounded quoted line explicitly labeled as untrusted data, never owner
+  instructions. Names strip attribution delimiters, and quoted text escapes
+  brackets and quotes so it cannot forge a host speaker prefix. Up to four attachments
   from that message are stored with the same limits and labeled
   `[from replied message by <author>]`, so "reply and tag" sees the quoted image.
   One admitted input is bounded at 16 000 characters; a longer body keeps its
@@ -110,10 +112,12 @@ unauthorized when the original sender has left `allowFrom`.
 * A write-ahead intent is committed before every external send **and edit**, and
   cleared only with that request's result, so an accepted request that crashes
   before its local commit is quarantined as ambiguous and never repeated. A proven refusal
-  (a 4xx rejection) is held for inspection after the retry bound; a proven
+  (a 4xx rejection) is held for inspection immediately; a proven
   non-send (a 429 cooldown) is retried on the adapter's own scan cadence; an
   ambiguous outcome (dropped connection, timeout, 5xx) is quarantined as
-  `unknown` and never resent, including after a restart.
+  `unknown` and never resent, including after a restart. An ambiguous preview
+  edit also holds the whole answer: the owner may see only a frozen preview,
+  not a delivered final answer.
 * Completed cron results and startup interruption notices are read from the
   gateway's channel-neutral durable outbox, delivered chunk by chunk with the
   same intent protocol, and marked `delivered`, `failed`, `withheld` or
