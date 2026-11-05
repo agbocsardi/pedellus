@@ -198,6 +198,8 @@ export type TelegramPendingDelivery = {
   sessionKey: string;
   senderId: string;
   text: string;
+  /** Reaction-change inputs are user actions but do not need an empty-answer notice. */
+  reactionChange?: true;
   messageId?: number;
   lastText?: string;
   nextChunkIndex: number;
@@ -1683,13 +1685,17 @@ export async function runTelegram(
       const answer = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), adapterContext);
       const message = answer?.model?.[0] as AssistantMessage | undefined;
       const answerText = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "";
-      const text = answerText.trim() === "" ? "The assistant returned no text response." : answerText;
       // Inputs the run consumed settle with this same committed answer, so one of them owns its single reply.
       const settlement = { answer: settled.answer } as const;
-      const role = await sharedDeliveryRole(conversation, item, settlement);
+      const group = await sharedDeliveryGroup(conversation.id, item, settlement);
+      const role: DeliveryRole = !group.present ? "retired" :
+        group.owner === undefined || group.owner === item.updateId ? "owner" : "sibling";
+      const text = answerText.trim() === ""
+        ? group.hasOrdinaryInput ? "The assistant returned no text response." : undefined
+        : answerText;
       await stopPreviewWatch();
       if (role === "owner") {
-        await flushFinal(text);
+        if (text !== undefined) await flushFinal(text);
         await retireSharedDelivery(conversation, item, settlement);
       } else if (role === "sibling") {
         await forget(item.updateId);
@@ -1948,41 +1954,29 @@ export async function runTelegram(
     conversationId: Conversation["id"],
     current: PendingReply,
     settlement: SharedAnswer,
-  ): Promise<{ readonly updateIds: number[]; readonly owner: number | undefined; readonly present: boolean }> => {
+  ): Promise<{ readonly updateIds: number[]; readonly owner: number | undefined; readonly present: boolean; readonly hasOrdinaryInput: boolean }> => {
     const members: { updateId: number; submissionId: number }[] = [];
     let present = false;
+    let hasOrdinaryInput = false;
     // A read-only commit: committed pending membership and submissions are the whole identity.
     await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
       members.length = 0;
       present = false;
+      hasOrdinaryInput = false;
       for (const candidate of doc.pending) {
         if (candidate.updateId === current.updateId) present = true;
         if (candidate.sessionKey !== current.sessionKey) continue;
         const record = await tx.submissionByRequest(conversationId, requestIdFor(identity, candidate.updateId));
         if (record !== undefined && answeredTogether(record, settlement)) {
           members.push({ updateId: candidate.updateId, submissionId: record.id });
+          if (candidate.reactionChange !== true) hasOrdinaryInput = true;
         }
       }
       return undefined;
     }, adapterContext);
     members.sort((left, right) => left.submissionId - right.submissionId || left.updateId - right.updateId);
-    return { updateIds: members.map((member) => member.updateId), owner: members[0]?.updateId, present };
-  };
-
-  /**
-   * Whether this admitted message delivers its shared answer or stays silent behind its owner. A record the
-   * owner already retired resolves `retired`, so an in-flight observer never sends again.
-   */
-  const sharedDeliveryRole = async (
-    conversation: Conversation,
-    current: PendingReply,
-    settlement: SharedAnswer,
-  ): Promise<DeliveryRole> => {
-    const group = await sharedDeliveryGroup(conversation.id, current, settlement);
-    if (!group.present) return "retired";
-    if (group.owner === undefined || group.owner === current.updateId) return "owner";
-    return "sibling";
+    return { updateIds: members.map((member) => member.updateId), owner: members[0]?.updateId, present, hasOrdinaryInput };
   };
 
   /**
@@ -2569,6 +2563,7 @@ export async function runTelegram(
           sessionKey,
           senderId,
           text,
+          reactionChange: true,
           ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
         });
       }
