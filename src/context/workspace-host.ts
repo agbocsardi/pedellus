@@ -19,8 +19,8 @@ export type WorkspaceContextHostConfig = Pick<PortConfig, "workspace" | "workspa
  * `workspaceContext` is absent by default and yields `{}`, so the gateway
  * installs no context extension. When present, every session key receives the
  * same fixed selection: the explicit `workspace` root for the fixed bootstrap
- * files plus the explicitly named memory files. Only an explicit
- * `workspaceContext.skills` section adds Markdown skill discovery, from
+ * files, explicitly named memory files and all Markdown beneath `memory/system/`.
+ * Only an explicit `workspaceContext.skills` section adds Markdown skill discovery, from
  * `<workspace>/skills` and, when configured, an explicit builtin skills root.
  * Only `workspaceContext.memoryManifest: true` adds the `# Memory Tree`
  * manifest after those memory files; topic bodies stay on disk for the granted
@@ -72,7 +72,7 @@ export function workspaceContextGatewayOptions(
         memoryManifest
           ? loadMemoryContext({
               workspaceRoot: config.workspace,
-              loadedFiles: injectedMemoryFiles(snapshot, workspace.memoryFiles ?? []),
+              loadedFiles: injectedMemoryFiles(snapshot),
             })
           : undefined,
       ]);
@@ -90,18 +90,13 @@ export function workspaceContextGatewayOptions(
 }
 
 /**
- * Only configured files present in the snapshot were injected. An empty file is
- * omitted by the workspace loader, so the manifest must not mark it `loaded`.
+ * Include explicit and discovered files actually injected, never omitted empty files.
  */
-function injectedMemoryFiles(
-  snapshot: WorkspaceContextSnapshot,
-  memoryFiles: readonly string[],
-): readonly string[] {
-  const injected = new Set((snapshot.memory ?? []).map((document) => document.source));
-  return Object.freeze(memoryFiles.filter((path) => injected.has(`workspace:${path}`)));
+function injectedMemoryFiles(snapshot: WorkspaceContextSnapshot): readonly string[] {
+  return Object.freeze((snapshot.memory ?? []).map((document) => document.source.slice("workspace:".length)));
 }
 
-/** Append the manifest beside, not instead of, the configured memory documents. */
+/** Append the manifest beside, not instead of, the loaded memory documents. */
 function withMemoryManifest(
   snapshot: WorkspaceContextSnapshot,
   memory: MemoryContextResult | undefined,

@@ -1,11 +1,11 @@
 /**
  * Opt-in workspace snapshot loading for the context extension.
  *
- * The caller names one explicit workspace root and an explicit list of
- * `memory/**\/*.md` files. This module reads only `AGENTS.md`, `SOUL.md`,
- * `USER.md`, and those selected memory files. It never discovers files, reads
- * `~/.nanobot` or environment variables, delegates to tools, or calls a model
- * provider. It does not install itself in the runtime; the host wires the
+ * The caller names one explicit workspace root and optional additional
+ * `memory/**\/*.md` files. This module reads `AGENTS.md`, `SOUL.md`, `USER.md`,
+ * the selected memory files and all Markdown beneath `memory/system/`.
+ * It never reads `~/.nanobot` or environment variables, delegates to tools, or
+ * calls a model provider. It does not install itself in the runtime; the host wires the
  * returned provider into `openGateway` or returns the snapshots directly.
  *
  * Path safety is Linux-only and fails closed elsewhere: directories are pinned
@@ -23,7 +23,7 @@
 import { constants } from "node:fs";
 import type { BigIntStats } from "node:fs";
 import { existsSync } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { lstat, open, opendir } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
@@ -49,6 +49,8 @@ export const WORKSPACE_CONTEXT_LIMITS = Object.freeze({
   maxPathSegmentChars: 64,
   maxPathSegments: 8,
   maxWorkspaceRootChars: 4_096,
+  /** Refuse the whole snapshot rather than partially discover system memory. */
+  maxSystemScannedEntries: 4_096,
 });
 
 /** The only bootstrap files read. Their order is fixed and their labels are deterministic. */
@@ -61,7 +63,8 @@ export interface WorkspaceContextRequest {
   readonly workspaceRoot: string;
   /**
    * Explicit workspace-relative `memory/**\/*.md` files, in output order.
-   * Omitted means no memory; `memory/MEMORY.md` is not discovered implicitly.
+   * All Markdown files beneath `memory/system/` are appended automatically, in path order,
+   * excluding already selected paths. `memory/MEMORY.md` is not discovered implicitly.
    */
   readonly memoryFiles?: readonly string[];
   /**
@@ -84,6 +87,7 @@ export type WorkspaceFileFailureKind =
   | "unreadable"
   | "changed"
   | "encoding"
+  | "bounds"
   | "io";
 
 export class WorkspaceContextInputError extends TypeError {
@@ -558,6 +562,79 @@ function recordDirectory(
   state.directories.set(key, Object.freeze({ segments: Object.freeze([...segments]), stat }));
 }
 
+/** Discover only system memory, through pinned directories, without a partial-result fallback. */
+async function discoverSystemMemory(root: FileHandle, state: LoadState): Promise<readonly string[]> {
+  const paths: string[] = [];
+  let scanned = 0;
+  const scan = async (directory: FileHandle, segments: readonly string[]): Promise<void> => {
+    const source = segments.join("/");
+    recordDirectory(state, segments, await statHandle(directory, source), source);
+    try {
+      // Latin-1 preserves filename bytes; default UTF-8 decoding can alias an
+      // invalid name to a different valid file containing U+FFFD.
+      for await (const entry of await opendir(procFdPath(directory.fd), { encoding: "latin1" })) {
+        if (++scanned > WORKSPACE_CONTEXT_LIMITS.maxSystemScannedEntries) {
+          throw new WorkspaceContextFileError("bounds", "memory/system");
+        }
+        const rawName = Buffer.from(entry.name, "latin1");
+        const name = rawName.toString("utf8");
+        if (!rawName.equals(Buffer.from(name, "utf8"))) throw new WorkspaceContextFileError("encoding", source);
+        // A link could hide an entire subtree, so never silently skip one.
+        if (entry.isSymbolicLink()) throw new WorkspaceContextFileError("symlink", source);
+        if (!entry.isDirectory() && !name.endsWith(".md")) continue;
+        const path = `${source}/${name}`;
+        try {
+          // Every traversed directory must be able to contain a representable note.
+          validatedMemoryPath(entry.isDirectory() ? `${path}/.md` : path);
+        } catch {
+          throw new WorkspaceContextFileError("bounds", source);
+        }
+        if (entry.isDirectory()) {
+          const child = await openPinned(directory, name, DIRECTORY_FLAGS, path);
+          try {
+            await scan(child, [...segments, name]);
+          } finally {
+            await child.close().catch(() => undefined);
+          }
+        } else {
+          paths.push(path);
+        }
+      }
+    } catch (error) {
+      throw fileFailure(error, source);
+    }
+  };
+
+  const rootBefore = await statHandle(root, "workspace-root");
+  let memory: FileHandle;
+  try {
+    memory = await openPinned(root, "memory", DIRECTORY_FLAGS, "memory");
+  } catch (error) {
+    if (!(error instanceof WorkspaceContextFileError) || error.kind !== "missing") throw error;
+    // Observe a directory created after an initially absent memory root too.
+    recordDirectory(state, [], rootBefore, "workspace-root");
+    return paths;
+  }
+  try {
+    recordDirectory(state, ["memory"], await statHandle(memory, "memory"), "memory");
+    let system: FileHandle;
+    try {
+      system = await openPinned(memory, "system", DIRECTORY_FLAGS, "memory/system");
+    } catch (error) {
+      if (!(error instanceof WorkspaceContextFileError) || error.kind !== "missing") throw error;
+      return paths;
+    }
+    try {
+      await scan(system, ["memory", "system"]);
+    } finally {
+      await system.close().catch(() => undefined);
+    }
+  } finally {
+    await memory.close().catch(() => undefined);
+  }
+  return paths.sort();
+}
+
 async function readMemoryFile(root: FileHandle, path: string, state: LoadState): Promise<string> {
   const segments = path.split("/");
   const name = segments[segments.length - 1]!;
@@ -669,11 +746,11 @@ async function verifyWorkspace(
   }
 
   for (const entry of state.directories.values()) {
-    const source = entry.segments.join("/");
+    const source = entry.segments.join("/") || "workspace-root";
     let handle: FileHandle | null = null;
     try {
-      handle = await openRelativeDirectory(root, entry.segments, source);
-      const now = await handle.stat({ bigint: true });
+      handle = entry.segments.length === 0 ? null : await openRelativeDirectory(root, entry.segments, source);
+      const now = await (handle ?? root).stat({ bigint: true });
       if (!sameDirectory(now, entry.stat)) {
         throw new WorkspaceContextFileError("changed", source);
       }
@@ -747,10 +824,15 @@ export async function loadWorkspaceContextSnapshot(
     }
 
     const memories: ContextDocumentSnapshot[] = [];
-    for (const path of memoryFiles) {
+    const appendMemory = async (path: string): Promise<void> => {
       const content = await readMemoryFile(root, path, state);
-      if (content.length === 0) continue;
-      memories.push(frozenDocument(`${WORKSPACE_SOURCE_PREFIX}${path}`, content));
+      if (content.length > 0) memories.push(frozenDocument(`${WORKSPACE_SOURCE_PREFIX}${path}`, content));
+    };
+    // Preserve explicit order and errors before discovering the automatic additions.
+    for (const path of memoryFiles) await appendMemory(path);
+    const selected = new Set(memoryFiles);
+    for (const path of await discoverSystemMemory(root, state)) {
+      if (!selected.has(path)) await appendMemory(path);
     }
     if (memories.length > 0) snapshot.memory = Object.freeze(memories);
 

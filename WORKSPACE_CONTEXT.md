@@ -31,13 +31,16 @@ snapshot provider and `openGateway` installs no context extension.
 - `workspace` is the existing explicit root and is also the bootstrap root.
   Bootstrap selection is fixed: `AGENTS.md`, `SOUL.md`, `USER.md`.
 - `memoryFiles` is an explicit ordered list of `memory/**/*.md` paths and
-  defaults to `[]`. No memory file is discovered. Paths are validated with the
-  loader's rules at config parse time and again before reading.
+  defaults to `[]`. These are additional sources: all `memory/system/**/*.md`
+  files are discovered recursively on every snapshot load, even with an empty list.
+  Explicit files stay in configured order; discovered paths follow in lexical order,
+  with exact path duplicates removed. No new flag is needed. Paths are validated
+  with the loader's rules at config parse time and again before reading.
 - `memoryManifest` is absent or `false` by default. When `true`, each snapshot
   also appends the `# Memory Tree` manifest from
-  [`MEMORY_CONTEXT.md`](./MEMORY_CONTEXT.md); configured `memoryFiles` that
-  were actually injected are its `loaded` entries and every other topic is read
-  on demand with the configured native `read` tool. An empty configured file is
+  [`MEMORY_CONTEXT.md`](./MEMORY_CONTEXT.md); explicit and discovered system files
+  that were actually injected are its `loaded` entries and every other topic is read
+  on demand with the configured native `read` tool. An empty memory file is
   omitted by this loader, so the manifest does not mark it `loaded`. `memoryFiles`
   has no count cap.
 - `skills` is absent by default and adds no discovery. When present,
@@ -50,8 +53,8 @@ snapshot provider and `openGateway` installs no context extension.
   requirement and port-builtin-curation rules.
 - Unknown `workspaceContext`, `workspaceContext.memoryManifest`, or
   `workspaceContext.skills` fields are rejected.
-  There is no bootstrap-file selection, include glob, implicit default memory
-  file, or skill auto-selection.
+  There is no bootstrap-file selection, general include glob, implicit
+  `memory/MEMORY.md`, or skill auto-selection.
 - **Identity is omitted.** The host does not render the Python identity template
   from runtime, platform, channel, workspace, or user values, and this slice has
   no identity config switch. The context extension therefore contributes no
@@ -64,6 +67,9 @@ snapshot provider and `openGateway` installs no context extension.
 - Startup/recovery reloads the config selection for every persisted session
   mapping before resume. Reopening, or an explicit per-session refresh,
   reconstructs workspace context from the current files, not from a cached copy.
+  Idle `/new` also rebuilds it on CLI/Telegram/Discord. Later system files therefore
+  need no list maintenance, but do not appear mid-conversation until one of these
+  boundaries. Ordinary turns do not rescan; no watcher or per-turn reload is installed.
   Refresh is available only for an existing mapped session, rejects a live run,
   and leaves the working snapshot in place if a loader fails; see
   [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md#explicit-refresh-of-one-conversation).
@@ -81,7 +87,11 @@ snapshot provider and `openGateway` installs no context extension.
   from the shared shell policy). The gateway's other environment variables,
   including credentials, never satisfy a `requires.env` gate.
 - This adds no tools, workspace roots, credentials, or provider calls. Tool
-  policy is unchanged.
+  policy is unchanged. Compatibility change: existing context-enabled hosts and
+  direct SDK loader calls now include system Markdown automatically. The same
+  host workspace notes also reach ordinary workers and prepared cron runs, even
+  when a worker executes in a worktree. Review note relevance/privacy and model
+  context size before activation; no stale-note cleanup is performed by the loader.
 - The configured `workspace` path is walked literally by the loader. A root path
   containing a symlink component fails closed even though `openGateway` accepts
   it after `realpath`; use a canonical explicit path when opting in. With a
@@ -124,12 +134,13 @@ gateway/runtime attaches the conversation ID and owns snapshot mapping.
 | `AGENTS.md` | Read from the workspace root if present. |
 | `SOUL.md` | Read from the workspace root if present. |
 | `USER.md` | Read from the workspace root if present. |
-| `memory/**/*.md` | Read only when individually named in `memoryFiles`, in that order. |
+| `memory/system/**/*.md` | Automatically read recursively, appended in lexical path order unless already explicitly selected. |
+| Other `memory/**/*.md` | Read only when individually named in `memoryFiles`, in that order. |
 | `skills/<name>/SKILL.md` | Read only when the explicit `workspaceContext.skills` section is present; see [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md). |
 | `<builtinSkillsRoot>/<name>/SKILL.md` | Read only when `workspaceContext.skills.builtinSkillsRoot` names an existing absolute directory. |
 
 Nothing else is discovered, scanned, or inferred. In particular there is no
-implicit `memory/MEMORY.md`, no `memory/system/` glob, no topic-memory tree, no
+implicit `memory/MEMORY.md`, no topic bodies without explicit selection, no
 skill scan without the explicit `skills` section, and no workspace-wide search. `memoryFiles` entries must be
 literal relative paths under `memory/` that end in `.md`. Any name the filesystem
 accepts is allowed (spaces and non-ASCII included), matching the memory
@@ -155,14 +166,16 @@ descriptor and used for a bounded indexed loop.
 | Situation | Result |
 | --- | --- |
 | Missing `AGENTS.md`/`SOUL.md`/`USER.md` | Omitted; load succeeds. |
-| Empty bootstrap or selected memory file | Omitted; load succeeds. |
+| Missing `memory/` or `memory/system/` | No automatic additions; nothing is created. |
+| Empty bootstrap or memory file | Omitted; load succeeds. |
+| System discovery exceeds 4,096 inspected entries or a locator bound | Rejected (`bounds`), never a partial snapshot. |
 | Missing selected memory file | `WorkspaceContextFileError` (`kind: "missing"`). |
 | File is a symlink | Rejected (`kind: "symlink"`). |
 | File has more than one hard link | Rejected (`kind: "hardlink"`). |
 | Path component symlink or non-directory | Rejected, never followed. |
 | FIFO/socket/device/directory where a file is expected | Rejected (`not-regular`). |
 | Unreadable file/directory | Rejected (`unreadable`). |
-| Invalid UTF-8 | Rejected (`encoding`). |
+| Invalid UTF-8 body or system filename bytes | Rejected (`encoding`); filenames are never lossily decoded. |
 | Invalid root, relative root, `/`, `~/.nanobot`, `/proc`, `/sys`, `/dev` | `WorkspaceContextInputError`. |
 | Observable file change during read | Rejected (`changed`). |
 | Selected file replaced after its read but before return | Rejected (`changed`, file source label). |
@@ -200,7 +213,9 @@ rather than falling back to weaker path checks.
   returning content with stale provenance.
 - Request/identity/memory inputs are read only through own data descriptors;
   revoked Proxies become typed `WorkspaceContextInputError` values.
-- No path, raw OS message, or file content is included in error messages.
+- System discovery enumerates pinned directories, rejects symlink entries, and
+  rechecks even empty directories; unsafe/unrepresentable subtrees fail the load.
+- No absolute path, raw OS message, or file content is included in error messages.
 
 This prevents ordinary symlink and hard-link escapes and detects observable
 file or directory replacement. Residual limits: the `nlink == 1` check does not
@@ -213,14 +228,15 @@ a filesystem that fails to update metadata.
 
 ## Limits
 
-`WORKSPACE_CONTEXT_LIMITS` exposes only label-shape limits: 256 code points per
+`WORKSPACE_CONTEXT_LIMITS` exposes a 4,096-inspected-entry system discovery fence
+(including non-Markdown entries), plus label-shape limits: 256 code points per
 provenance label (identity source is also counted in code points), at most 246
 characters per memory path (so `workspace:` plus the path fits the label bound),
 at most 8 path segments, and at most 64 characters per path segment. UTF-8 is
 decoded with `fatal: true`; a BOM is stripped by the decoder.
 
 There is no content budget. `AGENTS.md`, `SOUL.md`, `USER.md`, explicitly named
-memory files and host-supplied identity are read and returned in full, whatever
+memory files, discovered system Markdown and host-supplied identity are read and returned in full, whatever
 their byte or character size, as in the Python reference. The loader does not
 pre-check whether the renderer would clip anything, because the renderer no
 longer clips: no accepted document can be dropped after this load.
@@ -242,8 +258,8 @@ returned snapshot, and mutating a returned snapshot is rejected.
 
 ## Deliberate omissions from Python parity
 
-This slice maps only the pinned bootstrap files, explicit memory files, explicit
-workspace/builtin skill discovery, and an optional host-rendered identity. It
+This slice maps the pinned bootstrap files, explicit memory files, automatic
+system memory, explicit workspace/builtin skill discovery, and an optional host-rendered identity. It
 does **not** implement or claim parity with:
 
 - `MemoryStore.get_memory_context()` system/legacy paragraph deduplication or
@@ -259,7 +275,7 @@ does **not** implement or claim parity with:
   [`SKILLS_CONTEXT.md`](./SKILLS_CONTEXT.md));
 - Python's runtime/user-message metadata, platform policy, manifest retrieval,
   recent history injection, or tool contract;
-- any filesystem discovery beyond the named files and skill directories, or any
+- any filesystem discovery beyond system memory and explicit skill directories, or any
   default `~/.nanobot` workspace/credential lookup.
 
 The existing context extension remains responsible for rendering,
