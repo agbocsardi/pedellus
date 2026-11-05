@@ -1699,7 +1699,7 @@ export async function runTelegram(
         : answerText;
       await stopPreviewWatch();
       if (role === "owner") {
-        if (text !== undefined) await flushFinal(text);
+        await flushFinal(text ?? "");
         await retireSharedDelivery(conversation, item, settlement);
       } else if (role === "sibling") {
         await forget(item.updateId);
@@ -1758,7 +1758,8 @@ export async function runTelegram(
           await apiCall(api, "deleteMessage", signal, (callSignal) => withChatSendOrder(item.chatId, () =>
             api.deleteMessage(item.chatId, current.messageId!, toGrammySignal(callSignal))), { throttle: outboundThrottle });
         } catch (error) {
-          if (isMessageNotFound(error)) {
+          if (error instanceof TelegramApiError && error.method === "deleteMessage" && error.status === 400 &&
+              error.description === "Bad Request: message to delete not found") {
             // Deletion is already achieved.
           } else {
             if (error instanceof TelegramApiError && error.outcome === "unknown") {
@@ -1771,6 +1772,7 @@ export async function runTelegram(
         await clearPreview(item.updateId);
         current = state.pending.find((entry) => entry.updateId === item.updateId) ?? current;
       }
+      if (text.trim() === "") return;
       const chunks = splitOutboundText(plan === "legacy" ? text.trim() : text, plan);
       for (let index = current.nextChunkIndex; index < chunks.length; index++) {
         const chunk = chunks[index]!;
