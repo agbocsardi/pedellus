@@ -3,7 +3,7 @@
 Date: 2026-10-31 (overnight batch started 2026-10-30). This is a handoff note,
 not a new work order. It records what is usable now, how to turn it on without
 activating anything by accident, what was actually measured, and the limits that
-remain. `2026-10-30_lean-assistant_TODO.md` stays the work-order authority.
+remain. It does not authorize new work.
 
 ## Source identity
 

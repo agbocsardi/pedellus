@@ -1,8 +1,7 @@
 # Parity close: P1–P7 handoff and combined offline acceptance
 
-Date: 2026-10-31. This is a handoff note, not a work order.
-`2026-10-30_lean-assistant_TODO.md` stays the single work-order authority; P6's
-checkbox and any follow-up items belong to the parent. The note records what is
+Date: 2026-10-31. This is a historical handoff note, not a work order.
+The note records what is
 usable now, how to turn each part on without activating anything by accident,
 what was actually measured, and which limits and live gaps remain.
 

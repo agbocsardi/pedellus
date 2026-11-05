@@ -90,8 +90,6 @@ edits need restart only; unit edits additionally need daemon-reload.
   concurrently and never await one another.
   `telegram-rich.ts` owns the rich-message limits, fence-aware splitting and the literal-text
   escaping the adapter uses for host notices.
-- `2026-10-30_lean-assistant_TODO.md` — single current work order:
-  useful memory, scheduled outcomes and understandable recovery before breadth.
 - `plan/` — historical roadmaps and implementation evidence, not a work queue.
 
 ## Invariants worth not breaking

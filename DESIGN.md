@@ -8,9 +8,8 @@ read-only reference; the live fork, deployment and real user data are not
 changed. Nothing here is deployed, and this document does not authorize a
 production cutover. Use Node >= 22.19 and the exact pinned dependencies.
 
-The [lean assistant plan](2026-10-30_lean-assistant_TODO.md) is the current scope
-and work-order authority; [plan/](plan/) preserves historical roadmaps and
-implementation evidence, not a work queue. Out of scope: WebUI/API server,
+Current repository instructions govern new work; [plan/](plan/) preserves
+historical handoffs and implementation evidence, not a work queue. Out of scope: WebUI/API server,
 migration or archival import, MCP, and a custom scheduler. Coding tools run on
 the actual workspace through the guarded host, or through the optional
 direct-workspace Bubblewrap shell.
