@@ -200,6 +200,8 @@ export type TelegramPendingDelivery = {
   text: string;
   /** Reaction-change inputs are user actions but do not need an empty-answer notice. */
   reactionChange?: true;
+  /** Persisted on the shared-answer owner before siblings retire; preserves empty-answer classification. */
+  reactionGroupHasOrdinaryInput?: true;
   messageId?: number;
   lastText?: string;
   nextChunkIndex: number;
@@ -1690,8 +1692,10 @@ export async function runTelegram(
       const group = await sharedDeliveryGroup(conversation.id, item, settlement);
       const role: DeliveryRole = !group.present ? "retired" :
         group.owner === undefined || group.owner === item.updateId ? "owner" : "sibling";
+      const groupOwner = state.pending.find((entry) => entry.updateId === item.updateId) ?? item;
       const text = answerText.trim() === ""
-        ? group.hasOrdinaryInput ? "The assistant returned no text response." : undefined
+        ? (group.hasOrdinaryInput || groupOwner.reactionGroupHasOrdinaryInput === true)
+          ? "The assistant returned no text response." : undefined
         : answerText;
       await stopPreviewWatch();
       if (role === "owner") {
@@ -1747,6 +1751,26 @@ export async function runTelegram(
       }
       // Before rich messages, foreground answers were trimmed before legacy chunking. Preserve
       // that exact input for an already-progressed legacy cursor during upgrade recovery.
+      if (text.trim() === "" && current.messageId !== undefined) {
+        // An empty final must remove a streamed preview. Keep its durable id until deletion is
+        // confirmed: on an ambiguous result recovery retries deletion, where not-found is success.
+        try {
+          await apiCall(api, "deleteMessage", signal, (callSignal) => withChatSendOrder(item.chatId, () =>
+            api.deleteMessage(item.chatId, current.messageId!, toGrammySignal(callSignal))), { throttle: outboundThrottle });
+        } catch (error) {
+          if (isMessageNotFound(error)) {
+            // Deletion is already achieved.
+          } else {
+            if (error instanceof TelegramApiError && error.outcome === "unknown") {
+              await markUnknown(item.updateId, "final");
+              console.warn(`Telegram preview deletion outcome unknown for update ${item.updateId}; inspect the Durable channel-state record.`);
+            }
+            throw error;
+          }
+        }
+        await clearPreview(item.updateId);
+        current = state.pending.find((entry) => entry.updateId === item.updateId) ?? current;
+      }
       const chunks = splitOutboundText(plan === "legacy" ? text.trim() : text, plan);
       for (let index = current.nextChunkIndex; index < chunks.length; index++) {
         const chunk = chunks[index]!;
@@ -1959,7 +1983,7 @@ export async function runTelegram(
     let present = false;
     let hasOrdinaryInput = false;
     // A read-only commit: committed pending membership and submissions are the whole identity.
-    await stateConversation.commit(async (tx) => {
+    state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
       members.length = 0;
       present = false;
@@ -1970,10 +1994,17 @@ export async function runTelegram(
         const record = await tx.submissionByRequest(conversationId, requestIdFor(identity, candidate.updateId));
         if (record !== undefined && answeredTogether(record, settlement)) {
           members.push({ updateId: candidate.updateId, submissionId: record.id });
+          // Legacy records have no reactionChange bit. Treat them conservatively as ordinary input:
+          // this may preserve an empty-answer notice for an old reaction, but never loses one for text.
           if (candidate.reactionChange !== true) hasOrdinaryInput = true;
         }
       }
-      return undefined;
+      // Siblings can finish and retire before the earliest submission observes settlement. Commit the
+      // classification onto that owner while the member set is still present, so crash/reopen keeps it.
+      const owner = members.slice().sort((left, right) => left.submissionId - right.submissionId || left.updateId - right.updateId)[0];
+      const ownerPending = owner && doc.pending.find((entry) => entry.updateId === owner.updateId);
+      if (hasOrdinaryInput && ownerPending) ownerPending.reactionGroupHasOrdinaryInput = true;
+      return copyJson(doc) as unknown as ChannelState;
     }, adapterContext);
     members.sort((left, right) => left.submissionId - right.submissionId || left.updateId - right.updateId);
     return { updateIds: members.map((member) => member.updateId), owner: members[0]?.updateId, present, hasOrdinaryInput };
