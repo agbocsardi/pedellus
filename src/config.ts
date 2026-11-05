@@ -200,10 +200,10 @@ export interface DigestConfig {
 }
 
 export interface WorkspaceContextConfig {
-  /** Explicit workspace-relative `memory/**\/*.md` files, in output order. Defaults to none. */
+  /** Additional memory files in output order; system Markdown is always discovered by the loader. Defaults to []. */
   readonly memoryFiles: readonly string[];
   /**
-   * Opt-in topic memory manifest. The named `memoryFiles` are marked loaded and
+   * Opt-in topic memory manifest. Actually injected explicit and system files are marked loaded and
    * the remaining `memory/**\/*.md` topics are listed for on-demand reads.
    * Absent or false leaves the snapshot unchanged.
    */

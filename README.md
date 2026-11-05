@@ -266,7 +266,8 @@ need a **fresh extension and dedicated registry per Harness/storage**: conversat
 IDs collide across stores. `openGateway` can also accept an opt-in host snapshot
 provider and reconstructs snapshots before resume; it does not load files itself.
 An opt-in [workspace loader](./WORKSPACE_CONTEXT.md) supplies fixed bootstrap files
-and explicitly selected memory files to such a provider; it can also append a
+and explicitly selected memory files, plus all Markdown beneath `memory/system/`,
+to such a provider; it can also append a
 bounded topic-memory manifest for on-demand reads ([MEMORY_CONTEXT.md](./MEMORY_CONTEXT.md));
 model-facing note and conversation recall has a separate three-tool contract
 ([MEMORY_RECALL.md](./MEMORY_RECALL.md)). Skill discovery is also opt-in through

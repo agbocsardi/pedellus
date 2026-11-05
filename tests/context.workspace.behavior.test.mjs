@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdirSync, readdirSync, readlinkSync, realpathSync, renameSync, writeFileSync } from "node:fs";
-import { chmod, link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -113,13 +113,138 @@ test("loads the fixed bootstrap files and explicit memory files deterministicall
   assert.equal(render(extension, "nanobot_skills"), "");
 });
 
-test("missing and empty bootstrap files are omitted and memory is never discovered implicitly", async (t) => {
+test("system memory is recursively loaded in stable order and picked up afresh", { timeout: 10_000 }, async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, {
+    "memory/topic.md": "explicit topic",
+    "memory/MEMORY.md": "unselected index",
+    "memory/system/z.md": "selected system",
+    "memory/system/.hidden.md": "hidden",
+    "memory/system/nested/ü note.md": "nested Unicode",
+    "memory/system/HISTORY.md": "system history",
+    "memory/system/MEMORY.md": "system index",
+    "memory/system/empty.md": "",
+    "memory/system/ignored.MD": "uppercase suffix",
+    "memory/system/ignored.txt": "not Markdown",
+  });
+  const selection = { memoryFiles: ["memory/topic.md", "memory/system/z.md"] };
+  const first = await load(root, selection);
+  assert.deepEqual(first.memory.map(({ source }) => source), [
+    "workspace:memory/topic.md",
+    "workspace:memory/system/z.md",
+    "workspace:memory/system/.hidden.md",
+    "workspace:memory/system/HISTORY.md",
+    "workspace:memory/system/MEMORY.md",
+    "workspace:memory/system/nested/ü note.md",
+  ]);
+  assert.ok(Object.isFrozen(first.memory));
+  assert.ok(first.memory.every(Object.isFrozen));
+  await writeFiles(root, { "memory/system/added.md": "added", "memory/system/z.md": "edited" });
+  await rm(join(root, "memory/system/.hidden.md"));
+  const second = await load(root, selection);
+  assert.deepEqual(second.memory.map(({ content }) => content), [
+    "explicit topic", "edited", "system history", "system index", "added", "nested Unicode",
+  ]);
+  assert.equal(first.memory[1].content, "selected system");
+  const automatic = await load(root);
+  assert.equal(automatic.memory.length, 5);
+  assert.ok(automatic.memory.every(({ source }) => source.startsWith("workspace:memory/system/")));
+});
+
+test("automatic system memory fails closed on unsafe or invalid content", { timeout: 10_000 }, async (t) => {
+  const outside = await tempRoot(t);
+  await writeFile(join(outside, "secret.md"), "outside");
+  for (const directoryLink of [false, true]) {
+    const root = await tempRoot(t);
+    await mkdir(join(root, "memory/system"), { recursive: true });
+    await symlink(directoryLink ? outside : join(outside, "secret.md"), join(root, "memory/system/link"));
+    await assert.rejects(load(root), isFileError("symlink", "memory/system"));
+  }
+  const linkedRoot = await tempRoot(t);
+  await mkdir(join(linkedRoot, "memory"));
+  await symlink(outside, join(linkedRoot, "memory/system"));
+  await assert.rejects(load(linkedRoot), isFileError("symlink", "memory/system"));
+  const hardlinked = await tempRoot(t);
+  await mkdir(join(hardlinked, "memory/system"), { recursive: true });
+  await link(join(outside, "secret.md"), join(hardlinked, "memory/system/note.md"));
+  await assert.rejects(load(hardlinked), isFileError("hardlink", "memory/system/note.md"));
+  const invalid = await tempRoot(t);
+  await writeFiles(invalid, { "memory/system/note.md": Buffer.from([0xff]) });
+  await assert.rejects(load(invalid), isFileError("encoding", "memory/system/note.md"));
+  await writeFile(join(invalid, "memory/system/note.md"), "private");
+  await chmod(join(invalid, "memory/system/note.md"), 0o000);
+  if (process.getuid?.() !== 0) {
+    await assert.rejects(load(invalid), isFileError("unreadable", "memory/system/note.md"));
+  }
+});
+
+test("system discovery refuses invalid filename bytes instead of loading a valid twin twice", { timeout: 10_000 }, async (t) => {
+  for (const directory of [false, true]) {
+    const root = await tempRoot(t);
+    const valid = `memory/system/bad-�${directory ? "/note.md" : ".md"}`;
+    await writeFiles(root, { [valid]: "valid replacement character" });
+    assert.deepEqual((await load(root)).memory.map(({ content }) => content), ["valid replacement character"]);
+    const malformed = Buffer.concat([
+      Buffer.from(join(root, "memory/system/bad-")), Buffer.from([0xff]), Buffer.from(directory ? "" : ".md"),
+    ]);
+    if (directory) {
+      await mkdir(malformed);
+      await writeFile(Buffer.concat([malformed, Buffer.from("/note.md")]), "must not be silently omitted");
+    } else {
+      await writeFile(malformed, "must not be silently omitted");
+    }
+    await assert.rejects(load(root), isFileError("encoding", "memory/system"));
+  }
+});
+
+test("system discovery refuses locator and scan bounds instead of partial context", { timeout: 15_000 }, async (t) => {
+  const invalid = await tempRoot(t);
+  await writeFiles(invalid, { [`memory/system/${"x".repeat(65)}/note.md`]: "unrepresentable" });
+  await assert.rejects(load(invalid), isFileError("bounds", "memory/system"));
+  const oversized = await tempRoot(t);
+  await mkdir(join(oversized, "memory/system"), { recursive: true });
+  await Promise.all(Array.from({ length: WORKSPACE_CONTEXT_LIMITS.maxSystemScannedEntries + 1 }, (_, index) =>
+    writeFile(join(oversized, "memory/system", `${index}.txt`), "")));
+  await assert.rejects(load(oversized), isFileError("bounds", "memory/system"));
+});
+
+test("system directory replacement during a load is rejected", { timeout: 10_000 }, async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, { "memory/system/note.md": "original" });
+  const system = join(root, "memory/system");
+  const probe = await open(join(system, "note.md"));
+  const prototype = Object.getPrototypeOf(probe);
+  const stat = prototype.stat;
+  await probe.close();
+  let replaced = false;
+  t.mock.method(prototype, "stat", async function (...args) {
+    const info = await stat.apply(this, args);
+    if (!replaced && readlinkSync(`/proc/self/fd/${this.fd}`) === join(system, "note.md")) {
+      replaced = true;
+      renameSync(system, `${system}.moved`);
+      mkdirSync(system);
+      writeFileSync(join(system, "note.md"), "replacement");
+    }
+    return info;
+  });
+  await assert.rejects(load(root), (error) => {
+    assert.ok(error instanceof WorkspaceContextFileError);
+    assert.equal(error.kind, "changed");
+    assert.match(error.source, /^memory\/system/);
+    return true;
+  });
+  assert.equal(replaced, true);
+});
+
+test("missing and empty bootstrap files are omitted and topic memory is never discovered implicitly", async (t) => {
   const root = await tempRoot(t);
   await writeFiles(root, {
     "AGENTS.md": "",
     "memory/MEMORY.md": "must not be loaded without an explicit selection",
   });
 
+  assert.deepEqual(await load(root), {});
+  await mkdir(join(root, "memory/system"));
   assert.deepEqual(await load(root), {});
   const withEmptySelection = await load(root, { memoryFiles: ["memory/MEMORY.md"] });
   assert.deepEqual(Object.keys(withEmptySelection), ["memory"]);

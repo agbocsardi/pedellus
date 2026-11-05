@@ -81,7 +81,10 @@ test("workspace context stays default-off without an explicit config section", a
   const temp = await tempRoot(t, "nanobot-workspace-host-off-");
   const workspace = join(temp, "workspace");
   await mkdir(workspace);
-  await writeFiles(workspace, { "AGENTS.md": "MUST-NOT-APPEAR-WITHOUT-OPT-IN" });
+  await writeFiles(workspace, {
+    "AGENTS.md": "MUST-NOT-APPEAR-WITHOUT-OPT-IN",
+    "memory/system/now.md": "SYSTEM-MUST-NOT-APPEAR-WITHOUT-OPT-IN",
+  });
   const config = hostConfig(workspace, join(temp, "state"));
   assert.equal(config.workspaceContext, undefined);
   assert.deepEqual(workspaceContextGatewayOptions(config), {});
@@ -175,6 +178,76 @@ test("explicit host config drives the Gateway path for every session and across 
   } finally {
     if (gateway) await gateway.close(context);
   }
+});
+
+test("empty memoryFiles loads system bodies and the topic tree through refresh and startup", { timeout: 20_000 }, async (t) => {
+  const temp = await tempRoot(t, "nanobot-system-memory-host-");
+  const workspace = join(temp, "workspace");
+  await writeFiles(workspace, {
+    "AGENTS.md": "AGENTS-AUTO",
+    "SOUL.md": "SOUL-AUTO",
+    "USER.md": "USER-AUTO",
+    "memory/system/now.md": "---\ndescription: Current priorities\n---\nSYSTEM_BODY",
+    "memory/system/empty.md": "",
+    "memory/topic.md": "---\ndescription: Topic description\n---\nTOPIC_BODY_NOT_IN_PROMPT",
+  });
+  const config = hostConfig(workspace, join(temp, "state"), {
+    workspaceContext: { memoryFiles: [], memoryManifest: true },
+  });
+  const captured = [];
+  const models = setupModels("fixture", captured);
+  let gateway;
+  try {
+    gateway = await openGateway(config, context, { models, agentHistory: false, ...workspaceContextGatewayOptions(config) });
+    await send(gateway, "cli:default", "auto-1", "hello");
+    const first = captured.at(-1);
+    for (const marker of ["AGENTS-AUTO", "SOUL-AUTO", "USER-AUTO", "SYSTEM_BODY"]) {
+      assert.equal(first.split(marker).length - 1, 1, marker);
+    }
+    assert.match(first, /- `memory\/system\/now\.md` \(loaded, \d+ chars\): Current priorities/);
+    assert.match(first, /- `memory\/topic\.md` \(topic, \d+ chars\): Topic description/);
+    assert.doesNotMatch(first, /TOPIC_BODY_NOT_IN_PROMPT|memory\/system\/empty\.md/);
+    assert.equal(first.split("# Memory Tree").length - 1, 1);
+    assert.equal(first.split("- `memory/system/now.md`").length - 1, 1);
+
+    await writeFiles(workspace, { "memory/system/later.md": "LATER_BODY" });
+    await send(gateway, "cli:default", "auto-2", "same snapshot");
+    assert.doesNotMatch(captured.at(-1), /LATER_BODY/);
+    await gateway.refreshContext("cli:default", context);
+    await send(gateway, "cli:default", "auto-3", "refreshed");
+    assert.match(captured.at(-1), /LATER_BODY/);
+    assert.match(captured.at(-1), /- `memory\/system\/later\.md` \(loaded,/);
+
+    await writeFiles(workspace, { "memory/system/bad.md": Buffer.from([0xff]) });
+    await assert.rejects(gateway.refreshContext("cli:default", context), isFileError("encoding", "memory/system/bad.md"));
+    await send(gateway, "cli:default", "auto-4", "old snapshot survives");
+    assert.match(captured.at(-1), /SYSTEM_BODY/);
+    assert.match(captured.at(-1), /LATER_BODY/);
+    await rm(join(workspace, "memory/system/bad.md"));
+    await rm(join(workspace, "memory/system/later.md"));
+    await writeFiles(workspace, { "memory/system/now.md": "RESET_BODY" });
+    assert.equal((await gateway.resetSession("cli:default", context)).promptRebuilt, true);
+    await send(gateway, "cli:default", "auto-5", "reset");
+    assert.match(captured.at(-1), /RESET_BODY/);
+    assert.doesNotMatch(captured.at(-1), /SYSTEM_BODY|LATER_BODY/);
+
+    await gateway.close(context);
+    gateway = undefined;
+    await writeFiles(workspace, { "memory/system/startup.md": "STARTUP_BODY" });
+    gateway = await openGateway(config, context, { models, agentHistory: false, ...workspaceContextGatewayOptions(config) });
+    await send(gateway, "cli:default", "auto-6", "reopened");
+    assert.match(captured.at(-1), /STARTUP_BODY/);
+    const root = await gateway.harness.root(context);
+    assert.doesNotMatch(JSON.stringify((await root.agent(context)).sections), /nanobot_|STARTUP_BODY/);
+  } finally {
+    if (gateway) await gateway.close(context);
+  }
+
+  // The memory tree switch controls metadata only, not system-body injection.
+  const withoutManifest = hostConfig(workspace, join(temp, "unused"), { workspaceContext: {} });
+  const snapshot = await workspaceContextGatewayOptions(withoutManifest).contextSnapshotProvider("cli:default", 1, context);
+  assert.ok(snapshot.memory.some(({ content }) => content === "STARTUP_BODY"));
+  assert.ok(snapshot.memory.every(({ source }) => source !== "memory:manifest"));
 });
 
 test("workspaceContext config rejects unsafe, duplicate, and unknown selections", () => {

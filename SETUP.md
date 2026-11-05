@@ -81,7 +81,8 @@ The shipped [`config.example.json`](./config.example.json) is the starting point
 | --- | --- |
 | `workspace` / `dataDir` | Workspace root and private state directory, both relative to the config file. |
 | `modelPresets` / `modelPreset` | Named provider/model/thinking choices and the configured default (`deep` in the example). Each pair and thinking level must exist in the pinned catalog ([providers](./PROVIDERS.md)). Local `/model fast` temporarily switches; `/model default` or restart returns to the configured preset. |
-| `workspaceContext.memoryFiles` | `["memory/MEMORY.md"]` is loaded into every turn; a missing named file fails closed. |
+| `workspaceContext` | Enables bootstrap (`AGENTS.md`, `SOUL.md`, `USER.md`) and automatic recursive `memory/system/**/*.md` loading at startup, new-session and explicit refresh/reset boundaries. No per-turn rescan. |
+| `workspaceContext.memoryFiles` | Additional ordered memory sources (example: `["memory/MEMORY.md"]`); `[]` still includes system Markdown. A missing named file fails closed. |
 | `workspaceContext.memoryManifest` | Lists the other `memory/**/*.md` topics recursively for on-demand `read`; their bodies stay out of the prompt. |
 | `workspaceContext.skills` | Its presence opts into workspace skill discovery; `disabledSkills` can hide names. |
 | `toolAllowlist` | Config authority: these coding tools are enabled for authenticated mapped chats. `[]` or absent disables them. |

@@ -14,8 +14,10 @@ separate configured capability for file edits. This module never creates, writes
 renames, or deletes a file, including a missing `memory/` directory.
 
 The host opt-in is `workspaceContext.memoryManifest: true`. The configured
-`workspaceContext.memoryFiles` are the configured memory sources; only files
-actually injected are marked loaded in the manifest. Other topic bodies stay on disk.
+`workspaceContext.memoryFiles` are additional configured sources; the workspace
+loader also injects all `memory/system/**/*.md` automatically whenever workspace
+context is enabled. Only files actually injected are marked loaded in the manifest.
+Other topic bodies stay on disk. This manifest helper itself does not inject bodies.
 
 ## API
 
@@ -166,14 +168,14 @@ The helper deliberately does not duplicate the native tools:
 
 This is the memory-discovery foundation, not full Python `MemoryStore` parity.
 It does not implement `get_memory_context()` system/legacy paragraph
-deduplication, automatic `MEMORY.md`/`memory/system/` injection, `history.jsonl`,
+deduplication, automatic `MEMORY.md` injection, `history.jsonl`,
 archived summaries, Dream, cursor/usage state, ranking or retrieval, or
 model-facing tool actions. The separate approved recall tools are specified in
 [MEMORY_RECALL.md](./MEMORY_RECALL.md); this helper retains no tool cursor or
 retrieval implementation. It also omits the memory-tree description format's
-Python truncation suffix. The host injects only the explicitly configured files,
-not every file Python would mark loaded. It does
-not include topic bodies, follow symlinks, or create `memory/` directories.
+Python truncation suffix. The host's workspace loader injects configured files
+and system Markdown; this helper does not include topic bodies, follow symlinks,
+or create `memory/` directories.
 Unlike Python's tree, which slices the combined file list to 80, this helper
 lists every discovered topic and every explicitly loaded file.
 
@@ -191,13 +193,16 @@ When it is `true`:
   workspace selections agree at startup;
 - each conversation snapshot loads `loadWorkspaceContextSnapshot()` first, then
   `loadMemoryContext()` without a cache, and appends the manifest document after
-  the configured memory documents;
-- only configured files actually present in that snapshot are passed as
-  `loadedFiles`. The workspace loader omits empty files, so an empty configured
+  the loaded memory documents;
+- explicit and discovered system files actually present in that snapshot are passed
+  as `loadedFiles`. The workspace loader omits empty files, so an empty memory
   file is not falsely marked `loaded`; if it remains discoverable it is shown as
   a zero-body topic;
 - the snapshot provider is re-run on every gateway open, so a topic write made
   through the configured native tools is present after reopen;
+- system files have one loaded metadata entry each, even though topic discovery
+  skips `system/`; bodies are not repeated in the manifest. Separate manifest reads
+  do not form an atomic filesystem snapshot with the workspace loader;
 - a loaded-file error rejects conversation setup instead of installing false
   content. Broken discovered topics and stopped scans are
   not errors; each has a visible manifest line.
