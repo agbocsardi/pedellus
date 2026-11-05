@@ -70,6 +70,7 @@ import {
   type TelegramObservedTarget,
   type TelegramQuotedContext,
 } from "./telegram-interactions.js";
+import { telegramMessageContent, type TelegramContentSource } from "./telegram-content.js";
 import {
   PLAIN_TEXT_LIMIT,
   RICH_TEXT_LIMIT,
@@ -2451,6 +2452,9 @@ export async function runTelegram(
           // A quoted/replied-to message contributes bounded, labeled reference context and its
           // message identity. An ordinary message keeps its exact original input; its own identity
           // is still durably observed and reachable through the `telegram` tool's `targets` action.
+          // A plain-body read is bounded the same way for the target excerpt only; it never becomes
+          // a host command, because control parsing above reads `message.text` alone.
+          const ownContent = telegramMessageContent(message);
           const input = quoted === undefined
             ? body
             : `${incomingContextText({ messageId: message.message_id, replyTo: quoted.context })}\n${body}`;
@@ -2475,7 +2479,8 @@ export async function runTelegram(
               messageId: message.message_id,
               direction: "incoming",
               senderId: String(message.from!.id),
-              text: message.text ?? message.caption ?? "",
+              text: ownContent.text,
+              textSource: ownContent.source,
               observedAtMs,
             });
             if (quoted?.target !== undefined) observeTarget(doc, quoted.target);
@@ -3618,8 +3623,13 @@ function chatIdForSession(sessionKey: string, botId: string): number | undefined
 }
 
 /**
- * Bounded reference context for a quoted/replied-to message in the same private chat. The text is
- * untrusted reference, never authorization; an observed target is recorded only as an identity.
+ * Reference context for one replied-to message in the same private chat.
+ *
+ * The excerpt comes from the admitted update itself: an explicit partial quote first (it is the
+ * exact fragment the sender referenced), otherwise the replied-to message's own readable text,
+ * caption or rich blocks. A body that cannot be read becomes a bounded host label; it is never
+ * filled from a transcript, a recent-target cache or another chat. A cross-chat or external reply
+ * yields no context and no observed target, so it can never become same-chat target authority.
  */
 function quotedMessageContext(
   message: TelegramMessage,
@@ -3627,7 +3637,11 @@ function quotedMessageContext(
 ): { readonly context: TelegramQuotedContext; readonly target?: TelegramObservedTarget } | undefined {
   const quoted = message.reply_to_message;
   if (quoted === undefined || quoted.chat.id !== message.chat.id) return undefined;
-  const text = quoted.text ?? quoted.caption ?? "";
+  const content = telegramMessageContent(quoted);
+  const partialQuote = message.quote;
+  const usePartialQuote = partialQuote !== undefined && partialQuote.text.trim() !== "";
+  const text = usePartialQuote ? partialQuote.text : content.text;
+  const textSource: TelegramContentSource = usePartialQuote ? "text" : content.source;
   const from = quoted.from;
   const author: TelegramQuotedContext["author"] = from === undefined
     ? "unknown"
@@ -3644,6 +3658,7 @@ function quotedMessageContext(
       direction: author === "the assistant" ? "outgoing" : "incoming",
       senderId: from === undefined ? "unknown" : String(from.id),
       text,
+      textSource,
       observedAtMs: Date.now(),
     },
   };

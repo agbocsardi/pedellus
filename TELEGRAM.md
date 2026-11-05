@@ -510,16 +510,30 @@ An ordinary user message keeps its existing input text (including literal `//`
 handling), so literal content is unchanged. A message that replies to another
 message in the same private chat is prefixed with a bounded, labeled context
 block naming the current message id and the quoted message id/author; the quoted
-text is JSON-quoted and marked as untrusted reference. Quoted text is never an
-authorization and never creates cross-chat authority. A forwarded message adds
-no authority either.
+text is JSON-quoted and marked as untrusted reference. The reference is read from
+that admitted update only: an explicit partial quote if present, otherwise the
+replied-to message's `text`, media `caption`, or a received `rich_message` block
+tree (paragraphs, headings, lists, quotations, tables, captions, formatting
+wrappers and custom-emoji alternative text). Identifiers, URLs, button targets
+and other transport metadata are not copied, and button labels are not message
+content. A body with no readable text becomes an explicit label such as
+`[photo message without readable text]`; it is never an empty quote and is never
+filled from a transcript, another chat or a recent-target cache. Quoted text is
+never an authorization and never creates cross-chat authority. A forwarded
+message adds no authority either. This extraction feeds reference excerpts and
+observed-target text only: an ordinary inbound rich message is not admitted as a
+new turn's body, and host controls are still parsed from `message.text` alone.
 
 The channel-state document keeps two bounded sets:
 
 - `targets`: recently observed message identities in each private chat — every
   admitted user message (and a quoted message) plus every bot message actually
-  accepted by Telegram, with a truncated excerpt. Old targets are evicted; a
-  target that is not present fails closed.
+  accepted by Telegram, with a truncated excerpt and the source it came from
+  (`text`, `rich`, `empty`, `unreadable`). Old targets are evicted; a target that
+  is not present fails closed. A readable observation replaces the excerpt; an
+  empty or unreadable re-observation of the same message keeps the earlier
+  readable excerpt and its original observation time, so an unsupported
+  extraction never erases known content.
 - `actions`: write-ahead records for model-requested external effects. Each has
   an identity derived from the Durable tool task id (not the provider call id),
   kind, exact chat and (for a reply/reaction) target, reply text, emoji, or the
@@ -719,6 +733,9 @@ message.
   message ID and actual text; native reply actions also record every returned ID.
 - `sendRichMessage` is in the ambiguous-send method set, so a 5xx or transport failure is `unknown`
   like any other send.
+- A received rich message carries `rich_message.blocks`; `rich_message.markdown` is an input-only
+  send field and is not mirrored back. Reply context and observed-target excerpts read the
+  block tree with a typed, bounded traversal (see the quoted-message rules above).
 - Attachment captions stay plain text with no `parse_mode`, and media is sent through the upload
   actions, not as rich media blocks.
 

@@ -8,6 +8,12 @@
  * control-character sanitized and JSON-quoted so it stays visibly untrusted reference context,
  * never an instruction or an authorization.
  *
+ * An excerpt carries the source it was read from. When a later observation of the same message
+ * cannot read text (an unsupported rich body, a non-text message), the earlier readable excerpt is
+ * kept instead of being overwritten with an empty string; only a readable observation replaces it.
+ * The label of an unreadable observation is host text, not channel text, and nothing here reads a
+ * transcript or a "recent target" cache to fill a quote.
+ *
  * A native media send records its workspace-relative path and bounded caption instead of a target
  * text; its reply target is optional. Action records never carry an absolute host path.
  *
@@ -18,13 +24,15 @@
 
 import type { Draft } from "@earendil-works/chord";
 
+import { TELEGRAM_CONTENT_LIMITS, isTelegramContentSource, type TelegramContentSource } from "./telegram-content.js";
+
 export const TELEGRAM_TARGET_LIMITS = Object.freeze({
   /** Total observed message targets retained across chats. */
   total: 200,
   /** Observed targets retained per private chat, oldest evicted first. */
   perChat: 40,
-  /** Stored excerpt bound for one target; longer text is truncated. */
-  textChars: 600,
+  /** Stored excerpt bound for one target; the same bound one received-message extraction respects. */
+  textChars: TELEGRAM_CONTENT_LIMITS.excerptChars,
   /** Targets listed to the model, newest first. */
   listing: 20,
 });
@@ -86,7 +94,10 @@ export type TelegramObservedTarget = {
   readonly direction: TelegramTargetDirection;
   /** Authenticated user id for inbound messages, the bot id for outbound ones. */
   readonly senderId: string;
+  /** Readable excerpt, or a fixed host label when the observed body was empty or not text. */
   readonly text: string;
+  /** Where `text` came from; absent on legacy records and outgoing sends means readable text. */
+  readonly textSource?: TelegramContentSource;
   readonly observedAtMs: number;
 };
 
@@ -162,6 +173,7 @@ export function validObservedTarget(value: unknown): value is TelegramObservedTa
   if (value.direction !== "incoming" && value.direction !== "outgoing") return false;
   if (typeof value.senderId !== "string" || value.senderId === "") return false;
   if (typeof value.text !== "string") return false;
+  if (value.textSource !== undefined && !isTelegramContentSource(value.textSource)) return false;
   if (typeof value.observedAtMs !== "number" || !Number.isFinite(value.observedAtMs)) return false;
   return true;
 }
@@ -198,6 +210,11 @@ export function validActionRecord(value: unknown): value is TelegramActionRecord
 /**
  * Record one observed message identity, replacing any older observation of the same message and
  * evicting the oldest target beyond the per-chat and total bounds. Invalid input is ignored.
+ *
+ * A readable observation always replaces the stored excerpt. An empty or unreadable re-observation
+ * of a message whose earlier excerpt was readable keeps that excerpt and its original observation
+ * time, because the newer update proves the identity but not the content; the retained text is the
+ * earlier readable snapshot, never a fresh claim about the current message.
  */
 export function observeTarget(
   doc: { targets: TelegramObservedTarget[] },
@@ -208,11 +225,24 @@ export function observeTarget(
     ...target,
     text: sanitizeTelegramReferenceText(target.text, TELEGRAM_TARGET_LIMITS.textChars),
   };
+  const known = doc.targets.find((entry) =>
+    validObservedTarget(entry) &&
+    entry.chatId === bounded.chatId && entry.messageId === bounded.messageId);
+  const keepKnown = known !== undefined && known.text !== "" &&
+    (bounded.text === "" || bounded.textSource === "empty" || bounded.textSource === "unreadable");
+  const observed: TelegramObservedTarget = keepKnown && known !== undefined
+    ? {
+        ...bounded,
+        text: known.text,
+        textSource: known.textSource ?? "text",
+        observedAtMs: known.observedAtMs,
+      }
+    : bounded;
   doc.targets = doc.targets.filter((entry) =>
     validObservedTarget(entry) &&
-    !(entry.chatId === bounded.chatId && entry.messageId === bounded.messageId));
-  doc.targets.push(bounded);
-  const perChat = doc.targets.filter((entry) => entry.chatId === bounded.chatId);
+    !(entry.chatId === observed.chatId && entry.messageId === observed.messageId));
+  doc.targets.push(observed);
+  const perChat = doc.targets.filter((entry) => entry.chatId === observed.chatId);
   if (perChat.length > TELEGRAM_TARGET_LIMITS.perChat) {
     const evict = new Set(
       perChat
@@ -221,7 +251,7 @@ export function observeTarget(
         .map((entry) => entry.messageId),
     );
     doc.targets = doc.targets.filter((entry) =>
-      !(entry.chatId === bounded.chatId && evict.has(entry.messageId)));
+      !(entry.chatId === observed.chatId && evict.has(entry.messageId)));
   }
   if (doc.targets.length > TELEGRAM_TARGET_LIMITS.total) {
     doc.targets = doc.targets
