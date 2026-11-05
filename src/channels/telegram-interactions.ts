@@ -228,7 +228,10 @@ export function observeTarget(
   const known = doc.targets.find((entry) =>
     validObservedTarget(entry) &&
     entry.chatId === bounded.chatId && entry.messageId === bounded.messageId);
-  const keepKnown = known !== undefined && known.text !== "" &&
+  // Legacy observations and outgoing sends have no source; their nonempty text is readable.
+  const knownReadable = known !== undefined && known.text !== "" &&
+    (known.textSource === undefined || known.textSource === "text" || known.textSource === "rich");
+  const keepKnown = knownReadable &&
     (bounded.text === "" || bounded.textSource === "empty" || bounded.textSource === "unreadable");
   const observed: TelegramObservedTarget = keepKnown && known !== undefined
     ? {

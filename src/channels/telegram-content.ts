@@ -76,9 +76,17 @@ function pushExcerpt(builder: ExcerptBuilder, value: string): void {
   builder.truncated = true;
 }
 
+/** Check before reading the next array element, not just after visiting it. */
+function hasExcerptBudget(builder: ExcerptBuilder): boolean {
+  if (builder.nodes >= TELEGRAM_CONTENT_LIMITS.richNodes || builder.chars >= TELEGRAM_CONTENT_LIMITS.excerptChars) {
+    builder.truncated = true;
+  }
+  return !builder.truncated;
+}
+
 function takeNode(builder: ExcerptBuilder, depth: number): boolean {
-  if (builder.truncated) return false;
-  if (depth > TELEGRAM_CONTENT_LIMITS.richDepth || builder.nodes >= TELEGRAM_CONTENT_LIMITS.richNodes) {
+  if (!hasExcerptBudget(builder)) return false;
+  if (depth > TELEGRAM_CONTENT_LIMITS.richDepth) {
     builder.truncated = true;
     return false;
   }
@@ -94,7 +102,9 @@ function richTextInto(value: RichText, depth: number, builder: ExcerptBuilder): 
     return;
   }
   if (Array.isArray(value)) {
-    for (const child of value) richTextInto(child, depth, builder);
+    for (let index = 0; index < value.length && hasExcerptBudget(builder); index += 1) {
+      richTextInto(value[index]!, depth + 1, builder);
+    }
     return;
   }
   if (value === null || typeof value !== "object") return;
@@ -149,27 +159,41 @@ function richBlockInto(block: RichBlock, depth: number, builder: ExcerptBuilder)
       // A divider has no text, an anchor name is a target, and buttons are controls.
       return;
     case "list":
-      for (const item of block.items) {
-        for (const child of item.blocks) richBlockInto(child, depth + 1, builder);
+      for (let index = 0; index < block.items.length && hasExcerptBudget(builder); index += 1) {
+        if (!takeNode(builder, depth + 1)) break;
+        const item = block.items[index]!;
+        for (let child = 0; child < item.blocks.length && hasExcerptBudget(builder); child += 1) {
+          richBlockInto(item.blocks[child]!, depth + 2, builder);
+        }
       }
       return;
     case "blockquote":
-      for (const child of block.blocks) richBlockInto(child, depth + 1, builder);
+      for (let index = 0; index < block.blocks.length && hasExcerptBudget(builder); index += 1) {
+        richBlockInto(block.blocks[index]!, depth + 1, builder);
+      }
       return;
     case "collage":
     case "slideshow":
-      for (const child of block.blocks) richBlockInto(child, depth + 1, builder);
+      for (let index = 0; index < block.blocks.length && hasExcerptBudget(builder); index += 1) {
+        richBlockInto(block.blocks[index]!, depth + 1, builder);
+      }
       richCaptionInto(block.caption, depth + 1, builder);
       return;
     case "details":
       richTextInto(block.summary, depth + 1, builder);
       pushExcerpt(builder, "\n");
-      for (const child of block.blocks) richBlockInto(child, depth + 1, builder);
+      for (let index = 0; index < block.blocks.length && hasExcerptBudget(builder); index += 1) {
+        richBlockInto(block.blocks[index]!, depth + 1, builder);
+      }
       return;
     case "table":
-      for (const row of block.cells) {
-        for (const cell of row) {
-          if (cell.text !== undefined) richTextInto(cell.text, depth + 1, builder);
+      for (let index = 0; index < block.cells.length && hasExcerptBudget(builder); index += 1) {
+        if (!takeNode(builder, depth + 1)) break;
+        const row = block.cells[index]!;
+        for (let cellIndex = 0; cellIndex < row.length && hasExcerptBudget(builder); cellIndex += 1) {
+          if (!takeNode(builder, depth + 2)) break;
+          const cell = row[cellIndex]!;
+          if (cell.text !== undefined) richTextInto(cell.text, depth + 3, builder);
           pushExcerpt(builder, " ");
         }
         pushExcerpt(builder, "\n");
@@ -194,10 +218,14 @@ function richBlockInto(block: RichBlock, depth: number, builder: ExcerptBuilder)
 /** Bounded display text for a rich message's blocks, or "" when no block carries text. */
 export function telegramRichMessageText(blocks: readonly RichBlock[]): string {
   const builder: ExcerptBuilder = { parts: [], chars: 0, nodes: 0, truncated: false };
-  for (const block of blocks) richBlockInto(block, 0, builder);
+  for (let index = 0; index < blocks.length && hasExcerptBudget(builder); index += 1) {
+    richBlockInto(blocks[index]!, 0, builder);
+  }
   const text = builder.parts.join("").replace(/\n{3,}/gu, "\n\n").trim();
   if (text === "") return "";
-  return builder.truncated && !text.endsWith(TRUNCATION_MARKER) ? `${text}${TRUNCATION_MARKER}` : text;
+  return builder.truncated
+    ? `${text.slice(0, TELEGRAM_CONTENT_LIMITS.excerptChars - TRUNCATION_MARKER.length).trimEnd()}${TRUNCATION_MARKER}`
+    : text;
 }
 
 function contentKindLabel(message: Message): string | undefined {

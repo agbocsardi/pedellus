@@ -529,8 +529,10 @@ The channel-state document keeps two bounded sets:
 - `targets`: recently observed message identities in each private chat — every
   admitted user message (and a quoted message) plus every bot message actually
   accepted by Telegram, with a truncated excerpt and the source it came from
-  (`text`, `rich`, `empty`, `unreadable`). Old targets are evicted; a target that
-  is not present fails closed. A readable observation replaces the excerpt; an
+  (`text`, `rich`, `empty`, `unreadable`). An explicit partial quote selects the
+  fragment for the current turn only; the target excerpt still comes from the full
+  received message. Old targets are evicted; a target that is not present fails
+  closed. A readable observation replaces the excerpt; an
   empty or unreadable re-observation of the same message keeps the earlier
   readable excerpt and its original observation time, so an unsupported
   extraction never erases known content.

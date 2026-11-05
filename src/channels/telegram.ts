@@ -70,7 +70,7 @@ import {
   type TelegramObservedTarget,
   type TelegramQuotedContext,
 } from "./telegram-interactions.js";
-import { telegramMessageContent, type TelegramContentSource } from "./telegram-content.js";
+import { telegramMessageContent } from "./telegram-content.js";
 import {
   PLAIN_TEXT_LIMIT,
   RICH_TEXT_LIMIT,
@@ -3641,7 +3641,6 @@ function quotedMessageContext(
   const partialQuote = message.quote;
   const usePartialQuote = partialQuote !== undefined && partialQuote.text.trim() !== "";
   const text = usePartialQuote ? partialQuote.text : content.text;
-  const textSource: TelegramContentSource = usePartialQuote ? "text" : content.source;
   const from = quoted.from;
   const author: TelegramQuotedContext["author"] = from === undefined
     ? "unknown"
@@ -3657,8 +3656,9 @@ function quotedMessageContext(
       messageId: quoted.message_id,
       direction: author === "the assistant" ? "outgoing" : "incoming",
       senderId: from === undefined ? "unknown" : String(from.id),
-      text,
-      textSource,
+      // The selected fragment belongs only to this turn; observe the complete received body.
+      text: content.text,
+      textSource: content.source,
       observedAtMs: Date.now(),
     },
   };

@@ -20,7 +20,7 @@ const [
   { parseConfig },
   { openGateway },
   { runTelegram, TelegramState },
-  { telegramMessageContent },
+  { telegramMessageContent, TELEGRAM_CONTENT_LIMITS },
   { observeTarget },
   { BACKGROUND_CONTEXT, withCancel },
   { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
@@ -397,7 +397,7 @@ test('received message shapes become bounded excerpts and honest labels, never a
   });
   assert.equal(longRich.source, 'rich');
   assert.ok(longRich.text.endsWith('…[truncated]'), 'length-bound truncation is marked');
-  assert.ok(longRich.text.length < 700);
+  assert.ok(longRich.text.length <= TELEGRAM_CONTENT_LIMITS.excerptChars);
 
   const long = telegramMessageContent({
     message_id: 11,
@@ -407,6 +407,60 @@ test('received message shapes become bounded excerpts and honest labels, never a
   });
   assert.equal(long.source, 'text');
   assert.ok(long.text.length > 600, 'plain text is bounded later by the shared excerpt sanitizer');
+});
+
+test('rich extraction stops reading arrays when its character or node budget is exhausted', () => {
+  const long = { type: 'paragraph', text: 'x'.repeat(1_500) };
+  const unreadTail = (first) => Object.defineProperty([first], 1, {
+    get() { assert.fail('extraction read past its character budget'); },
+  });
+  const message = (blocks) => ({
+    message_id: 1, date: 0, chat: privateChat(), rich_message: { blocks },
+  });
+  const textTail = unreadTail(long.text);
+  const shapes = [
+    unreadTail(long),
+    [{ type: 'paragraph', text: textTail }],
+    [{ type: 'list', items: unreadTail({ label: '-', blocks: [long] }) }],
+    [{ type: 'list', items: [{ label: '-', blocks: unreadTail(long) }] }],
+    [{ type: 'blockquote', blocks: unreadTail(long) }],
+    [{ type: 'collage', blocks: unreadTail(long) }],
+    [{ type: 'slideshow', blocks: unreadTail(long) }],
+    [{ type: 'details', summary: 'Summary', blocks: unreadTail(long) }],
+    [{ type: 'table', cells: unreadTail([{ text: long.text }]) }],
+    [{ type: 'table', cells: [unreadTail({ text: long.text })] }],
+  ];
+  for (const blocks of shapes) {
+    const content = telegramMessageContent(message(blocks));
+    assert.equal(content.source, 'rich');
+    assert.ok(content.text.endsWith('…[truncated]'));
+    assert.ok(content.text.length <= TELEGRAM_CONTENT_LIMITS.excerptChars);
+  }
+
+  // Instrument index reads, not elapsed time: even textless containers must spend the node budget.
+  const counted = (value) => {
+    let reads = 0;
+    const array = new Proxy(Array(TELEGRAM_CONTENT_LIMITS.richNodes * 2).fill(value), {
+      get(target, key, receiver) {
+        if (typeof key === 'string' && /^\d+$/u.test(key)) {
+          reads += 1;
+          assert.ok(reads <= TELEGRAM_CONTENT_LIMITS.richNodes, 'extraction read past its node budget');
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    return { array, reads: () => reads };
+  };
+  for (const [value, blocks] of [
+    [{ type: 'divider' }, (array) => array],
+    [{ type: 'anchor', name: 'not-display-text' }, (array) => [{ type: 'paragraph', text: array }]],
+    [{ label: '-', blocks: [] }, (array) => [{ type: 'list', items: array }]],
+    [[], (array) => [{ type: 'table', cells: array }]],
+  ]) {
+    const counter = counted(value);
+    telegramMessageContent(message(blocks(counter.array)));
+    assert.ok(counter.reads() > 0, 'the fixture actually traversed the instrumented array');
+  }
 });
 
 test('a target keeps its earlier readable excerpt when a later observation cannot read text', () => {
@@ -430,6 +484,29 @@ test('a target keeps its earlier readable excerpt when a later observation canno
   });
   assert.equal(doc.targets[0].text, 'the edited note');
   assert.equal(doc.targets[0].observedAtMs, 3_000);
+});
+
+test('target preservation distinguishes readable snapshots from host labels and legacy records', () => {
+  const identity = { chatId: CHAT_ID, messageId: 100, direction: 'incoming', senderId: '501' };
+  for (const source of ['empty', 'unreadable']) {
+    const doc = { targets: [] };
+    observeTarget(doc, { ...identity, text: '[earlier host label]', textSource: source, observedAtMs: 1_000 });
+    observeTarget(doc, {
+      ...identity, text: '[document message without readable text]', textSource: 'unreadable', observedAtMs: 2_000,
+    });
+    assert.equal(doc.targets[0].text, '[document message without readable text]');
+    assert.equal(doc.targets[0].observedAtMs, 2_000);
+  }
+  for (const source of [undefined, 'text', 'rich']) {
+    const doc = { targets: [] };
+    observeTarget(doc, {
+      ...identity, text: 'readable snapshot', ...(source === undefined ? {} : { textSource: source }), observedAtMs: 1_000,
+    });
+    observeTarget(doc, { ...identity, text: '[empty message]', textSource: 'empty', observedAtMs: 2_000 });
+    assert.equal(doc.targets[0].text, 'readable snapshot');
+    assert.equal(doc.targets[0].textSource, source ?? 'text');
+    assert.equal(doc.targets[0].observedAtMs, 1_000);
+  }
 });
 
 test('an ordinary rich delivery quoted by reply reaches the model as readable reference context', { timeout: 25_000 }, async () => {
@@ -662,6 +739,7 @@ test('a cross-chat reply grants no quote or target, and an explicit partial quot
     requests.push(request);
     const input = lastUserText(request.messages);
     if (input.includes('what is this foreign thing?')) return fauxAssistantMessage('FOREIGN-SEEN');
+    if (input.includes('quoted message id 105')) return fauxAssistantMessage('UNCACHED-PARTIAL-SEEN');
     if (input.includes('what did the local note say?')) return fauxAssistantMessage('PARTIAL-SEEN');
     return fauxAssistantMessage('ACK');
   }));
@@ -708,6 +786,25 @@ test('a cross-chat reply grants no quote or target, and an explicit partial quot
     const partialInput = lastUserText(partial.messages);
     assert.ok(partialInput.includes('[Telegram quoted message id 100 from the user: "local note"]'),
       'the explicit partial quote is the referenced fragment');
+    const partialState = await stateDoc(store.gateway);
+    assert.equal(partialState.targets.find((entry) => entry.messageId === 100)?.text, 'the local note text',
+      'the selected fragment never replaces the complete received target excerpt');
+
+    // No previous target is required: observe the full body on the first partial-quote reply too.
+    transport.enqueue([messageUpdate(743, 103, 'what did the local note say?', CHAT_ID, {
+      reply_to_message: {
+        message_id: 105, date: 0, chat: privateChat(), from: privateUser(),
+        rich_message: { blocks: [{ type: 'paragraph', text: 'another full rich note' }] },
+      },
+      quote: { text: 'rich note', position: 13, is_manual: true },
+    })]);
+    await transport.waitForText((text) => text === 'UNCACHED-PARTIAL-SEEN', 'the uncached partial quote answer');
+    const newPartial = requests.find((request) => lastUserText(request.messages).includes('quoted message id 105'));
+    assert.ok(newPartial);
+    assert.ok(lastUserText(newPartial.messages).includes('from the user: "rich note"]'));
+    const newPartialState = await stateDoc(store.gateway);
+    assert.equal(newPartialState.targets.find((entry) => entry.messageId === 105)?.text, 'another full rich note',
+      'an uncached target is observed from its complete received rich body');
   } finally {
     await stop(harness);
     transport.restore();

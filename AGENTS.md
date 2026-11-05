@@ -449,9 +449,10 @@ edits need restart only; unit edits additionally need daemon-reload.
   unsupported tag, too long) resends that chunk as plain text split under 4096. Every other
   rejection and every ambiguous outcome keeps the existing hold semantics and is never resent.
   Attachment captions remain plain text with no `parse_mode`, and no media block is used for
-  attachments. Inbound reply context and observed-target excerpts are read from the admitted update:
-  an explicit partial quote, else `text`/`caption`, else a received `rich_message.blocks` tree
-  traversed by declared shape within bounded depth/node/character budgets. Only display text is
+  attachments. Inbound reply context uses an explicit partial quote when present; observed-target
+  excerpts always describe the full received message. Both are read from the admitted update:
+  `text`/`caption`, else a received `rich_message.blocks` tree traversed by declared shape within
+  bounded depth/node/character budgets, including array iteration. Only display text is
   copied (never URLs, identifiers or button targets), unreadable bodies become fixed labels rather
   than empty strings, and an unreadable/empty re-observation keeps an earlier readable target excerpt.
   Nothing is filled from a transcript or recent-target cache, and controls are still parsed from

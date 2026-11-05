@@ -20,7 +20,9 @@ must not be a cron-specific or recent-target-cache workaround.
 - [x] Register the new test file in the npm behavior suite.
 - [x] Update `TELEGRAM.md` and the Telegram invariant in `AGENTS.md`.
 - [x] Typecheck, build, new suite, existing Telegram/rich/cron-origin suites, full behavior suite.
-- [ ] Independent audit/review (separate agent); merge only after a clean review.
+- [x] Resolve initial independent review: keep full targets for partial quotes, stop array iteration
+      at extraction budgets, and preserve only readable snapshots (including legacy records).
+- [ ] Fresh independent re-review of the corrected diff; merge only after a clean review.
 
 ## Residual limitations (documented, not fixed here)
 
@@ -51,4 +53,11 @@ must not be a cron-specific or recent-target-cache workaround.
 - Checks: `npm run typecheck`; `npm run build`; new suite 7/7; existing telegram-interactions /
   telegram-rich / cron-origin-delivery / telegram-media 68/68; `npm run test:execution` 2/2; full
   `npm run test:behavior` 548/548 in ~46s (inside the suite's 60s budget).
-- Next: independent review of the diff in this worktree; no merge from this session.
+- Independent Pi Luna review found three issues: partial quote fragments overwrote full targets,
+  iteration continued after extraction budgets, and unreadable labels were preserved as readable
+  snapshots. All three were fixed without waivers; added instrumented-array budget tests, source/
+  legacy preservation cases and cached/uncached partial-quote target assertions. Rich truncation
+  markers now fit within the excerpt budget, and array/container nesting counts toward traversal.
+- Corrected checks: typecheck/build pass; focused suite 9/9; full behavior suite 550/550 in ~45s;
+  execution suite 2/2; `git diff --check` clean.
+- Next: fresh independent re-review of the corrected diff; no merge until clean.
