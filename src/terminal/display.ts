@@ -14,12 +14,17 @@ export function ownerDisplay(input: Interface, output: Writable): TerminalDispla
   input.once("close", onClose);
   // Node's typings mark these public fields readonly; an empty native redraw needs a temporary
   // view of them. Restore them synchronously, without emitting keypresses or changing undo history.
-  const buffer = input as { line: string; cursor: number };
+  const buffer = input as { line: string; cursor: number; prevRows?: number };
+  // Node's append fast path can wrap without updating its redraw cache. Synchronize from the
+  // actual cursor BEFORE changing the prompt, including before readline's own resize handler.
+  const synchronizeRows = () => { if (drawn) buffer.prevRows = input.getCursorPos().rows; };
+  output.prependListener("resize", synchronizeRows);
   let status: string | undefined;
   let partial = "";
   const promptText = () => `${partial ? `${partial}\n` : ""}${status ? `You [${status}]: ` : "You: "}`;
   const prompt = () => {
     if (closed) return;
+    synchronizeRows();
     input.setPrompt(promptText());
     input.prompt(true);
     drawn = true;
@@ -36,6 +41,7 @@ export function ownerDisplay(input: Interface, output: Writable): TerminalDispla
     }
     // A native empty redraw clears every occupied row and resets readline's previous-row count.
     // Restore the public buffer/cursor without echoing them until the next prompt is drawn.
+    synchronizeRows();
     const { line, cursor } = input;
     buffer.line = "";
     buffer.cursor = 0;
@@ -49,9 +55,25 @@ export function ownerDisplay(input: Interface, output: Writable): TerminalDispla
       drawn = false;
     }
   };
-  const onLine = () => {
-    // Enter has already committed this block to the screen and moved to a fresh line. Do not
-    // erase it or print its transient assistant fragment twice on the next streaming update.
+  const onLine = (submitted: string) => {
+    if (drawn) {
+      // Enter moved to a fresh row and cleared readline's buffer. Reconstruct the submitted
+      // block's height, then commit it without the transient spinner in the owner's label.
+      const { line, cursor } = input;
+      buffer.line = submitted;
+      buffer.cursor = submitted.length;
+      let rows: number;
+      try {
+        rows = input.getCursorPos().rows + 1;
+      } finally {
+        buffer.line = line;
+        buffer.cursor = cursor;
+      }
+      moveCursor(output, 0, -rows);
+      cursorTo(output, 0);
+      clearScreenDown(output);
+      output.write(`${partial ? `${partial}\n` : ""}You: ${submitted}\n`);
+    }
     drawn = false;
     partial = "";
     input.setPrompt(promptText());
@@ -83,6 +105,7 @@ export function ownerDisplay(input: Interface, output: Writable): TerminalDispla
       partial = "";
       input.removeListener("line", onLine);
       input.removeListener("close", onClose);
+      output.removeListener("resize", synchronizeRows);
     },
   };
 }

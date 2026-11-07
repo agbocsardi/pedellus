@@ -267,6 +267,8 @@ type GenerationOutput = {
   finalized: boolean;
   /** Interactive answer header already printed for this generation's text. */
   labelled: boolean;
+  /** A host notice or another input interrupted this answer's visible text block. */
+  interrupted?: boolean;
 };
 type RunOutput = { generation?: GenerationOutput };
 type ExternalRun = {
@@ -324,8 +326,6 @@ export async function runTerminalConversation(
   let activityHandle: unknown;
   let activityFrame = 0;
   let observedRunInputs: readonly number[] = [];
-  /** Assistant text has begun for the current admitted batch; no activity line is drawn over it. */
-  let activitySuppressed = false;
   let inputEnded = false;
   /** Last successful search base and cursor; the cursor is opaque and never printed. */
   let pendingSearch: { readonly query: HistoryQuery; readonly cursor: HistoryCursor } | undefined;
@@ -374,6 +374,7 @@ export async function runTerminalConversation(
 
   const endOpenLines = async (): Promise<void> => {
     for (const state of runOutputs.values()) {
+      if (state.generation?.active && state.generation.labelled) state.generation.interrupted = true;
       if (state.generation?.openLine) {
         state.generation.openLine = false;
         await write("\n");
@@ -406,7 +407,12 @@ export async function runTerminalConversation(
   /** The activity line exists only beside a drawn prompt and only for admitted, unsettled local input. */
   const startActivityIfPending = (): void => {
     if (display === undefined || !interactive || !promptVisible) return;
-    if (submissions.size === 0 || activitySuppressed || signal?.aborted) return;
+    const pending = [...submissions.values()].filter((local) => !local.finalized);
+    if (pending.length === 0 || signal?.aborted) return;
+    // Only a local answer that has actually begun suppresses activity. An external answer must
+    // not latch off a still-queued owner's spinner, nor may a finished sibling keep it suppressed.
+    if (pending.some((local) => local.runTaskId !== undefined &&
+      runOutputs.get(local.runTaskId)?.generation?.labelled)) return;
     if (activityHandle !== undefined) return;
     activityFrame = 0;
     renderActivity();
@@ -429,15 +435,16 @@ export async function runTerminalConversation(
     }
     startActivityIfPending();
   };
-  /** One interactive answer header per committed answer block; host notices stay unlabelled. */
+  /** Label each visible answer block, including continuations separated by owner/host text. */
   const labelAssistant = async (state?: GenerationOutput): Promise<void> => {
     if (display === undefined || !interactive) return;
-    activitySuppressed = true;
+    const continued = state?.labelled === true;
     if (state !== undefined) {
-      if (state.labelled) return;
+      if (state.labelled && !state.interrupted) return;
       state.labelled = true;
+      state.interrupted = false;
     }
-    await write(`${ASSISTANT_LABEL}\n`);
+    await write(`${continued ? "Assistant (continued):" : ASSISTANT_LABEL}\n`);
   };
 
   const rememberAnswer = (id: number): boolean => {
@@ -696,7 +703,10 @@ export async function runTerminalConversation(
   };
 
   watch.start(async (snapshot) => {
-    const callback = serializeRender(() => streamView(snapshot));
+    const callback = serializeRender(async () => {
+      await streamView(snapshot);
+      startActivityIfPending();
+    });
     watchCallbacks.add(callback);
     try {
       await callback;
@@ -742,6 +752,7 @@ export async function runTerminalConversation(
           const remaining = Math.max(0, MAX_RESPONSE_CHARS - generation.streamed.length);
           const shown = completePrefix(suffix, remaining);
           if (shown) {
+            if (!generation.openLine) await labelAssistant(generation);
             if (!generation.openLine && !generation.streamed.endsWith("\n")) await write("\n");
             await write(shown);
             generation.streamed += shown;
@@ -797,9 +808,6 @@ export async function runTerminalConversation(
           submissions.delete(id);
           reservedInputs = Math.max(0, reservedInputs - 1);
           cleanupRun(local?.runTaskId);
-          activitySuppressed = [...submissions.values()].some((pending) =>
-            !pending.finalized && pending.runTaskId !== undefined &&
-            (runOutputs.get(pending.runTaskId)?.generation?.streamed.length ?? 0) > 0);
         });
         waits.delete(task);
         showPrompt();

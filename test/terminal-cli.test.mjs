@@ -82,7 +82,10 @@ test("real readline preserves wrapped Unicode editing across activity and stream
     input.write(null, { name: "left" });
     input.write(null, { name: "left" });
     const { line, cursor } = input;
+    const wrappedRows = input.getCursorPos().rows;
+    chunks.length = 0;
     display.status("| Waiting for the assistant...");
+    assert.ok(chunks.join("").startsWith(`\x1b[${wrappedRows}A`), "redraw returns to the actual wrapped origin, not readline's stale row cache");
     display.status("/ Assistant working...");
     assert.equal(input.line, line);
     assert.equal(input.cursor, cursor);
@@ -109,6 +112,20 @@ test("real readline preserves wrapped Unicode editing across activity and stream
     display.status("- Waiting for the assistant...");
     assert.equal(input.cursor, cursor + 1);
     display.status(undefined);
+    // A whole append can wrap via Node's fast path without refreshing its cached row count.
+    source.write(" appended text crossing several more rows");
+    const appendedRows = input.getCursorPos().rows;
+    chunks.length = 0;
+    display.status("\\ Assistant working...");
+    assert.ok(chunks.join("").startsWith(`\x1b[${appendedRows}A`));
+    const submitted = input.line;
+    chunks.length = 0;
+    source.write("\r");
+    const entered = chunks.join("");
+    const permanentInput = entered.slice(entered.lastIndexOf("\x1b[0J") + "\x1b[0J".length);
+    assert.equal(permanentInput, `You: ${submitted}\n`, "transient spinner is not committed in the submitted label");
+    display.status(undefined);
+    display.prompt();
     display.erasePrompt();
     chunks.length = 0;
     output.write("permanent answer\n");
@@ -145,9 +162,11 @@ test("activity does not rearm over streaming text, and a queued successor return
       submitted.push({ resolve });
       return { id, wait: () => settlement };
     },
-    answer: async (id) => ({ text: id === 101 ? "partial" : "second answer" }),
+    answer: async (id) => ({ text: id === 101 ? "partial more" : "second answer" }),
   };
+  const chunks = [];
   const output = new Writable({ write(chunk, _encoding, callback) {
+    chunks.push(chunk.toString());
     if (chunk.toString().includes("Reply pending")) receipts[receiptCount++]();
     callback();
   } });
@@ -160,6 +179,11 @@ test("activity does not rearm over streaming text, and a queued successor return
     await watching;
     input.write("first");
     await firstReceipt;
+    await deliver({ run: { taskId: 99, inputs: [999] }, answers: [] });
+    await deliver({ answers: [{ taskId: 99, entryId: 900, text: "external answer" }] });
+    timer.tick();
+    assert.match(statuses.filter((text) => typeof text === "string").at(-1), /Waiting for the assistant/,
+      "an external answer must not disable the pending local input's spinner");
     await deliver({ run: { taskId: 10, inputs: [1], generation: { attempt: 0, text: "partial" } }, answers: [] });
     const afterPartial = statuses.length;
     input.write("second");
@@ -167,6 +191,8 @@ test("activity does not rearm over streaming text, and a queued successor return
     await new Promise((resolve) => setImmediate(resolve));
     timer.tick();
     assert.equal(statuses.slice(afterPartial).filter((text) => typeof text === "string").length, 0);
+    await deliver({ run: { taskId: 10, inputs: [1], generation: { attempt: 0, text: "partial more" } }, answers: [] });
+    assert.match(chunks.join(""), /Assistant \(continued\):\n more/);
     await deliver({ answers: [] });
     submitted[0].resolve({ status: "done", type: "input", answer: 101 });
     await new Promise((resolve) => setImmediate(resolve));

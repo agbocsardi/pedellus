@@ -123,8 +123,9 @@ carriage returns, and bidi formatting controls are removed; ordinary newlines an
 Unicode scalar values are preserved. See [workspace context](./WORKSPACE_CONTEXT.md).
 
 An interactive attach (stdin and stdout are both a TTY) labels the two roles: the
-readline prompt reads `You: ` and each answer begins with one `Assistant:` line. It
-prints one connection line: earlier replies are not replayed, `/history` prints them,
+readline prompt reads `You: ` and each answer begins with `Assistant:`. If owner
+input or a host notice interrupts streaming, the remaining text is labelled
+`Assistant (continued):`. It prints one connection line: earlier replies are not replayed, `/history` prints them,
 and closing the terminal does not cancel admitted work. Each ordinary input or
 `/attach` turn then prints one receipt, only after native admission and before any
 reply, saying the reply is pending and that `/status` distinguishes a running turn
