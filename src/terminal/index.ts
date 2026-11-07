@@ -193,16 +193,20 @@ export interface TerminalAttachmentHost {
 
 /**
  * Optional owner-terminal display. Absent keeps plain line-oriented output, which is what a piped
- * run and an SDK caller rely on. Every hook is idempotent: the host preserves the typed input
- * buffer when the prompt is erased, and a status line never displaces the prompt line.
+ * run and an SDK caller rely on. Prompt/status hooks preserve the host's typed input buffer;
+ * an optional streaming writer lets readline keep that buffer editable during assistant output.
  */
 export interface TerminalDisplay {
   /** True only for a real owner terminal; interactive receipts and activity exist only then. */
   readonly interactive: boolean;
   /** Draw the host's prompt. */
   prompt(): void;
-  /** Erase the displayed prompt line; the typed buffer stays in the host input source. */
+  /** Erase the displayed prompt block; the typed buffer stays in the host input source. */
   erasePrompt(): void;
+  /** Optional readline-aware streaming output, preserving a partially typed next message. */
+  write?(text: string, target: Writable): boolean;
+  /** Release the display, leaving any unfinished assistant text visible. */
+  close?(): void;
   /** Replace the transient status line above the prompt, or clear it with `undefined`. */
   status(text: string | undefined): void;
 }
@@ -220,6 +224,8 @@ export interface TerminalIO {
   readonly errorOutput?: Writable;
   /** Optional interactive prompt, activity line and receipts; absent keeps answer-only output. */
   readonly display?: TerminalDisplay;
+  /** Plain prompt fallback for a TTY without cursor-control support. */
+  readonly prompt?: () => void;
   /** Optional timer source for the activity line; defaults to an unref'd interval. */
   readonly activityTimer?: TerminalActivityTimer;
   /** Close an input source that supports prompt cancellation (for example readline.Interface). */
@@ -310,14 +316,14 @@ export async function runTerminalConversation(
   let outputTail: Promise<void> = Promise.resolve();
   let renderTail: Promise<void> = Promise.resolve();
   let outputFailure: unknown;
-  // Owner-terminal display state. A prompt is drawn only by showPrompt and erased before any
-  // written text; the status line lives above it and never owns the prompt or typed input.
+  // Owner-terminal display state. A host may keep the editable prompt visible during streaming;
+  // otherwise it is erased before written text. Activity never owns assistant or owner text.
   const display = io.display;
   const interactive = display?.interactive === true;
   let promptVisible = false;
   let activityHandle: unknown;
   let activityFrame = 0;
-  let activityPhase: "waiting" | "working" = "waiting";
+  let observedRunInputs: readonly number[] = [];
   /** Assistant text has begun for the current admitted batch; no activity line is drawn over it. */
   let activitySuppressed = false;
   let inputEnded = false;
@@ -349,8 +355,14 @@ export async function runTerminalConversation(
       if (outputFailure !== undefined) throw outputFailure;
       // A status line or prompt display never survives text: the line belongs to the output.
       stopActivity();
-      erasePrompt();
-      if (!target.write(cleaned)) await waitForDrain(target, signal);
+      if (display?.write !== undefined) {
+        const ready = display.write(cleaned, target);
+        promptVisible = !inputEnded && !signal?.aborted;
+        if (!ready) await waitForDrain(target, signal);
+      } else {
+        erasePrompt();
+        if (!target.write(cleaned)) await waitForDrain(target, signal);
+      }
     });
     outputTail = operation.catch((error: unknown) => {
       if (!signal?.aborted) outputFailure ??= error;
@@ -388,7 +400,8 @@ export async function runTerminalConversation(
     if (display === undefined || !promptVisible) return;
     const glyph = ACTIVITY_FRAMES[activityFrame % ACTIVITY_FRAMES.length]!;
     activityFrame++;
-    display.status(`${glyph} ${activityPhase === "working" ? ACTIVITY_WORKING : ACTIVITY_WAITING}`);
+    const working = [...submissions.values()].some((local) => !local.finalized && observedRunInputs.includes(local.id));
+    display.status(`${glyph} ${working ? ACTIVITY_WORKING : ACTIVITY_WAITING}`);
   };
   /** The activity line exists only beside a drawn prompt and only for admitted, unsettled local input. */
   const startActivityIfPending = (): void => {
@@ -406,7 +419,9 @@ export async function runTerminalConversation(
   };
   /** Restore the prompt, and the activity line, when no answer text is being written. */
   const showPrompt = (): void => {
-    if (display === undefined || !interactive || signal?.aborted || inputEnded) return;
+    if (signal?.aborted || inputEnded) return;
+    if (display === undefined) { io.prompt?.(); return; }
+    if (!interactive) return;
     stopActivity();
     if (!promptVisible) {
       display.prompt();
@@ -417,6 +432,7 @@ export async function runTerminalConversation(
   /** One interactive answer header per committed answer block; host notices stay unlabelled. */
   const labelAssistant = async (state?: GenerationOutput): Promise<void> => {
     if (display === undefined || !interactive) return;
+    activitySuppressed = true;
     if (state !== undefined) {
       if (state.labelled) return;
       state.labelled = true;
@@ -576,6 +592,8 @@ export async function runTerminalConversation(
 
   const streamView = async (snapshot: TerminalSnapshot): Promise<void> => {
     const run = snapshot.run;
+    observedRunInputs = run?.inputs ?? [];
+    if (activityHandle !== undefined) renderActivity();
     if (run === undefined) {
       // Keep the final streamed line open until the submission receipt is reconciled below.
       for (const state of runOutputs.values()) if (state.generation?.active) state.generation.active = false;
@@ -614,12 +632,6 @@ export async function runTerminalConversation(
       }
     }
     for (const id of ownedInputs) submissions.get(id)!.runTaskId = run.taskId;
-    // A run containing an admitted local input is the first evidence that the model can work on it;
-    // a still-unobserved admitted input stays on the waiting label.
-    if (activityPhase !== "working") {
-      activityPhase = "working";
-      if (activityHandle !== undefined) renderActivity();
-    }
     const runFirst = run.inputs[0];
     if (runFirst !== undefined) {
       for (const id of ownedInputs) {
@@ -785,10 +797,9 @@ export async function runTerminalConversation(
           submissions.delete(id);
           reservedInputs = Math.max(0, reservedInputs - 1);
           cleanupRun(local?.runTaskId);
-          if (submissions.size === 0) {
-            activitySuppressed = false;
-            activityPhase = "waiting";
-          }
+          activitySuppressed = [...submissions.values()].some((pending) =>
+            !pending.finalized && pending.runTaskId !== undefined &&
+            (runOutputs.get(pending.runTaskId)?.generation?.streamed.length ?? 0) > 0);
         });
         waits.delete(task);
         showPrompt();
@@ -1541,6 +1552,7 @@ export async function runTerminalConversation(
     await admissionTail;
     await outputTail;
     await renderTail;
+    display?.close?.();
   }
   if (outputFailure !== undefined) throw outputFailure;
 }

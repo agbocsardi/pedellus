@@ -128,16 +128,18 @@ prints one connection line: earlier replies are not replayed, `/history` prints 
 and closing the terminal does not cancel admitted work. Each ordinary input or
 `/attach` turn then prints one receipt, only after native admission and before any
 reply, saying the reply is pending and that `/status` distinguishes a running turn
-from a queued one. While that input is admitted and unsettled, and before any answer
-text is written, one activity line above the prompt animates: `Waiting for the
-assistant...` until a committed snapshot shows a run that owns the input, then
-`Assistant working...`. Neither label claims a model request is generating before
-that run is observed, and the line is cleared, with its timer released, on answer
-text, settlement, abort or attachment close. Prompt erasure preserves the typed
-buffer, so multiline and Unicode input and its cursor keep working. Host notices are
+from a queued one. While an input is admitted and unsettled, and before its answer
+text is written, a spinner in the input prompt reports `Waiting for the assistant...`
+until a committed snapshot shows a run that owns it, then `Assistant working...`.
+Neither label claims a model request is generating before that run is observed.
+Activity stops on answer text and returns for a still-waiting successor after the
+answer settles; its timer is released on settlement, abort or attachment close.
+Readline redraws the complete editable block, including transient assistant text,
+so wrapped and Unicode input keeps its buffer and cursor during streaming. Host notices are
 never labelled as assistant text, and reasoning, tool calls/arguments and tool output
-stay hidden. A non-interactive terminal (or `TERM=dumb`) gets no labels, receipts or
-activity line; piped output stays answer-only.
+stay hidden. A non-interactive terminal gets no labels, receipts or activity;
+piped output stays answer-only. A TTY with `TERM=dumb` retains a plain `> ` prompt
+without those interactive extras.
 
 ## Gateway and local transport
 

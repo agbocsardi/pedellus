@@ -3,11 +3,13 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { Writable } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
+import { createInterface } from "node:readline";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { runTerminalConversation } from "../dist/terminal/index.js";
+import { ownerDisplay } from "../dist/terminal/display.js";
 import { inProcessTerminalConversation } from "../dist/terminal/conversation.js";
 import { openGateway } from "../dist/runtime.js";
 import { parseConfig } from "../dist/config.js";
@@ -66,6 +68,136 @@ function controlledTimer() {
     },
   };
 }
+
+test("real readline preserves wrapped Unicode editing across activity and streaming output", { timeout: timeoutMs }, () => {
+  const source = new PassThrough();
+  const chunks = [];
+  const output = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
+  output.columns = 12;
+  const input = createInterface({ input: source, output, terminal: true });
+  const display = ownerDisplay(input, output);
+  try {
+    display.prompt();
+    source.write("next message 界🙂 that wraps");
+    input.write(null, { name: "left" });
+    input.write(null, { name: "left" });
+    const { line, cursor } = input;
+    display.status("| Waiting for the assistant...");
+    display.status("/ Assistant working...");
+    assert.equal(input.line, line);
+    assert.equal(input.cursor, cursor);
+    display.status(undefined);
+    assert.equal(input.getPrompt(), "You: ");
+    assert.ok(input.getCursorPos().rows > 0, "the actual input spans multiple terminal rows");
+    display.write("Assistant:\ncommitted answer line one\nstreamed", output);
+    assert.equal(input.line, line);
+    assert.equal(input.cursor, cursor);
+    assert.equal(input.getPrompt(), "streamed\nYou: ");
+    source.write("X");
+    assert.equal(input.line, `${line.slice(0, cursor)}X${line.slice(cursor)}`);
+    // Redrawing a completed answer must start at its fresh output row, not move up into it
+    // using readline's old wrapped-input row count.
+    chunks.length = 0;
+    display.write(" tail\n", output);
+    const frame = chunks.join("");
+    const afterCommittedAnswer = frame.slice(frame.indexOf("streamed tail\n") + "streamed tail\n".length);
+    assert.ok(afterCommittedAnswer.startsWith("\x1b[1G\x1b[0J"));
+    assert.equal(input.getPrompt(), "You: ");
+    assert.equal(input.cursor, cursor + 1);
+    output.columns = 8;
+    output.emit("resize");
+    display.status("- Waiting for the assistant...");
+    assert.equal(input.cursor, cursor + 1);
+    display.status(undefined);
+    display.erasePrompt();
+    chunks.length = 0;
+    output.write("permanent answer\n");
+    display.prompt();
+    assert.ok(chunks.join("").startsWith("permanent answer\n\x1b[1G\x1b[0J"));
+    input.close();
+    display.close();
+    assert.equal(source.isPaused(), true, "display cleanup must not resume closed stdin");
+  } finally {
+    display.close();
+    input.close();
+    source.destroy();
+  }
+});
+
+test("activity does not rearm over streaming text, and a queued successor returns to waiting", { timeout: timeoutMs }, async () => {
+  const input = new PassThrough({ objectMode: true });
+  const timer = controlledTimer();
+  const statuses = [];
+  const submitted = [];
+  let deliver;
+  let ready;
+  const watching = new Promise((resolve) => { ready = resolve; });
+  const receipts = [];
+  let receiptCount = 0;
+  const firstReceipt = new Promise((resolve) => { receipts.push(resolve); });
+  const secondReceipt = new Promise((resolve) => { receipts.push(resolve); });
+  const conversation = {
+    watch: async () => ({ start(listener) { deliver = listener; ready(); }, stop: async () => {} }),
+    submit: async () => {
+      let resolve;
+      const settlement = new Promise((done) => { resolve = done; });
+      const id = submitted.length + 1;
+      submitted.push({ resolve });
+      return { id, wait: () => settlement };
+    },
+    answer: async (id) => ({ text: id === 101 ? "partial" : "second answer" }),
+  };
+  const output = new Writable({ write(chunk, _encoding, callback) {
+    if (chunk.toString().includes("Reply pending")) receipts[receiptCount++]();
+    callback();
+  } });
+  const controller = new AbortController();
+  const terminal = runTerminalConversation(conversation, withAbortSignal(controller.signal, BACKGROUND_CONTEXT), {
+    input, output, activityTimer: timer.timer,
+    display: { interactive: true, prompt() {}, erasePrompt() {}, status(text) { statuses.push(text); } },
+  });
+  try {
+    await watching;
+    input.write("first");
+    await firstReceipt;
+    await deliver({ run: { taskId: 10, inputs: [1], generation: { attempt: 0, text: "partial" } }, answers: [] });
+    const afterPartial = statuses.length;
+    input.write("second");
+    await secondReceipt;
+    await new Promise((resolve) => setImmediate(resolve));
+    timer.tick();
+    assert.equal(statuses.slice(afterPartial).filter((text) => typeof text === "string").length, 0);
+    await deliver({ answers: [] });
+    submitted[0].resolve({ status: "done", type: "input", answer: 101 });
+    await new Promise((resolve) => setImmediate(resolve));
+    timer.tick();
+    assert.match(statuses.filter((text) => typeof text === "string").at(-1), /Waiting for the assistant/);
+    await deliver({ run: { taskId: 20, inputs: [2] }, answers: [] });
+    timer.tick();
+    assert.match(statuses.filter((text) => typeof text === "string").at(-1), /Assistant working/);
+    submitted[1].resolve({ status: "done", type: "input", answer: 102 });
+    input.end();
+    await terminal;
+    const frames = statuses.length;
+    timer.tick();
+    assert.equal(statuses.length, frames, "no timer remains after attachment shutdown");
+  } finally {
+    submitted.forEach(({ resolve }) => resolve({ status: "unanswered", type: "input", reason: "aborted" }));
+    controller.abort();
+    input.end();
+    await Promise.allSettled([terminal]);
+    input.destroy();
+  }
+});
+
+test("a plain TTY prompt remains available without interactive display features", { timeout: timeoutMs }, async () => {
+  let prompts = 0;
+  await runTerminalConversation({ watch: async () => ({ start() {}, stop: async () => {} }) }, BACKGROUND_CONTEXT, {
+    input: inputLines(""), output: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+    prompt() { prompts++; },
+  });
+  assert.equal(prompts, 2);
+});
 
 test("settled final text waits for slow writable and appears exactly once", { timeout: timeoutMs + 2_000 }, async () => {
   const { harness, conversation, faux } = await makeHarness(new MemoryStorage());
