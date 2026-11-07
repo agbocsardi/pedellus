@@ -81,6 +81,36 @@ const MAX_REMEMBERED_LOCAL_INPUTS = 1_024;
 const MAX_EXTERNAL_RUNS = 64;
 const LITERAL_SLASH_PREFIX = "//";
 /**
+ * Interactive-only receipts and display. A slow reply must look pending rather than broken, and a
+ * closed terminal must not look like a lost answer. Neither receipt claims a model turn is running:
+ * native admission only establishes that the input is durable, so `/status` stays the authority on
+ * whether it is queued or running.
+ */
+const INTERACTIVE_ATTACH_NOTICE =
+  "Attached. Earlier replies are not replayed; /history prints them. Closing this terminal does not cancel admitted work.";
+const INTERACTIVE_PENDING_NOTICE = "Reply pending; it may be queued behind a running turn. /status shows progress.";
+const ASSISTANT_LABEL = "Assistant:";
+const ACTIVITY_FRAMES = ["|", "/", "-", "\\"] as const;
+const ACTIVITY_INTERVAL_MS = 250;
+/**
+ * The activity line reports only what committed state establishes: an admitted input is pending, and
+ * a run containing it has been observed. "Waiting" is also what a queued input shows, so neither
+ * label claims that the model is generating.
+ */
+const ACTIVITY_WAITING = "Waiting for the assistant...";
+const ACTIVITY_WORKING = "Assistant working...";
+
+const DEFAULT_ACTIVITY_TIMER: TerminalActivityTimer = {
+  set(callback, milliseconds) {
+    const handle = setInterval(callback, milliseconds);
+    (handle as { unref?: () => void }).unref?.();
+    return handle;
+  },
+  clear(handle) {
+    clearInterval(handle as ReturnType<typeof setInterval>);
+  },
+};
+/**
  * Only a busy refusal guarantees no effect. Other failures may follow acceptance or a lost
  * acknowledgement, so report uncertainty without echoing an internal message.
  */
@@ -161,13 +191,37 @@ export interface TerminalAttachmentHost {
   submit(path: string, prompt: string, context: Context): Promise<TerminalAttachmentSubmission>;
 }
 
+/**
+ * Optional owner-terminal display. Absent keeps plain line-oriented output, which is what a piped
+ * run and an SDK caller rely on. Every hook is idempotent: the host preserves the typed input
+ * buffer when the prompt is erased, and a status line never displaces the prompt line.
+ */
+export interface TerminalDisplay {
+  /** True only for a real owner terminal; interactive receipts and activity exist only then. */
+  readonly interactive: boolean;
+  /** Draw the host's prompt. */
+  prompt(): void;
+  /** Erase the displayed prompt line; the typed buffer stays in the host input source. */
+  erasePrompt(): void;
+  /** Replace the transient status line above the prompt, or clear it with `undefined`. */
+  status(text: string | undefined): void;
+}
+
+/** Timer hooks for the transient status line, so checks can drive frames deterministically. */
+export interface TerminalActivityTimer {
+  set(callback: () => void, milliseconds: number): unknown;
+  clear(handle: unknown): void;
+}
+
 export interface TerminalIO {
   /** Each item is a completed line; the source owns any memory bound before yielding it. */
   readonly input: AsyncIterable<string>;
   readonly output: Writable;
   readonly errorOutput?: Writable;
-  /** Called before input and after each line, allowing a readline host to show its prompt. */
-  readonly prompt?: () => void;
+  /** Optional interactive prompt, activity line and receipts; absent keeps answer-only output. */
+  readonly display?: TerminalDisplay;
+  /** Optional timer source for the activity line; defaults to an unref'd interval. */
+  readonly activityTimer?: TerminalActivityTimer;
   /** Close an input source that supports prompt cancellation (for example readline.Interface). */
   readonly closeInput?: () => void;
   /** Optional host-owned model policy; standalone terminal callers remain read-only without it. */
@@ -205,6 +259,8 @@ type GenerationOutput = {
   openLine: boolean;
   /** Final entry reconciled; suppress older committed snapshots still queued behind output backpressure. */
   finalized: boolean;
+  /** Interactive answer header already printed for this generation's text. */
+  labelled: boolean;
 };
 type RunOutput = { generation?: GenerationOutput };
 type ExternalRun = {
@@ -254,6 +310,17 @@ export async function runTerminalConversation(
   let outputTail: Promise<void> = Promise.resolve();
   let renderTail: Promise<void> = Promise.resolve();
   let outputFailure: unknown;
+  // Owner-terminal display state. A prompt is drawn only by showPrompt and erased before any
+  // written text; the status line lives above it and never owns the prompt or typed input.
+  const display = io.display;
+  const interactive = display?.interactive === true;
+  let promptVisible = false;
+  let activityHandle: unknown;
+  let activityFrame = 0;
+  let activityPhase: "waiting" | "working" = "waiting";
+  /** Assistant text has begun for the current admitted batch; no activity line is drawn over it. */
+  let activitySuppressed = false;
+  let inputEnded = false;
   /** Last successful search base and cursor; the cursor is opaque and never printed. */
   let pendingSearch: { readonly query: HistoryQuery; readonly cursor: HistoryCursor } | undefined;
 
@@ -280,6 +347,9 @@ export async function runTerminalConversation(
     const target = toError ? (io.errorOutput ?? io.output) : io.output;
     const operation = outputTail.then(async () => {
       if (outputFailure !== undefined) throw outputFailure;
+      // A status line or prompt display never survives text: the line belongs to the output.
+      stopActivity();
+      erasePrompt();
       if (!target.write(cleaned)) await waitForDrain(target, signal);
     });
     outputTail = operation.catch((error: unknown) => {
@@ -305,6 +375,54 @@ export async function runTerminalConversation(
   };
   const notice = (text: string, toError = false): Promise<void> =>
     serializeRender(() => rawNotice(text, toError));
+
+  const activityTimer = io.activityTimer ?? DEFAULT_ACTIVITY_TIMER;
+  const stopActivity = (): void => {
+    if (activityHandle !== undefined) {
+      activityTimer.clear(activityHandle);
+      activityHandle = undefined;
+    }
+    display?.status(undefined);
+  };
+  const renderActivity = (): void => {
+    if (display === undefined || !promptVisible) return;
+    const glyph = ACTIVITY_FRAMES[activityFrame % ACTIVITY_FRAMES.length]!;
+    activityFrame++;
+    display.status(`${glyph} ${activityPhase === "working" ? ACTIVITY_WORKING : ACTIVITY_WAITING}`);
+  };
+  /** The activity line exists only beside a drawn prompt and only for admitted, unsettled local input. */
+  const startActivityIfPending = (): void => {
+    if (display === undefined || !interactive || !promptVisible) return;
+    if (submissions.size === 0 || activitySuppressed || signal?.aborted) return;
+    if (activityHandle !== undefined) return;
+    activityFrame = 0;
+    renderActivity();
+    activityHandle = activityTimer.set(renderActivity, ACTIVITY_INTERVAL_MS);
+  };
+  const erasePrompt = (): void => {
+    if (display === undefined || !promptVisible) return;
+    promptVisible = false;
+    display.erasePrompt();
+  };
+  /** Restore the prompt, and the activity line, when no answer text is being written. */
+  const showPrompt = (): void => {
+    if (display === undefined || !interactive || signal?.aborted || inputEnded) return;
+    stopActivity();
+    if (!promptVisible) {
+      display.prompt();
+      promptVisible = true;
+    }
+    startActivityIfPending();
+  };
+  /** One interactive answer header per committed answer block; host notices stay unlabelled. */
+  const labelAssistant = async (state?: GenerationOutput): Promise<void> => {
+    if (display === undefined || !interactive) return;
+    if (state !== undefined) {
+      if (state.labelled) return;
+      state.labelled = true;
+    }
+    await write(`${ASSISTANT_LABEL}\n`);
+  };
 
   const rememberAnswer = (id: number): boolean => {
     if (answerIds.has(id)) return false;
@@ -386,6 +504,7 @@ export async function runTerminalConversation(
         true,
       );
     } else {
+      await labelAssistant();
       await rawNotice(limitResponse(finalText));
     }
   };
@@ -448,6 +567,7 @@ export async function runTerminalConversation(
         active: false,
         openLine: false,
         finalized: false,
+        labelled: false,
       };
       runOutputs.set(taskId, run);
     }
@@ -494,6 +614,12 @@ export async function runTerminalConversation(
       }
     }
     for (const id of ownedInputs) submissions.get(id)!.runTaskId = run.taskId;
+    // A run containing an admitted local input is the first evidence that the model can work on it;
+    // a still-unobserved admitted input stays on the waiting label.
+    if (activityPhase !== "working") {
+      activityPhase = "working";
+      if (activityHandle !== undefined) renderActivity();
+    }
     const runFirst = run.inputs[0];
     if (runFirst !== undefined) {
       for (const id of ownedInputs) {
@@ -545,7 +671,8 @@ export async function runTerminalConversation(
     const limitExceeded = delta.length > remaining;
     const shown = completePrefix(delta, remaining);
     if (shown) {
-      if (!state.openLine) state.openLine = true;
+      if (!state.openLine) await labelAssistant(state);
+      state.openLine = true;
       await write(shown);
       state.streamed += shown;
       state.openLine = !shown.endsWith("\n");
@@ -596,6 +723,7 @@ export async function runTerminalConversation(
           if (generation?.streamed.length === 0) await rawNotice("The assistant returned no text response.");
           else await rawNotice("[The committed assistant entry had no text; the streamed partial was not a final answer.]", true);
         } else if (generation === undefined || generation.streamed.length === 0) {
+          await labelAssistant(generation);
           await rawNotice(limitResponse(finalText));
         } else if (finalText.startsWith(generation.streamed)) {
           const suffix = finalText.slice(generation.streamed.length);
@@ -657,8 +785,13 @@ export async function runTerminalConversation(
           submissions.delete(id);
           reservedInputs = Math.max(0, reservedInputs - 1);
           cleanupRun(local?.runTaskId);
+          if (submissions.size === 0) {
+            activitySuppressed = false;
+            activityPhase = "waiting";
+          }
         });
         waits.delete(task);
+        showPrompt();
       });
     waits.add(task);
   };
@@ -674,6 +807,11 @@ export async function runTerminalConversation(
       submissions.set(submission.id, { id: submission.id, submission });
       rememberLocalInput(submission.id);
       waitForSubmission(submission.id, submission);
+      // Only after native admission: a rejected input has its own refusal notice instead.
+      if (interactive) {
+        await notice(INTERACTIVE_PENDING_NOTICE);
+        showPrompt();
+      }
     });
     admissionTail = operation.catch(async (error: unknown) => {
       reservedInputs = Math.max(0, reservedInputs - 1);
@@ -1161,6 +1299,10 @@ export async function runTerminalConversation(
       `Stored attachment at ${safeLabel(admitted.attachment.relativePath, 200)} ` +
       `(${admitted.attachment.bytes} bytes) and admitted its turn.`,
     );
+    if (interactive) {
+      await notice(INTERACTIVE_PENDING_NOTICE);
+      showPrompt();
+    }
   };
 
   /**
@@ -1308,6 +1450,7 @@ export async function runTerminalConversation(
       .finally(() => {
         activeCommands--;
         commands.delete(task);
+        showPrompt();
       });
     commands.add(task);
     admissionTail = task.catch(() => undefined);
@@ -1317,21 +1460,21 @@ export async function runTerminalConversation(
   const onAbort = (): void => closeInput();
   signal?.addEventListener("abort", onAbort, { once: true });
   if (signal?.aborted) closeInput();
-  let inputEnded = false;
 
   try {
-    io.prompt?.();
+    if (interactive) await notice(INTERACTIVE_ATTACH_NOTICE);
+    showPrompt();
     for await (const line of input) {
       if (signal?.aborted) break;
       // This bounds admitted content after the source yields a complete line, not its ingress buffer.
       if (line.length > MAX_ADMITTED_LINE_CODE_UNITS) {
         await notice(`Input exceeds the ${MAX_ADMITTED_LINE_CODE_UNITS}-code-unit CLI limit.`, true);
-        io.prompt?.();
+        showPrompt();
         continue;
       }
       const leading = line.trimStart();
       if (!leading) {
-        io.prompt?.();
+        showPrompt();
         continue;
       }
       if (looksLikeOAuthCallback(line)) {
@@ -1354,7 +1497,7 @@ export async function runTerminalConversation(
       } else {
         await queueInput(line);
       }
-      io.prompt?.();
+      showPrompt();
     }
     inputEnded = !signal?.aborted;
 
@@ -1389,6 +1532,9 @@ export async function runTerminalConversation(
   } finally {
     signal?.removeEventListener("abort", onAbort);
     if (signal?.aborted) closeInput();
+    // A disconnect or abort never leaves an activity interval behind.
+    inputEnded = true;
+    stopActivity();
     for (const stream of outputStreams) stream.off("error", onOutputError);
     await watch.stop();
     await Promise.allSettled([...watchCallbacks, ...waits, ...commands]);

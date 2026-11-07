@@ -42,6 +42,31 @@ function inputLines(...lines) {
   return (async function* () { yield* lines; })();
 }
 
+/** One line, then an open input; the check decides when EOF happens. */
+function heldInput(line) {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  return {
+    release,
+    input: (async function* () { yield line; await held; })(),
+  };
+}
+
+/** Deterministic activity timer: frames advance only when the check ticks them. */
+function controlledTimer() {
+  const callbacks = new Map();
+  const cleared = [];
+  let next = 0;
+  return {
+    cleared,
+    tick() { for (const callback of [...callbacks.values()]) callback(); },
+    timer: {
+      set(callback) { const handle = ++next; callbacks.set(handle, callback); return handle; },
+      clear(handle) { cleared.push(handle); callbacks.delete(handle); },
+    },
+  };
+}
+
 test("settled final text waits for slow writable and appears exactly once", { timeout: timeoutMs + 2_000 }, async () => {
   const { harness, conversation, faux } = await makeHarness(new MemoryStorage());
   const expected = `synthetic-${"answer-".repeat(50)}`;
@@ -74,6 +99,177 @@ test("settled final text waits for slow writable and appears exactly once", { ti
     assert.equal(printed.replace(/\n+$/, ""), expected);
   } finally {
     release?.();
+    controller.abort();
+    await Promise.allSettled([terminal]);
+    await harness.close(BACKGROUND_CONTEXT);
+  }
+});
+
+test("interactive receipts follow durable admission and precede the reply", { timeout: timeoutMs + 2_000 }, async () => {
+  const { harness, conversation, faux } = await makeHarness(new MemoryStorage());
+  faux.setResponses([fauxAssistantMessage("synthetic admitted answer")]);
+  let releaseAdmission;
+  let markEntered;
+  const gate = new Promise((resolve) => { releaseAdmission = resolve; });
+  const entered = new Promise((resolve) => { markEntered = resolve; });
+  const proxy = new Proxy(conversation, { get(target, property) {
+    if (property === "submit") return async (...args) => {
+      markEntered();
+      await gate;
+      return target.submit(...args);
+    };
+    const value = Reflect.get(target, property, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  const chunks = [];
+  const statuses = [];
+  const output = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
+  const controller = new AbortController();
+  const terminal = runTerminalConversation(inProcessTerminalConversation(proxy), withAbortSignal(controller.signal, BACKGROUND_CONTEXT), {
+    input: inputLines("synthetic prompt"),
+    output,
+    display: {
+      interactive: true,
+      prompt() {},
+      erasePrompt() {},
+      status(text) { statuses.push(text); },
+    },
+  });
+  try {
+    await entered;
+    const waiting = chunks.join("");
+    assert.match(waiting, /Earlier replies are not replayed; \/history prints them/);
+    assert.match(waiting, /Closing this terminal does not cancel admitted work/);
+    assert.doesNotMatch(waiting, /Reply pending/, "a receipt must not precede durable admission");
+    releaseAdmission();
+    await terminal;
+    const printed = chunks.join("");
+    assert.match(printed, /Reply pending; it may be queued behind a running turn/);
+    assert.ok(printed.indexOf("Reply pending") < printed.indexOf("synthetic admitted answer"));
+  } finally {
+    releaseAdmission?.();
+    controller.abort();
+    await Promise.allSettled([terminal]);
+    await harness.close(BACKGROUND_CONTEXT);
+  }
+});
+
+test("interactive attachment receipt also follows durable admission", { timeout: timeoutMs + 2_000 }, async () => {
+  const { harness, conversation, faux } = await makeHarness(new MemoryStorage());
+  faux.setResponses([fauxAssistantMessage("synthetic attachment answer")]);
+  let releaseAdmission;
+  let markEntered;
+  const gate = new Promise((resolve) => { releaseAdmission = resolve; });
+  const entered = new Promise((resolve) => { markEntered = resolve; });
+  const chunks = [];
+  const output = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
+  const controller = new AbortController();
+  const terminal = runTerminalConversation(inProcessTerminalConversation(conversation), withAbortSignal(controller.signal, BACKGROUND_CONTEXT), {
+    input: inputLines("/attach synthetic.txt -- describe"),
+    output,
+    display: {
+      interactive: true,
+      prompt() {},
+      erasePrompt() {},
+      status() {},
+    },
+    attachments: { submit: async (path, prompt, context) => {
+      markEntered();
+      await gate;
+      const submission = await conversation.submit({ type: "input", content: `stored ${path} ${prompt}` }, context);
+      return { submission, attachment: { relativePath: "media/cli/document-synthetic.txt", bytes: 12 } };
+    } },
+  });
+  try {
+    await entered;
+    assert.doesNotMatch(chunks.join(""), /Stored attachment|Reply pending/);
+    releaseAdmission();
+    await terminal;
+    const printed = chunks.join("");
+    assert.match(printed, /Stored attachment at media\/cli\/document-synthetic\.txt \(12 bytes\) and admitted its turn/);
+    assert.match(printed, /Reply pending/);
+    assert.ok(printed.indexOf("Stored attachment") < printed.indexOf("Reply pending"));
+    assert.ok(printed.indexOf("Reply pending") < printed.indexOf("synthetic attachment answer"));
+  } finally {
+    releaseAdmission?.();
+    controller.abort();
+    await Promise.allSettled([terminal]);
+    await harness.close(BACKGROUND_CONTEXT);
+  }
+});
+
+test("activity line reports waiting then work, and stops before committed answer text", { timeout: timeoutMs + 2_000 }, async () => {
+  const { harness, conversation, faux } = await makeHarness(new MemoryStorage());
+  let releaseGeneration;
+  const generationGate = new Promise((resolve) => { releaseGeneration = resolve; });
+  faux.setResponses([async () => {
+    await generationGate;
+    return fauxAssistantMessage("synthetic spinner answer");
+  }]);
+  const statuses = [];
+  let promptCalls = 0;
+  let eraseCalls = 0;
+  const timer = controlledTimer();
+  const chunks = [];
+  const output = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
+  const controller = new AbortController();
+  const held = heldInput("synthetic prompt");
+  // Hold committed snapshots so the waiting label is observed before any run; deliver them together.
+  const buffered = [];
+  let deliver;
+  const snapshots = new Proxy(conversation, { get(target, property) {
+    if (property === "watch") return async (...args) => {
+      const watch = await target.watch(...args);
+      return {
+        start(listener) { deliver = listener; watch.start((call) => { buffered.push(call); }); },
+        stop: () => watch.stop(),
+      };
+    };
+    const value = Reflect.get(target, property, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  const terminal = runTerminalConversation(inProcessTerminalConversation(snapshots), withAbortSignal(controller.signal, BACKGROUND_CONTEXT), {
+    input: held.input,
+    output,
+    display: {
+      interactive: true,
+      prompt() { promptCalls++; },
+      erasePrompt() { eraseCalls++; },
+      status(text) { statuses.push(text); },
+    },
+    activityTimer: timer.timer,
+  });
+  const frames = () => statuses.filter((text) => typeof text === "string");
+  try {
+    // The activity line starts only after durable admission and beside a drawn prompt.
+    await eventually(async () => frames().length > 0, "activity line did not start after admission");
+    assert.ok(promptCalls > 0);
+    assert.match(frames()[0], /^\| Waiting for the assistant\.\.\.$/);
+    const beforeTick = statuses.length;
+    timer.tick();
+    assert.ok(statuses.length > beforeTick, "one timer tick renders one frame");
+    assert.match(frames().at(-1), /^\/ Waiting for the assistant\.\.\.$/);
+    // An observed run containing the admitted input switches the same line to work, before any text.
+    await eventually(async () => {
+      const pending = buffered.splice(0);
+      for (const call of pending) await deliver(call);
+      timer.tick();
+      return frames().at(-1)?.includes("Assistant working...") === true;
+    }, "activity line never reported the observed run");
+    assert.doesNotMatch(chunks.join(""), /Assistant:/);
+    releaseGeneration();
+    await eventually(async () => chunks.join("").includes("synthetic spinner answer"), "committed answer did not arrive");
+    held.release();
+    await terminal;
+    const printed = chunks.join("");
+    assert.equal(printed.split("Assistant:").length - 1, 1, "one answer header");
+    assert.ok(printed.indexOf("Assistant:") < printed.indexOf("synthetic spinner answer"));
+    assert.ok(eraseCalls > 0, "the prompt line is cleared before answer text");
+    assert.equal(timer.cleared.length, 1, "the activity interval is released once");
+    assert.equal(statuses.at(-1), undefined, "the activity line is cleared before the prompt returns");
+  } finally {
+    releaseGeneration?.();
+    held.release();
     controller.abort();
     await Promise.allSettled([terminal]);
     await harness.close(BACKGROUND_CONTEXT);

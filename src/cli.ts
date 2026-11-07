@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createInterface } from "node:readline";
+import { clearLine, createInterface, cursorTo, moveCursor } from "node:readline";
 import { resolve } from "node:path";
 import { stdin, stderr, stdout } from "node:process";
 import type { AuthType } from "@earendil-works/pi-ai";
@@ -23,7 +23,7 @@ import { createMediaStore } from "./media/attachments.js";
 import { LOCAL_ATTACHMENT_DIRECTORY } from "./media/local.js";
 import { cancelPreparedContextBlock, listPreparedContextBlocks, PreparedContextRecoveryError } from "./recovery/index.js";
 import { createRestartCoordinator, replaceProcess, restartPlan, restartSupported, RESTART_FAILURE_DIAGNOSTIC } from "./restart.js";
-import { runTerminalConversation } from "./terminal/index.js";
+import { runTerminalConversation, type TerminalDisplay } from "./terminal/index.js";
 import { openGateway } from "./runtime.js";
 import { prepareDataDirectory } from "./store.js";
 import { StartupDiagnosticError, startupDiagnostic } from "./startup-diagnostics.js";
@@ -576,6 +576,69 @@ function replaceGatewayProcess(): void {
 }
 
 /**
+ * The owner terminal's prompt and transient status line.
+ *
+ * The status line sits above the readline prompt: starting one moves the prompt down, later frames
+ * replace only the line above it (DECSC/DECRC), and clearing leaves the prompt line and typed
+ * buffer untouched. Readline owns input echo, so no hook writes over the prompt or an answer's text.
+ */
+function ownerDisplay(
+  input: ReturnType<typeof createInterface>,
+  closed: () => boolean,
+  markClosed: () => void,
+): TerminalDisplay {
+  let promptDrawn = false;
+  let statusDrawn = false;
+  const prompt = (): void => {
+    if (closed()) return;
+    try {
+      input.prompt(true);
+      promptDrawn = true;
+    } catch {
+      markClosed();
+    }
+  };
+  return {
+    interactive: true,
+    prompt,
+    erasePrompt() {
+      if (!promptDrawn) return;
+      promptDrawn = false;
+      cursorTo(stdout, 0);
+      clearLine(stdout, 0);
+    },
+    status(text) {
+      if (text === undefined) {
+        if (!statusDrawn) return;
+        statusDrawn = false;
+        stdout.write("\x1b7");
+        moveCursor(stdout, 0, -1);
+        cursorTo(stdout, 0);
+        clearLine(stdout, 0);
+        stdout.write("\x1b8");
+        return;
+      }
+      if (!promptDrawn) return;
+      if (!statusDrawn) {
+        statusDrawn = true;
+        cursorTo(stdout, 0);
+        clearLine(stdout, 0);
+        promptDrawn = false;
+        stdout.write(`${text}\n`);
+        prompt();
+        return;
+      }
+      stdout.write("\x1b7");
+      moveCursor(stdout, 0, -1);
+      cursorTo(stdout, 0);
+      clearLine(stdout, 0);
+      stdout.write(text);
+      stdout.write("\x1b8");
+    },
+  };
+}
+
+/**
  * A CLI is a conversation surface over the running gateway. Disconnecting closes
  * only this attachment and its local watchers; durably admitted turns keep running
  * and the same `cli` conversation is resumed on the next attach.
@@ -631,23 +694,17 @@ async function runAgent(
       }
     }
     // Readline's post-line size check bounds admission, not its pre-newline input buffer.
-    input = createInterface({ input: stdin, output: stdout, terminal: Boolean(stdin.isTTY && stdout.isTTY) });
+    const terminalInput = Boolean(stdin.isTTY && stdout.isTTY);
+    const displayed = terminalInput && process.env.TERM !== "dumb";
+    input = createInterface({ input: stdin, output: stdout, terminal: terminalInput });
     input.once("close", () => { inputClosed = true; });
-    input.setPrompt("> ");
+    input.setPrompt(terminalInput ? "You: " : "> ");
     await runTerminalConversation(client, context, {
       input,
       output: stdout,
       errorOutput: stderr,
-      // A piped stdin can already be closed before the remote watch attaches;
-      // prompting then throws ERR_USE_AFTER_CLOSE. Prompts are interactive-only.
-      prompt: () => {
-        if (inputClosed || input?.terminal !== true) return;
-        try {
-          input.prompt();
-        } catch {
-          inputClosed = true;
-        }
-      },
+      // A display exists only for a real owner terminal; a piped run stays answer-only.
+      ...(displayed ? { display: ownerDisplay(input, () => inputClosed, () => { inputClosed = true; }) } : {}),
       closeInput: () => input?.close(),
       modelSelection: {
         list: () => client!.listModels(context),

@@ -122,6 +122,23 @@ tool calls/arguments, and tool output are not printed. ESC/C1 terminal controls,
 carriage returns, and bidi formatting controls are removed; ordinary newlines and
 Unicode scalar values are preserved. See [workspace context](./WORKSPACE_CONTEXT.md).
 
+An interactive attach (stdin and stdout are both a TTY) labels the two roles: the
+readline prompt reads `You: ` and each answer begins with one `Assistant:` line. It
+prints one connection line: earlier replies are not replayed, `/history` prints them,
+and closing the terminal does not cancel admitted work. Each ordinary input or
+`/attach` turn then prints one receipt, only after native admission and before any
+reply, saying the reply is pending and that `/status` distinguishes a running turn
+from a queued one. While that input is admitted and unsettled, and before any answer
+text is written, one activity line above the prompt animates: `Waiting for the
+assistant...` until a committed snapshot shows a run that owns the input, then
+`Assistant working...`. Neither label claims a model request is generating before
+that run is observed, and the line is cleared, with its timer released, on answer
+text, settlement, abort or attachment close. Prompt erasure preserves the typed
+buffer, so multiline and Unicode input and its cursor keep working. Host notices are
+never labelled as assistant text, and reasoning, tool calls/arguments and tool output
+stay hidden. A non-interactive terminal (or `TERM=dumb`) gets no labels, receipts or
+activity line; piped output stays answer-only.
+
 ## Gateway and local transport
 
 The gateway serves one private Unix socket inside the configured `dataDir`
