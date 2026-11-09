@@ -676,10 +676,16 @@ process racing the workspace between them is not fully excluded on this host
   flood-gated action is skipped without retry. Typing is not awaited by model
   admission or reply delivery; Telegram rate limits still apply to the shared
   outbound gate. No typing state is stored.
-- `getUpdates` has its own flood wait and bounded transport/5xx retries,
-  independent of outbound calls. Outbound calls share one bot-token flood gate;
+- `getMe` at startup and `getUpdates` polling retry transport failures, timeouts
+  and Telegram 5xx across a sustained outage, with cancellation-aware capped
+  exponential backoff (1s to 60s, bounded jitter) and no fixed attempt limit; a
+  successful read resets the backoff. Fatal auth/config rejections (for example
+  401/409), non-transient local/programming failures and every outbound call keep
+  their previous bounded behavior. One fixed announcement and one fixed recovery
+  notice are emitted per outage episode, never one per retry. `getUpdates` has its
+  own flood wait, independent of outbound calls. Outbound calls share one bot-token flood gate;
   a later concurrent deadline wins. Full finite, positive `retry_after` values
-  are honored, including after a call exhausts its bounded attempts. Waits are
+  are honored, including after an outbound call exhausts its bounded attempts. Waits are
   abortable and have a five-minute per-call budget; long timer waits are chunked
   below Node's timer limit. Replaceable previews yield during a flood wait rather
   than queueing stale edits.
@@ -701,8 +707,9 @@ process racing the workspace between them is not fully excluded on this host
   `/abort`, or `reset` when the `/new` reset ended the turn), which is forgotten
   silently because the user asked for it; empty text answers also get a fixed
   user-visible response.
-  Polling errors other than cancellation terminate `runTelegram` for the host to
-  handle.
+  A fatal polling error (for example rejected credentials or a local failure)
+  terminates `runTelegram` for the host to handle; a transient read outage is
+  retried in place instead.
 
 ## Rich message formatting
 

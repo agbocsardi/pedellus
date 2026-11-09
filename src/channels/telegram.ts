@@ -101,6 +101,9 @@ const API = "https://api.telegram.org";
 const TELEGRAM_LIMIT = PLAIN_TEXT_LIMIT;
 const MAX_ADMITTED = 1000;
 const MAX_API_ATTEMPTS = 5;
+/** Safe reads (getMe/getUpdates) retry through a Telegram outage without a fixed attempt limit. */
+const READ_RETRY_BASE_MS = 1_000;
+const READ_RETRY_MAX_MS = 60_000;
 const POLL_TIMEOUT_MAX = 50;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const FLOOD_WAIT_BUDGET_MS = 5 * 60_000;
@@ -462,6 +465,21 @@ export async function runTelegram(
   const cleanupContext = withoutAbortSignal(adapterContext);
   const signal = adapterContext.abortSignal;
   if (signal?.aborted) return;
+  /** One announcement and one recovery notice per read-outage episode, never one per retry. */
+  let readOutage: { readonly method: string } | undefined;
+  const readOutageHooks: ReadOutageHooks = {
+    entered(method) {
+      if (readOutage !== undefined) return;
+      readOutage = { method };
+      console.warn(`Telegram ${method} is retrying through a service outage.`);
+    },
+    recovered() {
+      if (readOutage === undefined) return;
+      const method = readOutage.method;
+      readOutage = undefined;
+      console.info(`Telegram ${method} read recovered after the service outage.`);
+    },
+  };
   // Outbound uploads resolve against the configured workspace only; the media opt-in is the
   // operator switch. Absent means every file send is refused before any external call.
   const outboundWorkspace = options.media?.workspace;
@@ -474,7 +492,10 @@ export async function runTelegram(
     fetch: telegramFetch as unknown as NonNullable<ApiClientOptions["fetch"]>,
   });
 
-  const me = await apiCall(api, "getMe", signal, (callSignal) => api.getMe(toGrammySignal(callSignal)), { throttle: pollThrottle });
+  const me = await apiCall(api, "getMe", signal, (callSignal) => api.getMe(toGrammySignal(callSignal)), {
+    throttle: pollThrottle,
+    retryOutage: readOutageHooks,
+  });
   if (!me) throw new Error("Telegram getMe returned no result");
   const identity = String(me.id);
   const stateConversation = await gateway.conversationFor(
@@ -2380,7 +2401,7 @@ export async function runTelegram(
         offset: state.offset,
         timeout: Math.min(options.pollTimeoutSeconds ?? 30, POLL_TIMEOUT_MAX),
         allowed_updates: ["message", "message_reaction"],
-      }, toGrammySignal(callSignal)), { throttle: pollThrottle, retryNetwork: true });
+      }, toGrammySignal(callSignal)), { throttle: pollThrottle, retryOutage: readOutageHooks });
       if (!updates) throw new Error("Telegram getUpdates returned no result");
       for (const update of updates) {
         if (signal?.aborted) break;
@@ -3979,10 +4000,16 @@ function splitPlainTextLossless(text: string): string[] {
   return chunks;
 }
 
+type ReadOutageHooks = {
+  entered(method: string): void;
+  recovered(): void;
+};
+
 type ApiCallOptions = {
   throttle?: TelegramFloodGate;
   replaceable?: boolean;
-  retryNetwork?: boolean;
+  /** Present only for idempotent reads that must survive a sustained Telegram outage. */
+  retryOutage?: ReadOutageHooks;
 };
 
 type GrammySignal = Parameters<Api["getMe"]>[0];
@@ -4029,7 +4056,7 @@ async function apiCall<T>(
   options: ApiCallOptions = {},
 ): Promise<T | undefined> {
   let waitedMs = 0;
-  for (let attempt = 0; attempt < MAX_API_ATTEMPTS; attempt++) {
+  for (let attempt = 0; ; attempt++) {
     if (signal?.aborted) throw signal.reason;
     if (options.throttle) {
       for (;;) {
@@ -4040,7 +4067,9 @@ async function apiCall<T>(
     }
     if (signal?.aborted) throw signal.reason;
     try {
-      return await request(signal);
+      const result = await request(signal);
+      options.retryOutage?.recovered();
+      return result;
     } catch (error) {
       if (error instanceof GrammyError) {
         if (method === "editMessageText" && error.error_code === 400 &&
@@ -4056,11 +4085,12 @@ async function apiCall<T>(
           if (!Number.isFinite(deadline)) throw new TelegramApiError(method, 429, "rejected", undefined, { cause: error });
           options.throttle?.defer(deadline);
           if (options.replaceable) return undefined;
-          if (attempt < MAX_API_ATTEMPTS - 1) continue;
+          if (options.retryOutage !== undefined || attempt < MAX_API_ATTEMPTS - 1) continue;
           throw new TelegramApiError(method, 429, "rejected", undefined, { cause: error });
         }
-        if (options.retryNetwork && error.error_code >= 500 && attempt < MAX_API_ATTEMPTS - 1) {
-          await delay(backoff(attempt), signal);
+        if (options.retryOutage !== undefined && error.error_code >= 500) {
+          options.retryOutage.entered(method);
+          await delay(readRetryBackoff(attempt), signal);
           continue;
         }
         throw new TelegramApiError(method, error.error_code,
@@ -4078,8 +4108,9 @@ async function apiCall<T>(
           throw new TelegramApiError(method, 0, "unknown", undefined, { cause: error });
         }
         if (signal?.aborted) throw signal.reason;
-        if (options.retryNetwork && attempt < MAX_API_ATTEMPTS - 1) {
-          await delay(backoff(attempt), signal);
+        if (options.retryOutage !== undefined && isTransientTransportError(error.error)) {
+          options.retryOutage.entered(method);
+          await delay(readRetryBackoff(attempt), signal);
           continue;
         }
       }
@@ -4088,7 +4119,6 @@ async function apiCall<T>(
       throw new Error(`Telegram ${method} transport failed`, { cause: error });
     }
   }
-  throw new Error(`Telegram ${method} request attempts exhausted`);
 }
 
 export class TelegramApiError extends Error {
@@ -4128,6 +4158,12 @@ function isProvenRefusal(error: unknown): boolean {
     (error instanceof HttpError && isProvenPreConnectFailure(error.error));
 }
 
+const TRANSIENT_TRANSPORT_CODES: ReadonlySet<string> = new Set([
+  "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "ENETUNREACH", "ENETDOWN", "EHOSTUNREACH",
+  "EAI_AGAIN", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_SOCKET", "UND_ERR_CLOSED",
+]);
+
 function isProvenPreConnectFailure(error: unknown): boolean {
   const pending: unknown[] = [error];
   const visited = new Set<unknown>();
@@ -4145,6 +4181,37 @@ function isProvenPreConnectFailure(error: unknown): boolean {
 
 function backoff(attempt: number): number {
   return Math.min(10_000, 250 * 2 ** attempt);
+}
+
+/** Capped exponential outage delay with bounded jitter; a successful read starts the next episode at 1s. */
+function readRetryBackoff(attempt: number): number {
+  const exponential = Math.min(READ_RETRY_MAX_MS, READ_RETRY_BASE_MS * 2 ** Math.min(attempt, 16));
+  return Math.min(READ_RETRY_MAX_MS, Math.round(exponential * (1 + Math.random() * 0.2)));
+}
+
+/** Network failures, grammY timeouts and a 5xx body parse are transient; local/programming failures are not. */
+function isTransientTransportError(error: unknown): boolean {
+  const pending: unknown[] = [error];
+  const visited = new Set<unknown>();
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current || typeof current !== "object" || visited.has(current)) continue;
+    visited.add(current);
+    if (current instanceof SyntaxError) return true;
+    const candidate = current as { name?: unknown; code?: unknown; errno?: unknown; message?: unknown;
+      cause?: unknown; error?: unknown; errors?: unknown };
+    if (candidate.name === "TimeoutError" || candidate.name === "AbortError") return true;
+    const code = candidate.code ?? candidate.errno;
+    if (typeof code === "string" && TRANSIENT_TRANSPORT_CODES.has(code)) return true;
+    if (candidate.message === "fetch failed") return true;
+    if (typeof candidate.message === "string" && /^Request to '.+' timed out after .+ seconds$/.test(candidate.message)) {
+      return true;
+    }
+    if (candidate.cause !== undefined) pending.push(candidate.cause);
+    if (candidate.error instanceof Error) pending.push(candidate.error);
+    if (current instanceof AggregateError && Array.isArray(candidate.errors)) pending.push(...candidate.errors);
+  }
+  return false;
 }
 
 class TelegramFloodGate {
