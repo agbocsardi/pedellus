@@ -113,7 +113,7 @@ test('a non-transient Telegram transport failure preserves its native cause for 
   }
 });
 
-test('startup getMe survives more than five transport failures and reaches polling', { timeout: 15_000 }, async (t) => {
+test('startup getMe survives more than five transport/5xx failures and reaches polling', { timeout: 15_000 }, async (t) => {
   const original = globalThis.fetch;
   const scope = withCancel(BACKGROUND_CONTEXT);
   let getMeCalls = 0;
@@ -122,6 +122,8 @@ test('startup getMe survives more than five transport failures and reaches polli
     const method = methodOf(input);
     if (method === 'getMe') {
       getMeCalls += 1;
+      if (getMeCalls === 2) return failureResponse(502);
+      if (getMeCalls === 4) return new Response('{"message":"bad gateway"}', { status: 502 });
       if (getMeCalls <= 6) throw Object.assign(new Error('synthetic transport failure'), { code: 'ECONNRESET' });
       return jsonResponse(getMeResult);
     }
@@ -147,7 +149,7 @@ test('startup getMe survives more than five transport failures and reaches polli
   }
 });
 
-test('polling survives transport and 5xx failures without changing the durable offset', { timeout: 15_000 }, async (t) => {
+test('polling survives successive transport/5xx outages, resets backoff and preserves the durable offset', { timeout: 15_000 }, async (t) => {
   const original = globalThis.fetch;
   const warnings = console.warn;
   const infos = console.info;
@@ -165,19 +167,23 @@ test('polling survives transport and 5xx failures without changing the durable o
     if (method === 'getUpdates') {
       getUpdatesCalls += 1;
       offsets.push(JSON.parse(init.body).offset);
-      if (getUpdatesCalls <= 6) {
+      if (getUpdatesCalls <= 8) {
         if (getUpdatesCalls === 6) {
           return new Response('<html>bad gateway</html>', { status: 502, headers: { 'content-type': 'text/html' } });
+        }
+        if (getUpdatesCalls === 4 || getUpdatesCalls === 8) {
+          return new Response(JSON.stringify({ ok: false, message: 'bad gateway' }), { status: 502 });
         }
         if (getUpdatesCalls % 2 === 0) return failureResponse(503);
         throw Object.assign(new Error('synthetic transport failure'), {
           code: getUpdatesCalls === 1 ? 'ECONNRESET' : 'ETIMEDOUT',
         });
       }
-      if (getUpdatesCalls === 7) {
+      if (getUpdatesCalls === 9 || getUpdatesCalls === 11) {
         successfulPolls += 1;
         return jsonResponse([]);
       }
+      if (getUpdatesCalls === 10) return failureResponse(502);
       return heldRead(init);
     }
     if (method === 'setMyCommands') return jsonResponse(true);
@@ -188,17 +194,25 @@ test('polling survives transport and 5xx failures without changing the durable o
     token: '123:synthetic-token', allowFrom: ['1'], pollTimeoutSeconds: 1,
   }, scope.context);
   try {
-    await advanceUntil(t, () => successfulPolls > 0, 'polling retry recovery');
-    assert.ok(getUpdatesCalls >= 7);
-    assert.ok(offsets.length >= 7);
+    await advanceUntil(t, () => getUpdatesCalls === 10, 'second polling outage');
+    assert.equal(successfulPolls, 1);
+    // The first episode reached the capped delay; the new one must restart at 1–1.2s.
+    t.mock.timers.tick(999);
+    await flush();
+    assert.equal(getUpdatesCalls, 10, 'second outage retried before its base delay');
+    t.mock.timers.tick(201);
+    await flush();
+    assert.equal(successfulPolls, 2, 'backoff did not reset after a successful poll');
+    assert.equal(getUpdatesCalls, 12, 'recovered polling did not reach its next read');
+    assert.equal(offsets.length, 12);
     assert.deepEqual([...new Set(offsets)], [42]);
     assert.equal(store.state.offset, 42);
     assert.deepEqual(store.state.pending, []);
     const log = messages.join('\n');
     assert.match(log, /Telegram getUpdates is retrying through a service outage\./);
-    assert.equal((log.match(/is retrying through a service outage/g) ?? []).length, 1);
+    assert.equal((log.match(/is retrying through a service outage/g) ?? []).length, 2);
     assert.match(log, /Telegram getUpdates read recovered after the service outage\./);
-    assert.equal((log.match(/read recovered after the service outage/g) ?? []).length, 1);
+    assert.equal((log.match(/read recovered after the service outage/g) ?? []).length, 2);
   } finally {
     scope.cancel(new DOMException('test finished', 'AbortError'));
     await adapter.catch(() => undefined);
@@ -227,7 +241,7 @@ test('cancellation releases a startup retry backoff promptly and does not retry 
     for (let round = 0; round < 20 && getMeCalls === 0; round += 1) await flush(1);
     assert.equal(getMeCalls, 1, 'startup read did not reach its first failed attempt');
     scope.cancel(stopped);
-    await assert.rejects(adapter, (error) => error === stopped);
+    await adapter;
     t.mock.timers.tick(120_000);
     await flush(20);
     assert.equal(getMeCalls, 1, 'cancelled startup retried after its backoff');
@@ -255,7 +269,7 @@ test('cancellation aborts an in-flight startup read instead of waiting for its t
     for (let round = 0; round < 20 && !started; round += 1) await flush(1);
     assert.ok(started, 'startup read did not start');
     scope.cancel(stopped);
-    await assert.rejects(adapter, (error) => error === stopped);
+    await adapter;
   } finally {
     scope.cancel(stopped);
     await adapter.catch(() => undefined);
@@ -263,28 +277,89 @@ test('cancellation aborts an in-flight startup read instead of waiting for its t
   }
 });
 
-test('a permanent Telegram auth failure stays fatal without an outage retry', { timeout: 10_000 }, async () => {
+for (const failedMethod of ['getMe', 'getUpdates']) {
+  test(`a permanent ${failedMethod} auth failure stays fatal without an outage retry`, { timeout: 10_000 }, async () => {
+    const original = globalThis.fetch;
+    let failedCalls = 0;
+    globalThis.fetch = async (input) => {
+      const method = methodOf(input);
+      if (method === failedMethod) {
+        failedCalls += 1;
+        return failureResponse(401, 'Unauthorized');
+      }
+      if (method === 'getMe') return jsonResponse(getMeResult);
+      if (method === 'setMyCommands') return jsonResponse(true);
+      throw new Error('unexpected mocked Telegram method');
+    };
+    try {
+      await assert.rejects(runTelegram(syntheticGateway().gateway, {
+        token: '123:synthetic-token', allowFrom: ['1'],
+      }, BACKGROUND_CONTEXT), (error) => {
+        assert.equal(failedCalls, 1);
+        assert.equal(error.status, 401);
+        assert.equal(error.method, failedMethod);
+        const log = failureDiagnostic(error, 'gateway.telegram');
+        assert.match(log, /401/);
+        assert.ok(log.includes(failedMethod));
+        assert.ok(!log.includes('123:synthetic-token'));
+        return true;
+      });
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+}
+
+test('non-JSON auth errors and malformed successful responses are not mistaken for outages', { timeout: 10_000 }, async () => {
   const original = globalThis.fetch;
-  let getMeCalls = 0;
-  globalThis.fetch = async (input) => {
-    if (methodOf(input) !== 'getMe') throw new Error('unexpected mocked Telegram method');
-    getMeCalls += 1;
-    return failureResponse(401, 'Unauthorized');
-  };
   try {
-    await assert.rejects(runTelegram(syntheticGateway().gateway, {
-      token: '123:synthetic-token', allowFrom: ['1'],
-    }, BACKGROUND_CONTEXT), (error) => {
-      assert.equal(getMeCalls, 1);
-      assert.equal(error.status, 401);
-      assert.equal(error.method, 'getMe');
-      const log = failureDiagnostic(error, 'gateway.telegram');
-      assert.match(log, /401/);
-      assert.match(log, /getMe/);
-      assert.ok(!log.includes('123:synthetic-token'));
-      return true;
-    });
+    for (const [status, body] of [[401, '<html>unauthorized</html>'], [200, 'not JSON'],
+      [200, '{"ok":false,"message":"invalid response"}']]) {
+      let calls = 0;
+      globalThis.fetch = async () => {
+        calls += 1;
+        return new Response(body, { status });
+      };
+      await assert.rejects(runTelegram({}, {
+        token: '123:synthetic-token', allowFrom: ['1'],
+      }, BACKGROUND_CONTEXT));
+      assert.equal(calls, 1, `HTTP ${status} with a malformed body was retried`);
+    }
   } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('cancellation releases a polling retry backoff without another read', { timeout: 10_000 }, async (t) => {
+  const original = globalThis.fetch;
+  const scope = withCancel(BACKGROUND_CONTEXT);
+  let calls = 0;
+  globalThis.fetch = async (input) => {
+    const method = methodOf(input);
+    if (method === 'getMe') return jsonResponse(getMeResult);
+    if (method === 'setMyCommands') return jsonResponse(true);
+    if (method === 'getUpdates') {
+      calls += 1;
+      return failureResponse(502);
+    }
+    throw new Error('unexpected mocked Telegram method');
+  };
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  const adapter = runTelegram(syntheticGateway().gateway, {
+    token: '123:synthetic-token', allowFrom: ['1'],
+  }, scope.context);
+  try {
+    await flush(20);
+    assert.equal(calls, 1);
+    scope.cancel(new DOMException('test cancelled polling', 'AbortError'));
+    await adapter;
+    t.mock.timers.tick(120_000);
+    await flush();
+    assert.equal(calls, 1, 'cancelled polling retried after its backoff');
+  } finally {
+    scope.cancel(new DOMException('test finished', 'AbortError'));
+    await adapter.catch(() => undefined);
+    t.mock.timers.reset();
     globalThis.fetch = original;
   }
 });

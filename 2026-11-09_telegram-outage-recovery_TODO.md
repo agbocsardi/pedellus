@@ -19,7 +19,8 @@ these idempotent reads, not to broad channel/adapter/process restarts or a super
       cancellation during backoff and in-flight startup work, fatal auth, and safe cause diagnostics.
 - [x] Update `TELEGRAM.md` startup/outage and `getUpdates` retry semantics.
 - [x] Run typecheck, build, focused Telegram transport checks, full behavior and execution suites.
-- [ ] Independent review findings fixed or explicitly waived by the parent/owner.
+- [x] Independent review findings fixed by the parent; no findings waived.
+- [x] Re-run full validation after review corrections and merge the scoped fix.
 
 ## Session log
 
@@ -42,3 +43,15 @@ these idempotent reads, not to broad channel/adapter/process restarts or a super
 - Validation: `npm run typecheck`; `npm run build`; focused transport suite 8/8; full
   `npm run test:behavior` 561/561 in ~45.9s (inside the 60s suite timeout); `npm run test:execution`
   2/2; `git diff --check` clean. No live checks were run.
+- Fresh independent Pi DeepSeek Flash review found two low-severity issues: HTTP 5xx with
+  non-Telegram JSON could still fail immediately, and polling-auth/second-outage boundaries
+  lacked regressions. Both are fixed, with no waivers. Safe-read HTTP 5xx is now recognized
+  before grammY discards HTTP status, regardless of response body. Malformed successful or
+  non-JSON auth responses remain fatal rather than being retried indiscriminately.
+- Added polling-auth and second-outage/backoff-reset/announcement regressions, expanded startup
+  and polling proxy-5xx coverage, and pinned malformed-response and polling-backoff cancellation
+  boundaries. Startup cancellation now exits cleanly like polling cancellation; jitter remains
+  effective at the cap, and the original finite 429 attempt/wait budgets are preserved.
+- Corrected validation: typecheck/build pass; focused transport suite 11/11; full behavior
+  564/564 in ~44.8s; execution 2/2; whitespace check clean. The review was independent; the
+  parent made and validated the small corrections directly. No live checks or deployment.

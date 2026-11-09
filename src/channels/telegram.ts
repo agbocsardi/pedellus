@@ -492,10 +492,16 @@ export async function runTelegram(
     fetch: telegramFetch as unknown as NonNullable<ApiClientOptions["fetch"]>,
   });
 
-  const me = await apiCall(api, "getMe", signal, (callSignal) => api.getMe(toGrammySignal(callSignal)), {
-    throttle: pollThrottle,
-    retryOutage: readOutageHooks,
-  });
+  let me: Awaited<ReturnType<Api["getMe"]>> | undefined;
+  try {
+    me = await apiCall(api, "getMe", signal, (callSignal) => api.getMe(toGrammySignal(callSignal)), {
+      throttle: pollThrottle,
+      retryOutage: readOutageHooks,
+    });
+  } catch (error) {
+    if (signal?.aborted) return;
+    throw error;
+  }
   if (!me) throw new Error("Telegram getMe returned no result");
   const identity = String(me.id);
   const stateConversation = await gateway.conversationFor(
@@ -4023,18 +4029,27 @@ function toGrammySignal(signal?: AbortSignal): GrammySignal {
  * `AbortSignal`. Re-express it with a native controller so grammY's timeout and chat cancellation still
  * abort the in-flight request. The listener lives on grammY's per-call signal, so nothing outlives the call.
  */
-export function telegramFetch(
+export async function telegramFetch(
   input: Parameters<typeof fetch>[0],
   init?: Parameters<typeof fetch>[1],
 ): Promise<Response> {
   const signal: unknown = init?.signal;
-  if (signal === undefined || signal === null || signal instanceof AbortSignal) {
-    return globalThis.fetch(input, { ...init, redirect: "error" });
+  let nativeSignal = init?.signal ?? null;
+  if (signal !== undefined && signal !== null && !(signal instanceof AbortSignal)) {
+    const controller = new AbortController();
+    if ((signal as AbortSignal).aborted) controller.abort();
+    else (signal as AbortSignal).addEventListener("abort", () => controller.abort(), { once: true });
+    nativeSignal = controller.signal;
   }
-  const controller = new AbortController();
-  if ((signal as AbortSignal).aborted) controller.abort();
-  else (signal as AbortSignal).addEventListener("abort", () => controller.abort(), { once: true });
-  return globalThis.fetch(input, { ...init, signal: controller.signal, redirect: "error" });
+  const response = await globalThis.fetch(input, { ...init, signal: nativeSignal, redirect: "error" });
+  // grammY discards HTTP status before decoding JSON. Preserve safe-read 5xx even when a
+  // proxy returns HTML or JSON without Telegram's error_code; outbound decoding is unchanged.
+  const method = String(input).split("/").at(-1);
+  if ((method === "getMe" || method === "getUpdates") && response.status >= 500 && response.status < 600) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new TelegramApiError(method, response.status, "rejected");
+  }
+  return response;
 }
 
 /** Bot API methods whose request may already have been accepted when 5xx/transport fails. */
@@ -4085,7 +4100,7 @@ async function apiCall<T>(
           if (!Number.isFinite(deadline)) throw new TelegramApiError(method, 429, "rejected", undefined, { cause: error });
           options.throttle?.defer(deadline);
           if (options.replaceable) return undefined;
-          if (options.retryOutage !== undefined || attempt < MAX_API_ATTEMPTS - 1) continue;
+          if (attempt < MAX_API_ATTEMPTS - 1) continue;
           throw new TelegramApiError(method, 429, "rejected", undefined, { cause: error });
         }
         if (options.retryOutage !== undefined && error.error_code >= 500) {
@@ -4185,11 +4200,11 @@ function backoff(attempt: number): number {
 
 /** Capped exponential outage delay with bounded jitter; a successful read starts the next episode at 1s. */
 function readRetryBackoff(attempt: number): number {
-  const exponential = Math.min(READ_RETRY_MAX_MS, READ_RETRY_BASE_MS * 2 ** Math.min(attempt, 16));
-  return Math.min(READ_RETRY_MAX_MS, Math.round(exponential * (1 + Math.random() * 0.2)));
+  const exponential = Math.min(READ_RETRY_MAX_MS / 1.2, READ_RETRY_BASE_MS * 2 ** Math.min(attempt, 16));
+  return Math.round(exponential * (1 + Math.random() * 0.2));
 }
 
-/** Network failures, grammY timeouts and a 5xx body parse are transient; local/programming failures are not. */
+/** Network failures, grammY timeouts and safe-read HTTP 5xx are transient; malformed/local failures are not. */
 function isTransientTransportError(error: unknown): boolean {
   const pending: unknown[] = [error];
   const visited = new Set<unknown>();
@@ -4197,7 +4212,7 @@ function isTransientTransportError(error: unknown): boolean {
     const current = pending.pop();
     if (!current || typeof current !== "object" || visited.has(current)) continue;
     visited.add(current);
-    if (current instanceof SyntaxError) return true;
+    if (current instanceof TelegramApiError && current.status >= 500 && current.status < 600) return true;
     const candidate = current as { name?: unknown; code?: unknown; errno?: unknown; message?: unknown;
       cause?: unknown; error?: unknown; errors?: unknown };
     if (candidate.name === "TimeoutError" || candidate.name === "AbortError") return true;

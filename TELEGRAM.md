@@ -679,12 +679,18 @@ process racing the workspace between them is not fully excluded on this host
 - `getMe` at startup and `getUpdates` polling retry transport failures, timeouts
   and Telegram 5xx across a sustained outage, with cancellation-aware capped
   exponential backoff (1s to 60s, bounded jitter) and no fixed attempt limit; a
-  successful read resets the backoff. Fatal auth/config rejections (for example
+  successful read resets the backoff. Safe-read HTTP 5xx is recognized before
+  JSON decoding, including HTML or non-Telegram JSON from an intermediary;
+  malformed successful responses are not treated as outages. Cancellation during
+  startup or polling stops the adapter without reporting a channel failure.
+  Fatal auth/config rejections (for example
   401/409), non-transient local/programming failures and every outbound call keep
   their previous bounded behavior. One fixed announcement and one fixed recovery
   notice are emitted per outage episode, never one per retry. `getUpdates` has its
-  own flood wait, independent of outbound calls. Outbound calls share one bot-token flood gate;
-  a later concurrent deadline wins. Full finite, positive `retry_after` values
+  own flood wait, independent of outbound calls. Rate-limit (429) handling retains
+  its finite attempt and five-minute wait budgets; sustained 429 is not covered
+  by outage recovery. Outbound calls share one bot-token flood gate; a later
+  concurrent deadline wins. Full finite, positive `retry_after` values
   are honored, including after an outbound call exhausts its bounded attempts. Waits are
   abortable and have a five-minute per-call budget; long timer waits are chunked
   below Node's timer limit. Replaceable previews yield during a flood wait rather
