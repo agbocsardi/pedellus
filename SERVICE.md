@@ -99,6 +99,12 @@ journalctl --user -u durable-nanobot.service --since "1 hour ago"
 journalctl --user -u durable-nanobot.service -f
 ```
 
+The gateway also emits content-free structured lifecycle/timing records with the
+`durable-nanobot journal:` prefix: native submission/task/model/tool spans plus
+host preparation/queue/delivery boundaries, ten-second slow-work warnings, and
+safe transient-failure and typing-recovery visibility. See
+[OBSERVABILITY.md](OBSERVABILITY.md) for correlation, coverage and privacy limits.
+
 Durable report callbacks and gateway/CLI failure boundaries emit bounded
 `durable-nanobot diagnostic:` records: stages, safe error classes/codes, cause
 chains, code-relative stack locations, task IDs, report reasons/bounded restart

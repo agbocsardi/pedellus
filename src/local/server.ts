@@ -3,7 +3,9 @@ import { connect, createServer, type Server, type Socket } from "node:net";
 import { resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { Context } from "@earendil-works/chord";
-import { withCancel } from "@earendil-works/chord/context";
+import { withCancel, withTelemetry } from "@earendil-works/chord/context";
+import type { TelemetryContext } from "@earendil-works/pi-telemetry";
+import { journalEvent, journalTelemetry, observeOperation } from "../observability.js";
 import type { Conversation, Cursor, EntryId, Tx } from "@earendil-works/pi-durable";
 import type { HistoryEpisodeQuery } from "../history/episodes.js";
 import type { BackgroundStatus } from "../background-status.js";
@@ -284,6 +286,8 @@ class LocalConnection {
       const result = await this.dispatch(request);
       if (!this.finished && request.method !== "restart") this.send({ id: request.id, result });
     } catch (error) {
+      journalEvent("local.request.failed", { type: request.method,
+        "conversation.id": this.gatewayConversation?.id }, error);
       if (!this.finished) this.send({ id: request.id, error: errorBody(error) });
     }
   }
@@ -640,10 +644,12 @@ class LocalConnection {
     const record = params === undefined ? {} : requireObject(params);
     onlyKeys(record, ["content"]);
     const content = requireString(record, "content", LOCAL_PROTOCOL_LIMITS.maxInputChars);
-    const submission = await this.surface.submit(content, this.scope.context);
-    this.submissions.set(submission.id, submission);
-    this.observe(submission);
-    return { id: submission.id };
+    return observeOperation("gateway.local.submit", { "conversation.id": this.gatewayConversation!.id }, async (span) => {
+      const submission = await this.surface!.submit(content, withTelemetry(span, this.scope.context));
+      this.submissions.set(submission.id, submission);
+      this.observe(submission, span);
+      return { id: submission.id };
+    });
   }
 
   /**
@@ -665,11 +671,13 @@ class LocalConnection {
 
     let prepared: LocalAttachment;
     try {
-      prepared = await prepareLocalAttachment(ingress.store, {
+      prepared = await observeOperation("gateway.local.attachment.prepare", {
+        "conversation.id": this.gatewayConversation!.id,
+      }, () => prepareLocalAttachment(ingress.store, {
         path,
         ...(content === undefined ? {} : { text: content }),
         ...(this.scope.context.abortSignal === undefined ? {} : { signal: this.scope.context.abortSignal }),
-      });
+      }));
     } catch (error) {
       if (this.scope.context.abortSignal?.aborted) throw error;
       if (error instanceof LocalAttachmentError) {
@@ -678,17 +686,25 @@ class LocalConnection {
       throw new LocalRequestError("failed", "the attachment could not be prepared");
     }
 
-    const submission = await this.surface.submit(prepared.content, this.scope.context);
-    this.submissions.set(submission.id, submission);
-    this.observe(submission);
-    return {
-      id: submission.id,
-      attachment: { relativePath: prepared.relativePath, bytes: prepared.bytes },
-    };
+    return observeOperation("gateway.local.submit", { "conversation.id": this.gatewayConversation!.id }, async (span) => {
+      const submission = await this.surface!.submit(prepared.content, withTelemetry(span, this.scope.context));
+      this.submissions.set(submission.id, submission);
+      this.observe(submission, span);
+      return {
+        id: submission.id,
+        attachment: { relativePath: prepared.relativePath, bytes: prepared.bytes },
+      };
+    });
   }
 
-  private observe(submission: TerminalSubmission): void {
-    void submission.wait(this.scope.context).then((settlement) => {
+  private observe(submission: TerminalSubmission, parent: TelemetryContext = journalTelemetry): void {
+    void observeOperation("gateway.local.settlement", {
+      "conversation.id": this.gatewayConversation!.id, "submission.id": submission.id,
+    }, async (span) => {
+      const settlement = await submission.wait(this.scope.context);
+      span.setAttributes({ status: settlement.status });
+      return settlement;
+    }, parent).then((settlement) => {
       if (this.finished) return;
       this.submissions.delete(submission.id);
       this.settled.set(submission.id, settlement);

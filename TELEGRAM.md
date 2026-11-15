@@ -668,14 +668,18 @@ process racing the workspace between them is not fully excluded on this host
   a full durable pending queue (1000 items) fails closed before offset advance.
   Long-poll timeout is sent in seconds and the grammY request deadline is bounded
   to 60 seconds. All requests reject redirects.
-- While an admitted user turn is active, the adapter sends a best-effort
-  `sendChatAction` typing action and refreshes it before Telegram's short
+- After an admitted user turn has passed its submission-slot wait and attachment
+  preparation, the adapter sends a best-effort `sendChatAction` typing action
+  and refreshes it before Telegram's short
   lifetime. One loop per chat is shared by queued turns and stops when the last
   one settles, is aborted, or the adapter shuts down. Control acknowledgements,
   unauthorized input and scheduled-outbox delivery do not type. A rejected or
   flood-gated action is skipped without retry. Typing is not awaited by model
   admission or reply delivery; Telegram rate limits still apply to the shared
-  outbound gate. No typing state is stored.
+  outbound gate. No typing state is stored. Structured journal records now expose
+  preparation/queue/delivery timings, temporary failures and typing unavailability
+  or recovery; see [OBSERVABILITY.md](OBSERVABILITY.md). This instrumentation does
+  not change typing start time or retry ordering.
 - `getMe` at startup and `getUpdates` polling retry transport failures, timeouts
   and Telegram 5xx across a sustained outage, with cancellation-aware capped
   exponential backoff (1s to 60s, bounded jitter) and no fixed attempt limit; a

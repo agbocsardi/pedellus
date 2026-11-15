@@ -134,6 +134,7 @@ import {
 import { authStorePath, FileCredentialStore } from "./auth/store.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
 import { reportFailure } from "./failure-diagnostics.js";
+import { journalTelemetry } from "./observability.js";
 import {
   BACKGROUND_STATUS_LIMITS,
   backgroundLabel,
@@ -2164,6 +2165,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       settings: { steeringMode: "all" as const },
       models,
       registry,
+      telemetry: journalTelemetry,
       // Durable reports asynchronous storage, scheduler, hook and listener failures here even
       // when no public operation throws. Record the original cause before it is otherwise lost.
       onReport: (report: Report) => reportFailure(report.error, `durable.${report.kind}`,

@@ -29,6 +29,7 @@ import { openGateway } from "./runtime.js";
 import { prepareDataDirectory } from "./store.js";
 import { StartupDiagnosticError, startupDiagnostic } from "./startup-diagnostics.js";
 import { reportFailure, type FailureStage } from "./failure-diagnostics.js";
+import { journalEvent, observeOperation } from "./observability.js";
 
 /** Every synopsis, the fixed default configuration note and the help hint; never supplied arguments. */
 const USAGE = renderUsage();
@@ -385,7 +386,9 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
   });
   try {
     const socketPath = await localSocketPath(config);
-    gateway = await openGateway(config, context, workspaceContextGatewayOptions(config));
+    journalEvent("gateway.starting");
+    gateway = await observeOperation("gateway.open", {},
+      () => openGateway(config, context, workspaceContextGatewayOptions(config)));
     stage = "gateway.local";
     // The gateway owns local attachments too: the CLI only names an operator path. CLI
     // originals live in a code-owned child of the validated operator media root, so a
@@ -470,6 +473,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
         restart: restartHost,
       }, context));
     }
+    journalEvent("gateway.surfaces.started");
     if (!channels.started()) {
       stage = "gateway.wait";
       await aborted(stop.signal);
@@ -501,6 +505,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       reportFailure(error, stage);
     }
   } finally {
+    journalEvent("gateway.stopping");
     process.off("SIGINT", shutdown);
     process.off("SIGTERM", shutdown);
     try {
@@ -517,6 +522,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       }
     }
   }
+  journalEvent("gateway.stopped", { isError: failure !== undefined });
   if (failure !== undefined) throw failure.error;
   if (restart.accepted()) replaceGatewayProcess();
 }

@@ -26,7 +26,9 @@
 import { defineDoc, AssistantEntry, ConversationBusy, LiveDoc } from "@earendil-works/pi-durable";
 import type { Context, Draft } from "@earendil-works/chord";
 import { copyJson } from "@earendil-works/chord";
-import { withCancel, withoutAbortSignal } from "@earendil-works/chord/context";
+import { withCancel, withoutAbortSignal, withTelemetry } from "@earendil-works/chord/context";
+import type { TelemetrySpan } from "@earendil-works/pi-telemetry";
+import { journalEvent, observeOperation } from "../observability.js";
 import type { Conversation, Submission, SubmissionId, SubmissionRecord } from "@earendil-works/pi-durable";
 import type { AssistantMessage, ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { FollowUpMode } from "../config.js";
@@ -298,6 +300,7 @@ type ChannelState = DiscordChannelState;
 
 type TypingLoop = {
   turns: number;
+  unavailable: boolean;
   stopped: boolean;
   timer: ReturnType<typeof setInterval> | undefined;
 };
@@ -580,12 +583,20 @@ export async function runDiscord(
   const startTyping = (channelId: string): (() => void) => {
     let loop = typingLoops.get(channelId);
     if (loop === undefined) {
-      loop = { turns: 0, stopped: false, timer: undefined };
+      loop = { turns: 0, unavailable: false, stopped: false, timer: undefined };
       typingLoops.set(channelId, loop);
       const created = loop;
       const refresh = () => {
         if (created.stopped || stopping || signal?.aborted) return;
-        void transport.typing(channelId).catch(() => undefined);
+        void transport.typing(channelId).then(() => {
+          if (created.stopped || signal?.aborted) return;
+          if (created.unavailable) journalEvent("discord.typing.recovered", { "channel.id": channelId });
+          created.unavailable = false;
+        }).catch((error: unknown) => {
+          if (created.stopped || signal?.aborted) return;
+          if (!created.unavailable) journalEvent("discord.typing.failed", { "channel.id": channelId }, error);
+          created.unavailable = true;
+        });
       };
       refresh();
       created.timer = setInterval(refresh, DISCORD_LIMITS.typingRefreshMs);
@@ -757,9 +768,12 @@ export async function runDiscord(
 
     // A reply does not carry the quoted message's attachments, so they are pulled in from that
     // message with the same store, size bound and concurrency gate as this message's own files.
-    const quoted = message.quoted ?? await fetchQuoted(message);
-    const referenced = await storeReferencedAttachments(quoted);
-    const stored = await storeAttachments(message);
+    const { quoted, referenced, stored } = await observeOperation("gateway.discord.ingress.prepare", {
+      "message.key": key, "channel.id": channelId, attachments: message.attachments.length,
+    }, async () => {
+      const quoted = message.quoted ?? await fetchQuoted(message);
+      return { quoted, referenced: await storeReferencedAttachments(quoted), stored: await storeAttachments(message) };
+    });
     const attachments = [...referenced.attachments, ...stored.attachments];
     const composed = [
       composeInboundText(message, stored.attachments.length > 0, quoted, referenced.attachments.length > 0),
@@ -801,6 +815,8 @@ export async function runDiscord(
     });
     // The exact input and its identity are durable before any model submission, so a crash cannot
     // lose or duplicate it.
+    journalEvent("discord.admitted", { "message.key": key, "channel.id": channelId,
+      attachments: attachments.length, "queue.depth": state.pending.length });
     markReading(channelId, message.id);
     drain();
   };
@@ -1030,8 +1046,11 @@ export async function runDiscord(
       if (notice) activeNotices += 1;
       else activeReplies += 1;
       const slot = beginSubmission(item.channelId);
-      const task = Promise.resolve().then(() => deliver(item, slot)).catch(async (error: unknown) => {
-        // Keep durable state for the next scan; no exception details or tight retry loop in the log.
+      const task = observeOperation("gateway.discord.delivery", {
+        "message.key": item.key, "channel.id": item.channelId, notice,
+        "queue.depth": state.pending.length, attempt: (deliveryFailures.get(item.key) ?? 0) + 1,
+      }, (trace) => deliver(item, slot, trace)).catch(async (error: unknown) => {
+        // The span logs safe failure causes; keep durable state for the next scan.
         failedThisCycle.add(item.key);
         await holdFailedDelivery(item.key, error).catch(() => undefined);
       }).finally(() => {
@@ -1046,7 +1065,7 @@ export async function runDiscord(
     }
   };
 
-  const deliver = async (item: DiscordPendingDelivery, slot: SubmissionSlot): Promise<void> => {
+  const deliver = async (item: DiscordPendingDelivery, slot: SubmissionSlot, trace: TelemetrySpan): Promise<void> => {
     if (!options.allowFrom.includes(item.senderId)) {
       // The sender was removed from the live allowlist after admission: nothing is submitted or sent.
       await forget(item.key);
@@ -1057,9 +1076,11 @@ export async function runDiscord(
       return;
     }
     // Enter this channel's submission order before any asynchronous preparation.
-    await slot.prior;
-    const content = await prepareInputContent(item);
-    const conversation = await gateway.conversationFor(item.sessionKey, adapterContext);
+    await observeOperation("gateway.discord.queue", {}, () => slot.prior, trace);
+    const content = await observeOperation("gateway.discord.prepare", {}, () => prepareInputContent(item), trace);
+    const conversation = await observeOperation("gateway.discord.conversation", {},
+      () => gateway.conversationFor(item.sessionKey, adapterContext), trace);
+    trace.setAttributes({ "conversation.id": conversation.id });
     const requestId = requestIdFor(identity, item.key);
     const streaming = options.streaming !== false;
     const watch = streaming ? await conversation.watch(adapterContext) : undefined;
@@ -1115,15 +1136,20 @@ export async function runDiscord(
         content,
         requestId,
         whenBusy: await submissionMode(conversation, item),
-      }, adapterContext);
+      }, withTelemetry(trace, adapterContext));
       // Ordering is established; free the channel's next submission place while this turn runs.
       slot.release();
       submissionId = submission.id;
-      const settled = await submission.wait(adapterContext);
+      trace.setAttributes({ "submission.id": submission.id });
+      const settled = await observeOperation("gateway.discord.settlement", { "submission.id": submission.id },
+        () => submission.wait(adapterContext), trace);
+      trace.setAttributes({ status: settled.status });
       if (settled.status !== "done" || settled.type !== "input") {
         // A native abort or a queued reset deliberately ends the turn: it is not a delivery failure.
         const intentional = settled.status === "unanswered" &&
           (settled.reason === "aborted" || settled.reason === "reset");
+        trace.setAttributes({ intentional });
+        if (!intentional) trace.setStatus({ status: "error" });
         await stopPreviewWatch();
         // A failed run has no committed answer and Durable exposes no run identity at settlement, so
         // each admitted message reports its own fixed notice.
@@ -1138,9 +1164,10 @@ export async function runDiscord(
       // Inputs the run consumed settle with this same committed answer, so one of them owns its single reply.
       const settlement = { answer: settled.answer } as const;
       const role = await sharedDeliveryRole(conversation, item, settlement);
+      trace.setAttributes({ outcome: role });
       await stopPreviewWatch();
       if (role === "owner") {
-        await flushFinal(text);
+        await observeOperation("gateway.discord.reply", {}, () => flushFinal(text), trace);
         await retireSharedDelivery(conversation, item, settlement);
       } else if (role === "sibling") {
         await forget(item.key);
@@ -2437,7 +2464,9 @@ export async function runDiscord(
         scheduledActive.add(record.id);
         scheduledChannelActive.add(channelId);
         const task = Promise.resolve()
-          .then(() => deliverScheduled(sessionKey, channelId, record))
+          .then(() => observeOperation("gateway.discord.scheduled_delivery", {
+            "channel.id": channelId, "delivery.id": record.id,
+          }, () => deliverScheduled(sessionKey, channelId, record)))
           .catch(() => {
             // Keep the durable record pending; the next scan retries or quarantines it.
           })
@@ -2651,6 +2680,7 @@ export async function runDiscord(
   try {
     await recoverScheduled();
     recoveryComplete = true;
+    journalEvent("discord.serving", { "queue.depth": state.pending.length });
     drain();
     // Cosmetic and best effort: a slow or failed registration must not delay ingress.
     void transport.registerCommands(discordCommandSpecs(availableCommandNames())).catch(() => undefined);

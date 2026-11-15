@@ -1,8 +1,10 @@
 import { defineDoc, AssistantEntry, ConversationBusy, LiveDoc } from "@earendil-works/pi-durable";
 import type { Context, Draft } from "@earendil-works/chord";
 import { copyJson } from "@earendil-works/chord";
-import { withCancel, withoutAbortSignal } from "@earendil-works/chord/context";
+import { withCancel, withoutAbortSignal, withTelemetry } from "@earendil-works/chord/context";
 import { Api, GrammyError, HttpError, InputFile } from "grammy";
+import type { TelemetryContext, TelemetrySpan } from "@earendil-works/pi-telemetry";
+import { journalEvent, journalTelemetry, observeOperation } from "../observability.js";
 import type { Message } from "grammy/types";
 import type { ApiClientOptions } from "grammy";
 import type { MessageReactionUpdated, ReactionType, ReactionTypeEmoji, Update } from "grammy/types";
@@ -314,6 +316,7 @@ function answeredTogether(record: SubmissionRecord, settlement: SharedAnswer): b
 type TypingLoop = {
   /** Overlapping queued turns in one chat share this loop; the indicator stays until the last one settles. */
   turns: number;
+  unavailable: boolean;
   stopped: boolean;
   timer: ReturnType<typeof setTimeout> | undefined;
 };
@@ -786,9 +789,24 @@ export async function runTelegram(
   const typingLoops = new Map<number, TypingLoop>();
   const refreshTyping = async (chatId: number, loop: TypingLoop): Promise<void> => {
     if (loop.stopped || stopping || signal?.aborted) return;
-    await apiCall(api, "sendChatAction", signal,
-      (callSignal) => api.sendChatAction(chatId, "typing", {}, toGrammySignal(callSignal)),
-      { throttle: outboundThrottle, replaceable: true }).catch(() => undefined);
+    try {
+      const sent = await apiCall(api, "sendChatAction", signal,
+        (callSignal) => api.sendChatAction(chatId, "typing", {}, toGrammySignal(callSignal)),
+        { throttle: outboundThrottle, replaceable: true });
+      if (!loop.stopped && !signal?.aborted) {
+        if (sent === undefined && !loop.unavailable) {
+          journalEvent("telegram.typing.skipped", { "chat.id": chatId, "cooldown.ms": outboundThrottle.remainingMs() });
+        } else if (sent !== undefined && loop.unavailable) {
+          journalEvent("telegram.typing.recovered", { "chat.id": chatId });
+        }
+        loop.unavailable = sent === undefined;
+      }
+    } catch (error) {
+      if (!loop.stopped && !signal?.aborted) {
+        if (!loop.unavailable) journalEvent("telegram.typing.failed", { "chat.id": chatId }, error);
+        loop.unavailable = true;
+      }
+    }
     if (loop.stopped) return;
     loop.timer = setTimeout(() => {
       loop.timer = undefined;
@@ -807,7 +825,7 @@ export async function runTelegram(
     if (stopping || signal?.aborted) return () => undefined;
     let loop = typingLoops.get(chatId);
     if (loop === undefined) {
-      const created: TypingLoop = { turns: 0, stopped: false, timer: undefined };
+      const created: TypingLoop = { turns: 0, unavailable: false, stopped: false, timer: undefined };
       typingLoops.set(chatId, created);
       loop = created;
       void refreshTyping(chatId, created);
@@ -1531,7 +1549,9 @@ export async function runTelegram(
         scheduledActive.add(record.id);
         scheduledChatActive.add(chatId);
         const task = Promise.resolve()
-          .then(() => deliverScheduled(sessionKey, chatId, record))
+          .then(() => observeOperation("gateway.telegram.scheduled_delivery", {
+            "chat.id": chatId, "delivery.id": record.id,
+          }, () => deliverScheduled(sessionKey, chatId, record)))
           .catch(() => {
             // Keep the durable record pending; the next scan retries or quarantines it.
           })
@@ -1600,8 +1620,11 @@ export async function runTelegram(
       if (notice) activeNotices += 1;
       else activeReplies += 1;
       const slot = beginSubmission(item.chatId);
-      const task = Promise.resolve().then(() => deliver(item, slot)).catch(async (error: unknown) => {
-        // Keep durable state for the next polling cycle; no exception details or tight retry loop in the log.
+      const task = observeOperation("gateway.telegram.delivery", {
+        "update.id": item.updateId, "chat.id": item.chatId, notice,
+        "queue.depth": state.pending.length, attempt: (deliveryFailures.get(item.updateId) ?? 0) + 1,
+      }, (trace) => deliver(item, slot, trace)).catch(async (error: unknown) => {
+        // The span logs safe failure causes; keep durable state for the next polling cycle.
         failedThisPoll.add(item.updateId);
         await holdFailedDelivery(item.updateId, error).catch(() => undefined);
       }).finally(() => {
@@ -1616,7 +1639,7 @@ export async function runTelegram(
     }
   };
 
-  const deliver = async (item: PendingReply, slot: SubmissionSlot) => {
+  const deliver = async (item: PendingReply, slot: SubmissionSlot, trace: TelemetrySpan) => {
     if (!options.allowFrom.includes(item.senderId)) {
       if (item.messageId !== undefined) {
         await apiCall(api, "deleteMessage", signal, (callSignal) => withChatSendOrder(item.chatId, () => api.deleteMessage(item.chatId, item.messageId!, toGrammySignal(callSignal))), { throttle: outboundThrottle }).catch(() => undefined);
@@ -1630,11 +1653,14 @@ export async function runTelegram(
     }
     // Enter this chat's submission order before any asynchronous preparation, so a slow first lookup cannot let a
     // later message submit ahead of an earlier one.
-    await slot.prior;
+    await observeOperation("gateway.telegram.queue", {}, () => slot.prior, trace);
     // Attachment storage and local transcription happen inside this chat's admission order, before the model sees
     // anything. A failure keeps the durable record and the ordinary retry path; other chats keep polling.
-    const content = await prepareInputContent(item);
-    const conversation = await gateway.conversationFor(item.sessionKey, adapterContext);
+    const content = await observeOperation("gateway.telegram.prepare", {},
+      (span) => prepareInputContent(item, span), trace);
+    const conversation = await observeOperation("gateway.telegram.conversation", {},
+      () => gateway.conversationFor(item.sessionKey, adapterContext), trace);
+    trace.setAttributes({ "conversation.id": conversation.id });
     const requestId = requestIdFor(identity, item.updateId);
     const watch = await conversation.watch(adapterContext);
     let previewTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1664,6 +1690,7 @@ export async function runTelegram(
       previewDirty = true;
       schedulePreview();
     };
+    journalEvent("telegram.typing.requested", { "update.id": item.updateId, "chat.id": item.chatId });
     const stopTyping = startTyping(item.chatId);
     try {
       watch.start(async (call) => {
@@ -1691,15 +1718,20 @@ export async function runTelegram(
         content,
         requestId,
         whenBusy: await submissionMode(conversation, item),
-      }, adapterContext);
+      }, withTelemetry(trace, adapterContext));
       // Ordering is established; free the chat's next submission place while this turn runs.
       slot.release();
       submissionId = submission.id;
-      const settled = await submission.wait(adapterContext);
+      trace.setAttributes({ "submission.id": submission.id });
+      const settled = await observeOperation("gateway.telegram.settlement", { "submission.id": submission.id },
+        () => submission.wait(adapterContext), trace);
+      trace.setAttributes({ status: settled.status });
       if (settled.status !== "done" || settled.type !== "input") {
         // A native abort or a queued reset deliberately ends the turn: it is not a delivery failure to report.
         const intentional = settled.status === "unanswered" &&
           (settled.reason === "aborted" || settled.reason === "reset");
+        trace.setAttributes({ intentional });
+        if (!intentional) trace.setStatus({ status: "error" });
         await stopPreviewWatch();
         // A failed run has no committed answer and Durable exposes no run identity at settlement, so each
         // admitted message reports its own fixed notice. Grouping by the identical reason text would let a
@@ -1716,9 +1748,10 @@ export async function runTelegram(
       const group = await sharedDeliveryGroup(conversation.id, item, settlement);
       const role: DeliveryRole = !group.present ? "retired" :
         group.owner === undefined || group.owner === item.updateId ? "owner" : "sibling";
+      trace.setAttributes({ outcome: role });
       await stopPreviewWatch();
       if (role === "owner") {
-        await flushFinal(answerText);
+        await observeOperation("gateway.telegram.reply", {}, () => flushFinal(answerText), trace);
         await retireSharedDelivery(conversation, item, settlement);
       } else if (role === "sibling") {
         await forget(item.updateId);
@@ -2059,6 +2092,7 @@ export async function runTelegram(
   const downloadAttachment = async (
     ingress: TelegramMediaIngress,
     current: TelegramPendingAttachment,
+    telemetry: TelemetryContext,
   ): Promise<StoredMedia> => {
     if (current.declaredBytes !== undefined && current.declaredBytes > ingress.store.maxFileBytes) {
       throw new MediaRejected("too-large");
@@ -2079,8 +2113,8 @@ export async function runTelegram(
     }
     let file;
     try {
-      file = await apiCall(api, "getFile", signal,
-        (callSignal) => api.getFile(current.fileId, toGrammySignal(callSignal)), { throttle: pollThrottle });
+      file = await observeOperation("gateway.telegram.file.lookup", {}, () => apiCall(api, "getFile", signal,
+        (callSignal) => api.getFile(current.fileId, toGrammySignal(callSignal)), { throttle: pollThrottle }), telemetry);
     } catch (error) {
       if (signal?.aborted) throw signal.reason ?? error;
       // A definitive request rejection (unknown id, expired file, Bot API size limit)
@@ -2102,18 +2136,19 @@ export async function runTelegram(
     const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
     let response: Response;
     try {
-      response = await globalThis.fetch(url, { method: "GET", redirect: "error", signal: combined });
+      response = await observeOperation("gateway.telegram.file.headers", {},
+        () => globalThis.fetch(url, { method: "GET", redirect: "error", signal: combined }), telemetry);
     } catch (error) {
       if (signal?.aborted) throw signal.reason ?? error;
-      // The URL carries the bot token: never let it reach an error message or log.
-      throw new Error("Telegram file download failed");
+      // Preserve the cause for the value-free diagnostic formatter only; never print this URL/error raw.
+      throw new Error("Telegram file download failed", { cause: error });
     }
     if (!response.ok) {
       await response.body?.cancel().catch(() => undefined);
       if (response.status >= 400 && response.status < 500) throw new MediaRejected("unavailable");
-      throw new Error("Telegram file download failed");
+      throw Object.assign(new Error("Telegram file download failed"), { status: response.status });
     }
-    return ingress.store.save({
+    return observeOperation("gateway.telegram.file.store", {}, () => ingress.store.save({
       kind: current.kind,
       identity: current.identity,
       ...(current.mimeType === undefined ? {} : { mimeType: current.mimeType }),
@@ -2121,13 +2156,14 @@ export async function runTelegram(
       ...(announced === undefined ? {} : { declaredBytes: announced }),
       body: boundedFileBody(response, ingress.store.maxFileBytes, combined),
       ...(signal === undefined ? {} : { signal }),
-    });
+    }), telemetry);
   };
 
   const storeAttachment = async (
     ingress: TelegramMediaIngress,
     item: PendingReply,
     admitted: TelegramPendingAttachment,
+    telemetry: TelemetryContext,
   ): Promise<TelegramPendingAttachment> => {
     const current = attachmentRecord(item.updateId, admitted.identity) ?? admitted;
     if (current.status === "failed") return current;
@@ -2145,7 +2181,8 @@ export async function runTelegram(
       if (present) return current;
     }
     try {
-      const stored = await mediaWork.run(() => downloadAttachment(ingress, current), signal);
+      const stored = await observeOperation("gateway.telegram.media", {},
+        (span) => mediaWork.run(() => downloadAttachment(ingress, current, span), signal), telemetry);
       const next: TelegramPendingAttachment = {
         ...current,
         status: "stored",
@@ -2212,16 +2249,18 @@ export async function runTelegram(
 
   const prepareInputContent = async (
     item: PendingReply,
+    telemetry: TelemetryContext = journalTelemetry,
   ): Promise<string | (TextContent | ImageContent)[]> => {
     const ingress = mediaIngress;
     if (ingress === undefined || item.attachments === undefined || item.attachments.length === 0) return item.text;
     const images: ImageContent[] = [];
     const blocks: string[] = [];
     for (const admitted of item.attachments) {
-      const stored = await storeAttachment(ingress, item, admitted);
+      const stored = await storeAttachment(ingress, item, admitted, telemetry);
       let speech: AttachmentSpeech = {};
       if (stored.status === "stored" && stored.kind === "audio") {
-        speech = await transcribeAttachment(ingress, item, stored);
+        speech = await observeOperation("gateway.telegram.transcribe", {},
+          () => transcribeAttachment(ingress, item, stored), telemetry);
       }
       blocks.push(attachmentContextText(stored, speech));
       if (stored.kind === "photo" && stored.status === "stored" && stored.relativePath !== undefined) {
@@ -2395,6 +2434,7 @@ export async function runTelegram(
       await sendOwnerPlainText(owner.chatId, owner.senderId, text);
     },
   });
+  journalEvent("telegram.polling", { "queue.depth": state.pending.length });
   drain();
 
   try {
@@ -2523,6 +2563,11 @@ export async function runTelegram(
             return copyJson(doc) as unknown as ChannelState;
           }, adapterContext);
           // The exact input and the offset commit before any model submission, so a crash cannot lose or duplicate it.
+          journalEvent("telegram.admitted", {
+            "update.id": update.update_id, "message.id": message.message_id, "chat.id": message.chat.id,
+            "attachments": attachments?.length ?? 0, "queue.depth": state.pending.length,
+            "source.age_ms": Math.max(0, observedAtMs - message.date * 1000),
+          });
           drain();
           continue;
         }
@@ -4098,6 +4143,7 @@ async function apiCall<T>(
           }
           const deadline = Date.now() + (retryAfter === undefined ? FLOOD_WAIT_WITHOUT_HINT_MS : retryAfter * 1000);
           if (!Number.isFinite(deadline)) throw new TelegramApiError(method, 429, "rejected", undefined, { cause: error });
+          journalEvent("telegram.rate_limited", { type: method, "cooldown.ms": Math.max(0, deadline - Date.now()) });
           options.throttle?.defer(deadline);
           if (options.replaceable) return undefined;
           if (attempt < MAX_API_ATTEMPTS - 1) continue;
