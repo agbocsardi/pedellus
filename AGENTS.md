@@ -138,7 +138,11 @@ edits need restart only; unit edits additionally need daemon-reload.
   owner surface. Memory recall remains read-only over mapped chats; legacy
   history SDK/local calls do not grant model-facing authority. Telegram actions
   additionally require a live adapter, current private-chat
-  admission and observed same-chat targets. Discord is a second opt-in channel:
+  admission and observed same-chat targets. In the same intent commit, a fresh call ID is refused
+  when its same-chat/kind/target/payload effect has an intent, sending, unknown or partially delivered
+  predecessor. Unknown and failed/denied partial-delivery records are never evicted in either pruning
+  path; a full log refuses. This is exact-effect matching, not detection of reworded/retargeted sends,
+  and it does not fence ordinary answers, scheduled outbox deliveries or Discord. Discord is a second opt-in channel:
   `discord.allowFrom` is a required explicit sender list (no wildcard) and
   `dmAllowFrom`/`allowChannels` narrow direct messages and guild channels, with a
   mention-or-reply guild policy unless `open`; the session key is host-derived and

@@ -11,11 +11,11 @@
 - [x] Stale host notices: explicit safe retirement without retrying/forgetting ambiguous answers.
 - [x] Images: bound model-facing read payloads without modifying stored originals.
 - [x] Live model/preset/credential reload: explicit owner action with safe busy handling.
-- [ ] Incident: prevent fresh tool-call IDs from retrying identical Telegram actions with unresolved outcomes.
+- [x] Incident: prevent fresh tool-call IDs from retrying identical Telegram actions with unresolved outcomes.
 - [x] Operational defaults: source unit PATH/memory guidance; actionable git identity failures (no invented author).
 - [x] Web 403/browser and external COROS/T3 constraints: implement safe supported paths, document external limits (no automatic bypass or external completion bridge).
-- [ ] Independently review every implementation with Pi Codex Luna; fix findings before integration.
-- [ ] Integrated typecheck, existing behavior/execution suites and offline acceptance.
+- [x] Independently review every implementation with Pi Codex Luna; fix findings before integration.
+- [x] Integrated typecheck, existing behavior/execution suites and offline acceptance.
 
 ## Boundaries
 
@@ -48,3 +48,9 @@ Final integration Luna review found one P2: a definite failure after a question 
 Session was interrupted by the coding account's ChatGPT Plus usage limit (not a bot provider error). On resumption the owner reported a duplicate bot message. Read-only live-store/journal inspection confirms one scheduled turn issued two distinct Telegram reply tool tasks with identical target/text; both external outcomes timed out as unknown. Call-ID-only dedupe allowed the model's fresh-call retry, so unknown effects need transactional logical-action admission fencing across fresh IDs (not transport retries). Existing unknown records also include prior media sends. Live gateway still runs its earlier source snapshot (state v8); none of today's source changes has been deployed or the store mutated by this work.
 
 Integrated reload `4314c8ac` after fresh Luna review confirmed the prior four consistency findings and cron integration gap were fixed. One further P2 (stale disk snapshot during async validation) was fixed by parent in `e5f7c50f`: re-read/compare parsed config on the Session line before policy writes; a deterministic stale-snapshot race now refuses and retains the old model, then succeeds when the file is restored. Typecheck/build and all 13 model/preset checks pass. Last-read-to-commit external-edit window is explicit and never overwrites the file. Direct↔preset transitions remain restart-only; CLI-only reload handles within-mode foreground changes and credential references, refuses captured nonterminal work, preserves scheduled/background policy, accepts already-managed live MCP changes, and uses stored-commit publication. No findings waived. A real storage fault remains uninjected; native failure semantics were reviewed, not experimentally demonstrated. Duplicate-action fence `7829805b` is ready for fresh Luna review.
+
+Integrated action fence `dc58ac73` after independent Luna review. Reviewer found P1 partial-delivery records could still be evicted; parent fixed both terminal-pruning/full-log eviction in `0d58ddfc` and added retention/capacity regressions. Unknown and accepted-prefix failed/denied effects remain exact-identity fences across fresh call IDs, concurrency and reopen. Refusals add no record or transport call. Typecheck/build and 30 interaction/outbound-media checks pass under 60s. No findings waived. Scope is model-requested Telegram effects, not ordinary replies, cron outbox or Discord; arbitrarily reworded/retargeted effects cannot be recognized and are explicitly discouraged. Live deployment, default model and hard resource caps remain operator work. No running delegates remain.
+
+Final integrated validation: `npm run typecheck` and build pass; standard `npm run test:behavior` passes 617/617 in 49.9s with unchanged GNU 60s phase timeout; `npm run test:execution` passes 2/2; offline `test:core-acceptance` reports pass; `git diff --check` clean. All implementation/review work is committed, with no review findings waived. No live store changes, config edits or service restarts were performed.
+
+Deployment and external limits remain explicit operator work: source restart (and daemon-reload if adopting unit templates), default preset and resource caps, COROS provider token lifecycle, any external T3 completion bridge, and browser provisioning/access. The web reader never bypasses 403/authentication. The action fence cannot infer equivalence of arbitrarily reworded/retargeted effects or supply Telegram exactly-once delivery. Live-run restart coverage and injected storage-failure publication remain unrun as noted above; all channel checks use synthetic transports, not live acceptance.
