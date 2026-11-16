@@ -319,9 +319,12 @@ edits need restart only; unit edits additionally need daemon-reload.
   (`O_CREAT | O_EXCL`), never a precheck plus truncation; `edit` keeps exact-text
   in-process protection only, and an uncooperative outside editor between read
   and write is not detected. The cursor advances only after a settled turn is
-  validated from its own committed input through its own answer: any failed
-  `pi.tool-result` fails the batch even if the model answers later, and a
-  non-empty report is required. A run uses an explicitly configured background
+  validated from its own committed input through its own answer. Failed exploratory reads are
+  harmless, but failed mutations require a later successful same-operation retry at the same
+  normalized workspace path with unchanged replacement/content; edits also require an intervening
+  successful read and preserve every replacement's `newText` while refreshing exact `oldText`.
+  An unrelated same-file edit or an edit after a refused create is not a verified repair.
+  Host budget/usage and non-tool failures remain fatal, and a non-empty report is required. A run uses an explicitly configured background
   model (`digest.preset` or `digest.model`) and never inherits the foreground
   model or thinking level; absent one, a start is refused. Captured internal chunk safeguards are
   200,000 evidence characters (narrowed for model context), 2,000 entries, 24 tool calls,
@@ -331,7 +334,8 @@ edits need restart only; unit edits additionally need daemon-reload.
   responses include tool-call responses; native retries are recorded separately. The next-episode
   estimate counts chunks with the actual reader (including interacting character, entry and
   evidence-step bounds), then allows three rounds plus framing per chunk with 25% headroom, but is neither exact
-  tokenization nor a financial ceiling. A failed tool ends the run before another model round.
+  tokenization nor a financial ceiling. Fatal tool failures abort before another model round;
+  harmless reads and repairable mutations may continue only within the existing bounds.
   Missing usage fails the chunk closed; native retries, polls, compaction and crashes prevent
   exact network-spend accounting. Finished chunks keep their acknowledgements on failure.
   Write/file counts are summed per chunk for invocation reporting, not a cross-chunk distinct-file
@@ -457,6 +461,11 @@ edits need restart only; unit edits additionally need daemon-reload.
   than empty strings, and an unreadable/empty re-observation keeps an earlier readable target excerpt.
   Nothing is filled from a transcript or recent-target cache, and controls are still parsed from
   `message.text` alone.
+- Telegram locations and venues are readable labeled update content (bounded venue labels and
+  six-decimal coordinates), including reply/target excerpts; no geocoding, attachment or authority
+  is implied. Attachment suffixes use fixed known MIME/name metadata, never byte sniffing or the
+  announced filename as a path. Recovery adopts complete legacy generic identity locators before
+  redownloading, without renaming originals; stored paths remain authoritative.
 - Media ingress is opt-in (`media` config) and owned by the gateway. Discord
   attachments are stored once at admission under `media/discord/` with the same
   size bound; Discord audio is never transcribed. Telegram
