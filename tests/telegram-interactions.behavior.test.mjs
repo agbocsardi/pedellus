@@ -94,8 +94,12 @@ function messageUpdate(updateId, messageId, text, chatId = CHAT_ID, extra = {}) 
  * earlier turn was answered instead of relying on a timer or an accidental same-batch grouping.
  */
 function after(predicate, updates) {
-  return async () => {
-    while (!predicate()) await new Promise((resolve) => setImmediate(resolve));
+  return async (signal) => {
+    while (!predicate()) {
+      signal?.throwIfAborted();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    signal?.throwIfAborted();
     return updates;
   };
 }
@@ -152,11 +156,7 @@ function telegramMock(batches) {
         if (typeof batch === 'function') {
           // A batch thunk lets a test admit later messages only after the earlier turn was answered.
           // Adapter shutdown still releases it, so a gated poll never outlives the test.
-          return response(await Promise.race([batch(), new Promise((_, reject) => {
-            const onAbort = () => reject(new DOMException('The operation was aborted', 'AbortError'));
-            if (signal?.aborted) return onAbort();
-            signal?.addEventListener('abort', onAbort, { once: true });
-          })]));
+          return response(await batch(signal));
         }
         return response(batch);
       }
@@ -756,6 +756,40 @@ test('consecutive ordinary owner messages from one chat coalesce into one ordere
     await cleanup(store);
   }
 });
+
+for (const boundary of ['sender', 'control']) {
+  test(`coalescing stops at an intervening ${boundary} boundary`, { timeout: 15_000 }, async () => {
+    const store = await syntheticStore(`coalesce-${boundary}`, { allowFrom: ['501', '999'] });
+    const inputs = [];
+    store.faux.setResponses(Array.from({ length: 10 }, () => (request) => {
+      const last = request.messages.filter((message) => message.role === 'user').at(-1);
+      inputs.push(typeof last.content === 'string' ? last.content : last.content.map((part) => part.text ?? '').join(''));
+      return fauxAssistantMessage('BOUNDARY-ANSWER');
+    }));
+    const middle = boundary === 'sender'
+      ? messageUpdate(801, 201, 'BOB-MIDDLE', CHAT_ID, { from: privateUser(999) })
+      : messageUpdate(801, 201, '/help');
+    const transport = telegramMock([[
+      messageUpdate(800, 200, 'ALICE-FIRST'), middle,
+      messageUpdate(802, 202, 'ALICE-LAST'),
+    ]]);
+    let harness;
+    try {
+      harness = start(store, transport, ['501', '999']);
+      const count = boundary === 'sender' ? 3 : 2;
+      await until(() => inputs.length === count && transport.sent.filter((entry) => entry.text === 'BOUNDARY-ANSWER').length === count,
+        'separate boundary turns');
+      assert.ok(inputs[0].includes('ALICE-FIRST'));
+      assert.ok(inputs.at(-1).includes('ALICE-LAST'));
+      assert.ok(!inputs.some((text) => text.includes('ALICE-FIRST') && text.includes('ALICE-LAST')));
+      if (boundary === 'sender') assert.ok(inputs[1].includes('BOB-MIDDLE'));
+    } finally {
+      await stop(harness);
+      transport.restore();
+      await cleanup(store);
+    }
+  });
+}
 
 test('an ambiguous action send is quarantined and never resent, including across reopen', { timeout: 25_000 }, async () => {
   const store = await syntheticStore('unknown-action');

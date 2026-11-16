@@ -1727,7 +1727,12 @@ export async function runTelegram(
       const absorbed = new Set<number>();
       let chars = owner.text.length;
       for (const candidate of doc.pending) {
-        if (!coalescableWith(owner, candidate)) continue;
+        if (candidate.chatId !== owner.chatId || candidate.updateId <= owner.updateId) continue;
+        // Only consecutive same-chat inputs may join: another sender, a notice or control is a
+        // barrier, never something to skip in search of a later matching message.
+        if (!coalescableWith(owner, candidate) || doc.controls.some((control) =>
+          control.chatId === owner.chatId && control.updateId > owner.updateId
+          && control.updateId < candidate.updateId)) break;
         const nextChars = chars + candidate.text.length;
         if (parts.length >= TELEGRAM_COALESCE_LIMITS.maxParts ||
             nextChars > TELEGRAM_COALESCE_LIMITS.maxChars) break;
@@ -2843,6 +2848,16 @@ export async function runTelegram(
   ): Promise<void> {
     const chatId = message.chat.id;
     const sessionKey = `telegram:${identity}:chat:${chatId}`;
+    // Persistently seal earlier inputs before a control can complete and its notice disappear.
+    // Otherwise a later input could be merged across that already-applied context boundary.
+    state = await stateConversation.commit(async (tx) => {
+      const doc = await tx.doc(TelegramState, stateConversation.id);
+      for (const entry of doc.pending) {
+        if (entry.chatId === chatId && coalescableRecord(entry)) entry.coalescedParts = 1;
+      }
+      return copyJson(doc) as unknown as ChannelState;
+    }, adapterContext);
+    finishCoalesceWindow(chatId);
     const recorded = state.controls.find((entry) => entry.updateId === update.update_id);
     if (recorded !== undefined) {
       // The command was durably admitted before its effect, so a replay reports it instead of running it twice.
