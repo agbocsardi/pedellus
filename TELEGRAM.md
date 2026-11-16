@@ -644,7 +644,8 @@ every `intent`/`sending` action is quarantined as `unknown`. A repeat of the sam
 action identity resolves to its stored record while retained and is not resent;
 a mismatched chat, target or payload is denied without disclosing the old result.
 Interrupted tool execution remains non-replayable even after record pruning.
-Unknown outcomes are never evicted; if unresolved records fill the bounded log,
+Unknown outcomes and failed/denied actions with an accepted prefix or returned message ids are
+never evicted, by either settled-record pruning or full-log eviction. If these records fill the bounded log,
 new actions are denied rather than losing reconciliation evidence. Target observation is
 best-effort bookkeeping: a failed target commit can make an id untargetable but
 never turns an accepted send into an ambiguous delivery.

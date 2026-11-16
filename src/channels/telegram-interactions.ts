@@ -53,7 +53,7 @@ export const TELEGRAM_TARGET_LIMITS = Object.freeze({
 export const TELEGRAM_ACTION_LIMITS = Object.freeze({
   /** Total action records retained; terminal records are evicted first. */
   total: 100,
-  /** Known settled (sent/failed/denied) records kept; unknown outcomes are never evicted. */
+  /** Definitively settled records kept; unknown and partially delivered outcomes are never evicted. */
   settled: 60,
   /** Maximum text one native reply action may send. */
   textChars: 8_192,
@@ -571,8 +571,12 @@ export function actionFor(
   return actions.find((entry) => validActionRecord(entry) && entry.callId === callId);
 }
 
+function evictableAction(entry: TelegramActionRecord): boolean {
+  return TERMINAL_ACTION.has(entry.status) && (entry.status === "sent" || !acceptedActionPart(entry));
+}
+
 function pruneActions(actions: TelegramActionRecord[]): void {
-  const settled = actions.filter((entry) => validActionRecord(entry) && TERMINAL_ACTION.has(entry.status));
+  const settled = actions.filter((entry) => validActionRecord(entry) && evictableAction(entry));
   if (settled.length <= TELEGRAM_ACTION_LIMITS.settled) return;
   const drop = new Set(
     settled
@@ -603,13 +607,13 @@ export function admitAction(
   if (!validActionRecord(record) || !Array.isArray(actions)) return "full";
   // Any stored record with this call id, even a malformed one, blocks a second external effect.
   if (actions.some((entry) => isRecord(entry) && entry.callId === record.callId)) return "duplicate";
-  // Checked before pruning so a partially delivered settled record is never the one evicted first.
+  // Partial and unknown records remain fences across every pruning and full-log eviction path.
   if (conflictingAction(actions, record) !== undefined) return "conflict";
   pruneActions(actions);
   if (actions.length >= TELEGRAM_ACTION_LIMITS.total) {
     const oldest = actions
       .map((entry, index) => ({ entry, index }))
-      .filter(({ entry }) => validActionRecord(entry) && TERMINAL_ACTION.has(entry.status))
+      .filter(({ entry }) => validActionRecord(entry) && evictableAction(entry))
       .sort((left, right) =>
         numberOrZero(left.entry.settledAtMs ?? left.entry.startedAtMs) -
         numberOrZero(right.entry.settledAtMs ?? right.entry.startedAtMs))[0];

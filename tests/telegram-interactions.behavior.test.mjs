@@ -676,6 +676,35 @@ test('the action fence refuses a distinct call id for the same unresolved effect
     'the same file under a different native kind is a different visible effect');
 });
 
+test('partial-delivery fences survive settled pruning and refuse eviction at the full-log bound', async () => {
+  const { admitAction, settleActionRecord, TELEGRAM_ACTION_LIMITS } =
+    await import(new URL('../dist/channels/telegram-interactions.js', import.meta.url).href);
+  const record = (index) => ({ callId: `partial-${index}`, kind: 'reply', chatId: CHAT_ID,
+    targetMessageId: 101, text: `effect-${index}`, status: 'intent', nextChunkIndex: 0, startedAtMs: index });
+  const actions = [];
+  const first = record(0);
+  admitAction(actions, first);
+  first.nextChunkIndex = 1;
+  settleActionRecord(actions, first.callId, 'failed', { settledAtMs: 1 });
+  for (let index = 1; index <= TELEGRAM_ACTION_LIMITS.settled + 2; index++) {
+    admitAction(actions, record(index));
+    settleActionRecord(actions, `partial-${index}`, 'sent', { settledAtMs: index + 1 });
+  }
+  assert.ok(actions.includes(first), 'ordinary terminal pruning retains the accepted prefix fence');
+  assert.equal(admitAction(actions, { ...record(0), callId: 'fresh-retry' }), 'conflict');
+  const full = [];
+  for (let index = 0; index < TELEGRAM_ACTION_LIMITS.total; index++) {
+    const partial = { ...record(index), nextChunkIndex: 1 };
+    assert.equal(admitAction(full, partial), 'admitted');
+    settleActionRecord(full, partial.callId, index % 2 ? 'denied' : 'failed', { settledAtMs: index + 1 });
+  }
+  assert.equal(full.length, TELEGRAM_ACTION_LIMITS.total);
+  const before = structuredClone(full);
+  assert.equal(admitAction(full, record(999)), 'full', 'partial outcomes cannot be evicted for an unrelated effect');
+  assert.deepEqual(full, before);
+  assert.equal(admitAction(full, { ...record(0), callId: 'retry-at-capacity' }), 'conflict');
+});
+
 test('the action fence blocks a partially delivered effect but not a settled one', async () => {
   const { admitAction, settleActionRecord } =
     await import(new URL('../dist/channels/telegram-interactions.js', import.meta.url).href);
