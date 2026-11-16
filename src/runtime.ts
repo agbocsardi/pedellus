@@ -1992,7 +1992,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         : [];
       return withContext(capture.tools.filter((name) => workerCodingTools.includes(name)));
     }
-    if (!toolExtension) {
+    if (!toolExtension && !scheduledRun) {
       // Retire instead of creating an empty document: a disabled ceiling must durably remove
       // previously captured tools so re-enabling it cannot resurrect them.
       await tx.retireDoc(ConfigToolCaptureDoc, conversationId);
@@ -2066,21 +2066,24 @@ export async function openGateway(config: PortConfig, context: Context, options:
   }
   /**
    * Reapply tool and extension policy after a live MCP change. Authenticated chats may gain the new
-   * registration; existing workers are pruned against their durable capture, never widened by it.
+   * registration; existing workers and scheduled runs are pruned against their durable captures,
+   * never widened by it.
    */
   async function refreshMcpConversationPolicy(): Promise<void> {
     const open = harnessRef.current;
     if (open === undefined) return;
     let failure: unknown;
-    for (const conversationId of new Set([...authorizedChatConversations, ...workerChildConversations])) {
+    for (const conversationId of new Set([
+      ...authorizedChatConversations, ...workerChildConversations, ...scheduledRunTargets,
+    ])) {
       try {
         const conversation = await open.conversation(conversationId, context);
         if (conversation === undefined) continue;
-        if (!workerChildConversations.has(conversationId)) {
+        if (!workerChildConversations.has(conversationId) && !scheduledRunTargets.has(conversationId)) {
           await applyConversationPolicy(conversation, context);
           continue;
         }
-        // A worker keeps its pinned model, cwd and thinking level. Reapply only its extension
+        // A worker or scheduled run keeps its pinned model, cwd and thinking level. Reapply only its extension
         // selection and the capture intersection: a newly added MCP tool is never added to an
         // existing capture, while a removed one is pruned in this same commit.
         await conversation.commit(async (tx) => {

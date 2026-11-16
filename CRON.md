@@ -790,8 +790,11 @@ ceiling plus `memory_search`/`memory_browse`/`memory_read` and the five connecte
 names, with no `codemode`, `tool_search`, `worker`, `cron`, MCP management, channel tool or captured
 classifier; the run is offered the recall and MCP tools directly. A gated model request lets the
 test act between rounds: `memory_search` and the captured MCP tool both succeed against the real
-workspace and the real server, then the capture is narrowed to `read` and the same two names are
-asserted denied while `read` still succeeds. A second case leaves a stale capture naming recall and
+workspace and the real server. Owner MCP removal and re-addition during the run permanently prune
+its captured MCP names; re-addition never restores them, while captured recall survives policy
+refresh even with an empty coding ceiling. Both `read` and empty-ceiling variants run. The capture
+is then narrowed to coding tools and the same capability calls are denied while `read`, if granted,
+still succeeds. A separate case leaves a stale capture naming recall and
 MCP on a settled automation conversation, reopens with both withdrawn, asserts the capture is
 retired and the conversation holds no tool, then reopens once more with both enabled and asserts no
 name is resurrected and the conversation still has no recall scope. The live-run reopen bound (the

@@ -1468,7 +1468,8 @@ test("a recurring run rebuilds the origin's workspace context for each episode",
   }
 });
 
-test("an isolated scheduled run captures only its origin's read-only recall and exact MCP tools", { timeout: 40_000 }, async () => {
+for (const codingTools of [["read"], []]) {
+test(`an isolated scheduled run captures and permanently prunes capabilities (coding: ${codingTools.length})`, { timeout: 40_000 }, async () => {
   // Scouts and reflections had to run in `origin` mode because an isolated run had no read-only
   // recall and no MCP tool. The capture now carries both from the authenticated origin, and exactly
   // them: no scheduling, worker delegation, MCP management, channel action, classifier or Code Mode.
@@ -1489,7 +1490,7 @@ test("an isolated scheduled run captures only its origin's read-only recall and 
       dataDir: resolve(directory, "state"),
       model,
       allowedModels: [model],
-      toolAllowlist: ["read"],
+      toolAllowlist: codingTools,
       cron: { enabled: true, timeZone: "UTC" },
       mcp: {
         enabled: true,
@@ -1498,6 +1499,8 @@ test("an isolated scheduled run captures only its origin's read-only recall and 
         },
       },
     }, directory);
+    const configFile = resolve(directory, "config.json");
+    await writeFile(configFile, JSON.stringify(config));
     const echoName = mcpToolNames("synthetic", ["echo"]).get("echo");
     const capturedMcpNames = [...mcpToolNames("synthetic", ["a-b", "a_b", "echo", "fail", "slow"]).values()];
     const provider = fauxProvider({ provider: providerId, models: [MODEL] });
@@ -1511,7 +1514,9 @@ test("an isolated scheduled run captures only its origin's read-only recall and 
     const thirdRound = new Promise((reached) => { reachedThirdRound = reached; });
     let scheduledTurns = 0;
     let addIssued = false;
-    provider.setResponses(Array.from({ length: 12 }, () => async (transcript) => {
+    let removeIssued = false;
+    let restoreIssued = false;
+    provider.setResponses(Array.from({ length: 20 }, () => async (transcript) => {
       const input = userTexts(transcript.messages)[0];
       if (input === scheduledContent("capability probe")) {
         scheduledTurns += 1;
@@ -1531,12 +1536,23 @@ test("an isolated scheduled run captures only its origin's read-only recall and 
           return fauxAssistantMessage([
             fauxToolCall("memory_search", { target: "notes", query: "CAPABILITY-RECALL-MARKER" }, { id: "capability-recall-revoked" }),
             fauxToolCall(echoName, { label: "captured" }, { id: "capability-mcp-revoked" }),
-            fauxToolCall("read", { path: "note.txt" }, { id: "capability-read" }),
+            ...(codingTools.length === 0 ? [] : [fauxToolCall("read", { path: "note.txt" }, { id: "capability-read" })]),
           ], { stopReason: "toolUse" });
         }
         // Reached only after the revoked round's own tool results committed.
         reachedThirdRound();
         return fauxAssistantMessage("CAPABILITY-ANSWER");
+      }
+      const latest = input;
+      if (latest === "remove probe server" && !removeIssued) {
+        removeIssued = true;
+        return fauxAssistantMessage([fauxToolCall("mcp", { action: "remove", name: "synthetic" }, { id: "remove-probe-server" })], { stopReason: "toolUse" });
+      }
+      if (latest === "restore probe server" && !restoreIssued) {
+        restoreIssued = true;
+        return fauxAssistantMessage([fauxToolCall("mcp", {
+          action: "add", name: "synthetic", server: { command: process.execPath, args: [MCP_FIXTURE] },
+        }, { id: "restore-probe-server" })], { stopReason: "toolUse" });
       }
       if (input === "schedule a capability probe" && !addIssued) {
         addIssued = true;
@@ -1548,13 +1564,13 @@ test("an isolated scheduled run captures only its origin's read-only recall and 
     }));
     const models = createModels();
     models.setProvider(provider.provider);
-    const gateway = await openGateway(config, context, { models });
+    const gateway = await openGateway({ ...config, configFile }, context, { models });
     try {
       const chat = await gateway.conversationFor("cron-conversations:capabilities", context);
       // MCP auto-enables Code Mode, so the chat holds the compositor and the cron tool; its MCP
       // tools stay deferred there. The scheduled run below must get neither one.
       assert.deepEqual(offeredToolNames(await chat.agent(context)).sort(),
-        ["codemode", "cron", "memory_browse", "memory_read", "memory_search", "read", "tool_search"].sort(),
+        ["codemode", "cron", "memory_browse", "memory_read", "memory_search", "mcp", ...codingTools, "tool_search"].sort(),
         "the origin chat holds recall, its coding tool, cron and the compositor");
       const claimed = changeWatcher(gateway.harness, (changes) => changes.some((change) =>
         change.type === "document" && change.record.kind === CRON_JOBS_KIND
@@ -1583,7 +1599,7 @@ test("an isolated scheduled run captures only its origin's read-only recall and 
         const capture = await gateway.harness.snapshot(ConfigToolCaptureDoc, automationId, context);
         assert.equal(capture.originConversationId, chat.id);
         assert.deepEqual([...capture.tools].sort(),
-          ["read", "memory_search", "memory_browse", "memory_read", ...capturedMcpNames].sort(),
+          [...codingTools, "memory_search", "memory_browse", "memory_read", ...capturedMcpNames].sort(),
           "captured names are the coding ceiling plus recall and the exact connected MCP tools");
         for (const name of ["codemode", "tool_search", "worker", "cron", "mcp", "telegram", "discord_history"]) {
           assert.ok(!capture.tools.includes(name), `a scheduled run never captures ${name}`);
@@ -1594,7 +1610,7 @@ test("an isolated scheduled run captures only its origin's read-only recall and 
         // deferred MCP tool, so its captured MCP names are in the offered set.
         const automation = await gateway.harness.conversation(automationId, context);
         const automationTools = offeredToolNames(await automation.agent(context));
-        for (const name of ["read", "memory_search", "memory_browse", "memory_read", echoName]) {
+        for (const name of [...codingTools, "memory_search", "memory_browse", "memory_read", echoName]) {
           assert.ok(automationTools.includes(name), `the scheduled run is offered ${name}: ${automationTools.join(", ")}`);
         }
         for (const name of ["codemode", "tool_search", "worker", "cron", "mcp", "telegram", "discord_history"]) {
@@ -1615,8 +1631,23 @@ test("an isolated scheduled run captures only its origin's read-only recall and 
         assert.equal(mcp.isError, false, `mcp result: ${mcp.text.slice(0, 300)}`);
         assert.match(mcp.text, /echo:captured/, "the captured MCP tool reached the server");
 
-        // Durable revocation: the same names are removed from the capture, as a narrowed config or a
-        // reopen writes it. The revoked names deny; the still-captured coding tool keeps working.
+        // Actual live management must permanently prune the running capture, including when the
+        // coding ceiling is empty. Re-adding identical registration names cannot restore old grants.
+        for (const command of ["remove probe server", "restore probe server"]) {
+          const result = await (await chat.submit({ type: "input", content: command }, context)).wait(context);
+          assert.equal(result.status, "done");
+          const managed = (await toolResults(chat)).find((entry) => entry.id ===
+            (command === "remove probe server" ? "remove-probe-server" : "restore-probe-server"));
+          assert.ok(managed, `management call was made: ${command}`);
+          assert.equal(managed.isError, false, managed.text);
+          const pruned = await gateway.harness.snapshot(ConfigToolCaptureDoc, automationId, context);
+          assert.ok(pruned, "a recall-only scheduled capture survives live policy refresh");
+          assert.ok(pruned.tools.includes("memory_search"), "recall survives independently of coding");
+          assert.ok(!pruned.tools.includes(echoName), "removed MCP names are never resurrected");
+        }
+        assert.equal(gateway.mcp.servers.find((server) => server.name === "synthetic")?.state, "connected");
+
+        // Narrow recall as well; the still-captured coding tool, if any, keeps working.
         await gateway.harness.commit(async (tx) => {
           const doc = await tx.doc(ConfigToolCaptureDoc, automationId);
           doc.tools = doc.tools.filter((name) => name === "read");
@@ -1629,10 +1660,12 @@ test("an isolated scheduled run captures only its origin's read-only recall and 
         assert.match(revokedRecall.text, /captured authority/);
         const revokedMcp = afterRevocation.find((result) => result.id === "capability-mcp-revoked");
         assert.equal(revokedMcp.isError, true, "a revoked MCP tool is denied");
-        assert.match(revokedMcp.text, /captured authority/);
-        const read = afterRevocation.find((result) => result.id === "capability-read");
-        assert.equal(read.isError, false, `the captured coding tool still works: ${read.text.slice(0, 200)}`);
-        assert.match(read.text, /CAPABILITY-READ-CONTENT/);
+        assert.match(revokedMcp.text, /captured authority|not available|not enabled|not callable|unknown tool/i);
+        if (codingTools.length > 0) {
+          const read = afterRevocation.find((result) => result.id === "capability-read");
+          assert.equal(read.isError, false, `the captured coding tool still works: ${read.text.slice(0, 200)}`);
+          assert.match(read.text, /CAPABILITY-READ-CONTENT/);
+        }
 
         // The run settles and its capture is retired with it in the same terminal commit.
         await settledWatcher.promise;
@@ -1653,6 +1686,8 @@ test("an isolated scheduled run captures only its origin's read-only recall and 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+}
 
 test("a stale scheduled-run recall/MCP capture never survives a reopen", { timeout: 30_000 }, async () => {
   // A crash before a run's terminal commit leaves its capture on the automation conversation. A
