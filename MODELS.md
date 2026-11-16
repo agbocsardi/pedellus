@@ -304,8 +304,8 @@ candidate against the *current live* MCP block, not the block read at open, so a
 owner's `mcp` add or remove does not make every later model reload look unrelated.
 Any other MCP difference, including a hand edit made outside the gateway, is still
 an unrelated refusal that needs `/restart`; a difference that appears while the
-candidate itself is being validated is rechecked before and inside the commit and
-refused the same way.
+candidate itself is being validated is detected by a second full config read inside the commit,
+before policy writes, and refused if its parsed values differ from the validated snapshot.
 
 Switching between direct-model and named-preset selection is restart-required and
 refused as a distinct outcome. Each attached host caches that capability when it
@@ -347,7 +347,9 @@ publication starts under the new policy, which is intended, while any other work
 admitted in that same microtask window also observes the new policy once the commit
 resolves; nothing observes a candidate that was not stored. A Storage failure fails
 the Session without publishing, and recovery reopens from what was stored. There is
-no file watcher, no automatic retry and no drain or scheduling pause.
+no file watcher, no automatic retry and no drain or scheduling pause. The final file read and
+stored policy commit are not a portable filesystem compare-and-swap: an outside edit after that
+last read can remain unapplied until the next explicit reload/restart; it is never overwritten.
 
 Credential values are never read into a notice, transcript or diagnostic. A
 configured environment reference that is unset or blank fails the whole reload

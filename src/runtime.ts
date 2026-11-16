@@ -3725,6 +3725,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
                 const inbox = await tx.doc(InboxDoc, conversationId);
                 if (inbox.items.length > 0) return { kind: "busy" } as const;
               }
+              // Auth validation and the preceding reads may have awaited while an outside editor
+              // changed the file. Compare a fresh parsed snapshot before the first policy write;
+              // checking only effectiveLiveConfig would miss unapplied edits on disk.
+              let latest: PortConfig;
+              try { latest = await options.reloadConfig!(); }
+              catch { return { kind: "invalid" } as const; }
+              if (modelReloadCompatibility(candidate, latest) !== "unchanged") {
+                return { kind: "unrelated" } as const;
+              }
               // Only foreground mapped chats are repolicied. An automation, worker or digest target
               // keeps the exact model, thinking level and per-run authority prepared for its run.
               for (const conversationId of authorizedChatConversations) {
@@ -3753,6 +3762,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         })();
         if (outcome.kind === "busy") return { status: "busy" };
         if (outcome.kind === "unrelated") return { status: "refused", reason: "unrelated" };
+        if (outcome.kind === "invalid") return { status: "refused", reason: "invalid" };
         if (outcome.kind === "pinned") return { status: "refused", reason: "pinned" };
         // Durable publishes a stored commit to `observeCommits()` observers before the commit's wait
         // resolves. This fallback is a no-op unless that ever changed, and keeps the in-memory

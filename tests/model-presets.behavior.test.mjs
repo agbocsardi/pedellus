@@ -1010,6 +1010,47 @@ test("an input admitted while the candidate is validated keeps the old catalog a
   }
 });
 
+test("reload refuses a disk edit made after its candidate snapshot was read", { timeout: 20_000 }, async () => {
+  const { root, workspace, dataDir } = await tempDirs("reload-disk-race");
+  const server = await localModelServer();
+  const configFile = resolve(root, "config.json");
+  process.env.RELOAD_MODEL_KEY = "synthetic-reload-race";
+  let gateway;
+  try {
+    const base = reloadConfigValues(workspace, dataDir, server.baseUrl);
+    const candidate = { ...base, modelPreset: "deep" };
+    await writeFile(configFile, JSON.stringify(base));
+    let edited = false;
+    gateway = await openGateway(await loadConfig(configFile), context, {
+      reloadConfig: async () => {
+        const snapshot = await loadConfig(configFile);
+        if (!edited) {
+          edited = true;
+          // The first valid snapshot is now stale, just as when an outside editor writes while
+          // credential validation awaits. Only a second disk read can detect the unapplied edit.
+          await writeFile(configFile, JSON.stringify({ ...candidate, toolAllowlist: ["read"] }));
+        }
+        return snapshot;
+      },
+      agentHistory: false,
+    });
+    await gateway.conversationFor("cli:reload-disk-race", context);
+    await writeFile(configFile, JSON.stringify(candidate));
+    assert.deepEqual(await gateway.reloadModels(context), { status: "refused", reason: "unrelated" });
+    assert.equal((await gateway.listModels("cli:reload-disk-race", context)).selected.modelId, "alpha");
+    assert.equal(server.requests.length, 0);
+    await writeFile(configFile, JSON.stringify(candidate));
+    assert.deepEqual(await gateway.reloadModels(context), {
+      status: "reloaded", models: 2, presets: 2, defaultPreset: "deep",
+    });
+    assert.equal((await gateway.listModels("cli:reload-disk-race", context)).selected.modelId, "beta");
+  } finally {
+    delete process.env.RELOAD_MODEL_KEY;
+    if (gateway) await gateway.close(context).catch(() => undefined);
+    await server.close();
+  }
+});
+
 test("a reload leaves an isolated scheduled target's prepared model and thinking untouched", { timeout: 30_000 }, async () => {
   const { root, workspace, dataDir } = await tempDirs("reload-cron-target");
   const server = await localModelServer();
