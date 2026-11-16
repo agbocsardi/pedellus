@@ -537,7 +537,10 @@ delivery: a scheduled run has no way to opt out of its own message, so an explic
 be silently dropped. A successful answer whose trimmed text is exactly `[SILENT]` (the retired
 marker) is instead treated as unusable and queues that same fixed empty-result notice, so the
 occurrence stays visible; the answer itself stays in the run's conversation, and the marker has no
-meaning in an ordinary chat reply. Both the suppression check and that substitution run before
+meaning in an ordinary chat reply. An answer whose text begins with `[FAILED]` reports that the
+run's own work failed: the terminal commit records it as an error (`run reported failure`), so it
+queues the fixed failure notice even for a `silent` job. The marker can only escalate an answered
+occurrence to failure, never suppress a delivery. Both the suppression check and that substitution run before
 admission, so a suppressed occurrence creates no record, an unusable one queues its notice in the
 same terminal commit, and a reopen or retried terminal commit cannot create one later. A cancelled, superseded,
 fenced or missing-job run passes no settlement (`delivery: null`) and sends nothing externally, so

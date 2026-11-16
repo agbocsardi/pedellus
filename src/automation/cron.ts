@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { copyJson, type Context, type Draft, type JsonValue } from "@earendil-works/chord";
-import { ConversationBusy, InboxDoc, LiveDoc, ResetEntry, defineDoc, defineExtension, defineTask } from "@earendil-works/pi-durable";
+import { AssistantEntry, ConversationBusy, InboxDoc, LiveDoc, ResetEntry, defineDoc, defineExtension, defineTask } from "@earendil-works/pi-durable";
 import type {
   ConversationHandle,
   ConversationId,
@@ -610,6 +610,13 @@ interface WaitSettlement {
   readonly status: "ok" | "error";
   readonly error: string | null;
   readonly answerEntryId: EntryId | null;
+}
+/** An answer whose text begins with this marker reports that the occurrence failed. */
+export const CRON_FAILURE_MARKER = "[FAILED]";
+function reportsFailure(entry: { readonly model?: readonly unknown[] } | undefined): boolean {
+  const message = entry?.model?.[0] as { content?: readonly { type: string; text?: string }[] } | undefined;
+  const body = (message?.content ?? []).flatMap((part) => part.type === "text" ? [part.text ?? ""] : []).join("");
+  return body.trimStart().startsWith(CRON_FAILURE_MARKER);
 }
 function outcomeOf(record: SubmissionRecord): WaitSettlement {
   if (record.status === "done" && record.type === "input") {
@@ -1477,6 +1484,13 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
         return terminalAborted<CronRunCheckpoint, CronRunResult>(
           runResult(input, "superseded", "job is owned by another execution"), "superseded",
         );
+      }
+      // A run that answered may still report that its own work failed. The marker can only turn an
+      // answered occurrence into a failure, never suppress or alter a delivery, so it reaches the same
+      // sanitized failure path as an unanswered run, `silent` or not. No model text is copied.
+      if (settlement.status === "ok" && settlement.answerEntryId !== null
+        && reportsFailure(await tx.entry(AssistantEntry, settlement.answerEntryId))) {
+        settlement = { status: "error", error: "run reported failure", answerEntryId: null };
       }
       job.lastOutcome = {
         scheduledAtMs: input.scheduledAtMs,
