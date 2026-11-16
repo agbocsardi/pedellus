@@ -208,6 +208,15 @@ edits need restart only; unit edits additionally need daemon-reload.
   are temporary: a CLI reattach keeps the temporary selection, while a gateway
   restart or reopen restores the configured preset without rewriting prepared
   dispatches. Direct-model (non-preset) selection retains its persisted semantics.
+- CLI-only `/reload` applies foreground model/preset/direct-thinking and credential-reference
+  changes from a fully validated config file. Direct↔preset transitions and unrelated startup
+  changes require restart. Every nonterminal task or queued input blocks reload except sleeping
+  native cron timers, so no captured work resumes under changed credentials. Managed MCP edits
+  are reflected in the live baseline; unapplied disk edits are refused. Config is re-read inside the
+  policy commit before writes, though an external edit after that last read can remain unapplied
+  until another explicit reload/restart (no filesystem CAS). Only authenticated mapped chats are
+  repolicied, and pinned background models remain allowed. A matching stored policy-revision
+  commit publishes registry/defaults through synchronous native `observeCommits`, never beforehand.
 - `ask_user` is model-only, sole-tool-round delivery to the unique authenticated mapped-chat owner
   surface (CLI or Telegram), never worker, isolated cron, digest, root, fork or state authority.
   It ends the tool round without parking tasks; answers arrive as ordinary later inputs. Button claims
