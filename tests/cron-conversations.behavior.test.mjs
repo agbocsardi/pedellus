@@ -1570,7 +1570,7 @@ test(`an isolated scheduled run captures and permanently prunes capabilities (co
       // MCP auto-enables Code Mode, so the chat holds the compositor and the cron tool; its MCP
       // tools stay deferred there. The scheduled run below must get neither one.
       assert.deepEqual(offeredToolNames(await chat.agent(context)).sort(),
-        ["codemode", "cron", "memory_browse", "memory_read", "memory_search", "mcp", ...codingTools, "tool_search"].sort(),
+        ["ask_user", "codemode", "cron", "memory_browse", "memory_read", "memory_search", "mcp", ...codingTools, "tool_search"].sort(),
         "the origin chat holds recall, its coding tool, cron and the compositor");
       const claimed = changeWatcher(gateway.harness, (changes) => changes.some((change) =>
         change.type === "document" && change.record.kind === CRON_JOBS_KIND
@@ -1601,7 +1601,7 @@ test(`an isolated scheduled run captures and permanently prunes capabilities (co
         assert.deepEqual([...capture.tools].sort(),
           [...codingTools, "memory_search", "memory_browse", "memory_read", ...capturedMcpNames].sort(),
           "captured names are the coding ceiling plus recall and the exact connected MCP tools");
-        for (const name of ["codemode", "tool_search", "worker", "cron", "mcp", "telegram", "discord_history"]) {
+        for (const name of ["ask_user", "codemode", "tool_search", "worker", "cron", "mcp", "telegram", "discord_history"]) {
           assert.ok(!capture.tools.includes(name), `a scheduled run never captures ${name}`);
         }
         assert.equal(capture.classifierModel, null, "a scheduled run never captures a classifier");
@@ -1613,7 +1613,7 @@ test(`an isolated scheduled run captures and permanently prunes capabilities (co
         for (const name of [...codingTools, "memory_search", "memory_browse", "memory_read", echoName]) {
           assert.ok(automationTools.includes(name), `the scheduled run is offered ${name}: ${automationTools.join(", ")}`);
         }
-        for (const name of ["codemode", "tool_search", "worker", "cron", "mcp", "telegram", "discord_history"]) {
+        for (const name of ["ask_user", "codemode", "tool_search", "worker", "cron", "mcp", "telegram", "discord_history"]) {
           assert.ok(!automationTools.includes(name), `the scheduled run is not offered ${name}`);
         }
         releaseInspection();

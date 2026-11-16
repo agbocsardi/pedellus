@@ -126,7 +126,7 @@ edits need restart only; unit edits additionally need daemon-reload.
   call-time capture checks gate recall/MCP. Live MCP changes and reopen permanently prune the
   capture, even with no coding tools; re-enabling never restores a removed grant. Idle automation
   conversations have no such scope, and persistent history confers no permission.
-  The `skill`, `cron`, `memory_search`, `memory_browse`, `memory_read`, `worker`,
+  The `skill`, `cron`, `memory_search`, `memory_browse`, `memory_read`, `worker`, `ask_user`,
   `mcp` management and scoped `telegram` tools grant no coding-tool authority and
   are exempt from the coding-tool hook, so enabling a coding tool never suppresses them.
   Memory recall is enabled by default for validated mapped chats; the SDK's
@@ -208,6 +208,14 @@ edits need restart only; unit edits additionally need daemon-reload.
   are temporary: a CLI reattach keeps the temporary selection, while a gateway
   restart or reopen restores the configured preset without rewriting prepared
   dispatches. Direct-model (non-preset) selection retains its persisted semantics.
+- `ask_user` is model-only, sole-tool-round delivery to the unique authenticated mapped-chat owner
+  surface (CLI or Telegram), never worker, isolated cron, digest, root, fork or state authority.
+  It ends the tool round without parking tasks; answers arrive as ordinary later inputs. Button claims
+  and typed answers settle with admission in one commit; typed text answers the oldest delivered
+  question for that exact session. `/new` cancels pending questions. Unknown external sends are
+  quarantined and retained, never reported as definite failure, resent or evicted to admit more.
+  Missing/ambiguous surfaces refuse; Discord has no question surface. Origin-mode cron shares its
+  ordinary chat class and can ask, unlike isolated scheduled-run conversations.
 - Telegram-only `/notices` lists unknown non-answer host notices and dismisses exact same-chat
   IDs without resending or touching model/scheduled answers. Interruption notices retain failed
   dismissal provenance in the outbox; pending control/restart acknowledgements leave the queue only
