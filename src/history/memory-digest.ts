@@ -41,9 +41,10 @@
  * - A resumed attempt re-submits the same request ID, so a turn that already settled is not
  *   re-run; a crash between request and result repeats that turn at the provider, not the batch.
  * - A settled turn is validated from its own committed input entry through its own answer before the
- *   cursor may move: any failed `pi.tool-result` in that turn fails the batch (even if the model
- *   answered later), the answer must be a non-empty report, and the bounded paged scan must reach it.
- *   The check reads the committed transcript, so it survives a reopen.
+ *   cursor may move: a failed read is harmless, a failed write/edit must be repaired by a later
+ *   successful mutation of that same file, a host budget/usage refusal stays fatal, the answer must be
+ *   a non-empty report, and the bounded paged scan must reach it. The check reads the committed
+ *   transcript, so it survives a reopen.
  * - `write` performs one guarded `O_CREAT | O_EXCL` create through the host environment: a concurrent
  *   create by this process or an outside editor fails the call and is never overwritten. `edit` keeps
  *   the native exact-text semantics and its in-process serialization; an outside process changing the
@@ -88,6 +89,7 @@ import {
   type Task,
   type TaskId,
   type TaskRuntime,
+  type ToolDiagnostic,
   type ToolRegistration,
   type Tx,
 } from "@earendil-works/pi-durable";
@@ -168,6 +170,13 @@ export const MEMORY_DIGEST_LIMITS = Object.freeze({
   noticeRecords: 100,
 });
 
+/**
+ * Marker the host puts on every budget/usage refusal it adds to a tool result. It is internal and
+ * fixed, so final validation can fail the batch even when the refused call was a harmless read: a
+ * model must never be able to repair away a host accounting failure by reading or answering later.
+ */
+export const MEMORY_DIGEST_BUDGET_REFUSAL_PREFIX = "Memory digestion budget refusal: ";
+
 /** Fixed, value-free refusal when every retained notice is still undelivered or unknown. */
 export const MEMORY_DIGEST_NOTICE_FULL_REASON =
   "memory digestion cannot start: its bounded internal issue notices are full of undelivered reports; " +
@@ -246,8 +255,13 @@ original transcripts stay the authority; you are not rewriting or archiving them
 - \`edit\` matches exact text and is safe against changes made through this assistant's own tools. It
   cannot detect an outside editor changing the file between your read and your write: only edit text
   you just saw, never force a missing match, and re-read when a match fails.
-- A failed or refused tool call fails this batch. Stop there and report what could not be saved; do
-  not try another path or a different edit in the same run. The batch will be retried later.
+- A failed read is harmless: the missing or out-of-scope path was not read. Do not treat it as a saved
+  fact, and do not keep retrying the same path; read a different file or continue with what you have.
+- A failed write or edit must be repaired in this same run by a later successful \`write\` or \`edit\` of
+  that exact file. After a create-only refusal, read the existing file and update it with an exact
+  \`edit\`. After a stale edit, re-read the file and retry the exact current \`oldText\`. A host budget
+  or policy refusal is not repairable: stop and report it. A batch with an unrepaired failed write or
+  edit, or a host refusal, is not acknowledged and will be retried later.
 - A batch may be replayed after an interrupted attempt. Before adding a fact, check whether it is
   already recorded: a replay must not duplicate or corrupt what an earlier attempt wrote.
 - Do not restructure the workspace wholesale, do not rename or delete files you were not asked to
@@ -302,7 +316,7 @@ function digestScopeHook(workspaceRoot: string, options: MemoryDigestScopeOption
   const root = resolve(workspaceRoot);
   return hook(ToolTask, {
     async beforeTool(call, api, context) {
-      const refuseBudget = (reason: string) => ({ block: reason });
+      const refuseBudget = (reason: string) => ({ block: `${MEMORY_DIGEST_BUDGET_REFUSAL_PREFIX}${reason}` });
       if (!(MEMORY_DIGEST_TOOL_NAMES as readonly string[]).includes(call.name)) {
         return { block: `Memory digestion holds only ${MEMORY_DIGEST_TOOL_NAMES.join(", ")}; ${call.name} is not available` };
       }
@@ -325,7 +339,7 @@ function digestScopeHook(workspaceRoot: string, options: MemoryDigestScopeOption
         ? DIGEST_RUN_LIMITS_DEFAULT
         : options.limitsFor(api.conversationId);
       if (limits === undefined) {
-        return refuseBudget("Memory digestion cannot verify its configured run budget; the batch was not acknowledged");
+        return refuseBudget("its configured run budget could not be verified; the batch was not acknowledged");
       }
       if (options.harness !== undefined) {
         let use: DigestToolUse;
@@ -338,30 +352,30 @@ function digestScopeHook(workspaceRoot: string, options: MemoryDigestScopeOption
             context,
           );
         } catch {
-          return refuseBudget("Memory digestion could not verify its tool and spending budget; the batch was not acknowledged");
+          return refuseBudget("its tool and spending budget could not be verified; the batch was not acknowledged");
         }
         if (use.calls > limits.maxToolCalls) {
-          return refuseBudget("Memory digestion reached its configured tool-call budget; the batch was not acknowledged");
+          return refuseBudget("it reached its configured tool-call budget; the batch was not acknowledged");
         }
         // A tool round needs room for one more successful response. Native failed attempts and
         // retries are reported separately; the owner-approved limit counts successful responses.
         if (!limits.spendingAdmissionOnly && use.successfulRequests >= limits.maxRequests) {
-          return refuseBudget("Memory digestion reached its configured successful-response budget; the batch was not acknowledged");
+          return refuseBudget("it reached its configured successful-response budget; the batch was not acknowledged");
         }
         if (use.unaccountedResponses > 0) {
           return refuseBudget(
-            "Memory digestion cannot verify a committed response's reported usage; the batch was not acknowledged",
+            "a committed response's reported usage could not be verified; the batch was not acknowledged",
           );
         }
         if (!limits.spendingAdmissionOnly && use.chargedInputTokens + use.reserveNextTokens > limits.maxInputTokens) {
-          return refuseBudget("Memory digestion reached its configured input-token budget; the batch was not acknowledged");
+          return refuseBudget("it reached its configured input-token budget; the batch was not acknowledged");
         }
         if (call.name === "write" || call.name === "edit") {
           if (use.paths.size > limits.maxChangedFiles) {
-            return refuseBudget("Memory digestion reached its configured changed-file budget; the batch was not acknowledged");
+            return refuseBudget("it reached its configured changed-file budget; the batch was not acknowledged");
           }
           if (use.diffChars > limits.maxDiffChars) {
-            return refuseBudget("Memory digestion reached its configured changed-text budget; the batch was not acknowledged");
+            return refuseBudget("it reached its configured changed-text budget; the batch was not acknowledged");
           }
         }
       }
@@ -668,16 +682,30 @@ export function createMemoryDigestScopeExtension(
   return defineExtension({
     name: MEMORY_DIGEST_SCOPE_EXTENSION_NAME,
     hooks: [digestScopeHook(workspaceRoot, options), hook(GenerationTask, {
-      async afterTools(_assistant, _results, api, context) {
+      async afterTools(assistant, results, api, context) {
         if (options.harness === undefined) return;
-        const harness = options.harness();
-        const limits = options.limitsFor?.(api.conversationId) ?? DIGEST_RUN_LIMITS_DEFAULT;
-        const use = await digestTranscriptUse(harness, api.conversationId, limits, context);
-        if (![...use.results.values()].some((failed) => failed)) return;
-        // A failed tool already fails the batch. Preserve its committed result, then abort rather
-        // than letting the model retry tools forever. abort() joins this generation task too, so
-        // start it without awaiting our own termination. Its abort mark precedes another request.
-        const conversation = await harness.conversation(api.conversationId, context);
+        const calls = toolCallsOf(await api.entry(assistant, context).catch(() => undefined));
+        let fatal = false;
+        for (const id of results) {
+          const entry = await api.entry(id, context).catch(() => undefined);
+          if (entry === undefined) continue;
+          for (const outcome of toolOutcomesOf(entry, calls)) {
+            if (!outcome.isError) continue;
+            if (digestFailureVerdict(outcome.name, outcome.arguments, outcome.diagnostics) === "fatal") {
+              fatal = true;
+              break;
+            }
+          }
+          if (fatal) break;
+        }
+        if (!fatal) return;
+        // A host budget/usage refusal, a harness interruption or an impossible mutation is not
+        // repairable. Preserve its committed result, then abort rather than spending more requests
+        // on calls that can only be refused again. A harmless failed read and an in-scope failed
+        // write/edit do not abort: the model may re-read and repair them before its report, and the
+        // final committed-turn validation still decides whether the batch may be acknowledged.
+        // abort() joins this generation task too, so start it without awaiting our own termination.
+        const conversation = await options.harness().conversation(api.conversationId, context);
         void conversation?.abort(withoutAbortSignal(context)).catch(() => {
           // The deadline and final turn validation still fail closed if teardown races this abort.
         });
@@ -836,6 +864,9 @@ function renderMemoryDigestInput(batch: DigestBatch, prompt: string, index: stri
     "  the exact current oldText. edit matches exact text and is serialized against changes made through",
     "  this assistant's own tools in this process; an outside editor changing the file between your read",
     "  and your write is not detected, so only edit text you just saw.",
+    "- A failed read is harmless and is never saved as fact. A failed write/edit must be repaired by a",
+    "  later successful write/edit of that same file in this run; a host budget/usage refusal is fatal.",
+    "  An unrepaired mutation or a host refusal fails the batch and leaves the frontier unchanged.",
     "- You cannot message anyone, schedule work, run commands, browse or start other agents.",
     "",
     `Curation policy (agent-owned workspace file ${MEMORY_DIGEST_PROMPT_FILE}, editable in an ordinary conversation):`,
@@ -1523,7 +1554,9 @@ export function renderMemoryDigestStatus(status: MemoryDigestStatusView): string
 
 /** Fixed, value-free failure reasons: they never contain tool output, file content or model text. */
 const TURN_FAILURE_REASONS = Object.freeze({
-  toolCallFailed: "a digest tool call failed; the batch was not acknowledged",
+  toolCallFailed: "a digest tool call failed and was not repaired; the batch was not acknowledged",
+  budgetRefused:
+    "a digest tool call failed on a host budget or policy refusal; the batch was not acknowledged",
   noReport: "the digest turn produced no final report; the batch was not acknowledged",
   unverifiable: "the digest turn could not be verified; the batch was not acknowledged",
 });
@@ -1533,6 +1566,101 @@ const TURN_SCAN_LIMITS = Object.freeze({
   entriesPerPage: 200,
   maxEntries: 4_000,
 });
+
+interface DigestTurnCall {
+  readonly name: string;
+  readonly arguments: unknown;
+}
+
+interface DigestToolOutcome {
+  readonly name: string;
+  readonly arguments: unknown;
+  readonly entryId: EntryId;
+  readonly isError: boolean;
+  readonly diagnostics: readonly ToolDiagnostic[];
+}
+
+/** Failure codes a plain tool error or a harmless path refusal may carry. */
+const HARMLESS_TOOL_CODES = new Set(["tool_error", "blocked", "invalid_arguments"]);
+
+type DigestFailureVerdict = "harmless-read" | "repairable-mutation" | "fatal";
+
+function mutationPathOf(args: unknown): string | undefined {
+  return isRecord(args) && typeof args.path === "string" ? args.path : undefined;
+}
+
+function diagnosticsOf(entry: EntryRecord): readonly ToolDiagnostic[] {
+  return ToolResultEntry.is(entry) ? entry.data.diagnostics : [];
+}
+
+/** True when the host refused a call for its own budget or usage accounting, never a path refusal. */
+function isDigestBudgetRefusal(diagnostics: readonly ToolDiagnostic[]): boolean {
+  return diagnostics.some((diagnostic) => typeof diagnostic.message === "string"
+    && diagnostic.message.includes(MEMORY_DIGEST_BUDGET_REFUSAL_PREFIX));
+}
+
+/** Harness-written terminal codes (interrupted, aborted, restart limit) are never recoverable. */
+function hasNonToolFailure(diagnostics: readonly ToolDiagnostic[]): boolean {
+  return diagnostics.some((diagnostic) => diagnostic.severity === "error"
+    && diagnostic.code !== undefined && !HARMLESS_TOOL_CODES.has(diagnostic.code));
+}
+
+/**
+ * Classify one failed tool result without trusting model text. A failed read is exploratory and
+ * harmless (its path refusal read nothing), and an in-scope write/edit failure may be repaired by a
+ * later successful mutation of the same file. A host budget/usage refusal and any non-tool failure
+ * are fatal; an out-of-scope mutation has no possible same-path repair, so it is fatal too.
+ */
+function digestFailureVerdict(
+  name: string,
+  args: unknown,
+  diagnostics: readonly ToolDiagnostic[],
+): DigestFailureVerdict {
+  if (isDigestBudgetRefusal(diagnostics) || hasNonToolFailure(diagnostics)) return "fatal";
+  if (name === "read") return "harmless-read";
+  if (name !== "write" && name !== "edit") return "fatal";
+  const path = mutationPathOf(args);
+  if (path === undefined || memoryDigestScopeProblem(path) !== undefined) return "fatal";
+  return "repairable-mutation";
+}
+
+function toolCallsOf(entry: EntryRecord | undefined): Map<string, DigestTurnCall> {
+  const calls = new Map<string, DigestTurnCall>();
+  for (const message of entry?.model ?? []) {
+    const record = message as unknown as Record<string, unknown>;
+    const content = record["content"];
+    if (record["role"] !== "assistant" || !Array.isArray(content)) continue;
+    for (const part of content) {
+      if (isRecord(part) && part["type"] === "toolCall"
+        && typeof part["id"] === "string" && typeof part["name"] === "string") {
+        calls.set(part["id"], { name: part["name"], arguments: part["arguments"] });
+      }
+    }
+  }
+  return calls;
+}
+
+/** Paired calls and results of one tool-result entry, in committed order. */
+function toolOutcomesOf(
+  entry: EntryRecord,
+  calls: ReadonlyMap<string, DigestTurnCall>,
+): DigestToolOutcome[] {
+  if (entry.kind !== ToolResultEntry.kind) return [];
+  const diagnostics = diagnosticsOf(entry);
+  const outcomes: DigestToolOutcome[] = [];
+  for (const message of entry.model ?? []) {
+    if (!isRecord(message) || message.role !== "toolResult" || typeof message.toolCallId !== "string") continue;
+    const call = calls.get(message.toolCallId);
+    outcomes.push({
+      name: call?.name ?? "",
+      arguments: call?.arguments,
+      entryId: entry.id,
+      isError: message.isError === true,
+      diagnostics,
+    });
+  }
+  return outcomes;
+}
 
 type TurnCheck =
   | { readonly status: "ok"; readonly answer: string }
@@ -1545,8 +1673,9 @@ type TurnCheck =
  * its own answer entry, never an earlier or later turn. Within it:
  * - the first entry is this task's digest input (kind and `data.taskId`), so a different attempt's
  *   turn cannot be mistaken for this one;
- * - any `pi.tool-result` entry with a failed result fails the batch, even when the model recovered and
- *   answered later — a refused write, a stale edit or a failed read is not a successful curation;
+ * - a failed read is harmless, but a failed write/edit must be followed by a successful mutation of
+ *   that same workspace-relative path, and a host budget/usage or non-tool failure is fatal even when
+ *   the model read or answered later;
  * - the answer must be a committed assistant entry with a non-empty report.
  *
  * The scan is bounded and paged; failing to reach the answer within the bound fails closed. It reads
@@ -1564,8 +1693,9 @@ async function validateCommittedTurn(
   let examined = 0;
   let sawInput = false;
   let reachedAnswer = false;
-  let failedTool = false;
   let answer: string | null = null;
+  const calls = new Map<string, DigestTurnCall>();
+  const outcomes: DigestToolOutcome[] = [];
   while (examined < TURN_SCAN_LIMITS.maxEntries) {
     const page = await conversation.entries(
       { order: "ascending", minEntryId: turn.entryId, maxEntryId: turn.answerEntryId },
@@ -1584,7 +1714,10 @@ async function validateCommittedTurn(
         }
         sawInput = true;
       }
-      if (entry.kind === ToolResultEntry.kind && hasFailedToolResult(entry)) failedTool = true;
+      if (entry.kind === AssistantEntry.kind) {
+        for (const [id, call] of toolCallsOf(entry)) calls.set(id, call);
+      }
+      if (entry.kind === ToolResultEntry.kind) outcomes.push(...toolOutcomesOf(entry, calls));
       if (entry.id === turn.answerEntryId) {
         if (entry.kind !== AssistantEntry.kind) return { status: "failed", reason: TURN_FAILURE_REASONS.unverifiable };
         reachedAnswer = true;
@@ -1597,16 +1730,28 @@ async function validateCommittedTurn(
     if (cursor === undefined) break;
   }
   if (!sawInput || !reachedAnswer) return { status: "failed", reason: TURN_FAILURE_REASONS.unverifiable };
-  if (failedTool) return { status: "failed", reason: TURN_FAILURE_REASONS.toolCallFailed };
+  const successes = outcomes.filter((outcome) => !outcome.isError);
+  for (const failure of outcomes) {
+    if (!failure.isError) continue;
+    const verdict = digestFailureVerdict(failure.name, failure.arguments, failure.diagnostics);
+    if (verdict === "fatal") {
+      return {
+        status: "failed",
+        reason: isDigestBudgetRefusal(failure.diagnostics)
+          ? TURN_FAILURE_REASONS.budgetRefused
+          : TURN_FAILURE_REASONS.toolCallFailed,
+      };
+    }
+    if (verdict === "harmless-read") continue;
+    const path = mutationPathOf(failure.arguments);
+    const repaired = path !== undefined && successes.some((success) =>
+      success.entryId > failure.entryId
+      && (success.name === "write" || success.name === "edit")
+      && mutationPathOf(success.arguments) === path);
+    if (!repaired) return { status: "failed", reason: TURN_FAILURE_REASONS.toolCallFailed };
+  }
   if (answer === null) return { status: "failed", reason: TURN_FAILURE_REASONS.noReport };
   return { status: "ok", answer };
-}
-
-function hasFailedToolResult(entry: EntryRecord): boolean {
-  for (const message of entry.model ?? []) {
-    if (isRecord(message) && message.role === "toolResult" && message.isError === true) return true;
-  }
-  return false;
 }
 
 function acceptEpisodeBatch(
@@ -2318,6 +2463,10 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             return;
           }
           try {
+            // Transient provider failures, including 429/rate-limit responses, are retried by the
+            // native generation task under Durable's settings.retry before this submission settles.
+            // The digest run adds no retry of its own: it never replays a tool call, a mutation or an
+            // acknowledged chunk, and an exhausted provider request leaves the frontier unchanged.
             const submission = await conversation.submit({
               type: "input",
               content: input,
@@ -2362,9 +2511,10 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           }
 
           // A settled turn alone does not prove successful curation: validate the committed turn
-          // (its own input entry through its own answer) before the frontier may move. A failed tool
-          // call, an unverifiable range or an empty report fails the batch without an acknowledgement,
-          // and the same accounting applies to a resumed attempt after a reopen.
+          // (its own input entry through its own answer) before the frontier may move. A failed read is
+          // harmless, but an unrepaired failed write/edit, a host budget/usage or non-tool refusal, an
+          // unverifiable range or an empty report fails the batch without an acknowledgement, and the
+          // same accounting applies to a resumed attempt after a reopen.
           if (settlement.entryId === null || settlement.answerEntryId === null) {
             await withdrawTarget(runtime, targetId, context);
             await failed(TURN_FAILURE_REASONS.unverifiable);

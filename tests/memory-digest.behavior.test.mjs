@@ -631,6 +631,128 @@ test('a refused, create-only or stale call fails the batch, and only a clean tur
   }
 });
 
+test('failed exploratory reads are harmless and do not block a clean digest', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const store = await openStore(fixture, (request) => {
+    const text = transcriptText(request.messages);
+    if (!text.includes('read-missing')) {
+      return fauxAssistantMessage([
+        fauxToolCall('read', { path: 'memory/topics/missing.md' }, { id: 'read-missing' }),
+        fauxToolCall('read', { path: 'AGENTS.md' }, { id: 'read-outside' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('Neither exploratory read produced a fact, so nothing was saved.');
+  });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
+
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'completed', JSON.stringify(task.state.outcome));
+  assert.equal(task.state.outcome.result.outcome, 'digested');
+  assert.ok((await cursorDoc(store.gateway.harness, origin.id)).nextEntryId > started.throughEntryId,
+    'a missing or out-of-scope read leaves the batch eligible');
+  const target = await targetOf(store.gateway.harness, started.taskId);
+  const results = await toolResults(store.gateway.harness, target.id);
+  assert.deepEqual(results.map((result) => [result.name, result.isError]), [['read', true], ['read', true]]);
+  assert.equal(await exists(join(fixture.workspace, 'memory/topics/missing.md')), false,
+    'a failed read never creates its path');
+});
+
+test('a stale edit is repaired by a re-read and exact edit in the same turn', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const existing = 'memory/topics/deploy.md';
+  await mkdir(join(fixture.workspace, 'memory/topics'), { recursive: true });
+  await writeFile(join(fixture.workspace, existing), '---\ndescription: Deploy notes\n---\n\nOWNER-ORIGINAL\n', 'utf8');
+  const store = await openStore(fixture, (request) => {
+    const text = transcriptText(request.messages);
+    if (!text.includes('edit-stale')) return toolEdit(existing, 'STALE-OLD-TEXT', 'never\n', 'edit-stale');
+    if (!text.includes('read-current')) return toolRead(existing, 'read-current');
+    if (!text.includes('edit-repair')) {
+      return toolEdit(existing, 'OWNER-ORIGINAL', `OWNER-ORIGINAL\n\n- ${FACT_LINE}`, 'edit-repair');
+    }
+    return fauxAssistantMessage('Re-read the current text and repaired the stale edit exactly.');
+  });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
+
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'completed', JSON.stringify(task.state.outcome));
+  assert.equal(task.state.outcome.result.outcome, 'digested');
+  assert.ok((await cursorDoc(store.gateway.harness, origin.id)).nextEntryId > started.throughEntryId);
+  const body = await readFile(join(fixture.workspace, existing), 'utf8');
+  assert.match(body, /OWNER-ORIGINAL/);
+  assert.equal(body.match(new RegExp(FACT, 'g')).length, 1);
+  const target = await targetOf(store.gateway.harness, started.taskId);
+  const results = await toolResults(store.gateway.harness, target.id);
+  assert.deepEqual(results.map((result) => [result.name, result.isError]), [
+    ['edit', true],
+    ['read', false],
+    ['edit', false],
+  ], 'the failed edit is followed by the read and successful repair');
+});
+
+test('a successful mutation of another file does not repair a failed edit', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const existing = 'memory/topics/deploy.md';
+  await mkdir(join(fixture.workspace, 'memory/topics'), { recursive: true });
+  await writeFile(join(fixture.workspace, existing), 'OWNER-ORIGINAL\n', 'utf8');
+  const store = await openStore(fixture, (request) => {
+    const text = transcriptText(request.messages);
+    if (!text.includes('edit-stale-other')) return toolEdit(existing, 'STALE-OLD-TEXT', 'never\n', 'edit-stale-other');
+    if (!text.includes('write-other')) return toolWrite('memory/topics/other.md', '- unrelated\n', 'write-other');
+    return fauxAssistantMessage('The unrelated write succeeded, but the deploy edit was never repaired.');
+  });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
+
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'failed');
+  assert.match(task.state.outcome.error.message, /tool call failed/);
+  assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+  assert.equal(await readFile(join(fixture.workspace, existing), 'utf8'), 'OWNER-ORIGINAL\n');
+  assert.equal(await readFile(join(fixture.workspace, 'memory/topics/other.md'), 'utf8'), '- unrelated\n',
+    'the unrelated successful write is kept, not rolled back');
+});
+
+test('a budget refusal on a failed read is never concealed by a later answer', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await writeFile(join(fixture.workspace, 'SOUL.md'), 'owner rules\n', 'utf8');
+  const store = await openStore(fixture, (request) => {
+    const text = transcriptText(request.messages);
+    if (!text.includes('read-allowed')) return toolRead('SOUL.md', 'read-allowed');
+    if (!text.includes('read-over-budget')) return toolRead('SOUL.md', 'read-over-budget');
+    return fauxAssistantMessage('The last read was refused, so nothing else was saved.');
+  }, { digest: { maxToolCalls: 1 } });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
+
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'failed');
+  assert.match(task.state.outcome.error.message, /tool call failed/);
+  assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined,
+    'a failed read refused by the host budget never advances the frontier');
+  const target = await targetOf(store.gateway.harness, started.taskId);
+  const results = await toolResults(store.gateway.harness, target.id);
+  assert.deepEqual(results.map((result) => [result.name, result.isError]), [['read', false], ['read', true]]);
+  assert.match(results[1].text, /budget refusal: it reached its configured tool-call budget/);
+});
+
 test('a concurrent create between the decision and the write is never overwritten', { timeout: 30_000 }, async (t) => {
   const fixture = await fixtureWorkspace();
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));

@@ -885,15 +885,22 @@ One run, in order:
    own committed range — its placed digest input entry through its own answer entry — in pages,
    bounded to 4,000 entries. That bound covers the run's own turn (one input entry, at most
    `maxToolCalls` tool rounds and the answer), not the batch: a bigger batch is one larger input
-   entry, not more entries, so raising the batch bounds does not move it. The input must be this task's input (kind and `data.taskId`), no
-   `pi.tool-result` inside the range may be an error (a refused write, a stale edit or a failed read
-   fails the batch even when the model recovered and answered later), and the answer entry must be a
-   non-empty assistant report. Only then is the batch acknowledged, re-validating it against the
-   committed transcript. The terminal commit retires the captured tools and hook in the same commit
-   that records the outcome. Provider error, a failed or refused tool call, an empty report, an
-   unverifiable range, a withdrawn input, a cancelled task or an expired turn deadline leaves the
-   frontier unchanged, so the same batch is offered again. Because the check reads the committed
-   transcript, the same accounting applies to a resumed attempt after a reopen.
+   entry, not more entries, so raising the batch bounds does not move it. The input must be this task's input (kind and `data.taskId`). A failed read is harmless: a missing, out-of-scope or otherwise
+   refused exploratory read read nothing and does not fail the batch. A failed `write` or `edit` must be
+   repaired within the same committed turn by a later successful `write` or `edit` of that exact
+   workspace-relative path; the classifier uses each failed call's paired result and the committed call
+   arguments, never model narration, so a successful mutation of another file is not a repair. A host
+   budget/usage refusal, a harness interruption/abort or any other non-tool failure is fatal even when a
+   read or answer follows. A mutation refused outside the curation scope is fatal because no later
+   same-path success is possible. The model may therefore re-read and fix a stale edit or a create-only
+   collision inside the existing tool/request/time/write bounds; an unrepaired failure is not silently
+   dropped. The answer entry must be a non-empty assistant report. Only then is the batch acknowledged,
+   re-validating it against the committed transcript. The terminal commit retires the captured tools and
+   hook in the same commit that records the outcome. Provider error, an unrepaired failed write/edit, a
+   host budget/usage refusal, an empty report, an unverifiable range, a withdrawn input, a cancelled task
+   or an expired turn deadline leaves the frontier unchanged, so the same batch is offered again.
+   Because the check reads the committed transcript, the same accounting applies to a resumed attempt
+   after a reopen.
 
 The model input is bounded by the O1 batch plus fixed prompt limits in `MEMORY_DIGEST_LIMITS`: the
 prompt file is read up to 64 KiB and rendered to 16,000 characters, the derived index to 12,000, and
@@ -949,18 +956,29 @@ mutates anything. `maxRequests` counts successful committed model responses (`st
 `toolUse`), including responses requesting tools. Native failed attempts/retries are allowed outside
 that count, as approved by the owner. Status separates successful responses from all recorded
 responses. Input spend is `usage.input + usage.cacheRead + usage.cacheWrite`; pi-ai reports the cache
-counters separately, so nothing is counted twice. Missing usage fails the run closed. A failed tool
-aborts the target after its result is committed, rather than inviting another request to repair it.
-Final response/token usage is checked again before acknowledgement, including runs without tools.
+counters separately, so nothing is counted twice. Missing usage fails the run closed. A host budget,
+usage or non-tool failure aborts the target after its result is committed; a harmless failed read or
+an in-scope failed write/edit does not abort, so the model may repair it before its report. The
+committed turn validation still fails the batch when the repair is absent. Final response/token usage
+is checked again before acknowledgement, including runs without tools.
+
+Native provider retry already exists below digestion: pi-durable's generation task retries a
+retryable error response, including transient 429/rate-limit text, under its default `settings.retry`
+(enabled, three attempts, 2s exponential backoff, 60s per-delay cap). Digest neither overrides that
+policy nor adds a retry. Native retry reissues a provider request from the committed transcript; it
+never replays a tool call, a mutation or an acknowledged chunk, and subscription/quota 429s are
+classified non-retryable. A digest chunk whose provider request still fails is not acknowledged and
+is offered again only by a later explicit start.
 Tool/time/write limits are the primary operational bounds. Tokens are a soft actual-usage ceiling,
 not a hard pre-dispatch or financial cap. Native retries can spend beyond it; deferred polls,
 compaction and a crash before a response commits are not fully counted. Committed counters survive
 reopen, but uncommitted provider activity cannot be reconstructed. Before submit, pi-ai's text-token
 estimate checks the rendered input plus catalog output ceiling and 4,096 tokens for tool/framing
 headroom against the model context. Native pi-ai also clamps output to available model capacity. A budget refusal is a failed
-tool result, so the batch is not acknowledged; whatever earlier calls already wrote stays (there is
-still no rollback), and the same batch is offered again. These are conservative text-unit bounds,
-not a git-diff computation.
+tool result with the host's fixed refusal marker, so the batch is not acknowledged even when the
+refused call was a read and the model answered later; whatever earlier calls already wrote stays
+(there is still no rollback), and the same batch is offered again. These are conservative text-unit
+bounds, not a git-diff computation.
 
 Reopen is restored from the task itself: a live digest target keeps its pinned model, thinking level,
 captured Markdown tools and scope hook, and its queued turn resumes before the configured default can
