@@ -18,10 +18,10 @@ only sees updates that already passed the private-chat allowlist check, so an
 unauthorized sender, a group, a bot, or an attachment can never be a control and
 never reaches it. `message.text` (not a caption) is classified:
 
-- The owner controls are `/new`, `/abort`, `/stop`, `/status`, `/model`,
-  `/digest`, `/mcp`, `/restart` and `/help`. `/stop` is an alias of `/abort` with
-  exactly the same effect and the same durable record (it is normalized before
-  admission, so there is one control kind and one code path). Which of them this
+- The owner controls are `/new`, `/abort`, `/stop`, `/status`, `/notices`,
+  `/model`, `/digest`, `/mcp`, `/restart` and `/help`. `/stop` is an alias of
+  `/abort` with exactly the same effect and the same durable record (it is
+  normalized before admission, so there is one control kind and one code path). Which of them this
   adapter advertises depends on what the host really exposes (see
   [Host capability and the native menu](#host-capability-and-the-native-menu)).
   A typed command the host cannot perform is refused with fixed text and is
@@ -34,7 +34,8 @@ never reaches it. `message.text` (not a caption) is classified:
 - Matching is an exact leading command token (case-insensitive). `/new`,
   `/abort`, `/stop`, `/status` and `/restart` take no arguments; `/model` takes
   one configured preset name or `default`; `/digest` takes nothing or the literal
-  `status`; `/mcp` takes nothing; `/help` takes nothing or one command name this host
+  `status`; `/mcp` takes nothing; `/notices` takes nothing or `dismiss <id>`;
+  `/help` takes nothing or one command name this host
   offers, and answers with that command's usage and one-sentence detail. Any
   other argument to a control gets a bounded usage notice; `/help <name>` for a
   name that is not offered gets a fixed refusal that names the reason (another
@@ -528,11 +529,13 @@ instead of a silent failure:
   authority.
 - `/mcp` needs a gateway opened from an on-disk configuration file; without one
   it is neither advertised nor performed.
+- `/notices` needs the gateway's delivery outbox; without one it is neither
+  advertised nor performed, and a typed one gets a fixed refusal.
 
 A test-only host that offers none of the optional host operations therefore
 advertises exactly `/new`, `/abort`, `/stop`, `/help`, while the shipped gateway
 with the CLI restart host advertises `/new`, `/abort`, `/stop`, `/status`,
-`/model`, `/digest`, `/mcp`, `/restart`, `/help`.
+`/notices`, `/model`, `/digest`, `/mcp`, `/restart`, `/help`.
 
 An ordinary user message keeps its existing input text (including literal `//`
 handling), so literal content is unchanged. A message that replies to another
@@ -726,18 +729,20 @@ process racing the workspace between them is not fully excluded on this host
   a full durable pending queue (1000 items) fails closed before offset advance.
   Long-poll timeout is sent in seconds and the grammY request deadline is bounded
   to 60 seconds. All requests reject redirects.
-- After an admitted user turn has passed its submission-slot wait and attachment
-  preparation, the adapter sends a best-effort `sendChatAction` typing action
-  and refreshes it before Telegram's short
-  lifetime. One loop per chat is shared by queued turns and stops when the last
-  one settles, is aborted, or the adapter shuts down. Control acknowledgements,
-  unauthorized input and scheduled-outbox delivery do not type. A rejected or
-  flood-gated action is skipped without retry. Typing is not awaited by model
-  admission or reply delivery; Telegram rate limits still apply to the shared
-  outbound gate. No typing state is stored. Structured journal records now expose
-  preparation/queue/delivery timings, temporary failures and typing unavailability
-  or recovery; see [OBSERVABILITY.md](OBSERVABILITY.md). This instrumentation does
-  not change typing start time or retry ordering.
+- Typing follows the committed live state of the admitted input rather than mere admission:
+  the adapter sends a best-effort `sendChatAction` typing action only while that input's run has
+  an active generation attempt, and refreshes it before Telegram's short lifetime. A queued input,
+  a tool round, a run natively waiting for another task, a parked run and an answered run do not
+  type. One loop per chat is shared by overlapping generations and stops at every other boundary,
+  so a run waiting on background work never leaves an endless typing keepalive; it resumes only
+  when generation actually resumes. Typing therefore does not promise progress and does not imply
+  background or tool work is advancing; `/status` remains the authority on queued and background
+  state. Control acknowledgements, unauthorized input and scheduled-outbox delivery do
+  not type. A rejected or flood-gated action is skipped without retry. Typing is not awaited by
+  model admission or reply delivery; Telegram rate limits still apply to the shared outbound gate.
+  No typing state is stored. Structured journal records expose preparation/queue/delivery timings,
+  temporary failures and typing unavailability or recovery; see
+  [OBSERVABILITY.md](OBSERVABILITY.md).
 - `getMe` at startup and `getUpdates` polling retry transport failures, timeouts
   and Telegram 5xx across a sustained outage, with cancellation-aware capped
   exponential backoff (1s to 60s, bounded jitter) and no fixed attempt limit; a
@@ -1019,6 +1024,27 @@ attached CLI. Delivery text is the committed answer entry of the scheduled submi
 ordinary reply is produced, because the adapter sends only records from this outbox for work it did
 not submit itself. When native admission batches several inputs into one run they settle on the same
 answer entry, so a batched answer can describe more than the scheduled message.
+
+## Stale host notices
+
+A host notice (currently `host:turn-interrupted:<taskId>`) whose write-ahead intent was interrupted
+by a process stop becomes `unknown` at the next open and is never auto-resent. The authenticated owner
+of that private chat can inspect and retire exactly those records without touching ambiguous model
+answers:
+
+- `/notices` lists at most four of this chat's `unknown` host notices, oldest first, with the exact id
+  and its unknown-since instant. It never lists a withheld, pending, delivered or failed record, a
+  model answer, a scheduled result, another chat's records or any notice text.
+- `/notices dismiss <id>` changes exactly one record in this same mapped chat from `unknown` to
+  `failed`, with the fixed reason that the owner dismissed it and it was not resent. The original
+  notice text and `unknownSince` provenance stay stored; the external outcome stays unknown. A
+  replayed or wrong id, a non-host record, a record that is not `unknown`, and another chat's record
+  are refused with fixed text and no change.
+
+This is a durable owner decision, not a resend and not a claim that anything was delivered. An
+ambiguous scheduled **answer** is not offered here: its record is never dismissed by this command and
+still requires the manual reconciliation below after checking Telegram. An unreadable outbox
+produces fixed text and changes nothing.
 
 Reconciliation for scheduled records uses the origin conversation's `CronDeliveriesDoc` token rather
 than `TelegramState`. Stop the adapter first. If Telegram accepted the exact intended text, advance

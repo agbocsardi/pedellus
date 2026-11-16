@@ -70,6 +70,14 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     surfaces: ["cli", "telegram", "discord"],
   },
   {
+    name: "notices",
+    args: "[dismiss <id>]",
+    summary: "Inspect or dismiss this chat's stale host notices",
+    usage: "Usage: /notices | /notices dismiss <id>",
+    detail: "Lists only non-answer host notices whose delivery outcome is unknown, and retires exactly one by its id. Nothing is resent and model answers are never listed or dismissed.",
+    surfaces: ["telegram"],
+  },
+  {
     name: "history",
     args: "[count]",
     summary: "Show recent committed messages",

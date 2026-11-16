@@ -419,7 +419,9 @@ the gateway retries each admission once from the authoritative native task.
 Shared owner controls have the same effects in CLI and Telegram: `/new`, `/abort`/`/stop`,
 `/status`, `/model`, `/digest`, `/digest status`, `/help` and supported `/restart`.
 Presentation remains channel-specific; CLI retains browsing, compaction, attachment and `/refresh`
-controls. `/restart` is whole-process replacement, not a Harness reopen or terminal reconnect.
+controls. Telegram additionally offers `/notices` to inspect and dismiss that chat's stale unknown
+host notices; it is not a CLI or model control and never resends an ambiguous answer.
+`/restart` is whole-process replacement, not a Harness reopen or terminal reconnect.
 There is no Telegram `/refresh`; `/new` rebuilds that chat's prompt. See
 [Telegram controls](./TELEGRAM.md#controls).
 

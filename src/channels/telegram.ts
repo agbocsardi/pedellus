@@ -39,6 +39,7 @@ import type {
 import { inProcessTerminalConversation } from "../terminal/conversation.js";
 import { renderBackgroundStatus, type BackgroundStatus } from "../background-status.js";
 import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
+import { isTurnInterruptionNotice } from "../recovery/interruption.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import { MEDIA_LIMITS, MediaRejected, createMediaStore, type MediaRejectionReason, type MediaStore, type StoredMedia } from "../media/attachments.js";
 import { createTranscriber, type HexEngine, type Transcriber, type TranscriptionBackend, type TranscriptionFailure, type WhisperCliEngine } from "../media/transcription.js";
@@ -340,6 +341,23 @@ type TypingLoop = {
   stopped: boolean;
   timer: ReturnType<typeof setTimeout> | undefined;
 };
+
+/**
+ * Whether the typing indicator truthfully represents live work of one admitted input: an active
+ * generation attempt of that input's run. A queued input, a tool round, a run natively waiting for
+ * another task, a parked run and an answered run are not generating, so they do not type. Typing is
+ * therefore presence, never a promise of progress and never an endless keepalive for background work.
+ */
+export function telegramTypingActive(
+  live: {
+    readonly run?: { readonly inputs?: readonly number[] };
+    readonly generation?: unknown;
+  } | undefined,
+  submissionId: number | undefined,
+): boolean {
+  if (submissionId === undefined || live?.run?.inputs === undefined) return false;
+  return live.run.inputs.includes(submissionId) && live.generation !== undefined;
+}
 type ChannelState = TelegramChannelState;
 
 // Stored alongside the adapter's stable channel conversation, not in a plaintext sidecar.
@@ -497,6 +515,7 @@ export async function runTelegram(
     restart: options.restart !== undefined && options.restart.supported,
     digest: typeof gateway.memoryDigest?.start === "function" && typeof gateway.memoryDigest?.status === "function",
     mcp: typeof gateway.mcpAdmin?.list === "function" && typeof gateway.mcpAdmin?.submitCallback === "function",
+    notices: typeof gateway.cronOutbox?.list === "function" && typeof gateway.cronOutbox?.update === "function",
   };
   const scope = withCancel(context);
   const adapterContext = scope.context;
@@ -1855,8 +1874,24 @@ export async function runTelegram(
       previewDirty = true;
       schedulePreview();
     };
-    journalEvent("telegram.typing.requested", { "update.id": item.updateId, "chat.id": item.chatId });
-    const stopTyping = startTyping(item.chatId);
+    let stopTyping: (() => void) | undefined;
+    // Typing follows the committed live state, not submission: it starts when this input's run has
+    // an active generation attempt, and stops at every other boundary (queued, tool round, waiting
+    // for another task, parked, answered). A run waiting on background work therefore never keeps it
+    // alive, and a tool round never pretends the model is typing.
+    const syncTyping = (live: Parameters<typeof telegramTypingActive>[0]) => {
+      if (telegramTypingActive(live, submissionId)) {
+        if (stopTyping !== undefined) return;
+        // One shared loop per chat: only a new loop is a request worth recording.
+        if (!typingLoops.has(item.chatId)) {
+          journalEvent("telegram.typing.requested", { "update.id": item.updateId, "chat.id": item.chatId });
+        }
+        stopTyping = startTyping(item.chatId);
+        return;
+      }
+      stopTyping?.();
+      stopTyping = undefined;
+    };
     try {
       watch.start(async (call) => {
         // Durable's watches never send Chord's recoverable `failed` call; it ends instead.
@@ -1866,6 +1901,7 @@ export async function runTelegram(
           run?: { inputs?: SubmissionId[] };
           generation?: { message?: { content?: { type: string; text?: string }[] } };
         } | undefined;
+        syncTyping(live);
         const inputs = live?.run?.inputs;
         if (submissionId === undefined || inputs === undefined || !inputs.includes(submissionId)) return;
         // One preview per run: the run's first input owns the single live preview message, so a steered
@@ -1887,6 +1923,9 @@ export async function runTelegram(
       // Ordering is established; free the chat's next submission place while this turn runs.
       slot.release();
       submissionId = submission.id;
+      // The acquisition/current watch value may already hold this run's generation; the next frame
+      // covers the case where it starts later.
+      syncTyping(watch.value.docs["pi.live"] as Parameters<typeof telegramTypingActive>[0]);
       trace.setAttributes({ "submission.id": submission.id });
       const settled = await observeOperation("gateway.telegram.settlement", { "submission.id": submission.id },
         () => submission.wait(adapterContext), trace);
@@ -1922,7 +1961,7 @@ export async function runTelegram(
         await forget(item.updateId);
       }
     } finally {
-      stopTyping();
+      stopTyping?.();
       await stopPreviewWatch();
     }
 
@@ -2912,6 +2951,28 @@ export async function runTelegram(
       drain();
       return;
     }
+    if (parsed.command === "notices") {
+      if (!hostCommands.notices) {
+        await admitNotice(update, message, sessionKey, NOTICES_UNAVAILABLE_HOST);
+        drain();
+        return;
+      }
+      const argument = parsed.args.trim();
+      if (argument === "") {
+        await admitNotice(update, message, sessionKey, await staleHostNoticesNotice(sessionKey));
+        drain();
+        return;
+      }
+      const dismiss = /^dismiss\s+(\S+)$/u.exec(argument);
+      if (dismiss === null || dismiss[1]!.length > 200) {
+        await admitNotice(update, message, sessionKey, usageNotice("notices"));
+        drain();
+        return;
+      }
+      await admitNotice(update, message, sessionKey, await dismissStaleHostNotice(sessionKey, dismiss[1]!));
+      drain();
+      return;
+    }
     if (parsed.command === "model") {
       if (!hostCommands.model) {
         await admitNotice(update, message, sessionKey, MODEL_UNAVAILABLE_HOST);
@@ -3552,6 +3613,91 @@ export async function runTelegram(
     }
   }
 
+  /**
+   * This chat's own non-answer host notices whose delivery outcome is unknown. Only exact host
+   * notice ids are projected: a model answer or a scheduled result is never listed here, and its
+   * text is never copied. Read only; nothing is retried or changed.
+   */
+  async function staleHostNoticesNotice(sessionKey: string): Promise<string> {
+    if (outbox === undefined) return NOTICES_UNAVAILABLE_HOST;
+    let records: readonly CronDeliveryRecord[];
+    try {
+      records = await outbox.list(sessionKey, adapterContext);
+    } catch {
+      return "Stale host notices are unavailable right now: this chat's delivery outbox could not be read. " +
+        "Nothing was changed and nothing was resent.";
+    }
+    const stale = records
+      .filter((record) => record.status === "unknown" && isTurnInterruptionNotice(record))
+      .sort((left, right) => unknownSinceMs(left) - unknownSinceMs(right));
+    if (stale.length === 0) {
+      return "No stale host notices in this chat. Model answers and scheduled results are never listed here.";
+    }
+    const rows = stale.slice(0, STALE_HOST_NOTICE_ROWS).map((record) =>
+      `  ${boundedLabel(record.id, 80)} — outcome unknown since ${unknownSinceText(record)}`);
+    return [
+      `Stale host notices in this chat: ${stale.length}. Their delivery outcome is unknown, so none was resent.`,
+      ...rows,
+      ...(stale.length > rows.length ? [`  … ${stale.length - rows.length} more not shown`] : []),
+      "Use /notices dismiss <id> for exactly one whose unknown outcome you accept.",
+    ].join("\n").slice(0, MAX_NOTICE_CHARS);
+  }
+
+  /**
+   * Retire exactly one stale host notice of this chat. The record keeps its text and unknown
+   * provenance; only its status settles as a fixed, owner-initiated dismissal. An ambiguous send
+   * is never retried and a model answer or scheduled result is never touched.
+   */
+  async function dismissStaleHostNotice(sessionKey: string, id: string): Promise<string> {
+    if (outbox === undefined) return NOTICES_UNAVAILABLE_HOST;
+    if (!isTurnInterruptionNotice({ id })) {
+      return "Only host notices can be dismissed here. Model answers and scheduled results are never " +
+        "dismissed or resent.";
+    }
+    let records: readonly CronDeliveryRecord[];
+    try {
+      records = await outbox.list(sessionKey, adapterContext);
+    } catch {
+      return "That stale notice could not be read right now. Nothing was changed and nothing was resent.";
+    }
+    const current = records.find((record) => record.id === id);
+    if (current === undefined) {
+      return "No stale host notice with that exact id exists in this chat. Nothing was changed and " +
+        "nothing was resent.";
+    }
+    if (!isTurnInterruptionNotice(current)) {
+      return "Only host notices can be dismissed here. Model answers and scheduled results are never " +
+        "dismissed or resent.";
+    }
+    if (current.status !== "unknown") {
+      return "That host notice is not in an unknown state, so it was not dismissed. Nothing was changed " +
+        "and nothing was resent.";
+    }
+    let dismissed = false;
+    try {
+      const updated = await outbox.update(sessionKey, id, (entry) => {
+        // Rechecked inside the commit: a concurrent scan or reopen may have settled it already.
+        if (!isTurnInterruptionNotice(entry) || entry.status !== "unknown") return;
+        dismissed = true;
+        entry.status = "failed";
+        entry.settledAt = Date.now();
+        entry.error = STALE_HOST_NOTICE_DISMISSED;
+      }, adapterContext);
+      if (updated === undefined) {
+        return "No stale host notice with that exact id exists in this chat. Nothing was changed and " +
+          "nothing was resent.";
+      }
+    } catch {
+      return "That stale notice could not be changed right now. Nothing was resent; try again later.";
+    }
+    if (!dismissed) {
+      return "That host notice is not in an unknown state, so it was not dismissed. Nothing was changed " +
+        "and nothing was resent.";
+    }
+    return `Dismissed stale host notice ${boundedLabel(id, 80)}. Its original outcome stays unknown; ` +
+      "it was not resent.";
+  }
+
   /** One bounded listing of the current selection and the finite configured choices. */
   function modelListingText(listing: GatewayModelList): string {
     const maxChoices = 50;
@@ -3960,6 +4106,7 @@ function offeredTelegramCommandNames(host: TelegramCommandHost): readonly string
     restart: host.restart,
     digest: host.digest,
     mcp: host.mcp,
+    notices: host.notices,
   };
   return conversationCommandNames("telegram").filter((name) => offered[name] === true);
 }
@@ -3971,6 +4118,7 @@ type TelegramCommandHost = {
   readonly restart: boolean;
   readonly digest: boolean;
   readonly mcp: boolean;
+  readonly notices: boolean;
 };
 
 type ParsedTelegramInput =
@@ -3979,7 +4127,7 @@ type ParsedTelegramInput =
   | { readonly kind: "unsupported"; readonly command: string }
   | { readonly kind: "foreign"; readonly command: string; readonly mention: string };
 
-type TelegramControl = "new" | "abort" | "stop" | "help" | "status" | "model" | "restart" | "digest" | "mcp";
+type TelegramControl = "new" | "abort" | "stop" | "help" | "status" | "model" | "restart" | "digest" | "mcp" | "notices";
 
 /**
  * A command with a native effect on this chat or this process; a refusal is terminal, never retried.
@@ -4072,6 +4220,25 @@ function usageNotice(name: string): string {
 const MCP_UNAVAILABLE_HOST =
   "MCP management is unavailable in this host: the gateway was opened without an on-disk configuration file, " +
   "so there is nothing to write. Nothing was sent to the assistant.";
+const NOTICES_UNAVAILABLE_HOST =
+  "Host notices are unavailable in this host: it exposes no delivery outbox. Nothing was changed and " +
+  "nothing was resent.";
+/** Bound of stale host notice rows in one listing; the count is still stated above the cut. */
+const STALE_HOST_NOTICE_ROWS = 4;
+const STALE_HOST_NOTICE_DISMISSED =
+  "stale host notice dismissed by the owner; the outcome stays unknown and it was not resent";
+
+/** Unknown-outcome provenance; a record without one falls back to its creation time. */
+function unknownSinceMs(record: CronDeliveryRecord): number {
+  const since = record.unknownSince;
+  return typeof since === "number" && Number.isSafeInteger(since) && since >= 0 ? since : record.createdAtMs;
+}
+
+function unknownSinceText(record: CronDeliveryRecord): string {
+  const at = unknownSinceMs(record);
+  return Number.isSafeInteger(at) && Math.abs(at) <= 8.64e15 ? new Date(at).toISOString() : "an unrecorded time";
+}
+
 /** One pending owner control command. Opaque, fixed-width and content-bound at creation. */
 const RESTART_UNAVAILABLE_HOST =
   "Restart is unavailable in this host: it cannot replace its own process with the same program and configuration. " +
@@ -4174,7 +4341,7 @@ function parseTelegramInput(raw: string, botUsername: string | undefined): Parse
   }
   if (command === "new" || command === "abort" || command === "stop" || command === "help" ||
       command === "status" || command === "model" || command === "restart" || command === "digest" ||
-      command === "mcp") {
+      command === "mcp" || command === "notices") {
     return { kind: "control", command, args: raw.slice(match[0].length).trim() };
   }
   return { kind: "unsupported", command };

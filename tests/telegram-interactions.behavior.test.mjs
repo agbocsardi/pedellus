@@ -322,7 +322,7 @@ test('the native menu lists only implemented commands', { timeout: 20_000 }, asy
     // not advertised here; `/status`, `/model` and the `/stop` alias of `/abort` are. Every
     // advertised command is implemented.
     assert.deepEqual(transport.commands[0].commands.map((entry) => entry.command),
-      ['new', 'abort', 'stop', 'status', 'model', 'digest', 'help']);
+      ['new', 'abort', 'stop', 'status', 'notices', 'model', 'digest', 'help']);
     // Descriptions are the catalogue's own summaries, so this test asserts the bound shape only;
     // telegram-commands.behavior.test.mjs pins the derived wording and order.
     assert.ok(transport.commands[0].commands.every((entry) => entry.description.length > 0

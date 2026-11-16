@@ -23,6 +23,7 @@ const [
   { getCurrentSystemPrompt },
   { MEMORY_DIGEST_RESULT_ENTRY_KIND, MEMORY_DIGEST_TASK_NAME },
   { RESTART_BUSY_MESSAGE, RestartBusyError },
+  { CronDeliveriesDoc },
 ] = await Promise.all([
   import(new URL('../dist/config.js', import.meta.url).href),
   import(new URL('../dist/runtime.js', import.meta.url).href),
@@ -33,6 +34,7 @@ const [
   import(`${modules}/pi-ai/dist/utils/transcript.js`),
   import(new URL('../dist/history/memory-digest.js', import.meta.url).href),
   import(new URL('../dist/restart.js', import.meta.url).href),
+  import(new URL('../dist/automation/cron-delivery.js', import.meta.url).href),
 ]);
 
 const { failureDiagnostic } = await import(new URL('../dist/failure-diagnostics.js', import.meta.url).href);
@@ -294,6 +296,22 @@ async function stateDoc(gateway) {
   }, context);
 }
 
+/** Create the chat mapping and seed its durable delivery outbox, as a prior run would have. */
+async function seedDeliveries(gateway, chatId, records) {
+  const conversation = await gateway.conversationFor(`telegram:${BOT_ID}:chat:${chatId}`, context);
+  await conversation.commit(async (tx) => {
+    const doc = await tx.doc(CronDeliveriesDoc, conversation.id);
+    doc.deliveries.push(...records);
+    return undefined;
+  }, context);
+}
+
+async function deliveries(gateway, chatId) {
+  const conversation = await gateway.conversationFor(`telegram:${BOT_ID}:chat:${chatId}`, context);
+  const doc = await gateway.harness.snapshot(CronDeliveriesDoc, conversation.id, context);
+  return doc?.deliveries ?? [];
+}
+
 function userTexts(messages) {
   return messages
     .filter((message) => message.role === 'user')
@@ -369,6 +387,7 @@ test('a native host advertises exactly the implemented owner commands, with the 
       { command: 'abort', description: 'Stop this turn and withdraw queued messages' },
       { command: 'stop', description: 'Alias of /abort: stop this turn here' },
       { command: 'status', description: "Show this conversation's model and run state" },
+      { command: 'notices', description: "Inspect or dismiss this chat's stale host notices" },
       { command: 'model', description: 'List or select a model for this conversation' },
       { command: 'digest', description: 'Digest closed conversation episodes' },
       { command: 'restart', description: 'Replace the whole gateway process' },
@@ -419,8 +438,8 @@ test('a narrow SDK host keeps the base commands and truthfully refuses typed hos
     assert.doesNotMatch(unsafe, /SYNTHETIC-HELP-ARGUMENT|\.\./i, 'the unsafe argument never reaches the reply');
     const help = texts.find((text) => text.startsWith('Controls for this chat'));
     // Only the offered controls are listed as controls; the rest are named once as not offered.
-    assert.match(help, /Not offered by this host: \/status, \/model, \/digest, \/mcp, \/restart\./);
-    assert.doesNotMatch(help, /^\/(status|model|restart|digest|refresh)\b/m);
+    assert.match(help, /Not offered by this host: \/status, \/notices, \/model, \/digest, \/mcp, \/restart\./);
+    assert.doesNotMatch(help, /^\/(status|notices|model|restart|digest|refresh)\b/m);
     assert.doesNotMatch(help, /\/refresh/);
     assert.equal(store.captured.length, 0, 'no command reached the model');
   } finally {
@@ -464,7 +483,7 @@ test('a full host fits its whole /help listing in one bounded notice and keeps d
     const help = rendered(transport.sent[0].text);
     // Every offered control and the trailing limits line arrive: nothing is cut mid-document.
     assert.match(help, /^Controls for this chat/);
-    for (const line of ['new', 'abort', 'stop', 'status', 'model', 'digest', 'mcp', 'restart', 'help']) {
+    for (const line of ['new', 'abort', 'stop', 'status', 'notices', 'model', 'digest', 'mcp', 'restart', 'help']) {
       assert.ok(help.includes(`/${line}`), `the listing names /${line}`);
     }
     assert.match(help, /\/help \[command\] — Show these controls, or one command's detail/);
@@ -510,6 +529,88 @@ test('/mcp is bounded status and never reaches the model', { timeout: 20_000 }, 
     assert.match(texts[0], /OAuth logins waiting for a callback: none/);
     assert.match(texts[1], /Usage: \/mcp/);
     assert.equal(store.captured.length, 0, 'no /mcp form reached the model');
+  } finally {
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('stale host notices are inspected and dismissed by exact id without touching answers or other chats', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('stale-notices');
+  const session = `telegram:${BOT_ID}:chat:${CHAT_ID}`;
+  const otherSession = `telegram:${BOT_ID}:chat:502`;
+  const unknownSince = Date.UTC(2026, 10, 1, 9, 0, 0);
+  const hostText = 'HOST-NOTICE-TEXT-901';
+  const settledText = 'HOST-NOTICE-TEXT-902';
+  const answerText = 'SCHEDULED-ANSWER-SECRET';
+  const otherText = 'OTHER-CHAT-HOST-NOTICE';
+  await seedDeliveries(store.gateway, CHAT_ID, [
+    {
+      id: 'host:turn-interrupted:901', sessionKey: session, text: hostText,
+      createdAtMs: unknownSince - 1_000, status: 'unknown', nextChunkIndex: 0, unknownSince,
+    },
+    {
+      id: 'host:turn-interrupted:902', sessionKey: session, text: settledText,
+      createdAtMs: unknownSince, status: 'failed', nextChunkIndex: 0, settledAt: unknownSince,
+      error: 'already terminal',
+    },
+    {
+      id: 'cron:job-a:1000', sessionKey: session, text: answerText,
+      createdAtMs: unknownSince, status: 'unknown', nextChunkIndex: 0, unknownSince,
+    },
+  ]);
+  await seedDeliveries(store.gateway, 502, [{
+    id: 'host:turn-interrupted:903', sessionKey: otherSession, text: otherText,
+    createdAtMs: unknownSince, status: 'unknown', nextChunkIndex: 0, unknownSince,
+  }]);
+  const commands = [
+    '/notices',
+    '/notices dismiss host:turn-interrupted:901',
+    '/notices dismiss cron:job-a:1000',
+    '/notices dismiss host:turn-interrupted:903',
+    '/notices dismiss host:turn-interrupted:901',
+    '/notices dismiss host:turn-interrupted:902',
+  ];
+  const transport = telegramMock([commands.map((command, index) => textUpdate(800 + index, 800 + index, command))]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.length === commands.length, 'one reply per /notices request');
+    await flush();
+    const texts = transport.sent.map((entry) => rendered(entry.text));
+    const listing = texts.find((text) => text.startsWith('Stale host notices in this chat'));
+    assert.ok(listing !== undefined);
+    // Only this chat's unknown host notice is inspectable: no withheld record, no answer, no other chat.
+    assert.match(listing, /host:turn-interrupted:901/);
+    assert.match(listing, /outcome unknown since 2026-11-01T09:00:00\.000Z/);
+    assert.doesNotMatch(listing, /host:turn-interrupted:902/);
+    assert.doesNotMatch(listing, /host:turn-interrupted:903/);
+    assert.doesNotMatch(listing, /cron:job-a/);
+    assert.doesNotMatch(listing, /SCHEDULED-ANSWER-SECRET/);
+
+    assert.ok(texts.some((text) => /^Dismissed stale host notice host:turn-interrupted:901\./.test(text)));
+    assert.ok(texts.some((text) => /Only host notices can be dismissed/.test(text)));
+    assert.ok(texts.some((text) => /No stale host notice with that exact id exists in this chat/.test(text)));
+    assert.ok(texts.some((text) => /not in an unknown state, so it was not dismissed/.test(text)));
+
+    const chatRecords = await deliveries(store.gateway, CHAT_ID);
+    const dismissed = chatRecords.find((entry) => entry.id === 'host:turn-interrupted:901');
+    assert.equal(dismissed.status, 'failed');
+    assert.equal(dismissed.text, hostText, 'the notice text is preserved');
+    assert.equal(dismissed.unknownSince, unknownSince, 'the unknown-outcome provenance is preserved');
+    assert.match(dismissed.error, /dismissed by the owner; the outcome stays unknown and it was not resent/);
+    const answer = chatRecords.find((entry) => entry.id === 'cron:job-a:1000');
+    assert.equal(answer.status, 'unknown', 'an ambiguous model answer is never dismissed here');
+    assert.equal(answer.text, answerText);
+    const settled = chatRecords.find((entry) => entry.id === 'host:turn-interrupted:902');
+    assert.equal(settled.status, 'failed', 'a non-unknown host notice is not retired');
+    assert.equal(settled.error, 'already terminal');
+    const other = (await deliveries(store.gateway, 502)).find((entry) => entry.id === 'host:turn-interrupted:903');
+    assert.equal(other.status, 'unknown', 'another chat\'s notice is out of scope');
+    assert.equal(other.text, otherText);
+    assert.equal(store.captured.length, 0, 'no /notices request reached the model');
+    assert.ok(!texts.some((text) => text.includes(answerText) || text.includes(hostText) ||
+      text.includes(settledText) || text.includes(otherText)), 'notice text is never echoed in a reply');
   } finally {
     await cleanup(store, harness);
     transport.restore();
@@ -673,7 +774,7 @@ test('/model lists and selects one configured preset for this chat only', { time
     // restart capability, so `/restart` is not offered either.
     // A typed command is refused with the same catalogue reason `/help refresh` gives.
     assert.match(texts[6], /^\/refresh is only available in the terminal\. Available: /m);
-    assert.match(texts[6], /Available: \/new, \/abort, \/stop, \/status, \/model, \/digest, \/help/);
+    assert.match(texts[6], /Available: \/new, \/abort, \/stop, \/status, \/notices, \/model, \/digest, \/help/);
     assert.doesNotMatch(texts[6], /restart/);
 
     assert.deepEqual((await store.gateway.listModels(`telegram:${BOT_ID}:chat:${CHAT_ID}`, context)).selected,

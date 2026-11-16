@@ -13,7 +13,7 @@ const modules = join(packageRoot, 'node_modules/@earendil-works');
 const [
   { parseConfig },
   { openGateway },
-  { runTelegram },
+  { runTelegram, telegramTypingActive },
   { BACKGROUND_CONTEXT, withCancel },
   { createModels, fauxAssistantMessage, fauxProvider },
 ] = await Promise.all([
@@ -179,6 +179,19 @@ async function cleanup(store, harness) {
   await rm(store.directory, { recursive: true, force: true });
 }
 
+test('the typing predicate follows an active generation, never a queued, tool or waiting run', () => {
+  assert.equal(telegramTypingActive(undefined, 1), false, 'no live state types nothing');
+  assert.equal(telegramTypingActive({}, 1), false, 'no run is not generating');
+  assert.equal(telegramTypingActive({ run: { inputs: [2] } }, 1), false, 'another run input never types');
+  assert.equal(telegramTypingActive({ run: { inputs: [1] } }, 1), false,
+    'a run natively waiting for another task is not generating');
+  assert.equal(telegramTypingActive({ run: { inputs: [1] }, generation: { attempt: 1 } }, 1), true);
+  assert.equal(telegramTypingActive({ run: { inputs: [1] }, tools: [{ status: 'running' }] }, 1), false,
+    'a tool round is foreground work, not the model typing');
+  assert.equal(telegramTypingActive({ run: { inputs: [1] }, generation: { attempt: 1 } }, undefined), false,
+    'before admission nothing is attributed to this chat');
+});
+
 test('typing starts during a held model turn, refreshes, and stops at settlement', { timeout: 20_000 }, async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const store = await syntheticStore('held');
@@ -258,14 +271,20 @@ test('overlapping queued turns share one typing loop and shutdown ends it', { ti
     await flush();
     assert.equal(transport.actions.length, 2, 'no duplicate overlapping refresh');
 
+
     resolvers[0]();
     await until(() => transport.sent.some((entry) => entry.text === 'reply:0'), 'first reply');
     resolvers[1]();
     await until(() => transport.sent.some((entry) => entry.text === 'reply:1'), 'second reply');
 
-    // The third turn never settles, so the shared loop keeps running for it.
+    // The third turn has no answer yet, so its own generation, not a keepalive, starts a fresh
+    // indicator. Once the adapter stops, no timer keeps refreshing.
+    const beforeRemaining = harness.transport.actions.length;
+    // A coalesced watch frame can hand generation from one run to the next without an observed idle
+    // boundary, so an already-live loop advances on its own refresh clock; a fresh loop refreshes
+    // immediately. Either way the remaining generation is the only reason typing continues.
     t.mock.timers.tick(4_000);
-    await advanceUntil(t, () => transport.actions.length >= 3, 'a typing action for the remaining turn');
+    await advanceUntil(t, () => transport.actions.length > beforeRemaining, 'typing for the remaining generation');
 
     harness.scope.cancel(new DOMException('test finished', 'AbortError'));
     await harness.adapter.catch(() => undefined);

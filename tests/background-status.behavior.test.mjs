@@ -180,6 +180,9 @@ test('the fixed renderer never calls queued, sleeping or parked work running', (
     workers: {
       live: 2,
       parked: 0,
+      running: 1,
+      waiting: 0,
+      queued: 1,
       items: [
         { taskId: 41, status: 'running', task: 'summarize the inbox', workspace: 'shared' },
         { taskId: 42, status: 'pending', task: 'draft release notes', workspace: 'worktree' },
@@ -195,12 +198,37 @@ test('the fixed renderer never calls queued, sleeping or parked work running', (
     digest: { live: 'own', parked: false },
   };
   assert.deepEqual(renderBackgroundStatus(busy), [
-    'Background: 2 live workers, 1 cron run executing, 1 cron run queued, digest running in this chat',
+    'Background: 2 live workers (1 running, 1 queued), 1 cron run executing, 1 cron run queued, digest running in this chat',
     '  worker 41 (running): summarize the inbox — shared workspace',
     '  worker 42 (queued): draft release notes — isolated worktree',
     '  cron "nightly digest" (running)',
     'Cron: 3 scheduled jobs, next due 2026-11-01T09:00:00.000Z',
   ]);
+
+  // A run natively waiting for another task is not generating: the headline distinguishes it from
+  // an executing worker instead of folding both into one "live" count.
+  const waitingWork = {
+    ...emptyBackgroundStatus(),
+    workers: {
+      live: 1,
+      parked: 0,
+      running: 0,
+      waiting: 1,
+      queued: 0,
+      items: [{ taskId: 43, status: 'waiting', task: 'collect the result', workspace: 'shared' }],
+    },
+  };
+  assert.deepEqual(renderBackgroundStatus(waitingWork).slice(0, 2), [
+    'Background: 1 live worker (1 waiting)',
+    '  worker 43 (waiting for another task): collect the result — shared workspace',
+  ]);
+
+  // An older host that does not classify worker states still renders the count without inventing one.
+  const unclassified = {
+    ...emptyBackgroundStatus(),
+    workers: { live: 2, parked: 0, items: [{ taskId: 44, status: 'running', task: 'probe', workspace: 'shared' }] },
+  };
+  assert.equal(renderBackgroundStatus(unclassified)[0], 'Background: 2 live workers');
 
   // Nothing above is executing: queued and parked work is named as such, and the shared run is not
   // presented as this chat's own.
@@ -372,11 +400,15 @@ test('a running worker is reported inside its own spawning chat and nowhere else
   assert.equal(worker.workspace, 'shared');
   assert.ok(['pending', 'running'].includes(worker.status), `native worker state: ${worker.status}`);
   assert.equal(worker.task, 'read note.txt and report the count');
+  // The state counts and the row agree: a queued worker is not reported as running.
+  assert.equal(status.workers.running, worker.status === 'running' ? 1 : 0);
+  assert.equal(status.workers.queued, worker.status === 'running' ? 0 : 1);
+  assert.equal(status.workers.waiting, 0);
   assert.equal(status.cron.scheduled, 0);
   assert.equal(status.cron.running.total, 0);
   assert.equal(status.digest.live, 'none');
   const rendered = renderBackgroundStatus(status).join('\n');
-  assert.match(rendered, /^Background: 1 live worker$/m);
+  assert.match(rendered, /^Background: 1 live worker \([^)]*\)$/m);
   assert.match(rendered, new RegExp(`worker ${record.taskId} \\((queued|running)\\): read note\\.txt and report the count — shared workspace`));
   assert.doesNotMatch(rendered, /cron|digest/i);
 

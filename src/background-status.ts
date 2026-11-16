@@ -40,6 +40,15 @@ export interface BackgroundWorkers {
   readonly live: number;
   /** Unfinished workers Durable holds parked, so nothing will run without a native retry. */
   readonly parked: number;
+  /**
+   * Live workers whose own turn is executing or finishing. Optional so an older host that did not
+   * distinguish these states still renders; absent means "not classified", never zero.
+   */
+  readonly running?: number;
+  /** Live workers natively waiting for another task, such as a child they started. */
+  readonly waiting?: number;
+  /** Live workers admitted but not started yet, including a native retry backoff. */
+  readonly queued?: number;
   readonly items: readonly BackgroundWorker[];
 }
 
@@ -89,7 +98,7 @@ export interface BackgroundStatus {
 /** An empty snapshot: nothing runs, nothing is scheduled, no digest is live, nothing is active. */
 export function emptyBackgroundStatus(): BackgroundStatus {
   return {
-    workers: { live: 0, parked: 0, items: [] },
+    workers: { live: 0, parked: 0, running: 0, waiting: 0, queued: 0, items: [] },
     cron: { scheduled: 0, nextAtMs: null, running: { total: 0, items: [] }, pending: 0, parked: 0 },
     digest: { live: "none", parked: false },
     active: { interrupting: 0 },
@@ -134,7 +143,16 @@ export function renderBackgroundStatus(status: BackgroundStatus | undefined): st
   // An older host has no such field; then nothing is claimed about a restart.
   const interrupting = status.active?.interrupting ?? 0;
   const summary: string[] = [];
-  if (workers.live > 0) summary.push(plural(workers.live, "live worker", "live workers"));
+  if (workers.live > 0) {
+    // Distinguish executing work from queued and natively waiting work in the one headline, so a
+    // chat with a run waiting on background work does not read as if the model were generating.
+    const states: string[] = [];
+    if ((workers.running ?? 0) > 0) states.push(`${workers.running} running`);
+    if ((workers.waiting ?? 0) > 0) states.push(`${workers.waiting} waiting`);
+    if ((workers.queued ?? 0) > 0) states.push(`${workers.queued} queued`);
+    summary.push(plural(workers.live, "live worker", "live workers") +
+      (states.length === 0 ? "" : ` (${states.join(", ")})`));
+  }
   if (workers.parked > 0) summary.push(plural(workers.parked, "parked worker", "parked workers"));
   if (cron.running.total > 0) summary.push(plural(cron.running.total, "cron run", "cron runs") + " executing");
   if (cron.pending > 0) summary.push(plural(cron.pending, "cron run", "cron runs") + " queued");

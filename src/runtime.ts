@@ -3936,6 +3936,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const workerItems: BackgroundWorker[] = [];
       let liveWorkers = 0;
       let parkedWorkers = 0;
+      let runningWorkers = 0;
+      let waitingWorkers = 0;
+      let queuedWorkers = 0;
       if (workerFoundation !== undefined && workerSpawners.has(conversationId)) {
         for (const view of await workerFoundation.list(harness!, conversationId, ctx)) {
           if (view.status !== "queued" && view.status !== "running") continue;
@@ -3944,8 +3947,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const state = task.state.status;
           if (state === "terminal") continue;
           const blockReason = (await blockedNow()).get(view.taskId);
-          if (blockReason === undefined) liveWorkers += 1;
-          else parkedWorkers += 1;
+          if (blockReason === undefined) {
+            liveWorkers += 1;
+            // Count only what the native state establishes: a waiting worker is not generating, and
+            // a queued one has not started. A parked worker is reported separately below.
+            if (state === "running" || state === "completing") runningWorkers += 1;
+            else if (state === "waiting") waitingWorkers += 1;
+            else if (state === "pending" || state === "sleeping") queuedWorkers += 1;
+          } else parkedWorkers += 1;
           if (workerItems.length >= BACKGROUND_STATUS_LIMITS.rows) continue;
           workerItems.push({
             taskId: view.taskId,
@@ -3996,7 +4005,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const digestParked = digestStatus.liveTaskId !== null
         && (await blockedNow()).has(digestStatus.liveTaskId);
       return {
-        workers: { live: liveWorkers, parked: parkedWorkers, items: workerItems },
+        workers: {
+          live: liveWorkers,
+          parked: parkedWorkers,
+          running: runningWorkers,
+          waiting: waitingWorkers,
+          queued: queuedWorkers,
+          items: workerItems,
+        },
         cron: {
           scheduled,
           nextAtMs,
