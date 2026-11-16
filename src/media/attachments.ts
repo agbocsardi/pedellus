@@ -83,8 +83,11 @@ export interface MediaStore {
   /** Workspace-relative directory (posix separators). */
   readonly directory: string;
   readonly maxFileBytes: number;
-  /** Deterministic locator for one identity; no download needed to compute it. */
-  locator(identity: string, kind: MediaKind, mimeType?: string): string;
+  /**
+   * Deterministic locator for one identity; no download needed to compute it. The
+   * announced filename only contributes a bounded, known-format suffix.
+   */
+  locator(identity: string, kind: MediaKind, mimeType?: string, originalName?: string): string;
   /** Atomic, deduplicating store of one original file. */
   save(request: SaveMediaRequest): Promise<StoredMedia>;
   /** Read a stored original without following symlinks or escaping the media root. */
@@ -132,12 +135,23 @@ function validateChildDirectory(value: unknown): string {
   return value;
 }
 
-/** Bounded printable metadata; never used to build a filesystem path. */
+/**
+ * Bounded printable metadata. Only a short, known-format suffix of this value can reach a
+ * locator; nothing else here becomes a filesystem path.
+ *
+ * A name longer than the bound keeps that suffix instead of losing it to a blind cut: the
+ * extension is how a caller tells a `.xlsx` from a `.bin`.
+ */
 export function sanitizeOriginalName(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/[\\/]/g, "_").trim();
   if (cleaned === "") return undefined;
-  return cleaned.slice(0, MEDIA_LIMITS.maxOriginalNameChars);
+  const bound = MEDIA_LIMITS.maxOriginalNameChars;
+  if (cleaned.length <= bound) return cleaned;
+  const dot = cleaned.lastIndexOf(".");
+  const suffix = dot > 0 && /^\.[A-Za-z0-9]{1,15}$/.test(cleaned.slice(dot)) ? cleaned.slice(dot) : "";
+  const stem = (suffix === "" ? cleaned : cleaned.slice(0, dot)).slice(0, bound - suffix.length);
+  return `${stem}${suffix}`;
 }
 
 const IMAGE_EXTENSIONS: Readonly<Record<string, string>> = Object.freeze({
@@ -163,18 +177,45 @@ const AUDIO_EXTENSIONS: Readonly<Record<string, string>> = Object.freeze({
   "audio/x-flac": ".flac",
 });
 
+/**
+ * Document formats this store names explicitly. The list stays a fixed table of
+ * well-known announced types: nothing is sniffed from the bytes, and an unlisted
+ * type is stored as a generic `.bin` original instead of a guessed format.
+ */
 const DOCUMENT_EXTENSIONS: Readonly<Record<string, string>> = Object.freeze({
   "application/pdf": ".pdf",
   "application/json": ".json",
+  "application/xml": ".xml",
   "application/zip": ".zip",
   "application/gzip": ".gz",
-  "application/octet-stream": ".bin",
+  "application/x-tar": ".tar",
+  "application/x-7z-compressed": ".7z",
+  "application/vnd.rar": ".rar",
+  "application/rtf": ".rtf",
+  "application/epub+zip": ".epub",
+  "application/msword": ".doc",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+  "application/vnd.ms-excel": ".xls",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+  "application/vnd.ms-powerpoint": ".ppt",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+  "application/vnd.oasis.opendocument.text": ".odt",
+  "application/vnd.oasis.opendocument.spreadsheet": ".ods",
+  "application/vnd.oasis.opendocument.presentation": ".odp",
   "text/plain": ".txt",
   "text/markdown": ".md",
   "text/csv": ".csv",
+  "text/tab-separated-values": ".tsv",
+  "text/xml": ".xml",
   "text/html": ".html",
   ...IMAGE_EXTENSIONS,
   ...AUDIO_EXTENSIONS,
+});
+
+/** The formats a filename-derived suffix may select; the photo branch never consults a name. */
+const KNOWN_EXTENSIONS: Readonly<Record<"audio" | "document", ReadonlySet<string>>> = Object.freeze({
+  audio: new Set(Object.values(AUDIO_EXTENSIONS)),
+  document: new Set(Object.values(DOCUMENT_EXTENSIONS)),
 });
 
 function normalizedMime(mimeType: string | undefined): string | undefined {
@@ -183,11 +224,36 @@ function normalizedMime(mimeType: string | undefined): string | undefined {
   return base === "" ? undefined : base;
 }
 
-function extensionFor(kind: MediaKind, mimeType: string | undefined): string {
+/**
+ * A known extension taken from the announced filename. The name is untrusted display
+ * metadata, so only a short plain suffix this store already claims is accepted and
+ * nothing is inferred from the bytes.
+ */
+function extensionFromName(originalName: string | undefined, allowed: ReadonlySet<string>): string | undefined {
+  if (originalName === undefined) return undefined;
+  const dot = originalName.lastIndexOf(".");
+  if (dot <= 0) return undefined;
+  const suffix = originalName.slice(dot).toLowerCase();
+  return allowed.has(suffix) ? suffix : undefined;
+}
+
+/**
+ * The locator suffix for one attachment. An announced MIME type wins when this store
+ * knows it; an unlisted or absent one (commonly `application/octet-stream`) falls
+ * back to a known filename extension, so an `.xlsx` announced as a generic document
+ * is stored as `.xlsx` rather than `.bin`. The bytes themselves are never inspected.
+ */
+function extensionFor(kind: MediaKind, mimeType: string | undefined, originalName?: string): string {
   const mime = normalizedMime(mimeType);
   if (kind === "photo") return (mime === undefined ? undefined : IMAGE_EXTENSIONS[mime]) ?? ".jpg";
-  if (kind === "audio") return (mime === undefined ? undefined : AUDIO_EXTENSIONS[mime]) ?? ".oga";
-  return (mime === undefined ? undefined : DOCUMENT_EXTENSIONS[mime]) ?? ".bin";
+  if (kind === "audio") {
+    return (mime === undefined ? undefined : AUDIO_EXTENSIONS[mime])
+      ?? extensionFromName(originalName, KNOWN_EXTENSIONS.audio)
+      ?? ".oga";
+  }
+  return (mime === undefined ? undefined : DOCUMENT_EXTENSIONS[mime])
+    ?? extensionFromName(originalName, KNOWN_EXTENSIONS.document)
+    ?? ".bin";
 }
 
 function identityHash(identity: string): string {
@@ -274,8 +340,8 @@ export function createMediaStore(options: MediaStoreOptions): MediaStore {
     return target;
   };
 
-  const locator = (identity: string, kind: MediaKind, mimeType?: string): string => {
-    return `${directory}/${kind}-${identityHash(identity)}${extensionFor(kind, mimeType)}`;
+  const locator = (identity: string, kind: MediaKind, mimeType?: string, originalName?: string): string => {
+    return `${directory}/${kind}-${identityHash(identity)}${extensionFor(kind, mimeType, originalName)}`;
   };
 
   const inspect = async (relativePath: string): Promise<StoredMedia | undefined> => {
@@ -331,7 +397,7 @@ export function createMediaStore(options: MediaStoreOptions): MediaStore {
       if (request.declaredBytes !== undefined && request.declaredBytes > maxFileBytes) {
         throw new MediaRejected("too-large");
       }
-      const relativePath = locator(request.identity, request.kind, request.mimeType);
+      const relativePath = locator(request.identity, request.kind, request.mimeType, request.originalName);
       const target = await absolute(relativePath);
       const mimeType = request.mimeType === undefined ? undefined : normalizedMime(request.mimeType);
       const metadata = {

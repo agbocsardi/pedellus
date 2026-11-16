@@ -72,7 +72,7 @@ import {
   type TelegramObservedTarget,
   type TelegramQuotedContext,
 } from "./telegram-interactions.js";
-import { telegramMessageContent } from "./telegram-content.js";
+import { telegramLocationContext, telegramMessageContent } from "./telegram-content.js";
 import {
   PLAIN_TEXT_LIMIT,
   RICH_TEXT_LIMIT,
@@ -2100,7 +2100,7 @@ export async function runTelegram(
     // The same underlying file (Telegram's content-stable unique id) may arrive in a later
     // update: an already stored original is reused instead of downloading it again.
     const already = await ingress.store.existing(
-      ingress.store.locator(current.identity, current.kind, current.mimeType),
+      ingress.store.locator(current.identity, current.kind, current.mimeType, current.originalName),
     );
     if (already !== undefined) {
       return {
@@ -2500,6 +2500,13 @@ export async function runTelegram(
             continue;
           }
           const caption = message.text !== undefined ? parsed.text : message.caption;
+          // A shared location or venue is readable message content, not an attachment: it is
+          // rendered from the update's own numbers and venue text, and nothing is looked up. A
+          // caption on the same message stays ordinary input ahead of the labeled block.
+          const located = telegramLocationContext(message);
+          const captionOrLocation = caption === undefined || caption.trim() === ""
+            ? located
+            : located === undefined ? caption : `${caption}\n\n${located}`;
           // With media configured, supported originals are admitted with the input and stored in the
           // delivery path; without it, the previous text-only behavior is unchanged.
           const plan = mediaIngress === undefined
@@ -2512,7 +2519,7 @@ export async function runTelegram(
               .some((field) => (message as unknown as Record<string, unknown>)[field] !== undefined);
             body = hasAttachment
               ? disabledAttachmentText(caption)
-              : caption ?? "[Unsupported Telegram message: this adapter accepts text only.]";
+              : captionOrLocation ?? "[Unsupported Telegram message: this adapter accepts text only.]";
           } else if (plan?.kind === "attachment") {
             // The caption stays ordinary input; the attachment block is added after storage.
             body = caption ?? "";
@@ -2521,7 +2528,7 @@ export async function runTelegram(
             // Video and similar kinds are never downloaded, stored or implied to have been read.
             body = unsupportedAttachmentText(plan.label, caption);
           } else {
-            body = caption ?? "[Empty Telegram message: no text, caption or supported attachment.]";
+            body = captionOrLocation ?? "[Empty Telegram message: no text, caption or supported attachment.]";
           }
           const quoted = quotedMessageContext(message, identity);
           // A quoted/replied-to message contributes bounded, labeled reference context and its

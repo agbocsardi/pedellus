@@ -253,8 +253,9 @@ export function attachmentContextText(
   }
   if (attachment.kind === "document" && attachment.status === "stored") {
     lines.push(
-      "No content was extracted from this document. It is only a file on disk; read or convert it with the " +
-      "configured tools if its contents matter.",
+      "No content was extracted from this document. It is only a file on disk; the stored name's extension is " +
+      "untrusted metadata, not a verified format. Read or convert the file with the configured tools if its " +
+      "contents matter.",
     );
   }
   return lines.join("\n");

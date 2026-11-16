@@ -209,8 +209,15 @@ download keeps the admitted update instead of losing it, and a reopen resumes it
   it is resolved once successfully to its canonical path; a failed attempt can be
   retried, and every level below it is still checked individually. Filenames are
   generated from the attachment kind and a hash of Telegram's content-stable file
-  identity, never from the announced filename, so a retry or replay maps to the
-  same file and a re-sent file is stored once. Publication is atomic with private
+  identity, never from the announced filename itself, so a retry or replay maps to the
+  same file and a re-sent file is stored once. Only the locator's extension is
+  metadata-shaped: a known announced MIME type names it, and an unlisted or
+  generic one (commonly `application/octet-stream`) falls back to a known
+  extension in the announced filename, so a spreadsheet announced generically is
+  stored as `.xlsx` instead of `.bin`. That suffix is the only part of the name
+  that can influence the path; an unknown or malformed one yields `.bin`, the
+  bytes are never inspected, and nothing is guessed from the file's content.
+  Publication is atomic with private
   permissions, and a symlinked, hardlinked or non-regular target path is refused
   rather than followed or overwritten. Stored originals are never deleted by the adapter and there is no
   total-disk cap; keeping the workspace media directory bounded is the
@@ -222,7 +229,19 @@ download keeps the admitted update instead of losing it, and a reopen resumes it
   content, whatever MIME they announce.
 - **Documents** have no extraction scope: the file simply exists on disk with no
   read, OCR, PDF/Office conversion or automatic content extraction. The turn says
-  so explicitly and leaves reading it to the configured tools.
+  so explicitly, repeats the bounded original filename and announced MIME type as
+  untrusted metadata, and notes that the stored extension is not a verified
+  format; reading the file is left to the configured tools. A long announced name
+  is bounded while keeping a short plain suffix, so the extension survives.
+- **Locations and venues** are message content, not attachments, and are never
+  downloaded. A pin becomes a labeled block holding the message's own coordinates
+  (six decimals) and, for a venue, its name and address as bounded single-line
+  quoted untrusted text; the block states that no map, place, address or
+  geocoding lookup was made, so a live location reads as the snapshot it is. Place
+  identifiers, live-location period, accuracy, heading and proximity radius are
+  not copied. A caption on the same message stays ordinary input ahead of the
+  block. When no `media` block is configured the same block replaces the old
+  "text only" notice for that message.
 - **Voice/audio** is stored first and then transcribed locally by the configured
   engine. Three explicit backends exist: the default `faster-whisper` helper
   (`scripts/local-transcribe.py` through `uv`, model `small` on CPU with `int8`),
@@ -638,7 +657,10 @@ process racing the workspace between them is not fully excluded on this host
   messages from those IDs are admitted; groups, bots, unknown users, and
   malformed/non-text content do not create user conversations. Non-text
   messages from an allowed user are submitted as an explicit unsupported-input
-  notice, not represented as content the agent has seen.
+  notice, not represented as content the agent has seen. A shared location or
+  venue is the one exception: it is submitted as labeled message content built
+  from the update's own coordinates and venue text, with no lookup of any kind,
+  never as an unsupported or empty notice.
 - Session keys are stable per bot ID and private chat. Request IDs are stable
   per bot ID and Telegram `update_id`. Unknown/denied updates advance the
   offset without a reply.
