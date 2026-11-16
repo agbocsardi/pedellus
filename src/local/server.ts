@@ -435,6 +435,13 @@ class LocalConnection {
           this.scope.context,
         );
       }
+      case "reloadModels": {
+        onlyKeys(requireObject(request.params ?? {}), []);
+        if (typeof this.options.gateway.reloadModels !== "function") {
+          throw new LocalRequestError("unavailable", "live model reload is unavailable on this host");
+        }
+        return this.options.gateway.reloadModels(this.scope.context);
+      }
       case "refreshContext": {
         if (!this.options.contextRefresh) {
           throw new LocalRequestError("unavailable", "workspace context is not configured");
@@ -559,6 +566,7 @@ class LocalConnection {
       tools: this.options.tools,
       contextRefresh: this.options.contextRefresh,
       presets: this.options.presets,
+      reload: typeof this.options.gateway.reloadModels === "function",
       attachments: this.options.attachments !== undefined,
       digest: true,
       mcp: this.options.gateway.mcpAdmin !== undefined,

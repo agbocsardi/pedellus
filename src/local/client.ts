@@ -7,6 +7,7 @@ import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "..
 import type { HistoryPage, HistoryQuery } from "../history/index.js";
 import type { MemoryDigestStartResult, MemoryDigestStatusView } from "../history/memory-digest.js";
 import type { GatewayModelList, GatewayModelSelection, GatewayModelSelectionRequest } from "../runtime.js";
+import type { ModelReloadResult } from "../model-reload.js";
 import type { McpAdminListing, McpCallbackResult } from "../mcp/index.js";
 import type { McpAuthorizationLink } from "../mcp/surface.js";
 import { validAskQuestionView, type AskQuestionView } from "../questions/index.js";
@@ -67,6 +68,8 @@ export interface LocalGatewayClient extends TerminalConversation {
   readonly tools: readonly string[];
   readonly contextRefresh: boolean;
   readonly presets: boolean;
+  /** True only when the gateway host supplied a configuration-file loader for /reload. */
+  readonly reloadSupported: boolean;
   /** True when the gateway has a configured media store for local attachments. */
   readonly attachments: boolean;
   /** True when this host exposes the manual memory-digestion entry and status. */
@@ -79,6 +82,8 @@ export interface LocalGatewayClient extends TerminalConversation {
   listModels(context: Context): Promise<GatewayModelList>;
   selectModel(selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection>;
   selectModelPreset(name: string, context: Context): Promise<GatewayModelSelection>;
+  /** Explicit host-only foreground model/credential reload; requires `reloadSupported`. */
+  reloadModels(context: Context): Promise<ModelReloadResult>;
   refreshContext(context: Context): Promise<{ readonly skills: number }>;
   /** Start one bounded digestion batch for this attachment's conversation. */
   digestStart(context: Context): Promise<MemoryDigestStartResult>;
@@ -180,6 +185,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
   tools: readonly string[] = [];
   contextRefresh = false;
   presets = false;
+  reloadSupported = false;
   attachments = false;
   digest = false;
   mcp = false;
@@ -221,6 +227,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
     this.tools = tools as string[];
     this.contextRefresh = result.contextRefresh === true;
     this.presets = result.presets === true;
+    this.reloadSupported = result.reload === true;
     this.attachments = result.attachments === true;
     this.digest = result.digest === true;
     this.mcp = result.mcp === true;
@@ -362,6 +369,11 @@ class LocalGatewayConnection implements LocalGatewayClient {
 
   async selectModelPreset(name: string, context: Context): Promise<GatewayModelSelection> {
     return this.call("selectModelPreset", { name }, context);
+  }
+
+  async reloadModels(context: Context): Promise<ModelReloadResult> {
+    if (!this.reloadSupported) throw new Error("live model reload is unavailable");
+    return this.call("reloadModels", {}, context);
   }
 
   async refreshContext(context: Context): Promise<{ readonly skills: number }> {

@@ -18,6 +18,7 @@ import {
 import { renderMcpListing, type McpAdminListing, type McpCallbackResult } from "../mcp/admin.js";
 import { looksLikeOAuthCallback } from "../mcp/surface.js";
 import { renderBackgroundStatus } from "../background-status.js";
+import { renderModelReloadNotice, type ModelReloadResult } from "../model-reload.js";
 import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "../history/episodes.js";
 import {
   renderMemoryDigestStart,
@@ -116,6 +117,11 @@ const DEFAULT_ACTIVITY_TIMER: TerminalActivityTimer = {
  */
 const RESTART_REFUSED =
   "Gateway restart was not confirmed; the gateway may already be restarting. Check its status before retrying.";
+
+export interface TerminalModelReloadHost {
+  /** Explicit host-owned reload of foreground model presets, selection and credentials references. */
+  reload(): Promise<ModelReloadResult>;
+}
 
 export interface TerminalModelSelectionHost {
   list(): Promise<GatewayModelList>;
@@ -234,6 +240,8 @@ export interface TerminalIO {
   readonly modelSelection?: TerminalModelSelectionHost;
   /** Optional read-only configured tool authority; absent leaves the local tool commands unavailable. */
   readonly toolPolicy?: TerminalToolPolicyHost;
+  /** Optional host-owned live model/credential reload; absent leaves /reload unavailable. */
+  readonly reload?: TerminalModelReloadHost;
   /** Optional host-owned workspace-context refresh; standalone callers leave /refresh unavailable. */
   readonly contextRefresh?: TerminalContextRefreshHost;
   /** Optional host-owned memory-digestion entry; absent leaves /digest unavailable. */
@@ -849,6 +857,7 @@ export async function runTerminalConversation(
     }
     if (io.modelSelection) offered.add("model");
     if (io.toolPolicy) offered.add("tools");
+    if (io.reload) offered.add("reload");
     if (io.contextRefresh?.available) offered.add("refresh");
     if (io.digest) offered.add("digest");
     if (io.mcp) offered.add("mcp");
@@ -1382,6 +1391,11 @@ export async function runTerminalConversation(
       case "tools":
         await showTools(args);
         return;
+      case "reload": {
+        if (args.trim()) { await notice(conversationCommandUsage("reload"), true); return; }
+        await notice(renderModelReloadNotice(await offeredHost(io.reload).reload()));
+        return;
+      }
       case "refresh":
         await refreshContext(args);
         return;

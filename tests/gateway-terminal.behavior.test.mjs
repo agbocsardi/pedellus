@@ -366,6 +366,7 @@ test("terminal /help lists only offered commands and one command's detail on dem
     "/help model",
     "/help attach",
     "/help guarantee",
+    "/help reload",
     "/help ../SYNTHETIC-HELP-ARGUMENT",
   ));
   io.prompt = () => {};
@@ -374,7 +375,7 @@ test("terminal /help lists only offered commands and one command's detail on dem
   // The listing is the catalogue's one-line form, and only this host's commands are advertised.
   assert.match(printed, /Local commands in this CLI conversation:/);
   assert.match(printed, /\/model \[preset\] — List or select a model for this conversation/);
-  assert.match(printed, /Not offered by this host: \/digest, \/attach, \/restart\./);
+  assert.match(printed, /Not offered by this host: \/digest, \/attach, \/restart, \/reload\./);
   assert.match(printed, /Unknown slash commands are not sent to the model/);
   // `/help <command>` carries the catalogue's usage line and its one-sentence detail.
   assert.match(printed, /Usage: \/model \[preset\] \| \/model <provider> <modelId> \[thinkingLevel\]/);
@@ -387,6 +388,33 @@ test("terminal /help lists only offered commands and one command's detail on dem
   assert.doesNotMatch(printed, /SYNTHETIC-HELP-ARGUMENT|synthetic-help-argument/);
 });
 
+test("terminal /reload reports a bounded host result and is offered only by a supporting host", { timeout: 20_000 }, async (t) => {
+  const { socketPath, provider } = await makeEnvironment(t);
+  const client = await connectLocalGateway({ socketPath, context });
+  t.after(async () => { await client.close(); });
+  let calls = 0;
+  const { chunks, io } = terminalIO(client, lines(
+    "/help reload",
+    "/reload",
+    "/reload",
+    "/reload extra",
+  ));
+  io.prompt = () => {};
+  io.reload = {
+    reload: async () => (++calls === 1
+      ? { status: "reloaded", models: 2, presets: 1, defaultPreset: "fast" }
+      : { status: "busy" }),
+  };
+  await runTerminalConversation(client, context, io);
+  const printed = chunks.join("");
+  assert.match(printed, /Usage: \/reload\nHost-only: validates the whole file/);
+  assert.match(printed, /Model configuration reloaded: 2 allowed models, 1 preset; default preset fast\./);
+  assert.match(printed, /Background model captures .* are unchanged\./);
+  assert.match(printed, /Model reload refused: live work is active or queued, so nothing was changed\./);
+  assert.match(printed, /Usage: \/reload/);
+  assert.equal(provider.state.callCount, 0, "a host reload is never a model turn");
+});
+
 test("typed local commands share the catalogue refusal and never reach the model", { timeout: 20_000 }, async (t) => {
   const { socketPath } = await makeEnvironment(t);
   const client = await connectLocalGateway({ socketPath, context });
@@ -395,6 +423,7 @@ test("typed local commands share the catalogue refusal and never reach the model
     "/attach",
     "/digest",
     "/restart",
+    "/reload",
     "/goal",
     "/foo_bar",
     "/../SYNTHETIC-TYPED-ARGUMENT",
@@ -403,7 +432,7 @@ test("typed local commands share the catalogue refusal and never reach the model
   await runTerminalConversation(client, context, io);
   const printed = chunks.join("");
   // A catalogued command this host lacks gives the same reason `/help <command>` gives.
-  for (const name of ["attach", "digest", "restart"]) {
+  for (const name of ["attach", "digest", "restart", "reload"]) {
     assert.match(printed, new RegExp(`/${name} is not offered by this host\\.`));
   }
   // The refusal keeps the actionable fix and the effect command's no-effect guarantee.
@@ -416,6 +445,45 @@ test("typed local commands share the catalogue refusal and never reach the model
   // A name that is not command-shaped is never echoed, and the line still never reaches the model.
   assert.match(printed, /No such command here\.[\s\S]*?It was not sent to the model\./);
   assert.doesNotMatch(printed, /SYNTHETIC-TYPED-ARGUMENT|synthetic-typed-argument/);
+});
+
+test("the local protocol advertises reload only from a supporting gateway", { timeout: 20_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "nanobot-local-reload-"));
+  const socketPath = join(directory, "gateway.sock");
+  let calls = 0;
+  const gateway = {
+    // Attach reprints still-open questions from this exact conversation, so the fake handle needs
+    // one empty question document in addition to the reload surface.
+    async conversationFor() {
+      return {
+        id: 1,
+        async commit(change) {
+          return change({ doc: async () => ({ version: 1, questions: [] }) });
+        },
+      };
+    },
+    async reloadModels() {
+      calls += 1;
+      return { status: "refused", reason: "pinned" };
+    },
+  };
+  const server = await serveLocalGateway({
+    socketPath,
+    gateway,
+    context,
+    tools: [],
+    contextRefresh: false,
+    presets: true,
+  });
+  const client = await connectLocalGateway({ socketPath, context });
+  t.after(async () => {
+    await client.close();
+    await server.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+  assert.equal(client.reloadSupported, true);
+  assert.deepEqual(await client.reloadModels(context), { status: "refused", reason: "pinned" });
+  assert.equal(calls, 1, "the attach capability and the method use the same host surface");
 });
 
 test("a second local gateway owner is refused without disturbing the live one", { timeout: 20_000 }, async (t) => {

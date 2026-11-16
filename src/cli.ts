@@ -389,7 +389,12 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
     const socketPath = await localSocketPath(config);
     journalEvent("gateway.starting");
     gateway = await observeOperation("gateway.open", {},
-      () => openGateway(config, context, workspaceContextGatewayOptions(config)));
+      () => openGateway(config, context, {
+        ...workspaceContextGatewayOptions(config),
+        // The candidate loader is host-owned and fixed to the file this gateway opened from. No
+        // model, chat message or tool can name a path for a reload.
+        ...(config.configFile === undefined ? {} : { reloadConfig: () => loadConfig(config.configFile!) }),
+      }));
     stage = "gateway.local";
     // The gateway owns local attachments too: the CLI only names an operator path. CLI
     // originals live in a code-owned child of the validated operator media root, so a
@@ -668,6 +673,7 @@ async function runAgent(
           : {}),
       },
       ...(client.restartSupported ? { restart: () => client!.restart(context) } : {}),
+      ...(client.reloadSupported ? { reload: { reload: () => client!.reloadModels(context) } } : {}),
       toolPolicy: { tools: client.tools },
       contextRefresh: {
         available: client.contextRefresh,

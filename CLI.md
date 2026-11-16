@@ -378,6 +378,7 @@ it never observed reports its own end. See
 | `/abort`, `/stop` | Use native `Conversation.abort()`: stop foreground conversation work, withdraw queued inputs, and wait for native idleness. It does not implement Python sustained-goal/background abort semantics. |
 | `/new` | Start a fresh context in the same conversation and rebuild configured workspace instructions, memory and skills, exactly as Telegram does. With workspace context configured, a busy conversation is refused; prompt replacement and the reset marker commit atomically. No handoff, archive, summary, usage reset or extra model call; original entries and tool authority remain. Without configured workspace context, native reset semantics apply, including safe-boundary placement while busy. |
 | `/restart` | Ask the owner host to replace the whole gateway process after graceful teardown, using the same executable, argv and environment. Advertised only when supported. Refused with a fixed no-effect reason while live work (a running generation, tool, compaction, worker, digest or cron run) would be interrupted; a sleeping cron timer does not block. Finish or abort that work and retry; nothing is auto-cancelled. Configuration and workspace context reload; every attached CLI and Telegram surface disconnects. The local acknowledgement is flushed before shutdown. |
+| `/reload` | CLI-only owner action: re-read and fully validate the configuration file the gateway opened from, then apply only foreground model selection (`model`, `allowedModels`, direct `thinkingLevel`, `modelPreset`, `modelPresets`) and `credentials` references without a restart. Named-preset chats reset to the new configured default; a direct selection is kept while it remains allowed. Refused with no effect while any live task or queued input exists (an armed native cron timer is the one exception; a sleeping or blocked background capture still refuses, because it could resume under the rotated credential), when the file cannot be validated, when a startup-only field changed (tools, channels, workspace, MCP, providers, background model config, classifier, vision handoff), when switching between direct-model and preset mode, or when a model still pinned by prepared or captured background work would leave the allowlist. A managed MCP add or remove is reflected live and does not block a later reload. The new catalog is published only with the stored policy commit. Prepared dispatches and isolated scheduled targets are never rewritten; the background event catalog, tools and channel authority are unchanged. Credential values are never printed. There is no file watcher; use `/restart` for changes outside this scope. |
 
 Digest sizing: `digest.episodesPerRun` is the whole-episode ceiling (default 1).
 `maxInputTokens` (500,000 including cached input) and `maxRequests` (12 successful
@@ -418,10 +419,11 @@ the gateway retries each admission once from the authoritative native task.
 
 Shared owner controls have the same effects in CLI and Telegram: `/new`, `/abort`/`/stop`,
 `/status`, `/model`, `/digest`, `/digest status`, `/help` and supported `/restart`.
-Presentation remains channel-specific; CLI retains browsing, compaction, attachment and `/refresh`
-controls. Telegram additionally offers `/notices` to inspect and dismiss that chat's stale unknown
+Presentation remains channel-specific; CLI retains browsing, compaction, attachment, `/refresh` and
+`/reload`. Telegram additionally offers `/notices` to inspect and dismiss that chat's stale unknown
 host notices; it is not a CLI or model control and never resends an ambiguous answer.
-`/restart` is whole-process replacement, not a Harness reopen or terminal reconnect.
+`/restart` is whole-process replacement, not a Harness reopen or terminal reconnect; `/reload` is a
+narrower host-owned model/credential reload that never reopens the Harness.
 There is no Telegram `/refresh`; `/new` rebuilds that chat's prompt. See
 [Telegram controls](./TELEGRAM.md#controls).
 

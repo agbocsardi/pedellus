@@ -189,6 +189,13 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     surfaces: ["cli", "telegram", "discord"],
   },
   {
+    name: "reload",
+    summary: "Reload model presets and credentials from the configuration file",
+    usage: "Usage: /reload",
+    detail: "Host-only: validates the whole file and applies only model selection, named presets and credentials references; tools, channels, workspace, MCP, background model captures and other settings need /restart, and so does switching between direct-model and preset mode. Refused while any live work exists except an armed native cron timer, including sleeping or blocked background captures.",
+    surfaces: ["cli"],
+  },
+  {
     name: "help",
     args: "[command]",
     summary: "Show these controls, or one command's detail",

@@ -25,7 +25,9 @@ never reaches it. `message.text` (not a caption) is classified:
   adapter advertises depends on what the host really exposes (see
   [Host capability and the native menu](#host-capability-and-the-native-menu)).
   A typed command the host cannot perform is refused with fixed text and is
-  never sent to the assistant. A control this host does not implement gets its
+  never sent to the assistant. `/reload` is CLI-only: it needs the gateway host's
+  private configuration path, and the catalogue refuses it here as belonging to
+  the terminal. A control this host does not implement gets its
   own fixed capability notice, which adds what the catalogue reason cannot: the
   missing host surface (for example "opened without an on-disk configuration
   file"), and for `/digest` that nothing was started. `/help <name>` for a name

@@ -133,6 +133,7 @@ test("process help prints the overview on stdout and reads no configuration", { 
   // The generated slash-command catalogue is part of the overview, with its availability caveat.
   assert.match(overview, /availability depends on the gateway/);
   assert.match(overview, /\/help \[command\] — Show these controls, or one command's detail/);
+  assert.match(overview, /\/reload — Reload model presets and credentials from the configuration file/);
   // Help text stays short: the overview is about one screen and no line is a paragraph.
   const overviewLines = overview.trimEnd().split("\n");
   assert.ok(overviewLines.length <= 60, `the overview is ${overviewLines.length} lines`);

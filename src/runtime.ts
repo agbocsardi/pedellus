@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { isChordError } from "@earendil-works/chord";
 import { processLock } from "@earendil-works/chord/node";
@@ -5,10 +6,10 @@ import type { Context, Draft } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
 import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
-import { AgentDoc, AssistantEntry, ResetEntry, ToolTask, configure, ConversationBusy, createRegistry, defineDoc, defineExtension, hook, Harness, LiveDoc, type AgentChange, type AgentState, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type Report, type Storage, type TaskId, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
+import { AgentDoc, AssistantEntry, ResetEntry, ToolTask, configure, ConversationBusy, createRegistry, defineDoc, defineExtension, hook, Harness, InboxDoc, LiveDoc, type AgentChange, type AgentState, type CommitObservation, type CommitPublication, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type Report, type Storage, type TaskId, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS, createContextExtensionBuilder, type ContextExtensionReplacement, type ConversationContextSnapshot } from "./context/index.js";
 import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./context/skill-tool.js";
-import { CRON_RUN_TASK_NAME, CronJobsDoc, createCronFoundation } from "./automation/cron.js";
+import { CRON_RUN_TASK_NAME, CRON_TIMER_TASK_NAME, CronJobsDoc, createCronFoundation } from "./automation/cron.js";
 import {
   automationConversationOf,
   classifyAutomationConversation,
@@ -136,9 +137,13 @@ import {
   createProviderModels,
   nativeModelReference,
   resolveClassifierModel,
-  resolveModelChoices,
   type ResolvedModelChoice,
 } from "./providers.js";
+import { resolveModelConfiguration, type ResolvedModelConfiguration } from "./model-config.js";
+import {
+  modelReloadCompatibility,
+  type ModelReloadResult,
+} from "./model-reload.js";
 import { authStorePath, FileCredentialStore } from "./auth/store.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
 import { reportFailure } from "./failure-diagnostics.js";
@@ -221,6 +226,27 @@ const SessionMap = defineDoc<{ sessions: Record<string, number> }>({
   initial: () => ({ sessions: {} }), checkpointWhen: () => true,
 });
 
+/**
+ * Durable identity of the last committed foreground policy revision.
+ *
+ * A live model reload writes one random revision here in the same commit as every conversation
+ * policy it updates. The in-memory provider registry is published only when `observeCommits()`
+ * reports that exact revision in a stored commit, so a candidate is never visible before its commit
+ * is durable, and a failed or refused commit never publishes one.
+ */
+const ModelPolicyRevisionDoc = defineDoc<{ revision: string }>({
+  kind: "nanobot.model-policy-revision", version: 1, scope: "session",
+  initial: () => ({ revision: "" }), checkpointWhen: () => true,
+});
+
+/** Whether one stored commit carried a specific model-policy revision document. */
+function publicationCarriesRevision(publication: CommitPublication, revision: string): boolean {
+  return publication.changes.some((change) => change.type === "document" && change.kind === "change"
+    && change.record.scope.kind === "session"
+    && change.record.kind === ModelPolicyRevisionDoc.definition.kind
+    && (change.value as { readonly revision?: unknown }).revision === revision);
+}
+
 export interface GatewayModelChoice {
   provider: string;
   modelId: string;
@@ -277,6 +303,12 @@ export interface GatewayContextRefresh {
 
 export interface OpenGatewayOptions {
   readonly models?: Models;
+  /**
+   * Host-owned candidate loader for an explicit live model/credential reload. It must re-read the
+   * same configuration file the gateway opened from and return a fully parsed result; the runtime
+   * never accepts a path from a model, chat or tool. Absent, no `/reload` host method is exposed.
+   */
+  readonly reloadConfig?: () => Promise<PortConfig>;
   /** Explicit host-owned context snapshots; absent means no context extension is installed. */
   readonly contextSnapshotProvider?: GatewayContextSnapshotProvider;
   /**
@@ -436,6 +468,13 @@ export interface Gateway {
   listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
   /** Persists a native pi.agent choice; rejects ConversationBusy atomically without changing it. */
   selectModel(sessionKey: string, selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection>;
+  /**
+   * Explicit host-only reload of foreground model presets, model selection and credential
+   * references. It re-reads and fully validates the host-owned configuration file, then applies
+   * only those fields; tools, channels, workspace context, MCP and background model captures need
+   * `/restart`. Present only when the host supplied a configuration-file loader.
+   */
+  readonly reloadModels?: (context: Context) => Promise<ModelReloadResult>;
   /**
    * Temporarily selects a configured named preset in this conversation, using its provider/model
    * and its thinking level (or `off`). `default` returns to the configured preset. Named-preset
@@ -729,7 +768,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
   ];
   // Fail at startup, not at the first tool call, when the default cannot be represented by the host shell.
   const toolTimeoutSeconds = parseToolTimeoutSeconds(config.toolTimeoutSeconds);
-  const allowedModels = config.allowedModels ?? [config.model];
   // The gateway and the terminal login/logout command must resolve one private store
   // file. Resolve the future canonical data directory without creating it: a failed
   // startup keeps its existing side-effect-free behavior, and startup below re-checks
@@ -746,8 +784,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
     }
     prepared = createProviderModels(config, process.env, new FileCredentialStore(authStorePath(credentialStoreDir)));
   }
-  const { models, model } = prepared;
-  const choices = resolveModelChoices(models, allowedModels);
+  let models = prepared.models;
+  const resolvedModels = resolveModelConfiguration(config, models);
+  let { choices, choicesByConfigured, choicesByNative, configuredPresetName, presetCatalog, defaultChoice } = resolvedModels;
+  let defaultThinkingLevel = resolvedModels.defaultThinkingLevel;
+  // One live model/credential configuration, replaced only by the explicit host reload below.
+  let liveModelConfig = config;
   // The one configured classifier model, resolved against the very catalog Code Mode uses.
   const classifierGrant = options.models === undefined
     ? prepared.classifier
@@ -758,59 +800,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // native credential. Stored OAuth is checked for presence, not refreshed.
     await assertConfiguredModelAuth(models, choices, context.abortSignal);
   }
-  const choicesByConfigured = new Map(choices.map((choice) => [modelKey(choice.configured), choice]));
-  const choicesByNative = new Map(choices.map((choice) => [modelKey(choice.native), choice]));
-  // Named presets are a config-level catalog over the same finite model choices. Validate every
-  // reference and thinking level before storage or dispatch, so a bad preset fails at startup.
-  const configuredPresetName = config.modelPreset;
-  const presetCatalog = new Map<string, { readonly choice: ResolvedModelChoice; readonly thinkingLevel?: ModelThinkingLevel }>();
-  if (configuredPresetName !== undefined) {
-    if (config.modelPresets === undefined || Object.keys(config.modelPresets).length === 0) {
-      throw new StartupDiagnosticError("model", { detail: "modelPreset requires a non-empty modelPresets catalog" });
-    }
-    for (const [name, preset] of Object.entries(config.modelPresets)) {
-      const choice = choicesByConfigured.get(modelKey(preset));
-      if (choice === undefined) {
-        throw new StartupDiagnosticError("model", {
-          detail: `Model preset ${name} is outside the configured model catalog`,
-        });
-      }
-      if (preset.thinkingLevel !== undefined && !choice.thinkingLevels.includes(preset.thinkingLevel)) {
-        throw new StartupDiagnosticError("model", {
-          detail: `Unsupported thinkingLevel ${preset.thinkingLevel} for model preset ${name}`,
-        });
-      }
-      presetCatalog.set(name, {
-        choice,
-        ...(preset.thinkingLevel === undefined ? {} : { thinkingLevel: preset.thinkingLevel }),
-      });
-    }
-    if (!presetCatalog.has(configuredPresetName)) {
-      throw new StartupDiagnosticError("model", { detail: "modelPreset must name a configured model preset" });
-    }
-  }
-  const defaultPreset = configuredPresetName === undefined ? undefined : presetCatalog.get(configuredPresetName);
-  const defaultChoice = defaultPreset?.choice ?? choicesByConfigured.get(modelKey(config.model));
-  if (!defaultChoice) {
-    throw new StartupDiagnosticError("model", { detail: "Default model must be included in allowedModels" });
-  }
-  if (modelKey(model) !== modelKey(defaultChoice.native)) {
-    throw new StartupDiagnosticError("model", {
-      detail: "Resolved default model does not match its configured choice",
-    });
-  }
-  if (config.thinkingLevel !== undefined && !defaultChoice.thinkingLevels.includes(config.thinkingLevel)) {
-    throw new StartupDiagnosticError("model", {
-      detail: `Unsupported thinkingLevel ${config.thinkingLevel} for default model ${config.model.provider}/${config.model.modelId}`,
-    });
-  }
   if (options.contextSnapshotProvider !== undefined && typeof options.contextSnapshotProvider !== "function") {
     throw new TypeError("contextSnapshotProvider must be a function");
   }
   if (options.agentHistory !== undefined && typeof options.agentHistory !== "boolean") {
     throw new TypeError("agentHistory must be a boolean");
   }
-  const defaultThinkingLevel = defaultPreset?.thinkingLevel ?? config.thinkingLevel ?? "off";
   /**
    * Explicit background model for memory digestion. It is resolved from `digest.preset` or
    * `digest.model` only: the origin conversation's current model and thinking level are never
@@ -904,7 +899,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     });
     visionExtension = createVisionHandoffExtension({
       handoff: visionHandoff,
-      defaultModel: defaultChoice.native,
+      // Read at each request so a host model reload updates the fallback without rebuilding the hook.
+      defaultModel: () => defaultChoice.native,
       preparedModel: (taskId) => {
         // Consume the pin for exactly the saved dispatch that startup found. A later retry
         // re-prepares from the reset AgentDoc model, so a stale task-lifetime pin would apply
@@ -1025,9 +1021,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     }
   }
   const hostPolicy: AgentChange = { cwd: workspace };
-  const defaultAgentPolicy: AgentChange = {
+  let defaultAgentPolicy: AgentChange = {
     ...hostPolicy,
-    model,
+    model: defaultChoice.native,
     thinkingLevel: defaultThinkingLevel,
     tools: [],
     modelTools: [],
@@ -1312,27 +1308,41 @@ export async function openGateway(config: PortConfig, context: Context, options:
     }
     return environments.forConversation(conversationId, ctx);
   };
-  const fallbackThinkingLevel = (choice: ResolvedModelChoice): ModelThinkingLevel =>
-    choice.thinkingLevels.includes(defaultThinkingLevel) ? defaultThinkingLevel : "off";
+  const fallbackThinkingLevel = (
+    choice: ResolvedModelChoice,
+    preferred: ModelThinkingLevel = defaultThinkingLevel,
+  ): ModelThinkingLevel => choice.thinkingLevels.includes(preferred) ? preferred : "off";
   const choiceFromState = (state: Readonly<AgentState> | undefined): ResolvedModelChoice | undefined =>
     state?.model === undefined ? undefined : choicesByNative.get(modelKey(state.model));
+  /** The live catalog exactly as the open path or the last published reload left it. */
+  const liveResolvedModels = (): ResolvedModelConfiguration => ({
+    choices, choicesByConfigured, choicesByNative, configuredPresetName, presetCatalog, defaultChoice, defaultThinkingLevel,
+  });
   /**
-   * Reapply host policy to a persisted conversation. Named-preset mode additionally resets a
-   * selection left by a previous run to the configured preset on startup, so a temporary CLI
-   * switch never survives a restart or a configuration reload.
+   * Reapply host policy to a persisted conversation, computed only from one resolved catalog so a
+   * reload can evaluate a candidate without touching the live bindings first. Named-preset mode
+   * additionally resets a selection left by a previous run to the configured preset on startup, so
+   * a temporary CLI switch never survives a restart or a configuration reload.
    */
-  const policyForState = (
+  const policyAgainst = (
+    resolved: ResolvedModelConfiguration,
     state: Readonly<AgentState> | undefined,
     resetToConfiguredPreset = false,
   ): AgentChange => {
-    const existing = resetToConfiguredPreset ? undefined : choiceFromState(state);
-    const choice = existing ?? defaultChoice;
+    const existing = resetToConfiguredPreset
+      ? undefined
+      : state?.model === undefined ? undefined : resolved.choicesByNative.get(modelKey(state.model));
+    const choice = existing ?? resolved.defaultChoice;
     const modelWasRevoked = existing === undefined;
     const thinkingLevel = !modelWasRevoked && state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
       ? state.thinkingLevel
-      : fallbackThinkingLevel(choice);
+      : fallbackThinkingLevel(choice, resolved.defaultThinkingLevel);
     return { ...hostPolicy, model: choice.native, thinkingLevel };
   };
+  const policyForState = (
+    state: Readonly<AgentState> | undefined,
+    resetToConfiguredPreset = false,
+  ): AgentChange => policyAgainst(liveResolvedModels(), state, resetToConfiguredPreset);
   let contextExtension: Extension | undefined;
   const contextExtensionBuilder = createContextExtensionBuilder();
   const contextConversations = new Set<ConversationId>();
@@ -2081,11 +2091,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ...choice.configured,
     thinkingLevel,
   });
-  const publicPresets: readonly GatewayModelPreset[] = [...presetCatalog].map(([name, preset]) => ({
+  const publicPresetsFor = (
+    catalog: ReadonlyMap<string, { readonly choice: ResolvedModelChoice; readonly thinkingLevel?: ModelThinkingLevel }>,
+  ): readonly GatewayModelPreset[] => [...catalog].map(([name, preset]) => ({
     name,
     ...preset.choice.configured,
     ...(preset.thinkingLevel === undefined ? {} : { thinkingLevel: preset.thinkingLevel }),
   }));
+  let publicPresets = publicPresetsFor(presetCatalog);
   async function applyConversationPolicy(conversation: Conversation, ctx: Context): Promise<void> {
     await conversation.commit(async (tx) => {
       const state = await tx.doc(AgentDoc, conversation.id);
@@ -2294,7 +2307,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const harnessOptions = {
       // Consume the whole pending steering burst at each native boundary, including worker steers.
       settings: { steeringMode: "all" as const },
-      models,
+      // A host reload swaps this catalog without reopening the Harness; every generation, compaction,
+      // hook and tool resolves the current one at each use.
+      models: () => models,
       registry,
       telemetry: journalTelemetry,
       // Durable reports asynchronous storage, scheduler, hook and listener failures here even
@@ -3551,6 +3566,205 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }, ctx);
       return publicSelection(target, level);
     };
+    /**
+     * Explicit host reload of the foreground model catalog and credential references.
+     *
+     * The contract is deliberately narrow. Everything is validated before the first in-memory
+     * change, the candidate may differ from the live file only in foreground model fields, and the
+     * registry is published only with the exact commit Storage stored (a revision document in that
+     * commit identifies it). Any live work other than an armed native cron timer refuses the reload:
+     * a sleeping or blocked capture can resume later, and rotating a credential or catalog under it
+     * would silently change the authority of work admitted under the previous policy. Work admitted
+     * after the commit uses the newly published registry and credentials.
+     */
+    let reloadInProgress = false;
+    /** The live configuration a candidate is classified against, including a managed MCP edit. */
+    const effectiveLiveConfig = (): PortConfig => {
+      if (liveMcpConfig === liveModelConfig.mcp) return liveModelConfig;
+      const { mcp: _startupMcp, ...rest } = liveModelConfig;
+      return liveMcpConfig === undefined ? rest : { ...rest, mcp: liveMcpConfig };
+    };
+    /** An armed native cron timer sleeps until its slot and holds no model capture. */
+    const armedCronTimer = (kind: string, status: string): boolean =>
+      kind === CRON_TIMER_TASK_NAME && status === "sleeping";
+    // A queued owner input is work even before its native task exists, so it blocks a reload just as
+    // an executing task does. Every live task blocks except an armed native cron timer, including a
+    // sleeping or blocked task whose captured model and credential would otherwise change.
+    const reloadBlocked = async (ctx: Context): Promise<boolean> => {
+      const inspection = await harnessRef.current!.inspect(ctx);
+      return inspection.submissions.length > 0
+        || inspection.tasks.some((task) => !armedCronTimer(task.record.kind, task.state.kind));
+    };
+    /**
+     * Models resolved at open for work the configuration file cannot rebuild. A candidate that drops
+     * one from the finite allowlist would strand that work at its next resume, so it is refused.
+     */
+    const capturedBackgroundModels = (): readonly { readonly provider: string; readonly modelId: string }[] => [
+      ...(digestChoice === undefined ? [] : [digestChoice.model]),
+      ...(workerPreset === undefined ? [] : [workerPreset.model]),
+      ...(configuredSummary === undefined ? [] : [configuredSummary.model]),
+      ...(options.episodeSummary === undefined ? [] : [options.episodeSummary]),
+    ];
+    const reloadModels = async (ctx: Context): Promise<ModelReloadResult> => {
+      if (options.reloadConfig === undefined || options.models !== undefined || credentialStoreDir === undefined) {
+        return { status: "refused", reason: "unavailable" };
+      }
+      if (reloadInProgress) return { status: "busy" };
+      reloadInProgress = true;
+      let observation: CommitObservation | undefined;
+      let pending: { readonly revision: string; readonly publish: () => void } | undefined;
+      try {
+        if (await reloadBlocked(ctx)) return { status: "busy" };
+        let candidate: PortConfig;
+        try {
+          candidate = await options.reloadConfig();
+        } catch {
+          return { status: "refused", reason: "invalid" };
+        }
+        const compatibility = modelReloadCompatibility(effectiveLiveConfig(), candidate);
+        if (compatibility === "unrelated") return { status: "refused", reason: "unrelated" };
+        if (compatibility === "mode") return { status: "refused", reason: "mode" };
+        if (compatibility === "pinned") return { status: "refused", reason: "pinned" };
+        const counts = (value: PortConfig) => ({
+          models: (value.allowedModels ?? [value.model]).length,
+          presets: value.modelPresets === undefined ? 0 : Object.keys(value.modelPresets).length,
+          ...(value.modelPreset === undefined ? {} : { defaultPreset: value.modelPreset }),
+        });
+        if (compatibility === "unchanged") return { status: "unchanged", ...counts(effectiveLiveConfig()) };
+
+        let nextModels: Models;
+        let nextResolved: ResolvedModelConfiguration;
+        try {
+          nextModels = createProviderModels(
+            candidate,
+            process.env,
+            new FileCredentialStore(authStorePath(credentialStoreDir)),
+          ).models;
+          nextResolved = resolveModelConfiguration(candidate, nextModels);
+          await assertConfiguredModelAuth(nextModels, nextResolved.choices, ctx.abortSignal);
+        } catch {
+          // Parse, provider, catalog and credential failures are all a candidate this host refuses.
+          // Nothing above this point changed the live catalog or a conversation.
+          return { status: "refused", reason: "invalid" };
+        }
+        // Validation may have awaited environment or credential reads; do not apply over work that
+        // started meanwhile.
+        if (await reloadBlocked(ctx)) return { status: "busy" };
+        for (const model of capturedBackgroundModels()) {
+          if (!nextResolved.choicesByNative.has(modelKey(model))) return { status: "refused", reason: "pinned" };
+        }
+
+        // The candidate values are computed completely before anything is published: no temporary
+        // assignment to the live bindings can leak into a concurrent read while an await is pending.
+        const nextPublicPresets = publicPresetsFor(nextResolved.presetCatalog);
+        const nextDefaultAgentPolicy: AgentChange = {
+          ...hostPolicy,
+          model: nextResolved.defaultChoice.native,
+          thinkingLevel: nextResolved.defaultThinkingLevel,
+          tools: [],
+          modelTools: [],
+        };
+        const revision = randomUUID();
+        let published = false;
+        const publish = (): void => {
+          if (published) return;
+          published = true;
+          models = nextModels;
+          choices = nextResolved.choices;
+          choicesByConfigured = nextResolved.choicesByConfigured;
+          choicesByNative = nextResolved.choicesByNative;
+          configuredPresetName = nextResolved.configuredPresetName;
+          presetCatalog = nextResolved.presetCatalog;
+          defaultChoice = nextResolved.defaultChoice;
+          defaultThinkingLevel = nextResolved.defaultThinkingLevel;
+          publicPresets = nextPublicPresets;
+          defaultAgentPolicy = nextDefaultAgentPolicy;
+          liveModelConfig = candidate;
+        };
+        pending = { revision, publish };
+        observation = harness!.observeCommits({
+          // Synchronous assignments only: publishes the candidate exactly when Storage stored the
+          // commit carrying this revision document. It never awaits, throws or calls the Session.
+          advance: (publication: CommitPublication) => {
+            const awaiting = pending;
+            if (awaiting === undefined || !publicationCarriesRevision(publication, awaiting.revision)) return;
+            pending = undefined;
+            awaiting.publish();
+          },
+          end: () => {},
+        });
+        const outcome = await (async () => {
+          try {
+            return await root.commit(async (tx) => {
+              // Definitive gate on the Session line: no submission, task creation or configuration
+              // commit can interleave with these reads and writes. Native nonterminal states are
+              // scanned one status at a time so a long terminal history costs no full scan.
+              for (const status of ["pending", "running", "waiting", "sleeping", "completing"] as const) {
+                let taskCursor: Cursor | undefined;
+                do {
+                  const page = await tx.scanTasks({ status }, 1000, taskCursor);
+                  for (const record of page.items) {
+                    if (!armedCronTimer(record.kind, record.state.status)) return { kind: "busy" } as const;
+                  }
+                  taskCursor = page.next;
+                } while (taskCursor !== undefined);
+              }
+              // A managed MCP edit rewrites the same file and updates the live block; any other MCP
+              // change that landed while the candidate was validated stays a startup-only refusal.
+              if (modelReloadCompatibility(effectiveLiveConfig(), candidate) !== "reloadable") {
+                return { kind: "unrelated" } as const;
+              }
+              for (const model of capturedBackgroundModels()) {
+                if (!nextResolved.choicesByNative.has(modelKey(model))) return { kind: "pinned" } as const;
+              }
+              // A queued or placed owner input is refused in the same commit that would repolicy the
+              // conversation, so no admitted turn can begin under a policy this reload replaced.
+              for (const conversationId of authorizedChatConversations) {
+                const live = await tx.doc(LiveDoc, conversationId);
+                if (live.run !== undefined) return { kind: "busy" } as const;
+                const inbox = await tx.doc(InboxDoc, conversationId);
+                if (inbox.items.length > 0) return { kind: "busy" } as const;
+              }
+              // Only foreground mapped chats are repolicied. An automation, worker or digest target
+              // keeps the exact model, thinking level and per-run authority prepared for its run.
+              for (const conversationId of authorizedChatConversations) {
+                if (automationConversations.has(conversationId) || workerChildConversations.has(conversationId)
+                  || digestTargetConversations.has(conversationId) || scheduledRunTargets.has(conversationId)) {
+                  continue;
+                }
+                const state = await tx.doc(AgentDoc, conversationId);
+                const change = policyAgainst(nextResolved, state, nextResolved.configuredPresetName !== undefined);
+                await configure(tx, conversationId, {
+                  model: change.model ?? null,
+                  thinkingLevel: change.thinkingLevel ?? null,
+                });
+              }
+              const doc = await tx.doc(ModelPolicyRevisionDoc);
+              doc.revision = revision;
+              return { kind: "applied" } as const;
+            }, ctx);
+          } finally {
+            // The commit either published (the observer runs before its wait resolves) or stored
+            // nothing; the pending candidate is dropped either way.
+            observation?.detach();
+            observation = undefined;
+            pending = undefined;
+          }
+        })();
+        if (outcome.kind === "busy") return { status: "busy" };
+        if (outcome.kind === "unrelated") return { status: "refused", reason: "unrelated" };
+        if (outcome.kind === "pinned") return { status: "refused", reason: "pinned" };
+        // Durable publishes a stored commit to `observeCommits()` observers before the commit's wait
+        // resolves. This fallback is a no-op unless that ever changed, and keeps the in-memory
+        // catalog consistent with the commit that really landed.
+        publish();
+        return { status: "reloaded", ...counts(candidate) };
+      } finally {
+        observation?.detach();
+        pending = undefined;
+        reloadInProgress = false;
+      }
+    };
     const gateway: Gateway = {
       harness,
       memorySearch: (caller, query, ctx) => {
@@ -3716,6 +3930,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           thinkingLevel: preset.thinkingLevel ?? "off",
         }, ctx);
       },
+      ...(options.reloadConfig === undefined || options.models !== undefined ? {} : { reloadModels }),
       visionHandoffStats() {
         return visionHandoff === undefined
           ? {

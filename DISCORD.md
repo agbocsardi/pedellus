@@ -205,7 +205,7 @@ The Discord chat offers the shared owner commands, and `/help` lists exactly
 those this host implements: `/new`, `/abort` (and `/stop`), `/status`, `/model
 [preset]`, `/digest [status]`, `/restart`, `/mcp` (read-only status) and `/help
 [command]`. An unsupported command is refused with fixed text naming the surface
-that owns it (`/history` is CLI-only). `//text` sends a leading slash to the
+that owns it (`/history` and `/reload` are CLI-only). `//text` sends a leading slash to the
 assistant literally. In a mention-gated guild a typed command follows the
 mention (`@bot /status`); exactly that one leading self-mention is dropped
 before parsing.

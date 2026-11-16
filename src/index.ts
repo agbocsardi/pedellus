@@ -85,4 +85,5 @@ export {
   type GatewayMcpStatus,
   type OpenGatewayOptions,
 } from "./runtime.js";
+export type { ModelReloadResult } from "./model-reload.js";
 export { main } from "./cli.js";

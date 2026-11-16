@@ -109,6 +109,18 @@ The gateway uses stored OAuth without a login flow: a request resolves and
 refreshes the provider credential natively. `/restart` keeps the current process
 environment; a systemd environment-file change needs a service restart.
 
+The local CLI owner may run `/reload` after editing `credentials` references in
+the configuration file. It re-reads and fully validates the whole file, resolves
+the candidate provider catalog and fails closed if a referenced variable is unset
+or blank, then swaps only the foreground model catalog and provider wrappers once
+the committing transaction is stored. Values are never printed, persisted to a
+transcript or written to diagnostics. Only new work uses the rotated references: a
+reload is refused while any live task (including a sleeping or blocked background
+capture) or queued input exists, except an armed native cron timer, so no work
+admitted under the previous credential resumes under the new one. Changing
+`providers` definitions (or any non-model field) still needs `/restart`; see
+[live reload](./MODELS.md#live-reload-cli-owner-action).
+
 ## Custom compatible providers
 
 Use `providers` for an OpenAI-, Anthropic- or Google-compatible endpoint that is

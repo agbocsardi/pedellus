@@ -15,8 +15,8 @@ import type { VisionHandoff } from "./vision.js";
 
 export interface VisionHandoffHookOptions {
   readonly handoff: VisionHandoff;
-  /** Host default when a conversation has no stored model selection. */
-  readonly defaultModel: ModelReference;
+  /** Host default when a conversation has no stored model selection; read at each request. */
+  readonly defaultModel: ModelReference | (() => ModelReference);
   /**
    * Model pinned by a live prepared generation dispatch, keyed by task ID.
    * Startup recovery resets conversation state to the configured preset, but a
@@ -45,7 +45,7 @@ export function createVisionHandoffExtension(options: VisionHandoffHookOptions):
         try {
           target = options.preparedModel(api.taskId)
             ?? await selectedModel(api, context)
-            ?? options.defaultModel;
+            ?? (typeof options.defaultModel === "function" ? options.defaultModel() : options.defaultModel);
         } catch (error) {
           if (context.abortSignal?.aborted) throw error;
           return replaced(options.handoff.failClosed(request.messages));

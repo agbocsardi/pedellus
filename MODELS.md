@@ -275,6 +275,86 @@ finish before revoking that model. Generation `prepare`/`retry` and
 compaction `select` checkpoints have not selected a request model; they resume
 using the normalized current `pi.agent` choice.
 
+## Live reload (CLI owner action)
+
+`/reload` re-reads and fully validates the configuration file the gateway opened
+from, then applies only the foreground model surface without a restart:
+`model`, `allowedModels`, direct-mode `thinkingLevel`, `modelPreset`,
+`modelPresets`, and `credentials` references. It is offered only by the local CLI
+host, and only when the gateway opened from a configuration file, because that
+host owns the configuration path; the model catalog and credential reference
+remain gateway state, never a chat-granted capability. Telegram and Discord keep
+using `/restart` for model configuration changes.
+
+Before any apply the whole candidate is parsed and the fresh provider catalog and
+credential references are resolved. A candidate that changes anything else is
+refused as unrelated instead of partially applied: tools, channels, workspace
+context, MCP, `providers`, classifier, digest/worker/summary configuration,
+vision-handoff configuration, storage paths and every other startup field need
+`/restart`. Named-preset entries still referenced by `digest.preset`,
+`workers.preset`, `episodeSummary.preset` or `visionHandoff.describerPreset` must
+stay identical; with vision handoff configured the whole preset catalog is pinned,
+and a model captured at open for digestion, workers or episode summaries may not
+leave the new finite allowlist. Background model captures resolved at open are not
+reconstructed by a reload.
+
+The one exception to the startup-only rule is a managed MCP edit, which this same
+process already applied and wrote to the same file. A reload classifies the
+candidate against the *current live* MCP block, not the block read at open, so an
+owner's `mcp` add or remove does not make every later model reload look unrelated.
+Any other MCP difference, including a hand edit made outside the gateway, is still
+an unrelated refusal that needs `/restart`; a difference that appears while the
+candidate itself is being validated is rechecked before and inside the commit and
+refused the same way.
+
+Switching between direct-model and named-preset selection is restart-required and
+refused as a distinct outcome. Each attached host caches that capability when it
+attaches (the local CLI decides once whether `/model <preset>` exists), and this
+reload has no live channel to republish it. Changing models, preset entries or the
+configured default *within* the current mode is fully supported.
+
+A reload refuses any live work whatsoever, not just work it would interrupt. The
+only exception is an armed native cron timer: it sleeps until its slot and holds no
+model capture. A sleeping, blocked, waiting, pending, running or finishing task, or
+a queued owner input, refuses the reload, because such work can resume later and a
+rotated credential reference or a narrowed catalog would silently change the
+authority of work that was admitted under the previous policy. Work admitted after
+the commit uses the newly published catalog and credential references.
+
+The definitive check runs inside the atomic policy commit: one commit scans the
+native nonterminal task states, then every mapped chat's live run and inbox, and
+only then repolicies each idle chat and writes one revision document. Nothing is
+written when that check refuses, so a concurrently admitted input cannot slip
+between the check and the commit. Only foreground mapped chats are repolicied: an
+isolated scheduled run's automation conversation keeps the exact model, thinking
+level and per-run captured authority prepared for its run, and worker and digest
+targets are untouched. Named-preset chats reset to the new configured default (the
+same rule as a reopen); direct-mode chats keep a still-allowed selection. New
+conversations use the new default.
+
+The new provider catalog is published only together with the commit that Storage
+actually stored. Reload attaches a synchronous `observeCommits()` observer, matches
+the exact commit that carries its random revision document, and only there assigns
+the live registry, catalog and credential wrappers. No global is assigned while a
+validation await is pending, a refused or failed commit publishes nothing, and no
+Durable internal registry or checkpoint is mutated. The catalog reaches Durable
+through the public `HarnessOptions.models` function seam (resolved at each
+generation, compaction, hook and tool call) and the vision hook re-reads the default
+at each request.
+
+Residual limits: a native cron timer that fires between the commit and its
+publication starts under the new policy, which is intended, while any other work
+admitted in that same microtask window also observes the new policy once the commit
+resolves; nothing observes a candidate that was not stored. A Storage failure fails
+the Session without publishing, and recovery reopens from what was stored. There is
+no file watcher, no automatic retry and no drain or scheduling pause.
+
+Credential values are never read into a notice, transcript or diagnostic. A
+configured environment reference that is unset or blank fails the whole reload
+closed, and an explicit reference never falls back to ambient provider variables.
+The status line reports only counts and the default preset name. There is no file
+watcher and no automatic retry.
+
 This guard follows Durable 1.5.0's public task records and dispatch paths:
 `generation.ts` resolves the checkpoint model before streaming or polling, while
 `compaction.ts` resolves it before summarization. The scan covers those model

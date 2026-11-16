@@ -74,7 +74,11 @@ rebuilds the assembled workspace prompt from the current files, so a host with a
 prompt snapshot refuses it while that chat has a running turn rather than
 half-applying; there is no separate `/refresh` command. Routine command receipts
 are terse ("Context reset.", "Idle. Queue cleared."); status views retain
-their data. `/restart` is a full
+their data. The CLI-only `/reload` owner action validates the whole
+configuration file and applies only foreground model presets/selection and
+credential references, refusing while any live work or queued input exists (an
+armed native cron timer is the one exception) and refusing a direct/preset mode
+switch; everything else needs a restart. `/restart` is a full
 process replacement: after the normal graceful teardown the same executable,
 argv and current environment are re-exec'd (POSIX `process.execve`), so current
 code and the re-read config load. Its acknowledgement is short: the replacement
