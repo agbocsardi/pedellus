@@ -4,11 +4,11 @@
 
 - [x] Digest: distinguish recoverable reads from mutation failures; safe bounded provider retry behavior.
 - [x] Isolated cron: explicit captured read-only recall/MCP authority without management or recursive scheduling.
-- [ ] Telegram conversation flow: bounded idle-message coalescing, passive reaction context.
+- [x] Telegram conversation flow: bounded idle-message coalescing, passive reaction context.
 - [x] Telegram inputs: location pins and attachment filename/MIME preservation.
 - [ ] Owner interaction: structured questions/buttons with bounded authenticated lifecycle.
-- [ ] Background progress: honest worker visibility and completion integration where supported.
-- [ ] Stale host notices: explicit safe retirement without retrying/forgetting ambiguous answers.
+- [x] Background progress: honest worker visibility and completion integration where supported (external T3 bridge unavailable).
+- [x] Stale host notices: explicit safe retirement without retrying/forgetting ambiguous answers.
 - [x] Images: bound model-facing read payloads without modifying stored originals.
 - [ ] Live model/preset/credential reload: explicit owner action with safe busy handling.
 - [x] Operational defaults: source unit PATH/memory guidance; actionable git identity failures (no invented author).
@@ -37,3 +37,5 @@ Telegram media Luna review found two P2 issues: reply pins lacked coordinates an
 Integrated image commit `b141c508` after clean independent Luna review; parent reproduced typecheck/build and all 15 image/tool-policy/vision checks under 60s (4.1s). Native Photon copies are bounded, originals untouched; native pre-processor file allocation and repeated bounded image resend remain documented limitations. Isolated cron implementation `599dbb8` is awaiting independent review; no new reviewer launched because existing implementers still fill the three-agent ceiling. Telegram coalescing/passive reactions `c7075fa6` also awaits review. Parent pre-review spotted two cron concerns to address: live MCP refresh does not include scheduled targets (revoke then re-enable could resurrect a capture), and the no-coding-extension policy branch may retire an otherwise legitimate recall/MCP-only scheduled capture. Neither cron nor coalescing is integrated at that point.
 
 Luna independently confirmed both cron concerns (P1 live revoke/re-enable, P2 empty coding ceiling). Parent fixed both in `857e2531` after integrating `5cb8eafe`; live MCP policy refresh now includes scheduled targets and persists intersections, and scheduled captures no longer depend on a coding extension. Expanded real-MCP tests exercise owner remove/re-add while a run is gated, both with `read` and with an empty coding ceiling; removed grants remain absent and recall survives. Typecheck/build and 28 cron conversation/delivery checks passed under 60s (20.8s). Findings fixed, none waived. Genuine live-run process-restart coverage remains untested; stale terminal captures/reopen and live refresh are covered.
+
+Integrated batching `0507e0fe` with review fixes `be027c0e`: same-chat sender/notice/control barriers stop merging and controls persistently seal earlier inputs; test poll thunks now observe abort. Added sender/control ordering regressions. Integrated visibility `85b60cdd` with fixes `050de743`: native deferred/retry phases never type; `/notices` also covers pending restart/reset acknowledgements, retaining their original unknown provenance in a bounded 100-record dismissal archive while freeing delivery slots. Wrong-owner/answer/replay cases remain denied. Parent focused checks passed for each worktree (14 flow, 29 notice/status); integrated 75-check run found one location-fixture assumption needing adjustment because consecutive place updates now correctly coalesce; fixed fixture to expect one answer with both locations preserved. Findings fixed, none waived. Structured-question fixes are validated in their worktree; reload review remains running.

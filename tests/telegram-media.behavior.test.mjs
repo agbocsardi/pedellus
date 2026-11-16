@@ -508,7 +508,7 @@ test('a location pin and a venue reach the turn as labeled context and nothing i
   let harness;
   try {
     harness = start(store, transport);
-    await until(() => transport.sent.filter((entry) => entry.text === 'PLACE-NOTED').length === 2, 'both place answers');
+    await until(() => transport.sent.filter((entry) => entry.text === 'PLACE-NOTED').length === 1, 'coalesced place answer');
     assert.equal(transport.getFileCalls.length, 0, 'a location never spends a getFile call');
     assert.equal(transport.downloads.length, 0, 'a location is never downloaded');
     assert.deepEqual(await mediaFiles(store.workspace), [], 'nothing is stored for a location');

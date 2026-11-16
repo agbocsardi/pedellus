@@ -166,7 +166,10 @@ edits need restart only; unit edits additionally need daemon-reload.
   keep their previous behavior. The owner gate reads before submission, so a run
   replaced in that narrow gap can still receive a steer and cause duplicate
   cron/chat delivery; that residual is explicitly documented, not claimed closed. The harness always uses native `steeringMode: "all"`: every queued steer is
-  placed together at a boundary, including worker steers; follow-up queueing is unchanged. A steer
+  placed together at a boundary, including worker steers. Telegram follow-up-mode inputs have a
+  bounded 700 ms idle coalescing window (at most three extensions, eight messages and 8,000 input
+  characters); sender, same-chat notice and control boundaries stop merging, while steer placement
+  is unchanged. Reactions are bounded passive context for the next owner input, never model turns. A steer
   that arrives at the final boundary is placed there and answered by the following
   run. Telegram stores the requested mode with the admitted message, and an absent
   or unrecognized value is conservatively follow-up queueing. A committed answer is
@@ -205,6 +208,12 @@ edits need restart only; unit edits additionally need daemon-reload.
   are temporary: a CLI reattach keeps the temporary selection, while a gateway
   restart or reopen restores the configured preset without rewriting prepared
   dispatches. Direct-model (non-preset) selection retains its persisted semantics.
+- Telegram-only `/notices` lists unknown non-answer host notices and dismisses exact same-chat
+  IDs without resending or touching model/scheduled answers. Interruption notices retain failed
+  dismissal provenance in the outbox; pending control/restart acknowledgements leave the queue only
+  in the commit that archives their original text and unknown outcome (100 records, refuse when full).
+  Typing refreshes represent only active provider generation, never tool work, deferred polls,
+  retry backoff or background keepalives. Worker status distinguishes running/waiting/queued.
 - Shared CLI, authenticated Telegram and authenticated Discord owner controls are `/new`,
   `/abort`/`/stop`, `/status`, `/model`, `/digest` and `/digest status`, plus `/restart` and
   the read-only `/mcp` status command, advertised only where the host implements
