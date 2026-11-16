@@ -15,6 +15,8 @@ import { Type } from "typebox";
 import {
   defineExtension,
   defineTool,
+  hook,
+  ToolTask,
   type ConversationId,
   type Extension,
 } from "@earendil-works/pi-durable";
@@ -26,10 +28,11 @@ import {
   buildQuestionRecords,
   markQuestionDelivered,
   markQuestionDeliveryFailed,
+  markQuestionDeliveryUnknown,
   normalizeAskInput,
   questionView,
 } from "./ask.js";
-import type { AskSurfaceRegistry } from "./surface.js";
+import { AskDeliveryUnknown, type AskSurfaceRegistry } from "./surface.js";
 
 export interface AskUserToolOptions {
   /** Live owner surfaces: the attached terminal and/or the running Telegram adapter. */
@@ -152,8 +155,13 @@ export function createAskUserTool(options: AskUserToolOptions): { readonly exten
         await api.commit(async (tx) => {
           const doc = await tx.doc(AskQuestionsDoc, api.conversationId);
           markQuestionDelivered(doc, delivered);
-          markQuestionDeliveryFailed(doc, refused);
+          const unknownId = failure instanceof AskDeliveryUnknown ? refused[0] : undefined;
+          if (unknownId !== undefined) markQuestionDeliveryUnknown(doc, unknownId);
+          markQuestionDeliveryFailed(doc, refused.filter((id) => id !== unknownId));
         }, context).catch(() => undefined);
+        if (failure instanceof AskDeliveryUnknown) {
+          return { ...errorResult("Question delivery outcome is unknown. It may have reached the owner; it is quarantined and will not be resent. Do not claim delivery or non-delivery."), control: { terminate: true } };
+        }
         return errorResult(delivered.length === 0
           ? "The owner surface did not accept the question, so it was closed. Nothing is waiting for an answer; do " +
             "not claim it was delivered."
@@ -181,5 +189,25 @@ export function createAskUserTool(options: AskUserToolOptions): { readonly exten
       };
     },
   });
-  return { extension: defineExtension({ name: "nanobot-ask-user-tool", tools: [tool] }) };
+  return { extension: defineExtension({
+    name: "nanobot-ask-user-tool", tools: [tool],
+    hooks: [hook(ToolTask, {
+      async beforeTool(call, api, context) {
+        if (call.name !== ASK_USER_TOOL_NAME) return undefined;
+        // Native terminate requires every result in the round to request it. Refuse mixed rounds
+        // before delivery, rather than display a question and let generation continue afterward.
+        const page = await api.entries({ order: "descending" }, 200, undefined, context);
+        for (const entry of page.items) {
+          for (const message of entry.model ?? []) {
+            if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+            const calls = message.content.filter((part) => part.type === "toolCall");
+            if (!calls.some((part) => part.id === call.id)) continue;
+            return calls.length === 1 ? undefined
+              : { block: "ask_user must be the only tool call in its round. Complete other work first, then ask." };
+          }
+        }
+        return { block: "The question's sole-tool round could not be verified; nothing was delivered." };
+      },
+    })],
+  }) };
 }

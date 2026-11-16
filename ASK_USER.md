@@ -35,8 +35,11 @@ The tool admits each question in the conversation's own durable document
 fork), marks it `sending`, delivers it to the live surface, then marks it
 `delivered`. It returns a bounded receipt naming the question ids, sets
 `control.terminate`, and the run ends at that tool round: no further model request
-is made and no answer is claimed in the tool result. A delivery failure marks the
-question `failed` and returns an error result, so nothing waits for an answer. A
+is made and no answer is claimed in the tool result. Asking alongside another tool is refused
+before delivery: the model must finish other work, then issue `ask_user` alone, because native
+termination requires every result in the round to request it. A definite delivery failure marks the
+question `failed`. An ambiguous external send is immediately quarantined as `unknown`, with an
+honest unknown-outcome receipt, never reported as definite non-delivery or resent. A
 crash between admission and delivery leaves `sending`; the next read quarantines it
 as `unknown` after five minutes and never re-sends it.
 
@@ -59,14 +62,17 @@ follow-up inputs over time, never a combined fabricated answer).
 - **Local terminal** has no button protocol: the question is printed with numbered
   options and the owner types an answer as an ordinary message. Attaching prints
   questions that are still open in that conversation, so a gateway restart does not
-  hide an outstanding decision. Typed answers do not claim the record; it stays open
-  until it expires, is answered through a rich surface, or is cancelled.
+  hide an outstanding decision. The next non-empty ordinary text input settles the oldest delivered
+  question for that exact session in the same commit as input admission, without duplicating the
+  answer text in question state. This frees the chat to ask again and prevents reprinting an answered
+  question on reattach. For multiple questions, successive typed inputs answer them in delivery order.
 
 Only the option label from the stored record is admitted, never the callback payload,
 so a forged or stale payload cannot inject text. The callback id, chat id, sender and
 answer are validated in that order. A reply the owner types instead of pressing a
-button is an ordinary message on any surface and does not claim the record; the
-buttons stay answerable until the question expires or `/new` cancels it.
+button is an ordinary message: Telegram and CLI atomically settle the oldest delivered question
+when admitting it. Commands, empty text and attachment-only inputs do not count as typed answers.
+A later button for that answered question is refused as a replay.
 
 ## Expiry and cancellation
 
@@ -80,8 +86,9 @@ meaningful next turn, and an expired or cancelled button is refused with fixed t
 
 ## Retention and limits
 
-At most 24 records are kept per conversation. Pending records are never evicted;
-terminal records are pruned after 30 minutes, oldest first. Questions, labels,
+At most 24 records are kept per conversation. Pending and unknown-outcome records are never evicted;
+definitive terminal records are pruned after 30 minutes, oldest first. New admissions refuse when
+retained unknown outcomes fill the bound. Questions, labels,
 descriptions, session keys and admitted answer text are bounded (500/60/200/200/600
 characters). No host path, credential, transcript entry or other chat's text is
 stored in the question document.

@@ -351,7 +351,7 @@ function pruneQuestions(questions: Draft<AskQuestionRecord>[], nowMs: number): v
       questions.splice(index, 1);
       continue;
     }
-    if (question.status === "pending") continue;
+    if (question.status === "pending" || question.status === "unknown") continue;
     const settledAt = question.answeredAtMs ?? question.expiresAtMs;
     if (nowMs - settledAt >= ASK_USER_LIMITS.retainedTerminalMs) questions.splice(index, 1);
   }
@@ -359,7 +359,7 @@ function pruneQuestions(questions: Draft<AskQuestionRecord>[], nowMs: number): v
   const excess = questions.length - ASK_USER_LIMITS.retainedRecords;
   let removed = 0;
   for (let index = 0; index < questions.length && removed < excess;) {
-    if (questions[index]!.status === "pending") {
+    if (questions[index]!.status === "pending" || questions[index]!.status === "unknown") {
       index += 1;
       continue;
     }
@@ -382,6 +382,7 @@ export function admitQuestionRecords(
   expireQuestions(doc.questions, nowMs);
   if (doc.questions.some((question) => question.status === "pending")) return "pending";
   pruneQuestions(doc.questions, nowMs);
+  if (doc.questions.length + records.length > ASK_USER_LIMITS.retainedRecords) return "invalid";
   for (const record of records) {
     if (doc.questions.some((question) => question.id === record.id)) return "invalid";
     doc.questions.push(record as Draft<AskQuestionRecord>);
@@ -408,6 +409,30 @@ export function markQuestionDeliveryFailed(doc: Draft<AskQuestionsDocument>, ids
     question.delivery = "failed";
     question.status = "failed";
   }
+}
+
+/** An ambiguous send is quarantined, retained, and never retried or reported as definite failure. */
+export function markQuestionDeliveryUnknown(doc: Draft<AskQuestionsDocument>, id: string): void {
+  const record = doc.questions.find((question) => question.id === id && question.status === "pending");
+  if (record === undefined) return;
+  record.status = "unknown";
+  record.delivery = "unknown";
+}
+
+/** The next ordinary text input answers the oldest delivered question in this exact session.
+ * Hosts call this inside the same commit as admitting that input; no answer text is duplicated here.
+ */
+export function claimTypedQuestionAnswer(
+  doc: Draft<AskQuestionsDocument>, sessionKey: string, text: string, nowMs: number,
+): string | undefined {
+  if (!Array.isArray(doc.questions) || text.trim() === "") return undefined;
+  expireQuestions(doc.questions, nowMs);
+  const record = doc.questions.find((question) => validQuestionRecord(question)
+    && question.sessionKey === sessionKey && question.status === "pending" && question.delivery === "delivered");
+  if (record === undefined) return undefined;
+  record.status = "answered";
+  record.answeredAtMs = nowMs;
+  return record.id;
 }
 
 /** Pending question views for one attach or call, expiring overdue records in place. */

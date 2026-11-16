@@ -11,6 +11,9 @@ const {
   cancelPendingQuestions,
   claimOutcomeText,
   claimQuestionAnswer,
+  claimTypedQuestionAnswer,
+  markQuestionDelivered,
+  markQuestionDeliveryUnknown,
   normalizeAskInput,
   parseQuestionCallback,
   pendingQuestionViews,
@@ -158,6 +161,26 @@ test('pending views expire overdue questions and /new cancels the rest', () => {
   assert.equal(claimOutcomeText(claimQuestionAnswer(doc, {
     questionId: next.id, optionId: 'a', sessionKey: 'telegram:7:chat:501', nowMs: T0 + 900_003,
   }).result), 'This question was cancelled.');
+});
+
+test('typed answers claim only delivered questions in their session and unknown outcomes are retained', () => {
+  const doc = store();
+  const [record] = ask();
+  admitQuestionRecords(doc, [record], T0);
+  assert.equal(claimTypedQuestionAnswer(doc, record.sessionKey, 'yes', T0 + 1), undefined);
+  markQuestionDelivered(doc, [record.id]);
+  assert.equal(claimTypedQuestionAnswer(doc, 'foreign', 'yes', T0 + 1), undefined);
+  assert.equal(claimTypedQuestionAnswer(doc, record.sessionKey, ' ', T0 + 1), undefined);
+  assert.equal(claimTypedQuestionAnswer(doc, record.sessionKey, 'my answer', T0 + 1), record.id);
+  assert.equal(claimTypedQuestionAnswer(doc, record.sessionKey, 'replay', T0 + 2), undefined);
+  for (let index = 0; index < ASK_USER_LIMITS.retainedRecords; index++) {
+    const [unknown] = ask({ idFor: () => index.toString(16).padStart(10, '0') });
+    unknown.status = 'pending';
+    doc.questions.push(unknown);
+    markQuestionDeliveryUnknown(doc, unknown.id);
+  }
+  assert.equal(admitQuestionRecords(doc, ask({ idFor: () => 'ffffffffff' }), T0 + 10_000_000), 'invalid');
+  assert.equal(doc.questions.filter((entry) => entry.status === 'unknown').length, ASK_USER_LIMITS.retainedRecords);
 });
 
 test('callback payloads are opaque, bounded and parsed only for this prefix and option set', () => {

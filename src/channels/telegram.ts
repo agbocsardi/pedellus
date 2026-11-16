@@ -32,6 +32,8 @@ import {
   AskQuestionsDoc,
   claimOutcomeText,
   claimQuestionAnswer,
+  claimTypedQuestionAnswer,
+  AskDeliveryUnknown,
   parseQuestionCallback,
   questionCallbackData,
   renderQuestionText,
@@ -2670,7 +2672,12 @@ export async function runTelegram(
     async deliverQuestion(sessionKey, question) {
       const owner = ownerChatFor(sessionKey);
       if (owner === undefined) throw new Error("the requesting Telegram owner chat is no longer authorized");
-      await sendAskQuestion(owner.chatId, question);
+      try {
+        await sendAskQuestion(owner.chatId, question);
+      } catch (error) {
+        if (error instanceof TelegramApiError && error.outcome === "unknown") throw new AskDeliveryUnknown();
+        throw error;
+      }
     },
   });
   journalEvent("telegram.polling", { "queue.depth": state.pending.length });
@@ -2780,13 +2787,16 @@ export async function runTelegram(
             ? body
             : `${incomingContextText({ messageId: message.message_id, replyTo: quoted.context })}\n${body}`;
           const observedAtMs = Date.now();
+          const answerConversation = message.text?.trim() ? await gateway.conversationFor(sessionKey, adapterContext) : undefined;
           state = await stateConversation.commit(async (tx) => {
             const doc = await tx.doc(TelegramState, stateConversation.id);
             if (!doc.pending.some((entry) => entry.updateId === update.update_id)) {
               if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
-              // Reactions already retained for this chat become passive context for this input and are
-              // consumed in the same commit, so a crash cannot attach them twice.
+              // Reactions and a typed question answer settle with this exact durable admission.
               const reactions = takeReactionContextText(doc.reactionContext, message.chat.id, observedAtMs);
+              if (answerConversation !== undefined) {
+                claimTypedQuestionAnswer(await tx.doc(AskQuestionsDoc, answerConversation.id), sessionKey, message.text!, observedAtMs);
+              }
               doc.pending.push({
                 updateId: update.update_id,
                 nextChunkIndex: 0,

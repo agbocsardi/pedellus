@@ -526,7 +526,9 @@ class LocalConnection {
     const conversation = await this.options.gateway.conversationFor(sessionKey, this.scope.context);
     this.gatewayConversation = conversation;
     this.sessionKey = sessionKey;
-    this.surface = inProcessTerminalConversation(conversation, this.options.followUpMode ?? "followUp");
+    this.surface = inProcessTerminalConversation(conversation, this.options.followUpMode ?? "followUp", {
+      sessionKey, harness: this.options.gateway.harness,
+    });
     this.detachMcpSurface = this.options.gateway.mcpSurfaces?.attach({
       owns: (candidate) => candidate === sessionKey,
       deliverAuthorization: async (target, authorization) => {

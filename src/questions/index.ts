@@ -12,8 +12,10 @@ export {
   cancelPendingQuestions,
   claimOutcomeText,
   claimQuestionAnswer,
+  claimTypedQuestionAnswer,
   markQuestionDelivered,
   markQuestionDeliveryFailed,
+  markQuestionDeliveryUnknown,
   normalizeAskInput,
   parseQuestionCallback,
   pendingQuestionViews,
@@ -32,6 +34,7 @@ export {
 } from "./ask.js";
 export {
   createAskSurfaceRegistry,
+  AskDeliveryUnknown,
   type AskOwnerSurface,
   type AskSurfaceRegistry,
 } from "./surface.js";

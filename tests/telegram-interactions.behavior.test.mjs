@@ -898,7 +898,8 @@ test('an ambiguous action send is quarantined and never resent, including across
   }
 });
 
-test('a durable question renders buttons and one authenticated press admits one answer', { timeout: 20_000 }, async () => {
+for (const answerMethod of ['button', 'text']) {
+test(`a durable question accepts one authenticated ${answerMethod} answer`, { timeout: 20_000 }, async () => {
   const store = await syntheticStore('ask-user');
   store.faux.setResponses([
     () => fauxAssistantMessage([
@@ -925,9 +926,13 @@ test('a durable question renders buttons and one authenticated press admits one 
     // The turn ended at the tool round: no answer was fabricated before the owner pressed a button.
     assert.equal(transport.sent.some((entry) => entry.text === 'synthetic answer to the button'), false);
 
-    transport.pushBatch([callbackUpdate(702, question.messageId, CHAT_ID, buttons[0].callback_data)]);
-    await until(() => transport.callbacks.answers.some((entry) => entry.text === 'Answered: Yes'), 'accepted tap');
-    await until(() => transport.callbacks.edits.some((entry) => entry.messageId === question.messageId), 'keyboard removed');
+    if (answerMethod === 'button') {
+      transport.pushBatch([callbackUpdate(702, question.messageId, CHAT_ID, buttons[0].callback_data)]);
+      await until(() => transport.callbacks.answers.some((entry) => entry.text === 'Answered: Yes'), 'accepted tap');
+      await until(() => transport.callbacks.edits.some((entry) => entry.messageId === question.messageId), 'keyboard removed');
+    } else {
+      transport.pushBatch([messageUpdate(702, 102, 'my custom typed answer')]);
+    }
     await until(() => transport.sent.some((entry) => entry.text === 'synthetic answer to the button'), 'answer reply');
 
     // A replay of the same button is refused by the durable record and starts no second turn.
@@ -948,3 +953,4 @@ test('a durable question renders buttons and one authenticated press admits one 
     await cleanup(store, harness);
   }
 });
+}

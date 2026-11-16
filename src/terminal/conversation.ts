@@ -1,5 +1,6 @@
 import type { Context } from "@earendil-works/chord";
-import { AssistantEntry, LiveDoc } from "@earendil-works/pi-durable";
+import { AssistantEntry, LiveDoc, type Harness } from "@earendil-works/pi-durable";
+import { AskQuestionsDoc, claimTypedQuestionAnswer } from "../questions/ask.js";
 import type {
   Conversation,
   ConversationView,
@@ -413,6 +414,7 @@ function projectSettlement(settled: SettledSubmissionRecord): TerminalSettlement
 export function inProcessTerminalConversation(
   conversation: Conversation,
   followUpMode: FollowUpMode = "followUp",
+  owner?: { readonly sessionKey: string; readonly harness: Pick<Harness, "submission"> },
 ): TerminalConversation {
   /** Native submissions this surface admitted, oldest first. */
   const admitted: number[] = [];
@@ -443,11 +445,19 @@ export function inProcessTerminalConversation(
       };
     },
     async submit(content, context) {
-      const submission = await conversation.submit({
-        type: "input",
+      const draft = {
+        type: "input" as const,
         content,
-        whenBusy: followUpMode === "steer" && await ownerRun(context) ? "steer" : "followUp",
-      }, context);
+        whenBusy: followUpMode === "steer" && await ownerRun(context) ? "steer" as const : "followUp" as const,
+      };
+      const submission = owner !== undefined && typeof content === "string"
+        ? await owner.harness.submission(await conversation.commit(async (tx) => {
+            const id = await conversation.submit(tx, draft);
+            claimTypedQuestionAnswer(await tx.doc(AskQuestionsDoc, conversation.id), owner.sessionKey, content, Date.now());
+            return id;
+          }, context), context)
+        : await conversation.submit(draft, context);
+      if (submission === undefined) throw new Error("The admitted owner input could not be read");
       admitted.push(submission.id);
       if (admitted.length > TERMINAL_ADMITTED_SUBMISSIONS) admitted.shift();
       return {

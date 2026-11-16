@@ -14,12 +14,16 @@
 import type { Context } from "@earendil-works/chord";
 import type { AskQuestionView } from "./ask.js";
 
+export class AskDeliveryUnknown extends Error {
+  constructor() { super("Question delivery outcome is unknown"); this.name = "AskDeliveryUnknown"; }
+}
+
 export interface AskOwnerSurface {
   /** True only for the exact authenticated session this attachment owns right now. */
   owns(sessionKey: string): boolean;
   /**
-   * Render one already-durable question to the owner. Throwing means it was not delivered: the tool
-   * then closes the question so nothing waits for an answer and never claims success.
+   * Render one already-durable question. A definite refusal throws an ordinary error;
+   * an ambiguous external outcome throws AskDeliveryUnknown and is quarantined, never resent.
    */
   deliverQuestion(sessionKey: string, question: AskQuestionView, context: Context): Promise<void>;
 }

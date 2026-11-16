@@ -21,7 +21,7 @@ const { LocalGatewayError } = await import(pathToFileURL(`${pkg}/dist/local/prot
 const { runTerminalConversation } = await import(pathToFileURL(`${pkg}/dist/terminal/index.js`).href);
 const { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(pathToFileURL(`${ai}/index.js`).href);
 const { BACKGROUND_CONTEXT } = await import(pathToFileURL(`${chord}/context/index.js`).href);
-const { AskQuestionsDoc } = await import(pathToFileURL(`${pkg}/dist/questions/index.js`).href);
+const { AskQuestionsDoc, AskDeliveryUnknown } = await import(pathToFileURL(`${pkg}/dist/questions/index.js`).href);
 const { ToolResultEntry } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-durable/dist/index.js`).href);
 
 const context = BACKGROUND_CONTEXT;
@@ -650,8 +650,17 @@ test("ask_user refuses without a surface and reaches the attached CLI as durable
   const delivered = [];
   client.onAskQuestion = (question) => delivered.push(question);
   provider.setResponses([
+    fauxAssistantMessage([askCall("ask-mixed"), fauxToolCall("read", { path: "missing.md" }, { id: "mixed-read" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("mixed question was refused before delivery"),
+  ]);
+  await (await client.submit("mixed tool round", context)).wait(context);
+  assert.match(await toolResultText(conversation, "ask-mixed"), /only tool call/);
+  assert.equal(delivered.length, 0);
+  assert.equal((await askDocument(conversation)).questions.length, 0);
+  provider.setResponses([
     fauxAssistantMessage(askCall("ask-with-surface"), { stopReason: "toolUse" }),
     fauxAssistantMessage("synthetic answer to the owner decision"),
+    fauxAssistantMessage(askCall("ask-again"), { stopReason: "toolUse" }),
   ]);
 
   const asked = await client.submit("ask with this terminal attached", context);
@@ -666,8 +675,7 @@ test("ask_user refuses without a surface and reaches the attached CLI as durable
   assert.equal(doc.questions[0].status, "pending");
   assert.equal(doc.questions[0].delivery, "delivered");
 
-  // The terminal has no buttons: the owner's typed reply is an ordinary turn, and the durable
-  // question survives until the context is replaced.
+  // Typed replies settle the oldest delivered question atomically with ordinary input admission.
   const answered = await client.submit("Yes", context);
   assert.equal((await answered.wait(context)).status, "done");
   await eventually(async () => {
@@ -675,10 +683,30 @@ test("ask_user refuses without a surface and reaches the attached CLI as durable
     return page.items.some((entry) =>
       JSON.stringify(entry.model ?? []).includes("synthetic answer to the owner decision"));
   }, "the typed answer did not reach the model");
-  assert.equal((await askDocument(conversation)).questions[0].status, "pending");
-
+  assert.equal((await askDocument(conversation)).questions[0].status, "answered");
+  await (await client.submit("ask again", context)).wait(context);
+  await eventually(() => delivered.length === 2, "typed reply did not free the next question");
   await client.reset(context);
   doc = await askDocument(conversation);
-  assert.equal(doc.questions[0].status, "cancelled", "/new retires questions the new context cannot answer");
+  assert.equal(doc.questions[0].status, "answered");
+  assert.equal(doc.questions[1].status, "cancelled", "/new retires questions the new context cannot answer");
   await client.close();
+});
+
+test("ambiguous question delivery is quarantined rather than reported as non-delivery", { timeout: 15_000 }, async (t) => {
+  const { gateway, provider } = await makeEnvironment(t);
+  const conversation = await gateway.conversationFor("cli:default", context);
+  const detach = gateway.askSurfaces.attach({
+    owns: (key) => key === "cli:default",
+    async deliverQuestion() { throw new AskDeliveryUnknown(); },
+  });
+  t.after(detach);
+  provider.setResponses([fauxAssistantMessage([fauxToolCall("ask_user", {
+    questions: [{ question: "Deploy?", options: [{ label: "Yes" }, { label: "No" }] }],
+  }, { id: "ask-unknown" })], { stopReason: "toolUse" })]);
+  assert.equal((await (await conversation.submit({ type: "input", content: "ask" }, context)).wait(context)).status, "done");
+  assert.match(await toolResultText(conversation, "ask-unknown"), /outcome is unknown/);
+  const doc = await askDocument(conversation);
+  assert.equal(doc.questions[0].status, "unknown");
+  assert.equal(doc.questions[0].delivery, "unknown");
 });
