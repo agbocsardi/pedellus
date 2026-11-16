@@ -163,7 +163,13 @@ function telegramMock(batches) {
       return response(true);
     }
     if (method === 'getUpdates') {
-      if (batchIndex < batches.length) return response(batches[batchIndex++]);
+      if (batchIndex < batches.length) {
+        const batch = batches[batchIndex++];
+        if (typeof batch === 'function') {
+          return response(await Promise.race([batch(signal), hang(signal)]));
+        }
+        return response(batch);
+      }
       return hang(signal);
     }
     if (method === 'sendMessage') {
@@ -398,11 +404,19 @@ test('five native kinds upload bounded workspace files with captions from the cu
     if (calls.every((call) => transcript.includes(call.id))) return fauxAssistantMessage('FILES-SENT');
     return fauxAssistantMessage('ACK');
   }));
-  const transport = telegramMock([[
-    messageUpdate(700, 100, 'send the files'),
-    messageUpdate(701, 200, 'other chat note', OTHER_CHAT_ID),
-    messageUpdate(702, 101, 'cross target'),
-  ]]);
+  let transport;
+  transport = telegramMock([
+    [messageUpdate(700, 100, 'send the files'), messageUpdate(701, 200, 'other chat note', OTHER_CHAT_ID)],
+    // The cross-chat attempt is admitted only after the upload turn was answered, so it is its own
+    // turn rather than part of one coalesced input.
+    async (signal) => {
+      while (!transport.sent.some((entry) => entry.text === 'FILES-SENT')) {
+        if (signal?.aborted) return [];
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      return [messageUpdate(702, 101, 'cross target')];
+    },
+  ]);
   let harness;
   try {
     harness = start(store, transport);

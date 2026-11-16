@@ -697,7 +697,9 @@ test('/model is refused atomically while this chat runs a turn', { timeout: 20_0
   const listingBatch = new Promise((resolve) => { releaseListing = resolve; });
   const transport = telegramMock([
     [textUpdate(500, 500, 'hold this turn')],
-    [textUpdate(501, 501, 'second queued input')],
+    // Admitted only after the held turn is running, so it queues in its own turn instead of joining
+    // the coalescing window of the first message.
+    async () => { await entered; return [textUpdate(501, 501, 'second queued input')]; },
     [textUpdate(502, 502, '/model deep')],
     async () => { await listingBatch; return [textUpdate(503, 503, '/model')]; },
   ]);
@@ -737,8 +739,8 @@ test('/status reports bounded current-chat metadata without a model request', { 
   const idleBatch = new Promise((resolve) => { releaseIdle = resolve; });
   const transport = telegramMock([
     [textUpdate(600, 600, 'held turn')],
-    [textUpdate(601, 601, '/status')],
-    [textUpdate(602, 602, '/status now')],
+    // The status views are admitted only while the held turn is genuinely running.
+    async () => { await entered; return [textUpdate(601, 601, '/status'), textUpdate(602, 602, '/status now')]; },
     async () => { await idleBatch; return [textUpdate(603, 603, '/status')]; },
   ]);
   let harness;

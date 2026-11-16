@@ -117,7 +117,10 @@ function telegramMock(updates, options = {}) {
   const rich = [];
   const plain = [];
   const edits = [];
-  let polled = false;
+  // A flat update list is one poll batch; nested arrays (or thunks) are successive batches, so a test
+  // can admit a later message only after an earlier answer instead of relying on one batch.
+  const batches = Array.isArray(updates[0]) ? updates : [updates];
+  let batchIndex = 0;
   let nextMessageId = 900;
   const json = (body, status = 200) => new Response(JSON.stringify(body), {
     status,
@@ -142,9 +145,16 @@ function telegramMock(updates, options = {}) {
       });
     }
     if (method === 'getUpdates') {
-      if (!polled) {
-        polled = true;
-        return response(updates);
+      if (batchIndex < batches.length) {
+        const batch = batches[batchIndex++];
+        if (typeof batch === 'function') {
+          return response(await Promise.race([batch(), new Promise((_, reject) => {
+            const aborted = () => reject(new DOMException('The operation was aborted', 'AbortError'));
+            if (signal?.aborted) return aborted();
+            signal?.addEventListener('abort', aborted, { once: true });
+          })]));
+        }
+        return response(batch);
       }
       return await new Promise((_, reject) => {
         const aborted = () => reject(new DOMException('The operation was aborted', 'AbortError'));
@@ -267,8 +277,19 @@ test('an unsupported rich method latches off and the reply is sent plain', { tim
   let harness;
   try {
     store.faux.setResponses([fauxAssistantMessage('FIRST-REPLY'), fauxAssistantMessage('SECOND-REPLY')]);
-    const transport = telegramMock(
-      [update(610, 'first'), update(611, 'second')],
+    let transport;
+    transport = telegramMock(
+      [
+        [update(610, 'first')],
+        // The second message is admitted after the first plain reply, so the latched-off method is
+        // observed on a genuinely later turn rather than inside one coalesced input.
+        async () => {
+          while (!transport.plain.some((entry) => entry.text === 'FIRST-REPLY')) {
+            await new Promise((resolve) => setImmediate(resolve));
+          }
+          return [update(611, 'second')];
+        },
+      ],
       { richFailure: () => notFound },
     );
     harness = start(store, transport);

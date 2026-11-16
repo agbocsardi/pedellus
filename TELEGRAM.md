@@ -477,7 +477,11 @@ busy-mode (`whenBusy: "steer"`); an absent value is the historical follow-up
 queueing, so no further migration is needed and a record written by an earlier
 build keeps its old semantics. A stored value other than the exact `"steer"`
 string is conservatively read as follow-up queueing rather than trusted.
-Migration validates the shapes it upgrades; invalid stored shapes fail closed.
+Version 9 adds the bounded passive reaction context and the optional coalescing
+bookkeeping on a pending record (`admittedAtMs`, `inputMessageId`,
+`coalescedParts`); versions 1–8 migrate with an empty reaction context and no
+coalescing metadata, and a legacy pending record is never merged. Migration
+validates the shapes it upgrades; invalid stored shapes fail closed.
 
 Not implemented here: tool-authority or approval commands, history commands,
 `/tools`, and any command that would widen tool authority. `/stop` is only the
@@ -548,7 +552,7 @@ message adds no authority either. This extraction feeds reference excerpts and
 observed-target text only: an ordinary inbound rich message is not admitted as a
 new turn's body, and host controls are still parsed from `message.text` alone.
 
-The channel-state document keeps two bounded sets:
+The channel-state document keeps three bounded sets:
 
 - `targets`: recently observed message identities in each private chat — every
   admitted user message (and a quoted message) plus every bot message actually
@@ -565,6 +569,13 @@ The channel-state document keeps two bounded sets:
   kind, exact chat and (for a reply/reaction) target, reply text, emoji, or the
   workspace-relative file path with its bounded caption, plus status, accepted
   chunk cursor and returned message ids.
+- `reactionContext`: at most 8 authenticated reaction changes per private chat
+  (24 in total), each one bounded summary of the target and its old/new/added/
+  removed reaction lists. A later change to the same message replaces its note;
+  the oldest is evicted beyond either bound, and a note older than one hour is
+  dropped rather than attached. These notes are passive context for the next
+  ordinary owner input in that chat, and they are consumed in the same commit
+  that admits that input.
 
 `openGateway` creates a model-facing `telegram` tool only when `config.telegram`
 is configured, and offers it only in a scope-checked mapped Telegram private-chat
@@ -631,22 +642,24 @@ new actions are denied rather than losing reconciliation evidence. Target observ
 best-effort bookkeeping: a failed target commit can make an id untargetable but
 never turns an accepted send into an ambiguous delivery.
 
-An authenticated reaction change becomes an ordinary model turn. The update's
-`user` (never `actor_chat`) must be a non-bot sender in the live allowlist, the
-chat must be private with matching durable admission evidence, and the reacted
-message must be an observed target in that chat; otherwise the update only
-advances the offset. The turn input labels the target and the old/new reaction
-lists, including added and removed emoji. Pending input and offset commit
-together and use the normal submission request id, so a replay cannot admit the
-same reaction twice and a crash before submission is recovered normally. The
-reply to a reaction turn is an ordinary unthreaded answer.
+An authenticated reaction change is retained as bounded passive context for the
+next ordinary owner input in that chat; it never starts a model turn by itself.
+The update's `user` (never `actor_chat`) must be a non-bot sender in the live
+allowlist, the chat must be private with matching durable admission evidence, and
+the reacted message must be an observed target in that chat; otherwise the update
+only advances the offset. The retained note labels the target and the
+old/new/added/removed reaction lists, including removed emoji, and is prefixed to
+the next admitted owner input in the same commit that clears it, so a replay
+cannot retain it twice and a crash cannot attach it twice. A later change to the
+same message replaces its note rather than appending another one.
 
 Telegram limitations: private-chat reaction-update delivery is unverified live.
 The installed Bot API type documentation requires administrator status for
 `message_reaction` updates, which is not a private-chat role; requesting that
 update type alone does not establish that Telegram sends it to a private bot chat.
-This adapter handles authenticated updates if received; it does not promise
-private-chat reaction-triggered turns work on the live service. Bot-generated
+This adapter handles authenticated updates if received and attaches them to the
+next owner input; it does not promise the live service delivers private-chat
+reaction updates at all. Bot-generated
 reaction events are ignored, so actions cannot start a second model loop.
 Bot API sends have no idempotency
 key; an ambiguous action or delivery is quarantined for reconciliation, not
@@ -681,6 +694,24 @@ process racing the workspace between them is not fully excluded on this host
   turn. Recovered deliveries are checked against the current allowlist;
   revoked senders' pending outputs are discarded (a known preview is best-effort
   deleted).
+- Consecutive ordinary owner messages from the same sender and chat are
+  coalesced into one turn. After the earliest record's admission, its delivery
+  holds that chat's submission place for a short idle window (700 ms), which
+  each newly admitted message resets up to three times, so one turn is at most
+  about 2.8 s away from the first message. The merge is one durable commit that
+  appends the later records' already-admitted text and attachments to the
+  earliest record in arrival order and removes those records; the merged input
+  labels each message id and keeps each message's own quoted reply block. The
+  earliest request ID is kept, so its one answer is the shared answer and a
+  later replay cannot produce a second turn. Bounds are 8 messages and 8,000
+  characters per merged input; beyond either, later messages remain their own
+  turn. A media album's separate photo/document updates use the same window.
+  Notices, controls, OAuth callbacks, scheduled deliveries, legacy records
+  without admission metadata and `followUpMode: "steer"` messages never enter
+  the window, so steering still places each message natively and a control
+  acknowledgement is delivered immediately. The window is in-memory only: a
+  restart either merges the still-pending records again or delivers them
+  separately, never both.
 - The adapter watches committed snapshots for the active input and coalesces
   partial text updates into rich `editMessageText` calls. It filters to text
   blocks only (never reasoning/thinking), explicitly flushes the final assistant

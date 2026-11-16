@@ -57,20 +57,26 @@ import {
 } from "./telegram-media.js";
 import {
   TELEGRAM_ACTION_LIMITS,
+  TELEGRAM_COALESCE_LIMITS,
   TELEGRAM_TARGET_LIMITS,
   actionFor,
   admitAction,
+  coalescedInputText,
   findTarget,
   incomingContextText,
   observeTarget,
-  reactionChangeText,
+  reactionChangeSummary,
+  retainReactionNote,
   settleActionRecord,
+  takeReactionContextText,
   targetsForChat,
   unresolvedActions,
   validTelegramFilePath,
   type TelegramActionRecord,
   type TelegramObservedTarget,
   type TelegramQuotedContext,
+  type TelegramInputPart,
+  type TelegramReactionNote,
 } from "./telegram-interactions.js";
 import { telegramLocationContext, telegramMessageContent } from "./telegram-content.js";
 import {
@@ -232,6 +238,18 @@ export type TelegramPendingDelivery = {
   noticeFormat?: "status" | "model";
   /** The acknowledgement is withheld until the command's native call returns (or reports that it is still pending). */
   hold?: boolean;
+  /**
+   * When this ordinary input was durably admitted. Absent on a legacy record; such a record is never
+   * merged with another one, because its arrival window is unknown.
+   */
+  admittedAtMs?: number;
+  /** The inbound Telegram message id this input was admitted from, for coalesced-input labels. */
+  inputMessageId?: number;
+  /**
+   * Messages this record already carries after one durable coalescing merge (the first is 1). Absent
+   * means never merged; a merged record is never merged again, so a retry cannot exceed the bound.
+   */
+  coalescedParts?: number;
 };
 /**
  * One authenticated control command. `admitted` is committed with the acknowledgement and the polling offset before
@@ -274,6 +292,8 @@ export type TelegramChannelState = {
   targets: TelegramObservedTarget[];
   /** Bounded write-ahead records of model-requested native replies and reactions. */
   actions: TelegramActionRecord[];
+  /** Bounded authenticated reaction changes kept as passive context for the next owner input. */
+  reactionContext: TelegramReactionNote[];
 };
 export type TelegramRestartRecord = {
   chatId: number;
@@ -325,13 +345,13 @@ type ChannelState = TelegramChannelState;
 // Stored alongside the adapter's stable channel conversation, not in a plaintext sidecar.
 export const TelegramState = defineDoc<ChannelState>({
   kind: "nanobot.telegram-state",
-  version: 8,
+  version: 9,
   scope: "conversation",
   history: "latest",
   fork: "initial",
   checkpointWhen: (_value, _ops, { deltasSinceBase }) => deltasSinceBase >= 64,
   migrate: (value, fromVersion) => {
-    if (fromVersion < 1 || fromVersion > 7) {
+    if (fromVersion < 1 || fromVersion > 8) {
       throw new Error(`Unsupported Telegram state version ${fromVersion}`);
     }
     if (!Array.isArray(value.pending) || value.pending.some((item) =>
@@ -361,12 +381,23 @@ export const TelegramState = defineDoc<ChannelState>({
       typeof (entry as Record<string, unknown>).senderId !== "string"))) {
       throw new Error("Stored Telegram state contains invalid restart records");
     }
+    // Passive reaction context arrived with version 9; earlier states migrate without any.
+    if (value.reactionContext !== undefined && !Array.isArray(value.reactionContext)) {
+      throw new Error("Stored Telegram state contains invalid reaction context");
+    }
     for (const item of value.pending as unknown as Record<string, unknown>[]) {
       if (item.attachments !== undefined && (!Array.isArray(item.attachments) ||
         item.attachments.some((entry: unknown) => entry === null || typeof entry !== "object" ||
           Array.isArray(entry) || typeof (entry as Record<string, unknown>).fileId !== "string" ||
           typeof (entry as Record<string, unknown>).identity !== "string"))) {
         throw new Error("Stored Telegram state contains invalid attachments");
+      }
+      // Coalescing bookkeeping is optional; a malformed value must not silently widen an input.
+      for (const key of ["admittedAtMs", "inputMessageId", "coalescedParts"] as const) {
+        const stored = item[key];
+        if (stored !== undefined && (!Number.isSafeInteger(stored) || (stored as number) < 1)) {
+          throw new Error("Stored Telegram state contains invalid pending coalescing metadata");
+        }
       }
     }
     return {
@@ -382,9 +413,13 @@ export const TelegramState = defineDoc<ChannelState>({
         ? value.origins as unknown as Record<string, TelegramOriginBinding> : {},
       targets: Array.isArray(value.targets) ? value.targets as unknown as TelegramObservedTarget[] : [],
       actions: Array.isArray(value.actions) ? value.actions as unknown as TelegramActionRecord[] : [],
+      reactionContext: Array.isArray(value.reactionContext)
+        ? value.reactionContext as unknown as TelegramReactionNote[] : [],
     };
   },
-  initial: () => ({ offset: 0, pending: [], controls: [], origins: {}, targets: [], actions: [] }),
+  initial: () => ({
+    offset: 0, pending: [], controls: [], origins: {}, targets: [], actions: [], reactionContext: [],
+  }),
 });
 
 export interface TelegramGateway {
@@ -579,6 +614,48 @@ export async function runTelegram(
     } finally {
       slot.release();
     }
+  };
+
+  /**
+   * Per-chat coalescing gate for the delivery that currently holds this chat's submission place.
+   * Each newly admitted ordinary message resets a short idle timer (up to a fixed extension cap);
+   * then the waiting delivery merges the records that arrived. Nothing here is durable: every
+   * admitted message already has its pending record and polling offset committed, so a restart either
+   * merges the surviving records again or delivers them separately — never both and never neither.
+   */
+  const coalesceWaiters = new Map<number, () => void>();
+  const coalesceTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  const coalesceExtensions = new Map<number, number>();
+
+  const finishCoalesceWindow = (chatId: number): void => {
+    const timer = coalesceTimers.get(chatId);
+    if (timer !== undefined) clearTimeout(timer);
+    coalesceTimers.delete(chatId);
+    coalesceExtensions.delete(chatId);
+    const waiter = coalesceWaiters.get(chatId);
+    coalesceWaiters.delete(chatId);
+    waiter?.();
+  };
+
+  /** Open this chat's idle window; `undefined` when the chat already has one or is stopping. */
+  const openCoalesceWindow = (chatId: number): Promise<void> | undefined => {
+    if (stopping || signal?.aborted || coalesceWaiters.has(chatId)) return undefined;
+    return new Promise<void>((resolve) => {
+      coalesceWaiters.set(chatId, resolve);
+      coalesceTimers.set(chatId,
+        setTimeout(() => finishCoalesceWindow(chatId), TELEGRAM_COALESCE_LIMITS.idleMs));
+    });
+  };
+
+  /** Let one newly admitted ordinary message extend a waiting delivery's idle window, within the cap. */
+  const extendCoalesceWindow = (chatId: number): void => {
+    const timer = coalesceTimers.get(chatId);
+    if (timer === undefined || !coalesceWaiters.has(chatId)) return;
+    const extensions = coalesceExtensions.get(chatId) ?? 0;
+    if (extensions >= TELEGRAM_COALESCE_LIMITS.maxExtensions) return;
+    clearTimeout(timer);
+    coalesceExtensions.set(chatId, extensions + 1);
+    coalesceTimers.set(chatId, setTimeout(() => finishCoalesceWindow(chatId), TELEGRAM_COALESCE_LIMITS.idleMs));
   };
 
   const outbox = gateway.cronOutbox;
@@ -1600,6 +1677,84 @@ export async function runTelegram(
     if (released) requestScheduledScan();
   };
 
+  /**
+   * An ordinary owner input a short idle window may hold open for the next one. Notices, steers,
+   * legacy records, and records already claimed by a send are excluded; a steer keeps its own native
+   * placement, so coalescing never changes busy-mode behavior.
+   */
+  const coalescableRecord = (record: PendingReply): boolean =>
+    record.notice !== true && record.hold !== true && record.whenBusy === undefined &&
+    record.deliveryStatus === undefined && record.sendIntent === undefined &&
+    record.admittedAtMs !== undefined && record.inputMessageId !== undefined &&
+    record.coalescedParts === undefined && record.nextChunkIndex === 0 && record.messageId === undefined;
+
+  /** Whether `candidate` is a later ordinary message from this same sender and chat that may join. */
+  const coalescableWith = (owner: PendingReply, candidate: PendingReply): boolean =>
+    candidate.updateId !== owner.updateId && candidate.updateId > owner.updateId &&
+    candidate.chatId === owner.chatId && candidate.sessionKey === owner.sessionKey &&
+    candidate.senderId === owner.senderId && coalescableRecord(candidate);
+
+  /**
+   * Give consecutive ordinary owner messages (and the separate updates of one media album) a bounded
+   * chance to join this turn. The wait is a short in-memory idle window; the merge itself is one
+   * commit that appends each later record's already-admitted text and attachments to this record in
+   * arrival order and removes those records. That keeps the earlier record's stable request id and
+   * its one reply, and a restart after the merge delivers the merged input once.
+   *
+   * Returns `absent` when this record is gone (already merged into an earlier delivery): the caller
+   * then stops without submitting anything, so the same input cannot run twice.
+   */
+  const coalesceAdmittedDelivery = async (item: PendingReply): Promise<"ready" | "absent"> => {
+    if (!coalescableRecord(item) || earlySubmissions.has(item.updateId)) return "ready";
+    // Already merged into an earlier delivery: submit nothing, so the same input cannot run twice.
+    if (!state.pending.some((entry) => entry.updateId === item.updateId)) return "absent";
+    const wait = openCoalesceWindow(item.chatId);
+    if (wait !== undefined) await wait;
+    if (signal?.aborted) return "ready";
+    let absent = false;
+    state = await stateConversation.commit(async (tx) => {
+      const doc = await tx.doc(TelegramState, stateConversation.id);
+      const owner = doc.pending.find((entry) => entry.updateId === item.updateId);
+      if (owner === undefined) {
+        absent = true;
+        return copyJson(doc) as unknown as ChannelState;
+      }
+      if (!coalescableRecord(owner)) return copyJson(doc) as unknown as ChannelState;
+      const parts: TelegramInputPart[] = [owner.inputMessageId === undefined
+        ? { text: owner.text }
+        : { messageId: owner.inputMessageId, text: owner.text }];
+      const attachments = [...(owner.attachments ?? [])];
+      const absorbed = new Set<number>();
+      let chars = owner.text.length;
+      for (const candidate of doc.pending) {
+        if (!coalescableWith(owner, candidate)) continue;
+        const nextChars = chars + candidate.text.length;
+        if (parts.length >= TELEGRAM_COALESCE_LIMITS.maxParts ||
+            nextChars > TELEGRAM_COALESCE_LIMITS.maxChars) break;
+        parts.push(candidate.inputMessageId === undefined
+          ? { text: candidate.text }
+          : { messageId: candidate.inputMessageId, text: candidate.text });
+        attachments.push(...(candidate.attachments ?? []));
+        absorbed.add(candidate.updateId);
+        chars = nextChars;
+      }
+      if (absorbed.size === 0) return copyJson(doc) as unknown as ChannelState;
+      owner.text = coalescedInputText(parts);
+      owner.coalescedParts = parts.length;
+      if (attachments.length > 0) owner.attachments = attachments;
+      doc.pending = doc.pending.filter((entry) => !absorbed.has(entry.updateId));
+      return copyJson(doc) as unknown as ChannelState;
+    }, adapterContext);
+    if (absent) return "absent";
+    const merged = state.pending.find((entry) => entry.updateId === item.updateId);
+    if (merged === undefined) return "absent";
+    item.text = merged.text;
+    if (merged.coalescedParts === undefined) delete item.coalescedParts;
+    else item.coalescedParts = merged.coalescedParts;
+    if (merged.attachments !== undefined) item.attachments = merged.attachments;
+    return "ready";
+  };
+
   const drain = () => {
     if (stopping || signal?.aborted) return;
     const heldChats = new Set<number>();
@@ -1654,6 +1809,11 @@ export async function runTelegram(
     // Enter this chat's submission order before any asynchronous preparation, so a slow first lookup cannot let a
     // later message submit ahead of an earlier one.
     await observeOperation("gateway.telegram.queue", {}, () => slot.prior, trace);
+    // A short, bounded idle window lets consecutive ordinary owner messages join this turn. The wait
+    // holds this chat's submission place, so a later message's own delivery cannot submit first.
+    const coalesced = await observeOperation("gateway.telegram.coalesce", {},
+      () => coalesceAdmittedDelivery(item), trace);
+    if (coalesced === "absent") return;
     // Attachment storage and local transcription happen inside this chat's admission order, before the model sees
     // anything. A failure keeps the durable record and the ordinary retry path; other chats keep polling.
     const content = await observeOperation("gateway.telegram.prepare", {},
@@ -2545,13 +2705,18 @@ export async function runTelegram(
             const doc = await tx.doc(TelegramState, stateConversation.id);
             if (!doc.pending.some((entry) => entry.updateId === update.update_id)) {
               if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
+              // Reactions already retained for this chat become passive context for this input and are
+              // consumed in the same commit, so a crash cannot attach them twice.
+              const reactions = takeReactionContextText(doc.reactionContext, message.chat.id, observedAtMs);
               doc.pending.push({
                 updateId: update.update_id,
                 nextChunkIndex: 0,
                 chatId: message.chat.id,
                 sessionKey,
                 senderId: String(message.from!.id),
-                text: input,
+                text: reactions === undefined ? input : `${reactions}\n${input}`,
+                admittedAtMs: observedAtMs,
+                inputMessageId: message.message_id,
                 ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
                 ...(attachments === undefined ? {} : { attachments }),
               });
@@ -2575,6 +2740,9 @@ export async function runTelegram(
             "attachments": attachments?.length ?? 0, "queue.depth": state.pending.length,
             "source.age_ms": Math.max(0, observedAtMs - message.date * 1000),
           });
+          // A delivery already holding this chat's place gets a short chance to take this message
+          // into the same turn; it was durably admitted above, so nothing is lost if it is not.
+          if (admittedWhenBusy === undefined) extendCoalesceWindow(message.chat.id);
           drain();
           continue;
         }
@@ -2598,6 +2766,8 @@ export async function runTelegram(
     detachMcpSurface = undefined;
     stopAllTyping();
     if (scheduledTimer !== undefined) clearInterval(scheduledTimer);
+    // Release any delivery waiting on a coalescing window, so shutdown never waits for an idle timer.
+    for (const chatId of [...coalesceWaiters.keys()]) finishCoalesceWindow(chatId);
     scope.cancel(new DOMException("Telegram adapter stopped", "AbortError"));
     await Promise.allSettled([...active, ...pendingControls, ...scheduledTasks]);
   }
@@ -2622,11 +2792,12 @@ export async function runTelegram(
   }
 
   /**
-   * One authenticated reaction change becomes an ordinary durable input. The sender is the update's
-   * `user` (never `actor_chat`), the chat must have matching private-chat admission evidence for this
-   * bot, and the reacted message must be an observed target in that exact chat; otherwise the update
-   * only advances the offset. Pending input and offset commit together, so a replay cannot admit it
-   * twice and a crash before submission is recovered by the normal delivery path.
+   * One authenticated reaction change is retained as bounded passive context for the next ordinary
+   * owner input in this chat; it never starts a model turn by itself. The sender is the update's
+   * `user` (never `actor_chat`), the chat must have matching private-chat admission evidence for
+   * this bot, and the reacted message must be an observed target in that exact chat; otherwise the
+   * update only advances the offset. The note and offset commit together, so a replay cannot retain
+   * it twice and a crash cannot lose it. A later change to the same message replaces its note.
    */
   async function handleReaction(update: Update, reaction: MessageReactionUpdated): Promise<void> {
     if (!isAllowedPrivateReaction(reaction, options.allowFrom)) {
@@ -2643,31 +2814,26 @@ export async function runTelegram(
       await persistOffset(update.update_id + 1);
       return;
     }
-    const text = reactionChangeText({
+    const text = reactionChangeSummary({
       messageId: reaction.message_id,
       target,
       oldReaction: reaction.old_reaction,
       newReaction: reaction.new_reaction,
     });
-    const sessionKey = `telegram:${identity}:chat:${chatId}`;
+    const observedAtMs = Date.now();
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
-      if (!doc.pending.some((entry) => entry.updateId === update.update_id)) {
-        if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
-        doc.pending.push({
-          updateId: update.update_id,
-          nextChunkIndex: 0,
-          chatId,
-          sessionKey,
-          senderId,
-          text,
-          ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
-        });
-      }
+      retainReactionNote(doc.reactionContext, {
+        updateId: update.update_id,
+        chatId,
+        messageId: reaction.message_id,
+        senderId,
+        text,
+        observedAtMs,
+      });
       doc.offset = Math.max(doc.offset, update.update_id + 1);
       return copyJson(doc) as unknown as ChannelState;
     }, adapterContext);
-    drain();
   }
 
   async function handleControl(

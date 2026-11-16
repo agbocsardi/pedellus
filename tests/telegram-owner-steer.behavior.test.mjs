@@ -343,13 +343,18 @@ test('messages steered across tool rounds deliver their one shared answer exactl
   }
 });
 
-test('the default follow-up mode still answers every message in its own turn', { timeout: 30_000 }, async () => {
+test('the default follow-up mode still answers a later message in its own turn', { timeout: 30_000 }, async () => {
   const store = await syntheticStore('queued');
-  const transport = telegramMock([[
-    textUpdate(10, 'first queued message'),
-    textUpdate(11, 'second queued message'),
-  ]]);
-  const script = scriptedRequests(store.faux, [
+  let script;
+  const transport = telegramMock([
+    [textUpdate(10, 'first queued message')],
+    // Admitted only after the first turn is genuinely running, outside any coalescing window.
+    async () => {
+      await script.entered;
+      return [textUpdate(11, 'second queued message')];
+    },
+  ]);
+  script = scriptedRequests(store.faux, [
     () => fauxAssistantMessage('FIRST-QUEUED-ANSWER'),
     () => fauxAssistantMessage('SECOND-QUEUED-ANSWER'),
   ]);

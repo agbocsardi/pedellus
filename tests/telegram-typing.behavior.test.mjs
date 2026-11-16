@@ -68,7 +68,9 @@ function telegramMock(identity, updates, actionFailure) {
   const original = globalThis.fetch;
   const actions = [];
   const sent = [];
-  let polled = false;
+  // A flat update list is one poll batch; nested arrays (or thunks) are successive batches.
+  const batches = Array.isArray(updates[0]) ? updates : [updates];
+  let batchIndex = 0;
   let nextMessageId = 900;
   const json = (body, status = 200) => new Response(JSON.stringify(body), {
     status,
@@ -87,9 +89,16 @@ function telegramMock(identity, updates, actionFailure) {
       });
     }
     if (method === 'getUpdates') {
-      if (!polled) {
-        polled = true;
-        return response(updates);
+      if (batchIndex < batches.length) {
+        const batch = batches[batchIndex++];
+        if (typeof batch === 'function') {
+          return response(await Promise.race([batch(signal), new Promise((_, reject) => {
+            const aborted = () => reject(new DOMException('The operation was aborted', 'AbortError'));
+            if (signal?.aborted) return aborted();
+            signal?.addEventListener('abort', aborted, { once: true });
+          })]));
+        }
+        return response(batch);
       }
       // The adapter's long poll: hold until the test stops it, then reject like a real abort.
       return await new Promise((_, reject) => {
@@ -144,6 +153,16 @@ async function until(predicate, label) {
   }
 }
 
+/** Tick the mocked clock and drain promises until `predicate` holds; no sleeping. */
+async function advanceUntil(t, predicate, label, totalMs = 20_000, stepMs = 100) {
+  for (let elapsed = 0; elapsed < totalMs; elapsed += stepMs) {
+    t.mock.timers.tick(stepMs);
+    await flush();
+    if (predicate()) return;
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
 async function start(store, transport) {
   const scope = withCancel(context);
   const adapter = runTelegram(store.gateway, {
@@ -173,7 +192,7 @@ test('typing starts during a held model turn, refreshes, and stops at settlement
   try {
     harness = await start(store, telegramMock(7, [update(700, 'slow request')]));
 
-    await until(() => harness.transport.actions.length === 1, 'initial typing action');
+    await advanceUntil(t, () => harness.transport.actions.length === 1, 'initial typing action');
     assert.deepEqual(harness.transport.actions[0], { chatId: 501, action: 'typing' });
     assert.equal(harness.transport.sent.length, 0, 'the model turn is still held');
 
@@ -193,7 +212,7 @@ test('typing starts during a held model turn, refreshes, and stops at settlement
   }
 });
 
-test('overlapping queued turns share one typing loop and shutdown ends it', { timeout: 20_000 }, async (t) => {
+test('overlapping queued turns share one typing loop and shutdown ends it', { timeout: 25_000 }, async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const store = await syntheticStore('queued');
   let harness;
@@ -203,40 +222,57 @@ test('overlapping queued turns share one typing loop and shutdown ends it', { ti
   const gate = () => new Promise((resolve) => { resolvers.push(resolve); });
   const gates = [gate(), gate(), gate()];
   let calls = 0;
+  let releaseSecond;
+  let releaseThird;
+  const secondReady = new Promise((resolve) => { releaseSecond = resolve; });
+  const thirdReady = new Promise((resolve) => { releaseThird = resolve; });
   store.faux.setResponses(Array.from({ length: 8 }, () => async () => {
     const index = calls++;
     if (index < gates.length) await gates[index];
     return fauxAssistantMessage(`reply:${index}`);
   }));
+  // Each later message is admitted only when the test says so, and its own coalescing window is
+  // advanced before the next one, so these are separate queued turns.
+  const transport = telegramMock(7, [
+    [update(710, 'first')],
+    async () => { await secondReady; return [update(711, 'second')]; },
+    async () => { await thirdReady; return [update(712, 'third')]; },
+  ]);
   try {
-    harness = await start(store, telegramMock(7, [
-      update(710, 'first'), update(711, 'second'), update(712, 'third'),
-    ]));
-
-    await until(() => harness.transport.actions.length === 1, 'one typing loop for the chat');
+    harness = await start(store, transport);
+    await advanceUntil(t, () => transport.actions.length === 1, 'one typing loop for the chat');
     await flush();
-    assert.equal(harness.transport.actions.length, 1, 'queued turns do not start a second loop');
+    assert.equal(transport.actions.length, 1, 'queued turns do not start a second loop');
+
+    releaseSecond();
+    await flush();
+    t.mock.timers.tick(1_000);
+    await flush();
+    releaseThird();
+    await flush();
+    t.mock.timers.tick(1_000);
+    await flush();
 
     t.mock.timers.tick(4_000);
-    await until(() => harness.transport.actions.length === 2, 'one shared refresh');
+    await advanceUntil(t, () => transport.actions.length >= 2, 'one shared refresh');
     await flush();
-    assert.equal(harness.transport.actions.length, 2, 'no duplicate overlapping refresh');
+    assert.equal(transport.actions.length, 2, 'no duplicate overlapping refresh');
 
     resolvers[0]();
+    await until(() => transport.sent.some((entry) => entry.text === 'reply:0'), 'first reply');
     resolvers[1]();
-    await until(() => harness.transport.sent.some((entry) => entry.text === 'reply:0')
-      && harness.transport.sent.some((entry) => entry.text === 'reply:1'), 'both released replies');
+    await until(() => transport.sent.some((entry) => entry.text === 'reply:1'), 'second reply');
 
     // The third turn never settles, so the shared loop keeps running for it.
     t.mock.timers.tick(4_000);
-    await until(() => harness.transport.actions.length === 3, 'refresh for the remaining turn');
+    await advanceUntil(t, () => transport.actions.length >= 3, 'a typing action for the remaining turn');
 
     harness.scope.cancel(new DOMException('test finished', 'AbortError'));
     await harness.adapter.catch(() => undefined);
-    const stoppedActions = harness.transport.actions.length;
+    const stoppedActions = transport.actions.length;
     t.mock.timers.tick(20_000);
     await flush();
-    assert.equal(harness.transport.actions.length, stoppedActions, 'shutdown clears the refresh timer');
+    assert.equal(transport.actions.length, stoppedActions, 'shutdown clears the refresh timer');
 
     // The adapter stopped, but Durable's model work for the third turn continues independently.
     resolvers[2]();
@@ -259,7 +295,7 @@ test('a rejected typing action never blocks the reply', { timeout: 20_000 }, asy
   try {
     harness = await start(store, telegramMock(7, [update(720, 'typing fails')], 400));
 
-    await until(() => harness.transport.actions.length === 1, 'rejected typing attempt');
+    await advanceUntil(t, () => harness.transport.actions.length === 1, 'rejected typing attempt');
     release();
     await until(() => harness.transport.sent.some((entry) => entry.text === 'REPLY-AFTER-TYPING-FAILURE'),
       'reply after the rejected typing action');

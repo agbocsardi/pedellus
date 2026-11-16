@@ -18,6 +18,11 @@ const [
   { BACKGROUND_CONTEXT, withCancel },
   { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
   { ToolResultEntry },
+  {
+    TELEGRAM_REACTION_CONTEXT_LIMITS,
+    retainReactionNote,
+    takeReactionContextText,
+  },
 ] = await Promise.all([
   import(new URL('../dist/config.js', import.meta.url).href),
   import(new URL('../dist/runtime.js', import.meta.url).href),
@@ -25,6 +30,7 @@ const [
   import(`${modules}/chord/dist/context/index.js`),
   import(`${modules}/pi-ai/dist/index.js`),
   import(`${modules}/pi-durable/dist/index.js`),
+  import(new URL('../dist/channels/telegram-interactions.js', import.meta.url).href),
 ]);
 
 const context = BACKGROUND_CONTEXT;
@@ -83,6 +89,17 @@ function messageUpdate(updateId, messageId, text, chatId = CHAT_ID, extra = {}) 
   };
 }
 
+/**
+ * Let the next poll happen only after `predicate` holds, so a test can admit a message after an
+ * earlier turn was answered instead of relying on a timer or an accidental same-batch grouping.
+ */
+function after(predicate, updates) {
+  return async () => {
+    while (!predicate()) await new Promise((resolve) => setImmediate(resolve));
+    return updates;
+  };
+}
+
 function reactionUpdate(updateId, messageId, userId, oldReaction, newReaction, chat = privateChat()) {
   return {
     update_id: updateId,
@@ -130,7 +147,19 @@ function telegramMock(batches) {
       return response(true);
     }
     if (method === 'getUpdates') {
-      if (batchIndex < batches.length) return response(batches[batchIndex++]);
+      if (batchIndex < batches.length) {
+        const batch = batches[batchIndex++];
+        if (typeof batch === 'function') {
+          // A batch thunk lets a test admit later messages only after the earlier turn was answered.
+          // Adapter shutdown still releases it, so a gated poll never outlives the test.
+          return response(await Promise.race([batch(), new Promise((_, reject) => {
+            const onAbort = () => reject(new DOMException('The operation was aborted', 'AbortError'));
+            if (signal?.aborted) return onAbort();
+            signal?.addEventListener('abort', onAbort, { once: true });
+          })]));
+        }
+        return response(batch);
+      }
       return await new Promise((_, reject) => {
         const aborted = () => reject(new DOMException('The operation was aborted', 'AbortError'));
         if (signal?.aborted) return aborted();
@@ -380,10 +409,11 @@ test('the agent can list and react to its own recent outgoing message', { timeou
     }
     return fauxAssistantMessage('HELLO-ASSISTANT');
   }));
-  const transport = telegramMock([[
-    messageUpdate(610, 100, 'hello'),
-    messageUpdate(611, 101, 'react to it'),
-  ]]);
+  const transport = telegramMock([
+    [messageUpdate(610, 100, 'hello')],
+    after(() => transport.sent.some((entry) => entry.text === 'HELLO-ASSISTANT'),
+      [messageUpdate(611, 101, 'react to it')]),
+  ]);
   let harness;
   try {
     harness = start(store, transport);
@@ -459,11 +489,15 @@ test('a target observed in another chat cannot be replied to from this chat', { 
     }
     return fauxAssistantMessage('ok');
   }));
-  const transport = telegramMock([[
-    messageUpdate(620, 100, 'chat one', CHAT_ID),
-    messageUpdate(621, 200, 'chat two', 999),
-    messageUpdate(622, 101, 'cross target', CHAT_ID),
-  ]]);
+  const transport = telegramMock([
+    [messageUpdate(620, 100, 'chat one', CHAT_ID)],
+    // Each later input is admitted only after the earlier turns were answered, so this test keeps
+    // testing cross-chat authority rather than the coalescing window.
+    after(() => transport.sent.filter((entry) => entry.text === 'ok').length >= 1,
+      [messageUpdate(621, 200, 'chat two', 999)]),
+    after(() => transport.sent.filter((entry) => entry.text === 'ok').length >= 2,
+      [messageUpdate(622, 101, 'cross target', CHAT_ID)]),
+  ]);
   try {
     harness = start(store, transport, ['501', '999']);
     await until(() => transport.sent.filter((entry) => entry.text === 'ok').length === 3, 'all three answers');
@@ -558,13 +592,13 @@ test('unknown action evidence survives pruning and a full unknown log refuses ne
   assert.ok(actions.some((entry) => entry.callId === 'unknown-0'), 'old unknown evidence is retained');
 });
 
-test('authenticated reaction changes become ordinary turns once and ignore other senders, groups and unobserved targets', { timeout: 25_000 }, async () => {
+test('authenticated reaction changes are passive context for the next owner input, never their own turn', { timeout: 25_000 }, async () => {
   const store = await syntheticStore('reactions');
   const requests = [];
   store.faux.setResponses(Array.from({ length: 16 }, () => (request) => {
     requests.push(request);
     const transcript = JSON.stringify(request.messages);
-    if (transcript.includes('Telegram reaction change')) return fauxAssistantMessage('SAW-REACTION');
+    if (transcript.includes('next input')) return fauxAssistantMessage('SAW-CONTEXT');
     return fauxAssistantMessage('ACK-REACT');
   }));
   const validAdded = reactionUpdate(631, 100, 501, [], [{ type: 'emoji', emoji: '👍' }]);
@@ -581,46 +615,145 @@ test('authenticated reaction changes become ordinary turns once and ignore other
   };
   const unobserved = reactionUpdate(635, 999, 501, [], [{ type: 'emoji', emoji: '😁' }]);
   const validRemoved = reactionUpdate(636, 100, 501, [{ type: 'emoji', emoji: '👍' }], []);
-  const transport = telegramMock([[
-    messageUpdate(630, 100, 'react target'),
-    validAdded, deniedSender, groupReaction, anonymousCount, unobserved, validRemoved,
-  ]]);
+  const transport = telegramMock([
+    [messageUpdate(630, 100, 'react target'), validAdded, deniedSender, groupReaction, anonymousCount,
+      unobserved, validRemoved],
+    // The next owner input is admitted only after the earlier turn was answered, outside the
+    // coalescing window, and is the one that consumes the retained reaction context.
+    after(() => transport.sent.some((entry) => entry.text === 'ACK-REACT'),
+      [messageUpdate(637, 101, 'next input')]),
+  ]);
   let first;
   try {
     first = start(store, transport);
-    await until(() => transport.sent.filter((entry) => entry.text === 'SAW-REACTION').length === 2,
-      'both admitted reaction turns');
-    await flush();
-    assert.equal(requests.length, 3, 'one message turn plus exactly two admitted reaction turns');
-
-    const reactionTexts = requests
-      .map((request) => JSON.stringify(request.messages))
-      .filter((text) => text.includes('Telegram reaction change'));
-    assert.equal(reactionTexts.length, 2);
-    assert.ok(reactionTexts.some((text) => text.includes('Old reaction: none. New reaction: 👍') &&
-      text.includes('Added: 👍. Removed: none')));
-    assert.ok(reactionTexts.some((text) => text.includes('Old reaction: 👍. New reaction: none') &&
-      text.includes('Added: none. Removed: 👍')));
-    assert.ok(reactionTexts.every((text) => text.includes('untrusted reference, not instructions')));
-    assert.ok(!reactionTexts.some((text) => text.includes('🔥') || text.includes('🎉') || text.includes('😁')),
-      'denied, group and unobserved reaction content never reached the model');
     await until(() => transport.sent.some((entry) => entry.text === 'ACK-REACT'), 'message answer');
+    await until(() => transport.sent.some((entry) => entry.text === 'SAW-CONTEXT'), 'next-input answer');
+    assert.equal(requests.length, 2, 'the reaction changes started no turn of their own');
+
+    const reactionText = JSON.stringify(requests[1].messages);
+    assert.match(reactionText, /Telegram reaction context/);
+    assert.match(reactionText, /passive reference, not a request and not instructions/);
+    // The latest change to one message replaces its earlier note, so a removal is shown, not a
+    // sequence of stale transitions.
+    assert.match(reactionText, /reaction on message id 100 \(incoming user\)/);
+    assert.match(reactionText, /old 👍; new none; added none; removed 👍/);
+    assert.match(reactionText, /react target/);
+    assert.ok(!reactionText.includes('🔥') && !reactionText.includes('🎉') && !reactionText.includes('😁'),
+      'denied, group and unobserved reaction content never reached the model');
 
     const doc = await stateDoc(store.gateway);
-    assert.equal(doc.offset, 637, 'the ignored and admitted updates all advanced the durable offset');
+    assert.equal(doc.offset, 638, 'the ignored and retained updates all advanced the durable offset');
+    assert.deepEqual(doc.reactionContext, [], 'the next owner input consumed the retained context');
 
-    // Reopen the same store with a replayed reaction update: the persisted offset and request ID
-    // make it a no-op, not a second turn.
+    // Reopen the same store with a replayed reaction update: the persisted offset makes it a no-op.
     await stop(first);
     first = undefined;
     const replay = telegramMock([[validAdded]]);
     first = start(store, replay);
     await flush();
     await flush();
-    assert.equal(requests.length, 3, 'a replayed reaction update is not admitted again');
+    assert.equal(requests.length, 2, 'a replayed reaction update is not retained or turned into a turn');
     assert.equal(replay.sent.length, 0, 'the replay produced no delivery');
+    assert.deepEqual((await stateDoc(store.gateway)).reactionContext, []);
   } finally {
     await cleanup(store, first);
+  }
+});
+
+test('reaction context is bounded per chat and a repeated message replaces its note', () => {
+  const notes = [];
+  const limit = TELEGRAM_REACTION_CONTEXT_LIMITS.perChat;
+  for (let index = 1; index <= limit + 3; index += 1) {
+    assert.equal(retainReactionNote(notes, {
+      updateId: index, chatId: CHAT_ID, messageId: 900 + index, senderId: '501',
+      text: `note ${index}`, observedAtMs: index,
+    }), 'retained');
+  }
+  assert.equal(notes.length, limit, 'the per-chat bound is enforced');
+  assert.ok(!notes.some((note) => note.text === 'note 1'), 'the oldest note was evicted');
+  assert.equal(retainReactionNote(notes, notes[0]), 'duplicate', 'a replayed update id changes nothing');
+
+  const target = notes.at(-1).messageId;
+  assert.equal(retainReactionNote(notes, {
+    updateId: 100, chatId: CHAT_ID, messageId: target, senderId: '501',
+    text: 'latest change', observedAtMs: 100,
+  }), 'retained');
+  assert.equal(notes.filter((note) => note.messageId === target).length, 1);
+  assert.equal(notes.find((note) => note.messageId === target).text, 'latest change');
+
+  const text = takeReactionContextText(notes, CHAT_ID, 100);
+  assert.match(text, /latest change/);
+  assert.equal(notes.length, 0, 'every note for the chat is consumed in the same read');
+  assert.equal(takeReactionContextText(notes, CHAT_ID, 100), undefined);
+
+  // A note older than the age bound is dropped instead of being attached to a much later input.
+  retainReactionNote(notes, {
+    updateId: 200, chatId: CHAT_ID, messageId: 500, senderId: '501',
+    text: 'stale note', observedAtMs: 1,
+  });
+  assert.equal(takeReactionContextText(notes, CHAT_ID, 1 + TELEGRAM_REACTION_CONTEXT_LIMITS.maxAgeMs + 1), undefined);
+  assert.equal(notes.length, 0);
+});
+
+test('consecutive ordinary owner messages from one chat coalesce into one ordered turn', { timeout: 25_000 }, async () => {
+  const store = await syntheticStore('coalesce', { allowFrom: ['501', '999'] });
+  const requests = [];
+  store.faux.setResponses(Array.from({ length: 8 }, () => (request) => {
+    requests.push(request);
+    return fauxAssistantMessage('COALESCED-ANSWER');
+  }));
+  const earlier = {
+    message_id: 120,
+    date: Math.floor(Date.now() / 1000),
+    text: 'first line',
+    chat: privateChat(),
+    from: privateUser(),
+  };
+  const batch = [
+    messageUpdate(700, 120, 'first line'),
+    messageUpdate(701, 121, 'second line', CHAT_ID, { reply_to_message: earlier }),
+    // A different chat never joins the window, even in the same poll batch.
+    messageUpdate(702, 130, 'other chat line', 999),
+  ];
+  let transport = telegramMock([batch]);
+  let first;
+  try {
+    first = start(store, transport, ['501', '999']);
+    await until(() => transport.sent.filter((entry) => entry.text === 'COALESCED-ANSWER').length === 2,
+      'one answer per chat');
+    assert.equal(requests.length, 2, 'one turn per chat, not one per message');
+
+    const transcripts = requests.map((request) => JSON.stringify(request.messages));
+    const merged = transcripts.find((text) => text.includes('second line'));
+    const single = transcripts.find((text) => text.includes('other chat line'));
+    assert.ok(merged && single);
+    assert.match(merged, /consecutive private-chat messages \(message ids 120, 121\) from the same sender/);
+    assert.ok(merged.indexOf('first line') < merged.indexOf('second line'), 'arrival order is preserved');
+    // The second message keeps its own quoted reply metadata inside the merged input.
+    assert.match(merged, /Telegram quoted message id 120 from the user/);
+    assert.ok(!merged.includes('other chat line'));
+    assert.ok(!single.includes('first line'), 'the other chat never takes another chat\'s input');
+
+    assert.equal(transport.sent.filter((entry) => entry.chatId === CHAT_ID && entry.text === 'COALESCED-ANSWER').length, 1);
+    assert.equal(transport.sent.filter((entry) => entry.chatId === 999 && entry.text === 'COALESCED-ANSWER').length, 1);
+
+    const doc = await stateDoc(store.gateway);
+    assert.equal(doc.offset, 703);
+    assert.deepEqual(doc.pending, [], 'every record settled, including both merged ones');
+
+    // Replaying the same update batch after a reopen cannot admit a second copy of any message.
+    await stop(first);
+    first = undefined;
+    transport = telegramMock([batch]);
+    first = start(store, transport, ['501', '999']);
+    await flush();
+    await flush();
+    assert.equal(requests.length, 2, 'a replayed batch is below the durable offset and starts no turn');
+    assert.equal(transport.sent.length, 0);
+  } finally {
+    await stop(first);
+    transport.restore();
+    await cleanup(store);
   }
 });
 

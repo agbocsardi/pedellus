@@ -611,6 +611,52 @@ test('a photo is stored and submitted as native image content with its relative 
   }
 });
 
+test('an album of consecutive photos coalesces into one turn that keeps every stored original', { timeout: 25_000 }, async () => {
+  const store = await syntheticStore('album', { media: { directory: 'media' } });
+  const requests = [];
+  store.faux.setResponses(Array.from({ length: 8 }, () => (request) => {
+    requests.push({ messages: request.messages });
+    return fauxAssistantMessage('ALBUM-SEEN');
+  }));
+  const secondBytes = Buffer.concat([PHOTO_BYTES, Buffer.from([0x01])]);
+  const files = new Map([
+    ['photo-a', { path: 'photos/file_a.jpg', bytes: PHOTO_BYTES, contentType: 'image/jpeg' }],
+    ['photo-b', { path: 'photos/file_b.jpg', bytes: secondBytes, contentType: 'image/jpeg' }],
+  ]);
+  // Telegram delivers one album as separate photo messages; the caption rides on one of them.
+  const transport = telegramMock([[
+    photoUpdate(511, 111, {
+      fileId: 'photo-a', uniqueId: 'unique-album-a', bytes: PHOTO_BYTES,
+      extra: { media_group_id: 'album-1' },
+    }),
+    photoUpdate(512, 112, {
+      fileId: 'photo-b', uniqueId: 'unique-album-b', bytes: secondBytes, caption: 'both of these',
+      extra: { media_group_id: 'album-1' },
+    }),
+  ]], files);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.some((entry) => entry.text === 'ALBUM-SEEN'), 'album answer');
+    assert.equal(requests.length, 1, 'one album is one turn, not one turn per photo');
+
+    const stored = await mediaFiles(store.workspace);
+    assert.equal(stored.length, 2, 'both originals are stored once');
+    const message = userMessages(requests)[0];
+    const text = messageText(message);
+    const images = message.content.filter((part) => part.type === 'image');
+    assert.equal(images.length, 2, 'both photos reach the turn as native image content');
+    assert.deepEqual(images.map((part) => part.data), [PHOTO_BYTES, secondBytes].map((bytes) => bytes.toString('base64')));
+    assert.match(text, /consecutive private-chat messages/);
+    for (const name of stored) {
+      assert.match(text, new RegExp(`Stored file \\(workspace-relative\\): media/${name}`));
+    }
+    assert.match(text, /both of these/);
+  } finally {
+    await cleanup(store, harness, transport);
+  }
+});
+
 test('an animation with its backward-compatibility document field stays unsupported and is never downloaded', { timeout: 20_000 }, async () => {
   const store = await syntheticStore('animation', { media: { directory: 'media' } });
   const requests = [];
@@ -746,18 +792,29 @@ test('a too-large or rejected Telegram file becomes a truthful note and the turn
     'big-1',
     { path: 'documents/file_9.bin', bytes: Buffer.from('x'), declaredSize: 25 * 1024 * 1024 },
   ]]);
-  const transport = telegramMock([[
-    // The message already announces an oversize file: no getFile call is spent on it.
-    documentUpdate(540, 140, {
-      fileId: 'big-1', uniqueId: 'unique-big-1', bytes: Buffer.from('x'), fileName: 'big.bin',
-      mimeType: 'application/octet-stream', declaredSize: 25 * 1024 * 1024,
-    }),
-    // This one announces a small message but getFile reports the real oversize.
-    documentUpdate(541, 141, {
-      fileId: 'big-2', uniqueId: 'unique-big-2', bytes: Buffer.from('x'), fileName: 'big2.bin',
-      mimeType: 'application/octet-stream',
-    }),
-  ]], files);
+  let transport;
+  transport = telegramMock([
+    [
+      // The message already announces an oversize file: no getFile call is spent on it.
+      documentUpdate(540, 140, {
+        fileId: 'big-1', uniqueId: 'unique-big-1', bytes: Buffer.from('x'), fileName: 'big.bin',
+        mimeType: 'application/octet-stream', declaredSize: 25 * 1024 * 1024,
+      }),
+    ],
+    // Admitted after the first answer, so these are two turns rather than one coalesced input.
+    async () => {
+      while (!transport.sent.some((entry) => entry.text === 'LARGE-NOTED')) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      return [
+        // This one announces a small message but getFile reports the real oversize.
+        documentUpdate(541, 141, {
+          fileId: 'big-2', uniqueId: 'unique-big-2', bytes: Buffer.from('x'), fileName: 'big2.bin',
+          mimeType: 'application/octet-stream',
+        }),
+      ];
+    },
+  ], files);
   files.set('big-2', { path: 'documents/file_10.bin', bytes: Buffer.from('x'), declaredSize: 25 * 1024 * 1024 });
   let harness;
   try {
@@ -846,10 +903,23 @@ test('a symlinked or hardlinked locator is refused and never written through', {
     ['link-1', { path: 'documents/file_1.txt', bytes: Buffer.from('HOSTILE ONE'), contentType: 'text/plain' }],
     ['link-2', { path: 'documents/file_2.txt', bytes: Buffer.from('HOSTILE TWO'), contentType: 'text/plain' }],
   ]);
-  const transport = telegramMock([[
-    documentUpdate(560, 160, { fileId: 'link-1', uniqueId: 'unique-link-1', bytes: Buffer.from('HOSTILE ONE'), fileName: 'one.txt', mimeType: 'text/plain' }),
-    documentUpdate(561, 161, { fileId: 'link-2', uniqueId: 'unique-link-2', bytes: Buffer.from('HOSTILE TWO'), fileName: 'two.txt', mimeType: 'text/plain' }),
-  ]], files);
+  let transport;
+  transport = telegramMock([
+    [documentUpdate(560, 160, {
+      fileId: 'link-1', uniqueId: 'unique-link-1', bytes: Buffer.from('HOSTILE ONE'),
+      fileName: 'one.txt', mimeType: 'text/plain',
+    })],
+    // Admitted after the first answer, so each refusal is its own turn.
+    async () => {
+      while (!transport.sent.some((entry) => entry.text === 'LINKS-REFUSED')) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      return [documentUpdate(561, 161, {
+        fileId: 'link-2', uniqueId: 'unique-link-2', bytes: Buffer.from('HOSTILE TWO'),
+        fileName: 'two.txt', mimeType: 'text/plain',
+      })];
+    },
+  ], files);
   let harness;
   try {
     harness = start(store, transport);
@@ -988,10 +1058,17 @@ test('the same Telegram file sent twice is stored once and every turn keeps the 
     return fauxAssistantMessage('DEDUPE-OK');
   }));
   const files = new Map([['photo-7', { path: 'photos/file_7.jpg', bytes: PHOTO_BYTES, contentType: 'image/jpeg' }]]);
-  const transport = telegramMock([[
-    photoUpdate(580, 180, { fileId: 'photo-7', uniqueId: 'unique-photo-7', bytes: PHOTO_BYTES }),
-    photoUpdate(581, 181, { fileId: 'photo-7', uniqueId: 'unique-photo-7', bytes: PHOTO_BYTES }),
-  ]], files);
+  let transport;
+  transport = telegramMock([
+    [photoUpdate(580, 180, { fileId: 'photo-7', uniqueId: 'unique-photo-7', bytes: PHOTO_BYTES })],
+    // Admitted after the first answer, so these stay two turns that share one stored original.
+    async () => {
+      while (!transport.sent.some((entry) => entry.text === 'DEDUPE-OK')) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      return [photoUpdate(581, 181, { fileId: 'photo-7', uniqueId: 'unique-photo-7', bytes: PHOTO_BYTES })];
+    },
+  ], files);
   let harness;
   try {
     harness = start(store, transport);
