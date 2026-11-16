@@ -778,7 +778,10 @@ test('silent jobs suppress success and empty answers but keep failure notices an
       assert.ok(!targetTools.includes(forbidden), `a background target must not hold ${forbidden}: ${targetTools}`);
     }
     const capture = await store.gateway.harness.snapshot(ConfigToolCaptureDoc, target, context);
-    assert.deepEqual([...capture.tools].sort(), ['read']);
+    // The capture is the origin's coding ceiling plus its read-only recall; MCP is not configured
+    // here, so no MCP registration is captured.
+    assert.deepEqual([...capture.tools].sort(),
+      ['memory_browse', 'memory_read', 'memory_search', 'read']);
 
     released = true;
     markReleased();

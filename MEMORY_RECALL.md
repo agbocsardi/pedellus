@@ -144,8 +144,14 @@ enabled by default for authenticated mapped chats; SDK `agentHistory: false`
 opts out of these model-facing tools. This switch does not remove legacy
 `Gateway.history*` SDK/local APIs or their existing tests. Ordinary workers receive
 only named memory tools captured in their authority; enabling memory recall later
-does not widen an existing worker capture. No root, fork, raw, or task-owned conversation gains
-mapped-chat history authority through a ref.
+does not widen an existing worker capture. An isolated scheduled run receives the
+tools only as an exact per-run capture from its authenticated origin (no
+scheduling, worker, channel, classifier or Code Mode authority comes with them):
+every call rechecks that durable capture against the origin and the current
+recall grant, so a narrowed config denies and reopening prunes it. No root, fork,
+raw, or other task-owned conversation gains
+mapped-chat history authority through a ref, and an automation conversation gains
+none between runs.
 
 This document specifies the approved interface and intended semantics. It makes
 no claim of live-model usefulness, production migration, or deployment acceptance.

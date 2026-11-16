@@ -127,16 +127,28 @@ host process owned by the gateway; `toolSandbox: "bwrap"` applies only to the
 shell backend and does **not** wrap MCP servers. There is no additional MCP
 confinement layer, so treat a server command as host-level authority.
 
-MCP tools are enabled in authenticated mapped ordinary chats and in ordinary workers
-with an exact per-tool capture from an authorized spawning chat. Neither requires a
-nonempty coding `toolAllowlist`. Workers may discover and compose captured MCP tools,
-but never receive Telegram, cron or recursive worker delegation. A worker-specific
-call-time hook checks its durable capture; reopening prunes it against current config,
-and completion/cancellation retires it. See [worker authority](WORKERS.md).
+MCP tools are enabled in authenticated mapped ordinary chats, in ordinary workers
+with an exact per-tool capture from an authorized spawning chat, and in an isolated
+scheduled run for the duration of one run. None requires a nonempty coding
+`toolAllowlist`. Workers may discover and compose captured MCP tools, but never
+receive Telegram, cron or recursive worker delegation. A worker-specific call-time
+hook checks its durable capture; reopening prunes it against current config, and
+completion/cancellation retires it. See [worker authority](WORKERS.md).
+
+An isolated scheduled run captures, from its authenticated origin, the exact
+registration names of the currently connected servers — nothing more; a server
+added or authorized after that run started is never added to its capture, and
+neither MCP management nor login is ever captured. The run offers those tools
+directly (it has no Code Mode or tool search to load a deferred tool), and a
+scheduled-run call-time hook rechecks the durable capture against the origin and
+the current connection on every call. Reopening prunes the capture against the
+current config and retires it for a finished run, and completion/cancellation
+retires it with the rest of the run's authority. See [cron authority](CRON.md).
 Code Mode can also be enabled independently (`codemode.enabled`). Root, state,
-forked, raw and other task-owned conversations, digest runs and scheduled-run automation conversations
-remain denied. MCP connections and their configured cwd remain gateway-owned, not
-isolated inside a worker's shell sandbox or worktree.
+forked, raw and other task-owned conversations, digest runs and every other
+scheduled-run scope remain denied, and a scheduled run's capture is never
+composable through Code Mode. MCP connections and their configured cwd remain
+gateway-owned, not isolated inside a worker's shell sandbox or worktree.
 
 The ceiling is enforced twice: the tool filter enables the tools per
 conversation, and a call-time `ToolTask` hook rechecks the conversation and the
@@ -488,8 +500,10 @@ Known limits of this slice:
   policy without a restart. There is still no lazy reconnect: an unrelated
   dropped connection makes that server's tools fail until a management action or
   a restart reconnects it.
-- No config hot reload, no per-conversation MCP selection and no scheduled-run
-  MCP authority.
+- No config hot reload, no per-conversation MCP selection by a user, and no MCP
+  authority beyond the exact per-run capture above: a scheduled run cannot
+  manage, log in to, add or remove a server, and a live configuration change
+  only narrows what its call-time hook allows.
 - Startup and connection failures are visible only as fixed failure codes on the
   SDK `gateway.mcp` surface and in `/mcp`. The codes name no cause; inspect the
   server command yourself.

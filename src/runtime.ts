@@ -1204,6 +1204,37 @@ export async function openGateway(config: PortConfig, context: Context, options:
       },
     })],
   });
+  /**
+   * Call-time authority for a live scheduled run's non-coding capture. The coding-tool hook exempts
+   * memory recall (a context tool) and MCP names (delegated to their own hook), so their exact grants
+   * are rechecked here: the durable capture must name the tool, its recorded origin must still be an
+   * authenticated mapped chat holding that capability now, and the conversation must still be a live
+   * run target. A revoked name, a narrowed config, a closed server or a retired capture fails closed.
+   */
+  const scheduledRunCapabilityExtension = defineExtension({
+    name: "nanobot-scheduled-run-capabilities",
+    hooks: [hook(ToolTask, {
+      async beforeTool(call, api, ctx) {
+        const recall = (MEMORY_TOOL_NAMES as readonly string[]).includes(call.name);
+        const mcp = mcpRef.current?.ownsTool(call.name) === true;
+        if (!recall && !mcp) return undefined;
+        if (!scheduledRunTargets.has(api.conversationId)) {
+          return { block: "Scheduled run capability is no longer active" };
+        }
+        const capture = await api.snapshot(ConfigToolCaptureDoc, api.conversationId, ctx);
+        const origin = capture?.originConversationId;
+        if (capture === undefined || typeof origin !== "number" || !Number.isSafeInteger(origin) || origin < 1
+          || !authorizedChatConversations.has(origin as ConversationId)
+          || !Array.isArray(capture.tools) || !capture.tools.includes(call.name)) {
+          return { block: `Tool ${call.name} is outside this scheduled run's captured authority` };
+        }
+        if (!scheduledRunCapabilityNames(origin as ConversationId).includes(call.name)) {
+          return { block: `Tool ${call.name} is outside the current scheduled-run grants` };
+        }
+        return undefined;
+      },
+    })],
+  });
   // Live memory-digestion targets. They are task-owned like a worker child, but deliberately get
   // no Code Mode, no MCP/web/channel/history tool and no shell: only the curation-scope hook and the
   // captured Markdown tools. The set is rebuilt from live digest tasks on reopen.
@@ -1289,10 +1320,27 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const memoryServiceRef: { current: MemoryService | undefined } = { current: undefined };
   const memoryTools = historyEnabled ? createMemoryTools({
     service: () => memoryServiceRef.current,
-    caller: (conversationId) => historyConversations.has(conversationId) || workerChildConversations.has(conversationId),
+    caller: (conversationId) => historyConversations.has(conversationId)
+      || workerChildConversations.has(conversationId)
+      || scheduledRunTargets.has(conversationId),
   }) : undefined;
   const memoryToolRegistrations = memoryTools?.extension.tools ?? [];
   const historyConversations = new Set<ConversationId>();
+  // A live scheduled run's automation target, and only until its terminal commit. It selects the
+  // capture's call-time checks and the read-only recall scope for that one run; an idle automation
+  // conversation, a chat, a worker, a digest target, a fork or the root is never in it.
+  const scheduledRunTargets = new Set<ConversationId>();
+  /**
+   * The non-coding capabilities a scheduled run may capture from its authenticated origin right now:
+   * the read-only memory recall that origin holds and the exact tools of its connected MCP servers.
+   * Scheduling, worker delegation, MCP management/login, channel actions, classifiers and Code Mode
+   * are deliberately absent, as is anything the origin does not currently hold. Every call is
+   * rechecked against the durable capture and this function, so a narrowed config denies.
+   */
+  const scheduledRunCapabilityNames = (originConversationId: ConversationId): string[] => [
+    ...(historyEnabled && historyConversations.has(originConversationId) ? [...MEMORY_TOOL_NAMES] : []),
+    ...(mcpRef.current?.toolNames ?? []),
+  ];
   // Mapped session keys own their snapshot. A scheduled run's target is tracked separately in
   // insertion order so the cap can drop an idle target instead of failing the run, and never a
   // mapped session's snapshot.
@@ -1322,6 +1370,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
       if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
       if (memoryTools !== undefined) selected.push(memoryTools.extension);
       if (webTool !== undefined) selected.push(webTool.extension);
+    } else if (scheduledRunTargets.has(conversationId)) {
+      // A live scheduled run's capture is prepared per run and retired with it. These extensions are
+      // that capture's call-time checks, not authority: the hook rechecks the durable capture and the
+      // current grants, and the MCP hook rechecks the server's live state on every call. Code Mode,
+      // tool search and MCP management are deliberately absent.
+      selected.push(scheduledRunCapabilityExtension);
+      if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
+      if (memoryTools !== undefined) selected.push(memoryTools.extension);
     }
     // A live digest target keeps its narrowing path hook across a reopen. The hook grants nothing;
     // it only refuses paths outside the curation scope and makes write create-only.
@@ -1455,8 +1511,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (owner !== undefined) {
             const capture = await tx.doc(ConfigToolCaptureDoc, targetConversationId);
             capture.originConversationId = originConversationId;
-            capture.tools = authorizedChatConversations.has(originConversationId) ? [...toolAllowlist] : [];
-            // A scheduled run never holds Code Mode or classifier authority.
+            // The captured ceiling is the origin's current authority: its configured coding tools
+            // plus the read-only recall and exact MCP tools it holds right now. Scheduling, worker
+            // delegation, MCP management/login, channel actions, classifiers and Code Mode are never
+            // captured, and every call still passes the durable-capture and current-config checks.
+            capture.tools = authorizedChatConversations.has(originConversationId)
+              ? [...toolAllowlist, ...scheduledRunCapabilityNames(originConversationId)]
+              : [];
             capture.classifierModel = null;
             captured.push(...capture.tools);
           } else {
@@ -1484,6 +1545,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // explicitly; otherwise a read-tool image would bypass the flagged-preset handoff.
           if (visionExtension !== undefined) extensions.push(visionExtension);
           if (toolExtension !== undefined) extensions.push(toolExtension);
+          // The captured recall and MCP names carry their own call-time hooks: an automation
+          // conversation gets no chat policy pass, so these have to be selected here explicitly.
+          extensions.push(scheduledRunCapabilityExtension);
+          if (mcpRef.current !== undefined) extensions.push(mcpRef.current.extension);
+          if (memoryTools !== undefined) extensions.push(memoryTools.extension);
           if (contextConversations.has(targetConversationId) && contextExtension !== undefined) {
             extensions.push(contextExtension);
           }
@@ -1494,12 +1560,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const originAgent = await tx.doc(AgentDoc, originConversationId);
           await configure(tx, targetConversationId, {
             tools,
+            // An explicit list offers deferred MCP tools directly: this run has no Code Mode or tool
+            // search to load them, and the capture is the grant.
             modelTools: tools,
             extensions,
             cwd: workspace,
             ...(originAgent.model === undefined ? {} : { model: { ...originAgent.model } }),
             ...(originAgent.thinkingLevel === undefined ? {} : { thinkingLevel: originAgent.thinkingLevel }),
           });
+          // The capture's call-time checks are live only while this run is the target's live run.
+          scheduledRunTargets.add(targetConversationId);
         },
         // A separate run target's captured authority ends with the run: retire its capture document
         // and stop offering its tools in the same commit that records the terminal outcome, so a
@@ -1510,6 +1580,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // none of its documents are retired.
         finalize: async ({ tx, job, occurrence, originConversationId, targetConversationId, background, delivery }) => {
           if (background) {
+            scheduledRunTargets.delete(targetConversationId);
             await tx.retireDoc(ConfigToolCaptureDoc, targetConversationId);
             await configure(tx, targetConversationId, { tools: [], modelTools: [] });
           }
@@ -1815,9 +1886,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const cronTools = cronToolRegistration !== undefined && cronOwners.has(conversationId)
       ? [cronToolRegistration]
       : [];
-    // Recall is read-only over mapped chats; workers need explicit captures for each tool.
+    // Recall is read-only over mapped chats; workers need explicit captures for each tool, and a
+    // live scheduled run holds only the recall tools its own capture names.
     const memoryToolsForConversation = historyEnabled
-      && (historyConversations.has(conversationId) || workerChildConversations.has(conversationId))
+      && (historyConversations.has(conversationId) || workerChildConversations.has(conversationId)
+        || scheduledRunTargets.has(conversationId))
       ? memoryToolRegistrations
       : [];
     // Telegram interaction is a scoped channel capability for one mapped private chat, not a coding
@@ -1857,10 +1930,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
     backgroundTools?: ReadonlySet<string>,
   ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
     const worker = workerChildConversations.has(conversationId);
-    const captured = worker ? backgroundTools ?? new Set<string>() : undefined;
+    const scheduledRun = scheduledRunTargets.has(conversationId);
+    const captured = worker || scheduledRun ? backgroundTools ?? new Set<string>() : undefined;
     const contextTools = contextToolsFor(conversationId).filter((tool) =>
-      !worker || captured!.has(tool.name));
-    // MCP stays deferred in both mapped chats and captured workers.
+      captured === undefined || captured.has(tool.name)
+        // A scheduled run's `skill` loader is context delivery for the snapshot installed for that
+        // run, not a captured tool, so its restored snapshot decides and it is never filtered here.
+        || (scheduledRun && tool.name === SKILL_TOOL_NAME));
+    // MCP stays deferred in mapped chats and captured workers.
     const authorized = authorizedChatConversations.has(conversationId);
     const codeModeOfferedBase = codeModeRef.current !== undefined
       && (authorized || captured?.has(CODEMODE_TOOL_NAME));
@@ -1884,6 +1961,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const modelTools = [
         ...toolFilterFromNames(names).tools,
         ...toolFilterFromNames(offered).tools,
+        // A scheduled run has no Code Mode or tool search to load a deferred tool, so the MCP tools
+        // its capture names are offered directly: the capture is the explicit grant.
+        ...(scheduledRun ? toolFilterFromNames(deferred).tools : []),
         ...contextTools,
       ];
       return { tools, modelTools };
@@ -1926,8 +2006,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const capture = await tx.doc(ConfigToolCaptureDoc, conversationId);
       const names = toolAllowlist.filter((name) =>
         backgroundTools.has(name) && capture.tools.includes(name));
+      // A scheduled run's captured recall and MCP names are re-bounded the same way, so a revoke, a
+      // narrowed config or a closed server is pruned from the durable document here and cannot
+      // return when that capability is enabled again later.
+      const origin = capture.originConversationId;
+      const originAuthorized = Number.isSafeInteger(origin) && origin > 0
+        && authorizedChatConversations.has(origin as ConversationId);
+      const capabilities = scheduledRun && originAuthorized
+        ? scheduledRunCapabilityNames(origin as ConversationId).filter((name) =>
+          backgroundTools.has(name) && capture.tools.includes(name))
+        : [];
       // Persist the prune so a later call-time check cannot revive a name the origin lost.
-      capture.tools = names;
+      capture.tools = [...names, ...capabilities];
       return withContext(names);
     }
     await tx.retireDoc(ConfigToolCaptureDoc, conversationId);
@@ -2085,8 +2175,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
         config: mcpConfig,
         workspace,
         dataDir: mcpDataDir,
+        // A live scheduled run's captured MCP tools stay callable for that run; the exact per-tool
+        // grant is checked against its durable capture by the run-capability hook below.
         isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId)
-          || workerChildConversations.has(conversationId),
+          || workerChildConversations.has(conversationId)
+          || scheduledRunTargets.has(conversationId),
         delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
       });
       replaceMcpRegistrations(mcpRef.current);
@@ -2157,6 +2250,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (workerFoundation) registry.install(workerFoundation.extension);
     if (workerTool) registry.install(workerTool.extension);
     registry.install(workerCapabilityExtension);
+    registry.install(scheduledRunCapabilityExtension);
     registry.install(memoryDigest.extension);
     registry.install(digestScopeExtension);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
@@ -2195,7 +2289,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
           workspace,
           dataDir: mcpDataDir,
           isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId)
-            || workerChildConversations.has(conversationId),
+            || workerChildConversations.has(conversationId)
+            || scheduledRunTargets.has(conversationId),
           delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
         });
         mcpRef.current = integration;
@@ -2367,7 +2462,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const memoryHost = {
       async scope(caller: ConversationId, ctx: Context, operation: typeof MEMORY_TOOL_NAMES[number]) {
         const worker = workerChildConversations.has(caller);
-        if (!historyConversations.has(caller) && !worker) throw new Error("Memory recall is unavailable in this conversation");
+        const scheduledRun = scheduledRunTargets.has(caller);
+        if (!historyConversations.has(caller) && !worker && !scheduledRun) {
+          throw new Error("Memory recall is unavailable in this conversation");
+        }
         const mapped = await mappedChatSessions(ctx);
         let workspaceRoot = workspace;
         if (worker) {
@@ -2384,6 +2482,22 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const workerRoot = workerWorkspaceRoots.get(caller);
           if (workerRoot === undefined) throw new Error("Worker workspace is unavailable; refusing memory access");
           workspaceRoot = workerRoot;
+        } else if (scheduledRun) {
+          // A scheduled run's recall is the origin's read-only recall as it is now: the durable
+          // capture must name this exact tool, and its origin must still be a mapped chat that holds
+          // recall. Notes stay in the shared workspace this run executes with; nothing about the run
+          // is authority, and a narrowed config denies instead of widening.
+          const capture = await harness!.snapshot(ConfigToolCaptureDoc, caller, ctx);
+          const origin = capture?.originConversationId;
+          if (capture === undefined || typeof origin !== "number" || !Number.isSafeInteger(origin) || origin < 1
+            || !Array.isArray(capture.tools) || capture.tools.some((name) => typeof name !== "string")
+            || (capture.classifierModel !== null && typeof capture.classifierModel !== "string")
+            || !authorizedChatConversations.has(origin as ConversationId)
+            || !mapped.some((session) => session.conversationId === origin)
+            || !capture.tools.includes(operation)
+            || !scheduledRunCapabilityNames(origin as ConversationId).includes(operation)) {
+            throw new Error("Scheduled-run memory recall is outside its live captured authority");
+          }
         } else if (!mapped.some((session) => session.conversationId === caller)) {
           throw new Error("Memory recall is unavailable in this conversation");
         }
@@ -2899,10 +3013,20 @@ export async function openGateway(config: PortConfig, context: Context, options:
     for (const { conversationId: targetConversationId, originConversationId } of runTargetCandidates) {
       const tools = new Set<string>();
       const capture = await harness.snapshot(ConfigToolCaptureDoc, targetConversationId, context);
+      // A live scheduled run's target is classified from the run task that still targets it, never
+      // from its capture: losing the capture makes it deny, not stop being a run target.
+      const scheduledRun = backgroundTargetRuns.get(targetConversationId)?.surface === "scheduled";
+      if (scheduledRun) scheduledRunTargets.add(targetConversationId);
       if (capture !== undefined && capture.originConversationId === originConversationId
         && authorizedChatConversations.has(originConversationId)) {
+        // A live scheduled run may also hold the non-coding capabilities its origin currently has;
+        // the bound is still the stored capture intersected with that, so a revoke or a new server
+        // can only narrow it, never widen what the run actually captured.
         const ceiling = workerChildPolicies.has(targetConversationId)
-          ? workerToolNames() : toolAllowlist;
+          ? workerToolNames()
+          : scheduledRun
+            ? [...toolAllowlist, ...scheduledRunCapabilityNames(originConversationId)]
+            : toolAllowlist;
         for (const name of boundedCapturedTools(capture.tools, ceiling, true)) tools.add(name);
       }
       backgroundToolBounds.set(targetConversationId, tools);

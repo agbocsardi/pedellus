@@ -6,9 +6,9 @@
 //
 // The foundation cases drive the foundation directly with a faux provider and real task waits; the
 // gateway cases drive the real Gateway and assert the automation class, authority retirement, the
-// mapped chat rule, per-run workspace context and episode cataloguing.
+// mapped chat rule, per-run workspace context, the per-run recall/MCP capture and episode cataloguing.
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -36,6 +36,9 @@ const { BACKGROUND_CONTEXT } = await load(`${chord}/context/index.js`);
 const { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentTools } = await load(
   `${ai}/index.js`,
 );
+const { ToolResultEntry } = await load(`${durable}/index.js`);
+const { mcpToolNames } = await load(`${pkg}/dist/mcp/index.js`);
+const MCP_FIXTURE = resolve(import.meta.dirname, "fixtures/mcp-stdio-server.mjs");
 const { getCurrentSystemPrompt } = await load(`${ai}/utils/transcript.js`);
 const context = BACKGROUND_CONTEXT;
 
@@ -177,6 +180,24 @@ function hostSeams(harnessRef) {
 const transcriptKinds = (page) => page.items
   .map((entry) => entry.kind)
   .filter((kind) => kind === "pi.reset" || kind === "pi.assistant" || kind === CRON_INPUT_ENTRY_KIND);
+
+/** The tools one conversation's agent offers, by registration name. */
+const offeredToolNames = (agent) => (agent.tools ?? [])
+  .map((tool) => (typeof tool === "string" ? tool : tool.name));
+
+/** Every committed tool result of one conversation, keyed by the model's tool-call ID. */
+async function toolResults(conversation) {
+  const items = (await conversation.entries({}, 500, undefined, context)).items;
+  return items.filter(ToolResultEntry.is).map((entry) => {
+    const message = entry.model?.[0];
+    return {
+      id: message?.toolCallId,
+      name: message?.toolName,
+      isError: message?.isError === true,
+      text: (message?.content ?? []).map((part) => (part.type === "text" ? part.text : "")).join("\n"),
+    };
+  });
+}
 
 /**
  * One isolated store: a faux provider, the host seams above, the cron foundation and an ownerless
@@ -1441,6 +1462,303 @@ test("a recurring run rebuilds the origin's workspace context for each episode",
         await gateway.harness.abortTask(timerTaskId, context).catch(() => undefined);
       }
       await gateway.close(context);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an isolated scheduled run captures only its origin's read-only recall and exact MCP tools", { timeout: 40_000 }, async () => {
+  // Scouts and reflections had to run in `origin` mode because an isolated run had no read-only
+  // recall and no MCP tool. The capture now carries both from the authenticated origin, and exactly
+  // them: no scheduling, worker delegation, MCP management, channel action, classifier or Code Mode.
+  // Every call is checked at call time against the durable capture and the current grants, so a
+  // narrowed capture denies while the run's captured coding tool keeps working.
+  const directory = await temp("nanobot-cron-capabilities-");
+  try {
+    const workspace = resolve(directory, "workspace");
+    await mkdir(resolve(workspace, "memory"), { recursive: true });
+    await writeFile(resolve(workspace, "memory", "notes.md"), "# Notes\n\nCAPABILITY-RECALL-MARKER\n");
+    await writeFile(resolve(workspace, "note.txt"), "CAPABILITY-READ-CONTENT\n");
+    const { openGateway } = await load(`${pkg}/dist/runtime.js`);
+    const { parseConfig } = await load(`${pkg}/dist/config.js`);
+    const providerId = "cron-capabilities-faux";
+    const model = { provider: providerId, modelId: "synthetic" };
+    const config = parseConfig({
+      workspace,
+      dataDir: resolve(directory, "state"),
+      model,
+      allowedModels: [model],
+      toolAllowlist: ["read"],
+      cron: { enabled: true, timeZone: "UTC" },
+      mcp: {
+        enabled: true,
+        servers: {
+          synthetic: { command: process.execPath, args: [MCP_FIXTURE] },
+        },
+      },
+    }, directory);
+    const echoName = mcpToolNames("synthetic", ["echo"]).get("echo");
+    const capturedMcpNames = [...mcpToolNames("synthetic", ["a-b", "a_b", "echo", "fail", "slow"]).values()];
+    const provider = fauxProvider({ provider: providerId, models: [MODEL] });
+    let releaseInspection;
+    const inspectionGate = new Promise((release) => { releaseInspection = release; });
+    let releaseNarrowing;
+    const narrowingGate = new Promise((release) => { releaseNarrowing = release; });
+    let reachedSecondRound;
+    const secondRound = new Promise((reached) => { reachedSecondRound = reached; });
+    let reachedThirdRound;
+    const thirdRound = new Promise((reached) => { reachedThirdRound = reached; });
+    let scheduledTurns = 0;
+    let addIssued = false;
+    provider.setResponses(Array.from({ length: 12 }, () => async (transcript) => {
+      const input = userTexts(transcript.messages)[0];
+      if (input === scheduledContent("capability probe")) {
+        scheduledTurns += 1;
+        // The claim commit (conversation, class marker, queue entry, capture) precedes this request.
+        if (scheduledTurns === 1) {
+          await inspectionGate;
+          return fauxAssistantMessage([
+            fauxToolCall("memory_search", { target: "notes", query: "CAPABILITY-RECALL-MARKER" }, { id: "capability-recall" }),
+            fauxToolCall(echoName, { label: "captured" }, { id: "capability-mcp" }),
+          ], { stopReason: "toolUse" });
+        }
+        // Reached only after the allowed round's tool results committed, so the capture can be
+        // narrowed in between and the same names requested again.
+        if (scheduledTurns === 2) {
+          reachedSecondRound();
+          await narrowingGate;
+          return fauxAssistantMessage([
+            fauxToolCall("memory_search", { target: "notes", query: "CAPABILITY-RECALL-MARKER" }, { id: "capability-recall-revoked" }),
+            fauxToolCall(echoName, { label: "captured" }, { id: "capability-mcp-revoked" }),
+            fauxToolCall("read", { path: "note.txt" }, { id: "capability-read" }),
+          ], { stopReason: "toolUse" });
+        }
+        // Reached only after the revoked round's own tool results committed.
+        reachedThirdRound();
+        return fauxAssistantMessage("CAPABILITY-ANSWER");
+      }
+      if (input === "schedule a capability probe" && !addIssued) {
+        addIssued = true;
+        return fauxAssistantMessage([
+          fauxToolCall("cron", { action: "add", message: "capability probe", after_seconds: 1 }, { id: "capability-add" }),
+        ], { stopReason: "toolUse" });
+      }
+      return fauxAssistantMessage("Scheduled the capability probe.");
+    }));
+    const models = createModels();
+    models.setProvider(provider.provider);
+    const gateway = await openGateway(config, context, { models });
+    try {
+      const chat = await gateway.conversationFor("cron-conversations:capabilities", context);
+      // MCP auto-enables Code Mode, so the chat holds the compositor and the cron tool; its MCP
+      // tools stay deferred there. The scheduled run below must get neither one.
+      assert.deepEqual(offeredToolNames(await chat.agent(context)).sort(),
+        ["codemode", "cron", "memory_browse", "memory_read", "memory_search", "read", "tool_search"].sort(),
+        "the origin chat holds recall, its coding tool, cron and the compositor");
+      const claimed = changeWatcher(gateway.harness, (changes) => changes.some((change) =>
+        change.type === "document" && change.record.kind === CRON_JOBS_KIND
+        && change.conversationId === chat.id && change.value !== null
+        && typeof change.value.oneOffConversationId === "number"
+        && Array.isArray(change.value.jobs) && change.value.jobs.some((job) => job.lastOutcome === null)),
+      "the scheduled run's claim");
+      const settledWatcher = changeWatcher(gateway.harness, (changes) => changes.some((change) =>
+        change.type === "document" && change.record.kind === CRON_JOBS_KIND
+        && change.conversationId === chat.id && change.value !== null
+        && Array.isArray(change.value.jobs) && change.value.jobs.some((job) => job.lastOutcome?.status === "ok")),
+      "the scheduled run to settle");
+      try {
+        const submission = await chat.submit(
+          { type: "input", content: "schedule a capability probe", requestId: "capability-request" },
+          context,
+        );
+        assert.equal((await submission.wait(context)).status, "done");
+        const publication = await claimed.promise;
+        const automationId = publication.changes
+          .find((change) => change.type === "document" && change.record.kind === CRON_JOBS_KIND
+            && change.conversationId === chat.id)?.value?.oneOffConversationId;
+        assert.equal(typeof automationId, "number", "the claim records the automation conversation");
+
+        // The capture is the origin's current authority and nothing else.
+        const capture = await gateway.harness.snapshot(ConfigToolCaptureDoc, automationId, context);
+        assert.equal(capture.originConversationId, chat.id);
+        assert.deepEqual([...capture.tools].sort(),
+          ["read", "memory_search", "memory_browse", "memory_read", ...capturedMcpNames].sort(),
+          "captured names are the coding ceiling plus recall and the exact connected MCP tools");
+        for (const name of ["codemode", "tool_search", "worker", "cron", "mcp", "telegram", "discord_history"]) {
+          assert.ok(!capture.tools.includes(name), `a scheduled run never captures ${name}`);
+        }
+        assert.equal(capture.classifierModel, null, "a scheduled run never captures a classifier");
+
+        // The run is offered those tools directly: it has no Code Mode or tool search to load a
+        // deferred MCP tool, so its captured MCP names are in the offered set.
+        const automation = await gateway.harness.conversation(automationId, context);
+        const automationTools = offeredToolNames(await automation.agent(context));
+        for (const name of ["read", "memory_search", "memory_browse", "memory_read", echoName]) {
+          assert.ok(automationTools.includes(name), `the scheduled run is offered ${name}: ${automationTools.join(", ")}`);
+        }
+        for (const name of ["codemode", "tool_search", "worker", "cron", "mcp", "telegram", "discord_history"]) {
+          assert.ok(!automationTools.includes(name), `the scheduled run is not offered ${name}`);
+        }
+        releaseInspection();
+
+        // The allowed round: recall and the captured MCP tool both run. This request is only built
+        // after their results committed.
+        await secondRound;
+        const allowed = await toolResults(automation);
+        const recall = allowed.find((result) => result.id === "capability-recall");
+        assert.ok(recall, "the recall call reached the transcript");
+        assert.equal(recall.isError, false, `recall result: ${recall.text.slice(0, 300)}`);
+        assert.match(recall.text, /memory\/notes\.md/, "the note is searched in the run's workspace");
+        const mcp = allowed.find((result) => result.id === "capability-mcp");
+        assert.ok(mcp, "the MCP call reached the transcript");
+        assert.equal(mcp.isError, false, `mcp result: ${mcp.text.slice(0, 300)}`);
+        assert.match(mcp.text, /echo:captured/, "the captured MCP tool reached the server");
+
+        // Durable revocation: the same names are removed from the capture, as a narrowed config or a
+        // reopen writes it. The revoked names deny; the still-captured coding tool keeps working.
+        await gateway.harness.commit(async (tx) => {
+          const doc = await tx.doc(ConfigToolCaptureDoc, automationId);
+          doc.tools = doc.tools.filter((name) => name === "read");
+        }, context);
+        releaseNarrowing();
+        await thirdRound;
+        const afterRevocation = await toolResults(automation);
+        const revokedRecall = afterRevocation.find((result) => result.id === "capability-recall-revoked");
+        assert.equal(revokedRecall.isError, true, "revoked recall is denied");
+        assert.match(revokedRecall.text, /captured authority/);
+        const revokedMcp = afterRevocation.find((result) => result.id === "capability-mcp-revoked");
+        assert.equal(revokedMcp.isError, true, "a revoked MCP tool is denied");
+        assert.match(revokedMcp.text, /captured authority/);
+        const read = afterRevocation.find((result) => result.id === "capability-read");
+        assert.equal(read.isError, false, `the captured coding tool still works: ${read.text.slice(0, 200)}`);
+        assert.match(read.text, /CAPABILITY-READ-CONTENT/);
+
+        // The run settles and its capture is retired with it in the same terminal commit.
+        await settledWatcher.promise;
+        assert.equal(await gateway.harness.snapshot(ConfigToolCaptureDoc, automationId, context), undefined,
+          "a finished run keeps no captured authority");
+        assert.deepEqual((await automation.agent(context)).tools, [],
+          "the automation conversation is denied between runs");
+      } finally {
+        releaseInspection();
+        releaseNarrowing();
+        claimed.stop();
+        settledWatcher.stop();
+      }
+    } finally {
+      await gateway.close(context);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a stale scheduled-run recall/MCP capture never survives a reopen", { timeout: 30_000 }, async () => {
+  // A crash before a run's terminal commit leaves its capture on the automation conversation. A
+  // reopen must not admit those names for a conversation that is no longer a live run target, and a
+  // later re-enable of recall or MCP must not resurrect them.
+  const directory = await temp("nanobot-cron-capabilities-reopen-");
+  try {
+    const workspace = resolve(directory, "workspace");
+    await mkdir(workspace);
+    const { openGateway } = await load(`${pkg}/dist/runtime.js`);
+    const { parseConfig } = await load(`${pkg}/dist/config.js`);
+    const providerId = "cron-capabilities-reopen-faux";
+    const model = { provider: providerId, modelId: "synthetic" };
+    const config = parseConfig({
+      workspace,
+      dataDir: resolve(directory, "state"),
+      model,
+      allowedModels: [model],
+      toolAllowlist: ["read"],
+      cron: { enabled: true, timeZone: "UTC" },
+      mcp: {
+        enabled: true,
+        servers: { synthetic: { command: process.execPath, args: [MCP_FIXTURE] } },
+      },
+    }, directory);
+    const echoName = mcpToolNames("synthetic", ["echo"]).get("echo");
+    const provider = fauxProvider({ provider: providerId, models: [MODEL] });
+    let addIssued = false;
+    provider.setResponses(Array.from({ length: 8 }, () => (transcript) => {
+      const input = userTexts(transcript.messages)[0];
+      if (input === scheduledContent("stale capability probe")) return fauxAssistantMessage("STALE-PROBE-ANSWER");
+      if (input === "schedule a stale capability probe" && !addIssued) {
+        addIssued = true;
+        return fauxAssistantMessage([
+          fauxToolCall("cron", { action: "add", message: "stale capability probe", after_seconds: 1 }, { id: "stale-add" }),
+        ], { stopReason: "toolUse" });
+      }
+      return fauxAssistantMessage("Scheduled the stale capability probe.");
+    }));
+    const models = createModels();
+    models.setProvider(provider.provider);
+    const sessionKey = "cron-conversations:capabilities-reopen";
+    let automationId;
+    let chatId;
+
+    const first = await openGateway(config, context, { models });
+    try {
+      const chat = await first.conversationFor(sessionKey, context);
+      chatId = chat.id;
+      const settledWatcher = changeWatcher(first.harness, (changes) => changes.some((change) => {
+        if (change.type !== "document" || change.record.kind !== CRON_JOBS_KIND
+          || change.conversationId !== chat.id || change.value === null) return false;
+        return Array.isArray(change.value.jobs)
+          && change.value.jobs.some((job) => job.lastOutcome?.status === "ok");
+      }), "the stale probe run to settle");
+      try {
+        const submission = await chat.submit(
+          { type: "input", content: "schedule a stale capability probe", requestId: "stale-request" },
+          context,
+        );
+        assert.equal((await submission.wait(context)).status, "done");
+        const publication = await settledWatcher.promise;
+        automationId = publication.changes.find((change) =>
+          change.type === "document" && change.record.kind === CRON_JOBS_KIND
+          && change.conversationId === chat.id)?.value?.jobs[0]?.lastOutcome?.conversationId;
+        assert.equal(typeof automationId, "number");
+      } finally {
+        settledWatcher.stop();
+      }
+      // A capture left behind by a run that crashed before its terminal commit.
+      await first.harness.commit(async (tx) => {
+        const capture = await tx.doc(ConfigToolCaptureDoc, automationId);
+        capture.originConversationId = chatId;
+        capture.tools = ["read", "memory_search", "memory_browse", "memory_read", echoName];
+        capture.classifierModel = null;
+      }, context);
+    } finally {
+      await first.close(context);
+    }
+
+    // Reopen with recall and MCP both withdrawn: neither the stale capture nor the automation
+    // conversation may keep them.
+    const second = await openGateway(config, context, { models, agentHistory: false });
+    try {
+      assert.equal(await second.harness.snapshot(ConfigToolCaptureDoc, automationId, context), undefined,
+        "a reopened gateway retires a capture that belongs to no live run");
+      const conversation = await second.harness.conversation(automationId, context);
+      assert.deepEqual((await conversation.agent(context)).tools, []);
+    } finally {
+      await second.close(context);
+    }
+
+    // Re-enabling recall and MCP in a later open cannot revive the retired names.
+    const third = await openGateway(config, context, { models });
+    try {
+      assert.equal(await third.harness.snapshot(ConfigToolCaptureDoc, automationId, context), undefined,
+        "a re-enabled capability never resurrects a retired capture");
+      const conversation = await third.harness.conversation(automationId, context);
+      assert.deepEqual((await conversation.agent(context)).tools, []);
+      await assert.rejects(
+        () => third.memorySearch(automationId, { target: "notes", query: "CAPABILITY-RECALL-MARKER" }, context),
+        /Memory recall is unavailable in this conversation/,
+        "an automation conversation between runs has no recall scope",
+      );
+    } finally {
+      await third.close(context);
     }
   } finally {
     await rm(directory, { recursive: true, force: true });

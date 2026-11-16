@@ -70,12 +70,14 @@ one execution. Scheduled work follows that split.
 Automation conversations are a distinct conversation class, not chats: they are ownerless so they
 outlive every run task, they carry a `nanobot.cron.conversation` marker naming their class, origin
 and job, and the origin's own job document records the same ID. They never become chat sessions,
-never appear in the session map, never receive foreground chat, channel, worker, MCP, Code Mode,
-classifier, scheduling or digest authority, and never appear to the read-only `history` tool as a
-readable chat source. A mapped session key naming anything that is not an ordinary chat
-conversation is refused when the channel resolves it, before it can become a cron owner or receive
-chat policy, so a forged or stale map entry cannot reach either path. The shared history scope rule
-classifies them explicitly (`automation`) rather
+never appear in the session map, never receive foreground chat, channel, worker, MCP management,
+Code Mode, classifier, scheduling or digest authority, and never appear to the read-only `history`
+tool as a readable chat source. A live run's target holds exactly its own prepared capture (its
+configured coding tools plus that origin's read-only recall and exact MCP tools), which is retired
+with the run; the conversation between runs holds nothing. A mapped session key naming anything that
+is not an ordinary chat conversation is refused when the channel resolves it, before it can become a
+cron owner or receive chat policy, so a forged or stale map entry cannot reach either path. The
+shared history scope rule classifies them explicitly (`automation`) rather
 than relying on them being absent from the session map.
 
 Opening a store reads the session map once and restores that class *before* any mapped key is
@@ -597,19 +599,32 @@ fault document is itself ignored rather than replacing job or outbox data.
   `prepare` callback, which also copies the origin's current model and thinking level and sets the
   configured workspace: an ownerless conversation inherits no agent state from Durable. The
   gateway records a `nanobot.config-tool-capture` document on the target with the origin
-  conversation ID and the coding-tool names the authenticated origin currently has; it offers
-  exactly those tools, so a **background** run cannot schedule another job or widen authority. A
-  different host must apply the same deny-by-default rule. The capture is a snapshot of names, not
-  a grant: every call must also remain inside the current config `toolAllowlist` and require the
+  conversation ID and the exact names the authenticated origin currently holds: its configured
+  coding tools, the read-only memory recall it has (`memory_search`, `memory_browse`, `memory_read`
+  while recall is enabled and it is a mapped chat), and the registration names of the currently
+  connected MCP servers. It offers exactly those tools, so a **background** run cannot schedule
+  another job or widen authority, and it captures no scheduling, worker delegation, MCP management
+  or login, channel action, classifier or Code Mode authority. Recall and MCP are the origin's
+  read-only/remote capabilities, not new ones: a scheduled-run call-time hook rechecks the durable
+  capture and the current grants (recall still enabled, the server still connected and configured)
+  on every call, and the recall service rechecks its own scope, so a revoked capability denies
+  instead of widening. MCP tools are offered directly rather than deferred, because a scheduled run
+  has no Code Mode or tool search to load a deferred tool. A different host must apply the same
+  deny-by-default rule. The capture is a snapshot of names, not
+  a grant: every call must also remain inside the current config `toolAllowlist` (or, for the two
+  non-coding capabilities, inside the current recall/MCP grants) and require the
   recorded origin to still be an authenticated mapped chat, so narrowing the config and reopening
-  narrows a pending run. The capture is written together with the origin conversation in the same
+  narrows a pending run. A server configured or authorized after a run started is never added to
+  that run's capture. The capture is written together with the origin conversation in the same
   commit that claims the conversation, and the foundation's optional `finalize` callback lets the
   host retire it in every terminal commit of the run (normal completion or error, target
   missing, job record missing, generation change or cancellation, and ownership fencing) and in the
   abort handler; only a phase fault or a crash before that commit defers retirement to the next
-  reopen (see below). Because preparation happens per run, a later run's authority is whatever the
-  configuration allows then, never what an earlier run held. When the origin has no known owner,
-  `prepare` records no capture and the run stays default-deny.
+  reopen (see below). A reopen re-bounds a live scheduled run against that same current ceiling and
+  the origin's current recall/MCP grants, so a revoked capability is pruned from the durable capture
+  there and cannot return when it is enabled again. Because preparation happens per run, a later
+  run's authority is whatever the configuration allows then, never what an earlier run held. When
+  the origin has no known owner, `prepare` records no capture and the run stays default-deny.
   When a context snapshot provider is configured, `prepare` also rebuilds the origin's snapshot
   for the target conversation — bootstrap/AGENTS files, memory, the skill summary — and the
   read-only `skill` tool, so a scheduled turn renders the workspace context a normal turn would see
@@ -635,14 +650,16 @@ fault document is itself ignored rather than replacing job or outbox data.
   chat sources. Episode summaries are therefore not generated for one (the catalog records the opt-in
   watermark and defers), so nothing spends a model call on text no surface can read.
 - A background run's captured tools are bounded, not independent. The config hook requires each
-  requested name to be in the current config ceiling, in that run's capture, and the recorded
-  origin to still be an authenticated mapped chat; a malformed or missing capture, or an unknown
-  origin owner, fails closed. There is no expiry and no copied grant document. Because Durable's
+  requested coding name to be in the current config ceiling, in that run's capture, and the recorded
+  origin to still be an authenticated mapped chat; the scheduled-run hook does the same for the
+  captured recall and MCP names against the current grants, and the MCP hook against the live
+  connection. A malformed or missing capture, or an unknown origin owner, fails closed. There is no expiry and no copied grant document. Because Durable's
   tool hooks run only in the call phase, the gateway also intersects every live run target before
   `resume()` with the current ceiling and its authenticated origin, so a new admission after the
   config narrowed is not offered the removed tool. A committed `execute` intent for a native coding
-  tool is `unsafe` and settles as interrupted rather than rerunning. Every terminal commit of a run
-  that already prepared a separate target retires that target's captured tools in the same commit,
+  tool is `unsafe` and settles as interrupted rather than rerunning (an MCP call is `unsafe` for the
+  same reason). Every terminal commit of a run that already prepared a separate target retires that
+  target's captured tools in the same commit,
   as does the abort handler, so a completed, failed, cancelled or superseded run leaves no capture
   behind for a later admission. A phase fault or a crash before the terminal commit still leaves
   the capture until the next reopen, where the pre-resume pass retires it; in that interval a
@@ -766,6 +783,21 @@ gateway case schedules a recurring job
 through the `cron` tool with a context snapshot provider whose content changes on every call, and
 asserts that each episode's request renders the snapshot rebuilt for it instead of the one the
 earlier episode installed.
+
+The same suite covers the per-run recall/MCP capture with a real MCP stdio fixture and a workspace
+note. An isolated scheduled run's durable capture is asserted to be exactly the origin's coding
+ceiling plus `memory_search`/`memory_browse`/`memory_read` and the five connected MCP registration
+names, with no `codemode`, `tool_search`, `worker`, `cron`, MCP management, channel tool or captured
+classifier; the run is offered the recall and MCP tools directly. A gated model request lets the
+test act between rounds: `memory_search` and the captured MCP tool both succeed against the real
+workspace and the real server, then the capture is narrowed to `read` and the same two names are
+asserted denied while `read` still succeeds. A second case leaves a stale capture naming recall and
+MCP on a settled automation conversation, reopens with both withdrawn, asserts the capture is
+retired and the conversation holds no tool, then reopens once more with both enabled and asserts no
+name is resurrected and the conversation still has no recall scope. The live-run reopen bound (the
+per-capability ceiling and prune of a still-running target) is derived from the same helpers but is
+not exercised across a process restart, because a scheduled run cannot be parked deterministically
+without a committed test seam.
 
 Stored-document compatibility was verified in that same suite: a job document written by the earlier
 per-occurrence model (no `conversationId`, no `oneOffConversationId`, no `oneOffQueue`) is exercised
