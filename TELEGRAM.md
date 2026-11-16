@@ -217,6 +217,9 @@ download keeps the admitted update instead of losing it, and a reopen resumes it
   stored as `.xlsx` instead of `.bin`. That suffix is the only part of the name
   that can influence the path; an unknown or malformed one yields `.bin`, the
   bytes are never inspected, and nothing is guessed from the file's content.
+  Recovery checks the prior generic identity locator before downloading again,
+  adopting already-published originals without renaming them, including a crash
+  before the stored-path commit. Older originals may therefore keep `.bin`.
   Publication is atomic with private
   permissions, and a symlinked, hardlinked or non-regular target path is refused
   rather than followed or overwritten. Stored originals are never deleted by the adapter and there is no
@@ -241,7 +244,9 @@ download keeps the admitted update instead of losing it, and a reopen resumes it
   identifiers, live-location period, accuracy, heading and proximity radius are
   not copied. A caption on the same message stays ordinary input ahead of the
   block. When no `media` block is configured the same block replaces the old
-  "text only" notice for that message.
+  "text only" notice for that message. Replies and observed-target excerpts use
+  this same display text from the received update, not a transcript lookup;
+  an explicit partial quote still takes precedence for reply context.
 - **Voice/audio** is stored first and then transcribed locally by the configured
   engine. Three explicit backends exist: the default `faster-whisper` helper
   (`scripts/local-transcribe.py` through `uv`, model `small` on CPU with `int8`),

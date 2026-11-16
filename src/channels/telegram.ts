@@ -2099,8 +2099,8 @@ export async function runTelegram(
     }
     // The same underlying file (Telegram's content-stable unique id) may arrive in a later
     // update: an already stored original is reused instead of downloading it again.
-    const already = await ingress.store.existing(
-      ingress.store.locator(current.identity, current.kind, current.mimeType, current.originalName),
+    const already = await ingress.store.existingFor(
+      current.identity, current.kind, current.mimeType, current.originalName,
     );
     if (already !== undefined) {
       return {

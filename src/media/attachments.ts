@@ -96,6 +96,8 @@ export interface MediaStore {
   absolute(relativePath: string): Promise<string>;
   /** Resolve a stored original that already exists and is a regular file. */
   existing(relativePath: string): Promise<StoredMedia | undefined>;
+  /** Reuse current or legacy identity locators before downloading an original again. */
+  existingFor(identity: string, kind: MediaKind, mimeType?: string, originalName?: string): Promise<StoredMedia | undefined>;
 }
 
 /** Validate and normalize a workspace-relative media directory (default `media`). */
@@ -384,12 +386,26 @@ export function createMediaStore(options: MediaStoreOptions): MediaStore {
     }
   };
 
+  const existingFor = async (
+    identity: string, kind: MediaKind, mimeType?: string, originalName?: string,
+  ): Promise<StoredMedia | undefined> => {
+    const current = locator(identity, kind, mimeType, originalName);
+    const found = await existing(current);
+    if (found !== undefined || kind === "photo") return found;
+    // Before known document/name suffixes were added, unknown documents used .bin and
+    // unknown audio used .oga. Adopt complete published bytes even if the old process
+    // crashed before committing the locator. Never rename or reinterpret those bytes.
+    const legacy = `${directory}/${kind}-${identityHash(identity)}${kind === "audio" ? ".oga" : ".bin"}`;
+    return legacy === current ? undefined : existing(legacy);
+  };
+
   return {
     directory,
     maxFileBytes,
     locator,
     absolute,
     existing,
+    existingFor,
 
     async save(request: SaveMediaRequest): Promise<StoredMedia> {
       const { signal } = request;
@@ -408,7 +424,7 @@ export function createMediaStore(options: MediaStoreOptions): MediaStore {
       };
       await ensureMediaRoot(await workspaceRoot(), segments);
 
-      const already = await existing(relativePath);
+      const already = await existingFor(request.identity, request.kind, request.mimeType, request.originalName);
       if (already !== undefined) {
         // The identity is content-stable and publication is atomic, so a complete
         // existing file is this attachment; a retry or reopen never re-downloads it.

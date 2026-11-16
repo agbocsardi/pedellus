@@ -479,6 +479,13 @@ test('a shared location or venue becomes bounded labeled context with no lookup'
   assert.equal(/\d+\.\d+/u.test(unusable), false, 'no coordinate-like number is invented');
 
   // A venue whose location object is missing still names what the message carried.
+  const receivedPin = { message_id: 7, date: 0, chat, location: { latitude: 1, longitude: 2 } };
+  const excerpt = telegramMessageContent(receivedPin);
+  assert.equal(excerpt.source, 'text', 'structured display text uses the existing readable source');
+  assert.match(excerpt.text, /Coordinates: 1\.000000, 2\.000000/);
+  const captioned = telegramMessageContent({ ...receivedPin, caption: 'meet here' });
+  assert.ok(captioned.text.startsWith('meet here\n\n[Telegram location'));
+
   const venueOnly = telegramLocationContext({
     message_id: 6,
     date: 0,

@@ -1295,6 +1295,28 @@ test('the shared store names a known format from the announced MIME type or file
   }
 });
 
+test('legacy identity bytes are adopted before a renamed extension can trigger a download', { timeout: 10_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'nanobot-media-legacy-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = createMediaStore({ workspace: directory });
+  const original = await store.save({
+    identity: 'legacy-sheet', kind: 'document', mimeType: 'application/octet-stream',
+    body: (async function* () { yield Buffer.from('opaque original'); })(),
+  });
+  assert.match(original.relativePath, /\.bin$/);
+  const recovered = await store.existingFor('legacy-sheet', 'document',
+    'application/octet-stream', 'budget.xlsx');
+  assert.equal(recovered.relativePath, original.relativePath);
+  const saved = await store.save({
+    identity: 'legacy-sheet', kind: 'document', mimeType: 'application/octet-stream',
+    originalName: 'budget.xlsx',
+    body: (async function* () { throw new Error('must not redownload or consume new bytes'); })(),
+  });
+  assert.equal(saved.relativePath, original.relativePath);
+  assert.equal((await store.read(saved.relativePath)).toString(), 'opaque original');
+  assert.deepEqual(await readdir(join(directory, 'media')), [original.relativePath.split('/').at(-1)]);
+});
+
 test('the shared store keeps unknown document formats as safe generic originals', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'nanobot-media-store-'));
   try {

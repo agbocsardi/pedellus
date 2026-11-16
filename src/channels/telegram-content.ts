@@ -13,8 +13,8 @@
  * no rich content can become a host control.
  *
  * A shared location or venue is rendered separately by `telegramLocationContext` as a labeled,
- * bounded block of the numbers and venue text the message carried; it is message content, not a
- * reference excerpt, and it never triggers a lookup.
+ * bounded block of the numbers and venue text the message carried. It also supplies readable
+ * reference excerpts from that same update, and never triggers a lookup.
  */
 
 import type { Message, RichBlock, RichBlockCaption, RichText } from "grammy/types";
@@ -32,7 +32,8 @@ export const TELEGRAM_CONTENT_LIMITS = Object.freeze({
   coordinateDecimals: 6,
 });
 
-/** Where a message excerpt came from. `empty` and `unreadable` carry a host label, not channel text. */
+/** `text` includes bounded display rendering of location metadata from the update.
+ * `empty` and `unreadable` carry a host label, not channel text. */
 export type TelegramContentSource = "text" | "rich" | "empty" | "unreadable";
 
 export type TelegramMessageContent = {
@@ -307,10 +308,10 @@ export function telegramLocationContext(message: Message): string | undefined {
  */
 export function telegramMessageContent(message: Message): TelegramMessageContent {
   const plain = message.text ?? message.caption;
-  if (plain !== undefined) {
-    return plain.trim() === ""
-      ? { source: "empty", text: EMPTY_TEXT_LABEL }
-      : { source: "text", text: plain };
+  const location = telegramLocationContext(message);
+  if (plain !== undefined || location !== undefined) {
+    const text = [plain, location].filter((part) => part !== undefined && part.trim() !== "").join("\n\n");
+    return text === "" ? { source: "empty", text: EMPTY_TEXT_LABEL } : { source: "text", text };
   }
   const rich = message.rich_message;
   if (rich !== undefined) {
