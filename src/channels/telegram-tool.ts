@@ -16,7 +16,9 @@
  * model may use.
  *
  * The tool is not replay-safe: an interrupted execution is never rerun by Durable. The adapter's
- * write-ahead action record additionally refuses to resend an action whose outcome is unknown.
+ * write-ahead action record additionally refuses to resend an action whose outcome is unknown, and
+ * refuses a fresh call that would repeat the same still-unresolved effect (same chat, kind, target
+ * and reply text, emoji, or workspace-relative path with caption) in that chat.
  */
 import type { Context } from "@earendil-works/chord";
 import { Type } from "typebox";
@@ -146,7 +148,10 @@ export function createTelegramTool(options: TelegramToolOptions): { readonly ext
         : "Outbound files are not enabled in this host. ") +
       "Never guess an id: only ids listed by targets, named in the current Telegram context, or returned " +
       "by an earlier action are valid. This tool cannot choose another chat, cannot fetch a remote URL, " +
-      "cannot reuse a Telegram file id and cannot forward messages.",
+      "cannot reuse a Telegram file id and cannot forward messages. If an earlier reply, reaction or file " +
+      "in this chat with the same kind, target and content has no definite outcome, the repeat is refused " +
+      "rather than sent again: do not retry that effect with a new call id or slightly different wording, " +
+      "because only an identical repeat is recognised and a reworded one may deliver the effect twice.",
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("targets"),

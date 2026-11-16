@@ -619,9 +619,11 @@ test('unknown action evidence survives pruning and a full unknown log refuses ne
   const { admitAction, settleActionRecord, TELEGRAM_ACTION_LIMITS } =
     await import(new URL('../dist/channels/telegram-interactions.js', import.meta.url).href);
   const actions = [];
+  // Each record is its own effect: an identical repeat of an unresolved one is fenced, so the bound
+  // is exercised with distinct payloads rather than by defeating the fence.
   const record = (callId) => ({
     callId, kind: 'reply', chatId: CHAT_ID, targetMessageId: 100,
-    text: 'unresolved evidence', status: 'intent', nextChunkIndex: 0, startedAtMs: 1,
+    text: `unresolved evidence ${callId}`, status: 'intent', nextChunkIndex: 0, startedAtMs: 1,
   });
   for (let index = 0; index < TELEGRAM_ACTION_LIMITS.total; index++) {
     const id = `unknown-${index}`;
@@ -632,6 +634,88 @@ test('unknown action evidence survives pruning and a full unknown log refuses ne
   assert.equal(admitAction(actions, record('would-evict')), 'full');
   assert.equal(actions.length, TELEGRAM_ACTION_LIMITS.total);
   assert.ok(actions.some((entry) => entry.callId === 'unknown-0'), 'old unknown evidence is retained');
+});
+
+test('the action fence refuses a distinct call id for the same unresolved effect, per identity', async () => {
+  const { admitAction, conflictingAction } =
+    await import(new URL('../dist/channels/telegram-interactions.js', import.meta.url).href);
+  const actions = [];
+  const reply = (callId, overrides = {}) => ({
+    callId, kind: 'reply', chatId: CHAT_ID, targetMessageId: 100, text: 'SAME-EFFECT',
+    status: 'intent', nextChunkIndex: 0, startedAtMs: 1, ...overrides,
+  });
+  const react = (callId, emoji) => ({
+    callId, kind: 'react', chatId: CHAT_ID, targetMessageId: 450, emoji,
+    status: 'intent', nextChunkIndex: 0, startedAtMs: 2,
+  });
+  const media = (callId, overrides = {}) => ({
+    callId, kind: 'document', chatId: CHAT_ID, targetMessageId: 0, path: 'files/report.pdf',
+    status: 'intent', nextChunkIndex: 0, startedAtMs: 3, ...overrides,
+  });
+
+  assert.equal(admitAction(actions, reply('first')), 'admitted');
+  const untouched = JSON.parse(JSON.stringify(actions));
+  assert.equal(admitAction(actions, reply('second')), 'conflict');
+  assert.deepEqual(actions, untouched, 'the refused call created no record and changed nothing');
+  assert.equal(conflictingAction(actions, reply('second'))?.callId, 'first');
+
+  // A different target, payload, chat or kind is a different visible effect.
+  assert.equal(admitAction(actions, reply('other-target', { targetMessageId: 101 })), 'admitted');
+  assert.equal(admitAction(actions, reply('other-text', { text: 'OTHER-EFFECT' })), 'admitted');
+  assert.equal(admitAction(actions, reply('other-chat', { chatId: 999 })), 'admitted');
+  assert.equal(admitAction(actions, react('react-1', '👍')), 'admitted');
+  assert.equal(admitAction(actions, react('react-2', '👍')), 'conflict');
+  assert.equal(admitAction(actions, react('react-3', '🔥')), 'admitted');
+
+  // Media identity is the workspace-relative path with its caption; omitted and empty are one identity.
+  assert.equal(admitAction(actions, media('media-1', { caption: '' })), 'admitted');
+  assert.equal(admitAction(actions, media('media-2')), 'conflict');
+  assert.equal(admitAction(actions, media('media-3', { caption: 'CAPTION' })), 'admitted');
+  assert.equal(admitAction(actions, media('media-4', { path: 'files/photo.png' })), 'admitted');
+  assert.equal(admitAction(actions, media('media-5', { kind: 'photo' })), 'admitted',
+    'the same file under a different native kind is a different visible effect');
+});
+
+test('the action fence blocks a partially delivered effect but not a settled one', async () => {
+  const { admitAction, settleActionRecord } =
+    await import(new URL('../dist/channels/telegram-interactions.js', import.meta.url).href);
+  const actions = [];
+  const reply = (callId, text) => ({
+    callId, kind: 'reply', chatId: CHAT_ID, targetMessageId: 100, text,
+    status: 'intent', nextChunkIndex: 0, startedAtMs: 1,
+  });
+  const settled = (callId, status, progress = {}) => {
+    const entry = actions.find((candidate) => candidate.callId === callId);
+    Object.assign(entry, progress);
+    settleActionRecord(actions, callId, status);
+  };
+
+  assert.equal(admitAction(actions, reply('sending-once', 'SENDING-EFFECT')), 'admitted');
+  settled('sending-once', 'sending');
+  assert.equal(admitAction(actions, reply('sending-retry', 'SENDING-EFFECT')), 'conflict');
+
+  assert.equal(admitAction(actions, reply('sent-once', 'SENT-EFFECT')), 'admitted');
+  settled('sent-once', 'sent');
+  assert.equal(admitAction(actions, reply('sent-again', 'SENT-EFFECT')), 'admitted',
+    'a definitively sent effect does not block a legitimate later repeat');
+
+  assert.equal(admitAction(actions, reply('failed-clean', 'UNSENT-EFFECT')), 'admitted');
+  settled('failed-clean', 'failed');
+  assert.equal(admitAction(actions, reply('failed-retry', 'UNSENT-EFFECT')), 'admitted',
+    'a definitively unsent effect does not block a legitimate later attempt');
+
+  assert.equal(admitAction(actions, reply('partial-failed', 'PARTIAL-EFFECT')), 'admitted');
+  settled('partial-failed', 'failed', { nextChunkIndex: 1, resultMessageIds: [4242] });
+  assert.equal(admitAction(actions, reply('partial-retry', 'PARTIAL-EFFECT')), 'conflict',
+    'a failed reply that already delivered a prefix must not be resent from the start');
+
+  assert.equal(admitAction(actions, reply('partial-denied', 'DENIED-EFFECT')), 'admitted');
+  settled('partial-denied', 'denied', { resultMessageIds: [4243] });
+  assert.equal(admitAction(actions, reply('denied-retry', 'DENIED-EFFECT')), 'conflict');
+
+  // The unknown record is kept exactly as it is; the fence never rewrites, ages or delivers it.
+  const unknown = actions.find((entry) => entry.callId === 'sending-once');
+  assert.equal(unknown.status, 'sending');
 });
 
 test('authenticated reaction changes are passive context for the next owner input, never their own turn', { timeout: 25_000 }, async () => {
@@ -897,6 +981,107 @@ test('an ambiguous action send is quarantined and never resent, including across
     await cleanup(store, harness);
   }
 });
+
+test('a fresh call id cannot resend an unknown reply, even after a targets listing and a reopen',
+  { timeout: 25_000 }, async () => {
+    const store = await syntheticStore('duplicate-effect');
+    let harness;
+    store.faux.setResponses(Array.from({ length: 16 }, () => (request) => {
+      const transcript = JSON.stringify(request.messages);
+      if (!transcript.includes('incident reply')) return fauxAssistantMessage('idle');
+      if (!transcript.includes('first-call')) {
+        return fauxAssistantMessage([
+          fauxToolCall('telegram', { action: 'reply', messageId: 641, text: 'UNKNOWN-REPLY' }, { id: 'first-call' }),
+        ], { stopReason: 'toolUse' });
+      }
+      if (!transcript.includes('second-call')) {
+        // The incident: a distinct tool task retried the same target and text after listing targets.
+        return fauxAssistantMessage([
+          fauxToolCall('telegram', { action: 'targets' }, { id: 'listing' }),
+          fauxToolCall('telegram', { action: 'reply', messageId: 641, text: 'UNKNOWN-REPLY' }, { id: 'second-call' }),
+        ], { stopReason: 'toolUse' });
+      }
+      return fauxAssistantMessage('AFTER-DUPLICATE');
+    }));
+    const transport = telegramMock([[messageUpdate(650, 641, 'incident reply')]]);
+    try {
+      harness = start(store, transport);
+      await until(() => transport.sent.some((entry) => entry.text === 'AFTER-DUPLICATE'), 'final answer');
+      assert.equal(transport.sendAttempts.filter((entry) => entry.text === 'UNKNOWN-REPLY').length, 1,
+        'the repeated effect made no second external send attempt');
+      assert.equal(transport.sent.filter((entry) => entry.text === 'UNKNOWN-REPLY').length, 0);
+
+      const chat = await store.gateway.conversationFor(`telegram:${BOT_ID}:chat:${CHAT_ID}`, context);
+      const refused = await toolResults(chat, 'second-call');
+      assert.equal(refused.isError, true);
+      assert.match(refused.text, /No new Telegram message was sent/);
+      assert.match(refused.text, /may already have been applied, possibly in part/);
+      assert.match(refused.text, /new call id/);
+
+      const unresolved = (await stateDoc(store.gateway)).actions;
+      assert.equal(unresolved.length, 1, 'the refused call created no action record');
+      assert.equal(unresolved[0].status, 'unknown');
+      assert.equal(unresolved[0].text, 'UNKNOWN-REPLY');
+      assert.equal(unresolved[0].resultMessageIds, undefined);
+
+      // Reopening keeps the unknown record authoritative: the same effect is still refused.
+      await stop(harness);
+      harness = undefined;
+      const replay = telegramMock([[messageUpdate(650, 641, 'incident reply')]]);
+      harness = start(store, replay);
+      await until(() => store.gateway.telegramActions.current() !== undefined, 'reopened adapter host');
+      const host = store.gateway.telegramActions.current();
+      const session = `telegram:${BOT_ID}:chat:${CHAT_ID}`;
+      const repeated = await host.act(session, 'fresh-after-reopen', {
+        kind: 'reply', messageId: 641, text: 'UNKNOWN-REPLY',
+      }, context);
+      assert.equal(repeated.ok, false);
+      assert.match(repeated.text, /No new Telegram message was sent/);
+      assert.equal(repeated.messageIds, undefined);
+      assert.equal(replay.sendAttempts.length, 0, 'the unresolved effect is never resent after reopen');
+      assert.deepEqual((await stateDoc(store.gateway)).actions, unresolved,
+        'the unknown record is left exactly as it was');
+
+      // A different effect in the same chat is still allowed to send.
+      const different = await host.act(session, 'independent-effect', {
+        kind: 'reply', messageId: 641, text: 'INDEPENDENT-REPLY',
+      }, context);
+      assert.equal(different.ok, true, different.text);
+      assert.equal(replay.sendAttempts.filter((entry) => entry.text === 'INDEPENDENT-REPLY').length, 1);
+    } finally {
+      await cleanup(store, harness);
+    }
+  });
+
+test('two concurrent fresh calls for one effect cannot both reach the transport',
+  { timeout: 20_000 }, async () => {
+    const store = await syntheticStore('fence-race');
+    store.faux.setResponses([() => fauxAssistantMessage('idle')]);
+    const transport = telegramMock([[messageUpdate(655, 101, 'race request')]]);
+    let harness;
+    try {
+      harness = start(store, transport);
+      await until(() => transport.sent.some((entry) => entry.text === 'idle'), 'first answer');
+      await until(() => store.gateway.telegramActions.current() !== undefined, 'adapter host');
+      const host = store.gateway.telegramActions.current();
+      const session = `telegram:${BOT_ID}:chat:${CHAT_ID}`;
+      const request = { kind: 'reply', messageId: 101, text: 'CONCURRENT-EFFECT' };
+      const outcomes = await Promise.all([
+        host.act(session, 'race-a', request, context),
+        host.act(session, 'race-b', request, context),
+      ]);
+      assert.equal(outcomes.filter((outcome) => outcome.ok).length, 1, 'exactly one admission wins the effect');
+      assert.match(outcomes.find((outcome) => !outcome.ok).text, /No new Telegram message was sent/);
+      assert.equal(transport.sendAttempts.filter((entry) => entry.text === 'CONCURRENT-EFFECT').length, 1,
+        'only the admitted call reached the mocked Telegram API');
+      const records = (await stateDoc(store.gateway)).actions
+        .filter((entry) => entry.text === 'CONCURRENT-EFFECT');
+      assert.equal(records.length, 1, 'the losing call left no record behind');
+      assert.ok(['sent', 'unknown', 'sending'].includes(records[0].status));
+    } finally {
+      await cleanup(store, harness);
+    }
+  });
 
 for (const answerMethod of ['button', 'text']) {
 test(`a durable question accepts one authenticated ${answerMethod} answer`, { timeout: 20_000 }, async () => {

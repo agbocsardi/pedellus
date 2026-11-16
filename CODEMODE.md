@@ -267,8 +267,9 @@ tools and Telegram actions — without adding authority. Deferred MCP tools rema
 discoverable through `searchTools()`/`ALL_TOOLS`; tools outside the ceiling (for
 example `write` when only `read` is configured) are absent. The Telegram action
 tool now accepts nested Code Mode callers while keeping its live-adapter,
-current-chat, observed-target, write-ahead journal and task-id checks; an
-unobserved target is denied by the host, not by a blanket caller rule. Code Mode
+current-chat, observed-target, write-ahead journal, duplicate-effect fence and
+task-id checks; an unobserved target is denied by the host, not by a blanket
+caller rule. Code Mode
 stays non-recursive (`codemode` and `tool_search` remain model-only).
 
 The prior MCP-only wiring was accepted: standalone review passed `4d61f50` with

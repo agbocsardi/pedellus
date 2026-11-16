@@ -813,3 +813,68 @@ test('an abort during upload leaves an unknown, never-resent action and detaches
     await rm(store.directory, { recursive: true, force: true });
   }
 });
+
+test('a repeat of an unresolved upload is refused, while a settled or different effect still sends',
+  { timeout: 25_000 }, async () => {
+    const store = await syntheticStore('duplicate-upload');
+    await prepareFiles(store.workspace);
+    store.faux.setResponses(Array.from({ length: 12 }, () => (request) => {
+      const transcript = JSON.stringify(request.messages);
+      if (!transcript.includes('upload the report')) return fauxAssistantMessage('idle');
+      if (!transcript.includes('unknown-upload')) {
+        return fauxAssistantMessage([
+          fauxToolCall('telegram', {
+            action: 'send', kind: 'document', path: 'files/report.pdf', caption: 'UNKNOWN-UPLOAD',
+          }, { id: 'unknown-upload' }),
+        ], { stopReason: 'toolUse' });
+      }
+      if (!transcript.includes('repeat-upload')) {
+        return fauxAssistantMessage([
+          fauxToolCall('telegram', {
+            action: 'send', kind: 'document', path: 'files/report.pdf', caption: 'UNKNOWN-UPLOAD',
+          }, { id: 'repeat-upload' }),
+        ], { stopReason: 'toolUse' });
+      }
+      return fauxAssistantMessage('UPLOAD-DONE');
+    }));
+    const transport = telegramMock([[messageUpdate(750, 100, 'upload the report')]]);
+    let harness;
+    try {
+      harness = start(store, transport);
+      await until(() => transport.sent.some((entry) => entry.text === 'UPLOAD-DONE'), 'upload turn');
+      assert.equal(transport.uploadAttempts.filter((entry) => entry.caption === 'UNKNOWN-UPLOAD').length, 1,
+        'the repeated upload made no second external attempt');
+      assert.equal(transport.uploads.length, 0);
+
+      const chat = await store.gateway.conversationFor(`telegram:${BOT_ID}:chat:${CHAT_ID}`, context);
+      const refused = await toolResults(chat, 'repeat-upload');
+      assert.equal(refused.isError, true);
+      assert.match(refused.text, /No new Telegram message was sent/);
+      assert.equal(refused.text.includes('UNKNOWN-UPLOAD'), false, 'the refusal discloses no channel content');
+
+      const records = (await stateDoc(store.gateway)).actions;
+      assert.equal(records.length, 1, 'the refused upload created no action record');
+      assert.equal(records[0].status, 'unknown');
+      assert.equal(records[0].path, 'files/report.pdf');
+
+      const host = store.gateway.telegramActions.current();
+      const session = `telegram:${BOT_ID}:chat:${CHAT_ID}`;
+      // A different caption is a different visible effect.
+      const otherCaption = await host.act(session, 'other-caption', {
+        kind: 'document', path: 'files/report.pdf', caption: 'OTHER-CAPTION',
+      }, context);
+      assert.equal(otherCaption.ok, true, otherCaption.text);
+      assert.equal(transport.uploadAttempts.filter((entry) => entry.caption === 'OTHER-CAPTION').length, 1);
+      // A definitively sent effect does not block a deliberate later repeat of the same effect.
+      const again = await host.act(session, 'other-caption-again', {
+        kind: 'document', path: 'files/report.pdf', caption: 'OTHER-CAPTION',
+      }, context);
+      assert.equal(again.ok, true, again.text);
+      assert.equal(transport.uploadAttempts.filter((entry) => entry.caption === 'OTHER-CAPTION').length, 2);
+      assert.ok((await stateDoc(store.gateway)).actions
+        .some((entry) => entry.caption === 'UNKNOWN-UPLOAD' && entry.status === 'unknown'),
+      'the unresolved upload is retained as evidence');
+    } finally {
+      await cleanup(store, harness);
+    }
+  });

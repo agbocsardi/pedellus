@@ -85,6 +85,7 @@ import {
   targetsForChat,
   unresolvedActions,
   validTelegramFilePath,
+  type TelegramActionAdmission,
   type TelegramActionRecord,
   type TelegramObservedTarget,
   type TelegramQuotedContext,
@@ -1112,6 +1113,20 @@ export async function runTelegram(
   };
 
   /**
+   * Fixed refusal for a fresh call that would repeat an effect whose earlier attempt in this chat has
+   * no definite outcome. It states the uncertainty, that nothing new left the host, and what not to do:
+   * a reworded or re-identified retry would duplicate the effect rather than resolve it.
+   */
+  const repeatedEffectOutcome = (): TelegramActionOutcome => ({
+    ok: false,
+    text: "No new Telegram message was sent. An earlier action in this chat with the same kind, target and " +
+      "content has no definite outcome yet, so it may already have been applied, possibly in part. Do not " +
+      "work around this by rewording the text, changing the target or using a new call id: if the earlier " +
+      "attempt was delivered, that would deliver the effect twice. Tell the owner the earlier delivery's " +
+      "outcome is unknown.",
+  });
+
+  /**
    * One native media upload. The workspace file is read into bounded memory before the API call so
    * the bytes cannot change mid-upload, and every refusal happens before any external request. The
    * `sending` record was already written by `act`, so an abort or transport ambiguity here stays
@@ -1364,12 +1379,17 @@ export async function runTelegram(
         nextChunkIndex: 0,
         startedAtMs: Date.now(),
       };
-      let admission: "admitted" | "duplicate" | "full" = "full";
+      let admission: TelegramActionAdmission = "full";
       await mutateState((doc) => {
         admission = admitAction(doc.actions, record);
       });
       if (admission === "full") {
         return { ok: false, text: "Too many Telegram actions are awaiting outcome; this action was not taken." };
+      }
+      if (admission === "conflict") {
+        // The fence refused inside the intent transaction: no record, no preflight and no API call
+        // was made for this call id, and the earlier record is left exactly as it was.
+        return repeatedEffectOutcome();
       }
       if (admission === "duplicate") {
         const duplicate = actionFor(state.actions, callId);

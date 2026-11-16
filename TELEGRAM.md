@@ -573,7 +573,9 @@ The channel-state document keeps three bounded sets:
   an identity derived from the Durable tool task id (not the provider call id),
   kind, exact chat and (for a reply/reaction) target, reply text, emoji, or the
   workspace-relative file path with its bounded caption, plus status, accepted
-  chunk cursor and returned message ids.
+  chunk cursor and returned message ids. The same kind, chat, target and payload
+  also fence the effect itself: a fresh call id for a still-unresolved or
+  partially delivered repeat is refused before any API request.
 - `reactionContext`: at most 8 authenticated reaction changes per private chat
   (24 in total), each one bounded summary of the target and its old/new/added/
   removed reaction lists. A later change to the same message replaces its note;
@@ -646,6 +648,30 @@ Unknown outcomes are never evicted; if unresolved records fill the bounded log,
 new actions are denied rather than losing reconciliation evidence. Target observation is
 best-effort bookkeeping: a failed target commit can make an id untargetable but
 never turns an accepted send into an ambiguous delivery.
+
+The record is also an admission fence over the external effect, not only over one
+call id. A new tool execution gets a new call id, so without that fence a model
+retry would send the same message a second time. A fresh call that repeats an
+effect whose earlier record is `intent`, `sending` or `unknown` is therefore
+refused inside the same commit that would have admitted it: no action record and
+no API request are created for the new call, the earlier record is left exactly as
+it was, and two concurrent calls cannot both pass. Matching is exact and
+chat-local — same kind, same target, and the same reply text, reaction emoji, or
+workspace-relative path with caption, where an absent and an empty caption are one
+identity. Fields earlier state versions already stored are enough, so existing
+telegram-state needs no migration. A settled `sent` record does not block a
+legitimate later repeat, and neither does a definitively unsent one; a `failed` or
+`denied` record that had already accepted a reply prefix or returned message ids
+does block, because resending it would repeat that delivered prefix. The refusal
+tells the model the earlier delivery may already have been applied, possibly in
+part, that nothing new was sent, and that retrying this effect by rewording it,
+changing the target or using a new call id would duplicate it — the model should
+report the unknown outcome instead. This recognises an identical repeat only: a
+reworded attempt to duplicate an unresolved effect is not detected, and an unknown
+record permanently blocks that exact effect in that chat rather than ageing out,
+being retried, or being marked delivered. There is no new config, no per-chat
+disable, no fuzzy semantic matching, no time-to-live and no answer or outbox
+coalescing.
 
 An authenticated reaction change is retained as bounded passive context for the
 next ordinary owner input in that chat; it never starts a model turn by itself.

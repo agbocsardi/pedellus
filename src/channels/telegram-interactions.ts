@@ -21,6 +21,13 @@
  * the Telegram call and the outcome after it; an interrupted intent or a `sending` record is
  * quarantined as `unknown` on reopen and is never resent automatically.
  *
+ * The record is also an admission fence over the external effect, not only over one call id. A fresh
+ * call that would repeat the same visible effect in the same chat is refused while an earlier record
+ * for it is unresolved or was partially delivered, because a new tool task id would otherwise send
+ * the message a second time. Matching is exact: same chat, same kind, same target and the same reply
+ * text, reaction emoji, or workspace-relative path with caption. A reworded attempt to duplicate an
+ * unresolved effect is not recognised.
+ *
  * Two conversation-flow rules also live here. An authenticated reaction change is passive context:
  * it is retained as one bounded note per reacted message and attached to the next ordinary owner
  * input, never turned into a model turn by itself. Consecutive ordinary owner messages (including
@@ -170,6 +177,44 @@ export function quoteTelegramReference(text: string): string {
 
 function numberOrZero(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * True when two records stand for the same visible channel effect: the same chat, the same kind, the
+ * same target and the same payload. Omitted and empty optional values are one identity (the adapter
+ * normalises an empty caption to an absent one), while an optional value a legacy record lacks never
+ * matches a supplied one.
+ */
+function sameActionEffect(left: TelegramActionRecord, right: TelegramActionRecord): boolean {
+  if (left.kind !== right.kind || left.chatId !== right.chatId) return false;
+  if (left.targetMessageId !== right.targetMessageId) return false;
+  if (left.kind === "reply") return typeof left.text === "string" && left.text === right.text;
+  if (left.kind === "react") return typeof left.emoji === "string" && left.emoji === right.emoji;
+  return typeof left.path === "string" && left.path === right.path &&
+    (left.caption ?? "") === (right.caption ?? "");
+}
+
+/** True when Telegram already accepted part of this effect, so a resend would repeat that part. */
+function acceptedActionPart(record: TelegramActionRecord): boolean {
+  return record.nextChunkIndex > 0 || (record.resultMessageIds?.length ?? 0) > 0;
+}
+
+/**
+ * One stored record for the same effect whose outcome is not definitively settled, or `undefined`.
+ *
+ * An `intent`, `sending` or `unknown` effect may already have been applied, so a second admission
+ * would risk a duplicate delivery. A settled record normally no longer blocks an independent later
+ * request, but a knowably failed or denied one that already had a part accepted still does: resending
+ * it would repeat the delivered prefix.
+ */
+export function conflictingAction(
+  actions: readonly TelegramActionRecord[],
+  record: TelegramActionRecord,
+): TelegramActionRecord | undefined {
+  return actions.find((entry) =>
+    validActionRecord(entry) && entry.callId !== record.callId && sameActionEffect(entry, record) &&
+    (entry.status === "intent" || entry.status === "sending" || entry.status === "unknown" ||
+      (entry.status !== "sent" && acceptedActionPart(entry))));
 }
 
 /** True when a stored value has the shape this module can act on. */
@@ -541,18 +586,25 @@ function pruneActions(actions: TelegramActionRecord[]): void {
   }
 }
 
+export type TelegramActionAdmission = "admitted" | "duplicate" | "conflict" | "full";
+
 /**
- * Admit one action intent. A duplicate call id is reported without change. A full log evicts the
+ * Admit one action intent inside the caller's own state transaction. A duplicate call id is reported
+ * without change. A fresh call for the same still-unresolved effect in the same chat is refused
+ * (`conflict`) instead of becoming a second external send, and the fence is checked and applied in
+ * this same synchronous pass so two concurrent admissions cannot both pass. A full log evicts the
  * oldest settled record; with no evictable record it refuses (`full`) rather than dropping an
  * unresolved external effect.
  */
 export function admitAction(
   actions: TelegramActionRecord[],
   record: TelegramActionRecord,
-): "admitted" | "duplicate" | "full" {
+): TelegramActionAdmission {
   if (!validActionRecord(record) || !Array.isArray(actions)) return "full";
   // Any stored record with this call id, even a malformed one, blocks a second external effect.
   if (actions.some((entry) => isRecord(entry) && entry.callId === record.callId)) return "duplicate";
+  // Checked before pruning so a partially delivered settled record is never the one evicted first.
+  if (conflictingAction(actions, record) !== undefined) return "conflict";
   pruneActions(actions);
   if (actions.length >= TELEGRAM_ACTION_LIMITS.total) {
     const oldest = actions
