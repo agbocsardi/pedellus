@@ -37,6 +37,44 @@ Because the unit file cannot expand shell variables in `ExecStart`, those two
 paths are edited directly in the copy. Everything else uses systemd specifiers:
 `%h` is the user's home and `%i` is the unit instance name.
 
+## Process environment and resource limits
+
+Both units set an explicit `PATH` of
+`%h/.local/bin:/usr/local/bin:/usr/bin:/bin`. A user manager does not read a
+login shell's profile, so a service started from a terminal can otherwise inherit
+a different `PATH` than the gateway's shell tools, skill lookups, MCP stdio
+command lookup and local transcription (`uv`) expect. The per-user directory is
+first because that is where `uv` and many other user-installed tools usually
+live. This is a predictable default, not a promise that every operator tool is
+found: extend it with a unit drop-in (`Environment=PATH=...`) when this host uses
+a different location, and do not rely on a shell profile. The absolute Node path
+in `ExecStart` is unaffected.
+
+`MemoryAccounting=yes` makes the service's cgroup usage visible without imposing
+a guessed limit. The cgroup contains the gateway and its children — shell
+commands, MCP stdio servers and local transcription helpers — so these are
+occupancy figures, not just the Node heap. Disk, CPU and process counts remain
+uncapped, and the optional Bubblewrap shell is accidental-damage protection,
+not a quota (see [EXECUTION.md](./EXECUTION.md)).
+
+To add a bound, use an operator drop-in rather than editing the shipped unit,
+for example:
+
+```ini
+# ~/.config/systemd/user/durable-nanobot.service.d/memory.conf
+[Service]
+MemoryHigh=2G
+# MemoryMax=3G
+```
+
+`MemoryHigh` throttles and reclaims; `MemoryMax` is a hard limit whose OOM kill
+can end the gateway or an in-flight child. Committed Durable work, queued input
+and the transcript stay in the store and reopen after a restart, but an
+interrupted model turn or tool call is not replayed. Choose a value from observed
+`systemctl --user show durable-nanobot.service -p MemoryCurrent` or
+`systemd-cgtop` on this host; do not copy a number from another deployment. Run
+`systemctl --user daemon-reload` after changing a unit or drop-in.
+
 ## Checkout command and build workflow
 
 The package exposes only `durable-nanobot` as its executable. From the checkout,

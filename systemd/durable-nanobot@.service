@@ -17,6 +17,12 @@ Type=exec
 # are not valid normalized unit instance names, including any name with `/`.
 ExecStart=/usr/bin/node /opt/durable-nanobot/bin/durable-nanobot.mjs gateway --config %h/.durable-nanobot/instances/i-%i/config.json
 WorkingDirectory=%h/.durable-nanobot/instances/i-%i
+# Explicit, predictable PATH for shell tools, skills, MCP stdio lookup and local
+# transcription (uv). Extend it with a drop-in, never a login-shell profile.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Account this service cgroup's memory only; no guessed hard limit is imposed.
+# Add an optional MemoryHigh=/MemoryMax= drop-in when the host needs a bound.
+MemoryAccounting=yes
 # Optional per-instance environment, e.g. one provider key per line. Keep the
 # file private and outside this repository; it is ignored when absent.
 EnvironmentFile=-%h/.durable-nanobot/instances/i-%i/secrets.env

@@ -444,7 +444,17 @@ carries only a fixed failure code (`start-failed`, `start-timeout`,
 `missing-environment`, `auth-required`, `connection-closed`, `closed`),
 never a transport message, response body, stderr tail, URL or configured value.
 `auth-required` means the entry uses OAuth and has no usable stored grant (or the
-server rejected it); only a new owner-initiated login changes that.
+server rejected it); only a new owner-initiated login changes that. The status
+view appends `owner login required` to that code so the next action is explicit.
+
+Access-token expiry is handled by the native provider's refresh on a `401`. If the
+provider also refuses that refresh (for example an expired or revoked refresh
+token), the entry reports the same `auth-required` and only a new owner login
+starts a new authorization. There is no proactive expiry timer, background
+refresh scheduler or automatic re-login, and the grant's expiry timestamp,
+tokens and provider response are never shown. A server that is already connected
+can fail a later tool call after its grant stops working while its status still
+shows `connected` until a management action or restart reconnects it.
 
 Tool calls pass `timeoutSeconds` (default 60) as the native per-request timeout
 and the calling turn's abort signal. The committed cancellation test covers a

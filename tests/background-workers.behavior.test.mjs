@@ -30,6 +30,7 @@ const [
     resolveWorkerTarget,
     workerResultRequestId,
     workerSteerRequestId,
+    workerTaskPrompt,
   },
   { WORKER_TOOL_NAME, createWorkerTool },
   { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
@@ -182,6 +183,33 @@ async function exists(path) {
     return false;
   }
 }
+
+test('worker task prompt sends git identity failures back as a blocker, not an invented author', () => {
+  const input = {
+    requestId: 'synthetic-request',
+    prompt: 'make the change',
+    workspaceMode: 'worktree',
+    model: { provider: 'worker-fixture', modelId: 'synthetic' },
+    thinkingLevel: 'off',
+  };
+  const worktree = workerTaskPrompt(input, {
+    mode: 'worktree',
+    path: '/synthetic/worker-worktree',
+    branch: 'nanobot/worker-7',
+    baseCommit: '0123456789abcdef',
+  });
+  assert.match(worktree, /If Git refuses to create a commit because no author identity is configured/);
+  assert.match(worktree, /do not invent a name or\s+email and do not write Git configuration/);
+  assert.match(worktree, /report the missing identity as a\s+blocker/);
+  assert.match(worktree, /Task:\nmake the change/);
+
+  const shared = workerTaskPrompt({ ...input, workspaceMode: 'shared' }, {
+    mode: 'shared',
+    path: '/synthetic/workspace',
+  });
+  assert.match(shared, /no author identity is configured/);
+  assert.match(shared, /Task:\nmake the change/);
+});
 
 async function fixtureWorkspace({ git: useGit = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'nanobot-workers-'));

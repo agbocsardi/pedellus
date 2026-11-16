@@ -109,6 +109,20 @@ const REQUEST_HEADERS = Object.freeze({
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+/**
+ * Host-authored failure text for a non-success status. An access refusal is external and stays
+ * external: this reader has no browser session, cookies or credentials, and it never suggests
+ * changing headers or reaching a private target to get around the answer.
+ */
+function httpFailure(status: number): string {
+  if (status === 401 || status === 403) {
+    return `The page returned HTTP ${status}. The site refused this plain reader (no cookies, login session or JavaScript), ` +
+      "and this tool does not bypass the refusal. Use another public source, or an already authorized browser " +
+      "tool if this conversation provides one; do not retry with altered headers, credentials or private addresses.";
+  }
+  return `The page returned HTTP ${status}.`;
+}
+
 function safeMime(value: string): string {
   const mime = value.split(";")[0]?.trim().toLowerCase() ?? "";
   return /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(mime) ? mime : "";
@@ -254,7 +268,7 @@ export class PublicWebFetcher {
         }
         if (response.status < 200 || response.status > 299) {
           response.dispose();
-          throw new WebFetchError("http", `The page returned HTTP ${response.status}.`);
+          throw new WebFetchError("http", httpFailure(response.status));
         }
         try {
           return await this.#readPage(originalUrl, url, response, redirects);

@@ -832,6 +832,10 @@ test("shipped user units are static user-service examples and verify with the re
     assert.match(text, /^StandardOutput=journal$/m);
     assert.match(text, /^StandardError=journal$/m);
     assert.match(text, /^EnvironmentFile=-%h\//m);
+    assert.match(text, /^Environment=PATH=%h\/\.local\/bin:\/usr\/local\/bin:\/usr\/bin:\/bin$/m);
+    assert.match(text, /^MemoryAccounting=yes$/m);
+    assert.doesNotMatch(text, /^MemoryMax=|^MemoryHigh=|^TasksMax=/m,
+      'the shipped unit accounts memory but imposes no guessed resource cap');
     assert.match(text, /bin\/durable-nanobot\.mjs gateway --config /);
     assert.match(text, /^WantedBy=default.target$/m);
     assert.doesNotMatch(text, /npm start|durable-nanobot\.service\b.*ExecStart|OPENAI|ANTHROPIC|DEEPSEEK_API_KEY|API_KEY=/);

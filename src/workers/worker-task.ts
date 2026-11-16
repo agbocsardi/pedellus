@@ -477,6 +477,10 @@ export function workerTaskPrompt(input: WorkerTaskInput, workspace: WorkerWorksp
     "",
     `Workspace: ${place}`,
     "",
+    "If Git refuses to create a commit because no author identity is configured, do not invent a name or",
+    "email and do not write Git configuration (global or repository): report the missing identity as a",
+    "blocker and finish whatever else the task allows.",
+    "",
     "Task:",
     input.prompt,
   ].join("\n");

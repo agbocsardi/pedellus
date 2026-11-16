@@ -461,6 +461,26 @@ test("public fetch revalidates every hop and refuses non-public targets", { time
   });
   await assert.rejects(hop.fetch("https://example.com/a"), (error) => error.code === "redirect");
 
+  // A site refusal stays an external decision: bounded guidance, no bypass and no raw body.
+  const refused = new PublicWebFetcher({
+    resolver: publicResolver([], PUBLIC_ADDRESS),
+    transport: fetchTransport({
+      "https://example.com/read": { status: 403, body: "SYNTHETIC-RAW-FORBIDDEN-BODY" },
+      "https://example.com/missing": { status: 404, body: "" },
+    }, []),
+  });
+  await assert.rejects(refused.fetch("https://example.com/read"), (error) => {
+    assert.equal(error.code, "http");
+    assert.match(error.message, /HTTP 403/);
+    assert.match(error.message, /does not bypass the refusal/);
+    assert.match(error.message, /already authorized browser\s+tool if this conversation provides one/);
+    assert.doesNotMatch(error.message, /SYNTHETIC-RAW-FORBIDDEN-BODY/);
+    return true;
+  });
+  await assert.rejects(refused.fetch("https://example.com/missing"), {
+    message: "The page returned HTTP 404.",
+  });
+
   // Binary content types fail explicitly; the body is never decoded as text.
   for (const contentType of ["image/png", "application/pdf", "application/octet-stream"]) {
     const fetcher = new PublicWebFetcher({

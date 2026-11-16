@@ -131,6 +131,12 @@ crash, and this layer has no retry framework.
   discovery, per-call provider override, custom base URL or self-hosted search.
 - `web_fetch` is not a browser: no JavaScript, no subresources, no cookies, no
   login, no paywall handling and no crawling/polling. It reads one URL.
+- A site may refuse this reader with HTTP 401 or 403 even though a browser can
+  read it, because the request carries no session, cookies or browser identity.
+  The host-authored failure says so and points to another public source or an
+  already authorized browser tool if the conversation provides one. This tool
+  has no browser, cookie or login fallback, and it never retries with altered
+  headers, credentials or a private target to get around the refusal.
 - Only identity content encoding is accepted; compressed responses are refused
   rather than decompressed.
 - No PDF, Office, image, OCR or archive extraction, and no conversion of

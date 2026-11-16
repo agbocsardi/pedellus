@@ -222,6 +222,11 @@ Provenance (mode, path, branch, base commit) is committed with the prepared targ
 inspectable while the worker is still running. The worktree and branch are the task's artifacts:
 cancellation or failure deletes nothing, and the spawning agent decides what to review or integrate.
 
+The worker task prompt tells the child that if Git refuses to create a commit because no author
+identity is configured, it must not invent a name or email and must not write Git configuration
+(global or repository); it reports the missing identity as a blocker instead. The host never sets an
+author identity, inspects the owner's Git configuration or changes it for the worker.
+
 ## Authority
 
 The child conversation starts default-deny. In the same commit that prepares it, the host records the

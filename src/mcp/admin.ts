@@ -197,7 +197,11 @@ export function renderMcpListing(listing: McpAdminListing, maxChars: number = MC
       ? server.enabled ? "configured, not connected" : "disabled"
       : server.state === "connected"
         ? `connected, ${server.tools ?? 0} tools`
-        : server.state === "closed" ? "closed" : `failed: ${server.failure ?? "unknown"}`;
+        : server.state === "closed"
+          ? "closed"
+          : server.failure === "auth-required"
+            ? "failed: auth-required (owner login required)"
+            : `failed: ${server.failure ?? "unknown"}`;
     lines.push(`- ${server.name} (${server.kind}${server.oauth ? ", oauth" : ""}): ${state}`);
   }
   if (listing.logins.length === 0) {

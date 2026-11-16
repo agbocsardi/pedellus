@@ -19,6 +19,7 @@ const [
     FileMcpOAuthStateStore,
     MCP_ADMIN_TOOL_NAME,
     createMcpAdmin,
+    renderMcpListing,
     adoptMcpOAuthRefresh,
     commitMcpOAuthState,
     mcpOAuthGrantEpoch,
@@ -115,6 +116,22 @@ function deferred() {
   const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
   return { promise, resolve };
 }
+
+test('MCP status makes a rejected OAuth grant actionable without exposing token material', () => {
+  const text = renderMcpListing({
+    configured: true,
+    servers: [
+      { name: 'remote', kind: 'http', enabled: true, oauth: true, state: 'failed', failure: 'auth-required', tools: 0 },
+      { name: 'local', kind: 'stdio', enabled: true, oauth: false, state: 'failed', failure: 'start-failed', tools: 0 },
+    ],
+    logins: [],
+  });
+  assert.match(text, /remote \(http, oauth\): failed: auth-required \(owner login required\)/);
+  assert.match(text, /local \(stdio\): failed: start-failed/);
+  assert.doesNotMatch(text, new RegExp(ACCESS_TOKEN));
+  assert.doesNotMatch(text, new RegExp(REFRESH_TOKEN));
+  assert.doesNotMatch(text, /synthetic-access-token-value|authorization URL|refresh token/i);
+});
 
 function lastUserText(messages) {
   const users = messages.filter((message) => message.role === 'user');
