@@ -84,7 +84,7 @@ const error = (message: string) => ({ output: [{ type: "text" as const, text: me
 function result(value: unknown) {
   const text = JSON.stringify({ notice: NOTICE, ...(value as Record<string, unknown>) });
   if (Buffer.byteLength(text, "utf8") > MEMORY_TOOL_OUTPUT_BYTES) {
-    return error("Memory result exceeds the output byte limit, so nothing was returned and the continuation did not advance. Retry the same request and cursor with a smaller limit; changing limit on a continuation is supported. At limit 1, the single result cannot be returned.");
+    return error("Memory result exceeds the output byte limit, so nothing was returned and the continuation did not advance. Retry the same request and cursor with a smaller limit; changing limit on a continuation is supported. At the minimum limit, the single result cannot be returned.");
   }
   return {
     output: [{ type: "text" as const, text }],

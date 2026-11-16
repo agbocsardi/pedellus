@@ -611,12 +611,12 @@ interface WaitSettlement {
   readonly error: string | null;
   readonly answerEntryId: EntryId | null;
 }
-/** An answer whose text begins with this marker reports that the occurrence failed. */
-export const CRON_FAILURE_MARKER = "[FAILED]";
+/** An answer whose first line is exactly this marker reports that the occurrence failed. */
+const CRON_FAILURE_MARKER = "[FAILED]";
 function reportsFailure(entry: { readonly model?: readonly unknown[] } | undefined): boolean {
   const message = entry?.model?.[0] as { content?: readonly { type: string; text?: string }[] } | undefined;
   const body = (message?.content ?? []).flatMap((part) => part.type === "text" ? [part.text ?? ""] : []).join("");
-  return body.trimStart().startsWith(CRON_FAILURE_MARKER);
+  return body.trimStart().split(/\r?\n/, 1)[0]!.trim() === CRON_FAILURE_MARKER;
 }
 function outcomeOf(record: SubmissionRecord): WaitSettlement {
   if (record.status === "done" && record.type === "input") {
