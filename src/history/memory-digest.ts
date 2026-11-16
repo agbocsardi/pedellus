@@ -42,7 +42,8 @@
  *   re-run; a crash between request and result repeats that turn at the provider, not the batch.
  * - A settled turn is validated from its own committed input entry through its own answer before the
  *   cursor may move: a failed read is harmless, a failed write/edit must be repaired by a later
- *   successful mutation of that same file, a host budget/usage refusal stays fatal, the answer must be
+ *   same-operation retry at its normalized path with unchanged replacement/content (and an intervening
+ *   successful read for edits); a host budget/usage refusal stays fatal, the answer must be
  *   a non-empty report, and the bounded paged scan must reach it. The check reads the committed
  *   transcript, so it survives a reopen.
  * - `write` performs one guarded `O_CREAT | O_EXCL` create through the host environment: a concurrent
@@ -257,9 +258,10 @@ original transcripts stay the authority; you are not rewriting or archiving them
   you just saw, never force a missing match, and re-read when a match fails.
 - A failed read is harmless: the missing or out-of-scope path was not read. Do not treat it as a saved
   fact, and do not keep retrying the same path; read a different file or continue with what you have.
-- A failed write or edit must be repaired in this same run by a later successful \`write\` or \`edit\` of
-  that exact file. After a create-only refusal, read the existing file and update it with an exact
-  \`edit\`. After a stale edit, re-read the file and retry the exact current \`oldText\`. A host budget
+- A failed mutation needs a successful retry of the same operation at the same normalized path with
+  identical intended replacement/content. After a stale edit, re-read successfully, then retry with
+  refreshed exact \`oldText\` but unchanged \`newText\`. An unrelated same-file edit or editing after a
+  refused create is not a verified repair. A host budget
   or policy refusal is not repairable: stop and report it. A batch with an unrepaired failed write or
   edit, or a host refusal, is not acknowledged and will be retried later.
 - A batch may be replayed after an interrupted attempt. Before adding a fact, check whether it is
@@ -691,7 +693,7 @@ export function createMemoryDigestScopeExtension(
           if (entry === undefined) continue;
           for (const outcome of toolOutcomesOf(entry, calls)) {
             if (!outcome.isError) continue;
-            if (digestFailureVerdict(outcome.name, outcome.arguments, outcome.diagnostics) === "fatal") {
+            if (digestFailureVerdict(outcome.name, outcome.arguments, outcome.diagnostics, workspaceRoot) === "fatal") {
               fatal = true;
               break;
             }
@@ -865,7 +867,9 @@ function renderMemoryDigestInput(batch: DigestBatch, prompt: string, index: stri
     "  this assistant's own tools in this process; an outside editor changing the file between your read",
     "  and your write is not detected, so only edit text you just saw.",
     "- A failed read is harmless and is never saved as fact. A failed write/edit must be repaired by a",
-    "  later successful write/edit of that same file in this run; a host budget/usage refusal is fatal.",
+    "  successful same-operation retry at its normalized path with unchanged replacement/content.",
+    "  For edits, re-read successfully before retrying refreshed oldText with unchanged newText.",
+    "  An unrelated same-file edit is not a repair; a host budget/usage refusal is fatal.",
     "  An unrepaired mutation or a host refusal fails the batch and leaves the frontier unchanged.",
     "- You cannot message anyone, schedule work, run commands, browse or start other agents.",
     "",
@@ -1585,8 +1589,43 @@ const HARMLESS_TOOL_CODES = new Set(["tool_error", "blocked", "invalid_arguments
 
 type DigestFailureVerdict = "harmless-read" | "repairable-mutation" | "fatal";
 
-function mutationPathOf(args: unknown): string | undefined {
-  return isRecord(args) && typeof args.path === "string" ? args.path : undefined;
+/** Match the execution hook's lexical resolution and containment rules. */
+function mutationPathOf(args: unknown, workspaceRoot: string): string | undefined {
+  if (!isRecord(args) || typeof args.path !== "string" || args.path.length === 0) return undefined;
+  const root = resolve(workspaceRoot);
+  const inside = relative(root, resolve(root, args.path));
+  if (inside.length === 0 || inside === ".." || inside.startsWith(`..${sep}`) || isAbsolute(inside)) return undefined;
+  const path = inside.split(sep).join("/");
+  return memoryDigestScopeProblem(path) === undefined ? path : undefined;
+}
+
+/** A repair preserves the operation and intended replacement, not merely the file path. */
+function repairsMutation(
+  failure: DigestToolOutcome,
+  success: DigestToolOutcome,
+  outcomes: readonly DigestToolOutcome[],
+  workspaceRoot: string,
+): boolean {
+  if (success.entryId <= failure.entryId || success.name !== failure.name
+    || mutationPathOf(success.arguments, workspaceRoot) !== mutationPathOf(failure.arguments, workspaceRoot)
+    || !isRecord(failure.arguments) || !isRecord(success.arguments)) return false;
+  if (failure.name === "write") {
+    return typeof failure.arguments.content === "string" && success.arguments.content === failure.arguments.content;
+  }
+  const attempted = failure.arguments.edits;
+  const retried = success.arguments.edits;
+  return failure.name === "edit" && Array.isArray(attempted) && attempted.length > 0
+    && Array.isArray(retried) && attempted.length === retried.length
+    && attempted.every((edit, index) => {
+      const retry = retried[index];
+      return isRecord(edit) && isRecord(retry) && typeof edit.newText === "string"
+        && typeof edit.oldText === "string" && edit.oldText.length > 0
+        && typeof retry.oldText === "string" && retry.oldText.length > 0
+        && retry.newText === edit.newText;
+    })
+    && outcomes.some((read) => !read.isError && read.name === "read"
+      && read.entryId > failure.entryId && read.entryId < success.entryId
+      && mutationPathOf(read.arguments, workspaceRoot) === mutationPathOf(failure.arguments, workspaceRoot));
 }
 
 function diagnosticsOf(entry: EntryRecord): readonly ToolDiagnostic[] {
@@ -1608,19 +1647,20 @@ function hasNonToolFailure(diagnostics: readonly ToolDiagnostic[]): boolean {
 /**
  * Classify one failed tool result without trusting model text. A failed read is exploratory and
  * harmless (its path refusal read nothing), and an in-scope write/edit failure may be repaired by a
- * later successful mutation of the same file. A host budget/usage refusal and any non-tool failure
+ * later verified retry of the same operation and replacement. A host budget/usage refusal and any non-tool failure
  * are fatal; an out-of-scope mutation has no possible same-path repair, so it is fatal too.
  */
 function digestFailureVerdict(
   name: string,
   args: unknown,
   diagnostics: readonly ToolDiagnostic[],
+  workspaceRoot: string,
 ): DigestFailureVerdict {
   if (isDigestBudgetRefusal(diagnostics) || hasNonToolFailure(diagnostics)) return "fatal";
   if (name === "read") return "harmless-read";
   if (name !== "write" && name !== "edit") return "fatal";
-  const path = mutationPathOf(args);
-  if (path === undefined || memoryDigestScopeProblem(path) !== undefined) return "fatal";
+  const path = mutationPathOf(args, workspaceRoot);
+  if (path === undefined) return "fatal";
   return "repairable-mutation";
 }
 
@@ -1673,8 +1713,9 @@ type TurnCheck =
  * its own answer entry, never an earlier or later turn. Within it:
  * - the first entry is this task's digest input (kind and `data.taskId`), so a different attempt's
  *   turn cannot be mistaken for this one;
- * - a failed read is harmless, but a failed write/edit must be followed by a successful mutation of
- *   that same workspace-relative path, and a host budget/usage or non-tool failure is fatal even when
+ * - a failed read is harmless, but a failed mutation requires a successful same-operation retry
+ *   at its normalized path with unchanged replacement/content (and an intervening successful read
+ *   for edits); a host budget/usage or non-tool failure is fatal even when
  *   the model read or answered later;
  * - the answer must be a committed assistant entry with a non-empty report.
  *
@@ -1684,6 +1725,7 @@ type TurnCheck =
 async function validateCommittedTurn(
   conversation: Pick<Conversation, "entries">,
   turn: { readonly taskId: number; readonly entryId: EntryId; readonly answerEntryId: EntryId },
+  workspaceRoot: string,
   context: Context,
 ): Promise<TurnCheck> {
   if (turn.entryId >= turn.answerEntryId) {
@@ -1733,7 +1775,7 @@ async function validateCommittedTurn(
   const successes = outcomes.filter((outcome) => !outcome.isError);
   for (const failure of outcomes) {
     if (!failure.isError) continue;
-    const verdict = digestFailureVerdict(failure.name, failure.arguments, failure.diagnostics);
+    const verdict = digestFailureVerdict(failure.name, failure.arguments, failure.diagnostics, workspaceRoot);
     if (verdict === "fatal") {
       return {
         status: "failed",
@@ -1743,11 +1785,7 @@ async function validateCommittedTurn(
       };
     }
     if (verdict === "harmless-read") continue;
-    const path = mutationPathOf(failure.arguments);
-    const repaired = path !== undefined && successes.some((success) =>
-      success.entryId > failure.entryId
-      && (success.name === "write" || success.name === "edit")
-      && mutationPathOf(success.arguments) === path);
+    const repaired = successes.some((success) => repairsMutation(failure, success, outcomes, workspaceRoot));
     if (!repaired) return { status: "failed", reason: TURN_FAILURE_REASONS.toolCallFailed };
   }
   if (answer === null) return { status: "failed", reason: TURN_FAILURE_REASONS.noReport };
@@ -2530,7 +2568,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
                   taskId: Number(running.id),
                   entryId: settlement.entryId,
                   answerEntryId: settlement.answerEntryId,
-                }, context);
+                }, options.workspaceRoot, context);
           } catch {
             checked = { status: "failed", reason: TURN_FAILURE_REASONS.unverifiable };
           }

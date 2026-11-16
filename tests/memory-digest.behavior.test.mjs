@@ -670,8 +670,10 @@ test('a stale edit is repaired by a re-read and exact edit in the same turn', { 
   await writeFile(join(fixture.workspace, existing), '---\ndescription: Deploy notes\n---\n\nOWNER-ORIGINAL\n', 'utf8');
   const store = await openStore(fixture, (request) => {
     const text = transcriptText(request.messages);
-    if (!text.includes('edit-stale')) return toolEdit(existing, 'STALE-OLD-TEXT', 'never\n', 'edit-stale');
-    if (!text.includes('read-current')) return toolRead(existing, 'read-current');
+    if (!text.includes('edit-stale')) {
+      return toolEdit('memory/topics/../topics/deploy.md', 'STALE-OLD-TEXT', `OWNER-ORIGINAL\n\n- ${FACT_LINE}`, 'edit-stale');
+    }
+    if (!text.includes('read-current')) return toolRead('./memory/topics/deploy.md', 'read-current');
     if (!text.includes('edit-repair')) {
       return toolEdit(existing, 'OWNER-ORIGINAL', `OWNER-ORIGINAL\n\n- ${FACT_LINE}`, 'edit-repair');
     }
@@ -724,6 +726,30 @@ test('a successful mutation of another file does not repair a failed edit', { ti
   assert.equal(await readFile(join(fixture.workspace, existing), 'utf8'), 'OWNER-ORIGINAL\n');
   assert.equal(await readFile(join(fixture.workspace, 'memory/topics/other.md'), 'utf8'), '- unrelated\n',
     'the unrelated successful write is kept, not rolled back');
+});
+
+test('an unrelated same-file edit after re-reading does not repair the failed replacement', { timeout: 30_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const existing = 'memory/topics/deploy.md';
+  await mkdir(join(fixture.workspace, 'memory/topics'), { recursive: true });
+  await writeFile(join(fixture.workspace, existing), 'OWNER-ORIGINAL\n', 'utf8');
+  const store = await openStore(fixture, (request) => {
+    const text = transcriptText(request.messages);
+    if (!text.includes('edit-stale-same')) return toolEdit(existing, 'STALE-OLD-TEXT', FACT_LINE, 'edit-stale-same');
+    if (!text.includes('read-same')) return toolRead(existing, 'read-same');
+    if (!text.includes('edit-unrelated')) return toolEdit(existing, 'OWNER-ORIGINAL', 'UNRELATED', 'edit-unrelated');
+    return fauxAssistantMessage('An unrelated edit succeeded, not the intended change.');
+  });
+  t.after(async () => { await store.gateway.close(context).catch(() => undefined); });
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  const task = await settleTask(store.gateway.harness, started.taskId);
+  assert.equal(task.state.outcome.status, 'failed');
+  assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined);
+  assert.equal(await readFile(join(fixture.workspace, existing), 'utf8'), 'UNRELATED\n');
 });
 
 test('a budget refusal on a failed read is never concealed by a later answer', { timeout: 30_000 }, async (t) => {

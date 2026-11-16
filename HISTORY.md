@@ -887,13 +887,15 @@ One run, in order:
    `maxToolCalls` tool rounds and the answer), not the batch: a bigger batch is one larger input
    entry, not more entries, so raising the batch bounds does not move it. The input must be this task's input (kind and `data.taskId`). A failed read is harmless: a missing, out-of-scope or otherwise
    refused exploratory read read nothing and does not fail the batch. A failed `write` or `edit` must be
-   repaired within the same committed turn by a later successful `write` or `edit` of that exact
-   workspace-relative path; the classifier uses each failed call's paired result and the committed call
-   arguments, never model narration, so a successful mutation of another file is not a repair. A host
+   repaired within the same committed turn by a successful retry of the same operation at the same
+   normalized workspace-relative path with identical replacement/content. An edit additionally requires
+   a successful intervening read before retrying refreshed `oldText` with unchanged `newText`.
+   Unrelated same-file edits and an edit after a refused create are not verified repairs. The classifier
+   uses paired committed calls/results, never model narration. A host
    budget/usage refusal, a harness interruption/abort or any other non-tool failure is fatal even when a
    read or answer follows. A mutation refused outside the curation scope is fatal because no later
-   same-path success is possible. The model may therefore re-read and fix a stale edit or a create-only
-   collision inside the existing tool/request/time/write bounds; an unrepaired failure is not silently
+   same-path success is possible. The model may therefore re-read and fix a stale edit
+   inside the existing tool/request/time/write bounds; an unrepaired failure is not silently
    dropped. The answer entry must be a non-empty assistant report. Only then is the batch acknowledged,
    re-validating it against the committed transcript. The terminal commit retires the captured tools and
    hook in the same commit that records the outcome. Provider error, an unrepaired failed write/edit, a
