@@ -110,8 +110,9 @@ try {
   const state = await gateway.harness.snapshot(AgentDoc, recovered.id, context);
   assert.deepEqual(state.model, { provider: "fixture", modelId: "alpha" });
   assert.equal(state.thinkingLevel, "high");
-  assert.deepEqual(state.tools, []);
-  assert.deepEqual(state.modelTools, []);
+  // No coding tool is granted; the mapped chat keeps only the owner-question capability.
+  assert.deepEqual(state.tools.map((tool) => (typeof tool === 'string' ? tool : tool.name)).sort(), ['ask_user']);
+  assert.deepEqual(state.modelTools.map((tool) => (typeof tool === 'string' ? tool : tool.name)).sort(), ['ask_user']);
   assert.deepEqual(dispatched, ["alpha"]);
   console.log("PASS: atomic busy rejection, thinking persistence/reset, reopen, and allowlist revocation use synthetic models only");
 } finally {

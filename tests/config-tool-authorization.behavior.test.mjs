@@ -85,7 +85,7 @@ test('config authority runs read and memory recall in a mapped chat while other 
   try {
     gateway = await openGateway(store.config(['read']), context, { models });
     const chat = await gateway.conversationFor('telegram:7:chat:501', context);
-    assert.deepEqual(toolNames(await chat.agent(context)).sort(), ['memory_browse', 'memory_read', 'memory_search', 'read']);
+    assert.deepEqual(toolNames(await chat.agent(context)).sort(), ['ask_user', 'memory_browse', 'memory_read', 'memory_search', 'read']);
 
     await say(chat, `remember ${marker}`);
     await say(chat, 'recall the note');

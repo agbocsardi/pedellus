@@ -9,6 +9,7 @@ import type { MemoryDigestStartResult, MemoryDigestStatusView } from "../history
 import type { GatewayModelList, GatewayModelSelection, GatewayModelSelectionRequest } from "../runtime.js";
 import type { McpAdminListing, McpCallbackResult } from "../mcp/index.js";
 import type { McpAuthorizationLink } from "../mcp/surface.js";
+import { validAskQuestionView, type AskQuestionView } from "../questions/index.js";
 import type {
   CronOperatorCancelOutcome,
   CronOperatorCreateOutcome,
@@ -90,6 +91,10 @@ export interface LocalGatewayClient extends TerminalConversation {
   readonly pendingNotices: readonly LocalHostNotice[];
   /** Mark printed host notices delivered; a failed call leaves them pending for the next attach. */
   ackNotices(ids: readonly string[], context: Context): Promise<void>;
+  /** Questions still open in this exact conversation; reprinted once on attach. */
+  readonly askQuestions: readonly AskQuestionView[];
+  /** Direct, transient owner delivery from the gateway for a question it just admitted. */
+  onAskQuestion?: ((question: AskQuestionView) => void) | undefined;
   /** Direct, transient owner delivery from the gateway; never a transcript or durable outbox entry. */
   onMcpAuthorization?: ((authorization: McpAuthorizationLink) => void) | undefined;
   onMcpNotice?: ((text: string) => void) | undefined;
@@ -169,6 +174,8 @@ class LocalGatewayConnection implements LocalGatewayClient {
   sessionKey = "";
   onMcpAuthorization: ((authorization: McpAuthorizationLink) => void) | undefined;
   onMcpNotice: ((text: string) => void) | undefined;
+  onAskQuestion: ((question: AskQuestionView) => void) | undefined;
+  askQuestions: readonly AskQuestionView[] = [];
   pendingNotices: LocalHostNotice[] = [];
   tools: readonly string[] = [];
   contextRefresh = false;
@@ -218,6 +225,15 @@ class LocalGatewayConnection implements LocalGatewayClient {
     this.digest = result.digest === true;
     this.mcp = result.mcp === true;
     this.restartSupported = result.restart === true;
+    const questions = result.questions;
+    if (questions !== undefined) {
+      if (!Array.isArray(questions) || questions.some((entry) => !validAskQuestionView(entry))) {
+        throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attach result");
+      }
+      this.askQuestions = questions as AskQuestionView[];
+    } else {
+      this.askQuestions = [];
+    }
     const notices = result.notices;
     if (notices === undefined) {
       this.pendingNotices = [];
@@ -536,7 +552,9 @@ class LocalGatewayConnection implements LocalGatewayClient {
     if ("event" in message) {
       if (message.event === "snapshot") this.queueSnapshot(message.snapshot);
       else if (message.event === "settled") this.receiveSettlement(message.id, message.settlement);
-      else if (message.event === "mcpAuthorization") {
+      else if (message.event === "askQuestion") {
+        if (validAskQuestionView(message.question)) this.onAskQuestion?.(message.question);
+      } else if (message.event === "mcpAuthorization") {
         const authorization = asObject(message.authorization);
         if (authorization !== undefined
           && typeof authorization.requestId === "string"

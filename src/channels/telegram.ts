@@ -7,7 +7,7 @@ import type { TelemetryContext, TelemetrySpan } from "@earendil-works/pi-telemet
 import { journalEvent, journalTelemetry, observeOperation } from "../observability.js";
 import type { Message } from "grammy/types";
 import type { ApiClientOptions } from "grammy";
-import type { MessageReactionUpdated, ReactionType, ReactionTypeEmoji, Update } from "grammy/types";
+import type { CallbackQuery, MessageReactionUpdated, ReactionType, ReactionTypeEmoji, Update } from "grammy/types";
 import type { Conversation, Submission, SubmissionId, SubmissionRecord } from "@earendil-works/pi-durable";
 import type { AssistantMessage, ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { FollowUpMode } from "../config.js";
@@ -28,6 +28,16 @@ import {
   renderMemoryDigestStatus,
 } from "../history/memory-digest.js";
 import { renderMcpListing } from "../mcp/admin.js";
+import {
+  AskQuestionsDoc,
+  claimOutcomeText,
+  claimQuestionAnswer,
+  parseQuestionCallback,
+  questionCallbackData,
+  renderQuestionText,
+  type AskQuestionView,
+  type AskSurfaceRegistry,
+} from "../questions/index.js";
 import { looksLikeOAuthCallback } from "../mcp/surface.js";
 import type {
   GatewayMcpAdmin,
@@ -501,6 +511,11 @@ export interface TelegramGateway {
   mcpAdmin?: GatewayMcpAdmin;
   /** Live MCP login delivery and callback surfaces, attached by this adapter while it runs. */
   mcpSurfaces?: import("../mcp/surface.js").McpSurfaceRegistry;
+  /**
+   * Live owner-question surfaces. The model's `ask_user` tool delivers here only for an exact mapped
+   * private chat; this adapter re-authenticates the chat and sender when a button is pressed.
+   */
+  askSurfaces?: AskSurfaceRegistry;
 }
 
 export async function runTelegram(
@@ -1401,6 +1416,7 @@ export async function runTelegram(
 
   let detachTelegramActions: (() => void) | undefined;
   let detachMcpSurface: (() => void) | undefined;
+  let detachAskSurface: (() => void) | undefined;
 
   // A completed background result is sent as stored text: no submission, no preview, no model turn.
   const scheduledSessions = async (): Promise<{ sessionKey: string; chatId: number }[]> => {
@@ -2649,6 +2665,14 @@ export async function runTelegram(
       await sendOwnerPlainText(owner.chatId, owner.senderId, text);
     },
   });
+  detachAskSurface = gateway.askSurfaces?.attach({
+    owns: (sessionKey) => ownerChatFor(sessionKey) !== undefined,
+    async deliverQuestion(sessionKey, question) {
+      const owner = ownerChatFor(sessionKey);
+      if (owner === undefined) throw new Error("the requesting Telegram owner chat is no longer authorized");
+      await sendAskQuestion(owner.chatId, question);
+    },
+  });
   journalEvent("telegram.polling", { "queue.depth": state.pending.length });
   drain();
 
@@ -2661,7 +2685,7 @@ export async function runTelegram(
       const updates = await apiCall(api, "getUpdates", signal, (callSignal) => api.getUpdates({
         offset: state.offset,
         timeout: Math.min(options.pollTimeoutSeconds ?? 30, POLL_TIMEOUT_MAX),
-        allowed_updates: ["message", "message_reaction"],
+        allowed_updates: ["message", "message_reaction", "callback_query"],
       }, toGrammySignal(callSignal)), { throttle: pollThrottle, retryOutage: readOutageHooks });
       if (!updates) throw new Error("Telegram getUpdates returned no result");
       for (const update of updates) {
@@ -2806,6 +2830,11 @@ export async function runTelegram(
           await handleReaction(update, reaction);
           continue;
         }
+        const callback = update.callback_query;
+        if (callback !== undefined) {
+          await handleAskCallback(update, callback);
+          continue;
+        }
         // An unhandled update type (for example an anonymous reaction count) advances the offset
         // without a model call.
         await persistOffset(update.update_id + 1);
@@ -2819,6 +2848,8 @@ export async function runTelegram(
     detachTelegramActions = undefined;
     detachMcpSurface?.();
     detachMcpSurface = undefined;
+    detachAskSurface?.();
+    detachAskSurface = undefined;
     stopAllTyping();
     if (scheduledTimer !== undefined) clearInterval(scheduledTimer);
     // Release any delivery waiting on a coalescing window, so shutdown never waits for an idle timer.
@@ -2844,6 +2875,101 @@ export async function runTelegram(
         console.warn("Telegram command menu registration failed; the implemented commands still work when typed.");
       }
     }
+  }
+
+  /**
+   * Render one durable question with native inline buttons. Buttons carry opaque question and option
+   * ids only; the visible label is model text and the press is re-authenticated before it counts.
+   */
+  async function sendAskQuestion(chatId: number, question: AskQuestionView): Promise<void> {
+    const text = renderQuestionText(question, "telegram", Date.now());
+    const inline_keyboard = question.options.map((option) => [{
+      text: option.label,
+      callback_data: questionCallbackData(question.id, option.id),
+    }]);
+    const sent = await apiCall<Message.TextMessage>(api, "sendMessage", signal, (callSignal) => withChatSendOrder(chatId, () =>
+      api.sendMessage(chatId, text, { reply_markup: { inline_keyboard } }, toGrammySignal(callSignal))),
+    { throttle: outboundThrottle });
+    // A throttled or otherwise skipped call would leave an admitted question undelivered while the
+    // tool reported success; any non-result is a delivery failure here.
+    if (sent === undefined) throw new Error("the question message was not sent");
+  }
+
+  /** Cosmetic acknowledgement; an expired query id or a flood wait changes no durable answer state. */
+  async function acknowledgeCallback(query: CallbackQuery, text: string): Promise<void> {
+    try {
+      await apiCall(api, "answerCallbackQuery", signal, (callSignal) =>
+        api.answerCallbackQuery(query.id, { text }, toGrammySignal(callSignal)), { throttle: outboundThrottle });
+    } catch {
+      // The popup is best effort; an unacknowledged press still has its durable outcome.
+    }
+  }
+
+  /** Best effort: the durable record already refuses a later tap with fixed text. */
+  async function removeQuestionKeyboard(chatId: number, messageId: number): Promise<void> {
+    try {
+      await apiCall(api, "editMessageReplyMarkup", signal, (callSignal) => withChatSendOrder(chatId, () =>
+        api.editMessageReplyMarkup(chatId, messageId, { reply_markup: { inline_keyboard: [] } },
+          toGrammySignal(callSignal))), { throttle: outboundThrottle });
+    } catch {
+      // A keyboard that stays visible is harmless: the next tap is answered by the durable record.
+    }
+  }
+
+  /**
+   * One button press becomes one ordinary durable input only after the exact private chat, the bound
+   * sender and the durable question record all accept it. The claim and the follow-up admission share
+   * one commit, so a duplicate, stale, expired or replayed tap can never admit a second turn.
+   */
+  async function handleAskCallback(update: Update, query: CallbackQuery): Promise<void> {
+    const message = query.message;
+    const senderId = String(query.from.id);
+    const chatId = message?.chat.id;
+    const binding = chatId === undefined ? undefined : originBindingOf(state.origins, chatId, identity);
+    const parsed = parseQuestionCallback(query.data);
+    const authorized = message !== undefined && chatId !== undefined && message.chat.type === "private"
+      && options.allowFrom.includes(senderId) && binding !== undefined && binding.senderId === senderId;
+    if (!authorized || parsed === undefined) {
+      await acknowledgeCallback(query, "This button is not available here.");
+      await persistOffset(update.update_id + 1);
+      return;
+    }
+    if (gateway.askSurfaces === undefined) {
+      await acknowledgeCallback(query, "Questions are not supported in this host.");
+      await persistOffset(update.update_id + 1);
+      return;
+    }
+    const sessionKey = `telegram:${identity}:chat:${chatId}`;
+    const conversation = await gateway.conversationFor(sessionKey, adapterContext);
+    const committed = await stateConversation.commit(async (tx) => {
+      const questions = await tx.doc(AskQuestionsDoc, conversation.id);
+      const claim = claimQuestionAnswer(questions, {
+        questionId: parsed.questionId,
+        optionId: parsed.optionId,
+        sessionKey,
+        nowMs: Date.now(),
+      }).result;
+      const doc = await tx.doc(TelegramState, stateConversation.id);
+      if (claim.status === "accepted" && !doc.pending.some((entry) => entry.updateId === update.update_id)) {
+        if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
+        doc.pending.push({
+          updateId: update.update_id,
+          nextChunkIndex: 0,
+          chatId,
+          sessionKey,
+          senderId,
+          text: claim.text,
+        });
+      }
+      doc.offset = Math.max(doc.offset, update.update_id + 1);
+      return { claim, state: copyJson(doc) as unknown as ChannelState };
+    }, adapterContext);
+    state = committed.state;
+    await acknowledgeCallback(query, claimOutcomeText(committed.claim));
+    if (committed.claim.status !== "invalid" && committed.claim.status !== "stale") {
+      await removeQuestionKeyboard(chatId, message.message_id);
+    }
+    drain();
   }
 
   /**

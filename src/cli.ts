@@ -17,6 +17,7 @@ import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { COMMANDS, commandUsage, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
 import { SAFE_COMMAND_NAME } from "./help/commands.js";
 import { connectLocalGateway } from "./local/client.js";
+import { renderQuestionText, type AskQuestionView } from "./questions/index.js";
 import { gatewaySocketPath, serveLocalGateway } from "./local/server.js";
 import { LocalGatewayError } from "./local/protocol.js";
 import { createMediaStore } from "./media/attachments.js";
@@ -622,6 +623,13 @@ async function runAgent(
       ].join("\n"));
     };
     client.onMcpNotice = (text) => { stdout.write(`\n${text}\n`); };
+    // A model question is delivered here while this terminal is attached. The owner answers with an
+    // ordinary next message; no button protocol or second prompt exists in a text terminal.
+    const printQuestion = (question: AskQuestionView): void => {
+      stdout.write(`\n${renderQuestionText(question, "cli", Date.now())}\n`);
+    };
+    client.onAskQuestion = printQuestion;
+    for (const question of client.askQuestions) printQuestion(question);
     // A host interruption notice recorded before this attachment was live. It is ordinary host text,
     // not a transcript entry and not a model turn; acknowledge only after writing it, so a crash
     // repeats the notice on the next attach instead of losing it.

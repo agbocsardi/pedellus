@@ -143,7 +143,9 @@ test("explicit host config drives the Gateway path for every session and across 
 
     assert.doesNotMatch(captured[0], /## Identity|Your workspace is at:|## Runtime\n|## Skill /);
     const agent = await alpha.agent(context);
-    assert.deepEqual([agent.tools, agent.callable], [[], []]);
+    // Workspace context adds no tool; the mapped chat keeps only the owner-question capability.
+    assert.deepEqual(agent.tools.map((tool) => tool.name), ["ask_user"]);
+    assert.deepEqual(agent.callable, []);
 
     const root = await gateway.harness.root(context);
     assert.doesNotMatch(JSON.stringify((await root.agent(context)).sections), /nanobot_|AGENTS-ALPHA/);

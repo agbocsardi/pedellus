@@ -21,6 +21,8 @@ const { LocalGatewayError } = await import(pathToFileURL(`${pkg}/dist/local/prot
 const { runTerminalConversation } = await import(pathToFileURL(`${pkg}/dist/terminal/index.js`).href);
 const { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(pathToFileURL(`${ai}/index.js`).href);
 const { BACKGROUND_CONTEXT } = await import(pathToFileURL(`${chord}/context/index.js`).href);
+const { AskQuestionsDoc } = await import(pathToFileURL(`${pkg}/dist/questions/index.js`).href);
+const { ToolResultEntry } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-durable/dist/index.js`).href);
 
 const context = BACKGROUND_CONTEXT;
 const timeoutMs = 15_000;
@@ -36,6 +38,28 @@ async function eventually(check, message) {
 
 function lines(...values) {
   return (async function* () { yield* values; })();
+}
+
+async function toolResultText(conversation, callId) {
+  const page = await conversation.entries({}, 200, undefined, context);
+  const result = page.items.filter(ToolResultEntry.is)
+    .map((entry) => entry.model?.[0])
+    .find((message) => message?.toolCallId === callId);
+  assert.ok(result, `synthetic ${callId} call reached the transcript`);
+  return (result.content ?? []).map((part) => (part.type === "text" ? part.text : "")).join("\n");
+}
+
+async function askDocument(conversation) {
+  return conversation.commit(async (tx) => {
+    const doc = await tx.doc(AskQuestionsDoc, conversation.id);
+    return {
+      questions: doc.questions.map((question) => ({
+        id: question.id,
+        status: question.status,
+        delivery: question.delivery,
+      })),
+    };
+  }, context);
 }
 
 function capture(chunks) {
@@ -600,3 +624,61 @@ function rawConnection(socketPath) {
     socket.once("error", rejectConnection);
   });
 }
+
+test("ask_user refuses without a surface and reaches the attached CLI as durable questions", { timeout: 30_000 }, async (t) => {
+  const { gateway, provider, socketPath } = await makeEnvironment(t);
+  const conversation = await gateway.conversationFor("cli:default", context);
+  const askCall = (id) => fauxToolCall("ask_user", {
+    questions: [{
+      question: "Deploy now?",
+      options: [{ label: "Yes", description: "publish the current build" }, { label: "No" }],
+    }],
+  }, { id });
+
+  // No owner surface is attached yet: the tool admits nothing and says so.
+  provider.setResponses([
+    fauxAssistantMessage(askCall("ask-no-surface"), { stopReason: "toolUse" }),
+    // A refused question does not end the turn: the model continues without pretending to ask.
+    fauxAssistantMessage("synthetic answer without asking"),
+  ]);
+  const unattached = await conversation.submit({ type: "input", content: "ask without an owner surface" }, context);
+  assert.equal((await unattached.wait(context)).status, "done");
+  assert.match(await toolResultText(conversation, "ask-no-surface"), /No live owner surface/);
+  assert.equal((await askDocument(conversation)).questions.length, 0);
+
+  const client = await connectLocalGateway({ socketPath, context });
+  const delivered = [];
+  client.onAskQuestion = (question) => delivered.push(question);
+  provider.setResponses([
+    fauxAssistantMessage(askCall("ask-with-surface"), { stopReason: "toolUse" }),
+    fauxAssistantMessage("synthetic answer to the owner decision"),
+  ]);
+
+  const asked = await client.submit("ask with this terminal attached", context);
+  assert.equal((await asked.wait(context)).status, "done");
+  await eventually(() => delivered.length === 1, "the attached CLI did not receive the question");
+  assert.equal(delivered[0].question, "Deploy now?");
+  assert.deepEqual(delivered[0].options.map((option) => option.label), ["Yes", "No"]);
+  assert.match(await toolResultText(conversation, "ask-with-surface"), /delivered to the owner's surface/);
+
+  let doc = await askDocument(conversation);
+  assert.equal(doc.questions.length, 1);
+  assert.equal(doc.questions[0].status, "pending");
+  assert.equal(doc.questions[0].delivery, "delivered");
+
+  // The terminal has no buttons: the owner's typed reply is an ordinary turn, and the durable
+  // question survives until the context is replaced.
+  const answered = await client.submit("Yes", context);
+  assert.equal((await answered.wait(context)).status, "done");
+  await eventually(async () => {
+    const page = await conversation.entries({}, 200, undefined, context);
+    return page.items.some((entry) =>
+      JSON.stringify(entry.model ?? []).includes("synthetic answer to the owner decision"));
+  }, "the typed answer did not reach the model");
+  assert.equal((await askDocument(conversation)).questions[0].status, "pending");
+
+  await client.reset(context);
+  doc = await askDocument(conversation);
+  assert.equal(doc.questions[0].status, "cancelled", "/new retires questions the new context cannot answer");
+  await client.close();
+});

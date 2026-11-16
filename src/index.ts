@@ -61,6 +61,23 @@ export {
   type PreparedResponseEvidence,
 } from "./recovery/index.js";
 export {
+  ASK_USER_LIMITS,
+  ASK_USER_TOOL_NAME,
+  AskQuestionsDoc,
+  claimOutcomeText,
+  claimQuestionAnswer,
+  createAskSurfaceRegistry,
+  createAskUserTool,
+  parseQuestionCallback,
+  pendingQuestionViews,
+  questionCallbackData,
+  renderQuestionText,
+  type AskOwnerSurface,
+  type AskQuestionRecord,
+  type AskQuestionView,
+  type AskSurfaceRegistry,
+} from "./questions/index.js";
+export {
   openGateway,
   type Gateway,
   type GatewayContextRefresh,

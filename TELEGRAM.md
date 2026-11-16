@@ -495,7 +495,7 @@ exposes no grant or approval commands and the model cannot ask for one.
 
 ## Replies, quotes, reactions and native actions
 
-The adapter requests `message` and `message_reaction` updates and registers the
+The adapter requests `message`, `message_reaction` and `callback_query` updates and registers the
 implemented owner controls with `setMyCommands` for all private chats at startup.
 Registration is best-effort: a rejection or flood wait logs one fixed warning
 and leaves typed commands working; no unimplemented command is advertised.
@@ -672,7 +672,20 @@ are not verified here. Path resolution and open are separate host calls: a local
 process racing the workspace between them is not fully excluded on this host
 (Node has no `openat`), though the final component is opened with `O_NOFOLLOW`.
 
-## Behavior
+### Owner questions
+
+A mapped private chat is also an owner-question surface. The model's `ask_user`
+tool renders one bounded question with one inline button per option; the press
+reaches this adapter as a `callback_query`. Buttons carry an opaque
+`pq:<question id>:<option id>` payload only — never the label, a chat id or a
+secret. A press counts only for the exact private chat, the bound admitted
+sender and the current `allowFrom`; the answer is claimed in the durable question
+record and admitted as one ordinary follow-up input in the same commit, so a
+duplicate, stale, expired, cancelled or replayed press gets one fixed toast and
+can never start a second turn. The keyboard is removed best effort after a
+terminal outcome; expiry is enforced by the durable record, not a timer. See
+[`ASK_USER.md`](./ASK_USER.md).
+
 
 - Requires a nonempty allowlist of decimal Telegram user IDs. Only private
   messages from those IDs are admitted; groups, bots, unknown users, and

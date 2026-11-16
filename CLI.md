@@ -429,6 +429,18 @@ Equivalent presets can both show as selected because the marker matches the actu
 provider/model/thinking settings, not a separately stored preset identity. A legacy
 pair selection may match no preset. See [model selection](./MODELS.md).
 
+## Owner questions
+
+A mapped CLI attach is an owner-question surface for the model's `ask_user` tool.
+A question is printed with numbered options and a bounded expiry hint; the owner
+answers by typing an ordinary next message (the terminal has no button protocol).
+A successful attach reprints questions still open in this conversation, so a
+gateway restart does not hide an outstanding decision. Two attachments sharing
+one conversation refuse delivery rather than guessing a recipient, and with no
+attachment the tool refuses and admits nothing. `/new` cancels open questions
+because the new context can no longer answer them; `/abort` and a restart leave
+them answerable. See [`ASK_USER.md`](./ASK_USER.md).
+
 ## Local attachments
 
 `/attach` is explicit, one file per command, and opt-in with the same top-level

@@ -112,6 +112,16 @@ offered only when the top-level `media` configuration is present and
 `toolAllowlist` contains `read`, so it adds no read grant. See
 [Telegram interactions](./TELEGRAM.md#replies-quotes-reactions-and-native-actions).
 
+Every mapped ordinary chat (the CLI attach included) also receives the
+model-facing `ask_user` tool. It asks the owner 1-4 bounded decisions with 2-4
+options, delivers them to the unique live surface for that exact session
+(Telegram buttons, or numbered text in the local terminal), and ends the turn;
+the owner's answer arrives later as an ordinary follow-up turn. It is not a
+coding-tool name, adds no authority, admits nothing when no surface is attached,
+and never reaches a worker, fork, root, digest or scheduled-run automation
+conversation. A question that appears to collect a credential is refused. See
+[`ASK_USER.md`](./ASK_USER.md).
+
 ## Configured authority
 
 `toolAllowlist` is the only coding-tool authority. A validated mapped ordinary chat

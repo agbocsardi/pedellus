@@ -6,7 +6,7 @@ import type { Context } from "@earendil-works/chord";
 import { withCancel, withTelemetry } from "@earendil-works/chord/context";
 import type { TelemetryContext } from "@earendil-works/pi-telemetry";
 import { journalEvent, journalTelemetry, observeOperation } from "../observability.js";
-import type { Conversation, Cursor, EntryId, Tx } from "@earendil-works/pi-durable";
+import type { Conversation, ConversationId, Cursor, EntryId, Tx } from "@earendil-works/pi-durable";
 import type { HistoryEpisodeQuery } from "../history/episodes.js";
 import type { BackgroundStatus } from "../background-status.js";
 import type { HistoryQuery } from "../history/index.js";
@@ -19,6 +19,7 @@ import {
   type LocalAttachmentRejection,
 } from "../media/local.js";
 import type { Gateway, GatewayMcpAdmin, GatewayModelSelectionRequest } from "../runtime.js";
+import { AskQuestionsDoc, pendingQuestionViews, type AskQuestionView } from "../questions/index.js";
 import { isTurnInterruptionNotice } from "../recovery/interruption.js";
 import { CRON_OPERATOR_LIMITS, CronOperatorInputError, type CronOperator } from "../automation/operator.js";
 import { RestartBusyError } from "../restart.js";
@@ -182,6 +183,7 @@ class LocalConnection {
   private watch: TerminalWatch | undefined;
   private sessionKey: string | undefined;
   private detachMcpSurface: (() => void) | undefined;
+  private detachAskSurface: (() => void) | undefined;
   private readonly submissions = new Map<number, TerminalSubmission>();
   private settled = new Map<number, TerminalSettlement>();
   private settledOrder: number[] = [];
@@ -209,6 +211,8 @@ class LocalConnection {
     this.finished = true;
     this.detachMcpSurface?.();
     this.detachMcpSurface = undefined;
+    this.detachAskSurface?.();
+    this.detachAskSurface = undefined;
     this.scope.cancel(new Error("local client disconnected"));
     try {
       await this.watch?.stop();
@@ -228,6 +232,8 @@ class LocalConnection {
     this.finished = true;
     this.detachMcpSurface?.();
     this.detachMcpSurface = undefined;
+    this.detachAskSurface?.();
+    this.detachAskSurface = undefined;
     this.scope.cancel(new Error("local client disconnected"));
     void this.watch?.stop().catch(() => undefined);
     this.watch = undefined;
@@ -534,6 +540,16 @@ class LocalConnection {
         this.send({ event: "mcpNotice", text });
       },
     });
+    // The model's `ask_user` reaches this exact attachment or no one, and never a sibling terminal.
+    this.detachAskSurface = this.options.gateway.askSurfaces?.attach({
+      owns: (candidate) => candidate === sessionKey,
+      deliverQuestion: async (target, question) => {
+        if (target !== sessionKey) throw new Error("question belongs to another session");
+        if (!this.send({ event: "askQuestion", question })) {
+          throw new Error("the local attachment is no longer connected");
+        }
+      },
+    });
     return {
       protocol: LOCAL_PROTOCOL_VERSION,
       sessionKey,
@@ -546,7 +562,18 @@ class LocalConnection {
       mcp: this.options.gateway.mcpAdmin !== undefined,
       restart: this.options.restart?.supported === true,
       notices: await this.pendingHostNotices(sessionKey),
+      // Questions admitted before this attachment (or before a gateway restart) are shown once;
+      // the owner answers them as ordinary messages, so nothing is re-admitted or re-sent.
+      questions: await this.pendingQuestions(conversation.id),
     };
+  }
+
+  /** Bounded still-open questions for this exact attached conversation; expiring them is a commit. */
+  private async pendingQuestions(conversationId: ConversationId): Promise<readonly AskQuestionView[]> {
+    return this.gatewayConversation!.commit(async (tx) => {
+      const doc = await tx.doc(AskQuestionsDoc, conversationId);
+      return pendingQuestionViews(doc, Date.now()).views;
+    }, this.scope.context);
   }
 
   /**

@@ -215,7 +215,8 @@ test("context remains absent and tool policy remains empty without opt-in", asyn
     gateway = await openGateway(config, context, { models, agentHistory: false });
     const conversation = await gateway.conversationFor("plain-session", context);
     const agent = await conversation.agent(context);
-    assert.deepEqual(agent.tools, []);
+    // The only tool a mapped chat holds without opt-in is the owner-question surface.
+    assert.deepEqual(agent.tools.map((tool) => tool.name), ["ask_user"]);
     assert.deepEqual(agent.callable, []);
     assert.doesNotMatch(JSON.stringify(agent.sections), /nanobot_identity|nanobot_memory/);
     await send(gateway, "plain-session", "plain-request", "no context please");
@@ -439,7 +440,9 @@ test("opt-in context follows session mappings across conversations, stores, and 
     stores[0].capturedHostSnapshots.alpha.identity.content = "mutated host snapshot after capture";
     assert.match(stores[0].captured[1], /store-a context for beta/);
     assert.doesNotMatch(stores[0].captured[1], /store-a context for alpha|private-store-a-alpha/);
-    assert.deepEqual(await alpha.agent(context).then(({ tools, callable }) => [tools, callable]), [[], []]);
+    const alphaAgent = await alpha.agent(context);
+    assert.deepEqual(alphaAgent.tools.map((tool) => tool.name), ["ask_user"]);
+    assert.deepEqual(alphaAgent.callable, []);
     await send(first, "alpha", "store-a-alpha-2", "alpha after another session was added");
     assert.match(stores[0].captured[2], /store-a context for alpha/);
     assert.doesNotMatch(stores[0].captured[2], /mutated host snapshot/);

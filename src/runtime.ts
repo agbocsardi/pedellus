@@ -64,6 +64,14 @@ import {
 } from "./channels/discord-history.js";
 import type { CronOwner } from "./automation/cron.js";
 import {
+  ASK_USER_TOOL_NAME,
+  AskQuestionsDoc,
+  cancelPendingQuestions,
+  createAskSurfaceRegistry,
+  createAskUserTool,
+  type AskSurfaceRegistry,
+} from "./questions/index.js";
+import {
   EpisodeDoc,
   createEpisodeCatalog,
   type EpisodeCatalog,
@@ -400,6 +408,12 @@ export interface Gateway {
    * session it authenticated; a URL or completion notice never goes to another chat or attachment.
    */
   readonly mcpSurfaces?: McpSurfaceRegistry;
+  /**
+   * Live owner surfaces for model-requested questions. A foreground terminal or channel attaches the
+   * exact session it authenticated; `ask_user` delivers only to the unique surface that owns it, and
+   * never to another chat or a sibling attachment.
+   */
+  readonly askSurfaces?: AskSurfaceRegistry;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
   /**
    * Bounded, read-only background activity for one already-mapped conversation: its own live
@@ -680,6 +694,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
   let liveMcpConfig: McpConfig | undefined = mcpConfig;
   const mcpConfigured = mcpHasEnabledServers(mcpConfig);
   const mcpSurfaces = config.configFile === undefined ? undefined : createMcpSurfaceRegistry();
+  // Owner-question delivery is a channel-neutral capability, not a coding tool: mapped chats are
+  // offered `ask_user`, and a live terminal or channel surface attaches the exact session it owns.
+  const askSurfaces = createAskSurfaceRegistry();
   // Native Code Mode composes whatever tools the current conversation already holds. It is
   // independently enableable with `codemode.enabled`; when that block is absent the legacy rule
   // still ties it to configured MCP, and an explicit `false` disables it either way.
@@ -1055,6 +1072,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // Config authorization names only mapped ordinary chat conversations (loaded map + scope checked).
   // The call-time hook consults this set; the policy filter reads the same rule from committed state.
   const authorizedChatConversations = new Set<ConversationId>();
+  const askUserTool = createAskUserTool({
+    surfaces: askSurfaces,
+    sessionKeyFor: (conversationId) => sessionKeyForConversation.get(conversationId),
+    isAuthorizedChat: (conversationId) => authorizedChatConversations.has(conversationId),
+  });
   // Native public web tools carry network authority only: they are not coding tools, are never named by
   // `toolAllowlist`, and are offered solely in mapped ordinary chat conversations whose scope this host
   // validated. The search key is resolved once here; an absent value fails startup instead of quietly
@@ -1114,6 +1136,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // authenticated mapped chats; login also requires a unique live owner surface.
           // It exists only when the host can write configuration.
           ...(config.configFile === undefined ? [] : [MCP_ADMIN_TOOL_NAME]),
+          // Owner questions are an interactive capability scoped by their own hook, not coding
+          // authority, so the ceiling must not suppress them.
+          ASK_USER_TOOL_NAME,
           // History retrieval is read-only over mapped chats and has its own scope checks, so the
           // ceiling must not suppress it when coding tools are enabled.
           ...(historyEnabled ? [...MEMORY_TOOL_NAMES] : []),
@@ -1359,6 +1384,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // Code Mode is selected independently of MCP connection state; each bundle is selected only
     // while it is live for this open.
     if (authorizedChatConversations.has(conversationId)) {
+      // Owner questions are an interactive capability for this validated chat only, never a worker,
+      // fork, root or scheduled/digest target.
+      selected.push(askUserTool.extension);
       if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
       if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
       // MCP management is a mapped-chat capability only: a worker, fork, root or scheduled run
@@ -1916,8 +1944,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const mcpAdminTools = mcpAdminRef.current !== undefined && authorizedChatConversations.has(conversationId)
       ? [...(mcpAdminRef.current.extension.tools ?? [])]
       : [];
+    // Owner questions are offered to the same validated chats; the call-time check and the live
+    // surface registry still decide whether this chat can actually reach its owner.
+    const askUserTools = authorizedChatConversations.has(conversationId)
+      ? [...(askUserTool.extension.tools ?? [])]
+      : [];
     return [...skillTools, ...cronTools, ...memoryToolsForConversation, ...telegramTools,
-      ...discordHistoryTools, ...webTools, ...workerTools, ...mcpAdminTools];
+      ...discordHistoryTools, ...webTools, ...workerTools, ...mcpAdminTools, ...askUserTools];
   };
   /**
    * The authority-derived tool filter. The host ceiling directly authorizes authenticated mapped
@@ -2246,6 +2279,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (skillTool) registry.install(skillTool.extension);
     if (memoryTools) registry.install(memoryTools.extension);
     if (telegramTool) registry.install(telegramTool.extension);
+    registry.install(askUserTool.extension);
     if (discordHistoryTool) registry.install(discordHistoryTool.extension);
     if (webTool) registry.install(webTool.extension);
     if (cronFoundation) registry.install(cronFoundation.extension);
@@ -3553,6 +3587,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }),
       ...(telegramActions === undefined ? {} : { telegramActions }),
       ...(discordHistory === undefined ? {} : { discordHistory }),
+      askSurfaces,
       get mcp() {
         return mcpRef.current === undefined ? undefined : { servers: mcpRef.current.status };
       },
@@ -3813,9 +3848,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // same way `conversationFor` resolves it (creating only that host-supplied key). No other
         // session selector exists here.
         const conversation = await gateway.conversationFor(sessionKey, ctx);
+        // A new context retires questions the owner can no longer meaningfully answer: an answer
+        // would start a fresh turn that no longer sees the question in its context. Existing buttons
+        // remain, and a later tap is refused with fixed text.
+        const cancelQuestions = () => conversation.commit(async (tx) => {
+          cancelPendingQuestions(await tx.doc(AskQuestionsDoc, conversation.id));
+        }, ctx);
         // Without a host prompt snapshot there is nothing to rebuild: the native reset is the whole effect.
         if (!options.contextSnapshotProvider) {
           await conversation.reset(undefined, ctx);
+          await cancelQuestions();
           return { status: "reset", skills: 0, promptRebuilt: false };
         }
         let skills: number;
@@ -3826,6 +3868,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (error instanceof ConversationBusy) return { status: "busy" };
           throw error;
         }
+        await cancelQuestions();
         return { status: "reset", skills, promptRebuilt: true };
       },
       async close(ctx) {

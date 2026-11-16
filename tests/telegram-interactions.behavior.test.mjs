@@ -122,12 +122,36 @@ function reactionUpdate(updateId, messageId, userId, oldReaction, newReaction, c
  * Mocked Bot API. `batches` are returned by successive getUpdates calls; once exhausted the call
  * holds until the adapter aborts, like the real long poll.
  */
+function callbackUpdate(updateId, messageId, userId, data, chatId = CHAT_ID) {
+  return {
+    update_id: updateId,
+    callback_query: {
+      id: `cb-${updateId}`,
+      from: privateUser(userId),
+      chat_instance: 'synthetic-instance',
+      data,
+      message: {
+        message_id: messageId,
+        date: Math.floor(Date.now() / 1000),
+        chat: privateChat(chatId),
+        text: 'synthetic question',
+      },
+    },
+  };
+}
+
+/**
+ * Mocked Bot API. `batches` are returned by successive getUpdates calls; once exhausted the call
+ * holds until the adapter aborts, or until a test pushes a later batch with `pushBatch`.
+ */
 function telegramMock(batches) {
   const original = globalThis.fetch;
   const sent = [];
   const sendAttempts = [];
   const reactions = [];
   const commands = [];
+  const callbacks = { answers: [], edits: [] };
+  const waiters = [];
   let batchIndex = 0;
   let nextMessageId = 900;
   const json = (body, status = 200) => new Response(JSON.stringify(body), {
@@ -160,7 +184,8 @@ function telegramMock(batches) {
         }
         return response(batch);
       }
-      return await new Promise((_, reject) => {
+      return await new Promise((resolve, reject) => {
+        waiters.push({ resolve, reject });
         const aborted = () => reject(new DOMException('The operation was aborted', 'AbortError'));
         if (signal?.aborted) return aborted();
         signal?.addEventListener('abort', aborted, { once: true });
@@ -176,7 +201,7 @@ function telegramMock(batches) {
         return json({ ok: false, error_code: 500, description: 'Internal Server Error' }, 500);
       }
       const messageId = nextMessageId++;
-      sent.push({ chatId: body.chat_id, text, messageId, replyTo });
+      sent.push({ chatId: body.chat_id, text, messageId, replyTo, replyMarkup: body.reply_markup });
       return response({
         message_id: messageId,
         date: Math.floor(Date.now() / 1000),
@@ -196,7 +221,7 @@ function telegramMock(batches) {
         return json({ ok: false, error_code: 500, description: 'Internal Server Error' }, 500);
       }
       const messageId = nextMessageId++;
-      sent.push({ chatId: body.chat_id, text, messageId, replyTo, rich: true });
+      sent.push({ chatId: body.chat_id, text, messageId, replyTo, rich: true, replyMarkup: body.reply_markup });
       return response({
         message_id: messageId,
         date: Math.floor(Date.now() / 1000),
@@ -208,10 +233,27 @@ function telegramMock(batches) {
       reactions.push({ chatId: body.chat_id, messageId: body.message_id, reaction: body.reaction });
       return response(true);
     }
+    if (method === 'answerCallbackQuery') {
+      callbacks.answers.push({ id: body.callback_query_id, text: body.text });
+      return response(true);
+    }
+    if (method === 'editMessageReplyMarkup') {
+      callbacks.edits.push({ chatId: body.chat_id, messageId: body.message_id });
+      return response(true);
+    }
     if (method === 'editMessageText' || method === 'deleteMessage') return response(true);
     throw new Error(`unexpected mocked Telegram method: ${method}`);
   };
-  return { sent, sendAttempts, reactions, commands, restore() { globalThis.fetch = original; } };
+  return {
+    sent, sendAttempts, reactions, commands, callbacks, batches,
+    /** Deliver a later update batch to a held long poll, or leave it for the next one. */
+    pushBatch(batch) {
+      batches.push(batch);
+      const waiter = waiters.shift();
+      if (waiter !== undefined) waiter.resolve(response(batches[batchIndex++]));
+    },
+    restore() { globalThis.fetch = original; },
+  };
 }
 
 async function until(predicate, label) {
@@ -851,6 +893,57 @@ test('an ambiguous action send is quarantined and never resent, including across
     await flush();
     assert.equal(replay.sent.length, 0, 'reopen sends nothing for the quarantined action');
     assert.equal(replay.sendAttempts.length, 0, 'reopen makes no external action attempt');
+  } finally {
+    await cleanup(store, harness);
+  }
+});
+
+test('a durable question renders buttons and one authenticated press admits one answer', { timeout: 20_000 }, async () => {
+  const store = await syntheticStore('ask-user');
+  store.faux.setResponses([
+    () => fauxAssistantMessage([
+      fauxToolCall('ask_user', {
+        questions: [{ question: 'Deploy now?', options: [{ label: 'Yes' }, { label: 'No' }] }],
+      }, { id: 'ask-1' }),
+    ], { stopReason: 'toolUse' }),
+    () => fauxAssistantMessage('synthetic answer to the button'),
+    () => fauxAssistantMessage('synthetic unexpected second turn'),
+  ]);
+  const transport = telegramMock([[messageUpdate(701, 101, 'ask me something')]]);
+  let harness;
+  try {
+    harness = start(store, transport);
+    await until(() => transport.sent.some((entry) => entry.replyMarkup !== undefined), 'question message');
+    const question = transport.sent.find((entry) => entry.replyMarkup !== undefined);
+    assert.match(question.text, /\[Question [0-9a-f]{10}\]/);
+    assert.match(question.text, /Deploy now\?/);
+    assert.match(question.text, /1\. Yes[\s\S]*2\. No/);
+    const buttons = question.replyMarkup.inline_keyboard.flat();
+    assert.deepEqual(buttons.map((button) => button.text), ['Yes', 'No']);
+    assert.match(buttons[0].callback_data, /^pq:[0-9a-f]{10}:a$/);
+    assert.match(buttons[1].callback_data, /^pq:[0-9a-f]{10}:b$/);
+    // The turn ended at the tool round: no answer was fabricated before the owner pressed a button.
+    assert.equal(transport.sent.some((entry) => entry.text === 'synthetic answer to the button'), false);
+
+    transport.pushBatch([callbackUpdate(702, question.messageId, CHAT_ID, buttons[0].callback_data)]);
+    await until(() => transport.callbacks.answers.some((entry) => entry.text === 'Answered: Yes'), 'accepted tap');
+    await until(() => transport.callbacks.edits.some((entry) => entry.messageId === question.messageId), 'keyboard removed');
+    await until(() => transport.sent.some((entry) => entry.text === 'synthetic answer to the button'), 'answer reply');
+
+    // A replay of the same button is refused by the durable record and starts no second turn.
+    transport.pushBatch([callbackUpdate(703, question.messageId, CHAT_ID, buttons[0].callback_data)]);
+    await until(() => transport.callbacks.answers.some((entry) => entry.text === 'Already answered.'), 'replay tap');
+
+    // A click from a sender this private chat never admitted gets no answer and no turn.
+    transport.pushBatch([callbackUpdate(704, question.messageId, 999, buttons[0].callback_data)]);
+    await until(() => transport.callbacks.answers.some((entry) => entry.text === 'This button is not available here.'),
+      'foreign tap');
+
+    await flush();
+    assert.equal(transport.sent.filter((entry) => entry.text === 'synthetic unexpected second turn').length, 0,
+      'no refused tap started a model turn');
+    assert.equal(transport.sent.filter((entry) => entry.text === 'synthetic answer to the button').length, 1,
+      'exactly one answer turn was consumed');
   } finally {
     await cleanup(store, harness);
   }
