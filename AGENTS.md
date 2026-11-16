@@ -461,6 +461,11 @@ edits need restart only; unit edits additionally need daemon-reload.
   than empty strings, and an unreadable/empty re-observation keeps an earlier readable target excerpt.
   Nothing is filled from a transcript or recent-target cache, and controls are still parsed from
   `message.text` alone.
+- Native `read` uses Durable's Photon processor for model-facing image copies only: at most
+  1568×1568 pixels and 1 MiB base64, intersected with caller limits. Sources declaring more than
+  50 MP or exceeding 64 MiB are refused before decode (native read has already loaded the file).
+  Processor failures fail closed; original files and native coordinate/conversion diagnostics remain
+  intact. Other image ingress and tool/path authority are unchanged.
 - Telegram locations and venues are readable labeled update content (bounded venue labels and
   six-decimal coordinates), including reply/target excerpts; no geocoding, attachment or authority
   is implied. Attachment suffixes use fixed known MIME/name metadata, never byte sniffing or the
