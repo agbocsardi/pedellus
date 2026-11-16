@@ -356,7 +356,10 @@ export function telegramTypingActive(
   submissionId: number | undefined,
 ): boolean {
   if (submissionId === undefined || live?.run?.inputs === undefined) return false;
-  return live.run.inputs.includes(submissionId) && live.generation !== undefined;
+  const generation = live.generation;
+  return live.run.inputs.includes(submissionId) && generation !== null && typeof generation === "object"
+    && (!('deferred' in generation) || generation.deferred === undefined)
+    && (!('retry' in generation) || generation.retry === undefined);
 }
 type ChannelState = TelegramChannelState;
 
@@ -438,6 +441,14 @@ export const TelegramState = defineDoc<ChannelState>({
   initial: () => ({
     offset: 0, pending: [], controls: [], origins: {}, targets: [], actions: [], reactionContext: [],
   }),
+});
+
+export const TelegramNoticeDismissals = defineDoc<{
+  records: { id: string; sessionKey: string; text: string; unknownSince?: number; dismissedAt: number }[];
+}>({
+  kind: "nanobot.telegram-notice-dismissals", version: 1, scope: "conversation",
+  history: "latest", fork: "initial", initial: () => ({ records: [] }),
+  checkpointWhen: (_value, _ops, { deltasSinceBase }) => deltasSinceBase >= 64,
 });
 
 export interface TelegramGateway {
@@ -3630,15 +3641,23 @@ export async function runTelegram(
     const stale = records
       .filter((record) => record.status === "unknown" && isTurnInterruptionNotice(record))
       .sort((left, right) => unknownSinceMs(left) - unknownSinceMs(right));
-    if (stale.length === 0) {
+    const pending = state.pending.filter((entry) => entry.sessionKey === sessionKey
+      && entry.notice === true && entry.deliveryStatus === "unknown");
+    const all = [
+      ...stale.map((record) => ({ id: record.id, since: unknownSinceText(record) })),
+      ...pending.map((entry) => ({ id: `telegram:${entry.updateId}`,
+        since: entry.unknownSince === undefined ? "unrecorded time" : new Date(entry.unknownSince).toISOString() })),
+    ];
+    if (all.length === 0) {
       return "No stale host notices in this chat. Model answers and scheduled results are never listed here.";
     }
-    const rows = stale.slice(0, STALE_HOST_NOTICE_ROWS).map((record) =>
-      `  ${boundedLabel(record.id, 80)} — outcome unknown since ${unknownSinceText(record)}`);
+    all.sort((left, right) => (Date.parse(left.since) || 0) - (Date.parse(right.since) || 0));
+    const rows = all.slice(0, STALE_HOST_NOTICE_ROWS).map((record) =>
+      `  ${boundedLabel(record.id, 80)} — outcome unknown since ${record.since}`);
     return [
-      `Stale host notices in this chat: ${stale.length}. Their delivery outcome is unknown, so none was resent.`,
+      `Stale host notices in this chat: ${all.length}. Their delivery outcome is unknown, so none was resent.`,
       ...rows,
-      ...(stale.length > rows.length ? [`  … ${stale.length - rows.length} more not shown`] : []),
+      ...(all.length > rows.length ? [`  … ${all.length - rows.length} more not shown`] : []),
       "Use /notices dismiss <id> for exactly one whose unknown outcome you accept.",
     ].join("\n").slice(0, MAX_NOTICE_CHARS);
   }
@@ -3650,6 +3669,32 @@ export async function runTelegram(
    */
   async function dismissStaleHostNotice(sessionKey: string, id: string): Promise<string> {
     if (outbox === undefined) return NOTICES_UNAVAILABLE_HOST;
+    if (/^telegram:-?\d+$/.test(id)) {
+      const updateId = Number(id.slice("telegram:".length));
+      if (!Number.isSafeInteger(updateId) || id !== `telegram:${updateId}`) {
+        return "No stale host notice with that exact id exists in this chat. Nothing was changed and nothing was resent.";
+      }
+      let outcome = "missing";
+      state = await stateConversation.commit(async (tx) => {
+        const doc = await tx.doc(TelegramState, stateConversation.id);
+        const notice = doc.pending.find((entry) => entry.updateId === updateId && entry.sessionKey === sessionKey);
+        if (notice?.notice !== true || notice.deliveryStatus !== "unknown") {
+          return copyJson(doc) as unknown as ChannelState;
+        }
+        const archive = await tx.doc(TelegramNoticeDismissals, stateConversation.id);
+        // Refuse rather than silently evict provenance. Archival records retain the original unknown
+        // outcome; dismissal frees only the delivery queue slot and never claims external delivery.
+        if (archive.records.length >= 100) { outcome = "full"; return copyJson(doc) as unknown as ChannelState; }
+        archive.records.push({ id, sessionKey, text: notice.text,
+          ...(notice.unknownSince === undefined ? {} : { unknownSince: notice.unknownSince }), dismissedAt: Date.now() });
+        doc.pending = doc.pending.filter((entry) => entry !== notice);
+        outcome = "dismissed";
+        return copyJson(doc) as unknown as ChannelState;
+      }, adapterContext);
+      if (outcome === "dismissed") return `Dismissed stale host notice ${id}. Its original outcome stays unknown; it was not resent.`;
+      if (outcome === "full") return "Notice dismissal archive is full. Nothing was changed or resent.";
+      return "No stale host notice with that exact id exists in this chat. Nothing was changed and nothing was resent.";
+    }
     if (!isTurnInterruptionNotice({ id })) {
       return "Only host notices can be dismissed here. Model answers and scheduled results are never " +
         "dismissed or resent.";

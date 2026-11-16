@@ -1027,7 +1027,8 @@ answer entry, so a batched answer can describe more than the scheduled message.
 
 ## Stale host notices
 
-A host notice (currently `host:turn-interrupted:<taskId>`) whose write-ahead intent was interrupted
+A host notice (an interruption notice `host:turn-interrupted:<taskId>`, or a Telegram-only
+acknowledgement such as `Restarted.` or `Context reset.` listed as `telegram:<updateId>`) whose write-ahead intent was interrupted
 by a process stop becomes `unknown` at the next open and is never auto-resent. The authenticated owner
 of that private chat can inspect and retire exactly those records without touching ambiguous model
 answers:
@@ -1037,7 +1038,11 @@ answers:
   model answer, a scheduled result, another chat's records or any notice text.
 - `/notices dismiss <id>` changes exactly one record in this same mapped chat from `unknown` to
   `failed`, with the fixed reason that the owner dismissed it and it was not resent. The original
-  notice text and `unknownSince` provenance stay stored; the external outcome stays unknown. A
+  notice text and `unknownSince` provenance stay stored; the external outcome stays unknown.
+  Telegram-only pending notices instead leave the delivery queue in the same commit that archives
+  their original text, unknown-since instant and explicit dismissal time in a separate bounded
+  channel document. Its 100-record bound refuses further archival when full, never evicting
+  unknown provenance. A
   replayed or wrong id, a non-host record, a record that is not `unknown`, and another chat's record
   are refused with fixed text and no change.
 

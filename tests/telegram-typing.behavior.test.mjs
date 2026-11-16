@@ -186,6 +186,10 @@ test('the typing predicate follows an active generation, never a queued, tool or
   assert.equal(telegramTypingActive({ run: { inputs: [1] } }, 1), false,
     'a run natively waiting for another task is not generating');
   assert.equal(telegramTypingActive({ run: { inputs: [1] }, generation: { attempt: 1 } }, 1), true);
+  assert.equal(telegramTypingActive({ run: { inputs: [1] }, generation: { deferred: { pollAt: 10 } } }, 1), false,
+    'provider poll wait is not an active request');
+  assert.equal(telegramTypingActive({ run: { inputs: [1] }, generation: { retry: { at: 10 } } }, 1), false,
+    'provider backoff is not an active request');
   assert.equal(telegramTypingActive({ run: { inputs: [1] }, tools: [{ status: 'running' }] }, 1), false,
     'a tool round is foreground work, not the model typing');
   assert.equal(telegramTypingActive({ run: { inputs: [1] }, generation: { attempt: 1 } }, undefined), false,

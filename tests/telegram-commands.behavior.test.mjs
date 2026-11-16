@@ -16,7 +16,7 @@ const modules = join(packageRoot, 'node_modules/@earendil-works');
 const [
   { loadConfig, parseConfig },
   { openGateway },
-  { runTelegram, TelegramState, TelegramApiError },
+  { runTelegram, TelegramState, TelegramApiError, TelegramNoticeDismissals },
   { workspaceContextGatewayOptions },
   { BACKGROUND_CONTEXT, withCancel },
   { createModels, fauxAssistantMessage, fauxProvider },
@@ -563,8 +563,24 @@ test('stale host notices are inspected and dismissed by exact id without touchin
     id: 'host:turn-interrupted:903', sessionKey: otherSession, text: otherText,
     createdAtMs: unknownSince, status: 'unknown', nextChunkIndex: 0, unknownSince,
   }]);
+  const stateConversation = await store.gateway.conversationFor(`telegram:${BOT_ID}:channel-state`, context);
+  await stateConversation.commit(async (tx) => {
+    const doc = await tx.doc(TelegramState, stateConversation.id);
+    for (const [updateId, text, notice, sessionKey] of [
+      [-810, 'Restarted.', true, session], [-811, 'Context reset.', true, session],
+      [-812, 'AMBIGUOUS-MODEL-ANSWER', false, session], [-813, 'FOREIGN-NOTICE', true, otherSession],
+    ]) {
+      doc.pending.push({ updateId, text, notice, sessionKey, chatId: sessionKey === session ? CHAT_ID : 502,
+        senderId: '501', nextChunkIndex: 0, deliveryStatus: 'unknown', unknownSince });
+    }
+  }, context);
   const commands = [
     '/notices',
+    '/notices dismiss telegram:-810',
+    '/notices dismiss telegram:-811',
+    '/notices dismiss telegram:-812',
+    '/notices dismiss telegram:-813',
+    '/notices dismiss telegram:-810',
     '/notices dismiss host:turn-interrupted:901',
     '/notices dismiss cron:job-a:1000',
     '/notices dismiss host:turn-interrupted:903',
@@ -587,6 +603,16 @@ test('stale host notices are inspected and dismissed by exact id without touchin
     assert.doesNotMatch(listing, /host:turn-interrupted:903/);
     assert.doesNotMatch(listing, /cron:job-a/);
     assert.doesNotMatch(listing, /SCHEDULED-ANSWER-SECRET/);
+    assert.match(listing, /telegram:-810/);
+    assert.match(listing, /telegram:-811/);
+    assert.doesNotMatch(listing, /telegram:-812|telegram:-813/);
+    const archived = await store.gateway.harness.snapshot(TelegramNoticeDismissals, stateConversation.id, context);
+    assert.deepEqual(archived.records.map((entry) => [entry.id, entry.text, entry.unknownSince]), [
+      ['telegram:-810', 'Restarted.', unknownSince], ['telegram:-811', 'Context reset.', unknownSince],
+    ]);
+    const pending = (await store.gateway.harness.snapshot(TelegramState, stateConversation.id, context)).pending;
+    assert.equal(pending.find((entry) => entry.updateId === -812).deliveryStatus, 'unknown');
+    assert.equal(pending.find((entry) => entry.updateId === -813).deliveryStatus, 'unknown');
 
     assert.ok(texts.some((text) => /^Dismissed stale host notice host:turn-interrupted:901\./.test(text)));
     assert.ok(texts.some((text) => /Only host notices can be dismissed/.test(text)));
