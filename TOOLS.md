@@ -272,8 +272,16 @@ built by `createHostExecutionEnv`:
   creation is removed from the cache; `close` cleans every environment and then
   releases the store lock.
 - Tool definitions, truncation, retained tail, streaming and spill behavior are
-  the native Durable implementations. `read`/`write`/`edit` are unchanged. The
-  `bash` wrapper declares the configured host default in the tool and timeout
+  the native Durable implementations. `read`, `write` and `edit` keep their
+  native semantics; `read` additionally prepares images with Durable's native
+  Photon processor. Only the model-facing copy is bounded: at most 1568x1568
+  pixels and 1 MiB of base64, with the caller's own resize limits still
+  narrowing it. A source above 50,000,000 declared pixels or 64 MiB is refused
+  before decoding, and a processor load, decode or encode failure becomes the
+  read tool's ordinary error result, never the raw oversized payload. The file
+  on disk is never modified; the native diagnostic names any conversion and the
+  coordinate scale back to the original. The `bash` wrapper declares the
+  configured host default in the tool and timeout
   descriptions and replaces the native user-visible
   `Command timed out after undefined seconds` message with that duration when
   the host default fires; execution, output and spill are untouched. With

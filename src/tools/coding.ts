@@ -7,6 +7,7 @@ import {
   type Wrap,
 } from "@earendil-works/pi-durable";
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import { createReadImageProcessor } from "../media/read-images.js";
 import { createConfigToolHook } from "./config-authority.js";
 
 /** Native coding tools this slice can register, in ceiling order. */
@@ -92,7 +93,8 @@ function withHostTimeoutDeclaration<T extends ToolRegistration>(
  * Register the native read/write/edit/bash tools over the guarded host environment. The configured
  * ceiling authorizes authenticated mapped chat conversations; the host's call-time hook rechecks
  * that, and a scheduled-run target must present a capture bounded by the current ceiling. Tool
- * definitions, limits, output windows and spill behavior stay native.
+ * definitions, limits, output windows and spill behavior stay native; `read` prepares a bounded,
+ * model-facing image copy while the original file stays untouched.
  */
 export function createCodingToolExtension(options: CodingToolExtensionOptions): Extension {
   const selected = new Set(options.tools);
@@ -108,9 +110,12 @@ export function createCodingToolExtension(options: CodingToolExtensionOptions): 
 
   const tools: ToolRegistration[] = [];
   const wraps: Wrap[] = [];
+  // One processor per extension: Photon starts lazily on the first image and its
+  // worker bounds decode time and releases memory when idle.
+  const readImages = createReadImageProcessor();
   for (const name of CODING_TOOL_NAMES) {
     if (!selected.has(name)) continue;
-    if (name === "read") tools.push(createReadTool());
+    if (name === "read") tools.push(createReadTool({ images: readImages }));
     else if (name === "write") tools.push(createWriteTool());
     else if (name === "edit") tools.push(createEditTool());
     else {
