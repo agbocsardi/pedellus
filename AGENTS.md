@@ -120,13 +120,18 @@ edits need restart only; unit edits additionally need daemon-reload.
   chat, an origin, a digest
   source, a worker, an MCP/Code Mode/compositor scope or a scheduling scope.
   Isolated cron runs capture an origin subset bounded by current config, prepare it
-  per run (including its workspace context), and lose it on completion; persistent
-  history confers no permission.
+  per run (including its workspace context), and lose it on completion. The subset may include
+  the origin's read-only recall and exact connected MCP names, directly offered without Code Mode;
+  never MCP management/login, delegation, classifiers, channel actions or scheduling. Separate
+  call-time capture checks gate recall/MCP. Live MCP changes and reopen permanently prune the
+  capture, even with no coding tools; re-enabling never restores a removed grant. Idle automation
+  conversations have no such scope, and persistent history confers no permission.
   The `skill`, `cron`, `memory_search`, `memory_browse`, `memory_read`, `worker`,
   `mcp` management and scoped `telegram` tools grant no coding-tool authority and
   are exempt from the coding-tool hook, so enabling a coding tool never suppresses them.
   Memory recall is enabled by default for validated mapped chats; the SDK's
-  `agentHistory: false` disables it. Worker recall still requires exact captured grants;
+  `agentHistory: false` disables it. Worker and live isolated-run recall require exact captured grants;
+  isolated-run recall is rechecked against its authenticated origin on every call, never its own history;
   legacy `Gateway.history*` SDK/local APIs and their tests do not widen model-facing
   or captured worker authority. MCP management can write server configuration and launch host-level stdio processes; it is limited
   to authenticated mapped chats, with login additionally requiring a unique live
@@ -381,9 +386,11 @@ edits need restart only; unit edits additionally need daemon-reload.
   is retired with the capture. Digest and scheduled-run automation targets remain unchanged.
 - MCP is a separate, default-off connection authority from `toolAllowlist`:
   `mcp.enabled` plus at least one enabled server connects it, and only
-  authenticated mapped chats and ordinary workers with captured grants receive MCP tools;
-  Code Mode follows its own switch and the same scope rule. Root, state, fork, raw/other
-  task-owned, digest and scheduled-run automation conversations get none. A worker's worktree does
+  authenticated mapped chats, ordinary workers with captured grants, and live isolated scheduled
+  runs with exact per-run captures receive MCP tools. Scheduled runs offer those tools directly,
+  never through Code Mode; no MCP management or login is inherited. Code Mode follows its own
+  switch and excludes scheduled runs. Root, state, fork, raw/other task-owned, digest and idle
+  scheduled-run automation conversations get none. A worker's worktree does
   not confine MCP: the server keeps its gateway-owned host cwd and authority. A configured stdio server is a native host
   process, not covered by `toolSandbox: "bwrap"`. Secrets are referenced by
   environment variable name.
