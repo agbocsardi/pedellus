@@ -693,6 +693,31 @@ test("ask_user refuses without a surface and reaches the attached CLI as durable
   await client.close();
 });
 
+test("partial question delivery ends the turn while keeping accepted questions answerable", { timeout: 15_000 }, async (t) => {
+  const { gateway, provider } = await makeEnvironment(t);
+  const conversation = await gateway.conversationFor("cli:default", context);
+  let sends = 0;
+  const detach = gateway.askSurfaces.attach({
+    owns: (key) => key === "cli:default",
+    async deliverQuestion() { if (++sends > 1) throw new Error("definite refusal"); },
+  });
+  t.after(detach);
+  let continued = false;
+  provider.setResponses([
+    fauxAssistantMessage([fauxToolCall("ask_user", {
+      questions: ["First decision?", "Second decision?"].map((question) => ({
+        question, options: [{ label: "Yes" }, { label: "No" }],
+      })),
+    }, { id: "ask-partial" })], { stopReason: "toolUse" }),
+    () => { continued = true; return fauxAssistantMessage("must not continue"); },
+  ]);
+  assert.equal((await (await conversation.submit({ type: "input", content: "ask" }, context)).wait(context)).status, "done");
+  assert.equal(continued, false);
+  assert.match(await toolResultText(conversation, "ask-partial"), /Delivered question/);
+  assert.deepEqual((await askDocument(conversation)).questions.map((question) => [question.status, question.delivery]),
+    [["pending", "delivered"], ["failed", "failed"]]);
+});
+
 test("ambiguous question delivery is quarantined rather than reported as non-delivery", { timeout: 15_000 }, async (t) => {
   const { gateway, provider } = await makeEnvironment(t);
   const conversation = await gateway.conversationFor("cli:default", context);

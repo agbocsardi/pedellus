@@ -162,11 +162,12 @@ export function createAskUserTool(options: AskUserToolOptions): { readonly exten
         if (failure instanceof AskDeliveryUnknown) {
           return { ...errorResult("Question delivery outcome is unknown. It may have reached the owner; it is quarantined and will not be resent. Do not claim delivery or non-delivery."), control: { terminate: true } };
         }
-        return errorResult(delivered.length === 0
+        const result = errorResult(delivered.length === 0
           ? "The owner surface did not accept the question, so it was closed. Nothing is waiting for an answer; do " +
             "not claim it was delivered."
           : `Delivered question ${delivered.join(", ")}; the remaining question(s) were closed because the owner ` +
             "surface did not accept them. Do not claim an answer in this turn.");
+        return delivered.length > 0 ? { ...result, control: { terminate: true } } : result;
       }
 
       const ids = records.map((record) => record.id);
