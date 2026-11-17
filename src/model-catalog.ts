@@ -417,7 +417,8 @@ export type RefreshOutcome =
   | { readonly provider: string; readonly status: "stale" }
   | { readonly provider: string; readonly status: "rejected"; readonly reason: string }
   | { readonly provider: string; readonly status: "failed"; readonly reason: string }
-  | { readonly provider: string; readonly status: "unknown-provider" };
+  | { readonly provider: string; readonly status: "unknown-provider" }
+  | { readonly provider: string; readonly status: "superseded" };
 
 export interface RefreshOptions {
   readonly baseUrl?: string;
@@ -426,6 +427,13 @@ export interface RefreshOptions {
   readonly now?: () => number;
   readonly timeoutMs?: number;
   readonly maxBodyBytes?: number;
+  /** Merged-file bound; defaults to the offline reader's limit so a write is always loadable. */
+  readonly maxFileBytes?: number;
+}
+
+function sameEntry(left: CatalogEntry, right: CatalogEntry | undefined): boolean {
+  return right !== undefined && left.lastModified === right.lastModified
+    && left.checkedAt === right.checkedAt && left.etag === right.etag;
 }
 
 type Proposal =
@@ -565,9 +573,11 @@ export async function refreshModelCatalog(
         const providerId = result.outcome.provider;
         const onDisk = current[providerId];
         if (proposal.kind === "replace") {
-          // Another refresh stored a newer shard meanwhile: keep it.
-          if (onDisk !== undefined && onDisk.lastModified > proposal.entry.lastModified) {
-            result.outcome = { provider: providerId, status: "stale" };
+          // Another refresh stored this provider since our snapshot. A strictly older shard of ours
+          // never wins, and an equal timestamp proves nothing (second precision): keep theirs.
+          if (onDisk !== undefined && !sameEntry(onDisk, snapshot[providerId])
+            && onDisk.lastModified >= proposal.entry.lastModified) {
+            result.outcome = { provider: providerId, status: "superseded" };
             continue;
           }
           current[providerId] = proposal.entry;
@@ -579,7 +589,18 @@ export async function refreshModelCatalog(
           changed = true;
         }
       }
-      if (changed) await writeAtomic(path, `${JSON.stringify({ version: FORMAT_VERSION, providers: current })}\n`);
+      if (!changed) return;
+      const contents = `${JSON.stringify({ version: FORMAT_VERSION, providers: current })}\n`;
+      if (Buffer.byteLength(contents, "utf8") > (options.maxFileBytes ?? MAX_FILE_BYTES)) {
+        // The offline reader would refuse this file: keep last-good and report nothing as updated.
+        for (const result of results) {
+          if (result.proposal !== undefined && result.outcome.status !== "superseded") {
+            result.outcome = { provider: result.outcome.provider, status: "failed", reason: "catalog file would exceed its size limit" };
+          }
+        }
+        return;
+      }
+      await writeAtomic(path, contents);
     });
   }
   return results.map((result) => result.outcome);

@@ -44,6 +44,7 @@ function describe(outcome: RefreshOutcome): string {
     case "rejected": return `refused invalid catalog (${outcome.reason}); last-good kept`;
     case "failed": return `refresh failed (${outcome.reason}); last-good kept`;
     case "unknown-provider": return "not a native Pi AI provider; skipped";
+    case "superseded": return "another refresh stored this provider meanwhile; kept it";
   }
 }
 

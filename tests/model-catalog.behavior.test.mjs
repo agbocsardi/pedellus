@@ -374,7 +374,7 @@ test("a concurrent older refresh never replaces a newer stored shard or another 
   assert.deepEqual(fast.map((outcome) => outcome.status), ["updated", "updated"]);
   releaseSlow();
   const [late] = await slow;
-  assert.equal(late.status, "stale");
+  assert.equal(late.status, "superseded");
   const file = JSON.parse(await readFile(modelCatalogPath(dir), "utf8"));
   assert.equal(file.providers[PROVIDER].etag, '"new"');
   assert.equal(file.providers[other].etag, '"other"');
@@ -391,4 +391,39 @@ test("the offline read refuses symlinks and special files without blocking", { t
   const fifo = await freshDir("fifo");
   execFileSync("mkfifo", [modelCatalogPath(fifo)]);
   assert.equal((await loadModelCatalog(fifo)).issue, "invalid");
+});
+
+test("equal-timestamp concurrent refreshes keep the committed shard", { timeout: 10_000 }, async () => {
+  const dir = await freshDir("concurrent-tie");
+  let releaseSlow;
+  let slowEntered;
+  const slowGate = new Promise((resolveGate) => { releaseSlow = resolveGate; });
+  const entered = new Promise((resolveEntered) => { slowEntered = resolveEntered; });
+  const slow = refreshModelCatalog(dir, [PROVIDER], {
+    fetch: async () => {
+      slowEntered();
+      await slowGate;
+      return new Response(JSON.stringify([...bundled]), { status: 200, headers: { "last-modified": NEWER, etag: '"old"' } });
+    },
+    now: fixedClock,
+    timeoutMs: 2_000,
+  });
+  await entered;
+  script = [shard([...bundled, synthetic], NEWER, '"new"')];
+  assert.equal((await refresh(dir))[0].status, "updated");
+  releaseSlow();
+  assert.equal((await slow)[0].status, "superseded");
+  assert.equal(JSON.parse(await readFile(modelCatalogPath(dir), "utf8")).providers[PROVIDER].etag, '"new"');
+});
+
+test("a merged file the offline reader would refuse is never written", { timeout: 10_000 }, async () => {
+  const dir = await freshDir("file-bound");
+  script = [shard([...bundled, synthetic])];
+  assert.equal((await refresh(dir))[0].status, "updated");
+  const lastGood = await readFile(modelCatalogPath(dir), "utf8");
+  script = [shard([...bundled], NEWEST)];
+  const [outcome] = await refresh(dir, { maxFileBytes: 64 });
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.reason, /size limit/);
+  assert.equal(await readFile(modelCatalogPath(dir), "utf8"), lastGood);
 });

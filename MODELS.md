@@ -32,8 +32,11 @@ Refresh is fail-safe per provider. An unreachable, timed-out, redirected, non-2x
 oversized, non-JSON, malformed, duplicate-ID or older-than-stored response keeps
 that provider's last-good entry; a run where nothing changed writes nothing. A
 shard not newer than the bundled data is not stored. Results are merged under a
-cross-process lock against the file as it is then, so concurrent refreshes keep
-each other's providers and an older shard never replaces a newer one.
+cross-process lock against the file as it is then: concurrent refreshes keep each
+other's providers, and a shard never replaces one another refresh stored meanwhile
+unless it is strictly newer (`Last-Modified` has second precision, so a tie keeps
+the committed shard). A merged file over the 32 MiB offline-read bound is not
+written; last-good stays.
 
 Entries are projected, not copied. Only catalog metadata fields are kept (ID,
 name, API, base URL, limits, costs, input/output, thinking map, input limits,
