@@ -22,7 +22,7 @@ keeps it, and a gateway restart returns to the configured preset.
 One bounded synthetic live-model core run passed; see [acceptance](./ACCEPTANCE.md#2026-10-30--one-live-run-passed).
 This is not a real-workspace or live-channel acceptance claim.
 
-Copy `config.example.json` to a private explicit config file and edit the workspace, model, and environment-variable *names*. The config contains no credentials. Provider spellings are native Pi AI IDs, documented legacy aliases, or explicit custom compatible providers; [providers and auth](./PROVIDERS.md) lists the migration aliases, login/logout commands, native OAuth, the private credential store and the custom `providers` block. Credential references and `telegram.tokenEnv` must be environment-variable names, not values or `${...}` expressions; the runtime never reads Pi's credential store, performs model discovery, or falls back to another model. Native catalogs/routes are not drop-in Python-provider parity, and broad provider acceptance remains open. SDK hosts may pass an explicit pi-ai `Models` instance as `openGateway(config, context, { models })` for offline/custom use; the CLI never installs a faux provider. Code Mode classifiers are default-deny and need one explicit `classifierModel` pair; image generation is not installed.
+Copy `config.example.json` to a private explicit config file and edit the workspace, model, and environment-variable *names*. The config contains no credentials. Provider spellings are native Pi AI IDs, documented legacy aliases, or explicit custom compatible providers; [providers and auth](./PROVIDERS.md) lists the migration aliases, login/logout commands, native OAuth, the private credential store and the custom `providers` block. Credential references and `telegram.tokenEnv` must be environment-variable names, not values or `${...}` expressions; the runtime never reads Pi's credential store, performs model discovery, or falls back to another model; the explicit `models refresh` command can overlay newer native model metadata from pi.dev without granting it ([catalog updates](./MODELS.md#catalog-updates)). Native catalogs/routes are not drop-in Python-provider parity, and broad provider acceptance remains open. SDK hosts may pass an explicit pi-ai `Models` instance as `openGateway(config, context, { models })` for offline/custom use; the CLI never installs a faux provider. Code Mode classifiers are default-deny and need one explicit `classifierModel` pair; image generation is not installed.
 
 ```sh
 npm ci
@@ -39,7 +39,7 @@ TypeScript edits: no full build, watcher or hot reload is required. Run
 command link. `npm run build` remains available for compiled output/tests. See
 [checkout and service updates](./SERVICE.md#checkout-command-and-build-workflow).
 
-Without `--config`, `gateway`, `agent`, `login`, `logout`, `recovery` and `cron` use the fixed primary file
+Without `--config`, `gateway`, `agent`, `login`, `logout`, `models`, `recovery` and `cron` use the fixed primary file
 `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
 the working directory. A secondary instance passes its own explicit `--config`.
 [User services](./SERVICE.md) documents the shipped foreground systemd user

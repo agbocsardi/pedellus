@@ -23,7 +23,7 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
     "provider credential is missing or misconfigured; run durable-nanobot login, set the environment variable " +
     "named by credentials.<provider>, or set the provider's native API-key environment (diagnostic details suppressed)",
   model:
-    "configured model or thinking level is unavailable; compare model/allowedModels with the pinned provider catalog " +
+    "configured model or thinking level is unavailable; compare model/allowedModels with `durable-nanobot models list` " +
     "(diagnostic details suppressed)",
   authProvider:
     "unknown provider or no interactive login method; run `durable-nanobot login` without a provider to list " +

@@ -17,7 +17,9 @@ The gateway registers only providers referenced by `allowedModels`, named
 `modelPresets` (which derive `allowedModels`), `credentials`, or `providers`.
 Native provider factories and catalogs come directly from
 `@earendil-works/pi-ai@1.5.0`; there is no second hand-maintained provider list,
-catalog refresh, model discovery, fallback chain or automatic substitution.
+model discovery, fallback chain or automatic substitution. The explicit
+`durable-nanobot models refresh` command can overlay newer native model metadata
+from pi.dev ([catalog updates](./MODELS.md#catalog-updates)); it grants nothing.
 
 Existing configuration keeps working through these explicit legacy spellings.
 They are compatibility aliases, not a provider whitelist:
@@ -207,8 +209,9 @@ fails without any provider or image-model request.
 
 ## Explicit gaps
 
-- No dynamic provider/model discovery, catalog refresh, fallback chain or
-  automatic model substitution.
+- No dynamic provider/model discovery, automatic or startup catalog refresh,
+  fallback chain or automatic model substitution. Catalog updates are the explicit
+  pi.dev `models refresh` command only; custom providers are not refreshed.
 - No endpoint override for a native provider, only whole custom providers.
 - No custom-provider classifier or image entries, provider headers, compatibility
   overrides, command-backed credentials or `${VAR}` interpolation.

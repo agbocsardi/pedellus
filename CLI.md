@@ -21,7 +21,7 @@ durable-nanobot agent                      # attaches to the same default gatewa
 durable-nanobot agent --config /path/to/config.json     # attach a terminal to that gateway
 ```
 
-Without `--config`, `gateway`, `agent`, `login`, `logout`, `recovery` and `cron` read exactly
+Without `--config`, `gateway`, `agent`, `login`, `logout`, `models`, `recovery` and `cron` read exactly
 `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
 the shell's working directory. A secondary instance passes its own explicit
 `--config`. There is no config discovery, merging, search, auto-generation or
@@ -41,6 +41,7 @@ durable-nanobot gateway --help
 durable-nanobot agent --help
 durable-nanobot login --help
 durable-nanobot logout --help
+durable-nanobot models --help
 durable-nanobot recovery --help
 durable-nanobot cron --help
 ```

@@ -26,6 +26,7 @@ import {
   type ModelReference,
   type PortConfig,
 } from "./config.js";
+import { withCatalogOverlay, type CatalogOverlay } from "./model-catalog.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
 
 /**
@@ -281,12 +282,15 @@ function nativeProviders(): ReadonlyMap<string, Provider> {
 /**
  * Register the configured custom providers and the native providers referenced
  * by model allowances or credential references. No catalog refresh, discovery,
- * request client or provider whitelist is involved.
+ * request client or provider whitelist is involved. An optional, already validated
+ * last-good catalog overlay (see `model-catalog.ts`) only adds or updates native
+ * model metadata; `allowedModels` remains the authority.
  */
 export function createProviderModels(
   config: PortConfig,
   env: NodeJS.ProcessEnv = process.env,
   credentials?: CredentialStore,
+  catalog?: CatalogOverlay,
 ): { models: Models; model: ModelReference; classifier: ModelReference | undefined } {
   const builtins = nativeProviders();
   const custom = config.providers ?? {};
@@ -339,7 +343,7 @@ export function createProviderModels(
     const envName = [...envNames][0];
     const definition = customProviderConfig(spelling);
     const provider = definition === undefined
-      ? withConfiguredCredential(builtins.get(nativeId)!, spelling, envName)
+      ? withConfiguredCredential(withCatalogOverlay(builtins.get(nativeId)!, catalog), spelling, envName)
       : customProvider(spelling, definition, envName);
     if (provider.id !== nativeId) {
       throw new StartupDiagnosticError("provider", { detail: "Native provider alias identity changed unexpectedly" });

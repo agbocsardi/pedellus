@@ -21,6 +21,7 @@ const PAGES = [
   ["agent", /Usage: durable-nanobot agent \[--config <path>\] \[--conversation <name>\]/, /Never opens a second runtime/],
   ["login", /Usage: durable-nanobot login \[--config <path>\] \[provider\] \[--auth api_key\|oauth\]/, /Terminal-only/],
   ["logout", /Usage: durable-nanobot logout \[--config <path>\] \[provider\]/, /terminal-only path as login/],
+  ["models", /Usage: durable-nanobot models <refresh\|list> \[--config <path>\] \[provider\.\.\.\]/, /only catalog network path/],
   [
     "recovery",
     /Usage: durable-nanobot recovery \[--config <path>\] \[--cancel <taskId> --fingerprint <sha256>\]/,

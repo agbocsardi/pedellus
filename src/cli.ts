@@ -13,6 +13,7 @@ import {
   type CronInvocation,
 } from "./automation/operator-cli.js";
 import { loadConfig, defaultConfigPath } from "./config.js";
+import { runModelsCommand, type ModelsInvocation } from "./model-catalog-cli.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { COMMANDS, commandUsage, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
 import { SAFE_COMMAND_NAME } from "./help/commands.js";
@@ -231,6 +232,30 @@ function authInvocation(args: readonly string[]): AuthInvocation | undefined {
     : { kind, config, ...(provider === undefined ? {} : { provider }) };
 }
 
+function modelsInvocation(args: readonly string[]): { readonly invocation: ModelsInvocation; readonly config: ConfigSource } | undefined {
+  if (args[0] !== "models") return undefined;
+  const action = args[1];
+  if (action !== "refresh" && action !== "list") throw new UsageError();
+  let config: ConfigSource = { kind: "default" };
+  let configSeen = false;
+  const providers: string[] = [];
+  const rest = args.slice(2);
+  for (let index = 0; index < rest.length;) {
+    const argument = rest[index];
+    if (argument === "--config" && !configSeen && rest[index + 1]) {
+      config = { kind: "path", path: rest[index + 1]! };
+      configSeen = true;
+      index += 2;
+    } else if (argument !== undefined && PROVIDER_ARGUMENT.test(argument) && providers.length < 64) {
+      providers.push(argument);
+      index += 1;
+    } else {
+      throw new UsageError();
+    }
+  }
+  return { invocation: { action, providers }, config };
+}
+
 /**
  * Load the selected configuration. A missing default file gets its own fixed
  * diagnostic; an explicit path keeps the existing unreadable/invalid text and
@@ -272,6 +297,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     await runCron(cron.invocation, await readConfig(cron.config));
     return;
   }
+  const models = modelsInvocation(args);
+  if (models !== undefined) {
+    await runModels(models.invocation, await readConfig(models.config));
+    return;
+  }
   const auth = authInvocation(args);
   if (auth !== undefined) {
     await runAuthCommand(auth, await readConfig(auth.config));
@@ -310,6 +340,30 @@ async function runAuthCommand(
     // embed credentials, URLs or paths.
     if (error instanceof StartupDiagnosticError || error instanceof UsageError) throw error;
     throw new StartupDiagnosticError(stop.signal.aborted ? "authCanceled" : "authFailed", { cause: error });
+  } finally {
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
+  }
+}
+
+/** Explicit terminal catalog command. It never opens the gateway, reads credentials or edits config. */
+async function runModels(
+  invocation: ModelsInvocation,
+  config: Awaited<ReturnType<typeof loadConfig>>,
+): Promise<void> {
+  const stop = new AbortController();
+  const shutdown = () => stop.abort(new Error("models command cancelled"));
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+  try {
+    let result;
+    try {
+      result = await runModelsCommand(config, invocation, { output: stdout, signal: stop.signal });
+    } catch (cause) {
+      if (cause instanceof StartupDiagnosticError) throw cause;
+      throw new StartupDiagnosticError(stop.signal.aborted ? "unexpected" : "workspace", { cause });
+    }
+    if (!result.ok) process.exitCode = 1;
   } finally {
     process.off("SIGINT", shutdown);
     process.off("SIGTERM", shutdown);

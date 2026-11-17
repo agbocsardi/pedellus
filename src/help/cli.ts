@@ -30,7 +30,7 @@ export const COMPATIBILITY_SYNOPSIS = "durable-nanobot --config <path>   (agent,
 const DEFAULT_CONFIG_FILE = "~/.durable-nanobot/config.json";
 
 /** The one sentence the usage block adds after its synopses, because it is the only configuration default. */
-const DEFAULT_CONFIG_NOTE = `Without --config, gateway, agent, login, logout, recovery and cron use ${DEFAULT_CONFIG_FILE}.`;
+const DEFAULT_CONFIG_NOTE = `Without --config, gateway, agent, login, logout, models, recovery and cron use ${DEFAULT_CONFIG_FILE}.`;
 
 const CONFIG_OPTION: HelpOption = {
   flags: "--config <path>",
@@ -86,6 +86,20 @@ export const COMMANDS: readonly CommandHelp[] = [
     options: [CONFIG_OPTION, { flags: "[provider]", text: "A native Pi AI provider ID; a legacy alias is resolved." }],
     details: ["The same explicit terminal-only path as login."],
     examples: ["durable-nanobot logout", "durable-nanobot logout openai"],
+  },
+  {
+    name: "models",
+    synopsis: "durable-nanobot models <refresh|list> [--config <path>] [provider...]",
+    summary: "Refresh or list the native model catalog from pi.dev",
+    options: [
+      CONFIG_OPTION,
+      { flags: "[provider...]", text: "Native provider IDs; default: the native providers this configuration names." },
+    ],
+    details: [
+      "refresh is the only catalog network path; list is offline. Neither grants a model: edit allowedModels.",
+      "A refreshed catalog applies at gateway restart or the next /reload that changes model config.",
+    ],
+    examples: ["durable-nanobot models refresh", "durable-nanobot models list openai-codex"],
   },
   {
     name: "recovery",

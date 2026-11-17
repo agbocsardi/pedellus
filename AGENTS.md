@@ -69,6 +69,9 @@ edits need restart only; unit edits additionally need daemon-reload.
   `credentials.<provider>` environment reference, Durable's own file
   `CredentialStore` under the canonical `dataDir`, and the terminal-only
   `login`/`logout` commands. No provider whitelist, no Pi credential store.
+- `src/model-catalog.ts`, `src/model-catalog-cli.ts` — Pi-style pi.dev catalog
+  shards: explicit terminal `models refresh|list`, validated atomic last-good
+  `model-catalog.json` under `dataDir`, offline overlay at open and `/reload`.
 - `src/automation/` — cron timer/run tasks, persistent automation conversations, the
   model-facing `cron` tool and the owner's terminal scheduling console
   (`cron create|list|show|cancel` over the private local socket).
@@ -194,7 +197,11 @@ edits need restart only; unit edits additionally need daemon-reload.
   is unset or blank, resolution fails closed and never falls back to the
   provider's ambient variables. A stored login credential wins over the
   reference, and two configured spellings for one native provider may not name
-  different references. The credential store is Durable's private file under the
+  different references. A pi.dev catalog overlay (explicit `models refresh` only,
+  never at startup or from a turn) only makes native model metadata resolvable;
+  it never widens `allowedModels`/presets, and entries with an unknown type/API or
+  an unbundled base URL/header set are skipped so no credential is redirected.
+  The credential store is Durable's private file under the
   canonical `dataDir` (never Pi's), and `login`/`logout` are explicit terminal
   commands that never run at startup or from a chat turn.
 - Classifiers are default-deny: at most one `classifierModel` pair, which must be a

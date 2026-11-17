@@ -2,8 +2,62 @@
 
 Named presets are the config-first model surface; direct model/allowlist configs
 remain supported. Both use the pinned Pi AI 1.5.0 registry and Durable's native
-`pi.agent` state. There is no second selection store, automatic model discovery,
-catalog refresh or fallback chain.
+`pi.agent` state. There is no second selection store, automatic model discovery
+or fallback chain. The native catalog can be refreshed explicitly from pi.dev; see
+[catalog updates](#catalog-updates).
+
+## Catalog updates
+
+New native models can become resolvable without upgrading `@earendil-works/pi-ai`,
+using the same public catalog Pi coding-agent overlays on its bundled data: one
+shard per provider at `https://pi.dev/api/models/providers/<id>?types=chat,image,classifier`.
+As in Pi, a shard is used only when its `Last-Modified` is newer than the
+installed pi-ai's bundled model data, is revalidated with its ETag, and replaces
+bundled entries by model type and ID.
+
+```bash
+durable-nanobot models refresh [--config <path>] [provider...]
+durable-nanobot models list    [--config <path>] [provider...]
+```
+
+Without providers, both use the native providers this configuration names
+(custom `providers` entries have no shard). `refresh` is the only network path:
+gateway startup, `/reload` and chat turns never fetch. Each request is a plain GET
+with no credentials or cookies, no redirects, a 10-second deadline and a 4 MiB body
+cap. A validated result is written atomically (`0600`) to `model-catalog.json`
+under the canonical `dataDir`; `list` is offline and marks `bundled`/`refreshed`
+entries and the chat models `allowedModels` grants.
+
+Refresh is fail-safe per provider. An unreachable, timed-out, redirected, non-2xx,
+oversized, non-JSON, malformed, duplicate-ID or older-than-stored response keeps
+that provider's last-good entry; a run where nothing changed writes nothing. A
+shard not newer than the bundled data is not stored. Well-formed entries this
+pi-ai build cannot use safely are skipped and counted: an unknown model type or
+API, or a base URL or header set that no bundled model of that provider uses (so a
+catalog can never send a provider credential somewhere new).
+
+Gateway open and `/reload` read the file offline and re-validate every entry
+against the installed pi-ai. A missing file is the bundled catalog; an unreadable
+or invalid file is also the bundled catalog, with one `model_catalog.ignored`
+journal warning at startup. After a pi-ai upgrade, entries not newer than the new
+bundled data are ignored, as in Pi.
+
+A refreshed catalog only makes model metadata resolvable. It never adds a model to
+`allowedModels`, presets, a classifier grant or a worker capture. Practical
+adoption:
+
+1. `durable-nanobot models refresh`, then `durable-nanobot models list <provider>`
+   to confirm the model is really listed (a model absent from pi.dev cannot be
+   used, and listing is not evidence that the service accepts it).
+2. Add the exact pair to `allowedModels` or a preset in the config file.
+3. In an attached CLI, `/reload` (it refuses while work is running, like any model
+   reload), or restart the gateway. Send one real turn before relying on it.
+
+A catalog-only metadata change with no config change applies at the next gateway
+restart (an unchanged config makes `/reload` a no-op). If an allowlisted model
+exists only in the refreshed file and that file is later removed or becomes
+invalid, startup fails with the fixed model diagnostic and `/reload` refuses;
+refresh again or remove the model from the config.
 
 ## Configuration
 

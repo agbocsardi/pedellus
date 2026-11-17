@@ -147,7 +147,8 @@ import {
 import { authStorePath, FileCredentialStore } from "./auth/store.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
 import { reportFailure } from "./failure-diagnostics.js";
-import { journalTelemetry } from "./observability.js";
+import { journalEvent, journalTelemetry } from "./observability.js";
+import { loadModelCatalog } from "./model-catalog.js";
 import {
   BACKGROUND_STATUS_LIMITS,
   backgroundLabel,
@@ -782,7 +783,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
     } catch (cause) {
       throw new StartupDiagnosticError("workspace", { cause });
     }
-    prepared = createProviderModels(config, process.env, new FileCredentialStore(authStorePath(credentialStoreDir)));
+    // Offline last-good catalog from an explicit `models refresh`; an unusable file is the bundled catalog.
+    const catalog = await loadModelCatalog(credentialStoreDir);
+    if (catalog.issue !== undefined) journalEvent("model_catalog.ignored", { reason: catalog.issue });
+    prepared = createProviderModels(
+      config,
+      process.env,
+      new FileCredentialStore(authStorePath(credentialStoreDir)),
+      catalog.overlay,
+    );
   }
   let models = prepared.models;
   const resolvedModels = resolveModelConfiguration(config, models);
@@ -3639,6 +3648,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
             candidate,
             process.env,
             new FileCredentialStore(authStorePath(credentialStoreDir)),
+            (await loadModelCatalog(credentialStoreDir)).overlay,
           ).models;
           nextResolved = resolveModelConfiguration(candidate, nextModels);
           await assertConfiguredModelAuth(nextModels, nextResolved.choices, ctx.abortSignal);
