@@ -13,6 +13,7 @@ const { createProviderModels } = await import(pathToFileURL(`${pkg}/dist/provide
 const { parseConfig, loadConfig } = await import(pathToFileURL(`${pkg}/dist/config.js`).href);
 const { openGateway } = await import(pathToFileURL(`${pkg}/dist/runtime.js`).href);
 const { BACKGROUND_CONTEXT } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/chord/dist/context/index.js`).href);
+const { createModels } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-ai/dist/index.js`).href);
 const { builtinProviders, getBuiltinModelDataGeneratedAt } = await import(
   pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-ai/dist/providers/all.js`).href
 );
@@ -284,4 +285,110 @@ test("gateway opens offline from the last-good catalog; reload adopts or refuses
     delete process.env[keyName];
     if (gateway) await gateway.close(context);
   }
+});
+
+test("catalog entries cannot change the request model, add fallbacks or inject request fields", { timeout: 10_000 }, async () => {
+  const dir = await freshDir("projection");
+  const native = "openai";
+  const openai = builtinProviders().find((provider) => provider.id === native).getModels();
+  const target = openai[0];
+  const fallbackCarrier = builtinProviders().flatMap((provider) => provider.getModels())
+    .find((model) => Array.isArray(model.compat?.allowedFallbackModels));
+  // Served shard: the bundled model with request-shaping extras, plus new entries carrying
+  // compatibility values this build never ships.
+  script = [shard([
+    { ...target, samplingParams: { model: "outside-allowlist", store: true }, samplingParamsByThinkingLevel: { high: { model: "x" } }, lab: "x" },
+    { ...target, id: "fallbacks", compat: { allowedFallbackModels: fallbackCarrier.compat.allowedFallbackModels } },
+    { ...target, id: "field-name", compat: { maxTokensField: "model" } },
+    { ...target, id: "unknown-format", compat: { thinkingFormat: "future-format" } },
+    { ...target, id: "unknown-compat", compat: { futureFlag: true, supportsStore: false } },
+  ])];
+  const [outcome] = await refreshModelCatalog(dir, [native], { baseUrl, now: fixedClock, timeoutMs: 2_000 });
+  assert.equal(outcome.status, "updated");
+  // A new request field name or thinking format cannot be served by this build: skipped.
+  assert.equal(outcome.skipped, 2);
+  const loaded = await loadModelCatalog(dir);
+  const stored = loaded.overlay.get(native);
+  const byId = new Map(stored.map((model) => [model.id, model]));
+  assert.equal(byId.has("field-name"), false);
+  assert.equal(byId.has("unknown-format"), false);
+  // Fallback models the bundled entry never named are dropped; the model itself stays usable.
+  assert.equal(byId.get("fallbacks").compat?.allowedFallbackModels, undefined);
+  // Unknown keys are dropped; a known boolean is kept.
+  assert.deepEqual(byId.get("unknown-compat").compat, { supportsStore: false });
+  const replaced = stored.find((model) => model.id === target.id);
+  for (const key of ["samplingParams", "samplingParamsByThinkingLevel", "lab"]) assert.equal(key in replaced, false);
+
+  // Payload level: the request a refreshed entry produces names exactly the configured model.
+  const config = configFor(dir, [{ provider: native, modelId: target.id }]);
+  const { models } = createProviderModels(config, {}, undefined, loaded.overlay);
+  const originalFetch = globalThis.fetch;
+  let body;
+  globalThis.fetch = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return new Response("{}", { status: 500 });
+  };
+  try {
+    const stream = models.streamSimple(models.getModel(native, target.id), {
+      messages: [{ role: "user", content: "synthetic", timestamp: 0 }],
+    }, { apiKey: "synthetic-not-a-credential" });
+    for await (const event of stream) if (event.type === "done" || event.type === "error") break;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(body.model, target.id);
+  assert.notEqual(body.store, true);
+});
+
+test("current native ID forms are accepted", { timeout: 10_000 }, async () => {
+  const dir = await freshDir("ids");
+  script = [shard([...bundled, { ...synthetic, id: "@cf/vendor/model-0731" }, { ...synthetic, id: "~vendor/model-latest" }])];
+  const [outcome] = await refresh(dir);
+  assert.equal(outcome.status, "updated");
+  assert.deepEqual(outcome.added, ["@cf/vendor/model-0731", "~vendor/model-latest"]);
+  script = [shard([{ ...synthetic, id: "has space" }])];
+  assert.equal((await refresh(dir))[0].status, "rejected");
+});
+
+test("a concurrent older refresh never replaces a newer stored shard or another provider", { timeout: 10_000 }, async () => {
+  const dir = await freshDir("concurrent");
+  const other = "openai";
+  const otherBundled = builtinProviders().find((provider) => provider.id === other).getModels();
+  // The slow refresh holds its (older) response until the fast one has written its newer shard.
+  let releaseSlow;
+  let slowEntered;
+  const slowGate = new Promise((resolveGate) => { releaseSlow = resolveGate; });
+  const entered = new Promise((resolveEntered) => { slowEntered = resolveEntered; });
+  const slowFetch = async () => {
+    slowEntered();
+    await slowGate;
+    return new Response(JSON.stringify([...bundled, synthetic]), {
+      status: 200, headers: { "last-modified": NEWER, etag: '"old"' },
+    });
+  };
+  const slow = refreshModelCatalog(dir, [PROVIDER], { fetch: slowFetch, now: fixedClock, timeoutMs: 2_000 });
+  // The slow run has read its (empty) snapshot; only the locked re-read can see the newer shard.
+  await entered;
+  script = [shard([...bundled], NEWEST, '"new"'), shard([...otherBundled], NEWEST, '"other"')];
+  const fast = await refreshModelCatalog(dir, [PROVIDER, other], { baseUrl, now: fixedClock, timeoutMs: 2_000 });
+  assert.deepEqual(fast.map((outcome) => outcome.status), ["updated", "updated"]);
+  releaseSlow();
+  const [late] = await slow;
+  assert.equal(late.status, "stale");
+  const file = JSON.parse(await readFile(modelCatalogPath(dir), "utf8"));
+  assert.equal(file.providers[PROVIDER].etag, '"new"');
+  assert.equal(file.providers[other].etag, '"other"');
+});
+
+test("the offline read refuses symlinks and special files without blocking", { timeout: 10_000 }, async () => {
+  const { symlink } = await import("node:fs/promises");
+  const { execFileSync } = await import("node:child_process");
+  const linked = await freshDir("symlink");
+  const real = join(linked, "elsewhere.json");
+  await writeFile(real, JSON.stringify({ version: 1, providers: {} }));
+  await symlink(real, modelCatalogPath(linked));
+  assert.equal((await loadModelCatalog(linked)).issue, "invalid");
+  const fifo = await freshDir("fifo");
+  execFileSync("mkfifo", [modelCatalogPath(fifo)]);
+  assert.equal((await loadModelCatalog(fifo)).issue, "invalid");
 });

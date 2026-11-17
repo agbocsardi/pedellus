@@ -199,8 +199,10 @@ edits need restart only; unit edits additionally need daemon-reload.
   reference, and two configured spellings for one native provider may not name
   different references. A pi.dev catalog overlay (explicit `models refresh` only,
   never at startup or from a turn) only makes native model metadata resolvable;
-  it never widens `allowedModels`/presets, and entries with an unknown type/API or
-  an unbundled base URL/header set are skipped so no credential is redirected.
+  it never widens `allowedModels`/presets. Entries are field-projected (no sampling
+  overrides; compatibility limited to bundled keys/values, unbundled fallback lists
+  dropped), and entries with an unknown type/API or an unbundled base URL/header
+  set are skipped, so a catalog neither renames request models nor redirects credentials.
   The credential store is Durable's private file under the
   canonical `dataDir` (never Pi's), and `login`/`logout` are explicit terminal
   commands that never run at startup or from a chat turn.

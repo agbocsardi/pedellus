@@ -31,13 +31,24 @@ entries and the chat models `allowedModels` grants.
 Refresh is fail-safe per provider. An unreachable, timed-out, redirected, non-2xx,
 oversized, non-JSON, malformed, duplicate-ID or older-than-stored response keeps
 that provider's last-good entry; a run where nothing changed writes nothing. A
-shard not newer than the bundled data is not stored. Well-formed entries this
-pi-ai build cannot use safely are skipped and counted: an unknown model type or
-API, or a base URL or header set that no bundled model of that provider uses (so a
-catalog can never send a provider credential somewhere new).
+shard not newer than the bundled data is not stored. Results are merged under a
+cross-process lock against the file as it is then, so concurrent refreshes keep
+each other's providers and an older shard never replaces a newer one.
 
-Gateway open and `/reload` read the file offline and re-validate every entry
-against the installed pi-ai. A missing file is the bundled catalog; an unreadable
+Entries are projected, not copied. Only catalog metadata fields are kept (ID,
+name, API, base URL, limits, costs, input/output, thinking map, input limits,
+prompt cache, headers, compatibility); request-shaping extras such as
+`samplingParams` are dropped, so an entry cannot rename the request model or add
+request fields. Compatibility overrides keep only keys and values this pi-ai
+already ships; a structured value such as `allowedFallbackModels` (which names
+further request models) is kept only when it equals the bundled entry for that
+same model, otherwise it is dropped and the model runs without it. Entries this
+build cannot serve safely are skipped and counted: an unknown model type, API or
+compatibility value, or a base URL or header set that no bundled model of that
+provider uses (so a catalog can never send a provider credential somewhere new).
+
+Gateway open and `/reload` read the file offline (regular file only: no symlink,
+FIFO or file over 32 MiB) and re-validate every entry against the installed pi-ai. A missing file is the bundled catalog; an unreadable
 or invalid file is also the bundled catalog, with one `model_catalog.ignored`
 journal warning at startup. After a pi-ai upgrade, entries not newer than the new
 bundled data are ignored, as in Pi.
