@@ -1,5 +1,8 @@
 @import "tailwindcss";
 @import "streamdown/styles.css";
+/* Streamdown's chrome is Tailwind-classed, and Tailwind skips node_modules
+   when scanning, so name it explicitly. */
+@source "../node_modules/streamdown/dist/*.js";
 
 /*
  * Palette. Light + dark via prefers-color-scheme; the tokens are also what
@@ -50,9 +53,12 @@
 }
 
 html,
-body {
+body,
+#root {
   margin: 0;
   height: 100%;
+  /* The page itself never scrolls; only the message list does. */
+  overflow: hidden;
   background: var(--bg);
   color: var(--ink);
   font-family: var(--font-sans);
@@ -74,6 +80,7 @@ textarea:focus-visible {
 
 .screen {
   height: 100dvh;
+  overflow-y: auto;
   display: grid;
   place-items: center;
   padding: 24px;
@@ -144,6 +151,10 @@ label {
   margin-top: 8px;
 }
 input {
+  /* Inputs have a wide intrinsic size; without these the pairing card grows
+     past the screen edge. */
+  width: 100%;
+  min-width: 0;
   border: 1px solid var(--line);
   background: var(--bg);
   color: var(--ink);
@@ -298,6 +309,7 @@ input#pair-code {
 .messages {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
   padding: 8px 14px 18px;
 }
@@ -406,7 +418,9 @@ input#pair-code {
   border-radius: 20px;
   padding: 10px 16px;
   font: inherit;
-  font-size: 0.95rem;
+  /* 16px minimum: iOS zooms the page on focusing smaller text, leaving it
+     zoomed and scrollable in both directions. */
+  font-size: 1rem;
   line-height: 1.4;
   max-height: 140px;
   min-width: 0;
@@ -439,3 +453,4 @@ input#pair-code {
     animation-iteration-count: 1 !important;
   }
 }
+
