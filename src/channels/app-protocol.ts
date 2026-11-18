@@ -1,13 +1,13 @@
 /**
- * Wire protocol v1 for the `app` channel: limits, close codes, fixed error texts and the pure
+ * Wire protocol v2 for the `app` channel: limits, close codes, fixed error texts and the pure
  * frame/field validation both the listener and the adapter share.
  *
- * The contract is normative in the sibling `durable-app` repository (`protocol/v1.md`); this module
- * implements it exactly and adds nothing to the wire. Tailscale identity headers are never read:
+ * The contract is normative in the sibling `durable-app` repository (`protocol/v2.md` and `v2.ts`). Tailscale identity headers are never read:
  * the device token is the only authority.
  */
 
-export const APP_PROTOCOL_VERSION = 1;
+export const APP_PROTOCOL_VERSION = 2;
+export const APP_MAIN_THREAD = "main";
 
 /** Every bound the gateway enforces; the app enforces the same values before sending. */
 export const APP_LIMITS = Object.freeze({
@@ -17,6 +17,11 @@ export const APP_LIMITS = Object.freeze({
   /** Request ids and `send` keys. */
   idPattern: /^[A-Za-z0-9_-]{1,64}$/,
   replayBatch: 500,
+  threadTitleChars: 80,
+  maxOpenThreads: 50,
+  /** Maximum archived threads in a `threads` reply, not a storage cap. */
+  maxListedArchivedThreads: 200,
+  threadIdPattern: /^(main|t_[A-Za-z0-9_-]{1,40})$/,
   /** One-time pairing code: single use, ten minutes. */
   pairCodeChars: 8,
   pairTtlMs: 10 * 60_000,
@@ -25,6 +30,8 @@ export const APP_LIMITS = Object.freeze({
   pairRateMax: 5,
   labelMinChars: 1,
   labelMaxChars: 40,
+  /** Agent display name in the hello reply: at most 40 printable characters. */
+  agentNameMaxChars: 40,
   cookieName: "durable_device",
   /** Distinct paired devices retained; further pairing is refused until one is revoked. */
   maxDevices: 16,
@@ -37,6 +44,8 @@ export const APP_LIMITS = Object.freeze({
   /** `send` keys are remembered for idempotency; pruning is by age only (keys are tiny). */
   sendKeyTtlMs: 7 * 24 * 60 * 60_000,
   maxUnresolvedControls: 64,
+  /** `control.args`: the text after the command name. */
+  controlArgsChars: 1_000,
 } as const);
 
 /** `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`: 8 characters, no `I`/`O`, case-insensitive input. */
@@ -52,16 +61,40 @@ export const APP_CLOSE = Object.freeze({
 
 /** Fixed reply error codes; no free text ever leaves the gateway on a response. */
 export type AppErrorCode = "bad_request" | "too_large" | "unsupported" | "not_ready" | "internal";
-export type AppControlCommand = "new" | "abort" | "status";
-/** Catalogued commands this phase does not implement; a typed one is refused, not a violation. */
-export const APP_LATER_COMMANDS: readonly string[] = ["model", "digest", "restart", "mcp"];
-export const APP_REQUEST_OPS: readonly string[] = ["hello", "send", "ack", "control", "ping", "history", "tasks"];
+/** One `hello.commands` entry, rendered from the shared catalogue's `app` surface. */
+export type AppCommandInfo = { name: string; args?: string; summary: string; usage: string };
+export const APP_REQUEST_OPS: readonly string[] = [
+  "hello", "send", "ack", "control", "ping", "history", "tasks",
+  "threads", "thread.create", "thread.rename", "thread.archive",
+];
+
+export type AppThreadOrigin = { thread: string; messageId: string };
+export type AppThreadInfo = {
+  id: string; title: string; archived: boolean; archivedReason?: "manual" | "idle";
+  origin?: AppThreadOrigin; createdAt: string; lastAt: string;
+};
+
+export function validThreadTitle(value: unknown): value is string {
+  return typeof value === "string" && Array.from(value).length <= APP_LIMITS.threadTitleChars &&
+    value.trim() !== "" && !/[\p{C}\p{Zl}\p{Zp}]/u.test(value);
+}
+
+export function parseThreadId(value: unknown): string | undefined {
+  return typeof value === "string" && APP_LIMITS.threadIdPattern.test(value) ? value : undefined;
+}
 
 /** A printable device label: 1–40 characters, no control or format characters. */
 export function validAppLabel(value: unknown): value is string {
   if (typeof value !== "string") return false;
   if (value.length < APP_LIMITS.labelMinChars || value.length > APP_LIMITS.labelMaxChars) return false;
   return /^[\x21-\x7e\u00a0-\uffff]+$/u.test(value) && !/[\u202a-\u202e\u2066-\u2069]/u.test(value);
+}
+
+/** The hello reply's agent display name: 1–40 printable characters (spaces allowed). */
+export function validAppAgentName(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (value.length > APP_LIMITS.agentNameMaxChars || value.trim() === "") return false;
+  return /^[\x20-\x7e\u00a0-\uffff]+$/u.test(value) && !/[\u202a-\u202e\u2066-\u2069]/u.test(value);
 }
 
 /**
@@ -79,18 +112,22 @@ export type AppDurableEvent =
   | {
     event: "message";
     cursor: number;
+    /** Missing only on legacy v1 records; they belong to main. */
+    thread?: string;
     id: string;
     role: "user" | "assistant" | "notice";
     text: string;
     at: string;
     key?: string;
   }
-  | { event: "settled"; cursor: number; key: string; outcome: "answered" | "failed" | "aborted" }
-  | { event: "divider"; cursor: number; at: string; reason: "new" };
+  | { event: "settled"; cursor: number; thread?: string; key: string; outcome: "answered" | "failed" | "aborted" }
+  | { event: "divider"; cursor: number; thread?: string; at: string; reason: "new" }
+  | { event: "thread"; cursor: number; thread: AppThreadInfo };
 
 /** One pending model input (an admitted `send`) or held host notice. */
 export type AppPendingInput = {
   readonly key: string;
+  readonly thread?: string;
   readonly text: string;
   readonly admittedAtMs: number;
   /** A host notice: delivered as `message{role:"notice"}`, never submitted to the model. */
@@ -105,10 +142,16 @@ export type AppPendingInput = {
   readonly held?: boolean;
 };
 
+/** A command with a native effect on its thread or on this process; a refusal is terminal, never retried. */
+export type AppMutation = "new" | "abort" | "model" | "restart" | "digest";
+
 /** One authenticated control command, admitted with its acknowledgement before the effect. */
 export type AppControlRecord = {
   readonly key: string;
-  readonly command: "new" | "abort";
+  readonly thread?: string;
+  readonly command: AppMutation;
+  /** The `model` preset argument, already validated against the configured catalog. */
+  readonly option?: string;
   readonly status: "admitted" | "applied" | "refused" | "unconfirmed";
 };
 

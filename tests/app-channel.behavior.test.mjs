@@ -3,10 +3,11 @@
 // static path safety, callback interception and scheduled delivery.
 //
 // Real Gateway over a temporary store, faux provider, one real loopback listener on an ephemeral
-// port and a synthetic WebSocket client (the `ws` package itself) speaking protocol v1. No
+// port and a synthetic WebSocket client (the `ws` package itself) speaking protocol v2. No
 // tailnet, no live device, no paid inference. Every wait is event-driven; no test sleeps on a
 // schedule, and every handle is cleaned up by the test that created it.
 import assert from 'node:assert/strict';
+import { rm } from 'node:fs/promises';
 import { test } from 'node:test';
 
 import {
@@ -66,7 +67,14 @@ test('the app config block is opt-in, strict and loopback-only', { timeout: 10_0
     ...WORKSPACE_BASE,
     app: { port: 43190, staticRoot: '/tmp/synthetic-pwa' },
   }, '/tmp/synthetic');
-  assert.deepEqual(parsed.app, { port: 43190, staticRoot: '/tmp/synthetic-pwa' });
+  assert.deepEqual(parsed.app, { port: 43190, staticRoot: '/tmp/synthetic-pwa', autoArchiveDays: 14, agentName: 'Durable' });
+  for (const autoArchiveDays of [0, -1, 1.5, '14', null]) {
+    assert.throws(() => parseConfig({ ...WORKSPACE_BASE, app: { port: 43190, staticRoot: '/p', autoArchiveDays } }, '/tmp'), /app\.autoArchiveDays/u);
+  }
+  assert.equal(parseConfig({ ...WORKSPACE_BASE, app: { port: 43190, staticRoot: '/p', agentName: 'Work Bench' } }, '/tmp').app.agentName, 'Work Bench');
+  for (const agentName of ['', 'x'.repeat(41), 'bad\nname', 7]) {
+    assert.throws(() => parseConfig({ ...WORKSPACE_BASE, app: { port: 43190, staticRoot: '/p', agentName } }, '/tmp'), /app\.agentName/u);
+  }
   // Absent stays absent: nothing about the app channel is configured or loaded.
   assert.equal(parseConfig({ ...WORKSPACE_BASE }, '/tmp/synthetic').app, undefined);
 
@@ -220,7 +228,7 @@ test('unauthenticated and revoked streams complete the upgrade then close 4401',
     const cookie = await pairedDevice(store, base, 'phone');
     const live = deviceClient(base, cookie);
     await live.open();
-    live.send({ type: 'req', id: 'r1', op: 'hello', v: 1, cursor: null });
+    live.send({ type: 'req', id: 'r1', op: 'hello', v: 2, cursor: null });
     await live.wait(() => live.response('r1') !== undefined, 'hello reply');
 
     // The same device opening a newer stream replaces the old one.
@@ -228,7 +236,7 @@ test('unauthenticated and revoked streams complete the upgrade then close 4401',
     await newer.open();
     await until(() => live.closed.code !== undefined, 'the older stream is replaced');
     assert.equal(live.closed.code, 4409);
-    newer.send({ type: 'req', id: 'r1', op: 'hello', v: 1, cursor: null });
+    newer.send({ type: 'req', id: 'r1', op: 'hello', v: 2, cursor: null });
     await newer.wait(() => newer.response('r1') !== undefined, 'the newer stream answers');
 
     assert.equal(await store.gateway.appConsole.console().revoke('phone'), 'revoked');
@@ -251,11 +259,12 @@ test('hello replays the durable log in bounded batches, answers later hellos and
     const cookie = await pairedDevice(store, base, 'phone');
     const device = deviceClient(base, cookie);
     await device.open();
-    device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
     await device.wait(() => device.events('message').length >= APP_LIMITS.replayBatch, 'first replay batch');
     const hello = device.response('h1');
     assert.equal(hello.ok, true);
-    assert.equal(hello.v, 1);
+    assert.equal(hello.v, 2);
+    assert.equal(hello.agent, 'Durable');
     assert.equal(hello.device, 'phone');
     assert.equal(hello.head, 600);
     assert.equal(device.events('message').length, APP_LIMITS.replayBatch, 'replay is bounded at 500');
@@ -263,7 +272,7 @@ test('hello replays the durable log in bounded batches, answers later hellos and
     assert.equal(device.events('message')[0].text, 'seeded event 1');
 
     // A later hello on the same open stream is answered normally and replays the next batch.
-    device.send({ type: 'req', id: 'h2', op: 'hello', v: 1, cursor: 500 });
+    device.send({ type: 'req', id: 'h2', op: 'hello', v: 2, cursor: 500 });
     await device.wait(() => device.response('h2') !== undefined && device.events('message').length >= 600,
       'the continued batch');
     assert.equal(device.response('h2').ok, true);
@@ -277,7 +286,7 @@ test('hello replays the durable log in bounded batches, answers later hellos and
     const deviceId = Object.keys(state.acks)[0];
     assert.equal(state.acks[deviceId], 600);
     assert.equal(state.events.length, 0, 'acked events were trimmed');
-    device.send({ type: 'req', id: 'h3', op: 'hello', v: 1, cursor: 1 });
+    device.send({ type: 'req', id: 'h3', op: 'hello', v: 2, cursor: 1 });
     await device.wait(() => device.response('h3') !== undefined, 'post-ack hello');
     assert.equal(device.events('message').length, 600, 'the trimmed prefix did not replay again');
     await device.close();
@@ -292,7 +301,7 @@ test('send is idempotent by key: one echo, one turn, one settlement', { timeout:
     const cookie = await pairedDevice(store, base);
     const device = deviceClient(base, cookie);
     await device.open();
-    device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
     await device.wait(() => device.response('h1') !== undefined, 'hello reply');
 
     device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'hello there' });
@@ -328,11 +337,11 @@ test('send is idempotent by key: one echo, one turn, one settlement', { timeout:
 
 test('a full turn echoes, previews, answers and settles in protocol order', { timeout: 30_000 }, async () => {
   await withChannel('full-turn', { streamTokensPerSecond: 40 }, async ({ store, base }) => {
-    store.setAnswer(Array.from({ length: 40 }, (_, index) => `answer line ${index}`).join(' '));
+    store.setAnswer(Array.from({ length: 24 }, (_, index) => `answer line ${index}`).join(' '));
     const cookie = await pairedDevice(store, base);
     const device = deviceClient(base, cookie);
     await device.open();
-    device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
     await device.wait(() => device.response('h1') !== undefined, 'hello reply');
 
     device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'stream me an answer' });
@@ -354,7 +363,7 @@ test('a full turn echoes, previews, answers and settles in protocol order', { ti
     const answered = device.events('message').find((event) => event.role === 'assistant');
     assert.ok(answered !== undefined);
     assert.equal(answered.key, 'k1');
-    assert.match(answered.text, /answer line 39/u);
+    assert.match(answered.text, /answer line 23/u);
     const settled = device.events('settled')[0];
     assert.deepEqual({ key: settled.key, outcome: settled.outcome }, { key: 'k1', outcome: 'answered' });
     const state = await appState(store.gateway);
@@ -368,7 +377,7 @@ test('a reconnect replays exactly what was missed', { timeout: 30_000 }, async (
     const cookie = await pairedDevice(store, base);
     const first = deviceClient(base, cookie);
     await first.open();
-    first.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    first.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
     await first.wait(() => first.response('h1') !== undefined, 'hello reply');
     // Hold the provider call so the socket dies while the turn is genuinely running.
     const entered = store.gate.hold();
@@ -383,7 +392,7 @@ test('a reconnect replays exactly what was missed', { timeout: 30_000 }, async (
 
     const second = deviceClient(base, cookie);
     await second.open();
-    second.send({ type: 'req', id: 'h2', op: 'hello', v: 1, cursor: echo.cursor });
+    second.send({ type: 'req', id: 'h2', op: 'hello', v: 2, cursor: echo.cursor });
     await second.wait(() => second.events('settled').length === 1, 'the missed events replayed');
     assert.equal(second.events('message').length, 1, 'only events after the cursor replayed');
     assert.equal(second.events('message')[0].role, 'assistant');
@@ -400,7 +409,7 @@ test('controls map to the owner operations and reply with fixed results', { time
     const cookie = await pairedDevice(store, base);
     const device = deviceClient(base, cookie);
     await device.open();
-    device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
     await device.wait(() => device.response('h1') !== undefined, 'hello reply');
 
     device.send({ type: 'req', id: 'c1', op: 'control', command: 'status' });
@@ -428,12 +437,84 @@ test('controls map to the owner operations and reply with fixed results', { time
     }, 'the replay reports');
     assert.equal(device.events('divider').length, 1, 'no second boundary was recorded');
 
-    device.send({ type: 'req', id: 'c4', op: 'control', command: 'model' });
-    await device.wait(() => device.response('c4') !== undefined, 'later command reply');
+    // A name hello did not list is `unsupported`; a malformed frame is still `bad_request`.
+    device.send({ type: 'req', id: 'c4', op: 'control', command: 'reload' });
+    await device.wait(() => device.response('c4') !== undefined, 'unlisted command reply');
     assert.equal(device.response('c4').error, 'unsupported');
     device.send({ type: 'req', id: 'c5', op: 'control', command: 'nonsense' });
     await device.wait(() => device.response('c5') !== undefined, 'unknown command reply');
-    assert.equal(device.response('c5').error, 'bad_request');
+    assert.equal(device.response('c5').error, 'unsupported');
+    device.send({ type: 'req', id: 'c6', op: 'control', command: 'status', args: 'x'.repeat(1_001) });
+    await device.wait(() => device.response('c6') !== undefined, 'oversize args reply');
+    assert.equal(device.response('c6').error, 'bad_request');
+    await device.close();
+  });
+});
+
+const PRESETS = {
+  fast: { provider: 'fixture', modelId: 'alpha', thinkingLevel: 'off' },
+  deep: { provider: 'fixture', modelId: 'beta', thinkingLevel: 'high' },
+};
+
+test('hello lists the app command catalogue and control routes args to the owner commands', { timeout: 30_000 }, async () => {
+  const requests = [];
+  const restart = { supported: true, request: async () => { requests.push('restart'); } };
+  const rawConfig = (raw) => {
+    const { model: _model, allowedModels: _allowed, ...rest } = raw;
+    return parseConfig({ ...rest, modelPresets: PRESETS, modelPreset: 'fast', digest: { preset: 'fast' } }, '/tmp');
+  };
+  await withChannel('commands', { rawConfig, adapter: { restart } }, async ({ store, base }) => {
+    const cookie = await pairedDevice(store, base);
+    const device = deviceClient(base, cookie);
+    await device.open();
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
+    await device.wait(() => device.response('h1') !== undefined, 'hello reply');
+    const commands = device.response('h1').commands;
+    assert.deepEqual(commands.map((command) => command.name),
+      ['new', 'abort', 'stop', 'status', 'model', 'digest', 'restart', 'help']);
+    const model = commands.find((command) => command.name === 'model');
+    assert.equal(model.args, '[preset]');
+    assert.match(model.usage, /^Usage: \/model /u);
+    for (const command of commands) {
+      assert.match(command.name, /^[a-z][a-z0-9_-]{0,22}$/u);
+      assert.equal(typeof command.summary, 'string');
+    }
+
+    const notices = () => device.events('message').filter((event) => event.role === 'notice').map((event) => event.text);
+    const lastNotice = async (id, frame, label) => {
+      const before = notices().length;
+      device.send({ type: 'req', id, op: 'control', ...frame });
+      await device.wait(() => device.response(id) !== undefined && notices().length > before, label);
+      assert.equal(device.response(id).ok, true);
+      return notices().at(-1);
+    };
+
+    assert.match(await lastNotice('m1', { command: 'model' }, 'preset listing'),
+      /\* fast — fixture alpha \[thinking: off\] \(default\)/u);
+    assert.equal(await lastNotice('m2', { command: 'model', args: 'deep' }, 'preset applied'),
+      'Model set to fixture/beta (thinking: high) for this thread.');
+    const state = await appState(store.gateway);
+    assert.deepEqual([state.controls.at(-1).command, state.controls.at(-1).option, state.controls.at(-1).status],
+      ['model', 'deep', 'applied']);
+    assert.match(await lastNotice('m3', { command: 'model', args: 'nope' }, 'unknown preset'),
+      /^Unknown model preset nope: nothing was changed\./u);
+
+    // Bad arguments answer with the catalogue's usage line and no effect.
+    assert.match(await lastNotice('u1', { command: 'model', args: 'a b' }, 'model usage'), /^Usage: \/model .*Nothing was sent/u);
+    assert.match(await lastNotice('u2', { command: 'new', args: 'now' }, 'new usage'), /^Usage: \/new \(no arguments\)\./u);
+    assert.match(await lastNotice('u3', { command: 'digest', args: 'later' }, 'digest usage'), /^Usage: \/digest /u);
+    assert.equal(device.events('divider').length, 0, 'a usage refusal reset nothing');
+
+    assert.match(await lastNotice('p1', { command: 'help' }, 'help listing'), /^Controls for this thread[\s\S]*\/model \[preset\]/u);
+    assert.match(await lastNotice('p2', { command: 'help', args: 'restart' }, 'help detail'), /^Usage: \/restart\n/u);
+    assert.match(await lastNotice('d1', { command: 'digest', args: 'status' }, 'digest status'), /\S/u);
+
+    // Restart: durable acknowledgement first, then exactly one host request; a second is not re-requested.
+    assert.equal(await lastNotice('r1', { command: 'restart' }, 'restart ack'), 'Restart requested; checking active work.');
+    await until(() => requests.length === 1, 'restart requested once');
+    assert.deepEqual((await appState(store.gateway)).restart, ['main']);
+    assert.match(await lastNotice('r2', { command: 'restart' }, 'second restart'), /already requested/u);
+    assert.equal(requests.length, 1);
     await device.close();
   });
 });
@@ -463,7 +544,7 @@ test('early sends, bad json, wrong versions and oversize frames close with fixed
 
     const wrongVersion = deviceClient(base, cookie);
     await wrongVersion.open();
-    wrongVersion.send({ type: 'req', id: 'r1', op: 'hello', v: 2, cursor: null });
+    wrongVersion.send({ type: 'req', id: 'r1', op: 'hello', v: 1, cursor: null });
     await wrongVersion.wait(() => wrongVersion.closed.code !== undefined, 'wrong version close');
     assert.equal(wrongVersion.closed.code, 4426);
     await wrongVersion.close();
@@ -477,7 +558,7 @@ test('early sends, bad json, wrong versions and oversize frames close with fixed
 
     const oversize = deviceClient(base, cookie);
     await oversize.open();
-    oversize.send({ type: 'req', id: 'r1', op: 'hello', v: 1, cursor: null });
+    oversize.send({ type: 'req', id: 'r1', op: 'hello', v: 2, cursor: null });
     await oversize.wait(() => oversize.response('r1') !== undefined, 'hello reply');
     oversize.send(JSON.stringify({ type: 'req', id: 'r2', op: 'send', key: 'big', text: 'x'.repeat(300_000) }));
     await oversize.wait(() => oversize.closed.code !== undefined, 'oversize frame close');
@@ -514,7 +595,7 @@ test('a callback-shaped send is consumed before admission and never stored', { t
     const cookie = await pairedDevice(store, base);
     const device = deviceClient(base, cookie);
     await device.open();
-    device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
     await device.wait(() => device.response('h1') !== undefined, 'hello reply');
     const callback = 'https://example.mcp/redirect?state=abc&code=secret-code';
     device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: callback });
@@ -546,7 +627,7 @@ test('a steering owner message joins the tool round and the pair is answered onc
     const cookie = await pairedDevice(store, base);
     const device = deviceClient(base, cookie);
     await device.open();
-    device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
     await device.wait(() => device.response('h1') !== undefined, 'hello reply');
 
     const entered = store.gate.hold();
@@ -609,7 +690,7 @@ test('a reopen reports interrupted controls, releases held acknowledgements and 
     const cookie = await pairedDevice(store, base);
     const device = deviceClient(base, cookie);
     await device.open();
-    device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
     await device.wait(() => device.response('h1') !== undefined, 'hello reply');
 
     // The interrupted command is reported once, never replayed.
@@ -646,7 +727,7 @@ test('a failed run settles its key as failed and reports the error state', { tim
     const cookie = await pairedDevice(store, base);
     const device = deviceClient(base, cookie);
     await device.open();
-    device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
     await device.wait(() => device.response('h1') !== undefined, 'hello reply');
     device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'this run will fail' });
     await device.wait(() => device.response('s1') !== undefined, 'send admitted');
@@ -687,7 +768,7 @@ test('scheduled results are delivered through the channel-neutral outbox as curs
       nextChunkIndex: 0,
     });
   }, context);
-  const app = startApp(store);
+  const app = startApp(store, { scanIntervalMs: 50 });
   const base = `http://127.0.0.1:${await app.port}`;
   try {
     const cookie = await (async () => {
@@ -698,7 +779,7 @@ test('scheduled results are delivered through the channel-neutral outbox as curs
     })();
     const device = deviceClient(base, cookie);
     await device.open();
-    device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
     await device.wait(() => device.response('h1') !== undefined, 'hello reply');
     await device.wait(() => device.events('message').some((event) => event.text === 'SCHEDULED-REMINDER'),
       'the scheduled result arrived');
@@ -715,4 +796,635 @@ test('scheduled results are delivered through the channel-neutral outbox as curs
     await app.stop();
     await store.close();
   }
+});
+
+async function request(device, id, op, fields = {}) {
+  device.send({ type: 'req', id, op, ...fields });
+  await device.wait(() => device.response(id) !== undefined, `${op} reply`);
+  return device.response(id);
+}
+
+async function connectV2(base, cookie, cursor = null) {
+  const device = deviceClient(base, cookie);
+  await device.open();
+  assert.equal((await request(device, 'hello', 'hello', { v: 2, cursor })).v, 2);
+  await device.wait(() => device.events('status').length > 0, 'end of replay');
+  return device;
+}
+
+async function createSide(device, key, title) {
+  const result = await request(device, `create-${key}`, 'thread.create', { key, title });
+  assert.equal(result.ok, true);
+  assert.equal(result.duplicate, false);
+  assert.match(result.thread, /^t_[A-Za-z0-9_-]{1,40}$/u);
+  return result.thread;
+}
+
+test('the hello reply carries the configured agent display name', { timeout: 15_000 }, async () => {
+  await withChannel('agent-name', { appBlock: { agentName: 'Work Bench' } }, async ({ base, store }) => {
+    const device = await connectV2(base, await pairedDevice(store, base));
+    assert.equal(device.response('hello').agent, 'Work Bench');
+    await device.close();
+  });
+});
+
+test('thread registry is durable, creation is idempotent, and only open side threads count', { timeout: 15_000 }, async () => {
+  await withChannel('registry', {}, async ({ base, store, app }) => {
+    const device = await connectV2(base, await pairedDevice(store, base));
+    for (const [i, title] of ['', 'x'.repeat(81), 'line\nbreak'].entries()) {
+      assert.equal((await request(device, `invalid-${i}`, 'thread.create', { key: 'first', title })).error, 'bad_request');
+    }
+    const side = await createSide(device, 'first');
+    app.clock.now += 1_000;
+    assert.equal((await request(device, 'rename', 'thread.rename', { thread: side, title: 'Research' })).ok, true);
+    assert.equal((await request(device, 'rename-main', 'thread.rename', { thread: 'main', title: 'Invalid' })).error, 'bad_request');
+    for (let i = 1; i < 50; i++) await createSide(device, `fill-${i}`);
+    const retry = await request(device, 'retry', 'thread.create', { key: 'first', title: 'Not a rename' });
+    assert.deepEqual([retry.thread, retry.duplicate], [side, true]);
+    assert.equal((await request(device, 'over-limit', 'thread.create', { key: 'overflow' })).error, 'bad_request');
+
+    assert.equal((await request(device, 'archive', 'thread.archive', { thread: side, archived: true })).ok, true);
+    assert.equal((await request(device, 'archived-send', 'send', { thread: side, key: 'refused', text: 'No' })).error, 'bad_request');
+    assert.equal((await request(device, 'archived-status', 'control', { thread: side, command: 'status' })).error, 'bad_request');
+    const replacement = await createSide(device, 'overflow');
+    assert.equal((await request(device, 'restore-full', 'thread.archive', { thread: side, archived: false })).error, 'bad_request');
+    assert.equal((await request(device, 'archive-spare', 'thread.archive', { thread: replacement, archived: true })).ok, true);
+    app.clock.now += 1_000;
+    assert.equal((await request(device, 'restore', 'thread.archive', { thread: side, archived: false })).ok, true);
+    const matches = await request(device, 'search', 'threads', { query: 'sEaRc' });
+    assert.deepEqual(matches.threads.map(({ id }) => id), [side]);
+    for (const [i, query] of ['', 'x'.repeat(81), null].entries()) {
+      assert.equal((await request(device, `bad-search-${i}`, 'threads', { query })).error, 'bad_request');
+    }
+    const { threads } = await request(device, 'list', 'threads');
+    assert.equal(threads.length, 52);
+    assert.equal(threads[0].id, side);
+    assert.equal(threads.find((thread) => thread.id === 'main').archived, false);
+    assert.equal(threads.find((thread) => thread.id === replacement).archivedReason, 'manual');
+    assert.equal(threads.find((thread) => thread.id === side).archivedReason, undefined);
+    assert.deepEqual(device.events('thread').filter((event) => event.thread.id === side)
+      .map(({ thread }) => [thread.title, thread.archived]),
+    [['New thread', false], ['Research', false], ['Research', true], ['Research', false]]);
+    await device.close();
+  });
+});
+
+test('threads lists only the 200 most recently active archives without deleting older ones', { timeout: 15_000 }, async () => {
+  const store = await openAppStore('archive-list');
+  const { AppState } = await import('../dist/channels/app.js');
+  try {
+    // Seed the full registry before the listener takes its in-memory snapshot.
+    const state = await store.gateway.conversationFor('app:channel-state', context);
+    const entry = (id, index, archived) => ({
+      id, title: '😀'.repeat(80), archived,
+      createdAt: new Date(0).toISOString(), lastAt: new Date(index * 1_000).toISOString(),
+    });
+    await state.commit(async (tx) => {
+      const doc = await tx.doc(AppState, state.id);
+      doc.threads = [entry('main', 0, false),
+        ...Array.from({ length: 202 }, (_, i) => entry(`t_archive_${i}`, i + 1, true)),
+        ...Array.from({ length: 49 }, (_, i) => entry(`t_open_${i}`, i + 1, false))];
+    }, context);
+    const reopened = startApp(store, { now: 300_000 });
+    try {
+      const base = `http://127.0.0.1:${await reopened.port}`;
+      const device = await connectV2(base, await pairedDevice(store, base));
+      const list = await request(device, 'list', 'threads');
+      assert.ok(Buffer.byteLength(JSON.stringify(list)) <= APP_LIMITS.frameBytes);
+      assert.equal(list.threads.filter((thread) => !thread.archived).length, 50);
+      assert.equal(list.threads.at(-1).id, 'main');
+      assert.deepEqual(list.threads.filter((thread) => thread.archived).map((thread) => thread.id),
+        Array.from({ length: 200 }, (_, i) => `t_archive_${201 - i}`));
+      const search = await request(device, 'search', 'threads', { query: '😀' });
+      assert.equal(search.threads.length, 200);
+      assert.equal(search.threads[0].id, 't_archive_201');
+      assert.equal((await request(device, 'restore-old', 'thread.archive', { thread: 't_archive_0', archived: false })).ok, true);
+      await device.close();
+    } finally {
+      await reopened.stop();
+    }
+  } finally {
+    await store.close();
+  }
+});
+
+test('threads run concurrently, replay through one cursor, and archive aborts only its own turn', { timeout: 20_000 }, async () => {
+  await withChannel('parallel', { streamTokensPerSecond: 40, cron: true }, async ({ base, store }) => {
+    const answer = (label) => fauxAssistantMessage(label.repeat(50));
+    store.script([() => answer('Main reply. '), () => answer('Side reply. '),
+      () => answer('Never delivered. '), () => fauxAssistantMessage('Main survived.')]);
+    const cookie = await pairedDevice(store, base);
+    const device = await connectV2(base, cookie);
+    const side = await createSide(device, 'parallel');
+    const idle = await createSide(device, 'idle');
+    assert.equal((await request(device, 'main', 'send', { key: 'for-main', text: 'main input' })).ok, true);
+    await until(() => store.captured.length === 1, 'main model request');
+    assert.equal((await request(device, 'side', 'send', { thread: side, key: 'for-side', text: 'side input' })).ok, true);
+    await until(() => store.captured.length === 2, 'simultaneous side model request');
+    assert.equal(device.events('settled').length, 0, 'both providers started before either turn settled');
+    const mainChat = await store.gateway.conversationFor(APP_CHAT_SESSION_KEY, context);
+    const sideChat = await store.gateway.conversationFor(`${APP_CHAT_SESSION_KEY}:${side}`, context);
+    assert.notEqual(sideChat.id, mainChat.id);
+    const tools = async (chat) => (await chat.agent(context)).tools.map((tool) => tool.name);
+    assert.deepEqual(await tools(sideChat), await tools(mainChat));
+    assert.ok((await tools(sideChat)).includes('cron'));
+    assert.deepEqual(store.captured[1].messages.filter((message) => message.role === 'user').map((message) => message.content), ['side input']);
+    assert.equal((await request(device, 'duplicate', 'send', { thread: side, key: 'for-main', text: 'retry' })).duplicate, true);
+
+    const replay = await connectV2(base, await pairedDevice(store, base, 'second'));
+    await replay.wait(() => replay.events('status').some((event) => event.thread === side), 'side status after replay');
+    assert.equal(replay.events('status').some((event) => event.thread === idle), false);
+    const firstStatus = replay.frames.findIndex((frame) => frame.event === 'status');
+    assert.deepEqual(replay.frames.slice(1, firstStatus).map((event) => event.cursor), [1, 2, 3, 4]);
+    for (const receiver of [device, replay]) {
+      await receiver.wait(() => receiver.events('settled').length === 2, 'both turns settled');
+      for (const [key, thread, label] of [['for-main', 'main', 'Main'], ['for-side', side, 'Side']]) {
+        assert.equal(receiver.events('settled').find((event) => event.key === key).thread, thread);
+        assert.equal(receiver.events('message').find((event) => event.key === key && event.role === 'user').thread, thread);
+        const reply = receiver.events('message').find((event) => event.key === key && event.role === 'assistant');
+        assert.equal(reply.thread, thread);
+        assert.ok(reply.text.startsWith(label));
+        assert.ok(receiver.events('preview').some((event) => event.thread === thread && event.key === key));
+      }
+    }
+    const aborting = await request(device, 'abortable', 'send', { thread: side, key: 'abort-me', text: 'stop me' });
+    assert.equal(aborting.ok, true);
+    await until(() => store.captured.length === 3, 'abortable side turn started');
+    assert.equal((await request(device, 'keep-running', 'send', { key: 'keep-running', text: 'Keep this main turn' })).ok, true);
+    await until(() => store.captured.length === 4, 'main turn started before side archive');
+    assert.equal((await request(device, 'archive', 'thread.archive', { thread: side, archived: true })).ok, true);
+    await device.wait(() => device.events('settled').some((event) => event.key === 'abort-me'), 'archived turn settled');
+    const ended = device.events('settled').find((event) => event.key === 'abort-me');
+    assert.deepEqual([ended.thread, ended.outcome], [side, 'aborted']);
+    assert.equal((await request(device, 'restore', 'thread.archive', { thread: side, archived: false })).ok, true);
+    assert.equal((await request(device, 'side-reset', 'control', { thread: side, command: 'new' })).ok, true);
+    await device.wait(() => device.events('message').some((event) => event.text === 'Context reset.' && event.thread === side), 'side reset notice');
+    assert.deepEqual(device.events('divider').map((event) => event.thread), [side]);
+    await device.wait(() => device.events('settled').some((event) => event.key === 'keep-running' && event.outcome === 'answered'), 'main survives side archive and reset');
+    await replay.close();
+    await device.close();
+  });
+});
+
+test('a reopened gateway recovers an interrupted side turn and routes its notice to that side', { timeout: 20_000 }, async () => {
+  const gatewayOptions = { contextSnapshotProvider: () => ({ identity: { source: 'synthetic', content: 'pinned' } }) };
+  const original = await openAppStore('side-restart', { gatewayOptions, keepDirectory: true, streamTokensPerSecond: 40 });
+  original.setAnswer('Unfinished answer. '.repeat(100));
+  const app = startApp(original);
+  let reopened;
+  let nextApp;
+  try {
+    const base = `http://127.0.0.1:${await app.port}`;
+    const cookie = await pairedDevice(original, base);
+    const device = await connectV2(base, cookie);
+    const side = await createSide(device, 'interrupted');
+    assert.equal((await request(device, 'turn', 'send', { thread: side, key: 'interrupted-turn', text: 'interrupted input' })).ok, true);
+    await device.wait(() => device.events('preview').some((event) => event.thread === side), 'side turn reached streaming');
+    await app.stop();
+    await original.close();
+    reopened = await openAppStore('reopened', { directory: original.directory, gatewayOptions });
+    nextApp = startApp(reopened);
+    const after = await connectV2(`http://127.0.0.1:${await nextApp.port}`, cookie);
+    await after.wait(() => after.events('message').some((event) => event.role === 'notice' && /interrupted/iu.test(event.text)) &&
+      after.events('settled').some((event) => event.key === 'interrupted-turn'), 'recovery notice and settlement');
+    const events = after.events('message');
+    assert.deepEqual(events.map((event) => [event.thread, event.role]), [[side, 'user'], [side, 'notice']]);
+    assert.equal(after.events('settled')[0].thread, side);
+    const retry = await request(after, 'create-retry', 'thread.create', { key: 'interrupted' });
+    assert.deepEqual([retry.thread, retry.duplicate], [side, true]);
+    assert.equal(reopened.captured.length, 0, 'recovery did not retry inference');
+    await after.close();
+  } finally {
+    await nextApp?.stop();
+    await reopened?.close();
+    await app.stop();
+    await original.close();
+    await rm(original.directory, { recursive: true, force: true });
+  }
+});
+
+test('a cron job created by an app side turn delivers back to that thread', { timeout: 15_000 }, async () => {
+  await withChannel('side-cron', { cron: true }, async ({ base, store }) => {
+    const device = await connectV2(base, await pairedDevice(store, base));
+    const side = await createSide(device, 'cron');
+    store.script([
+      () => fauxAssistantMessage([fauxToolCall('cron', {
+        action: 'add', message: 'test reminder', at: new Date(Date.now() + 1_000).toISOString(),
+      }, { id: 'add-reminder' })], { stopReason: 'toolUse' }),
+      () => fauxAssistantMessage('Reminder scheduled.'),
+      () => fauxAssistantMessage('SIDE-CRON-RESULT'),
+    ]);
+    assert.equal((await request(device, 'add-job', 'send', { thread: side, key: 'add-job', text: 'Add a reminder' })).ok, true);
+    await device.wait(() => device.events('settled').some((event) => event.key === 'add-job'), 'cron tool turn settled');
+    assert.equal((await request(device, 'archive-cron', 'thread.archive', { thread: side, archived: true })).ok, true);
+    await device.wait(() => device.events('message').some((event) => event.text === 'SIDE-CRON-RESULT'), 'scheduled result');
+    const result = device.events('message').find((event) => event.text === 'SIDE-CRON-RESULT');
+    assert.deepEqual([result.thread, result.role, result.key], [side, 'assistant', undefined]);
+    assert.ok(result.id.startsWith('outbox:'));
+    const lifecycle = device.events('thread').filter((event) => event.thread.id === side);
+    assert.deepEqual(lifecycle.map((event) => event.thread.archived), [false, true, false]);
+    assert.ok(lifecycle[2].cursor < result.cursor);
+    assert.equal(lifecycle[2].thread.archivedReason, undefined);
+    await device.close();
+  });
+});
+
+test('a registered app fork inherits only the prefix through its anchor and reopens as chat', { timeout: 20_000 }, async () => {
+  const gatewayOptions = { contextSnapshotProvider: () => ({ identity: { source: 'synthetic', content: 'app context' } }) };
+  const original = await openAppStore('fork-side', { gatewayOptions, cron: true, keepDirectory: true });
+  const app = startApp(original);
+  let reopened;
+  let nextApp;
+  try {
+    const base = `http://127.0.0.1:${await app.port}`;
+    const cookie = await pairedDevice(original, base);
+    const device = await connectV2(base, cookie);
+    original.setAnswer('committed anchor answer');
+    const send = async (key, text) => {
+      assert.equal((await request(device, key, 'send', { key, text })).ok, true);
+      await device.wait(() => device.events('settled').some((event) => event.key === key), `${key} settled`);
+    };
+    await send('anchor', 'context before fork');
+    const answer = device.events('message').find((event) => event.role === 'assistant' && event.key === 'anchor');
+    await send('too-late', 'context after fork point');
+    const main = await original.gateway.conversationFor(APP_CHAT_SESSION_KEY, context);
+    const { defineDoc } = await import('@earendil-works/pi-durable');
+    const { encodedSessionKey } = await import('../dist/history/scope.js');
+    const mapToken = defineDoc({ kind: 'nanobot.session-map', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', initial: () => ({ sessions: {} }), checkpointWhen: () => true });
+    const root = await original.gateway.harness.root(context);
+    const outside = await original.gateway.conversationFor('not-app', context);
+    const other = await outside.submit({ type: 'input', content: 'non-app chat' }, context);
+    const otherResult = await other.wait(context);
+    const nativeFork = await outside.fork(otherResult.answer, { ownership: { kind: 'ownerless' } }, context);
+    await root.commit(async (tx) => {
+      const map = await tx.doc(mapToken, root.id);
+      map.sessions[encodedSessionKey(`${APP_CHAT_SESSION_KEY}:t_unregistered`)] = nativeFork.id;
+    }, context);
+    await assert.rejects(original.gateway.conversationFor(`${APP_CHAT_SESSION_KEY}:t_unregistered`, context), /forked conversation/u);
+    assert.deepEqual((await nativeFork.agent(context)).tools, []);
+    const rawAppFork = await main.fork(Number(answer.id.split(':').at(-1)), { ownership: { kind: 'ownerless' } }, context);
+    await root.commit(async (tx) => {
+      const map = await tx.doc(mapToken, root.id);
+      map.sessions[encodedSessionKey(`${APP_CHAT_SESSION_KEY}:t_raw_app`)] = rawAppFork.id;
+    }, context);
+    await assert.rejects(original.gateway.conversationFor(`${APP_CHAT_SESSION_KEY}:t_raw_app`, context), /forked conversation/u);
+
+    for (const [i, from] of [null, { thread: 't_unknown', messageId: answer.id },
+      { thread: 'main', messageId: 'answer:12345' }, { thread: 'main', messageId: `answer:${otherResult.answer}` }].entries()) {
+      assert.equal((await request(device, `invalid-${i}`, 'thread.create', { key: 'invalid', from })).error, 'bad_request');
+    }
+    // Acknowledging and trimming the echo must not invalidate a committed app answer.
+    assert.equal((await request(device, 'ack', 'ack', { cursor: device.events('settled').at(-1).cursor })).ok, true);
+    const from = { thread: 'main', messageId: answer.id };
+    const result = await request(device, 'fork', 'thread.create', { key: 'fork', from, title: 'Branch' });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    const child = result.thread;
+    const replay = await request(device, 'fork-again', 'thread.create', { key: 'fork', from });
+    assert.deepEqual([replay.thread, replay.duplicate], [child, true]);
+    assert.deepEqual((await request(device, 'list', 'threads')).threads.find((entry) => entry.id === child).origin, from);
+    const childKey = `${APP_CHAT_SESSION_KEY}:${child}`;
+    const childChat = await original.gateway.conversationFor(childKey, context);
+    await root.commit(async (tx) => {
+      const map = await tx.doc(mapToken, root.id);
+      map.sessions[encodedSessionKey('foreign-alias')] = childChat.id;
+    }, context);
+    await assert.rejects(original.gateway.conversationFor('foreign-alias', context), /forked conversation/u);
+    await root.commit(async (tx) => {
+      const map = await tx.doc(mapToken, root.id);
+      delete map.sessions[encodedSessionKey('foreign-alias')];
+    }, context);
+    assert.equal((await request(device, 'child-before-reopen', 'send', { thread: child, key: 'child-anchor', text: 'child prefix' })).ok, true);
+    await device.wait(() => device.events('settled').some((event) => event.key === 'child-anchor'), 'child anchor settled');
+    const nestedFrom = { thread: child, messageId: 'send:child-anchor' };
+    await request(device, 'archive-child', 'thread.archive', { thread: child, archived: true });
+    assert.equal((await request(device, 'no-archived-forks', 'thread.create', { key: 'archived-fork', from: nestedFrom })).error, 'bad_request');
+    await request(device, 'restore-child', 'thread.archive', { thread: child, archived: false });
+    const nested = await request(device, 'fork-side', 'thread.create', { key: 'fork-side', from: nestedFrom });
+    assert.equal(nested.ok, true);
+    assert.equal(device.events('message').filter((event) => event.thread === child).some((event) => event.key === 'anchor'), false);
+
+    const wrong = await request(device, 'fork-wrong', 'thread.create', { key: 'fork-wrong', from });
+    assert.equal(wrong.ok, true);
+    const wrongChat = await original.gateway.conversationFor(`${APP_CHAT_SESSION_KEY}:${wrong.thread}`, context);
+    const { AppState } = await import('../dist/channels/app.js');
+    const appDoc = await original.gateway.conversationFor('app:channel-state', context);
+    await main.reset(undefined, context);
+    const resetAt = await main.commit((tx) => tx.latestEntryId(main.id), context);
+    const resetFork = await main.fork(resetAt, { ownership: { kind: 'ownerless' } }, context);
+    await root.commit(async (tx) => {
+      const map = await tx.doc(mapToken, root.id);
+      map.sessions[encodedSessionKey(`${APP_CHAT_SESSION_KEY}:t_reset`)] = resetFork.id;
+      const doc = await tx.doc(AppState, appDoc.id);
+      // Preserve round-2 enrollments even though their source key was not stored separately.
+      delete doc.forks[`c${childChat.id}`].parentThread;
+      const wrongId = 'send:too-late';
+      doc.threads.find((entry) => entry.id === wrong.thread).origin.messageId = wrongId;
+      doc.forks[`c${wrongChat.id}`].messageId = wrongId;
+      const resetMessage = `answer:${resetAt}`;
+      const timestamp = new Date().toISOString();
+      doc.threads.push({ id: 't_reset', title: 'reset fork', origin: { thread: 'main', messageId: resetMessage }, archived: false, createdAt: timestamp, lastAt: timestamp });
+      doc.forks[`c${resetFork.id}`] = { thread: 't_reset', parentThread: 'main', at: resetAt, messageId: resetMessage };
+      doc.answerAnchors[resetMessage] = { thread: 'main', at: resetAt };
+    }, context);
+    await app.stop();
+    await original.close();
+    reopened = await openAppStore('fork-reopen', { directory: original.directory, cron: true, gatewayOptions });
+    nextApp = startApp(reopened);
+    const next = await connectV2(`http://127.0.0.1:${await nextApp.port}`, cookie);
+    await assert.rejects(reopened.gateway.conversationFor(`${APP_CHAT_SESSION_KEY}:${wrong.thread}`, context), /forked conversation/u);
+    await assert.rejects(reopened.gateway.conversationFor(`${APP_CHAT_SESSION_KEY}:t_reset`, context), /forked conversation/u);
+    assert.equal((await request(next, 'send-child', 'send', { thread: nested.thread, key: 'child', text: 'side continuation' })).ok, true);
+    await next.wait(() => next.events('settled').some((event) => event.key === 'child' && event.outcome === 'answered'), 'child answer');
+    const frame = reopened.captured[0];
+    assert.deepEqual(frame.messages.filter((message) => message.role === 'user').map((message) => message.content),
+      ['context before fork', 'child prefix', 'side continuation']);
+    assert.deepEqual(next.events('message').filter((event) => event.thread === nested.thread).map((event) => event.key), ['child', 'child']);
+    assert.ok(frame.messages.some((message) => message.role === 'assistant' && message.content.some((part) => part.text === 'committed anchor answer')));
+    const tools = async (key) => (await (await reopened.gateway.conversationFor(key, context)).agent(context)).tools.map((tool) => tool.name);
+    assert.deepEqual(await tools(`${APP_CHAT_SESSION_KEY}:${nested.thread}`), await tools(APP_CHAT_SESSION_KEY));
+    assert.ok((await tools(`${APP_CHAT_SESSION_KEY}:${nested.thread}`)).includes('cron'));
+    await next.close();
+  } finally {
+    await nextApp?.stop();
+    await reopened?.close();
+    await app.stop();
+    await original.close();
+    await rm(original.directory, { recursive: true, force: true });
+  }
+});
+
+test('capacity-blocked side deliveries neither take dispatch slots nor replay a delivered occurrence after ack', { timeout: 15_000 }, async () => {
+  const store = await openAppStore('cron-capacity');
+  let app;
+  try {
+    const { AppState } = await import('../dist/channels/app.js');
+    const { CronDeliveriesDoc } = await import('../dist/automation/cron-delivery.js');
+    const sideKey = `${APP_CHAT_SESSION_KEY}:t_blocked`;
+    const side = await store.gateway.conversationFor(sideKey, context);
+    const main = await store.gateway.conversationFor(APP_CHAT_SESSION_KEY, context);
+    const state = await store.gateway.conversationFor('app:channel-state', context);
+    const now = Date.now();
+    const info = (id, archived = false) => ({ id, title: id, archived, createdAt: new Date(now).toISOString(), lastAt: new Date(now).toISOString() });
+    const delivery = (sessionKey, id) => ({ sessionKey, id, text: id, createdAtMs: now, status: 'pending', nextChunkIndex: 0 });
+    const stale = delivery(sideKey, 'cron:blocked:0');
+    await state.commit(async (tx) => {
+      const doc = await tx.doc(AppState, state.id);
+      doc.threads = [info('main'), info('t_blocked', true), ...Array.from({ length: 50 }, (_, i) => info(`t_open${i}`))];
+      doc.origin = { admittedAtMs: now };
+      doc.sideOrigins = { t_blocked: { admittedAtMs: now } };
+      (await tx.doc(CronDeliveriesDoc, side.id)).deliveries = [stale, ...Array.from({ length: 4 }, (_, i) => delivery(sideKey, `cron:blocked:${i+1}`))];
+      (await tx.doc(CronDeliveriesDoc, main.id)).deliveries = [delivery(APP_CHAT_SESSION_KEY, 'cron:main:0')];
+    }, context);
+    const outbox = store.gateway.cronOutbox;
+    let injectRollback = true;
+    let rolledBack = false;
+    let staleScans = 0;
+    let replayStale = false;
+    app = startApp(store, { scanIntervalMs: 50, gateway: { ...store.gateway, cronOutbox: {
+      ...outbox,
+      async list(key, ctx) {
+        if (replayStale && key === sideKey) { staleScans++; return [stale]; }
+        return outbox.list(key, ctx);
+      },
+      async update(key, id, change, ctx) {
+        try {
+          return await outbox.update(key, id, async (record, tx) => {
+            await change(record, tx);
+            if (injectRollback && key === sideKey && record.status === 'delivered') throw new Error('simulate failed outbox commit');
+          }, ctx);
+        } catch (error) {
+          if (error.message === 'simulate failed outbox commit') rolledBack = true;
+          throw error;
+        }
+      },
+    } } });
+    const base = `http://127.0.0.1:${await app.port}`;
+    const device = await connectV2(base, await pairedDevice(store, base));
+    await device.wait(() => device.events('message').some((event) => event.text === 'cron:main:0'), 'main result despite full archive capacity', 3500);
+    assert.ok((await outbox.list(sideKey, context)).every((record) => record.status === 'pending'));
+    assert.equal((await request(device, 'free-slot', 'thread.archive', { thread: 't_open0', archived: true })).ok, true);
+    await until(() => rolledBack, 'aborted transaction');
+    const failed = await appState(store.gateway);
+    assert.equal(failed.threads.find(({ id }) => id === 't_blocked').archived, true);
+    assert.ok(!failed.events.some((event) => event.thread === 't_blocked' || event.thread?.id === 't_blocked'));
+    injectRollback = false;
+    await device.wait(() => device.events('message').filter((event) => event.thread === 't_blocked').length === 5, 'every pending result delivered');
+    assert.ok((await outbox.list(sideKey, context)).every((record) => record.status === 'delivered'));
+    await request(device, 'ack-archive', 'ack', { cursor: device.events('message').at(-1).cursor });
+    assert.equal((await request(device, 'rearchive', 'thread.archive', { thread: 't_blocked', archived: true })).ok, true);
+    const before = await appState(store.gateway);
+    replayStale = true;
+    await until(() => staleScans >= 1, 'stale retry after replay trimming');
+    const after = await appState(store.gateway);
+    assert.equal(after.nextCursor, before.nextCursor, 'retry neither appends nor restores');
+    await device.close();
+  } finally {
+    await app?.stop();
+    await store.close();
+  }
+});
+
+test('snapshot-blocked archived deliveries neither take dispatch slots nor delay main', { timeout: 15_000 }, async () => {
+  // Unlike the open-cap blocker above, the open-thread cap has room here: the snapshot cap is
+  // the only reason the archived origin cannot be restored, and its five pending records must
+  // not fill the four dispatch slots of every scan ahead of main's own pending result.
+  const gatewayOptions = { contextSnapshotProvider: () => ({ identity: { source: 'synthetic', content: 'snapshot' } }) };
+  const store = await openAppStore('cron-snapshot-cap', { gatewayOptions });
+  let app;
+  try {
+    const { AppState } = await import('../dist/channels/app.js');
+    const { CronDeliveriesDoc } = await import('../dist/automation/cron-delivery.js');
+    const { defineDoc } = await import('@earendil-works/pi-durable');
+    const { encodedSessionKey } = await import('../dist/history/scope.js');
+    const mapToken = defineDoc({ kind: 'nanobot.session-map', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', initial: () => ({ sessions: {} }), checkpointWhen: () => true });
+    const root = await store.gateway.harness.root(context);
+    const sideKey = `${APP_CHAT_SESSION_KEY}:t_blocked`;
+    // Mapped before main, so the archived origin's session iterates first in the scan.
+    const side = await store.gateway.conversationFor(sideKey, context);
+    const main = await store.gateway.conversationFor(APP_CHAT_SESSION_KEY, context);
+    const state = await store.gateway.conversationFor('app:channel-state', context);
+    const now = Date.now();
+    const info = (id, archived = false) => ({ id, title: id, archived, createdAt: new Date(now).toISOString(), lastAt: new Date(now).toISOString() });
+    await state.commit(async (tx) => {
+      const doc = await tx.doc(AppState, state.id);
+      doc.threads = [info('main'), info('t_blocked', true)];
+      doc.origin = { admittedAtMs: now };
+      doc.sideOrigins = { t_blocked: { admittedAtMs: now } };
+      (await tx.doc(CronDeliveriesDoc, side.id)).deliveries = Array.from({ length: 5 }, (_, i) =>
+        ({ sessionKey: sideKey, id: `cron:blocked:${i}`, text: `blocked ${i}`, createdAtMs: now, status: 'pending', nextChunkIndex: 0 }));
+      (await tx.doc(CronDeliveriesDoc, main.id)).deliveries =
+        [{ sessionKey: APP_CHAT_SESSION_KEY, id: 'cron:main:0', text: 'MAIN-FIRST', createdAtMs: now, status: 'pending', nextChunkIndex: 0 }];
+    }, context);
+    // Fill every remaining snapshot slot with inert mappings, leaving open-thread room free.
+    await root.commit(async (tx) => {
+      const map = await tx.doc(mapToken, root.id);
+      for (const [key, id] of [[sideKey, side.id], [APP_CHAT_SESSION_KEY, main.id], ['app:channel-state', state.id]]) {
+        if (map.sessions[encodedSessionKey(key)] === undefined) map.sessions[encodedSessionKey(key)] = id;
+      }
+      const remaining = 257 - Object.keys(map.sessions).length;
+      for (let i = 0; i < remaining; i += 1) {
+        map.sessions[encodedSessionKey(`snapshot:${i}`)] = (await tx.createConversation({ ownership: { kind: 'ownerless' } })).id;
+      }
+    }, context);
+    app = startApp(store, { scanIntervalMs: 50 });
+    const base = `http://127.0.0.1:${await app.port}`;
+    const device = await connectV2(base, await pairedDevice(store, base));
+    await device.wait(() => device.events('message').some((event) => event.text === 'MAIN-FIRST'),
+      'main delivers although the archived origin precedes it');
+    const outbox = store.gateway.cronOutbox;
+    assert.ok((await outbox.list(sideKey, context)).every((record) => record.status === 'pending'),
+      'the snapshot-blocked origin never took a delivery slot');
+    assert.ok(!device.events('message').some((event) => event.thread === 't_blocked'));
+    assert.ok(!device.events('thread').some((event) => event.thread.id === 't_blocked'));
+    await device.close();
+  } finally {
+    await app?.stop();
+    await store.close();
+  }
+});
+
+test('a send to an archived thread is refused before its snapshot is touched', { timeout: 15_000 }, async () => {
+  const loads = [];
+  const gatewayOptions = { contextSnapshotProvider: (key) => {
+    loads.push(key);
+    return { identity: { source: 'synthetic', content: `snapshot ${key}` } };
+  } };
+  await withChannel('archived-send', { gatewayOptions }, async ({ base, store }) => {
+    const device = await connectV2(base, await pairedDevice(store, base));
+    const side = await createSide(device, 'arch');
+    assert.equal((await request(device, 'warm', 'send', { thread: side, key: 'warm', text: 'warm the snapshot' })).ok, true);
+    await device.wait(() => device.events('settled').some((event) => event.key === 'warm'), 'warm settled');
+    const key = `${APP_CHAT_SESSION_KEY}:${side}`;
+    const before = loads.filter((entry) => entry === key).length;
+    assert.ok(before >= 1, 'the open thread installed its snapshot');
+    assert.equal((await request(device, 'archive', 'thread.archive', { thread: side, archived: true })).ok, true);
+    assert.equal((await request(device, 'archived-send', 'send', { thread: side, key: 'after', text: 'nope' })).error, 'bad_request');
+    assert.equal(loads.filter((entry) => entry === key).length, before, 'the refused send reinstalled nothing');
+    await device.close();
+  });
+});
+
+test('archived mappings do not pin snapshot slots or force a restart below the same cap', { timeout: 20_000 }, async () => {
+  const loads = [];
+  const gatewayOptions = { contextSnapshotProvider: (key) => {
+    loads.push(key);
+    return { identity: { source: 'synthetic', content: 'snapshot ' + key } };
+  } };
+  const original = await openAppStore('snapshot-cap', { keepDirectory: true });
+  let reopened;
+  let app;
+  const free = `${APP_CHAT_SESSION_KEY}:t_free`;
+  const cold = `${APP_CHAT_SESSION_KEY}:t_cold`;
+  try {
+    const { AppState } = await import('../dist/channels/app.js');
+    const { defineDoc } = await import('@earendil-works/pi-durable');
+    const { encodedSessionKey } = await import('../dist/history/scope.js');
+    const mapToken = defineDoc({ kind: 'nanobot.session-map', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', initial: () => ({ sessions: {} }), checkpointWhen: () => true });
+    const root = await original.gateway.harness.root(context);
+    const state = await original.gateway.conversationFor('app:channel-state', context);
+    const now = new Date().toISOString();
+    const info = (id, archived = false) => ({ id, title: id, archived, createdAt: now, lastAt: now });
+    await root.commit(async (tx) => {
+      const map = await tx.doc(mapToken, root.id);
+      const doc = await tx.doc(AppState, state.id);
+      doc.threads = [info('main'), info('t_free'), info('t_cold', true), info('t_older', true)];
+      for (const key of [free, cold, `${APP_CHAT_SESSION_KEY}:t_older`, ...Array.from({ length: 253 }, (_, i) => `snapshot:${i}`)]) {
+        map.sessions[encodedSessionKey(key)] = (await tx.createConversation({ ownership: { kind: 'ownerless' } })).id;
+      }
+    }, context);
+    await original.close();
+    reopened = await openAppStore('snapshot-reopen', { directory: original.directory, gatewayOptions });
+    assert.ok(!loads.includes(cold));
+    assert.ok(loads.includes(free));
+    app = startApp(reopened);
+    const base = `http://127.0.0.1:${await app.port}`;
+    const device = await connectV2(base, await pairedDevice(reopened, base));
+    await createSide(device, 'last-slot');
+    assert.equal((await request(device, 'over-cap', 'thread.create', { key: 'over-cap' })).error, 'not_ready');
+    assert.equal((await request(device, 'blocked-send', 'send', { key: 'retry-me', text: 'needs a snapshot' })).error, 'not_ready');
+    assert.ok(!(await appState(reopened.gateway)).sendKeys.some(({ key }) => key === 'retry-me'));
+    assert.equal((await request(device, 'blocked-restore', 'thread.archive', { thread: 't_cold', archived: false })).error, 'bad_request');
+    assert.equal((await request(device, 'free', 'thread.archive', { thread: 't_free', archived: true })).ok, true);
+    assert.equal((await request(device, 'restore', 'thread.archive', { thread: 't_cold', archived: false })).ok, true);
+    assert.ok(loads.includes(cold));
+    assert.equal((await request(device, 'verify-snapshot', 'send', { thread: 't_cold', key: 'retry-me', text: 'snapshot is ready' })).ok, true);
+    await device.wait(() => device.events('settled').some((event) => event.key === 'retry-me' && event.outcome === 'answered'), 'restored turn');
+    assert.ok(reopened.captured.some(({ system }) => system.includes('snapshot ' + cold)));
+    await device.close();
+  } finally {
+    await app?.stop();
+    if (reopened !== undefined) await reopened.close();
+    else await original.close();
+    await rm(original.directory, { recursive: true, force: true });
+  }
+});
+
+test('archive fences an admitted input paused immediately before native submission', { timeout: 10_000 }, async () => {
+  const store = await openAppStore('archive-fence');
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const gateway = store.gateway;
+  let gatedThread;
+  let gateOnce = true;
+  const app = startApp(store, { gateway: { ...gateway, async conversationFor(key, ctx) {
+    const chat = await gateway.conversationFor(key, ctx);
+    if (key !== gatedThread || !gateOnce) return chat;
+    return new Proxy(chat, { get(target, prop) {
+      if (prop === 'watch') return async (...args) => {
+        if (gateOnce) { gateOnce = false; entered.resolve(); await release.promise; }
+        return target.watch(...args);
+      };
+      const value = target[prop];
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+  } } });
+  try {
+    const base = `http://127.0.0.1:${await app.port}`;
+    const device = await connectV2(base, await pairedDevice(store, base));
+    const thread = await createSide(device, 'race');
+    gatedThread = `${APP_CHAT_SESSION_KEY}:${thread}`;
+    assert.equal((await request(device, 'race-send', 'send', { thread, key: 'race', text: 'must not run' })).ok, true);
+    await entered.promise;
+    device.send({ type: 'req', id: 'archive-race', op: 'thread.archive', thread, archived: true });
+    assert.equal((await request(device, 'fenced-send', 'send', { thread, key: 'fenced', text: 'also must not run' })).error, 'not_ready');
+    release.resolve();
+    await device.wait(() => device.response('archive-race')?.ok === true, 'archive completes');
+    await device.wait(() => device.events('settled').some(({ key, outcome }) => key === 'race' && outcome === 'aborted'), 'archive settles input');
+    const chat = await gateway.conversationFor(gatedThread, context);
+    assert.equal(await chat.commit((tx) => tx.submissionByRequest(chat.id, 'app:send:race'), context), undefined);
+    assert.equal(store.captured.length, 0);
+    await device.close();
+  } finally {
+    release.resolve();
+    await app.stop();
+    await store.close();
+  }
+});
+
+test('idle archive uses the configured clock and skips running and queued work', { timeout: 15_000 }, async () => {
+  await withChannel('idle-archive', { adapter: { autoArchiveDays: 1, scanIntervalMs: 50 } }, async ({ app, store, base }) => {
+    const device = await connectV2(base, await pairedDevice(store, base));
+    const idle = await createSide(device, 'will-expire');
+    const busy = await createSide(device, 'will-not-expire');
+    try {
+      const entered = store.gate.hold();
+      assert.equal((await request(device, 'busy', 'send', { thread: busy, key: 'busy', text: 'running' })).ok, true);
+      await entered;
+      assert.equal((await request(device, 'queued', 'send', { thread: busy, key: 'queued', text: 'queued' })).ok, true);
+      await untilAsync(async () => {
+        const chat = await store.gateway.conversationFor(`${APP_CHAT_SESSION_KEY}:${busy}`, context);
+        return (await chat.commit((tx) => tx.submissionByRequest(chat.id, 'app:send:queued'), context))?.status === 'queued';
+      }, 'native queued submission');
+      assert.equal((await request(device, 'fork-queued', 'thread.create', { key: 'not-placed', from: { thread: busy, messageId: 'send:queued' } })).error, 'bad_request');
+      app.clock.now += 86_400_001;
+      await device.wait(() => device.events('thread').some(({ thread }) => thread.id === idle && thread.archivedReason === 'idle'), 'idle archive scan');
+      const list = await request(device, 'list', 'threads');
+      assert.equal(list.threads.find((thread) => thread.id === busy).archived, false);
+      assert.equal(list.threads.find((thread) => thread.id === 'main').archived, false);
+    } finally {
+      store.gate.release();
+    }
+    await device.wait(() => device.events('settled').length === 2, 'busy and queued turns finish');
+    await device.close();
+  });
 });

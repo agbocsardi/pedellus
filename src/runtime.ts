@@ -63,7 +63,12 @@ import {
   createDiscordHistoryTool,
   type DiscordHistoryRegistry,
 } from "./channels/discord-history.js";
-import { createAppConsoleRegistry, type AppConsoleRegistry } from "./channels/app.js";
+import {
+  APP_CHAT_SESSION_KEY, APP_STATE_SESSION_KEY, AppState, AppThreadCapacityError, appForkEntry,
+  createAppConsoleRegistry, sessionForThread, threadInfo,
+  type AppConsoleRegistry, type AppGateway,
+} from "./channels/app.js";
+import { APP_MAIN_THREAD, parseThreadId } from "./channels/app-protocol.js";
 import type { CronOwner } from "./automation/cron.js";
 import {
   ASK_USER_TOOL_NAME,
@@ -451,6 +456,12 @@ export interface Gateway {
    * `app pair|devices|revoke` commands reach it over the private socket.
    */
   readonly appConsole?: AppConsoleRegistry;
+  readonly forkAppThread?: NonNullable<AppGateway["forkAppThread"]>;
+  readonly appThreadBusy?: NonNullable<AppGateway["appThreadBusy"]>;
+  /** Present only when `config.app` is configured: snapshot-slot room and eager thread reservation. */
+  readonly appSnapshotRoom?: NonNullable<AppGateway["appSnapshotRoom"]>;
+  readonly createAppThread?: NonNullable<AppGateway["createAppThread"]>;
+  readonly reserveAppThread?: NonNullable<AppGateway["reserveAppThread"]>;
   /**
    * MCP server connection state; absent when MCP is not configured and enabled. A failed server has
    * no tools; its status carries a fixed failure code, never a transport message or configured value.
@@ -1524,7 +1535,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // Harness.open() has run. It reports whether skills were installed for that conversation, and it
   // rebuilds a background target's snapshot instead of reusing the one an earlier run installed.
   const contextInstallerRef: {
-    current?: (sessionKey: string, conversationId: ConversationId, ctx: Context) => Promise<boolean>;
+    current?: (sessionKey: string, conversationId: ConversationId, ctx: Context, tx: Tx, background: boolean) => Promise<boolean>;
   } = {};
   const cronFoundation = cronEnabled
     ? createCronFoundation({
@@ -1581,7 +1592,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // authority. An origin-mode run answers inside the conversation that already has the
         // configured authority, so it needs no capture.
         prepare: async ({ tx, originConversationId, targetConversationId, background }, ctx) => {
-          if (!background) return;
+          if (!background) {
+            const owner = cronOwners.get(originConversationId);
+            if (owner?.sessionKey.startsWith(`${APP_CHAT_SESSION_KEY}:`) && !contextConversations.has(originConversationId)) {
+              await contextInstallerRef.current?.(owner.sessionKey, originConversationId, ctx, tx, false);
+              await configure(tx, originConversationId, {
+                ...extensionsPolicy(originConversationId), ...await toolFilterFor(tx, originConversationId),
+              });
+            }
+            return;
+          }
           // Classify the conversation first, from the durable marker the foundation wrote in the same
           // commit: a forged or stale mapping can never be mistaken for chat via this host, and a
           // failure later in this preparation cannot leave the conversation chat-like in memory.
@@ -1621,7 +1641,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // with no known owner skips this and keeps the run default-deny. The cron tool and
           // foundation are never offered here.
           const skillsInstalled = owner !== undefined && contextInstallerRef.current !== undefined
-            ? await contextInstallerRef.current(owner.sessionKey, targetConversationId, ctx)
+            ? await contextInstallerRef.current(owner.sessionKey, targetConversationId, ctx, tx, true)
             : false;
           const tools = [
             ...captured.flatMap((name) => {
@@ -1693,6 +1713,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (job === null || !isChatSessionKey(job.owner.sessionKey)) return;
           if (!cronDeliveryPrefixes.some((prefix) => job.owner.sessionKey.startsWith(prefix))) return;
           let text: string;
+          let appAnswerEntry: EntryId | undefined;
           if (delivery.status === "error") {
             text = cronOutcomeNotice("failed", job.id, occurrence.scheduledAtMs);
           } else {
@@ -1708,6 +1729,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
             // so a run that produced no usable message is visible rather than silently dropped. A
             // failed run never reaches this branch and keeps its sanitized notice.
             if (job.silent === true) return;
+            if (job.owner.sessionKey.startsWith("app:") && answer?.conversationId === originConversationId &&
+                body !== "" && body !== "[SILENT]") appAnswerEntry = answer.id;
             text = body === "" || body === "[SILENT]"
               ? cronOutcomeNotice("empty", job.id, occurrence.scheduledAtMs)
               : body.length > CRON_DELIVERY_MAX_TEXT_CHARS
@@ -1726,6 +1749,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
               createdAtMs: now(),
               status: "pending",
               nextChunkIndex: 0,
+              ...(appAnswerEntry === undefined ? {} : { appAnswerEntry }),
             });
           } catch {
             admission = "invalid";
@@ -1800,7 +1824,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // the spawning session is mapped.
           const spawnerKey = sessionKeyForConversation.get(spawnerConversationId);
           const skillsInstalled = spawnerKey !== undefined && contextInstallerRef.current !== undefined
-            ? await contextInstallerRef.current(spawnerKey, target, ctx)
+            ? await contextInstallerRef.current(spawnerKey, target, ctx, tx, true)
             : false;
           // Explicit worker grants are independent of the foreground coding ceiling. Snapshot
           // delivery cannot add a skill tool the worker configuration withheld.
@@ -2244,7 +2268,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // Backstop: a job whose conversation is not chat scope never reaches a provider call. An
           // automation conversation and a summary task's own target are equally out of scope.
           scope: (tx: Tx, conversationId: ConversationId): Promise<ChatScopeExclusion | undefined> =>
-            readChatScope((id) => scopeRecordFor(tx, id), conversationId, root.id),
+            chatScopeById(tx, conversationId),
           // Resolved lazily: the catalog is created after this object so its extension can be
           // installed in the initial registry.
           listEpisodes: (conversationId, query, ctx) =>
@@ -2440,23 +2464,123 @@ export async function openGateway(config: PortConfig, context: Context, options:
     };
     const root = await harness.root(context, { agent: defaultAgentPolicy });
 
+    /**
+     * The one narrow fork exception (AGENTS.md): an app-channel thread fork is admissible as an
+     * ordinary mapped chat only under its own exact registered app session key. Every hop of a
+     * fork-of-fork chain must carry a durable enrollment whose recorded app message resolves, in the
+     * conversation the native parent names, to a committed user or assistant transcript entry equal
+     * to the native fork cutoff; the enrollment is the authority and the thread registry's displayed
+     * `origin` is only metadata. The base of the chain must be the exact app mapping of a validated
+     * app chat (main or an unenrolled side thread). Anything else stays a denied fork.
+     */
+    async function appForkAdmissible(tx: Tx, sessionKey: string, conversationId: ConversationId): Promise<boolean> {
+      if (!sessionKey.startsWith(`${APP_CHAT_SESSION_KEY}:`)) return false;
+      const callerThread = parseThreadId(sessionKey.slice(APP_CHAT_SESSION_KEY.length + 1));
+      if (callerThread === undefined || callerThread === APP_MAIN_THREAD) return false;
+      let child = await tx.conversation(conversationId);
+      if (child === undefined || child.parent === undefined || child.owner !== undefined) return false;
+      const map = await tx.doc(SessionMap, root.id);
+      const stateId = map.sessions[encodedSessionKey(APP_STATE_SESSION_KEY)] as ConversationId | undefined;
+      if (stateId === undefined || stateId === root.id) return false;
+      const stateRecord = await tx.conversation(stateId);
+      if (stateRecord === undefined || stateRecord.owner !== undefined || stateRecord.parent !== undefined) return false;
+      const state = await tx.doc(AppState, stateId);
+      let childThread = callerThread;
+      const seen = new Set<ConversationId>();
+      while (child.parent !== undefined) {
+        if (seen.has(child.id) || child.id === root.id || child.owner !== undefined || automationConversations.has(child.id)) return false;
+        seen.add(child.id);
+        const enrollment = state.forks?.[`c${child.id}`];
+        if (enrollment === undefined || enrollment.thread !== childThread ||
+            map.sessions[encodedSessionKey(sessionForThread(childThread))] !== child.id) return false;
+        if (threadInfo(state, childThread) === undefined || typeof enrollment.messageId !== "string") return false;
+        if (enrollment.at !== child.parent.at) return false;
+        const parentId = child.parent.conversationId;
+        // Older enrollments omitted the source key. Recover it from the native parent and its
+        // unique app mapping, never from the displayed origin, and apply the same entry check.
+        let parentThread = enrollment.parentThread;
+        if (parentThread === undefined) {
+          const matches = state.threads?.filter(({ id }) => parseThreadId(id) === id &&
+            map.sessions[encodedSessionKey(sessionForThread(id))] === parentId);
+          if (matches?.length !== 1) return false;
+          parentThread = matches[0]!.id;
+        }
+        if (parseThreadId(parentThread) !== parentThread ||
+            map.sessions[encodedSessionKey(sessionForThread(parentThread))] !== parentId) return false;
+        const anchor = await appForkEntry(tx, state, parentId, {
+          thread: parentThread, messageId: enrollment.messageId,
+        });
+        if (anchor !== child.parent.at) return false;
+        const parent = await tx.conversation(child.parent.conversationId);
+        if (parent === undefined) return false;
+        child = parent;
+        childThread = parentThread;
+      }
+      if (child.id === root.id || child.id === stateId || child.owner !== undefined || automationConversations.has(child.id) ||
+          automationConversationOf(await tx.doc(CronConversationDoc, child.id)) !== undefined) return false;
+      if (childThread === APP_MAIN_THREAD) {
+        return state.forks?.[`c${child.id}`] === undefined &&
+          map.sessions[encodedSessionKey(APP_CHAT_SESSION_KEY)] === child.id;
+      }
+      const baseInfo = threadInfo(state, childThread);
+      if (baseInfo === undefined || state.forks?.[`c${child.id}`] !== undefined) return false;
+      return map.sessions[encodedSessionKey(sessionForThread(childThread))] === child.id;
+    }
+    /** Structural scope of one session's conversation, with the app fork exception bound to that key. */
+    async function chatScopeForSession(
+      tx: Tx, sessionKey: string, conversationId: ConversationId,
+    ): Promise<ChatScopeExclusion | undefined> {
+      const reason = await readChatScope((id) => scopeRecordFor(tx, id), conversationId, root.id);
+      if (reason !== "forked") return reason;
+      return await appForkAdmissible(tx, sessionKey, conversationId) ? undefined : reason;
+    }
+    /** Conversation-id-only scope for background summary work: the exact mapped key decides forks. */
+    async function chatScopeById(tx: Tx, conversationId: ConversationId): Promise<ChatScopeExclusion | undefined> {
+      const reason = await readChatScope((id) => scopeRecordFor(tx, id), conversationId, root.id);
+      if (reason !== "forked") return reason;
+      const map = await tx.doc(SessionMap, root.id);
+      const sessions = readMappedSessions(map.sessions, root.id);
+      const session = sessions.find((candidate) => candidate.conversationId === conversationId);
+      if (session === undefined) return reason;
+      return await appForkAdmissible(tx, session.sessionKey, conversationId) ? undefined : reason;
+    }
+    /** Encoded session keys of archived side threads: their snapshots are evictable, not pinned. */
+    async function archivedAppSessionKeys(tx: Tx): Promise<Set<string>> {
+      const map = await tx.doc(SessionMap, root.id);
+      const stateId = map.sessions[encodedSessionKey(APP_STATE_SESSION_KEY)] as ConversationId | undefined;
+      const keys = new Set<string>();
+      if (stateId === undefined || stateId === root.id) return keys;
+      const state = await tx.doc(AppState, stateId);
+      for (const info of state.threads ?? []) {
+        if (info.id !== APP_MAIN_THREAD && info.archived) keys.add(encodedSessionKey(sessionForThread(info.id)));
+      }
+      return keys;
+    }
+    /** Mapped conversations that still demand a snapshot slot; archived app threads do not. */
+    async function snapshotSlotsUsed(tx: Tx): Promise<number> {
+      const map = await tx.doc(SessionMap, root.id);
+      const total = Object.keys(map.sessions).length;
+      if (total < CONTEXT_LIMITS.maxConversations) return total;
+      let archived = 0;
+      for (const key of await archivedAppSessionKeys(tx)) if (map.sessions[key] !== undefined) archived += 1;
+      return total - archived;
+    }
+
     // One immutable identity document per store, minted on first open. A derived index binds
     // its rows to this value instead of to a file path, which a replaced store can reuse.
     const storeIdentity = await ensureStoreIdentity(harness!, context, { now });
 
     // History scope: mapped chat sessions only. A channel's own state conversation, a scheduled run's
     // automation conversation and the root are not chat history, and the host has already
-    // authenticated the session key before naming it. A mapped chat session is also unforked: search,
-    // every entry/episode read and the background episode/summary work share that check, so a forged
-    // or stale map entry cannot expose or summarize an automation, task-owned or inherited
-    // transcript, a fork, or the root.
+    // authenticated the session key before naming it. Search, episode reads and summary work share
+    // the same checked scope, including the narrow exception for registered app thread forks.
     const assertMappedChatConversations = async (
-      conversationIds: readonly ConversationId[],
+      sessions: readonly { readonly sessionKey: string; readonly conversationId: ConversationId }[],
       ctx: Context,
     ): Promise<void> => {
       await root.commit(async (tx) => {
-        for (const conversationId of conversationIds) {
-          const reason = await readChatScope((id) => scopeRecordFor(tx, id), conversationId, root.id);
+        for (const { sessionKey, conversationId } of sessions) {
+          const reason = await chatScopeForSession(tx, sessionKey, conversationId);
           if (reason !== undefined) throw new Error(chatScopeMessage(reason));
         }
       }, ctx);
@@ -2471,8 +2595,13 @@ export async function openGateway(config: PortConfig, context: Context, options:
       if (mapping === undefined) return [];
       const candidates = readChatSessions(mapping.sessions, root.id);
       return root.commit(async (tx) => {
-        const { chat } = await partitionChatScope((id) => scopeRecordFor(tx, id), candidates, root.id);
-        return chat;
+        const { chat, excluded } = await partitionChatScope((id) => scopeRecordFor(tx, id), candidates, root.id);
+        const chats = [...chat];
+        for (const entry of excluded) {
+          if (entry.reason !== "forked") continue;
+          if (await appForkAdmissible(tx, entry.sessionKey, entry.conversationId)) chats.push(entry);
+        }
+        return chats;
       }, ctx);
     };
     // Episode cataloguing covers chat and automation conversations alike: a scheduled run's episodes
@@ -2553,7 +2682,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         );
       }
       // Fail loudly rather than silently indexing a task-owned transcript or inherited fork.
-      await assertMappedChatConversations(mappedSessions.map(({ conversationId }) => conversationId), ctx);
+      await assertMappedChatConversations(mappedSessions, ctx);
       return mappedSessions;
     };
     historyIndex = createHistoryIndex({
@@ -2635,23 +2764,34 @@ export async function openGateway(config: PortConfig, context: Context, options:
       history: createHistoryBackend(memoryHost),
     }) : undefined;
 
-    // At the snapshot cap, drop the oldest installed background target that is not running and not a
-    // mapped session. Without an evictable target the builder's RangeError stays the last resort.
-    const makeSnapshotRoom = async (ctx: Context): Promise<void> => {
+    // Archived app mappings stay chat owners, but their idle workspace snapshots are evictable.
+    async function makeSnapshotRoom(target: ConversationId, ctx: Context, commit?: Tx): Promise<void> {
       if (contextConversations.size < CONTEXT_LIMITS.maxConversations) return;
-      for (const candidate of backgroundTargets.slice()) {
-        if (sessionConversations.has(candidate) || !contextConversations.has(candidate)) continue;
-        const live = await harnessRef.current!.snapshot(LiveDoc, candidate, ctx);
-        if (live?.run !== undefined) continue;
-        backgroundTargets.splice(backgroundTargets.indexOf(candidate), 1);
-        contextConversations.delete(candidate);
-        skillConversations.delete(candidate);
-        skillTool?.removeConversation(candidate);
-        contextExtension = contextExtensionBuilder.remove(candidate);
-        registry.install(contextExtension);
-        return;
+      async function evict(tx: Tx): Promise<void> {
+        if (contextConversations.size < CONTEXT_LIMITS.maxConversations) return;
+        const map = await tx.doc(SessionMap, root.id);
+        const candidates = backgroundTargets.filter((id) => !sessionConversations.has(id));
+        for (const key of await archivedAppSessionKeys(tx)) {
+          const id = map.sessions[key] as ConversationId | undefined;
+          if (id !== undefined) candidates.push(id);
+        }
+        for (const candidate of candidates) {
+          if (candidate === target || !contextConversations.has(candidate) || contextSnapshotLoads.has(candidate)) continue;
+          if ((await tx.doc(LiveDoc, candidate)).run !== undefined ||
+              (await tx.doc(InboxDoc, candidate)).items.length > 0) continue;
+          const index = backgroundTargets.indexOf(candidate);
+          if (index >= 0) backgroundTargets.splice(index, 1);
+          contextConversations.delete(candidate);
+          skillConversations.delete(candidate);
+          skillTool?.removeConversation(candidate);
+          contextExtension = contextExtensionBuilder.remove(candidate);
+          registry.install(contextExtension);
+          return;
+        }
       }
-    };
+      if (commit === undefined) await root.commit(evict, ctx);
+      else await evict(commit);
+    }
     const contextSnapshotLoads = new Map<ConversationId, Promise<unknown>>();
     /**
      * Install one conversation's workspace snapshot. A mapped chat is installed once per process; a
@@ -2665,10 +2805,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
       conversationId: ConversationId,
       ctx: Context,
       backgroundTarget: boolean,
+      tx?: Tx,
     ): Promise<boolean> => {
       if (!options.contextSnapshotProvider) return false;
       const loading = contextSnapshotLoads.get(conversationId);
-      if (loading !== undefined) {
+      if (loading !== undefined && tx === undefined) {
         await loading;
         return skillConversations.has(conversationId);
       }
@@ -2684,8 +2825,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
             throw new TypeError("Context snapshot provider must return an object or undefined");
           }
           const snapshot = bindContextSnapshot(supplied, conversationId);
-          if (backgroundTarget && !installed) await makeSnapshotRoom(ctx);
-          const replacement = installed
+          if (!contextConversations.has(conversationId) && contextConversations.size >= CONTEXT_LIMITS.maxConversations) {
+            await makeSnapshotRoom(conversationId, ctx, tx);
+          }
+          const replacement = contextConversations.has(conversationId)
             ? contextExtensionBuilder.replace(snapshot)
             : { extension: contextExtensionBuilder.add(snapshot) };
           contextConversations.add(conversationId);
@@ -2715,8 +2858,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ): Promise<void> => {
       await installContextSnapshot(sessionKey, conversationId, ctx, false);
     };
-    contextInstallerRef.current = (sessionKey, conversationId, ctx) =>
-      installContextSnapshot(sessionKey, conversationId, ctx, true);
+    contextInstallerRef.current = (sessionKey, conversationId, ctx, tx, background) =>
+      installContextSnapshot(sessionKey, conversationId, ctx, background, tx);
 
     // Explicit same-conversation refresh: re-run the host provider and apply the new snapshot to the
     // next turn. It is opt-in, per session key, and refuses a live run. Provider or loader failure
@@ -2827,8 +2970,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
       await root.commit(async (tx) => { await tx.doc(SessionMap, root.id); }, context);
       const mapping = await harness.snapshot(SessionMap, root.id, context);
       storedMappedSessions = readMappedSessions(mapping?.sessions, root.id);
-      if (options.contextSnapshotProvider && storedMappedSessions.length > CONTEXT_LIMITS.maxConversations) {
-        throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
+      if (options.contextSnapshotProvider) {
+        // Archived app threads hold no snapshot, so they do not count against the slot cap here.
+        const active = await root.commit(async (tx) => {
+          const archived = await archivedAppSessionKeys(tx);
+          return storedMappedSessions!.filter(({ sessionKey }) => !archived.has(encodedSessionKey(sessionKey))).length;
+        }, context);
+        if (active > CONTEXT_LIMITS.maxConversations) {
+          throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
+        }
       }
     }
     // Restore the class of every automation conversation this store names, before the mapped-chat
@@ -2929,14 +3079,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const sessions = storedMappedSessions;
       // A stored key names a mapped session only while its conversation is still ordinary chat: the
       // class pass above removed this host's automation conversations, and the shared scope rule
-      // removes the root, a task-owned conversation and a fork, exactly as the channel ingress refuses
+      // removes the root, task-owned conversations and unregistered forks, as channel ingress refuses
       // that same key. Such a key therefore gains no cron owner, no unevictable snapshot slot and no
       // resume target here, and a forked id leaves this set so its snapshot stays evictable. A missing
       // conversation keeps its explicit failure below.
       const outOfScope = new Set<ConversationId>();
+      let archivedAppKeys = new Set<string>();
       await root.commit(async (tx) => {
-        for (const { conversationId } of sessions) {
-          const reason = await readChatScope((id) => scopeRecordFor(tx, id), conversationId, root.id);
+        archivedAppKeys = await archivedAppSessionKeys(tx);
+        for (const { sessionKey, conversationId } of sessions) {
+          const reason = await chatScopeForSession(tx, sessionKey, conversationId);
           if (reason === "automation" || reason === "root" || reason === "task-owned" || reason === "forked") {
             outOfScope.add(conversationId);
           }
@@ -2948,7 +3100,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (!(await harness.conversation(conversationId, context))) {
             throw new Error("Stored session mapping points to a missing conversation");
           }
-          await ensureContextSnapshot(sessionKey, conversationId, context);
+          // An archived app thread stays a mapped chat (cron owner, resume target), but its
+          // snapshot is evictable and is rebuilt by the restore that makes it usable again.
+          if (!archivedAppKeys.has(encodedSessionKey(sessionKey))) {
+            await ensureContextSnapshot(sessionKey, conversationId, context);
+          }
         }
         cronOwners.set(conversationId, { ownerId: sessionKey, sessionKey });
         sessionConversations.add(conversationId);
@@ -3577,7 +3733,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           const record = value.find((entry) =>
             entry !== null && typeof entry === "object" && (entry as { id?: unknown }).id === id);
           if (record === undefined) return undefined;
-          change(record as Draft<CronDeliveryRecord>);
+          await change(record as Draft<CronDeliveryRecord>, tx);
           return copyCronDelivery(record as Draft<CronDeliveryRecord>);
         }, ctx);
       },
@@ -3847,6 +4003,62 @@ export async function openGateway(config: PortConfig, context: Context, options:
     };
     const gateway: Gateway = {
       harness,
+      ...(config.app === undefined ? {} : {
+        async forkAppThread(stateId, thread, from, register, ctx) {
+          if (parseThreadId(thread) !== thread || thread === APP_MAIN_THREAD || parseThreadId(from.thread) !== from.thread) return false;
+          const stateKey = encodedSessionKey(APP_STATE_SESSION_KEY);
+          const sourceKey = encodedSessionKey(sessionForThread(from.thread));
+          const targetKey = encodedSessionKey(sessionForThread(thread));
+          const anchor = await root.commit(async (tx) => {
+            const map = await tx.doc(SessionMap, root.id);
+            const id = map.sessions[sourceKey] as ConversationId | undefined;
+            if (map.sessions[stateKey] !== stateId || id === undefined ||
+                id === stateId || await chatScopeForSession(tx, sessionForThread(from.thread), id) !== undefined ||
+                automationConversationOf(await tx.doc(CronConversationDoc, id)) !== undefined) return undefined;
+            const state = await tx.doc(AppState, stateId);
+            if (threadInfo(state, from.thread)?.archived !== false) return undefined;
+            const at = await appForkEntry(tx, state, id, from);
+            if (at === undefined) return undefined;
+            if (options.contextSnapshotProvider && await snapshotSlotsUsed(tx) >= CONTEXT_LIMITS.maxConversations) {
+              throw new AppThreadCapacityError();
+            }
+            return { id, at, policy: policyForState(await tx.doc(AgentDoc, id)) };
+          }, ctx);
+          if (anchor === undefined) return false;
+          const source = await harness!.conversation(anchor.id, ctx);
+          if (source === undefined) return false;
+          const fork = await source.fork(anchor.at, {
+            ownership: { kind: "ownerless" },
+            agent: anchor.policy,
+            async init(tx, child) {
+              const map = await tx.doc(SessionMap, root.id);
+              if (map.sessions[stateKey] !== stateId || map.sessions[sourceKey] !== anchor.id ||
+                  Object.hasOwn(map.sessions, targetKey)) throw new Error("App thread mapping changed");
+              if (options.contextSnapshotProvider && await snapshotSlotsUsed(tx) >= CONTEXT_LIMITS.maxConversations) {
+                throw new AppThreadCapacityError();
+              }
+              const state = await tx.doc(AppState, stateId);
+              register(state);
+              const origin = threadInfo(state, thread)?.origin;
+              if (origin?.thread !== from.thread || origin.messageId !== from.messageId) throw new Error("App fork registration is missing provenance");
+              const enrollment = { thread, parentThread: from.thread, at: anchor.at, messageId: from.messageId };
+              if (state.forks === undefined) state.forks = { [`c${child}`]: enrollment };
+              else state.forks[`c${child}`] = enrollment;
+              map.sessions[targetKey] = child;
+            },
+          }, ctx);
+          // Apply ordinary mapped-chat policy; native forks always start with denied tools.
+          await gateway.conversationFor(sessionForThread(thread), ctx);
+          await episodeSummaries?.initialize(harness!, fork.id, ctx).catch(() => undefined);
+          return true;
+        },
+        async appThreadBusy(tx, thread) {
+          const map = await tx.doc(SessionMap, root.id);
+          const id = map.sessions[encodedSessionKey(sessionForThread(thread))] as ConversationId | undefined;
+          if (id === undefined) return false;
+          return (await tx.doc(LiveDoc, id)).run !== undefined || (await tx.doc(InboxDoc, id)).items.length > 0;
+        },
+      }),
       memorySearch: (caller, query, ctx) => {
         const service = memoryServiceRef.current;
         if (!service) throw new Error("Memory recall is unavailable");
@@ -3904,8 +4116,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
             conversationId = map.sessions[key] as ConversationId;
             return;
           }
-          if (options.contextSnapshotProvider && Object.keys(map.sessions).length >= CONTEXT_LIMITS.maxConversations) {
-            throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
+          if (options.contextSnapshotProvider && await snapshotSlotsUsed(tx) >= CONTEXT_LIMITS.maxConversations) {
+            throw new AppThreadCapacityError(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
           }
           const created = await tx.createConversation({ ownership: { kind: "ownerless" } });
           createdNow = created.id as ConversationId;
@@ -3920,10 +4132,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
         }, ctx);
         if (!Number.isSafeInteger(conversationId)) throw new Error("Stored conversation mapping has an invalid ID");
         // The stored map is host data, not authority: it can be forged, imported or left behind by an
-        // older layout. A mapped session key may therefore name only an ordinary chat conversation;
-        // anything else is refused here, before it can become a cron owner or receive chat policy.
+        // older layout. A mapped session key may therefore name only an ordinary chat conversation —
+        // or, under its own exact key, a registered app thread fork — before it can become a cron
+        // owner or receive chat policy.
         const scopeReason = await root.commit(
-          (tx) => readChatScope((id) => scopeRecordFor(tx, id), conversationId!, root.id), ctx,
+          (tx) => chatScopeForSession(tx, sessionKey, conversationId!), ctx,
         );
         if (scopeReason !== undefined) throw new Error(chatScopeMessage(scopeReason));
         // A mapped session key is the cron owner; unmapped conversations (such as a scheduled run's
@@ -3975,6 +4188,40 @@ export async function openGateway(config: PortConfig, context: Context, options:
       },
       backgroundStatus: (sessionKey, ctx) => backgroundStatusFor(sessionKey, ctx),
       activeWork: (ctx) => activeWorkFor(ctx),
+      ...(config.app === undefined ? {} : {
+        async createAppThread(stateId, thread, register, ctx) {
+          await root.commit(async (tx) => {
+            const map = await tx.doc(SessionMap, root.id);
+            const key = encodedSessionKey(sessionForThread(thread));
+            if (parseThreadId(thread) !== thread || thread === APP_MAIN_THREAD ||
+                map.sessions[encodedSessionKey(APP_STATE_SESSION_KEY)] !== stateId || Object.hasOwn(map.sessions, key)) {
+              throw new Error("Invalid app thread mapping");
+            }
+            if (options.contextSnapshotProvider && await snapshotSlotsUsed(tx) >= CONTEXT_LIMITS.maxConversations) {
+              throw new AppThreadCapacityError();
+            }
+            register(await tx.doc(AppState, stateId));
+            const chat = await tx.createConversation({ ownership: { kind: "ownerless" } });
+            map.sessions[key] = chat.id;
+          }, ctx);
+        },
+        async appSnapshotRoom(tx) {
+          return !options.contextSnapshotProvider || await snapshotSlotsUsed(tx) < CONTEXT_LIMITS.maxConversations;
+        },
+        /** Create the thread's mapping and snapshot now; `full` reports the snapshot-slot cap. */
+        reserveAppThread: async (thread: string, ctx) => {
+          try {
+            await gateway.conversationFor(sessionForThread(thread), ctx);
+            return "ok" as const;
+          } catch (error) {
+            if (error instanceof AppThreadCapacityError || (error instanceof RangeError &&
+                /conversation snapshots are accepted/u.test(error.message))) {
+              return "full" as const;
+            }
+            throw error;
+          }
+        },
+      }),
       async listModels(sessionKey, ctx) {
         const conversation = await existingConversationFor(sessionKey, ctx);
         await applyConversationPolicy(conversation, ctx);
@@ -4233,7 +4480,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       // State-only conversations hold channel bookkeeping, not discussion: they are not history.
       if (!isChatSessionKey(sessionKey)) throw new Error("State-only conversations are not chat history");
       const conversation = await existingConversationFor(sessionKey, ctx);
-      await assertMappedChatConversations([conversation.id], ctx);
+      await assertMappedChatConversations([{ sessionKey, conversationId: conversation.id }], ctx);
       return conversation;
     }
     async function existingConversationFor(sessionKey: string, ctx: Context): Promise<Conversation> {

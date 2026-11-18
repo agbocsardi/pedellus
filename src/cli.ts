@@ -587,7 +587,10 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       channels.start("gateway.app", runApp(gateway, {
         port: config.app.port,
         staticRoot: config.app.staticRoot,
+        autoArchiveDays: config.app.autoArchiveDays ?? 14,
+        agentName: config.app.agentName ?? "Durable",
         followUpMode: config.followUpMode ?? "followUp",
+        restart: restartHost,
       }, context));
     }
     journalEvent("gateway.surfaces.started");

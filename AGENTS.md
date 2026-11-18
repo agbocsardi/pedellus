@@ -52,6 +52,9 @@ keep it in sync.
 - **Only authenticated mapped ordinary chats get foreground authority.** Root,
   fork, raw, state, task-owned and automation conversations never become chats,
   origins or tool scopes.
+  Sole exception: an app side-thread fork made by `thread.create {from}` and
+  admitted under its own exact registered key after exact cutoff checks (APP.md,
+  "Fork admission"); every other fork stays denied.
 - **Background work runs on captured, narrowing-only grants.** Workers, cron runs
   and digests capture a subset of their origin's authority; removal prunes it
   permanently, re-enabling never restores it. No recursive delegation.

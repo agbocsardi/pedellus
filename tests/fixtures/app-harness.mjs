@@ -2,7 +2,7 @@
 //
 // No network beyond one loopback listener: the Gateway is real over a temporary store with a faux
 // provider, the listener binds 127.0.0.1 on an ephemeral port, and a synthetic WebSocket client
-// (the `ws` package itself) speaks wire protocol v1 against it. Every wait is event-driven, the
+// (the `ws` package itself) speaks wire protocol v2 against it. Every wait is event-driven, the
 // clock is controllable for pairing expiry and the rate limit, and every handle is cleaned up by
 // the test that created it.
 import assert from 'node:assert/strict';
@@ -66,7 +66,7 @@ export async function openAppStore(label, options = {}) {
       toolAllowlist: options.tools ?? [],
       ...(options.cron === true ? { cron: { enabled: true } } : {}),
       ...(options.followUpMode === undefined ? {} : { followUpMode: options.followUpMode }),
-      app: options.appBlock ?? { port: 43190, staticRoot },
+      app: { port: 43190, staticRoot, ...(options.appBlock ?? {}) },
     };
     let config;
     if (options.rawConfig !== undefined) {
@@ -74,7 +74,7 @@ export async function openAppStore(label, options = {}) {
     } else {
       config = parseConfig(raw, directory);
     }
-    const gateway = await openGateway(config, context, { models });
+    const gateway = await openGateway(config, context, { models, ...options.gatewayOptions });
     return {
       directory,
       workspace,
@@ -87,7 +87,7 @@ export async function openAppStore(label, options = {}) {
       script(steps) { gate.script(steps); },
       async close() {
         await gateway.close(context).catch(() => undefined);
-        await rm(directory, { recursive: true, force: true });
+        if (!options.keepDirectory) await rm(directory, { recursive: true, force: true });
       },
     };
   } catch (error) {
@@ -112,13 +112,17 @@ export async function makeStaticRoot(directory) {
 /** Start the real adapter over the real gateway with a controllable clock and ephemeral port. */
 export function startApp(store, options = {}) {
   const scope = withCancel(context);
-  const clock = { now: Date.now() };
+  const clock = { now: options.now ?? Date.now() };
   let portResolve;
   const port = new Promise((resolvePort) => { portResolve = resolvePort; });
-  const adapter = runApp(store.gateway, {
+  const adapter = runApp(options.gateway ?? store.gateway, {
     port: options.port ?? 0,
     staticRoot: options.staticRoot ?? store.staticRoot,
     ...(options.followUpMode === undefined ? {} : { followUpMode: options.followUpMode }),
+    autoArchiveDays: options.autoArchiveDays ?? store.config.app.autoArchiveDays,
+    agentName: options.agentName ?? store.config.app.agentName,
+    ...(options.scanIntervalMs === undefined ? {} : { scanIntervalMs: options.scanIntervalMs }),
+    ...(options.restart === undefined ? {} : { restart: options.restart }),
     now: () => clock.now,
     onListening: (bound) => portResolve(bound),
   }, scope.context);

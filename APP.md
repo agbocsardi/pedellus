@@ -3,9 +3,9 @@
 The `app` adapter is opt-in, adds no tool authority and runs inside the same gateway process as
 the CLI, Telegram and Discord. It serves the built PWA from the sibling `durable-app` repository
 over one loopback HTTP+WebSocket listener; `tailscale serve` publishes it on the tailnet with the
-node's `*.ts.net` certificate. The wire contract is protocol v1, normative in the sibling
-repository (`protocol/v1.md`); this gateway implements it exactly and changes to it belong there,
-not here. `src/channels/app-protocol.ts` holds the limits, close codes and pure validation;
+node's `*.ts.net` certificate. The wire contract is protocol v2, normative in the sibling
+repository (`protocol/v2.md` and `protocol/v2.ts`). Ship the v2 app and gateway together: the
+unchanged `/v1/*` URLs accept wire version 2 only. `src/channels/app-protocol.ts` holds the limits, close codes and pure validation;
 `src/channels/app-listener.ts` owns transport mechanics (sockets, bodies, cookies, MIME types,
 path safety); `src/channels/app.ts` owns admission, the durable event log, controls, pairing and
 the operator console.
@@ -28,6 +28,8 @@ listener is loaded.
 | --- | --- |
 | `port` | Required explicit integer 1–65535. The listener binds `127.0.0.1` only; no other bind is configurable, and `tailscale serve` is the only publisher. Never Funnel, port forwarding or a wildcard bind. |
 | `staticRoot` | Required absolute directory holding the built PWA. Files are served with safe path resolution (no traversal, no directory listing, encoded separators are not structure), correct MIME types and `index.html` for the root; `sw.js` is always served `no-store`. |
+| `autoArchiveDays` | Optional integer ≥1, default 14. Automatically archive inactive side threads, but never while they have running or queued work. |
+| `agentName` | Optional agent display name, 1–40 printable characters, default `Durable`. Sent as `agent` in every `hello` reply; display only, no authority. |
 
 The block is strict: an unrecognized key is refused at startup instead of being ignored, like the
 Discord block. The listener ignores Tailscale identity headers by construction: any local process
@@ -63,7 +65,7 @@ an omitted label picks a free `device-<n>`. Revoke is exact-label.
 `POST /v1/pair` exchanges one console-created code for a device token. The code is 8 characters
 from `[A-Z2-9]` minus `I`/`O` (case-insensitive input), single-use, and expires after ten minutes.
 Only its hash is stored. The token is long and random, exists only in the `durable_device` cookie
-(`HttpOnly; Secure; SameSite=Strict; Path=/v1; Max-Age=34560000`, the 400-day lifetime v1
+(`HttpOnly; Secure; SameSite=Strict; Path=/v1; Max-Age=34560000`, the 400-day lifetime the protocol
 requires because iOS drops session cookies when a home-screen app closes) and only its SHA-256
 hash with the label and
 created time is stored durably in the app channel state — the same file-based trust boundary as the
@@ -82,18 +84,48 @@ replays again from its cursor — the app fetches the next 500-event batch that 
 
 ## Session and authority
 
-One host-derived session key, `app:chat`, is shared by every paired device; the gateway validates
-it as an ordinary mapped chat, exactly like the other channels. There is no per-device
-conversation. The state document lives in the `app:channel-state` conversation (`nanobot.app-state`),
-never in a plaintext sidecar.
+Every paired device shares the same threads. `main` keeps its `app:chat` session and history;
+retained v1 events and pending work without a thread belong to `main`. Side threads use host-assigned
+IDs and host-derived session keys. They start empty unless `thread.create {from: {thread, messageId}}`
+forks a validated open app chat at a committed message; admission resolves that message to a
+typed committed transcript entry equal to the native fork cutoff, per exact session key, at
+creation and reopen. The fork inherits only the context through that message, records `origin`,
+and receives the same ordinary chat policy. A queued echo, host notice, or isolated cron reply
+has no entry in that chat and cannot be forked. No other kind of fork receives chat authority. There is no per-device conversation. The registry and log live in the
+`app:channel-state` conversation (`nanobot.app-state`), never in a plaintext sidecar.
+
+`threads` returns `main`, every open thread and the 200 most recently active archived threads,
+newest activity first. With `query` (1–80 characters), it returns up to 200 case-insensitive title
+substring matches, including older archives, newest first. `thread.create` defaults to `New thread`
+and remembers its key for at least seven days; titles are 1–80 printable characters.
+Manual archive aborts the thread's turn and records `archivedReason: "manual"`. The idle scan
+records `"idle"` without aborting work. Archive does not delete history, cancel schedules, or reset
+the episode; the separately configured idle rollover still runs under its own safeguards.
+An archived thread refuses `send` and `control` with `bad_request`. Restoring clears the reason
+and counts toward the 50-open-side-thread limit. `main` cannot be renamed or archived.
+Lifecycle changes append durable `thread` events.
 
 The adapter grants no tool: coding tools, MCP, web, cron, memory and worker authority are whatever
 the configuration already gives that mapped chat. The app chat is **not** an MCP login or
-`ask_user` owner surface in this phase: protocol v1 has no event that could carry a one-time
+`ask_user` owner surface in this phase: protocol v2 has no event that could carry a one-time
 authorization URL or an owner question without persisting it in the durable event log, and
 persisting such a URL in channel state is forbidden by the channels' binding contract (see
 *Known gaps*). A callback-shaped `send` is still intercepted before transcript admission, refused
 with one fixed notice, and its text is never stored.
+
+## Fork admission
+
+Only an ownerless fork created by the app channel's `thread.create {from}` from a validated,
+open app chat may be admitted as an ordinary mapped chat, and only under its own exact
+registered app session key: at ingress and at reopen the gateway resolves the fork's recorded
+app message in the conversation its native parent names to a committed user or assistant
+transcript entry and requires it to equal the native fork cutoff at every hop of a
+fork-of-fork chain, with each hop's durable enrollment, exact session mapping and parent
+cutoff agreeing; the enrollment record is the authority, and the registry's displayed
+`origin` is metadata. It gets the source chat's ordinary policy, not inherited grants
+or new authority. Every other fork remains denied, and the exception is never
+conversation-wide: a key naming anything but an ordinary chat or a validated enrolled
+app fork is refused at ingress, before it can become a cron owner or receive chat policy.
 
 ## Protocol and delivery
 
@@ -102,13 +134,17 @@ fixed error codes only, never free text. Frames and request bodies are bounded a
 `send.text` at 16 000 characters (an over-bound text is the fixed `too_large` error); ids and
 keys at 1–64 characters of `[A-Za-z0-9_-]`.
 
-Durable egress is the adapter's own cursor-numbered event log — `message` (roles `user`,
-`assistant`, `notice`), `settled`, `divider` — appended in one commit per delivery. `hello` replays
+Durable egress is one adapter-wide cursor log — `message` (roles `user`, `assistant`, `notice`),
+`settled`, `divider` and `thread` — across all threads. Each event names its thread; lifecycle
+events carry its full metadata. `hello` replies with the protocol version, the device label, the
+durable head cursor, the configured agent display name (`app.agentName`, default `Durable`) and
+`commands` (the shared catalogue's `app` surface this host implements, in catalogue order), and replays
 events with `cursor > hello.cursor` (oldest first, at most 500 per batch; the app re-`hello`s for
 more), live sockets are pushed every event after their own position, and `ack` records each
 device's highest stored cursor, clamped to the current head. Replay is idempotent by cursor on the
-client, so delivery is at-least-once and the cursor is the dedupe identity; a replay always ends
-with one `status` event (`idle` when nothing is known). Outbound `preview` frames are bounded to
+client, so delivery is at-least-once and the cursor is the dedupe identity. After replay, the
+adapter sends `status` for `main` and all other threads with non-idle app turns. `send` and
+`control` default to `main`. Previews and status are independent per thread. Previews are bounded to
 the same frame budget with a tail-safe prefix of the streamed text; the final message carries the
 whole answer. Retention trims events acknowledged by every
 active device, then a hard cap of 2 000 keeps the newest; a `hello` below the retention floor
@@ -136,34 +172,41 @@ owner-run check as Telegram.
 
 ## Controls
 
-The `control` op implements `new`, `abort` and `status`, mapping to the same host operations the
-Telegram commands use: `new` is the paired reset (native reset plus prompt-snapshot rebuild,
+The `control` op takes `command` (a name from `hello.commands`) and optional `args` (≤ 1 000
+characters), acting on its thread. The app surface is `new`, `abort`/`stop`, `status`, `model
+[preset]`, `digest [status]`, `restart` and `help [command]`, each offered only when the host
+implements it; CLI-only commands (`tools`, `refresh`, `compact`, `reload`) and `mcp`/`notices`
+are not listed. They map to the same host operations the Telegram and Discord commands use: `new` is the paired reset (native reset plus prompt-snapshot rebuild,
 refused atomically while a run is live) and appends a durable `divider{reason:"new"}` event;
 `abort` withdraws this chat's queued inputs and stops its live work; `status` is the bounded
 read-only projection. The visible result of every control arrives as a `message{role:"notice"}`
 event, with the same acknowledgement texts (`Context reset.`, `Idle. Queue cleared.`), the same
 held acknowledgement until the native call returns, the same 30-second still-pending wording, and
-the same at-most-once control records with replay reporting. The catalogued later commands
-(`model`, `digest`, `restart`, `mcp`) are refused with the fixed `unsupported` error; anything
-else is `bad_request`.
+the same at-most-once control records with replay reporting. `model <preset>` applies to that
+thread only until restart; `digest` starts one batch for that thread's conversation; `restart`
+records the requesting thread durably, then asks the host once, and the replacement posts
+`Restarted.` there (a host refusal is reported instead). An unlisted name is `unsupported`;
+bad arguments are answered by a usage notice with no effect; a non-string `command`/`args` or
+oversize `args` is `bad_request`.
 
 ## Scheduled results and interruption notices
 
-The adapter consumes the channel-neutral durable outbox (`nanobot.cron.deliveries`) for its one
-chat, like Telegram: a completed cron result is appended as `message{role:"assistant"}` and a
-host interruption notice as `message{role:"notice"}`, both cursor events, authorized by this
-channel's own durable admission evidence (created by the first authenticated input; a fresh
-admission restores it and releases withheld records). The outbox record is marked `delivered`
-after the append; a crash between the two is closed by the event's stable id (`outbox:<record
-id>`), so the append is never duplicated. A malformed record is quarantined `failed` with a fixed
-reason and a durable fault entry; no raw record contents are logged.
+The adapter consumes the channel-neutral durable outbox (`nanobot.cron.deliveries`) for each
+thread's own session. A cron result restores its archived thread before appending the result as
+`message{role:"assistant"}`. The restore, message, and outbox settlement commit together, so replay
+trimming cannot make a retry append or restore twice. At the 50-open-thread limit the result stays
+pending in the outbox without consuming a dispatch slot. A host interruption notice is appended as
+`message{role:"notice"}` without restoring the thread. Both are authorized by the
+thread's own durable admission evidence (created by the first authenticated input; a fresh
+admission restores it and releases withheld records). A malformed record is quarantined `failed`
+with a fixed reason and a durable fault entry; no raw record contents are logged.
 
 ## Bounded and default-deny behavior
 
 * Pending inputs are bounded at 500; further `send`s reply the fixed `not_ready` error and admit
   nothing. Control records follow the Telegram bounds (at most 64 unresolved).
-* Delivery concurrency is bounded at eight replies and eight notices; one chat keeps one
-  submission order.
+* Each thread keeps its own submission order and may run concurrently with other threads.
+  Delivery tracks up to eight replies per thread and eight notices across the adapter.
 * A delivery that keeps failing is held after ten attempts (`held: true`), never resent
   automatically.
 * Device sockets are bounded by the 16-device pairing limit; the pairing rate window is one minute.
@@ -172,7 +215,7 @@ reason and a durable fault entry; no raw record contents are logged.
 
 * **No MCP login or `ask_user` surface.** A mapped app chat cannot start an MCP login (no owner
   surface is registered, so the login is refused before delivery) and cannot receive an
-  `ask_user` question. Protocol v1 defines no owner-only non-durable event; a later protocol
+  `ask_user` question. Protocol v2 defines no owner-only non-durable event; a later protocol
   revision must add one before this channel can carry URLs or questions.
 * **No uploads, media, history, tasks, cards or Web Push.** The protocol marks them *later*;
   `history` and `tasks` reply `unsupported`; a `send` with `attachments` replies `unsupported`.
@@ -188,10 +231,13 @@ reason and a durable fault entry; no raw record contents are logged.
   enforced with `4400` up to that backstop.
 * **Very long final answers** are still sent as one durable message, which can exceed the frame
   budget. Unlike previews, final answers must not be trimmed; they need lossless chunking.
+* **Archive keeps the mapping.** Idle archived snapshots are evictable and rebuilt on restore.
+  The gateway reserves snapshot capacity before acknowledging a new thread or send.
+* **Legacy fork anchors.** For assistant replies written before fork support, the gateway needs the
+  retained app event to identify the native entry. New replies keep that link after replay trimming.
 * **Not covered offline:** a real `tailscale serve` proxy, an installed PWA's cookie jar, iOS
-  suspension and reconnect backoff, `sw.js` update semantics, and mid-turn process replacement
-  (the listener closes all sockets with 1001; the app replays from its stored cursor after
-  reconnect).
+  suspension and reconnect backoff, `sw.js` update semantics, or native process replacement with
+  a real device. Offline checks reopen a gateway mid-turn and verify side-thread recovery.
 
 ## Dependency
 
@@ -208,10 +254,13 @@ types, pairing (good/bad/expired/reused codes, the rate limit and its rolling wi
 uniqueness), the auth close codes (4401, 4409, 4400, 4426), bounded replay with later `hello`
 continuation and ack trimming, idempotent send and the `too_large` text bound, a full streaming
 turn (echo, preview, status, answer, settled), a steered pair answered once with a settled per
-key, reconnect without loss, controls with their replay reporting, a seeded reopen (interrupted
+key, reconnect without loss, controls with their replay reporting, the `hello.commands`
+catalogue with `model`/`help`/`digest`/`restart` arguments, usage notices and `unsupported`, a seeded reopen (interrupted
 command reported, held acknowledgement released, a pre-restart turn still answered), a failed run
 (`settled{failed}` with the error presence state), revocation, oversize frames and callback
-interception. No tailnet, device, credential or paid inference is
+interception. v2 coverage includes thread lifecycle, search and list limits, concurrent turns and
+replay, fork context and scope checks after reopen, idle archive, interruption recovery, and cron restore.
+No tailnet, device, credential or paid inference is
 used. The `app pair`/`devices`/`revoke` local-socket dispatch is exercised through the same console
 host the running adapter exports; the thin socket layer itself follows the `cron` console's
 existing tests.
