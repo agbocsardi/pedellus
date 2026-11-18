@@ -1,204 +1,289 @@
-/**
- * The agent's avatar: a hand-drawn doodle helper robot (original design: a
- * hovering kettle-shaped riveted steel body in a bowler hat, one big brass
- * camera-lens eye, noodle arms and a hover wisp; retro-futurist in feel). Each pose is drawn twice with slightly different wobble and
- * the two frames alternate ("line boil") while the agent works. Look and
- * motion live here and in the `.avatar` rules of styles.css; callers only
- * give it a sized slot (it fills its parent) and a state.
- */
-import { memo, type ReactNode } from "react";
+import { memo, useState, useSyncExternalStore } from "react";
 
 export type AvatarState = "idle" | "queued" | "thinking" | "tool" | "error" | "offline";
 
-type F = 0 | 1;
-
-/** Deterministic hand-drawn wobble: nudge every number in a path a little,
- *  differently per frame. Paths use only M/L/Q/C (no arc flags to break). */
-function w(d: string, f: F, amp = 0.5): string {
-  let i = 0;
-  return d.replace(/-?\d*\.?\d+/g, (m) => {
-    const x = Math.sin((f + 1) * 91.7 + i++ * 12.9898) * 43758.5453;
-    return (parseFloat(m) + (x - Math.floor(x) - 0.5) * 2 * amp).toFixed(2);
-  });
+interface SpriteEntry {
+  readonly hold: string;
+  readonly accent?: string;
 }
 
-/** Circle as a path, drawn with a slight overshoot like a pen stroke. */
-function circ(cx: number, cy: number, r: number, over = 0.18): string {
-  const k = r * 0.552;
-  return (
-    `M${cx - r} ${cy} C${cx - r} ${cy - k} ${cx - k} ${cy - r} ${cx} ${cy - r} ` +
-    `C${cx + k} ${cy - r} ${cx + r} ${cy - k} ${cx + r} ${cy} ` +
-    `C${cx + r} ${cy + k} ${cx + k} ${cy + r} ${cx} ${cy + r} ` +
-    `C${cx - k} ${cy + r} ${cx - r} ${cy + k} ${cx - r} ${cy - r * over}`
-  );
+type SpriteMap = Partial<Record<AvatarState, SpriteEntry>>;
+
+const AVATAR_STATES: readonly AvatarState[] = ["idle", "queued", "thinking", "tool", "error", "offline"];
+
+let customSprites: SpriteMap | null = null;
+let fetchStarted = false;
+const listeners = new Set<() => void>();
+
+function notify(): void {
+  for (const listener of listeners) listener();
 }
 
-const S = (d: string, cls = "ln") => <path className={cls} d={d} />;
-
-interface Pose {
-  /** Pupil offset (where it looks). */
-  look?: [number, number];
-  /** Replaces the lens interior (closed eye, x eye). */
-  eye?: string;
-  /** Hat placement: [dx, dy, degrees]. */
-  hat?: [number, number, number];
-  arms: (f: F) => ReactNode;
-  extra?: (f: F) => ReactNode;
-  wisp?: boolean;
+function validSpriteUrl(value: unknown): value is string {
+  return typeof value === "string" && value.startsWith("/avatar/");
 }
 
-const POSES: Record<AvatarState, Pose> = {
-  idle: {
-    arms: (f) => (
-      <>
-        {S(w("M18 31 Q12 34 12.5 40.5", f))}
-        {S(w(circ(12.5, 41.5, 1.5), f, 0.2), "fillink")}
-        <g className="wave">
-          {S(w("M46 31 Q52 34 51.5 40.5", f))}
-          {S(w(circ(51.5, 41.5, 1.5), f, 0.2), "fillink")}
-        </g>
-      </>
-    ),
-  },
-  queued: {
-    look: [1.6, 1],
-    arms: (f) => (
-      <>
-        {S(w("M18 31 Q12 33 15.5 37.5", f))}
-        {S(w("M46 32 Q50 35 47.5 38.5", f))}
-      </>
-    ),
-    extra: (f) => (
-      <g>
-        {S(w("M45.5 34 L54.5 35.5 L53 47.5 L44 46 Z", f, 0.35), "prop")}
-        {S(w("M48 33.5 L52 34.2", f, 0.3), "ln thick")}
-        {S(w("M47 39 L52 39.8 M46.6 42 L50.5 42.6", f, 0.3), "ln thin")}
-        {S(w(circ(47.5, 39.5, 1.5), f, 0.2), "fillink")}
-      </g>
-    ),
-  },
-  thinking: {
-    look: [-1.6, -1.8],
-    arms: (f) => (
-      <>
-        {S(w("M18 33 Q20 43 27 40", f))}
-        {S(w(circ(27.8, 39.6, 1.5), f, 0.2), "fillink")}
-        {S(w(f ? "M46 32 Q53 35 51 41" : "M46 32 Q53 36 50.5 43", f))}
-        {S(w(circ(f ? 51 : 50.5, f ? 42 : 44, 1.5), f, 0.2), "fillink")}
-      </>
-    ),
-    extra: (f) => (
-      <>
-        {S(w(circ(46.5, 13.5, 1), f, 0.25), "fillink")}
-        {S(w(circ(50.5, 9.5, 1.4), f, 0.25), "fillink")}
-        {S(w(circ(55.5, 5, 1.9), f, 0.25), "fillink")}
-      </>
-    ),
-  },
-  tool: {
-    look: [1.4, 2],
-    arms: (f) => (
-      <>
-        {S(w("M18 32 Q12.5 36 16 41", f))}
-        {S(w(circ(16.3, 42, 1.5), f, 0.2), "fillink")}
-        {S(w(f ? "M46 32 Q52 37 46.5 42" : "M46 32 Q53 36 48 41", f))}
-      </>
-    ),
-    extra: (f) => {
-      const [x, y] = f ? [46.5, 42.5] : [48, 41.5];
-      const a = f ? 0 : -1.2;
-      return (
-        <>
-          {S(w(`M${x - 1} ${y - 1} L${x + 3} ${y + 3}`, f, 0.2), "grip")}
-          {S(w(`M${x + 3} ${y + 3} L${x + 8 + a} ${y + 7.5 - a}`, f, 0.2), "ln thin")}
-          {S(w(circ(x - 0.5, y - 0.5, 1.5), f, 0.2), "fillink")}
-          {f === 0 && S(w(`M${x + 10} ${y + 4} L${x + 12} ${y + 3} M${x + 9.5} ${y + 7} L${x + 12} ${y + 7.5}`, f, 0.2), "ln thin spark")}
-        </>
-      );
-    },
-  },
-  error: {
-    hat: [0, -3.5, 8],
-    eye: "M28.5 25.5 L35.5 32.5 M35.5 25.5 L28.5 32.5",
-    arms: (f) => (
-      <>
-        {S(w(f ? "M18 30 Q11 28 10 21" : "M18 30 Q10.5 27 10.5 20.5", f))}
-        {S(w(circ(10.3, 19.8, 1.5), f, 0.2), "fillink")}
-        {S(w(f ? "M46 30 Q53 28 54 21" : "M46 30 Q53.5 27 53.5 20.5", f))}
-        {S(w(circ(53.7, 19.8, 1.5), f, 0.2), "fillink")}
-      </>
-    ),
-    extra: (f) => S(w("M48.5 11 Q51.5 15 49.6 16.6 Q47.3 16.3 48.5 11", f, 0.25), "ln thin"),
-  },
-  offline: {
-    eye: "M24.5 28.6 Q32 27.4 39.5 28.6 M28.4 29.4 Q32 34.4 35.6 29.4",
-    hat: [1, 2.5, -14],
-    wisp: false,
-    arms: (f) => (
-      <>
-        {S(w("M18 33 Q15.5 39 17 44.5", f))}
-        {S(w(circ(17.2, 45.5, 1.5), f, 0.2), "fillink")}
-        {S(w("M46 33 Q48.5 39 47 44.5", f))}
-        {S(w(circ(46.8, 45.5, 1.5), f, 0.2), "fillink")}
-      </>
-    ),
-    extra: (f) => (
-      <g className="zz">
-        {S(w("M45 13 L49 13 L45 17 L49 17", f, 0.2), "ln thin")}
-        {S(w("M51 6 L54 6 L51 9 L54 9", f, 0.2), "ln thin")}
-      </g>
-    ),
-  },
+function parseManifest(raw: unknown): SpriteMap | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (obj.custom !== true || !obj.states || typeof obj.states !== "object") return null;
+  const statesObj = obj.states as Record<string, unknown>;
+  const map: SpriteMap = {};
+  let count = 0;
+  for (const state of AVATAR_STATES) {
+    const entry = statesObj[state];
+    if (!entry || typeof entry !== "object") continue;
+    const { hold, accent } = entry as Record<string, unknown>;
+    if (!validSpriteUrl(hold)) continue;
+    map[state] = validSpriteUrl(accent) ? { hold, accent } : { hold };
+    count++;
+  }
+  return count > 0 ? map : null;
+}
+
+function loadCustomSprites(): void {
+  if (fetchStarted || typeof fetch !== "function" || typeof window === "undefined") return;
+  fetchStarted = true;
+  void fetch("/avatar/manifest.json", { cache: "no-store" })
+    .then((res) => (res.ok ? res.json() : null))
+    .then((data) => {
+      const parsed = parseManifest(data);
+      if (parsed) {
+        customSprites = parsed;
+        notify();
+      }
+    })
+    .catch(() => {
+      // Offline or unavailable: keep the built-in default robot.
+    });
+}
+
+function subscribeSprites(listener: () => void): () => void {
+  listeners.add(listener);
+  loadCustomSprites();
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+function getSprites(): SpriteMap | null {
+  return customSprites;
+}
+
+interface DefaultPose {
+  /** Body transform: [dx, dy, angle]. */
+  body: [x: number, y: number, angle: number];
+  /** Left and right eye style. */
+  eyes: "open" | "blink" | "glance-right" | "squint" | "focus" | "error" | "shut";
+  /** Eye offset inside the visor. */
+  gaze?: [x: number, y: number];
+  /** Antenna beacon state. */
+  beacon: "on" | "bright" | "alert" | "off";
+  /** Optional simple status accent outside the chassis. */
+  extra?: "dots-a" | "dots-b" | "thought-a" | "thought-b" | "gear-a" | "gear-b" | "jolt" | "zzz";
+}
+
+const DEFAULT_POSES: Record<AvatarState, [hold: DefaultPose, accent: DefaultPose]> = {
+  idle: [
+    { body: [0, 0, 0], eyes: "open", gaze: [0, 0], beacon: "on" },
+    { body: [0, 0.5, 0], eyes: "blink", gaze: [0, 0], beacon: "on" },
+  ],
+  queued: [
+    { body: [-1, 0.5, -3], eyes: "glance-right", gaze: [2.2, 0.4], beacon: "on", extra: "dots-a" },
+    { body: [-1, -0.5, -5], eyes: "glance-right", gaze: [2.4, -0.8], beacon: "bright", extra: "dots-b" },
+  ],
+  thinking: [
+    { body: [1, 0.5, 4], eyes: "squint", gaze: [1.8, -1.2], beacon: "bright", extra: "thought-a" },
+    { body: [1.5, 1, 6], eyes: "squint", gaze: [2.2, -1.6], beacon: "on", extra: "thought-b" },
+  ],
+  tool: [
+    { body: [-1.5, 0, -5], eyes: "focus", gaze: [1.6, 0.8], beacon: "bright", extra: "gear-a" },
+    { body: [-1, 0.8, -8], eyes: "focus", gaze: [2, 1], beacon: "on", extra: "gear-b" },
+  ],
+  error: [
+    { body: [0, 1, -7], eyes: "error", beacon: "alert" },
+    { body: [0, -2, -10], eyes: "error", beacon: "alert", extra: "jolt" },
+  ],
+  offline: [
+    { body: [0, 4, 3], eyes: "shut", beacon: "off", extra: "zzz" },
+    { body: [0, 3, 2], eyes: "shut", beacon: "off", extra: "zzz" },
+  ],
 };
 
-function Frame({ state, f }: { state: AvatarState; f: F }) {
-  const p = POSES[state];
-  const [lx, ly] = p.look ?? [0, 0];
-  const [hx, hy, ha] = p.hat ?? [0, 0, 0];
+function Eyes({ mode, gaze }: { mode: DefaultPose["eyes"]; gaze: [number, number] }) {
+  const [gx, gy] = gaze;
+  if (mode === "blink") {
+    return (
+      <>
+        <path className="eye-line" d="M21 34.5q3-2.2 6 0" />
+        <path className="eye-line" d="M37 34.5q3-2.2 6 0" />
+      </>
+    );
+  }
+  if (mode === "shut") {
+    return (
+      <>
+        <path className="eye-shut" d="M21 35h6" />
+        <path className="eye-shut" d="M37 35h6" />
+      </>
+    );
+  }
+  if (mode === "error") {
+    return (
+      <>
+        <path className="eye-alarm" d="M21.5 31.5 26.5 36.5M26.5 31.5 21.5 36.5" />
+        <path className="eye-alarm" d="M37.5 31.5 42.5 36.5M42.5 31.5 37.5 36.5" />
+      </>
+    );
+  }
+  const r = mode === "squint" ? 2.5 : mode === "focus" ? 2.7 : 3;
   return (
-    <g className={f ? "fr fb" : "fr fa"}>
-      {p.wisp !== false &&
-        S(w("M28.5 49 Q32 51.5 29.8 54.2 Q27.8 57 31.5 59 M35.5 49 Q33.2 52.2 35.6 55", f, 0.4), "ln thin wisp")}
-      {S(w("M20.4 22.5 Q22.5 15 32 15 Q41.8 15 43.8 22 L46.6 38 Q47 46 32 46.2 Q17 46 17.4 38.2 L20.9 21.4", f), "body")}
-      {S(w("M23.2 21 Q21.6 26 21.4 32", f, 0.3), "ln thin shine")}
-      {S(w("M17.8 37.4 Q32 40.4 46.2 37.4", f, 0.35), "ln thin")}
-      {[21.5, 26.5, 37.5, 42.5].map((x) => (
-        <path key={x} className="fillink" d={w(circ(x, x < 30 ? 41.6 + (x - 21.5) * 0.12 : 42.2 - (x - 37.5) * 0.12, 0.75), f, 0.1)} />
-      ))}
-      {p.arms(f)}
-      <g className="eye">
-        {S(w(circ(32, 29, 8.4), f, 0.35), "brass")}
-        {S(w(circ(32, 29, 5.3), f, 0.25), "glass")}
-        {p.eye ? (
-          S(w(p.eye, f, 0.3), state === "error" ? "ln bad" : "ln mark")
-        ) : (
-          <>
-            {S(w(circ(32 + lx * 0.8, 29 + ly * 0.8, 3), f, 0.2), "iris")}
-            {S(w(circ(32 + lx * 0.8, 29 + ly * 0.8, 1.5), f, 0.12), "pupil")}
-            {S(w(circ(30.2 + lx * 0.5, 27.2 + ly * 0.5, 0.85), f, 0.1), "glint")}
-          </>
-        )}
-      </g>
-      <g transform={`translate(${hx} ${hy}) rotate(${ha} 32 15)`}>
-        {S(w("M25.4 15 Q24.6 7.6 32 7.2 Q39.4 7.6 38.6 15", f, 0.35), "hat")}
-        {S(w("M25.6 12.8 Q32 11.8 38.4 12.8", f, 0.25), "ln thin band")}
-        {S(w("M21.6 15.8 Q32 12.6 42.4 15.8", f, 0.3), "ln thick")}
-      </g>
-      {p.extra?.(f)}
+    <g transform={`translate(${gx} ${gy})`}>
+      <circle className="iris" cx="24" cy="34" r={r} />
+      <circle className="iris" cx="40" cy="34" r={r} />
+      <circle className="glint" cx="23" cy="32.9" r="0.9" />
+      <circle className="glint" cx="39" cy="32.9" r="0.9" />
+      {mode === "squint" && (
+        <>
+          <path className="lid" d="M20 30.8h8v2.2h-8z" />
+          <path className="lid" d="M36 30.8h8v2.2h-8z" />
+        </>
+      )}
+      {mode === "focus" && (
+        <>
+          <path className="lid" d="M20 30.5 28 32.3v-2H20z" />
+          <path className="lid" d="M44 30.5 36 32.3v-2H44z" />
+        </>
+      )}
     </g>
   );
 }
 
-// Memoised: the paths never change for a state, and Chat re-renders on every
-// streamed token.
-export const Avatar = memo(function Avatar({ state }: { state: AvatarState }) {
+function Extra({ kind }: { kind: DefaultPose["extra"] }) {
+  if (!kind) return null;
+  if (kind === "dots-a" || kind === "dots-b") {
+    const dy = kind === "dots-b" ? -1.4 : 0;
+    return (
+      <g>
+        <circle className="pip" cx="26" cy={56.5 + dy} r="1.4" />
+        <circle className="pip" cx="32" cy={56.5 - dy * 0.6} r="1.4" />
+        <circle className="pip" cx="38" cy={56.5 + dy} r="1.4" />
+      </g>
+    );
+  }
+  if (kind === "thought-a" || kind === "thought-b") {
+    const shift = kind === "thought-b" ? -1 : 0;
+    return (
+      <g>
+        <circle className="pip" cx="49" cy={16 + shift} r="1.4" />
+        <circle className="pip" cx="54" cy={11.5 + shift} r="2.1" />
+        <circle className="pip" cx="59" cy={6.5 + shift} r="2.7" />
+      </g>
+    );
+  }
+  if (kind === "gear-a" || kind === "gear-b") {
+    const angle = kind === "gear-b" ? 30 : 0;
+    return (
+      <g transform={`translate(54 46) rotate(${angle})`}>
+        <circle className="brass" cx="0" cy="0" r="5.2" />
+        <path className="fine" d="M0-7.2v2.1M0 5.1v2.1M-7.2 0h2.1M5.1 0h2.1M-5.1-5.1l1.5 1.5M3.6 3.6l1.5 1.5M5.1-5.1l-1.5 1.5M-3.6 3.6l-1.5 1.5" />
+        <circle className="visor" cx="0" cy="0" r="2.1" />
+      </g>
+    );
+  }
+  if (kind === "jolt") {
+    return (
+      <g>
+        <path className="fine" d="M12 13 8.5 9.5M52 13 55.5 9.5" />
+      </g>
+    );
+  }
+  if (kind === "zzz") {
+    return (
+      <g className="sleep">
+        <path className="fine" d="M47 16h4.5l-4.5 4.5h4.5" />
+        <path className="fine" d="M54 9.5h3.5l-3.5 3.5h3.5" />
+      </g>
+    );
+  }
+  return null;
+}
+
+function DefaultFrame({ pose, accent }: { pose: DefaultPose; accent: boolean }) {
+  const [dx, dy, angle] = pose.body;
+  const beaconClass =
+    pose.beacon === "alert"
+      ? "beacon-alert"
+      : pose.beacon === "off"
+        ? "beacon-off"
+        : pose.beacon === "bright"
+          ? "beacon-bright"
+          : "beacon";
   return (
-    <span className="avatar" data-state={state} aria-hidden="true">
-      <svg viewBox="7 3 50 54">
-        <g className="bob">
-          <Frame state={state} f={0} />
-          <Frame state={state} f={1} />
-        </g>
+    <g className={accent ? "avatar-accent" : "avatar-hold"}>
+      <g transform={`translate(${32 + dx} ${34 + dy}) rotate(${angle}) translate(-32 -34)`}>
+        {/* Antenna */}
+        <path d="M32 19v-6.5" />
+        <circle className={beaconClass} cx="32" cy="10" r="3" />
+        {/* Side ear caps */}
+        <rect className="ear" x="8.5" y="29" width="4.5" height="10" rx="2" />
+        <rect className="ear" x="51" y="29" width="4.5" height="10" rx="2" />
+        {/* Main rounded head / chassis */}
+        <rect className="shell" x="13" y="19" width="38" height="30" rx="10" />
+        <path className="shade" d="M45 20.5c3.2 1.8 5 5 5 8.8v10.2c0 4.8-3.8 8.5-8.5 8.5H21.5c2.2 0 18 0 21-2.5 3.8-3.2 4.3-16.8 2.5-25Z" />
+        <path className="shine fine" d="M18.5 23.5c2-1.2 4.8-1.5 8.5-1.5" />
+        {/* Recessed face visor */}
+        <rect className="visor" x="17.5" y="26.5" width="29" height="15" rx="6.5" />
+        <Eyes mode={pose.eyes} gaze={pose.gaze ?? [0, 0]} />
+        {/* Chin seam / grille */}
+        <path className="fine" d="M26 45h12" />
+      </g>
+      <Extra kind={pose.extra} />
+    </g>
+  );
+}
+
+// Chat can re-render on every streamed token. The two drawings only change
+// when state or custom sprites change; no timers or document-global IDs.
+export const Avatar = memo(function Avatar({ state }: { state: AvatarState }) {
+  const sprites = useSyncExternalStore(subscribeSprites, getSprites, () => null);
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+
+  const custom = sprites?.[state] ?? sprites?.idle;
+  const useCustom = custom !== undefined && failedUrl !== custom.hold;
+  const hasAccent = useCustom ? custom.accent !== undefined : true;
+
+  if (useCustom) {
+    return (
+      <span className="avatar" data-state={state} data-animated={hasAccent ? "true" : "false"} aria-hidden="true">
+        <img
+          key={`${state}-hold-${custom.hold}`}
+          className="sprite avatar-hold"
+          src={custom.hold}
+          alt=""
+          draggable={false}
+          onError={() => setFailedUrl(custom.hold)}
+        />
+        {custom.accent && (
+          <img
+            key={`${state}-accent-${custom.accent}`}
+            className="sprite avatar-accent"
+            src={custom.accent}
+            alt=""
+            draggable={false}
+            onError={() => setFailedUrl(custom.hold)}
+          />
+        )}
+      </span>
+    );
+  }
+
+  const [hold, accent] = DEFAULT_POSES[state];
+  return (
+    <span className="avatar" data-state={state} data-animated="true" aria-hidden="true">
+      <svg key={state} viewBox="0 0 64 64" focusable="false">
+        <DefaultFrame pose={hold} accent={false} />
+        <DefaultFrame pose={accent} accent />
       </svg>
     </span>
   );
