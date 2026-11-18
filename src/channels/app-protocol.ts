@@ -30,6 +30,8 @@ export const APP_LIMITS = Object.freeze({
   pairRateMax: 5,
   labelMinChars: 1,
   labelMaxChars: 40,
+  /** Agent display name in the hello reply: at most 40 printable characters. */
+  agentNameMaxChars: 40,
   cookieName: "durable_device",
   /** Distinct paired devices retained; further pairing is refused until one is revoked. */
   maxDevices: 16,
@@ -85,6 +87,13 @@ export function validAppLabel(value: unknown): value is string {
   if (typeof value !== "string") return false;
   if (value.length < APP_LIMITS.labelMinChars || value.length > APP_LIMITS.labelMaxChars) return false;
   return /^[\x21-\x7e\u00a0-\uffff]+$/u.test(value) && !/[\u202a-\u202e\u2066-\u2069]/u.test(value);
+}
+
+/** The hello reply's agent display name: 1–40 printable characters (spaces allowed). */
+export function validAppAgentName(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (value.length > APP_LIMITS.agentNameMaxChars || value.trim() === "") return false;
+  return /^[\x20-\x7e\u00a0-\uffff]+$/u.test(value) && !/[\u202a-\u202e\u2066-\u2069]/u.test(value);
 }
 
 /**

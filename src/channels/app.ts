@@ -54,6 +54,7 @@ import {
   APP_PROTOCOL_VERSION,
   APP_REQUEST_OPS,
   parseHelloCursor,
+  validAppAgentName,
   validAppLabel,
   validThreadTitle,
   parseThreadId,
@@ -214,6 +215,8 @@ export type AppOptions = {
   /** Absolute directory holding the built PWA, served as static files. */
   readonly staticRoot: string;
   readonly autoArchiveDays?: number;
+  /** Agent display name sent in every hello reply; 1–40 printable characters. */
+  readonly agentName?: string;
   /** Configured owner busy-mode, written onto each admitted input. */
   readonly followUpMode?: FollowUpMode;
   /** Controlled clock for offline checks; absent keeps wall time. */
@@ -503,6 +506,9 @@ export function validateOptions(options: AppOptions): void {
       options.scanIntervalMs < 50 || options.scanIntervalMs > 60_000)) {
     throw new Error("App scanIntervalMs must be an integer from 50 to 60000");
   }
+  if (options.agentName !== undefined && !validAppAgentName(options.agentName)) {
+    throw new Error("App agentName must be 1 to 40 printable characters");
+  }
 }
 
 // ── The adapter ──────────────────────────────────────────────────────────────
@@ -510,6 +516,7 @@ export function validateOptions(options: AppOptions): void {
 export async function runApp(gateway: AppGateway, options: AppOptions, context: Context): Promise<void> {
   validateOptions(options);
   const now = options.now ?? (() => Date.now());
+  const agentName = options.agentName ?? "Durable";
   const scanIntervalMs = options.scanIntervalMs ?? SCHEDULED_SCAN_INTERVAL_MS;
   const archiveAfterMs = (options.autoArchiveDays ?? 14) * DAY_MS;
   const scope = withCancel(context);
@@ -738,7 +745,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       return;
     }
     socket.hello = true;
-    sendOk({ v: APP_PROTOCOL_VERSION, device: socket.session.label, head: headCursor() });
+    sendOk({ v: APP_PROTOCOL_VERSION, device: socket.session.label, head: headCursor(), agent: agentName });
     // Replay from the acknowledged position (or the retention floor), oldest first, bounded.
     const head = headCursor();
     socket.lastSent = head === null ? state.floor : Math.min(Math.max(cursor ?? 0, state.floor), head);

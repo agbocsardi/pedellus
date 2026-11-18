@@ -66,7 +66,7 @@ export async function openAppStore(label, options = {}) {
       toolAllowlist: options.tools ?? [],
       ...(options.cron === true ? { cron: { enabled: true } } : {}),
       ...(options.followUpMode === undefined ? {} : { followUpMode: options.followUpMode }),
-      app: options.appBlock ?? { port: 43190, staticRoot },
+      app: { port: 43190, staticRoot, ...(options.appBlock ?? {}) },
     };
     let config;
     if (options.rawConfig !== undefined) {
@@ -120,6 +120,7 @@ export function startApp(store, options = {}) {
     staticRoot: options.staticRoot ?? store.staticRoot,
     ...(options.followUpMode === undefined ? {} : { followUpMode: options.followUpMode }),
     autoArchiveDays: options.autoArchiveDays ?? store.config.app.autoArchiveDays,
+    agentName: options.agentName ?? store.config.app.agentName,
     ...(options.scanIntervalMs === undefined ? {} : { scanIntervalMs: options.scanIntervalMs }),
     now: () => clock.now,
     onListening: (bound) => portResolve(bound),

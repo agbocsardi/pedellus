@@ -6,6 +6,7 @@ import {
   MemoryContextInputError,
   validateMemoryLoadedFiles,
 } from "./context/memory.js";
+import { validAppAgentName } from "./channels/app-protocol.js";
 import {
   WorkspaceContextInputError,
   validateWorkspaceMemoryFiles,
@@ -428,6 +429,8 @@ export interface PortConfig {
     readonly port: number;
     readonly staticRoot: string;
     readonly autoArchiveDays?: number;
+    /** Agent display name in every hello reply; 1–40 printable characters. */
+    readonly agentName?: string;
   };
 }
 
@@ -1345,7 +1348,7 @@ function discordConfig(value: unknown): NonNullable<PortConfig["discord"]> {
 }
 
 /** Exactly the accepted `app` keys; an unknown key is a typo that must not silently widen access. */
-const APP_KEYS = ["port", "staticRoot", "autoArchiveDays"] as const;
+const APP_KEYS = ["port", "staticRoot", "autoArchiveDays", "agentName"] as const;
 
 /** `app`: opt-in, loopback-only, with an explicit port and an absolute static root. */
 function appConfig(value: unknown): NonNullable<PortConfig["app"]> {
@@ -1361,7 +1364,11 @@ function appConfig(value: unknown): NonNullable<PortConfig["app"]> {
   if (typeof autoArchiveDays !== "number" || !Number.isSafeInteger(autoArchiveDays) || autoArchiveDays < 1) {
     throw new Error("app.autoArchiveDays must be an integer of at least 1");
   }
-  return Object.freeze({ port: a.port, staticRoot: a.staticRoot, autoArchiveDays });
+  const agentName = a.agentName === undefined ? "Durable" : a.agentName;
+  if (!validAppAgentName(agentName)) {
+    throw new Error("app.agentName must be 1 to 40 printable characters");
+  }
+  return Object.freeze({ port: a.port, staticRoot: a.staticRoot, autoArchiveDays, agentName });
 }
 
 /**

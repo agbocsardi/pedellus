@@ -29,6 +29,7 @@ listener is loaded.
 | `port` | Required explicit integer 1–65535. The listener binds `127.0.0.1` only; no other bind is configurable, and `tailscale serve` is the only publisher. Never Funnel, port forwarding or a wildcard bind. |
 | `staticRoot` | Required absolute directory holding the built PWA. Files are served with safe path resolution (no traversal, no directory listing, encoded separators are not structure), correct MIME types and `index.html` for the root; `sw.js` is always served `no-store`. |
 | `autoArchiveDays` | Optional integer ≥1, default 14. Automatically archive inactive side threads, but never while they have running or queued work. |
+| `agentName` | Optional agent display name, 1–40 printable characters, default `Durable`. Sent as `agent` in every `hello` reply; display only, no authority. |
 
 The block is strict: an unrecognized key is refused at startup instead of being ignored, like the
 Discord block. The listener ignores Tailscale identity headers by construction: any local process
@@ -121,7 +122,8 @@ keys at 1–64 characters of `[A-Za-z0-9_-]`.
 
 Durable egress is one adapter-wide cursor log — `message` (roles `user`, `assistant`, `notice`),
 `settled`, `divider` and `thread` — across all threads. Each event names its thread; lifecycle
-events carry its full metadata. `hello` replays
+events carry its full metadata. `hello` replies with the protocol version, the device label, the
+durable head cursor and the configured agent display name (`app.agentName`, default `Durable`), and replays
 events with `cursor > hello.cursor` (oldest first, at most 500 per batch; the app re-`hello`s for
 more), live sockets are pushed every event after their own position, and `ack` records each
 device's highest stored cursor, clamped to the current head. Replay is idempotent by cursor on the

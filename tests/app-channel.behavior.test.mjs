@@ -67,9 +67,13 @@ test('the app config block is opt-in, strict and loopback-only', { timeout: 10_0
     ...WORKSPACE_BASE,
     app: { port: 43190, staticRoot: '/tmp/synthetic-pwa' },
   }, '/tmp/synthetic');
-  assert.deepEqual(parsed.app, { port: 43190, staticRoot: '/tmp/synthetic-pwa', autoArchiveDays: 14 });
+  assert.deepEqual(parsed.app, { port: 43190, staticRoot: '/tmp/synthetic-pwa', autoArchiveDays: 14, agentName: 'Durable' });
   for (const autoArchiveDays of [0, -1, 1.5, '14', null]) {
     assert.throws(() => parseConfig({ ...WORKSPACE_BASE, app: { port: 43190, staticRoot: '/p', autoArchiveDays } }, '/tmp'), /app\.autoArchiveDays/u);
+  }
+  assert.equal(parseConfig({ ...WORKSPACE_BASE, app: { port: 43190, staticRoot: '/p', agentName: 'Work Bench' } }, '/tmp').app.agentName, 'Work Bench');
+  for (const agentName of ['', 'x'.repeat(41), 'bad\nname', 7]) {
+    assert.throws(() => parseConfig({ ...WORKSPACE_BASE, app: { port: 43190, staticRoot: '/p', agentName } }, '/tmp'), /app\.agentName/u);
   }
   // Absent stays absent: nothing about the app channel is configured or loaded.
   assert.equal(parseConfig({ ...WORKSPACE_BASE }, '/tmp/synthetic').app, undefined);
@@ -260,6 +264,7 @@ test('hello replays the durable log in bounded batches, answers later hellos and
     const hello = device.response('h1');
     assert.equal(hello.ok, true);
     assert.equal(hello.v, 2);
+    assert.equal(hello.agent, 'Durable');
     assert.equal(hello.device, 'phone');
     assert.equal(hello.head, 600);
     assert.equal(device.events('message').length, APP_LIMITS.replayBatch, 'replay is bounded at 500');
@@ -742,6 +747,14 @@ async function createSide(device, key, title) {
   assert.match(result.thread, /^t_[A-Za-z0-9_-]{1,40}$/u);
   return result.thread;
 }
+
+test('the hello reply carries the configured agent display name', { timeout: 15_000 }, async () => {
+  await withChannel('agent-name', { appBlock: { agentName: 'Work Bench' } }, async ({ base, store }) => {
+    const device = await connectV2(base, await pairedDevice(store, base));
+    assert.equal(device.response('hello').agent, 'Work Bench');
+    await device.close();
+  });
+});
 
 test('thread registry is durable, creation is idempotent, and only open side threads count', { timeout: 15_000 }, async () => {
   await withChannel('registry', {}, async ({ base, store, app }) => {
