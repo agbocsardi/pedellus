@@ -6,7 +6,7 @@
  * motion live here and in the `.avatar` rules of styles.css; callers only
  * give it a sized slot (it fills its parent) and a state.
  */
-import type { ReactNode } from "react";
+import { memo, type ReactNode } from "react";
 
 export type AvatarState = "idle" | "queued" | "thinking" | "tool" | "error" | "offline";
 
@@ -189,7 +189,9 @@ function Frame({ state, f }: { state: AvatarState; f: F }) {
   );
 }
 
-export function Avatar({ state }: { state: AvatarState }) {
+// Memoised: the paths never change for a state, and Chat re-renders on every
+// streamed token.
+export const Avatar = memo(function Avatar({ state }: { state: AvatarState }) {
   return (
     <span className="avatar" data-state={state} aria-hidden="true">
       <svg viewBox="7 3 50 54">
@@ -200,4 +202,4 @@ export function Avatar({ state }: { state: AvatarState }) {
       </svg>
     </span>
   );
-}
+});

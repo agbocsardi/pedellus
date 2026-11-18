@@ -16,7 +16,7 @@
   --color-card: #ffffff;
   --color-card-foreground: #22211e;
   --color-muted: #ecebe5;
-  --color-muted-foreground: #76746c;
+  --color-muted-foreground: #6e6c64;
   --color-border: #e3e1d9;
   --color-sidebar: #f2f1ec;
   --color-primary: #0e7a6a;
@@ -49,7 +49,7 @@
 :root {
   --accent: var(--color-primary);
   --danger: var(--color-destructive);
-  --amber: #b8892c;
+  --amber: #8c6519;
   --line: var(--color-border);
   --ink: var(--color-foreground);
   --muted-ink: var(--color-muted-foreground);
@@ -73,7 +73,7 @@
     --steel: #5b6c74;
     --steel-shine: #8fa2aa;
     --brass: #c7983f;
-    --hat: #101214;
+    --hat: #454a52;
     --bubble-ink: #f1fbf8;
     --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 10px 30px rgb(0 0 0 / 0.35);
   }
@@ -278,7 +278,9 @@ svg {
 }
 
 /* hover bob (not when switched off) */
-.avatar:not([data-state="offline"]) .bob {
+.avatar:not([data-state="offline"]) {
+  /* On the HTML element, not inside the SVG, so the compositor animates it
+     without repainting the drawing every frame. */
   animation: av-bob 2.8s ease-in-out infinite;
 }
 .avatar[data-state="offline"] .bob {
