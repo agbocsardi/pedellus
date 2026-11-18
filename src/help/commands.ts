@@ -8,7 +8,7 @@
  */
 
 /** Where a conversation command may appear. Process-level help is not a surface. */
-export type ConversationSurface = "cli" | "telegram" | "discord";
+export type ConversationSurface = "cli" | "telegram" | "discord" | "app";
 
 export interface ConversationCommand {
   readonly name: string;
@@ -46,28 +46,28 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     summary: "Start a fresh context for this conversation",
     usage: "Usage: /new",
     detail: "A busy conversation refuses it or applies it at its next safe boundary; stored history and tool authority are unchanged.",
-    surfaces: ["cli", "telegram", "discord"],
+    surfaces: ["cli", "telegram", "discord", "app"],
   },
   {
     name: "abort",
     summary: "Stop this turn and withdraw queued messages",
     usage: "Usage: /abort",
     detail: "Other chats, cron runs and background work are unaffected.",
-    surfaces: ["cli", "telegram", "discord"],
+    surfaces: ["cli", "telegram", "discord", "app"],
   },
   {
     name: "stop",
     summary: "Alias of /abort: stop this turn here",
     usage: "Usage: /stop",
     detail: "Exactly the same effect and durable record as /abort.",
-    surfaces: ["cli", "telegram", "discord"],
+    surfaces: ["cli", "telegram", "discord", "app"],
   },
   {
     name: "status",
     summary: "Show this conversation's model and run state",
     usage: "Usage: /status",
     detail: "Read-only: no model call or transcript read; background status may report another chat's run.",
-    surfaces: ["cli", "telegram", "discord"],
+    surfaces: ["cli", "telegram", "discord", "app"],
   },
   {
     name: "notices",
@@ -125,13 +125,15 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     surfaceUsage: {
       telegram: "Usage: /model (list the configured presets) or /model <preset> (or /model default).",
       discord: "Usage: /model (list the configured presets) or /model <preset> (or /model default).",
+      app: "Usage: /model (list the configured presets) or /model <preset> (or /model default).",
     },
     detail: "Applies to this conversation only: a preset lasts until the gateway restarts, a direct pick persists.",
     surfaceDetail: {
       telegram: "Applies to this chat only while the gateway stays open; a restart restores the configured preset.",
       discord: "Applies to this channel only while the gateway stays open; a restart restores the configured preset.",
+      app: "Applies to this thread only while the gateway stays open; a restart restores the configured preset.",
     },
-    surfaces: ["cli", "telegram", "discord"],
+    surfaces: ["cli", "telegram", "discord", "app"],
   },
   {
     name: "tools",
@@ -155,7 +157,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     usage: "Usage: /digest [status] — start a batch, or read its status.",
     detail: "Finishes admitted closed episodes in the shared workspace; /digest status is free.",
     refusalGuarantee: "Nothing was started.",
-    surfaces: ["cli", "telegram", "discord"],
+    surfaces: ["cli", "telegram", "discord", "app"],
   },
   {
     name: "mcp",
@@ -186,7 +188,10 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     summary: "Replace the whole gateway process",
     usage: "Usage: /restart",
     detail: "Affects every chat and all background work; refused while live work would be interrupted (count shown in /status), and a confirmation follows once the gateway is live.",
-    surfaces: ["cli", "telegram", "discord"],
+    surfaceDetail: {
+      app: "Affects every chat and all background work; refused while live work would be interrupted (count shown in /status). Devices reconnect and replay from their stored cursor.",
+    },
+    surfaces: ["cli", "telegram", "discord", "app"],
   },
   {
     name: "reload",
@@ -201,7 +206,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     summary: "Show these controls, or one command's detail",
     usage: "Usage: /help [command]",
     detail: "Lists this host's controls; /help <command> adds that command's usage and detail.",
-    surfaces: ["cli", "telegram", "discord"],
+    surfaces: ["cli", "telegram", "discord", "app"],
   },
 ];
 
@@ -209,6 +214,7 @@ const HEADINGS: Record<ConversationSurface, string> = {
   cli: "Local commands in this CLI conversation:",
   telegram: "Controls for this chat (other messages go to the assistant):",
   discord: "Controls for this channel (other messages go to the assistant):",
+  app: "Controls for this thread (other messages go to the assistant):",
 };
 
 /** How a refusal names the surface a command belongs to, as a complete phrase: "in the terminal", "in Telegram". */
@@ -216,6 +222,7 @@ const SURFACE_LABEL: Record<ConversationSurface, string> = {
   cli: "the terminal",
   telegram: "Telegram",
   discord: "Discord",
+  app: "the app",
 };
 
 export function findConversationCommand(name: string): ConversationCommand | undefined {
