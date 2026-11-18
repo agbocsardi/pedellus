@@ -1,0 +1,93 @@
+<!doctype html>
+<!-- Throwaway lab: compare ways to keep the header still when the iOS
+     keyboard opens. Open /keyboard-lab.html?s=A … ?s=E on the device. -->
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<title>Keyboard lab</title>
+<style>
+  :root { --bg: #f7f6f3; --ink: #24231f; --line: #e2dfd8; --accent: #0f7a6a; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #171917; --ink: #eeece6; --line: #2e312d; } }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.4 system-ui, sans-serif; }
+  .shell { display: flex; flex-direction: column; }
+  header { padding: calc(env(safe-area-inset-top) + 10px) 14px 10px; border-bottom: 1px solid var(--line); background: var(--bg); z-index: 2; }
+  header b { font-size: 18px; }
+  nav { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+  nav a { padding: 3px 9px; border: 1px solid var(--line); border-radius: 99px; color: inherit; text-decoration: none; font-size: 13px; }
+  nav a.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #m { font: 12px ui-monospace, monospace; opacity: .7; margin-top: 4px; }
+  .list { flex: 1; overflow-y: auto; padding: 12px 14px; }
+  .list p { margin: 0 0 12px; }
+  footer { display: flex; gap: 8px; padding: 10px 12px calc(env(safe-area-inset-bottom) + 10px); border-top: 1px solid var(--line); background: var(--bg); }
+  textarea { flex: 1; font: inherit; font-size: 16px; border: 1px solid var(--line); border-radius: 20px; padding: 9px 14px; resize: none; background: transparent; color: inherit; }
+  /* A–D: fixed shell, page never scrolls */
+  body.fixed, body.fixed html { overflow: hidden; height: 100%; }
+  body.fixed .shell { position: fixed; left: 0; right: 0; top: 0; height: var(--h, 100dvh); transform: translateY(var(--y, 0px)); }
+  /* E: ordinary scrolling document with sticky header and composer */
+  body.sticky .shell { min-height: 100dvh; }
+  body.sticky header { position: sticky; top: 0; }
+  body.sticky footer { position: sticky; bottom: 0; }
+  body.sticky .list { overflow: visible; flex: none; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <b>Keyboard lab</b> · strategy <span id="s"></span>
+    <nav id="nav"></nav>
+    <div id="m"></div>
+  </header>
+  <div class="list" id="list"></div>
+  <footer><textarea id="t" rows="1" placeholder="Tap here"></textarea></footer>
+</div>
+<script>
+const S = new URLSearchParams(location.search).get("s") || "A";
+const D = {
+  A: "follow visualViewport (height + offset)",
+  B: "A + snap window scroll back to 0",
+  C: "B + focus without scroll on tap",
+  D: "C + composer parked at top while keyboard opens",
+  E: "plain document, sticky header/composer",
+};
+document.getElementById("s").textContent = S + " — " + D[S];
+document.getElementById("nav").innerHTML = Object.keys(D)
+  .map((k) => `<a href="?s=${k}" class="${k === S ? "on" : ""}">${k}</a>`).join("");
+document.getElementById("list").innerHTML = Array.from({ length: 30 },
+  (_, i) => `<p>Message ${i + 1}: some filler text so the list scrolls.</p>`).join("");
+const vv = window.visualViewport, root = document.documentElement, t = document.getElementById("t");
+const shell = document.querySelector(".shell"), footer = document.querySelector("footer");
+document.body.className = S === "E" ? "sticky" : "fixed";
+
+function meter() {
+  document.getElementById("m").textContent =
+    `inner ${innerHeight} · vv ${Math.round(vv.height)} @${Math.round(vv.offsetTop)} · scrollY ${Math.round(scrollY)}`;
+}
+function apply() {
+  if (S !== "E") {
+    root.style.setProperty("--h", vv.height + "px");
+    root.style.setProperty("--y", vv.offsetTop + "px");
+  }
+  if (S !== "A" && S !== "E" && scrollY !== 0) scrollTo(0, 0);
+  if (S === "D" && vv.height < innerHeight - 80) footer.style.order = "";
+  meter();
+}
+vv.addEventListener("resize", apply);
+vv.addEventListener("scroll", apply);
+addEventListener("scroll", apply, { passive: true });
+
+if (S === "C" || S === "D") {
+  t.addEventListener("touchend", (e) => {
+    if (document.activeElement === t) return;
+    e.preventDefault();
+    if (S === "D") footer.style.order = "-1"; // composer at the top: nothing to pan to
+    t.focus({ preventScroll: true });
+  });
+  t.addEventListener("blur", () => { footer.style.order = ""; });
+}
+apply();
+</script>
+</body>
+</html>
