@@ -2,18 +2,34 @@ import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type Keyb
 import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
-import { LIMITS, MAIN_THREAD, type DurableEvent, type MessageEvent, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { LIMITS, MAIN_THREAD, type ControlCommand, type DurableEvent, type MessageEvent, type ThreadInfo, type ThreadOrigin } from "./protocol";
 import { Avatar, type AvatarState } from "./Avatar";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 
 type Row = { kind: "ev"; ev: DurableEvent } | { kind: "pending"; m: Outgoing };
 type Tone = "ok" | "run" | "warn" | "bad";
-type Sheet = { kind: "list" | "menu" } | { kind: "rename"; title: string }
+type Sheet = { kind: "list" | "menu" | "tools" | "confirm-new" } | { kind: "rename"; title: string }
   | { kind: "create"; title: string; from?: ThreadOrigin }
   | { kind: "message"; title: string; from: ThreadOrigin };
 const LIST_ICON = "M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01";
 const TITLE_CONTROL = /[\p{Cc}\u2028\u2029]/u;
+const WRENCH_ICON = "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8Z";
+
+type CommandState = { online: boolean; writable: boolean; running: boolean };
+type Command = {
+  command: ControlCommand; description: string; icon: string; confirm?: boolean;
+  enabled: (s: CommandState) => boolean;
+};
+const ready = (s: CommandState) => s.online && s.writable;
+/** The composer toolbox and `/` menu. Add a row when the protocol gains a control. */
+const COMMANDS: Command[] = [
+  { command: "new", description: "Start a fresh context in this thread", icon: "M12 5v14M5 12h14", confirm: true, enabled: ready },
+  { command: "status", description: "Ask the agent what it is doing", icon: "M3 12h4l3-8 4 16 3-8h4", enabled: ready },
+  { command: "abort", description: "Stop the running turn", icon: "M6 6l12 12M18 6 6 18", enabled: (s) => ready(s) && s.running },
+];
+/** A lone `/word` in the composer is a command, never a message. */
+const SLASH = /^\/([a-z]*)$/i;
 
 function suggestedTitle(text: string) {
   return text.replace(/[\p{Cc}\s]+/gu, " ").trim().slice(0, LIMITS.threadTitleChars)
@@ -71,6 +87,9 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const [sheet, setSheet] = useState<Sheet | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [slashPick, setSlashPick] = useState(0);
+  const [slashHidden, setSlashHidden] = useState(false);
+  const wrenchRef = useRef<HTMLButtonElement>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const opener = useRef<HTMLElement | null>(null);
   const savingMessage = useRef(false);
@@ -99,6 +118,11 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const sourceTitle = origin?.thread === MAIN_THREAD ? "Main" : source?.title ?? "another thread";
   const back = source ?? store.threads.get(MAIN_THREAD)!;
   const canRetry = writable && !running;
+  const cmdState: CommandState = { online, writable, running };
+  const slash = SLASH.exec(text.trim());
+  const matches = slash ? COMMANDS.filter((c) => c.command.startsWith(slash[1].toLowerCase())) : [];
+  const slashOpen = !!slash && writable && !sheet && !slashHidden;
+  const picked = matches[Math.min(slashPick, matches.length - 1)];
   const forkError = store.forkRejected ? "Could not start a side thread from that message." : "";
   const forks = new Map<string, ThreadInfo[]>();
   let hasOtherActivity = false;
@@ -196,6 +220,10 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       conn.control(thread, "abort");
       return;
     }
+    if (slash) {
+      if (picked) runCommand(picked);
+      return;
+    }
     const t = text.trim();
     if (!t || t.length > LIMITS.sendTextChars) return;
     await queueMessage(t);
@@ -226,6 +254,22 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (slashOpen && (e.key === "ArrowDown" || e.key === "ArrowUp") && matches.length) {
+      e.preventDefault();
+      const i = matches.indexOf(picked) + (e.key === "ArrowDown" ? 1 : -1);
+      setSlashPick((i + matches.length) % matches.length);
+      return;
+    }
+    if (slashOpen && e.key === "Escape") {
+      e.preventDefault();
+      setSlashHidden(true);
+      return;
+    }
+    if (slash && e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (picked) runCommand(picked);
+      return;
+    }
     // On phones Enter makes a newline; send is the button. On desktop Enter
     // sends and Shift+Enter makes a newline.
     if (e.key === "Enter" && !e.shiftKey && FINE_POINTER) {
@@ -234,9 +278,18 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     }
   }
 
-  function command(c: "new" | "status") {
+  function command(c: ControlCommand) {
     conn.control(thread, c);
     setSheet(null);
+  }
+
+  function runCommand(c: Command) {
+    if (!c.enabled(cmdState)) return;
+    if (SLASH.test(text.trim())) setText("");
+    // From the `/` menu the field still has focus; return it to the wrench
+    // after the confirm sheet, not to the field (which would re-trigger iOS).
+    if (c.confirm) show({ kind: "confirm-new" }, sheet ? undefined : wrenchRef.current ?? undefined);
+    else command(c.command);
   }
 
   async function saveTitle(value: string) {
@@ -284,7 +337,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     }
   }
 
-  useEffect(() => { setSheet(null); setError(""); }, [thread]);
+  useEffect(() => { setSheet(null); setError(""); setSlashHidden(false); }, [thread]);
 
   return (
     <div className="app">
@@ -400,11 +453,21 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
       <footer className="composer">
         {!sheet && (error || forkError) && <p className="error-text" role="alert">{error || forkError}</p>}
+        {slashOpen && <div className="slash-list" aria-label="Commands" role="group">
+          {matches.length ? matches.map((c) => <CommandItem key={c.command} c={c} state={cmdState} active={c === picked}
+            onClick={() => runCommand(c)} keepFocus />) : <p className="sheet-help">No matching command.</p>}
+          {!online && <p className="sheet-help">Reconnect to use commands.</p>}
+        </div>}
         {archived ? (
           <p className="archived-hint">{archivedLabel(info)} · {online
             ? <button disabled={busy} onClick={() => void toggleArchive()}>Restore to reply</button>
             : "Reconnect to restore"}</p>
         ) : !writable ? <p className="archived-hint">Read-only until thread details are available.</p> : <div className="capsule">
+          <button ref={wrenchRef} className="wrench" aria-label="Commands" aria-haspopup="dialog"
+            aria-expanded={sheet?.kind === "tools"} disabled={!online}
+            onClick={(e) => show({ kind: "tools" }, e.currentTarget)}>
+            <Icon d={WRENCH_ICON} />
+          </button>
           <textarea
             ref={taRef}
             value={text}
@@ -412,14 +475,14 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             maxLength={LIMITS.sendTextChars}
             placeholder={running ? `${agentName} is working…` : `Message ${agentName}`}
             aria-label="Message"
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => { setText(e.target.value); setSlashPick(0); setSlashHidden(false); }}
             onKeyDown={onKeyDown}
             enterKeyHint={FINE_POINTER ? "send" : "enter"}
           />
           <button
             className={running ? "send stop" : "send"}
             aria-label={running ? "Stop" : "Send"}
-            data-ready={running || text.trim() !== "" ? "" : undefined}
+            data-ready={running || (slash ? !!picked?.enabled(cmdState) : text.trim() !== "") ? "" : undefined}
             onClick={() => void submit()}
           >
             {running ? (
@@ -436,6 +499,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       {sheet && (
         <Modal opener={opener.current} panel={sheet.kind} title={sheet.kind === "list" ? "Threads" :
           sheet.kind === "menu" ? "Thread menu" : sheet.kind === "message" ? "Message actions" :
+            sheet.kind === "tools" ? "Commands" : sheet.kind === "confirm-new" ? "New context" :
             sheet.kind === "rename" ? "Rename thread" : "New thread"}
           dismiss={() => { setError(""); setSheet(null); }}>
             <div className="sheet-grip" aria-hidden="true" />
@@ -444,7 +508,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             {sheet.kind === "menu" && <>
               {writable && <>
                 <SheetItem icon="M12 5v14M5 12h14" title="New context"
-                  sub="Start fresh; earlier messages stay above a divider" disabled={!online} onClick={() => command("new")} />
+                  sub="Start fresh; earlier messages stay above a divider" disabled={!online} onClick={() => show({ kind: "confirm-new" })} />
                 <SheetItem icon="M3 12h4l3-8 4 16 3-8h4" title="Status"
                   sub="Ask the agent what it is doing" disabled={!online} onClick={() => command("status")} />
               </>}
@@ -457,6 +521,18 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               </>}
               {!online && <p className="sheet-help">Reconnect to use these controls.</p>}
               {!writable && !archived && <p className="sheet-help">Thread details are not available.</p>}
+            </>}
+            {sheet.kind === "tools" && <>
+              <h2 className="sheet-heading">Commands</h2>
+              {COMMANDS.map((c) => <CommandItem key={c.command} c={c} state={cmdState} onClick={() => runCommand(c)} />)}
+              {!online && <p className="sheet-help">Reconnect to use commands.</p>}
+            </>}
+            {sheet.kind === "confirm-new" && <>
+              <h2 className="sheet-heading">Start a new context?</h2>
+              <p className="sheet-help">The agent starts fresh. Earlier messages stay above a divider.</p>
+              <button className="primary confirm" disabled={!ready(cmdState)} onClick={() => command("new")}>
+                Start new context
+              </button>
             </>}
             {sheet.kind === "message" && <SheetItem icon={LIST_ICON} title="Start side thread from here"
               sub="Fork the conversation at this message"
@@ -588,6 +664,21 @@ function SheetItem(props: { icon: string; title: string; sub?: string; disabled?
       <span>
         <b>{props.title}</b>
         {props.sub && <small>{props.sub}</small>}
+      </span>
+    </button>
+  );
+}
+
+function CommandItem({ c, state, active, keepFocus, onClick }: {
+  c: Command; state: CommandState; active?: boolean; keepFocus?: boolean; onClick: () => void;
+}) {
+  return (
+    <button className="sheet-item command-item" disabled={!c.enabled(state)} aria-current={active || undefined}
+      tabIndex={keepFocus ? -1 : undefined} onPointerDown={keepFocus ? (e) => e.preventDefault() : undefined} onClick={onClick}>
+      <span className="sheet-icon"><Icon d={c.icon} /></span>
+      <span>
+        <b>/{c.command}</b>
+        <small>{c.description}</small>
       </span>
     </button>
   );
