@@ -5,6 +5,7 @@ import {
   PROTOCOL_VERSION,
   type CommandInfo,
   type ControlCommand,
+  type PresetInfo,
   type Request,
   type Response,
   type ServerFrame,
@@ -77,6 +78,14 @@ export class Connection {
   control(thread: ThreadId, command: ControlCommand, args?: string) {
     if (this.store.connState !== "open" || !this.store.canWrite(thread)) return;
     this.write({ type: "req", id: this.id(), op: "control", thread, command, ...(args ? { args } : {}) });
+  }
+
+  /** Switch the thread's model preset; pending until its `model` event arrives. */
+  selectPreset(thread: ThreadId, preset: string) {
+    if (this.store.connState !== "open" || !this.store.canWrite(thread)) return;
+    if (this.request({ type: "req", id: this.id(), op: "control", thread, command: "model", args: preset }, (res) => {
+      if (!res?.ok && this.store.pendingModel(thread) === preset) this.store.setPendingModel(thread, undefined);
+    })) this.store.setPendingModel(thread, preset);
   }
 
   rename(thread: ThreadId, title: string) {
@@ -327,6 +336,11 @@ export class Connection {
           }
         }
         break;
+      case "model":
+        if (typeof f.thread === "string" && (f.preset === null || typeof f.preset === "string")) {
+          this.store.setModel(f);
+        }
+        break;
     }
   }
 
@@ -348,9 +362,11 @@ export class Connection {
       this.replayCursor = cursor;
       this.replayHead = res.head ?? null;
       this.store.resetStatuses();
+      this.store.resetModels();
       const device = typeof res.device === "string" ? res.device : undefined;
       const name = typeof res.agent === "string" ? res.agent.trim() : "";
-      this.store.setIdentity(device, name && [...name].length <= 40 ? name : undefined, commandList(res.commands));
+      this.store.setIdentity(device, name && [...name].length <= 40 ? name : undefined, commandList(res.commands),
+        presetList(res.presets));
       this.store.setMode("chat");
     });
   }
@@ -426,5 +442,21 @@ function commandList(raw: unknown): CommandInfo[] | undefined {
     if (typeof name !== "string" || !COMMAND_NAME.test(name) || typeof summary !== "string"
       || typeof usage !== "string" || (args !== undefined && typeof args !== "string")) return [];
     return [{ name, summary, usage, ...(args ? { args } : {}) }];
+  });
+}
+
+/** Keeps only well-formed, uniquely named `hello.presets` entries; undefined if none were sent. */
+function presetList(raw: unknown): PresetInfo[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const seen = new Set<string>();
+  const text = (v: unknown, max: number) => typeof v === "string" && v.trim() !== "" && v.length <= max && !/[\p{Cc}]/u.test(v);
+  return raw.flatMap((p): PresetInfo[] => {
+    if (!p || typeof p !== "object") return [];
+    const { name, label, model, thinking } = p as Record<string, unknown>;
+    if (!text(name, 64) || /\s/.test(name as string) || seen.has(name as string) || !text(model, 200)
+      || (label !== undefined && !text(label, 40)) || (thinking !== undefined && !text(thinking, 40))) return [];
+    seen.add(name as string);
+    return [{ name: name as string, model: model as string, ...(label ? { label: label as string } : {}),
+      ...(thinking ? { thinking: thinking as string } : {}) }];
   });
 }
