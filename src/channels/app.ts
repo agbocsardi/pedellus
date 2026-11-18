@@ -984,6 +984,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       return sendOk({ duplicate: true });
     }
     if (!looksLikeOAuthCallback(text) && gateway.reserveAppThread !== undefined) {
+      // Rechecked here, immediately before the reservation, so an archived thread is refused
+      // before its snapshot can be reinstalled, whatever awaits are added above this point.
+      if (!openThread(state, thread)) return sendError("bad_request");
       let reserved: "ok" | "full";
       try {
         reserved = await gateway.reserveAppThread(thread, adapterContext);
@@ -2038,6 +2041,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
 
   const scanScheduled = async (): Promise<void> => {
     if (outbox === undefined || stopping || signal?.aborted) return;
+    // Snapshot room is read once per scan, lazily and only when an archived origin needs it.
+    let snapshotBlocked: boolean | undefined;
     for (const { sessionKey } of await outbox.sessions(adapterContext)) {
       if (stopping || signal?.aborted) return;
       if (threadForSession(sessionKey) === undefined) continue;
@@ -2069,11 +2074,20 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           continue;
         }
         const record = value as CronDeliveryRecord;
-        // A capacity-blocked archived origin consumes no dispatch slot: its result waits in the
-        // outbox until an open slot exists, and every other thread (main included) keeps flowing.
+        // A capacity-blocked archived origin consumes no dispatch slot — neither for the
+        // open-thread cap nor for the snapshot cap: its result waits in the outbox until
+        // room exists, and every other thread (main included) keeps flowing.
         const originThread = threadForSession(sessionKey);
         if (!isTurnInterruptionNotice(record) && originThread !== undefined &&
-            threadInfo(state, originThread)?.archived === true && !canOpenSideThread(state)) continue;
+            threadInfo(state, originThread)?.archived === true) {
+          if (!canOpenSideThread(state)) continue;
+          if (snapshotBlocked === undefined) {
+            snapshotBlocked = gateway.appSnapshotRoom === undefined ? false
+              : !(await stateConversation.commit((tx) => gateway.appSnapshotRoom!(tx), adapterContext)
+                .catch(() => true));
+          }
+          if (snapshotBlocked) continue;
+        }
         const deliveryKey = JSON.stringify([sessionKey, record.id]);
         if (record.status !== "pending" || scheduledActive.has(deliveryKey)) continue;
         if (scheduledActive.size >= MAX_SCHEDULED_ACTIVE) return;

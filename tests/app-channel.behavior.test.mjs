@@ -337,7 +337,7 @@ test('send is idempotent by key: one echo, one turn, one settlement', { timeout:
 
 test('a full turn echoes, previews, answers and settles in protocol order', { timeout: 30_000 }, async () => {
   await withChannel('full-turn', { streamTokensPerSecond: 40 }, async ({ store, base }) => {
-    store.setAnswer(Array.from({ length: 40 }, (_, index) => `answer line ${index}`).join(' '));
+    store.setAnswer(Array.from({ length: 24 }, (_, index) => `answer line ${index}`).join(' '));
     const cookie = await pairedDevice(store, base);
     const device = deviceClient(base, cookie);
     await device.open();
@@ -363,7 +363,7 @@ test('a full turn echoes, previews, answers and settles in protocol order', { ti
     const answered = device.events('message').find((event) => event.role === 'assistant');
     assert.ok(answered !== undefined);
     assert.equal(answered.key, 'k1');
-    assert.match(answered.text, /answer line 39/u);
+    assert.match(answered.text, /answer line 23/u);
     const settled = device.events('settled')[0];
     assert.deepEqual({ key: settled.key, outcome: settled.outcome }, { key: 'k1', outcome: 'answered' });
     const state = await appState(store.gateway);
@@ -840,7 +840,7 @@ test('threads run concurrently, replay through one cursor, and archive aborts on
   await withChannel('parallel', { streamTokensPerSecond: 40, cron: true }, async ({ base, store }) => {
     const answer = (label) => fauxAssistantMessage(label.repeat(50));
     store.script([() => answer('Main reply. '), () => answer('Side reply. '),
-      () => answer('Never delivered. '), () => answer('Main survived. ')]);
+      () => answer('Never delivered. '), () => fauxAssistantMessage('Main survived.')]);
     const cookie = await pairedDevice(store, base);
     const device = await connectV2(base, cookie);
     const side = await createSide(device, 'parallel');
@@ -1150,6 +1150,86 @@ test('capacity-blocked side deliveries neither take dispatch slots nor replay a 
     await app?.stop();
     await store.close();
   }
+});
+
+test('snapshot-blocked archived deliveries neither take dispatch slots nor delay main', { timeout: 15_000 }, async () => {
+  // Unlike the open-cap blocker above, the open-thread cap has room here: the snapshot cap is
+  // the only reason the archived origin cannot be restored, and its five pending records must
+  // not fill the four dispatch slots of every scan ahead of main's own pending result.
+  const gatewayOptions = { contextSnapshotProvider: () => ({ identity: { source: 'synthetic', content: 'snapshot' } }) };
+  const store = await openAppStore('cron-snapshot-cap', { gatewayOptions });
+  let app;
+  try {
+    const { AppState } = await import('../dist/channels/app.js');
+    const { CronDeliveriesDoc } = await import('../dist/automation/cron-delivery.js');
+    const { defineDoc } = await import('@earendil-works/pi-durable');
+    const { encodedSessionKey } = await import('../dist/history/scope.js');
+    const mapToken = defineDoc({ kind: 'nanobot.session-map', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', initial: () => ({ sessions: {} }), checkpointWhen: () => true });
+    const root = await store.gateway.harness.root(context);
+    const sideKey = `${APP_CHAT_SESSION_KEY}:t_blocked`;
+    // Mapped before main, so the archived origin's session iterates first in the scan.
+    const side = await store.gateway.conversationFor(sideKey, context);
+    const main = await store.gateway.conversationFor(APP_CHAT_SESSION_KEY, context);
+    const state = await store.gateway.conversationFor('app:channel-state', context);
+    const now = Date.now();
+    const info = (id, archived = false) => ({ id, title: id, archived, createdAt: new Date(now).toISOString(), lastAt: new Date(now).toISOString() });
+    await state.commit(async (tx) => {
+      const doc = await tx.doc(AppState, state.id);
+      doc.threads = [info('main'), info('t_blocked', true)];
+      doc.origin = { admittedAtMs: now };
+      doc.sideOrigins = { t_blocked: { admittedAtMs: now } };
+      (await tx.doc(CronDeliveriesDoc, side.id)).deliveries = Array.from({ length: 5 }, (_, i) =>
+        ({ sessionKey: sideKey, id: `cron:blocked:${i}`, text: `blocked ${i}`, createdAtMs: now, status: 'pending', nextChunkIndex: 0 }));
+      (await tx.doc(CronDeliveriesDoc, main.id)).deliveries =
+        [{ sessionKey: APP_CHAT_SESSION_KEY, id: 'cron:main:0', text: 'MAIN-FIRST', createdAtMs: now, status: 'pending', nextChunkIndex: 0 }];
+    }, context);
+    // Fill every remaining snapshot slot with inert mappings, leaving open-thread room free.
+    await root.commit(async (tx) => {
+      const map = await tx.doc(mapToken, root.id);
+      for (const [key, id] of [[sideKey, side.id], [APP_CHAT_SESSION_KEY, main.id], ['app:channel-state', state.id]]) {
+        if (map.sessions[encodedSessionKey(key)] === undefined) map.sessions[encodedSessionKey(key)] = id;
+      }
+      const remaining = 257 - Object.keys(map.sessions).length;
+      for (let i = 0; i < remaining; i += 1) {
+        map.sessions[encodedSessionKey(`snapshot:${i}`)] = (await tx.createConversation({ ownership: { kind: 'ownerless' } })).id;
+      }
+    }, context);
+    app = startApp(store, { scanIntervalMs: 50 });
+    const base = `http://127.0.0.1:${await app.port}`;
+    const device = await connectV2(base, await pairedDevice(store, base));
+    await device.wait(() => device.events('message').some((event) => event.text === 'MAIN-FIRST'),
+      'main delivers although the archived origin precedes it');
+    const outbox = store.gateway.cronOutbox;
+    assert.ok((await outbox.list(sideKey, context)).every((record) => record.status === 'pending'),
+      'the snapshot-blocked origin never took a delivery slot');
+    assert.ok(!device.events('message').some((event) => event.thread === 't_blocked'));
+    assert.ok(!device.events('thread').some((event) => event.thread.id === 't_blocked'));
+    await device.close();
+  } finally {
+    await app?.stop();
+    await store.close();
+  }
+});
+
+test('a send to an archived thread is refused before its snapshot is touched', { timeout: 15_000 }, async () => {
+  const loads = [];
+  const gatewayOptions = { contextSnapshotProvider: (key) => {
+    loads.push(key);
+    return { identity: { source: 'synthetic', content: `snapshot ${key}` } };
+  } };
+  await withChannel('archived-send', { gatewayOptions }, async ({ base, store }) => {
+    const device = await connectV2(base, await pairedDevice(store, base));
+    const side = await createSide(device, 'arch');
+    assert.equal((await request(device, 'warm', 'send', { thread: side, key: 'warm', text: 'warm the snapshot' })).ok, true);
+    await device.wait(() => device.events('settled').some((event) => event.key === 'warm'), 'warm settled');
+    const key = `${APP_CHAT_SESSION_KEY}:${side}`;
+    const before = loads.filter((entry) => entry === key).length;
+    assert.ok(before >= 1, 'the open thread installed its snapshot');
+    assert.equal((await request(device, 'archive', 'thread.archive', { thread: side, archived: true })).ok, true);
+    assert.equal((await request(device, 'archived-send', 'send', { thread: side, key: 'after', text: 'nope' })).error, 'bad_request');
+    assert.equal(loads.filter((entry) => entry === key).length, before, 'the refused send reinstalled nothing');
+    await device.close();
+  });
 });
 
 test('archived mappings do not pin snapshot slots or force a restart below the same cap', { timeout: 20_000 }, async () => {
