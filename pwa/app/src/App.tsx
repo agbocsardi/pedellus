@@ -1,0 +1,119 @@
+import { useEffect, useRef, useState } from "react";
+import { useSyncExternalStore } from "react";
+import { Connection } from "./conn";
+import type { Store } from "./store";
+import { FirstRun } from "./FirstRun";
+import { Chat } from "./Chat";
+import { Avatar } from "./Avatar";
+
+export function App({ store }: { store: Store }) {
+  useSyncExternalStore(store.subscribe, store.getSnapshot);
+  const connRef = useRef<Connection | null>(null);
+  const [conn, setConn] = useState<Connection | null>(null);
+
+  useEffect(() => {
+    // The store is the source of truth; the connection starts once it is
+    // loaded so the hello cursor matches what is actually persisted.
+    let alive = true;
+    store
+      .init()
+      .catch((err) => console.error("store init failed; continuing with empty cache", err))
+      .finally(() => {
+        if (!alive) return;
+        connRef.current = new Connection(store);
+        setConn(connRef.current);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [store]);
+
+  // iOS keyboard handling, chosen on device with /keyboard-lab.html (F):
+  // the shell follows the visual viewport, the page scroll is snapped back,
+  // a tap focuses fields without letting iOS pan, and closing the keyboard
+  // blurs the field (iPad keeps focus otherwise, so the next tap would take
+  // iOS's own scrolling focus path and the header would bounce).
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const style = document.documentElement.style;
+    const isField = (el: EventTarget | null): el is HTMLElement =>
+      el instanceof HTMLElement && el.matches(".app textarea, .app input");
+    const kbOpen = () => vv.height < window.innerHeight - 80;
+    let wasOpen = false;
+    const sync = () => {
+      const open = kbOpen();
+      if (wasOpen && !open && isField(document.activeElement)) document.activeElement.blur();
+      wasOpen = open;
+      if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+      style.setProperty("--app-h", `${vv.height}px`);
+      style.setProperty("--vv-top", `${open ? vv.offsetTop : 0}px`);
+    };
+    const tap = (e: TouchEvent) => {
+      if (!isField(e.target) || kbOpen()) return;
+      e.preventDefault();
+      e.target.focus({ preventScroll: true });
+    };
+    vv.addEventListener("resize", sync);
+    vv.addEventListener("scroll", sync);
+    window.addEventListener("scroll", sync, { passive: true });
+    document.addEventListener("touchend", tap, { passive: false });
+    sync();
+    return () => {
+      vv.removeEventListener("resize", sync);
+      vv.removeEventListener("scroll", sync);
+      window.removeEventListener("scroll", sync);
+      document.removeEventListener("touchend", tap);
+      style.removeProperty("--app-h");
+      style.removeProperty("--vv-top");
+    };
+  }, []);
+
+  if (!conn && store.storageBlocked) return (
+    <div className="screen center">
+      <div className="card pad" role="status">
+        <h1>Close other Durable windows</h1>
+        <p className="dim">Durable will continue after its local storage can be upgraded.</p>
+      </div>
+    </div>
+  );
+  if (!conn) return <Splash />;
+  if (store.mode === "update") return <UpdateScreen />;
+  if (store.mode === "pair") return <FirstRun store={store} conn={conn} />;
+  return <Chat store={store} conn={conn} />;
+}
+
+function Splash() {
+  return (
+    <div className="screen center">
+      <div className="avatar-slot big">
+        <Avatar state="thinking" />
+      </div>
+    </div>
+  );
+}
+
+function UpdateScreen() {
+  return (
+    <div className="screen center">
+      <div className="card pad">
+        <div className="avatar-slot big">
+          <Avatar state="offline" />
+        </div>
+        <h1>Update available</h1>
+        <p className="dim">
+          The gateway speaks a newer protocol. Reload to pick up the new app.
+        </p>
+        <button className="primary" onClick={() =>
+            void navigator.serviceWorker
+              ?.getRegistration()
+              .then((r) => r?.update())
+              .catch(() => {})
+              .finally(() => location.reload())
+          }>
+          Reload
+        </button>
+      </div>
+    </div>
+  );
+}
