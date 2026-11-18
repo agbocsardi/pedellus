@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
@@ -152,16 +152,24 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     if (pinned.current) el.scrollTop = el.scrollHeight;
     markAtBottom(el);
   });
-  useEffect(() => {
-    const view = () => {
-      const el = scroller.current;
-      if (!el || sheet || document.hidden) return;
-      if (pinned.current) el.scrollTop = el.scrollHeight;
-      markAtBottom(el);
-    };
-    document.addEventListener("visibilitychange", view);
-    return () => document.removeEventListener("visibilitychange", view);
+  const followBottom = useEffectEvent(() => {
+    const el = scroller.current;
+    if (!el || sheet || document.hidden) return;
+    if (pinned.current) el.scrollTop = el.scrollHeight;
+    markAtBottom(el);
   });
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const view = () => followBottom();
+    const observer = new ResizeObserver(view);
+    observer.observe(el);
+    document.addEventListener("visibilitychange", view);
+    return () => {
+      observer.disconnect();
+      document.removeEventListener("visibilitychange", view);
+    };
+  }, []);
   useEffect(() => {
     const ta = taRef.current;
     if (!ta) return;

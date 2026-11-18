@@ -310,7 +310,7 @@ export class Connection {
         break;
       }
       case "preview":
-        // Show only the final answer. Live status frames drive the typing indicator.
+        this.store.notePreview(f.thread, f.key);
         break;
       case "status":
         this.store.setStatus(f);
@@ -347,10 +347,9 @@ export class Connection {
       this.replayCursor = cursor;
       this.replayHead = res.head ?? null;
       this.store.resetStatuses();
-      if (typeof res.device === "string") {
-        const name = typeof res.agent === "string" ? res.agent.trim() : "";
-        this.store.setIdentity(res.device, name && [...name].length <= 40 ? name : undefined);
-      }
+      const device = typeof res.device === "string" ? res.device : undefined;
+      const name = typeof res.agent === "string" ? res.agent.trim() : "";
+      this.store.setIdentity(device, name && [...name].length <= 40 ? name : undefined);
       this.store.setMode("chat");
     });
   }

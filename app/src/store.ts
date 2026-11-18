@@ -8,7 +8,8 @@ export type Outgoing = { key: string; thread: ThreadId; text: string; state: Out
 export type ThreadCreate = { key: string; title?: string; from?: ThreadOrigin; failed?: boolean };
 export type AgentStatus = Pick<StatusEvent, "state" | "label">;
 type ChatEvent = Exclude<DurableEvent, { event: "thread" }>;
-type Identity = { device: string; agent?: string };
+type Identity = { device?: string; agent?: string };
+type LiveStatus = AgentStatus & { turnKey?: string };
 
 interface Db extends DBSchema {
   events: { key: number; value: DurableEvent };
@@ -48,7 +49,8 @@ export class Store {
   resumeCursor: number | null = null;
 
   // Status is live; hello resends it rather than replaying it from storage.
-  private statuses = new Map<ThreadId, AgentStatus>();
+  private statuses = new Map<ThreadId, LiveStatus>();
+  private unfinished = new Map<ThreadId, Set<string>>();
   private viewed = new Map<ThreadId, number>();
   private db: IDBPDatabase<Db> | null = null;
   private queueChanges = typeof BroadcastChannel === "undefined" ? undefined : new BroadcastChannel("durable-app-queue");
@@ -228,13 +230,21 @@ export class Store {
       let keys = this.echoedKeys.get(ev.thread);
       if (!keys) this.echoedKeys.set(ev.thread, keys = new Set());
       keys.add(ev.key);
+      let unfinished = this.unfinished.get(ev.thread);
+      if (!unfinished) this.unfinished.set(ev.thread, unfinished = new Set());
+      unfinished.add(ev.key);
       const m = this.outgoing(ev.thread, ev.key);
       if (m && (m.state === "queued" || m.state === "sent")) {
         return this.updateOutgoing(m, "admitted");
       }
-    } else if (ev.event === "settled") {
-      const m = this.outgoing(ev.thread, ev.key);
-      if (m && !terminal(m.state)) return this.updateOutgoing(m, ev.outcome);
+    } else if (ev.event === "settled" || (ev.event === "message" && ev.role === "assistant")) {
+      const unfinished = this.unfinished.get(ev.thread);
+      if (ev.key && unfinished?.delete(ev.key) && !unfinished.size) this.unfinished.delete(ev.thread);
+      if (ev.key && this.statuses.get(ev.thread)?.turnKey === ev.key) this.statuses.delete(ev.thread);
+      if (ev.event === "settled") {
+        const m = this.outgoing(ev.thread, ev.key);
+        if (m && !terminal(m.state)) return this.updateOutgoing(m, ev.outcome);
+      }
     }
   }
 
@@ -365,7 +375,7 @@ export class Store {
     void this.db?.put("view", { thread, cursor }).catch(console.error);
   }
 
-  status(thread: ThreadId) { return this.statuses.get(thread) ?? IDLE; }
+  status(thread: ThreadId): AgentStatus { return this.statuses.get(thread) ?? IDLE; }
 
   resetStatuses() {
     this.statuses.clear();
@@ -373,8 +383,21 @@ export class Store {
   }
 
   setStatus(s: StatusEvent) {
-    this.statuses.set(s.thread, s);
+    // Status has no key. In each thread the oldest unfinished admission runs
+    // first; hold onto its key as new messages are admitted behind it.
+    const running = s.state === "queued" || s.state === "thinking" || s.state === "tool";
+    const turnKey = running ? this.statuses.get(s.thread)?.turnKey ??
+      this.unfinished.get(s.thread)?.values().next().value : undefined;
+    this.statuses.set(s.thread, { state: s.state, label: s.label, turnKey });
     this.changed();
+  }
+
+  notePreview(thread: ThreadId, key: string) {
+    // If available, the preview identifies the turn directly. Never use its text.
+    const status = this.statuses.get(thread);
+    if (status && status.state !== "idle" && status.state !== "error" && this.unfinished.get(thread)?.has(key)) {
+      status.turnKey = key;
+    }
   }
 
   setConn(s: ConnState) {
@@ -394,8 +417,9 @@ export class Store {
     }
   }
 
-  setIdentity(device: string, agent = this.identity?.agent) {
-    if (this.identity?.device === device && this.identity.agent === agent) return;
+  setIdentity(device: string | undefined, agent: string | undefined) {
+    device ??= this.identity?.device;
+    if (this.identity?.device === device && this.identity?.agent === agent) return;
     this.identity = { device, agent };
     this.searchCache = undefined;
     this.changed();
