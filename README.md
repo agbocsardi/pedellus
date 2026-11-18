@@ -4,7 +4,7 @@ Installable web app (PWA) for a personal [Durable Nanobot](../durable-nanobot)
 gateway, reached over the tailnet with `tailscale serve`. Personal use only,
 one owner.
 
-Status: design only. No code yet.
+Status: phase 1 app (`app/`) and phase 0 probe (`phase0/`) built; gateway channel in progress.
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — how the app and gateway fit together.
 - [2026-11-18_pwa_TODO.md](./2026-11-18_pwa_TODO.md) — plan and work log.
