@@ -56,7 +56,7 @@ import {
 } from "../help/commands.js";
 import { renderMemoryDigestStart, renderMemoryDigestStatus } from "../history/memory-digest.js";
 import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
-import type { GatewayMemoryDigest, GatewayModelList, GatewayModelSelection } from "../runtime.js";
+import type { GatewayMemoryDigest, GatewayModelList, GatewayModelPresets, GatewayModelSelection } from "../runtime.js";
 import {
   APP_CLOSE,
   APP_LIMITS,
@@ -66,6 +66,7 @@ import {
   APP_REQUEST_OPS,
   parseHelloCursor,
   validAppAgentName,
+  appPresetInfos,
   validAppLabel,
   validThreadTitle,
   parseThreadId,
@@ -173,6 +174,10 @@ export interface AppGateway {
   /** Optional host model catalog for the `status` and `model` controls. */
   listModels?(sessionKey: string, context: Context): Promise<GatewayModelList>;
   selectModelPreset?(sessionKey: string, name: string, context: Context): Promise<GatewayModelSelection>;
+  /** Read-only host preset catalog (no conversation involved); `undefined` without named presets. */
+  modelPresets?(): GatewayModelPresets | undefined;
+  /** Read-only selected model of a mapped key; `undefined` when unmapped, rejects when unreadable. */
+  selectedModel?(sessionKey: string, context: Context): Promise<GatewayModelSelection | undefined>;
   /** Manual memory-digestion entry for `digest` and `digest status`. */
   memoryDigest?: GatewayMemoryDigest;
   /** Optional bounded background snapshot for the `status` control. */
@@ -545,9 +550,10 @@ function parseModelArgument(args: string): ModelArgument {
 }
 
 /** The configured preset this thread currently uses, matched by provider/model/thinking. */
-function matchingPresetName(listing: GatewayModelList): string | undefined {
-  const selected = listing.selected;
-  return listing.presets?.find((preset) => preset.provider === selected.provider &&
+function matchingPresetName(
+  presets: GatewayModelList["presets"], selected: GatewayModelSelection,
+): string | undefined {
+  return presets?.find((preset) => preset.provider === selected.provider &&
     preset.modelId === selected.modelId && (preset.thinkingLevel ?? "off") === selected.thinkingLevel)?.name;
 }
 
@@ -572,7 +578,7 @@ function modelListingText(listing: GatewayModelList): string {
       ...rows,
     ].join("\n");
   }
-  const selectedPreset = matchingPresetName(listing);
+  const selectedPreset = matchingPresetName(listing.presets, listing.selected);
   const rows = presets.slice(0, MAX_MODEL_CHOICES).map((preset) => {
     const isDefault = preset.name === listing.defaultPreset;
     return `  ${preset.name === selectedPreset ? "* " : "  "}${boundedLabel(preset.name, 80)} — ` +
@@ -781,6 +787,43 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
   };
 
+  /**
+   * Non-durable `model` events: each thread's current preset name (`null` outside the presets) to one
+   * socket or every hello'd one. Never stored in the outbox and never consumes a cursor.
+   */
+  // Pushes run one after another so a slow read can never send an older selection after a newer one.
+  let modelPushes: Promise<void> = Promise.resolve();
+  function pushModelEvents(threads: readonly string[], only?: LiveSocket): Promise<void> {
+    const next = modelPushes.then(() => sendModelEvents(threads, only));
+    modelPushes = next.catch(() => undefined);
+    return next;
+  }
+
+  async function sendModelEvents(threads: readonly string[], only?: LiveSocket): Promise<void> {
+    for (const thread of threads) {
+      const host = gateway.modelPresets?.();
+      if (host === undefined || gateway.selectedModel === undefined || !openThread(state, thread)) continue;
+      // Name only presets hello.presets can list; anything dropped by the wire bounds reads as null.
+      const listed = new Set(appPresetInfos(host.presets).map((info) => info.name));
+      if (listed.size === 0) continue;
+      let selected: GatewayModelSelection | undefined;
+      try {
+        selected = await gateway.selectedModel(sessionForThread(thread), adapterContext);
+      } catch {
+        // An unreadable selection is unknown, never reported as the default.
+        continue;
+      }
+      // A thread without a mapped conversation yet runs the configured default preset.
+      const name = selected === undefined ? host.defaultPreset : matchingPresetName(host.presets, selected);
+      const preset = name !== undefined && listed.has(name) ? name : null;
+      if (!openThread(state, thread)) continue;
+      const frame = JSON.stringify({ type: "event", event: "model", thread, preset });
+      for (const socket of only === undefined ? sockets.values() : [only]) {
+        if (socket.hello && socket.session.isOpen()) socket.session.send(frame);
+      }
+    }
+  }
+
   // ── Sockets ───────────────────────────────────────────────────────────────
 
   const onSocket = (session: AppDeviceSession, hooks: AppSessionHooks): void => {
@@ -909,9 +952,12 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       sendError("bad_request");
       return;
     }
+    // Synchronous host read: no await between here and `hello = true`, so no frame slips in first.
+    const presets = appPresetInfos(gateway.modelPresets?.()?.presets);
     socket.hello = true;
     sendOk({
       v: APP_PROTOCOL_VERSION, device: socket.session.label, head: headCursor(), agent: agentName, commands: commandInfos,
+      presets,
     });
     // Replay from the acknowledged position (or the retention floor), oldest first, bounded.
     const head = headCursor();
@@ -930,6 +976,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       socket.session.send(statusFrame(APP_MAIN_THREAD, statuses.get(APP_MAIN_THREAD) ?? "idle"));
       for (const [thread, status] of statuses) {
         if (thread !== APP_MAIN_THREAD) socket.session.send(statusFrame(thread, status));
+      }
+      if (presets.length > 0) {
+        const open = (state.threads ?? []).filter((entry) => entry.id !== APP_MAIN_THREAD && !entry.archived);
+        await pushModelEvents([APP_MAIN_THREAD, ...open.map((entry) => entry.id)], socket);
       }
     }
   }
@@ -1020,6 +1070,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     sendOk({ thread, duplicate: false });
     pushEventsToSockets();
+    await pushModelEvents([thread]);
   }
 
   async function renameThread(
@@ -1840,6 +1891,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       outcome = await applyModelPreset(record);
     }
     if (outcome.kind !== "applied") return outcome;
+    if (record.command === "model") await pushModelEvents([record.thread]);
     await mutateState((doc) => {
       const entry = doc.controls.find((item) => item.key === record.key);
       if (entry !== undefined) entry.status = "applied";

@@ -489,15 +489,38 @@ test('hello lists the app command catalogue and control routes args to the owner
       return notices().at(-1);
     };
 
+    // Presets come from the host, not a conversation: the first hello on a fresh gateway (main unmapped)
+    // already lists them and reports the default for main. Model events never consume a cursor.
+    const presetList = [
+      { name: 'fast', model: 'fixture/alpha', thinking: 'off' },
+      { name: 'deep', model: 'fixture/beta', thinking: 'high' },
+    ];
+    assert.deepEqual(device.response('h1').presets, presetList);
+    await device.wait(() => device.events('model').length === 1, 'model event after first replay');
+    assert.deepEqual(device.events('model')[0], { type: 'event', event: 'model', thread: 'main', preset: 'fast' });
+    device.send({ type: 'req', id: 'h2', op: 'hello', v: 2, cursor: null });
+    await device.wait(() => device.events('model').length === 2, 'model event after second hello');
+    assert.equal(device.response('h2').head, device.response('h1').head, 'model events consume no cursor');
+
     assert.match(await lastNotice('m1', { command: 'model' }, 'preset listing'),
       /\* fast — fixture alpha \[thinking: off\] \(default\)/u);
     assert.equal(await lastNotice('m2', { command: 'model', args: 'deep' }, 'preset applied'),
       'Model set to fixture/beta (thinking: high) for this thread.');
+    await device.wait(() => device.events('model').length === 3, 'model event after switch');
+    assert.equal(device.events('model')[2].preset, 'deep');
+    assert.equal((await appState(store.gateway)).events.some((event) => event.event === 'model'), false, 'model is never durable');
     const state = await appState(store.gateway);
     assert.deepEqual([state.controls.at(-1).command, state.controls.at(-1).option, state.controls.at(-1).status],
       ['model', 'deep', 'applied']);
+    const modelEvents = () => device.events('model').length;
+    device.send({ type: 'req', id: 'tc', op: 'thread.create', key: 'model-thread' });
+    await device.wait(() => modelEvents() === 4, 'model event for the new thread');
+    const sideA = device.response('tc').thread;
+    assert.deepEqual(device.events('model')[3], { type: 'event', event: 'model', thread: sideA, preset: 'fast' });
+    const before = modelEvents();
     assert.match(await lastNotice('m3', { command: 'model', args: 'nope' }, 'unknown preset'),
       /^Unknown model preset nope: nothing was changed\./u);
+    assert.equal(modelEvents(), before, 'a refused preset change emits no model event');
 
     // Bad arguments answer with the catalogue's usage line and no effect.
     assert.match(await lastNotice('u1', { command: 'model', args: 'a b' }, 'model usage'), /^Usage: \/model .*Nothing was sent/u);
@@ -508,6 +531,22 @@ test('hello lists the app command catalogue and control routes args to the owner
     assert.match(await lastNotice('p1', { command: 'help' }, 'help listing'), /^Controls for this thread[\s\S]*\/model \[preset\]/u);
     assert.match(await lastNotice('p2', { command: 'help', args: 'restart' }, 'help detail'), /^Usage: \/restart\n/u);
     assert.match(await lastNotice('d1', { command: 'digest', args: 'status' }, 'digest status'), /\S/u);
+
+    // `new` leaves the selection alone; an archived thread gets no model event on a later hello. A thread
+    // opened after the archived one proves the event pass finished without it.
+    assert.equal(await lastNotice('n1', { command: 'new' }, 'new notice'), 'Context reset.');
+    device.send({ type: 'req', id: 'tb', op: 'thread.create', key: 'model-thread-b' });
+    await device.wait(() => device.response('tb') !== undefined, 'second thread created');
+    const sideB = device.response('tb').thread;
+    await device.wait(() => device.events('model').some((event) => event.thread === sideB), 'model event for the second thread');
+    device.send({ type: 'req', id: 'ar', op: 'thread.archive', thread: sideA, archived: true });
+    await device.wait(() => device.response('ar') !== undefined, 'archive reply');
+    assert.equal(device.response('ar').ok, true);
+    const seen = modelEvents();
+    device.send({ type: 'req', id: 'h3', op: 'hello', v: 2, cursor: null });
+    await device.wait(() => modelEvents() >= seen + 2, 'model events after the third hello');
+    const latest = device.events('model').slice(seen);
+    assert.deepEqual(latest.map((event) => [event.thread, event.preset]), [['main', 'deep'], [sideB, 'fast']]);
 
     // Restart: durable acknowledgement first, then exactly one host request; a second is not re-requested.
     assert.equal(await lastNotice('r1', { command: 'restart' }, 'restart ack'), 'Restart requested; checking active work.');

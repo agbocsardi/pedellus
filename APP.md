@@ -189,6 +189,22 @@ records the requesting thread durably, then asks the host once, and the replacem
 bad arguments are answered by a usage notice with no effect; a non-string `command`/`args` or
 oversize `args` is `bad_request`.
 
+### Model presets and `model` events
+
+`hello.presets` lists the host's named presets (config order, bounded; `[]` without named presets),
+read from the live host catalogue (`Gateway.modelPresets()`), so it needs no conversation, is
+complete on a fresh deployment and follows `/reload`. After the replay, and again whenever a
+thread's selection changes (`model` control, new thread), the gateway sends a non-durable
+`model{thread, preset}` event: it is never stored, never consumes a cursor and never moves `head`.
+A mapped thread reports its selection (`Gateway.selectedModel()`, read-only); a thread with no
+mapping yet reports the configured default; a thread whose selection cannot be read, an archived
+thread and a refused or unknown preset send nothing. `/new` appends a context entry and does not
+touch the stored model selection, so it sends no `model` event.
+Presets are bounded on the wire (at most 50; an entry whose name or `provider/model` is
+unprintable, contains whitespace or is too long is dropped) and a `model` event only names a
+listed preset, otherwise `null`. Known gap: a CLI `/reload` that changes presets or resets
+selections is not pushed to connected apps; they see it on their next `hello`.
+
 ## Scheduled results and interruption notices
 
 The adapter consumes the channel-neutral durable outbox (`nanobot.cron.deliveries`) for each

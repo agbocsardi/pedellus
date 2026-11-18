@@ -32,6 +32,10 @@ export const APP_LIMITS = Object.freeze({
   labelMaxChars: 40,
   /** Agent display name in the hello reply: at most 40 printable characters. */
   agentNameMaxChars: 40,
+  /** `hello.presets`: at most this many entries, each field bounded in characters. */
+  maxPresets: 50,
+  presetNameChars: 80,
+  presetModelChars: 240,
   cookieName: "durable_device",
   /** Distinct paired devices retained; further pairing is refused until one is revoked. */
   maxDevices: 16,
@@ -63,6 +67,8 @@ export const APP_CLOSE = Object.freeze({
 export type AppErrorCode = "bad_request" | "too_large" | "unsupported" | "not_ready" | "internal";
 /** One `hello.commands` entry, rendered from the shared catalogue's `app` surface. */
 export type AppCommandInfo = { name: string; args?: string; summary: string; usage: string };
+/** One `hello.presets` entry; `model` is `provider/model`. */
+export type AppPresetInfo = { name: string; model: string; thinking?: string };
 export const APP_REQUEST_OPS: readonly string[] = [
   "hello", "send", "ack", "control", "ping", "history", "tasks",
   "threads", "thread.create", "thread.rename", "thread.archive",
@@ -95,6 +101,22 @@ export function validAppAgentName(value: unknown): value is string {
   if (typeof value !== "string" || value.length === 0) return false;
   if (value.length > APP_LIMITS.agentNameMaxChars || value.trim() === "") return false;
   return /^[\x20-\x7e\u00a0-\uffff]+$/u.test(value) && !/[\u202a-\u202e\u2066-\u2069]/u.test(value);
+}
+
+/** Project configured presets onto the bounded wire shape; entries with unprintable fields are dropped. */
+export function appPresetInfos(
+  presets: readonly { name: string; provider: string; modelId: string; thinkingLevel?: string }[] | undefined,
+): AppPresetInfo[] {
+  const printable = (value: unknown, max: number): value is string => typeof value === "string" &&
+    value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069\s]/u.test(value);
+  const out: AppPresetInfo[] = [];
+  for (const preset of presets ?? []) {
+    const model = `${preset.provider}/${preset.modelId}`;
+    if (!printable(preset.name, APP_LIMITS.presetNameChars) || !printable(model, APP_LIMITS.presetModelChars)) continue;
+    out.push({ name: preset.name, model, ...(preset.thinkingLevel === undefined ? {} : { thinking: preset.thinkingLevel }) });
+    if (out.length >= APP_LIMITS.maxPresets) break;
+  }
+  return out;
 }
 
 /**
