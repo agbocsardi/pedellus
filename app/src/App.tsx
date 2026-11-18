@@ -28,34 +28,42 @@ export function App({ store }: { store: Store }) {
     };
   }, [store]);
 
-  // The keyboard can both shrink and pan the visual viewport on iOS.
+  // iOS keyboard handling, chosen on device with /keyboard-lab.html (F):
+  // the shell follows the visual viewport, the page scroll is snapped back,
+  // a tap focuses fields without letting iOS pan, and closing the keyboard
+  // blurs the field (iPad keeps focus otherwise, so the next tap would take
+  // iOS's own scrolling focus path and the header would bounce).
   useEffect(() => {
     const vv = window.visualViewport;
     if (!vv) return;
     const style = document.documentElement.style;
-    let frame: number | undefined;
+    const isField = (el: EventTarget | null): el is HTMLElement =>
+      el instanceof HTMLElement && el.matches(".app textarea, .app input");
+    const kbOpen = () => vv.height < window.innerHeight - 80;
+    let wasOpen = false;
     const sync = () => {
-      frame = undefined;
-      // iOS can still scroll the layout viewport after focusing a field.
-      if ((window.scrollX || window.scrollY) &&
-          document.activeElement?.matches(".app textarea, .app input")) {
-        window.scrollTo(0, 0);
-      }
+      const open = kbOpen();
+      if (wasOpen && !open && isField(document.activeElement)) document.activeElement.blur();
+      wasOpen = open;
+      if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
       style.setProperty("--app-h", `${vv.height}px`);
-      style.setProperty("--vv-top", `${vv.offsetTop}px`);
+      style.setProperty("--vv-top", `${open ? vv.offsetTop : 0}px`);
     };
-    const schedule = () => { frame ??= requestAnimationFrame(sync); };
-    vv.addEventListener("resize", schedule);
-    vv.addEventListener("scroll", schedule);
-    window.addEventListener("scroll", schedule);
-    document.addEventListener("focusin", schedule);
+    const tap = (e: TouchEvent) => {
+      if (!isField(e.target) || kbOpen()) return;
+      e.preventDefault();
+      e.target.focus({ preventScroll: true });
+    };
+    vv.addEventListener("resize", sync);
+    vv.addEventListener("scroll", sync);
+    window.addEventListener("scroll", sync, { passive: true });
+    document.addEventListener("touchend", tap, { passive: false });
     sync();
     return () => {
-      vv.removeEventListener("resize", schedule);
-      vv.removeEventListener("scroll", schedule);
-      window.removeEventListener("scroll", schedule);
-      document.removeEventListener("focusin", schedule);
-      if (frame !== undefined) cancelAnimationFrame(frame);
+      vv.removeEventListener("resize", sync);
+      vv.removeEventListener("scroll", sync);
+      window.removeEventListener("scroll", sync);
+      document.removeEventListener("touchend", tap);
       style.removeProperty("--app-h");
       style.removeProperty("--vv-top");
     };
