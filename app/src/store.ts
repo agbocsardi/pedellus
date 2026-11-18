@@ -32,6 +32,7 @@ export class Store {
   threads = new Map<ThreadId, ThreadInfo>([[MAIN_THREAD, MAIN]]);
   creates = new Map<string, ThreadCreate>();
   threadListUnavailable = false;
+  forkRejected = false;
   openThread: ThreadId = MAIN_THREAD;
   connState: ConnState = "offline";
   mode: Mode = "boot";
@@ -327,10 +328,17 @@ export class Store {
     return c;
   }
 
-  async finishCreate(c: ThreadCreate, ok: boolean) {
-    if (ok) {
+  clearForkRejection() {
+    if (!this.forkRejected) return;
+    this.forkRejected = false;
+    this.changed();
+  }
+
+  async finishCreate(c: ThreadCreate, ok: boolean, rejectedFork = false) {
+    if (ok || rejectedFork) {
       await this.db?.delete("creates", c.key);
       this.creates.delete(c.key);
+      if (rejectedFork) this.forkRejected = true;
     } else {
       const failed = { ...c, failed: true };
       await this.db?.put("creates", failed);

@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type 
 import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
-import { LIMITS, MAIN_THREAD, type DurableEvent, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { LIMITS, MAIN_THREAD, type DurableEvent, type MessageEvent, type ThreadInfo, type ThreadOrigin } from "./protocol";
 import { Avatar, type AvatarState } from "./Avatar";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
@@ -72,6 +72,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
+  const jumpCursor = useRef<number | undefined>(undefined);
   const pinned = useRef(true);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const press = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
@@ -88,8 +89,13 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const preview = archived ? undefined : store.preview(thread);
   const p = presence(store);
   const latest = store.latestViewable(thread);
-  const source = store.threads.get(info?.origin?.thread ?? MAIN_THREAD);
+  const origin = info?.origin;
+  const source = store.threads.get(origin?.thread ?? MAIN_THREAD);
+  const sourceMessage = origin && store.events.get(origin.thread)?.find((ev): ev is MessageEvent =>
+    ev.event === "message" && ev.id === origin.messageId);
+  const sourceTitle = origin?.thread === MAIN_THREAD ? "Main" : source?.title ?? "another thread";
   const back = source ?? store.threads.get(MAIN_THREAD)!;
+  const forkError = store.forkRejected ? "Could not start a side thread from that message." : "";
   const forks = new Map<string, ThreadInfo[]>();
   let hasOtherActivity = false;
   for (const t of store.threads.values()) {
@@ -129,6 +135,16 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   useLayoutEffect(() => {
     const el = scroller.current;
     if (!el || sheet || document.hidden) return;
+    if (jumpCursor.current !== undefined) {
+      const target = el.querySelector<HTMLElement>(`[data-message-cursor="${jumpCursor.current}"]`);
+      jumpCursor.current = undefined;
+      if (target) {
+        pinned.current = false;
+        target.scrollIntoView({ block: "center" });
+        target.focus({ preventScroll: true });
+        return;
+      }
+    }
     if (pinned.current) el.scrollTop = el.scrollHeight;
     markAtBottom(el);
   });
@@ -156,6 +172,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
   function show(next: Sheet) {
     taRef.current?.blur();
+    store.clearForkRejection();
     setError("");
     setSheet(next);
   }
@@ -307,7 +324,17 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         onPointerCancel={cancelPress}
         onPointerLeave={cancelPress}
       >
-        {empty && !running && !preview && (
+        {origin && <div className="msg origin-card-wrap">
+          <button className="origin-card" disabled={!source} onClick={() => {
+            jumpCursor.current = sourceMessage?.cursor;
+            store.selectThread(origin.thread);
+          }}>
+            <b>Started from {sourceTitle}</b>
+            <span>{sourceMessage?.text.slice(0, 220).trim() || "Original message not cached."}
+              {(sourceMessage?.text.length ?? 0) > 220 ? "…" : ""}</span>
+          </button>
+        </div>}
+        {!origin && empty && !running && !preview && (
           <div className="empty">
             <div className="avatar-slot big">
               <Avatar state={p.avatar} />
@@ -315,7 +342,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             <h2>{title}</h2>
             <p>{archived ? "No messages in this thread." : main
               ? "One ongoing thread with your agent. Ask anything to get started."
-              : info?.origin ? "Forked from an earlier message." : "A fresh conversation with your agent."}</p>
+              : "A fresh conversation with your agent."}</p>
           </div>
         )}
         {rows.map((r, i) =>
@@ -340,7 +367,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       </div>
 
       <footer className="composer">
-        {!sheet && error && <p className="error-text" role="alert">{error}</p>}
+        {!sheet && (error || forkError) && <p className="error-text" role="alert">{error || forkError}</p>}
         {archived ? (
           <p className="archived-hint">{archivedLabel(info)} · {online
             ? <button disabled={busy} onClick={() => void toggleArchive()}>Restore to reply</button>
@@ -404,7 +431,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             {(sheet.kind === "create" || sheet.kind === "rename") && (
               <ThreadTitleForm key={sheet.kind} kind={sheet.kind} initial={sheet.title} busy={busy} online={online} save={saveTitle} />
             )}
-            {error && <p className="error-text" role="alert">{error}</p>}
+            {(error || forkError) && <p className="error-text" role="alert">{error || forkError}</p>}
             <button className="sheet-cancel" onClick={() => { setError(""); setSheet(null); }}>
               {sheet.kind === "list" ? "Done" : "Cancel"}
             </button>
@@ -547,11 +574,14 @@ function EventRow({ ev, store, last, forks }: { ev: DurableEvent; store: Store; 
   }
   if (ev.event !== "message") return null; // settled only drives delivery state
   const state = ev.key ? store.outgoing(ev.thread, ev.key)?.state : undefined;
+  const anchor = Number.isSafeInteger(ev.cursor) && ev.cursor > 0 && ev.role !== "notice"
+    ? { "data-message-id": ev.id, "data-message-cursor": ev.cursor, "data-thread-title": suggestedTitle(ev.text), tabIndex: -1 }
+    : undefined;
   return <>
     {ev.role === "notice" ? <div className="notice">{ev.text}</div> : ev.role === "user" ? (
-      <UserBubble text={ev.text} messageId={ev.id} state={state} at={ev.at} last={last} />
+      <UserBubble text={ev.text} anchor={anchor} state={state} at={ev.at} last={last} />
     ) : (
-      <div className="msg assistant" data-message-id={ev.id} data-thread-title={suggestedTitle(ev.text)}>
+      <div className="msg assistant" {...anchor}>
         <Streamdown>{ev.text}</Streamdown>
       </div>
     )}
@@ -573,14 +603,13 @@ const DELIV: Record<OutgoingState, { label: string; icon: ReactNode }> = {
   aborted: { label: "Stopped", icon: <Icon d="M6 6l12 12M18 6 6 18" /> },
 };
 
-function UserBubble(props: { text: string; messageId?: string; state?: OutgoingState; at?: string | number; last: boolean }) {
+function UserBubble(props: { text: string; anchor?: React.HTMLAttributes<HTMLDivElement>; state?: OutgoingState; at?: string | number; last: boolean }) {
   const { state } = props;
   const show = state && (props.last || state === "queued" || state === "sent" || state === "failed");
   const d = state && DELIV[state];
   return (
     <div className="row user">
-      <div className="bubble" data-message-id={props.messageId}
-        data-thread-title={props.messageId ? suggestedTitle(props.text) : undefined}>{props.text}</div>
+      <div className="bubble" {...props.anchor}>{props.text}</div>
       {show && d && (
         <span className="deliv" data-state={state}>
           {state === "admitted" || state === "answered" || state === "sent" ? clock(props.at) : d.label}

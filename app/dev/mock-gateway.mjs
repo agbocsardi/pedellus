@@ -324,14 +324,12 @@ function onStream(ws, token) {
         const existing = created.get(key);
         if (existing) return reply(ws, frame.id, true, { thread: existing, duplicate: true });
         if (full()) return invalid();
-        let source = [];
         let origin;
         if (from !== undefined) {
           if (!from || typeof from.messageId !== "string" || !threads.has(from.thread)) return invalid();
-          const messages = events.filter((e) => e.event === "message" && e.thread === from.thread && e.role !== "notice");
-          const anchor = messages.findIndex((e) => e.id === from.messageId);
-          if (anchor < 0) return invalid();
-          source = messages.slice(0, anchor + 1);
+          const anchor = events.find((e) => e.event === "message" && e.thread === from.thread &&
+            e.id === from.messageId && (e.role === "user" || e.role === "assistant"));
+          if (!anchor) return invalid();
           origin = { thread: from.thread, messageId: from.messageId };
         }
         const id = `t_${randomBytes(12).toString("hex")}`;
@@ -339,11 +337,6 @@ function onStream(ws, token) {
         created.set(key, id);
         reply(ws, frame.id, true, { thread: id, duplicate: false });
         threadChanged(added);
-        // Synthetic transcript: copy visible history with fresh identity and
-        // without send keys (inherited messages aren't admissions).
-        for (const { role, text, at } of source) {
-          broadcast({ type: "event", event: "message", thread: id, id: `f${cursor + 1}`, role, text, at });
-        }
         break;
       }
       case "thread.rename": {

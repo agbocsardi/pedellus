@@ -23,8 +23,8 @@ mock and the same value as `MOCK_PORT` on Vite (dev or preview). Mock credential
 threads and cursors are in memory; after a mock restart use a fresh browser
 profile or clear site data before pairing again. Set `IDLE_ARCHIVE_MS=3000`
 on the mock to try automatic archiving after three seconds of idleness.
-The mock shows fork history by copying messages through the selected message;
-it doesn't run a real agent.
+The mock records and validates fork origins without copying messages into
+the new thread. It doesn't run a real agent.
 
 The production build, incl. the service worker and its precache manifest:
 

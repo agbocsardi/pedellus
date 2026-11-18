@@ -670,6 +670,40 @@ input#pair-code {
 [data-message-id] {
   -webkit-touch-callout: none;
 }
+[data-message-cursor]:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.origin-card-wrap {
+  margin-bottom: 12px;
+}
+.origin-card {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  max-width: 28rem;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-inline-start: 3px solid var(--accent);
+  border-radius: 12px;
+  background: var(--card);
+  font-size: 0.85rem;
+  text-align: start;
+}
+.origin-card b {
+  color: var(--accent);
+}
+.origin-card span {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  color: var(--muted-ink);
+}
+.origin-card:disabled {
+  cursor: default;
+}
 .fork-links {
   display: flex;
   flex-wrap: wrap;

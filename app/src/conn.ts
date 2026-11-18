@@ -98,7 +98,7 @@ export class Connection {
     if (this.store.connState !== "open") return;
     this.request({ type: "req", id: this.id(), op: "thread.create", key: c.key, title: c.title, from: c.from }, async (res) => {
       if (!res) return; // No reply: retry the same key after replay.
-      await this.store.finishCreate(c, res.ok);
+      await this.store.finishCreate(c, res.ok, !!c.from && !res.ok && res.error === "bad_request");
       if (res.ok && res.thread && openFrom === this.store.openThread) {
         if (this.store.threads.has(res.thread)) this.store.selectThread(res.thread);
         else this.selectCreated = { thread: res.thread, from: openFrom };
