@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Phase 0 Probe</title>
+  <meta name="theme-color" content="#466ee6">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icons/icon-180.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font: 16px/1.45 system-ui, sans-serif;
+      margin: 0 auto;
+      max-width: 34rem;
+      padding: 1rem;
+      padding-bottom: calc(1.5rem + env(safe-area-inset-bottom));
+    }
+    h1 { font-size: 1.25rem; margin: .5rem 0; }
+    h2 { font-size: 1rem; margin: .1rem 0 .6rem; }
+    section {
+      border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+      border-radius: .6rem;
+      padding: .8rem 1rem;
+      margin: 1rem 0;
+    }
+    button {
+      font: inherit;
+      padding: .45rem .8rem;
+      margin: .15rem .3rem .15rem 0;
+      border-radius: .4rem;
+      border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+      background: color-mix(in srgb, currentColor 8%, transparent);
+      color: inherit;
+    }
+    p { margin: .4rem 0; overflow-wrap: anywhere; }
+    .note { font-size: .85rem; opacity: .7; }
+    code { font-family: ui-monospace, monospace; font-size: .85em; }
+    dl { margin: .4rem 0; }
+    dd { margin: 0 0 .3rem 1rem; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Phase 0 probe</h1>
+    <p class="note">Throwaway checks for the PWA plan: installed-app detection, service worker,
+      Web Push, badge, cookie jar. See <code>phase0/README.md</code>.</p>
+
+    <section>
+      <h2>1 &middot; Display mode</h2>
+      <p id="display-mode">&hellip;</p>
+    </section>
+
+    <section>
+      <h2>2 &middot; Service worker</h2>
+      <p id="sw-status">&hellip;</p>
+      <p id="sw-detail">&hellip;</p>
+    </section>
+
+    <section>
+      <h2>3 &middot; Notifications &amp; push</h2>
+      <p id="push-status">&hellip;</p>
+      <button id="enable-push">Enable notifications &amp; subscribe</button>
+      <button id="test-push">Send test push in 10 s</button>
+      <p class="note">On iOS, do this <em>inside the installed home-screen app</em>, not a Safari
+        tab. Tap &ldquo;send test push&rdquo;, then lock the phone and wait.</p>
+    </section>
+
+    <section>
+      <h2>4 &middot; Badge</h2>
+      <p id="badge-status">&hellip;</p>
+      <button id="badge-1">Set badge 1</button>
+      <button id="badge-3">Set badge 3</button>
+      <button id="badge-clear">Clear badge</button>
+      <p class="note">Then go to the home screen and look at the app icon.</p>
+    </section>
+
+    <section>
+      <h2>5 &middot; Cookie &amp; storage jar</h2>
+      <p id="jar-status">&hellip;</p>
+      <button id="jar-set">Set new token in this jar</button>
+      <dl>
+        <dt>cookie <code>probe_token</code></dt><dd id="jar-cookie">&hellip;</dd>
+        <dt>localStorage <code>probe_token</code></dt><dd id="jar-local">&hellip;</dd>
+      </dl>
+      <p class="note">Set a token in Safari, then open the installed app (or vice versa).
+        Different or missing values = the jars are separate.</p>
+    </section>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

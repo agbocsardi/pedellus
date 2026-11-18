@@ -1,0 +1,16 @@
+{
+  "name": "phase0-probe",
+  "private": true,
+  "type": "module",
+  "description": "Throwaway phase 0 probe: iOS PWA push/badge/cookie-jar checks behind tailscale serve.",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "web-push": "4.0.0"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "icons": "node gen-icons.mjs"
+  }
+}
