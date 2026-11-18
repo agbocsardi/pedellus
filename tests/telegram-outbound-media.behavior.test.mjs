@@ -235,11 +235,15 @@ function telegramMock(batches) {
   };
 }
 
+// Polling waits use the real timer (not a busy setImmediate spin, which starves parallel test files of CPU),
+// captured at load so a test that mocks setTimeout cannot stall them.
+const realSetTimeout = globalThis.setTimeout;
+
 async function until(predicate, label) {
   const deadline = Date.now() + WAIT_MS;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => realSetTimeout(resolve, 2));
   }
 }
 
@@ -247,7 +251,7 @@ async function untilAsync(predicate, label) {
   const deadline = Date.now() + WAIT_MS;
   while (!(await predicate())) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => realSetTimeout(resolve, 2));
   }
 }
 
@@ -412,7 +416,7 @@ test('five native kinds upload bounded workspace files with captions from the cu
     async (signal) => {
       while (!transport.sent.some((entry) => entry.text === 'FILES-SENT')) {
         if (signal?.aborted) return [];
-        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => realSetTimeout(resolve, 2));
       }
       return [messageUpdate(702, 101, 'cross target')];
     },

@@ -89,6 +89,10 @@ function messageUpdate(updateId, messageId, text, chatId = CHAT_ID, extra = {}) 
   };
 }
 
+// Polling waits use the real timer (not a busy setImmediate spin, which starves parallel test files of CPU),
+// captured at load so a test that mocks setTimeout cannot stall them.
+const realSetTimeout = globalThis.setTimeout;
+
 /**
  * Let the next poll happen only after `predicate` holds, so a test can admit a message after an
  * earlier turn was answered instead of relying on a timer or an accidental same-batch grouping.
@@ -97,7 +101,7 @@ function after(predicate, updates) {
   return async (signal) => {
     while (!predicate()) {
       signal?.throwIfAborted();
-      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => realSetTimeout(resolve, 2));
     }
     signal?.throwIfAborted();
     return updates;
@@ -260,7 +264,7 @@ async function until(predicate, label) {
   const deadline = Date.now() + WAIT_MS;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => realSetTimeout(resolve, 2));
   }
 }
 

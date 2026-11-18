@@ -31,11 +31,15 @@ const { BACKGROUND_CONTEXT } = await import(pathToFileURL(`${modules}/chord/dist
 const context = BACKGROUND_CONTEXT;
 const timeoutMs = 15_000;
 
+// Polling waits use the real timer (not a busy setImmediate spin, which starves parallel test files of CPU),
+// captured at load so a test that mocks setTimeout cannot stall them.
+const realSetTimeout = globalThis.setTimeout;
+
 async function eventually(check, label) {
   const deadline = Date.now() + timeoutMs;
   while (!(await check())) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => realSetTimeout(resolve, 2));
   }
 }
 
