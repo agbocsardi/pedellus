@@ -84,6 +84,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const info = store.threads.get(thread);
   const title = main ? "Durable" : info?.title ?? "New thread";
   const archived = !!info?.archived;
+  const writable = store.canWrite(thread);
   const text = drafts[thread] ?? "";
   const setText = (value: string) => setDrafts((prev) => ({ ...prev, [thread]: value }));
   const online = store.connState === "open";
@@ -97,7 +98,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     ev.event === "message" && ev.id === origin.messageId);
   const sourceTitle = origin?.thread === MAIN_THREAD ? "Main" : source?.title ?? "another thread";
   const back = source ?? store.threads.get(MAIN_THREAD)!;
-  const canRetry = !archived && !running;
+  const canRetry = writable && !running;
   const forkError = store.forkRejected ? "Could not start a side thread from that message." : "";
   const forks = new Map<string, ThreadInfo[]>();
   let hasOtherActivity = false;
@@ -166,7 +167,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     if (!ta) return;
     ta.style.height = "auto";
     ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
-  }, [text, thread, archived]);
+  }, [text, thread, writable]);
 
   function cancelPress() {
     if (press.current) clearTimeout(press.current.timer);
@@ -182,7 +183,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   }
 
   async function submit() {
-    if (store.threads.get(thread)?.archived) return;
+    if (!store.canWrite(thread)) return;
     if (running) {
       conn.control(thread, "abort");
       return;
@@ -193,7 +194,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   }
 
   async function queueMessage(value: string, retryKey?: string) {
-    if (savingMessage.current || store.threads.get(thread)?.archived) return;
+    if (savingMessage.current || !store.canWrite(thread)) return;
     savingMessage.current = true;
     setError("");
     try {
@@ -205,6 +206,14 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       setError("Can’t save offline on this device.");
     } finally {
       savingMessage.current = false;
+    }
+  }
+
+  async function discardMessage(key: string) {
+    try {
+      await store.discardOutgoing(key);
+    } catch {
+      setError("Could not discard this queued message.");
     }
   }
 
@@ -368,7 +377,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           ) : (
             <UserBubble key={`p${r.m.key}`} text={r.m.text} state={r.m.state} at={r.m.at} last={i === lastUser}
               onRetry={canRetry && r.m.state === "failed" ? () => void queueMessage(r.m.text, r.m.key) : undefined}
-              held={archived} />
+              held={!writable ? archived ? "Held until restored" : "Thread unavailable" : undefined}
+              onDiscard={!writable || r.m.state === "failed" ? () => void discardMessage(r.m.key) : undefined} />
           ),
         )}
         {preview ? (
@@ -390,7 +400,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           <p className="archived-hint">{archivedLabel(info)} · {online
             ? <button disabled={busy} onClick={() => void toggleArchive()}>Restore to reply</button>
             : "Reconnect to restore"}</p>
-        ) : <div className="capsule">
+        ) : !writable ? <p className="archived-hint">Read-only until thread details are available.</p> : <div className="capsule">
           <textarea
             ref={taRef}
             value={text}
@@ -428,13 +438,13 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             {sheet.kind === "list" && <ThreadList store={store} conn={conn} online={online} onNew={() => show({ kind: "create", title: "" })}
               onSelect={(id) => { setSheet(null); store.selectThread(id); }} />}
             {sheet.kind === "menu" && <>
-              {!archived && <>
+              {writable && <>
                 <SheetItem icon="M12 5v14M5 12h14" title="New context"
                   sub="Start fresh; earlier messages stay above a divider" disabled={!online} onClick={() => command("new")} />
                 <SheetItem icon="M3 12h4l3-8 4 16 3-8h4" title="Status"
                   sub="Ask the agent what it is doing" disabled={!online} onClick={() => command("status")} />
               </>}
-              {!main && <>
+              {!main && (writable || archived) && <>
                 <SheetItem icon="M4 20h4L20 8l-4-4L4 16v4Z" title="Rename thread" disabled={!online || busy}
                   onClick={() => show({ kind: "rename", title })} />
                 <SheetItem icon="M4 9h16v11H4zM3 4h18v5H3zM10 13h4" title={archived ? "Restore thread" : "Archive thread"}
@@ -442,6 +452,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
                   disabled={!online || busy} onClick={() => void toggleArchive()} />
               </>}
               {!online && <p className="sheet-help">Reconnect to use these controls.</p>}
+              {!writable && !archived && <p className="sheet-help">Thread details are not available.</p>}
             </>}
             {sheet.kind === "message" && <SheetItem icon={LIST_ICON} title="Start side thread from here"
               sub="Fork the conversation at this message"
@@ -497,18 +508,22 @@ function ThreadList({ store, conn, online, onNew, onSelect }: {
   store: Store; conn: Connection; online: boolean; onNew: () => void; onSelect: (thread: string) => void;
 }) {
   const [input, setInput] = useState("");
-  const query = input.trim();
+  const query = input.trim() ? input : "";
+  const [remote, setRemote] = useState<{ query: string; ids: ReadonlySet<string> }>();
   useEffect(() => {
     if (!query || !online || TITLE_CONTROL.test(query)) return;
-    const timer = setTimeout(() => conn.searchThreads(query), 250);
-    return () => clearTimeout(timer);
+    let current = true;
+    const timer = setTimeout(() => conn.searchThreads(query, (ids) => {
+      if (current) setRemote({ query, ids });
+    }), 250);
+    return () => { current = false; clearTimeout(timer); };
   }, [conn, online, query]);
 
   const main = store.threads.get(MAIN_THREAD)!;
   const side = [...store.threads.values()].filter((t) => t.id !== MAIN_THREAD)
     .sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
   const archived = side.filter((t) => t.archived);
-  const results = query ? store.searchThreads(query) : [];
+  const results = query ? store.searchThreads(query, remote?.query === query ? remote.ids : undefined) : [];
   const row = (t: ThreadInfo, snippet?: string) => (
     <button key={t.id} className="sheet-item thread-row" aria-current={store.openThread === t.id ? "true" : undefined}
       onClick={() => onSelect(t.id)}>
@@ -638,7 +653,7 @@ const DELIV: Record<OutgoingState, { label: string; icon: ReactNode }> = {
 
 function UserBubble(props: {
   text: string; anchor?: React.HTMLAttributes<HTMLDivElement>; state?: OutgoingState; at?: string | number;
-  last: boolean; onRetry?: () => void; held?: boolean;
+  last: boolean; onRetry?: () => void; onDiscard?: () => void; held?: string;
 }) {
   const { state } = props;
   const show = state && (props.last || state === "queued" || state === "sent" || state === "failed");
@@ -648,9 +663,10 @@ function UserBubble(props: {
       <div className="bubble" {...props.anchor}>{props.text}</div>
       {show && d && (
         <span className="deliv" data-state={state}>
-          {props.held && (state === "queued" || state === "sent") ? "Held until restored"
+          {props.held && (state === "queued" || state === "sent") ? props.held
             : state === "admitted" || state === "answered" || state === "sent" ? clock(props.at) : d.label}
           {props.onRetry && <button className="retry-message" onClick={props.onRetry}>Retry</button>}
+          {props.onDiscard && <button className="retry-message" onClick={props.onDiscard}>Discard</button>}
           <span className="deliv-icon" role="img" aria-label={d.label}>
             {d.icon}
           </span>

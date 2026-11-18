@@ -25,6 +25,7 @@ export class Connection {
   private pending = new Map<string, (res?: Response) => void | Promise<void>>();
   private attempt = 0;
   private sending = new Set<string>();
+  private creating = new Set<string>();
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private pingWatch: ReturnType<typeof setTimeout> | undefined;
@@ -57,6 +58,9 @@ export class Connection {
       }
     });
     addEventListener("online", () => this.kick());
+    store.onQueueChange(() => {
+      void store.reloadQueue().then(() => this.flushQueue()).catch(console.error);
+    });
     this.connect();
   }
 
@@ -70,7 +74,7 @@ export class Connection {
 
   /** Typed owner control request; the visible result arrives as an event. */
   control(thread: ThreadId, command: ControlCommand) {
-    if (this.store.connState !== "open" || this.store.threads.get(thread)?.archived) return;
+    if (this.store.connState !== "open" || !this.store.canWrite(thread)) return;
     this.write({ type: "req", id: this.id(), op: "control", thread, command });
   }
 
@@ -88,23 +92,29 @@ export class Connection {
     });
   }
 
-  searchThreads(query: string) {
+  searchThreads(query: string, onResults: (ids: ReadonlySet<ThreadId>) => void) {
     if (this.store.connState !== "open") return;
     this.request({ type: "req", id: this.id(), op: "threads", query }, async (res) => {
-      if (res?.ok && res.threads) await this.store.mergeThreads(res.threads);
+      if (res?.ok && res.threads) {
+        await this.store.mergeThreads(res.threads).catch(console.error);
+        this.flushOutgoing();
+        onResults(new Set(res.threads.map((t) => t.id)));
+      }
     });
   }
 
   sendCreate(c: ThreadCreate, openFrom?: ThreadId) {
-    if (this.store.connState !== "open") return;
-    this.request({ type: "req", id: this.id(), op: "thread.create", key: c.key, title: c.title, from: c.from }, async (res) => {
+    const current = this.store.creates.get(c.key);
+    if (this.store.connState !== "open" || this.creating.has(c.key) || !current || current.failed) return;
+    if (this.request({ type: "req", id: this.id(), op: "thread.create", key: c.key, title: c.title, from: c.from }, async (res) => {
+      this.creating.delete(c.key);
       if (!res) return; // No reply: retry the same key after replay.
       await this.store.finishCreate(c, res.ok, !!c.from && !res.ok && res.error === "bad_request");
       if (res.ok && res.thread && openFrom === this.store.openThread) {
         if (this.store.threads.has(res.thread)) this.store.selectThread(res.thread);
         else this.selectCreated = { thread: res.thread, from: openFrom };
       }
-    });
+    })) this.creating.add(c.key);
   }
 
   /**
@@ -112,15 +122,18 @@ export class Connection {
    * live; everything queued/sent is flushed after each replay finishes.
    */
   sendOutgoing(m: Outgoing, retriedRace = false) {
-    if (this.store.connState !== "open" || this.store.threads.get(m.thread)?.archived || this.sending.has(m.key)) return;
+    const current = this.store.outgoing(m.thread, m.key);
+    if (this.store.connState !== "open" || !this.store.canWrite(m.thread) || this.sending.has(m.key) ||
+        (current?.state !== "queued" && current?.state !== "sent")) return;
     const frame = { type: "req", id: this.id(), op: "send", key: m.key, text: m.text, thread: m.thread } as const;
     if (this.request(frame, async (res) => {
-      this.sending.delete(m.key);
       const cur = this.store.outgoing(m.thread, m.key);
+      this.sending.delete(m.key);
       if (!res || !cur || (cur.state !== "queued" && cur.state !== "sent")) return;
       if (!res.ok && res.error === "bad_request" && m.thread !== MAIN_THREAD) {
         // Archive may have won the race with this send. The protocol doesn't
         // distinguish that from other bad requests, so check the thread list.
+        this.sending.add(m.key);
         await this.store.setOutgoingState(m.key, "queued").catch(console.error);
         this.checkRejectedSend(m, retriedRace);
         return;
@@ -136,8 +149,12 @@ export class Connection {
   private checkRejectedSend(m: Outgoing, retriedRace: boolean) {
     if (this.request({ type: "req", id: this.id(), op: "threads" }, async (res) => {
       this.sending.delete(m.key);
-      if (!res?.ok || !res.threads) return;
-      await this.store.mergeThreads(res.threads).catch(console.error);
+      if (!res) return;
+      if (!res.ok || !res.threads) {
+        this.store.markThreadUnconfirmed(m.thread);
+        return;
+      }
+      await this.store.mergeThreads(res.threads, true).catch(console.error);
       // An older archive may be absent from the bounded listing. Keep it
       // queued in that case too, until a restore event or reconnect.
       if (!res.threads.some((t) => t.id === m.thread && !t.archived)) return;
@@ -145,11 +162,17 @@ export class Connection {
       if (cur?.state !== "queued") return;
       if (retriedRace) await this.store.setOutgoingState(m.key, "failed");
       else this.sendOutgoing(cur, true);
-    })) this.sending.add(m.key);
+    })) return;
+    this.sending.delete(m.key);
   }
 
   private flushOutgoing(thread?: ThreadId) {
     for (const m of this.store.pending()) if (thread === undefined || m.thread === thread) this.sendOutgoing(m);
+  }
+
+  private flushQueue() {
+    this.flushOutgoing();
+    for (const c of this.store.creates.values()) if (!c.failed) this.sendCreate(c);
   }
 
   // -- lifecycle ---------------------------------------------------------
@@ -335,10 +358,11 @@ export class Connection {
       if (res.ok && res.threads) await this.store.mergeThreads(res.threads, true).catch(console.error);
       else this.store.setThreadListUnavailable();
       if (this.ws !== ws) return;
+      await this.store.reloadQueue().catch(console.error);
+      if (this.ws !== ws) return;
       this.attempt = 0;
       this.store.setConn("open");
-      this.flushOutgoing();
-      for (const c of this.store.creates.values()) if (!c.failed) this.sendCreate(c);
+      this.flushQueue();
     });
   }
 

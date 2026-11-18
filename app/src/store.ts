@@ -51,12 +51,13 @@ export class Store {
   private statuses = new Map<ThreadId, AgentStatus>();
   private viewed = new Map<ThreadId, number>();
   private db: IDBPDatabase<Db> | null = null;
+  private queueChanges = typeof BroadcastChannel === "undefined" ? undefined : new BroadcastChannel("durable-app-queue");
   private durableWriteFailed = false;
   private seenCursors = new Set<number>();
   private threadCursors = new Map<ThreadId, number>();
   private echoedKeys = new Map<ThreadId, Set<string>>();
   private searchText = new Map<number, { text: string; lower: string }>();
-  private searchCache?: { query: string; results: { thread: ThreadInfo; snippet?: string }[] };
+  private searchCache?: { query: string; remote: ReadonlySet<string> | undefined; results: { thread: ThreadInfo; snippet?: string }[] };
   private listeners = new Set<() => void>();
   private version = 0;
 
@@ -134,6 +135,27 @@ export class Store {
     this.changed();
   }
 
+  onQueueChange(listener: () => void) {
+    this.queueChanges?.addEventListener("message", listener);
+  }
+
+  async reloadQueue() {
+    if (!this.db) return;
+    const tx = this.db.transaction(["outbox", "creates"], "readonly");
+    const [outbox, creates] = await Promise.all([
+      tx.objectStore("outbox").getAll(), tx.objectStore("creates").getAll(), tx.done,
+    ]);
+    // The committed snapshot also accounts for deletions (retry/discard)
+    // made in another window. Normalize legacy entries as at startup.
+    this.outbox = new Map(outbox.map((m) => {
+      const thread = m.thread ?? MAIN_THREAD;
+      this.ensureThread(thread);
+      return [m.key, { ...m, thread }];
+    }));
+    this.creates = new Map(creates.map((c) => [c.key, c]));
+    this.changed();
+  }
+
   /** Commit each durable event and its derived state before acking it. */
   async applyDurable(ev: DurableEvent): Promise<boolean> {
     if (this.seenCursors.has(ev.cursor)) return !!this.db && !this.durableWriteFailed;
@@ -163,7 +185,7 @@ export class Store {
       const tx = this.db.transaction(["events", "outbox", "threads"], "readwrite");
       await Promise.all([
         tx.objectStore("events").put(ev),
-        outgoing && tx.objectStore("outbox").put(outgoing),
+        outgoing && this.persistReceipt(tx.objectStore("outbox"), outgoing, ev.event === "settled"),
         info && tx.objectStore("threads").put(info),
         tx.done,
       ]);
@@ -238,10 +260,20 @@ export class Store {
     // The gateway omits older archives from the default listing. Keep known
     // metadata so cached messages and origin links stay navigable.
     for (const t of list) this.cacheThread(t);
+    const updates = [...list];
+    if (refresh) {
+      const listed = new Set(list.map((t) => t.id));
+      for (const t of this.threads.values()) {
+        if (!listed.has(t.id)) {
+          const unconfirmed = this.markThreadUnconfirmed(t.id);
+          if (unconfirmed) updates.push(unconfirmed);
+        }
+      }
+    }
     this.changed();
     if (!this.db) return;
     const tx = this.db.transaction("threads", "readwrite");
-    await Promise.all([...list.map((t) => tx.store.put(t)), tx.done]);
+    await Promise.all([...updates.map((t) => tx.store.put(t)), tx.done]);
   }
 
   private cacheThread(info: ThreadInfo) {
@@ -258,9 +290,26 @@ export class Store {
     if (!this.threads.has(id)) this.cacheThread({ ...MAIN, id, title: "Thread" });
   }
 
-  searchThreads(input: string) {
+  canWrite(thread: ThreadId) {
+    const t = this.threads.get(thread);
+    return thread === MAIN_THREAD || !!t?.createdAt && !t.archived;
+  }
+
+  // A full list includes all open threads. If omitted, cached open metadata
+  // is no longer enough to write to that thread.
+  markThreadUnconfirmed(id: ThreadId) {
+    const t = this.threads.get(id);
+    if (id === MAIN_THREAD || !t?.createdAt || t.archived) return;
+    const unconfirmed = { ...t, createdAt: "" };
+    this.cacheThread(unconfirmed);
+    this.changed();
+    return unconfirmed;
+  }
+
+  searchThreads(input: string, remote?: ReadonlySet<string>) {
+    const titleQuery = input.toLowerCase();
     const query = normalize(input).toLowerCase();
-    if (this.searchCache?.query === query) return this.searchCache.results;
+    if (this.searchCache?.query === titleQuery && this.searchCache.remote === remote) return this.searchCache.results;
     const results: { thread: ThreadInfo; snippet?: string }[] = [];
     for (const t of this.threads.values()) {
       let snippet: string | undefined;
@@ -276,11 +325,13 @@ export class Store {
         break;
       }
       const title = t.id === MAIN_THREAD ? `Main Durable ${t.title}` : t.title;
-      if (snippet !== undefined || title.toLowerCase().includes(query)) results.push({ thread: t, snippet });
+      if (snippet !== undefined || title.toLowerCase().includes(titleQuery) || remote?.has(t.id)) {
+        results.push({ thread: t, snippet });
+      }
     }
     results.sort((a, b) => Number(b.thread.id === MAIN_THREAD) - Number(a.thread.id === MAIN_THREAD) ||
       b.thread.lastAt.localeCompare(a.thread.lastAt));
-    this.searchCache = { query, results };
+    this.searchCache = { query: titleQuery, remote, results };
     return results;
   }
 
@@ -363,8 +414,17 @@ export class Store {
     await Promise.all([tx.store.put(m), retryKey && tx.store.delete(retryKey), tx.done]);
     if (retryKey) this.outbox.delete(retryKey);
     this.outbox.set(m.key, m);
+    this.queueChanges?.postMessage(null);
     this.changed();
     return m;
+  }
+
+  async discardOutgoing(key: string) {
+    if (!this.db) throw new Error("IndexedDB unavailable");
+    await this.db.delete("outbox", key);
+    this.outbox.delete(key);
+    this.queueChanges?.postMessage(null);
+    this.changed();
   }
 
   async setOutgoingState(key: string, state: "queued" | "sent" | "admitted" | "failed") {
@@ -372,7 +432,19 @@ export class Store {
     if (!m || m.state === state || m.state === "admitted" || terminal(m.state)) return;
     const next = this.updateOutgoing(m, state);
     this.changed();
-    await this.db?.put("outbox", next);
+    if (!this.db) return;
+    const tx = this.db.transaction("outbox", "readwrite");
+    await Promise.all([this.persistReceipt(tx.store, next), tx.done]);
+  }
+
+  private async persistReceipt(store: {
+    get(key: string): Promise<Outgoing | undefined>;
+    put(value: Outgoing): Promise<string>;
+  }, next: Outgoing, settled = false) {
+    const saved = await store.get(next.key);
+    // Another window may already have advanced or discarded this entry.
+    if (saved && !terminal(saved.state) &&
+        (saved.state !== "admitted" || settled)) await store.put(next);
   }
 
   async queueCreate(title?: string, from?: ThreadOrigin): Promise<ThreadCreate> {
@@ -380,6 +452,7 @@ export class Store {
     const c = { key: newKey(), title, from };
     await this.db.put("creates", c);
     this.creates.set(c.key, c);
+    this.queueChanges?.postMessage(null);
     this.changed();
     return c;
   }
@@ -395,6 +468,7 @@ export class Store {
       await this.db?.delete("creates", c.key);
       this.creates.delete(c.key);
       if (rejectedFork) this.forkRejected = true;
+      this.queueChanges?.postMessage(null);
     } else {
       const failed = { ...c, failed: true };
       await this.db?.put("creates", failed);
