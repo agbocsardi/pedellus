@@ -21,6 +21,9 @@ interface Db extends DBSchema {
 const IDLE: AgentStatus = { state: "idle" };
 const MAIN: ThreadInfo = { id: MAIN_THREAD, title: "Main", archived: false, createdAt: "", lastAt: "" };
 
+const terminal = (state: OutgoingState) => state === "failed" || state === "answered" || state === "aborted";
+const normalize = (text: string) => text.trim().replace(/\s+/g, " ");
+
 /** Same key alphabet as the protocol's request ids. */
 function newKey(): string {
   return crypto.randomUUID().replaceAll("-", "");
@@ -38,6 +41,7 @@ export class Store {
   mode: Mode = "boot";
   device: string | null = null;
   storageBlocked = false;
+  replayReady = false;
   /** Max seen can be ahead of a replay gap; only resumeCursor is safe for hello. */
   cursor: number | null = null;
   resumeCursor: number | null = null;
@@ -51,6 +55,8 @@ export class Store {
   private seenCursors = new Set<number>();
   private threadCursors = new Map<ThreadId, number>();
   private echoedKeys = new Map<ThreadId, Set<string>>();
+  private searchText = new Map<number, { text: string; lower: string }>();
+  private searchCache?: { query: string; results: { thread: ThreadInfo; snippet?: string }[] };
   private listeners = new Set<() => void>();
   private version = 0;
 
@@ -65,7 +71,7 @@ export class Store {
   }
 
   async init() {
-    const db = this.db = await openDB<Db>("durable-app", 2, {
+    const db = await openDB<Db>("durable-app", 2, {
       blocked: () => {
         this.storageBlocked = true;
         this.changed();
@@ -81,33 +87,49 @@ export class Store {
         db.createObjectStore("settings");
       },
     });
+    let closed = false;
     db.onversionchange = () => {
+      closed = true;
       db.close();
       this.db = null;
     };
     this.storageBlocked = false;
-    for (const m of await db.getAll("outbox")) this.outbox.set(m.key, { ...m, thread: m.thread ?? MAIN_THREAD });
+    // Load the replay checkpoint and everything it covers from one snapshot.
+    const tx = db.transaction(["events", "outbox", "threads", "creates", "view", "settings"], "readonly");
+    const [events, outbox, threads, creates, viewed, open, resume] = await Promise.all([
+      tx.objectStore("events").getAll(), tx.objectStore("outbox").getAll(),
+      tx.objectStore("threads").getAll(), tx.objectStore("creates").getAll(), tx.objectStore("view").getAll(),
+      tx.objectStore("settings").get("openThread"), tx.objectStore("settings").get("resumeCursor"), tx.done,
+    ]).catch((err) => { db.close(); throw err; });
+    if (!closed) this.db = db;
+    const cachedThreads = new Set(threads.map((t) => t.id));
+    for (const t of threads) this.cacheThread(t);
+    for (const m of outbox) {
+      const thread = m.thread ?? MAIN_THREAD;
+      this.ensureThread(thread);
+      this.outbox.set(m.key, { ...m, thread });
+    }
     // IndexedDB returns events in primary-key (cursor) order. Normalize old
     // records on read; the upgrade never rewrites or drops the v1 log/outbox.
-    for (const ev of await db.getAll("events")) {
+    for (const ev of events) {
       this.cursor = ev.cursor;
       this.seenCursors.add(ev.cursor);
-      if (ev.event === "thread") this.threadCursors.set(ev.thread.id, ev.cursor);
-      else {
+      if (ev.event === "thread") {
+        this.threadCursors.set(ev.thread.id, ev.cursor);
+        if (!cachedThreads.has(ev.thread.id)) this.cacheThread(ev.thread);
+      } else {
         // Existing v2 caches have no checkpoint. Replay from the last v1
         // cursor (or the beginning) rather than trusting their high-water mark.
         if (ev.thread === undefined) this.resumeCursor = ev.cursor;
         this.absorbChat({ ...ev, thread: ev.thread ?? MAIN_THREAD });
       }
     }
-    // This cache includes the last authoritative listing, which can be newer
-    // than any retained thread event, so don't overwrite it with old history.
-    for (const t of await db.getAll("threads")) this.threads.set(t.id, t);
-    for (const c of await db.getAll("creates")) this.creates.set(c.key, c);
-    for (const v of await db.getAll("view")) this.viewed.set(v.thread, v.cursor);
-    const open = await db.get("settings", "openThread");
-    if (typeof open === "string") this.openThread = open;
-    const resume = await db.get("settings", "resumeCursor");
+    for (const c of creates) this.creates.set(c.key, c);
+    for (const v of viewed) this.viewed.set(v.thread, v.cursor);
+    if (typeof open === "string") {
+      this.ensureThread(open);
+      this.openThread = open;
+    }
     if (typeof resume === "number") this.resumeCursor = resume;
     this.changed();
   }
@@ -125,14 +147,14 @@ export class Store {
         this.threadCursors.set(ev.thread.id, ev.cursor);
         const lastAt = prev && Date.parse(prev.lastAt) > Date.parse(ev.thread.lastAt) ? prev.lastAt : ev.thread.lastAt;
         info = { ...ev.thread, lastAt };
-        this.threads.set(info.id, info);
+        this.cacheThread(info);
       }
     } else {
       outgoing = this.absorbChat(ev);
       const prev = this.threads.get(ev.thread);
       if (prev && "at" in ev && Date.parse(ev.at) > (Date.parse(prev.lastAt) || 0)) {
         info = { ...prev, lastAt: ev.at };
-        this.threads.set(info.id, info);
+        this.cacheThread(info);
       }
     }
     this.changed();
@@ -165,6 +187,12 @@ export class Store {
   }
 
   private absorbChat(ev: ChatEvent): Outgoing | undefined {
+    this.ensureThread(ev.thread);
+    if (ev.event === "message") {
+      const text = normalize(ev.text);
+      this.searchText.set(ev.cursor, { text, lower: text.toLowerCase() });
+      this.searchCache = undefined;
+    }
     let events = this.events.get(ev.thread);
     if (!events) this.events.set(ev.thread, events = []);
     let i = events.length;
@@ -175,13 +203,13 @@ export class Store {
       if (!keys) this.echoedKeys.set(ev.thread, keys = new Set());
       keys.add(ev.key);
       const m = this.outgoing(ev.thread, ev.key);
-      if (m && (m.state === "queued" || m.state === "sent" || m.state === "failed")) {
+      if (m && (m.state === "queued" || m.state === "sent")) {
         return this.updateOutgoing(m, "admitted");
       }
     } else if (ev.event === "settled" || (ev.event === "message" && ev.role === "assistant")) {
       if (ev.key && this.previews.get(ev.thread)?.key === ev.key) this.previews.delete(ev.thread);
       const m = ev.event === "settled" ? this.outgoing(ev.thread, ev.key) : undefined;
-      if (m && ev.event === "settled") return this.updateOutgoing(m, ev.outcome);
+      if (m && ev.event === "settled" && !terminal(m.state)) return this.updateOutgoing(m, ev.outcome);
     }
   }
 
@@ -209,34 +237,56 @@ export class Store {
     if (refresh) this.threadListUnavailable = false;
     // The gateway omits older archives from the default listing. Keep known
     // metadata so cached messages and origin links stay navigable.
-    for (const t of list) this.threads.set(t.id, t);
+    for (const t of list) this.cacheThread(t);
     this.changed();
     if (!this.db) return;
     const tx = this.db.transaction("threads", "readwrite");
     await Promise.all([...list.map((t) => tx.store.put(t)), tx.done]);
   }
 
-  messageMatches(query: string): Map<ThreadId, string> {
-    const matches = new Map<ThreadId, string>();
-    // Search the in-memory projection of the durable IndexedDB message log.
-    for (const [thread, events] of this.events) {
+  private cacheThread(info: ThreadInfo) {
+    const old = this.threads.get(info.id);
+    if (old && old.title === info.title && old.archived === info.archived && old.archivedReason === info.archivedReason &&
+        old.createdAt === info.createdAt && old.lastAt === info.lastAt && old.origin?.thread === info.origin?.thread &&
+        old.origin?.messageId === info.origin?.messageId) return;
+    this.threads.set(info.id, info);
+    this.searchCache = undefined;
+    if (info.origin) this.ensureThread(info.origin.thread);
+  }
+
+  private ensureThread(id: ThreadId) {
+    if (!this.threads.has(id)) this.cacheThread({ ...MAIN, id, title: "Thread" });
+  }
+
+  searchThreads(input: string) {
+    const query = normalize(input).toLowerCase();
+    if (this.searchCache?.query === query) return this.searchCache.results;
+    const results: { thread: ThreadInfo; snippet?: string }[] = [];
+    for (const t of this.threads.values()) {
+      let snippet: string | undefined;
+      const events = this.events.get(t.id) ?? [];
       for (let i = events.length - 1; i >= 0; i--) {
-        const ev = events[i];
-        if (ev.event !== "message") continue;
-        const text = ev.text.replace(/\s+/g, " ");
-        const at = text.toLowerCase().indexOf(query);
+        const entry = this.searchText.get(events[i].cursor);
+        if (!entry) continue;
+        const at = entry.lower.indexOf(query);
         if (at < 0) continue;
         const start = Math.max(0, at - 24);
-        const end = Math.min(text.length, at + query.length + 44);
-        matches.set(thread, (start ? "…" : "") + text.slice(start, end) + (end < text.length ? "…" : ""));
+        const end = Math.min(entry.text.length, at + query.length + 44);
+        snippet = (start ? "…" : "") + entry.text.slice(start, end) + (end < entry.text.length ? "…" : "");
         break;
       }
+      const title = t.id === MAIN_THREAD ? `Main Durable ${t.title}` : t.title;
+      if (snippet !== undefined || title.toLowerCase().includes(query)) results.push({ thread: t, snippet });
     }
-    return matches;
+    results.sort((a, b) => Number(b.thread.id === MAIN_THREAD) - Number(a.thread.id === MAIN_THREAD) ||
+      b.thread.lastAt.localeCompare(a.thread.lastAt));
+    this.searchCache = { query, results };
+    return results;
   }
 
   selectThread(thread: ThreadId) {
-    if (thread === this.openThread || !this.threads.has(thread)) return;
+    if (thread === this.openThread) return;
+    this.ensureThread(thread);
     this.openThread = thread;
     this.changed();
     void this.db?.put("settings", thread, "openThread").catch(console.error);
@@ -255,7 +305,7 @@ export class Store {
   }
 
   markViewed(thread: ThreadId, cursor: number) {
-    if (cursor <= (this.viewed.get(thread) ?? 0)) return;
+    if (!this.replayReady || cursor <= (this.viewed.get(thread) ?? 0)) return;
     this.viewed.set(thread, cursor);
     this.changed();
     void this.db?.put("view", { thread, cursor }).catch(console.error);
@@ -282,6 +332,8 @@ export class Store {
   setConn(s: ConnState) {
     if (this.connState !== s) {
       this.connState = s;
+      if (s === "connecting" || s === "replaying") this.replayReady = false;
+      if (s === "open") this.replayReady = true;
       if (s === "offline") {
         this.previews.clear();
         this.statuses.clear();
@@ -304,25 +356,29 @@ export class Store {
     }
   }
 
-  async createOutgoing(thread: ThreadId, text: string): Promise<Outgoing> {
+  async createOutgoing(thread: ThreadId, text: string, retryKey?: string): Promise<Outgoing> {
+    if (!this.db) throw new Error("IndexedDB unavailable");
     const m: Outgoing = { key: newKey(), thread, text, state: "queued", at: Date.now() };
-    await this.db?.put("outbox", m);
+    const tx = this.db.transaction("outbox", "readwrite");
+    await Promise.all([tx.store.put(m), retryKey && tx.store.delete(retryKey), tx.done]);
+    if (retryKey) this.outbox.delete(retryKey);
     this.outbox.set(m.key, m);
     this.changed();
     return m;
   }
 
-  async setOutgoingState(key: string, state: OutgoingState) {
+  async setOutgoingState(key: string, state: "queued" | "sent" | "admitted" | "failed") {
     const m = this.outbox.get(key);
-    if (!m || m.state === state) return;
+    if (!m || m.state === state || m.state === "admitted" || terminal(m.state)) return;
     const next = this.updateOutgoing(m, state);
     this.changed();
     await this.db?.put("outbox", next);
   }
 
   async queueCreate(title?: string, from?: ThreadOrigin): Promise<ThreadCreate> {
+    if (!this.db) throw new Error("IndexedDB unavailable");
     const c = { key: newKey(), title, from };
-    await this.db?.put("creates", c);
+    await this.db.put("creates", c);
     this.creates.set(c.key, c);
     this.changed();
     return c;

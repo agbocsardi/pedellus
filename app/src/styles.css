@@ -679,6 +679,7 @@ input#pair-code {
 }
 .origin-card {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 3px;
   width: 100%;
   max-width: 28rem;
@@ -692,6 +693,7 @@ input#pair-code {
 }
 .origin-card b {
   color: var(--accent);
+  overflow-wrap: anywhere;
 }
 .origin-card span {
   display: -webkit-box;
@@ -726,6 +728,18 @@ input#pair-code {
   background: var(--card);
   color: var(--accent);
   font-size: 0.82rem;
+}
+.message-actions {
+  min-width: 32px;
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--muted-ink);
+}
+.retry-message {
+  color: var(--accent);
+  text-decoration: underline;
 }
 .fork-chip > :first-child,
 .fork-chip .thread-running {

@@ -27,7 +27,7 @@ function forkAction(target: EventTarget | null, thread: string): Sheet | undefin
 }
 
 function archivedLabel(t: ThreadInfo | undefined) {
-  return t?.archivedReason === "idle" ? "Archived · idle" : "Archived";
+  return t?.archivedReason ? `Archived · ${t.archivedReason}` : "Archived";
 }
 
 /** One place maps connection + agent status to the header line and avatar. */
@@ -72,6 +72,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
+  const opener = useRef<HTMLElement | null>(null);
+  const savingMessage = useRef(false);
   const jumpCursor = useRef<number | undefined>(undefined);
   const pinned = useRef(true);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -95,6 +97,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     ev.event === "message" && ev.id === origin.messageId);
   const sourceTitle = origin?.thread === MAIN_THREAD ? "Main" : source?.title ?? "another thread";
   const back = source ?? store.threads.get(MAIN_THREAD)!;
+  const canRetry = !archived && !running;
   const forkError = store.forkRejected ? "Could not start a side thread from that message." : "";
   const forks = new Map<string, ThreadInfo[]>();
   let hasOtherActivity = false;
@@ -170,7 +173,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     press.current = null;
   }
 
-  function show(next: Sheet) {
+  function show(next: Sheet, trigger?: HTMLElement) {
+    if (!sheet) opener.current = trigger ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     taRef.current?.blur();
     store.clearForkRejection();
     setError("");
@@ -185,13 +189,22 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     }
     const t = text.trim();
     if (!t || t.length > LIMITS.sendTextChars) return;
-    setText("");
-    pinned.current = true;
+    await queueMessage(t);
+  }
+
+  async function queueMessage(value: string, retryKey?: string) {
+    if (savingMessage.current || store.threads.get(thread)?.archived) return;
+    savingMessage.current = true;
+    setError("");
     try {
-      conn.sendOutgoing(await store.createOutgoing(thread, t));
+      const m = await store.createOutgoing(thread, value, retryKey);
+      if (!retryKey) setDrafts((prev) => prev[thread] === text ? { ...prev, [thread]: "" } : prev);
+      pinned.current = true;
+      conn.sendOutgoing(m);
     } catch {
-      setDrafts((prev) => ({ ...prev, [thread]: prev[thread] || text }));
-      setError("Could not save your message on this device.");
+      setError("Can’t save offline on this device.");
+    } finally {
+      savingMessage.current = false;
     }
   }
 
@@ -233,7 +246,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         conn.sendCreate(create, online ? thread : undefined);
       }
     } catch {
-      setError("Could not save the thread on this device.");
+      setError("Can’t save offline on this device.");
     } finally {
       setBusy(false);
     }
@@ -269,7 +282,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           </div>
           <div className="who-text">
             <h1><button className="thread-switch" aria-label={`${title}, open threads`} aria-haspopup="dialog"
-              aria-expanded={sheet?.kind === "list"} onClick={(e) => { e.currentTarget.focus(); show({ kind: "list" }); }}>
+              aria-expanded={sheet?.kind === "list"} onClick={(e) => show({ kind: "list" }, e.currentTarget)}>
               <span className="switch-title">{title}</span><span aria-hidden="true">▾</span>
               {hasOtherActivity && <span className="thread-dot" role="img" aria-label="Activity in another thread" />}
             </button></h1>
@@ -283,7 +296,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           aria-label="Thread menu"
           aria-haspopup="dialog"
           aria-expanded={sheet?.kind === "menu"}
-          onClick={(e) => { e.currentTarget.focus(); show({ kind: "menu" }); }}
+          onClick={(e) => show({ kind: "menu" }, e.currentTarget)}
         >
           <Icon d="M6 12h.01M12 12h.01M18 12h.01" bold />
         </button>
@@ -325,7 +338,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         onPointerLeave={cancelPress}
       >
         {origin && <div className="msg origin-card-wrap">
-          <button className="origin-card" disabled={!source} onClick={() => {
+          <button className="origin-card" onClick={() => {
             jumpCursor.current = sourceMessage?.cursor;
             store.selectThread(origin.thread);
           }}>
@@ -348,9 +361,14 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         {rows.map((r, i) =>
           r.kind === "ev" ? (
             <EventRow key={`e${r.ev.cursor}`} ev={r.ev} store={store} last={i === lastUser}
-              forks={r.ev.event === "message" ? forks.get(r.ev.id) : undefined} />
+              forks={r.ev.event === "message" ? forks.get(r.ev.id) : undefined}
+              onActions={(ev, button) => show({ kind: "message", title: suggestedTitle(ev.text),
+                from: { thread: ev.thread, messageId: ev.id } }, button)}
+              onRetry={canRetry ? (m) => void queueMessage(m.text, m.key) : undefined} />
           ) : (
-            <UserBubble key={`p${r.m.key}`} text={r.m.text} state={r.m.state} at={r.m.at} last={i === lastUser} />
+            <UserBubble key={`p${r.m.key}`} text={r.m.text} state={r.m.state} at={r.m.at} last={i === lastUser}
+              onRetry={canRetry && r.m.state === "failed" ? () => void queueMessage(r.m.text, r.m.key) : undefined}
+              held={archived} />
           ),
         )}
         {preview ? (
@@ -402,7 +420,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       </footer>
 
       {sheet && (
-        <Modal title={sheet.kind === "list" ? "Threads" :
+        <Modal opener={opener.current} panel={sheet.kind} title={sheet.kind === "list" ? "Threads" :
           sheet.kind === "menu" ? "Thread menu" : sheet.kind === "message" ? "Message actions" :
             sheet.kind === "rename" ? "Rename thread" : "New thread"}
           dismiss={() => { setError(""); setSheet(null); }}>
@@ -441,13 +459,23 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   );
 }
 
-function Modal({ title, dismiss, children }: { title: string; dismiss: () => void; children: ReactNode }) {
+function Modal({ title, panel, opener, dismiss, children }: {
+  title: string; panel: Sheet["kind"]; opener: HTMLElement | null; dismiss: () => void; children: ReactNode;
+}) {
   const ref = useRef<HTMLDialogElement>(null);
   useLayoutEffect(() => {
     const dialog = ref.current!;
     dialog.showModal();
-    return () => dialog.close();
-  }, []);
+    return () => {
+      dialog.close();
+      if (opener?.isConnected) opener.focus({ preventScroll: true });
+    };
+  }, [opener]);
+  useLayoutEffect(() => {
+    const dialog = ref.current!;
+    const selector = panel === "list" ? ".thread-search" : panel === "create" || panel === "rename" ? "#thread-title" : ".sheet-item:not(:disabled)";
+    (dialog.querySelector<HTMLElement>(selector) ?? dialog.querySelector<HTMLElement>(".sheet-cancel"))?.focus();
+  }, [panel]);
   return (
     <dialog ref={ref} className="sheet-layer" aria-label={title}
       onCancel={(e) => { e.preventDefault(); dismiss(); }}
@@ -480,16 +508,14 @@ function ThreadList({ store, conn, online, onNew, onSelect }: {
   const side = [...store.threads.values()].filter((t) => t.id !== MAIN_THREAD)
     .sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
   const archived = side.filter((t) => t.archived);
-  const matches = query ? store.messageMatches(query.replace(/\s+/g, " ").toLowerCase()) : undefined;
-  const results = query ? [main, ...side].filter((t) => matches?.has(t.id) ||
-    (t.id === MAIN_THREAD ? `Main Durable ${t.title}` : t.title).toLowerCase().includes(query.toLowerCase())) : [];
-  const row = (t: ThreadInfo) => (
+  const results = query ? store.searchThreads(query) : [];
+  const row = (t: ThreadInfo, snippet?: string) => (
     <button key={t.id} className="sheet-item thread-row" aria-current={store.openThread === t.id ? "true" : undefined}
       onClick={() => onSelect(t.id)}>
       <span className="thread-name">
         <b>{t.id === MAIN_THREAD ? "Main" : t.title}</b>
         {t.archived && <small>{archivedLabel(t)}</small>}
-        {matches?.has(t.id) && <small className="thread-snippet">{matches.get(t.id)}</small>}
+        {snippet && <small className="thread-snippet">{snippet}</small>}
       </span>
       <ThreadSignals store={store} thread={t.id} />
     </button>
@@ -500,18 +526,18 @@ function ThreadList({ store, conn, online, onNew, onSelect }: {
       maxLength={LIMITS.threadTitleChars} value={input} onChange={(e) => setInput(e.target.value)} />
     {store.threadListUnavailable && <p className="sheet-help">Could not refresh the thread list. Showing known threads.</p>}
     {query ? (
-      results.length ? results.map(row) : <p className="sheet-help">No matching threads.</p>
+      results.length ? results.map(({ thread, snippet }) => row(thread, snippet)) : <p className="sheet-help">No matching threads.</p>
     ) : <>
       <SheetItem icon="M12 5v14M5 12h14" title="New thread" sub="Start an empty conversation" onClick={onNew} />
       {[...store.creates.values()].map((c) => <p className="sheet-help" key={c.key}>
         {c.title || "New thread"} · {c.failed ? "Could not create" : "Waits for connection"}
       </p>)}
       {row(main)}
-      {side.filter((t) => !t.archived).map(row)}
+      {side.filter((t) => !t.archived).map((t) => row(t))}
       {archived.length > 0 && <details className="thread-archive">
         <summary>Archived ({archived.length}){archived.some((t) => store.isUnread(t.id)) &&
           <span className="thread-dot" role="img" aria-label="Unread" />}</summary>
-        {archived.map(row)}
+        {archived.map((t) => row(t))}
       </details>}
     </>}
   </>;
@@ -526,7 +552,7 @@ function ThreadTitleForm({ kind, initial, busy, online, save }: {
     <h2 className="sheet-heading">{create ? "New thread" : "Rename thread"}</h2>
     <label htmlFor="thread-title">{create ? "Title (optional)" : "Title"}</label>
     <input id="thread-title" value={title} onChange={(e) => setTitle(e.target.value)}
-      maxLength={LIMITS.threadTitleChars} placeholder="New thread" autoFocus />
+      maxLength={LIMITS.threadTitleChars} placeholder="New thread" />
     {!online && <p className="sheet-help">{create ? "This thread will sync when you reconnect." : "Reconnect to rename this thread."}</p>}
     <button className="primary" disabled={busy || TITLE_CONTROL.test(title) || (!create && (!online || !title.trim()))}>
       {create ? "Create thread" : "Save title"}
@@ -563,7 +589,11 @@ function Icon({ d, bold }: { d: string; bold?: boolean }) {
   );
 }
 
-function EventRow({ ev, store, last, forks }: { ev: DurableEvent; store: Store; last: boolean; forks?: ThreadInfo[] }) {
+function EventRow({ ev, store, last, forks, onActions, onRetry }: {
+  ev: DurableEvent; store: Store; last: boolean; forks?: ThreadInfo[];
+  onActions: (ev: MessageEvent, button: HTMLButtonElement) => void;
+  onRetry?: (m: Outgoing) => void;
+}) {
   if (ev.event === "divider") {
     const t = clock(ev.at);
     return (
@@ -573,20 +603,23 @@ function EventRow({ ev, store, last, forks }: { ev: DurableEvent; store: Store; 
     );
   }
   if (ev.event !== "message") return null; // settled only drives delivery state
-  const state = ev.key ? store.outgoing(ev.thread, ev.key)?.state : undefined;
+  const outgoing = ev.key ? store.outgoing(ev.thread, ev.key) : undefined;
   const anchor = Number.isSafeInteger(ev.cursor) && ev.cursor > 0 && ev.role !== "notice"
     ? { "data-message-id": ev.id, "data-message-cursor": ev.cursor, "data-thread-title": suggestedTitle(ev.text), tabIndex: -1 }
     : undefined;
   return <>
     {ev.role === "notice" ? <div className="notice">{ev.text}</div> : ev.role === "user" ? (
-      <UserBubble text={ev.text} anchor={anchor} state={state} at={ev.at} last={last} />
+      <UserBubble text={ev.text} anchor={anchor} state={outgoing?.state} at={ev.at} last={last}
+        onRetry={onRetry && outgoing?.state === "failed" ? () => onRetry(outgoing) : undefined} />
     ) : (
       <div className="msg assistant" {...anchor}>
         <Streamdown>{ev.text}</Streamdown>
       </div>
     )}
-    {!!forks?.length && <div className="msg fork-links" data-role={ev.role}>
-      {forks.map((t) => <button key={t.id} className="fork-chip" onClick={() => store.selectThread(t.id)}>
+    {(anchor || !!forks?.length) && <div className="msg fork-links" data-role={ev.role}>
+      {anchor && <button className="message-actions" aria-label="Message actions" aria-haspopup="dialog"
+        onClick={(e) => onActions(ev, e.currentTarget)}>⋯</button>}
+      {forks?.map((t) => <button key={t.id} className="fork-chip" onClick={() => store.selectThread(t.id)}>
         <span aria-hidden="true">↳</span><span className="fork-title">{t.title}</span>
         <ThreadSignals store={store} thread={t.id} />
       </button>)}
@@ -603,7 +636,10 @@ const DELIV: Record<OutgoingState, { label: string; icon: ReactNode }> = {
   aborted: { label: "Stopped", icon: <Icon d="M6 6l12 12M18 6 6 18" /> },
 };
 
-function UserBubble(props: { text: string; anchor?: React.HTMLAttributes<HTMLDivElement>; state?: OutgoingState; at?: string | number; last: boolean }) {
+function UserBubble(props: {
+  text: string; anchor?: React.HTMLAttributes<HTMLDivElement>; state?: OutgoingState; at?: string | number;
+  last: boolean; onRetry?: () => void; held?: boolean;
+}) {
   const { state } = props;
   const show = state && (props.last || state === "queued" || state === "sent" || state === "failed");
   const d = state && DELIV[state];
@@ -612,7 +648,9 @@ function UserBubble(props: { text: string; anchor?: React.HTMLAttributes<HTMLDiv
       <div className="bubble" {...props.anchor}>{props.text}</div>
       {show && d && (
         <span className="deliv" data-state={state}>
-          {state === "admitted" || state === "answered" || state === "sent" ? clock(props.at) : d.label}
+          {props.held && (state === "queued" || state === "sent") ? "Held until restored"
+            : state === "admitted" || state === "answered" || state === "sent" ? clock(props.at) : d.label}
+          {props.onRetry && <button className="retry-message" onClick={props.onRetry}>Retry</button>}
           <span className="deliv-icon" role="img" aria-label={d.label}>
             {d.icon}
           </span>

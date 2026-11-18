@@ -24,6 +24,7 @@ export class Connection {
   private nextId = 0;
   private pending = new Map<string, (res?: Response) => void | Promise<void>>();
   private attempt = 0;
+  private sending = new Set<string>();
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private pingWatch: ReturnType<typeof setTimeout> | undefined;
@@ -110,17 +111,45 @@ export class Connection {
    * Send an outgoing message. Queued (stays "queued") unless the stream is
    * live; everything queued/sent is flushed after each replay finishes.
    */
-  sendOutgoing(m: Outgoing) {
-    if (this.store.connState !== "open") return;
+  sendOutgoing(m: Outgoing, retriedRace = false) {
+    if (this.store.connState !== "open" || this.store.threads.get(m.thread)?.archived || this.sending.has(m.key)) return;
     const frame = { type: "req", id: this.id(), op: "send", key: m.key, text: m.text, thread: m.thread } as const;
-    if (this.request(frame, (res) => {
-      const cur = this.store.outbox.get(m.key);
+    if (this.request(frame, async (res) => {
+      this.sending.delete(m.key);
+      const cur = this.store.outgoing(m.thread, m.key);
       if (!res || !cur || (cur.state !== "queued" && cur.state !== "sent")) return;
+      if (!res.ok && res.error === "bad_request" && m.thread !== MAIN_THREAD) {
+        // Archive may have won the race with this send. The protocol doesn't
+        // distinguish that from other bad requests, so check the thread list.
+        await this.store.setOutgoingState(m.key, "queued").catch(console.error);
+        this.checkRejectedSend(m, retriedRace);
+        return;
+      }
       if (!res.ok) console.warn("send rejected:", res.error);
-      return this.store.setOutgoingState(m.key, res.ok ? "admitted" : "failed");
+      await this.store.setOutgoingState(m.key, res.ok ? "admitted" : "failed");
     })) {
+      this.sending.add(m.key);
       void this.store.setOutgoingState(m.key, "sent").catch(console.error);
     }
+  }
+
+  private checkRejectedSend(m: Outgoing, retriedRace: boolean) {
+    if (this.request({ type: "req", id: this.id(), op: "threads" }, async (res) => {
+      this.sending.delete(m.key);
+      if (!res?.ok || !res.threads) return;
+      await this.store.mergeThreads(res.threads).catch(console.error);
+      // An older archive may be absent from the bounded listing. Keep it
+      // queued in that case too, until a restore event or reconnect.
+      if (!res.threads.some((t) => t.id === m.thread && !t.archived)) return;
+      const cur = this.store.outgoing(m.thread, m.key);
+      if (cur?.state !== "queued") return;
+      if (retriedRace) await this.store.setOutgoingState(m.key, "failed");
+      else this.sendOutgoing(cur, true);
+    })) this.sending.add(m.key);
+  }
+
+  private flushOutgoing(thread?: ThreadId) {
+    for (const m of this.store.pending()) if (thread === undefined || m.thread === thread) this.sendOutgoing(m);
   }
 
   // -- lifecycle ---------------------------------------------------------
@@ -247,9 +276,12 @@ export class Connection {
         }
         if (!await this.store.applyDurable(f)) this.ackFrozen = true;
         if (this.ws !== ws) break;
-        if (f.event === "thread" && f.thread.id === this.selectCreated?.thread) {
-          if (this.store.openThread === this.selectCreated.from) this.store.selectThread(f.thread.id);
-          this.selectCreated = undefined;
+        if (f.event === "thread") {
+          if (f.thread.id === this.selectCreated?.thread) {
+            if (this.store.openThread === this.selectCreated.from) this.store.selectThread(f.thread.id);
+            this.selectCreated = undefined;
+          }
+          if (!f.thread.archived) this.flushOutgoing(f.thread.id);
         }
         this.ack(ws);
         break;
@@ -305,7 +337,7 @@ export class Connection {
       if (this.ws !== ws) return;
       this.attempt = 0;
       this.store.setConn("open");
-      for (const m of this.store.pending()) this.sendOutgoing(m);
+      this.flushOutgoing();
       for (const c of this.store.creates.values()) if (!c.failed) this.sendCreate(c);
     });
   }
