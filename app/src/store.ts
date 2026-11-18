@@ -1,5 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
-import { MAIN_THREAD, type CommandInfo, type DurableEvent, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { MAIN_THREAD, type CommandInfo, type DurableEvent, type ModelEvent, type PresetInfo, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
 
 export type ConnState = "offline" | "connecting" | "replaying" | "open";
 export type Mode = "boot" | "chat" | "pair" | "update";
@@ -8,7 +8,7 @@ export type Outgoing = { key: string; thread: ThreadId; text: string; state: Out
 export type ThreadCreate = { key: string; title?: string; from?: ThreadOrigin; failed?: boolean };
 export type AgentStatus = Pick<StatusEvent, "state" | "label">;
 type ChatEvent = Exclude<DurableEvent, { event: "thread" }>;
-type Identity = { device?: string; agent?: string; commands?: CommandInfo[] };
+type Identity = { device?: string; agent?: string; commands?: CommandInfo[]; presets?: PresetInfo[] };
 type LiveStatus = AgentStatus & { turnKey?: string };
 
 interface Db extends DBSchema {
@@ -50,6 +50,9 @@ export class Store {
 
   // Status is live; hello resends it rather than replaying it from storage.
   private statuses = new Map<ThreadId, LiveStatus>();
+  // Model presets are live too: hello resends each thread's selection.
+  private models = new Map<ThreadId, string | null>();
+  private pendingModels = new Map<ThreadId, string>();
   private unfinished = new Map<ThreadId, Set<string>>();
   private viewed = new Map<ThreadId, number>();
   private db: IDBPDatabase<Db> | null = null;
@@ -76,6 +79,8 @@ export class Store {
   get agentName() { return this.identity?.agent ?? "Durable"; }
   /** The gateway's last advertised commands; undefined until a hello listed them. */
   get commands() { return this.identity?.commands; }
+  /** The gateway's last advertised model presets; undefined until a hello listed them. */
+  get presets() { return this.identity?.presets; }
 
   async init() {
     const db = await openDB<Db>("durable-app", 2, {
@@ -384,6 +389,28 @@ export class Store {
     this.changed();
   }
 
+  /** Confirmed preset: a name, null (custom model), or undefined (not reported yet). */
+  model(thread: ThreadId): string | null | undefined { return this.models.get(thread); }
+  pendingModel(thread: ThreadId): string | undefined { return this.pendingModels.get(thread); }
+
+  resetModels() {
+    this.models.clear();
+    this.pendingModels.clear();
+    this.changed();
+  }
+
+  setModel(ev: Pick<ModelEvent, "thread" | "preset">) {
+    this.models.set(ev.thread, ev.preset);
+    this.pendingModels.delete(ev.thread);
+    this.changed();
+  }
+
+  setPendingModel(thread: ThreadId, preset: string | undefined) {
+    if (preset === undefined) this.pendingModels.delete(thread);
+    else this.pendingModels.set(thread, preset);
+    this.changed();
+  }
+
   setStatus(s: StatusEvent) {
     // Status has no key. In each thread the oldest unfinished admission runs
     // first; hold onto its key as new messages are admitted behind it.
@@ -419,12 +446,15 @@ export class Store {
     }
   }
 
-  setIdentity(device: string | undefined, agent: string | undefined, commands: CommandInfo[] | undefined) {
+  setIdentity(device: string | undefined, agent: string | undefined, commands: CommandInfo[] | undefined,
+    presets: PresetInfo[] | undefined) {
     device ??= this.identity?.device;
     commands ??= this.identity?.commands;
+    presets ??= this.identity?.presets;
     if (this.identity?.device === device && this.identity?.agent === agent
-      && JSON.stringify(this.identity?.commands) === JSON.stringify(commands)) return;
-    this.identity = { device, agent, commands };
+      && JSON.stringify(this.identity?.commands) === JSON.stringify(commands)
+      && JSON.stringify(this.identity?.presets) === JSON.stringify(presets)) return;
+    this.identity = { device, agent, commands, presets };
     this.searchCache = undefined;
     this.changed();
     void this.db?.put("settings", this.identity, "identity").catch(console.error);

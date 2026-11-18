@@ -47,8 +47,13 @@ const COMMANDS = [
   { name: "compact", summary: "Compact the context to free space", usage: "Usage: /compact" },
   { name: "help", summary: "List the available commands", usage: "Usage: /help" },
 ];
-const MODEL_PRESETS = ["fast", "smart", "deep"];
-let mockModel = "smart";
+/** hello.presets, in config order; each thread starts on DEFAULT_PRESET */
+const PRESETS = [
+  { name: "fast", label: "Fast", model: "anthropic/claude-haiku-5-5", thinking: "off" },
+  { name: "smart", label: "Smart", model: "anthropic/claude-sonnet-5-5", thinking: "low" },
+  { name: "deep", label: "Deep", model: "anthropic/claude-opus-5-5", thinking: "high" },
+];
+const DEFAULT_PRESET = "smart";
 /** live streams: { ws, token, helloed } */
 const sockets = new Set();
 const rateFailures = [];
@@ -57,7 +62,7 @@ const iso = () => new Date().toISOString();
 
 function addThread(id, title, origin) {
   const at = iso();
-  const thread = { info: { id, title, archived: false, origin, createdAt: at, lastAt: at }, state: "idle", running: null, queue: [] };
+  const thread = { info: { id, title, archived: false, origin, createdAt: at, lastAt: at }, state: "idle", running: null, queue: [], preset: DEFAULT_PRESET };
   threads.set(id, thread);
   return thread;
 }
@@ -308,7 +313,7 @@ function onStream(ws, token) {
           return;
         }
         conn.helloed = true;
-        reply(ws, frame.id, true, { v: 2, device, head: cursor || null, agent: AGENT_NAME, commands: COMMANDS });
+        reply(ws, frame.id, true, { v: 2, device, head: cursor || null, agent: AGENT_NAME, commands: COMMANDS, presets: PRESETS });
         // replay: oldest first, one bounded batch; the client re-hellos
         // with its new cursor if the batch was full
         const from = frame.cursor ?? 0;
@@ -319,6 +324,9 @@ function onStream(ws, token) {
           if (t === main || t.state !== "idle") {
             ws.send(JSON.stringify({ type: "event", event: "status", thread: t.info.id, state: t.state }));
           }
+        }
+        for (const t of threads.values()) {
+          ws.send(JSON.stringify({ type: "event", event: "model", thread: t.info.id, preset: t.preset }));
         }
         break;
       }
@@ -351,6 +359,7 @@ function onStream(ws, token) {
         created.set(key, id);
         reply(ws, frame.id, true, { thread: id, duplicate: false });
         threadChanged(added);
+        emit(added, "model", { preset: added.preset });
         break;
       }
       case "thread.rename": {
@@ -423,9 +432,12 @@ function onStream(ws, token) {
           emit(thread, "divider", { at: iso(), reason: "new" });
           notice(thread, "New context started.");
         } else if (cmd === "model") {
-          if (!a) notice(thread, `Model: ${mockModel}. Presets: ${MODEL_PRESETS.join(", ")}.`);
-          else if (MODEL_PRESETS.includes(a)) notice(thread, `Model set to ${(mockModel = a)}.`);
-          else notice(thread, COMMANDS.find((c) => c.name === "model").usage);
+          if (!a) notice(thread, `Model: ${thread.preset}. Presets: ${PRESETS.map((p) => p.name).join(", ")}.`);
+          else if (PRESETS.some((p) => p.name === a)) {
+            thread.preset = a;
+            notice(thread, `Model set to ${a}.`);
+            emit(thread, "model", { preset: a });
+          } else notice(thread, COMMANDS.find((c) => c.name === "model").usage);
         } else if (cmd === "digest") {
           notice(thread, `Digest: ${events.filter((e) => e.thread === thread.info.id).length} events in this thread, ${threads.size} threads.`);
         } else if (cmd === "compact") {

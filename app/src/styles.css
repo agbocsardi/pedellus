@@ -439,7 +439,7 @@ input#pair-code {
 .thread-back {
   flex: 0 1 auto;
   max-width: 27%;
-  min-width: 0;
+  min-width: 44px;
   min-height: 38px;
   color: var(--accent);
   font-size: 0.85rem;
@@ -488,6 +488,56 @@ input#pair-code {
 .icon-btn svg {
   width: 22px;
   height: 22px;
+}
+
+/* Model preset chip: shrinks and truncates before the thread title does. */
+.model-chip {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 3 auto;
+  min-width: 44px;
+  max-width: 34%;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.model-chip > :last-child {
+  flex: none;
+  color: var(--muted-ink);
+}
+.model-chip-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-chip[data-pending] .model-chip-text {
+  color: var(--muted-ink);
+  animation: pulse 1.2s ease-in-out infinite alternate;
+}
+.model-chip:disabled {
+  opacity: 0.5;
+}
+/* Narrow phones: tighter header so the back link and title keep room. */
+@media (max-width: 360px) {
+  .top {
+    gap: 8px;
+  }
+  .model-chip {
+    padding: 0 8px;
+  }
+  .model-chip > :last-child {
+    display: none;
+  }
+}
+@keyframes pulse {
+  to { opacity: 0.45; }
 }
 
 .messages {
@@ -1026,6 +1076,36 @@ input#pair-code {
 }
 .thread-row {
   min-height: 44px;
+}
+.preset-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.preset-item[aria-current="true"] {
+  background: var(--muted);
+}
+/* The id wraps as a unit; only one longer than the row breaks inside. */
+.preset-model {
+  display: inline-block;
+  max-width: 100%;
+}
+.preset-text .nowrap {
+  white-space: nowrap;
+}
+.preset-check {
+  flex: none;
+  color: var(--accent);
+}
+.preset-check svg {
+  display: block;
+  width: 20px;
+  height: 20px;
+}
+.preset-pending {
+  flex: none;
+  color: var(--muted-ink);
+  font-size: 0.8rem;
 }
 .thread-name {
   flex: 1;
