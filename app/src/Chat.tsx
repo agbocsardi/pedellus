@@ -2,14 +2,14 @@ import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type Keyb
 import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
-import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type PresetInfo, type ThreadInfo, type ThreadOrigin } from "./protocol";
 import { Avatar, type AvatarState } from "./Avatar";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 
 type Row = { kind: "ev"; ev: DurableEvent } | { kind: "pending"; m: Outgoing };
 type Tone = "ok" | "run" | "warn" | "bad";
-type Sheet = { kind: "list" | "menu" | "tools" | "confirm-new" } | { kind: "rename"; title: string }
+type Sheet = { kind: "list" | "menu" | "tools" | "confirm-new" | "model" } | { kind: "rename"; title: string }
   | { kind: "create"; title: string; from?: ThreadOrigin }
   | { kind: "message"; title: string; from: ThreadOrigin };
 const LIST_ICON = "M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01";
@@ -37,6 +37,8 @@ const COMMAND_ICONS: Record<string, string> = {
   help: "M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0",
 };
 const COMMAND_ICON = "M15 4 9 20";
+const CHECK_ICON = "M5 12.5 10 17 19 7";
+const presetName = (p: PresetInfo) => p.label ?? p.name;
 const ARGS_MAX = 1000;
 /** `/name` or `/name args` in the composer is a command, never a message. */
 const SLASH = /^\/([a-z0-9_-]*)(?:\s([\s\S]*))?$/i;
@@ -138,6 +140,12 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const picked: CommandInfo | undefined = matches[args === undefined ? Math.min(slashPick, matches.length - 1) : 0];
   const argsTooLong = (args?.trim().length ?? 0) > ARGS_MAX;
   const slashOpen = !!slash && writable && !sheet && !slashHidden;
+  const presets = store.presets ?? [];
+  const model = store.model(thread);
+  const pendingModel = store.pendingModel(thread);
+  const shown = pendingModel ?? model;
+  const chipText = shown === null ? "custom" : shown === undefined ? "model"
+    : presetName(presets.find((p) => p.name === shown) ?? { name: shown, model: "" });
   const forkError = store.forkRejected ? "Could not start a side thread from that message." : "";
   const forks = new Map<string, ThreadInfo[]>();
   let hasOtherActivity = false;
@@ -398,6 +406,12 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             </p>
           </div>
         </div>
+        {presets.length > 0 && <button className="model-chip" disabled={!ready(cmdState)}
+          aria-label={`Model: ${chipText}${pendingModel ? ", switching" : ""}`} aria-haspopup="dialog"
+          aria-expanded={sheet?.kind === "model"} data-pending={pendingModel ? "" : undefined}
+          onClick={(e) => show({ kind: "model" }, e.currentTarget)}>
+          <span className="model-chip-text">{chipText}</span><span aria-hidden="true">▾</span>
+        </button>}
         <button
           className="icon-btn"
           aria-label="Thread menu"
@@ -539,7 +553,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       {sheet && (
         <Modal opener={opener.current} panel={sheet.kind} title={sheet.kind === "list" ? "Threads" :
           sheet.kind === "menu" ? "Thread menu" : sheet.kind === "message" ? "Message actions" :
-            sheet.kind === "tools" ? "Commands" : sheet.kind === "confirm-new" ? "New context" :
+            sheet.kind === "tools" ? "Commands" : sheet.kind === "model" ? "Model" : sheet.kind === "confirm-new" ? "New context" :
             sheet.kind === "rename" ? "Rename thread" : "New thread"}
           dismiss={() => { setError(""); setSheet(null); }}>
             <div className="sheet-grip" aria-hidden="true" />
@@ -566,6 +580,26 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               <h2 className="sheet-heading">Commands</h2>
               {commands.map((c) => <CommandItem key={c.name} c={c} state={cmdState} onClick={() => runCommand(c)} />)}
               {!online && <p className="sheet-help">Reconnect to use commands.</p>}
+            </>}
+            {sheet.kind === "model" && <>
+              <h2 className="sheet-heading">Model</h2>
+              {presets.map((p) => {
+                const current = p.name === model;
+                return <button key={p.name} className="sheet-item preset-item" disabled={!ready(cmdState)}
+                  aria-current={current || undefined} onClick={() => {
+                    if (!current || pendingModel) conn.selectPreset(thread, p.name);
+                    setSheet(null);
+                  }}>
+                  <span className="preset-text">
+                    <b>{presetName(p)}</b>
+                    <small><span className="preset-model">{p.model}</span>{p.thinking && <span className="nowrap"> · thinking {p.thinking}</span>}</small>
+                  </span>
+                  {p.name === pendingModel ? <small className="preset-pending">Switching…</small>
+                    : current && <span className="preset-check" role="img" aria-label="Current"><Icon d={CHECK_ICON} bold /></span>}
+                </button>;
+              })}
+              {model === null && <p className="sheet-help">This thread uses a custom model.</p>}
+              {!online && <p className="sheet-help">Reconnect to switch models.</p>}
             </>}
             {sheet.kind === "confirm-new" && <>
               <h2 className="sheet-heading">Start a new context?</h2>
