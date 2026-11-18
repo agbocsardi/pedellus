@@ -40,6 +40,8 @@ const COMMAND_ICON = "M15 4 9 20";
 const CHECK_ICON = "M5 12.5 10 17 19 7";
 const presetName = (p: PresetInfo) => p.label ?? p.name;
 const ARGS_MAX = 1000;
+/** A picked preset that the gateway accepts but never confirms stops pulsing after this. */
+const MODEL_PENDING_MS = 15_000;
 /** `/name` or `/name args` in the composer is a command, never a message. */
 const SLASH = /^\/([a-z0-9_-]*)(?:\s([\s\S]*))?$/i;
 
@@ -180,6 +182,16 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
   useLayoutEffect(() => { pinned.current = true; }, [thread]);
   useEffect(() => cancelPress, []);
+  // Clear an unconfirmed pick after a while; a `model` event clears it sooner.
+  useEffect(() => {
+    if (!pendingModel) return;
+    const timer = setTimeout(() => store.setPendingModel(thread, undefined), MODEL_PENDING_MS);
+    return () => clearTimeout(timer);
+  }, [store, thread, pendingModel]);
+  // Leaving a thread drops its pending pick, so it does not pulse again on return.
+  useEffect(() => () => {
+    if (store.pendingModel(thread)) store.setPendingModel(thread, undefined);
+  }, [store, thread]);
 
   // Follow new content only if already at the bottom. A modal covers the
   // conversation, so don't mark it viewed (or follow) until dismissed.
@@ -561,10 +573,10 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               onSelect={(id) => { setSheet(null); store.selectThread(id); }} />}
             {sheet.kind === "menu" && <>
               {writable && <>
-                <SheetItem icon="M12 5v14M5 12h14" title="New context"
-                  sub="Start fresh; earlier messages stay above a divider" disabled={!online} onClick={() => show({ kind: "confirm-new" })} />
-                <SheetItem icon="M3 12h4l3-8 4 16 3-8h4" title="Status"
-                  sub="Ask the agent what it is doing" disabled={!online} onClick={() => command("status")} />
+                {commands.some((c) => c.name === "new") && <SheetItem icon="M12 5v14M5 12h14" title="New context"
+                  sub="Start fresh; earlier messages stay above a divider" disabled={!online} onClick={() => show({ kind: "confirm-new" })} />}
+                {commands.some((c) => c.name === "status") && <SheetItem icon="M3 12h4l3-8 4 16 3-8h4" title="Status"
+                  sub="Ask the agent what it is doing" disabled={!online} onClick={() => command("status")} />}
               </>}
               {!main && (writable || archived) && <>
                 <SheetItem icon="M4 20h4L20 8l-4-4L4 16v4Z" title="Rename thread" disabled={!online || busy}
