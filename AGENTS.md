@@ -11,3 +11,13 @@ machine; durable agent preferences for this project go here.
   effort medium. GLM-5.3 cannot see images.
 - No swipe navigation in the app (collides with Safari's back gesture).
 - Pi children ask for approval on commands they flag as risky; answer them.
+
+## Delegation briefs
+
+- Keep each task small and scoped: 3–4 items, one feature per brief, a commit
+  after each item. Split bigger work into a sequence of briefs.
+- GLM-5.3 suits well-scoped work (app UI, mock gateway, small diffs). Use Sol
+  or Opus for gateway work that touches security invariants, durability or
+  forks.
+- Tell workers to re-read a file after any failed or partial edit before
+  assuming it applied.
