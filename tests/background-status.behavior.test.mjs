@@ -468,7 +468,7 @@ test('a one-shot job is scheduled until its run is genuinely executing', { timeo
           action: 'add',
           message: 'deliver the reminder',
           name: 'status reminder',
-          at: new Date(Date.now() + 1_500).toISOString(),
+          at: new Date(Date.now() + 500).toISOString(),
         }, { id: 'cron-add' }),
       ], { stopReason: 'toolUse' });
     }

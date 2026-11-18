@@ -834,7 +834,7 @@ async function withOriginRun(label, scheduledAnswer, body, options = {}) {
           name: 'origin reminder',
           isolated: false,
           ...(options.silent === true ? { silent: true } : {}),
-          at: new Date(Date.now() + 1_500).toISOString(),
+          at: new Date(Date.now() + 500).toISOString(),
         }, { id: 'origin-cron-add' }),
       ], { stopReason: 'toolUse' });
     }
@@ -1065,7 +1065,7 @@ test('an isolated occurrence in the same origin chat never disables owner steeri
           message: 'ISOLATED-PROMPT',
           name: 'isolated reminder',
           isolated: true,
-          at: new Date(Date.now() + 1_500).toISOString(),
+          at: new Date(Date.now() + 500).toISOString(),
         }, { id: 'isolated-cron-add' }),
       ], { stopReason: 'toolUse' });
     }

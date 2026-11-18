@@ -309,7 +309,7 @@ test('an origin-mode scheduled answer is delivered once through the durable outb
               message: scheduledMessage,
               name: 'origin reminder',
               isolated: false,
-              at: new Date(Date.now() + 1_500).toISOString(),
+              at: new Date(Date.now() + 500).toISOString(),
             }, { id: 'origin-cron-add' }),
           ], { stopReason: 'toolUse' });
         },
@@ -405,7 +405,7 @@ test('a non-Telegram origin never queues an origin-mode result', { timeout: 20_0
             action: 'add',
             message: scheduledMessage,
             isolated: false,
-            at: new Date(Date.now() + 1_500).toISOString(),
+            at: new Date(Date.now() + 500).toISOString(),
           }, { id: 'local-cron-add' }),
         ], { stopReason: 'toolUse' });
       },
@@ -445,7 +445,7 @@ test('isolated-mode delivery remains admitted for a Telegram origin', { timeout:
           fauxToolCall('cron', {
             action: 'add',
             message: scheduledMessage,
-            at: new Date(Date.now() + 1_500).toISOString(),
+            at: new Date(Date.now() + 500).toISOString(),
           }, { id: 'isolated-cron-add' }),
         ], { stopReason: 'toolUse' });
       },
@@ -494,7 +494,7 @@ test('an isolated scheduled run that errors queues one sanitized failure notice'
           fauxToolCall('cron', {
             action: 'add',
             message: scheduledMessage,
-            at: new Date(Date.now() + 1_500).toISOString(),
+            at: new Date(Date.now() + 500).toISOString(),
           }, { id: 'failing-cron-add' }),
         ], { stopReason: 'toolUse' });
       },
@@ -555,7 +555,7 @@ test('an empty origin-mode answer queues one notice and stays one record after r
             action: 'add',
             message: scheduledMessage,
             isolated: false,
-            at: new Date(Date.now() + 1_500).toISOString(),
+            at: new Date(Date.now() + 500).toISOString(),
           }, { id: 'empty-cron-add' }),
         ], { stopReason: 'toolUse' });
       },
@@ -627,7 +627,7 @@ test('an aborted scheduled run queues nothing', { timeout: 25_000 }, async () =>
           fauxToolCall('cron', {
             action: 'add',
             message: scheduledMessage,
-            at: new Date(Date.now() + 1_500).toISOString(),
+            at: new Date(Date.now() + 500).toISOString(),
           }, { id: 'cancelled-cron-add' }),
         ], { stopReason: 'toolUse' });
       },
@@ -700,7 +700,7 @@ test('silent jobs suppress success and empty answers but keep failure notices an
       when: ({ input }) => input === 'schedule silent jobs' && !scheduled,
       respond: () => {
         scheduled = true;
-        const at = new Date(Date.now() + 1_500).toISOString();
+        const at = new Date(Date.now() + 500).toISOString();
         return fauxAssistantMessage([
           fauxToolCall('cron', {
             action: 'add', message: 'silent empty reminder', name: 'silent empty', silent: true, at,
@@ -872,7 +872,7 @@ test('a silent origin run stays undelivered while a non-silent unusable answer q
       when: ({ input }) => input === 'schedule silent origin jobs' && !scheduled,
       respond: () => {
         scheduled = true;
-        const at = new Date(Date.now() + 1_500).toISOString();
+        const at = new Date(Date.now() + 500).toISOString();
         return fauxAssistantMessage([
           fauxToolCall('cron', {
             action: 'add', message: 'silent origin reminder', name: 'silent origin', isolated: false, silent: true, at,
