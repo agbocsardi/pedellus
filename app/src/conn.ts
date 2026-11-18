@@ -3,6 +3,7 @@ import {
   LIMITS,
   MAIN_THREAD,
   PROTOCOL_VERSION,
+  type CommandInfo,
   type ControlCommand,
   type Request,
   type Response,
@@ -73,9 +74,9 @@ export class Connection {
   }
 
   /** Typed owner control request; the visible result arrives as an event. */
-  control(thread: ThreadId, command: ControlCommand) {
+  control(thread: ThreadId, command: ControlCommand, args?: string) {
     if (this.store.connState !== "open" || !this.store.canWrite(thread)) return;
-    this.write({ type: "req", id: this.id(), op: "control", thread, command });
+    this.write({ type: "req", id: this.id(), op: "control", thread, command, ...(args ? { args } : {}) });
   }
 
   rename(thread: ThreadId, title: string) {
@@ -349,7 +350,7 @@ export class Connection {
       this.store.resetStatuses();
       const device = typeof res.device === "string" ? res.device : undefined;
       const name = typeof res.agent === "string" ? res.agent.trim() : "";
-      this.store.setIdentity(device, name && [...name].length <= 40 ? name : undefined);
+      this.store.setIdentity(device, name && [...name].length <= 40 ? name : undefined, commandList(res.commands));
       this.store.setMode("chat");
     });
   }
@@ -413,4 +414,17 @@ export class Connection {
       console.error("replay checkpoint not persisted; acks stop", err);
     }
   }
+}
+
+const COMMAND_NAME = /^[a-z][a-z0-9_-]{0,22}$/;
+/** Keeps only well-formed `hello.commands` entries; undefined if none were sent. */
+function commandList(raw: unknown): CommandInfo[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  return raw.flatMap((c): CommandInfo[] => {
+    if (!c || typeof c !== "object") return [];
+    const { name, args, summary, usage } = c as Record<string, unknown>;
+    if (typeof name !== "string" || !COMMAND_NAME.test(name) || typeof summary !== "string"
+      || typeof usage !== "string" || (args !== undefined && typeof args !== "string")) return [];
+    return [{ name, summary, usage, ...(args ? { args } : {}) }];
+  });
 }

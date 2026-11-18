@@ -1,5 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
-import { MAIN_THREAD, type DurableEvent, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { MAIN_THREAD, type CommandInfo, type DurableEvent, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
 
 export type ConnState = "offline" | "connecting" | "replaying" | "open";
 export type Mode = "boot" | "chat" | "pair" | "update";
@@ -8,7 +8,7 @@ export type Outgoing = { key: string; thread: ThreadId; text: string; state: Out
 export type ThreadCreate = { key: string; title?: string; from?: ThreadOrigin; failed?: boolean };
 export type AgentStatus = Pick<StatusEvent, "state" | "label">;
 type ChatEvent = Exclude<DurableEvent, { event: "thread" }>;
-type Identity = { device?: string; agent?: string };
+type Identity = { device?: string; agent?: string; commands?: CommandInfo[] };
 type LiveStatus = AgentStatus & { turnKey?: string };
 
 interface Db extends DBSchema {
@@ -74,6 +74,8 @@ export class Store {
   }
 
   get agentName() { return this.identity?.agent ?? "Durable"; }
+  /** The gateway's last advertised commands; undefined until a hello listed them. */
+  get commands() { return this.identity?.commands; }
 
   async init() {
     const db = await openDB<Db>("durable-app", 2, {
@@ -417,10 +419,12 @@ export class Store {
     }
   }
 
-  setIdentity(device: string | undefined, agent: string | undefined) {
+  setIdentity(device: string | undefined, agent: string | undefined, commands: CommandInfo[] | undefined) {
     device ??= this.identity?.device;
-    if (this.identity?.device === device && this.identity?.agent === agent) return;
-    this.identity = { device, agent };
+    commands ??= this.identity?.commands;
+    if (this.identity?.device === device && this.identity?.agent === agent
+      && JSON.stringify(this.identity?.commands) === JSON.stringify(commands)) return;
+    this.identity = { device, agent, commands };
     this.searchCache = undefined;
     this.changed();
     void this.db?.put("settings", this.identity, "identity").catch(console.error);

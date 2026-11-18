@@ -2,7 +2,7 @@ import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type Keyb
 import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
-import { LIMITS, MAIN_THREAD, type ControlCommand, type DurableEvent, type MessageEvent, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type ThreadInfo, type ThreadOrigin } from "./protocol";
 import { Avatar, type AvatarState } from "./Avatar";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
@@ -17,19 +17,29 @@ const TITLE_CONTROL = /[\p{Cc}\u2028\u2029]/u;
 const WRENCH_ICON = "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8Z";
 
 type CommandState = { online: boolean; writable: boolean; running: boolean };
-type Command = {
-  command: ControlCommand; description: string; icon: string; confirm?: boolean;
-  enabled: (s: CommandState) => boolean;
-};
 const ready = (s: CommandState) => s.online && s.writable;
-/** The composer toolbox and `/` menu. Add a row when the protocol gains a control. */
-const COMMANDS: Command[] = [
-  { command: "new", description: "Start a fresh context in this thread", icon: "M12 5v14M5 12h14", confirm: true, enabled: ready },
-  { command: "status", description: "Ask the agent what it is doing", icon: "M3 12h4l3-8 4 16 3-8h4", enabled: ready },
-  { command: "abort", description: "Stop the running turn", icon: "M6 6l12 12M18 6 6 18", enabled: (s) => ready(s) && s.running },
+/** The toolbox lists `hello.commands`; this is only for before a gateway has sent one. */
+const FALLBACK_COMMANDS: CommandInfo[] = [
+  { name: "new", summary: "Start a fresh context in this thread", usage: "Usage: /new" },
+  { name: "status", summary: "Ask the agent what it is doing", usage: "Usage: /status" },
+  { name: "abort", summary: "Stop the running turn", usage: "Usage: /abort" },
 ];
-/** A lone `/word` in the composer is a command, never a message. */
-const SLASH = /^\/([a-z]*)$/i;
+/** Local rules on top of the gateway's list. */
+const canRun = (c: CommandInfo, s: CommandState) => ready(s) && (c.name !== "abort" || s.running);
+const CONFIRM = new Set(["new"]); // leaves a visible divider
+const COMMAND_ICONS: Record<string, string> = {
+  new: "M12 5v14M5 12h14",
+  status: "M3 12h4l3-8 4 16 3-8h4",
+  abort: "M6 6l12 12M18 6 6 18",
+  model: "M8 8h8v8H8zM10 3v3M14 3v3M10 18v3M14 18v3M3 10h3M3 14h3M18 10h3M18 14h3",
+  digest: "M5 6h14M5 12h14M5 18h9",
+  compact: "M8 3v5H3M16 3v5h5M8 21v-5H3M16 21v-5h5",
+  help: "M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0",
+};
+const COMMAND_ICON = "M15 4 9 20";
+const ARGS_MAX = 1000;
+/** `/name` or `/name args` in the composer is a command, never a message. */
+const SLASH = /^\/([a-z0-9_-]*)(?:\s([\s\S]*))?$/i;
 
 function suggestedTitle(text: string) {
   return text.replace(/[\p{Cc}\s]+/gu, " ").trim().slice(0, LIMITS.threadTitleChars)
@@ -119,10 +129,15 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const back = source ?? store.threads.get(MAIN_THREAD)!;
   const canRetry = writable && !running;
   const cmdState: CommandState = { online, writable, running };
-  const slash = SLASH.exec(text.trim());
-  const matches = slash ? COMMANDS.filter((c) => c.command.startsWith(slash[1].toLowerCase())) : [];
+  const commands = store.commands ?? FALLBACK_COMMANDS;
+  const slash = SLASH.exec(text);
+  const typed = slash?.[1].toLowerCase() ?? "";
+  const args = slash?.[2]; // undefined until a space follows the name
+  const matches = !slash ? [] : args === undefined ? commands.filter((c) => c.name.startsWith(typed))
+    : commands.filter((c) => c.name === typed);
+  const picked: CommandInfo | undefined = matches[args === undefined ? Math.min(slashPick, matches.length - 1) : 0];
+  const argsTooLong = (args?.trim().length ?? 0) > ARGS_MAX;
   const slashOpen = !!slash && writable && !sheet && !slashHidden;
-  const picked = matches[Math.min(slashPick, matches.length - 1)];
   const forkError = store.forkRejected ? "Could not start a side thread from that message." : "";
   const forks = new Map<string, ThreadInfo[]>();
   let hasOtherActivity = false;
@@ -221,7 +236,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       return;
     }
     if (slash) {
-      if (picked) runCommand(picked);
+      runSlash();
       return;
     }
     const t = text.trim();
@@ -254,9 +269,9 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
-    if (slashOpen && (e.key === "ArrowDown" || e.key === "ArrowUp") && matches.length) {
+    if (slashOpen && (e.key === "ArrowDown" || e.key === "ArrowUp") && args === undefined && matches.length) {
       e.preventDefault();
-      const i = matches.indexOf(picked) + (e.key === "ArrowDown" ? 1 : -1);
+      const i = matches.indexOf(picked!) + (e.key === "ArrowDown" ? 1 : -1);
       setSlashPick((i + matches.length) % matches.length);
       return;
     }
@@ -267,7 +282,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     }
     if (slash && e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (picked) runCommand(picked);
+      runSlash();
       return;
     }
     // On phones Enter makes a newline; send is the button. On desktop Enter
@@ -278,18 +293,38 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     }
   }
 
-  function command(c: ControlCommand) {
-    conn.control(thread, c);
+  function command(c: string, args?: string) {
+    conn.control(thread, c, args);
     setSheet(null);
   }
 
-  function runCommand(c: Command) {
-    if (!c.enabled(cmdState)) return;
-    if (SLASH.test(text.trim())) setText("");
+  /** Enter or send with `/…` in the composer: never a chat message. */
+  function runSlash() {
+    setSlashHidden(false); // an unknown name shows its hint again
+    if (picked && !argsTooLong) runCommand(picked, args);
+  }
+
+  /** `args` is the text after `/name `; undefined when picked from a list. */
+  function runCommand(c: CommandInfo, args?: string) {
+    if (!canRun(c, cmdState)) return;
+    if (c.args && args === undefined) {
+      // Commands with arguments go through the composer, with usage shown.
+      setText(`/${c.name} `);
+      setSlashPick(0);
+      setSlashHidden(false);
+      if (sheet) {
+        setSheet(null);
+        // On touch, the tap into the field opens the keyboard (strategy F);
+        // a programmatic focus here would let iOS scroll the page.
+        if (FINE_POINTER) requestAnimationFrame(() => taRef.current?.focus());
+      }
+      return;
+    }
+    if (SLASH.test(text)) setText("");
     // From the `/` menu the field still has focus; return it to the wrench
     // after the confirm sheet, not to the field (which would re-trigger iOS).
-    if (c.confirm) show({ kind: "confirm-new" }, sheet ? undefined : wrenchRef.current ?? undefined);
-    else command(c.command);
+    if (CONFIRM.has(c.name)) show({ kind: "confirm-new" }, sheet ? undefined : wrenchRef.current ?? undefined);
+    else command(c.name, args?.trim() || undefined);
   }
 
   async function saveTitle(value: string) {
@@ -454,8 +489,11 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       <footer className="composer">
         {!sheet && (error || forkError) && <p className="error-text" role="alert">{error || forkError}</p>}
         {slashOpen && <div className="slash-list" aria-label="Commands" role="group">
-          {matches.length ? matches.map((c) => <CommandItem key={c.command} c={c} state={cmdState} active={c === picked}
-            onClick={() => runCommand(c)} keepFocus />) : <p className="sheet-help">No matching command.</p>}
+          {matches.map((c) => <CommandItem key={c.name} c={c} state={cmdState} active={c === picked}
+            onClick={() => runCommand(c, args)} keepFocus />)}
+          {!picked ? <p className="sheet-help" role="status">Unknown command /{typed}</p>
+            : args !== undefined && <p className="slash-usage" role="status">{argsTooLong
+              ? `Arguments are limited to ${ARGS_MAX} characters.` : picked.usage}</p>}
           {!online && <p className="sheet-help">Reconnect to use commands.</p>}
         </div>}
         {archived ? (
@@ -464,7 +502,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             : "Reconnect to restore"}</p>
         ) : !writable ? <p className="archived-hint">Read-only until thread details are available.</p> : <div className="capsule">
           <button ref={wrenchRef} className="wrench" aria-label="Commands" aria-haspopup="dialog"
-            aria-expanded={sheet?.kind === "tools"} disabled={!online}
+            aria-expanded={sheet?.kind === "tools"}
             onClick={(e) => show({ kind: "tools" }, e.currentTarget)}>
             <Icon d={WRENCH_ICON} />
           </button>
@@ -482,7 +520,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           <button
             className={running ? "send stop" : "send"}
             aria-label={running ? "Stop" : "Send"}
-            data-ready={running || (slash ? !!picked?.enabled(cmdState) : text.trim() !== "") ? "" : undefined}
+            data-ready={running || (slash ? !!picked && canRun(picked, cmdState) && !argsTooLong : text.trim() !== "") ? "" : undefined}
             onClick={() => void submit()}
           >
             {running ? (
@@ -524,7 +562,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             </>}
             {sheet.kind === "tools" && <>
               <h2 className="sheet-heading">Commands</h2>
-              {COMMANDS.map((c) => <CommandItem key={c.command} c={c} state={cmdState} onClick={() => runCommand(c)} />)}
+              {commands.map((c) => <CommandItem key={c.name} c={c} state={cmdState} onClick={() => runCommand(c)} />)}
               {!online && <p className="sheet-help">Reconnect to use commands.</p>}
             </>}
             {sheet.kind === "confirm-new" && <>
@@ -670,15 +708,15 @@ function SheetItem(props: { icon: string; title: string; sub?: string; disabled?
 }
 
 function CommandItem({ c, state, active, keepFocus, onClick }: {
-  c: Command; state: CommandState; active?: boolean; keepFocus?: boolean; onClick: () => void;
+  c: CommandInfo; state: CommandState; active?: boolean; keepFocus?: boolean; onClick: () => void;
 }) {
   return (
-    <button className="sheet-item command-item" disabled={!c.enabled(state)} aria-current={active || undefined}
+    <button className="sheet-item command-item" disabled={!canRun(c, state)} aria-current={active || undefined}
       tabIndex={keepFocus ? -1 : undefined} onPointerDown={keepFocus ? (e) => e.preventDefault() : undefined} onClick={onClick}>
-      <span className="sheet-icon"><Icon d={c.icon} /></span>
+      <span className="sheet-icon"><Icon d={COMMAND_ICONS[c.name] ?? COMMAND_ICON} /></span>
       <span>
-        <b>/{c.command}</b>
-        <small>{c.description}</small>
+        <b>/{c.name}{c.args && <span className="command-args"> {c.args}</span>}</b>
+        <small>{c.summary}</small>
       </span>
     </button>
   );
