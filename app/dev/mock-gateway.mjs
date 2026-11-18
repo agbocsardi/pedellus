@@ -297,7 +297,10 @@ function onStream(ws, token) {
         break;
       }
       case "threads": {
-        const list = [...threads.values()].map((t) => t.info).sort((a, b) => b.lastAt.localeCompare(a.lastAt));
+        let archived = 0;
+        const list = [...threads.values()].map((t) => t.info)
+          .sort((a, b) => b.lastAt.localeCompare(a.lastAt))
+          .filter((t) => !t.archived || archived++ < 200);
         reply(ws, frame.id, true, { threads: list });
         break;
       }

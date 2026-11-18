@@ -29,13 +29,17 @@ export class Connection {
   private pingWatch: ReturnType<typeof setTimeout> | undefined;
   private replaying = false;
   private replayCount = 0;
+  private replayCursor: number | null = null;
+  private replayHead: number | null = null;
+  private replayComplete = false;
   /** 4409: another stream replaced us; stay quiet until the app is visible. */
   private suppressed = false;
   /** 4401/4426: only revive() (pairing success) starts us again. */
   private dead = false;
-  private ackCursor: number | null = null;
   private ackFrozen = false;
+  private ackCursor: number | null = null;
   private ackTimer: ReturnType<typeof setTimeout> | undefined;
+  private selectCreated: { thread: ThreadId; from: ThreadId } | undefined;
 
   constructor(private store: Store) {
     this.pingTimer = setInterval(
@@ -88,7 +92,10 @@ export class Connection {
     this.request({ type: "req", id: this.id(), op: "thread.create", key: c.key, title: c.title }, async (res) => {
       if (!res) return; // No reply: retry the same key after replay.
       await this.store.finishCreate(c, res.ok);
-      if (res.ok && res.thread && from === this.store.openThread) this.store.selectThread(res.thread);
+      if (res.ok && res.thread && from === this.store.openThread) {
+        if (this.store.threads.has(res.thread)) this.store.selectThread(res.thread);
+        else this.selectCreated = { thread: res.thread, from };
+      }
     });
   }
 
@@ -124,7 +131,7 @@ export class Connection {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/v1/stream`);
     this.ws = ws;
-    ws.onopen = () => this.hello();
+    ws.onopen = () => this.hello(this.store.resumeCursor);
     // Keep replay, writes to IndexedDB, and thread snapshots in wire order.
     let frames = Promise.resolve();
     ws.onmessage = (e) => {
@@ -140,7 +147,11 @@ export class Connection {
     this.pending.clear();
     clearTimeout(this.pingWatch);
     this.pingWatch = undefined;
-    this.flushAck();
+    clearTimeout(this.ackTimer);
+    this.ackTimer = undefined;
+    this.ackCursor = null;
+    this.replayComplete = false;
+    this.selectCreated = undefined;
     this.store.setConn("offline");
     switch (code) {
       case CLOSE.unauthorized:
@@ -223,11 +234,17 @@ export class Connection {
       case "settled":
       case "divider":
       case "thread": {
-        this.replayCount++;
-        const stored = await this.store.applyDurable(f);
-        // Ack drives gateway retention: only what IndexedDB really holds.
-        if (!stored) this.ackFrozen = true;
-        if (this.ws === ws && stored && !this.ackFrozen) this.ack(f.cursor);
+        if (this.replaying && this.replayHead !== null && f.cursor <= this.replayHead) {
+          this.replayCount++;
+          this.replayCursor = f.cursor;
+        }
+        if (!await this.store.applyDurable(f)) this.ackFrozen = true;
+        if (this.ws !== ws) break;
+        if (f.event === "thread" && f.thread.id === this.selectCreated?.thread) {
+          if (this.store.openThread === this.selectCreated.from) this.store.selectThread(f.thread.id);
+          this.selectCreated = undefined;
+        }
+        this.ack(ws);
         break;
       }
       case "preview":
@@ -238,9 +255,11 @@ export class Connection {
         // Main status is guaranteed after each batch, even when all threads
         // are idle. Other status frames are routed normally, in any order.
         if (f.thread === MAIN_THREAD && this.replaying) {
-          if (this.replayCount >= LIMITS.replayBatch) this.hello();
+          if (this.replayCount >= LIMITS.replayBatch) this.hello(this.replayCursor);
           else {
             this.replaying = false;
+            this.replayComplete = true;
+            this.ack(ws);
             this.refreshThreads(ws);
           }
         }
@@ -249,12 +268,12 @@ export class Connection {
   }
 
   /** hello (also mid-stream re-hello when a 500-event replay batch is full). */
-  private hello() {
+  private hello(cursor: number | null) {
     // Live frames from before a re-hello can still be in flight. Only the
     // hello reply arms the new replay boundary.
     this.replaying = false;
     this.store.setConn("replaying");
-    this.request({ type: "req", id: this.id(), op: "hello", v: PROTOCOL_VERSION, cursor: this.store.cursor }, (res) => {
+    this.request({ type: "req", id: this.id(), op: "hello", v: PROTOCOL_VERSION, cursor }, (res) => {
       if (!res) return;
       if (!res.ok) {
         console.warn("hello rejected:", res.error);
@@ -263,6 +282,8 @@ export class Connection {
       }
       this.replaying = true;
       this.replayCount = 0;
+      this.replayCursor = cursor;
+      this.replayHead = res.head ?? null;
       this.store.resetStatuses();
       if (typeof res.device === "string") this.store.setDevice(res.device);
       this.store.setMode("chat");
@@ -303,22 +324,28 @@ export class Connection {
   }
 
   /** Coalesce acks so a big replay does not become one frame per event. */
-  private ack(cursor: number) {
-    this.ackCursor = Math.max(this.ackCursor ?? 0, cursor);
-    if (this.ackTimer === undefined) {
-      this.ackTimer = setTimeout(() => {
-        this.ackTimer = undefined;
-        this.flushAck();
-      }, 250);
-    }
+  private ack(ws: WebSocket) {
+    if (!this.replayComplete || this.ackFrozen || this.store.cursor === null) return;
+    // Only called after the triggering event (or the whole replay) commits.
+    this.ackCursor = this.store.cursor;
+    if (this.ackTimer !== undefined) return;
+    this.ackTimer = setTimeout(() => {
+      this.ackTimer = undefined;
+      const cursor = this.ackCursor;
+      this.ackCursor = null;
+      if (cursor !== null) void this.flushAck(ws, cursor);
+    }, 250);
   }
 
-  private flushAck() {
-    if (this.ackTimer !== undefined) {
-      clearTimeout(this.ackTimer);
-      this.ackTimer = undefined;
+  private async flushAck(ws: WebSocket, cursor: number) {
+    if (this.ws !== ws || !this.replayComplete || this.ackFrozen) return;
+    try {
+      if (await this.store.checkpoint(cursor) && this.ws === ws && !this.ackFrozen) {
+        this.write({ type: "req", id: this.id(), op: "ack", cursor });
+      }
+    } catch (err) {
+      this.ackFrozen = true;
+      console.error("replay checkpoint not persisted; acks stop", err);
     }
-    if (this.ackCursor === null) return;
-    this.write({ type: "req", id: this.id(), op: "ack", cursor: this.ackCursor });
   }
 }

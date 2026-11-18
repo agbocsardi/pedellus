@@ -46,6 +46,14 @@ export function App({ store }: { store: Store }) {
     };
   }, []);
 
+  if (!conn && store.storageBlocked) return (
+    <div className="screen center">
+      <div className="card pad" role="status">
+        <h1>Close other Durable windows</h1>
+        <p className="dim">Durable will continue after its local storage can be upgraded.</p>
+      </div>
+    </div>
+  );
   if (!conn) return <Splash />;
   if (store.mode === "update") return <UpdateScreen />;
   if (store.mode === "pair") return <FirstRun store={store} conn={conn} />;

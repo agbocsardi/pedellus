@@ -15,7 +15,7 @@ interface Db extends DBSchema {
   threads: { key: string; value: ThreadInfo };
   creates: { key: string; value: ThreadCreate };
   view: { key: string; value: { thread: ThreadId; cursor: number } };
-  settings: { key: "openThread"; value: ThreadId };
+  settings: { key: "openThread" | "resumeCursor"; value: ThreadId | number };
 }
 
 const IDLE: AgentStatus = { state: "idle" };
@@ -36,8 +36,10 @@ export class Store {
   connState: ConnState = "offline";
   mode: Mode = "boot";
   device: string | null = null;
-  /** Highest durable cursor received, across all threads. */
+  storageBlocked = false;
+  /** Max seen can be ahead of a replay gap; only resumeCursor is safe for hello. */
   cursor: number | null = null;
+  resumeCursor: number | null = null;
 
   // Live frames are not durable; hello resends current statuses, not previews.
   private previews = new Map<ThreadId, PreviewEvent>();
@@ -45,7 +47,9 @@ export class Store {
   private viewed = new Map<ThreadId, number>();
   private db: IDBPDatabase<Db> | null = null;
   private durableWriteFailed = false;
-  private echoedKeys = new Set<string>();
+  private seenCursors = new Set<number>();
+  private threadCursors = new Map<ThreadId, number>();
+  private echoedKeys = new Map<ThreadId, Set<string>>();
   private listeners = new Set<() => void>();
   private version = 0;
 
@@ -61,6 +65,10 @@ export class Store {
 
   async init() {
     const db = this.db = await openDB<Db>("durable-app", 2, {
+      blocked: () => {
+        this.storageBlocked = true;
+        this.changed();
+      },
       upgrade(db, oldVersion) {
         if (oldVersion < 1) {
           db.createObjectStore("events", { keyPath: "cursor" });
@@ -72,31 +80,52 @@ export class Store {
         db.createObjectStore("settings");
       },
     });
+    db.onversionchange = () => {
+      db.close();
+      this.db = null;
+    };
+    this.storageBlocked = false;
     for (const m of await db.getAll("outbox")) this.outbox.set(m.key, { ...m, thread: m.thread ?? MAIN_THREAD });
     // IndexedDB returns events in primary-key (cursor) order. Normalize old
     // records on read; the upgrade never rewrites or drops the v1 log/outbox.
     for (const ev of await db.getAll("events")) {
       this.cursor = ev.cursor;
-      if (ev.event !== "thread") this.absorbChat({ ...ev, thread: ev.thread ?? MAIN_THREAD });
+      this.seenCursors.add(ev.cursor);
+      if (ev.event === "thread") this.threadCursors.set(ev.thread.id, ev.cursor);
+      else {
+        // Existing v2 caches have no checkpoint. Replay from the last v1
+        // cursor (or the beginning) rather than trusting their high-water mark.
+        if (ev.thread === undefined) this.resumeCursor = ev.cursor;
+        this.absorbChat({ ...ev, thread: ev.thread ?? MAIN_THREAD });
+      }
     }
     // This cache includes the last authoritative listing, which can be newer
     // than any retained thread event, so don't overwrite it with old history.
     for (const t of await db.getAll("threads")) this.threads.set(t.id, t);
     for (const c of await db.getAll("creates")) this.creates.set(c.key, c);
     for (const v of await db.getAll("view")) this.viewed.set(v.thread, v.cursor);
-    this.openThread = (await db.get("settings", "openThread")) ?? MAIN_THREAD;
+    const open = await db.get("settings", "openThread");
+    if (typeof open === "string") this.openThread = open;
+    const resume = await db.get("settings", "resumeCursor");
+    if (typeof resume === "number") this.resumeCursor = resume;
     this.changed();
   }
 
   /** Commit each durable event and its derived state before acking it. */
   async applyDurable(ev: DurableEvent): Promise<boolean> {
-    if (this.cursor !== null && ev.cursor <= this.cursor) return !this.durableWriteFailed;
-    this.cursor = ev.cursor;
+    if (this.seenCursors.has(ev.cursor)) return !!this.db && !this.durableWriteFailed;
+    this.seenCursors.add(ev.cursor);
+    this.cursor = Math.max(this.cursor ?? 0, ev.cursor);
     let outgoing: Outgoing | undefined;
     let info: ThreadInfo | undefined;
     if (ev.event === "thread") {
-      info = ev.thread;
-      this.threads.set(info.id, info);
+      const prev = this.threads.get(ev.thread.id);
+      if (ev.cursor > (this.threadCursors.get(ev.thread.id) ?? 0)) {
+        this.threadCursors.set(ev.thread.id, ev.cursor);
+        const lastAt = prev && Date.parse(prev.lastAt) > Date.parse(ev.thread.lastAt) ? prev.lastAt : ev.thread.lastAt;
+        info = { ...ev.thread, lastAt };
+        this.threads.set(info.id, info);
+      }
     } else {
       outgoing = this.absorbChat(ev);
       const prev = this.threads.get(ev.thread);
@@ -124,19 +153,33 @@ export class Store {
     }
   }
 
+  /** Save the replay-safe cursor before the gateway can retire those events. */
+  async checkpoint(cursor: number) {
+    if (!this.db || this.durableWriteFailed) return false;
+    if (cursor > (this.resumeCursor ?? 0)) {
+      await this.db.put("settings", cursor, "resumeCursor");
+      this.resumeCursor = Math.max(this.resumeCursor ?? 0, cursor);
+    }
+    return true;
+  }
+
   private absorbChat(ev: ChatEvent): Outgoing | undefined {
     let events = this.events.get(ev.thread);
     if (!events) this.events.set(ev.thread, events = []);
-    events.push(ev);
+    let i = events.length;
+    while (i > 0 && events[i - 1].cursor > ev.cursor) i--;
+    events.splice(i, 0, ev);
     if (ev.event === "message" && ev.role === "user" && ev.key) {
-      this.echoedKeys.add(ev.key);
-      const m = this.outbox.get(ev.key);
+      let keys = this.echoedKeys.get(ev.thread);
+      if (!keys) this.echoedKeys.set(ev.thread, keys = new Set());
+      keys.add(ev.key);
+      const m = this.outgoing(ev.thread, ev.key);
       if (m && (m.state === "queued" || m.state === "sent" || m.state === "failed")) {
         return this.updateOutgoing(m, "admitted");
       }
     } else if (ev.event === "settled" || (ev.event === "message" && ev.role === "assistant")) {
       if (ev.key && this.previews.get(ev.thread)?.key === ev.key) this.previews.delete(ev.thread);
-      const m = ev.event === "settled" ? this.outbox.get(ev.key) : undefined;
+      const m = ev.event === "settled" ? this.outgoing(ev.thread, ev.key) : undefined;
       if (m && ev.event === "settled") return this.updateOutgoing(m, ev.outcome);
     }
   }
@@ -147,8 +190,13 @@ export class Store {
     return next;
   }
 
-  hasEcho(key: string): boolean {
-    return this.echoedKeys.has(key);
+  outgoing(thread: ThreadId, key: string) {
+    const m = this.outbox.get(key);
+    return m?.thread === thread ? m : undefined;
+  }
+
+  hasEcho(thread: ThreadId, key: string): boolean {
+    return this.echoedKeys.get(thread)?.has(key) ?? false;
   }
 
   setThreadListUnavailable() {
@@ -167,7 +215,7 @@ export class Store {
   }
 
   selectThread(thread: ThreadId) {
-    if (thread === this.openThread) return;
+    if (thread === this.openThread || !this.threads.has(thread)) return;
     this.openThread = thread;
     this.changed();
     void this.db?.put("settings", thread, "openThread").catch(console.error);

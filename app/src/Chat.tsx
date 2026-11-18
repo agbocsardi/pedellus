@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
@@ -84,7 +84,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
   const rows: Row[] = (store.events.get(thread) ?? []).map((ev) => ({ kind: "ev", ev }));
   for (const m of store.outbox.values()) {
-    if (m.thread === thread && (m.state === "queued" || m.state === "sent" || m.state === "failed") && !store.hasEcho(m.key)) {
+    if (m.thread === thread && (m.state === "queued" || m.state === "sent" || m.state === "failed") && !store.hasEcho(thread, m.key)) {
       rows.push({ kind: "pending", m });
     }
   }
@@ -96,20 +96,32 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   });
   const empty = !rows.some((r) => r.kind === "pending" || r.ev.event === "message");
 
-  useEffect(() => { pinned.current = true; }, [thread]);
-  useEffect(() => {
-    const view = () => { if (!sheet && !document.hidden) store.markViewed(thread, latest); };
-    view();
-    document.addEventListener("visibilitychange", view);
-    return () => document.removeEventListener("visibilitychange", view);
-  }, [store, thread, latest, sheet]);
+  function markAtBottom(el: HTMLDivElement) {
+    if (!sheet && !document.hidden && el.scrollHeight - el.scrollTop - el.clientHeight <= 2) {
+      store.markViewed(thread, latest);
+    }
+  }
+
+  useLayoutEffect(() => { pinned.current = true; }, [thread]);
   useEffect(() => cancelPress, []);
 
-  // Stay glued to the bottom while the user is already there (streams,
-  // previews and new events all push without yanking the view otherwise).
-  useEffect(() => {
+  // Follow new content only if already at the bottom. A modal covers the
+  // conversation, so don't mark it viewed (or follow) until dismissed.
+  useLayoutEffect(() => {
     const el = scroller.current;
-    if (el && pinned.current) el.scrollTop = el.scrollHeight;
+    if (!el || sheet || document.hidden) return;
+    if (pinned.current) el.scrollTop = el.scrollHeight;
+    markAtBottom(el);
+  });
+  useEffect(() => {
+    const view = () => {
+      const el = scroller.current;
+      if (!el || sheet || document.hidden) return;
+      if (pinned.current) el.scrollTop = el.scrollHeight;
+      markAtBottom(el);
+    };
+    document.addEventListener("visibilitychange", view);
+    return () => document.removeEventListener("visibilitychange", view);
   });
   useEffect(() => {
     const ta = taRef.current;
@@ -117,12 +129,6 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     ta.style.height = "auto";
     ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
   }, [text, thread, archived]);
-  useEffect(() => {
-    if (!sheet) return;
-    const onKey = (e: globalThis.KeyboardEvent) => e.key === "Escape" && setSheet(null);
-    addEventListener("keydown", onKey);
-    return () => removeEventListener("keydown", onKey);
-  }, [sheet]);
 
   function cancelPress() {
     if (press.current) clearTimeout(press.current.timer);
@@ -229,7 +235,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           </div>
         </div>
         <button className="icon-btn" aria-label="Open threads" aria-haspopup="dialog"
-          aria-expanded={sheet?.kind === "list"} onClick={() => show({ kind: "list" })}>
+          aria-expanded={sheet?.kind === "list"} onClick={(e) => { e.currentTarget.focus(); show({ kind: "list" }); }}>
           <Icon d={LIST_ICON} bold />
         </button>
         <button
@@ -237,7 +243,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           aria-label="Thread menu"
           aria-haspopup="dialog"
           aria-expanded={sheet?.kind === "menu"}
-          onClick={() => show({ kind: "menu" })}
+          onClick={(e) => { e.currentTarget.focus(); show({ kind: "menu" }); }}
         >
           <Icon d="M6 12h.01M12 12h.01M18 12h.01" bold />
         </button>
@@ -249,7 +255,9 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         onScroll={(e) => {
           cancelPress();
           const el = e.currentTarget;
-          pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+          if (sheet || document.hidden) return;
+          pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 2;
+          if (pinned.current) markAtBottom(el);
         }}
         onContextMenu={(e) => {
           const title = messageTitle(e.target);
@@ -343,11 +351,10 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       </footer>
 
       {sheet && (
-        <div className="sheet-layer">
-          <button className="sheet-backdrop" aria-label="Dismiss sheet" onClick={() => { setError(""); setSheet(null); }} />
-          <div className="sheet" role="dialog" aria-modal="true" aria-label={sheet.kind === "list" ? "Threads" :
-            sheet.kind === "menu" ? "Thread menu" : sheet.kind === "message" ? "Message actions" :
-              sheet.kind === "rename" ? "Rename thread" : "New thread"}>
+        <Modal title={sheet.kind === "list" ? "Threads" :
+          sheet.kind === "menu" ? "Thread menu" : sheet.kind === "message" ? "Message actions" :
+            sheet.kind === "rename" ? "Rename thread" : "New thread"}
+          dismiss={() => { setError(""); setSheet(null); }}>
             <div className="sheet-grip" aria-hidden="true" />
             {sheet.kind === "list" && <ThreadList store={store} onNew={() => show({ kind: "create", title: "" })}
               onSelect={(id) => { setSheet(null); store.selectThread(id); }} />}
@@ -377,10 +384,25 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             <button className="sheet-cancel" onClick={() => { setError(""); setSheet(null); }}>
               {sheet.kind === "list" ? "Done" : "Cancel"}
             </button>
-          </div>
-        </div>
+        </Modal>
       )}
     </div>
+  );
+}
+
+function Modal({ title, dismiss, children }: { title: string; dismiss: () => void; children: ReactNode }) {
+  const ref = useRef<HTMLDialogElement>(null);
+  useLayoutEffect(() => {
+    const dialog = ref.current!;
+    dialog.showModal();
+    return () => dialog.close();
+  }, []);
+  return (
+    <dialog ref={ref} className="sheet-layer" aria-label={title}
+      onCancel={(e) => { e.preventDefault(); dismiss(); }}
+      onClick={(e) => { if (e.target === e.currentTarget) dismiss(); }}>
+      <div className="sheet">{children}</div>
+    </dialog>
   );
 }
 
@@ -406,7 +428,7 @@ function ThreadList({ store, onNew, onSelect }: {
     {store.threadListUnavailable && <p className="sheet-help">Could not refresh the thread list. Showing known threads.</p>}
     <SheetItem icon="M12 5v14M5 12h14" title="New thread" sub="Start a separate conversation" onClick={onNew} />
     {[...store.creates.values()].map((c) => <p className="sheet-help" key={c.key}>
-      {c.title || "New thread"} · {c.failed ? "Could not create" : "Waiting to sync"}
+      {c.title || "New thread"} · {c.failed ? "Could not create" : "Waits for connection"}
     </p>)}
     {row(main)}
     {side.filter((t) => !t.archived).map(row)}
@@ -476,7 +498,7 @@ function EventRow({ ev, store, last }: { ev: DurableEvent; store: Store; last: b
   if (ev.event !== "message") return null; // settled only drives delivery state
   if (ev.role === "notice") return <div className="notice" data-thread-title={suggestedTitle(ev.text)}>{ev.text}</div>;
   if (ev.role === "user") {
-    const state = ev.key ? store.outbox.get(ev.key)?.state : undefined;
+    const state = ev.key ? store.outgoing(ev.thread, ev.key)?.state : undefined;
     return <UserBubble text={ev.text} state={state} at={ev.at} last={last} />;
   }
   return (
