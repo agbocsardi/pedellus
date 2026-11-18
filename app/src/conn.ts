@@ -1,12 +1,15 @@
 import {
   CLOSE,
   LIMITS,
+  MAIN_THREAD,
+  PROTOCOL_VERSION,
   type ControlCommand,
-  type Event,
+  type Request,
   type Response,
   type ServerFrame,
+  type ThreadId,
 } from "./protocol";
-import type { Outgoing, Store } from "./store";
+import type { Outgoing, Store, ThreadCreate } from "./store";
 
 const BASE_DELAY_MS = 1_000;
 const MAX_DELAY_MS = 30_000;
@@ -19,20 +22,26 @@ const MAX_DELAY_MS = 30_000;
 export class Connection {
   private ws: WebSocket | null = null;
   private nextId = 0;
-  private pending = new Map<string, (res: Response) => void>();
+  private pending = new Map<string, (res?: Response) => void | Promise<void>>();
   private attempt = 0;
+  private sending = new Set<string>();
+  private creating = new Set<string>();
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private pingWatch: ReturnType<typeof setTimeout> | undefined;
   private replaying = false;
   private replayCount = 0;
+  private replayCursor: number | null = null;
+  private replayHead: number | null = null;
+  private replayComplete = false;
   /** 4409: another stream replaced us; stay quiet until the app is visible. */
   private suppressed = false;
   /** 4401/4426: only revive() (pairing success) starts us again. */
   private dead = false;
-  private ackCursor: number | null = null;
   private ackFrozen = false;
+  private ackCursor: number | null = null;
   private ackTimer: ReturnType<typeof setTimeout> | undefined;
+  private selectCreated: { thread: ThreadId; from: ThreadId } | undefined;
 
   constructor(private store: Store) {
     this.pingTimer = setInterval(
@@ -49,6 +58,9 @@ export class Connection {
       }
     });
     addEventListener("online", () => this.kick());
+    store.onQueueChange(() => {
+      void store.reloadQueue().then(() => this.flushQueue()).catch(console.error);
+    });
     this.connect();
   }
 
@@ -61,59 +73,144 @@ export class Connection {
   }
 
   /** Typed owner control request; the visible result arrives as an event. */
-  control(command: ControlCommand) {
-    this.write({ type: "req", id: this.id(), op: "control", command });
+  control(thread: ThreadId, command: ControlCommand) {
+    if (this.store.connState !== "open" || !this.store.canWrite(thread)) return;
+    this.write({ type: "req", id: this.id(), op: "control", thread, command });
+  }
+
+  rename(thread: ThreadId, title: string) {
+    return this.mutate({ type: "req", id: this.id(), op: "thread.rename", thread, title });
+  }
+
+  archive(thread: ThreadId, archived: boolean) {
+    return this.mutate({ type: "req", id: this.id(), op: "thread.archive", thread, archived });
+  }
+
+  private mutate(frame: Request): Promise<Response | undefined> {
+    return new Promise((resolve) => {
+      if (this.store.connState !== "open" || !this.request(frame, resolve)) resolve(undefined);
+    });
+  }
+
+  searchThreads(query: string, onResults: (ids: ReadonlySet<ThreadId>) => void) {
+    if (this.store.connState !== "open") return;
+    this.request({ type: "req", id: this.id(), op: "threads", query }, async (res) => {
+      if (res?.ok && res.threads) {
+        await this.store.mergeThreads(res.threads).catch(console.error);
+        this.flushOutgoing();
+        onResults(new Set(res.threads.map((t) => t.id)));
+      }
+    });
+  }
+
+  sendCreate(c: ThreadCreate, openFrom?: ThreadId) {
+    const current = this.store.creates.get(c.key);
+    if (this.store.connState !== "open" || this.creating.has(c.key) || !current || current.failed) return;
+    if (this.request({ type: "req", id: this.id(), op: "thread.create", key: c.key, title: c.title, from: c.from }, async (res) => {
+      this.creating.delete(c.key);
+      if (!res) return; // No reply: retry the same key after replay.
+      await this.store.finishCreate(c, res.ok, !!c.from && !res.ok && res.error === "bad_request");
+      if (res.ok && res.thread && openFrom === this.store.openThread) {
+        if (this.store.threads.has(res.thread)) this.store.selectThread(res.thread);
+        else this.selectCreated = { thread: res.thread, from: openFrom };
+      }
+    })) this.creating.add(c.key);
   }
 
   /**
    * Send an outgoing message. Queued (stays "queued") unless the stream is
    * live; everything queued/sent is flushed after each replay finishes.
    */
-  sendOutgoing(m: Outgoing) {
-    if (this.store.connState !== "open") return;
-    const id = this.id();
-    this.pending.set(id, (res) => {
-      const cur = this.store.outbox.get(m.key);
-      if (!cur) return;
-      if (res.ok && (cur.state === "queued" || cur.state === "sent")) {
-        void this.store.setOutgoingState(m.key, "admitted");
-      } else if (!res.ok) {
-        console.warn("send rejected:", res.error);
-        void this.store.setOutgoingState(m.key, "failed");
+  sendOutgoing(m: Outgoing, retriedRace = false) {
+    const current = this.store.outgoing(m.thread, m.key);
+    if (this.store.connState !== "open" || !this.store.canWrite(m.thread) || this.sending.has(m.key) ||
+        (current?.state !== "queued" && current?.state !== "sent")) return;
+    const frame = { type: "req", id: this.id(), op: "send", key: m.key, text: m.text, thread: m.thread } as const;
+    if (this.request(frame, async (res) => {
+      const cur = this.store.outgoing(m.thread, m.key);
+      this.sending.delete(m.key);
+      if (!res || !cur || (cur.state !== "queued" && cur.state !== "sent")) return;
+      if (!res.ok && res.error === "bad_request" && m.thread !== MAIN_THREAD) {
+        // Archive may have won the race with this send. The protocol doesn't
+        // distinguish that from other bad requests, so check the thread list.
+        this.sending.add(m.key);
+        await this.store.setOutgoingState(m.key, "queued").catch(console.error);
+        this.checkRejectedSend(m, retriedRace);
+        return;
       }
-    });
-    if (this.write({ type: "req", id, op: "send", key: m.key, text: m.text })) {
-      void this.store.setOutgoingState(m.key, "sent");
+      if (!res.ok) console.warn("send rejected:", res.error);
+      await this.store.setOutgoingState(m.key, res.ok ? "admitted" : "failed");
+    })) {
+      this.sending.add(m.key);
+      void this.store.setOutgoingState(m.key, "sent").catch(console.error);
     }
+  }
+
+  private checkRejectedSend(m: Outgoing, retriedRace: boolean) {
+    if (this.request({ type: "req", id: this.id(), op: "threads" }, async (res) => {
+      this.sending.delete(m.key);
+      if (!res) return;
+      if (!res.ok || !res.threads) {
+        this.store.markThreadUnconfirmed(m.thread);
+        return;
+      }
+      await this.store.mergeThreads(res.threads, true).catch(console.error);
+      // An older archive may be absent from the bounded listing. Keep it
+      // queued in that case too, until a restore event or reconnect.
+      if (!res.threads.some((t) => t.id === m.thread && !t.archived)) return;
+      const cur = this.store.outgoing(m.thread, m.key);
+      if (cur?.state !== "queued") return;
+      if (retriedRace) await this.store.setOutgoingState(m.key, "failed");
+      else this.sendOutgoing(cur, true);
+    })) return;
+    this.sending.delete(m.key);
+  }
+
+  private flushOutgoing(thread?: ThreadId) {
+    for (const m of this.store.pending()) if (thread === undefined || m.thread === thread) this.sendOutgoing(m);
+  }
+
+  private flushQueue() {
+    this.flushOutgoing();
+    for (const c of this.store.creates.values()) if (!c.failed) this.sendCreate(c);
   }
 
   // -- lifecycle ---------------------------------------------------------
 
   private kick() {
     if (this.dead || this.suppressed) return;
-    if (!this.ws || this.ws.readyState >= WebSocket.CLOSING) this.connect();
+    if (!this.ws) this.connect();
   }
 
   connect() {
     if (this.dead) return;
-    if (this.ws && this.ws.readyState <= WebSocket.OPEN) return;
+    if (this.ws) return;
     clearTimeout(this.reconnectTimer);
     this.store.setConn("connecting");
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/v1/stream`);
     this.ws = ws;
-    ws.onopen = () => this.hello();
-    ws.onmessage = (e) => void this.frame(String(e.data));
+    ws.onopen = () => this.hello(this.store.resumeCursor);
+    // Keep replay, writes to IndexedDB, and thread snapshots in wire order.
+    let frames = Promise.resolve();
+    ws.onmessage = (e) => {
+      frames = frames.then(() => this.frame(ws, String(e.data))).catch(console.error);
+    };
     ws.onclose = (e) => this.closed(e.code);
     ws.onerror = () => {};
   }
 
   private closed(code: number) {
     this.ws = null;
+    for (const handler of this.pending.values()) void handler();
     this.pending.clear();
     clearTimeout(this.pingWatch);
     this.pingWatch = undefined;
-    this.flushAck();
+    clearTimeout(this.ackTimer);
+    this.ackTimer = undefined;
+    this.ackCursor = null;
+    this.replayComplete = false;
+    this.selectCreated = undefined;
     this.store.setConn("offline");
     switch (code) {
       case CLOSE.unauthorized:
@@ -157,15 +254,22 @@ export class Connection {
     return `r${++this.nextId}`;
   }
 
-  private write(frame: object): boolean {
+  private write(frame: Request): boolean {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     ws.send(JSON.stringify(frame));
     return true;
   }
 
-  private async frame(data: string) {
-    if (data.length > LIMITS.frameBytes) {
+  private request(frame: Request, handler: (res?: Response) => void | Promise<void>): boolean {
+    if (!this.write(frame)) return false;
+    this.pending.set(frame.id, handler);
+    return true;
+  }
+
+  private async frame(ws: WebSocket, data: string) {
+    if (this.ws !== ws) return;
+    if (new TextEncoder().encode(data).length > LIMITS.frameBytes) {
       this.ws?.close(CLOSE.protocol);
       return;
     }
@@ -180,65 +284,86 @@ export class Connection {
       const handler = this.pending.get(f.id);
       if (handler) {
         this.pending.delete(f.id);
-        handler(f);
+        await handler(f);
       }
       return;
     }
-    await this.event(f as Event);
+    switch (f.event) {
+      case "message":
+      case "settled":
+      case "divider":
+      case "thread": {
+        if (this.replaying && this.replayHead !== null && f.cursor <= this.replayHead) {
+          this.replayCount++;
+          this.replayCursor = f.cursor;
+        }
+        if (!await this.store.applyDurable(f)) this.ackFrozen = true;
+        if (this.ws !== ws) break;
+        if (f.event === "thread") {
+          if (f.thread.id === this.selectCreated?.thread) {
+            if (this.store.openThread === this.selectCreated.from) this.store.selectThread(f.thread.id);
+            this.selectCreated = undefined;
+          }
+          if (!f.thread.archived) this.flushOutgoing(f.thread.id);
+        }
+        this.ack(ws);
+        break;
+      }
+      case "preview":
+        this.store.setPreview(f);
+        break;
+      case "status":
+        this.store.setStatus(f);
+        // Main status is guaranteed after each batch, even when all threads
+        // are idle. Other status frames are routed normally, in any order.
+        if (f.thread === MAIN_THREAD && this.replaying) {
+          if (this.replayCount >= LIMITS.replayBatch) this.hello(this.replayCursor);
+          else {
+            this.replaying = false;
+            this.replayComplete = true;
+            this.ack(ws);
+            this.refreshThreads(ws);
+          }
+        }
+        break;
+    }
   }
 
   /** hello (also mid-stream re-hello when a 500-event replay batch is full). */
-  private hello() {
-    this.replaying = true;
-    this.replayCount = 0;
+  private hello(cursor: number | null) {
+    // Live frames from before a re-hello can still be in flight. Only the
+    // hello reply arms the new replay boundary.
+    this.replaying = false;
     this.store.setConn("replaying");
-    const id = this.id();
-    this.pending.set(id, (res) => {
+    this.request({ type: "req", id: this.id(), op: "hello", v: PROTOCOL_VERSION, cursor }, (res) => {
+      if (!res) return;
       if (!res.ok) {
         console.warn("hello rejected:", res.error);
         this.ws?.close();
         return;
       }
+      this.replaying = true;
+      this.replayCount = 0;
+      this.replayCursor = cursor;
+      this.replayHead = res.head ?? null;
+      this.store.resetStatuses();
       if (typeof res.device === "string") this.store.setDevice(res.device);
-      this.attempt = 0;
       this.store.setMode("chat");
     });
-    this.write({ type: "req", id, op: "hello", v: 1, cursor: this.store.cursor });
   }
 
-  private async event(ev: Event) {
-    switch (ev.event) {
-      case "message":
-      case "settled":
-      case "divider": {
-        const { isNew, stored } = await this.store.applyDurable(ev);
-        if (isNew) this.replayCount++;
-        // Ack drives gateway retention: only what IndexedDB really holds.
-        // Once a write fails, acks stop so the gateway keeps everything.
-        if (!stored) this.ackFrozen = true;
-        if (isNew && stored && !this.ackFrozen) this.ack(ev.cursor);
-        break;
-      }
-      case "preview":
-        this.store.setPreview(ev);
-        break;
-      case "status":
-        this.store.setStatus({ state: ev.state, label: ev.label });
-        // The status event after hello ends the replay batch. A full batch
-        // (500) may have more behind it: re-hello with the new cursor.
-        if (this.replaying) {
-          if (this.replayCount >= LIMITS.replayBatch) {
-            this.hello();
-          } else {
-            this.replaying = false;
-            this.store.setConn("open");
-            for (const m of this.store.pending()) this.sendOutgoing(m);
-          }
-        }
-        break;
-      default:
-        break;
-    }
+  private refreshThreads(ws: WebSocket) {
+    this.request({ type: "req", id: this.id(), op: "threads" }, async (res) => {
+      if (!res) return;
+      if (res.ok && res.threads) await this.store.mergeThreads(res.threads, true).catch(console.error);
+      else this.store.setThreadListUnavailable();
+      if (this.ws !== ws) return;
+      await this.store.reloadQueue().catch(console.error);
+      if (this.ws !== ws) return;
+      this.attempt = 0;
+      this.store.setConn("open");
+      this.flushQueue();
+    });
   }
 
   // -- liveness ----------------------------------------------------------
@@ -262,22 +387,28 @@ export class Connection {
   }
 
   /** Coalesce acks so a big replay does not become one frame per event. */
-  private ack(cursor: number) {
-    this.ackCursor = Math.max(this.ackCursor ?? 0, cursor);
-    if (this.ackTimer === undefined) {
-      this.ackTimer = setTimeout(() => {
-        this.ackTimer = undefined;
-        this.flushAck();
-      }, 250);
-    }
+  private ack(ws: WebSocket) {
+    if (!this.replayComplete || this.ackFrozen || this.store.cursor === null) return;
+    // Only called after the triggering event (or the whole replay) commits.
+    this.ackCursor = this.store.cursor;
+    if (this.ackTimer !== undefined) return;
+    this.ackTimer = setTimeout(() => {
+      this.ackTimer = undefined;
+      const cursor = this.ackCursor;
+      this.ackCursor = null;
+      if (cursor !== null) void this.flushAck(ws, cursor);
+    }, 250);
   }
 
-  private flushAck() {
-    if (this.ackTimer !== undefined) {
-      clearTimeout(this.ackTimer);
-      this.ackTimer = undefined;
+  private async flushAck(ws: WebSocket, cursor: number) {
+    if (this.ws !== ws || !this.replayComplete || this.ackFrozen) return;
+    try {
+      if (await this.store.checkpoint(cursor) && this.ws === ws && !this.ackFrozen) {
+        this.write({ type: "req", id: this.id(), op: "ack", cursor });
+      }
+    } catch (err) {
+      this.ackFrozen = true;
+      console.error("replay checkpoint not persisted; acks stop", err);
     }
-    if (this.ackCursor === null) return;
-    this.write({ type: "req", id: this.id(), op: "ack", cursor: this.ackCursor });
   }
 }

@@ -1,13 +1,8 @@
 #!/usr/bin/env node
 // Development mock of the durable-nanobot gateway's /v1 surface, speaking
-// protocol v1 (../../protocol/v1.md) so the app can be exercised end to end
-// without the real gateway. Pairs with a printed one-time code, echoes user
-// messages, streams a fake preview, then settles with a markdown answer.
-//
-// State is in memory: restarting the mock resets cursors (the app survives
-// that — it re-plays from its stored cursor, or from scratch if the store is
-// gone).
-import { createHash, randomBytes, randomInt } from "node:crypto";
+// protocol v2 (../../protocol/v2.md). Pairs with a printed one-time code
+// and has independent fake agent turns per thread. State is in memory.
+import { randomBytes, randomInt } from "node:crypto";
 import http from "node:http";
 import { WebSocketServer } from "ws";
 
@@ -16,8 +11,10 @@ const FRAME_BYTES = 262_144;
 const SEND_TEXT_CHARS = 16_000;
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const REPLAY_BATCH = 500;
-const LABEL_RE = /^.{1,40}$/s;
-const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // [A-Z2-9] minus I, O
+const IDLE_ARCHIVE_MS = Number(process.env.IDLE_ARCHIVE_MS ?? 14 * 24 * 60 * 60 * 1000);
+const LABEL_RE = /^[^\p{Cc}\u2028\u2029]{1,40}$/u;
+const TITLE_RE = /^[^\p{Cc}\u2028\u2029]{1,80}$/u;
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // [A-Z2-9] minus I, O
 
 const pairCode =
   process.argv[2] ||
@@ -35,15 +32,26 @@ const acks = new Map();
 /** all durable events, cursor ascending */
 const events = [];
 let cursor = 0;
-let status = { state: "idle", label: undefined };
+const threads = new Map();
+const created = new Map(); // create key -> thread id
+const MAX_OPEN_THREADS = 50;
 /** live streams: { ws, token, helloed } */
 const sockets = new Set();
 const rateFailures = [];
 
 const iso = () => new Date().toISOString();
 
+function addThread(id, title, origin) {
+  const at = iso();
+  const thread = { info: { id, title, archived: false, origin, createdAt: at, lastAt: at }, state: "idle", running: null, queue: [] };
+  threads.set(id, thread);
+  return thread;
+}
+const main = addThread("main", "Main");
+const full = () => [...threads.values()].filter((t) => t !== main && !t.info.archived).length >= MAX_OPEN_THREADS;
+
 function isDurable(ev) {
-  return ev.event === "message" || ev.event === "settled" || ev.event === "divider";
+  return ev.event === "message" || ev.event === "settled" || ev.event === "divider" || ev.event === "thread";
 }
 
 function broadcast(ev) {
@@ -53,18 +61,37 @@ function broadcast(ev) {
   }
   const frame = JSON.stringify(ev);
   for (const s of sockets) {
-    if (s.ws.readyState === s.ws.OPEN) s.ws.send(frame);
+    if (s.helloed && s.ws.readyState === s.ws.OPEN) s.ws.send(frame);
   }
 }
 
-function notice(text) {
-  broadcast({ type: "event", event: "message", id: `n${cursor + 1}`, role: "notice", text, at: iso() });
+function emit(thread, event, fields = {}) {
+  if (event === "status") thread.state = fields.state;
+  if (fields.at) thread.info.lastAt = fields.at;
+  broadcast({ type: "event", event, thread: thread.info.id, ...fields });
+}
+
+function threadChanged(thread) {
+  // Keep a snapshot in replay, not a pointer to mutable metadata.
+  broadcast({ type: "event", event: "thread", thread: { ...thread.info } });
+}
+
+function archiveIdle() {
+  for (const t of threads.values()) {
+    if (t === main || t.info.archived || t.running || t.queue.length) continue;
+    if (Date.now() - Date.parse(t.info.lastAt) < IDLE_ARCHIVE_MS) continue;
+    t.info.archived = true;
+    t.info.archivedReason = "idle";
+    threadChanged(t);
+  }
+}
+if (IDLE_ARCHIVE_MS > 0) setInterval(archiveIdle, Math.min(IDLE_ARCHIVE_MS, 1000)).unref();
+
+function notice(thread, text) {
+  emit(thread, "message", { id: `n${cursor + 1}`, role: "notice", text, at: iso() });
 }
 
 // -- fake agent turns -------------------------------------------------------
-
-let runningTurn = null;
-const turnQueue = [];
 
 function answerFor(key) {
   const asked = admitted.get(key) ?? "…";
@@ -90,55 +117,34 @@ function answerFor(key) {
   ].join("\n");
 }
 
-function startTurn() {
-  const key = turnQueue.shift();
-  if (!key) {
-    runningTurn = null;
-    return;
-  }
+function startTurn(thread) {
+  const key = thread.queue.shift();
+  if (!key) return;
   const text = answerFor(key);
   const words = text.split(/(?<=\s)/); // keep separators
-  runningTurn = { key, timers: [] };
-  const at = (ms, fn) => runningTurn.timers.push(setTimeout(fn, ms));
-  const alive = () => runningTurn?.key === key;
+  const turn = thread.running = { key, timers: [] };
+  const at = (ms, fn) => turn.timers.push(setTimeout(fn, ms));
 
-  broadcast({ type: "event", event: "status", state: "queued" });
-  at(300, () => {
-    if (!alive()) return;
-    broadcast({ type: "event", event: "status", state: "thinking" });
-  });
+  emit(thread, "status", { state: "queued" });
+  at(300, () => emit(thread, "status", { state: "thinking" }));
   for (let n = 1; n <= words.length; n++) {
-    at(600 + n * 90, () => {
-      if (!alive()) return;
-      broadcast({
-        type: "event",
-        event: "preview",
-        key,
-        text: words.slice(0, n).join(""),
-      });
-    });
+    at(600 + n * 90, () => emit(thread, "preview", { key, text: words.slice(0, n).join("") }));
   }
   at(600 + words.length * 90 + 200, () => {
-    if (!alive()) return;
-    broadcast({
-      type: "event",
-      event: "message",
-      id: `a-${key}`,
-      role: "assistant",
-      text,
-      at: iso(),
-      key,
-    });
-    broadcast({ type: "event", event: "settled", key, outcome: "answered" });
-    broadcast({ type: "event", event: "status", state: "idle" });
-    runningTurn = null;
-    if (turnQueue.length) startTurn();
+    emit(thread, "message", { id: `a-${key}`, role: "assistant", text, at: iso(), key });
+    emit(thread, "settled", { key, outcome: "answered" });
+    emit(thread, "status", { state: "idle" });
+    thread.running = null;
+    startTurn(thread);
   });
 }
 
-function enqueueTurn(key) {
-  turnQueue.push(key);
-  if (!runningTurn) startTurn();
+function abortTurn(thread) {
+  if (!thread.running) return;
+  for (const timer of thread.running.timers) clearTimeout(timer);
+  emit(thread, "settled", { key: thread.running.key, outcome: "aborted" });
+  emit(thread, "status", { state: "idle" });
+  thread.running = null;
 }
 
 // -- HTTP: pairing ----------------------------------------------------------
@@ -204,7 +210,7 @@ const server = http.createServer(async (req, res) => {
   // Secure omitted: this is plain HTTP on loopback in development.
   res.setHeader(
     "Set-Cookie",
-    `durable_device=${token}; Path=/v1; HttpOnly; SameSite=Strict`,
+    `durable_device=${token}; Path=/v1; HttpOnly; SameSite=Strict; Max-Age=34560000`,
   );
   res.writeHead(204).end();
   console.log(`paired device "${device}"`);
@@ -235,7 +241,10 @@ server.on("upgrade", (req, socket, head) => {
 
 function reply(ws, id, ok, extra = {}) {
   if (ws.readyState !== ws.OPEN) return;
-  ws.send(JSON.stringify({ type: "res", id, ok, ...extra }));
+  const data = JSON.stringify({ type: "res", id, ok, ...extra });
+  ws.send(Buffer.byteLength(data) <= FRAME_BYTES
+    ? data
+    : JSON.stringify({ type: "res", id, ok: false, error: "too_large" }));
 }
 
 function onStream(ws, token) {
@@ -272,9 +281,11 @@ function onStream(ws, token) {
       ws.close(4400); // hello must come first
       return;
     }
+    const thread = threads.get(frame.thread === undefined ? "main" : frame.thread);
+    const invalid = () => reply(ws, frame.id, false, { error: "bad_request" });
     switch (frame.op) {
       case "hello": {
-        if (frame.v !== 1) {
+        if (frame.v !== 2) {
           ws.close(4426);
           return;
         }
@@ -283,22 +294,78 @@ function onStream(ws, token) {
           return;
         }
         conn.helloed = true;
-        reply(ws, frame.id, true, { v: 1, device, head: cursor || null });
+        reply(ws, frame.id, true, { v: 2, device, head: cursor || null });
         // replay: oldest first, one bounded batch; the client re-hellos
         // with its new cursor if the batch was full
         const from = frame.cursor ?? 0;
         for (const ev of events.filter((e) => e.cursor > from).slice(0, REPLAY_BATCH)) {
           ws.send(JSON.stringify(ev));
         }
-        ws.send(JSON.stringify({ type: "event", event: "status", ...status }));
+        for (const t of threads.values()) {
+          if (t === main || t.state !== "idle") {
+            ws.send(JSON.stringify({ type: "event", event: "status", thread: t.info.id, state: t.state }));
+          }
+        }
+        break;
+      }
+      case "threads": {
+        const { query } = frame;
+        if (query !== undefined && (typeof query !== "string" || !TITLE_RE.test(query))) return invalid();
+        const list = [...threads.values()].map((t) => t.info).sort((a, b) => b.lastAt.localeCompare(a.lastAt));
+        let archived = 0;
+        reply(ws, frame.id, true, { threads: query === undefined
+          ? list.filter((t) => !t.archived || archived++ < 200)
+          : list.filter((t) => t.title.toLowerCase().includes(query.toLowerCase())).slice(0, 200) });
+        break;
+      }
+      case "thread.create": {
+        const { key, title = "New thread", from } = frame;
+        if (typeof key !== "string" || !ID_RE.test(key) || typeof title !== "string" || !TITLE_RE.test(title)) return invalid();
+        const existing = created.get(key);
+        if (existing) return reply(ws, frame.id, true, { thread: existing, duplicate: true });
+        if (full()) return invalid();
+        let origin;
+        if (from !== undefined) {
+          if (!from || typeof from.messageId !== "string" || !threads.has(from.thread)) return invalid();
+          const anchor = events.find((e) => e.event === "message" && e.thread === from.thread &&
+            e.id === from.messageId && (e.role === "user" || e.role === "assistant"));
+          if (!anchor) return invalid();
+          origin = { thread: from.thread, messageId: from.messageId };
+        }
+        const id = `t_${randomBytes(12).toString("hex")}`;
+        const added = addThread(id, title, origin);
+        created.set(key, id);
+        reply(ws, frame.id, true, { thread: id, duplicate: false });
+        threadChanged(added);
+        break;
+      }
+      case "thread.rename": {
+        if (!thread || thread === main || typeof frame.title !== "string" || !TITLE_RE.test(frame.title)) return invalid();
+        thread.info.title = frame.title;
+        reply(ws, frame.id, true);
+        threadChanged(thread);
+        break;
+      }
+      case "thread.archive": {
+        const { archived } = frame;
+        if (!thread || thread === main || typeof archived !== "boolean" || (!archived && thread.info.archived && full())) return invalid();
+        if (archived) {
+          abortTurn(thread);
+          for (const key of thread.queue.splice(0)) emit(thread, "settled", { key, outcome: "aborted" });
+        }
+        thread.info.archived = archived;
+        if (archived) thread.info.archivedReason = "manual";
+        else {
+          delete thread.info.archivedReason;
+          thread.info.lastAt = iso();
+        }
+        reply(ws, frame.id, true);
+        threadChanged(thread);
         break;
       }
       case "send": {
         const { key, text } = frame;
-        if (typeof key !== "string" || !ID_RE.test(key) || typeof text !== "string") {
-          reply(ws, frame.id, false, { error: "bad_request" });
-          return;
-        }
+        if (!thread || thread.info.archived || typeof key !== "string" || !ID_RE.test(key) || typeof text !== "string") return invalid();
         if (text.length > SEND_TEXT_CHARS) {
           reply(ws, frame.id, false, { error: "too_large" });
           return;
@@ -309,16 +376,9 @@ function onStream(ws, token) {
         }
         admitted.set(key, text);
         reply(ws, frame.id, true, { duplicate: false });
-        broadcast({
-          type: "event",
-          event: "message",
-          id: `u-${key}`,
-          role: "user",
-          text,
-          at: iso(),
-          key,
-        });
-        enqueueTurn(key);
+        emit(thread, "message", { id: `u-${key}`, role: "user", text, at: iso(), key });
+        thread.queue.push(key);
+        if (!thread.running) startTurn(thread);
         break;
       }
       case "ack": {
@@ -332,32 +392,21 @@ function onStream(ws, token) {
       }
       case "control": {
         const cmd = frame.command;
-        if (cmd !== "new" && cmd !== "abort" && cmd !== "status") {
-          reply(ws, frame.id, false, { error: "bad_request" });
-          return;
-        }
+        if (!thread || thread.info.archived || !["new", "abort", "status"].includes(cmd)) return invalid();
         reply(ws, frame.id, true);
         if (cmd === "abort") {
-          if (runningTurn) {
-            const key = runningTurn.key;
-            for (const t of runningTurn.timers) clearTimeout(t);
-            runningTurn = null;
-            broadcast({ type: "event", event: "settled", key, outcome: "aborted" });
-            broadcast({ type: "event", event: "status", state: "idle" });
-            notice("Turn aborted.");
-            if (turnQueue.length) startTurn();
+          if (thread.running) {
+            abortTurn(thread);
+            notice(thread, "Turn aborted.");
+            startTurn(thread);
           } else {
-            notice("Nothing is running.");
+            notice(thread, "Nothing is running.");
           }
         } else if (cmd === "new") {
-          broadcast({ type: "event", event: "divider", at: iso(), reason: "new" });
-          notice("New thread started.");
+          emit(thread, "divider", { at: iso(), reason: "new" });
+          notice(thread, "New context started.");
         } else {
-          notice(
-            runningTurn
-              ? `Running: turn for ${runningTurn.key}.`
-              : `Idle. ${admitted.size} admitted message(s), ack at ${acks.get(token) ?? 0}.`,
-          );
+          notice(thread, thread.running ? `Running: turn for ${thread.running.key}.` : "Idle.");
         }
         break;
       }

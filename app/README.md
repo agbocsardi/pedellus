@@ -3,9 +3,9 @@
 The installable web app (PWA) that is the chat channel of the Durable agent
 gateway. Vite + TypeScript + React 19, Streamdown for streaming markdown,
 `vite-plugin-pwa` (injectManifest) for the service worker, `idb` for IndexedDB.
-The wire contract is [`../protocol/v1.md`](../protocol/v1.md); the app imports
-its types from [`../protocol/v1.ts`](../protocol/v1.ts) and implements it
-exactly.
+The wire contract is [`../protocol/v2.md`](../protocol/v2.md); the app imports
+its types from [`../protocol/v2.ts`](../protocol/v2.ts). HTTP and WebSocket
+paths still start with `/v1`.
 
 ## Development
 
@@ -18,9 +18,13 @@ npm run dev    # vite on http://localhost:5173, proxying /v1 (incl. ws) to it
 ```
 
 `npm run mock` accepts an explicit code as an argument (`node
-dev/mock-gateway.mjs MYCODE23`) and `PORT=…` for a different port. Mock state
-is in memory; restarting it resets cursors, which the app handles by replaying
-from its stored cursor.
+dev/mock-gateway.mjs MYC2DE23`). For a different mock port, set `PORT` on the
+mock and the same value as `MOCK_PORT` on Vite (dev or preview). Mock credentials,
+threads and cursors are in memory; after a mock restart use a fresh browser
+profile or clear site data before pairing again. Set `IDLE_ARCHIVE_MS=3000`
+on the mock to try automatic archiving after three seconds of idleness.
+The mock records and validates fork origins without copying messages into
+the new thread. It doesn't run a real agent.
 
 The production build, incl. the service worker and its precache manifest:
 
