@@ -37,6 +37,18 @@ let cursor = 0;
 const threads = new Map();
 const created = new Map(); // create key -> thread id
 const MAX_OPEN_THREADS = 50;
+/** hello.commands, in menu order (stands in for the gateway's command catalogue) */
+const COMMANDS = [
+  { name: "new", summary: "Start a fresh context in this thread", usage: "Usage: /new" },
+  { name: "abort", summary: "Stop the running turn", usage: "Usage: /abort" },
+  { name: "status", summary: "Show what the agent is doing", usage: "Usage: /status" },
+  { name: "model", args: "[preset]", summary: "Show or switch the model preset", usage: "Usage: /model [fast|smart|deep]" },
+  { name: "digest", summary: "Summarise recent activity", usage: "Usage: /digest" },
+  { name: "compact", summary: "Compact the context to free space", usage: "Usage: /compact" },
+  { name: "help", summary: "List the available commands", usage: "Usage: /help" },
+];
+const MODEL_PRESETS = ["fast", "smart", "deep"];
+let mockModel = "smart";
 /** live streams: { ws, token, helloed } */
 const sockets = new Set();
 const rateFailures = [];
@@ -296,7 +308,7 @@ function onStream(ws, token) {
           return;
         }
         conn.helloed = true;
-        reply(ws, frame.id, true, { v: 2, device, head: cursor || null, agent: AGENT_NAME });
+        reply(ws, frame.id, true, { v: 2, device, head: cursor || null, agent: AGENT_NAME, commands: COMMANDS });
         // replay: oldest first, one bounded batch; the client re-hellos
         // with its new cursor if the batch was full
         const from = frame.cursor ?? 0;
@@ -394,8 +406,11 @@ function onStream(ws, token) {
       }
       case "control": {
         const cmd = frame.command;
-        if (!thread || thread.info.archived || !["new", "abort", "status"].includes(cmd)) return invalid();
+        const args = frame.args === undefined ? "" : frame.args;
+        if (!COMMANDS.some((c) => c.name === cmd)) return reply(ws, frame.id, false, { error: "unsupported" });
+        if (!thread || thread.info.archived || typeof args !== "string" || args.length > 1000) return invalid();
         reply(ws, frame.id, true);
+        const a = args.trim();
         if (cmd === "abort") {
           if (thread.running) {
             abortTurn(thread);
@@ -407,6 +422,16 @@ function onStream(ws, token) {
         } else if (cmd === "new") {
           emit(thread, "divider", { at: iso(), reason: "new" });
           notice(thread, "New context started.");
+        } else if (cmd === "model") {
+          if (!a) notice(thread, `Model: ${mockModel}. Presets: ${MODEL_PRESETS.join(", ")}.`);
+          else if (MODEL_PRESETS.includes(a)) notice(thread, `Model set to ${(mockModel = a)}.`);
+          else notice(thread, COMMANDS.find((c) => c.name === "model").usage);
+        } else if (cmd === "digest") {
+          notice(thread, `Digest: ${events.filter((e) => e.thread === thread.info.id).length} events in this thread, ${threads.size} threads.`);
+        } else if (cmd === "compact") {
+          notice(thread, "Context compacted: older turns summarised.");
+        } else if (cmd === "help") {
+          notice(thread, COMMANDS.map((c) => `/${c.name}${c.args ? ` ${c.args}` : ""} — ${c.summary}`).join("\n"));
         } else {
           notice(thread, thread.running ? `Running: turn for ${thread.running.key}.` : "Idle.");
         }

@@ -597,6 +597,9 @@ input#pair-code {
   line-height: 1.4;
   margin: 14px auto;
   max-width: 30rem;
+  /* command replies like /help are multi-line */
+  white-space: pre-line;
+  overflow-wrap: anywhere;
 }
 
 .divider {
@@ -819,6 +822,77 @@ input#pair-code {
 }
 .capsule textarea::placeholder {
   color: var(--muted-ink);
+}
+.capsule:has(.wrench) {
+  padding-left: 5px;
+}
+.wrench {
+  width: 36px;
+  height: 36px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--muted-ink);
+}
+.wrench svg {
+  width: 20px;
+  height: 20px;
+}
+.wrench[aria-expanded="true"],
+.wrench:not(:disabled):is(:hover, :active) {
+  background: var(--muted);
+  color: var(--ink);
+}
+.wrench:disabled {
+  opacity: 0.45;
+}
+/* The `/` menu floats above the capsule while the field keeps focus. */
+.slash-list {
+  position: absolute;
+  z-index: 1;
+  left: var(--gutter);
+  right: var(--gutter);
+  bottom: calc(100% - 2px);
+  max-width: 28rem;
+  margin: 0 auto;
+  padding: 6px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  box-shadow: var(--shadow);
+  animation: rise 0.18s ease-out;
+  /* the full list can be taller than the space left above the keyboard */
+  max-height: calc(var(--app-h, 100dvh) * 0.55);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.slash-usage {
+  margin: 4px 10px 6px;
+  color: var(--muted-ink);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+.command-args {
+  color: var(--muted-ink);
+  font-weight: 400;
+}
+.command-item b {
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+}
+.slash-list .command-item {
+  padding: 7px 8px;
+}
+.command-item[aria-current="true"] {
+  background: var(--muted);
+}
+.sheet .confirm {
+  width: calc(100% - 20px);
+  margin: 4px 10px 0;
 }
 .send {
   width: 36px;
