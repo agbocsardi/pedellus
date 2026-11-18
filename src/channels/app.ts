@@ -791,10 +791,21 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
    * Non-durable `model` events: each thread's current preset name (`null` outside the presets) to one
    * socket or every hello'd one. Never stored in the outbox and never consumes a cursor.
    */
-  async function pushModelEvents(threads: readonly string[], only?: LiveSocket): Promise<void> {
+  // Pushes run one after another so a slow read can never send an older selection after a newer one.
+  let modelPushes: Promise<void> = Promise.resolve();
+  function pushModelEvents(threads: readonly string[], only?: LiveSocket): Promise<void> {
+    const next = modelPushes.then(() => sendModelEvents(threads, only));
+    modelPushes = next.catch(() => undefined);
+    return next;
+  }
+
+  async function sendModelEvents(threads: readonly string[], only?: LiveSocket): Promise<void> {
     for (const thread of threads) {
       const host = gateway.modelPresets?.();
       if (host === undefined || gateway.selectedModel === undefined || !openThread(state, thread)) continue;
+      // Name only presets hello.presets can list; anything dropped by the wire bounds reads as null.
+      const listed = new Set(appPresetInfos(host.presets).map((info) => info.name));
+      if (listed.size === 0) continue;
       let selected: GatewayModelSelection | undefined;
       try {
         selected = await gateway.selectedModel(sessionForThread(thread), adapterContext);
@@ -803,9 +814,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         continue;
       }
       // A thread without a mapped conversation yet runs the configured default preset.
-      const preset = selected === undefined ? host.defaultPreset : matchingPresetName(host.presets, selected);
+      const name = selected === undefined ? host.defaultPreset : matchingPresetName(host.presets, selected);
+      const preset = name !== undefined && listed.has(name) ? name : null;
       if (!openThread(state, thread)) continue;
-      const frame = JSON.stringify({ type: "event", event: "model", thread, preset: preset ?? null });
+      const frame = JSON.stringify({ type: "event", event: "model", thread, preset });
       for (const socket of only === undefined ? sockets.values() : [only]) {
         if (socket.hello && socket.session.isOpen()) socket.session.send(frame);
       }

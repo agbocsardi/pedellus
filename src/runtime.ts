@@ -4263,6 +4263,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
         const id = await mappedConversationId(sessionKey, ctx);
         if (id === undefined) return undefined;
         const state = await harness!.snapshot(AgentDoc, id, ctx);
+        // Mapped but unreadable is unknown, never the default.
+        if (state === undefined) throw new Error("missing conversation state");
         const choice = choiceFromState(state) ?? defaultChoice;
         const level = state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
           ? state.thinkingLevel

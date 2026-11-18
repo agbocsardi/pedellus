@@ -200,6 +200,10 @@ A mapped thread reports its selection (`Gateway.selectedModel()`, read-only); a 
 mapping yet reports the configured default; a thread whose selection cannot be read, an archived
 thread and a refused or unknown preset send nothing. `/new` appends a context entry and does not
 touch the stored model selection, so it sends no `model` event.
+Presets are bounded on the wire (at most 50; an entry whose name or `provider/model` is
+unprintable, contains whitespace or is too long is dropped) and a `model` event only names a
+listed preset, otherwise `null`. Known gap: a CLI `/reload` that changes presets or resets
+selections is not pushed to connected apps; they see it on their next `hello`.
 
 ## Scheduled results and interruption notices
 
