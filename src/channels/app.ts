@@ -56,7 +56,7 @@ import {
 } from "../help/commands.js";
 import { renderMemoryDigestStart, renderMemoryDigestStatus } from "../history/memory-digest.js";
 import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
-import type { GatewayMemoryDigest, GatewayModelList, GatewayModelSelection } from "../runtime.js";
+import type { GatewayMemoryDigest, GatewayModelList, GatewayModelPresets, GatewayModelSelection } from "../runtime.js";
 import {
   APP_CLOSE,
   APP_LIMITS,
@@ -174,6 +174,10 @@ export interface AppGateway {
   /** Optional host model catalog for the `status` and `model` controls. */
   listModels?(sessionKey: string, context: Context): Promise<GatewayModelList>;
   selectModelPreset?(sessionKey: string, name: string, context: Context): Promise<GatewayModelSelection>;
+  /** Read-only host preset catalog (no conversation involved); `undefined` without named presets. */
+  modelPresets?(): GatewayModelPresets | undefined;
+  /** Read-only selected model of a mapped key; `undefined` when unmapped, rejects when unreadable. */
+  selectedModel?(sessionKey: string, context: Context): Promise<GatewayModelSelection | undefined>;
   /** Manual memory-digestion entry for `digest` and `digest status`. */
   memoryDigest?: GatewayMemoryDigest;
   /** Optional bounded background snapshot for the `status` control. */
@@ -546,9 +550,10 @@ function parseModelArgument(args: string): ModelArgument {
 }
 
 /** The configured preset this thread currently uses, matched by provider/model/thinking. */
-function matchingPresetName(listing: GatewayModelList): string | undefined {
-  const selected = listing.selected;
-  return listing.presets?.find((preset) => preset.provider === selected.provider &&
+function matchingPresetName(
+  presets: GatewayModelList["presets"], selected: GatewayModelSelection,
+): string | undefined {
+  return presets?.find((preset) => preset.provider === selected.provider &&
     preset.modelId === selected.modelId && (preset.thinkingLevel ?? "off") === selected.thinkingLevel)?.name;
 }
 
@@ -573,7 +578,7 @@ function modelListingText(listing: GatewayModelList): string {
       ...rows,
     ].join("\n");
   }
-  const selectedPreset = matchingPresetName(listing);
+  const selectedPreset = matchingPresetName(listing.presets, listing.selected);
   const rows = presets.slice(0, MAX_MODEL_CHOICES).map((preset) => {
     const isDefault = preset.name === listing.defaultPreset;
     return `  ${preset.name === selectedPreset ? "* " : "  "}${boundedLabel(preset.name, 80)} — ` +
@@ -788,10 +793,18 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
    */
   async function pushModelEvents(threads: readonly string[], only?: LiveSocket): Promise<void> {
     for (const thread of threads) {
-      const listing = await peekModelListing(thread);
+      const host = gateway.modelPresets?.();
+      if (host === undefined || gateway.selectedModel === undefined || !openThread(state, thread)) continue;
+      let selected: GatewayModelSelection | undefined;
+      try {
+        selected = await gateway.selectedModel(sessionForThread(thread), adapterContext);
+      } catch {
+        // An unreadable selection is unknown, never reported as the default.
+        continue;
+      }
       // A thread without a mapped conversation yet runs the configured default preset.
-      const preset = listing === undefined ? catalog?.defaultPreset : matchingPresetName(listing);
-      if (listing === undefined && catalog === undefined) continue;
+      const preset = selected === undefined ? host.defaultPreset : matchingPresetName(host.presets, selected);
+      if (!openThread(state, thread)) continue;
       const frame = JSON.stringify({ type: "event", event: "model", thread, preset: preset ?? null });
       for (const socket of only === undefined ? sockets.values() : [only]) {
         if (socket.hello && socket.session.isOpen()) socket.session.send(frame);
@@ -927,11 +940,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       sendError("bad_request");
       return;
     }
-    for (const entry of [APP_MAIN_THREAD, ...(state.threads ?? []).filter((item) => !item.archived).map((item) => item.id)]) {
-      if (catalog !== undefined || await peekModelListing(entry) !== undefined) break;
-    }
-    const presets = appPresetInfos(catalog?.presets);
-    if (!socket.session.isOpen()) return;
+    // Synchronous host read: no await between here and `hello = true`, so no frame slips in first.
+    const presets = appPresetInfos(gateway.modelPresets?.()?.presets);
     socket.hello = true;
     sendOk({
       v: APP_PROTOCOL_VERSION, device: socket.session.label, head: headCursor(), agent: agentName, commands: commandInfos,
@@ -2060,20 +2070,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       id: conversation.id,
       commit: (change, context) => conversation.commit(change, context),
     }, adapterContext));
-  }
-
-  /** Last model catalog seen on a mapped thread; presets are config, so it holds for unmapped threads. */
-  let catalog: GatewayModelList | undefined;
-  /** Read-only listing: unlike `readModelListing` it never creates a mapping or takes a snapshot slot. */
-  async function peekModelListing(thread: string): Promise<GatewayModelList | undefined> {
-    if (gateway.listModels === undefined) return undefined;
-    try {
-      const listing = await gateway.listModels(sessionForThread(thread), adapterContext);
-      if (listing.presets !== undefined && listing.presets.length > 0) catalog = listing;
-      return listing.presets === undefined || listing.presets.length === 0 ? undefined : listing;
-    } catch {
-      return undefined;
-    }
   }
 
   /** The host model catalog is per-session, so this thread's mapped conversation must exist first. */

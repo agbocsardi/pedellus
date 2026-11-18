@@ -303,6 +303,11 @@ export interface GatewayModelPreset {
   readonly thinkingLevel?: ModelThinkingLevel;
 }
 
+export interface GatewayModelPresets {
+  readonly presets: readonly GatewayModelPreset[];
+  readonly defaultPreset: string;
+}
+
 export interface GatewayModelList {
   models: readonly GatewayModelChoice[];
   selected: GatewayModelSelection;
@@ -504,6 +509,17 @@ export interface Gateway {
   activeWork(context: Context): Promise<BackgroundActiveWork>;
   /** Lists the explicit allowlist and persisted selection for an already-known session key. */
   listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
+  /**
+   * Read-only host catalog of named presets and the configured default: no conversation, mapping or
+   * commit is involved. `undefined` in legacy direct-model mode. Reflects the last `/reload`.
+   */
+  modelPresets(): GatewayModelPresets | undefined;
+  /**
+   * Read-only selected model of an already-mapped session key, resolved like `listModels` but
+   * without creating, committing or applying policy. `undefined` when the key has no mapping yet;
+   * it rejects when the stored state cannot be read.
+   */
+  selectedModel(sessionKey: string, context: Context): Promise<GatewayModelSelection | undefined>;
   /** Persists a native pi.agent choice; rejects ConversationBusy atomically without changing it. */
   selectModel(sessionKey: string, selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection>;
   /**
@@ -4238,6 +4254,21 @@ export async function openGateway(config: PortConfig, context: Context, options:
             : { presets: publicPresets, defaultPreset: configuredPresetName }),
         };
       },
+      modelPresets() {
+        return configuredPresetName === undefined
+          ? undefined
+          : { presets: publicPresets, defaultPreset: configuredPresetName };
+      },
+      async selectedModel(sessionKey, ctx) {
+        const id = await mappedConversationId(sessionKey, ctx);
+        if (id === undefined) return undefined;
+        const state = await harness!.snapshot(AgentDoc, id, ctx);
+        const choice = choiceFromState(state) ?? defaultChoice;
+        const level = state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
+          ? state.thinkingLevel
+          : fallbackThinkingLevel(choice);
+        return publicSelection(choice, level);
+      },
       async selectModel(sessionKey, selection, ctx) {
         return selectConversationModel(sessionKey, selection, ctx);
       },
@@ -4483,12 +4514,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
       await assertMappedChatConversations([{ sessionKey, conversationId: conversation.id }], ctx);
       return conversation;
     }
-    async function existingConversationFor(sessionKey: string, ctx: Context): Promise<Conversation> {
+    async function mappedConversationId(sessionKey: string, ctx: Context): Promise<ConversationId | undefined> {
       const key = encodedSessionKey(sessionKey);
       const map = await harness!.snapshot(SessionMap, root.id, ctx);
       const id = map && Object.hasOwn(map.sessions, key) ? map.sessions[key] : undefined;
-      if (!Number.isSafeInteger(id)) throw new Error("Unknown session key");
-      const conversation = await harness!.conversation(id as ConversationId, ctx);
+      return Number.isSafeInteger(id) ? id as ConversationId : undefined;
+    }
+    async function existingConversationFor(sessionKey: string, ctx: Context): Promise<Conversation> {
+      const id = await mappedConversationId(sessionKey, ctx);
+      if (id === undefined) throw new Error("Unknown session key");
+      const conversation = await harness!.conversation(id, ctx);
       if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
       return conversation;
     }
