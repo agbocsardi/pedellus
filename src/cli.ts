@@ -13,6 +13,13 @@ import {
   type CronInvocation,
 } from "./automation/operator-cli.js";
 import { loadConfig, defaultConfigPath } from "./config.js";
+import {
+  AppCommandError,
+  AppUsageError,
+  parseAppInvocation,
+  runAppCommand,
+  type AppInvocation,
+} from "./channels/app-operator-cli.js";
 import { runModelsCommand, type ModelsInvocation } from "./model-catalog-cli.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { COMMANDS, commandUsage, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
@@ -149,6 +156,18 @@ function agentInvocation(args: readonly string[]): LaunchInvocation {
     }
   }
   return { kind: "agent", config, ...(conversation === undefined ? {} : { conversation }) };
+}
+
+/** `app` reads its configuration like every other process command and attaches to the gateway. */
+function appInvocation(args: readonly string[]): { readonly invocation: AppInvocation; readonly config: ConfigSource } | undefined {
+  if (args[0] !== "app") return undefined;
+  const invocation = parseAppInvocation(args.slice(1));
+  return {
+    invocation,
+    config: invocation.configPath === undefined
+      ? { kind: "default" }
+      : { kind: "path", path: invocation.configPath },
+  };
 }
 
 /** `cron` reads its configuration like every other process command and attaches to the gateway. */
@@ -297,6 +316,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     await runCron(cron.invocation, await readConfig(cron.config));
     return;
   }
+  const app = appInvocation(args);
+  if (app !== undefined) {
+    await runAppOperator(app.invocation, await readConfig(app.config));
+    return;
+  }
   const models = modelsInvocation(args);
   if (models !== undefined) {
     await runModels(models.invocation, await readConfig(models.config));
@@ -407,6 +431,28 @@ async function runCron(invocation: CronInvocation, config: Awaited<ReturnType<ty
   try {
     client = await connectLocalGateway({ socketPath: await localSocketPath(config), operatorOnly: true, context });
     await runCronCommand({ client, command: invocation.command, output: stdout, context });
+  } finally {
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
+    await client?.close();
+  }
+}
+
+/**
+ * Owner app-channel controls: one connection to the running gateway, no chat attachment. The
+ * running app adapter owns every decision (label uniqueness, device limits, revocation); this
+ * process only parses flags and renders the bounded answer.
+ */
+async function runAppOperator(invocation: AppInvocation, config: Awaited<ReturnType<typeof loadConfig>>): Promise<void> {
+  const stop = new AbortController();
+  const context = withAbortSignal(stop.signal, BACKGROUND_CONTEXT);
+  const shutdown = () => stop.abort();
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+  let client: Awaited<ReturnType<typeof connectLocalGateway>> | undefined;
+  try {
+    client = await connectLocalGateway({ socketPath: await localSocketPath(config), operatorOnly: true, context });
+    await runAppCommand({ client, command: invocation.command, output: stdout, context });
   } finally {
     process.off("SIGINT", shutdown);
     process.off("SIGTERM", shutdown);
@@ -531,6 +577,17 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
           ? {}
           : { media: { workspace: config.workspace, directory: config.media.directory } }),
         restart: restartHost,
+      }, context));
+    }
+    if (config.app) {
+      // A third opt-in channel: the installable web app over a loopback listener. The adapter owns
+      // pairing, devices and the durable event log; this host only supplies the explicit config.
+      stage = "gateway.app";
+      const { runApp } = await import("./channels/app.js");
+      channels.start("gateway.app", runApp(gateway, {
+        port: config.app.port,
+        staticRoot: config.app.staticRoot,
+        followUpMode: config.followUpMode ?? "followUp",
       }, context));
     }
     journalEvent("gateway.surfaces.started");
@@ -815,6 +872,10 @@ export function runCli(): Promise<void> {
       console.error(error.message);
     } else if (error instanceof CronCommandError) {
       console.error(`durable-nanobot cron: ${error.message}`);
+    } else if (error instanceof AppUsageError) {
+      console.error(error.message);
+    } else if (error instanceof AppCommandError) {
+      console.error(`durable-nanobot app: ${error.message}`);
     } else if (error instanceof UnknownCommandError) {
       // Only a safe command-shaped token is echoed; any other supplied argument stays private.
       const echo = SAFE_COMMAND_NAME.test(error.token) ? `: ${error.token}` : "";

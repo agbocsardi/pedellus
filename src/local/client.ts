@@ -18,6 +18,7 @@ import type {
   CronOperatorListing,
 } from "../automation/operator.js";
 import type { CronScheduleInput } from "../automation/cron.js";
+import type { AppDeviceListing, AppPairingCreated, AppPairingRefusal } from "../channels/app.js";
 import type {
   TerminalAttachmentSubmission,
   TerminalConversation,
@@ -62,6 +63,11 @@ export interface LocalHostNotice {
   readonly id: string;
   readonly text: string;
 }
+
+/** Owner pairing outcome: one created code, or one fixed refusal reason. */
+export type AppPairingResult = AppPairingCreated | { readonly refused: AppPairingRefusal };
+/** One paired device row as the terminal prints it. */
+export type AppDeviceRow = AppDeviceListing;
 
 export interface LocalGatewayClient extends TerminalConversation {
   readonly sessionKey: string;
@@ -108,6 +114,10 @@ export interface LocalGatewayClient extends TerminalConversation {
   cronShow(id: string, context: Context): Promise<CronOperatorJob[]>;
   cronCreate(origin: string, request: CronScheduleInput, context: Context): Promise<CronOperatorCreateOutcome>;
   cronCancel(id: string, context: Context): Promise<CronOperatorCancelOutcome>;
+  /** Owner controls for the app channel: pairing, device listing and exact-label revocation. */
+  appPair(label: string | undefined, context: Context): Promise<AppPairingResult>;
+  appDevices(context: Context): Promise<readonly AppDeviceRow[]>;
+  appRevoke(label: string, context: Context): Promise<"revoked" | "missing">;
   historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage>;
   listEpisodes(sessionKey: string, query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage>;
   episode(sessionKey: string, startEntryId: number, context: Context): Promise<HistoryEpisode | undefined>;
@@ -417,6 +427,40 @@ class LocalGatewayConnection implements LocalGatewayClient {
 
   cronCancel(id: string, context: Context): Promise<CronOperatorCancelOutcome> {
     return this.call("cronCancel", { id }, context);
+  }
+
+  async appPair(label: string | undefined, context: Context): Promise<AppPairingResult> {
+    const result = await this.call<Record<string, unknown>>("appPair",
+      label === undefined ? {} : { label }, context);
+    if (typeof result.refused === "string") {
+      if (result.refused !== "label-in-use" && result.refused !== "device-limit" &&
+          result.refused !== "pairing-limit" && result.refused !== "invalid-label") {
+        throw new LocalGatewayError("unavailable", "local gateway sent an unexpected pairing result");
+      }
+      return { refused: result.refused };
+    }
+    if (typeof result.code !== "string" || typeof result.expiresAtMs !== "number") {
+      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected pairing result");
+    }
+    return { code: result.code, expiresAtMs: result.expiresAtMs };
+  }
+
+  async appDevices(context: Context): Promise<readonly AppDeviceRow[]> {
+    const result = await this.call<{ readonly devices?: unknown }>("appDevices", {}, context);
+    if (!Array.isArray(result.devices) || result.devices.some((entry) =>
+      entry === null || typeof entry !== "object" || typeof (entry as Record<string, unknown>).label !== "string" ||
+      typeof (entry as Record<string, unknown>).createdAtMs !== "number")) {
+      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected device listing");
+    }
+    return result.devices as AppDeviceRow[];
+  }
+
+  async appRevoke(label: string, context: Context): Promise<"revoked" | "missing"> {
+    const result = await this.call<{ readonly result?: unknown }>("appRevoke", { label }, context);
+    if (result.result !== "revoked" && result.result !== "missing") {
+      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected revoke result");
+    }
+    return result.result;
   }
 
   async historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage> {

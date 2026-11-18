@@ -63,6 +63,7 @@ import {
   createDiscordHistoryTool,
   type DiscordHistoryRegistry,
 } from "./channels/discord-history.js";
+import { createAppConsoleRegistry, type AppConsoleRegistry } from "./channels/app.js";
 import type { CronOwner } from "./automation/cron.js";
 import {
   ASK_USER_TOOL_NAME,
@@ -426,6 +427,12 @@ export interface Gateway {
    */
   readonly discordHistory?: DiscordHistoryRegistry;
   /**
+   * Live host registry for the app channel's operator console. Present only when `config.app` is
+   * configured; the running adapter attaches its pairing host, and the local terminal's
+   * `app pair|devices|revoke` commands reach it over the private socket.
+   */
+  readonly appConsole?: AppConsoleRegistry;
+  /**
    * MCP server connection state; absent when MCP is not configured and enabled. A failed server has
    * no tools; its status carries a fixed failure code, never a transport message or configured value.
    */
@@ -766,6 +773,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const cronDeliveryPrefixes: readonly string[] = [
     ...(config.telegram === undefined ? [] : ["telegram:"]),
     ...(config.discord === undefined ? [] : ["discord:"]),
+    ...(config.app === undefined ? [] : ["app:"]),
   ];
   // Fail at startup, not at the first tool call, when the default cannot be represented by the host shell.
   const toolTimeoutSeconds = parseToolTimeoutSeconds(config.toolTimeoutSeconds);
@@ -1053,6 +1061,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // worker, a fork, a root conversation or a scheduled/digest target.
   const discordHistory: DiscordHistoryRegistry | undefined =
     config.discord === undefined ? undefined : createDiscordHistoryRegistry();
+  // The app channel's operator console (pairing, devices, revoke) is a late-bound live host: the
+  // local terminal reaches it over the private socket, and the running adapter attaches here.
+  const appConsole: AppConsoleRegistry | undefined =
+    config.app === undefined ? undefined : createAppConsoleRegistry();
   const sessionKeyForConversation = new Map<ConversationId, string>();
   const telegramChatConversations = new Set<ConversationId>();
   const discordChatConversations = new Set<ConversationId>();
@@ -3821,6 +3833,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }),
       ...(telegramActions === undefined ? {} : { telegramActions }),
       ...(discordHistory === undefined ? {} : { discordHistory }),
+      ...(appConsole === undefined ? {} : { appConsole }),
       askSurfaces,
       get mcp() {
         return mcpRef.current === undefined ? undefined : { servers: mcpRef.current.status };

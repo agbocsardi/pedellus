@@ -407,6 +407,15 @@ export interface PortConfig {
     readonly streaming?: boolean;
     readonly receipts?: { readonly read?: string | false; readonly working?: string | false; readonly delayMs?: number };
   };
+  /**
+   * Opt-in installable web app channel. Absent keeps every `app` code path unloaded. The listener
+   * binds 127.0.0.1 only (no other bind is configurable); `tailscale serve` publishes it on the
+   * tailnet, and devices authenticate with one-time pairing codes from the owner's terminal.
+   */
+  app?: {
+    readonly port: number;
+    readonly staticRoot: string;
+  };
 }
 
 function object(value: unknown, name: string): Record<string, unknown> {
@@ -1217,6 +1226,9 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   if (raw.discord !== undefined) {
     Object.assign(config, { discord: discordConfig(raw.discord) });
   }
+  if (raw.app !== undefined) {
+    Object.assign(config, { app: appConfig(raw.app) });
+  }
   if (raw.web !== undefined) {
     Object.assign(config, { web: parseWebConfig(raw.web) });
   }
@@ -1296,6 +1308,22 @@ function discordConfig(value: unknown): NonNullable<PortConfig["discord"]> {
     discord.receipts = Object.freeze(receipts);
   }
   return Object.freeze(discord);
+}
+
+/** Exactly the accepted `app` keys; an unknown key is a typo that must not silently widen access. */
+const APP_KEYS = ["port", "staticRoot"] as const;
+
+/** `app`: opt-in, loopback-only, with an explicit port and an absolute static root. */
+function appConfig(value: unknown): NonNullable<PortConfig["app"]> {
+  const a = object(value, "app");
+  rejectUnknownKeys(a, APP_KEYS, "app");
+  if (typeof a.port !== "number" || !Number.isSafeInteger(a.port) || a.port < 1 || a.port > 65_535) {
+    throw new Error("app.port must be an integer from 1 to 65535");
+  }
+  if (typeof a.staticRoot !== "string" || a.staticRoot.trim() === "" || !a.staticRoot.startsWith("/")) {
+    throw new Error("app.staticRoot must be an absolute directory path");
+  }
+  return Object.freeze({ port: a.port, staticRoot: a.staticRoot });
 }
 
 /**

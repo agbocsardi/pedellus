@@ -339,6 +339,22 @@ class LocalConnection {
           this.scope.context,
         );
       }
+      case "appPair": {
+        const params = requireObject(request.params ?? {});
+        onlyKeys(params, ["label"]);
+        const label = params.label === undefined ? undefined : requireString(params, "label", 40);
+        return this.appConsole().pair(label);
+      }
+      case "appDevices": {
+        const params = requireObject(request.params ?? {});
+        onlyKeys(params, []);
+        return { devices: await this.appConsole().devices() };
+      }
+      case "appRevoke": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["label"]);
+        return { result: await this.appConsole().revoke(requireString(params, "label", 40)) };
+      }
     }
     if (this.surface === undefined || this.sessionKey === undefined || this.gatewayConversation === undefined) {
       throw new LocalRequestError("unavailable", "attach must be the first request");
@@ -651,6 +667,19 @@ class LocalConnection {
       throw new LocalRequestError("unavailable", "scheduling is not enabled in this gateway");
     }
     return operator;
+  }
+
+  /**
+   * Owner app-channel controls come from the running adapter through the gateway's registry, so
+   * this terminal never creates a device or a pairing code itself. Absent means the app channel is
+   * not running (or not configured) in this gateway.
+   */
+  private appConsole(): import("../channels/app.js").AppConsole {
+    const console = this.options.gateway.appConsole?.console();
+    if (console === undefined) {
+      throw new LocalRequestError("unavailable", "the app channel is not running in this gateway");
+    }
+    return console;
   }
 
   /** The attached conversation is the digest origin; no other conversation is addressable here. */

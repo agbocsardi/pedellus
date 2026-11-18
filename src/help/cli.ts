@@ -30,7 +30,7 @@ export const COMPATIBILITY_SYNOPSIS = "durable-nanobot --config <path>   (agent,
 const DEFAULT_CONFIG_FILE = "~/.durable-nanobot/config.json";
 
 /** The one sentence the usage block adds after its synopses, because it is the only configuration default. */
-const DEFAULT_CONFIG_NOTE = `Without --config, gateway, agent, login, logout, models, recovery and cron use ${DEFAULT_CONFIG_FILE}.`;
+const DEFAULT_CONFIG_NOTE = `Without --config, gateway, agent, login, logout, models, recovery, cron and app use ${DEFAULT_CONFIG_FILE}.`;
 
 const CONFIG_OPTION: HelpOption = {
   flags: "--config <path>",
@@ -141,6 +141,26 @@ export const COMMANDS: readonly CommandHelp[] = [
       "durable-nanobot cron show <jobId>",
       "durable-nanobot cron cancel <jobId>",
       "durable-nanobot cron create --origin <sessionKey> --key wake-1 --after 600 --message \"Stretch\"",
+    ],
+  },
+  {
+    name: "app",
+    synopsis: "durable-nanobot app <pair [--label <label>]|devices|revoke <label>> [--config <path>]",
+    summary: "Pair, list or revoke devices of the installable web app channel",
+    options: [
+      CONFIG_OPTION,
+      { flags: "--label <label>", text: "pair: optional printable device label (1-40); a default is chosen when omitted." },
+      { flags: "<label>", text: "revoke: one exact paired device label; its live stream is closed." },
+    ],
+    details: [
+      "Needs the app channel configured and the gateway running; every decision is the running adapter's.",
+      "A pairing code is single-use and expires after ten minutes; only its hash is stored.",
+    ],
+    examples: [
+      "durable-nanobot app pair",
+      "durable-nanobot app pair --label iphone",
+      "durable-nanobot app devices",
+      "durable-nanobot app revoke iphone",
     ],
   },
 ];
