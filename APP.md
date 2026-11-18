@@ -123,7 +123,8 @@ keys at 1–64 characters of `[A-Za-z0-9_-]`.
 Durable egress is one adapter-wide cursor log — `message` (roles `user`, `assistant`, `notice`),
 `settled`, `divider` and `thread` — across all threads. Each event names its thread; lifecycle
 events carry its full metadata. `hello` replies with the protocol version, the device label, the
-durable head cursor and the configured agent display name (`app.agentName`, default `Durable`), and replays
+durable head cursor, the configured agent display name (`app.agentName`, default `Durable`) and
+`commands` (the shared catalogue's `app` surface this host implements, in catalogue order), and replays
 events with `cursor > hello.cursor` (oldest first, at most 500 per batch; the app re-`hello`s for
 more), live sockets are pushed every event after their own position, and `ack` records each
 device's highest stored cursor, clamped to the current head. Replay is idempotent by cursor on the
@@ -157,16 +158,22 @@ owner-run check as Telegram.
 
 ## Controls
 
-The `control` op implements `new`, `abort` and `status`, mapping to the same host operations the
-Telegram commands use: `new` is the paired reset (native reset plus prompt-snapshot rebuild,
+The `control` op takes `command` (a name from `hello.commands`) and optional `args` (≤ 1 000
+characters), acting on its thread. The app surface is `new`, `abort`/`stop`, `status`, `model
+[preset]`, `digest [status]`, `restart` and `help [command]`, each offered only when the host
+implements it; CLI-only commands (`tools`, `refresh`, `compact`, `reload`) and `mcp`/`notices`
+are not listed. They map to the same host operations the Telegram and Discord commands use: `new` is the paired reset (native reset plus prompt-snapshot rebuild,
 refused atomically while a run is live) and appends a durable `divider{reason:"new"}` event;
 `abort` withdraws this chat's queued inputs and stops its live work; `status` is the bounded
 read-only projection. The visible result of every control arrives as a `message{role:"notice"}`
 event, with the same acknowledgement texts (`Context reset.`, `Idle. Queue cleared.`), the same
 held acknowledgement until the native call returns, the same 30-second still-pending wording, and
-the same at-most-once control records with replay reporting. The catalogued later commands
-(`model`, `digest`, `restart`, `mcp`) are refused with the fixed `unsupported` error; anything
-else is `bad_request`.
+the same at-most-once control records with replay reporting. `model <preset>` applies to that
+thread only until restart; `digest` starts one batch for that thread's conversation; `restart`
+records the requesting thread durably, then asks the host once, and the replacement posts
+`Restarted.` there (a host refusal is reported instead). An unlisted name is `unsupported`;
+bad arguments are answered by a usage notice with no effect; a non-string `command`/`args` or
+oversize `args` is `bad_request`.
 
 ## Scheduled results and interruption notices
 
@@ -233,7 +240,8 @@ types, pairing (good/bad/expired/reused codes, the rate limit and its rolling wi
 uniqueness), the auth close codes (4401, 4409, 4400, 4426), bounded replay with later `hello`
 continuation and ack trimming, idempotent send and the `too_large` text bound, a full streaming
 turn (echo, preview, status, answer, settled), a steered pair answered once with a settled per
-key, reconnect without loss, controls with their replay reporting, a seeded reopen (interrupted
+key, reconnect without loss, controls with their replay reporting, the `hello.commands`
+catalogue with `model`/`help`/`digest`/`restart` arguments, usage notices and `unsupported`, a seeded reopen (interrupted
 command reported, held acknowledgement released, a pre-restart turn still answered), a failed run
 (`settled{failed}` with the error presence state), revocation, oversize frames and callback
 interception. v2 coverage includes thread lifecycle, search and list limits, concurrent turns and

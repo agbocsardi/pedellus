@@ -122,6 +122,7 @@ export function startApp(store, options = {}) {
     autoArchiveDays: options.autoArchiveDays ?? store.config.app.autoArchiveDays,
     agentName: options.agentName ?? store.config.app.agentName,
     ...(options.scanIntervalMs === undefined ? {} : { scanIntervalMs: options.scanIntervalMs }),
+    ...(options.restart === undefined ? {} : { restart: options.restart }),
     now: () => clock.now,
     onListening: (bound) => portResolve(bound),
   }, scope.context);

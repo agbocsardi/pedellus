@@ -437,12 +437,84 @@ test('controls map to the owner operations and reply with fixed results', { time
     }, 'the replay reports');
     assert.equal(device.events('divider').length, 1, 'no second boundary was recorded');
 
-    device.send({ type: 'req', id: 'c4', op: 'control', command: 'model' });
-    await device.wait(() => device.response('c4') !== undefined, 'later command reply');
+    // A name hello did not list is `unsupported`; a malformed frame is still `bad_request`.
+    device.send({ type: 'req', id: 'c4', op: 'control', command: 'reload' });
+    await device.wait(() => device.response('c4') !== undefined, 'unlisted command reply');
     assert.equal(device.response('c4').error, 'unsupported');
     device.send({ type: 'req', id: 'c5', op: 'control', command: 'nonsense' });
     await device.wait(() => device.response('c5') !== undefined, 'unknown command reply');
-    assert.equal(device.response('c5').error, 'bad_request');
+    assert.equal(device.response('c5').error, 'unsupported');
+    device.send({ type: 'req', id: 'c6', op: 'control', command: 'status', args: 'x'.repeat(1_001) });
+    await device.wait(() => device.response('c6') !== undefined, 'oversize args reply');
+    assert.equal(device.response('c6').error, 'bad_request');
+    await device.close();
+  });
+});
+
+const PRESETS = {
+  fast: { provider: 'fixture', modelId: 'alpha', thinkingLevel: 'off' },
+  deep: { provider: 'fixture', modelId: 'beta', thinkingLevel: 'high' },
+};
+
+test('hello lists the app command catalogue and control routes args to the owner commands', { timeout: 30_000 }, async () => {
+  const requests = [];
+  const restart = { supported: true, request: async () => { requests.push('restart'); } };
+  const rawConfig = (raw) => {
+    const { model: _model, allowedModels: _allowed, ...rest } = raw;
+    return parseConfig({ ...rest, modelPresets: PRESETS, modelPreset: 'fast', digest: { preset: 'fast' } }, '/tmp');
+  };
+  await withChannel('commands', { rawConfig, adapter: { restart } }, async ({ store, base }) => {
+    const cookie = await pairedDevice(store, base);
+    const device = deviceClient(base, cookie);
+    await device.open();
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
+    await device.wait(() => device.response('h1') !== undefined, 'hello reply');
+    const commands = device.response('h1').commands;
+    assert.deepEqual(commands.map((command) => command.name),
+      ['new', 'abort', 'stop', 'status', 'model', 'digest', 'restart', 'help']);
+    const model = commands.find((command) => command.name === 'model');
+    assert.equal(model.args, '[preset]');
+    assert.match(model.usage, /^Usage: \/model /u);
+    for (const command of commands) {
+      assert.match(command.name, /^[a-z][a-z0-9_-]{0,22}$/u);
+      assert.equal(typeof command.summary, 'string');
+    }
+
+    const notices = () => device.events('message').filter((event) => event.role === 'notice').map((event) => event.text);
+    const lastNotice = async (id, frame, label) => {
+      const before = notices().length;
+      device.send({ type: 'req', id, op: 'control', ...frame });
+      await device.wait(() => device.response(id) !== undefined && notices().length > before, label);
+      assert.equal(device.response(id).ok, true);
+      return notices().at(-1);
+    };
+
+    assert.match(await lastNotice('m1', { command: 'model' }, 'preset listing'),
+      /\* fast — fixture alpha \[thinking: off\] \(default\)/u);
+    assert.equal(await lastNotice('m2', { command: 'model', args: 'deep' }, 'preset applied'),
+      'Model set to fixture/beta (thinking: high) for this thread.');
+    const state = await appState(store.gateway);
+    assert.deepEqual([state.controls.at(-1).command, state.controls.at(-1).option, state.controls.at(-1).status],
+      ['model', 'deep', 'applied']);
+    assert.match(await lastNotice('m3', { command: 'model', args: 'nope' }, 'unknown preset'),
+      /^Unknown model preset nope: nothing was changed\./u);
+
+    // Bad arguments answer with the catalogue's usage line and no effect.
+    assert.match(await lastNotice('u1', { command: 'model', args: 'a b' }, 'model usage'), /^Usage: \/model .*Nothing was sent/u);
+    assert.match(await lastNotice('u2', { command: 'new', args: 'now' }, 'new usage'), /^Usage: \/new \(no arguments\)\./u);
+    assert.match(await lastNotice('u3', { command: 'digest', args: 'later' }, 'digest usage'), /^Usage: \/digest /u);
+    assert.equal(device.events('divider').length, 0, 'a usage refusal reset nothing');
+
+    assert.match(await lastNotice('p1', { command: 'help' }, 'help listing'), /^Controls for this thread[\s\S]*\/model \[preset\]/u);
+    assert.match(await lastNotice('p2', { command: 'help', args: 'restart' }, 'help detail'), /^Usage: \/restart\n/u);
+    assert.match(await lastNotice('d1', { command: 'digest', args: 'status' }, 'digest status'), /\S/u);
+
+    // Restart: durable acknowledgement first, then exactly one host request; a second is not re-requested.
+    assert.equal(await lastNotice('r1', { command: 'restart' }, 'restart ack'), 'Restart requested; checking active work.');
+    await until(() => requests.length === 1, 'restart requested once');
+    assert.deepEqual((await appState(store.gateway)).restart, ['main']);
+    assert.match(await lastNotice('r2', { command: 'restart' }, 'second restart'), /already requested/u);
+    assert.equal(requests.length, 1);
     await device.close();
   });
 });

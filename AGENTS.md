@@ -187,8 +187,9 @@ edits need restart only; unit edits additionally need daemon-reload.
   idempotent there is no external-send intent to quarantine — the log append is the delivery, the
   deliberate reconciliation of Telegram's held-unknown boundary. `send` and `thread.create` keys
   are idempotent for at least seven days; send admission precedes submission with a stable request id.
-  Per-thread `control` new/abort/status reuse the Telegram control records, gating and held
-  acknowledgements, with results as `message{role:"notice"}` events and `/new` as a durable
+  `hello.commands` lists the catalogue's implemented `app` surface; per-thread `control
+  {command, args}` runs new/abort/stop/status/model/digest/restart/help through the Telegram control
+  records, gating and held acknowledgements (unlisted → `unsupported`, bad args → usage notice), with results as `message{role:"notice"}` events and `/new` as a durable
   `divider`. Cron results and interruption notices arrive through the same channel-neutral
   outbox to their original thread, deduplicated by origin and record id and authorized by that
   thread's own admission evidence. An app chat is not an MCP-login or `ask_user` owner surface: the protocol defines no event that
@@ -279,7 +280,7 @@ edits need restart only; unit edits additionally need daemon-reload.
   in the commit that archives their original text and unknown outcome (100 records, refuse when full).
   Typing refreshes represent only active provider generation, never tool work, deferred polls,
   retry backoff or background keepalives. Worker status distinguishes running/waiting/queued.
-- Shared CLI, authenticated Telegram and authenticated Discord owner controls are `/new`,
+- Shared CLI, authenticated Telegram, authenticated Discord and paired app owner controls are `/new`,
   `/abort`/`/stop`, `/status`, `/model`, `/digest` and `/digest status`, plus `/restart` and
   the read-only `/mcp` status command, advertised only where the host implements
   them. MCP configuration and login are ordinary model-management requests in an
