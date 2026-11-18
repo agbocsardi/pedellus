@@ -561,10 +561,10 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               onSelect={(id) => { setSheet(null); store.selectThread(id); }} />}
             {sheet.kind === "menu" && <>
               {writable && <>
-                <SheetItem icon="M12 5v14M5 12h14" title="New context"
-                  sub="Start fresh; earlier messages stay above a divider" disabled={!online} onClick={() => show({ kind: "confirm-new" })} />
-                <SheetItem icon="M3 12h4l3-8 4 16 3-8h4" title="Status"
-                  sub="Ask the agent what it is doing" disabled={!online} onClick={() => command("status")} />
+                {commands.some((c) => c.name === "new") && <SheetItem icon="M12 5v14M5 12h14" title="New context"
+                  sub="Start fresh; earlier messages stay above a divider" disabled={!online} onClick={() => show({ kind: "confirm-new" })} />}
+                {commands.some((c) => c.name === "status") && <SheetItem icon="M3 12h4l3-8 4 16 3-8h4" title="Status"
+                  sub="Ask the agent what it is doing" disabled={!online} onClick={() => command("status")} />}
               </>}
               {!main && (writable || archived) && <>
                 <SheetItem icon="M4 20h4L20 8l-4-4L4 16v4Z" title="Rename thread" disabled={!online || busy}
