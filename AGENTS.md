@@ -165,20 +165,21 @@ edits need restart only; unit edits additionally need daemon-reload.
   outcomes are retained, never blindly retried or evicted. The `app` channel is a third opt-in
   surface: one loopback-only HTTP+WebSocket listener (bind fixed to 127.0.0.1, published only with
   `tailscale serve`, Tailscale identity headers ignored), speaking the sibling `durable-app`
-  repository's normative protocol v1 exactly. One host-derived session key (`app:chat`) is shared by
-  every paired device and validated as an ordinary mapped chat; devices authenticate solely with a
+  repository's protocol v2 only. All devices share `main` (`app:chat`) and up to 50 open side
+  threads, each a separate host-derived ordinary mapped chat with the same policy. Archiving aborts
+  that chat's turn and refuses app send/control until restored; it is not deletion. Devices authenticate solely with a
   cookie token stored as a hash, created from a single-use ten-minute console code
   (`durable-nanobot app pair`, exact-label `revoke` over the private local socket). Egress is the
-  adapter's own durable cursor-numbered event log (at-least-once, deduplicated by cursor on the
+  adapter's one durable cursor-numbered event log across threads (at-least-once, deduplicated by cursor on the
   device, replayed after `hello`, trimmed by per-device `ack`s): because retransmission is
   idempotent there is no external-send intent to quarantine — the log append is the delivery, the
-  deliberate reconciliation of Telegram's held-unknown boundary. Ingress `send` keys are
-  idempotent for at least seven days, admission precedes submission with a stable request id,
-  and `control` new/abort/status reuse the Telegram control records, gating and held
+  deliberate reconciliation of Telegram's held-unknown boundary. `send` and `thread.create` keys
+  are idempotent for at least seven days; send admission precedes submission with a stable request id.
+  Per-thread `control` new/abort/status reuse the Telegram control records, gating and held
   acknowledgements, with results as `message{role:"notice"}` events and `/new` as a durable
   `divider`. Cron results and interruption notices arrive through the same channel-neutral
-  outbox, deduplicated by record id and authorized by this channel's own admission evidence. The
-  app chat is not an MCP-login or `ask_user` owner surface: the protocol defines no event that
+  outbox to their original thread, deduplicated by origin and record id and authorized by that
+  thread's own admission evidence. An app chat is not an MCP-login or `ask_user` owner surface: the protocol defines no event that
   could carry a one-time URL or a question without persisting it, so a mapped app chat cannot
   start an MCP login, and callback-shaped input is intercepted before admission and never stored.
   No new tool authority exists.

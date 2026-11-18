@@ -1,13 +1,13 @@
 /**
- * Wire protocol v1 for the `app` channel: limits, close codes, fixed error texts and the pure
+ * Wire protocol v2 for the `app` channel: limits, close codes, fixed error texts and the pure
  * frame/field validation both the listener and the adapter share.
  *
- * The contract is normative in the sibling `durable-app` repository (`protocol/v1.md`); this module
- * implements it exactly and adds nothing to the wire. Tailscale identity headers are never read:
+ * The contract is normative in the sibling `durable-app` repository (`protocol/v2.md` and `v2.ts`). Tailscale identity headers are never read:
  * the device token is the only authority.
  */
 
-export const APP_PROTOCOL_VERSION = 1;
+export const APP_PROTOCOL_VERSION = 2;
+export const APP_MAIN_THREAD = "main";
 
 /** Every bound the gateway enforces; the app enforces the same values before sending. */
 export const APP_LIMITS = Object.freeze({
@@ -17,6 +17,11 @@ export const APP_LIMITS = Object.freeze({
   /** Request ids and `send` keys. */
   idPattern: /^[A-Za-z0-9_-]{1,64}$/,
   replayBatch: 500,
+  threadTitleChars: 80,
+  maxOpenThreads: 50,
+  /** Maximum archived threads in a `threads` reply, not a storage cap. */
+  maxListedArchivedThreads: 200,
+  threadIdPattern: /^(main|t_[A-Za-z0-9_-]{1,40})$/,
   /** One-time pairing code: single use, ten minutes. */
   pairCodeChars: 8,
   pairTtlMs: 10 * 60_000,
@@ -55,7 +60,21 @@ export type AppErrorCode = "bad_request" | "too_large" | "unsupported" | "not_re
 export type AppControlCommand = "new" | "abort" | "status";
 /** Catalogued commands this phase does not implement; a typed one is refused, not a violation. */
 export const APP_LATER_COMMANDS: readonly string[] = ["model", "digest", "restart", "mcp"];
-export const APP_REQUEST_OPS: readonly string[] = ["hello", "send", "ack", "control", "ping", "history", "tasks"];
+export const APP_REQUEST_OPS: readonly string[] = [
+  "hello", "send", "ack", "control", "ping", "history", "tasks",
+  "threads", "thread.create", "thread.rename", "thread.archive",
+];
+
+export type AppThreadInfo = { id: string; title: string; archived: boolean; createdAt: string; lastAt: string };
+
+export function validThreadTitle(value: unknown): value is string {
+  return typeof value === "string" && Array.from(value).length <= APP_LIMITS.threadTitleChars &&
+    value.trim() !== "" && !/[\p{C}\p{Zl}\p{Zp}]/u.test(value);
+}
+
+export function parseThreadId(value: unknown): string | undefined {
+  return typeof value === "string" && APP_LIMITS.threadIdPattern.test(value) ? value : undefined;
+}
 
 /** A printable device label: 1–40 characters, no control or format characters. */
 export function validAppLabel(value: unknown): value is string {
@@ -79,18 +98,22 @@ export type AppDurableEvent =
   | {
     event: "message";
     cursor: number;
+    /** Missing only on legacy v1 records; they belong to main. */
+    thread?: string;
     id: string;
     role: "user" | "assistant" | "notice";
     text: string;
     at: string;
     key?: string;
   }
-  | { event: "settled"; cursor: number; key: string; outcome: "answered" | "failed" | "aborted" }
-  | { event: "divider"; cursor: number; at: string; reason: "new" };
+  | { event: "settled"; cursor: number; thread?: string; key: string; outcome: "answered" | "failed" | "aborted" }
+  | { event: "divider"; cursor: number; thread?: string; at: string; reason: "new" }
+  | { event: "thread"; cursor: number; thread: AppThreadInfo };
 
 /** One pending model input (an admitted `send`) or held host notice. */
 export type AppPendingInput = {
   readonly key: string;
+  readonly thread?: string;
   readonly text: string;
   readonly admittedAtMs: number;
   /** A host notice: delivered as `message{role:"notice"}`, never submitted to the model. */
@@ -108,6 +131,7 @@ export type AppPendingInput = {
 /** One authenticated control command, admitted with its acknowledgement before the effect. */
 export type AppControlRecord = {
   readonly key: string;
+  readonly thread?: string;
   readonly command: "new" | "abort";
   readonly status: "admitted" | "applied" | "refused" | "unconfirmed";
 };

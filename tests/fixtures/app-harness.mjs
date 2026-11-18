@@ -2,7 +2,7 @@
 //
 // No network beyond one loopback listener: the Gateway is real over a temporary store with a faux
 // provider, the listener binds 127.0.0.1 on an ephemeral port, and a synthetic WebSocket client
-// (the `ws` package itself) speaks wire protocol v1 against it. Every wait is event-driven, the
+// (the `ws` package itself) speaks wire protocol v2 against it. Every wait is event-driven, the
 // clock is controllable for pairing expiry and the rate limit, and every handle is cleaned up by
 // the test that created it.
 import assert from 'node:assert/strict';
@@ -74,7 +74,7 @@ export async function openAppStore(label, options = {}) {
     } else {
       config = parseConfig(raw, directory);
     }
-    const gateway = await openGateway(config, context, { models });
+    const gateway = await openGateway(config, context, { models, ...options.gatewayOptions });
     return {
       directory,
       workspace,
@@ -87,7 +87,7 @@ export async function openAppStore(label, options = {}) {
       script(steps) { gate.script(steps); },
       async close() {
         await gateway.close(context).catch(() => undefined);
-        await rm(directory, { recursive: true, force: true });
+        if (!options.keepDirectory) await rm(directory, { recursive: true, force: true });
       },
     };
   } catch (error) {

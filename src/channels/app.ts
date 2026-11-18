@@ -2,10 +2,9 @@
  * The `app` channel adapter: a third opt-in owner surface next to Telegram, Discord and the CLI.
  *
  * It serves an installable web app (PWA) over one loopback HTTP+WebSocket listener that
- * `tailscale serve` publishes on the tailnet, and speaks wire protocol v1 exactly as normative in
- * the sibling `durable-app` repository. One host-derived session key (`app:chat`) is shared by every
- * paired device; the gateway validates it as an ordinary mapped chat, so all existing authority,
- * tool policy, cron and memory rules apply unchanged.
+ * `tailscale serve` publishes on the tailnet, speaking the sibling repository's wire protocol v2.
+ * Every paired device shares the same threads, each a host-derived ordinary mapped chat with
+ * unchanged tool policy, cron and memory rules.
  *
  * Delivery semantics follow the Telegram adapter, the battle-tested reference:
  * - ingress admission is one durable commit (echo event, pending record, idempotency key) before
@@ -23,13 +22,13 @@
  *   outbox record id.
  *
  * No new tool authority exists: the adapter grants nothing. The app chat is denied the MCP login
- * and `ask_user` owner surfaces in phase 1 because protocol v1 defines no event that could carry a
+ * and `ask_user` owner surfaces in phase 1 because protocol v2 defines no event that could carry a
  * one-time authorization URL or a question without persisting it, and persisting such a URL in
  * channel state is forbidden by the other channels' binding contract. A callback-shaped `send` is
  * consumed before admission and never stored.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { defineDoc, AssistantEntry, ConversationBusy, LiveDoc } from "@earendil-works/pi-durable";
+import { defineDoc, AssistantEntry, ConversationBusy, InboxDoc, LiveDoc } from "@earendil-works/pi-durable";
 import type { Context, Draft } from "@earendil-works/chord";
 import { copyJson } from "@earendil-works/chord";
 import { withCancel, withoutAbortSignal, withTelemetry } from "@earendil-works/chord/context";
@@ -49,24 +48,31 @@ import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import {
   APP_CLOSE,
   APP_LIMITS,
+  APP_MAIN_THREAD,
   APP_LATER_COMMANDS,
   APP_PAIR_ALPHABET,
   APP_PROTOCOL_VERSION,
   APP_REQUEST_OPS,
   parseHelloCursor,
   validAppLabel,
+  validThreadTitle,
+  parseThreadId,
   type AppControlRecord,
   type AppDeviceRecord,
   type AppDurableEvent,
   type AppErrorCode,
   type AppPairingRecord,
   type AppPendingInput,
+  type AppThreadInfo,
 } from "./app-protocol.js";
 import { startAppListener, type AppDeviceSession, type AppSessionHooks } from "./app-listener.js";
 
-/** The one mapped ordinary chat every paired device shares. Host-derived, never model input. */
+/** Preserve the original mapped chat and its history. */
 export const APP_CHAT_SESSION_KEY = "app:chat";
 const APP_STATE_SESSION_KEY = `app${CHANNEL_STATE_SESSION_SUFFIX}`;
+const sessionForThread = (thread: string): string =>
+  thread === APP_MAIN_THREAD ? APP_CHAT_SESSION_KEY : `${APP_CHAT_SESSION_KEY}:${thread}`;
+const threadOf = (record: { readonly thread?: string }): string => record.thread ?? APP_MAIN_THREAD;
 
 const CONTROL_PENDING_NOTICE_MS = 30_000;
 const PREVIEW_COALESCE_MS = 700;
@@ -94,8 +100,12 @@ export type AppChannelState = {
   nextNoticeSeq: number;
   /** Bounded recent `send` keys, kept for at least seven days. */
   sendKeys: { readonly key: string; readonly atMs: number }[];
-  /** Durable admission evidence for this channel's one chat, set by the first authenticated input. */
+  // These fields are optional on stores written by v1. Existing records belong to main.
+  threads?: AppThreadInfo[];
+  createKeys?: { readonly key: string; readonly atMs: number; readonly thread: string }[];
+  /** Durable admission evidence, set by authenticated input to that exact thread. */
   origin?: { readonly admittedAtMs: number };
+  sideOrigins?: Record<string, { readonly admittedAtMs: number }>;
 };
 
 export const AppState = defineDoc<AppChannelState>({
@@ -197,7 +207,12 @@ type LiveSocket = {
   lastSent: number;
 };
 
-type DeferredControl = { readonly key: string; readonly command: "new" | "abort" };
+type DeferredControl = {
+  readonly key: string;
+  readonly thread: string;
+  readonly command: "new" | "abort";
+  readonly earlierKeys: ReadonlySet<string>;
+};
 
 type ControlOutcome =
   | { readonly kind: "applied"; readonly text?: string }
@@ -208,10 +223,16 @@ type ControlOutcome =
 type SubmissionSlot = { readonly prior: Promise<void>; release(): void };
 
 /** One durable event without its cursor, distributive over the union. */
-type AppEventInput =
-  | Omit<Extract<AppDurableEvent, { event: "message" }>, "cursor">
-  | Omit<Extract<AppDurableEvent, { event: "settled" }>, "cursor">
-  | Omit<Extract<AppDurableEvent, { event: "divider" }>, "cursor">;
+type WithoutCursor<T> = T extends { cursor: number } ? Omit<T, "cursor"> : never;
+type AppEventInput = WithoutCursor<AppDurableEvent> & { thread: string | AppThreadInfo };
+
+function threadInfo(doc: AppChannelState, thread: string): AppThreadInfo | undefined {
+  return doc.threads?.find((entry) => entry.id === thread);
+}
+
+function openThread(doc: AppChannelState, thread: string): boolean {
+  return threadInfo(doc, thread)?.archived === false;
+}
 
 // ── Pure helpers ─────────────────────────────────────────────────────────────
 
@@ -266,10 +287,7 @@ function isConversationBusy(error: unknown): boolean {
 }
 
 /** `send` key idempotency window: entries are pruned by age only, so the window is really seven days. */
-function pruneSendKeys(
-  keys: readonly { readonly key: string; readonly atMs: number }[],
-  nowMs: number,
-): { readonly key: string; readonly atMs: number }[] {
+function pruneKeys<T extends { readonly atMs: number }>(keys: readonly T[], nowMs: number): T[] {
   return keys.filter((entry) => nowMs - entry.atMs < APP_LIMITS.sendKeyTtlMs);
 }
 
@@ -278,8 +296,7 @@ function pruneEvents(doc: Draft<AppChannelState>): void {
   let floor = doc.floor;
   const activeAcks = doc.devices
     .filter((device) => device.revokedAtMs === undefined)
-    .map((device) => doc.acks[device.id])
-    .filter((ack): ack is number => typeof ack === "number" && Number.isSafeInteger(ack) && ack > 0);
+    .map((device) => doc.acks[device.id] ?? 0);
   if (activeAcks.length > 0) floor = Math.max(floor, Math.min(...activeAcks));
   if (doc.events.length > APP_LIMITS.maxEvents) {
     const cut = doc.events[doc.events.length - APP_LIMITS.maxEvents]!;
@@ -294,7 +311,11 @@ function pruneEvents(doc: Draft<AppChannelState>): void {
 function appendEvent(doc: Draft<AppChannelState>, event: AppEventInput): void {
   const cursor = doc.nextCursor;
   doc.nextCursor = cursor + 1;
-  doc.events.push({ ...event, cursor } as AppDurableEvent);
+  if (event.event === "message" || event.event === "divider") {
+    const info = doc.threads?.find((entry) => entry.id === event.thread);
+    if (info !== undefined && info.lastAt < event.at) info.lastAt = event.at;
+  }
+  doc.events.push({ ...event, cursor });
   pruneEvents(doc);
 }
 
@@ -411,9 +432,17 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   if (signal?.aborted) return;
 
   const stateConversation = await gateway.conversationFor(APP_STATE_SESSION_KEY, context);
-  let state = await stateConversation.commit(async (tx) =>
-    copyJson(await tx.doc(AppState, stateConversation.id)) as unknown as AppChannelState,
-  context);
+  let state = await stateConversation.commit(async (tx) => {
+    const doc = await tx.doc(AppState, stateConversation.id);
+    if (doc.threads === undefined) {
+      const activity = doc.events.flatMap((event) => "at" in event ? [event.at] : []).sort();
+      const createdAt = activity[0] ?? new Date(doc.origin?.admittedAtMs ?? now()).toISOString();
+      doc.threads = [{
+        id: APP_MAIN_THREAD, title: "Main", archived: false, createdAt, lastAt: activity.at(-1) ?? createdAt,
+      }];
+    }
+    return copyJson(doc) as unknown as AppChannelState;
+  }, context);
   /**
    * The busy-mode each admitted input asked for, written onto it so a later configuration change or
    * a recovery never re-reads it. Delivery may still fall back to follow-up queueing when another
@@ -427,16 +456,17 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const deliveryFailures = new Map<string, number>();
   const submissionChains = new Map<string, Promise<void>>();
   const earlySubmissions = new Map<string, Submission>();
-  /** This chat is gated while one of its control commands is applying or deferred. */
+  /** Gate only the chat whose control or archive is in progress. */
   const controlPendingSet = new Set<string>();
+  const archiving = new Set<string>();
   const deferredControls = new Map<string, DeferredControl>();
   const controlFailures = new Map<string, number>();
-  const controlChains: Promise<void>[] = [];
+  const runningControls = new Set<string>();
   const pendingControls = new Set<Promise<void>>();
   /** Pairing failures inside the rolling one-minute window; in-memory, so a restart clears it. */
   const pairingFailures: number[] = [];
   const active = new Set<Promise<void>>();
-  let activeReplies = 0;
+  const activeReplies = new Map<string, number>();
   let activeNotices = 0;
   let fatal: unknown;
   let stopping = false;
@@ -445,7 +475,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const scheduledTasks = new Set<Promise<void>>();
   let scheduledScanning = false;
   let scanTimer: ReturnType<typeof setInterval> | undefined;
-  let lastStatus: string | undefined;
+  const statuses = new Map<string, string>();
 
   const mutateState = async (
     change: (doc: Draft<AppChannelState>) => void | Promise<void>,
@@ -462,7 +492,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   // ── Egress: the durable cursor log, replayed and pushed ──────────────────
 
   const wireEvent = (event: AppDurableEvent): string =>
-    JSON.stringify({ type: "event", ...event } as Record<string, unknown>);
+    JSON.stringify({ type: "event", ...event, thread: event.thread ?? APP_MAIN_THREAD });
 
   /** Push every durable event after one socket's position, in order; only hello'd sockets receive live events. */
   const pushEvents = (socket: LiveSocket): void => {
@@ -478,12 +508,15 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     for (const socket of sockets.values()) pushEvents(socket);
   };
 
-  const headCursor = (): number | null => (state.events.length === 0 ? null : state.events.at(-1)!.cursor);
+  const headCursor = (): number | null => state.nextCursor > 1 ? state.nextCursor - 1 : null;
+  const statusFrame = (thread: string, stateValue: string): string =>
+    JSON.stringify({ type: "event", event: "status", thread, state: stateValue });
 
-  const broadcastStatus = (stateValue: string): void => {
-    if (lastStatus === stateValue) return;
-    lastStatus = stateValue;
-    const frame = JSON.stringify({ type: "event", event: "status", state: stateValue });
+  const broadcastStatus = (thread: string, stateValue: string): void => {
+    if ((statuses.get(thread) ?? "idle") === stateValue) return;
+    if (stateValue === "idle") statuses.delete(thread);
+    else statuses.set(thread, stateValue);
+    const frame = statusFrame(thread, stateValue);
     for (const socket of sockets.values()) {
       if (socket.hello && socket.session.isOpen()) socket.session.send(frame);
     }
@@ -505,7 +538,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     const live: LiveSocket = { session, hello: false, lastSent: state.floor };
     sockets.set(session.deviceId, live);
     hooks.onFrame((frame) => {
-      void handleFrame(live, frame).catch(() => undefined);
+      if (stopping || signal?.aborted) return;
+      const task = handleFrame(live, frame).catch(() => undefined).finally(() => active.delete(task));
+      active.add(task);
     });
     hooks.onClosed(() => {
       if (sockets.get(session.deviceId) === live) sockets.delete(session.deviceId);
@@ -552,13 +587,29 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           await handleHello(socket, frame, sendOk, sendError);
           return;
         case "send":
-          await handleSendFrame(socket, frame, sendOk, sendError);
+          await handleSendFrame(frame, sendOk, sendError);
           return;
         case "ack":
           await handleAck(socket, frame, sendOk, sendError);
           return;
         case "control":
-          await handleControlFrame(socket, frame, sendOk, sendError);
+          await handleControlFrame(frame, sendOk, sendError);
+          return;
+        case "threads": {
+          let archived = 0;
+          const threads = [...(state.threads ?? [])].sort((a, b) => b.lastAt.localeCompare(a.lastAt))
+            .filter((thread) => !thread.archived || archived++ < APP_LIMITS.maxListedArchivedThreads);
+          sendOk({ threads });
+          return;
+        }
+        case "thread.create":
+          await createThread(frame, sendOk, sendError);
+          return;
+        case "thread.rename":
+          await renameThread(frame, sendOk, sendError);
+          return;
+        case "thread.archive":
+          await archiveThread(frame, sendOk, sendError);
           return;
         case "ping":
           sendOk();
@@ -609,7 +660,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     // After the replay the socket always learns the current presence state; unknown means idle.
     if (socket.session.isOpen()) {
-      socket.session.send(JSON.stringify({ type: "event", event: "status", state: lastStatus ?? "idle" }));
+      socket.session.send(statusFrame(APP_MAIN_THREAD, statuses.get(APP_MAIN_THREAD) ?? "idle"));
+      for (const [thread, status] of statuses) {
+        if (thread !== APP_MAIN_THREAD) socket.session.send(statusFrame(thread, status));
+      }
     }
   }
 
@@ -637,14 +691,131 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     sendOk();
   }
 
+  // ── Thread lifecycle ──────────────────────────────────────────────────────
+
+  async function createThread(
+    frame: Record<string, unknown>,
+    sendOk: (body: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
+    const key = frame.key;
+    const title = frame.title === undefined ? "New thread" : frame.title;
+    if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key) || !validThreadTitle(title)) {
+      return sendError("bad_request");
+    }
+    let thread: string | undefined;
+    let duplicate = true;
+    await mutateState((doc) => {
+      thread = doc.createKeys?.find((entry) => entry.key === key)?.thread;
+      if (thread !== undefined) return;
+      const threads = doc.threads!;
+      if (threads.filter((entry) => entry.id !== APP_MAIN_THREAD && !entry.archived).length >=
+          APP_LIMITS.maxOpenThreads) return;
+      duplicate = false;
+      do {
+        thread = `t_${randomBytes(18).toString("base64url")}`;
+      } while (threads.some((entry) => entry.id === thread));
+      const atMs = now();
+      const at = new Date(atMs).toISOString();
+      const info = { id: thread, title, archived: false, createdAt: at, lastAt: at };
+      threads.push(info);
+      doc.createKeys = pruneKeys([...(doc.createKeys ?? []), { key, atMs, thread }], atMs);
+      appendEvent(doc, { event: "thread", thread: { ...info } });
+    });
+    if (thread === undefined) return sendError("bad_request");
+    sendOk({ thread, duplicate });
+    pushEventsToSockets();
+  }
+
+  async function renameThread(
+    frame: Record<string, unknown>,
+    sendOk: () => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
+    const thread = parseThreadId(frame.thread);
+    const title = frame.title;
+    if (thread === undefined || thread === APP_MAIN_THREAD || !validThreadTitle(title)) {
+      return sendError("bad_request");
+    }
+    let found = false;
+    await mutateState((doc) => {
+      const info = threadInfo(doc, thread);
+      if (info === undefined) return;
+      found = true;
+      if (info.title === title) return;
+      info.title = title;
+      info.lastAt = new Date(now()).toISOString();
+      appendEvent(doc, { event: "thread", thread: { ...info } });
+    });
+    if (!found) return sendError("bad_request");
+    sendOk();
+    pushEventsToSockets();
+  }
+
+  async function archiveThread(
+    frame: Record<string, unknown>,
+    sendOk: () => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
+    const thread = parseThreadId(frame.thread);
+    const archived = frame.archived;
+    if (thread === undefined || thread === APP_MAIN_THREAD || typeof archived !== "boolean") {
+      return sendError("bad_request");
+    }
+    const info = threadInfo(state, thread);
+    if (info === undefined) return sendError("bad_request");
+    if (archiving.has(thread) || controlPendingSet.has(thread)) return sendError("not_ready");
+    if (info.archived === archived) return sendOk();
+    archiving.add(thread);
+    try {
+      // Fence app submissions until the abort and archive commit are both complete. Inputs
+      // already submitted settle through the native record; never start a turn just to abort it.
+      const applied = await submitInOrder(thread, async () => {
+        const conversation = archived ? await gateway.conversationFor(sessionForThread(thread), adapterContext) : undefined;
+        if (conversation !== undefined) await conversation.abort(adapterContext);
+        let changed = false;
+        state = await stateConversation.commit(async (tx) => {
+          const doc = await tx.doc(AppState, stateConversation.id);
+          if (!archived && doc.threads!.filter((entry) => entry.id !== APP_MAIN_THREAD && !entry.archived).length >=
+              APP_LIMITS.maxOpenThreads) return copyJson(doc) as unknown as AppChannelState;
+          if (conversation !== undefined) {
+            const retired = new Set<string>();
+            for (const item of doc.pending) {
+              if (item.notice === true || threadOf(item) !== thread) continue;
+              if (await tx.submissionByRequest(conversation.id, requestIdFor(item.key)) !== undefined) continue;
+              appendEvent(doc, { event: "settled", thread, key: item.key, outcome: "aborted" });
+              retired.add(item.key);
+            }
+            doc.pending = doc.pending.filter((item) => !retired.has(item.key));
+          }
+          const entry = threadInfo(doc, thread)!;
+          entry.archived = archived;
+          entry.lastAt = new Date(now()).toISOString();
+          appendEvent(doc, { event: "thread", thread: { ...entry } });
+          changed = true;
+          return copyJson(doc) as unknown as AppChannelState;
+        }, adapterContext);
+        return changed;
+      });
+      if (!applied) return sendError("bad_request");
+      sendOk();
+      pushEventsToSockets();
+    } finally {
+      archiving.delete(thread);
+      drain();
+    }
+  }
+
   // ── Ingress ───────────────────────────────────────────────────────────────
 
   async function handleSendFrame(
-    socket: LiveSocket,
     frame: Record<string, unknown>,
     sendOk: (body?: Record<string, unknown>) => void,
     sendError: (error: AppErrorCode) => void,
   ): Promise<void> {
+    const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
+    if (thread === undefined || !openThread(state, thread)) return sendError("bad_request");
+    if (archiving.has(thread)) return sendError("not_ready");
     const key = frame.key;
     const text = frame.text;
     if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key) ||
@@ -660,48 +831,37 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       sendError("unsupported");
       return;
     }
-    // A callback-shaped body is consumed before admission; neither its text nor its values are stored.
-    if (looksLikeOAuthCallback(text)) {
-      const eventId = `notice:callback:${key}`;
-      await mutateState((doc) => {
-        if (hasEventId(doc, eventId)) return;
-        appendEvent(doc, {
-          event: "message",
-          id: eventId,
-          role: "notice",
-          text: CALLBACK_REFUSED_TEXT,
-          at: new Date(now()).toISOString(),
-        });
-      });
-      pushEventsToSockets();
-      sendOk({ duplicate: false });
-      return;
-    }
+    // Never store callback text. A refused callback still has an idempotent key.
+    const callback = looksLikeOAuthCallback(text);
     let duplicate = true;
+    let blocked: AppErrorCode | undefined;
     try {
       await mutateState((doc) => {
+        if (!openThread(doc, thread)) { blocked = "bad_request"; return; }
+        if (archiving.has(thread)) { blocked = "not_ready"; return; }
         if (doc.sendKeys.some((entry) => entry.key === key)) return;
         if (doc.pending.some((entry) => entry.key === key && entry.notice !== true)) return;
         // A key whose echo is still in the log is a duplicate even if its window entry was pruned.
-        if (hasEventId(doc, `send:${key}`)) return;
-        if (doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
+        const eventId = `send:${key}`;
+        const callbackId = `notice:callback:${key}`;
+        if (hasEventId(doc, eventId) || hasEventId(doc, callbackId)) return;
+        if (!callback && doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
         duplicate = false;
-        appendEvent(doc, {
-          event: "message",
-          id: `send:${key}`,
-          role: "user",
-          text,
-          at: new Date(now()).toISOString(),
-          key,
-        });
+        const atMs = now();
+        const at = new Date(atMs).toISOString();
+        doc.sendKeys = pruneKeys([...doc.sendKeys, { key, atMs }], atMs);
+        if (callback) {
+          appendEvent(doc, { event: "message", thread, id: callbackId, role: "notice", text: CALLBACK_REFUSED_TEXT, at });
+          return;
+        }
+        appendEvent(doc, { event: "message", thread, id: eventId, role: "user", text, at, key });
         doc.pending.push({
-          key,
-          text,
-          admittedAtMs: now(),
+          key, thread, text, admittedAtMs: atMs,
           ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
         });
-        doc.sendKeys = pruneSendKeys([...doc.sendKeys, { key, atMs: now() }], now());
-        doc.origin = { admittedAtMs: now() };
+        if (thread === APP_MAIN_THREAD) doc.origin = { admittedAtMs: atMs };
+        else if (doc.sideOrigins === undefined) doc.sideOrigins = { [thread]: { admittedAtMs: atMs } };
+        else doc.sideOrigins[thread] = { admittedAtMs: atMs };
       });
     } catch (error) {
       if (stopping || signal?.aborted) return;
@@ -714,23 +874,24 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       sendError("internal");
       return;
     }
+    if (blocked !== undefined) return sendError(blocked);
     pushEventsToSockets();
     sendOk({ duplicate });
-    if (!duplicate) {
+    if (!duplicate && !callback) {
       journalEvent("app.admitted", { "send.key": key, "queue.depth": state.pending.length });
-      void releaseWithheld();
+      void releaseWithheld(thread);
       drain();
     }
   }
 
   // ── Delivery of admitted work ─────────────────────────────────────────────
 
-  const beginSubmission = (): SubmissionSlot => {
-    const prior = submissionChains.get(APP_CHAT_SESSION_KEY) ?? Promise.resolve();
+  const beginSubmission = (thread: string): SubmissionSlot => {
+    const prior = submissionChains.get(thread) ?? Promise.resolve();
     let open!: () => void;
     const held = new Promise<void>((resolve) => { open = resolve; });
     const tail = prior.then(() => held);
-    submissionChains.set(APP_CHAT_SESSION_KEY, tail);
+    submissionChains.set(thread, tail);
     let released = false;
     return {
       prior,
@@ -738,7 +899,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         if (released) return;
         released = true;
         open();
-        if (submissionChains.get(APP_CHAT_SESSION_KEY) === tail) submissionChains.delete(APP_CHAT_SESSION_KEY);
+        if (submissionChains.get(thread) === tail) submissionChains.delete(thread);
       },
     };
   };
@@ -748,13 +909,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     for (const item of [...state.pending]) {
       const notice = item.notice === true;
       if (item.hold === true || item.held === true) continue;
-      if (notice ? activeNotices >= 8 : activeReplies >= 8) continue;
-      if (!notice && controlPendingSet.has(APP_CHAT_SESSION_KEY)) continue;
+      const thread = threadOf(item);
+      if (notice ? activeNotices >= 8 : (activeReplies.get(thread) ?? 0) >= 8) continue;
+      if (!notice && (controlPendingSet.has(thread) || archiving.has(thread))) continue;
       if (delivering.has(item.key) || failedThisCycle.has(item.key)) continue;
       delivering.add(item.key);
       if (notice) activeNotices += 1;
-      else activeReplies += 1;
-      const slot = beginSubmission();
+      else activeReplies.set(thread, (activeReplies.get(thread) ?? 0) + 1);
+      const slot = beginSubmission(thread);
       const task = observeOperation("gateway.app.delivery", {
         "send.key": item.key, notice, "queue.depth": state.pending.length,
         attempt: (deliveryFailures.get(item.key) ?? 0) + 1,
@@ -764,7 +926,11 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       }).finally(() => {
         slot.release();
         if (notice) activeNotices -= 1;
-        else activeReplies -= 1;
+        else {
+          const remaining = (activeReplies.get(thread) ?? 1) - 1;
+          if (remaining === 0) activeReplies.delete(thread);
+          else activeReplies.set(thread, remaining);
+        }
         active.delete(task);
         delivering.delete(item.key);
         if (!stopping && !signal?.aborted) drain();
@@ -774,6 +940,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   };
 
   const deliver = async (item: AppPendingInput, slot: SubmissionSlot, trace: TelemetrySpan): Promise<void> => {
+    const thread = threadOf(item);
     if (item.notice === true) {
       // Idempotent by the notice's own admission stamp: a redelivery after a crash appends nothing.
       const id = `notice:${item.key}#${item.noticeSeq ?? item.admittedAtMs}`;
@@ -781,6 +948,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         if (hasEventId(doc, id)) return;
         appendEvent(doc, {
           event: "message",
+          thread,
           id,
           role: "notice",
           text: item.text,
@@ -792,8 +960,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       return;
     }
     await observeOperation("gateway.app.queue", {}, () => slot.prior, trace);
+    if (!state.pending.some((entry) => entry.key === item.key)) return;
     const conversation = await observeOperation("gateway.app.conversation", {},
-      () => gateway.conversationFor(APP_CHAT_SESSION_KEY, adapterContext), trace);
+      () => gateway.conversationFor(sessionForThread(thread), adapterContext), trace);
     trace.setAttributes({ "conversation.id": conversation.id });
     const requestId = requestIdFor(item.key);
     const watch = await conversation.watch(adapterContext);
@@ -826,14 +995,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       if (text.trim() === "" || signal?.aborted) return;
       // A preview must fit one frame; the final message carries the whole answer, so a cut is honest.
       let shown = text;
-      let frame = JSON.stringify({ type: "event", event: "preview", key: item.key, text: shown });
+      let frame = JSON.stringify({ type: "event", event: "preview", thread, key: item.key, text: shown });
       for (let bytes = Buffer.byteLength(frame); bytes > APP_LIMITS.frameBytes && shown.length > 0;
         bytes = Buffer.byteLength(frame)) {
         // Estimate the cut in code units, then recheck the serialized UTF-8 byte count.
         const excessUnits = Math.ceil((bytes - APP_LIMITS.frameBytes) * shown.length / bytes);
         shown = shown.slice(0, Math.max(0, shown.length - Math.max(64, excessUnits)));
         if (shown.length > 0 && /[\uD800-\uDBFF]/u.test(shown.at(-1) ?? "")) shown = shown.slice(0, -1);
-        frame = JSON.stringify({ type: "event", event: "preview", key: item.key, text: shown });
+        frame = JSON.stringify({ type: "event", event: "preview", thread, key: item.key, text: shown });
       }
       for (const socket of sockets.values()) {
         if (socket.hello && socket.session.isOpen()) socket.session.send(frame);
@@ -843,28 +1012,31 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       run?: { inputs?: SubmissionId[] };
       generation?: unknown;
     };
-    const syncStatus = (live: LiveView | undefined): void => {
-      if (submissionId === undefined) {
-        broadcastStatus("queued");
-        return;
-      }
-      const inputs = live?.run?.inputs;
-      if (live === undefined || inputs === undefined || !inputs.includes(submissionId)) {
-        broadcastStatus("queued");
+    const syncStatus = (view: { docs: Record<string, unknown> }, queued = false): void => {
+      const live = view.docs["pi.live"] as LiveView | undefined;
+      const inbox = view.docs["pi.inbox"] as { items?: unknown[] } | undefined;
+      if (live?.run === undefined) {
+        broadcastStatus(thread, queued || (inbox?.items?.length ?? 0) > 0 ? "queued" : "idle");
         return;
       }
       const generation = live.generation;
       const generating = generation !== null && typeof generation === "object" &&
         (!("deferred" in (generation as object)) || (generation as { deferred?: unknown }).deferred === undefined) &&
         (!("retry" in (generation as object)) || (generation as { retry?: unknown }).retry === undefined);
-      broadcastStatus(generating ? "thinking" : "tool");
+      broadcastStatus(thread, generating ? "thinking" : "tool");
     };
+    const refreshStatus = () => conversation.commit(async (tx) => {
+      syncStatus({ docs: {
+        "pi.live": await tx.doc(LiveDoc, conversation.id),
+        "pi.inbox": await tx.doc(InboxDoc, conversation.id),
+      } });
+    }, adapterContext);
     try {
       watch.start(async (call) => {
         // Durable's watches never send Chord's recoverable `failed` call; it ends instead.
         if (call.kind !== "value") return;
         const live = call.value.docs["pi.live"] as LiveView | undefined;
-        syncStatus(live);
+        syncStatus(call.value, submissionId === undefined);
         const inputs = live?.run?.inputs;
         if (submissionId === undefined || inputs === undefined || !inputs.includes(submissionId)) return;
         // One preview per run: the run's first input owns the single live preview.
@@ -885,7 +1057,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       }, withTelemetry(trace, adapterContext));
       slot.release();
       submissionId = submission.id;
-      syncStatus(watch.value.docs["pi.live"] as LiveView | undefined);
+      syncStatus(watch.value);
       trace.setAttributes({ "submission.id": submission.id });
       const settled = await observeOperation("gateway.app.settlement", { "submission.id": submission.id },
         () => submission.wait(adapterContext), trace);
@@ -897,21 +1069,18 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           (settled.reason === "aborted" || settled.reason === "reset");
         if (!intentional) {
           trace.setStatus({ status: "error" });
-          broadcastStatus("error");
-          await appendSettled(item.key, "failed");
-        } else {
-          await appendSettled(item.key, "aborted");
+          broadcastStatus(thread, "error");
         }
-        await forget(item.key);
-        broadcastStatus("idle");
+        await settleOne(item, intentional ? "aborted" : "failed");
+        await refreshStatus();
         return;
       }
       const answer = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), adapterContext);
       const message = answer?.model?.[0] as AssistantMessage | undefined;
       const answerText = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "";
       const text = answerText.trim() === "" ? "The assistant returned no text response." : answerText;
-      await settleShared(conversation, settled.answer, text);
-      broadcastStatus("idle");
+      await settleShared(thread, conversation, settled.answer, text);
+      await refreshStatus();
     } finally {
       await stopPreviewWatch();
     }
@@ -930,11 +1099,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   };
 
   /** A failed or aborted settlement settles exactly this key; failures are never grouped by text. */
-  const appendSettled = async (key: string, outcome: "failed" | "aborted"): Promise<void> => {
+  const settleOne = async (item: AppPendingInput, outcome: "failed" | "aborted"): Promise<void> => {
     await mutateState((doc) => {
-      if (!doc.pending.some((entry) => entry.key === key && entry.notice !== true)) return;
-      appendEvent(doc, { event: "settled", key, outcome });
-    });
+      if (!doc.pending.some((entry) => entry.key === item.key && entry.notice !== true)) return;
+      appendEvent(doc, { event: "settled", thread: threadOf(item), key: item.key, outcome });
+      doc.pending = doc.pending.filter((entry) => entry.key !== item.key);
+    }, cleanupContext);
+    deliveryFailures.delete(item.key);
     pushEventsToSockets();
   };
 
@@ -946,6 +1117,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
    * silent, and a crash before the commit replays it exactly once.
    */
   const settleShared = async (
+    thread: string,
     conversation: Conversation,
     answerEntry: number,
     answerText: string,
@@ -954,7 +1126,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       const doc = await tx.doc(AppState, stateConversation.id);
       const members: { key: string; submissionId: number }[] = [];
       for (const candidate of doc.pending) {
-        if (candidate.notice === true) continue;
+        if (candidate.notice === true || threadOf(candidate) !== thread) continue;
         const record = await tx.submissionByRequest(conversation.id, requestIdFor(candidate.key));
         if (record !== undefined && answeredTogether(record, answerEntry)) {
           members.push({ key: candidate.key, submissionId: record.id });
@@ -962,18 +1134,19 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       }
       members.sort((left, right) => left.submissionId - right.submissionId || (left.key < right.key ? -1 : 1));
       const retired = new Set(members.map((member) => member.key));
-      const group = doc.pending.filter((entry) => retired.has(entry.key));
-      if (group.length > 0 && !hasEventId(doc, `answer:${answerEntry}`)) {
+      const answerId = thread === APP_MAIN_THREAD ? `answer:${answerEntry}` : `answer:${thread}:${answerEntry}`;
+      if (members.length > 0 && !hasEventId(doc, answerId)) {
         appendEvent(doc, {
           event: "message",
-          id: `answer:${answerEntry}`,
+          thread,
+          id: answerId,
           role: "assistant",
           text: answerText,
           at: new Date(now()).toISOString(),
           ...(members[0] === undefined ? {} : { key: members[0].key }),
         });
         for (const member of members) {
-          appendEvent(doc, { event: "settled", key: member.key, outcome: "answered" });
+          appendEvent(doc, { event: "settled", thread, key: member.key, outcome: "answered" });
         }
       }
       doc.pending = doc.pending.filter((entry) => !retired.has(entry.key));
@@ -1010,7 +1183,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   // ── Owner busy-mode ────────────────────────────────────────────────────────
 
   /** Whether this conversation's current run may take a steer from this channel. */
-  const ownerRun = async (conversation: Conversation): Promise<boolean> =>
+  const ownerRun = async (conversation: Conversation, thread: string): Promise<boolean> =>
     conversation.commit(async (tx) => {
       const live = await tx.doc(LiveDoc, conversation.id);
       const inputs = live.run?.inputs;
@@ -1018,7 +1191,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       if (await originOccurrencePending(tx, conversation.id)) return false;
       const first = firstInput(inputs);
       for (const candidate of state.pending) {
-        if (candidate.notice === true) continue;
+        if (candidate.notice === true || threadOf(candidate) !== thread) continue;
         const record = await tx.submissionByRequest(conversation.id, requestIdFor(candidate.key));
         if (record?.id === first) return true;
       }
@@ -1030,17 +1203,19 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     current: AppPendingInput,
   ): Promise<"steer" | "followUp"> => {
     if (current.whenBusy !== "steer") return "followUp";
-    return (await ownerRun(conversation)) ? "steer" : "followUp";
+    return (await ownerRun(conversation, threadOf(current))) ? "steer" : "followUp";
   };
 
   // ── Controls ──────────────────────────────────────────────────────────────
 
   async function handleControlFrame(
-    socket: LiveSocket,
     frame: Record<string, unknown>,
     sendOk: (body?: Record<string, unknown>) => void,
     sendError: (error: AppErrorCode) => void,
   ): Promise<void> {
+    const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
+    if (thread === undefined || !openThread(state, thread)) return sendError("bad_request");
+    if (archiving.has(thread)) return sendError("not_ready");
     const command = frame.command;
     if (typeof command !== "string") {
       sendError("bad_request");
@@ -1054,7 +1229,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       sendError("bad_request");
       return;
     }
-    const key = `c:${frame.id as string}`;
+    const key = thread === APP_MAIN_THREAD ? `c:${frame.id as string}` : `c:${thread}:${frame.id as string}`;
     const recorded = state.controls.find((entry) => entry.key === key);
     if (recorded !== undefined) {
       // While the command is still applying its acknowledgement is still held: a reused request id
@@ -1066,16 +1241,16 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       }
       // The command was durably admitted before its effect, so a replay reports it instead of rerunning.
       if (recorded.status === "admitted") await markControlUnconfirmed(key);
-      await admitNotice(key, replayControlText(recorded));
+      await admitNotice(thread, key, replayControlText(recorded));
       sendOk();
       drain();
       return;
     }
     if (command === "status") {
       if (typeof gateway.listModels !== "function") {
-        await admitNotice(key, STATUS_UNAVAILABLE_HOST);
+        await admitNotice(thread, key, STATUS_UNAVAILABLE_HOST);
       } else {
-        await admitNotice(key, await statusNotice());
+        await admitNotice(thread, key, await statusNotice(thread));
       }
       sendOk();
       drain();
@@ -1083,7 +1258,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     // A mutating control: the visible result arrives later as `message{role:"notice"}`.
     try {
-      await admitControl(key, command);
+      await admitControl(thread, key, command);
     } catch (error) {
       if (stopping || signal?.aborted) return;
       if (error instanceof Error && error.message === QUEUE_FULL) {
@@ -1098,7 +1273,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   }
 
   /** Queue one bounded host notice through the same durable pending queue every reply uses. */
-  const admitNotice = async (key: string, text: string, hold = false): Promise<void> => {
+  const admitNotice = async (thread: string, key: string, text: string): Promise<void> => {
     await mutateState((doc) => {
       if (doc.pending.some((entry) => entry.key === key)) return;
       if (doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
@@ -1106,33 +1281,37 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       doc.nextNoticeSeq = noticeSeq + 1;
       doc.pending.push({
         key,
+        thread,
         text: text.slice(0, MAX_NOTICE_CHARS),
         admittedAtMs: now(),
         notice: true,
         noticeSeq,
-        ...(hold ? { hold: true } : {}),
       });
     });
-    if (!hold) drain();
+    drain();
   };
 
-  async function admitControl(key: string, command: "new" | "abort"): Promise<void> {
-    if (controlPendingSet.has(APP_CHAT_SESSION_KEY) || deferredControls.size > 0) {
-      await admitNotice(key, "Previous command pending. This command wasn't started; retry later.");
+  async function admitControl(thread: string, key: string, command: "new" | "abort"): Promise<void> {
+    if (controlPendingSet.has(thread)) {
+      await admitNotice(thread, key, "Previous command pending. This command wasn't started; retry later.");
       return;
     }
     if (state.controls.filter((entry) => entry.status === "admitted" || entry.status === "unconfirmed").length >=
         APP_LIMITS.maxUnresolvedControls) {
-      await admitNotice(key,
+      await admitNotice(thread, key,
         `Too many control commands are still unconfirmed (limit ${APP_LIMITS.maxUnresolvedControls}); this ${command} ` +
         "was not started and was not sent to the assistant. Wait for them to finish or restart the gateway.");
       return;
     }
-    controlPendingSet.add(APP_CHAT_SESSION_KEY);
+    controlPendingSet.add(thread);
+    const earlierKeys = new Set<string>();
     try {
       await mutateState((doc) => {
+        for (const item of doc.pending) {
+          if (item.notice !== true && threadOf(item) === thread) earlierKeys.add(item.key);
+        }
         if (!doc.controls.some((entry) => entry.key === key)) {
-          doc.controls = pruneControls([...doc.controls, { key, command, status: "admitted" as const }], doc.pending);
+          doc.controls = pruneControls([...doc.controls, { key, thread, command, status: "admitted" as const }], doc.pending);
         }
         if (!doc.pending.some((entry) => entry.key === key)) {
           if (doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
@@ -1140,6 +1319,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           doc.nextNoticeSeq = noticeSeq + 1;
           doc.pending.push({
             key,
+            thread,
             text: CONTROL_ACK[command],
             admittedAtMs: now(),
             notice: true,
@@ -1149,12 +1329,12 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         }
       });
     } catch (error) {
-      controlPendingSet.delete(APP_CHAT_SESSION_KEY);
+      controlPendingSet.delete(thread);
       throw error;
     }
-    const record: DeferredControl = { key, command };
-    const prior = controlChains.at(-1) ?? Promise.resolve();
-    const run = prior.then(() => applyControl(record));
+    const record: DeferredControl = { key, thread, command, earlierKeys };
+    runningControls.add(thread);
+    const run = applyControl(record);
     let ack: "waiting" | "pending" | "applied" | "refused" = "waiting";
     const pendingTimer = setTimeout(() => {
       if (ack !== "waiting") return;
@@ -1162,14 +1342,12 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       void releaseControlNotice(key, CONTROL_PENDING[command]).catch(() => undefined);
     }, CONTROL_PENDING_NOTICE_MS);
     pendingTimer.unref?.();
-    const chain = run.then(() => undefined, () => undefined);
-    controlChains.push(chain);
     const task = run.then(async (outcome) => {
       if (outcome.kind === "refused") {
         const wasWaiting = ack === "waiting";
         ack = "refused";
         await markControlRefused(key, outcome.text).catch(() => undefined);
-        if (!wasWaiting) await publishLateControlNotice(key, outcome.text).catch(() => undefined);
+        if (!wasWaiting) await publishLateControlNotice(record.thread, key, outcome.text).catch(() => undefined);
         return;
       }
       if (outcome.kind !== "applied") {
@@ -1182,7 +1360,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       }
       if (ack !== "waiting") {
         if (outcome.text !== undefined) {
-          await publishLateControlNotice(key, outcome.text).catch(() => undefined);
+          await publishLateControlNotice(record.thread, key, outcome.text).catch(() => undefined);
         }
         return;
       }
@@ -1200,10 +1378,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }).catch(() => undefined).finally(() => {
       clearTimeout(pendingTimer);
       pendingControls.delete(task);
-      const index = controlChains.indexOf(chain);
-      if (index >= 0) controlChains.splice(index, 1);
+      runningControls.delete(thread);
       if (!stopping && !signal?.aborted) {
-        if (!deferredControls.has(key)) controlPendingSet.delete(APP_CHAT_SESSION_KEY);
+        if (!deferredControls.has(key)) controlPendingSet.delete(thread);
         drain();
       }
     });
@@ -1214,10 +1391,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   /** Apply one recorded control after its earlier inputs were placed, recording the truthful outcome. */
   async function applyControl(record: DeferredControl): Promise<ControlOutcome> {
     try {
-      // While the command is gated every non-notice record predates it, so all of them are flushed.
-      for (const earlier of state.pending.filter((item) => item.notice !== true)) {
-        const conversation = await gateway.conversationFor(APP_CHAT_SESSION_KEY, adapterContext);
-        await submitInOrder(async () => {
+      for (const earlier of state.pending.filter((item) => record.earlierKeys.has(item.key))) {
+        const conversation = await gateway.conversationFor(sessionForThread(record.thread), adapterContext);
+        await submitInOrder(record.thread, async () => {
+          if (!state.pending.some((item) => item.key === earlier.key)) return;
           const submission = await conversation.submit({
             type: "input",
             content: earlier.text,
@@ -1244,9 +1421,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     let outcome: ControlOutcome;
     if (record.command === "new") {
-      outcome = await applyNewSession();
+      outcome = await applyNewSession(record.thread);
     } else {
-      const conversation = await gateway.conversationFor(APP_CHAT_SESSION_KEY, adapterContext);
+      const conversation = await gateway.conversationFor(sessionForThread(record.thread), adapterContext);
       await conversation.abort(adapterContext);
       outcome = { kind: "applied" };
     }
@@ -1257,7 +1434,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       doc.controls = pruneControls(doc.controls, doc.pending);
       // The context boundary the app renders as a durable divider event.
       if (record.command === "new" && !hasEventId(doc, `divider:${record.key}`)) {
-        appendEvent(doc, { event: "divider", at: new Date(now()).toISOString(), reason: "new" });
+        appendEvent(doc, { event: "divider", thread: record.thread, at: new Date(now()).toISOString(), reason: "new" });
       }
     }, adapterContext);
     controlFailures.delete(record.key);
@@ -1266,15 +1443,15 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   }
 
   /** `new`: a native reset plus, when the host offers it, the prompt-snapshot rebuild. */
-  async function applyNewSession(): Promise<ControlOutcome> {
+  async function applyNewSession(thread: string): Promise<ControlOutcome> {
     const resetSession = gateway.resetSession;
     if (resetSession === undefined) {
-      const conversation = await gateway.conversationFor(APP_CHAT_SESSION_KEY, adapterContext);
+      const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
       await conversation.reset(undefined, adapterContext);
       return { kind: "applied" };
     }
     try {
-      const result = await resetSession(APP_CHAT_SESSION_KEY, adapterContext);
+      const result = await resetSession(sessionForThread(thread), adapterContext);
       if (result.status === "busy") return { kind: "refused", text: RESET_BUSY };
       return { kind: "applied" };
     } catch (error) {
@@ -1285,19 +1462,19 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
 
   /** Retry deferred commands on the adapter's own scan cadence, like the Telegram poll cadence. */
   const resumeDeferredControls = (): void => {
-    if (stopping || signal?.aborted || controlChains.length > 0) return;
-    for (const [key, record] of [...deferredControls]) {
+    if (stopping || signal?.aborted) return;
+    for (const [key, record] of deferredControls) {
+      if (runningControls.has(record.thread)) continue;
       const durable = state.controls.find((entry) => entry.key === key);
       if (durable === undefined || durable.status !== "admitted") {
         deferredControls.delete(key);
         controlFailures.delete(key);
-        controlPendingSet.delete(APP_CHAT_SESSION_KEY);
+        controlPendingSet.delete(record.thread);
         continue;
       }
-      const run = Promise.resolve().then(() => applyControl(record));
-      const chain = run.then(() => undefined, () => undefined);
-      controlChains.push(chain);
-      const task = run.then(async (outcome) => {
+      runningControls.add(record.thread);
+      const task = applyControl(record).then(async (outcome) => {
+        if (outcome.kind === "deferred") return;
         deferredControls.delete(key);
         controlFailures.delete(key);
         if (outcome.kind === "applied") {
@@ -1305,26 +1482,25 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           if (state.pending.some((entry) => entry.key === key && entry.hold === true)) {
             await releaseControlNotice(key, text).catch(() => undefined);
           } else {
-            await publishLateControlNotice(key, text).catch(() => undefined);
+            await publishLateControlNotice(record.thread, key, text).catch(() => undefined);
           }
         } else if (outcome.kind === "refused") {
           if (state.pending.some((entry) => entry.key === key && entry.hold === true)) {
             await markControlRefused(key, outcome.text).catch(() => undefined);
           } else {
-            await publishLateControlNotice(key, outcome.text).catch(() => undefined);
+            await publishLateControlNotice(record.thread, key, outcome.text).catch(() => undefined);
           }
         } else if (outcome.kind === "abandoned") {
           await markControlUnconfirmed(key).catch(() => undefined);
         }
-        controlPendingSet.delete(APP_CHAT_SESSION_KEY);
+        controlPendingSet.delete(record.thread);
       }, (error: unknown) => {
         if (signal?.aborted) return;
         fatal ??= error;
         scope.cancel(error instanceof Error ? error : new Error("App deferred control failed"));
       }).catch(() => undefined).finally(() => {
         pendingControls.delete(task);
-        const index = controlChains.indexOf(chain);
-        if (index >= 0) controlChains.splice(index, 1);
+        runningControls.delete(record.thread);
         if (!stopping && !signal?.aborted) drain();
       });
       pendingControls.add(task);
@@ -1370,7 +1546,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   };
 
   /** A final outcome published after its "still pending" wording; never loses the only answer. */
-  const publishLateControlNotice = async (key: string, text: string): Promise<void> => {
+  const publishLateControlNotice = async (thread: string, key: string, text: string): Promise<void> => {
     await mutateState((doc) => {
       const notice = doc.pending.find((item) => item.key === key);
       if (notice !== undefined) {
@@ -1385,6 +1561,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       doc.nextNoticeSeq = noticeSeq + 1;
       doc.pending.push({
         key,
+        thread,
         text: text.slice(0, MAX_LATE_CONTROL_CHARS),
         admittedAtMs: now(),
         notice: true,
@@ -1395,16 +1572,16 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   };
 
   /** Bounded point-in-time metadata of this chat, exactly the Telegram `/status` projection. */
-  async function statusNotice(): Promise<string> {
+  async function statusNotice(thread: string): Promise<string> {
     try {
       let listing: import("../runtime.js").GatewayModelList | undefined;
       try {
-        await gateway.conversationFor(APP_CHAT_SESSION_KEY, adapterContext);
-        listing = await gateway.listModels!(APP_CHAT_SESSION_KEY, adapterContext);
+        await gateway.conversationFor(sessionForThread(thread), adapterContext);
+        listing = await gateway.listModels!(sessionForThread(thread), adapterContext);
       } catch {
         listing = undefined;
       }
-      const conversation = await gateway.conversationFor(APP_CHAT_SESSION_KEY, adapterContext);
+      const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
       const status = await inProcessTerminalConversation(conversation).status(adapterContext);
       const selection = listing?.selected;
       const model = selection === undefined
@@ -1413,7 +1590,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       let background: string[] = [];
       try {
         if (typeof gateway.backgroundStatus === "function") {
-          background = renderBackgroundStatus(await gateway.backgroundStatus(APP_CHAT_SESSION_KEY, adapterContext));
+          background = renderBackgroundStatus(await gateway.backgroundStatus(sessionForThread(thread), adapterContext));
         }
       } catch {
         background = [];
@@ -1435,8 +1612,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
   }
 
-  const submitInOrder = async <T>(work: () => Promise<T>): Promise<T> => {
-    const slot = beginSubmission();
+  const submitInOrder = async <T>(thread: string, work: () => Promise<T>): Promise<T> => {
+    const slot = beginSubmission(thread);
     try {
       await slot.prior;
       return await work();
@@ -1592,6 +1769,15 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   // ── Scheduled results and interruption notices ────────────────────────────
 
   const outbox = gateway.cronOutbox;
+  const threadForSession = (sessionKey: string): string | undefined => {
+    if (sessionKey === APP_CHAT_SESSION_KEY) return APP_MAIN_THREAD;
+    const prefix = `${APP_CHAT_SESSION_KEY}:`;
+    if (!sessionKey.startsWith(prefix)) return undefined;
+    const thread = sessionKey.slice(prefix.length);
+    return thread !== APP_MAIN_THREAD && threadInfo(state, thread) !== undefined ? thread : undefined;
+  };
+  const hasOrigin = (thread: string): boolean =>
+    (thread === APP_MAIN_THREAD ? state.origin : state.sideOrigins?.[thread]) !== undefined;
 
   const updateScheduled = async (
     sessionKey: string,
@@ -1610,7 +1796,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
 
   const deliverScheduled = async (sessionKey: string, record: CronDeliveryRecord): Promise<void> => {
     if (outbox === undefined) return;
-    if (record.sessionKey !== sessionKey || sessionKey !== APP_CHAT_SESSION_KEY) {
+    const thread = threadForSession(sessionKey);
+    if (record.sessionKey !== sessionKey || thread === undefined) {
       await updateScheduled(sessionKey, record.id, (entry) => {
         entry.status = "failed";
         entry.settledAt = now();
@@ -1627,7 +1814,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       return;
     }
     // Authorization is this channel's own durable admission evidence, never the session string alone.
-    if (state.origin === undefined) {
+    if (!hasOrigin(thread)) {
       await updateScheduled(sessionKey, record.id, (entry) => {
         entry.status = "withheld";
         entry.withheldSince = now();
@@ -1636,7 +1823,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       console.warn(`App scheduled delivery withheld for ${record.id}: no durable origin admission evidence.`);
       return;
     }
-    const id = `outbox:${record.id}`;
+    const id = thread === APP_MAIN_THREAD ? `outbox:${record.id}` : `outbox:${thread}:${record.id}`;
     // The dedupe and the append share one commit, like the notice path: a crash between them can
     // never duplicate the event, and a concurrent scan finds the id already in the log.
     await mutateState((doc) => {
@@ -1644,6 +1831,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       appendEvent(doc, {
         event: "message",
         id,
+        thread,
         role: isTurnInterruptionNotice(record) ? "notice" : "assistant",
         text: record.text,
         at: new Date(now()).toISOString(),
@@ -1661,7 +1849,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (outbox === undefined || stopping || signal?.aborted) return;
     for (const { sessionKey } of await outbox.sessions(adapterContext)) {
       if (stopping || signal?.aborted) return;
-      if (sessionKey !== APP_CHAT_SESSION_KEY) continue;
+      if (threadForSession(sessionKey) === undefined) continue;
       let records: readonly unknown[];
       try {
         records = await outbox.list(sessionKey, adapterContext);
@@ -1690,9 +1878,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           continue;
         }
         const record = value as CronDeliveryRecord;
-        if (record.status !== "pending" || scheduledActive.has(record.id)) continue;
+        const deliveryKey = JSON.stringify([sessionKey, record.id]);
+        if (record.status !== "pending" || scheduledActive.has(deliveryKey)) continue;
         if (scheduledActive.size >= MAX_SCHEDULED_ACTIVE) return;
-        scheduledActive.add(record.id);
+        scheduledActive.add(deliveryKey);
         const task = Promise.resolve()
           .then(() => observeOperation("gateway.app.scheduled_delivery", { "delivery.id": record.id },
             () => deliverScheduled(sessionKey, record)))
@@ -1700,7 +1889,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
             // Keep the durable record pending; the next scan retries it.
           })
           .finally(() => {
-            scheduledActive.delete(record.id);
+            scheduledActive.delete(deliveryKey);
             scheduledTasks.delete(task);
           });
         scheduledTasks.add(task);
@@ -1715,11 +1904,12 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   };
 
   /** A fresh authenticated admission restores the origin evidence, releasing withheld results. */
-  const releaseWithheld = async (): Promise<void> => {
-    if (outbox === undefined || stopping || signal?.aborted || state.origin === undefined) return;
+  const releaseWithheld = async (thread: string): Promise<void> => {
+    if (outbox === undefined || stopping || signal?.aborted || !hasOrigin(thread)) return;
+    const sessionKey = sessionForThread(thread);
     let records: readonly unknown[];
     try {
-      records = await outbox.list(APP_CHAT_SESSION_KEY, adapterContext);
+      records = await outbox.list(sessionKey, adapterContext);
     } catch {
       return;
     }
@@ -1729,7 +1919,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       const record = value as { id?: unknown; status?: unknown };
       if (record.status !== "withheld" || typeof record.id !== "string" || record.id === "") continue;
       try {
-        await updateScheduled(APP_CHAT_SESSION_KEY, record.id, (entry) => {
+        await updateScheduled(sessionKey, record.id, (entry) => {
           entry.status = "pending";
           delete entry.withheldSince;
           delete entry.error;
@@ -1763,6 +1953,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         doc.nextNoticeSeq = noticeSeq + 1;
         doc.pending.push({
           key: entry.key,
+          thread: threadOf(entry),
           text: UNCONFIRMED_CONTROL,
           admittedAtMs: now(),
           notice: true,
