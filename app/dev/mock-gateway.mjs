@@ -7,6 +7,8 @@ import http from "node:http";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 8791);
+const AGENT_NAME = process.env.AGENT_NAME?.trim() || "Durable";
+if ([...AGENT_NAME].length > 40) throw new Error("AGENT_NAME must be at most 40 characters");
 const FRAME_BYTES = 262_144;
 const SEND_TEXT_CHARS = 16_000;
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -294,7 +296,7 @@ function onStream(ws, token) {
           return;
         }
         conn.helloed = true;
-        reply(ws, frame.id, true, { v: 2, device, head: cursor || null });
+        reply(ws, frame.id, true, { v: 2, device, head: cursor || null, agent: AGENT_NAME });
         // replay: oldest first, one bounded batch; the client re-hellos
         // with its new cursor if the batch was full
         const from = frame.cursor ?? 0;

@@ -1,7 +1,7 @@
 # Durable — app
 
 The installable web app (PWA) that is the chat channel of the Durable agent
-gateway. Vite + TypeScript + React 19, Streamdown for streaming markdown,
+gateway. Vite + TypeScript + React 19, Streamdown for rendering answer markdown,
 `vite-plugin-pwa` (injectManifest) for the service worker, `idb` for IndexedDB.
 The wire contract is [`../protocol/v2.md`](../protocol/v2.md); the app imports
 its types from [`../protocol/v2.ts`](../protocol/v2.ts). HTTP and WebSocket
@@ -19,8 +19,9 @@ npm run dev    # vite on http://localhost:5173, proxying /v1 (incl. ws) to it
 
 `npm run mock` accepts an explicit code as an argument (`node
 dev/mock-gateway.mjs MYC2DE23`). For a different mock port, set `PORT` on the
-mock and the same value as `MOCK_PORT` on Vite (dev or preview). Mock credentials,
-threads and cursors are in memory; after a mock restart use a fresh browser
+mock and the same value as `MOCK_PORT` on Vite (dev or preview). Set
+`AGENT_NAME` on the mock to override the default display name, “Durable”.
+Mock credentials, threads and cursors are in memory; after a mock restart use a fresh browser
 profile or clear site data before pairing again. Set `IDLE_ARCHIVE_MS=3000`
 on the mock to try automatic archiving after three seconds of idleness.
 The mock records and validates fork origins without copying messages into

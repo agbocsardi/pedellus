@@ -1,5 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
-import { MAIN_THREAD, type DurableEvent, type PreviewEvent, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { MAIN_THREAD, type DurableEvent, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
 
 export type ConnState = "offline" | "connecting" | "replaying" | "open";
 export type Mode = "boot" | "chat" | "pair" | "update";
@@ -8,6 +8,8 @@ export type Outgoing = { key: string; thread: ThreadId; text: string; state: Out
 export type ThreadCreate = { key: string; title?: string; from?: ThreadOrigin; failed?: boolean };
 export type AgentStatus = Pick<StatusEvent, "state" | "label">;
 type ChatEvent = Exclude<DurableEvent, { event: "thread" }>;
+type Identity = { device?: string; agent?: string };
+type LiveStatus = AgentStatus & { turnKey?: string };
 
 interface Db extends DBSchema {
   events: { key: number; value: DurableEvent };
@@ -15,7 +17,7 @@ interface Db extends DBSchema {
   threads: { key: string; value: ThreadInfo };
   creates: { key: string; value: ThreadCreate };
   view: { key: string; value: { thread: ThreadId; cursor: number } };
-  settings: { key: "openThread" | "resumeCursor"; value: ThreadId | number };
+  settings: { key: "openThread" | "resumeCursor" | "identity"; value: ThreadId | number | Identity };
 }
 
 const IDLE: AgentStatus = { state: "idle" };
@@ -39,16 +41,16 @@ export class Store {
   openThread: ThreadId = MAIN_THREAD;
   connState: ConnState = "offline";
   mode: Mode = "boot";
-  device: string | null = null;
+  private identity?: Identity;
   storageBlocked = false;
   replayReady = false;
   /** Max seen can be ahead of a replay gap; only resumeCursor is safe for hello. */
   cursor: number | null = null;
   resumeCursor: number | null = null;
 
-  // Live frames are not durable; hello resends current statuses, not previews.
-  private previews = new Map<ThreadId, PreviewEvent>();
-  private statuses = new Map<ThreadId, AgentStatus>();
+  // Status is live; hello resends it rather than replaying it from storage.
+  private statuses = new Map<ThreadId, LiveStatus>();
+  private unfinished = new Map<ThreadId, Set<string>>();
   private viewed = new Map<ThreadId, number>();
   private db: IDBPDatabase<Db> | null = null;
   private queueChanges = typeof BroadcastChannel === "undefined" ? undefined : new BroadcastChannel("durable-app-queue");
@@ -70,6 +72,8 @@ export class Store {
     this.version++;
     for (const fn of this.listeners) fn();
   }
+
+  get agentName() { return this.identity?.agent ?? "Durable"; }
 
   async init() {
     const db = await openDB<Db>("durable-app", 2, {
@@ -97,10 +101,11 @@ export class Store {
     this.storageBlocked = false;
     // Load the replay checkpoint and everything it covers from one snapshot.
     const tx = db.transaction(["events", "outbox", "threads", "creates", "view", "settings"], "readonly");
-    const [events, outbox, threads, creates, viewed, open, resume] = await Promise.all([
+    const [events, outbox, threads, creates, viewed, open, resume, identity] = await Promise.all([
       tx.objectStore("events").getAll(), tx.objectStore("outbox").getAll(),
       tx.objectStore("threads").getAll(), tx.objectStore("creates").getAll(), tx.objectStore("view").getAll(),
-      tx.objectStore("settings").get("openThread"), tx.objectStore("settings").get("resumeCursor"), tx.done,
+      tx.objectStore("settings").get("openThread"), tx.objectStore("settings").get("resumeCursor"),
+      tx.objectStore("settings").get("identity"), tx.done,
     ]).catch((err) => { db.close(); throw err; });
     if (!closed) this.db = db;
     const cachedThreads = new Set(threads.map((t) => t.id));
@@ -132,6 +137,7 @@ export class Store {
       this.openThread = open;
     }
     if (typeof resume === "number") this.resumeCursor = resume;
+    if (typeof identity === "object" && identity) this.identity = identity;
     this.changed();
   }
 
@@ -224,14 +230,21 @@ export class Store {
       let keys = this.echoedKeys.get(ev.thread);
       if (!keys) this.echoedKeys.set(ev.thread, keys = new Set());
       keys.add(ev.key);
+      let unfinished = this.unfinished.get(ev.thread);
+      if (!unfinished) this.unfinished.set(ev.thread, unfinished = new Set());
+      unfinished.add(ev.key);
       const m = this.outgoing(ev.thread, ev.key);
       if (m && (m.state === "queued" || m.state === "sent")) {
         return this.updateOutgoing(m, "admitted");
       }
     } else if (ev.event === "settled" || (ev.event === "message" && ev.role === "assistant")) {
-      if (ev.key && this.previews.get(ev.thread)?.key === ev.key) this.previews.delete(ev.thread);
-      const m = ev.event === "settled" ? this.outgoing(ev.thread, ev.key) : undefined;
-      if (m && ev.event === "settled" && !terminal(m.state)) return this.updateOutgoing(m, ev.outcome);
+      const unfinished = this.unfinished.get(ev.thread);
+      if (ev.key && unfinished?.delete(ev.key) && !unfinished.size) this.unfinished.delete(ev.thread);
+      if (ev.key && this.statuses.get(ev.thread)?.turnKey === ev.key) this.statuses.delete(ev.thread);
+      if (ev.event === "settled") {
+        const m = this.outgoing(ev.thread, ev.key);
+        if (m && !terminal(m.state)) return this.updateOutgoing(m, ev.outcome);
+      }
     }
   }
 
@@ -324,7 +337,7 @@ export class Store {
         snippet = (start ? "…" : "") + entry.text.slice(start, end) + (end < entry.text.length ? "…" : "");
         break;
       }
-      const title = t.id === MAIN_THREAD ? `Main Durable ${t.title}` : t.title;
+      const title = t.id === MAIN_THREAD ? `Main ${this.agentName} ${t.title}` : t.title;
       if (snippet !== undefined || title.toLowerCase().includes(titleQuery) || remote?.has(t.id)) {
         results.push({ thread: t, snippet });
       }
@@ -362,13 +375,7 @@ export class Store {
     void this.db?.put("view", { thread, cursor }).catch(console.error);
   }
 
-  preview(thread: ThreadId) { return this.previews.get(thread); }
-  status(thread: ThreadId) { return this.statuses.get(thread) ?? IDLE; }
-
-  setPreview(p: PreviewEvent) {
-    this.previews.set(p.thread, p);
-    this.changed();
-  }
+  status(thread: ThreadId): AgentStatus { return this.statuses.get(thread) ?? IDLE; }
 
   resetStatuses() {
     this.statuses.clear();
@@ -376,8 +383,21 @@ export class Store {
   }
 
   setStatus(s: StatusEvent) {
-    this.statuses.set(s.thread, s);
+    // Status has no key. In each thread the oldest unfinished admission runs
+    // first; hold onto its key as new messages are admitted behind it.
+    const running = s.state === "queued" || s.state === "thinking" || s.state === "tool";
+    const turnKey = running ? this.statuses.get(s.thread)?.turnKey ??
+      this.unfinished.get(s.thread)?.values().next().value : undefined;
+    this.statuses.set(s.thread, { state: s.state, label: s.label, turnKey });
     this.changed();
+  }
+
+  notePreview(thread: ThreadId, key: string) {
+    // If available, the preview identifies the turn directly. Never use its text.
+    const status = this.statuses.get(thread);
+    if (status && status.state !== "idle" && status.state !== "error" && this.unfinished.get(thread)?.has(key)) {
+      status.turnKey = key;
+    }
   }
 
   setConn(s: ConnState) {
@@ -385,10 +405,7 @@ export class Store {
       this.connState = s;
       if (s === "connecting" || s === "replaying") this.replayReady = false;
       if (s === "open") this.replayReady = true;
-      if (s === "offline") {
-        this.previews.clear();
-        this.statuses.clear();
-      }
+      if (s === "offline") this.statuses.clear();
       this.changed();
     }
   }
@@ -400,11 +417,13 @@ export class Store {
     }
   }
 
-  setDevice(d: string) {
-    if (this.device !== d) {
-      this.device = d;
-      this.changed();
-    }
+  setIdentity(device: string | undefined, agent: string | undefined) {
+    device ??= this.identity?.device;
+    if (this.identity?.device === device && this.identity?.agent === agent) return;
+    this.identity = { device, agent };
+    this.searchCache = undefined;
+    this.changed();
+    void this.db?.put("settings", this.identity, "identity").catch(console.error);
   }
 
   async createOutgoing(thread: ThreadId, text: string, retryKey?: string): Promise<Outgoing> {

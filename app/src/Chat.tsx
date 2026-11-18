@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
@@ -82,14 +82,14 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const thread = store.openThread;
   const main = thread === MAIN_THREAD;
   const info = store.threads.get(thread);
-  const title = main ? "Durable" : info?.title ?? "New thread";
+  const agentName = store.agentName;
+  const title = main ? agentName : info?.title ?? "New thread";
   const archived = !!info?.archived;
   const writable = store.canWrite(thread);
   const text = drafts[thread] ?? "";
   const setText = (value: string) => setDrafts((prev) => ({ ...prev, [thread]: value }));
   const online = store.connState === "open";
   const running = !archived && isRunning(store.status(thread).state);
-  const preview = archived ? undefined : store.preview(thread);
   const p = presence(store);
   const latest = store.latestViewable(thread);
   const origin = info?.origin;
@@ -152,16 +152,24 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     if (pinned.current) el.scrollTop = el.scrollHeight;
     markAtBottom(el);
   });
-  useEffect(() => {
-    const view = () => {
-      const el = scroller.current;
-      if (!el || sheet || document.hidden) return;
-      if (pinned.current) el.scrollTop = el.scrollHeight;
-      markAtBottom(el);
-    };
-    document.addEventListener("visibilitychange", view);
-    return () => document.removeEventListener("visibilitychange", view);
+  const followBottom = useEffectEvent(() => {
+    const el = scroller.current;
+    if (!el || sheet || document.hidden) return;
+    if (pinned.current) el.scrollTop = el.scrollHeight;
+    markAtBottom(el);
   });
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const view = () => followBottom();
+    const observer = new ResizeObserver(view);
+    observer.observe(el);
+    document.addEventListener("visibilitychange", view);
+    return () => {
+      observer.disconnect();
+      document.removeEventListener("visibilitychange", view);
+    };
+  }, []);
   useEffect(() => {
     const ta = taRef.current;
     if (!ta) return;
@@ -356,7 +364,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               {(sourceMessage?.text.length ?? 0) > 220 ? "…" : ""}</span>
           </button>
         </div>}
-        {!origin && empty && !running && !preview && (
+        {!origin && empty && !running && (
           <div className="empty">
             <div className="avatar-slot big">
               <Avatar state={p.avatar} />
@@ -381,17 +389,13 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               onDiscard={!writable || r.m.state === "failed" ? () => void discardMessage(r.m.key) : undefined} />
           ),
         )}
-        {preview ? (
-          <div className="msg assistant streaming" aria-busy="true">
-            <Streamdown>{preview.text}</Streamdown>
-          </div>
-        ) : running ? (
+        {running && (
           <div className="typing" role="status" aria-label={p.text}>
             <i />
             <i />
             <i />
           </div>
-        ) : null}
+        )}
       </div>
 
       <footer className="composer">
@@ -406,7 +410,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             value={text}
             rows={1}
             maxLength={LIMITS.sendTextChars}
-            placeholder={running ? "Durable is working…" : "Message Durable"}
+            placeholder={running ? `${agentName} is working…` : `Message ${agentName}`}
             aria-label="Message"
             onChange={(e) => setText(e.target.value)}
             onKeyDown={onKeyDown}
@@ -628,7 +632,7 @@ function EventRow({ ev, store, last, forks, onActions, onRetry }: {
         onRetry={onRetry && outgoing?.state === "failed" ? () => onRetry(outgoing) : undefined} />
     ) : (
       <div className="msg assistant" {...anchor}>
-        <Streamdown>{ev.text}</Streamdown>
+        <Streamdown mode="static">{ev.text}</Streamdown>
       </div>
     )}
     {(anchor || !!forks?.length) && <div className="msg fork-links" data-role={ev.role}>

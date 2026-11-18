@@ -28,21 +28,36 @@ export function App({ store }: { store: Store }) {
     };
   }, [store]);
 
-  // Keep the virtual keyboard height in a CSS variable so the composer can
-  // ride above it (iOS standalone has no reliable visual viewport otherwise).
+  // The keyboard can both shrink and pan the visual viewport on iOS.
   useEffect(() => {
     const vv = window.visualViewport;
     if (!vv) return;
-    const onResize = () => {
-      const kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-      document.documentElement.style.setProperty("--vkb", `${kb}px`);
+    const style = document.documentElement.style;
+    let frame: number | undefined;
+    const sync = () => {
+      frame = undefined;
+      // iOS can still scroll the layout viewport after focusing a field.
+      if ((window.scrollX || window.scrollY) &&
+          document.activeElement?.matches(".app textarea, .app input")) {
+        window.scrollTo(0, 0);
+      }
+      style.setProperty("--app-h", `${vv.height}px`);
+      style.setProperty("--vv-top", `${vv.offsetTop}px`);
     };
-    vv.addEventListener("resize", onResize);
-    vv.addEventListener("scroll", onResize);
-    onResize();
+    const schedule = () => { frame ??= requestAnimationFrame(sync); };
+    vv.addEventListener("resize", schedule);
+    vv.addEventListener("scroll", schedule);
+    window.addEventListener("scroll", schedule);
+    document.addEventListener("focusin", schedule);
+    sync();
     return () => {
-      vv.removeEventListener("resize", onResize);
-      vv.removeEventListener("scroll", onResize);
+      vv.removeEventListener("resize", schedule);
+      vv.removeEventListener("scroll", schedule);
+      window.removeEventListener("scroll", schedule);
+      document.removeEventListener("focusin", schedule);
+      if (frame !== undefined) cancelAnimationFrame(frame);
+      style.removeProperty("--app-h");
+      style.removeProperty("--vv-top");
     };
   }, []);
 
