@@ -58,6 +58,7 @@ function pinnedPresetNames(config: PortConfig): readonly string[] {
   if (config.workers?.preset !== undefined) names.add(config.workers.preset);
   if (config.episodeSummary?.preset !== undefined) names.add(config.episodeSummary.preset);
   if (config.visionHandoff?.describerPreset !== undefined) names.add(config.visionHandoff.describerPreset);
+  if (config.idleRollover?.preset !== undefined) names.add(config.idleRollover.preset);
   return [...names];
 }
 

@@ -158,6 +158,13 @@ export interface CodeModeConfig {
   readonly enabled: boolean;
 }
 
+export interface IdleRolloverConfig {
+  /** Minutes a mapped chat must stay fully idle before it rolls over. */
+  readonly afterMinutes: number;
+  /** Named preset that writes the handoff; usually a small, cheap model. */
+  readonly preset: string;
+}
+
 /**
  * Bounds for one explicitly started memory-digestion run. Absent fields keep the shared defaults;
  * the block itself neither enables nor schedules anything, and frequency stays with ordinary cron.
@@ -323,6 +330,11 @@ export interface PortConfig {
    * vision-capable ones. Absent leaves model requests untouched.
    */
   visionHandoff?: VisionHandoffConfig;
+  /**
+   * Idle episode rollover; absent is off. A mapped chat idle this long gets a short handoff from the
+   * named preset and starts a new episode, so digest and summaries see a closed episode.
+   */
+  idleRollover?: IdleRolloverConfig;
   /**
    * How an owner message is placed when its CLI or Telegram conversation is busy. Optional so a host
    * that builds `PortConfig` by hand stays source-compatible; `parseConfig` always normalizes it to
@@ -630,6 +642,24 @@ function modelPresetsConfig(value: unknown): Readonly<Record<string, ModelPreset
     flagsByPair.set(key, { name, flag });
   }
   return Object.freeze(presets);
+}
+
+function idleRolloverConfig(
+  value: unknown,
+  modelPresets: Readonly<Record<string, ModelPreset>> | undefined,
+): IdleRolloverConfig {
+  const raw = object(value, "idleRollover");
+  for (const key of Object.keys(raw)) {
+    if (key !== "afterMinutes" && key !== "preset") throw new Error(`Unknown idleRollover field: ${key}`);
+  }
+  const after = raw.afterMinutes;
+  if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 1 || after > 7 * 24 * 60) {
+    throw new Error("idleRollover.afterMinutes must be an integer from 1 to 10080");
+  }
+  if (modelPresets === undefined) throw new Error("idleRollover.preset requires named modelPresets");
+  const preset = modelPresetName(raw.preset, "idleRollover.preset");
+  if (!Object.hasOwn(modelPresets, preset)) throw new Error("idleRollover.preset must name an entry in modelPresets");
+  return Object.freeze({ afterMinutes: after, preset });
 }
 
 function visionHandoffConfig(
@@ -1166,6 +1196,9 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
       ...(summaryModel === undefined ? {} : { model: summaryModel }),
       ...(summaryPreset === undefined ? {} : { preset: summaryPreset }),
     };
+  }
+  if (raw.idleRollover !== undefined) {
+    Object.assign(config, { idleRollover: idleRolloverConfig(raw.idleRollover, modelPresets) });
   }
   if (raw.visionHandoff !== undefined) {
     Object.assign(config, { visionHandoff: visionHandoffConfig(raw.visionHandoff, modelPresets) });
