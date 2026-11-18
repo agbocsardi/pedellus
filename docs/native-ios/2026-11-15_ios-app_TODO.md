@@ -1,5 +1,9 @@
 # iOS app plan
 
+> **Parked (2026-11-18).** The project moved to a PWA (see `../../ARCHITECTURE.md`).
+> This native SwiftUI plan is kept for a possible later iOS app. The gateway
+> half and wire protocol are shared, so it would be a second client, not a redesign.
+
 Each phase ends with something usable on the phone. Gateway work happens in
 `durable-nanobot`; app work happens here.
 
