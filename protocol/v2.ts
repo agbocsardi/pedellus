@@ -21,7 +21,8 @@ export const CLOSE = {
 } as const;
 
 export type ErrorCode = "bad_request" | "too_large" | "unsupported" | "not_ready" | "internal";
-export type ControlCommand = "new" | "abort" | "status";
+export type ControlCommand = string;
+export type CommandInfo = { name: string; args?: string; summary: string; usage: string };
 export const MAIN_THREAD = "main";
 export type ThreadId = string;
 export type ThreadOrigin = { thread: ThreadId; messageId: string };
@@ -34,14 +35,14 @@ export type Request =
   | { type: "req"; id: string; op: "hello"; v: 2; cursor: number | null }
   | { type: "req"; id: string; op: "send"; key: string; text: string; thread?: ThreadId }
   | { type: "req"; id: string; op: "ack"; cursor: number }
-  | { type: "req"; id: string; op: "control"; command: ControlCommand; thread?: ThreadId }
+  | { type: "req"; id: string; op: "control"; command: ControlCommand; args?: string; thread?: ThreadId }
   | { type: "req"; id: string; op: "ping" }
   | { type: "req"; id: string; op: "threads"; query?: string }
   | { type: "req"; id: string; op: "thread.create"; key: string; title?: string; from?: ThreadOrigin }
   | { type: "req"; id: string; op: "thread.rename"; thread: ThreadId; title: string }
   | { type: "req"; id: string; op: "thread.archive"; thread: ThreadId; archived: boolean };
 
-export type HelloResult = { v: 2; device: string; head: number | null; agent: string };
+export type HelloResult = { v: 2; device: string; head: number | null; agent: string; commands: CommandInfo[] };
 export type SendResult = { duplicate: boolean };
 export type ThreadsResult = { threads: ThreadInfo[] };
 export type ThreadCreateResult = { thread: ThreadId; duplicate: boolean };
