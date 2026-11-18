@@ -1,6 +1,6 @@
-# Agent notes for this repository
+# Agent notes for `pwa/`
 
-Global rules live in `~/AGENTS.md`. Claude Code auto memory is off on this
+Global rules live in `~/AGENTS.md`; repository rules in `../AGENTS.md`. Claude Code auto memory is off on this
 machine; durable agent preferences for this project go here.
 
 ## Subagents

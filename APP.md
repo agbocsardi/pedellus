@@ -1,10 +1,10 @@
 # App channel (installable web app)
 
 The `app` adapter is opt-in, adds no tool authority and runs inside the same gateway process as
-the CLI, Telegram and Discord. It serves the built PWA from the sibling `durable-app` repository
+the CLI, Telegram and Discord. It serves the built PWA from `pwa/app/dist`
 over one loopback HTTP+WebSocket listener; `tailscale serve` publishes it on the tailnet with the
-node's `*.ts.net` certificate. The wire contract is protocol v2, normative in the sibling
-repository (`protocol/v2.md` and `protocol/v2.ts`). Ship the v2 app and gateway together: the
+node's `*.ts.net` certificate. The wire contract is protocol v2, normative in
+`pwa/protocol/v2.md` and `pwa/protocol/v2.ts`. Ship the v2 app and gateway together: the
 unchanged `/v1/*` URLs accept wire version 2 only. `src/channels/app-protocol.ts` holds the limits, close codes and pure validation;
 `src/channels/app-listener.ts` owns transport mechanics (sockets, bodies, cookies, MIME types,
 path safety); `src/channels/app.ts` owns admission, the durable event log, controls, pairing and
@@ -20,7 +20,7 @@ listener is loaded.
 
 ```json
 {
-  "app": { "port": 43190, "staticRoot": "/home/owner/deploy/durable-app/dist" }
+  "app": { "port": 43190, "staticRoot": "/home/owner/deploy/durable-pwa/dist" }
 }
 ```
 

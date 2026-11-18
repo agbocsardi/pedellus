@@ -47,7 +47,7 @@ app, and some scrolling/haptic polish.
 - **No public listener.** Loopback bind, published only with `tailscale serve`.
   Never Funnel, port forwarding or a wildcard bind.
 
-## Gateway side (in `durable-nanobot`)
+## Gateway side (`src/channels/app*.ts` in this repository)
 
 ### Listener
 
