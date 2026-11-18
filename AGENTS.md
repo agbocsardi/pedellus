@@ -89,8 +89,11 @@ edits need restart only; unit edits additionally need daemon-reload.
   [MEMORY_RECALL.md](./MEMORY_RECALL.md) for the approved three-tool model-facing recall contract.
 - `src/channels/` — Telegram and opt-in Discord adapters (`discord.ts` adapter,
   `discord-js.ts` the real discord.js transport, `discord-transport.ts` the narrow
-  contract and pure text/failure rules); no other channel is ported. Channels start
-  concurrently and never await one another.
+  contract and pure text/failure rules), plus the opt-in `app` channel (`app.ts` adapter
+  with the durable cursor event log, `app-listener.ts` the loopback HTTP+WebSocket
+  mechanics behind `tailscale serve`, `app-protocol.ts` the shared wire contract, and
+  `app-operator-cli.ts` the terminal `app pair|devices|revoke` console; see [APP.md](./APP.md)).
+  Channels start concurrently and never await one another.
   `telegram-rich.ts` owns the rich-message limits, fence-aware splitting and the literal-text
   escaping the adapter uses for host notices.
 - `plan/` — historical roadmaps and implementation evidence, not a work queue.
@@ -159,7 +162,26 @@ edits need restart only; unit edits additionally need daemon-reload.
   also require membership), failing closed when permissions are unknown. It is
   independent of `toolAllowlist`, is never inherited by workers, forks, roots,
   scheduled or digest targets, and detaches with the adapter. Unknown external
-  outcomes are retained, never blindly retried or evicted.
+  outcomes are retained, never blindly retried or evicted. The `app` channel is a third opt-in
+  surface: one loopback-only HTTP+WebSocket listener (bind fixed to 127.0.0.1, published only with
+  `tailscale serve`, Tailscale identity headers ignored), speaking the sibling `durable-app`
+  repository's normative protocol v1 exactly. One host-derived session key (`app:chat`) is shared by
+  every paired device and validated as an ordinary mapped chat; devices authenticate solely with a
+  cookie token stored as a hash, created from a single-use ten-minute console code
+  (`durable-nanobot app pair`, exact-label `revoke` over the private local socket). Egress is the
+  adapter's own durable cursor-numbered event log (at-least-once, deduplicated by cursor on the
+  device, replayed after `hello`, trimmed by per-device `ack`s): because retransmission is
+  idempotent there is no external-send intent to quarantine — the log append is the delivery, the
+  deliberate reconciliation of Telegram's held-unknown boundary. Ingress `send` keys are
+  idempotent for at least seven days, admission precedes submission with a stable request id,
+  and `control` new/abort/status reuse the Telegram control records, gating and held
+  acknowledgements, with results as `message{role:"notice"}` events and `/new` as a durable
+  `divider`. Cron results and interruption notices arrive through the same channel-neutral
+  outbox, deduplicated by record id and authorized by this channel's own admission evidence. The
+  app chat is not an MCP-login or `ask_user` owner surface: the protocol defines no event that
+  could carry a one-time URL or a question without persisting it, so a mapped app chat cannot
+  start an MCP login, and callback-shaped input is intercepted before admission and never stored.
+  No new tool authority exists.
 - Owner message placement is `followUpMode`, config-only and default `followUp`
   (historical queueing): `steer` submits a CLI or Telegram owner input with native
   `whenBusy: "steer"` so it joins the running turn after its tool round. Internal
