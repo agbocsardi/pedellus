@@ -301,12 +301,14 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   /** Enter or send with `/…` in the composer: never a chat message. */
   function runSlash() {
     setSlashHidden(false); // an unknown name shows its hint again
-    if (picked && !argsTooLong) runCommand(picked, args);
+    // A bare `/` only opens the list; it never runs the first command.
+    if (picked && typed !== "") runCommand(picked, args);
   }
 
   /** `args` is the text after `/name `; undefined when picked from a list. */
   function runCommand(c: CommandInfo, args?: string) {
-    if (!canRun(c, cmdState)) return;
+    // Every path (Enter, send button, tapping a list row) passes through here.
+    if (!canRun(c, cmdState) || (args?.trim().length ?? 0) > ARGS_MAX) return;
     if (c.args && args === undefined) {
       // Commands with arguments go through the composer, with usage shown.
       setText(`/${c.name} `);
