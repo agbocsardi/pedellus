@@ -46,10 +46,21 @@ import { inProcessTerminalConversation } from "../terminal/conversation.js";
 import { renderBackgroundStatus, type BackgroundStatus } from "../background-status.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import {
+  conversationCommandNames,
+  conversationCommandRefusal,
+  conversationCommandUsage,
+  conversationDetailBlock,
+  conversationHelpListing,
+  findConversationCommand,
+  offeredConversationCommands,
+} from "../help/commands.js";
+import { renderMemoryDigestStart, renderMemoryDigestStatus } from "../history/memory-digest.js";
+import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
+import type { GatewayMemoryDigest, GatewayModelList, GatewayModelSelection } from "../runtime.js";
+import {
   APP_CLOSE,
   APP_LIMITS,
   APP_MAIN_THREAD,
-  APP_LATER_COMMANDS,
   APP_PAIR_ALPHABET,
   APP_PROTOCOL_VERSION,
   APP_REQUEST_OPS,
@@ -58,7 +69,9 @@ import {
   validAppLabel,
   validThreadTitle,
   parseThreadId,
+  type AppCommandInfo,
   type AppControlRecord,
+  type AppMutation,
   type AppDeviceRecord,
   type AppDurableEvent,
   type AppErrorCode,
@@ -116,6 +129,8 @@ export type AppChannelState = {
   /** Durable admission evidence, set by authenticated input to that exact thread. */
   origin?: { readonly admittedAtMs: number };
   sideOrigins?: Record<string, { readonly admittedAtMs: number }>;
+  /** Threads owed a confirmation once the process that recorded an applied `restart` is replaced. */
+  restart?: string[];
 };
 
 export const AppState = defineDoc<AppChannelState>({
@@ -155,8 +170,11 @@ export interface AppGateway {
   reserveAppThread?(thread: string, context: Context): Promise<"ok" | "full">;
   /** Host-authenticated durable outbox for completed cron results and interruption notices. */
   cronOutbox?: CronDeliveryOutbox;
-  /** Optional host model catalog for the `status` control's model line. */
-  listModels?(sessionKey: string, context: Context): Promise<import("../runtime.js").GatewayModelList>;
+  /** Optional host model catalog for the `status` and `model` controls. */
+  listModels?(sessionKey: string, context: Context): Promise<GatewayModelList>;
+  selectModelPreset?(sessionKey: string, name: string, context: Context): Promise<GatewayModelSelection>;
+  /** Manual memory-digestion entry for `digest` and `digest status`. */
+  memoryDigest?: GatewayMemoryDigest;
   /** Optional bounded background snapshot for the `status` control. */
   backgroundStatus?(sessionKey: string, context: Context): Promise<BackgroundStatus>;
   /**
@@ -209,6 +227,12 @@ export function createAppConsoleRegistry(): AppConsoleRegistry {
   };
 }
 
+export type AppRestartHost = {
+  readonly supported: boolean;
+  /** Called at most once, only after the command's acknowledgement is durable. */
+  request(): Promise<void>;
+};
+
 export type AppOptions = {
   /** Explicit loopback port from the strict `app` config block; tests may request an ephemeral 0. */
   readonly port: number;
@@ -219,6 +243,8 @@ export type AppOptions = {
   readonly agentName?: string;
   /** Configured owner busy-mode, written onto each admitted input. */
   readonly followUpMode?: FollowUpMode;
+  /** Host process replacement for the `restart` control; absent leaves it unoffered. */
+  readonly restart?: AppRestartHost;
   /** Controlled clock for offline checks; absent keeps wall time. */
   readonly now?: () => number;
   /** Adapter scan cadence; tests may shorten it. Default 2s, bounds 50ms–60s. */
@@ -237,12 +263,13 @@ type LiveSocket = {
 type DeferredControl = {
   readonly key: string;
   readonly thread: string;
-  readonly command: "new" | "abort";
+  readonly command: AppMutation;
+  readonly option?: string;
   readonly earlierKeys: ReadonlySet<string>;
 };
 
 type ControlOutcome =
-  | { readonly kind: "applied"; readonly text?: string }
+  | { readonly kind: "applied"; readonly text?: string; readonly requestRestart?: true }
   | { readonly kind: "refused"; readonly text: string }
   | { readonly kind: "deferred" }
   | { readonly kind: "abandoned" };
@@ -419,26 +446,54 @@ function pruneControls(controls: readonly AppControlRecord[], pending: readonly 
   });
 }
 
-const CONTROL_ACK: Record<"new" | "abort", string> = {
+const CONTROL_ACK: Record<AppMutation, string> = {
   new: "Context reset.",
   abort: "Idle. Queue cleared.",
+  model: "Model selected.",
+  restart: "Restart requested; checking active work.",
+  digest: "Digest requested.",
 };
-const CONTROL_PENDING: Record<"new" | "abort", string> = {
+const CONTROL_PENDING: Record<AppMutation, string> = {
   new: "Reset pending.",
   abort: "Still stopping. New messages are held.",
+  model: "Model change pending.",
+  restart: "Restart pending.",
+  digest: "Digest pending; not started yet.",
 };
 const UNCONFIRMED_CONTROL = "Command interrupted; outcome unknown. Send it again if needed.";
+/** An interrupted restart is never repeated automatically, and resending it is the caller's decision. */
+const UNCONFIRMED_RESTART = "Restart interrupted; outcome unknown. Not retried.";
+/** The confirmation the replacement process owes the thread that asked for `restart`. */
+const RESTART_LIVE = "Restarted.";
+/** The host refused the replacement, so this process is still serving. */
+const RESTART_FAILED = "Restart refused. Gateway still running.";
+const RESTART_ALREADY_REQUESTED =
+  "A restart was already requested in this gateway and is still stopping it; this restart was not requested again.";
+const RESTART_REQUEST_FAILED =
+  "A restart was already requested in this gateway and the host refused it, so the gateway is still running. " +
+  "This restart was not requested again; fix the host and start the gateway yourself.";
+const MODEL_LISTING_UNAVAILABLE =
+  "Model choices are unavailable right now: this chat's host model catalog could not be read. Nothing changed.";
+const MODEL_PRESETS_UNAVAILABLE =
+  "Named model presets are not configured in this deployment, so /model <name> and /model default are unavailable. " +
+  "Nothing was changed; /model lists the current selection read only, and this command never rewrites the configuration.";
+/** At most this many configured presets or models in one listing notice. */
+const MAX_MODEL_CHOICES = 50;
 const CALLBACK_REFUSED_TEXT =
   "This looks like an OAuth callback URL. MCP login cannot be initiated from the app channel, so " +
   "it was not stored and was not sent to the assistant.";
 const RESET_BUSY = "Reset refused: chat busy. Abort or retry when idle.";
 const ARCHIVED_CONTROL_TEXT =
   "That command was not applied: its thread is archived. Restore the thread first.";
-const STATUS_UNAVAILABLE_HOST =
-  "Status is unavailable in this host: it exposes no model/status metadata for this chat. Nothing was sent to the assistant.";
 
 /** Replay wording for a command this adapter recorded before a restart; it is never run twice. */
 function replayControlText(entry: AppControlRecord): string {
+  if (entry.command === "restart") {
+    return entry.status === "applied"
+      ? "That /restart was already requested before this process restarted, so it is not requested again."
+      : "That /restart was interrupted before it was confirmed: it may or may not have restarted the gateway, and it " +
+        "is not requested again.";
+  }
   if (entry.status === "applied") return "That command was already applied before a restart, so it was not run again.";
   if (entry.status === "refused") {
     return "That command was refused before any effect and will not be retried; send it again if it is still needed.";
@@ -447,6 +502,92 @@ function replayControlText(entry: AppControlRecord): string {
     return "That command was already reported as interrupted; send it again if you still need it.";
   }
   return UNCONFIRMED_CONTROL;
+}
+
+/** Bound one host notice; a shortened notice says so instead of dropping its tail silently. */
+function boundNotice(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const marker = "\n… (truncated)";
+  let end = Math.max(0, limit - marker.length);
+  if (end > 0 && /[\uD800-\uDBFF]/u.test(text[end - 1]!)) end -= 1;
+  return `${text.slice(0, end)}${marker}`;
+}
+
+/** One printable, single-line label for host-generated notice text. */
+function boundedLabel(value: unknown, max: number): string {
+  const text = typeof value === "string" ? value : "";
+  const cleaned = text.replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gu, " ").replace(/\s+/gu, " ").trim();
+  if (cleaned === "") return "(unnamed)";
+  let bounded = cleaned.slice(0, max);
+  if (bounded.length > 0 && /[\uD800-\uDBFF]/u.test(bounded[bounded.length - 1]!)) bounded = bounded.slice(0, -1);
+  return bounded;
+}
+
+/** A fixed usage notice: the catalogue's app line, a no-argument note, and the no-effect tail. */
+function usageNotice(name: string): string {
+  const argumentsNote = findConversationCommand(name)?.args === undefined ? " (no arguments)." : "";
+  return `${conversationCommandUsage(name, "app")}${argumentsNote} Nothing was sent to the assistant.`;
+}
+
+type ModelArgument =
+  | { readonly kind: "list" }
+  | { readonly kind: "preset"; readonly name: string }
+  | { readonly kind: "usage" };
+
+/** Bound a `model` argument to the shape the config itself accepts: one name, never a selector triple. */
+function parseModelArgument(args: string): ModelArgument {
+  if (args === "") return { kind: "list" };
+  const parts = args.split(/\s+/u);
+  if (parts.length !== 1) return { kind: "usage" };
+  const name = parts[0]!;
+  if (name.length > 80 || !/^[^\s\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]+$/u.test(name)) return { kind: "usage" };
+  return { kind: "preset", name };
+}
+
+/** The configured preset this thread currently uses, matched by provider/model/thinking. */
+function matchingPresetName(listing: GatewayModelList): string | undefined {
+  const selected = listing.selected;
+  return listing.presets?.find((preset) => preset.provider === selected.provider &&
+    preset.modelId === selected.modelId && (preset.thinkingLevel ?? "off") === selected.thinkingLevel)?.name;
+}
+
+/** The read-only `model` listing, the same projection Telegram and Discord render. */
+function modelListingText(listing: GatewayModelList): string {
+  const selectedLine = `Current model: ${boundedLabel(listing.selected.provider, 80)}/` +
+    `${boundedLabel(listing.selected.modelId, 160)} (thinking: ${boundedLabel(listing.selected.thinkingLevel, 32)}).`;
+  const presets = listing.presets ?? [];
+  if (presets.length === 0) {
+    const rows = listing.models.slice(0, MAX_MODEL_CHOICES).map((choice) => {
+      const current = choice.provider === listing.selected.provider && choice.modelId === listing.selected.modelId;
+      const levels = choice.thinkingLevels.map((level) => boundedLabel(level, 32)).join(", ");
+      return `  ${current ? "* " : "  "}${boundedLabel(choice.provider, 80)} ${boundedLabel(choice.modelId, 160)} ` +
+        `— ${boundedLabel(choice.name, 160)} [thinking: ${levels === "" ? "off" : levels}]`;
+    });
+    if (listing.models.length > MAX_MODEL_CHOICES) rows.push(`  … ${listing.models.length - MAX_MODEL_CHOICES} more allowed models omitted`);
+    return [
+      selectedLine,
+      "Named model presets are not configured in this deployment, so /model <name> and /model default are " +
+        "unavailable here; this command never rewrites the configuration.",
+      "Configured direct choices (read only; the direct selection belongs to the local CLI):",
+      ...rows,
+    ].join("\n");
+  }
+  const selectedPreset = matchingPresetName(listing);
+  const rows = presets.slice(0, MAX_MODEL_CHOICES).map((preset) => {
+    const isDefault = preset.name === listing.defaultPreset;
+    return `  ${preset.name === selectedPreset ? "* " : "  "}${boundedLabel(preset.name, 80)} — ` +
+      `${boundedLabel(preset.provider, 80)} ${boundedLabel(preset.modelId, 160)} ` +
+      `[thinking: ${boundedLabel(preset.thinkingLevel ?? "off", 32)}]${isDefault ? " (default)" : ""}`;
+  });
+  if (presets.length > MAX_MODEL_CHOICES) rows.push(`  … ${presets.length - MAX_MODEL_CHOICES} more named presets omitted`);
+  return [
+    selectedLine,
+    ...(listing.defaultPreset === undefined ? [] : [`Configured default preset: ${boundedLabel(listing.defaultPreset, 80)}.`]),
+    "Named model presets (see /help model to select one):",
+    ...rows,
+    "A selection applies to this thread only and lasts while the gateway stays open; a restart restores the " +
+      "configured default and prepared requests keep their model.",
+  ].join("\n");
 }
 
 /** Why one stored outbox record cannot be delivered as-is, or `undefined` when it is usable. */
@@ -564,6 +705,30 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   let activeNotices = 0;
   let fatal: unknown;
   let stopping = false;
+  /**
+   * Optional host operations, resolved once. A narrow SDK host keeps new, abort/stop and help only;
+   * the rest are neither listed in `hello.commands` nor applied.
+   */
+  const hostCommands: Record<string, boolean> = {
+    new: true,
+    abort: true,
+    stop: true,
+    help: true,
+    status: typeof gateway.listModels === "function",
+    model: typeof gateway.listModels === "function" && typeof gateway.selectModelPreset === "function",
+    restart: options.restart?.supported === true,
+    digest: typeof gateway.memoryDigest?.start === "function" && typeof gateway.memoryDigest?.status === "function",
+  };
+  /** The catalogued app commands this host really implements, in catalogue order. */
+  const offeredCommands = conversationCommandNames("app").filter((name) => hostCommands[name] === true);
+  const commandInfos: AppCommandInfo[] = offeredConversationCommands("app", offeredCommands).map((command) => ({
+    name: command.name,
+    ...(command.args === undefined ? {} : { args: command.args }),
+    summary: command.summary,
+    usage: conversationCommandUsage(command.name, "app"),
+  }));
+  let restartHostRequested = false;
+  let restartHostRequestFailed = false;
   let recoveryComplete = false;
   const scheduledActive = new Set<string>();
   const scheduledTasks = new Set<Promise<void>>();
@@ -745,7 +910,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       return;
     }
     socket.hello = true;
-    sendOk({ v: APP_PROTOCOL_VERSION, device: socket.session.label, head: headCursor(), agent: agentName });
+    sendOk({
+      v: APP_PROTOCOL_VERSION, device: socket.session.label, head: headCursor(), agent: agentName, commands: commandInfos,
+    });
     // Replay from the acknowledged position (or the retention floor), oldest first, bounded.
     const head = headCursor();
     socket.lastSent = head === null ? state.floor : Math.min(Math.max(cursor ?? 0, state.floor), head);
@@ -1398,18 +1565,17 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (thread === undefined || !openThread(state, thread)) return sendError("bad_request");
     if (archiving.has(thread)) return sendError("not_ready");
     const command = frame.command;
-    if (typeof command !== "string") {
+    const rawArgs = frame.args ?? "";
+    if (typeof command !== "string" || typeof rawArgs !== "string" ||
+        rawArgs.length > APP_LIMITS.controlArgsChars) {
       sendError("bad_request");
       return;
     }
-    if (APP_LATER_COMMANDS.includes(command)) {
+    if (!offeredCommands.includes(command)) {
       sendError("unsupported");
       return;
     }
-    if (command !== "new" && command !== "abort" && command !== "status") {
-      sendError("bad_request");
-      return;
-    }
+    const args = rawArgs.trim();
     const key = thread === APP_MAIN_THREAD ? `c:${frame.id as string}` : `c:${thread}:${frame.id as string}`;
     const recorded = state.controls.find((entry) => entry.key === key);
     if (recorded !== undefined) {
@@ -1427,19 +1593,68 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       drain();
       return;
     }
-    if (command === "status") {
-      if (typeof gateway.listModels !== "function") {
-        await admitNotice(thread, key, STATUS_UNAVAILABLE_HOST);
-      } else {
-        await admitNotice(thread, key, await statusNotice(thread));
-      }
+    // Read-only commands answer with one notice; a refused or malformed one has no effect.
+    const notice = async (text: string, limit?: number): Promise<void> => {
+      await admitNotice(thread, key, text, limit);
       sendOk();
       drain();
-      return;
+    };
+    let mutation: AppMutation;
+    let option: string | undefined;
+    switch (command) {
+      case "help": {
+        if (args === "") return notice(conversationHelpListing("app", offeredCommands), MAX_LATE_CONTROL_CHARS);
+        const requested = args.toLowerCase();
+        const found = offeredCommands.includes(requested) ? findConversationCommand(requested) : undefined;
+        return notice(found === undefined
+          ? `${conversationCommandRefusal("app", requested, offeredCommands)} Nothing was sent to the assistant.`
+          : conversationDetailBlock(found, "app"), MAX_LATE_CONTROL_CHARS);
+      }
+      case "status":
+        if (args !== "") return notice(usageNotice("status"));
+        return notice(await statusNotice(thread));
+      case "model": {
+        const argument = parseModelArgument(args);
+        if (argument.kind === "usage") return notice(usageNotice("model"));
+        const listing = await readModelListing(thread);
+        if (argument.kind === "list") {
+          return notice(listing === undefined ? MODEL_LISTING_UNAVAILABLE : modelListingText(listing), MAX_LATE_CONTROL_CHARS);
+        }
+        if (listing === undefined) return notice(MODEL_LISTING_UNAVAILABLE);
+        if (listing.presets === undefined) return notice(MODEL_PRESETS_UNAVAILABLE);
+        if (argument.name !== "default" && !listing.presets.some((preset) => preset.name === argument.name)) {
+          return notice(`Unknown model preset ${boundedLabel(argument.name, 80)}: nothing was changed. ` +
+            "Use /model to list the configured presets.");
+        }
+        mutation = "model";
+        option = argument.name;
+        break;
+      }
+      case "digest":
+        // Read-only bounded status: no scan, no model call and no cursor change.
+        if (args.toLowerCase() === "status") return notice(await digestStatusNotice(thread));
+        if (args !== "") return notice(usageNotice("digest"));
+        mutation = "digest";
+        break;
+      case "restart":
+        if (args !== "") return notice(usageNotice("restart"));
+        if (restartHostRequested) return notice(restartHostRequestFailed ? RESTART_REQUEST_FAILED : RESTART_ALREADY_REQUESTED);
+        mutation = "restart";
+        break;
+      case "new":
+      case "abort":
+      case "stop":
+        if (args !== "") return notice(usageNotice(command));
+        // `stop` is an alias of `abort`: the same durable record and effect.
+        mutation = command === "stop" ? "abort" : command;
+        break;
+      default:
+        sendError("unsupported");
+        return;
     }
     // A mutating control: the visible result arrives later as `message{role:"notice"}`.
     try {
-      await admitControl(thread, key, command);
+      await admitControl(thread, key, mutation, option);
     } catch (error) {
       if (stopping || signal?.aborted) return;
       if (error instanceof Error && error.message === QUEUE_FULL) {
@@ -1454,7 +1669,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   }
 
   /** Queue one bounded host notice through the same durable pending queue every reply uses. */
-  const admitNotice = async (thread: string, key: string, text: string): Promise<void> => {
+  const admitNotice = async (thread: string, key: string, text: string, limit = MAX_NOTICE_CHARS): Promise<void> => {
     await mutateState((doc) => {
       if (doc.pending.some((entry) => entry.key === key)) return;
       if (doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
@@ -1463,7 +1678,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       doc.pending.push({
         key,
         thread,
-        text: text.slice(0, MAX_NOTICE_CHARS),
+        text: boundNotice(text, limit),
         admittedAtMs: now(),
         notice: true,
         noticeSeq,
@@ -1472,7 +1687,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     drain();
   };
 
-  async function admitControl(thread: string, key: string, command: "new" | "abort"): Promise<void> {
+  async function admitControl(thread: string, key: string, command: AppMutation, option?: string): Promise<void> {
     if (controlPendingSet.has(thread)) {
       await admitNotice(thread, key, "Previous command pending. This command wasn't started; retry later.");
       return;
@@ -1492,7 +1707,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           if (item.notice !== true && threadOf(item) === thread) earlierKeys.add(item.key);
         }
         if (!doc.controls.some((entry) => entry.key === key)) {
-          doc.controls = pruneControls([...doc.controls, { key, thread, command, status: "admitted" as const }], doc.pending);
+          doc.controls = pruneControls([...doc.controls, {
+            key, thread, command, ...(option === undefined ? {} : { option }), status: "admitted" as const,
+          }], doc.pending);
         }
         if (!doc.pending.some((entry) => entry.key === key)) {
           if (doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
@@ -1513,7 +1730,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       controlPendingSet.delete(thread);
       throw error;
     }
-    const record: DeferredControl = { key, thread, command, earlierKeys };
+    const record: DeferredControl = { key, thread, command, ...(option === undefined ? {} : { option }), earlierKeys };
     runningControls.add(thread);
     const run = applyControl(record);
     let ack: "waiting" | "pending" | "applied" | "refused" = "waiting";
@@ -1543,6 +1760,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         if (outcome.text !== undefined) {
           await publishLateControlNotice(record.thread, key, outcome.text).catch(() => undefined);
         }
+        if (outcome.requestRestart === true) requestRestart();
         return;
       }
       ack = "applied";
@@ -1551,6 +1769,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       } catch {
         // A failed release leaves the held notice for the next open to report; the command is done.
       }
+      if (outcome.requestRestart === true) requestRestart();
     }, (error: unknown) => {
       // The record stays `admitted` and the acknowledgement stays held: a reopen reports unconfirmed.
       if (signal?.aborted) return;
@@ -1607,15 +1826,28 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     let outcome: ControlOutcome;
     if (record.command === "new") {
       outcome = await applyNewSession(record.thread);
-    } else {
+    } else if (record.command === "abort") {
       const conversation = await gateway.conversationFor(sessionForThread(record.thread), adapterContext);
       await conversation.abort(adapterContext);
       outcome = { kind: "applied" };
+    } else if (record.command === "digest") {
+      outcome = await applyDigest(record.thread);
+    } else if (record.command === "restart") {
+      // No conversation effect: the record and its acknowledgement are durable first, and the host
+      // replacement is requested only after that acknowledgement was released.
+      outcome = { kind: "applied", text: CONTROL_ACK.restart, requestRestart: true };
+    } else {
+      outcome = await applyModelPreset(record);
     }
     if (outcome.kind !== "applied") return outcome;
     await mutateState((doc) => {
       const entry = doc.controls.find((item) => item.key === record.key);
       if (entry !== undefined) entry.status = "applied";
+      // The host replaces the process only after this commit, so the owed confirmation is durable first.
+      if (record.command === "restart" && entry !== undefined) {
+        const owed = doc.restart ?? [];
+        if (!owed.includes(record.thread)) doc.restart = [...owed, record.thread].slice(-APP_LIMITS.maxOpenThreads - 1);
+      }
       doc.controls = pruneControls(doc.controls, doc.pending);
       // The context boundary the app renders as a durable divider event.
       if (record.command === "new" && !hasEventId(doc, `divider:${record.key}`)) {
@@ -1669,6 +1901,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           } else {
             await publishLateControlNotice(record.thread, key, text).catch(() => undefined);
           }
+          if (outcome.requestRestart === true) requestRestart();
         } else if (outcome.kind === "refused") {
           if (state.pending.some((entry) => entry.key === key && entry.hold === true)) {
             await markControlRefused(key, outcome.text).catch(() => undefined);
@@ -1755,6 +1988,104 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }, cleanupContext);
     drain();
   };
+
+  /** `model <preset>`: the host's per-session preset selection, exactly as Telegram and Discord apply it. */
+  async function applyModelPreset(record: DeferredControl): Promise<ControlOutcome> {
+    const select = gateway.selectModelPreset;
+    if (select === undefined) return { kind: "refused", text: "Model selection is unavailable in this host; nothing was changed." };
+    try {
+      const selection = await select.call(gateway, sessionForThread(record.thread), record.option ?? "default", adapterContext);
+      return {
+        kind: "applied",
+        text: `Model set to ${boundedLabel(selection.provider, 80)}/${boundedLabel(selection.modelId, 160)} ` +
+          `(thinking: ${boundedLabel(selection.thinkingLevel, 32)}) for this thread.`,
+      };
+    } catch (error) {
+      if (isConversationBusy(error)) {
+        return { kind: "refused", text: "Model selection refused: thread busy. Abort or retry when idle." };
+      }
+      return { kind: "refused", text: "Model selection was refused; nothing was changed." };
+    }
+  }
+
+  /** `digest`: start one bounded digestion batch for this thread's own conversation. */
+  async function applyDigest(thread: string): Promise<ControlOutcome> {
+    const host = gateway.memoryDigest;
+    if (host === undefined) return { kind: "refused", text: "Memory digestion is unavailable in this host. Nothing was started." };
+    const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
+    const result = await host.start({
+      id: conversation.id,
+      commit: (change, context) => conversation.commit(change, context),
+    }, adapterContext);
+    return result.status === "refused"
+      ? { kind: "refused", text: renderMemoryDigestStart(result) }
+      : { kind: "applied", text: renderMemoryDigestStart(result) };
+  }
+
+  /** Bounded read-only `digest status`; it creates no task and reads no chat transcript. */
+  async function digestStatusNotice(thread: string): Promise<string> {
+    const host = gateway.memoryDigest!;
+    const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
+    return renderMemoryDigestStatus(await host.status({
+      id: conversation.id,
+      commit: (change, context) => conversation.commit(change, context),
+    }, adapterContext));
+  }
+
+  /** The host model catalog is per-session, so this thread's mapped conversation must exist first. */
+  async function readModelListing(thread: string): Promise<GatewayModelList | undefined> {
+    if (gateway.listModels === undefined) return undefined;
+    try {
+      await gateway.conversationFor(sessionForThread(thread), adapterContext);
+      return await gateway.listModels(sessionForThread(thread), adapterContext);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Ask the host to replace this process, at most once per adapter lifetime. A refusal is a known
+   * no-effect, so it is reported to the threads that asked and never upgraded into a success claim.
+   */
+  function requestRestart(): void {
+    if (restartHostRequested) return;
+    const host = options.restart;
+    if (host === undefined || !host.supported) return;
+    restartHostRequested = true;
+    void host.request().catch((error: unknown) => {
+      const busy = error instanceof RestartBusyError;
+      restartHostRequestFailed = !busy;
+      if (busy) restartHostRequested = false;
+      console.warn(busy
+        ? "App /restart was refused while live work is active; the gateway keeps running."
+        : "App /restart request was refused by the host; the gateway keeps running.");
+      void mutateState((doc) => {
+        admitRestartNotices(doc, busy ? RESTART_BUSY_MESSAGE : RESTART_FAILED);
+      }, cleanupContext).then(() => {
+        if (!stopping && !signal?.aborted) drain();
+      }).catch(() => undefined);
+    });
+  }
+
+  /**
+   * Queue one ordinary notice per recorded restart thread: the live confirmation in a replacement
+   * process, or the host-refusal report in the process that stayed up. Threads that do not fit stay owed.
+   */
+  function admitRestartNotices(doc: Draft<AppChannelState>, text: string): void {
+    const remaining: string[] = [];
+    for (const thread of doc.restart ?? []) {
+      if (!openThread(doc, thread)) continue;
+      if (doc.pending.length >= APP_LIMITS.maxPending) {
+        remaining.push(thread);
+        continue;
+      }
+      const noticeSeq = doc.nextNoticeSeq;
+      doc.nextNoticeSeq = noticeSeq + 1;
+      doc.pending.push({ key: `restart:${noticeSeq}`, thread, text, admittedAtMs: now(), notice: true, noticeSeq });
+    }
+    if (remaining.length > 0) doc.restart = remaining;
+    else delete doc.restart;
+  }
 
   /** Bounded point-in-time metadata of this chat, exactly the Telegram `/status` projection. */
   async function statusNotice(thread: string): Promise<string> {
@@ -2157,9 +2488,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     await mutateState((doc) => {
       for (const entry of doc.controls) {
         if (entry.status !== "admitted") continue;
+        const interrupted = entry.command === "restart" ? UNCONFIRMED_RESTART : UNCONFIRMED_CONTROL;
         const notice = doc.pending.find((item) => item.notice === true && item.key === entry.key);
         if (notice !== undefined) {
-          if (notice.hold === true) notice.text = UNCONFIRMED_CONTROL;
+          if (notice.hold === true) notice.text = interrupted;
           delete notice.hold;
           entry.status = "unconfirmed";
           continue;
@@ -2170,7 +2502,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         doc.pending.push({
           key: entry.key,
           thread: threadOf(entry),
-          text: UNCONFIRMED_CONTROL,
+          text: interrupted,
           admittedAtMs: now(),
           notice: true,
           noticeSeq,
@@ -2191,6 +2523,12 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (unresolved.length > 0) {
       console.warn(`App ${unresolved.length} control command(s) were interrupted; their effect is unconfirmed.`);
     }
+  }
+
+  // A restart this store recorded was requested by the process this one replaced: confirm it is live
+  // in every thread that asked, through the same durable notice queue every other notice uses.
+  if (state.restart !== undefined && state.restart.length > 0) {
+    await mutateState((doc) => admitRestartNotices(doc, RESTART_LIVE), adapterContext);
   }
 
   // The listener opens only after recovery, so no socket can observe pre-recovery state.

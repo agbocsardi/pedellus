@@ -44,6 +44,8 @@ export const APP_LIMITS = Object.freeze({
   /** `send` keys are remembered for idempotency; pruning is by age only (keys are tiny). */
   sendKeyTtlMs: 7 * 24 * 60 * 60_000,
   maxUnresolvedControls: 64,
+  /** `control.args`: the text after the command name. */
+  controlArgsChars: 1_000,
 } as const);
 
 /** `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`: 8 characters, no `I`/`O`, case-insensitive input. */
@@ -59,9 +61,8 @@ export const APP_CLOSE = Object.freeze({
 
 /** Fixed reply error codes; no free text ever leaves the gateway on a response. */
 export type AppErrorCode = "bad_request" | "too_large" | "unsupported" | "not_ready" | "internal";
-export type AppControlCommand = "new" | "abort" | "status";
-/** Catalogued commands this phase does not implement; a typed one is refused, not a violation. */
-export const APP_LATER_COMMANDS: readonly string[] = ["model", "digest", "restart", "mcp"];
+/** One `hello.commands` entry, rendered from the shared catalogue's `app` surface. */
+export type AppCommandInfo = { name: string; args?: string; summary: string; usage: string };
 export const APP_REQUEST_OPS: readonly string[] = [
   "hello", "send", "ack", "control", "ping", "history", "tasks",
   "threads", "thread.create", "thread.rename", "thread.archive",
@@ -141,11 +142,16 @@ export type AppPendingInput = {
   readonly held?: boolean;
 };
 
+/** A command with a native effect on its thread or on this process; a refusal is terminal, never retried. */
+export type AppMutation = "new" | "abort" | "model" | "restart" | "digest";
+
 /** One authenticated control command, admitted with its acknowledgement before the effect. */
 export type AppControlRecord = {
   readonly key: string;
   readonly thread?: string;
-  readonly command: "new" | "abort";
+  readonly command: AppMutation;
+  /** The `model` preset argument, already validated against the configured catalog. */
+  readonly option?: string;
   readonly status: "admitted" | "applied" | "refused" | "unconfirmed";
 };
 
