@@ -4,6 +4,7 @@ import { Connection } from "./conn";
 import type { Store } from "./store";
 import { FirstRun } from "./FirstRun";
 import { Chat } from "./Chat";
+import { Avatar } from "./Avatar";
 
 export function App({ store }: { store: Store }) {
   useSyncExternalStore(store.subscribe, store.getSnapshot);
@@ -54,8 +55,9 @@ export function App({ store }: { store: Store }) {
 function Splash() {
   return (
     <div className="screen center">
-      <div className="mark" aria-hidden="true" />
-      <p className="dim">Durable</p>
+      <div className="avatar-slot big">
+        <Avatar state="thinking" />
+      </div>
     </div>
   );
 }
@@ -64,6 +66,9 @@ function UpdateScreen() {
   return (
     <div className="screen center">
       <div className="card pad">
+        <div className="avatar-slot big">
+          <Avatar state="offline" />
+        </div>
         <h1>Update available</h1>
         <p className="dim">
           The gateway speaks a newer protocol. Reload to pick up the new app.

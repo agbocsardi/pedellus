@@ -2,6 +2,7 @@ import { useMemo, useState, type FormEvent } from "react";
 import { useSyncExternalStore } from "react";
 import type { Connection } from "./conn";
 import type { Store } from "./store";
+import { Avatar } from "./Avatar";
 
 /** Pairing-code alphabet: [A-Z2-9] minus I and O, case-insensitive input. */
 const CODE_CHARS = /^[A-HJ-NP-Z2-9]+$/;
@@ -76,8 +77,11 @@ export function FirstRun({ store, conn }: { store: Store; conn: Connection }) {
   return (
     <div className="screen center">
       <form className="card pad pair" onSubmit={pair}>
-        <div className="mark" aria-hidden="true" />
+        <div className="avatar-slot big">
+          <Avatar state={busy ? "thinking" : "idle"} />
+        </div>
         <h1>Durable</h1>
+        <p className="lede">Enter the one-time code from your host to pair this device.</p>
         {showHint && <p className="hint">{HINT}</p>}
         <label htmlFor="pair-code">Pairing code</label>
         <input
