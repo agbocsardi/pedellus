@@ -23,6 +23,7 @@ export const CLOSE = {
 export type ErrorCode = "bad_request" | "too_large" | "unsupported" | "not_ready" | "internal";
 export type ControlCommand = string;
 export type CommandInfo = { name: string; args?: string; summary: string; usage: string };
+export type PresetInfo = { name: string; label?: string; model: string; thinking?: string };
 export const MAIN_THREAD = "main";
 export type ThreadId = string;
 export type ThreadOrigin = { thread: ThreadId; messageId: string };
@@ -42,7 +43,7 @@ export type Request =
   | { type: "req"; id: string; op: "thread.rename"; thread: ThreadId; title: string }
   | { type: "req"; id: string; op: "thread.archive"; thread: ThreadId; archived: boolean };
 
-export type HelloResult = { v: 2; device: string; head: number | null; agent: string; commands: CommandInfo[] };
+export type HelloResult = { v: 2; device: string; head: number | null; agent: string; commands: CommandInfo[]; presets: PresetInfo[] };
 export type SendResult = { duplicate: boolean };
 export type ThreadsResult = { threads: ThreadInfo[] };
 export type ThreadCreateResult = { thread: ThreadId; duplicate: boolean };
@@ -68,8 +69,10 @@ export type StatusEvent = {
 
 export type ThreadEvent = { type: "event"; event: "thread"; cursor: number; thread: ThreadInfo };
 
+export type ModelEvent = { type: "event"; event: "model"; thread: ThreadId; preset: string | null };
+
 export type DurableEvent = MessageEvent | SettledEvent | DividerEvent | ThreadEvent;
-export type Event = DurableEvent | PreviewEvent | StatusEvent;
+export type Event = DurableEvent | PreviewEvent | StatusEvent | ModelEvent;
 export type ServerFrame = Response | Event;
 
 export type PairRequest = { code: string; label: string };
