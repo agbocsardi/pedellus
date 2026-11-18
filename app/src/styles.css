@@ -1,0 +1,441 @@
+@import "tailwindcss";
+@import "streamdown/styles.css";
+
+/*
+ * Palette. Light + dark via prefers-color-scheme; the tokens are also what
+ * Streamdown's built-in chrome (code blocks, tables, links) reads.
+ */
+@theme {
+  --color-background: #f7f6f3;
+  --color-foreground: #24231f;
+  --color-card: #ffffff;
+  --color-card-foreground: #24231f;
+  --color-muted: #ebe9e2;
+  --color-muted-foreground: #7c7a72;
+  --color-border: #e2e0d8;
+  --color-primary: #0e7a6a;
+  --color-primary-foreground: #ffffff;
+  --color-destructive: #b3403a;
+  --font-sans:
+    ui-round, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-background: #171917;
+    --color-foreground: #e7e5df;
+    --color-card: #202321;
+    --color-card-foreground: #e7e5df;
+    --color-muted: #26292a;
+    --color-muted-foreground: #94928a;
+    --color-border: #2c2f2c;
+    --color-primary: #4fbfa9;
+    --color-primary-foreground: #10201c;
+    --color-destructive: #d97069;
+  }
+}
+
+/* App chrome (plain CSS; Tailwind is only here for Streamdown's components) */
+
+:root {
+  --accent: var(--color-primary);
+  --danger: var(--color-destructive);
+  --amber: #c9a24b;
+  --line: var(--color-border);
+  --ink: var(--color-foreground);
+  --muted-ink: var(--color-muted-foreground);
+  --bg: var(--color-background);
+  --card: var(--color-card);
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.screen {
+  height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.dim {
+  color: var(--muted-ink);
+}
+
+/* Logo mark: rounded square with three speech dots. */
+.mark {
+  --s: 48px;
+  width: var(--s);
+  height: var(--s);
+  border-radius: calc(var(--s) * 0.24);
+  background: var(--accent);
+  position: relative;
+  margin-inline: auto;
+}
+.mark::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: calc(var(--s) * 0.14);
+  height: calc(var(--s) * 0.14);
+  border-radius: 50%;
+  background: #fff;
+  box-shadow:
+    calc(var(--s) * 0.28) 0 0 #fff,
+    calc(var(--s) * -0.28) 0 0 #fff;
+}
+.mark.small {
+  --s: 26px;
+  margin: 0;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+}
+.pad {
+  padding: 28px;
+  width: min(24rem, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.card h1 {
+  margin: 8px 0 4px;
+  font-size: 1.3rem;
+  text-align: center;
+}
+.hint {
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--muted-ink);
+  background: color-mix(in oklab, var(--accent) 9%, transparent);
+  border: 1px solid color-mix(in oklab, var(--accent) 25%, transparent);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+label {
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted-ink);
+  margin-top: 8px;
+}
+input {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--ink);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 1rem;
+}
+input#pair-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 1.3rem;
+  letter-spacing: 0.25em;
+  text-align: center;
+  text-transform: uppercase;
+}
+.primary {
+  margin-top: 14px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--accent);
+  color: var(--color-primary-foreground);
+  padding: 12px 16px;
+  font-weight: 600;
+}
+.primary:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.error-text {
+  color: var(--danger);
+  font-size: 0.82rem;
+  margin: 4px 0 0;
+}
+
+/* Chat screen */
+
+.app {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: calc(env(safe-area-inset-top) + 10px) 14px 10px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in oklab, var(--bg) 88%, transparent);
+  backdrop-filter: blur(8px);
+  position: sticky;
+  top: 0;
+  z-index: 4;
+}
+.who {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-right: auto;
+  min-width: 0;
+}
+.who h1 {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 650;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.74rem;
+  color: var(--muted-ink);
+  border: 1px solid var(--line);
+  background: var(--card);
+  border-radius: 999px;
+  padding: 4px 10px;
+  white-space: nowrap;
+}
+.pill i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted-ink);
+}
+.pill[data-kind="ok"] i {
+  background: var(--accent);
+}
+.pill[data-kind="run"] i {
+  background: var(--accent);
+  animation: pulse 1.3s ease-in-out infinite;
+}
+.pill[data-kind="warn"] i {
+  background: var(--amber);
+}
+.pill[data-kind="bad"] i {
+  background: var(--danger);
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.menu {
+  position: relative;
+}
+.icon-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--muted-ink);
+  display: grid;
+  place-items: center;
+  font-size: 1rem;
+}
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  background: transparent;
+  border: 0;
+  z-index: 5;
+}
+.menu-pop {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 6;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.12);
+  min-width: 180px;
+  overflow: hidden;
+}
+.menu-pop button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font-size: 0.9rem;
+  padding: 11px 14px;
+}
+.menu-pop button:hover {
+  background: var(--muted, var(--color-muted));
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 8px 14px 18px;
+}
+
+.msg {
+  max-width: 44rem;
+  margin: 0 auto;
+}
+.msg.assistant {
+  padding: 8px 0;
+  font-size: 0.95rem;
+  line-height: 1.6;
+}
+/* Horizontal code scrolling is the iOS-safe default; Streamdown adds the
+   copy button and block chrome on top. */
+.msg.assistant pre {
+  overflow-x: auto;
+}
+.msg.assistant table {
+  display: block;
+  overflow-x: auto;
+}
+
+.row.user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  margin: 12px 0;
+  max-width: 44rem;
+  margin-inline: auto;
+}
+.bubble {
+  background: var(--color-muted);
+  border-radius: 18px 18px 4px 18px;
+  padding: 9px 14px;
+  max-width: min(85%, 36rem);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.95rem;
+}
+.deliv {
+  font-size: 0.68rem;
+  color: var(--muted-ink);
+  margin: 3px 8px 0 0;
+}
+.deliv.bad {
+  color: var(--danger);
+}
+
+.notice {
+  text-align: center;
+  color: var(--muted-ink);
+  font-size: 0.8rem;
+  margin: 12px auto;
+  max-width: 44rem;
+}
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 22px auto;
+  max-width: 44rem;
+}
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+.divider span {
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted-ink);
+}
+
+.streaming .typing {
+  display: inline-block;
+  font-size: 1.1rem;
+  color: var(--muted-ink);
+  animation: pulse 1s ease-in-out infinite;
+}
+
+.empty {
+  text-align: center;
+  padding-top: 38vh;
+  font-size: 0.9rem;
+}
+
+.composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px 12px calc(env(safe-area-inset-bottom) + var(--vkb, 0px) + 10px);
+  border-top: 1px solid var(--line);
+  background: var(--bg);
+}
+.composer textarea {
+  flex: 1;
+  resize: none;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink);
+  border-radius: 20px;
+  padding: 10px 16px;
+  font: inherit;
+  font-size: 0.95rem;
+  line-height: 1.4;
+  max-height: 140px;
+  min-width: 0;
+}
+.composer textarea:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.send {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 0;
+  background: var(--accent);
+  color: var(--color-primary-foreground);
+  font-size: 0.95rem;
+  flex: none;
+  display: grid;
+  place-items: center;
+}
+.send.stop {
+  background: var(--danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
