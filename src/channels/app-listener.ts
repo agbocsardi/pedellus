@@ -93,6 +93,8 @@ export async function startAppListener(options: {
   readonly port: number;
   readonly staticRoot: string;
   readonly host: AppListenerHost;
+  /** Fatal listener errors after serving started; without a handler the process would crash. */
+  readonly onError?: (error: unknown) => void;
 }): Promise<AppListener> {
   const staticRoot = resolve(options.staticRoot);
   let staticRootReal: string;
@@ -303,6 +305,7 @@ export async function startAppListener(options: {
   });
   const address = server.address();
   const boundPort = typeof address === "object" && address !== null ? address.port : options.port;
+  server.on("error", (error) => options.onError?.(error));
   journalEvent("app.listener.serving", { port: boundPort });
   return {
     port: boundPort,

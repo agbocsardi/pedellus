@@ -181,6 +181,9 @@ reason and a durable fault entry; no raw record contents are logged.
   allows five more immediately.
 * **A label mismatch or a full device limit burns nothing but is not an explicit error.** They
   are reported as `invalid_code`/`bad_request` per the protocol's three-error vocabulary.
+* **Oversize frames beyond eight times the frame bound** are aborted by the WebSocket layer with
+  1009 (a network-class close for the app) rather than the gateway's `4400`; the bound itself is
+  enforced with `4400` up to that backstop.
 * **The cookie has no `Max-Age`.** The protocol names exactly its four attributes, so the cookie
   is session-scoped: a device that loses its cookie jar re-pairs with a new code.
 * **Not covered offline:** a real `tailscale serve` proxy, an installed PWA's cookie jar, iOS

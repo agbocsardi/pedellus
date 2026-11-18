@@ -1742,6 +1742,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       authenticate: (token) => authenticate(token),
       onSocket: (session, hooks) => onSocket(session, hooks),
     },
+    // A listener that dies takes the channel with it: the supervisor reports gateway.app and the
+    // host shuts down, instead of a half-open listener nobody is serving.
+    onError: (error) => {
+      if (stopping || signal?.aborted) return;
+      fatal ??= error instanceof Error ? error : new Error("App listener failed", { cause: error });
+      scope.cancel(fatal as Error);
+    },
   });
   const detachConsole = gateway.appConsole?.attach(consoleHost);
   recoveryComplete = true;
