@@ -111,11 +111,16 @@ edits need restart only; unit edits additionally need daemon-reload.
   every admitted Telegram or Discord user shares the configured workspace/tools. Raw, root and
   state conversations remain denied, as do forks except the following narrow case.
   Only an ownerless fork created by the app channel's `thread.create {from}` from a validated,
-  open app chat at a committed app message may be admitted as an ordinary mapped chat.
-  Its durable thread registry, exact app session mappings and native parent cutoff must agree
-  at admission and reopen. It gets the source chat's ordinary policy, not inherited grants
-  or new authority. Every other fork remains denied. A mapped key naming anything but an
-  ordinary chat is refused at ingress, before it can become a cron owner or receive chat policy.
+  open app chat may be admitted as an ordinary mapped chat, and only under its own exact
+  registered app session key: at ingress and at reopen the gateway resolves the fork's recorded
+  app message in the conversation its native parent names to a committed user or assistant
+  transcript entry and requires it to equal the native fork cutoff at every hop of a
+  fork-of-fork chain, with each hop's durable enrollment, exact session mapping and parent
+  cutoff agreeing; the enrollment record is the authority, and the registry's displayed
+  `origin` is metadata. It gets the source chat's ordinary policy, not inherited grants
+  or new authority. Every other fork remains denied, and the exception is never
+  conversation-wide: a key naming anything but an ordinary chat or a validated enrolled
+  app fork is refused at ingress, before it can become a cron owner or receive chat policy.
   A scheduled run's automation
   conversation is a distinct class: ownerless, recorded by its origin's cron
   documents and by its own class marker, adopted only while that marker names

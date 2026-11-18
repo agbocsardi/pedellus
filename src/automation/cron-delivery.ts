@@ -275,7 +275,7 @@ export interface CronDeliveryOutbox {
   update(
     sessionKey: string,
     id: string,
-    change: (record: Draft<CronDeliveryRecord>) => void,
+    change: (record: Draft<CronDeliveryRecord>, tx: import("@earendil-works/pi-durable").Tx) => void | Promise<void>,
     context: Context,
   ): Promise<CronDeliveryRecord | undefined>;
   /** Best-effort durable diagnostic for an unreadable/malformed outbox or record. */

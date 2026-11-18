@@ -86,10 +86,11 @@ replays again from its cursor — the app fetches the next 500-event batch that 
 Every paired device shares the same threads. `main` keeps its `app:chat` session and history;
 retained v1 events and pending work without a thread belong to `main`. Side threads use host-assigned
 IDs and host-derived session keys. They start empty unless `thread.create {from: {thread, messageId}}`
-forks a validated open app chat at a committed message. The fork inherits only the context through
-that message, records `origin`, and receives the same ordinary chat policy at creation and reopen.
-A queued echo, host notice, or isolated cron reply has no entry in that chat and cannot be forked.
-No other kind of fork receives chat authority. There is no per-device conversation. The registry and log live in the
+forks a validated open app chat at a committed message; admission resolves that message to a
+typed committed transcript entry equal to the native fork cutoff, per exact session key, at
+creation and reopen. The fork inherits only the context through that message, records `origin`,
+and receives the same ordinary chat policy. A queued echo, host notice, or isolated cron reply
+has no entry in that chat and cannot be forked. No other kind of fork receives chat authority. There is no per-device conversation. The registry and log live in the
 `app:channel-state` conversation (`nanobot.app-state`), never in a plaintext sidecar.
 
 `threads` returns `main`, every open thread and the 200 most recently active archived threads,
@@ -169,14 +170,13 @@ else is `bad_request`.
 
 The adapter consumes the channel-neutral durable outbox (`nanobot.cron.deliveries`) for each
 thread's own session. A cron result restores its archived thread before appending the result as
-`message{role:"assistant"}`; both events commit together. At the 50-open-thread limit the result
-stays pending until a slot opens. A host interruption notice is appended as
+`message{role:"assistant"}`. The restore, message, and outbox settlement commit together, so replay
+trimming cannot make a retry append or restore twice. At the 50-open-thread limit the result stays
+pending in the outbox without consuming a dispatch slot. A host interruption notice is appended as
 `message{role:"notice"}` without restoring the thread. Both are authorized by the
 thread's own durable admission evidence (created by the first authenticated input; a fresh
-admission restores it and releases withheld records). The outbox record is marked `delivered`
-after the append; a crash between the two is closed by the event's stable id (`outbox:<record
-id>`), so the append is never duplicated. A malformed record is quarantined `failed` with a fixed
-reason and a durable fault entry; no raw record contents are logged.
+admission restores it and releases withheld records). A malformed record is quarantined `failed`
+with a fixed reason and a durable fault entry; no raw record contents are logged.
 
 ## Bounded and default-deny behavior
 
@@ -208,7 +208,8 @@ reason and a durable fault entry; no raw record contents are logged.
   enforced with `4400` up to that backstop.
 * **Very long final answers** are still sent as one durable message, which can exceed the frame
   budget. Unlike previews, final answers must not be trimmed; they need lossless chunking.
-* **Archive keeps the mapping.** The gateway's existing mapped-conversation limits still apply.
+* **Archive keeps the mapping.** Idle archived snapshots are evictable and rebuilt on restore.
+  The gateway reserves snapshot capacity before acknowledging a new thread or send.
 * **Legacy fork anchors.** For assistant replies written before fork support, the gateway needs the
   retained app event to identify the native entry. New replies keep that link after replay trimming.
 * **Not covered offline:** a real `tailscale serve` proxy, an installed PWA's cookie jar, iOS

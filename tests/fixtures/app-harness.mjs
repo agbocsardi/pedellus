@@ -115,11 +115,12 @@ export function startApp(store, options = {}) {
   const clock = { now: options.now ?? Date.now() };
   let portResolve;
   const port = new Promise((resolvePort) => { portResolve = resolvePort; });
-  const adapter = runApp(store.gateway, {
+  const adapter = runApp(options.gateway ?? store.gateway, {
     port: options.port ?? 0,
     staticRoot: options.staticRoot ?? store.staticRoot,
     ...(options.followUpMode === undefined ? {} : { followUpMode: options.followUpMode }),
     autoArchiveDays: options.autoArchiveDays ?? store.config.app.autoArchiveDays,
+    ...(options.scanIntervalMs === undefined ? {} : { scanIntervalMs: options.scanIntervalMs }),
     now: () => clock.now,
     onListening: (bound) => portResolve(bound),
   }, scope.context);

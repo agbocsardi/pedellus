@@ -28,13 +28,13 @@
  * consumed before admission and never stored.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { defineDoc, AssistantEntry, ConversationBusy, InboxDoc, LiveDoc } from "@earendil-works/pi-durable";
+import { defineDoc, AssistantEntry, ConversationBusy, InboxDoc, LiveDoc, UserEntry } from "@earendil-works/pi-durable";
 import type { Context, Draft } from "@earendil-works/chord";
 import { copyJson } from "@earendil-works/chord";
 import { withCancel, withoutAbortSignal, withTelemetry } from "@earendil-works/chord/context";
 import type { TelemetrySpan } from "@earendil-works/pi-telemetry";
 import { journalEvent, observeOperation } from "../observability.js";
-import type { Conversation, ConversationId, EntryId, Submission, SubmissionId, SubmissionRecord, Tx } from "@earendil-works/pi-durable";
+import type { Conversation, ConversationId, EntryId, Harness, Submission, SubmissionId, SubmissionRecord, Tx } from "@earendil-works/pi-durable";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { FollowUpMode } from "../config.js";
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
@@ -83,6 +83,8 @@ const SCHEDULED_SCAN_INTERVAL_MS = 2_000;
 const MAX_SCHEDULED_ACTIVE = 4;
 const MAX_NOTICE_CHARS = 1_500;
 const DAY_MS = 86_400_000;
+/** A fork or first admission would exceed the host's snapshot-slot cap; nothing was created. */
+export class AppThreadCapacityError extends Error {}
 class ThreadCreateConflict extends Error {}
 const MAX_LATE_CONTROL_CHARS = 4_000;
 const QUEUE_FULL = "app durable output queue is full";
@@ -105,8 +107,8 @@ export type AppChannelState = {
   sendKeys: { readonly key: string; readonly atMs: number }[];
   // These fields are optional on stores written by v1. Existing records belong to main.
   threads?: AppThreadInfo[];
-  /** Internal authority evidence, bound to the native child and inclusive parent entry. */
-  forks?: Record<string, { thread: string; at: number; messageId: string }>;
+  /** Enrollment (authority) for each registered fork, keyed by its native conversation id. */
+  forks?: Record<string, { thread: string; parentThread?: string; at: number; messageId: string }>;
   /** Committed app-visible assistant messages, independent of cursor retention. */
   answerAnchors?: Record<string, { thread: string; at: number }>;
   createKeys?: { readonly key: string; readonly atMs: number; readonly thread: string }[];
@@ -137,6 +139,7 @@ export const AppState = defineDoc<AppChannelState>({
 });
 
 export interface AppGateway {
+  readonly harness?: Pick<Harness, "submission">;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
   forkAppThread?(
     stateId: ConversationId, thread: string, from: AppThreadOrigin,
@@ -144,6 +147,11 @@ export interface AppGateway {
   ): Promise<boolean>;
   /** Check native work in the same transaction as idle archive without creating a chat. */
   appThreadBusy?(tx: Tx, thread: string): Promise<boolean>;
+  createAppThread?(stateId: ConversationId, thread: string, init: (doc: Draft<AppChannelState>) => void, context: Context): Promise<void>;
+  /** Whether one more open mapping fits, checked in the restore transaction. */
+  appSnapshotRoom?(tx: Tx): Promise<boolean>;
+  /** Create the thread's mapping and snapshot now; `full` reports the snapshot-slot cap. */
+  reserveAppThread?(thread: string, context: Context): Promise<"ok" | "full">;
   /** Host-authenticated durable outbox for completed cron results and interruption notices. */
   cronOutbox?: CronDeliveryOutbox;
   /** Optional host model catalog for the `status` control's model line. */
@@ -210,6 +218,8 @@ export type AppOptions = {
   readonly followUpMode?: FollowUpMode;
   /** Controlled clock for offline checks; absent keeps wall time. */
   readonly now?: () => number;
+  /** Adapter scan cadence; tests may shorten it. Default 2s, bounds 50ms–60s. */
+  readonly scanIntervalMs?: number;
   /** Optional host/test hook with the bound port, fired once when the listener is serving. */
   readonly onListening?: (port: number) => void;
 };
@@ -262,7 +272,7 @@ function setArchived(doc: Draft<AppChannelState>, info: Draft<AppThreadInfo>, at
   appendEvent(doc, { event: "thread", thread: { ...info } });
 }
 
-/** Resolve an app message, not an arbitrary entry ID. Legacy answers need a retained echo. */
+/** Resolve an app message, not an arbitrary entry ID, to a typed committed transcript entry. */
 export async function appForkEntry(
   tx: Tx, state: AppChannelState, source: ConversationId, from: AppThreadOrigin,
 ): Promise<EntryId | undefined> {
@@ -285,8 +295,14 @@ export async function appForkEntry(
     }
   }
   if (at === undefined || !Number.isSafeInteger(at) || at <= 0) return undefined;
-  const entry = await tx.entry(at as EntryId);
-  return entry?.conversationId === source ? entry.id : undefined;
+  const raw = await tx.entry(at as EntryId);
+  // Only a committed app user or assistant message can anchor a fork: bookkeeping entries and
+  // display-only records never name model context.
+  if (raw === undefined || raw.conversationId !== source) return undefined;
+  const token = userKey === undefined ? AssistantEntry : UserEntry;
+  if (!(await tx.entry(token, at as EntryId))?.model?.some((message) =>
+    message.role === (userKey === undefined ? "assistant" : "user"))) return undefined;
+  return raw.id;
 }
 
 // ── Pure helpers ─────────────────────────────────────────────────────────────
@@ -413,6 +429,8 @@ const CALLBACK_REFUSED_TEXT =
   "This looks like an OAuth callback URL. MCP login cannot be initiated from the app channel, so " +
   "it was not stored and was not sent to the assistant.";
 const RESET_BUSY = "Reset refused: chat busy. Abort or retry when idle.";
+const ARCHIVED_CONTROL_TEXT =
+  "That command was not applied: its thread is archived. Restore the thread first.";
 const STATUS_UNAVAILABLE_HOST =
   "Status is unavailable in this host: it exposes no model/status metadata for this chat. Nothing was sent to the assistant.";
 
@@ -481,6 +499,10 @@ export function validateOptions(options: AppOptions): void {
   if (options.autoArchiveDays !== undefined && (!Number.isSafeInteger(options.autoArchiveDays) || options.autoArchiveDays < 1)) {
     throw new Error("App autoArchiveDays must be an integer of at least 1");
   }
+  if (options.scanIntervalMs !== undefined && (!Number.isSafeInteger(options.scanIntervalMs) ||
+      options.scanIntervalMs < 50 || options.scanIntervalMs > 60_000)) {
+    throw new Error("App scanIntervalMs must be an integer from 50 to 60000");
+  }
 }
 
 // ── The adapter ──────────────────────────────────────────────────────────────
@@ -488,6 +510,7 @@ export function validateOptions(options: AppOptions): void {
 export async function runApp(gateway: AppGateway, options: AppOptions, context: Context): Promise<void> {
   validateOptions(options);
   const now = options.now ?? (() => Date.now());
+  const scanIntervalMs = options.scanIntervalMs ?? SCHEDULED_SCAN_INTERVAL_MS;
   const archiveAfterMs = (options.autoArchiveDays ?? 14) * DAY_MS;
   const scope = withCancel(context);
   const adapterContext = scope.context;
@@ -803,14 +826,19 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       appendEvent(doc, { event: "thread", thread: { ...info } });
     };
     try {
-      if (from === undefined) await mutateState(register);
-      else {
-        if (!await gateway.forkAppThread?.(stateConversation.id, thread, from, register, adapterContext)) {
-          return sendError("bad_request");
+      if (from === undefined) {
+        if (gateway.createAppThread === undefined) await mutateState(register);
+        else {
+          await gateway.createAppThread(stateConversation.id, thread, register, adapterContext);
+          await mutateState(() => undefined);
         }
+      } else if (!await gateway.forkAppThread?.(stateConversation.id, thread, from, register, adapterContext)) {
+        return sendError("bad_request");
+      } else {
         await mutateState(() => undefined);
       }
     } catch (error) {
+      if (error instanceof AppThreadCapacityError) return sendError("not_ready");
       if (!(error instanceof ThreadCreateConflict)) throw error;
       const latest = await mutateState(() => undefined);
       const existing = latest.createKeys?.find((entry) => entry.key === key);
@@ -869,7 +897,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         let changed = false;
         state = await stateConversation.commit(async (tx) => {
           const doc = await tx.doc(AppState, stateConversation.id);
-          if (!archived && !canOpenSideThread(doc)) return copyJson(doc) as unknown as AppChannelState;
+          if (!archived && (!canOpenSideThread(doc) || await gateway.appSnapshotRoom?.(tx) === false)) {
+            return copyJson(doc) as unknown as AppChannelState;
+          }
           if (conversation !== undefined) {
             const retired = new Set<string>();
             for (const item of doc.pending) {
@@ -888,6 +918,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         return changed;
       });
       if (!applied) return sendError("bad_request");
+      if (!archived) await gateway.reserveAppThread?.(thread, adapterContext);
       sendOk();
       pushEventsToSockets();
     } finally {
@@ -939,6 +970,27 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (frame.attachments !== undefined) {
       sendError("unsupported");
       return;
+    }
+    // The first send into a thread creates its mapping and snapshot: reserve that before the
+    // admission is acked, so nothing is admitted that the host cannot hold.
+    if (state.sendKeys.some((item) => item.key === key) || hasEventId(state, `send:${key}`)) {
+      return sendOk({ duplicate: true });
+    }
+    if (!looksLikeOAuthCallback(text) && gateway.reserveAppThread !== undefined) {
+      let reserved: "ok" | "full";
+      try {
+        reserved = await gateway.reserveAppThread(thread, adapterContext);
+      } catch (error) {
+        if (stopping || signal?.aborted) return;
+        journalEvent("app.reserve.failed", {}, error);
+        sendError("internal");
+        return;
+      }
+      if (reserved === "full") {
+        journalEvent("app.send.refused", { reason: "capacity" });
+        sendError("not_ready");
+        return;
+      }
     }
     // Never store callback text. A refused callback still has an idempotent key.
     const callback = looksLikeOAuthCallback(text);
@@ -1156,14 +1208,23 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           ?.flatMap((part) => part.type === "text" && part.text ? [part.text] : []).join("");
         if (text) queuePreview(text);
       });
-      const early = earlySubmissions.get(item.key);
+      let submission = earlySubmissions.get(item.key);
       earlySubmissions.delete(item.key);
-      const submission = early ?? await conversation.submit({
-        type: "input",
-        content: item.text,
-        requestId,
-        whenBusy: await submissionMode(conversation, item),
-      }, withTelemetry(trace, adapterContext));
+      if (submission === undefined) {
+        const whenBusy = await submissionMode(conversation, item);
+        // Recheck after the last await before submitting. Archive retires unsubmitted input;
+        // a native submission may still settle after archive and must not be submitted again.
+        if (archiving.has(thread) || !openThread(state, thread)) {
+          const existing = await conversation.commit((tx) => tx.submissionByRequest(conversation.id, requestId), adapterContext);
+          if (existing === undefined) return;
+          submission = await gateway.harness?.submission(existing.id, adapterContext);
+          if (submission === undefined) return;
+        } else {
+          submission = await conversation.submit({
+            type: "input", content: item.text, requestId, whenBusy,
+          }, withTelemetry(trace, adapterContext));
+        }
+      }
       slot.release();
       submissionId = submission.id;
       syncStatus(watch.value);
@@ -1500,16 +1561,20 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
 
   /** Apply one recorded control after its earlier inputs were placed, recording the truthful outcome. */
   async function applyControl(record: DeferredControl): Promise<ControlOutcome> {
+    // An archived or archiving thread never receives a control effect, even one admitted while it
+    // was open: manual archive is refused while a control is pending, so this fails closed.
+    if (archiving.has(record.thread) || !openThread(state, record.thread)) {
+      return { kind: "refused", text: ARCHIVED_CONTROL_TEXT };
+    }
     try {
       for (const earlier of state.pending.filter((item) => record.earlierKeys.has(item.key))) {
         const conversation = await gateway.conversationFor(sessionForThread(record.thread), adapterContext);
         await submitInOrder(record.thread, async () => {
-          if (!state.pending.some((item) => item.key === earlier.key)) return;
+          const whenBusy = await submissionMode(conversation, earlier);
+          if (!state.pending.some((item) => item.key === earlier.key) ||
+              archiving.has(record.thread) || !openThread(state, record.thread)) return;
           const submission = await conversation.submit({
-            type: "input",
-            content: earlier.text,
-            requestId: requestIdFor(earlier.key),
-            whenBusy: await submissionMode(conversation, earlier),
+            type: "input", content: earlier.text, requestId: requestIdFor(earlier.key), whenBusy,
           }, adapterContext);
           // The normal delivery path reuses this turn, so a control-forced input is answered once.
           earlySubmissions.set(earlier.key, submission);
@@ -1934,35 +1999,34 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       return;
     }
     const id = thread === APP_MAIN_THREAD ? `outbox:${record.id}` : `outbox:${thread}:${record.id}`;
-    // The dedupe and the append share one commit, like the notice path: a crash between them can
-    // never duplicate the event, and a concurrent scan finds the id already in the log.
-    let deferred = false;
-    await mutateState((doc) => {
-      if (hasEventId(doc, id)) return;
-      if (archiving.has(thread)) { deferred = true; return; }
-      const info = threadInfo(doc, thread)!;
-      const interruption = isTurnInterruptionNotice(record);
-      if (!interruption && info.archived) {
-        if (!canOpenSideThread(doc)) { deferred = true; return; }
-        setArchived(doc, info, new Date(now()).toISOString());
+    // The restore, event append and settlement share a commit. Replaying a stale scan cannot
+    // append again, even after the original event has been trimmed.
+    let restored = false;
+    await outbox.update(sessionKey, record.id, async (entry, tx) => {
+      if (entry.status !== "pending" || entry.sessionKey !== sessionKey || archiving.has(thread)) return;
+      const doc = await tx.doc(AppState, stateConversation.id);
+      const info = threadInfo(doc, thread);
+      if (info === undefined) return;
+      if (!hasEventId(doc, id)) {
+        const interruption = isTurnInterruptionNotice(entry);
+        if (!interruption && info.archived) {
+          if (!canOpenSideThread(doc) || await gateway.appSnapshotRoom?.(tx) === false) return;
+          setArchived(doc, info, new Date(now()).toISOString());
+          restored = true;
+        }
+        if (entry.appAnswerEntry !== undefined) rememberAnswer(doc, id, thread, entry.appAnswerEntry);
+        appendEvent(doc, {
+          event: "message", id, thread, role: interruption ? "notice" : "assistant",
+          text: entry.text, at: new Date(now()).toISOString(),
+        });
       }
-      if (record.appAnswerEntry !== undefined) rememberAnswer(doc, id, thread, record.appAnswerEntry);
-      appendEvent(doc, {
-        event: "message",
-        id,
-        thread,
-        role: interruption ? "notice" : "assistant",
-        text: record.text,
-        at: new Date(now()).toISOString(),
-      });
-    });
-    if (deferred) return;
-    pushEventsToSockets();
-    await updateScheduled(sessionKey, record.id, (entry) => {
       entry.status = "delivered";
       entry.settledAt = now();
       delete entry.error;
     }, cleanupContext);
+    await mutateState(() => undefined);
+    pushEventsToSockets();
+    if (restored) await gateway.reserveAppThread?.(thread, adapterContext);
   };
 
   const scanScheduled = async (): Promise<void> => {
@@ -1998,6 +2062,11 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           continue;
         }
         const record = value as CronDeliveryRecord;
+        // A capacity-blocked archived origin consumes no dispatch slot: its result waits in the
+        // outbox until an open slot exists, and every other thread (main included) keeps flowing.
+        const originThread = threadForSession(sessionKey);
+        if (!isTurnInterruptionNotice(record) && originThread !== undefined &&
+            threadInfo(state, originThread)?.archived === true && !canOpenSideThread(state)) continue;
         const deliveryKey = JSON.stringify([sessionKey, record.id]);
         if (record.status !== "pending" || scheduledActive.has(deliveryKey)) continue;
         if (scheduledActive.size >= MAX_SCHEDULED_ACTIVE) return;
@@ -2131,7 +2200,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     resumeDeferredControls();
     drain();
     requestScheduledScan();
-  }, SCHEDULED_SCAN_INTERVAL_MS);
+  }, scanIntervalMs);
   scanTimer.unref?.();
 
   try {
